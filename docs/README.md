@@ -21,6 +21,8 @@ Source-adjacent references cover [record publication](../src/server/RECORD-VERSI
 
 The [application work list](application-todo.md) is the single source for approved open requirements, release checks and deferred ideas, with stable `CRS-###` identifiers. Keep status there; other documents provide design and evidence links. A checked implementation item or old passing test does not prove real-provider compatibility, physical passkeys, a target filesystem, model quality, or other explicitly open acceptance work.
 
+[Processing context and unattended continuation](processing-context-proposal.md) records the large-document proposal, corrections to earlier assumptions, offline scaling evidence and criteria for independent review before choosing an implementation. It does not establish live extraction quality or an adaptive-processing speedup.
+
 [Private home deployment options](home-cloud-deployment.md) records the proposed local/cloud arrangements, access controls, implementation prerequisites and dated DigitalOcean cost estimates. It is planning reference, not an additional supported installation path.
 
 Personal coordination journals, raw validation receipts, generated repository inventories and private reference artwork are excluded from the public repository. Maintained documentation contains the contracts contributors need; ordinary work must not depend on private notes.

@@ -59,29 +59,36 @@ before either assumption is relied on.
 ## Workload reality
 
 The measured 2026-09-23 slice covered 20 pages. Real sources are much larger: a 900-page source is
-in hand. Extrapolating the observed rate of 46.2 s and 122,254 input tokens per page:
+in hand. A constant-rate scenario using 46.2 s of provider-request time and 122,254 input tokens
+per page gives the following figures. Provider-request time includes proxy, transport and upstream
+wait; it is not total import time. These are historical scenario calculations, not current-code
+measurements or predictions for an arbitrary document:
 
-| Pages | Wall time | Requests | Input tokens |
-| ----- | --------- | -------- | ------------ |
-| 20    | 0.3 h     | 31       | 2.4 M        |
-| 100   | 1.3 h     | 155      | 12.2 M       |
-| 900   | 11.5 h    | 1,395    | 110 M        |
+| Pages | Provider-path time | Requests | Input tokens |
+| ----- | ------------------ | -------- | ------------ |
+| 20    | 0.3 h              | 31       | 2.4 M        |
+| 100   | 1.3 h              | 155      | 12.2 M       |
+| 900   | 11.5 h             | 1,395    | 110 M        |
 
 Against the whole-job bounds of two active hours, 16 slices, 256 turns, 2,048 requests and
 20 million measured tokens, three things follow.
 
-**The token budget binds first.** A 900-page source projects to roughly five times the whole-job
-token allowance, before the time allowance is reached. The request count still fits.
+**Time would bind slightly first under these assumptions.** Two hours at 46.2 seconds per page
+allows about 156 pages. The 20-million token allowance includes input and output: at 122,254.5
+input plus 1,314.7 output tokens per page it allows about 162 pages. This corrects the earlier
+claim that tokens bind first. Both allowances would be exceeded in the 900-page scenario; its
+projected request count still fits.
 
-**Completion requires repeated explicit continuation.** Two active hours covers about 156 pages at
-the observed rate, so a 900-page source needs roughly six budgets, each granted by an explicit
-Resume, each requiring an unlocked profile and therefore a person.
+**This scenario requires repeated explicit continuation.** A 900-page source would need at least
+six time allowances: the initial allowance plus five explicit Resumes, with an unlocked profile.
+This is not proof that current code or a particular real document requires those extensions.
 
-**These projections use pre-eviction numbers and overstate the token figure.** They come from a run
+**These projections use pre-eviction numbers and cannot establish current feasibility.** They come from a run
 whose per-request input grew from 11,446 to 136,739 tokens; transcript eviction landed afterwards
-and CRS-039 records that the post-eviction per-page rate is unmeasured. That single unmeasured
-number now decides whether a large source can complete at all, which makes it the most valuable
-measurement available and a reason to prioritise the live run under CRS-038.
+and CRS-039 records that the post-eviction per-page rate is unmeasured. Current tokens, elapsed
+time, requests, turns and slices all matter. Token rate alone does not decide completion or prove
+extraction accuracy. A budget stop with explicit Resume is also different from an inability to
+process the source at all.
 
 ### How the 900-page projection was derived
 
@@ -95,30 +102,83 @@ output tokens and 104,960 reported cached input tokens.
 A page does not contain 122,254 tokens. That figure is the cumulative cost of resending the
 transcript on every round trip for that page: per-request input rose from 11,446 to 136,739 tokens
 across the slice, so later pages each carried the accumulated history of earlier ones. This is the
-quantity transcript eviction attacks, and it is why the projection is an upper bound rather than an
-estimate. Cached input was 104,960 tokens, about 4.3 percent of input, with the optional cache
+quantity transcript eviction attacks. The projection is neither a proven upper bound nor a
+current estimate: other documents, rereads or provider conditions can exceed it. Cached input
+was 104,960 tokens, about 4.3 percent of input, with the optional cache
 setting off.
 
-Cost follows directly once a rate is known, and the model in use should supply it:
+### What an 800-page import must achieve
+
+One default allowance requires averages no greater than 25,000 reported input-plus-output tokens,
+nine active seconds and 2.56 physical provider requests per page across 800 pages. The 256-turn
+and 16-slice limits must also fit. These are necessary averages derived from the current limits,
+not a prediction of extraction quality or completion. Explicit Resume grants another allowance.
+
+An offline 2026-09-24 experiment extended the existing
+[controlled PDF harness](../src/server/test/intake-pdf-controlled.integration.test.ts) to an
+800-page dense fictional PDF, using the current application, native-PDF bridge and Import
+coordinator with unchanged production budgets. A scripted provider read one page per tool call
+and published one synthetic record per page in ten-page batches, an existing configurable plan
+size. All 800 pages were delivered and all 80 units accounted for in 896 requests and 14 slices,
+with no budget extension, unchanged original hash and no accepted records. Local execution took
+about 303 seconds; this measures the synthetic host workload with immediate scripted replies,
+not real model processing time or deployment performance.
+
+The same run sent 393,189,513 serialized text characters cumulatively, excluding media data; its
+largest request contained 822,130 text characters and at most two PDF parts. First requests in
+fresh contexts ranged from about 46,000 to 65,000 characters, while the last requests grew to
+roughly 690,000–822,000. This establishes repeated context in this workload despite existing
+evidence eviction. Characters are not provider tokens, and current capped 64-request contexts
+must not be modeled as one uninterrupted quadratic 800-page conversation.
+
+Repeating the same 800-page fixture with the default two-page plan size and one publication per
+unit stopped at `job_limit`: 671 pages delivered, 670 records in 335 accounted units, 65 units
+still remaining, 1,024 requests and 16 slices. It sent 830,087,567 text characters before stopping;
+the largest request was 1,532,547 characters. There were no budget extensions or accepted records,
+and the original hash remained unchanged. The batch container's terminal status was `complete`,
+but its item reason and reading checkpoint explicitly reported the budget pause; that container
+status does not establish complete document coverage. Local execution took about 757 seconds.
+
+The scripted schedule explains the difference. With one tool call per response, 800 reads plus
+80 ten-page publications and two setup calls require 882 executed calls. Each full 64-request
+context can execute 63 calls and use its final response to acknowledge results, giving 14 contexts
+and 896 requests. Two-page publications instead require 1,202 executed calls, which would need
+20 contexts and 1,222 requests; the default 16-slice allowance stops first. This proves a budget
+failure for that particular schedule, not for every possible model behavior or plan. Larger
+batches are not validated extraction-quality recommendations, and this comparison does not
+establish adaptive section boundaries or a live-model speedup.
+
+This is a counterexample to an absolute claim that the current pipeline cannot traverse 800 pages.
+It does not establish real-model feasibility: the fake provider retained perfect progress outside
+its conversation, generated records from page numbers rather than extracting them, and reported
+no token usage. The measured-token gate was therefore not exercised. Provider accuracy, media
+tokenization, elapsed time and autonomous recovery remain unqualified. A new adaptive scheduler
+has not been implemented or shown superior by this experiment.
+
+### Historical 900-page cost illustration
+
+For the 2026-09-23 pre-eviction constant-rate scenario only, cost follows once the applicable
+provider rates are known:
 
     cost ~= 110.0 x (input rate per million)  +  1.18 x (output rate per million)
 
 At illustrative input rates — these are placeholders for sensitivity, not quoted prices — 110 M
-input tokens costs roughly 550, 1,100 or 1,650 units at 5, 10 or 15 per million respectively, with
-output contributing about one percent of that. Substitute the configured route's actual published
+input tokens costs roughly 550, 1,100 or 1,650 units at 5, 10 or 15 per million respectively.
+Output tokens are about one percent of input-token volume; their cost share depends on the separate
+output rate. Substitute the configured route's actual published
 rates before treating any of it as a budget.
 
-Two factors move this by more than the rate does. Transcript eviction removes roughly 30x per
-evicted page and landed after this slice, so the true post-eviction figure is materially lower and
-currently unmeasured. And accepted prompt caching would reprice the repeated prefix at the
-provider's cache-read rate rather than its full input rate, which on a workload that is almost
-entirely resent context is the difference between an affordable import and an unaffordable one.
-That makes the CRS-039 cache verification a cost question, not only a latency one.
+Transcript eviction landed after that 2026-09-23 slice. A reduction in one removed payload is not the same
+as a whole-request or whole-import reduction; current repeated context, rereads and provider media
+usage require measurement. Provider prompt caching can change the price of eligible repeated
+prefixes when supported, but does not eliminate context limits or necessarily reduce the app's
+reported-token accounting. CRS-039 must measure actual usage and latency separately.
 
-**Transport is not the constraint at any of these sizes.** Roughly 0.9 GB of evidence and bounded
-context for a 900-page source moves in about 3.5 minutes on a 35 Mbit/s uplink and about 12 seconds
-on 500 Mbit/s, against 11.5 hours of provider wait. Placement must therefore be decided on
-development experience and host resources, not on transfer time.
+**Transport needs its own measurement.** As a bandwidth-only illustration, 0.9 decimal GB would
+take about 206 seconds at 35 Mbit/s or 14.4 seconds at 500 Mbit/s, before protocol overhead and
+latency. Neither that transfer volume nor sustained bandwidth has been established for a current
+900-page import. Provider-request timing includes transport and proxy work, so it cannot by itself
+rule out a transport constraint or determine placement.
 
 ## A. Placement metrics
 
@@ -127,8 +187,8 @@ development experience and host resources, not on transfer time.
 The application records one duration for a provider request. That duration covers the local
 proxy, the network, upstream queueing and the provider's own work, and
 [import performance](import-performance.md) is explicit that it "does not measure upstream
-compute separately." Moving the proxy changes three terms inside that one number and leaves the
-dominant term untouched, so comparing two such numbers cannot attribute a difference.
+compute separately." Moving the proxy may affect several components of that duration; comparing
+two aggregate numbers cannot identify which component changed or establish upstream dominance.
 
 The measured 2026-09-23 slice spent 923,903 ms of 931,179 ms in 31 provider-request spans, against
 274 ms of upload receive and about 2,389 ms across 20 host page reads. Any placement claim has to
@@ -528,17 +588,27 @@ separate, additive improvement. It is not required for the benefit described her
 
 ## E. Large-source completion (deferred)
 
+**2026-09-24 review amendment.** The options below preserve earlier reasoning. The user now
+requires productive background imports to continue without routine manual Resume at artificial
+whole-job allowance boundaries; that direction is no longer an undecided option. Current code
+still has those gates. Bounded model sessions remain useful and are distinct from cumulative job
+limits. Partitioning solely to get another allowance and a mandatory upfront allowance that
+recreates the same interruption are not the recommended design. The
+[processing proposal](processing-context-proposal.md) appends the measured findings, corrections,
+unselected alternatives and independent review criteria; CRS-039 and CRS-086 own the requirements.
+
 Recorded here because it sets the deployment cadence and the budget questions above. Not scheduled;
 do not begin before the measurement in the first step.
 
-A 900-page source projects to roughly 110 million input tokens against a 20-million whole-job
-allowance and about six explicit continuations, as the workload table shows. Sources of this size
-are real, so "import a chart" does not currently mean "import this chart".
+Under the historical constant-rate scenario, a 900-page source projects to roughly 110 million
+input tokens against a 20-million input-plus-output allowance, and at least six time allowances
+(five additional explicit Resumes). Sources of this size require current measurement; that
+scenario alone does not establish whether today's implementation can complete a particular chart.
 
 **First, measure — the option set depends on it.** Those projections use pre-eviction figures.
-Transcript eviction removes roughly 30x per evicted page, and CRS-039 records that the resulting
-per-page rate is unmeasured. Obtain it from the CRS-038 live run. If the true rate brings a large
-source within the existing allowance, most of what follows is unnecessary.
+CRS-039 records that the post-eviction per-page rate is unmeasured. Establish current scaling with
+offline transport/budget checks, then calibrate actual usage with a bounded provider test. If the
+result brings a large source within the existing allowances, some of what follows is unnecessary.
 
 If it does not, the options, none yet chosen:
 
@@ -546,12 +616,11 @@ If it does not, the options, none yet chosen:
   why the current numbers were chosen before changing them; they bound runaway provider spend, and
   a defect behind a raised ceiling is expensive rather than merely slow.
 - **Partition the source.** Divide a large original into several budgeted jobs tracked as one set.
-  This fits the existing plan-unit and extraction-unit model and needs no allowance change. Probably
-  the least invasive option.
+  The existing plan/unit model provides a starting point, but separate job allowances increase the
+  aggregate authorization for one original. This requires an explicit aggregate budget decision.
 - **Continue across allowance boundaries automatically.** Today only an explicit Resume grants a new
-  budget. Automating it conflicts with the deliberate requirement for a person, and cannot work
-  unattended anyway, because a restart locks the profile and the key cannot be recovered without an
-  authenticator.
+  budget. Automating it changes that deliberate authorization rule. A budget boundary alone does
+  not lock the profile; after a restart or actual lock, authentication is still necessary to resume.
 - **Skip low-yield pages.** This is CRS-044, which explicitly withholds triage until evidence
   supports it: low text density cannot by itself distinguish administrative content from missed
   extraction. Large charts make it attractive and the same caution applies.
@@ -561,9 +630,10 @@ If it does not, the options, none yet chosen:
   only because it decides whether a large source fits the budget at all. Prompt caching remains
   tied to CRS-039 and to whether `cache_control` is accepted on the configured route.
 
-The interaction with deployment is direct. A source needing six continuations spans days of
-elapsed time and repeated unlocks, so the deferral guardrail in section C and the reduced re-entry
-cost in section D are what make a large import survivable alongside ordinary deployments.
+The interaction with deployment is direct. A source needing repeated manual continuation may span
+multiple sessions and unlocks, depending on operator availability; days of elapsed time are not a
+mathematical consequence. The deferral guardrail in section C and re-entry work in section D can
+make such an import easier alongside ordinary deployments.
 
 ## Open questions
 
