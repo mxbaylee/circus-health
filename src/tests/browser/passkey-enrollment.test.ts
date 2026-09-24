@@ -253,6 +253,8 @@ for (const prfOutput of ['buffer', 'array'])
       assert.deepEqual((await api('/api/profiles')).value.data, []);
       await page.getByRole('button', { name: 'Create profile', exact: true }).click();
       await page.getByLabel('Display name', { exact: true }).fill('Fictional Passkey Robin');
+      await page.getByLabel('Full name on health records').fill('Fictional Passkey Robin');
+      await page.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
       await page.getByRole('button', { name: 'Continue to recovery key' }).click();
       const recovery = await page.getByLabel('Recovery key', { exact: true }).inputValue();
       await page.getByLabel('I have saved my recovery key').check();
@@ -280,6 +282,10 @@ for (const prfOutput of ['buffer', 'array'])
       await capture('open-profile');
       await verification.getByLabel('Recovery key', { exact: true }).fill(recovery);
       await verification.getByRole('button', { name: 'Open profile', exact: true }).click();
+      await page
+        .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
+        .getByRole('button', { name: 'Add passkey', exact: true })
+        .click();
       const dialog = page.getByRole('dialog', { name: 'Add passkey for Fictional Passkey Robin' });
       await dialog.getByRole('status').filter({ hasText: 'Confirm your passkey' }).waitFor();
       await page.waitForFunction(() => typeof window.releaseConfirmation === 'function');

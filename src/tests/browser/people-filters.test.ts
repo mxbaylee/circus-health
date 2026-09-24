@@ -92,6 +92,8 @@ test(
     );
     await page.getByRole('button', { name: 'Create profile', exact: true }).click();
     await page.getByLabel('Display name', { exact: true }).fill('Fictional Shortbread');
+    await page.getByLabel('Full name on health records').fill('Fictional Shortbread');
+    await page.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
     await page.getByRole('button', { name: 'Continue to recovery key' }).click();
     const recovery = await page.getByLabel('Recovery key', { exact: true }).inputValue();
     await page.getByLabel('I have saved my recovery key').check();
@@ -99,7 +101,7 @@ test(
     await page.getByLabel('Recovery key').fill(recovery);
     await page.getByRole('button', { name: 'Open profile' }).click();
     await page
-      .getByRole('dialog', { name: /^Add passkey for / })
+      .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
       .getByRole('button', { name: 'Skip', exact: true })
       .click();
     for (const step of ['About you', 'Primary care provider', 'Emergency contact']) {
