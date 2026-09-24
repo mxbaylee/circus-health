@@ -2,8 +2,8 @@
 
 These instructions apply to the whole repository.
 
-- Start ordinary commit subjects with a Gitmoji emoji (or its shortcode), for example `✨ Add import review` or `🐛 Fix upload retry`. Merge operations are exempt. This is a contributor default, and `git commit --no-verify` is available when an exception is useful. See `CONTRIBUTING.md` for setup.
-- After initial publication, send changes to `main` through pull requests and squash merge using a Gitmoji PR title. Do not push directly to `main`; see `CONTRIBUTING.md` for the hosted settings that enforce this policy.
+- Start ordinary commit subjects with any Unicode emoji (or an existing Gitmoji shortcode), for example `✨ Add import review` or `🐛 Fix upload retry`. Merge operations are exempt. This is a contributor default, and `git commit --no-verify` is available when an exception is useful. See `CONTRIBUTING.md` for setup.
+- After initial publication, send changes to `main` through pull requests and squash merge using an emoji-prefixed PR title. Do not push directly to `main`; see `CONTRIBUTING.md` for the hosted settings that enforce this policy.
 - Treat `README.md` and `docs/README.md` as public entry points. Keep setup on the supported npm → Docker Compose → LiteLLM path.
 - Put browser code in `src/app/`, server code in `src/server/`, cross-runtime contracts in `src/shared/`, deployment code in `deploy/`, and durable model instructions beside their server consumer.
 - Reuse existing components, tokens, data adapters, and domain contracts before adding a parallel implementation.

@@ -32,15 +32,20 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund --save-exact gitmojis@3.15.0
           node --input-type=module <<'NODE'
           import { gitmojis } from 'gitmojis';
-          // Use the standard Gitmoji catalog, pinned independently of PR code.
+          // Same rule as src/scripts/emoji-title.ts, without executing PR code.
+          // The catalog is only for backward-compatible shortcodes.
+          const leadingEmoji = new RegExp('^\\p{RGI_Emoji} ', 'v');
+          function validEmojiTitle(title) {
+            if (/[\r\n]/.test(title)) return false;
+            const prefix = leadingEmoji.exec(title)?.[0];
+            if (prefix) return title.slice(prefix.length).trim().length > 0;
+            return gitmojis.some(
+              ({ code }) => title.startsWith(`${code} `) && title.slice(code.length + 1).trim().length > 0,
+            );
+          }
           const title = process.env.PR_TITLE ?? '';
-          const valid = gitmojis.some(({ emoji, code }) =>
-            [emoji, code].some((prefix) =>
-              title.startsWith(`${prefix} `) && title.slice(prefix.length + 1).trim().length > 0,
-            ),
-          );
-          if (!valid) {
-            console.error('PR title must begin with an unbracketed Gitmoji and a description, e.g. ✨ Add import review or :sparkles: Add import review.');
+          if (!validEmojiTitle(title)) {
+            console.error('PR title must begin with an emoji (or Gitmoji shortcode), a space and a description, e.g. 📚 Update docs or :memo: Update docs.');
             process.exitCode = 1;
           }
           NODE

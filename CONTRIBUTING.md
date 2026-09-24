@@ -49,9 +49,9 @@ Keep requirements and enduring decisions in this repository, using the [single C
 
 ## Commit messages and pull requests
 
-Start ordinary commit subjects with a [Gitmoji](https://gitmoji.dev/), for example `✨ Add import review`, `🐛 Fix upload retry` or `📝 Clarify provider setup`. Gitmoji shortcodes such as `:sparkles:` are also accepted. This default applies to human and agent commits; merge operations are exempt.
+Start ordinary commit subjects with any Unicode emoji, followed by a space and description, for example `📚 Update docs`, `✨ Add import review`, `🐛 Fix upload retry` or `📝 Clarify provider setup`. Existing [Gitmoji shortcodes](https://gitmoji.dev/) such as `:sparkles:` are also accepted for compatibility; literal emojis are not restricted to that catalog. This default applies to human and agent commits; merge operations are exempt.
 
-[Husky](https://typicode.github.io/husky/) runs commitlint with `commitlint-config-gitmoji`. We disable the preset's additional conventional-commit rules, so no `feat:` prefix or other rigid formatting is required. This is the preset's permissive Gitmoji check, not a strict first-character validator. Commitlint's default ignores remain enabled for generated messages such as reverts and fixups.
+[Husky](https://typicode.github.io/husky/) runs commitlint with a single leading-emoji rule. The local hook and PR-title workflow use the same Unicode emoji rule supported by the contributor Node version, including flags, skin tones, keycaps and joined emoji. No `feat:` prefix is required. Brackets and text before the emoji are rejected; an emoji in the body cannot rescue a subject without one. Commitlint's default ignores remain enabled for generated messages such as reverts and fixups.
 
 Installing contributor dependencies with `npm ci` from the repository root installs the local hook through `prepare`. After recreating `.git`, run:
 
@@ -64,9 +64,9 @@ Use the contributor Node version on Git's PATH, including in graphical Git clien
 
 Exceptions are fine: use `git commit --no-verify` or `HUSKY=0 git commit ...` to skip local hooks, including when amending a merge. Branch commits are not scanned by CI.
 
-Submit changes to `main` through a pull request, then squash merge. The PR title supplies the squash commit title and must begin with an unbracketed Gitmoji emoji or shortcode followed by a space and description: `✨ Add import review` or `:sparkles: Add import review`. Bracketed prefixes are rejected. GitHub runs the **PR title** check when a PR opens, its title or commits change, or it reopens. Contributors using the GitHub editor or another language do not need Node locally to satisfy this check.
+Submit changes to `main` through a pull request, then squash merge. The PR title supplies the squash commit title and must begin with an unbracketed Unicode emoji or existing Gitmoji shortcode followed by a space and description: `✨ Add import review` or `:sparkles: Add import review`. Bracketed prefixes are rejected. GitHub runs the **PR title** check when a PR opens, its title or commits change, or it reopens. Contributors using the GitHub editor or another language do not need Node locally to satisfy this check.
 
-The title workflow installs a pinned Gitmoji catalog in an isolated runner directory. It checks out no repository code, runs no package install scripts, never evaluates title text as code, and requests no token permissions or secrets. Merge-message and revert ignores apply only to local commitlint, not the proposed PR title.
+The title workflow uses Unicode emoji matching and installs a pinned Gitmoji catalog only for shortcode compatibility in an isolated runner directory. Parity tests exercise the actual workflow script and local validator against the same accepted and rejected titles. It checks out no repository code, runs no package install scripts, never evaluates title text as code, and requests no token permissions or secrets. Merge-message and revert ignores apply only to local commitlint, not the proposed PR title.
 
 ### Repository administrator setup
 
