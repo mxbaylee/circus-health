@@ -108,7 +108,7 @@ test(
     assert.equal(await link.count(), 1);
     assert.match(
       await page.locator('body').innerText(),
-      /It may be repeated evidence or a separate measurement/,
+      /Matching numbers alone do not mean it is the same measurement/,
     );
     const path = process.env.CIRCUS_TEST_SCREENSHOTS;
     if (path) {
