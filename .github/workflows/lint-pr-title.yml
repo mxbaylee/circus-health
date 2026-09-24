@@ -33,15 +33,14 @@ jobs:
           node --input-type=module <<'NODE'
           import { gitmojis } from 'gitmojis';
           // Use the standard Gitmoji catalog, pinned independently of PR code.
-          // Brackets remain optional so the existing [🚀] style also works.
           const title = process.env.PR_TITLE ?? '';
           const valid = gitmojis.some(({ emoji, code }) =>
-            [emoji, code, `[${emoji}]`, `[${code}]`].some((prefix) =>
+            [emoji, code].some((prefix) =>
               title.startsWith(`${prefix} `) && title.slice(prefix.length + 1).trim().length > 0,
             ),
           );
           if (!valid) {
-            console.error('PR title must begin with a Gitmoji and a description, e.g. ✨ Add import review, :sparkles: Add import review, or [✨] Add import review.');
+            console.error('PR title must begin with an unbracketed Gitmoji and a description, e.g. ✨ Add import review or :sparkles: Add import review.');
             process.exitCode = 1;
           }
           NODE

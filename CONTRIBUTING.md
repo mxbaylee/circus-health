@@ -64,7 +64,7 @@ Use the contributor Node version on Git's PATH, including in graphical Git clien
 
 Exceptions are fine: use `git commit --no-verify` or `HUSKY=0 git commit ...` to skip local hooks, including when amending a merge. Branch commits are not scanned by CI.
 
-Submit changes to `main` through a pull request, then squash merge. The PR title supplies the squash commit title and must begin with a Gitmoji emoji or shortcode followed by a space and description. Optional brackets are supported: `✨ Add import review`, `:sparkles: Add import review` and `[✨] Add import review` all work. GitHub runs the **PR title** check when a PR opens, its title or commits change, or it reopens. Contributors using the GitHub editor or another language do not need Node locally to satisfy this check.
+Submit changes to `main` through a pull request, then squash merge. The PR title supplies the squash commit title and must begin with an unbracketed Gitmoji emoji or shortcode followed by a space and description: `✨ Add import review` or `:sparkles: Add import review`. Bracketed prefixes are rejected. GitHub runs the **PR title** check when a PR opens, its title or commits change, or it reopens. Contributors using the GitHub editor or another language do not need Node locally to satisfy this check.
 
 The title workflow installs a pinned Gitmoji catalog in an isolated runner directory. It checks out no repository code, runs no package install scripts, never evaluates title text as code, and requests no token permissions or secrets. Merge-message and revert ignores apply only to local commitlint, not the proposed PR title.
 
