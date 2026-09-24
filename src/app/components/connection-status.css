@@ -1,0 +1,78 @@
+.connection-control {
+  position: relative;
+  display: flex;
+}
+.connection-icon.connected {
+  color: var(--muted);
+}
+.connection-icon.reconnecting,
+.connection-icon.unavailable {
+  color: var(--pink);
+}
+.connection-details {
+  /* Status details contain no controls and must not cover nearby actions. */
+  pointer-events: none;
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 12px);
+  right: -40px;
+  width: min(280px, calc(100vw - 32px));
+  padding: 14px;
+  border: 1px solid var(--control-border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 8px 28px #00000020;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.connection-details p {
+  margin: 5px 0 0;
+}
+.app-update-notice {
+  position: fixed;
+  z-index: 30;
+  top: 86px;
+  right: 20px;
+  max-width: calc(100vw - 32px);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--control-border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 8px 28px #00000020;
+  font-size: 0.9rem;
+}
+.app-update-notice p {
+  margin: 4px 0 0;
+}
+.app-update-notice > svg {
+  flex-shrink: 0;
+  color: var(--pink);
+}
+.app-update-notice .button {
+  flex-shrink: 0;
+}
+.profile-startup-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+@media (max-width: 480px) {
+  .app-update-notice {
+    right: 16px;
+    flex-wrap: wrap;
+  }
+  .app-update-notice > div {
+    flex: 1;
+  }
+}
+@media print {
+  .connection-control,
+  .app-update-notice {
+    display: none;
+  }
+}

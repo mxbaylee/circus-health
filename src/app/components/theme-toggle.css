@@ -1,0 +1,48 @@
+.theme-toggle > label {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 30px;
+  cursor: pointer;
+}
+.theme-toggle > label > input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+.theme-toggle > label > span {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  color: var(--muted);
+}
+.theme-toggle > label:hover > span {
+  color: var(--text);
+}
+.theme-toggle > label > input:checked + span {
+  background: var(--theme-fill);
+  color: var(--theme-ink);
+  border-color: var(--control-border);
+  box-shadow: 0 1px 3px #00000012;
+}
+.theme-toggle > label > input:focus-visible + span {
+  outline: 2px solid var(--pink);
+  outline-offset: 2px;
+}
+@media (max-width: 640px) {
+  .theme-toggle > label {
+    width: 28px;
+    height: 28px;
+    flex-basis: 28px;
+  }
+  .theme-toggle > label > span {
+    width: 28px;
+    height: 28px;
+  }
+}

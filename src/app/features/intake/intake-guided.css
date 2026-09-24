@@ -1,0 +1,259 @@
+.intake-processing-details > summary {
+  cursor: pointer;
+  padding: 10px 0;
+  color: var(--muted);
+}
+.intake-guided-actions {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.intake-guided-actions > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.intake-guided-actions p {
+  flex: 1 1 200px;
+}
+.intake-processing-details {
+  margin-block: 8px;
+}
+.intake-original-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.intake-original-heading h3 {
+  margin: 0;
+}
+.report-status-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.report-status-tabs button {
+  min-height: 38px;
+  padding: 7px 1px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.report-status-tabs button[aria-selected='true'] {
+  border-bottom-color: var(--accent);
+  color: var(--ink);
+}
+.report-status-tabs button span {
+  margin-left: 3px;
+  font-size: 0.75rem;
+}
+.report-people,
+.report-people-detail {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+.report-people-list {
+  display: grid;
+  gap: 7px;
+}
+.report-person-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+.report-person-open {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 0;
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.report-person-open > svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+.report-person-open span,
+.report-person-open small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.report-person-open small {
+  margin-top: 3px;
+  color: var(--muted);
+}
+.report-person-row-actions,
+.report-person-primary-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.report-person-row-actions {
+  justify-content: flex-end;
+  padding-right: 10px;
+}
+.report-people-detail > .text-link {
+  justify-self: start;
+}
+.report-people-detail > header,
+.report-person-evidence > div,
+.report-person-matches article {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.report-people-detail h3,
+.report-people-detail h4,
+.report-people-detail p,
+.report-people-detail dl,
+.report-people-detail blockquote {
+  margin: 0;
+}
+.report-people-detail header h3 {
+  margin-block: 2px 3px;
+  font-size: clamp(1.2rem, 2vw, 1.55rem);
+}
+.report-people-detail header p:not(.eyebrow),
+.report-person-matches small {
+  color: var(--muted);
+}
+.report-person-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+.report-person-fields > div,
+.report-person-history,
+.report-person-uncertainties,
+.report-person-evidence,
+.report-person-matches,
+.report-person-self-match {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+.report-person-fields dt {
+  color: var(--muted);
+  font-size: 0.73rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.report-person-fields dd {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+}
+.report-person-history h4,
+.report-person-uncertainties h4,
+.report-person-evidence h4,
+.report-person-matches h4 {
+  margin-bottom: 7px;
+}
+.report-person-uncertainties ul {
+  margin: 0;
+  padding-left: 20px;
+}
+.report-person-evidence {
+  display: grid;
+  gap: 8px;
+}
+.report-person-evidence a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.report-person-evidence blockquote {
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+}
+.report-person-evidence footer,
+.report-person-matches small {
+  display: block;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  font-size: 0.76rem;
+}
+.report-person-matches {
+  display: grid;
+  gap: 9px;
+}
+.report-person-matches article + article {
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+}
+.report-load-more {
+  justify-self: start;
+}
+.intake-original-back {
+  display: none;
+}
+@media (max-width: 760px) {
+  .report-person-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .report-person-row-actions {
+    justify-content: space-between;
+    min-height: 42px;
+    padding: 0 10px 8px;
+  }
+  .report-people-detail > header,
+  .report-person-evidence > div,
+  .report-person-matches article {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .report-person-primary-actions,
+  .report-person-primary-actions .button {
+    width: 100%;
+  }
+  .report-person-primary-actions .text-link {
+    min-height: 42px;
+  }
+  .intake-original-back {
+    display: inline-flex;
+  }
+}
+@media (max-width: 600px) {
+  .intake-guided-actions p {
+    flex-basis: auto;
+  }
+  .intake-guided-actions > div {
+    width: 100%;
+  }
+  .intake-guided-actions > div > button {
+    flex: 1 1 auto;
+  }
+}
+
+.intake-source-context details {
+  margin-block: 12px;
+}
+.intake-source-context pre {
+  max-height: 18rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.intake-source-context .helper-text {
+  overflow-wrap: anywhere;
+}

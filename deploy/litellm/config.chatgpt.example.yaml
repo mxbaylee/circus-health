@@ -1,0 +1,15 @@
+# Copy outside Git. Select an eligible ChatGPT/Codex model for your account.
+# A real JPG reached a reviewable proposal through this route; broader gates remain.
+# LiteLLM manages device OAuth. It does not inherit the host Codex CLI login.
+# The launcher persists OAuth state separately from health data.
+model_list:
+  - model_name: health-primary
+    litellm_params:
+      model: chatgpt/gpt-6-astra
+    model_info:
+      mode: responses
+      supports_function_calling: true
+      supports_vision: true
+      # Declared PDF support: offline wire translation is tested; account/backend
+      # acceptance is checked at use time, with lossless PNG fallback on rejection.
+      supports_pdf_input: true

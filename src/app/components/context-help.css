@@ -1,0 +1,24 @@
+.context-help > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.85rem;
+}
+.context-help > summary::-webkit-details-marker {
+  display: none;
+}
+.context-help-content {
+  padding: 12px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  font-size: 0.875rem;
+}
+.context-help-content p + p,
+.context-help-content ul {
+  margin-top: 8px;
+}

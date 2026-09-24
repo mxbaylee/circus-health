@@ -1,0 +1,10 @@
+# Copy outside Git. Replace the model identifier with one available to your account.
+# Provider env file: ANTHROPIC_API_KEY=your-key
+model_list:
+  - model_name: health-primary
+    litellm_params:
+      model: anthropic/your-tool-capable-claude-model
+      api_key: os.environ/ANTHROPIC_API_KEY
+    model_info:
+      supports_function_calling: true
+      supports_vision: false

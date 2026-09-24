@@ -1,0 +1,308 @@
+import { useEffect, useState } from 'react';
+import type { Intake, IntakePackageInventory, IntakePackageMember } from '../../../shared/intake';
+import { api, useResource } from '../../data/api';
+import { formatBytes } from '../../data/format';
+import { ResourceState } from '../../components/ResourceState';
+import { LoadingIndicator } from '../../components/LoadingIndicator';
+
+type Structure = {
+  jsonPointer: string;
+  type: string;
+  totalChildren: number;
+  children: {
+    key: string;
+    jsonPointer: string | null;
+    type: string;
+    totalChildren: number | null;
+  }[];
+  literal: string | null;
+  offset: number;
+  nextOffset: number | null;
+  nextJSONOffset: number | null;
+};
+type MemberRead = {
+  member: IntakePackageMember;
+  contentUrl?: string;
+  sourceFileId?: string;
+  literal?: string;
+  structure?: Structure;
+  structureIssue?: string;
+  note?: string;
+  nextAction?: string;
+  imageContent?: string;
+  original?: {
+    text?: string | null;
+    nextOffset?: number | null;
+    page?: number;
+    totalPages?: number;
+    nextPage?: number | null;
+    note?: string;
+  };
+  metadata?: {
+    member: IntakePackageMember;
+    contentUrl?: string;
+    original?: MemberRead['original'];
+    note?: string;
+  };
+};
+
+export function PackageInventory({ intake }: { intake: Intake }) {
+  const [offset, setOffset] = useState(0);
+  const inventory = useResource<IntakePackageInventory>(
+    `/intakes/${encodeURIComponent(intake.id)}/package?offset=${offset}&limit=50`,
+  );
+  const [selected, setSelected] = useState<IntakePackageMember | null>(null);
+  const [read, setRead] = useState<MemberRead | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [history, setHistory] = useState<string[]>([]);
+  useEffect(() => inventory.reload(), [intake.version]);
+  async function inspect(
+    member: IntakePackageMember,
+    window: { jsonPointer?: string; jsonOffset?: number; offset?: number; page?: number } = {},
+  ) {
+    setBusy(true);
+    setError('');
+    setSelected(member);
+    try {
+      const result = await api<MemberRead>(
+        `/intakes/${encodeURIComponent(intake.id)}/package-member`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ memberId: member.memberId, limit: 50, ...window }),
+        },
+      );
+      setRead(result.data.metadata ? { ...result.data, ...result.data.metadata } : result.data);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'This member could not be inspected.');
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <section className="intake-package" aria-label="Package contents">
+      <h3>Package contents</h3>
+      <ResourceState resource={inventory}>
+        {(data) => (
+          <>
+            <p>
+              {data.totalMembers} retained file occurrences · {formatBytes(data.totalExpandedBytes)}{' '}
+              expanded · {data.uniqueByteContents} distinct byte contents.
+            </p>
+            <p className="helper-text">
+              An inventory lists what was supplied. Reading a member and reviewing its role do not
+              mark extraction complete.
+            </p>
+            <ul className="intake-package-members">
+              {data.members.map((member) => (
+                <li key={member.memberId}>
+                  <button
+                    className="text-link"
+                    disabled={busy}
+                    onClick={() => {
+                      setHistory([]);
+                      void inspect(member);
+                    }}
+                  >
+                    {member.filename || 'Unnamed member'}
+                  </button>
+                  <span>
+                    {formatBytes(member.bytes)} · {member.role?.role || 'Role unknown'} ·{' '}
+                    {member.coverage?.kind || member.status || 'Not read'}
+                  </span>
+                  {member.duplicateOf && (
+                    <small>
+                      Same bytes as another occurrence; both original locations remain retained.
+                    </small>
+                  )}
+                  {member.role && (
+                    <details>
+                      <summary>Role and references</summary>
+                      <p>{member.role.reason}</p>
+                      <p>
+                        {member.role.referenceCount} references ·{' '}
+                        {member.role.missingReferenceCount} not supplied
+                        {!!member.role.ambiguousReferenceCount &&
+                          ` · ${member.role.ambiguousReferenceCount} ambiguous`}
+                      </p>
+                    </details>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <div className="intake-actions">
+              <button
+                className="text-link"
+                disabled={!offset || busy}
+                onClick={() => setOffset(Math.max(0, offset - 50))}
+              >
+                Previous members
+              </button>
+              <span>
+                {data.members.length ? offset + 1 : 0}–{offset + data.members.length} of{' '}
+                {data.totalMembers}
+              </span>
+              <button
+                className="text-link"
+                disabled={data.nextOffset === null || busy}
+                onClick={() => setOffset(data.nextOffset!)}
+              >
+                Next members
+              </button>
+            </div>
+          </>
+        )}
+      </ResourceState>
+      {busy && <LoadingIndicator label="Reading selected member…" layout="panel" />}
+      {error && (
+        <p role="alert">
+          {error}{' '}
+          {selected && (
+            <button className="text-link" onClick={() => void inspect(selected)}>
+              Retry member
+            </button>
+          )}
+        </p>
+      )}
+      {read && selected?.memberId === read.member.memberId && (
+        <section className="intake-member-reading" aria-label="Selected package member">
+          <h4>{read.member.filename}</h4>
+          <p className="helper-text">{read.member.locator}</p>
+          {read.contentUrl && (
+            <a className="text-link" href={read.contentUrl} target="_blank" rel="noreferrer">
+              Open retained member
+            </a>
+          )}
+          {read.structure && (
+            <>
+              <p>
+                {read.structure.jsonPointer || 'Root'} · {read.structure.type}
+                {read.structure.totalChildren ? ` · ${read.structure.totalChildren} entries` : ''}
+              </p>
+              {history.length > 0 && (
+                <button
+                  className="text-link"
+                  disabled={busy}
+                  onClick={() => {
+                    const previous = history.at(-1)!;
+                    setHistory(history.slice(0, -1));
+                    void inspect(read.member, { jsonPointer: previous });
+                  }}
+                >
+                  Back to parent section
+                </button>
+              )}
+              <ul>
+                {read.structure.children.map((child, index) => (
+                  <li key={child.jsonPointer || index}>
+                    <button
+                      className="text-link"
+                      disabled={busy || child.jsonPointer === null}
+                      onClick={() => {
+                        setHistory([...history, read.structure!.jsonPointer]);
+                        void inspect(read.member, { jsonPointer: child.jsonPointer! });
+                      }}
+                    >
+                      {child.key}
+                    </button>{' '}
+                    · {child.type}
+                    {child.totalChildren ? ` · ${child.totalChildren} entries` : ''}
+                    {child.jsonPointer === null &&
+                      ' · Location too long to inspect here; open retained member.'}
+                  </li>
+                ))}
+              </ul>
+              {read.structure.literal !== null && (
+                <details open={!read.structure.children.length}>
+                  <summary>Literal source text</summary>
+                  <pre className="intake-member-literal">{read.structure.literal}</pre>
+                </details>
+              )}
+              {read.structure.nextJSONOffset !== null && (
+                <button
+                  className="text-link"
+                  disabled={busy}
+                  onClick={() =>
+                    void inspect(read.member, {
+                      jsonPointer: read.structure!.jsonPointer,
+                      jsonOffset: read.structure!.nextJSONOffset!,
+                    })
+                  }
+                >
+                  Next entries
+                </button>
+              )}
+              {read.structure.nextOffset !== null && (
+                <button
+                  className="text-link"
+                  disabled={busy}
+                  onClick={() =>
+                    void inspect(read.member, {
+                      jsonPointer: read.structure!.jsonPointer,
+                      offset: read.structure!.nextOffset!,
+                    })
+                  }
+                >
+                  Continue literal text
+                </button>
+              )}
+            </>
+          )}
+          {read.structureIssue && <p>{read.structureIssue}</p>}
+          {read.imageContent?.startsWith('data:image/') && (
+            <img
+              className="intake-member-image"
+              src={read.imageContent}
+              alt={`${read.member.filename}${read.original?.page ? `, page ${read.original.page}` : ''}`}
+            />
+          )}
+          {read.original?.text && <div className="intake-readable-text">{read.original.text}</div>}
+          {read.literal === '' && <p>This occurrence is empty.</p>}
+          {read.original?.nextOffset != null && (
+            <button
+              className="text-link"
+              disabled={busy}
+              onClick={() =>
+                void inspect(read.member, {
+                  offset: read.original!.nextOffset!,
+                  ...(read.original?.page ? { page: read.original.page } : {}),
+                })
+              }
+            >
+              Continue member text
+            </button>
+          )}
+          {read.original?.totalPages && (
+            <div className="intake-actions">
+              <span>
+                Page {read.original.page || 1} of {read.original.totalPages}
+              </span>
+              <button
+                className="text-link"
+                disabled={busy || (read.original.page || 1) <= 1}
+                onClick={() => void inspect(read.member, { page: (read.original!.page || 1) - 1 })}
+              >
+                Previous page
+              </button>
+              <button
+                className="text-link"
+                disabled={busy || read.original.nextPage == null}
+                onClick={() => void inspect(read.member, { page: read.original!.nextPage! })}
+              >
+                Next page
+              </button>
+            </div>
+          )}
+          {read.nextAction === 'inventory' && (
+            <p>This member is another archive. Its contents have not been expanded.</p>
+          )}
+          <p className="helper-text">
+            {read.note ||
+              read.original?.note ||
+              'This bounded view does not claim that the member has been fully extracted.'}
+          </p>
+        </section>
+      )}
+    </section>
+  );
+}

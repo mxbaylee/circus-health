@@ -1,0 +1,223 @@
+.clinical-related-review {
+  container-type: inline-size;
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
+}
+
+.intake-related-disclosure {
+  margin-top: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+}
+
+.intake-related-disclosure > summary {
+  padding: 0.75rem;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.intake-related-disclosure[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.intake-related-disclosure > .clinical-related-review {
+  padding: 0.85rem;
+  border-top: 0;
+}
+
+.intake-related-disclosure > .clinical-related-review > h4 {
+  margin-top: 0;
+}
+
+.clinical-related-review details {
+  padding: 0.75rem 0;
+}
+
+.clinical-related-review summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.clinical-related-review label,
+.clinical-related-search label {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.6rem 0;
+}
+
+.clinical-related-review input,
+.clinical-related-review select,
+.clinical-related-review textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+.clinical-related-review textarea {
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.clinical-related-search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+}
+
+.clinical-related-search .button {
+  margin-bottom: 0.6rem;
+}
+
+.clinical-related-reasons,
+.clinical-related-notice {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.clinical-evidence-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+}
+
+.clinical-evidence-pair > section {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.clinical-evidence-pair h5 {
+  margin: 0 0 0.5rem;
+}
+
+@container (max-width: 700px) {
+  .clinical-related-search,
+  .clinical-evidence-pair {
+    grid-template-columns: 1fr;
+  }
+
+  .clinical-related-search .button {
+    margin-bottom: 0;
+  }
+}
+
+@media (max-width: 700px) {
+  .clinical-related-search,
+  .clinical-evidence-pair {
+    grid-template-columns: 1fr;
+  }
+
+  .clinical-related-search .button {
+    margin-bottom: 0;
+  }
+}
+
+.record-correction-dialog {
+  width: min(760px, calc(100% - 32px));
+}
+
+.record-correction-form label,
+.record-correction-fields label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.record-correction-form > label,
+.record-correction-support {
+  margin-top: 0.9rem;
+}
+
+.record-correction-form input,
+.record-correction-form select,
+.record-correction-form textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  color: var(--ink);
+  font: inherit;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.record-correction-form textarea {
+  resize: vertical;
+}
+
+.record-correction-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.9rem;
+}
+
+.record-correction-support {
+  grid-template-columns: auto minmax(0, 1fr) !important;
+  align-items: start;
+}
+
+.record-correction-support input {
+  width: auto;
+  margin-top: 0.2rem;
+}
+
+.record-correction-diff {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.record-correction-diff > section {
+  min-width: 0;
+  padding: 0.75rem;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+.record-correction-diff h4,
+.record-correction-evidence h4 {
+  margin-bottom: 0.4rem;
+}
+
+.record-correction-diff dl {
+  margin: 0;
+}
+
+.record-correction-diff dl div + div {
+  margin-top: 0.7rem;
+}
+
+.record-correction-diff dt {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.record-correction-diff dd {
+  margin: 0.15rem 0 0;
+}
+
+.record-correction-evidence {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+@media (max-width: 700px) {
+  .record-correction-fields,
+  .record-correction-diff {
+    grid-template-columns: 1fr;
+  }
+}

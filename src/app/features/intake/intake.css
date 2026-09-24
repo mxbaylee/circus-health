@@ -1,0 +1,320 @@
+.intake-review-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.9fr);
+  gap: 22px;
+  align-items: start;
+}
+.intake-review-layout > * {
+  min-width: 0;
+}
+.intake-original-pane {
+  position: sticky;
+  top: 12px;
+  max-height: calc(100vh - 36px);
+  overflow: auto;
+}
+.intake-original-pane .source-preview img {
+  width: 100%;
+  height: auto;
+}
+.intake-metadata {
+  border-block: 1px solid var(--border);
+  padding: 14px 0;
+  margin: 12px 0;
+}
+.intake-metadata-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.intake-metadata .creatable-field {
+  min-width: 0;
+}
+.intake-reading-tabs,
+.intake-mobile-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  gap: 12px;
+}
+.intake-reading-tabs button,
+.intake-mobile-tabs button {
+  background: none;
+  color: var(--muted);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 8px 2px;
+  font: inherit;
+  cursor: pointer;
+}
+.intake-reading-tabs [aria-selected='true'],
+.intake-mobile-tabs [aria-selected='true'] {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+.intake-record-reading {
+  margin: 14px 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+.intake-readable-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.75;
+  padding: 12px 0;
+}
+.intake-text-anchor {
+  color: inherit;
+  background: color-mix(in srgb, #d39a29 22%, var(--surface));
+  text-decoration-style: dotted;
+  text-underline-offset: 4px;
+}
+.intake-issue {
+  padding: 12px;
+  border-left: 3px solid #c59539;
+  background: color-mix(in srgb, #d39a29 7%, var(--surface));
+  margin: 10px 0;
+  border-radius: 6px;
+}
+.intake-issue.is-resolved {
+  border-color: var(--accent);
+}
+.intake-issue summary {
+  cursor: pointer;
+  line-height: 1.5;
+}
+.intake-issue-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 10px;
+}
+.intake-issue-actions label {
+  display: grid;
+  gap: 8px;
+  flex-basis: 100%;
+}
+.intake-issue-actions input {
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  max-width: 100%;
+}
+.intake-package {
+  margin-block: 18px;
+}
+.intake-package-members {
+  list-style: none;
+  padding: 0;
+  max-height: 24rem;
+  overflow: auto;
+}
+.intake-package-members li {
+  display: grid;
+  gap: 5px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.intake-package-members .text-link {
+  justify-self: start;
+  text-align: left;
+}
+.intake-package-members span,
+.intake-package-members small {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+.intake-member-reading {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  margin-top: 14px;
+}
+.intake-member-literal {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 440px;
+  overflow: auto;
+  font: inherit;
+}
+.intake-member-image {
+  max-width: 100%;
+  height: auto;
+  margin-block: 12px;
+}
+@media (max-width: 1000px) {
+  .intake-review-layout {
+    display: block;
+  }
+  .intake-original-pane {
+    position: static;
+    max-height: none;
+  }
+}
+@media (max-width: 760px) {
+  .intake-metadata-fields {
+    grid-template-columns: 1fr;
+  }
+}
+.intake-accept {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.intake-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 16px 0;
+}
+.intake-duplicate {
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 12px 0;
+}
+.intake-duplicate {
+  background: color-mix(in srgb, var(--muted) 8%, var(--surface));
+}
+.intake-record {
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  margin-top: 12px;
+  padding: 14px;
+  transition: opacity 0.15s;
+}
+.intake-record.is-skipped {
+  border-style: dashed;
+}
+.intake-rule {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.intake-mapping {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.intake-mapping label {
+  display: grid;
+  gap: 6px;
+  font-size: 0.83rem;
+  font-weight: 650;
+}
+.intake-mapping input,
+.intake-mapping select,
+.intake-mapping textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+.intake-mapping textarea {
+  resize: vertical;
+  line-height: 1.45;
+}
+.intake-mapping-wide {
+  grid-column: 1 / -1;
+}
+.intake-rule {
+  margin-top: 13px;
+  font-size: 0.84rem;
+}
+.intake-source-identity {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0 0;
+}
+.intake-source-identity div {
+  min-width: 0;
+}
+.intake-source-identity dt {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+.intake-source-identity dd {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 0.84rem;
+}
+.intake-evidence {
+  margin-top: 15px;
+}
+.intake-evidence h4,
+.intake-evidence p {
+  margin: 5px 0;
+}
+.intake-evidence p {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+.intake-accept {
+  position: relative;
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--ink) 10%, transparent);
+  border-radius: 13px;
+  margin-top: 18px;
+  padding: 14px;
+  z-index: 1;
+}
+.intake-accept p {
+  margin: 0;
+  font-size: 0.88rem;
+}
+.intake-notice {
+  padding: 15px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.intake-notice {
+  background: var(--surface);
+}
+@media (max-width: 760px) {
+  .intake-mapping,
+  .intake-source-identity {
+    grid-template-columns: 1fr;
+  }
+  .intake-accept {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 700px) {
+  .intake-accept {
+    position: static;
+  }
+}
+
+.intake-reading-notes {
+  margin-top: 20px;
+  color: var(--muted);
+}
+.intake-reading-notes > summary {
+  cursor: pointer;
+  padding: 10px 0;
+}
+.intake-issue-saved {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: normal;
+  margin-top: 4px;
+}

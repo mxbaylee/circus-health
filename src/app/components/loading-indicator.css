@@ -1,0 +1,57 @@
+.loading-indicator {
+  --loading-indicator-size: 48px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+
+.loading-indicator[data-size='small'] {
+  --loading-indicator-size: 24px;
+}
+
+.loading-indicator[data-size='large'] {
+  --loading-indicator-size: 64px;
+}
+
+.loading-indicator-jester {
+  width: var(--loading-indicator-size);
+  height: var(--loading-indicator-size);
+  flex: 0 0 var(--loading-indicator-size);
+}
+
+.loading-indicator-control {
+  gap: 7px;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+}
+
+.loading-indicator-panel {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  min-height: 84px;
+  padding: 16px 10px;
+  text-align: left;
+}
+
+.loading-indicator-centered {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 100%;
+  min-height: 180px;
+  padding: 24px;
+  text-align: center;
+}
+
+@media (max-width: 600px) {
+  .loading-indicator-centered {
+    min-height: 140px;
+    padding: 18px;
+  }
+}

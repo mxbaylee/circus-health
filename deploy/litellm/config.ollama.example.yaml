@@ -1,0 +1,11 @@
+# Copy outside Git. Use a downloaded tool-capable model; disable Ollama cloud features.
+# Check Docker can reach host.docker.internal; Docker Desktop may reach host loopback.
+# Do not widen the host listener unless needed; restrict any exposed listener.
+model_list:
+  - model_name: health-primary
+    litellm_params:
+      model: ollama_chat/qwen3:4b
+      api_base: http://host.docker.internal:11434
+    model_info:
+      supports_function_calling: true
+      supports_vision: false

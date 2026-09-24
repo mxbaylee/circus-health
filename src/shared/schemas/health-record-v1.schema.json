@@ -1,0 +1,378 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Health source envelope v1",
+  "type": "object",
+  "required": ["format", "id", "kind", "payload", "provenance", "coverage"],
+  "properties": {
+    "format": {
+      "const": "health-record-v1"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "pattern": "\\S"
+    },
+    "kind": {
+      "enum": ["record", "document", "context", "unrecognized"]
+    },
+    "payload": {},
+    "provenance": {
+      "type": "object",
+      "required": ["capturedVia", "sourceSystem", "sourceRecordId", "evidenceClass", "locator"],
+      "properties": {
+        "capturedVia": {
+          "type": ["string", "null"]
+        },
+        "sourceSystem": {
+          "type": ["string", "null"]
+        },
+        "sourceRecordId": {
+          "type": ["string", "null"]
+        },
+        "evidenceClass": {
+          "enum": [
+            "provider_export",
+            "health_response",
+            "transcription",
+            "personal_report",
+            "unknown"
+          ]
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["status", "notes"],
+      "properties": {
+        "status": {
+          "enum": ["complete_response", "partial", "unknown"]
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "reviewIssues": {
+      "$ref": "#/$defs/reviewIssues"
+    },
+    "contextId": {
+      "description": "Links this envelope to one unique context envelope in the same proposal and original. The link alone proves no clinical field or patient identity. Exact shared text may support row fields within its evidenced scope: a report-wide method or category can span that report's sections and columns, while a row-, section- or column-specific fact cannot.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "pattern": "\\S"
+    },
+    "clinical": {
+      "description": "Canonical location for one unreviewed proposed clinical mapping. Role and classification fields such as eventKind, observationCategory, documentCategory and visitSpecialty belong inside clinical; same-named payload fields remain untouched literal evidence. Exact shared context may support date, method, unit or category only when it unambiguously applies to this row. Report-wide facts may span sections or columns within the same original, member, report and printed subject; row-, section- and column-specific facts do not cross their evidenced scope.",
+      "properties": {
+        "reviewIssues": {
+          "$ref": "#/$defs/reviewIssues"
+        }
+      }
+    },
+    "people": {
+      "description": "Unreviewed explicitly named clinician or relative proposals. Each field is supported by a same-envelope passage containing the name; People are saved separately from clinical acceptance.",
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/personProposal"
+      }
+    },
+    "report": {
+      "description": "Unreviewed extraction claim for presentation grouping; never proof of quote existence, subject identity, clinical equivalence or acceptance.",
+      "type": "object",
+      "required": ["key", "title", "anchor", "subject"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "\\S"
+        },
+        "anchor": {
+          "$ref": "#/$defs/reportAnchor"
+        },
+        "subject": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/reportAnchor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memberId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "section": {
+          "type": "object",
+          "required": ["key", "title", "anchor"],
+          "properties": {
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000,
+              "pattern": "\\S"
+            },
+            "anchor": {
+              "$ref": "#/$defs/reportAnchor"
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["people"],
+        "properties": { "people": { "minItems": 1 } }
+      },
+      "then": { "properties": { "kind": { "const": "record" } } }
+    }
+  ],
+  "$defs": {
+    "personProposal": {
+      "type": "object",
+      "required": ["id", "fullName", "role", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "role": {
+          "enum": ["clinician", "relative"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "relationship": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "\\S"
+        },
+        "phone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "\\S"
+        },
+        "email": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "\\S"
+        },
+        "schedulingUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "\\S"
+        },
+        "medicalHistory": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100000,
+          "pattern": "\\S"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/personEvidence"
+          }
+        },
+        "uncertainties": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "pattern": "\\S"
+          }
+        }
+      }
+    },
+    "personEvidence": {
+      "type": "object",
+      "required": ["textAnchor", "supports"],
+      "additionalProperties": false,
+      "properties": {
+        "textAnchor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000,
+          "pattern": "\\S"
+        },
+        "supports": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "fullName",
+              "title",
+              "relationship",
+              "phone",
+              "email",
+              "schedulingUrl",
+              "medicalHistory"
+            ]
+          }
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "\\S"
+        },
+        "memberId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "page": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "reviewIssues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sourceSuggestion": {
+            "$ref": "#/$defs/metadataLabel"
+          },
+          "metadataSuggestion": {
+            "$ref": "#/$defs/metadataSuggestion"
+          },
+          "selfSuggestion": {
+            "$ref": "#/$defs/selfSuggestion"
+          },
+          "choices": {
+            "$ref": "#/$defs/dateChoices"
+          }
+        }
+      }
+    },
+    "metadataSuggestion": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "careArea": {
+          "$ref": "#/$defs/metadataLabel"
+        },
+        "documentType": {
+          "$ref": "#/$defs/metadataLabel"
+        },
+        "topics": {
+          "type": "array",
+          "maxItems": 12,
+          "items": {
+            "$ref": "#/$defs/metadataLabel"
+          }
+        }
+      }
+    },
+    "selfSuggestion": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "fullName": {
+          "$ref": "#/$defs/metadataLabel"
+        },
+        "birthDate": {
+          "$ref": "#/$defs/metadataLabel"
+        }
+      }
+    },
+    "dateChoices": {
+      "description": "New converter output contract. The app supplies keep-unknown and manual controls; legacy retained envelopes are read by the backward-compatible runtime parser.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["label", "value"],
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "$ref": "#/$defs/metadataLabel"
+          },
+          "value": {
+            "$ref": "#/$defs/metadataLabel"
+          }
+        }
+      }
+    },
+    "metadataLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^(?=.*\\S)[^\\r\\n\\u2028\\u2029]+$"
+    },
+    "reportAnchor": {
+      "type": "object",
+      "required": ["locator", "text"],
+      "properties": {
+        "locator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "\\S"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000,
+          "pattern": "\\S"
+        }
+      }
+    }
+  }
+}

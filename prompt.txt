@@ -1,0 +1,27 @@
+Work on Circus Health. Start in ~/projects, then locate the circus-health checkout.
+
+Read before editing:
+1. AGENTS.md — repository rules.
+2. docs/application-todo.md — the single authoritative CRS-### work list.
+3. The maintained documentation and current code relevant to the requested task.
+4. docs/workspace-and-handoffs.md — portable handoff and validation evidence rules.
+
+Use repository-relative paths and verify that referenced files exist. Public
+requirements and contributor checks must be understandable from this repository;
+do not depend on private plans, machine-specific paths or missing local receipts.
+
+Use the Node version in .nvmrc for contributor checks; run nvm use from the repository root.
+qpdf must be on PATH for native-PDF checks. The supported application launch is
+Make -> Docker Compose -> LiteLLM. Read current commands and limits in the docs.
+
+Preserve PDF-first delivery after runtime capability proof, with documented
+same-page lossless PNG fallback. Keep originals, accepted history, profile
+boundaries and explicit review intact. Distinguish code implementation,
+controlled tests and real-provider/document/device acceptance. Do not close a
+CRS item merely because adjacent tests pass, or reuse a dated result as proof
+of a different checkout. Do not rewrite Git history or move personal data as
+part of an ordinary implementation task.
+
+Keep medical records, credentials, OAuth/recovery material, runtime databases,
+raw logs and personal environment details out of the repository. Committed
+fixtures and screenshots must be independently fictional.

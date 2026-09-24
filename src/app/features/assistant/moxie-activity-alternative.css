@@ -1,0 +1,150 @@
+.moxie-activity-alternative {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+.moxie-jester-alternative {
+  display: block;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 48px;
+  overflow: hidden;
+  image-rendering: pixelated;
+}
+.moxie-jester-alternative-frame {
+  visibility: hidden;
+  animation-duration: 2.8s;
+  animation-timing-function: step-end;
+  animation-iteration-count: infinite;
+}
+.moxie-jester-alternative-frame[data-pose='ready'] {
+  visibility: visible;
+  animation-name: moxie-alternative-ready;
+}
+.moxie-jester-alternative-frame[data-pose='windup'] {
+  animation-name: moxie-alternative-windup;
+}
+.moxie-jester-alternative-frame[data-pose='reach'] {
+  animation-name: moxie-alternative-reach;
+}
+.moxie-jester-alternative-frame[data-pose='kick'] {
+  animation-name: moxie-alternative-kick;
+}
+.moxie-jester-alternative-frame[data-pose='split'] {
+  animation-name: moxie-alternative-split;
+}
+.moxie-jester-alternative-frame[data-pose='transfer'] {
+  animation-name: moxie-alternative-transfer;
+}
+.moxie-jester-alternative-frame[data-pose='landing'] {
+  animation-name: moxie-alternative-landing;
+}
+.moxie-jester-alternative-frame[data-pose='rebound'] {
+  animation-name: moxie-alternative-rebound;
+}
+.moxie-jester-alternative-frame[data-pose='ta-da'] {
+  animation-name: moxie-alternative-finish;
+}
+/* Every boundary is shared by its two adjacent drawings: one visible frame
+   even on the first loop. The still holds give the quick cartwheel some air. */
+@keyframes moxie-alternative-ready {
+  0%,
+  91% {
+    visibility: visible;
+  }
+  18%,
+  100% {
+    visibility: hidden;
+  }
+}
+@keyframes moxie-alternative-windup {
+  0%,
+  26%,
+  100% {
+    visibility: hidden;
+  }
+  18% {
+    visibility: visible;
+  }
+}
+@keyframes moxie-alternative-reach {
+  0%,
+  33%,
+  100% {
+    visibility: hidden;
+  }
+  26% {
+    visibility: visible;
+  }
+}
+@keyframes moxie-alternative-kick {
+  0%,
+  39%,
+  100% {
+    visibility: hidden;
+  }
+  33% {
+    visibility: visible;
+  }
+}
+@keyframes moxie-alternative-split {
+  0%,
+  47%,
+  100% {
+    visibility: hidden;
+  }
+  39% {
+    visibility: visible;
+  }
+}
+@keyframes moxie-alternative-transfer {
+  0%,
+  53%,
+  100% {
+    visibility: hidden;
+  }
+  47% {
+    visibility: visible;
+  }
+}
+@keyframes moxie-alternative-landing {
+  0%,
+  60%,
+  100% {
+    visibility: hidden;
+  }
+  53% {
+    visibility: visible;
+  }
+}
+@keyframes moxie-alternative-rebound {
+  0%,
+  68%,
+  100% {
+    visibility: hidden;
+  }
+  60% {
+    visibility: visible;
+  }
+}
+@keyframes moxie-alternative-finish {
+  0%,
+  91%,
+  100% {
+    visibility: hidden;
+  }
+  68% {
+    visibility: visible;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .moxie-jester-alternative-frame {
+    animation: none;
+    visibility: hidden;
+  }
+  .moxie-jester-alternative-frame[data-pose='ready'] {
+    visibility: visible;
+  }
+}

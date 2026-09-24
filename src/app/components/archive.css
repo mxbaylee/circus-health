@@ -1,0 +1,40 @@
+.archive-control {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-block: 0.8rem;
+}
+.visibility-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  padding-block: 0.5rem;
+}
+.visibility-filter select {
+  max-width: 100%;
+  padding: 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  color: inherit;
+  background: var(--surface);
+}
+.medication-current-status .medication-status-controls {
+  align-items: end;
+  flex-wrap: wrap;
+}
+.medication-status-help {
+  min-width: 2.2rem;
+  min-height: 2.2rem;
+  border-radius: 50%;
+}
+.medication-status-history {
+  display: grid;
+  gap: 0.8rem;
+  padding-left: 1.3rem;
+}
+.medication-status-history li span {
+  display: block;
+}

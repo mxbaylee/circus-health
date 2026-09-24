@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 0 64 64">
+  <!-- Canonical Circus Health mark. Color slots resolve from app/tokens.css. -->
+  <path fill="var(--brand-pink)" d="M30 2C28 11 24 16 18 20L30 34 42 20C36 16 32 11 30 2Z"/>
+  <path fill="var(--brand-pink-fold)" d="M30 2V34L42 20C36 16 32 11 30 2Z"/>
+  <path fill="var(--brand-lavender)" d="M15 27C12 31 8 33 3 38 8 41 12 45 15 51L30 38C25 34 20 31 15 27Z"/>
+  <path fill="var(--brand-lavender-fold)" d="M3 38H30L15 51C12 45 8 41 3 38Z"/>
+  <path fill="var(--brand-blue)" d="M45 27C48 31 52 33 57 38 52 41 48 45 45 51L30 38C35 34 40 31 45 27Z"/>
+  <path fill="var(--brand-blue-fold)" d="M57 38H30L45 51C48 45 52 41 57 38Z"/>
+  <path fill="var(--brand-butter)" d="M30 31C27 38 23 41 17 44L30 61 43 44C37 41 33 38 30 31Z"/>
+  <path fill="var(--brand-butter-fold)" d="M30 31V61L43 44C37 41 33 38 30 31Z"/>
+  <path d="M16 28C17 34 24 36 30 40M45 28C43 34 36 36 30 40M30 20V40" fill="none" stroke="var(--brand-highlight)" stroke-width="1.5" stroke-linecap="round"/>
+  <path fill="var(--brand-highlight)" d="m30 35 4 5-4 5-4-5Z"/>
+</svg>

@@ -1,0 +1,149 @@
+services:
+  health:
+    build:
+      context: .
+    image: ${HEALTH_IMAGE:?use npm run start}
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ulimits:
+      core: 0
+    pids_limit: ${HEALTH_PIDS_LIMIT:-512}
+    shm_size: 128m
+    cpus: ${HEALTH_CPUS:-2}
+    init: true
+    depends_on:
+      litellm:
+        condition: service_healthy
+    environment:
+      DATA_DIR: /archive/data
+      HEALTH_RUNTIME_DIR: /run/health
+      HEALTH_PUBLIC_PORT: ${PORT:-3001}
+      HEALTH_PUBLIC_ORIGIN: ${HEALTH_PUBLIC_ORIGIN:-http://localhost:${PORT:-3001}}
+      HEALTH_AI_BACKEND: litellm
+      HEALTH_AI_MODEL: ${MODEL:?use npm run start with MODEL}
+      HEALTH_AI_BASE_URL: http://litellm:4000
+      HEALTH_AI_API_KEY_FILE: /run/secrets/litellm_master_key
+      HEALTH_AI_PROXY_RESOLVED_MODEL: ${RESPONSE_MODEL:?use npm run start}
+      HEALTH_AI_PROXY_IMAGES: ${IMAGES:-false}
+      HEALTH_AI_PROXY_PDF: ${PDF:-auto}
+      HEALTH_AI_PROXY_PROMPT_CACHE: ${PROMPT_CACHE:-false}
+      HEALTH_AI_PROXY_TIMEOUT_SECONDS: ${HEALTH_AI_PROXY_TIMEOUT_SECONDS:-300}
+      HEALTH_INTAKE_UPLOAD_MIB: ${HEALTH_INTAKE_UPLOAD_MIB:-128}
+      HEALTH_INTAKE_EXTRACTION_MIB: ${HEALTH_INTAKE_EXTRACTION_MIB:-64}
+      HEALTH_IMPORT_DIAGNOSTICS: ${HEALTH_IMPORT_DIAGNOSTICS:-false}
+    ports:
+      - '127.0.0.1:${PORT:-3001}:3001'
+    volumes:
+      - type: bind
+        source: ${DATA_DIR:?use npm run start with DATA_DIR}
+        target: /archive/data
+        bind:
+          create_host_path: false
+    secrets:
+      - litellm_master_key
+    tmpfs:
+      - /run/health:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,size=${HEALTH_RUNTIME_TMPFS_MIB:-1024}m
+      - /tmp:rw,nosuid,nodev,noexec,size=${HEALTH_TMP_TMPFS_MIB:-128}m
+    networks:
+      - proxy
+      - browser
+    logging:
+      driver: none
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3001/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+
+  litellm:
+    build:
+      context: ./deploy/litellm
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ulimits:
+      core: 0
+    pids_limit: ${LITELLM_PIDS_LIMIT:-256}
+    cpus: ${LITELLM_CPUS:-1}
+    entrypoint: ['/bin/sh', '/opt/circus/entrypoint.sh']
+    env_file:
+      - path: ${LITELLM_ENV_FILE:?use npm run start}
+        format: raw
+    environment:
+      CIRCUS_MODEL: ${MODEL:?use npm run start with MODEL}
+      CHATGPT_TOKEN_DIR: /var/lib/litellm/chatgpt
+      CHATGPT_AUTH_FILE: auth.json
+      LITELLM_LOCAL_MODEL_COST_MAP: 'True'
+      LITELLM_LOG: ERROR
+      LITELLM_MODE: PRODUCTION
+    volumes:
+      - type: bind
+        source: ${LITELLM_CONFIG:?use npm run start with LITELLM_CONFIG}
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./deploy/litellm/entrypoint.sh
+        target: /opt/circus/entrypoint.sh
+        read_only: true
+      - type: bind
+        source: ./deploy/litellm/configure.py
+        target: /opt/circus/configure.py
+        read_only: true
+      - type: bind
+        source: ./deploy/litellm/response_diagnostics.py
+        target: /tmp/response_diagnostics.py
+        read_only: true
+      - type: bind
+        source: ${CIRCUS_AUTH_DIR:?use npm run start}
+        target: /var/lib/litellm/chatgpt
+        bind:
+          create_host_path: false
+    secrets:
+      - litellm_master_key
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777,size=${HEALTH_TMP_TMPFS_MIB:-128}m
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - proxy
+      - provider
+    logging:
+      driver: none
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'python',
+          '-c',
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      start_period: 180s
+      retries: 3
+
+secrets:
+  litellm_master_key:
+    file: ${CIRCUS_PROXY_KEY:?use npm run start}
+
+networks:
+  proxy:
+    internal: true
+  # Docker does not publish ports on a container attached only to internal
+  # networks. This bridge makes the loopback browser binding reachable.
+  browser: {}
+  provider: {}

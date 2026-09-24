@@ -1,0 +1,11 @@
+#!/bin/sh
+# Executed from the read-only source tree, never from the noexec scratch mount.
+# The test's second PATH entry supplies its writable scratch directory. The
+# production parser deliberately passes only PATH to qpdf, so this fixture does
+# not require weakening that environment allowlist.
+scratch=${PATH#*:}
+scratch=${scratch%%:*}
+sleep 300 &
+child=$!
+printf '%s %s' "$$" "$child" > "$scratch/fictional-qpdf.pid"
+wait "$child"

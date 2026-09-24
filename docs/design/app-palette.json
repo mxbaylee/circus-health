@@ -1,0 +1,222 @@
+{
+  "status": "proposed design tokens, not application implementation",
+  "light": {
+    "background": "#FFF8FB",
+    "surface": "#FFFFFF",
+    "ink": "#2B2634",
+    "muted": "#665D70",
+    "border": "#D7CDDE",
+    "controlBorder": "#8B8094",
+    "pink": "#A63A75",
+    "blue": "#246887",
+    "pinkFill": "#F7D6E8",
+    "blueFill": "#D8EFF8",
+    "onAccent": "#FFFFFF",
+    "warning": "#765600",
+    "error": "#B33D55",
+    "success": "#306B5A"
+  },
+  "dark": {
+    "background": "#191722",
+    "surface": "#242130",
+    "ink": "#F8F1F6",
+    "muted": "#C0B3C8",
+    "border": "#493E54",
+    "controlBorder": "#8A7A97",
+    "pink": "#F3A6CE",
+    "blue": "#91D4ED",
+    "pinkFill": "#493047",
+    "blueFill": "#243E50",
+    "onAccent": "#191722",
+    "warning": "#E7CC7A",
+    "error": "#FF9AB0",
+    "success": "#9CD6C4"
+  },
+  "contrastChecks": {
+    "method": "WCAG relative sRGB luminance contrast; rounded ratios shown. Decorative border is not the control outline. Does not validate complete rendered UI.",
+    "pairs": [
+      {
+        "theme": "light",
+        "foreground": "ink",
+        "background": "background",
+        "ratio": 14.04,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "ink",
+        "background": "surface",
+        "ratio": 14.69,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "muted",
+        "background": "surface",
+        "ratio": 6.24,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "pink",
+        "background": "surface",
+        "ratio": 6.03,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "blue",
+        "background": "surface",
+        "ratio": 6.17,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "onAccent",
+        "background": "pink",
+        "ratio": 6.03,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "onAccent",
+        "background": "blue",
+        "ratio": 6.17,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "ink",
+        "background": "pinkFill",
+        "ratio": 11.01,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "ink",
+        "background": "blueFill",
+        "ratio": 12.33,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "controlBorder",
+        "background": "surface",
+        "ratio": 3.74,
+        "minimum": 3
+      },
+      {
+        "theme": "light",
+        "foreground": "warning",
+        "background": "surface",
+        "ratio": 6.77,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "error",
+        "background": "surface",
+        "ratio": 5.65,
+        "minimum": 4.5
+      },
+      {
+        "theme": "light",
+        "foreground": "success",
+        "background": "surface",
+        "ratio": 6.22,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "ink",
+        "background": "background",
+        "ratio": 15.93,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "ink",
+        "background": "surface",
+        "ratio": 14.16,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "muted",
+        "background": "surface",
+        "ratio": 7.88,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "pink",
+        "background": "surface",
+        "ratio": 8.36,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "blue",
+        "background": "surface",
+        "ratio": 9.62,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "onAccent",
+        "background": "pink",
+        "ratio": 9.4,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "onAccent",
+        "background": "blue",
+        "ratio": 10.82,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "ink",
+        "background": "pinkFill",
+        "ratio": 10.52,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "ink",
+        "background": "blueFill",
+        "ratio": 10.06,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "controlBorder",
+        "background": "surface",
+        "ratio": 3.98,
+        "minimum": 3
+      },
+      {
+        "theme": "dark",
+        "foreground": "warning",
+        "background": "surface",
+        "ratio": 9.97,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "error",
+        "background": "surface",
+        "ratio": 7.86,
+        "minimum": 4.5
+      },
+      {
+        "theme": "dark",
+        "foreground": "success",
+        "background": "surface",
+        "ratio": 9.61,
+        "minimum": 4.5
+      }
+    ]
+  }
+}

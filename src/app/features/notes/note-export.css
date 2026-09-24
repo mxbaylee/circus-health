@@ -1,0 +1,119 @@
+.source-dialog.note-export-dialog {
+  width: min(1100px, 96vw);
+  max-width: 1100px;
+}
+.export-options {
+  display: grid;
+  gap: 16px;
+}
+.export-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+.export-filters label {
+  display: grid;
+  gap: 4px;
+}
+.export-filters input,
+.export-filters select,
+.export-options select {
+  width: 100%;
+  padding: 8px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.export-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 10px 0;
+}
+.export-check input {
+  flex: 0 0 auto;
+  margin-top: 4px;
+}
+.export-check small {
+  font-size: 12px;
+  opacity: 0.75;
+}
+.export-choices {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 12px;
+}
+.export-preview {
+  display: block;
+  width: 100%;
+  height: 62vh;
+  border: 1px solid var(--border);
+  background: white;
+  margin-top: 16px;
+}
+.export-options summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.note-export-dialog .note-dialog-actions {
+  flex-wrap: wrap;
+}
+@media (max-width: 600px) {
+  .export-filters {
+    grid-template-columns: 1fr;
+  }
+  .source-dialog.note-export-dialog {
+    padding: 20px;
+  }
+  .export-preview {
+    height: 55vh;
+  }
+}
+
+.export-inclusions {
+  min-width: 0;
+  margin: 0;
+  padding: 14px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.export-inclusions legend {
+  padding: 0 6px;
+  font-weight: 600;
+}
+.export-check span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.export-check span small {
+  display: block;
+  margin-top: 3px;
+}
+.export-inclusions .note-field input {
+  width: 100%;
+  padding: 8px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.export-inclusions .export-choices {
+  margin-top: 12px;
+}
+.export-options p {
+  margin: 0;
+}
+.export-inclusions p {
+  margin-bottom: 12px;
+}
+.export-options h3 {
+  margin: 0;
+}
+
+.note-detail > .note-export-trigger {
+  margin-bottom: 20px;
+}

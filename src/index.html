@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#191722" />
+    <link id="fallback-favicon" rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link id="app-favicon" rel="icon" type="image/svg+xml" href="/favicon-dark.svg" />
+    <link
+      id="apple-touch-icon"
+      rel="apple-touch-icon"
+      sizes="180x180"
+      href="/apple-touch-icon.png"
+    />
+    <link id="app-manifest" rel="manifest" href="/site.webmanifest" />
+    <script>
+      // Apply appearance before the first paint, including the locked profile screen.
+      (() => {
+        let preference = 'system';
+        try {
+          const saved = localStorage.getItem('circus-health-theme');
+          const previous = saved === null ? localStorage.getItem('health-prototype-theme') : null;
+          if (['system', 'light', 'dark'].includes(saved)) preference = saved;
+          else if (['system', 'light', 'dark'].includes(previous)) preference = previous;
+        } catch {
+          /* Use device appearance when storage is unavailable. */
+        }
+        const theme =
+          preference === 'system'
+            ? matchMedia('(prefers-color-scheme: dark)').matches
+              ? 'dark'
+              : 'light'
+            : preference;
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document
+          .querySelector('meta[name="theme-color"]')
+          .setAttribute('content', theme === 'dark' ? '#191722' : '#fff8fb');
+        document.querySelector('#app-favicon').setAttribute('href', `/favicon-${theme}.svg`);
+      })();
+    </script>
+    <meta
+      name="description"
+      content="Circus Health keeps your original health evidence, records and personal notes together in a private local archive."
+    />
+    <title>Circus Health · Overview</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/app/main.tsx"></script>
+  </body>
+</html>

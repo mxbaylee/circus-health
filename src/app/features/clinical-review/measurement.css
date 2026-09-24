@@ -1,0 +1,83 @@
+.measurement-comparison,
+.measurement-settings {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+.measurement-columns,
+.measurement-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+.measurement-value,
+.measurement-review {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.8rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.measurement-value h4 {
+  margin: 0 0 0.5rem;
+}
+.measurement-literal {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.measurement-notice {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.measurement-settings label,
+.measurement-comparison > label {
+  display: grid;
+  gap: 0.35rem;
+}
+.measurement-settings input,
+.measurement-settings select,
+.measurement-settings textarea,
+.measurement-comparison select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.6rem;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+.measurement-settings textarea {
+  resize: vertical;
+}
+.measurement-settings fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.measurement-settings legend {
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+}
+.measurement-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.measurement-review dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.5rem;
+}
+.measurement-review dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 700px) {
+  .measurement-columns,
+  .measurement-fields {
+    grid-template-columns: 1fr;
+  }
+}

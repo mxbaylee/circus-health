@@ -1,0 +1,47 @@
+name: 🧹 Lint PR Title
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-emoji:
+    name: PR title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No repository checkout: neither PR code nor repository install scripts run.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24.19.0'
+          package-manager-cache: false
+      - name: Check the proposed squash-commit title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr-title"
+          cd "$RUNNER_TEMP/pr-title"
+          npm install --ignore-scripts --no-audit --no-fund --save-exact gitmojis@3.15.0
+          node --input-type=module <<'NODE'
+          import { gitmojis } from 'gitmojis';
+          // Use the standard Gitmoji catalog, pinned independently of PR code.
+          // Brackets remain optional so the existing [🚀] style also works.
+          const title = process.env.PR_TITLE ?? '';
+          const valid = gitmojis.some(({ emoji, code }) =>
+            [emoji, code, `[${emoji}]`, `[${code}]`].some((prefix) =>
+              title.startsWith(`${prefix} `) && title.slice(prefix.length + 1).trim().length > 0,
+            ),
+          );
+          if (!valid) {
+            console.error('PR title must begin with a Gitmoji and a description, e.g. ✨ Add import review, :sparkles: Add import review, or [✨] Add import review.');
+            process.exitCode = 1;
+          }
+          NODE

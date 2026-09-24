@@ -1,0 +1,159 @@
+.note-text-field {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+.note-text-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-weight: 600;
+}
+.note-text-tabs {
+  display: inline-flex;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.note-text-tabs button,
+.note-rich-toolbar button,
+.note-link-edit button {
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 9px;
+  cursor: pointer;
+}
+.note-text-tabs button[aria-selected='true'],
+.note-rich-toolbar button[aria-pressed='true'] {
+  background: var(--pink-fill);
+  color: var(--ink);
+}
+.note-text-source {
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  line-height: 1.65;
+}
+.note-text-source.source-mode {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.875rem;
+}
+.note-rich-editor {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.note-rich-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 9px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.note-rich-body {
+  padding: 14px;
+  min-height: 180px;
+  outline-offset: -3px;
+}
+.note-rich-body[contenteditable='false'] {
+  opacity: 0.75;
+}
+.note-text-preview {
+  padding: 12px 0;
+  overflow-wrap: anywhere;
+}
+.note-markdown {
+  color: var(--ink);
+  font-size: 0.95rem;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.note-markdown p {
+  margin: 0.65em 0;
+  white-space: pre-wrap;
+}
+.note-markdown h1 {
+  font-size: 1.7rem;
+}
+.note-markdown h2 {
+  font-size: 1.4rem;
+}
+.note-markdown h3 {
+  font-size: 1.2rem;
+}
+.note-markdown h1,
+.note-markdown h2,
+.note-markdown h3 {
+  margin: 0.9em 0 0.4em;
+}
+.note-markdown ul,
+.note-markdown ol {
+  padding-left: 1.65em;
+}
+.note-markdown blockquote {
+  margin: 1em 0;
+  padding: 0 1em;
+  border-left: 3px solid var(--border);
+}
+.note-markdown pre {
+  overflow-x: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  white-space: pre;
+}
+.note-markdown a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.note-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.note-table-scroll td,
+.note-table-scroll th {
+  border: 1px solid var(--border);
+  padding: 5px 10px;
+}
+.note-text-warning,
+.note-image-reference {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.note-link-edit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 7px;
+  padding: 10px;
+}
+.note-link-edit label {
+  flex: 1 1 230px;
+  display: grid;
+  gap: 4px;
+}
+.note-link-edit input {
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+}

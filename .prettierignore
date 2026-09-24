@@ -1,0 +1,26 @@
+# Generated, vendored, or runtime files are not formatting inputs.
+**/node_modules/
+**/dist/
+**/coverage/
+**/playwright-report/
+**/test-results/
+**/*.tsbuildinfo
+**/package-lock.json
+**/npm-shrinkwrap.json
+**/yarn.lock
+**/pnpm-lock.yaml
+src/shared/person-icon-catalog.json
+src/app/vite-env.d.ts
+
+# Private archives and exports belong outside the repository.
+/data/
+src/data/
+**/personaldata/
+**/profiles/
+**/backups/
+.downloads/
+
+# Historical documentation, visual references, and generated validation evidence.
+docs/design/mockups/
+docs/design/references/
+docs/validation/

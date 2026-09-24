@@ -1,0 +1,40 @@
+.moxie-activity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+.moxie-jester {
+  display: block;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 48px;
+  overflow: hidden;
+  image-rendering: pixelated;
+}
+.moxie-jester-frame {
+  visibility: hidden;
+  animation: moxie-cartwheel 1.68s step-end infinite;
+  animation-delay: calc(var(--frame) * 0.24s);
+}
+@keyframes moxie-cartwheel {
+  0% {
+    visibility: visible;
+  }
+  14.285714% {
+    visibility: hidden;
+  }
+  100% {
+    visibility: hidden;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .moxie-jester-frame {
+    animation: none;
+    visibility: hidden;
+  }
+  .moxie-jester-frame:first-child {
+    visibility: visible;
+  }
+}

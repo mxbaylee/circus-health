@@ -1,0 +1,10 @@
+# Copy outside Git. Replace the model identifier with one available to your account.
+# Provider env file: OPENAI_API_KEY=your-key
+model_list:
+  - model_name: health-primary
+    litellm_params:
+      model: openai/your-tool-capable-model
+      api_key: os.environ/OPENAI_API_KEY
+    model_info:
+      supports_function_calling: true
+      supports_vision: false

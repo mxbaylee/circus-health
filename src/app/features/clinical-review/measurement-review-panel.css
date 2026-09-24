@@ -1,0 +1,34 @@
+.measurement-review-panel {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.measurement-review-panel .section-heading {
+  align-items: flex-start;
+}
+
+.measurement-review-panel .section-heading h3,
+.measurement-review-panel .section-heading p,
+.measurement-review-panel .measurement-comparison h4,
+.measurement-review-panel .measurement-original p {
+  margin: 0;
+}
+
+.measurement-review-panel .section-heading > div,
+.measurement-review-panel .measurement-review-unavailable,
+.measurement-review-panel .measurement-review-controls {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.measurement-review-panel .measurement-review-controls {
+  justify-items: start;
+}
+
+.measurement-review-panel .measurement-review-controls .helper-text {
+  max-width: 48rem;
+  margin: 0;
+}

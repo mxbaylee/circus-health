@@ -1,0 +1,15 @@
+# Source uses LF; literal evidence and binary fixtures retain their exact bytes.
+* text=auto eol=lf
+*.json -text
+*.jsonl -text
+*.pdf -text
+*.PDF -text
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.ico -text
+*.zip -text
+*.woff -text
+*.woff2 -text
+src/server/test/fixtures/** -text
+src/tests/fixtures/** -text

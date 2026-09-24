@@ -1,0 +1,135 @@
+.shared-trend-chart {
+  --series-0: var(--blue);
+  --series-1: var(--pink);
+  --series-2: #c3acf4;
+  --series-3: #8edbbb;
+  --series-4: #e9c58c;
+  --series-5: #f3aa98;
+  --series-6: #a7befa;
+  --series-7: #d8a7df;
+  --series-8: #a8d789;
+  --series-9: #7ed6d3;
+  --series-10: #d0c895;
+  --series-11: #e7a6b4;
+  margin: 18px 0 0;
+}
+:root[data-theme='light'] .shared-trend-chart {
+  --series-2: #7451aa;
+  --series-3: #237653;
+  --series-4: #896214;
+  --series-5: #aa513e;
+  --series-6: #465ca5;
+  --series-7: #925298;
+  --series-8: #567b2b;
+  --series-9: #217b80;
+  --series-10: #7e7138;
+  --series-11: #995062;
+}
+.chart-legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+  gap: 12px 20px;
+  padding: 0;
+  margin: 0 0 15px;
+  list-style: none;
+}
+.chart-legend li {
+  display: flex;
+  align-items: start;
+  gap: 8px;
+  min-width: 0;
+  font-size: 0.8125rem;
+}
+.chart-legend li > svg {
+  flex-shrink: 0;
+  margin-top: 4px;
+}
+.chart-legend li > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.chart-legend li > span > span {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+.chart-scale-note {
+  margin-bottom: 13px;
+}
+.chart-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.shared-trend-chart .chart-canvas {
+  height: 310px;
+}
+.chart-caption {
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.6;
+  margin-top: 12px;
+}
+.comparison-context {
+  margin: 16px 0;
+  font-size: 0.8125rem;
+  line-height: 1.65;
+  color: var(--muted);
+  padding: 12px 14px;
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.chart-point-details {
+  border: 1px solid var(--control-border);
+  background: var(--tooltip);
+  border-radius: 9px;
+  padding: 13px 15px;
+  margin-top: 14px;
+}
+.chart-point-details > p {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.chart-point-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  text-align: left;
+  padding: 12px 0 0;
+  background: transparent;
+  font-size: 0.8125rem;
+}
+.chart-point-result > span:first-child {
+  display: grid;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.chart-point-result > span:first-child > span {
+  color: var(--muted);
+  font-size: 0.75rem;
+  margin-top: 3px;
+}
+.chart-point-result > span:last-child {
+  color: var(--blue);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.chart-point-hint {
+  margin-top: 10px;
+}
+.unplotted-row small {
+  display: block;
+  color: var(--muted);
+  font-size: 0.6875rem;
+}
+@media (max-width: 760px) {
+  .shared-trend-chart .chart-canvas {
+    height: 290px;
+  }
+  .chart-point-result {
+    align-items: start;
+  }
+}

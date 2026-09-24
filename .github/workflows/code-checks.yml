@@ -1,0 +1,105 @@
+name: 🧙🏼 Code checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HEALTH_CODEX_INTEGRATION_TEST: '0'
+      HUSKY: '0'
+    defaults:
+      run:
+        working-directory: .
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Install scoped PDF extraction dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qpdf
+      - run: npm run format:check
+      - name: Check tracked-file coverage
+        working-directory: .
+        run: node scripts/repository-file-inventory.ts --check
+      - name: Launcher and icon tooling tests
+        run: npm run test:deploy
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Server tests with temporary synthetic fixtures
+        run: npm run test:server
+      - name: Qualification oracles and host benchmark tests
+        run: npm run test:tools
+      - name: Controlled 100-page automatic continuation
+        run: npm run test:continuation
+      - run: npm run test:state
+      - run: npm run test:ui
+      - name: Install Chromium for the focused browser journey
+        run: npx playwright install --with-deps chromium
+      - name: Browser profile, import and recovery journey
+        run: npm run test:browser
+
+  brand-assets:
+    name: Brand assets (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: .
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: node -p '`${process.platform}/${process.arch} ${process.version}`'
+      - run: npm ci
+      # Check committed bytes before running tests; never regenerate away stale files.
+      - run: npm run brand:check
+      - run: node --test src/tests/brand-assets.test.ts
+
+  proxy-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Build the pinned proxy compatibility patch
+        run: docker build --tag circus-proxy-test deploy/litellm
+      - name: Offline response, native PDF and diagnostics regressions
+        run: >-
+          docker run --rm --network none --entrypoint python
+          -e LITELLM_LOCAL_MODEL_COST_MAP=True
+          --mount type=bind,source="${{ github.workspace }}/deploy",target=/workspace/deploy,readonly
+          --workdir /workspace/deploy/litellm
+          circus-proxy-test -m unittest test_chatgpt_stream_semantics test_native_pdf test_response_diagnostics test_configure test_chatgpt_login

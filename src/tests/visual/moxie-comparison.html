@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Moxie · two little jesters</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        color-scheme: light;
+        font-family:
+          ui-sans-serif,
+          -apple-system,
+          BlinkMacSystemFont,
+          'Segoe UI',
+          sans-serif;
+        color: #35263f;
+        background: #f7f3f7;
+      }
+      body {
+        margin: 0;
+      }
+      main {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 46px 32px 40px;
+      }
+      .eyebrow {
+        color: #826d8c;
+        font-size: 11px;
+        font-weight: 650;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 10px 0 12px;
+        font-size: 32px;
+        font-weight: 600;
+        letter-spacing: -0.045em;
+      }
+      .intro {
+        max-width: 690px;
+        margin: 0;
+        color: #74677c;
+        line-height: 1.6;
+        font-size: 14px;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px 22px;
+        margin: 27px 0 28px;
+        font-size: 13px;
+      }
+      button,
+      select {
+        font: inherit;
+        color: #46344f;
+        border: 1px solid #d5c7dc;
+        background: #fffafd;
+        border-radius: 8px;
+        padding: 9px 13px;
+      }
+      button {
+        min-width: 122px;
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: #987ca5;
+      }
+      :focus-visible {
+        outline: 3px solid #9f83c3;
+        outline-offset: 3px;
+      }
+      label {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      input {
+        accent-color: #946da9;
+        width: 16px;
+        height: 16px;
+      }
+      .themes {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 18px;
+      }
+      .theme {
+        padding: 26px 26px 24px;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: var(--surface);
+        color: var(--ink);
+      }
+      .theme-light {
+        --surface: #ffffff;
+        --ink: #2b2634;
+        --muted: #6d6079;
+        --border: #e1d6e7;
+        --brand-pink: #df86b8;
+        --brand-pink-fold: #c26699;
+        --brand-blue: #7cbee0;
+        --brand-blue-fold: #579cba;
+        --brand-lavender: #b39ade;
+        --brand-lavender-fold: #8f75bc;
+        --brand-butter: #e6b83f;
+        --brand-butter-fold: #a57420;
+        --brand-highlight: #fff8fb;
+      }
+      .theme-dark {
+        color-scheme: dark;
+        --surface: #242130;
+        --ink: #f8f1f6;
+        --muted: #bdb2cb;
+        --border: #3c354b;
+        --brand-pink: #f3a6ce;
+        --brand-pink-fold: #c97fae;
+        --brand-blue: #91d4ed;
+        --brand-blue-fold: #67b0cf;
+        --brand-lavender: #c5b4f3;
+        --brand-lavender-fold: #9e8aca;
+        --brand-butter: #f6d56f;
+        --brand-butter-fold: #b98a36;
+        --brand-highlight: #fff0f8;
+      }
+      h2 {
+        margin: 0 0 28px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 550;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .versions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 24px;
+      }
+      h3 {
+        margin: 0 0 7px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .caption {
+        margin: 0 0 24px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .size-label {
+        margin: 0 0 9px;
+        color: var(--muted);
+        font-size: 10px;
+        letter-spacing: 0.02em;
+      }
+      .sample {
+        height: 82px;
+      }
+      .sample .moxie-activity,
+      .sample .moxie-activity-alternative {
+        display: block;
+      }
+      .sample span {
+        display: block;
+        margin-top: 9px;
+        white-space: nowrap;
+        font-size: 11px;
+      }
+      .zoom {
+        height: 146px;
+        margin-top: 27px;
+        padding-top: 21px;
+        border-top: 1px solid var(--border);
+      }
+      .zoom svg {
+        width: 96px;
+        height: 96px;
+      }
+      .zoom span {
+        display: none;
+      }
+      .in-context {
+        margin: 32px 0 0;
+        padding: 23px 0 0;
+        border-top: 1px solid var(--border);
+      }
+      .context-label {
+        color: var(--muted);
+        font-size: 11px;
+        margin: 0 0 14px;
+      }
+      .in-context > div {
+        min-height: 48px;
+      }
+      .in-context > div + div {
+        margin-top: 8px;
+      }
+      .in-context span {
+        white-space: nowrap;
+      }
+      .notes {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 32px;
+        margin: 27px 1px 0;
+        color: #74677c;
+        font-size: 12px;
+        line-height: 1.7;
+      }
+      .notes p {
+        margin: 0;
+      }
+      .notes strong {
+        color: #493452;
+        font-weight: 600;
+      }
+      .is-paused .moxie-jester-frame,
+      .is-paused .moxie-jester-alternative-frame {
+        animation-play-state: paused;
+      }
+      .is-still .moxie-jester-frame,
+      .is-still .moxie-jester-alternative-frame {
+        animation: none;
+        visibility: hidden;
+      }
+      .is-still .moxie-jester-frame:first-child,
+      .is-still .moxie-jester-alternative-frame[data-pose='ready'] {
+        visibility: visible;
+      }
+      .is-inactive .moxie-activity,
+      .is-inactive .moxie-activity-alternative {
+        visibility: hidden;
+      }
+      .pose-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 18px;
+      }
+      .pose-strip figure {
+        margin: 0;
+      }
+      .pose-strip svg {
+        width: 64px;
+        height: 64px;
+      }
+      .pose-strip figcaption {
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 10px;
+      }
+      .poses {
+        margin-top: 18px;
+      }
+      details summary {
+        cursor: pointer;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      details[open] summary {
+        margin-bottom: 22px;
+      }
+      @media (max-width: 760px) {
+        main {
+          padding: 28px 18px;
+        }
+        .themes,
+        .notes {
+          grid-template-columns: 1fr;
+        }
+        h1 {
+          font-size: 29px;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #motion-note::after {
+          content: ' · System reduced motion is active';
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow">Moxie · a small character study</div>
+      <h1>Two little jesters.</h1>
+      <p class="intro">
+        The current jester and a more detailed alternate, shown together at the same 48-pixel size.
+        The alternate adds a soft bell hat, ruff, puffy trousers, and a short cartwheel with a held
+        finish.
+      </p>
+      <div class="controls">
+        <button id="play" type="button" aria-pressed="false">Pause animation</button>
+        <label><input id="still" type="checkbox" /> Reduced motion</label>
+        <label><input id="active" type="checkbox" checked /> Work is active</label>
+        <span id="motion-note" class="eyebrow" style="font-size: 9px; letter-spacing: 0.05em"
+          >48 px · transparent sprite</span
+        >
+      </div>
+      <div class="themes" id="themes"></div>
+      <div class="notes">
+        <p>
+          <strong>A · Current cute version.</strong> Seven drawings on a 24-pixel grid. Compact,
+          simple, and brisk. Preserved as the current implementation.
+        </p>
+        <p>
+          <strong>B · Bell &amp; tumble.</strong> Nine poses on a 32-pixel grid. A small windup,
+          planted hands, open split, landing squash, and a happy finish. An isolated alternative for
+          review.
+        </p>
+      </div>
+      <div class="theme theme-light poses">
+        <details>
+          <summary>Inspect the alternate’s nine drawings</summary>
+          <div class="pose-strip" id="pose-strip"></div>
+        </details>
+      </div>
+    </main>
+    <script type="module">
+      import React from 'react';
+      import { flushSync } from 'react-dom';
+      import { createRoot } from 'react-dom/client';
+      import { MoxieActivity } from '../../app/features/assistant/MoxieActivity.tsx';
+      import { MoxieActivityAlternative } from '../../app/features/assistant/MoxieActivityAlternative.tsx';
+
+      const roots = [];
+      const themes = document.getElementById('themes');
+      for (const theme of ['light', 'dark']) {
+        const panel = document.createElement('section');
+        panel.className = `theme theme-${theme}`;
+        panel.dataset.theme = theme;
+        panel.innerHTML = `<h2>${theme} theme</h2><div class="versions"></div><div class="in-context"><p class="context-label">In a status row · A, then B</p></div>`;
+        for (const [letter, name, description, Component] of [
+          ['A', 'Current cute', 'Simple & lively', MoxieActivity],
+          ['B', 'Bell & tumble', 'Detailed & expressive', MoxieActivityAlternative],
+        ]) {
+          const version = document.createElement('article');
+          version.dataset.version = letter;
+          version.innerHTML = `<h3>${letter} · ${name}</h3><p class="caption">${description}</p><p class="size-label">Actual size · 48 × 48</p><div class="sample actual"></div><div class="zoom"><p class="size-label">2× detail · 96 × 96</p><div class="sample"></div></div>`;
+          panel.querySelector('.versions').append(version);
+          const context = document.createElement('div');
+          context.dataset.version = letter;
+          panel.querySelector('.in-context').append(context);
+          for (const target of [...version.querySelectorAll('.sample'), context]) {
+            // Only the status-row copy is announced; the size studies are decorative.
+            if (target !== context) target.setAttribute('aria-hidden', 'true');
+            const root = createRoot(target);
+            roots.push([root, Component]);
+            flushSync(() => root.render(React.createElement(Component)));
+          }
+        }
+        themes.append(panel);
+      }
+      document.getElementById('play').addEventListener('click', (event) => {
+        const paused = document.body.classList.toggle('is-paused');
+        event.currentTarget.textContent = paused ? 'Play animation' : 'Pause animation';
+        event.currentTarget.setAttribute('aria-pressed', String(paused));
+      });
+      document.getElementById('still').addEventListener('change', (event) => {
+        document.body.classList.toggle('is-still', event.target.checked);
+        document.getElementById('play').disabled = event.target.checked;
+      });
+      document.getElementById('active').addEventListener('change', (event) => {
+        for (const [root, Component] of roots)
+          root.render(event.target.checked ? React.createElement(Component) : null);
+      });
+      // A static, inspectable strip from the actual SVG, never a separate redraw.
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          const svg = document.querySelector('.moxie-jester-alternative');
+          if (!svg) return;
+          for (const group of svg.querySelectorAll('[data-pose]')) {
+            const figure = document.createElement('figure');
+            const still = svg.cloneNode(false);
+            still.removeAttribute('class');
+            const drawing = group.cloneNode(true);
+            drawing.removeAttribute('class');
+            still.append(drawing);
+            const caption = document.createElement('figcaption');
+            caption.textContent = group.dataset.pose;
+            figure.append(still, caption);
+            document.getElementById('pose-strip').append(figure);
+          }
+        }),
+      );
+    </script>
+  </body>
+</html>

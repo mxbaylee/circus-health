@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "verbatimModuleSyntax": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "types": ["node"]
+  },
+  "include": [
+    "src/app/vite-env.d.ts",
+    "src/server/runtime-json.d.ts",
+    "src/server/test/**/*.ts",
+    "src/tests/**/*.ts",
+    "src/app/**/*.test.ts",
+    "src/tests/**/*.tsx"
+  ]
+}
