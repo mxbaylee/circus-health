@@ -1617,7 +1617,7 @@ theory T21 and issue OI-33.
 
 ### Open-issues register
 
-Canonical and living: later passes update statuses in place and add rows (latest: seventh pass). It supersedes the third-pass [open decisions](#open-decisions-for-the-owner), the
+Canonical and living: later passes update statuses in place and add rows (latest: eighth pass). It supersedes the third-pass [open decisions](#open-decisions-for-the-owner), the
 fourth-pass [updated list](#open-decisions-updated) and the open items in
 [decision readiness](#decision-readiness), all kept above as history. Statuses: **open** (needs a
 decision or result), **requirement** (decided; must be designed and built), **resolved** (decided;
@@ -1668,6 +1668,16 @@ in advance).
 | OI-40 | Birth date matches but the name differs: ask "another name?" instead of blocking; remember on yes                                               | Seventh                      | Open (proposed)    | Design with CRS-040 and CRS-090                                                              |
 | OI-41 | Ready-made review buckets (already saved, new and ready, differ, need an answer)                                                                | Seventh                      | Open (proposed)    | Owner review; needs OI-27                                                                    |
 | OI-42 | Index before planning so the model sees a table of contents in the first reading prompt                                                         | Seventh                      | Open (proposed)    | T23, CRS-113                                                                                 |
+| OI-43 | Keep a profile with background work open after sign-out or profile switch                                                                       | Eighth                       | Open (decided)     | Security review; design with CRS-081                                                         |
+| OI-44 | Semantic test equivalence, standard display names and a per-profile alias index; shared list licensing                                          | Eighth                       | Open (proposed)    | LOINC terms checked (eighth-pass addendum); owner review of OI-51                            |
+| OI-45 | Page progress and time estimate on Import                                                                                                       | Eighth                       | Open (decided)     | Design; estimate method from T2/T3 data                                                      |
+| OI-46 | Relative's records filed as reference with a People note per referring document                                                                 | Eighth                       | Open (decided)     | Design with CRS-085                                                                          |
+| OI-47 | Required dates for clinical records; partial dates                                                                                              | Eighth                       | Open (decided)     | Design; answered in eighth-pass addendum 2                                                   |
+| OI-48 | Imported clinician notes appear in Notes                                                                                                        | Eighth                       | Open (decided)     | Design                                                                                       |
+| OI-49 | Bulk-review layout usability test on fictional fixtures (T24)                                                                                   | Eighth                       | Deferred           | Default decided (eighth-pass addendum); layout test after OI-27                              |
+| OI-50 | Additive medication approval: list only medications not already on the person's list, matched brand ↔ generic                                   | Eighth                       | Open (decided)     | Design; matching needs OI-51                                                                 |
+| OI-51 | Bundle LOINC and RxNorm subsets for offline lookup so health terms never leave the server                                                       | Eighth                       | Open (proposed)    | Owner review; size and update cadence                                                        |
+| OI-52 | Stop imports button on Import, with resume from where it stopped                                                                                | Eighth                       | Open (decided)     | Design with OI-43                                                                            |
 
 ## Reconciliation, identity and architecture
 
@@ -2024,3 +2034,133 @@ Owner decisions after the seventh pass:
 ### Identifiers (seventh pass)
 
 Next free: candidate M, theory T24, issue OI-43. CRS-110 to CRS-113 are used.
+
+## Eighth pass: gaps between the import specification and the current tree
+
+Added 2026-09-25. The owner turned the user scenarios into an implementation-independent
+[import specification](import-scenarios.md): it states expected behavior only, so a builder with no
+access to this codebase could implement it. The comparison with the current tree, first drafted
+inside those scenarios, lives here instead so none of it is lost. Everything under "Today" was
+verified in the tree on 2026-09-25.
+
+### Owner decisions recorded in the specification
+
+Answered 2026-09-25, in addition to the seventh pass:
+
+- Supported types start reading automatically after upload.
+- Reading shows progress and a time estimate.
+- The app imposes no usage window or budget of its own; provider limits are waited out with backoff
+  and the estimate is updated.
+- Signing out, or switching to another profile (for example a managed child's), never stops an
+  upload or import. After a crash, reading resumes automatically once the person unlocks.
+- Reviewing while reading continues is allowed but not required, provided accuracy holds.
+- Bulk review must be easy (import all, discard all, filters beneath the kind filters); the exact
+  shape is to be tested.
+- "Already saved" needs the same test, matched semantically (a standard code or a confirmed
+  equivalence, with abbreviations such as Hgb matching Hemoglobin), the same date, and equal values
+  after unit conversion at the printed precision.
+- A correction shows the later-issued version on charts; the older one is marked outdated, off the
+  trend line or hidden, and listed below. When confident, this happens automatically.
+- A relative's records are kept as reference: no clinical results for Self, a People entry, a note
+  for each document that refers to the person, and no prompt for the optional relationship.
+- Clinical records need a date (supplied by the person if not printed) or are dismissed; dismissing
+  keeps the original. People records need no date.
+- Imported clinician notes appear in Notes.
+- Every file the person chose to upload is read and kept.
+
+### Gaps
+
+| Specification area            | Today (verified)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Gap                                                                                                                                                                                                                       |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Automatic reading             | Reading is an explicit "Read file with Moxie" step after upload ([import and rebuild](import-and-rebuild.md))                                                                                                                                                                                                                                                                                                                                                                                             | Start automatically for supported types                                                                                                                                                                                   |
+| Progress and estimate         | Import shows sections accounted for (plan units, not pages), entries found, windows read, the recent page interval and time since last progress ([reading activity](../src/app/features/import/ImportReadingActivity.tsx)). Page timing is typed "never an ETA" ([batch types](../src/shared/intake-batch.ts))                                                                                                                                                                                            | Add page progress and a time estimate; `remainingUnits` exists but is not shown on Import                                                                                                                                 |
+| Provider limits               | No backoff design; T15 is the brief                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Backoff, retry and estimate update                                                                                                                                                                                        |
+| Leaving is not stopping       | Browser close or session loss does not stop reading. Unlocking another profile locks all others ([vault app](../src/server/vault-app.ts)); locking zeroes the key, closes the app and pauses the batch ([encrypted profiles](../src/server/encrypted-profiles.ts), [intake batches](../src/server/intake-batches.ts)). The data key exists only in memory; stored copies are wrapped by passkey or recovery secret ([profile encryption](profile-encryption.md)). There is no sign-out distinct from lock | Keep a profile with background work open after switching; needs a security review because two decrypted profiles would be open unattended ([security](security.md) states one-at-a-time as intentional). Overlaps CRS-081 |
+| Automatic resume after unlock | After a crash, the batch is paused as interrupted and model work never restarts without explicit Resume                                                                                                                                                                                                                                                                                                                                                                                                   | Resume on unlock                                                                                                                                                                                                          |
+| Unattended finishing          | Time and context limits pause reading; about 12 Resume clicks are modeled for 800 pages                                                                                                                                                                                                                                                                                                                                                                                                                   | R2, R8 (candidate C)                                                                                                                                                                                                      |
+| Already-saved matching        | No test-name equivalence: series are keyed by exact code system, code, label, category, unit, specimen and method ([clinical import](../src/server/clinical-import.ts)). Related-record discovery ranks by exact code, label and shared words ([related records](../src/server/related-records.ts)). Mapping rules rename by exact label only                                                                                                                                                             | Semantic test match with confirmed equivalence rules, standard display names, alias search index; cross-original cue (OI-27) and buckets (OI-41)                                                                          |
+| Unit conversion               | Same-dimension conversion for unambiguous codes only; bare "oz" is ambiguous; no mg/dL↔mmol/L ([measurement units](../src/shared/measurement-units.ts)); conversion changes chart display only                                                                                                                                                                                                                                                                                                            | Conversion used for matching; per-analyte factors for a short list (open)                                                                                                                                                 |
+| Corrections on charts         | Both versions plotted unless a pair-review display preference hides one; the server never picks the newest ([comparisons](../src/app/data/comparisons.ts))                                                                                                                                                                                                                                                                                                                                                | Later-issued version displayed automatically when confident; older marked outdated                                                                                                                                        |
+| Relative's records            | Clinical rows about another person are blocked and stay pending ([intake workflow](../src/server/intake-workflow.ts)). People proposals need a passage naming the person; relationship is optional; relative lab values are not turned into history ([People format](../src/server/intake-people-format.ts))                                                                                                                                                                                              | File as reference automatically; summarize into the person's history; one note per referring document                                                                                                                     |
+| Dates                         | A missing date raises a non-blocking question with "Keep unconfirmed"; undated records can be saved ([intake review](../src/server/intake-review.ts)); undated and partial-date points are not plotted. An unreachable "Resolve the date question before saving" message remains ([Import page](../src/app/features/import/ImportPage.tsx))                                                                                                                                                               | Require a date for clinical records or dismiss; remove the dead message                                                                                                                                                   |
+| Clinician notes in Notes      | Clinician notes become Document records under Sources; Notes' history view includes only 24 structured document types ([historical notes](../src/server/historical-notes.ts))                                                                                                                                                                                                                                                                                                                             | Show imported clinician notes in Notes                                                                                                                                                                                    |
+| Medications                   | Imported medications start Inactive; the person activates what they take; personal choice is never overwritten ([medication preferences](../src/server/medication-preferences.ts))                                                                                                                                                                                                                                                                                                                        | None, if the owner keeps it; optionally list only newly imported medications in the activation prompt                                                                                                                     |
+| Formats                       | PDF, PNG, JPEG, WEBP, ZIP, JSON/JSONL recognized; others stored as generic binary                                                                                                                                                                                                                                                                                                                                                                                                                         | OI-08, OI-09                                                                                                                                                                                                              |
+| Identity                      | Birth-date mismatch blocks after extraction; name-only match passes; differing name with no hint blocks                                                                                                                                                                                                                                                                                                                                                                                                   | CRS-111, OI-40, CRS-090                                                                                                                                                                                                   |
+
+### New open issues
+
+| ID    | Issue                                                                                                  | Status          | Next step                               |
+| ----- | ------------------------------------------------------------------------------------------------------ | --------------- | --------------------------------------- |
+| OI-43 | Keep a profile with background work open after sign-out or profile switch                              | Open (decided)  | Security review; design with CRS-081    |
+| OI-44 | Semantic test equivalence, standard display names and a per-profile alias index; shared list licensing | Open (proposed) | Owner review; check LOINC terms         |
+| OI-45 | Page progress and time estimate on Import                                                              | Open (decided)  | Design; estimate method from T2/T3 data |
+| OI-46 | Relative's records filed as reference with a People note per referring document                        | Open (decided)  | Design with CRS-085                     |
+| OI-47 | Required dates for clinical records; partial dates                                                     | Open (decided)  | Owner answer on partial dates; design   |
+| OI-48 | Imported clinician notes appear in Notes                                                               | Open (decided)  | Design                                  |
+| OI-49 | Bulk-review layout usability test on fictional fixtures (T24)                                          | Open (proposed) | After OI-27                             |
+
+### Identifiers (eighth pass)
+
+Next free: candidate M, theory T25 (T24 is the proposed bulk-review test), issue OI-50.
+
+### Addendum: second round of owner answers and vocabulary research
+
+Answered 2026-09-25, after the gaps above were written. The specification carries the requirements;
+this records what they change here.
+
+- **Stopping.** Signing out never stops imports. The only stop is a **Stop imports** button on the
+  Import page, and a stopped import resumes where it stopped (OI-52). This settles the
+  specification's "lock now" question: nothing stops reading except that button. OI-43 is unchanged
+  and still needs its security review.
+- **Estimate.** "Estimating…" until a few pages finish, then a range such as "about 2–4 hours" from
+  the measured pace, recalculated after every wait (OI-45).
+- **Medications are additive.** After an import, the approval list shows only medications not
+  already on the person's list, matched brand ↔ generic. Those switched on join the list; those left
+  off stay as history, not taking. A new document never removes or deactivates anything. The
+  owner's example: with Advil and valacyclovir on the list, a document listing B12 and D3 shows only
+  B12 and D3; switching on B12 yields Advil, valacyclovir and B12 (OI-50).
+- **Bulk review default.** Within each kind (notes, people, test results and so on): "Select all",
+  then Approve or Dismiss. Layout beyond that default waits for T24 (OI-49, now deferred).
+
+**Medications gap, corrected.** The gaps table row above says "None, if the owner keeps it". That no
+longer holds. "Activate prescriptions" sets the Prescriptions filter to every Inactive prescription
+([clinical records](../src/app/pages/ClinicalRecords.tsx) `startActivation`), so a medication the
+person left off after one import reappears after the next, and nothing in the tree matches a brand
+to its generic (no RxNorm or equivalent). Verified in the tree on 2026-09-25.
+
+**Standard vocabularies exist, are free, and can be bundled (OI-44).** Checked 2026-09-25 against the
+publishers' own pages:
+
+| Source                                                                                                  | Covers                                                                               | Access                                              | Terms                                                                                           |
+| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| [LOINC](https://loinc.org/downloads/)                                                                   | Lab tests and observations, with short, long and consumer names                      | Full table download with a free account             | [Free, redistributable with attribution](https://loinc.org/kb/license/); core fields unmodified |
+| [LOINC Top 2000+ Lab Observations](https://loinc.org/usage/obs/)                                        | The tests behind about 98% of US lab result volume; US and SI unit versions          | Free spreadsheet                                    | LOINC license                                                                                   |
+| [NLM Clinical Tables LOINC API](https://clinicaltables.nlm.nih.gov/apidoc/loinc/v3/doc.html)            | LOINC search including consumer names                                                | Free web API, no key                                | NLM terms                                                                                       |
+| [RxNorm Current Prescribable Content](https://www.nlm.nih.gov/research/umls/rxnorm/docs/prescribe.html) | Drugs prescribable in the US, including many over-the-counter; brand ↔ generic links | Monthly download, no UMLS license needed            | NLM terms                                                                                       |
+| [RxNav APIs](https://lhncbc.nlm.nih.gov/RxNav/TermsofService.html)                                      | RxNorm lookups                                                                       | Free web API, no key, 20 requests per second per IP | Attribution required                                                                            |
+
+Supplements such as B12 and D3 may be missing from the prescribable subset; that is unverified and
+should be checked against the download before OI-50 relies on it. The online APIs would send the
+person's test and medication names to a third party, which is why OI-51 proposes bundling the
+downloadable subsets and looking them up locally.
+
+### Identifiers (eighth-pass addendum)
+
+Next free: candidate M, theory T25, issue OI-53.
+
+### Addendum 2: remaining specification questions settled
+
+Answered 2026-09-25. The specification is now one compact document with no open questions; only the
+bulk-review layout (OI-49) stays deferred.
+
+- **Per-substance units.** Convert mg/dL ↔ mmol/L only for a checked list: glucose, total, HDL and
+  LDL cholesterol, triglycerides, creatinine. Others in differing unit systems stay separate.
+- **Partial dates (OI-47).** A full date is required. A year-only or month-and-year date is proposed
+  as the first day of its period ("2019" as 1 January 2019) for the person to approve or change,
+  with the printed date shown as printed.
+- **Vocabularies (OI-51).** Bundled offline. The AI reader may suggest a standard name; it counts
+  only if found in the bundled list. The specification adds principle P16: health terms are never
+  sent to a lookup service.
+- **Stopped medications (OI-50).** An explicit stop in a document offers "mark as not taking?" for a
+  medication on the list; nothing changes without approval.
