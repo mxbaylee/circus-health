@@ -54,6 +54,7 @@ A design that breaks one is rejected, not traded off.
 | P14 | **No limits of our own.** No usage cap or budget; provider limits are waited out and retried.                                |
 | P15 | **Leaving is not stopping.** Closing the tab, signing out or switching profiles never stops an import.                       |
 | P16 | **Health terms stay private.** Test and medication names are never sent to a lookup service.                                 |
+| P17 | **Keep the complete extracted text.** Retain all readable document text, including administrative and repeated content, with source locations and explicit unreadable regions. |
 
 Reconciliation follows US certification criterion ONC 170.315(b)(2): match incoming data to the
 right patient, show it beside existing data with source and date, and incorporate it only after the
@@ -106,6 +107,34 @@ person validates it.
   finish, then a range such as "about 2–4 hours" from the measured pace, recalculated after every
   wait. The estimate predicts; it never promises. ("If it says 10 minutes I might check back; if it
   says 18 hours, I'm closing the tab.")
+
+### Complete text extraction
+
+Owner decision, 2026-09-26. Complete text extraction is required in addition to keeping the
+original and proposing structured clinical records. Implementation and verification are tracked
+in [CRS-115](application-todo.md#crs-115).
+
+- For every supported document or image being read, the app **must** extract and durably retain
+  all readable text on every page, including headings, footers, administrative instructions,
+  repeated text, annotations and legible handwriting. Clinical relevance is not a reason to omit
+  text. A usable text layer alone does not prove that visible annotations or image text were read.
+- Preserve wording, numbers, units, negation and meaningful reading order and table relationships.
+  Bind text to its original, page and applicable region or member so it can be checked against the
+  source. A summary or a collection of clinical findings is not complete extracted text.
+- Unreadable or uncertain regions **must** remain located exceptions with their uncertainty shown;
+  never guess missing words or claim complete extraction while a region remains unresolved.
+  Keep readable text from the rest of the document and allow the unresolved region to be retried.
+- Extracted text **must** remain searchable and retrievable by the authorized assistant without
+  requiring a new AI reading of the original. It remains source evidence, not automatically
+  accepted clinical data; profile, identity and review boundaries still apply. The original stays
+  unchanged and authoritative, and corrections to extracted text retain their history.
+- Complete text may be retained separately from structured proposals and served in bounded
+  passages. It need not be copied into every proposed record or sent in full on every model call.
+  Keeping it only in temporary model history or keeping only the original does not satisfy this
+  requirement. Reload and recovery must preserve the retained text without a new AI extraction.
+- Account separately for pages read, text retained, unresolved regions and clinical records
+  proposed or accepted. Fully retained text does not prove complete clinical extraction. The
+  retain-only format exclusions above remain in force.
 
 ### Reconciling with what is already saved
 
@@ -233,6 +262,16 @@ Each is a story and the checks a build must pass. The requirements above are the
 | 12  | **Handwriting and my own photo.** A doctor's handwritten note; a photo of my vitals.  | The note appears in Notes and as a document. The readings become test results sourced to the photo.                                                                                                                                                                                                                                            |
 | 13  | **A medication list that disagrees.** Lists one I stopped, omits one I started.       | Approval shows only medications not already on my list; Advil matches ibuprofen. Switching one on and leaving one off yields my list plus the one switched on. No import removes or deactivates anything. An explicit "discontinued" offers "mark as not taking?" and changes nothing until approved.                                          |
 | 14  | **Someone I manage.** My child's and a parent's records.                              | Records never cross profiles. An import in one profile continues while I use another.                                                                                                                                                                                                                                                          |
+
+### Complete-text acceptance scenario
+
+A forty-page report has six clinical findings and thirty-three pages containing only repeated
+headings and administrative continuation text. All forty pages' readable text must be durably
+retained and retrievable, including a phrase appearing only on an administrative page. The six
+findings may become separate structured proposals; administrative text needs no artificial
+clinical record. Verify source navigation and retrieval after reload and recovery without a new
+AI reading. A handwritten annotation absent from the PDF text layer must also be retained when
+legible, or listed as a located exception when unreadable.
 
 ## Deferred and not yet written
 

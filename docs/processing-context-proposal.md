@@ -2302,3 +2302,11 @@ bulk-review layout (OI-49) stays deferred.
   sent to a lookup service.
 - **Stopped medications (OI-50).** An explicit stop in a document offers "mark as not taking?" for a
   medication on the list; nothing changes without approval.
+
+## Owner decision — complete text extraction, 2026-09-26
+
+Complete text extraction is required, including administrative and repeated text that creates no structured clinical record. See the [product contract](import-scenarios.md#complete-text-extraction) and open [CRS-115](application-todo.md#crs-115). Preserved originals, successful page reads, temporary model exposure and correct clinical findings are individually insufficient: readable text must be durably retained, source-located and available to authorized search/assistant retrieval without new AI extraction. Unreadable regions remain explicit exceptions, never invented text.
+
+This settles the completeness question left open by the four-hour investigation. F9's thirty-three administrative pages omitted from proposal text now identify a relevant unmet requirement, not an acceptable omission simply because their clinical yield is zero. The measured endpoint examined proposal payloads; it does not mandate that all text live inside clinical proposals. A separate durable complete-text representation can satisfy the product requirement and support bounded model requests. Historical F8/F9 scores remain unchanged; no new implementation or verification is claimed.
+
+A/B/G may compact working context only while preserving and retrieving complete durable source text. K may use compact facts as an intermediate working representation, but cannot make them the sole retained extraction. J's adapter choice must cover all readable text, including visible text missing from a PDF text layer, while respecting retain-only format exclusions. H may remove redundant instruction copies without deleting document content. Revised L may label repeated passages but must preserve complete text coverage for each distinct imported original. Strategy qualification must test durable text completeness separately from clinical accuracy, context size and page traversal.

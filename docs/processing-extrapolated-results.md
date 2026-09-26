@@ -292,3 +292,7 @@ The held-out80-page arm remains unattempted, so there is no qualified eighty/200
 ## Four-hour investigation closure
 
 The [final independent review](processing-follow-up-experiments.md#four-hour-investigation-final-independent-closure) is positive for bounded execution: completeness **9/10**, extendedness **8/10**. All actual20/40-page remedy outcomes and accounting are verified. The80-page holdout remains unattempted because its fixed prerequisite failed; no successful long-report cost or quality forecast is validated. Existing matrix statuses and unknown usage remain unchanged. Both timers are being stopped; this is execution closure, not scientific or production qualification.
+
+## Complete-text requirement clarification — 2026-09-26
+
+The owner requires complete durable text extraction, including administrative pages; see [CRS-115](application-todo.md#crs-115). F9's retained originals and six correct findings do not compensate for the missing thirty-three full-page transcriptions in its proposal evidence. Complete durable text retention/retrieval was not established. A separate complete-text store may satisfy the product contract without duplicating text into every clinical proposal, but its performance has not been measured here. Historical results, failed gates, unattempted cells and NOT_ESTIMABLE forecasts remain unchanged; do not extrapolate complete-text processing cost from selective clinical output.
