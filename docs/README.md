@@ -23,6 +23,13 @@ The [application work list](application-todo.md) is the single source for approv
 
 [Processing context and unattended continuation](processing-context-proposal.md) records the large-document proposal, corrections to earlier assumptions, offline scaling evidence and criteria for independent review before choosing an implementation. It does not establish live extraction quality or an adaptive-processing speedup. [Processing experiments](processing-experiments.md) holds the briefs and append-only results for the experiments that proposal requires before a design is chosen.
 
+[Follow-up import experiments](processing-follow-up-experiments.md) records a unit-size sweep,
+live quality comparisons, and targeted OCR and fingerprinting follow-ups from those results.
+Its append-only results preserve the original designs, measured failures and independent
+verification. The [extrapolation register](processing-extrapolated-results.md) distinguishes
+executed tests, conditional estimates and unsupported forecasts. These experiments do not
+establish production behavior or close provider acceptance gates.
+
 [Private home deployment options](home-cloud-deployment.md) records the proposed local/cloud arrangements, access controls, implementation prerequisites and dated DigitalOcean cost estimates. It is planning reference, not an additional supported installation path.
 
 Personal coordination journals, raw validation receipts, generated repository inventories and private reference artwork are excluded from the public repository. Maintained documentation contains the contracts contributors need; ordinary work must not depend on private notes.

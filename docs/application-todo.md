@@ -418,7 +418,7 @@ These gates remain binding. Product items above refer to these checks; keep deta
 
 ### CRS-093
 
-- [ ] **Measure prefix hygiene savings.** Approved throwaway experiment (T5), not retained code, a feature or a provider acceptance gate. Move the schema to the system prefix and filter to conversion-only tools in a scripted harness branch, compare per-request characters on identical schedules and confirm no instruction text is lost. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
+- [x] **Measure prefix hygiene savings.** Approved throwaway experiment (T5), not retained code, a feature or a provider acceptance gate. Move the schema to the system prefix and filter to conversion-only tools in a scripted harness branch, compare per-request characters on identical schedules and confirm no instruction text is lost. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
 
 ### CRS-094
 
@@ -426,19 +426,19 @@ These gates remain binding. Product items above refer to these checks; keep deta
 
 ### CRS-095
 
-- [ ] **Test re-export fingerprinting on re-rendered fictional charts.** Approved throwaway experiment (T12), not retained code, a feature or a provider acceptance gate. Implement normalized page hashes and shingling with winnowing over the text layer, sweep window parameters and measure span precision and recall across font, margin, pagination, header, reordering and appended-year variants, including a single corrected value that must never be reported as an exact match. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
+- [x] **Test re-export fingerprinting on re-rendered fictional charts.** Approved throwaway experiment (T12), not retained code, a feature or a provider acceptance gate. Implement normalized page hashes and shingling with winnowing over the text layer, sweep window parameters and measure span precision and recall across font, margin, pagination, header, reordering and appended-year variants, including a single corrected value that must never be reported as an exact match. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
 
 ### CRS-096
 
-- [ ] **Classify date roles for date cutoffs without AI.** Approved throwaway experiment (T13), not retained code, a feature or a provider acceptance gate. Score rule-based print, visit, collection, result, addendum and quoted prior-study date roles on fictional pages, including a DEXA-style comparison and two encounters on one page, with zero tolerated false skips of in-range reports. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
+- [x] **Classify date roles for date cutoffs without AI.** Approved throwaway experiment (T13), not retained code, a feature or a provider acceptance gate. Score rule-based print, visit, collection, result, addendum and quoted prior-study date roles on fictional pages, including a DEXA-style comparison and two encounters on one page, with zero tolerated false skips of in-range reports. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
 
 ### CRS-097
 
-- [ ] **Count identity prompts with grouping and remembered spellings.** Approved throwaway experiment (T14), not retained code, a feature or a provider acceptance gate. Count prompts for a fictional 40-report chart with name variants and a same-surname other person under current code, grouping by spelling, and a remembered spelling from CRS-090, confirming the other person still asks. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
+- [x] **Count identity prompts with grouping and remembered spellings.** Approved throwaway experiment (T14), not retained code, a feature or a provider acceptance gate. Count prompts for a fictional 40-report chart with name variants and a same-surname other person under current code, grouping by spelling, and a remembered spelling from CRS-090, confirming the other person still asks. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
 
 ### CRS-098
 
-- [ ] **Inject faults to test unattended completion.** Approved throwaway experiment (T15), not retained code, a feature or a provider acceptance gate. Run a 200-page fictional source through scripted 503 bursts, 429 with Retry-After, a compressed quota window, a malformed response and one undecodable page, and check the job finishes with exceptions, parking only that page, with no human action. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
+- [x] **Inject faults to test unattended completion.** Approved throwaway experiment (T15), not retained code, a feature or a provider acceptance gate. Run a 200-page fictional source through scripted 503 bursts, 429 with Retry-After, a compressed quota window, a malformed response and one undecodable page, and check the job finishes with exceptions, parking only that page, with no human action. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
 
 ### CRS-099
 
@@ -446,7 +446,7 @@ These gates remain binding. Product items above refer to these checks; keep deta
 
 ### CRS-100
 
-- [ ] **Evaluate local OCR for scans and photos.** Approved throwaway experiment (T18), not retained code, a feature or a provider acceptance gate. Compare local engines that fit the TypeScript and Docker constraints on fictional scans and photos for character error rate, CPU and memory per page and image size, then measure how OCR text degrades fingerprinting and date-role rules. No cloud OCR. The result decides whether an OCR index stage and a "Find the words" option for images are worth designing. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
+- [x] **Evaluate local OCR for scans and photos.** Approved throwaway experiment (T18), not retained code, a feature or a provider acceptance gate. Compare local engines that fit the TypeScript and Docker constraints on fictional scans and photos for character error rate, CPU and memory per page and image size, then measure how OCR text degrades fingerprinting and date-role rules. No cloud OCR. The result decides whether an OCR index stage and a "Find the words" option for images are worth designing. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
 
 ### CRS-101
 
@@ -478,7 +478,7 @@ These gates remain binding. Product items above refer to these checks; keep deta
 
 ### CRS-108
 
-- [ ] **Test a pre-AI identity check from printed name and birth date.** Approved throwaway experiment (T21), not retained code, a feature or a provider acceptance gate. Before any model reading, can host rules find the printed patient name and birth date in a source's text layer (and later OCR text) well enough to stop a clearly wrong-person file early, so the person can upload the right documents before any tokens are spent or questions asked? Score detection of wrong-person files and, above all, false stops on correct-person files across fictional layouts, including family members who share a name, missing birth dates and mixed-person ZIPs. The existing PDF worker's page-text `identity` action is a candidate input. Absent or ambiguous identity must fall through to the existing post-extraction identity review; the check may stop a file only on a clear contradiction. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
+- [x] **Test a pre-AI identity check from printed name and birth date.** Approved throwaway experiment (T21), not retained code, a feature or a provider acceptance gate. Before any model reading, can host rules find the printed patient name and birth date in a source's text layer (and later OCR text) well enough to stop a clearly wrong-person file early, so the person can upload the right documents before any tokens are spent or questions asked? Score detection of wrong-person files and, above all, false stops on correct-person files across fictional layouts, including family members who share a name, missing birth dates and mixed-person ZIPs. The existing PDF worker's page-text `identity` action is a candidate input. Absent or ambiguous identity must fall through to the existing post-extraction identity review; the check may stop a file only on a clear contradiction. Follow the [brief and runner rules](processing-experiments.md); append results there, have an independent verifier append a verification entry, and close this item only after that entry agrees.
 
 ### CRS-109
 
@@ -518,3 +518,23 @@ Older reviews and archived receipts retain their original identifiers and claims
 - `T1` → [CRS-055](#crs-055); `T2` → [CRS-056](#crs-056); `T3` → [CRS-057](#crs-057); `T4` → [CRS-058](#crs-058); `T5` → [CRS-059](#crs-059); `T6` → [CRS-060](#crs-060); `T7` → [CRS-061](#crs-061); `T8` → [CRS-062](#crs-062).
 
 The former unnumbered release checklist is consolidated into CRS-063–CRS-073 and CRS-076–CRS-078. Repeated provider workflow, passkey, overlapping-document and combined release reminders now reference those same gates. The separate model-provider checklist moved into CRS-063–CRS-066 and CRS-074–CRS-078. Historical work-note requirements without IDs are retained in CRS-080–CRS-082. Completed historical journals remain evidence, not a second maintained backlog.
+
+## Follow-up experiment scope update — 2026-09-25
+
+The owner authorized execution of the F1–F7 follow-ups, then shortened the original F2 120-cell campaign after fourteen primary attempts in favor of a bounded three-anchor length check and explicit extrapolation. F1/F3/F4/F5/F6/F7 outcomes are independently verified; failed criteria remain failures. F2 supplemental execution and the final independent completeness review are still pending. The [result ledger](processing-follow-up-experiments.md) preserves all original and partial recordings; the [extrapolation register](processing-extrapolated-results.md) separates measurements from estimates and unavailable outcomes. This scope change does not close the original full-matrix comparison, standalone stage-four experiment requirements, CRS-086 implementation, or provider/document acceptance gates. Existing unchecked requirements above remain open.
+
+## Bounded follow-up execution closed — 2026-09-26
+
+- [x] **Owner-authorized bounded F1–F7 follow-up execution and independent review.** All declared offline studies, preserved original/partial results, the shortened fourteen-primary F2 prefix, three supplemental live length anchors and two prospective N400 interpolation checks are documented with independent verification. The final review gives completeness **9/10** and extendedness **9/10**, a positive disposition for the owner's revised bounded scope. The anchors used 26.507860 active minutes within their ninety-minute allocation; negative scientific outcomes remain negative. See the [final review](processing-follow-up-experiments.md#final-independent-review--bounded-follow-up-closure) and [extrapolation register](processing-extrapolated-results.md). No further live/OCR work remains for this bounded request.
+
+This local follow-up closure does not check off the original 120-cell confidence/noninferiority study, its 106 unattempted cells, gated finalization, unmet standalone T/CRS requirements or provider/document acceptance gates. The seven usage-unknown request identities remain unknown. No production default, OCR adoption, automatic skipping or retention remedy is approved by this completion.
+
+## Rereading-remedy investigation status — 2026-09-26
+
+F8/F9 conditional execution and terminal/accounting verification are complete; final independent whole-scope review is pending. Twenty/forty-page live attempts demonstrate all-page traversal without rereads and retain all six clinical findings, but their fixed representation/completeness gates fail. Eighty pages remains unattempted, successful scaling is NOT_ESTIMABLE, and the prior original120/production/provider requirements remain open. The [four-hour synthesis](processing-follow-up-experiments.md#four-hour-investigation-synthesis--2026-09-26) records evaluator false positives, safe identity abstention and preserved originals separately from genuine failed criteria. No existing unchecked requirement is closed. Follow-on product completeness design, evaluator compatibility and live-turnover validation are open questions, not permission for additional runs in this window.
+
+## Four-hour remedy investigation execution closed
+
+- [x] **Owner-authorized bounded F8/F9 rereading investigation and independent review.** All actual offline/live outcomes, conditional stops, evaluator limitations, retained originals and cumulative accounting are recorded and independently checked. Final review is positive: completeness **9/10**, extendedness **8/10**. See the [final review](processing-follow-up-experiments.md#four-hour-investigation-final-independent-closure). No more runs remain in these conditional protocols.
+
+This checkbox closes execution/reporting only. Both frozen scientific output gates remain failed; the80-page holdout is unattempted and successful long-document scaling remains NOT_ESTIMABLE. Product completeness semantics, evaluator inheritance/normalization, live turnover, identity/provenance review and all existing production/provider requirements stay open. Both follow-up timers are being stopped; no prototype is selected for adoption.

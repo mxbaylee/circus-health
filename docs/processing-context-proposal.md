@@ -121,6 +121,26 @@ timing comparison with the ten-page run. No adaptive implementation was tested.
 An independent reviewer checked both 800-page receipts and graded the scoped offline proof A.
 That grade is not a grade for model accuracy, the proposed architecture or production readiness.
 
+Follow-up, 2026-09-24: the owner requested completing the two-page experiment while retaining
+the original stopped recording. A fresh deterministic rerun reproduced all 1,024 original
+request-measurement rows exactly, then used the existing Resume action once on that rerun's
+saved checkpoint. Independent verification confirmed unchanged identity, proposals and cumulative
+counters at Resume, with the normal budget-offset extension. Both recordings are separately
+documented in [T1/T4 results](processing-experiments.md#t1-and-t4-where-the-input-characters-go):
+
+- **Original allowance only:** 671 pages read, 670 ready records, 335 accounted units,
+  1,024 requests and 16 sessions; 830,087,567 cumulative serialized text characters.
+- **Rerun plus one Resume:** all 800 pages read, 800 ready records, 400 accounted units,
+  1,222 requests and 20 sessions; 987,624,881 cumulative serialized text characters.
+  Resume added 198 requests and 157,537,314 characters, with zero remaining units or pending
+  windows. The retained original is unchanged, no tool errors occurred, and no records were accepted.
+
+The completed two-page schedule can now be compared with the completed ten-page schedule's
+896 requests and 393,189,513 characters. These are scripted control-flow and serialized-text
+measurements, not measured provider tokens, latency or extraction quality. The original guard
+finding remains valid; the separate follow-up establishes completion after an explicit extension.
+The fixed per-request cost model still fails: only 1,118 of 1,222 requests meet its ±20% tolerance.
+
 ## Mathematical claims and their limits
 
 For the measured scripted schedule let N be source pages and U be pages per publication:
@@ -135,6 +155,9 @@ allowance has enough slice capacity for the roughly four remaining sessions if t
 continues and no other limit binds. That resumed run was not performed. Setup, retries, rereads,
 multi-tool responses and real model choices can change these equations; they are not universal
 lower bounds. Resume cannot itself repair lost associations or reduce repeated input.
+
+The follow-up above subsequently measured the predicted 20 sessions and 1,222 requests after
+one Resume. The original stopped run and its mathematical prediction remain recorded separately.
 
 Under the current single allowance, 800 pages require averages no greater than 25,000 reported
 input-plus-output tokens, nine active seconds and 2.56 physical requests per page, plus compliance
@@ -1327,6 +1350,66 @@ Should that be allowed?
 Briefs, task IDs and results now live in [processing experiments](processing-experiments.md); see
 [experiments are now tasks](#experiments-are-now-tasks).
 
+The [follow-up experiment proposal](processing-follow-up-experiments.md) uses the completed
+two-page Resume comparison and the OCR/fingerprint failures to propose the next tests. It
+distinguishes unit-size arithmetic from live extraction quality and preserves the original
+results and criteria; its designs have not run and do not change task approvals.
+
+Execution update, 2026-09-25: the owner subsequently authorized these follow-ups.
+[F1's completed sweep](processing-follow-up-experiments.md#f1-results--completed-unit-size-sweep)
+is independently verified: at 800 pages U15/U20 reduce serialized text by 15.261%/18.120%
+versus U10, with complete coverage and later first proposals. At 200 pages their gains are
+4.981%/7.570%. F4/F5's separately frozen extensions pass their new unchanged-text matching
+corpora, while broad segmentation and historical within-encounter columns remain failures.
+Those results and independent verifications are appended in the follow-up document; F2 live
+quality and the OCR/integration follow-ups are still in progress. No production default,
+automatic skip or acceptance gate changes.
+
+The independently verified F7 identity follow-up subsequently repaired both old layout misses.
+Its first larger cohort contained duplicate PDFs and did not qualify after deduplication. A
+separately reserved 240-source holdout, with no duplicate bytes, detected 90/100 wrong-DOB
+files and made zero false stops on 100 correct and 40 unknown files; ambiguous mixed-role
+cases still abstain. This is a bounded text-layer result, not production identity validation;
+see the preserved [F7 recordings](processing-follow-up-experiments.md#f7-results--preserved-primary-cohort-and-corpus-correction).
+
+F3's independently checked development results select deskew alone: CER 1.016% and maximum
+CPU 4.83 seconds/page. Its five historical pages above 3% CER and twelve unrecovered exact
+negation-clause occurrences remain recorded; lower-error combined preprocessing exceeds the
+development CPU target. Held-out timing/quality and F6 integration remain unfinished; see
+[F3's interim results](processing-follow-up-experiments.md#f3-results--completed-development-and-regression-measurements)
+and the [current execution snapshot](processing-follow-up-experiments.md#execution-status--2026-09-25-update).
+
+Subsequent F3 held-out execution and independent verification are complete: deskew reaches
+3.025% CER, while combined geometry/order repair reaches 0.673% but exceeds five CPU seconds
+on 170/180 cold and 153/180 warm runs. No arm meets every original criterion. Four introduced
+annotation errors change `values` to `velues`; earlier exact negation-sentence failures retain
+their negation wording and do not establish polarity reversal. The
+[full F3 verification](processing-follow-up-experiments.md#independent-verification--completed-f3-held-out-matrix)
+and [complete strata](processing-ocr-follow-up-strata.md) preserve those distinctions. F6 proceeds
+as the separately declared diagnostic extension, not as adoption of a qualified OCR component.
+
+F6's full diagnostic matrix is now independently verified and fails its original gates:
+native unchanged recall is 80%; the experimental image index is usable on 4/20 held-out
+documents, with 12 strict correction-recovery failures among 16 accepted indexes despite
+literal critical fields surviving. See the [complete F6 verification](processing-follow-up-experiments.md#independent-verification--complete-f6-diagnostic-matrix).
+F2's first U15 cell completed with 160/160 literal matches and 3,152,735 tokens; its U20 cell
+was externally interrupted with unknown failed-request usage. The remaining 116 cells and
+finalization diagnostic remain unexecuted, so overall execution approval is withheld. See the
+[current execution status](processing-follow-up-experiments.md#execution-status--verified-offline-completion-and-unresolved-live-accounting).
+
+The owner subsequently approved the documented one-request accounting exception. After
+independent implementation review and a preserved CLI-startup correction, the same U20 run
+has resumed successfully. Its missing cost remains unknown; the approximately 27,500-token
+input reconstruction is an estimate, not recovered usage. The remaining matrix, finalization
+diagnostic and final execution review are still pending; see the
+[resumed execution status](processing-follow-up-experiments.md#execution-status--live-continuation-resumed).
+
+The U20 supplemental outcome is now independently verified: 160/160 literal records recovered,
+42 reads covering all 40 pages, 3,502,207 known tokens and 47.075 minutes of active processing.
+It still ends at `time_limit`, with unresolved original usage and unconfirmed identities.
+The original primary result remains intact; the next planned cell is running. See the
+[U20 verification](processing-follow-up-experiments.md#independent-verification--preserved-u20-supplemental-outcome).
+
 The experiments that must run before a design is selected. Each is a throwaway proof of concept
 or an analysis of existing data, not production code. Any of them can fail, and a failure is
 informative: it removes or reshapes a candidate. IDs match the theory tables above; methods are
@@ -1354,6 +1437,39 @@ technical starting points for whoever runs them.
 Offline and existing-data experiments come first; they cost no provider spend and prune candidates
 before any live run. Live runs use fictional sources and an explicit experiment spend cap, as the
 evaluation section requires.
+
+Recorded outcomes, 2026-09-24; measurements, reconstruction instructions, limitations and independent
+verification are in [the experiment results](processing-experiments.md). Completed experiment tasks
+do not approve production features. Later owner amendments in the briefs govern live-run stop rules.
+
+- **T1/T4 — measured, still open:** the original 800-page U=2 run stops at the guard; a verified
+  rerun plus one Resume completes all 800 pages in 1,222 requests, with both recordings retained.
+  The cost model still fails its ±20% criterion, and exact stale-history attribution remains unknown.
+- **T2/T3 — not run:** the historical per-request rows are unavailable; the owner chose to continue
+  without them, so latency slopes and the output floor remain unknown.
+- **T5 — verified failure:** preserving tool instructions yields 8.82%/11.92% savings at U=2/U=10,
+  below the 20% criterion.
+- **T9 — not run:** worktrees are available, but the required T2 delay distribution is missing;
+  no measured worker cap is selected.
+- **T12 — verified failure:** no swept setting meets all criteria; a corrected value is falsely
+  matched and row-major columns lose all span recall, even with oracle-assisted candidate intervals.
+- **T13 — verified bounded pass:** 28/29 date roles correct, with zero false skips on the fictional
+  corpus; the missed narrative comparison remains unknown and is kept for review.
+- **T14 — verified functional pass:** grouping reduces variant questions to three; remembering
+  all three spellings removes those questions while conflicts stay blocked; production integration is untested.
+- **T15 — verified functional pass:** every virtual-clock fault mix finishes 199/200 pages with only
+  the undecodable page parked and zero human callbacks; production timing and lifecycle remain untested.
+- **T17 — preparation only:** the reusable counts reducer and tests are independently verified;
+  no owner export was processed, and library statistics remain unknown.
+- **T18 — verified failure:** both local engines exceed 3% character error
+  across the 300-dpi stress matrix while every page meets the one-core CPU criterion; no OCR stage ships.
+- **T20 — verified inconclusive attempt:** the sole provider-path probe returns HTTP 400 without
+  usage; adapter inspection shows the requested output cap is not forwarded, leaving calibration open.
+- **T21 — verified failure:** zero correct-person false stops, but only 8/10 wrong-DOB files stopped,
+  below the 90% criterion; this does not enable the pre-AI identity feature.
+- **T22 — conditionally deferred:** no application OCR stage or measured host-responsiveness trigger
+  was introduced by these isolated prototypes.
+- **T19 remains withdrawn; stage 4 (T6–T8, T10–T11 and T16) was excluded by the owner.**
 
 ### Open decisions, updated
 
@@ -2024,3 +2140,25 @@ Owner decisions after the seventh pass:
 ### Identifiers (seventh pass)
 
 Next free: candidate M, theory T24, issue OI-43. CRS-110 to CRS-113 are used.
+
+## Bounded follow-up evidence update — 2026-09-25
+
+The owner shortened F2 after fourteen original primary attempts: six strictly complete and eight incomplete. The original 120-cell comparison, confidence intervals, quality noninferiority claim and full-matrix finalization remain incomplete/superseded. The [independently checked extrapolation register](processing-extrapolated-results.md) preserves every original cell: fourteen measured attempts, thirty-two conditional dense cost scenarios and seventy-four unsupported empirical completion forecasts, with the original structural estimates separate. Unattempted cells remain unattempted.
+
+New scripted N400 checks validate the frozen N200/N800 character interpolation at U10 and U20 with signed errors of −0.326920% and +0.024569%. That does not validate live token or latency scaling. The completed dense1 four-arm observation does not show monotonic benefit from larger units; all six attempted mixed-document cases failed to complete. Their retained evidence points to context retention and provenance/association problems that unit-size arithmetic cannot resolve.
+
+The six offline follow-ups F1/F3/F4/F5/F6/F7 have independently verified outcomes, including their failed criteria. The owner authorized three separate live length anchors within approximately ninety minutes of dispatch allowances to test the extrapolation assumptions. After a preserved authentication interruption and independently reviewed same-state continuation, those anchors are running. Final bounded execution review remains pending; no production unit size, OCR adoption, automatic skipping or open acceptance gate is selected by these results.
+
+## Final bounded follow-up disposition — 2026-09-26
+
+The bounded execution and review request is complete: the independent reviewer rates completeness **9/10** and extendedness **9/10** with no unresolved material gap requiring another live/OCR run within that scope. The three live anchors consumed 26.507860 active minutes. Dense20 recovered all eighty observations after authentication repair but retains unknown original usage and identity-pending records; single20 and single80 failed under the unchanged progress guard. The latter do not calibrate successful long-report cost or latency. The N400 checks support the fixed scripted interpolation, and all original/partial recordings and forecasts remain preserved.
+
+The [final independent review](processing-follow-up-experiments.md#final-independent-review--bounded-follow-up-closure) and [extrapolation register](processing-extrapolated-results.md) separate this execution closure from scientific success. The original 120-cell confidence/noninferiority study and gated finalization remain incomplete/superseded, with 106 cells unattempted; standalone open T/CRS experiments and production/provider gates remain open. No universal unit-size winner or tested context-retention remedy is selected. The completed recurring follow-up is being stopped.
+
+## Rereading-remedy evidence update — 2026-09-26
+
+F8/F9 isolate exact text retention and acknowledged-evidence replay. Offline context-turnover checks passed; new20/40-page live attempts read all pages once and preserved all six fictional clinical findings. F8 failed the fixed complete-document requirement; separately declared F9 failed full literal proposal transcription (7/40pages;33 omitted administrative pages retained in the original). Independent review found no lost authored clinical fact and identified four evaluator false positives caused by valid context inheritance/display-label mapping. The true all-page criterion still fails. Eighty-page validation remains unattempted and successful long-report scaling remains NOT_ESTIMABLE. See the [four-hour synthesis](processing-follow-up-experiments.md#four-hour-investigation-synthesis--2026-09-26). This is a tested mechanism candidate, not production selection or closure of existing acceptance gates; final execution review is pending.
+
+## Final four-hour investigation disposition
+
+Independent review gives completeness **9/10** and extendedness **8/10**, positive for the bounded F8/F9 investigation with no material execution/reporting gap requiring more runs. The source-retention candidate traversed20/40-page fixtures without rereading and preserved all six findings, but both declared output gates failed. Eighty-page validation and successful scaling remain unsupported; no production default or existing gate is approved. The [final review](processing-follow-up-experiments.md#four-hour-investigation-final-independent-closure) records all limitations and closes this follow-up within its shared four-hour allowance.
