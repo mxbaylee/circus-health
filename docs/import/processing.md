@@ -18,7 +18,7 @@ Originals remain unchanged. Located source text, alternatives, relationships, in
 
 Material source changes conservatively invalidate unaccepted interpretations, including ancestor package proposals. Dependency checks are currently broad: unrelated page changes can stale proposals because they share a source revision. Unchanged-text inspection preserves the material dependency. Accepted clinical history is never rewritten by extraction or inspection.
 
-Source mutations are authorized and version checked; stale writes preserve drafts for conflict recovery. The [source-text mutation path](../../src/server/intake-source-text.ts) currently includes the full revision in journal transaction results. Content-addressed page blobs do not eliminate that write amplification; see [record storage](../data/record-version-storage.md#source-text-write-amplification).
+Source mutations are authorized and version checked; stale writes preserve drafts for conflict recovery. The [source-text mutation path](../../src/server/intake-source-text.ts) journals a small receipt, the page and list blobs that changed, and a small source-pin record per affected intake; see [record storage](../data/record-version-storage.md#source-text-write-amplification).
 
 Text inspection, clinical interpretation and clinical acceptance are separate operations. A read page, an empty issue list or human text approval does not prove complete clinical extraction. New clinical records require explicit acceptance. Model summaries and cached replies are not recovery authority.
 

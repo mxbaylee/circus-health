@@ -1,7 +1,15 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, symlinkSync } from 'node:fs';
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  symlinkSync,
+  statSync,
+  utimesSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { openDatabase, transaction, type Database } from '../database.ts';
@@ -29,6 +37,11 @@ import type {
   IntakeSourceText,
 } from '../../shared/intake-source-text.ts';
 import { assertCurrentProposalSourceText } from '../intake-source-text-dependencies.ts';
+import {
+  readIntakeSourcePin,
+  withIntakeSourcePin,
+  withoutIntakeSourcePin,
+} from '../intake-source-pin.ts';
 
 const profileId = 'fictional-source-text';
 const intakeId = 'fictional-import';
@@ -207,7 +220,11 @@ test('unchanged pages are reused across immutable extraction checkpoints', (t) =
   const after = f.db
     .prepare("SELECT key FROM app_meta WHERE key LIKE 'intake_source_text:%:blob:%'")
     .all();
-  assert.equal(after.length - before.length, 1, 'only changed page content is newly retained');
+  assert.equal(
+    after.length - before.length,
+    2,
+    'only the changed page and the page-ref chunk listing it are newly retained',
+  );
   assert.equal(next.parentRevisionId, initial.id);
   assert.deepEqual(
     getIntakeSourceText(f.db, f.root, profileId, intakeId, initial.id).revision,
@@ -236,12 +253,8 @@ test('whole inspected page can correct unflagged text; history and outside page 
     getIntakeSourceText(f.db, f.root, profileId, intakeId, initial.id).revision,
     initial,
   );
-  const envelope = JSON.parse(
-    f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!
-      .details_json as string,
-  );
   assert.equal(
-    envelope.intake.sourceTextRevisionId,
+    readIntakeSourcePin(f.db, intakeId)!.revisionId,
     corrected.id,
     'clinical invalidation is in the durable edit transaction',
   );
@@ -428,11 +441,7 @@ test('crash after durable head publication but before projection recovers text a
     result = getIntakeSourceText(restored, f.root, profileId, intakeId);
   assert.ok(result.revision);
   assert.equal(result.revision.spans.length, 3);
-  const envelope = JSON.parse(
-    restored.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!
-      .details_json as string,
-  );
-  assert.equal(envelope.intake.sourceTextRevisionId, result.revision.id);
+  assert.equal(readIntakeSourcePin(restored, intakeId)!.revisionId, result.revision.id);
 });
 
 test('corrupt/missing committed journal objects fail rebuild; altered projection text fails retrieval', (t) => {
@@ -663,22 +672,23 @@ test('member correction atomically invalidates ancestor proposals without impers
       );
   });
   const initial = publish(f);
-  const metadata = (db = f.db) =>
+  const stored = (db = f.db) =>
     JSON.parse(
       db.prepare('SELECT details_json FROM source_files WHERE id=?').get(parent)!
         .details_json as string,
     ).intake;
+  const metadata = (db = f.db) => withIntakeSourcePin(stored(db), readIntakeSourcePin(db, parent));
   const before = metadata();
-  assert.equal(before.sourceTextRevisionId, undefined);
+  assert.equal(before.sourceTextRevisionId, null);
   assert.equal(before.version, 2);
   assert.ok(before.sourceTextDependencyToken);
   transaction(f.db, () => {
-    const saved = metadata();
+    const saved = stored();
     saved.proposals = [
       {
         id: 'parent-proposal',
         sourceTextRevisionId: null,
-        sourceTextDependencyToken: saved.sourceTextDependencyToken,
+        sourceTextDependencyToken: metadata().sourceTextDependencyToken,
       },
     ];
     f.db
@@ -694,7 +704,7 @@ test('member correction atomically invalidates ancestor proposals without impers
   });
   const after = metadata();
   assert.notEqual(after.sourceTextDependencyToken, before.sourceTextDependencyToken);
-  assert.equal(after.sourceTextRevisionId, undefined);
+  assert.equal(after.sourceTextRevisionId, null);
   assert.equal(after.sourceTextRequiresInterpretation, true);
   assert.throws(
     () => assertCurrentProposalSourceText(after, 'parent-proposal'),
@@ -949,12 +959,15 @@ test('unchanged text approval preserves clinical pins and receipts through rebui
   const f = fixture(t),
     initial = publish(f);
   const metadata = () =>
-    JSON.parse(
-      String(
-        f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!
-          .details_json,
-      ),
-    ).intake;
+    withIntakeSourcePin(
+      JSON.parse(
+        String(
+          f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!
+            .details_json,
+        ),
+      ).intake,
+      readIntakeSourcePin(f.db, intakeId),
+    );
   const before = metadata();
   const proposal = {
     id: 'existing-proposal',
@@ -1083,4 +1096,256 @@ test('attention totals include later files while pages omit completed files', (t
   assert.equal(last.sections, 31);
   assert.equal(last.items.length, 1);
   assert.equal(last.nextOffset, null);
+});
+
+function extractedEvidence(pages: number, extracted: number): SourceTextEvidence {
+  const done = (page: number) => page <= extracted;
+  const all = Array.from({ length: pages }, (_, i) => i + 1);
+  return {
+    adapter: { name: 'fictional-reader', version: '1' },
+    pages: all.map((page) => ({
+      page,
+      disposition: done(page) ? ('extracted' as const) : ('partial' as const),
+      inspected: false,
+    })),
+    spans: all.filter(done).map((page) => ({
+      id: `s${page}`,
+      text: `Fictional page ${page}. ` + 'Result value 1.00 within range. '.repeat(40),
+      region: { page },
+      provenance: 'native' as const,
+    })),
+    relations: all
+      .filter((page) => done(page + 1))
+      .map((page) => ({
+        id: `r${page}`,
+        kind: 'precedes' as const,
+        from: `s${page}`,
+        to: `s${page + 1}`,
+        provenance: 'adapter' as const,
+      })),
+    issues: all.map((page) => ({
+      id: `c${page}`,
+      region: { page },
+      kind: 'coverage' as const,
+      status: 'open' as const,
+      detail: done(page) ? 'Not independently inspected.' : 'Not yet extracted.',
+    })),
+  };
+}
+/** Average journal bytes for each of the last few page captures of a long document. */
+function captureBytes(t: TestContext, pages: number, proposals = 0) {
+  const f = fixture(t),
+    writeImmutable = f.storage.writeImmutable,
+    steps = 5;
+  if (proposals)
+    transaction(f.db, () =>
+      f.db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
+        JSON.stringify({
+          intake: {
+            version: 1,
+            proposals: Array.from({ length: proposals }, (_, i) => ({
+              id: `fictional-proposal-${i}`,
+              note: 'Fictional proposal wording. '.repeat(20),
+            })),
+          },
+        }),
+        intakeId,
+      ),
+    );
+  let written = 0;
+  f.storage.writeImmutable = (name, value) => {
+    written += value.length;
+    writeImmutable(name, value);
+  };
+  let head = publish(f, extractedEvidence(pages, pages - steps)).id;
+  const before = written;
+  for (let extracted = pages - steps + 1; extracted <= pages; extracted++)
+    head = publish(f, extractedEvidence(pages, extracted), head).id;
+  return { f, perCapture: (written - before) / steps };
+}
+
+test('journal bytes per page capture stay flat as the document grows', (t) => {
+  // Before CRS-117 each capture journaled the whole revision: about 65 KB at 30
+  // pages and 222 KB at 120 pages in the same fictional shape.
+  const small = captureBytes(t, 30),
+    large = captureBytes(t, 300);
+  assert.ok(
+    large.perCapture < small.perCapture * 1.5,
+    `per-capture journal bytes grew from ${small.perCapture} to ${large.perCapture}`,
+  );
+  const results = large.f.db
+    .prepare('SELECT result_json FROM __record_transactions')
+    .all()
+    .map((row) => String(row.result_json));
+  assert.equal(
+    results.some((result) => result.includes('Result value 1.00')),
+    false,
+  );
+});
+
+test('replayed operations return the original response from receipts and pre-receipt results', (t) => {
+  const f = fixture(t);
+  const request = {
+    operationId: randomUUID(),
+    expectedRevisionId: null,
+    sourceHash: f.sourceHash,
+    evidence: evidence(),
+  };
+  const first = publishIntakeSourceText(f.db, f.root, profileId, intakeId, request);
+  const [stored] = f.db
+    .prepare('SELECT result_json FROM __record_transactions WHERE operation_id=?')
+    .all(request.operationId);
+  assert.equal(JSON.parse(String(stored.result_json)).format, 'intake-source-text-receipt-v1');
+  assert.deepEqual(publishIntakeSourceText(f.db, f.root, profileId, intakeId, request), first);
+  assert.deepEqual(
+    publishIntakeSourceText(f.rebuild(), f.root, profileId, intakeId, request),
+    first,
+  );
+  // Results journaled before CRS-117 held the complete response and replay it verbatim.
+  f.db
+    .prepare('UPDATE __record_transactions SET result_json=? WHERE operation_id=?')
+    .run(JSON.stringify(first), request.operationId);
+  assert.deepEqual(publishIntakeSourceText(f.db, f.root, profileId, intakeId, request), first);
+});
+
+test('revisions stored before chunked page, relation and issue lists stay readable and extendable', (t) => {
+  const f = fixture(t);
+  const saved = publish(f);
+  const expected = getIntakeSourceText(f.db, f.root, profileId, intakeId);
+  const issues = getIntakeSourceIssues(f.db, f.root, profileId, intakeId);
+  const meta = (name: string) =>
+    JSON.parse(
+      String(
+        f.db
+          .prepare('SELECT value FROM app_meta WHERE key=?')
+          .get(`intake_source_text:v1:${intakeId}:${name}`)!.value,
+      ),
+    );
+  const storeBlob = (value: unknown) => {
+    const sha = digest(Buffer.from(JSON.stringify(value)));
+    f.db
+      .prepare('INSERT OR IGNORE INTO app_meta(key,value) VALUES(?,?)')
+      .run(`intake_source_text:v1:${intakeId}:blob:${sha}`, JSON.stringify(value));
+    return sha;
+  };
+  const revisionKey = `intake_source_text:v1:${intakeId}:revision:${saved.id}`;
+  const envelope = meta(`revision:${saved.id}`);
+  const value = envelope.value;
+  assert.ok(value.pageChunks && value.relationLists && value.issueIndex.chunkLists);
+  // Recreate the former layout: every page ref, one relation blob and every issue chunk inline.
+  transaction(f.db, () => {
+    value.pageRefs = value.pageChunks.flatMap((ref: string) => meta(`blob:${ref}`));
+    value.relationRef = storeBlob(
+      value.relationLists
+        .flatMap((ref: string) => meta(`blob:${ref}`))
+        .flatMap((ref: string) => meta(`blob:${ref}`)),
+    );
+    value.issueIndex = {
+      summary: value.issueIndex.summary,
+      chunks: value.issueIndex.chunkLists.flatMap((ref: string) => meta(`blob:${ref}`)),
+    };
+    delete value.pageChunks;
+    delete value.relationLists;
+    envelope.sha256 = digest(Buffer.from(JSON.stringify(value)));
+    f.db
+      .prepare('UPDATE app_meta SET value=? WHERE key=?')
+      .run(JSON.stringify(envelope), revisionKey);
+  });
+  assert.deepEqual(getIntakeSourceText(f.db, f.root, profileId, intakeId), expected);
+  assert.deepEqual(getIntakeSourceIssues(f.db, f.root, profileId, intakeId), issues);
+  const ev = evidence();
+  ev.spans[2].text = 'Administrative routing retained again.';
+  const next = publish(f, ev, saved.id);
+  assert.equal(next.parentRevisionId, saved.id);
+  assert.deepEqual(next.relations, saved.relations);
+  const [receipt] = f.db
+    .prepare('SELECT result_json FROM __record_transactions ORDER BY sequence DESC LIMIT 1')
+    .all();
+  assert.deepEqual(JSON.parse(String(receipt.result_json)).changedPages, [2]);
+});
+
+test('an unchanged original is hashed once, and any rewrite of it is hashed again', (t) => {
+  const f = fixture(t);
+  publish(f);
+  const before = statSync(f.path);
+  getIntakeSourceText(f.db, f.root, profileId, intakeId);
+  // Same length and timestamps would pass a size check; ctime still moves on any write.
+  writeFileSync(f.path, Buffer.from(readFileSync(f.path).toString().replace('1.00', '7.00')));
+  utimesSync(f.path, before.atime, before.mtime);
+  assert.throws(() => getIntakeSourceText(f.db, f.root, profileId, intakeId), {
+    code: 'SOURCE_CHANGED',
+  });
+});
+
+test('page captures do not copy the intake row, however many proposals it holds', (t) => {
+  // Before the source pin moved out of the intake row, about 214 KB of proposals
+  // raised each capture at 120 pages from 19.5 KB to 232 KB.
+  const bare = captureBytes(t, 120),
+    busy = captureBytes(t, 120, 400);
+  assert.ok(
+    busy.perCapture < bare.perCapture * 1.5,
+    `per-capture journal bytes grew from ${bare.perCapture} to ${busy.perCapture} with proposals`,
+  );
+});
+
+test('the first pinned revision continues the dependency chain kept in older intake rows', (t) => {
+  const f = fixture(t),
+    initial = publish(f);
+  const legacyToken = 'a'.repeat(64);
+  // Recreate an intake written before source pins: its pin fields live in the row.
+  transaction(f.db, () => {
+    f.db.prepare('DELETE FROM app_meta WHERE key=?').run(`intake_source_pin:v1:${intakeId}`);
+    f.db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
+      JSON.stringify({
+        intake: {
+          version: 7,
+          proposals: [],
+          sourceTextRevisionId: initial.id,
+          sourceTextDependencyToken: legacyToken,
+          sourceTextRequiresInterpretation: true,
+        },
+      }),
+      intakeId,
+    );
+  });
+  const row = () =>
+    String(
+      f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!.details_json,
+    );
+  const legacy = row();
+  const legacyView = JSON.parse(legacy).intake;
+  const ev = evidence();
+  ev.spans[2].text = 'Administrative routing retained again.';
+  const next = publish(f, ev, initial.id);
+  assert.equal(row(), legacy, 'a source revision leaves the intake row untouched');
+  const pinned = withIntakeSourcePin(JSON.parse(row()).intake, readIntakeSourcePin(f.db, intakeId));
+  assert.equal(pinned.sourceTextRevisionId, next.id);
+  assert.equal(pinned.version, 8);
+  assert.equal(pinned.sourceTextRequiresInterpretation, true);
+  assert.equal(
+    pinned.sourceTextDependencyToken,
+    digest(Buffer.from(JSON.stringify([legacyToken, intakeId, next.id]))),
+  );
+  assert.throws(
+    () =>
+      assertCurrentProposalSourceText(
+        {
+          ...pinned,
+          proposals: [{ id: 'old', ...legacyView }],
+        },
+        'old',
+      ),
+    code('SOURCE_TEXT_CHANGED'),
+  );
+  // Writing the pinned view back keeps the row's own pin fields and version base.
+  const back = withoutIntakeSourcePin(
+    { ...pinned, version: pinned.version + 1 },
+    legacyView,
+    readIntakeSourcePin(f.db, intakeId),
+  );
+  assert.deepEqual(back, { ...legacyView, version: 8 });
+  assert.equal(
+    withIntakeSourcePin(back, readIntakeSourcePin(f.db, intakeId)).version,
+    pinned.version + 1,
+  );
 });

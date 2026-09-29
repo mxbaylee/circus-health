@@ -15,7 +15,7 @@ import type {
   IntakePersonProposalState,
 } from '../shared/intake-people.ts';
 import type { IntakeReportGroup, IntakeWorkflow } from '../shared/intake.ts';
-import { inspectIntakeFile } from './intake-files.ts';
+import { verifyIntakeFileHash } from './intake-files.ts';
 import { canonicalLiteral, validateJSONL } from './intake-format.ts';
 import type { IntakeEntry } from './intake-format.ts';
 import { intakePersonDisplayTitle, validatedIntakePeople } from './intake-people-format.ts';
@@ -30,6 +30,7 @@ import {
 import { createNote, getNote, saveNote } from './notes.ts';
 import { personalDurabilityStatus } from './portable.ts';
 import { profileOriginal } from './profile-storage.ts';
+import { readIntakeSourcePin, withIntakeSourcePin } from './intake-source-pin.ts';
 
 type UnknownRecord = Record<string, unknown>;
 interface SourceFileRow {
@@ -152,7 +153,7 @@ function verifiedEntries(
   verifyIntakeOriginal(db, root, profileId, original.id);
   const selected = inputFile(db, original, proposalId);
   const path = profileOriginal(root, selected.path, profileId);
-  inspectIntakeFile(path, selected);
+  verifyIntakeFileHash(path, selected);
   const parsed = validateJSONL(readFileSync(path));
   if (!parsed.valid || !parsed.entries)
     throw new HttpError(409, 'INTAKE_PERSON_SOURCE', 'Retained People proposal is no longer valid');
@@ -339,7 +340,8 @@ function collectForOriginal(
             version,
             state: personState(db, intake, id, version),
             intakeId: original.id,
-            intakeVersion: intake.version,
+            intakeVersion: withIntakeSourcePin(intake, readIntakeSourcePin(db, original.id))
+              .version,
             proposalId,
             envelopeRecordId: recordId,
             envelopeId: entry.value.id,

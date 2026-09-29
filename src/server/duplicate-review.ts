@@ -10,7 +10,7 @@ import { canonicalLiteral } from './intake-format.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { relatedRecordIds } from './related-records.ts';
-import { inspectIntakeFile } from './intake-files.ts';
+import { verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
 import type {
   IntakePairScope,
@@ -663,7 +663,7 @@ export function verifyDuplicateOriginals(
       { path: string; bytes: number; sha256: string } | undefined;
     if (!source)
       throw new HttpError(409, 'DUPLICATE_EVIDENCE', 'The saved record original is unavailable');
-    inspectIntakeFile(profileOriginal(root, source.path, profileId), source);
+    verifyIntakeFileHash(profileOriginal(root, source.path, profileId), source);
     verified.add(id);
   }
 }

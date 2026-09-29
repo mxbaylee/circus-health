@@ -19,7 +19,7 @@ import {
   type IntakeOccurrenceContext,
   type OccurrenceAuthorityFinalizer,
 } from './duplicate-review.ts';
-import { inspectIntakeFile } from './intake-files.ts';
+import { verifyIntakeFileHash } from './intake-files.ts';
 import { validatedIntakePeople } from './intake-people-format.ts';
 import { profileOriginal } from './profile-storage.ts';
 import { createHash } from 'node:crypto';
@@ -2101,7 +2101,7 @@ export function projectClinicalReview(
       const assetFile = db.prepare('SELECT * FROM source_files WHERE id=?').get(sourceId) as
         AssetFileRow | undefined;
       if (assetFile && root) {
-        inspectIntakeFile(profileOriginal(root, assetFile.path, profileId), assetFile);
+        verifyIntakeFileHash(profileOriginal(root, assetFile.path, profileId), assetFile);
       }
       if (
         !assetFile ||

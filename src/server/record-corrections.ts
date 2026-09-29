@@ -6,7 +6,7 @@ import type {
   CorrectionSupportingReference,
 } from '../shared/record-correction.ts';
 import { getIntake, reviewIntake } from './intake.ts';
-import { inspectIntakeFile } from './intake-files.ts';
+import { verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
 import { validClinicalFieldValue } from './optical-prescription.ts';
 import {
@@ -47,7 +47,7 @@ function retainedOriginal(db: Database, context: CorrectionEvidenceContext, sour
       'CORRECTION_EVIDENCE',
       'Supporting original is not retained in this profile',
     );
-  inspectIntakeFile(profileOriginal(context.root, file.path, context.profileId), {
+  verifyIntakeFileHash(profileOriginal(context.root, file.path, context.profileId), {
     sha256: file.sha256 as string,
     bytes: file.bytes as number,
   });

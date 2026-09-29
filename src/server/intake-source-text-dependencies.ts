@@ -2,6 +2,12 @@ import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
 import type { SourceTextRevision } from '../shared/intake-source-text.ts';
+import {
+  readIntakeSourcePin,
+  withIntakeSourcePin,
+  writeIntakeSourcePin,
+  type IntakeSourcePin,
+} from './intake-source-pin.ts';
 
 /** Only inspection bookkeeping may change without invalidating clinical interpretation. */
 export function sourceTextConfirmationOnly(
@@ -46,26 +52,20 @@ export function invalidateIntakeSourceTextDependencies(
     .get(next.intakeId) as { sha256: string; details_json: string } | undefined;
   if (owner?.value !== next.profileId || !file || file.sha256 !== next.sourceHash)
     throw new HttpError(409, 'SOURCE_CHANGED', 'The source text no longer matches this intake');
-  const envelope = JSON.parse(file.details_json);
-  const details = envelope.intake;
+  const details = JSON.parse(file.details_json).intake;
   if (!details || typeof details !== 'object')
     throw new HttpError(409, 'SOURCE_CHANGED', 'The intake metadata is unavailable');
-  details.sourceTextRevisionId = next.id;
-  details.sourceTextDependencyToken = createHash('sha256')
-    .update(JSON.stringify([details.sourceTextDependencyToken || null, next.intakeId, next.id]))
-    .digest('hex');
+  // Proposals keep their old source pin and cannot be accepted after a material edit;
+  // draft and accepted history are kept. Only the small pin records change, so the
+  // intake rows (proposals and history) are not copied into the journal again.
+  const current = withIntakeSourcePin(details, readIntakeSourcePin(db, next.intakeId));
+  const pin = nextPin(db, next, next.intakeId, current, next.id);
   if (
     next.review &&
     ['correct', 'clarification', 'unreadable', 'not-text'].includes(next.review.action)
   )
-    details.sourceTextRequiresInterpretation = true;
-  details.version = Number(details.version || 0) + 1;
-  // Keep draft and accepted history. Their tokens/version pins now require fresh review;
-  // proposals retain their old source pin and cannot be accepted after a material edit.
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-    JSON.stringify(envelope),
-    next.intakeId,
-  );
+    pin.requiresInterpretation = true;
+  writeIntakeSourcePin(db, next.intakeId, pin);
   // A proposal for a ZIP/document may depend on an extracted descendant. Bind
   // every ancestor without pretending the child's revision is its own text.
   const seen = new Set([next.intakeId]);
@@ -78,21 +78,34 @@ export function invalidateIntakeSourceTextDependencies(
       .prepare("SELECT details_json FROM source_files WHERE id=? AND kind='intake_original'")
       .get(parent);
     if (!ancestor) throw new HttpError(409, 'SOURCE_CHANGED', 'Retained parent source is missing');
-    const saved = JSON.parse(String(ancestor.details_json));
-    const metadata = saved.intake;
+    const metadata = JSON.parse(String(ancestor.details_json)).intake;
     if (!metadata)
       throw new HttpError(409, 'SOURCE_CHANGED', 'Retained parent metadata is missing');
-    metadata.sourceTextDependencyToken = createHash('sha256')
-      .update(JSON.stringify([metadata.sourceTextDependencyToken || null, next.intakeId, next.id]))
-      .digest('hex');
-    metadata.version = Number(metadata.version || 0) + 1;
-    if (details.sourceTextRequiresInterpretation) metadata.sourceTextRequiresInterpretation = true;
-    db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-      JSON.stringify(saved),
-      parent,
-    );
+    const saved = withIntakeSourcePin(metadata, readIntakeSourcePin(db, parent));
+    const bound = nextPin(db, next, parent, saved, saved.sourceTextRevisionId || null);
+    if (pin.requiresInterpretation) bound.requiresInterpretation = true;
+    writeIntakeSourcePin(db, parent, bound);
     parent = metadata.parentSourceFileId;
   }
+}
+function nextPin(
+  db: DatabaseSync,
+  next: SourceTextRevision,
+  intakeId: string,
+  current: {
+    sourceTextDependencyToken?: string | null;
+    sourceTextRequiresInterpretation?: boolean;
+  },
+  revisionId: string | null,
+): IntakeSourcePin {
+  return {
+    revisionId,
+    dependencyToken: createHash('sha256')
+      .update(JSON.stringify([current.sourceTextDependencyToken || null, next.intakeId, next.id]))
+      .digest('hex'),
+    requiresInterpretation: !!current.sourceTextRequiresInterpretation,
+    version: (readIntakeSourcePin(db, intakeId)?.version ?? 0) + 1,
+  };
 }
 
 export function sourceTextProposalId(

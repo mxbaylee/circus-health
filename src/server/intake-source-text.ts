@@ -3,7 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { HttpError, transaction, type Database } from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import { profileOriginal } from './profile-storage.ts';
-import { inspectIntakeFile } from './intake-files.ts';
+import { verifyIntakeFileHash } from './intake-files.ts';
+import { readIntakeSourcePin } from './intake-source-pin.ts';
 import { visibilityCondition, visibilitySQL } from './visibility.ts';
 import {
   invalidateIntakeSourceTextDependencies,
@@ -80,7 +81,7 @@ function owner(db: Database, profileId: string, intakeId: string) {
 function source(db: Database, root: string, profileId: string, intakeId: string) {
   const row = owner(db, profileId, intakeId);
   const path = profileOriginal(root, row.path, profileId);
-  inspectIntakeFile(path, { bytes: row.bytes, sha256: row.sha256 });
+  verifyIntakeFileHash(path, { bytes: row.bytes, sha256: row.sha256 });
   return row;
 }
 function durable(db: Database) {
@@ -252,11 +253,69 @@ interface StoredIssueIndex {
   summary: SourceTextIssueSummary;
   chunks: { ref: string; count: number }[];
 }
+/** Since CRS-117 the chunk list itself is chunked, so the envelope stays small on long sources. */
+interface StoredIssueIndexRefs {
+  summary: SourceTextIssueSummary;
+  chunkLists: string[];
+}
 interface StoredRevision {
-  issueIndex?: StoredIssueIndex;
+  issueIndex?: StoredIssueIndex | StoredIssueIndexRefs;
   header: Omit<SourceTextRevision, 'pages' | 'spans' | 'issues' | 'relations'>;
+  /** Revisions written before CRS-117 list every page and every relation inline. */
+  pageRefs?: string[];
+  relationRef?: string;
+  /**
+   * Page refs in fixed slices; relations in content-defined chunks whose refs are chunked again,
+   * so one change rewrites one chunk and the envelope stays small.
+   */
+  pageChunks?: string[];
+  relationLists?: string[];
+}
+/** A validated revision envelope with its chunked references resolved. */
+interface LoadedRevision {
+  stored: StoredRevision;
+  header: StoredRevision['header'];
+  issueIndex?: StoredIssueIndex;
   pageRefs: string[];
-  relationRef: string;
+  relationRefs: string[];
+}
+const PAGE_CHUNK = 64;
+const MAX_PAGES = 10000;
+/**
+ * Content-defined boundaries: an insertion or removal changes the chunk it lands in, not every
+ * later chunk. Boundaries follow roughly one item in sixteen, capped at max.
+ */
+function chunkBy<T>(items: T[], identity: (item: T) => string, max: number): T[][] {
+  const chunks: T[][] = [];
+  let current: T[] = [];
+  for (const item of items) {
+    current.push(item);
+    if (current.length >= max || createHash('sha256').update(identity(item)).digest()[0] < 16) {
+      chunks.push(current);
+      current = [];
+    }
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+const hashRefs = (value: unknown, max: number): value is string[] =>
+  Array.isArray(value) && value.length <= max && value.every((ref) => HASH.test(ref));
+function issueIndexOf(
+  db: Database,
+  intakeId: string,
+  index: StoredIssueIndex | StoredIssueIndexRefs,
+): StoredIssueIndex {
+  if (!object(index)) return corrupt();
+  if (!('chunkLists' in index)) return index;
+  if (!hashRefs(index.chunkLists, MAX_PAGES)) corrupt();
+  return {
+    summary: index.summary,
+    chunks: index.chunkLists.flatMap((ref) => {
+      const chunks = readBlob(db, intakeId, ref);
+      if (!Array.isArray(chunks) || !chunks.length) corrupt();
+      return chunks as StoredIssueIndex['chunks'];
+    }),
+  };
 }
 function blob(db: Database, intakeId: string, value: unknown): string {
   const sha = hash(value);
@@ -277,7 +336,7 @@ function loadStoredRevision(
   intakeId: string,
   sourceHash: string,
   id: string,
-): StoredRevision {
+): LoadedRevision {
   if (!UUID.test(id)) bad('Invalid source-text revision');
   const raw = read(db, key(intakeId, `revision:${id}`));
   if (raw === undefined)
@@ -295,16 +354,43 @@ function loadStoredRevision(
     saved.header.sourceHash !== sourceHash ||
     (saved.header.parentRevisionId !== null && !UUID.test(saved.header.parentRevisionId)) ||
     !Number.isFinite(Date.parse(saved.header.createdAt)) ||
-    !Array.isArray(saved.pageRefs) ||
-    saved.pageRefs.length > 10000 ||
-    !Array.isArray(saved.header.protectedPages) ||
-    saved.header.protectedPages.some(
-      (p) => !Number.isSafeInteger(p) || p < 1 || p > saved.pageRefs.length,
-    ) ||
-    typeof saved.relationRef !== 'string'
+    (saved.pageChunks === undefined
+      ? !hashRefs(saved.pageRefs, MAX_PAGES)
+      : saved.pageRefs !== undefined ||
+        !hashRefs(saved.pageChunks, Math.ceil(MAX_PAGES / PAGE_CHUNK))) ||
+    (saved.relationLists === undefined
+      ? typeof saved.relationRef !== 'string'
+      : saved.relationRef !== undefined || !hashRefs(saved.relationLists, MAX_PAGES))
   )
     corrupt();
-  return saved;
+  const pageRefs = saved.pageChunks
+    ? saved.pageChunks.flatMap((ref) => {
+        const refs = readBlob(db, intakeId, ref);
+        if (!hashRefs(refs, PAGE_CHUNK) || !refs.length) corrupt();
+        return refs as string[];
+      })
+    : saved.pageRefs!;
+  if (
+    pageRefs.length > MAX_PAGES ||
+    !Array.isArray(saved.header.protectedPages) ||
+    saved.header.protectedPages.some(
+      (p) => !Number.isSafeInteger(p) || p < 1 || p > pageRefs.length,
+    )
+  )
+    corrupt();
+  return {
+    stored: saved,
+    header: saved.header,
+    issueIndex: saved.issueIndex && issueIndexOf(db, intakeId, saved.issueIndex),
+    pageRefs,
+    relationRefs: saved.relationLists
+      ? saved.relationLists.flatMap((ref) => {
+          const refs = readBlob(db, intakeId, ref);
+          if (!hashRefs(refs, PAGE_CHUNK) || !refs.length) corrupt();
+          return refs as string[];
+        })
+      : [saved.relationRef!],
+  };
 }
 function loadRevision(
   db: Database,
@@ -335,7 +421,11 @@ function loadRevision(
     pages,
     spans,
     issues,
-    relations: readBlob(db, intakeId, saved.relationRef) as SourceTextRelation[],
+    relations: saved.relationRefs.flatMap((ref) => {
+      const relations = readBlob(db, intakeId, ref);
+      if (!Array.isArray(relations)) corrupt();
+      return relations as SourceTextRelation[];
+    }),
   };
   try {
     validateSourceTextEvidence(revision);
@@ -409,7 +499,7 @@ export function rebindCopiedIntakeSourceText(
     const original = owner(db, profileId, intakeId);
     // Validate every page and relationship before copying its authority to a new owner.
     loadRevision(db, previousProfileId, intakeId, original.sha256, id);
-    const value = loadStoredRevision(db, previousProfileId, intakeId, original.sha256, id);
+    const value = loadStoredRevision(db, previousProfileId, intakeId, original.sha256, id).stored;
     value.header = {
       ...value.header,
       profileId,
@@ -453,9 +543,12 @@ export function intakeSourceTextInterpretationRevisionId(
   // The durable intake projection keeps the last material revision. The common
   // current-head path must not walk hundreds of whole-document approval receipts.
   const metadata = db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId);
-  const material = metadata
-    ? JSON.parse(String(metadata.details_json)).intake?.sourceTextRevisionId
-    : null;
+  const pin = readIntakeSourcePin(db, intakeId);
+  const material = pin
+    ? pin.revisionId
+    : metadata
+      ? JSON.parse(String(metadata.details_json)).intake?.sourceTextRevisionId
+      : null;
   if (id === head && typeof material === 'string') return material;
   let revision = loadRevision(db, profileId, intakeId, row.sha256, id);
   for (
@@ -598,7 +691,7 @@ export function listSourceAttention(
     nextOffset: offset + window.length < items.length ? offset + window.length : null,
   };
 }
-function persistIssueIndex(db: Database, revision: SourceTextRevision): StoredIssueIndex {
+function persistIssueIndex(db: Database, revision: SourceTextRevision): StoredIssueIndexRefs {
   const issues = revision.issues
     .filter(sourceIssueNeedsReview)
     .map(issueProjection)
@@ -608,12 +701,16 @@ function persistIssueIndex(db: Database, revision: SourceTextRevision): StoredIs
         a.region.page - b.region.page ||
         a.id.localeCompare(b.id),
     );
-  const chunks: StoredIssueIndex['chunks'] = [];
-  for (let offset = 0; offset < issues.length; offset += ISSUE_CHUNK) {
-    const values = issues.slice(offset, offset + ISSUE_CHUNK);
-    chunks.push({ ref: blob(db, revision.intakeId, values), count: values.length });
-  }
-  return { summary: issueSummary(revision.pages, revision.issues), chunks };
+  const chunks = chunkBy(issues, (issue) => issue.id, ISSUE_CHUNK).map((values) => ({
+    ref: blob(db, revision.intakeId, values),
+    count: values.length,
+  }));
+  return {
+    summary: issueSummary(revision.pages, revision.issues),
+    chunkLists: chunkBy(chunks, (chunk) => chunk.ref, PAGE_CHUNK).map((list) =>
+      blob(db, revision.intakeId, list),
+    ),
+  };
 }
 /** Bounded output and bounded page-blob working memory for pre-index revisions. No GET mutation. */
 export function getIntakeSourceIssues(
@@ -755,18 +852,27 @@ export function getIntakeSourceIssues(
   };
 }
 
-function persist(db: Database, revision: SourceTextRevision) {
+function persist(db: Database, revision: SourceTextRevision): string[] {
   const { pages, spans, issues, relations, ...header } = revision;
+  const pageRefs = pages.map((page) =>
+    blob(db, revision.intakeId, {
+      page,
+      spans: spans.filter((s) => s.region.page === page.page),
+      issues: issues.filter((i) => i.region.page === page.page),
+    }),
+  );
   const value: StoredRevision = {
     header,
-    pageRefs: pages.map((page) =>
-      blob(db, revision.intakeId, {
-        page,
-        spans: spans.filter((s) => s.region.page === page.page),
-        issues: issues.filter((i) => i.region.page === page.page),
-      }),
+    pageChunks: Array.from({ length: Math.ceil(pageRefs.length / PAGE_CHUNK) }, (_, i) =>
+      blob(db, revision.intakeId, pageRefs.slice(i * PAGE_CHUNK, (i + 1) * PAGE_CHUNK)),
     ),
-    relationRef: blob(db, revision.intakeId, relations),
+    relationLists: chunkBy(
+      chunkBy(relations, (relation) => relation.id, PAGE_CHUNK).map((chunk) =>
+        blob(db, revision.intakeId, chunk),
+      ),
+      (ref) => ref,
+      PAGE_CHUNK,
+    ).map((refs) => blob(db, revision.intakeId, refs)),
     issueIndex: persistIssueIndex(db, revision),
   };
   put(db, key(revision.intakeId, `revision:${revision.id}`), { value, sha256: hash(value) });
@@ -776,6 +882,43 @@ function persist(db: Database, revision: SourceTextRevision) {
     key(revision.intakeId, 'head'),
     encode({ revisionId: revision.id, sourceHash: revision.sourceHash }),
   );
+  return pageRefs;
+}
+/** The durable transaction result: identity only, never revision content (CRS-117). */
+interface SourceTextReceipt {
+  format: 'intake-source-text-receipt-v1';
+  revisionId: string;
+  parentRevisionId: string | null;
+  changedPages: number[];
+}
+function sourceTextReceipt(
+  revision: SourceTextRevision,
+  pageRefs: string[],
+  priorRefs: string[] | null,
+): SourceTextReceipt {
+  return {
+    format: 'intake-source-text-receipt-v1',
+    revisionId: revision.id,
+    parentRevisionId: revision.parentRevisionId,
+    changedPages: revision.pages
+      .filter((_page, index) => pageRefs[index] !== priorRefs?.[index])
+      .map((page) => page.page),
+  };
+}
+/** A replayed operation returns its stored result; rebuild the response it originally produced. */
+function replayedSourceText(
+  db: Database,
+  profileId: string,
+  intakeId: string,
+  sourceHash: string,
+  stored: unknown,
+): IntakeSourceText {
+  if (object(stored) && stored.format === 'intake-source-text-receipt-v1')
+    return dto(loadRevision(db, profileId, intakeId, sourceHash, String(stored.revisionId)));
+  // Results recorded before CRS-117 are the complete response itself.
+  if (object(stored) && stored.status === 'available' && object(stored.revision))
+    return stored as unknown as IntakeSourceText;
+  return corrupt();
 }
 function mutate(
   db: Database,
@@ -798,16 +941,19 @@ function mutate(
   if (request.sourceHash !== row.sha256)
     conflict('Source changed since this operation was prepared');
   const fp = hash({ profileId, intakeId, fingerprint });
+  // The response is built from the revision in memory; only the receipt becomes durable history.
+  let response: SourceTextRevision | undefined;
   // The operation receipt is also an ordinary durable record, so idempotency survives cache loss.
-  return transaction(
+  const result = transaction(
     db,
-    () => {
+    (): SourceTextReceipt => {
       const existing = read(db, key(intakeId, `operation:${request.operationId}`));
       if (existing) {
         const receipt = parse(existing);
         if (!object(receipt) || receipt.fingerprint !== fp)
           conflict('Operation ID was already used for a different source-text request');
-        return dto(loadRevision(db, profileId, intakeId, row.sha256, String(receipt.revisionId)));
+        response = loadRevision(db, profileId, intakeId, row.sha256, String(receipt.revisionId));
+        return sourceTextReceipt(response, [], []);
       }
       const head = currentIntakeSourceTextRevisionId(db, profileId, intakeId);
       if (head !== request.expectedRevisionId)
@@ -815,13 +961,17 @@ function mutate(
       const prior = head ? loadRevision(db, profileId, intakeId, row.sha256, head) : null;
       const revision = apply(prior);
       validateSourceTextEvidence(revision);
-      persist(db, revision);
+      const priorRefs = head
+        ? loadStoredRevision(db, profileId, intakeId, row.sha256, head).pageRefs
+        : null;
+      const pageRefs = persist(db, revision);
       invalidateIntakeSourceTextDependencies(db, prior, revision);
       put(db, key(intakeId, `operation:${request.operationId}`), {
         fingerprint: fp,
         revisionId: revision.id,
       });
-      return dto(revision);
+      response = revision;
+      return sourceTextReceipt(revision, pageRefs, priorRefs);
     },
     {
       actor: 'source-text',
@@ -831,6 +981,7 @@ function mutate(
       fingerprint: fp,
     },
   );
+  return response ? dto(response) : replayedSourceText(db, profileId, intakeId, row.sha256, result);
 }
 export function publishIntakeSourceText(
   db: Database,

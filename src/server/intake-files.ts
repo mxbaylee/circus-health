@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { openSync, readSync, closeSync, fstatSync, statSync } from 'node:fs';
 import { HttpError } from './database.ts';
 import type { IntakeImageEncoding } from './intake-image.ts';
 const MiB = 1024 * 1024;
@@ -120,6 +120,21 @@ export function inspectIntakeFile(
     text: validText ? text : null,
     totalCharacters: validText ? characters : null,
   };
+}
+// Originals are never rewritten, so a file whose identity and timestamps are
+// unchanged since it last hashed correctly is not read again. Any write changes
+// ctime, and a replacement changes the inode, so either forces a full rehash.
+const verified = new Map<string, string>();
+const VERIFIED_LIMIT = 256;
+export function verifyIntakeFileHash(path: string, expected: { bytes: number; sha256: string }) {
+  const stat = statSync(path, { bigint: true });
+  const key = `${expected.sha256}:${expected.bytes}:${path}`;
+  const identity = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+  if (verified.get(key) === identity) return;
+  verified.delete(key);
+  inspectIntakeFile(path, expected);
+  if (verified.size >= VERIFIED_LIMIT) verified.delete(verified.keys().next().value!);
+  verified.set(key, identity);
 }
 export function assertExtractionSize(bytes: number) {
   const maximum = intakeLimits().extractionBytes;

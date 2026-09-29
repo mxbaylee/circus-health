@@ -29,7 +29,12 @@ import {
   assertCurrentProposalSourceText,
   sourceTextProposalId,
 } from './intake-source-text-dependencies.ts';
-import { inspectIntakeFile, intakeLimits, assertExtractionSize } from './intake-files.ts';
+import {
+  inspectIntakeFile,
+  intakeLimits,
+  assertExtractionSize,
+  verifyIntakeFileHash,
+} from './intake-files.ts';
 import {
   intakeWorkflow,
   recordCandidateVersions,
@@ -119,6 +124,11 @@ import type {
   IntakeValidation,
 } from '../shared/intake.ts';
 import type { IntakeEntry } from './intake-format.ts';
+import {
+  parseIntakeSourcePin,
+  withIntakeSourcePin,
+  withoutIntakeSourcePin,
+} from './intake-source-pin.ts';
 
 type Workflow = ReturnType<typeof intakeWorkflow>;
 
@@ -132,6 +142,8 @@ interface SourceFileRow {
   mime_type: string;
   batch_id: string;
   details_json: string;
+  /** The intake's source pin record, joined by `row()` and the intake list. */
+  source_pin: string | null;
 }
 
 interface InternalProposal extends IntakeProposal {
@@ -448,14 +460,17 @@ function row(db: DatabaseSync, id: string): SourceFileRow {
   return required(
     db
       .prepare(
-        "SELECT f.*,p.name AS provider FROM source_files f JOIN providers p ON p.id=f.provider_id WHERE f.id=? AND f.kind='intake_original'",
+        "SELECT f.*,p.name AS provider,pin.value AS source_pin FROM source_files f JOIN providers p ON p.id=f.provider_id LEFT JOIN app_meta pin ON pin.key='intake_source_pin:v1:'||f.id WHERE f.id=? AND f.kind='intake_original'",
       )
       .get(id) as SourceFileRow | undefined,
     'Source intake not found',
   );
 }
 function details(file: SourceFileRow): IntakeDetails {
-  return (json(file.details_json) as { intake: IntakeDetails }).intake;
+  return withIntakeSourcePin(
+    (json(file.details_json) as { intake: IntakeDetails }).intake,
+    parseIntakeSourcePin(file.source_pin),
+  );
 }
 function checkVersion(db: DatabaseSync, file: SourceFileRow, version: unknown): void {
   if (!Number.isSafeInteger(version) || version !== details(file).version)
@@ -586,7 +601,7 @@ export function listIntakes(
     );
   const files = db
     .prepare(
-      'SELECT f.*,p.name AS provider FROM source_files f JOIN providers p ON p.id=f.provider_id WHERE ' +
+      "SELECT f.*,p.name AS provider,pin.value AS source_pin FROM source_files f JOIN providers p ON p.id=f.provider_id LEFT JOIN app_meta pin ON pin.key='intake_source_pin:v1:'||f.id WHERE " +
         where +
         " ORDER BY json_extract(f.details_json,'$.intake.createdAt') DESC,f.id LIMIT ? OFFSET ?",
     )
@@ -622,7 +637,7 @@ export function verifyIntakeOriginal(
   measureImportPhase(
     'original_integrity_verification',
     () =>
-      (inspectIntakeFile as unknown as InspectIntakeFile)(original.path, {
+      verifyIntakeFileHash(original.path, {
         bytes: original.size,
         sha256: original.sourceHash,
       }),
@@ -1100,9 +1115,9 @@ function publishIntakeInternal(
   };
 }
 function update(db: DatabaseSync, file: SourceFileRow, d: IntakeDetails): void {
-  const all = json(file.details_json) as Record<string, unknown>;
+  const all = json(file.details_json) as { intake: IntakeDetails };
   const before = details(file);
-  all.intake = d;
+  all.intake = withoutIntakeSourcePin(d, all.intake, parseIntakeSourcePin(file.source_pin));
   const raw = JSON.stringify(all);
   db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(raw, file.id);
   try {
