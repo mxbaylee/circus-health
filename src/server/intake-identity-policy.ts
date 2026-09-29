@@ -280,7 +280,8 @@ export function isGenericNameConfirmation(
     /\b(?:DOB|birth date|date of birth)\s*:?\s*(\d{1,4}[/-]\d{1,2}[/-]\d{1,4})/i.exec(
       issue.textAnchor,
     )?.[1];
-  const anchorDate = labelledAnchorDate || bannerDatePattern.exec(issue.textAnchor)?.[1];
+  const bannerDate = bannerDatePattern.exec(issue.textAnchor)?.[1];
+  const anchorDate = labelledAnchorDate || bannerDate;
   const rawDate = dateClaim?.[1] || anchorDate;
   if (
     dateClaim &&
@@ -288,7 +289,10 @@ export function isGenericNameConfirmation(
   )
     return false;
   if (!rawDate) return true;
-  const alternatives = numericDateReadings(rawDate);
+  // Model phrasing must not change an unlabelled original's compatibility.
+  // Only banners share the original reader's short-year readings; labelled
+  // DOBs still need interpretation and cannot take this permissive path.
+  const alternatives = numericDateReadings(rawDate, !labelledAnchorDate && !!bannerDate);
   if (!alternatives.length) return false;
   const owners = [
     { fullName: self.fullName, knownNames: self.knownNames, birthDate: self.birthDate },
@@ -741,6 +745,11 @@ export function assessIdentityPolicy({
     : [];
   const distinctOwners = [...new Map(exactOwners.map((owner) => [owner.personId, owner])).values()];
   const matchedOwner = distinctOwners.length === 1 ? distinctOwners[0] : undefined;
+  const incompatibleBanner =
+    !!matchedOwner?.birthDate &&
+    bannerBirthDates.some(
+      (readings) => !readings.some((date) => compatibleBirthDates(date, matchedOwner.birthDate!)),
+    );
   const savedNames = matchedOwner?.names || selfNames;
   const matchedBirthDate = matchedOwner ? matchedOwner.birthDate : selfBirthDate;
   const nameMatches = !!matchedOwner;
@@ -827,11 +836,13 @@ export function assessIdentityPolicy({
       message:
         'This report was assigned to another person. Confirm who these current records belong to.',
     };
-  // An unreadable printed DOB is not "no DOB": a Self confirmation of another
-  // report on this original cannot answer it, only one given for this report.
+  // A confirmation belongs to the reviewed report: A cannot answer B's
+  // unreadable DOB or incompatible banner merely because their names match.
+  // B's own applicable confirmation can still resolve its ownership question.
   const receipt =
     latestPersonChoice?.outcome === 'this_is_me' &&
-    (!unreadableBirthDate || latestPersonChoice.scope.groupId === group?.id)
+    ((!unreadableBirthDate && !incompatibleBanner) ||
+      latestPersonChoice.scope.groupId === group?.id)
       ? latestPersonChoice
       : undefined;
   const explicitReceipt =
@@ -951,12 +962,7 @@ export function assessIdentityPolicy({
     };
   // An unlabelled banner date cannot confirm a match, but one no reading of
   // which fits the saved person blocks it, whether or not the model asked.
-  if (
-    matchedOwner?.birthDate &&
-    bannerBirthDates.some(
-      (readings) => !readings.some((date) => compatibleBirthDates(date, matchedOwner.birthDate!)),
-    )
-  )
+  if (incompatibleBanner)
     return {
       ...common,
       status: 'confirmation_required',

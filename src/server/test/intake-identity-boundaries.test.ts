@@ -9,6 +9,7 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
 import { getIntakeIdentityReview, confirmIntakeIdentityScope } from '../intake-identity.ts';
 import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
+import { listIntakeImportFeed } from '../intake-report-queue.ts';
 import { createNote, getNote, saveNote } from '../notes.ts';
 import type { HealthRecordEnvelope } from '../../shared/intake.ts';
 
@@ -118,6 +119,143 @@ function fixture(
   const acceptedCount = () => Number(db.prepare('SELECT count(*) AS n FROM observations').get()!.n);
   return { db, root, profileId, item, identity, clinical, individual, bulk, acceptedCount };
 }
+
+// A caregiver can upload several people's reports together. Confirmation of A
+// cannot answer B's discrepancy, even with the same name and retained original.
+for (const family of [false, true])
+  for (const modelQuestion of [false, true])
+    test(`another report's ${family ? 'Person' : 'Self'} confirmation cannot answer a banner mismatch (${modelQuestion ? 'routine' : 'no'} question)`, async (t) => {
+      const secondHeading = 'Fictional Willow report';
+      const secondBanner = `${patient}   Female   4/17/1970`;
+      const f = fixture(
+        t,
+        `${heading}\n${patient}   Female   4/17/1982\nFictional count 12.00\n${secondHeading}\n${secondBanner}\nFictional count 14.00`,
+        'fictional-alder.txt',
+        { fullName: family ? otherPatient : patient, birthDate: selfBirthDate },
+      );
+      const person = family
+        ? createNote(f.db, {
+            kind: 'person',
+            title: patient,
+            person: { fullName: patient, birthDate: selfBirthDate },
+          })
+        : undefined;
+      const later = record();
+      later.id = 'fictional-second-count';
+      later.provenance.sourceRecordId = later.id;
+      later.report!.key = 'willow';
+      later.report!.title = secondHeading;
+      later.report!.anchor = { locator: 'page 1 later heading', text: secondHeading };
+      if (modelQuestion)
+        later.reviewIssues = [
+          {
+            kind: 'identity',
+            field: 'subject',
+            prompt: 'Does this report belong to you or another person?',
+            textAnchor: secondBanner,
+          },
+        ];
+      const current = intake.getIntake(f.db, f.root, f.profileId, f.item.id);
+      const proposed = intake.proposeConversion(f.db, f.root, f.profileId, f.item.id, {
+        version: current.version,
+        summary: 'Independently fictional later observation',
+        jsonlText: JSON.stringify(later),
+      });
+      const group = proposed.workflow!.reportGroups!.find(
+        (candidate) => candidate.report?.anchor?.text === secondHeading,
+      )!;
+      const preview = () => getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+      const proposalId = proposed.proposals.at(-1)!.id;
+      const clinical = () => intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, proposalId);
+      const individual = () => {
+        const review = clinical();
+        return intake.importIntake(f.db, f.root, f.profileId, f.item.id, {
+          version: review.version,
+          proposalId,
+          reviewToken: review.reviewToken,
+          decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+        });
+      };
+      const bulk = () => {
+        const review = clinical();
+        const selected = review.records[0]!;
+        return acceptIntakeReportSelection(f.db, f.root, f.profileId, {
+          operationId: randomUUID(),
+          blocks: [
+            {
+              intakeId: f.item.id,
+              proposalId,
+              intakeVersion: review.version,
+              reviewToken: review.reviewToken,
+              selections: [
+                {
+                  recordId: selected.id,
+                  candidateId: selected.candidateId!,
+                  candidateVersionId: selected.candidateVersionId!,
+                  mapping: {},
+                },
+              ],
+            },
+          ],
+        });
+      };
+      const confirm = async (review: Awaited<ReturnType<typeof preview>>) => {
+        const selected = person && getNote(f.db, person.id);
+        return confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+          version: review.scope!.intakeVersion,
+          operationId: randomUUID(),
+          scope: review.scope!,
+          outcome: selected ? 'this_is_person' : 'this_is_me',
+          attestation: review.scope!.questions?.length
+            ? 'confirmed_displayed_identity_questions'
+            : 'confirmed_displayed_report_subject',
+          ...(selected
+            ? { personSelection: { noteId: selected.id, expectedVersion: selected.version } }
+            : {}),
+        });
+      };
+      assert.equal((await preview()).blocking, true);
+      await confirm(await f.identity());
+      const after = await preview();
+      assert.equal(after.status, 'confirmation_required');
+      assert.equal(after.blocking, true);
+      assert.equal(after.evidencedIdentity.birthDate, undefined);
+      assert.deepEqual(after.conflicts, []);
+      assert.equal(clinical().records[0]!.identityReview?.blocking, true);
+      const feed = listIntakeImportFeed(f.db, f.root, f.profileId);
+      const feedRecord = feed.blocks
+        .flatMap((block) => block.records)
+        .find((candidate) => candidate.id === clinical().records[0]!.id);
+      assert.ok(feedRecord);
+      assert.equal(feedRecord.selectable, false);
+      assert.throws(individual, {
+        code: /^(?:QUESTIONS_PENDING|REVIEW_ISSUES_PENDING|IDENTITY_REVIEW_REQUIRED)$/,
+      });
+      assert.throws(bulk, {
+        code: /^(?:QUESTIONS_PENDING|REVIEW_ISSUES_PENDING|IDENTITY_REVIEW_REQUIRED)$/,
+      });
+      assert.equal(f.acceptedCount(), 0);
+
+      // B remains answerable: an explicit report decision resolves ownership
+      // without claiming that its unlabelled column is the person's birth date.
+      await confirm(after);
+      assert.equal((await preview()).blocking, false);
+      assert.equal(clinical().records[0]!.identityReview?.blocking, false);
+      const receipts = intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!
+        .identityConfirmations!;
+      assert.equal(receipts.length, 2);
+      assert.equal(receipts[1]!.scope.groupId, group.id);
+      assert.notEqual(receipts[0]!.scope.groupId, group.id);
+      assert.equal(receipts[1]!.scope.evidencedIdentity?.birthDate, undefined);
+      assert.equal(getNote(f.db, person?.id || 'person-note:self').person.birthDate, selfBirthDate);
+      if (modelQuestion) bulk();
+      else individual();
+      assert.equal(f.acceptedCount(), 1);
+      assert.equal(
+        f.db.prepare('SELECT person_id FROM observations').get()!.person_id,
+        person?.personId || 'patient',
+      );
+    });
 
 for (const [label, original] of [
   [

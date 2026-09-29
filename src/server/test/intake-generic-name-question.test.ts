@@ -44,6 +44,7 @@ function fixture(
     splitSubjectRoles?: boolean;
     noQuestion?: boolean;
     bannerDate?: string;
+    labelledDate?: string;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-name-question-')),
@@ -73,11 +74,11 @@ function fixture(
   const sourceHeader = options.ambiguousLabel
     ? labelledHeader.replace('1988-04-12', '4/12/1988')
     : options.labelled
-      ? labelledHeader
+      ? labelledHeader.replace('1988-04-12', options.labelledDate || '1988-04-12')
       : header.replace('4/12/1988', bannerDate);
   const sourcePrompt =
     options.labelled && !options.ambiguousLabel
-      ? prompt.replace('4/12/1988', '1988-04-12')
+      ? prompt.replace('4/12/1988', options.labelledDate || '1988-04-12')
       : prompt.replace('4/12/1988', bannerDate);
   const subject = options.wholeHeader ? sourceHeader : name;
   const original = `${heading}\n${options.forgedAnchor ? name : sourceHeader}\nFictional count 12`;
@@ -453,17 +454,41 @@ for (const family of [false, true])
       );
     });
 
-for (const [label, dob, blocking] of [
-  ['compatible', '1988-04-12', false],
-  ['incompatible', '1970-02-03', true],
-] as const)
-  test(`a two-digit-year banner date is ${label} with the saved birth date under any century reading, without a model question`, async (t) => {
-    const f = fixture(t, { dob, noQuestion: true, bannerDate: '4/12/88' });
-    const identity = await f.preview();
-    assert.equal(identity.blocking, blocking);
-    assert.equal(identity.status, blocking ? 'confirmation_required' : 'evidenced_match');
-    assert.equal(f.read().records[0]!.identityReview?.blocking, blocking);
-  });
+// Model phrasing cannot change the meaning of an unchanged original. A banner
+// reading is only a compatibility clue, never an evidenced or offered DOB.
+for (const family of [false, true])
+  for (const wholeHeader of [false, true])
+    for (const noQuestion of [false, true])
+      for (const [dob, blocking] of [
+        ['1988-04-12', false],
+        ['1888-12-04', false],
+        ['1970-02-03', true],
+      ] as const)
+        test(`short-year banner for ${family ? 'Person' : 'Self'}, ${wholeHeader ? 'full banner' : 'name'} subject, ${noQuestion ? 'no' : 'routine'} question, saved DOB ${dob}`, async (t) => {
+          const f = fixture(t, { family, wholeHeader, dob, noQuestion, bannerDate: '4/12/88' });
+          const identity = await f.preview();
+          assert.equal(identity.blocking, blocking);
+          assert.equal(identity.status, blocking ? 'confirmation_required' : 'evidenced_match');
+          assert.equal(identity.confidence, 'limited');
+          assert.equal(identity.evidencedIdentity.birthDate, undefined);
+          assert.equal(identity.offeredSelfFields.birthDate, undefined);
+          assert.deepEqual(identity.conflicts, []);
+          assert.equal(f.read().records[0]!.identityReview?.blocking, blocking);
+          assert.equal(getNote(f.db, f.family?.id || 'person-note:self').person.birthDate, dob);
+        });
+
+for (const family of [false, true])
+  for (const noQuestion of [false, true])
+    test(`a labelled short-year DOB still requires interpretation for ${family ? 'Person' : 'Self'} with ${noQuestion ? 'no' : 'a routine'} question`, async (t) => {
+      const f = fixture(t, { family, noQuestion, labelled: true, labelledDate: '4/12/88' });
+      const identity = await f.preview();
+      assert.equal(identity.blocking, true);
+      assert.equal(identity.status, 'confirmation_required');
+      assert.ok(identity.scope?.birthDateReview);
+      assert.equal(identity.evidencedIdentity.birthDate, undefined);
+      assert.equal(identity.offeredSelfFields.birthDate, undefined);
+      assert.equal(f.read().records[0]!.identityReview?.blocking, true);
+    });
 
 test('an impossible banner date blocks a name-only match without a model question', async (t) => {
   const f = fixture(t, { noQuestion: true, bannerDate: '13/32/1988' });

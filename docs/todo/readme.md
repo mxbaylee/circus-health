@@ -12,7 +12,6 @@ The detailed work list and design documents that preceded this index are archive
 
 ## Product and maintenance
 
-- [ ] <a id="crs-132"></a> [CRS-132](CRS-132.md) — Keep incompatible report banners blocked despite another report's confirmation, and handle compatible short-year banners consistently with and without model questions.
 - [ ] <a id="crs-133"></a> [CRS-133](CRS-133.md) — Allow an explicit report-scoped assignment despite an incorrect printed DOB, preserving originals, demographics and the reason for the human exception.
 - [ ] <a id="crs-033"></a> **CRS-033** — Finish Import inbox acceptance after real-use regressions: native drop, accurate long-run activity, and repeated complete-file review.
 - [ ] <a id="crs-037"></a> **CRS-037** — Verify native file drop and truthful indexing, reading, provider-wait and completion states, including multi-file estimates and long runs.
