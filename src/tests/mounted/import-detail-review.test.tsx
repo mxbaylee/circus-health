@@ -863,6 +863,10 @@ it('keeps an uncertain exact-record acceptance gated until its original receipt 
     .map(({ body }) => JSON.parse(body!));
   expect(bodies[1]).toEqual(bodies[0]);
   expect(await screen.findByText('This exact record was saved to your profile.')).toBeVisible();
+  // Every review GET in this fixture still returns pending. The durable receipt
+  // must remove repeat acceptance immediately, without waiting for that refresh.
+  expect(screen.queryByRole('button', { name: 'Confirm and save record' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Review later' })).toBeNull();
 });
 
 it('shows a stale draft comparison with explicit newer-value and reapply choices', async () => {

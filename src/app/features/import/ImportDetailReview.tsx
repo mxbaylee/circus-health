@@ -26,6 +26,7 @@ import type {
   IntakeEvidenceComparison,
   IntakeMappingRule,
   IntakeMetadata,
+  IntakeReportAcceptanceReceipt,
   IntakeReportQueueBlock,
   IntakeReportQueueDetail,
   IntakeReportQueueRecord,
@@ -1563,14 +1564,21 @@ function ImportRecordDetail({
     intake.reload();
     onChanged();
   });
-  const [recentDestination, setRecentDestination] = useState<IntakeAcceptedRecord>();
-  useEffect(() => setRecentDestination(undefined), [block.intakeId, block.proposalId, recordId]);
+  const [recentAcceptance, setRecentAcceptance] = useState<{
+    scope: string;
+    record: IntakeReportAcceptanceReceipt['receipts'][number]['records'][number];
+  }>();
+  const recentDestination =
+    recentAcceptance?.scope === detailScope ? recentAcceptance.record : undefined;
   const acceptance = useReportAcceptance(profile?.id || '', (result) => {
     if (activeDetailScope.current !== detailScope) return;
     const receipt = result.receipt.receipts.find(
       (item) => item.intakeId === block.intakeId && item.proposalId === block.proposalId,
     );
-    setRecentDestination(receipt?.records.find((item) => item.recordId === recordId));
+    const acceptedRecord = receipt?.records.find((item) => item.recordId === recordId);
+    setRecentAcceptance(
+      acceptedRecord ? { scope: detailScope, record: acceptedRecord } : undefined,
+    );
     setError('');
     setNotice('This exact record was saved to your profile.');
     review.reload();
@@ -1642,7 +1650,17 @@ function ImportRecordDetail({
         ),
     ) ||
       false);
-  const finalized = record?.reviewState === 'accepted' || record?.reviewState === 'kept_original';
+  // The exact receipt is authoritative before a background review refresh catches up.
+  // Scope and candidate pins prevent it from finalizing another profile or version.
+  const accepted =
+    record?.reviewState === 'accepted' ||
+    !!(
+      recentDestination &&
+      recentDestination.recordId === recordId &&
+      recentDestination.candidateId === record?.candidateId &&
+      recentDestination.candidateVersionId === record?.candidateVersionId
+    );
+  const finalized = accepted || record?.reviewState === 'kept_original';
   const durableDestination = intake.data
     ? acceptedRecordsForScope(intake.data, {
         groupId,
@@ -2448,7 +2466,7 @@ function ImportRecordDetail({
           <p role="status">
             {drafts.saving
               ? 'Saving your review…'
-              : record.reviewState === 'accepted'
+              : accepted
                 ? 'This exact record is already saved to your profile.'
                 : record.reviewState === 'kept_original'
                   ? 'This exact record is excluded from clinical results. Its original is kept.'
