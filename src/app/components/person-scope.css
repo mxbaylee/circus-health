@@ -1,0 +1,112 @@
+.person-context-indicator {
+  --person-context-background: #42476c;
+  --person-context-text: #eef0ff;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 0.65rem;
+  min-width: 0;
+  padding: 0.75rem 1rem;
+  border-radius: 5px;
+  background: var(--person-context-background);
+  color: var(--person-context-text);
+}
+.person-context-indicator strong {
+  overflow-wrap: anywhere;
+}
+.person-context-indicator svg {
+  flex-shrink: 0;
+}
+.person-context-indicator > span {
+  margin-left: auto;
+  white-space: nowrap;
+  font-size: 0.8rem;
+}
+html[data-theme='light'] .person-context-indicator {
+  --person-context-background: #c1c6f2;
+  --person-context-text: #292f5a;
+}
+.topbar:has(.person-context-indicator) {
+  gap: 1rem;
+  height: auto;
+  min-height: 82px;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--background);
+}
+@media (max-width: 760px) {
+  .topbar:has(.person-context-indicator) {
+    flex-wrap: wrap;
+  }
+  .person-context-indicator {
+    order: 3;
+    flex-basis: 100%;
+  }
+}
+.person-context-indicator > .person-context-copy {
+  margin: 0;
+  font-size: 0.9rem;
+  white-space: normal;
+}
+.person-context-name {
+  display: inline;
+  font-weight: 800;
+  padding: 0.15rem 0.35rem;
+  border-radius: 4px;
+  background: #ffffff24;
+  text-decoration: underline;
+  text-decoration-color: currentColor;
+  text-underline-offset: 3px;
+}
+.person-context-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.person-context-actions a {
+  text-decoration: underline;
+  font-weight: 600;
+}
+.person-context-actions a:hover {
+  background: #ffffff24;
+}
+.person-filter.is-self .selection-chip {
+  background: var(--surface);
+  border-color: var(--border);
+}
+.person-filter.is-editing {
+  flex-basis: 100%;
+}
+.person-filter .filter-panel {
+  margin-top: 0.5rem;
+}
+.person-filter .filter-row label {
+  display: grid;
+  gap: 0.5rem;
+}
+.person-filter select {
+  min-width: 12rem;
+  max-width: 100%;
+}
+.sidebar-footer .import-diagnostics-control {
+  margin: 0 0 0.5rem;
+}
+.sidebar-footer .import-diagnostics-control button {
+  width: 100%;
+  font-size: 0.75rem;
+  padding: 0.6rem;
+  white-space: normal;
+}
+.sidebar-footer .import-diagnostics-control p {
+  font-size: 0.75rem;
+}
+@media (max-width: 760px) {
+  .person-context-indicator {
+    flex-wrap: wrap;
+  }
+  .person-context-actions {
+    gap: 0.65rem;
+  }
+}

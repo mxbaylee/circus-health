@@ -1,3 +1,4 @@
+import { recordOwner } from './record-owner.ts';
 import { readProfileRegistry, recoverProfileDeletions } from './profile-registry.ts';
 import { diagnosticRoute } from '../shared/import-diagnostic-route.ts';
 import { createProfileLifecycle } from './profile-lifecycle.ts';
@@ -313,6 +314,10 @@ export function createApp({
         const { data, ...meta } = result;
         respond(data, meta);
       };
+      if (resource === 'import-diagnostics' && id === 'status' && method === 'GET') {
+        send(res, 200, { data: { enabled: diagnostics.enabled } });
+        return;
+      }
       if (resource === 'import-diagnostics' && parts.length === 1 && method === 'GET') {
         const salt = randomBytes(32);
         const snapshot = diagnostics.exportSnapshot(profileId, salt);
@@ -529,7 +534,7 @@ export function createApp({
           return;
         }
         if (resource === 'historical-note-options' && !id) {
-          respond(historicalNoteOptions(db));
+          respond(historicalNoteOptions(db, params));
           return;
         }
         if (resource === 'storage' && !id) {
@@ -550,7 +555,11 @@ export function createApp({
             const scope =
               key === 'procedures'
                 ? " WHERE person_id='patient' AND category NOT IN ('laboratory','pathology')"
-                : '';
+                : key === 'observations' || key === 'medications'
+                  ? " WHERE person_id='patient'"
+                  : key === 'testTypes'
+                    ? " WHERE id IN (SELECT test_type_id FROM observations WHERE person_id='patient')"
+                    : '';
             counts[key] = db.prepare(`SELECT COUNT(*) AS n FROM ${table}${scope}`).get()!
               .n as number;
           }
@@ -648,10 +657,27 @@ export function createApp({
             : list(q.sourceRecords(db, params));
           return;
         }
+        if (resource === 'record-owner') {
+          respond({ personId: recordOwner(db, params.get('type') || '', params.get('id') || '') });
+          return;
+        }
+        if (resource === 'clinical-people' && !id) {
+          respond(q.clinicalPeople(db));
+          return;
+        }
+        if (resource === 'clinical-person' && id) {
+          respond(q.clinicalPerson(db, id));
+          return;
+        }
+        if (resource === 'documents' && !id) {
+          list(q.documents(db, params));
+          return;
+        }
         if (resource === 'documents' && id) {
           const r = required(db.prepare('SELECT * FROM documents WHERE id=?').get(id));
           respond({
             id: r.id,
+            personId: q.documentPersonId(r.extra_json),
             title: r.title,
             date: r.effective_at,
             sourceRecordId: r.source_record_id,
@@ -936,6 +962,6 @@ export function createApp({
 }
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   throw new Error(
-    'Start from the repository root with DATA_DIR=/absolute/path/data MODEL=health-primary LITELLM_CONFIG=/absolute/path/litellm.yaml npm start; standalone index.ts is unsupported.',
+    'Start from the repository root with CRS_DATA_DIR=/absolute/path/data CRS_MODEL=health-primary CRS_LITELLM_CONFIG=/absolute/path/litellm.yaml npm start; standalone index.ts is unsupported.',
   );
 }

@@ -11,12 +11,12 @@ import { request as httpRequest } from 'node:http';
 import { startRuntime } from '../runtime.ts';
 
 async function fixture(t: TestContext, publicOrigin = 'http://localhost:5180') {
-  const names = ['HEALTH_PUBLIC_PORT', 'HEALTH_PUBLIC_ORIGIN', 'HEALTH_DEV'];
+  const names = ['CRS_PUBLIC_PORT', 'CRS_PUBLIC_ORIGIN', 'CRS_DEV'];
   const before = Object.fromEntries(names.map((key) => [key, process.env[key]]));
   Object.assign(process.env, {
-    HEALTH_PUBLIC_PORT: '5180',
-    HEALTH_PUBLIC_ORIGIN: publicOrigin,
-    HEALTH_DEV: '0',
+    CRS_PUBLIC_PORT: '5180',
+    CRS_PUBLIC_ORIGIN: publicOrigin,
+    CRS_DEV: '0',
   });
   t.after(() => {
     for (const [key, value] of Object.entries(before)) {

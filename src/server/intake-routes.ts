@@ -1,4 +1,6 @@
 import { measureImportPhase } from './import-diagnostics.ts';
+import { intakeSourceRoute } from './intake-source-routes.ts';
+import { listSourceAttention } from './intake-source-text.ts';
 import {
   acceptIntakeReportSelection,
   getIntakeReportAcceptance,
@@ -59,7 +61,22 @@ export async function handleIntakeRoute({
   assistant,
 }: IntakeRouteContext): Promise<boolean> {
   if (resource !== 'intakes') return false;
-  if (method === 'GET' && id === 'report-acceptance' && action)
+  if (
+    method === 'GET' &&
+    id &&
+    action &&
+    [
+      'source-text',
+      'source-issues',
+      'source-passage',
+      'source-preview',
+      'source-history',
+      'source-search',
+      'source-annotation',
+    ].includes(action)
+  )
+    respond(await intakeSourceRoute({ db, root, profileId, id, action, params }));
+  else if (method === 'GET' && id === 'report-acceptance' && action)
     respond(getIntakeReportAcceptance(db, root, profileId, action));
   else if (method === 'GET' && id === 'people' && action)
     respond(
@@ -79,6 +96,9 @@ export async function handleIntakeRoute({
         kind: params.get('kind'),
         edited: params.get('edited'),
         peopleCursor: params.get('peopleCursor'),
+        groupId: params.get('groupId'),
+        intakeId: params.get('intakeId'),
+        recordId: params.get('recordId'),
       }),
     );
   else if (method === 'GET' && id === 'report-queue') {
@@ -92,7 +112,9 @@ export async function handleIntakeRoute({
         ? getIntakeReportQueueGroup(db, root, profileId, action, window)
         : listIntakeReportQueue(db, root, profileId, window),
     );
-  } else if (method === 'GET' && id === 'limits') respond(intakeLimits());
+  } else if (method === 'GET' && id === 'source-attention' && !action)
+    respond(listSourceAttention(db, profileId, Number(params.get('offset') || 0)));
+  else if (method === 'GET' && id === 'limits') respond(intakeLimits());
   else if (method === 'GET' && !id)
     list(
       intake.listIntakes(
@@ -206,7 +228,9 @@ export async function handleIntakeRoute({
       if (error instanceof HttpError) throw error;
       throw new HttpError(400, 'INVALID_JSON', 'Expected a JSON object');
     }
-    if (id === 'report-acceptance' && !action)
+    if (id && action && ['source-text', 'source-extract', 'source-records'].includes(action))
+      respond(await intakeSourceRoute({ db, root, profileId, id, action, params, input }));
+    else if (id === 'report-acceptance' && !action)
       respond(acceptIntakeReportSelection(db, root, profileId, input));
     else if (id === 'people-disposition' && !action)
       respond(

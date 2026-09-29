@@ -67,8 +67,8 @@ interface ConnectionResult {
 
 // Opt in: builds the actual app image, starts the pinned LiteLLM image through
 // the Node launcher, and uses only temporary fictional profiles and a synthetic upstream.
-const enabled = process.env.HEALTH_LAUNCH_TEST === '1';
-const performanceOnly = process.env.HEALTH_LAUNCH_PERFORMANCE_ONLY === '1';
+const enabled = process.env.CRS_LAUNCH_TEST === '1';
+const performanceOnly = process.env.CRS_LAUNCH_PERFORMANCE_ONLY === '1';
 const repository = fileURLToPath(new URL('../../../', import.meta.url));
 const messageText = (message: UpstreamMessage | undefined): string =>
   typeof message?.content === 'string'
@@ -87,10 +87,10 @@ test(
     : 'Node Docker: LiteLLM chat, complaint diagnostics, encrypted recreation and cache-loss rebuild',
   { skip: !enabled, timeout: 1800000 },
   async (t) => {
-    const requestedProxyCpus = process.env.HEALTH_LAUNCH_LITELLM_CPUS ?? '1';
+    const requestedProxyCpus = process.env.CRS_LAUNCH_LITELLM_CPUS ?? '1';
     assert.ok(
       requestedProxyCpus === '1' || requestedProxyCpus === '2',
-      'HEALTH_LAUNCH_LITELLM_CPUS must be 1 or 2',
+      'CRS_LAUNCH_LITELLM_CPUS must be 1 or 2',
     );
     const proxyCpus = Number(requestedProxyCpus);
     const dockerInfo = JSON.parse(
@@ -305,7 +305,7 @@ test(
     const env = Object.fromEntries(
       Object.entries(process.env).filter(
         ([key]) =>
-          !/^(HEALTH_|CODEX_|LITELLM_|OLLAMA_|DATA_DIR$|AI$|MODEL$|AI_URL$|KEY_FILE$|AUTH_DIR$|ENV_FILE$|STACK$|RUNTIME$|PORT$|IMAGE$|NODE$|STATE_DIR$|RESPONSE_MODEL$|IMAGES$|PDF$)/.test(
+          !/^(CRS_|HEALTH_|CIRCUS_|CODEX_|LITELLM_|OLLAMA_|DATA_DIR$|AI$|MODEL$|AI_URL$|KEY_FILE$|AUTH_DIR$|ENV_FILE$|STACK$|RUNTIME$|PORT$|IMAGE$|NODE$|STATE_DIR$|RESPONSE_MODEL$|IMAGES$|PDF$|PROMPT_CACHE$)/.test(
             key,
           ),
       ),
@@ -386,13 +386,13 @@ test(
         cwd: repository,
         env: {
           ...env,
-          DATA_DIR: data,
-          MODEL: 'fictional-alias',
-          LITELLM_CONFIG: config,
-          LITELLM_ENV_FILE: providerEnv,
-          STATE_DIR: state,
-          PORT: String(port),
-          LITELLM_CPUS: String(proxyCpus),
+          CRS_DATA_DIR: data,
+          CRS_MODEL: 'fictional-alias',
+          CRS_LITELLM_CONFIG: config,
+          CRS_LITELLM_ENV_FILE: providerEnv,
+          CRS_STATE_DIR: state,
+          CRS_PORT: String(port),
+          CRS_LITELLM_CPUS: String(proxyCpus),
         },
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -980,7 +980,7 @@ test(
       version: rebuiltSelf.version,
     });
     execFileSync(
-      process.env.DOCKER || 'docker',
+      process.env.CRS_DOCKER || 'docker',
       ['kill', '--signal', 'KILL', `${composeProject}-health-1`],
       { encoding: 'utf8', timeout: 30000 },
     );

@@ -119,7 +119,7 @@ it('requires saved-key acknowledgement, then opens a separate empty login form',
   render(<ProfileManagement initialOpen />);
   await user.click(screen.getByRole('button', { name: 'Create profile' }));
   await user.type(screen.getByLabelText('Display name'), 'Robin');
-  await user.type(screen.getByLabelText('Full name on health records'), 'Robin Example');
+  await user.type(screen.getByLabelText('Your name'), 'Robin Example');
   fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
   await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
   expect(fetchMock).toHaveBeenCalledWith(
@@ -200,7 +200,7 @@ it('rejects a recovery verification file for another profile before activation',
   render(<ProfileManagement initialOpen />);
   await user.click(screen.getByRole('button', { name: 'Create profile' }));
   await user.type(screen.getByLabelText('Display name'), 'Robin');
-  await user.type(screen.getByLabelText('Full name on health records'), 'Robin Example');
+  await user.type(screen.getByLabelText('Your name'), 'Robin Example');
   fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
   await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
   await user.click(screen.getByLabelText(/I have saved/));
@@ -255,7 +255,7 @@ it('keeps the new-profile passkey choice through selection and continues to onbo
   render(<ProfileManagement initialOpen />);
   await user.click(screen.getByRole('button', { name: 'Create profile' }));
   await user.type(screen.getByLabelText('Display name'), 'Robin');
-  await user.type(screen.getByLabelText('Full name on health records'), 'Robin Example');
+  await user.type(screen.getByLabelText('Your name'), 'Robin Example');
   fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
   await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
   await user.click(screen.getByLabelText(/I have saved/));
@@ -265,9 +265,9 @@ it('keeps the new-profile passkey choice through selection and continues to onbo
   expect(await screen.findByRole('heading', { name: 'Recovery unlocked' })).toBeVisible();
   expect(enrollProfilePasskey).not.toHaveBeenCalled();
   await user.click(screen.getByRole('button', { name: 'Skip' }));
-  expect(await screen.findByRole('heading', { name: 'A little about you' })).toBeVisible();
-  await user.click(screen.getByRole('button', { name: 'Skip for now' }));
   expect(await screen.findByRole('heading', { name: 'Primary care provider' })).toBeVisible();
+  expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false);
+  expect(screen.queryByLabelText('Pronouns')).not.toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Skip for now' }));
   expect(await screen.findByRole('heading', { name: 'Emergency contact' })).toBeVisible();
   await user.click(screen.getByRole('button', { name: 'Skip for now' }));
@@ -345,44 +345,71 @@ it('copies and deletes only after the profile name is confirmed', async () => {
   );
 });
 
-it('saves About you fields as a versioned Self note and records progress', async () => {
+it.each(['none', 'completed', 'skipped'] as const)(
+  'enters care contacts without rewriting Self or legacy About you history (%s)',
+  async (legacy) => {
+    const unlocked = { ...profile, locked: false };
+    const current = selfNote({
+      completedSteps: legacy === 'completed' ? ['about-you'] : [],
+      skippedSteps: legacy === 'skipped' ? ['about-you'] : [],
+      finished: false,
+    });
+    current.person = {
+      ...current.person,
+      name: 'Cookie',
+      fullName: 'Cookie Doe',
+      knownNames: ['Doe, Cookie'],
+      birthDate: '1988-04-12',
+      pronouns: 'they/them',
+    };
+    const original = structuredClone(current);
+    selectProfile(unlocked);
+    replaceProfiles([unlocked]);
+    fetchMock.mockImplementation(async (url: string) =>
+      envelope(url.endsWith('/notes/patient') ? current : [unlocked]),
+    );
+    const user = userEvent.setup();
+    render(<ProfileManagement initialOpen />);
+    await user.click(await screen.findByRole('button', { name: 'Resume setup' }));
+    expect(await screen.findByRole('heading', { name: 'Care contacts' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Primary care provider' })).toBeVisible();
+    expect(screen.getByText('Step 1 of 2')).toBeVisible();
+    expect(screen.queryByLabelText('Display name')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Pronouns')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Date of birth')).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([, init]) => !!init?.method)).toBe(false);
+    expect(current).toEqual(original);
+    await user.click(screen.getByRole('button', { name: 'Back to profiles' }));
+    expect(await screen.findByRole('button', { name: 'Resume setup' })).toBeVisible();
+    expect(fetchMock.mock.calls.some(([, init]) => !!init?.method)).toBe(false);
+    expect(current).toEqual(original);
+  },
+);
+
+it('does not resume completed care contacts just because legacy About you remains unfinished', async () => {
   const unlocked = { ...profile, locked: false };
-  const current = selfNote();
+  const current = selfNote({
+    completedSteps: ['primary-care', 'emergency-contact'],
+    skippedSteps: [],
+    finished: false,
+  });
   selectProfile(unlocked);
   replaceProfiles([unlocked]);
-  fetchMock.mockImplementation(async (url: string, init: RequestInit = {}) => {
-    if (url === '/api/profiles/p-one/notes/patient' && !init?.method) return envelope(current);
-    if (url === '/api/profiles/p-one/notes/person-note%3Aself' && init?.method === 'PUT')
-      return envelope({
-        ...current,
-        version: 2,
-        person: JSON.parse(String(init!.body)).person,
-        title: JSON.parse(String(init!.body)).title,
-      });
-    return envelope([unlocked]);
-  });
-  const user = userEvent.setup();
+  fetchMock.mockImplementation(async (url: string) =>
+    envelope(url.endsWith('/notes/patient') ? current : [unlocked]),
+  );
   render(<ProfileManagement initialOpen />);
-  await user.click(await screen.findByRole('button', { name: 'Resume setup' }));
-  await user.clear(await screen.findByLabelText('Display name'));
-  await user.type(screen.getByLabelText('Display name'), 'Robin Example');
-  await user.type(screen.getByLabelText('Pronouns'), 'they/them');
-  await user.click(screen.getByRole('button', { name: 'Save and continue' }));
   await waitFor(() =>
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/profiles/p-one/notes/person-note%3Aself',
-      expect.objectContaining({ method: 'PUT' }),
-    ),
+    expect(fetchMock).toHaveBeenCalledWith('/api/profiles/p-one/notes/patient', expect.anything()),
   );
-  const put = fetchMock.mock.calls.find(
-    ([url, init]) => url.endsWith('person-note%3Aself') && init?.method === 'PUT',
-  );
-  expect(JSON.parse(String(put?.[1]?.body)).person).toMatchObject({
-    name: 'Robin Example',
-    pronouns: 'they/them',
-    onboarding: { completedSteps: ['about-you'], skippedSteps: [] },
+  await act(async () => {});
+  expect(screen.queryByRole('button', { name: 'Resume setup' })).not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.some(([, init]) => !!init?.method)).toBe(false);
+  expect(current.person.onboarding).toEqual({
+    completedSteps: ['primary-care', 'emergency-contact'],
+    skippedSteps: [],
+    finished: false,
   });
-  expect(screen.getByRole('heading', { name: 'Primary care provider' })).toBeVisible();
 });
 
 it('resumes at unfinished care after a skipped Self step without touching medications', async () => {
@@ -444,7 +471,7 @@ it('persists care contact ids before creating normal People notes', async () => 
   });
 });
 
-it('opens three-step onboarding after recovery activation remounts the real ProfileProvider tree', async () => {
+it('opens two-step care setup after recovery activation remounts the real ProfileProvider tree', async () => {
   let activated = false;
   const original = fetchMock.getMockImplementation()!;
   fetchMock.mockImplementation(async (url: string, init: RequestInit = {}) => {
@@ -466,7 +493,7 @@ it('opens three-step onboarding after recovery activation remounts the real Prof
   await user.click(await screen.findByRole('button', { name: 'Choose profile' }));
   await user.click(await screen.findByRole('button', { name: 'Create profile' }));
   await user.type(screen.getByLabelText('Display name'), 'Robin');
-  await user.type(screen.getByLabelText('Full name on health records'), 'Robin Example');
+  await user.type(screen.getByLabelText('Your name'), 'Robin Example');
   fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
   await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
   await user.click(screen.getByLabelText(/I have saved/));
@@ -474,8 +501,9 @@ it('opens three-step onboarding after recovery activation remounts the real Prof
   await user.type(screen.getByLabelText('Recovery key'), kit.phrase);
   await user.click(screen.getByRole('button', { name: 'Open profile' }));
   await user.click(await screen.findByRole('button', { name: 'Skip' }));
-  expect(await screen.findByRole('heading', { name: 'About you' })).toBeVisible();
-  expect(screen.getByLabelText('Display name')).toHaveValue('Robin');
+  expect(await screen.findByRole('heading', { name: 'Primary care provider' })).toBeVisible();
+  expect(screen.queryByLabelText('Display name')).not.toBeInTheDocument();
+  expect(screen.getByText('Step 1 of 2')).toBeVisible();
   expect(document.querySelector('.profile-root')).not.toBeNull();
 });
 
@@ -740,7 +768,7 @@ it('saves provider progress separately, resumes at emergency and returns Back wi
   expect(screen.queryByLabelText('Primary care provider')).not.toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Back to primary care provider' }));
   expect(await screen.findByLabelText('Primary care provider')).toHaveValue('Dr. Rivera');
-  expect(screen.getByRole('button', { name: 'Back to about you' })).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Back to profiles' })).toBeVisible();
   await user.click(screen.getByRole('button', { name: 'Save and continue' }));
   await user.click(await screen.findByRole('button', { name: 'Skip for now' }));
   await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
@@ -1007,7 +1035,7 @@ it.each(['success', 'skip'] as const)(
     await user.click(await screen.findByRole('button', { name: 'Choose profile' }));
     await user.click(await screen.findByRole('button', { name: 'Create profile' }));
     await user.type(screen.getByLabelText('Display name'), 'Robin');
-    await user.type(screen.getByLabelText('Full name on health records'), 'Robin Example');
+    await user.type(screen.getByLabelText('Your name'), 'Robin Example');
     fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
     await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
     await user.click(screen.getByLabelText(/I have saved/));
@@ -1021,13 +1049,14 @@ it.each(['success', 'skip'] as const)(
     await waitFor(() => expect(enrollProfilePasskey).toHaveBeenCalledTimes(1));
     if (outcome === 'success') await act(async () => pending.resolve());
     else await user.click(screen.getByRole('button', { name: 'Skip' }));
-    expect(await screen.findByRole('heading', { name: 'About you' })).toBeVisible();
-    expect(screen.getByLabelText('Display name')).toHaveValue('Robin');
+    expect(await screen.findByRole('heading', { name: 'Primary care provider' })).toBeVisible();
+    expect(screen.queryByLabelText('Display name')).not.toBeInTheDocument();
+    expect(screen.getByText('Step 1 of 2')).toBeVisible();
     if (outcome === 'skip') {
       expect(vi.mocked(enrollProfilePasskey).mock.calls[0][1].signal.aborted).toBe(true);
       await act(async () => pending.resolve());
       expect(notifySuccess).not.toHaveBeenCalled();
-      expect(screen.getByRole('heading', { name: 'About you' })).toBeVisible();
+      expect(screen.getByRole('heading', { name: 'Primary care provider' })).toBeVisible();
     }
   },
 );
@@ -1040,7 +1069,7 @@ it.each(['setup', 'unlock'] as const)(
     if (flow === 'setup') {
       await user.click(screen.getByRole('button', { name: 'Create profile' }));
       await user.type(screen.getByLabelText('Display name'), 'Bee');
-      await user.type(screen.getByLabelText('Full name on health records'), 'Bee Example');
+      await user.type(screen.getByLabelText('Your name'), 'Bee Example');
       fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
       await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
       await user.click(screen.getByLabelText(/I have saved/));
@@ -1122,7 +1151,7 @@ it('Back reuses pending setup and returns verification to its acknowledgement ga
   render(<ProfileManagement initialOpen />);
   await user.click(screen.getByRole('button', { name: 'Create profile' }));
   await user.type(screen.getByLabelText('Display name'), 'Robin');
-  await user.type(screen.getByLabelText('Full name on health records'), 'Robin Example');
+  await user.type(screen.getByLabelText('Your name'), 'Robin Example');
   fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
   await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
   await user.click(screen.getByRole('button', { name: 'Back to profile details' }));
@@ -1180,10 +1209,11 @@ it('a lock clears private setup fields and the Back path to them', async () => {
   const user = userEvent.setup();
   render(<ProfileManagement initialOpen />);
   await user.click(await screen.findByRole('button', { name: 'Resume setup' }));
-  expect(await screen.findByLabelText('Display name')).toBeVisible();
+  await user.type(await screen.findByLabelText('Primary care provider'), 'Cookie Clinic');
   act(() => replaceProfiles([profile]));
   expect(screen.getByRole('heading', { name: 'Profiles' })).toBeVisible();
-  expect(screen.queryByLabelText('Display name')).not.toBeInTheDocument();
+  expect(screen.queryByLabelText('Primary care provider')).not.toBeInTheDocument();
+  expect(screen.queryByDisplayValue('Cookie Clinic')).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /Back/ })).not.toBeInTheDocument();
 });
 
@@ -1203,7 +1233,7 @@ it('Back after activation returns through recovery options and onboarding withou
   render(<ProfileManagement initialOpen />);
   await user.click(screen.getByRole('button', { name: 'Create profile' }));
   await user.type(screen.getByLabelText('Display name'), 'Robin');
-  await user.type(screen.getByLabelText('Full name on health records'), 'Robin Example');
+  await user.type(screen.getByLabelText('Your name'), 'Robin Example');
   fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
   await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
   await user.click(screen.getByLabelText(/I have saved/));
@@ -1219,14 +1249,17 @@ it('Back after activation returns through recovery options and onboarding withou
   expect(signal.aborted).toBe(true);
   expect(screen.getByRole('heading', { name: 'Recovery unlocked' })).toBeVisible();
   await user.click(screen.getByRole('button', { name: 'Skip' }));
-  expect(await screen.findByRole('heading', { name: 'About you' })).toBeVisible();
+  expect(await screen.findByRole('heading', { name: 'Primary care provider' })).toBeVisible();
   await user.click(screen.getByRole('button', { name: 'Back to recovery options' }));
   expect(screen.getByRole('heading', { name: 'Recovery unlocked' })).toBeVisible();
   await user.click(screen.getByRole('button', { name: 'Skip' }));
-  await user.click(await screen.findByRole('button', { name: 'Save and continue' }));
-  expect(await screen.findByRole('heading', { name: 'Primary care provider' })).toBeVisible();
-  await user.click(screen.getByRole('button', { name: 'Back to about you' }));
-  expect(screen.getByRole('heading', { name: 'About you' })).toBeVisible();
+  await user.click(await screen.findByRole('button', { name: 'Skip for now' }));
+  expect(await screen.findByRole('heading', { name: 'Emergency contact' })).toBeVisible();
+  expect(screen.getByText('Step 2 of 2')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Back to primary care provider' }));
+  expect(screen.getByRole('heading', { name: 'Primary care provider' })).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Back to recovery options' }));
+  expect(screen.getByRole('heading', { name: 'Recovery unlocked' })).toBeVisible();
   expect(enrollProfilePasskey).toHaveBeenCalledOnce();
   expect(fetchMock.mock.calls.filter(([url]) => url === '/api/profile-setups')).toHaveLength(1);
   expect(
@@ -1449,7 +1482,7 @@ it('requires actual name and complete DOB separately from the new profile displa
   await user.type(screen.getByLabelText('Display name'), 'Friendly label');
   const next = screen.getByRole('button', { name: 'Continue to recovery key' });
   expect(next).toBeDisabled();
-  await user.type(screen.getByLabelText('Full name on health records'), 'Fictional Iris Meadow');
+  await user.type(screen.getByLabelText('Your name'), 'Fictional Iris Meadow');
   expect(next).toBeDisabled();
   fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
   expect(next).toBeEnabled();

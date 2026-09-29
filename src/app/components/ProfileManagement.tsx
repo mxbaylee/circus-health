@@ -40,7 +40,6 @@ import {
   removeProfilePasskey,
 } from '../data/profile-management';
 import { NoteDialog } from '../features/notes/NoteDialog';
-import { PartialDateField } from '../features/notes/PartialDateField';
 import { formatStorageBytes } from '../data/storage';
 import { ArchiveStorageSummary, ProfileStorage } from './ProfileStorage';
 import {
@@ -57,7 +56,8 @@ import './profile-management.css';
 let onboardingHandoff: string | null = null;
 let storageHandoff: string | null = null;
 let profileHandoff: { profileId: string; mode: 'recovery-choice' | 'setup-passkey' } | null = null;
-const onboardingKeys = ['about-you', 'primary-care', 'emergency-contact'];
+// Profile details were collected before recovery setup. Keep old progress entries as history.
+const onboardingKeys = ['primary-care', 'emergency-contact'];
 function onboardingStepDone(progress: Note['person']['onboarding'], key: string) {
   const done = (value: string) =>
     Boolean(progress?.completedSteps.includes(value) || progress?.skippedSteps.includes(value));
@@ -112,8 +112,6 @@ export function ProfileManagement({
     [copyFrom, setCopyFrom] = useState<string | undefined>(),
     [step, setStep] = useState(0),
     [selfNote, setSelfNote] = useState<Note | null>(null),
-    [birthDate, setBirthDate] = useState(''),
-    [pronouns, setPronouns] = useState(''),
     [primaryCare, setPrimaryCare] = useState(''),
     [primaryCarePhone, setPrimaryCarePhone] = useState(''),
     [emergencyContact, setEmergencyContact] = useState(''),
@@ -460,8 +458,6 @@ export function ProfileManagement({
       setSelfNote(note);
       setName(form.title);
       setIcon(typeof form.person.icon === 'string' ? form.person.icon : 'person');
-      setPronouns(typeof form.person.pronouns === 'string' ? form.person.pronouns : '');
-      setBirthDate(typeof form.person.birthDate === 'string' ? form.person.birthDate : '');
       setStep(next);
       setMode('onboarding');
     } catch (e) {
@@ -577,9 +573,7 @@ export function ProfileManagement({
     try {
       const key = onboardingKeys[step];
       let saved: Note;
-      if (key === 'about-you' && !skipped)
-        saved = await saveSelf(key, false, { name: name.trim(), pronouns, birthDate, icon });
-      else if ((key === 'primary-care' || key === 'emergency-contact') && !skipped) {
+      if ((key === 'primary-care' || key === 'emergency-contact') && !skipped) {
         if (!selfNote) throw new Error('Setup details have not loaded.');
         const primary = key === 'primary-care';
         if (primary && primaryCarePhone.trim() && !primaryCare.trim())
@@ -862,8 +856,6 @@ export function ProfileManagement({
       setSelfNote(null);
       careNotes.current.clear();
       setName('');
-      setPronouns('');
-      setBirthDate('');
       setPrimaryCare('');
       setPrimaryCarePhone('');
       setEmergencyContact('');
@@ -987,9 +979,7 @@ export function ProfileManagement({
                 (mode === 'onboarding' && setupPasskeyFlow && step === 0)
               ? 'Back to recovery options'
               : mode === 'onboarding' && step > 0
-                ? step === 2
-                  ? 'Back to primary care provider'
-                  : 'Back to about you'
+                ? 'Back to primary care provider'
                 : 'Back to profiles';
 
   const title =
@@ -1017,7 +1007,7 @@ export function ProfileManagement({
     ) : mode === 'remove-passkey' ? (
       'Remove passkey'
     ) : mode === 'onboarding' ? (
-      'A little about you'
+      'Care contacts'
     ) : (
       'Profiles'
     );
@@ -1276,7 +1266,7 @@ export function ProfileManagement({
               {!copyFrom && !placebo && (
                 <>
                   <label className="profile-management-field">
-                    Full name on health records
+                    Your name
                     <input
                       value={fullName}
                       onChange={(e) => setFullName(e.target.value)}
@@ -1297,8 +1287,8 @@ export function ProfileManagement({
                     />
                   </label>
                   <p>
-                    Your display name can be different. Your full name and date of birth help check
-                    whose records you upload.
+                    Your display name can be different. This name is added to your Names; it and
+                    your date of birth help check whose records you upload.
                   </p>
                 </>
               )}
@@ -1673,29 +1663,6 @@ export function ProfileManagement({
             </p>
             {step === 0 && (
               <>
-                <h3>About you</h3>
-                <label className="profile-management-field">
-                  Display name
-                  <input value={name} onChange={(e) => setName(e.target.value)} />
-                </label>
-                <PersonIconPicker
-                  value={icon}
-                  onChange={setIcon}
-                  backLabel="Back to profile details"
-                />
-                <label className="profile-management-field">
-                  Pronouns
-                  <input
-                    value={pronouns}
-                    onChange={(e) => setPronouns(e.target.value)}
-                    placeholder="Optional, in your own words"
-                  />
-                </label>
-                <PartialDateField label="Date of birth" value={birthDate} onChange={setBirthDate} />
-              </>
-            )}
-            {step === 1 && (
-              <>
                 <h3 className="profile-management-care-heading">
                   <Stethoscope size={24} aria-hidden="true" /> Primary care provider
                 </h3>
@@ -1726,7 +1693,7 @@ export function ProfileManagement({
                 </div>
               </>
             )}
-            {step === 2 && (
+            {step === 1 && (
               <>
                 <h3 className="profile-management-care-heading">
                   <HeartHandshake size={24} aria-hidden="true" /> Emergency contact
@@ -1768,7 +1735,7 @@ export function ProfileManagement({
               </button>
               <button
                 className="button primary"
-                disabled={busy || (step === 0 && !name.trim())}
+                disabled={busy}
                 onClick={() => void finishOnboarding(false)}
               >
                 {step === onboardingKeys.length - 1 ? 'Finish setup' : 'Save and continue'}

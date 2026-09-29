@@ -8,12 +8,16 @@ import { recordReportGroups, reportGroupsWithLegacyFallback } from './intake-rep
 import { intakeReportSourceForMember } from './intake-report-source.ts';
 import {
   assessIdentityPolicy,
+  confirmedPersonReceipt,
   collectEvidencedIdentity,
+  isGenericNameConfirmation,
+  competingIdentityBoundaries,
   currentIdentityRefusal,
   repeatedIdentityQuestionReceipt,
   exactCurrentIdentityResolutionOperationId,
   identityReceiptAppliesToCurrentBoundary,
   identityOriginalFingerprint,
+  type IdentityPolicyPersonSnapshot,
 } from './intake-identity-policy.ts';
 import type { IdentityGroundingLookup } from './intake-identity-grounding.ts';
 import type { ReportGroupContribution } from './intake-report-groups.ts';
@@ -65,6 +69,28 @@ interface DurableWorkflow extends Omit<IntakeWorkflow, 'questions' | 'decisions'
 
 interface IntakeWorkflowDetails {
   workflow?: DurableWorkflow;
+  proposals?: {
+    id: string;
+    manualSourceRecord?: import('../shared/intake-manual-source-record.ts').ManualSourceRecordReceipt;
+    sourceTextRevisionId?: string | null;
+    sourceTextDependencyToken?: string | null;
+  }[];
+}
+
+/** Same clinical payload derived from changed text requires its own review version. */
+export function intakeCandidateVersionId(
+  details: IntakeWorkflowDetails,
+  proposalId: string | null,
+  entry: Pick<IntakeEntry, 'value'>,
+): string {
+  const proposal = details.proposals?.find((p) => p.id === proposalId);
+  const revision = proposal?.sourceTextDependencyToken || proposal?.sourceTextRevisionId;
+  return (
+    'candidate-version:' +
+    workflowHash(
+      revision ? [canonicalLiteral(entry.value), revision] : canonicalLiteral(entry.value),
+    )
+  );
 }
 
 interface WorkflowFile {
@@ -128,7 +154,7 @@ export function recordCandidateVersions(
   const contributions: ReportGroupContribution[] = [];
   for (const entry of entries) {
     const id = intakeCandidateId(file, entry),
-      versionId = 'candidate-version:' + workflowHash(canonicalLiteral(entry.value));
+      versionId = intakeCandidateVersionId(details, proposalId, entry);
     let candidate = workflow.candidates.find((item) => item.id === id);
     if (sourceContextEnvelope(entry.value)) {
       const retainedVersion = candidate?.versions.find((item) => item.id === versionId);
@@ -254,7 +280,19 @@ export function workflowReview<T extends IntakeReview>(
   review: T,
   entries: IntakeEntry[],
   self?: IntakeIdentitySelfSnapshot,
-  identityContext?: { profileId: string; grounded: IdentityGroundingLookup },
+  identityContext?: {
+    profileId: string;
+    grounded: IdentityGroundingLookup;
+    people?: IdentityPolicyPersonSnapshot[];
+    originalBirthDates?: (
+      group: import('../shared/intake.ts').IntakeReportGroup,
+    ) => string[] | undefined;
+    subjectGrounded?: (group: import('../shared/intake.ts').IntakeReportGroup) => boolean;
+    nameQuestionGrounded?: (
+      group: import('../shared/intake.ts').IntakeReportGroup,
+      issue: Pick<import('../shared/intake.ts').IntakeReviewIssue, 'prompt' | 'textAnchor'>,
+    ) => boolean;
+  },
 ): T {
   const workflow = intakeWorkflow(details);
   const reportGroups = reportGroupsWithLegacyFallback(workflow);
@@ -287,7 +325,7 @@ export function workflowReview<T extends IntakeReview>(
     const entry = entriesByRecordId.get(record.id);
     if (!entry) throw new Error('Clinical review entry is missing from its retained proposal');
     const candidateId = intakeCandidateId(file, entry);
-    const versionId = 'candidate-version:' + workflowHash(canonicalLiteral(entry.value));
+    const versionId = intakeCandidateVersionId(details, review.proposalId, entry);
     record.candidateId = candidateId;
     record.candidateVersionId = versionId;
     record.reportGroups =
@@ -424,7 +462,12 @@ export function workflowReview<T extends IntakeReview>(
       const identityIssues = related.flatMap((candidate) =>
         (candidate.issues || []).filter((issue) => issue.kind === 'identity'),
       );
-      const { evidence, conflicts } = collectEvidencedIdentity(identityIssues);
+      const { evidence, conflicts } = collectEvidencedIdentity(
+        identityIssues,
+        group?.report?.subject?.text,
+        group ? identityContext?.originalBirthDates?.(group) : [],
+      );
+      const structuredEvidence = collectEvidencedIdentity(identityIssues).evidence;
       const ownIdentityIssues = (record.issues || []).filter((issue) => issue.kind === 'identity');
       const genericIdentityIssueId =
         'issue:' +
@@ -459,19 +502,29 @@ export function workflowReview<T extends IntakeReview>(
         : null;
       const hasUnstructuredIdentityQuestion = explicitIssues.some(
         (issue) =>
-          !group ||
-          !originalFingerprint ||
-          !identityContext ||
-          !repeatedIdentityQuestionReceipt({
-            issue,
-            group,
-            receipts: workflow.identityConfirmations,
-            profileId: identityContext.profileId,
-            intakeId: file.id,
-            sourceHash: file.sha256,
-            originalFingerprint,
-            grounded: (receipt) => identityContext.grounded(group, issue, receipt),
-          }),
+          !(
+            group &&
+            identityContext?.nameQuestionGrounded?.(group, issue) &&
+            isGenericNameConfirmation(
+              issue,
+              group.report?.subject?.text,
+              self,
+              identityContext.people || [],
+            )
+          ) &&
+          (!group ||
+            !originalFingerprint ||
+            !identityContext ||
+            !repeatedIdentityQuestionReceipt({
+              issue,
+              group,
+              receipts: workflow.identityConfirmations,
+              profileId: identityContext.profileId,
+              intakeId: file.id,
+              sourceHash: file.sha256,
+              originalFingerprint,
+              grounded: (receipt) => identityContext.grounded(group, issue, receipt),
+            })),
       );
       const explicit = exactCurrentIdentityResolutionOperationId({
         receipts: workflow.identityConfirmations,
@@ -505,6 +558,12 @@ export function workflowReview<T extends IntakeReview>(
       });
       const assessment = assessIdentityPolicy({
         self,
+        people: identityContext?.people,
+        originalEvidenceChecked:
+          !group || identityContext?.originalBirthDates?.(group) !== undefined,
+        nameEvidenceGrounded:
+          (review.proposalId === null && !!structuredEvidence.fullName) ||
+          !!(group && identityContext?.subjectGrounded?.(group)),
         evidence,
         evidenceConflicts: conflicts,
         group,
@@ -515,7 +574,93 @@ export function workflowReview<T extends IntakeReview>(
         explicitlyConfirmedOperationId: explicit,
         currentRefusal: currentIdentityRefusal(ownIdentityIssues),
       });
-      if (record.mapping.subject && !['self', 'unknown'].includes(record.mapping.subject)) {
+      const personReceipt =
+        group?.report?.subject && currentGroupVersion
+          ? confirmedPersonReceipt({
+              receipts: workflow.identityConfirmations,
+              boundary: {
+                profileId: identityContext?.profileId,
+                intakeId: file.id,
+                groupId: group.id,
+                groupVersionId: currentGroupVersion.id,
+                sourceHash: file.sha256,
+                memberId: group.memberId,
+                report: group.report!.anchor,
+                subject: group.report!.subject!,
+                evidencedIdentity: evidence,
+                evidenceOriginalFingerprint: originalFingerprint,
+                membership: currentGroupVersion.members,
+              },
+              candidateId: record.candidateId!,
+              candidateVersionId: record.candidateVersionId!,
+              proposalId: review.proposalId,
+              recordId: record.id,
+              resolutions: record.draft?.resolutions || [],
+              requiredIssueIds: ownIdentityIssues.map((issue) => issue.id),
+            })
+          : undefined;
+      if (personReceipt?.assignedPerson) {
+        assessment.status = 'prior_confirmation';
+        assessment.blocking = false;
+        assessment.message =
+          'This report was assigned to ' + personReceipt.assignedPerson.fullName + '.';
+        assessment.attribution = {
+          status: 'prior_confirmation',
+          basis: 'explicit_person_confirmation',
+          groupId: group!.id,
+          groupVersionId: currentVersion,
+          confirmationOperationId: personReceipt.operationId,
+          assignedPerson: personReceipt.assignedPerson,
+          evidencedIdentity: evidence,
+        };
+      }
+      // This receipt exists only on a host-created proposal, outside its untrusted JSONL.
+      // It assigns this single human-authored record, not other records or printed aliases.
+      const manual = details.proposals?.find((p) => p.id === review.proposalId)?.manualSourceRecord;
+      if (
+        manual &&
+        manual.profileId === identityContext?.profileId &&
+        manual.intakeId === file.id &&
+        manual.sourceHash === file.sha256 &&
+        entriesByRecordId.get(record.id)?.value.id === `manual:${manual.operationId}`
+      ) {
+        const available =
+          manual.person.personId === 'patient'
+            ? manual.person.noteId === self.noteId
+            : identityContext?.people?.some(
+                (person) =>
+                  person.noteId === manual.person.noteId &&
+                  person.personId === manual.person.personId,
+              );
+        assessment.status = available ? 'prior_confirmation' : 'conflict';
+        assessment.blocking = !available;
+        assessment.message = available
+          ? 'You assigned this manually authored record to ' + manual.person.fullName + '.'
+          : 'Choose an available person before saving this record.';
+        assessment.attribution = available
+          ? {
+              status: 'prior_confirmation',
+              basis: 'explicit_manual_source_record',
+              groupId: group?.id || null,
+              groupVersionId: currentVersion,
+              confirmationOperationId: manual.operationId,
+              assignedPerson: manual.person,
+              manualSourceRecord: manual,
+            }
+          : undefined;
+      }
+      if (group && competingIdentityBoundaries(group, reportGroups).length) {
+        assessment.status = 'conflict';
+        assessment.blocking = true;
+        assessment.message =
+          'This report boundary has conflicting subject claims; resolve identity individually';
+        assessment.attribution = undefined;
+      }
+      if (
+        !assessment.attribution?.assignedPerson &&
+        record.mapping.subject &&
+        !['self', 'unknown'].includes(record.mapping.subject)
+      ) {
         assessment.status = 'conflict';
         assessment.blocking = true;
         assessment.message =
@@ -529,14 +674,24 @@ export function workflowReview<T extends IntakeReview>(
         message: assessment.message,
         evidencedIdentity: assessment.evidencedIdentity,
         conflicts: assessment.conflicts,
+        ...(assessment.attribution?.assignedPerson
+          ? { assignedPerson: assessment.attribution.assignedPerson }
+          : {}),
       };
       if (assessment.attribution) {
         record.identityAttribution = assessment.attribution;
-        record.mapping.subject = 'self';
+        const otherPerson =
+          assessment.attribution.assignedPerson?.personId !== 'patient' &&
+          !!assessment.attribution.assignedPerson;
+        record.mapping.subject = otherPerson ? 'other' : 'self';
+        if (otherPerson && assessment.attribution.assignedPerson)
+          record.mapping.personId = assessment.attribution.assignedPerson.personId;
+        else delete record.mapping.personId;
         const internal = record as typeof record & {
           undraftedMapping?: { subject?: string };
         };
-        if (internal.undraftedMapping) internal.undraftedMapping.subject = 'self';
+        if (internal.undraftedMapping)
+          internal.undraftedMapping.subject = otherPerson ? 'other' : 'self';
       }
       if (assessment.status === 'missing_warning') {
         for (const issue of ownIdentityIssues) {
@@ -633,7 +788,7 @@ export function workflowSummary(
           resolvedDecision.candidateVersionId === version.id))
     )
       return false;
-    const outcome = workflow.reviewDrafts
+    const resolution = workflow.reviewDrafts
       .filter(
         (draft) =>
           !!version &&
@@ -641,7 +796,26 @@ export function workflowSummary(
           draft.candidateVersionId === version.id,
       )
       .flatMap((draft) => draft.resolutions)
-      .findLast((resolution) => resolution.issueId === q.id)?.outcome;
+      .findLast((resolution) => resolution.issueId === q.id);
+    const outcome = resolution?.outcome;
+    if (
+      outcome === 'other_person' &&
+      reviewKind === 'identity' &&
+      resolution?.operationId &&
+      workflow.identityConfirmations?.some(
+        (receipt) =>
+          receipt.outcome === 'this_is_person' &&
+          receipt.assignedPerson &&
+          receipt.operationId === resolution.operationId &&
+          (receipt.scope.assignmentTargets || receipt.scope.targets).some(
+            (target) =>
+              target.candidateId === q.candidateId &&
+              target.candidateVersionId === version?.id &&
+              (target.issueIds || [target.issueId]).includes(q.id),
+          ),
+      )
+    )
+      return false;
     if (outcome === 'this_is_me' && reviewKind === 'identity') return false;
     if (outcome === 'unknown' && reviewKind !== 'identity') return false;
     return true;

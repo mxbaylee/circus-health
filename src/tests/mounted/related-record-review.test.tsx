@@ -134,6 +134,35 @@ function Harness({
 }
 
 describe('RelatedRecordReview', () => {
+  it('blocks related-record writes and discovery while a field correction is pending', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const onDiscover = vi.fn();
+    const onCorrectSaved = vi.fn();
+    render(
+      <RelatedRecordReview
+        record={record()}
+        decision={decision()}
+        onChange={onChange}
+        onDiscover={onDiscover}
+        onCorrectSaved={onCorrectSaved}
+        disabled
+      />,
+    );
+    await user.click(screen.getByText(/Fictional ferritin result · 2026-08-24/));
+    const search = screen.getByRole('button', { name: 'Search saved records' });
+    const correct = screen.getByRole('button', { name: 'Correct this saved record' });
+    expect(search).toBeDisabled();
+    expect(correct).toBeDisabled();
+    expect(screen.getByLabelText('Relationship to Fictional ferritin result')).toBeDisabled();
+    await user.click(search);
+    await user.click(correct);
+    expect(onDiscover).not.toHaveBeenCalled();
+    expect(onCorrectSaved).not.toHaveBeenCalled();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getAllByRole('link', { name: 'Open original' })).toHaveLength(2);
+  });
+
   it('preserves a stale exact choice during draft refresh without adopting the displayed scope', () => {
     const oldScope = pairScope('saved-version-1');
     const changed = comparison(pairScope('saved-version-2'), { draftScopeStatus: 'stale' });

@@ -84,7 +84,7 @@ test(
       await panel.waitFor({ state: 'hidden' });
     }
 
-    const visuals = process.env.HEALTH_COLLECTION_FILTER_VISUAL_DIR;
+    const visuals = process.env.CRS_COLLECTION_FILTER_VISUAL_DIR;
     if (visuals) {
       assert(!resolve(visuals).startsWith(fileURLToPath(new URL('../../../', import.meta.url))));
       mkdirSync(visuals, { recursive: true });

@@ -19,7 +19,7 @@
     "build": "npm run brand:check && npm run typecheck && vite build",
     "test:server": "node --test src/server/test/*.test.ts",
     "test:tools": "node --test src/scripts/*.test.ts",
-    "test:continuation": "HEALTH_PDF_CONTROLLED_TEST=1 node --test src/server/test/intake-pdf-controlled.integration.test.ts",
+    "test:continuation": "CRS_PDF_CONTROLLED_TEST=1 node --test src/server/test/intake-pdf-controlled.integration.test.ts",
     "test:ui": "vitest run --config vitest.config.ts",
     "backup": "node src/server/recovery-cli.ts backup",
     "restore": "node src/server/recovery-cli.ts restore",

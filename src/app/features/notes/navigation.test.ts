@@ -121,3 +121,12 @@ test('first autosave and a stable person alias preserve the same editor while ot
     false,
   );
 });
+
+test('changing the person of an unsaved form leaves its editor, canonical Self does not', () => {
+  const current = location('/notes?new=1&id=draft');
+  assert.equal(
+    leavesNoteEditor(current, location('/notes?new=1&id=draft&personId=patient')),
+    false,
+  );
+  assert.equal(leavesNoteEditor(current, location('/notes?new=1&id=draft&personId=cookie')), true);
+});

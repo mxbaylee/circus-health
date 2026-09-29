@@ -1,22 +1,27 @@
 import { readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import type { LookupAddress } from 'node:dns';
 import { ModelContextLimitError, ModelError, privateAddress } from './model-config.ts';
 import { isModelToolTerminalError, ModelToolValidationError } from './model-tool-validation.ts';
 import { validateToolArguments } from './tool-arguments.ts';
+import { diagnosticValidationPath } from './import-diagnostic-error.ts';
 import {
   compactConsumedProxyHistory,
   compactIntakeMutationArguments,
   compactIntakeReadResult,
   proxyTranscriptLimit,
+  proxyTranscriptSize,
+  PROXY_TRANSCRIPT_LIMITS,
 } from './proxy-transcript.ts';
 import {
   importDiagnostics,
   structuralFields,
   beginImportPhase,
   measureImportPhase,
+  diagnosticFailureFields,
+  type ImportDiagnosticFields,
   type ImportDiagnosticContext,
   type ImportDiagnosticSink,
 } from './import-diagnostics.ts';
@@ -213,9 +218,19 @@ const transientAvailabilityRetryDelaysMs = [1000, 2000] as const;
 interface ProxyRequestFailure {
   status: number;
   classification: string;
+  retryAfterMs?: number;
 }
 
 const proxyRequestFailures = new WeakMap<ModelError, ProxyRequestFailure>();
+const successfulStatuses = new WeakMap<object, number>();
+/** HTTP Retry-After is an interval or absolute HTTP date, never document content. */
+export function proxyRetryAfterMs(value: string | null, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const seconds = /^\d+(?:\.\d+)?$/.test(value.trim())
+    ? Number(value) * 1000
+    : Date.parse(value) - now;
+  return Number.isFinite(seconds) && seconds >= 0 && now + seconds <= 8.64e15 ? seconds : undefined;
+}
 
 export function isUnsupportedPdfError(error: unknown): boolean {
   const failure = error instanceof ModelError ? proxyRequestFailures.get(error) : undefined;
@@ -233,9 +248,14 @@ export function isUnsupportedImageError(error: unknown): boolean {
   );
 }
 
-function proxyRequestError(message: string, status: number, classification: string): ModelError {
+function proxyRequestError(
+  message: string,
+  status: number,
+  classification: string,
+  retryAfterMs?: number,
+): ModelError {
   const error = new ModelError(message);
-  proxyRequestFailures.set(error, { status, classification });
+  proxyRequestFailures.set(error, { status, classification, retryAfterMs });
   return error;
 }
 
@@ -473,13 +493,13 @@ export function validateProxyConfig(
   env: NodeJS.ProcessEnv = process.env,
   common: { apiKey?: string | null } = {},
 ): Readonly<ProxyConfig> {
-  const candidateModel = env.HEALTH_AI_MODEL?.trim();
+  const candidateModel = env.CRS_AI_MODEL?.trim();
   const model =
     candidateModel && modelPattern.test(candidateModel)
       ? candidateModel
-      : fail('HEALTH_AI_MODEL must be an exact LiteLLM proxy model alias.');
+      : fail('CRS_AI_MODEL must be an exact LiteLLM proxy model alias.');
   const configuredBaseUrl =
-    env.HEALTH_AI_BASE_URL ?? fail('HEALTH_AI_BASE_URL is required for LiteLLM Proxy.');
+    env.CRS_AI_BASE_URL ?? fail('CRS_AI_BASE_URL is required for LiteLLM Proxy.');
   const baseUrl = (() => {
     try {
       return new URL(configuredBaseUrl);
@@ -496,14 +516,14 @@ export function validateProxyConfig(
     baseUrl.pathname !== '/'
   )
     fail('The LiteLLM Proxy endpoint must be an origin without credentials, query, or path.');
-  if (env.HEALTH_AI_API_KEY && env.HEALTH_AI_API_KEY_FILE)
+  if (env.CRS_AI_API_KEY && env.CRS_AI_API_KEY_FILE)
     fail('Set only one LiteLLM credential setting: API key or key file.');
   let apiKey: string | null | undefined = Object.hasOwn(common, 'apiKey')
     ? common.apiKey
-    : env.HEALTH_AI_API_KEY || null;
-  if (!Object.hasOwn(common, 'apiKey') && env.HEALTH_AI_API_KEY_FILE) {
+    : env.CRS_AI_API_KEY || null;
+  if (!Object.hasOwn(common, 'apiKey') && env.CRS_AI_API_KEY_FILE) {
     try {
-      apiKey = readFileSync(env.HEALTH_AI_API_KEY_FILE, 'utf8').trim();
+      apiKey = readFileSync(env.CRS_AI_API_KEY_FILE, 'utf8').trim();
     } catch {
       fail('The LiteLLM credential file could not be read.');
     }
@@ -517,40 +537,38 @@ export function validateProxyConfig(
   if (verifiedApiKey.length > 16000 || /[\r\n\x00]/.test(verifiedApiKey))
     fail('The LiteLLM credential is invalid.');
   const images =
-    env.HEALTH_AI_PROXY_IMAGES === 'true'
+    env.CRS_AI_PROXY_IMAGES === 'true'
       ? true
-      : env.HEALTH_AI_PROXY_IMAGES === 'false' || !env.HEALTH_AI_PROXY_IMAGES
+      : env.CRS_AI_PROXY_IMAGES === 'false' || !env.CRS_AI_PROXY_IMAGES
         ? false
-        : fail('HEALTH_AI_PROXY_IMAGES must be true or false.');
+        : fail('CRS_AI_PROXY_IMAGES must be true or false.');
   const pdf =
-    env.HEALTH_AI_PROXY_PDF === 'true'
+    env.CRS_AI_PROXY_PDF === 'true'
       ? true
-      : env.HEALTH_AI_PROXY_PDF === 'false' ||
-          env.HEALTH_AI_PROXY_PDF === 'auto' ||
-          !env.HEALTH_AI_PROXY_PDF
+      : env.CRS_AI_PROXY_PDF === 'false' || env.CRS_AI_PROXY_PDF === 'auto' || !env.CRS_AI_PROXY_PDF
         ? false
-        : fail('HEALTH_AI_PROXY_PDF must be true or false, or auto.');
+        : fail('CRS_AI_PROXY_PDF must be true or false, or auto.');
   // Absence must degrade silently in behaviour (no breakpoint sent) but visibly
   // in diagnostics — unlike `images`, a missing cache costs money and time, not
   // correctness, so this never fails closed the way `dataImage` does.
   const promptCache =
-    env.HEALTH_AI_PROXY_PROMPT_CACHE === 'true'
+    env.CRS_AI_PROXY_PROMPT_CACHE === 'true'
       ? true
-      : env.HEALTH_AI_PROXY_PROMPT_CACHE === 'false' || !env.HEALTH_AI_PROXY_PROMPT_CACHE
+      : env.CRS_AI_PROXY_PROMPT_CACHE === 'false' || !env.CRS_AI_PROXY_PROMPT_CACHE
         ? false
-        : fail('HEALTH_AI_PROXY_PROMPT_CACHE must be true or false.');
+        : fail('CRS_AI_PROXY_PROMPT_CACHE must be true or false.');
   const localOnly =
-    env.HEALTH_AI_PROXY_LOCAL_ONLY === 'true'
+    env.CRS_AI_PROXY_LOCAL_ONLY === 'true'
       ? true
-      : env.HEALTH_AI_PROXY_LOCAL_ONLY === 'false' || !env.HEALTH_AI_PROXY_LOCAL_ONLY
+      : env.CRS_AI_PROXY_LOCAL_ONLY === 'false' || !env.CRS_AI_PROXY_LOCAL_ONLY
         ? false
-        : fail('HEALTH_AI_PROXY_LOCAL_ONLY must be true or false.');
-  const resolvedModel = env.HEALTH_AI_PROXY_RESOLVED_MODEL?.trim() || null;
+        : fail('CRS_AI_PROXY_LOCAL_ONLY must be true or false.');
+  const resolvedModel = env.CRS_AI_PROXY_RESOLVED_MODEL?.trim() || null;
   if (resolvedModel && !modelPattern.test(resolvedModel))
-    fail('HEALTH_AI_PROXY_RESOLVED_MODEL must be a model identifier.');
+    fail('CRS_AI_PROXY_RESOLVED_MODEL must be a model identifier.');
   if (localOnly && !resolvedModel)
     fail(
-      'Local-only LiteLLM Proxy requires HEALTH_AI_PROXY_RESOLVED_MODEL from its verified Ollama mapping.',
+      'Local-only LiteLLM Proxy requires CRS_AI_PROXY_RESOLVED_MODEL from its verified Ollama mapping.',
     );
   if (
     localOnly &&
@@ -558,13 +576,13 @@ export function validateProxyConfig(
     /(?:cloud|https?:|openai|anthropic|azure|bedrock|vertex|gemini)/i.test(resolvedModel)
   )
     fail('Local-only LiteLLM Proxy requires a local Ollama model identity.');
-  if (env.HEALTH_AI_REASONING_EFFORT)
+  if (env.CRS_AI_REASONING_EFFORT)
     fail(
-      'LiteLLM Proxy reasoning effort must be configured in the selected proxy model; HEALTH_AI_REASONING_EFFORT is unsupported.',
+      'LiteLLM Proxy reasoning effort must be configured in the selected proxy model; CRS_AI_REASONING_EFFORT is unsupported.',
     );
-  const timeoutValue = env.HEALTH_AI_PROXY_TIMEOUT_SECONDS ?? '300';
+  const timeoutValue = env.CRS_AI_PROXY_TIMEOUT_SECONDS ?? '300';
   if (!/^\d+$/.test(timeoutValue) || Number(timeoutValue) < 30 || Number(timeoutValue) > 600)
-    fail('HEALTH_AI_PROXY_TIMEOUT_SECONDS must be an integer from 30 to 600.');
+    fail('CRS_AI_PROXY_TIMEOUT_SECONDS must be an integer from 30 to 600.');
   return Object.freeze({
     backend: 'litellm',
     model,
@@ -573,7 +591,7 @@ export function validateProxyConfig(
     reasoning: null,
     images,
     pdf,
-    pdfMode: env.HEALTH_AI_PROXY_PDF === 'false' ? 'disabled' : 'auto',
+    pdfMode: env.CRS_AI_PROXY_PDF === 'false' ? 'disabled' : 'auto',
     promptCache,
     localOnly,
     resolvedModel,
@@ -828,16 +846,20 @@ export async function proxyRequest(
     );
     if (requestSignal.aborted) requestFailure();
     const classification =
-      receivedResponse.status === 503
-        ? 'transient_availability'
-        : [400, 422].includes(receivedResponse.status) &&
-            ['pdf_unsupported', 'image_unsupported'].includes(inspectedClassification)
-          ? inspectedClassification
-          : receivedResponse.status === 500 ||
-              ([400, 413].includes(receivedResponse.status) &&
-                ['context_limit', 'prompt_cache_unsupported'].includes(inspectedClassification))
-            ? inspectedClassification
-            : 'unclassified';
+      receivedResponse.status === 429
+        ? 'quota'
+        : [401, 403].includes(receivedResponse.status)
+          ? 'authentication'
+          : receivedResponse.status === 503
+            ? 'transient_availability'
+            : [400, 422].includes(receivedResponse.status) &&
+                ['pdf_unsupported', 'image_unsupported'].includes(inspectedClassification)
+              ? inspectedClassification
+              : receivedResponse.status === 500 ||
+                  ([400, 413].includes(receivedResponse.status) &&
+                    ['context_limit', 'prompt_cache_unsupported'].includes(inspectedClassification))
+                ? inspectedClassification
+                : 'unclassified';
     const elapsed = now() - startedAt;
     reportProxyFailure(
       onDiagnostic,
@@ -857,15 +879,18 @@ export async function proxyRequest(
       requestContext,
     );
     const reference = ` Reference: ${correlationId}.`;
-    if (classification === 'context_limit' && [400, 413].includes(receivedResponse.status))
-      throw new ModelContextLimitError(
+    if (classification === 'context_limit' && [400, 413].includes(receivedResponse.status)) {
+      const error = new ModelContextLimitError(
         `The selected model reached its context limit. Completed work is kept; productive import reading can continue with a fresh context.${reference}`,
       );
+      proxyRequestFailures.set(error, { status: receivedResponse.status, classification });
+      throw error;
+    }
     const message =
       classification === 'responses-to-chat-transform'
         ? `LiteLLM could not translate the selected model's Responses API reply (HTTP ${receivedResponse.status}). Check the selected proxy model's Responses-to-chat compatibility, then retry.${reference}`
         : classification === 'prompt_cache_unsupported'
-          ? `LiteLLM Proxy rejected the prompt-cache request field (HTTP ${receivedResponse.status}). Set HEALTH_AI_PROXY_PROMPT_CACHE=false and retry.${reference}`
+          ? `LiteLLM Proxy rejected the prompt-cache request field (HTTP ${receivedResponse.status}). Set CRS_AI_PROXY_PROMPT_CACHE=false and retry.${reference}`
           : receivedResponse.status === 401 || receivedResponse.status === 403
             ? `LiteLLM Proxy authentication failed.${reference}`
             : receivedResponse.status === 429
@@ -873,9 +898,12 @@ export async function proxyRequest(
               : receivedResponse.status === 404
                 ? `The selected LiteLLM Proxy model or endpoint was not found.${reference}`
                 : `LiteLLM Proxy request failed (HTTP ${receivedResponse.status}).${reference}`;
-    if (['transient_availability', 'pdf_unsupported', 'image_unsupported'].includes(classification))
-      throw proxyRequestError(message, receivedResponse.status, classification);
-    fail(message);
+    throw proxyRequestError(
+      message,
+      receivedResponse.status,
+      classification,
+      proxyRetryAfterMs(receivedResponse.headers.get('retry-after')),
+    );
   }
   let text = '';
   let bytes = 0;
@@ -930,6 +958,8 @@ export async function proxyRequest(
   );
   try {
     const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === 'object')
+      successfulStatuses.set(parsed, receivedResponse.status);
     const counts = usage(parsed)?.total;
     diagnostics.record(
       'model.request.completed',
@@ -1157,10 +1187,26 @@ export class ProxyModelBridge {
     for (let attempt = 0; ; attempt++) {
       this.beforeRequest?.();
       const requestId = randomUUID();
+      const serialized = JSON.stringify(body);
+      const measuredEnvelope = proxyTranscriptSize(object(body) ? body : {});
       this.onEvent('model/requestStarted', {
         turnId: this.turnId,
         requestId,
         attempt: attempt + 1,
+        startedAt: new Date().toISOString(),
+        requestDigest: createHash('sha256').update(serialized).digest('hex'),
+        requestBytes: Buffer.byteLength(serialized),
+        model: this.config.model,
+        requestFit: {
+          policy: 'proxy-byte-envelope-v1',
+          qualified: false,
+          ...measuredEnvelope,
+          maxTextCharacters: PROXY_TRANSCRIPT_LIMITS.textCharacters,
+          maxMediaBytes: PROXY_TRANSCRIPT_LIMITS.mediaBytes,
+          inputTokens: null,
+          outputReserveTokens: null,
+          maxResponseBytes: 8 * 1024 * 1024,
+        },
         exposedCallIds,
         ...requestMediaCounts(body),
       });
@@ -1184,16 +1230,62 @@ export class ProxyModelBridge {
         this.onEvent('model/requestFinished', {
           requestId,
           failed: false,
+          outcome: 'response',
+          classification: null,
+          status:
+            result && typeof result === 'object' ? (successfulStatuses.get(result) ?? null) : null,
+          retryAt: null,
+          finishedAt: new Date().toISOString(),
           usage: usage(result)?.total ?? null,
         });
         return result;
       } catch (error) {
-        this.onEvent('model/requestFinished', { requestId, failed: true, usage: null });
-        const delay = transientAvailabilityRetryDelaysMs[attempt];
         const failure = error instanceof ModelError ? proxyRequestFailures.get(error) : undefined;
+        const rejected =
+          !!failure && [400, 401, 403, 404, 413, 422, 429, 503].includes(failure.status);
+        const classification =
+          failure?.classification === 'transient_availability'
+            ? 'transient'
+            : failure?.classification === 'quota'
+              ? 'quota'
+              : failure?.classification === 'authentication'
+                ? 'authentication'
+                : failure?.classification === 'context_limit'
+                  ? 'context_limit'
+                  : ['pdf_unsupported', 'image_unsupported', 'prompt_cache_unsupported'].includes(
+                        failure?.classification || '',
+                      )
+                    ? 'unsupported'
+                    : rejected
+                      ? 'invalid_request'
+                      : 'unknown';
+        const retryAt =
+          rejected && ['quota', 'transient'].includes(classification)
+            ? new Date(
+                Date.now() +
+                  Math.max(
+                    1000,
+                    failure?.retryAfterMs ?? (classification === 'quota' ? 60_000 : 1000),
+                  ),
+              ).toISOString()
+            : null;
+        this.onEvent('model/requestFinished', {
+          requestId,
+          failed: true,
+          usage: null,
+          finishedAt: new Date().toISOString(),
+          outcome: rejected ? 'rejected' : 'unknown',
+          classification,
+          status: failure?.status ?? null,
+          retryAt,
+        });
+        const baseDelay = transientAvailabilityRetryDelaysMs[attempt];
+        const delay =
+          baseDelay === undefined ? undefined : Math.max(baseDelay, failure?.retryAfterMs || 0);
         if (
           this.closed ||
           delay === undefined ||
+          delay > 60_000 ||
           failure?.status !== 503 ||
           failure.classification !== 'transient_availability'
         )
@@ -1441,6 +1533,21 @@ export class ProxyModelBridge {
         const byIndex = new Map(diagnostics.map((diagnostic) => [diagnostic.index, diagnostic]));
         for (const [index, call] of calls.entries()) {
           const diagnostic = byIndex.get(index);
+          if (diagnostic)
+            this.diagnostics.record(
+              'model.tool.failed',
+              {
+                toolName: call.name,
+                toolIndex: index,
+                reasonCode: 'invalid_tool_arguments',
+                errorType: 'model_tool_validation',
+                errorCategory: 'validation',
+                validationCode: diagnostic.code,
+                validationPath: diagnosticValidationPath(diagnostic.field),
+                dispatched: false,
+              },
+              this.diagnosticContext,
+            );
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
@@ -1514,6 +1621,7 @@ export class ProxyModelBridge {
         let value,
           toolError = false,
           terminalToolError = false;
+        let toolFailureFields: ImportDiagnosticFields = {};
         const toolStartedAt = performance.now();
         this.diagnostics.capturePayload?.(
           'tool.request',
@@ -1548,6 +1656,7 @@ export class ProxyModelBridge {
           );
           toolSpan.finish();
         } catch (error) {
+          toolFailureFields = diagnosticFailureFields(error);
           toolSpan.fail(error);
           toolError = true;
           terminalToolError = isModelToolTerminalError(error);
@@ -1583,6 +1692,7 @@ export class ProxyModelBridge {
                 toolIndex: index,
                 durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
                 errorCode: 'tool_rejected_after_close',
+                ...toolFailureFields,
                 ...(this.diagnostics.enabled ? structuralFields('result', value) : {}),
               },
               this.diagnosticContext,
@@ -1604,6 +1714,7 @@ export class ProxyModelBridge {
           toolName: call.name,
           toolIndex: index,
           durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
+          ...toolFailureFields,
           ...hostTimingFields(value),
           ...(this.diagnostics.enabled ? structuralFields('result', value) : {}),
         });

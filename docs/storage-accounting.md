@@ -28,7 +28,7 @@ Backups or old checkpoints outside profile directories are a separate archive-le
 
 ## Existing files and cleanup boundaries
 
-The encrypted product backup is a consistent copy of the complete durable `DATA_DIR` while its writer is stopped or through a suitable filesystem snapshot. Legacy portable backup/recovery helpers and standalone rebuild outputs are contributor or compatibility tools, not the encrypted product backup path. Retained backups can multiply storage, and the app has no automatic backup retention policy. Do not add automatic full backups on every import, save, or startup as part of this feature.
+The encrypted product backup is a consistent copy of the complete durable `CRS_DATA_DIR` while its writer is stopped or through a suitable filesystem snapshot. Legacy portable backup/recovery helpers and standalone rebuild outputs are contributor or compatibility tools, not the encrypted product backup path. Retained backups can multiply storage, and the app has no automatic backup retention policy. Do not add automatic full backups on every import, save, or startup as part of this feature.
 
 Current `profiles/<id>/db/` files and top-level checkpoints may be old rebuild/recovery outputs. Normal startup builds working SQLite in a separate runtime directory. Verify the running process, committed generations and recovery coverage before declaring a particular old file disposable. Current format helpers and recovery outputs still use `db/database.sqlite`; its presence is not proof the live application reads it.
 

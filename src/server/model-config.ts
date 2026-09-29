@@ -11,17 +11,17 @@ const fail = (message: string): never => {
   throw new ModelError(message);
 };
 export function modelConfig(env: NodeJS.ProcessEnv = process.env): Readonly<ProxyConfig> {
-  const backend = env.HEALTH_AI_BACKEND || 'litellm';
+  const backend = env.CRS_AI_BACKEND || 'litellm';
   if (backend !== 'litellm')
     fail(
-      'Only LiteLLM Proxy is supported. Remove the legacy HEALTH_AI_BACKEND setting and configure the Docker LiteLLM service.',
+      'Only LiteLLM Proxy is supported. Remove the legacy CRS_AI_BACKEND setting and configure the Docker LiteLLM service.',
     );
-  if (env.HEALTH_AI_API_KEY && env.HEALTH_AI_API_KEY_FILE)
+  if (env.CRS_AI_API_KEY && env.CRS_AI_API_KEY_FILE)
     fail('Set only one AI credential setting: API key or key file.');
-  if (env.DATA_DIR && env.HEALTH_AI_API_KEY_FILE) {
+  if (env.CRS_DATA_DIR && env.CRS_AI_API_KEY_FILE) {
     try {
-      const data = realpathSync(env.DATA_DIR);
-      for (const path of [env.HEALTH_AI_API_KEY_FILE].filter(Boolean)) {
+      const data = realpathSync(env.CRS_DATA_DIR);
+      for (const path of [env.CRS_AI_API_KEY_FILE].filter(Boolean)) {
         const rel = relative(data, realpathSync(path));
         if (!rel || !rel.startsWith('../'))
           fail('AI credentials must remain outside the health data directory.');
@@ -31,10 +31,10 @@ export function modelConfig(env: NodeJS.ProcessEnv = process.env): Readonly<Prox
       fail('The AI credential location could not be verified.');
     }
   }
-  let apiKey = env.HEALTH_AI_API_KEY || null;
-  if (env.HEALTH_AI_API_KEY_FILE) {
+  let apiKey = env.CRS_AI_API_KEY || null;
+  if (env.CRS_AI_API_KEY_FILE) {
     try {
-      apiKey = readFileSync(env.HEALTH_AI_API_KEY_FILE, 'utf8').trim();
+      apiKey = readFileSync(env.CRS_AI_API_KEY_FILE, 'utf8').trim();
     } catch {
       fail('The AI credential file could not be read.');
     }

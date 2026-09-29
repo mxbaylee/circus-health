@@ -1,8 +1,21 @@
+import {
+  mappingFields,
+  recordCorrectionFields,
+  type EditableKind,
+} from './import-correction-fields';
+import * as Dialog from '@radix-ui/react-dialog';
+import {
+  ImportPersonChoice,
+  ImportPrintedName,
+  printedNameReady,
+  personSelectionReady,
+  type ImportPersonSelection,
+} from './ImportPersonChoice';
 import { beginClientOperation } from '../../data/import-performance';
 import type { ClientOperationSummary } from '../../../shared/import-performance';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
-import { ArrowLeft, ArrowRight, Check, ExternalLink } from 'lucide-react';
+import type { ReactNode, RefObject } from 'react';
+import { ArrowLeft, ArrowRight, Check, ExternalLink, X } from 'lucide-react';
 import type {
   Intake,
   IntakeAcceptedRecord,
@@ -64,12 +77,15 @@ import {
   ReviewLayout,
   ReviewNavigationGuard,
   groupReviewIssues,
+  intakeEvidencePage,
   reviewRecordTitle,
 } from '../intake/ReviewWorkspace';
+import { SourceTextReview } from '../intake/SourceTextReview';
 import { SourceContextNotes } from '../intake/SourceContextNotes';
 import { useReportAcceptance } from '../intake/useReportAcceptance';
 import { initialDraft, type LocalReviewDraft, useReviewDrafts } from '../intake/useReviewDrafts';
 import { ImportSaveStatus } from './ImportSaveStatus';
+import { ImportRecordCorrection } from './ImportRecordCorrection';
 import { acceptedRecordsForScope, SavedRecordDestinations } from './SavedRecordDestinations';
 import '../intake/intake.css';
 import '../intake/intake-guided.css';
@@ -179,50 +195,6 @@ function DraftSummary({ draft }: { draft: LocalReviewDraft }) {
   );
 }
 
-type EditableKind = 'observation' | 'medication' | 'procedure' | 'document';
-type MappingField = {
-  key: keyof IntakeClinicalMapping;
-  label: string;
-  placeholder?: string;
-  multiline?: boolean;
-};
-
-const mappingFields: Record<EditableKind, MappingField[]> = {
-  observation: [
-    { key: 'testLabel', label: 'Test name' },
-    { key: 'observationCategory', label: 'Test classification' },
-    { key: 'valueText', label: 'Result' },
-    { key: 'unit', label: 'Unit' },
-    { key: 'referenceText', label: 'Reference range' },
-    { key: 'status', label: 'Status' },
-    { key: 'code', label: 'Code' },
-    { key: 'codeSystem', label: 'Code system' },
-    { key: 'specimen', label: 'Specimen' },
-    { key: 'method', label: 'Method' },
-  ],
-  medication: [
-    { key: 'medicationName', label: 'Medication' },
-    { key: 'doseText', label: 'Dose' },
-    { key: 'route', label: 'Route' },
-    { key: 'frequency', label: 'Frequency' },
-    { key: 'status', label: 'Status' },
-    { key: 'startDate', label: 'Explicit start date', placeholder: 'YYYY-MM-DD' },
-    { key: 'endDate', label: 'Explicit end date', placeholder: 'YYYY-MM-DD' },
-  ],
-  procedure: [
-    { key: 'procedureLabel', label: 'Procedure' },
-    { key: 'status', label: 'Status' },
-  ],
-  document: [
-    { key: 'documentTitle', label: 'Document title' },
-    { key: 'documentCategory', label: 'Document classification' },
-    { key: 'visitSpecialty', label: 'Visit specialty from evidence' },
-    { key: 'documentDate', label: 'Document date', placeholder: 'YYYY-MM-DD' },
-    { key: 'status', label: 'Status' },
-    { key: 'text', label: 'Document text', multiline: true },
-  ],
-};
-
 function reusableRule(
   record: IntakeReviewRecord,
   mapping: IntakeClinicalMapping,
@@ -285,7 +257,11 @@ export function ImportDetailReview({
   onBack,
   onChanged,
   onUseSource,
+  embedded = false,
+  beforeCloseRef,
 }: {
+  embedded?: boolean;
+  beforeCloseRef?: RefObject<(() => Promise<boolean>) | null>;
   selection: ImportDetailSelection;
   onBack: () => void;
   onChanged: () => void;
@@ -330,6 +306,7 @@ export function ImportDetailReview({
   const [peopleError, setPeopleError] = useState('');
   const [sourceBusy, setSourceBusy] = useState(false);
   const [sourceError, setSourceError] = useState('');
+  const [contextSheet, setContextSheet] = useState<'source' | 'identity' | null>(null);
   const [sourceDraft, setSourceDraft] = useState('');
   const sourceReviewContext = `${profile?.id || ''}:${selection.intakeId || ''}:${selection.groupId}`;
   const activeSourceReviewContext = useRef(sourceReviewContext);
@@ -500,7 +477,15 @@ export function ImportDetailReview({
   }, [identity.loading, identity.refreshing, restoringIdentity]);
   useEffect(() => {
     const group = displayedDetail?.group;
-    if (group) setSourceDraft(group.source || group.sourceSuggestion?.value || '');
+    if (group)
+      setSourceDraft(
+        (group.sourceCoverage?.current.status === 'single'
+          ? group.sourceCoverage.current.bySource[0]?.source
+          : undefined) ||
+          (!group.sourceConfirmation ? group.sourceSuggestion?.value : undefined) ||
+          group.source ||
+          '',
+      );
   }, [displayedDetail?.group.groupId, displayedDetail?.group.source]);
 
   const exact = useMemo(() => {
@@ -677,6 +662,7 @@ export function ImportDetailReview({
       }
       detail.reload();
       sourceReview.reload();
+      setContextSheet(null);
       onChanged();
     } catch (cause) {
       if (!current()) return;
@@ -693,7 +679,11 @@ export function ImportDetailReview({
     }
   }
 
-  async function confirmIdentity(fields: { fullName?: string; birthDate?: string }) {
+  async function confirmIdentity(
+    fields: { fullName?: string; birthDate?: string },
+    personSelection?: ImportPersonSelection,
+    printedName?: string,
+  ) {
     const group = displayedDetail?.group;
     const review = currentIdentityReview;
     const requestedProfile = profile?.id;
@@ -702,24 +692,23 @@ export function ImportDetailReview({
       setIdentityError('The exact identity scope is not ready. Reload it before confirming.');
       return;
     }
-    if (!['confirmation_required', 'evidenced_match', 'prior_confirmation'].includes(review.status))
-      return;
     const selected = Object.fromEntries(
-      Object.entries(fields).filter(
+      Object.entries(personSelection ? {} : fields).filter(
         ([field, value]) =>
           !!value &&
           review.offeredSelfFields[field as keyof typeof review.offeredSelfFields] === value,
       ),
     ) as { fullName?: string; birthDate?: string };
-    if (review.status !== 'confirmation_required' && !Object.keys(selected).length) return;
     // Retained uncertain requests are recoverable only inside the exact profile
     // and deep-link selection that created them.
-    const key = `${identityContext}:${review.scope.groupId}:${review.scope.groupVersionId}:${review.scope.intakeVersion}:${JSON.stringify(selected)}`;
-    const request = identityOperations.current.get(key) || {
+    const key = `${identityContext}:${review.scope.groupId}:${review.scope.groupVersionId}:${review.scope.intakeVersion}:${JSON.stringify([selected, personSelection, printedName])}`;
+    const request: IntakeIdentityConfirmation = identityOperations.current.get(key) || {
       version: review.scope.intakeVersion,
       operationId: crypto.randomUUID(),
       scope: review.scope,
-      outcome: 'this_is_me',
+      outcome: personSelection ? 'this_is_person' : 'this_is_me',
+      ...(personSelection ? { personSelection } : {}),
+      ...(printedName ? { printedName } : {}),
       attestation: review.scope.questions?.length
         ? 'confirmed_displayed_identity_questions'
         : 'confirmed_displayed_report_subject',
@@ -775,16 +764,20 @@ export function ImportDetailReview({
         return;
       }
       setIdentityNotice(
-        Object.keys(selected).length
-          ? review.status === 'confirmation_required'
-            ? 'Identity and the selected blank Self details were confirmed in one action. Clinical records are not saved yet.'
-            : 'The selected blank Self details were added. Clinical records are not saved yet.'
-          : 'Identity was confirmed for this report. Clinical records are not saved yet.',
+        personSelection
+          ? 'The report is assigned to the selected person in People. Clinical records remain in review.'
+          : Object.keys(selected).length
+            ? review.status === 'confirmation_required'
+              ? 'Identity and the selected blank Self details were confirmed in one action. Clinical records are not saved yet.'
+              : 'The selected blank Self details were added. Clinical records are not saved yet.'
+            : 'This report is confirmed as yours and its supported name is retained in your saved names. Clinical records are not saved yet.',
       );
       identity.reload();
       detail.reload();
       setIdentityRevision((revision) => revision + 1);
+      setContextSheet(null);
       onChanged();
+      if (!selection.recordId) onBack();
     } catch (cause) {
       if (!actionCurrent()) return;
       if (cause instanceof ApiError && cause.status === 409) {
@@ -793,6 +786,8 @@ export function ImportDetailReview({
           setIdentityNotice(
             'This report identity was already confirmed. No additional confirmation was recorded.',
           );
+          setContextSheet(null);
+          if (!selection.recordId) onBack();
           return;
         }
       }
@@ -806,7 +801,7 @@ export function ImportDetailReview({
     }
   }
 
-  const identityPanel = (
+  const identityEditor = (
     <ImportIdentityPanel
       review={
         identity.refreshing || restoringIdentity || identity.error
@@ -817,8 +812,14 @@ export function ImportDetailReview({
       error={identityError || identity.error?.message || ''}
       notice={identityNotice}
       busy={identityBusy}
+      onDone={() => {
+        setContextSheet(null);
+        if (!selection.recordId) onBack();
+      }}
       onRetry={identity.reload}
-      onConfirm={(fields) => void confirmIdentity(fields)}
+      onConfirm={(fields, personSelection, printedName) =>
+        void confirmIdentity(fields, personSelection, printedName)
+      }
     />
   );
   const sourceGroup = displayedDetail?.group;
@@ -829,12 +830,16 @@ export function ImportDetailReview({
       : sourceReview.error
         ? null
         : sourceReview.data;
+  const reviewedSource =
+    sourceGroup?.sourceCoverage?.current.status === 'single'
+      ? sourceGroup.sourceCoverage.current.bySource[0]?.source
+      : undefined;
   const sourcePanel =
     sourceGroup && sourceScope ? (
       <section className="import-source-question" aria-label="Report source label">
         <span>
-          {sourceGroup.sourceConfirmation
-            ? `Reviewed source: ${sourceGroup.source || 'Source not labeled'}. New eligible results you save use this label. Original issuer and upload history stay unchanged.`
+          {reviewedSource || sourceGroup.sourceConfirmation
+            ? `Reviewed source: ${reviewedSource || sourceGroup.source || 'Source not labeled'}. New eligible results you save use this label. Original issuer and upload history stay unchanged.`
             : sourceGroup.sourceSuggestion
               ? 'Suggested source—not applied yet. Use it for this report and eligible results you save. Original issuer and upload history stay unchanged.'
               : 'Add a source for this report and eligible results you save. Original issuer and upload history stay unchanged.'}
@@ -922,6 +927,107 @@ export function ImportDetailReview({
         </div>
       </section>
     ) : null;
+  const personConfirmed =
+    currentIdentityReview?.status === 'evidenced_match' ||
+    currentIdentityReview?.status === 'prior_confirmation';
+  const personLabel =
+    currentIdentityReview?.evidencedIdentity.fullName ||
+    currentIdentityReview?.assignedPerson?.fullName ||
+    currentIdentityReview?.scope?.subject.text ||
+    'Person not identified';
+  const identityPanel = (
+    <>
+      <div className="import-report-context import-detail-context">
+        {sourceGroup && sourceScope && (
+          <button
+            type="button"
+            className="import-source-control"
+            aria-label="Change source for this report"
+            onClick={() => setContextSheet('source')}
+          >
+            <span className="import-source">
+              {reviewedSource ||
+                (!sourceGroup.sourceConfirmation
+                  ? sourceGroup.sourceSuggestion?.value
+                  : undefined) ||
+                sourceGroup.source ||
+                'Source not labeled'}
+            </span>
+            {!reviewedSource && !sourceGroup.sourceConfirmation && sourceGroup.sourceSuggestion && (
+              <span className="import-suggested">Suggested · not applied</span>
+            )}
+            <span className="import-source-action">Change</span>
+          </button>
+        )}
+        <button
+          type="button"
+          className="import-source-control"
+          aria-label={`${personConfirmed ? 'Change' : 'Review'} person for this report`}
+          onClick={() => setContextSheet('identity')}
+        >
+          <span>
+            For {personLabel}
+            {personConfirmed &&
+            (!currentIdentityReview?.assignedPerson ||
+              currentIdentityReview.assignedPerson.personId === 'patient')
+              ? ' (you)'
+              : ''}
+          </span>
+          <span className="import-source-action">{personConfirmed ? 'Change' : 'Review'}</span>
+        </button>
+      </div>
+      <Dialog.Root
+        open={contextSheet !== null}
+        onOpenChange={(open) => {
+          if (!open && !identityBusy && !sourceBusy) setContextSheet(null);
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="import-sheet-overlay" />
+          <Dialog.Content className="import-sheet import-context-sheet">
+            <div className="import-sheet-header">
+              <Dialog.Title>
+                {contextSheet === 'identity' ? 'Who is this report for?' : 'Change source'}
+              </Dialog.Title>
+              <Dialog.Close
+                className="icon-button"
+                aria-label="Close"
+                disabled={identityBusy || sourceBusy}
+              >
+                <X size={18} />
+              </Dialog.Close>
+            </div>
+            <Dialog.Description>
+              Review the source and person for this report. Clinical records remain in review.
+            </Dialog.Description>
+            <nav className="import-context-tabs" aria-label="Report details">
+              <button
+                type="button"
+                aria-pressed={contextSheet === 'source'}
+                disabled={identityBusy || sourceBusy || !sourceScope}
+                onClick={() => setContextSheet('source')}
+              >
+                Source
+              </button>
+              <button
+                type="button"
+                aria-pressed={contextSheet === 'identity'}
+                disabled={identityBusy || sourceBusy}
+                onClick={() => setContextSheet('identity')}
+              >
+                Person
+              </button>
+            </nav>
+            <div hidden={contextSheet !== 'identity'}>{identityEditor}</div>
+            <div hidden={contextSheet !== 'source'}>
+              {sourcePanel}
+              {sourceError && <p role="alert">{sourceError}</p>}
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+    </>
+  );
   const commonIdentityIssueIds = (recordId: string) =>
     new Set(
       currentIdentityReview?.scope?.targets
@@ -949,13 +1055,15 @@ export function ImportDetailReview({
   if (selection.recordId && exact)
     return (
       <ImportRecordDetail
+        embedded={embedded}
+        beforeCloseRef={beforeCloseRef}
         groupId={selection.groupId}
         block={exact.block}
         recordId={exact.record.id}
         savedDestination={savedDestinations.get(recordKey(exact.block, exact.record))}
         identityPanel={identityPanel}
         identityRevision={identityRevision}
-        sourcePanel={sourcePanel}
+        sourcePanel={null}
         commonIdentityIssueIds={commonIdentityIssueIds(exact.record.id)}
         sourceError={sourceError}
         onBack={onBack}
@@ -977,9 +1085,11 @@ export function ImportDetailReview({
       <button type="button" className="text-link import-detail-back" onClick={onBack}>
         <ArrowLeft size={15} aria-hidden="true" /> Back to Import
       </button>
-      <header className="import-detail-heading">
+      <header className="import-detail-heading import-report-title">
         <div>
-          <p className="eyebrow">REPORT REVIEW</p>
+          <p className="eyebrow">
+            New Import Source: {group.member?.filename || group.original.filename}
+          </p>
           <h2>{group.title}</h2>
           <p>
             {group.source || 'Source not labeled'}
@@ -999,7 +1109,13 @@ export function ImportDetailReview({
         </a>
       </header>
       {identityPanel}
-      {sourcePanel}
+      <SourceTextReview
+        intakeId={group.intakeId}
+        onChanged={() => {
+          detail.reload();
+          onChanged();
+        }}
+      />
       <p className="helper-text">
         Choose a row for every field, question, related-record decision, correction, and original
         evidence control. Nothing is saved as a clinical record from this report overview.
@@ -1091,6 +1207,7 @@ function ImportIdentityPanel({
   busy,
   onRetry,
   onConfirm,
+  onDone,
 }: {
   review?: IntakeIdentityReview;
   loading: boolean;
@@ -1098,9 +1215,18 @@ function ImportIdentityPanel({
   notice: string;
   busy: boolean;
   onRetry: () => void;
-  onConfirm: (fields: { fullName?: string; birthDate?: string }) => void;
+  onDone: () => void;
+  onConfirm: (
+    fields: { fullName?: string; birthDate?: string },
+    personSelection?: ImportPersonSelection,
+    printedName?: string,
+  ) => void;
 }) {
-  const offered = review?.offeredSelfFields || {};
+  const [personSelection, setPersonSelection] = useState<ImportPersonSelection>();
+  const [selectedPrintedName, setSelectedPrintedName] = useState('');
+  const offered: { fullName?: string; birthDate?: string } = review?.offeredSelfFields.birthDate
+    ? { birthDate: review.offeredSelfFields.birthDate }
+    : {};
   const selectionScope = review?.scope
     ? [
         review.scope.profileId,
@@ -1121,6 +1247,13 @@ function ImportIdentityPanel({
   useEffect(() => {
     if (!review || !selectionScope) return;
     const previous = previousOffers.current;
+    if (previous.scope !== selectionScope) setSelectedPrintedName('');
+    if (previous.scope !== selectionScope)
+      setPersonSelection(
+        review.assignedPerson && review.assignedPerson.personId !== 'patient'
+          ? { noteId: review.assignedPerson.noteId, expectedVersion: review.assignedPerson.version }
+          : undefined,
+      );
     setSelected((current) => {
       const next = new Set<'fullName' | 'birthDate'>();
       if (
@@ -1172,11 +1305,11 @@ function ImportIdentityPanel({
       </section>
     );
 
-  if (review.status === 'conflict')
+  if (review.status === 'conflict' && !review.scope)
     return (
       <section className="import-identity-question is-conflict" role="alert">
         <div>
-          <strong>This report conflicts with Self. Saving is blocked.</strong>
+          <strong>Review the conflicting report evidence before choosing a person.</strong>
           <small>{review.message}</small>
           {review.conflicts.map((conflict) => (
             <small key={`${conflict.field}:${conflict.evidencedValue}`}>
@@ -1192,23 +1325,40 @@ function ImportIdentityPanel({
   const offeredEntries = (
     Object.entries(offered) as ['fullName' | 'birthDate', string | undefined][]
   ).filter((entry): entry is ['fullName' | 'birthDate', string] => !!entry[1]);
+  const unchanged =
+    confirmed &&
+    (!personSelection
+      ? !review.assignedPerson || review.assignedPerson.personId === 'patient'
+      : 'noteId' in personSelection && personSelection.noteId === review.assignedPerson?.noteId) &&
+    (!offered.birthDate || !selected.has('birthDate')) &&
+    !!review.evidencedIdentity.fullName;
   return (
-    <section className="import-identity-question" aria-label="Report identity">
+    <section
+      className="import-identity-question import-identity-editor"
+      aria-label="Report identity"
+    >
       <div>
         <strong>
           {confirmed
-            ? 'This report already matches Self.'
+            ? review.assignedPerson
+              ? `This report belongs to ${review.assignedPerson.fullName}.`
+              : 'This report already matches Self.'
             : `This report identifies “${review.evidencedIdentity.fullName || review.scope?.subject.text || 'Self'}”.`}
         </strong>
-        <small>{review.message}</small>
+        {!review.scope?.questions?.some((question) => question.prompt === review.message) && (
+          <small>{review.message}</small>
+        )}
         {review.evidencedIdentity.birthDate && (
           <small>Printed date of birth: {review.evidencedIdentity.birthDate}</small>
         )}
-        {review.scope?.targets.length !== undefined && !confirmed && (
+        {review.scope && !confirmed && (
           <small>
-            This confirmation applies to {review.scope.targets.length}{' '}
-            {review.scope.targets.length === 1 ? 'record' : 'records'} in this retained report
-            scope.
+            This confirmation applies to{' '}
+            {(review.scope.assignmentTargets || review.scope.targets).length}{' '}
+            {(review.scope.assignmentTargets || review.scope.targets).length === 1
+              ? 'record'
+              : 'records'}{' '}
+            in this retained report scope.
           </small>
         )}
         {review.scope?.questions?.map((question) => (
@@ -1220,7 +1370,24 @@ function ImportIdentityPanel({
             {question.textAnchor && <q>{question.textAnchor}</q>}
           </span>
         ))}
-        {offeredEntries.length > 0 && (
+        {review.scope && !review.evidencedIdentity.fullName && (
+          <ImportPrintedName
+            value={selectedPrintedName}
+            subjectText={review.scope.subject.text}
+            onChange={setSelectedPrintedName}
+            disabled={busy}
+          />
+        )}
+        <ImportPersonChoice
+          people={review.people}
+          peopleTruncated={review.peopleTruncated}
+          assignedPerson={review.assignedPerson}
+          printedName={review.evidencedIdentity.fullName || selectedPrintedName}
+          selection={personSelection}
+          onChange={setPersonSelection}
+          disabled={busy || !review.scope}
+        />
+        {!personSelection && offeredEntries.length > 0 && (
           <fieldset className="import-identity-self-fields">
             <legend>
               Optional blank Self details — importing clinical records does not require these
@@ -1250,29 +1417,47 @@ function ImportIdentityPanel({
         {notice && <small role="status">{notice}</small>}
         {error && <small role="alert">{error}</small>}
       </div>
-      {(!confirmed || offeredEntries.length > 0) && (
+      {!!review.scope && (
         <button
           className="button secondary"
           type="button"
-          disabled={busy || !review.scope || (confirmed && selected.size === 0)}
-          onClick={() =>
-            onConfirm(
-              Object.fromEntries(
-                [...selected].flatMap((field) => {
-                  const value = offered[field];
-                  return value ? [[field, value]] : [];
-                }),
-              ),
-            )
+          disabled={
+            busy ||
+            !review.scope ||
+            !personSelectionReady(personSelection) ||
+            (!review.evidencedIdentity.fullName &&
+              !printedNameReady(selectedPrintedName, review.scope.subject.text))
           }
+          onClick={() => {
+            if (unchanged) {
+              onDone();
+              return;
+            }
+            onConfirm(
+              personSelection
+                ? {}
+                : Object.fromEntries(
+                    [...selected].flatMap((field) => {
+                      const value = offered[field];
+                      return value ? [[field, value]] : [];
+                    }),
+                  ),
+              personSelection,
+              !review.evidencedIdentity.fullName ? selectedPrintedName.trim() : undefined,
+            );
+          }}
         >
           {busy
             ? 'Confirming…'
-            : confirmed
-              ? 'Add selected details to Self'
-              : offeredEntries.length
-                ? 'This is me and add selected details'
-                : 'This is me'}
+            : unchanged
+              ? 'Done'
+              : personSelection
+                ? 'Confirm person'
+                : confirmed
+                  ? 'Save changes'
+                  : offeredEntries.length
+                    ? 'This is me and add selected details'
+                    : 'This is me'}
         </button>
       )}
     </section>
@@ -1280,6 +1465,8 @@ function ImportIdentityPanel({
 }
 
 function ImportRecordDetail({
+  embedded = false,
+  beforeCloseRef,
   groupId,
   block,
   recordId,
@@ -1293,6 +1480,8 @@ function ImportRecordDetail({
   onChanged,
   onUseSource,
 }: {
+  embedded?: boolean;
+  beforeCloseRef?: RefObject<(() => Promise<boolean>) | null>;
   groupId: string;
   block: Pick<IntakeReportQueueBlock, 'intakeId' | 'proposalId'>;
   recordId: string;
@@ -1437,7 +1626,8 @@ function ImportRecordDetail({
       Object.entries(collected).map(([field, values]) => [field, [...values]]),
     ) as unknown as IntakeMetadataSuggestions;
   }, [review.data]);
-  const acceptanceBlocked = !!acceptance.recoveryOperationId || acceptance.recovering;
+  const acceptanceBlocked =
+    !!acceptance.recoveryOperationId || acceptance.recovering || !!review.data?.sourceTextStale;
   const canSave =
     !!record &&
     !!decision &&
@@ -1499,6 +1689,7 @@ function ImportRecordDetail({
 
   async function disposition(next: 'pending' | 'review_later' | 'keep_original_only') {
     if (!review.data || !record || !draft) return;
+    if (!(await flushPendingReview())) return;
     drafts.update(review.data, record, {
       disposition: next,
       decision: {
@@ -1684,14 +1875,33 @@ function ImportRecordDetail({
     }
   }
 
+  const [sourceTextPending, setSourceTextPending] = useState(false);
+  const correctionPending = useRef(false);
+  const [fieldCorrectionDirty, setFieldCorrectionDirty] = useState(false);
+  const [sourceTextLoaded, setSourceTextLoaded] = useState(false);
   const metadataPending = () =>
     metadataDirty || !!metadataOperation.current || !!metadataConflict || metadataBusy;
   async function flushPendingReview() {
+    if (correctionPending.current) {
+      setError('Update the correction, or use Close review inside the editor to discard it.');
+      return false;
+    }
+    if (sourceTextPending) {
+      setError('Save or discard the source text draft before leaving.');
+      return false;
+    }
     if (!(await drafts.flush())) return false;
     const operation = metadataOperation.current;
     if (operation) return sendMetadataOperation(operation);
     return !metadataPending();
   }
+  useEffect(() => {
+    if (!beforeCloseRef) return;
+    beforeCloseRef.current = flushPendingReview;
+    return () => {
+      beforeCloseRef.current = null;
+    };
+  });
 
   async function save() {
     if (!profile?.id || !review.data || !record || !decision || !canSave || acceptanceBlocked)
@@ -1702,7 +1912,8 @@ function ImportRecordDetail({
     const proposalId = block.proposalId;
     const exactRecord = record;
     await perform(async (diagnosticOperationId) => {
-      if (!(await drafts.flush())) throw new Error('Save the current review draft first.');
+      if (!(await flushPendingReview()))
+        throw new Error('Save or discard unfinished review edits before accepting this record.');
       if (activeDetailScope.current !== scope || activeProfile.current !== profileId) return;
       const fresh = (
         await api<IntakeReview>(
@@ -1754,6 +1965,7 @@ function ImportRecordDetail({
         throw new Error(
           acceptance.error || 'Save was not confirmed. Check the exact receipt before retrying.',
         );
+      if (embedded) onBack();
     }, 'review_save');
   }
 
@@ -1790,10 +2002,194 @@ function ImportRecordDetail({
       </section>
     );
 
+  const relatedReview = (
+    <ImportRelatedRecordEditor
+      record={record}
+      decision={decision}
+      busy={
+        busy ||
+        drafts.saving ||
+        acceptance.busy ||
+        acceptanceBlocked ||
+        !!drafts.comparison ||
+        fieldCorrectionDirty
+      }
+      onChange={(next) => drafts.update(review.data!, record, { decision: next })}
+      onDiscoverRelated={(search) =>
+        api<IntakeRelatedRecordsResult>(
+          `/intakes/${encodeURIComponent(block.intakeId)}/related-records`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              proposalId: block.proposalId,
+              recordId: record.id,
+              candidateVersionId: record.candidateVersionId,
+              ...search,
+            }),
+          },
+        ).then(({ data }) => data)
+      }
+      correctionSupporting={
+        record.candidateId && record.candidateVersionId && originalSourceFileId(record, intake.data)
+          ? {
+              reference: {
+                intakeId: intake.data.id,
+                proposalId: review.data.proposalId,
+                recordId: record.id,
+                candidateId: record.candidateId,
+                candidateVersionId: record.candidateVersionId,
+                originalSourceFileId: originalSourceFileId(record, intake.data)!,
+              },
+              label: record.title,
+              locator:
+                record.evidence.map((entry) => entry.locator).join(' · ') || 'Original intake',
+              contentUrl:
+                record.evidence.find((entry) => entry.contentUrl)?.contentUrl ||
+                intake.data.contentUrl,
+            }
+          : undefined
+      }
+      previewCorrection={(request) =>
+        api<RecordCorrectionPreview>('/clinical-review/correction-preview', {
+          method: 'POST',
+          body: JSON.stringify(request),
+        }).then(({ data }) => data)
+      }
+      applyCorrection={(request) =>
+        api<RecordCorrectionApplyResult>('/clinical-review/correction-apply', {
+          method: 'POST',
+          body: JSON.stringify(request),
+        }).then(({ data }) => data)
+      }
+      onCorrectionApplied={() => {
+        review.reload();
+        intake.reload();
+        onChanged();
+      }}
+    />
+  );
+
+  if (embedded && !finalized) {
+    const fields = recordCorrectionFields(decision.mapping.kind || record.kind, record.issues);
+    return (
+      <section className="import-detail is-embedded is-focused-correction">
+        <ReviewNavigationGuard
+          anyLocationChange
+          pending={() => correctionPending.current || drafts.pending()}
+          flush={flushPendingReview}
+        />
+        {(error || drafts.error) && (
+          <div className="import-error" role="alert">
+            {error || drafts.error}
+            {drafts.error && (
+              <button
+                className="text-link"
+                type="button"
+                onClick={() => void (drafts.conflict ? drafts.inspectConflict() : drafts.retry())}
+              >
+                {drafts.conflict ? 'Review newer saved changes' : 'Retry draft save'}
+              </button>
+            )}
+            {drafts.error && (
+              <button
+                className="text-link"
+                type="button"
+                disabled={drafts.saving}
+                onClick={async () => {
+                  if (await drafts.useCurrent()) {
+                    correctionPending.current = false;
+                    onBack();
+                  }
+                }}
+              >
+                Discard unsaved correction and close
+              </button>
+            )}
+          </div>
+        )}
+        {drafts.comparison && (
+          <section aria-label="Review draft conflict" className="import-page-notice">
+            <p>Newer saved fields</p>
+            <DraftSummary draft={initialDraft(drafts.comparison.record)} />
+            <p>Your reviewed fields</p>
+            <DraftSummary draft={drafts.comparison.local} />
+            <button className="button secondary" onClick={() => void drafts.useCurrent()}>
+              Use newer saved fields
+            </button>
+            <button className="button primary" onClick={() => void drafts.reapply()}>
+              Save my reviewed fields over these changes
+            </button>
+          </section>
+        )}
+        {review.data.sourceTextStale && (
+          <p role="alert">
+            The source text changed. Read the corrected source again before updating this record.
+          </p>
+        )}
+        <ImportRecordCorrection
+          key={`${detailScope}:${drafts.comparison ? 'conflict' : 'current'}`}
+          intake={intake.data}
+          record={record}
+          mapping={decision.mapping}
+          fields={fields}
+          disabled={
+            busy || drafts.saving || acceptanceBlocked || !!drafts.error || !!drafts.comparison
+          }
+          onDirtyChange={(dirty) => {
+            correctionPending.current = dirty;
+            setFieldCorrectionDirty(dirty);
+          }}
+          onClose={onBack}
+          onUpdate={async (patch, correctionReason) => {
+            const resolutions = (record.issues || [])
+              .filter(
+                (issue) =>
+                  ['uncertain_reading', 'date'].includes(issue.kind) &&
+                  issue.field &&
+                  Object.hasOwn(patch, issue.field),
+              )
+              .map((issue) => ({
+                issueId: issue.id,
+                outcome:
+                  patch[issue.field as keyof IntakeClinicalMapping] ===
+                  decision.mapping[issue.field as keyof IntakeClinicalMapping]
+                    ? ('confirmed' as const)
+                    : ('corrected' as const),
+                mapping: { [issue.field!]: patch[issue.field as keyof IntakeClinicalMapping] },
+              }));
+            drafts.update(review.data!, record, {
+              correctionReason,
+              decision: { ...decision, mapping: { ...decision.mapping, ...patch } },
+              resolutions: [
+                ...draft.resolutions.filter(
+                  (prior) => !resolutions.some((next) => next.issueId === prior.issueId),
+                ),
+                ...resolutions,
+              ],
+            });
+            const saved = await drafts.flush();
+            if (activeDetailScope.current !== detailScope || activeProfile.current !== profile?.id)
+              return false;
+            if (saved) {
+              correctionPending.current = false;
+              onChanged();
+            }
+            return saved;
+          }}
+        />
+        {relatedReview}
+      </section>
+    );
+  }
+
   return (
-    <section className="import-detail" aria-label={`Review ${reviewRecordTitle(record)}`}>
+    <section
+      className={`import-detail${embedded ? ' is-embedded' : ''}`}
+      aria-label={`Review ${reviewRecordTitle(record)}`}
+    >
       <ReviewNavigationGuard
-        pending={() => drafts.pending() || metadataPending()}
+        anyLocationChange
+        pending={() => drafts.pending() || metadataPending() || sourceTextPending}
         flush={flushPendingReview}
       />
       <button
@@ -1803,7 +2199,7 @@ function ImportRecordDetail({
           if (await flushPendingReview()) onBack();
         }}
       >
-        <ArrowLeft size={15} aria-hidden="true" /> Back to Import
+        <ArrowLeft size={15} aria-hidden="true" /> {embedded ? 'Close review' : 'Back to Import'}
       </button>
       {(error || sourceError || drafts.error || acceptance.error || metadataError) && (
         <div className="import-error" role="alert">
@@ -1852,7 +2248,7 @@ function ImportRecordDetail({
       />
       <header className="import-detail-heading">
         <div>
-          <p className="eyebrow">EXACT RECORD REVIEW</p>
+          <p className="eyebrow">{embedded ? 'REVIEW ORIGINAL & RECORD' : 'EXACT RECORD REVIEW'}</p>
           <h2>{reviewRecordTitle(record, decision.mapping)}</h2>
           <p>
             {intake.data.filename} · {record.date || 'Date not given'}
@@ -1921,7 +2317,34 @@ function ImportRecordDetail({
           </div>
         </section>
       )}
-      <ReviewLayout intake={intake.data}>
+      <details
+        className="intake-processing-details"
+        onToggle={(event) => {
+          if (event.currentTarget.open) setSourceTextLoaded(true);
+        }}
+      >
+        <summary>Extracted text & corrections</summary>
+        {sourceTextLoaded && (
+          <SourceTextReview
+            embedded
+            initialPage={intakeEvidencePage(intake.data, record.evidence)}
+            guardNavigation={false}
+            onPendingChange={setSourceTextPending}
+            intakeId={intake.data.id}
+            onChanged={() => {
+              intake.reload();
+              onChanged();
+            }}
+          />
+        )}
+      </details>
+      {review.data.sourceTextStale && (
+        <p className="intake-notice" role="alert">
+          Source text changed after these clinical drafts were prepared. Reread the corrected source
+          before accepting them. Existing accepted versions remain intact.
+        </p>
+      )}
+      <ReviewLayout intake={intake.data} evidence={record.evidence} sideBySide={embedded}>
         <details className="intake-processing-details">
           <summary>
             Source and file details
@@ -1956,59 +2379,7 @@ function ImportRecordDetail({
           onDraft={(patch) => drafts.update(review.data!, record, patch)}
           onAnswer={(id, value) => void answer(id, value)}
           onSuggestedSource={(source) => onUseSource(groupId, source)}
-          onDiscoverRelated={(search) =>
-            api<IntakeRelatedRecordsResult>(
-              `/intakes/${encodeURIComponent(block.intakeId)}/related-records`,
-              {
-                method: 'POST',
-                body: JSON.stringify({
-                  proposalId: block.proposalId,
-                  recordId: record.id,
-                  candidateVersionId: record.candidateVersionId,
-                  ...search,
-                }),
-              },
-            ).then(({ data }) => data)
-          }
-          correctionSupporting={
-            record.candidateId &&
-            record.candidateVersionId &&
-            originalSourceFileId(record, intake.data)
-              ? {
-                  reference: {
-                    intakeId: intake.data.id,
-                    proposalId: review.data.proposalId,
-                    recordId: record.id,
-                    candidateId: record.candidateId,
-                    candidateVersionId: record.candidateVersionId,
-                    originalSourceFileId: originalSourceFileId(record, intake.data)!,
-                  },
-                  label: record.title,
-                  locator:
-                    record.evidence.map((entry) => entry.locator).join(' · ') || 'Original intake',
-                  contentUrl:
-                    record.evidence.find((entry) => entry.contentUrl)?.contentUrl ||
-                    intake.data.contentUrl,
-                }
-              : undefined
-          }
-          previewCorrection={(request) =>
-            api<RecordCorrectionPreview>('/clinical-review/correction-preview', {
-              method: 'POST',
-              body: JSON.stringify(request),
-            }).then(({ data }) => data)
-          }
-          applyCorrection={(request) =>
-            api<RecordCorrectionApplyResult>('/clinical-review/correction-apply', {
-              method: 'POST',
-              body: JSON.stringify(request),
-            }).then(({ data }) => data)
-          }
-          onCorrectionApplied={() => {
-            review.reload();
-            intake.reload();
-            onChanged();
-          }}
+          relatedReview={relatedReview}
           onReviewLater={() => void disposition('review_later')}
         />
         {!!(review.data.sourceContext?.length || review.data.coverageGaps.length) && (
@@ -2077,7 +2448,9 @@ function ImportRecordDetail({
                 <button
                   className="button primary"
                   type="button"
-                  disabled={busy || !canSave || !!drafts.error || acceptanceBlocked}
+                  disabled={
+                    busy || !canSave || !!drafts.error || acceptanceBlocked || sourceTextPending
+                  }
                   onClick={() => void save()}
                 >
                   <Check size={16} aria-hidden="true" />{' '}
@@ -2098,6 +2471,70 @@ function ImportRecordDetail({
   );
 }
 
+function ImportRelatedRecordEditor({
+  record,
+  decision,
+  busy,
+  onChange,
+  onDiscoverRelated,
+  correctionSupporting,
+  previewCorrection,
+  applyCorrection,
+  onCorrectionApplied,
+}: {
+  record: IntakeReviewRecord;
+  decision: IntakeReviewDecision;
+  busy: boolean;
+  onChange: (next: IntakeReviewDecision) => void;
+  onDiscoverRelated: (search: RelatedRecordSearch) => Promise<IntakeRelatedRecordsResult>;
+  correctionSupporting?: CorrectionSupportingChoice;
+  previewCorrection: (request: RecordCorrectionRequest) => Promise<RecordCorrectionPreview>;
+  applyCorrection: (request: RecordCorrectionApplyRequest) => Promise<RecordCorrectionApplyResult>;
+  onCorrectionApplied: (result: RecordCorrectionApplyResult) => void | Promise<void>;
+}) {
+  const [correctionTarget, setCorrectionTarget] = useState<IntakeEvidenceComparison | null>(null);
+  return (
+    <>
+      <details
+        className="intake-related-disclosure"
+        open={comparisonDecisionsNeedReview(record, decision)}
+      >
+        <summary>
+          {record.comparisons?.length
+            ? `Review ${record.comparisons.length} possible related saved ${record.comparisons.length === 1 ? 'record' : 'records'}`
+            : 'Find possible related saved records'}
+        </summary>
+        <RelatedRecordReview
+          record={record}
+          decision={decision}
+          onChange={onChange}
+          onDiscover={onDiscoverRelated}
+          onCorrectSaved={(other) => setCorrectionTarget(other)}
+          disabled={busy}
+        />
+      </details>
+      {correctionTarget &&
+        ['observation', 'medication', 'procedure', 'document'].includes(correctionTarget.kind) && (
+          <RecordCorrectionDialog
+            open
+            onOpenChange={(open) => !open && setCorrectionTarget(null)}
+            target={{
+              kind: correctionTarget.kind as EditableKind,
+              recordId: correctionTarget.id,
+              title: correctionTarget.title,
+              mapping: correctionTarget.mapping,
+            }}
+            supporting={correctionSupporting}
+            previewCorrection={previewCorrection}
+            applyCorrection={applyCorrection}
+            onApplied={onCorrectionApplied}
+            returnLabel="Return to import review"
+          />
+        )}
+    </>
+  );
+}
+
 function StandaloneRecordEditor({
   record,
   decision,
@@ -2108,12 +2545,8 @@ function StandaloneRecordEditor({
   onDraft,
   onAnswer,
   onSuggestedSource,
-  onDiscoverRelated,
-  correctionSupporting,
-  previewCorrection,
-  applyCorrection,
-  onCorrectionApplied,
   onReviewLater,
+  relatedReview,
 }: {
   record: IntakeReviewRecord;
   decision: IntakeReviewDecision;
@@ -2124,14 +2557,9 @@ function StandaloneRecordEditor({
   onDraft: (patch: Partial<LocalReviewDraft>) => void;
   onAnswer: (questionId: string, answer: string) => void;
   onSuggestedSource: (source: string) => void;
-  onDiscoverRelated: (search: RelatedRecordSearch) => Promise<IntakeRelatedRecordsResult>;
-  correctionSupporting?: CorrectionSupportingChoice;
-  previewCorrection: (request: RecordCorrectionRequest) => Promise<RecordCorrectionPreview>;
-  applyCorrection: (request: RecordCorrectionApplyRequest) => Promise<RecordCorrectionApplyResult>;
-  onCorrectionApplied: (result: RecordCorrectionApplyResult) => void | Promise<void>;
+  relatedReview: ReactNode;
   onReviewLater: () => void;
 }) {
-  const [correctionTarget, setCorrectionTarget] = useState<IntakeEvidenceComparison | null>(null);
   const kind = decision.mapping.kind as EditableKind;
   const fields = mappingFields[kind] || [];
   const issueGroups = groupReviewIssues(record, draft.resolutions);
@@ -2224,42 +2652,7 @@ function StandaloneRecordEditor({
             onSave={(answer) => onAnswer(question.id, answer)}
           />
         ))}
-      <details
-        className="intake-related-disclosure"
-        open={comparisonDecisionsNeedReview(record, decision)}
-      >
-        <summary>
-          {record.comparisons?.length
-            ? `Review ${record.comparisons.length} possible related saved ${record.comparisons.length === 1 ? 'record' : 'records'}`
-            : 'Find possible related saved records'}
-        </summary>
-        <RelatedRecordReview
-          record={record}
-          decision={decision}
-          onChange={onChange}
-          onDiscover={onDiscoverRelated}
-          onCorrectSaved={(other) => setCorrectionTarget(other)}
-          disabled={busy}
-        />
-      </details>
-      {correctionTarget &&
-        ['observation', 'medication', 'procedure', 'document'].includes(correctionTarget.kind) && (
-          <RecordCorrectionDialog
-            open
-            onOpenChange={(open) => !open && setCorrectionTarget(null)}
-            target={{
-              kind: correctionTarget.kind as EditableKind,
-              recordId: correctionTarget.id,
-              title: correctionTarget.title,
-              mapping: correctionTarget.mapping,
-            }}
-            supporting={correctionSupporting}
-            previewCorrection={previewCorrection}
-            applyCorrection={applyCorrection}
-            onApplied={onCorrectionApplied}
-            returnLabel="Return to import review"
-          />
-        )}
+      {relatedReview}
       {decision.mapping.opticalPrescription && (
         <OpticalPrescriptionEditor
           prescription={decision.mapping.opticalPrescription}

@@ -8,7 +8,10 @@ import {
   identityReceiptAppliesToCurrentBoundary,
   repeatedIdentityQuestionReceipt,
 } from './intake-identity-policy.ts';
-import { identityGroundingLookup } from './intake-identity-grounding.ts';
+import {
+  identityGroundingLookup,
+  identitySubjectGroundingLookup,
+} from './intake-identity-grounding.ts';
 
 export const CLINICAL_SOURCE_SCOPE_COLLISION =
   'This issuing source identifier is already used by a different or unverified report subject or member. Nothing was merged. Review the originals; correct an extraction mistake only when supported by the source. Keep valid identifiers and patient identities unchanged.';
@@ -56,6 +59,7 @@ interface Original {
   details_json?: string;
 }
 interface OriginalScope {
+  profileId: string;
   intake: Record<string, unknown>;
   workflow: IntakeWorkflow;
   memberIds: Set<string>;
@@ -78,7 +82,7 @@ function evidenceFor(
   recordId: string,
   retained = false,
 ): Evidence {
-  const { workflow, intake, memberIds, packageSource, childBoundary } = originalScope;
+  const { workflow, intake, memberIds, packageSource, childBoundary, profileId } = originalScope;
   const report = value.report;
   const unsupportedMember =
     (!!intake.parentSourceFileId && !childBoundary) ||
@@ -124,8 +128,8 @@ function evidenceFor(
         group.sourceHash === original.sha256 &&
         canonicalLiteral(group.report?.anchor) === canonicalLiteral(report.anchor) &&
         canonicalLiteral(group.report?.subject) === canonicalLiteral(report.subject) &&
-        receipt.outcome === 'this_is_me' &&
-        receipt.scope.targets.some(
+        ['this_is_me', 'this_is_person'].includes(receipt.outcome) &&
+        (receipt.scope.assignmentTargets || receipt.scope.targets).some(
           (target) => target.recordId === recordId && target.candidateVersionId === version,
         ) &&
         identityReceiptAppliesToCurrentBoundary(receipt, {
@@ -165,6 +169,29 @@ function evidenceFor(
         )
       )
         return false;
+      // A null-proposal occurrence with the original's own line ID is literal
+      // uploaded JSONL, including report headers outside its clinical payload.
+      if (
+        recordId.startsWith(`${original.id}:line:`) &&
+        /^[1-9]\d*$/.test(recordId.slice(`${original.id}:line:`.length)) &&
+        current.members.some(
+          (member) =>
+            member.candidateVersionId === version &&
+            member.occurrences.some(
+              (occurrence) => occurrence.recordId === recordId && occurrence.proposalId === null,
+            ),
+        )
+      )
+        return true;
+      if (
+        identitySubjectGroundingLookup(db, {
+          profileId,
+          intakeId: original.id,
+          sourceHash: original.sha256,
+          workflow,
+        })(group)
+      )
+        return true;
       const clinicalIssues = object(value.clinical).reviewIssues;
       const questions = [
         ...(Array.isArray(value.reviewIssues) ? value.reviewIssues : []),
@@ -224,9 +251,13 @@ function evidenceFor(
         if (record.recordId !== recordId) return false;
         const attribution = object(record.identityAttribution);
         if (
-          !['explicit_report_confirmation', 'same_original_person_confirmation'].includes(
-            String(attribution.basis),
-          )
+          ![
+            'explicit_report_confirmation',
+            'same_original_person_confirmation',
+            'explicit_person_confirmation',
+            'matched_saved_self',
+            'matched_saved_person',
+          ].includes(String(attribution.basis))
         )
           return false;
         const group = workflow.reportGroups?.find((item) => item.id === attribution.groupId);
@@ -234,27 +265,36 @@ function evidenceFor(
         const receipt = workflow.identityConfirmations?.find(
           (item) => item.operationId === attribution.confirmationOperationId,
         );
-        return (
+        const exactAcceptedOccurrence =
           !!group &&
           !!historical &&
-          !!receipt &&
-          receipt.outcome === 'this_is_me' &&
           group.sourceFileId === original.id &&
           group.sourceHash === original.sha256 &&
           group.memberId === (report.memberId || null) &&
-          receipt.scope.memberId === group.memberId &&
-          receipt.scope.intakeId === original.id &&
-          receipt.scope.sourceHash === original.sha256 &&
-          receipt.scope.evidenceOriginalFingerprint ===
-            identityOriginalFingerprint(original.id, original.sha256, group, workflow) &&
           canonicalLiteral(group.report?.anchor) === canonicalLiteral(report.anchor) &&
           canonicalLiteral(group.report?.subject) === canonicalLiteral(report.subject) &&
-          receipt.scope.subject.text === report.subject!.text &&
           historical.members.some(
             (member) =>
               member.candidateVersionId === version &&
               member.occurrences.some((occurrence) => occurrence.recordId === recordId),
-          )
+          );
+        if (!exactAcceptedOccurrence) return false;
+        const originalFingerprint = identityOriginalFingerprint(
+          original.id,
+          original.sha256,
+          group!,
+          workflow,
+        );
+        if (['matched_saved_self', 'matched_saved_person'].includes(String(attribution.basis)))
+          return attribution.originalSubjectFingerprint === originalFingerprint;
+        return (
+          !!receipt &&
+          ['this_is_me', 'this_is_person'].includes(receipt.outcome) &&
+          receipt.scope.memberId === group!.memberId &&
+          receipt.scope.intakeId === original.id &&
+          receipt.scope.sourceHash === original.sha256 &&
+          receipt.scope.evidenceOriginalFingerprint === originalFingerprint &&
+          receipt.scope.subject.text === report.subject!.text
         );
       });
   if (confirmed || grounded || acceptedProof)
@@ -298,6 +338,9 @@ export function clinicalSourceScopeCheck(
   inputFileId = file.id || '',
 ): (entry: IntakeEntry) => string | null {
   const incomingOriginal: Original = { ...file, id: file.id || '' };
+  const profileId = String(
+    db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value || '',
+  );
   // The workflow can contain many historical candidates. Parse it once per
   // original in this synchronous snapshot, never once per candidate/evidence.
   // Each caller creates a new checker, including transactional projection.
@@ -312,6 +355,7 @@ export function clinicalSourceScopeCheck(
       workflow.plans.flatMap((plan) => (plan.index.members || []).map((member) => member.memberId)),
     );
     const result = {
+      profileId,
       intake,
       workflow,
       memberIds,

@@ -96,7 +96,11 @@ test('private copy retains current notes and original source owner unchanged', a
 test('deletion requires exact current identity/version and preserves independent backups', async (t) => {
   const { root, databases, actions } = fixture(t);
   const a = await actions.create({ fullName: 'River', birthDate: '1982-04-17', name: 'River' });
-  const b = await actions.create({ fullName: 'River', birthDate: '1982-04-17', name: 'River' });
+  await assert.rejects(
+    actions.create({ fullName: 'River', birthDate: '1982-04-17', name: 'River' }),
+    { code: 'DUPLICATE_PROFILE_DISPLAY' },
+  );
+  const b = await actions.create({ fullName: 'River', birthDate: '1982-04-17', name: 'River Two' });
   assert.throws(
     () => actions.remove(a.id, { confirmationName: 'river', version: a.version }),
     /current full name/,
@@ -113,7 +117,7 @@ test('deletion requires exact current identity/version and preserves independent
   assert.ok(!existsSync(resolve(root, 'data/profiles', a.id)));
   assert.ok(existsSync(path));
   assert.ok(databases.has(b.id));
-  actions.remove(b.id, { confirmationName: 'River', version: b.version });
+  actions.remove(b.id, { confirmationName: 'River Two', version: b.version });
   assert.deepEqual(actions.list(), []);
 });
 test('a durable deletion intent resumes on startup', async (t) => {

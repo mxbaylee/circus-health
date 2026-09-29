@@ -1,3 +1,4 @@
+import { usePersonScope } from '../../components/PersonScope';
 import {
   ClinicalRedirect,
   isReclassifiedRecord,
@@ -75,6 +76,8 @@ const formatDate = (value: string) =>
 
 export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) {
   const [params, setParams] = useSearchParams();
+  const personScope = usePersonScope();
+  const ownerPersonId = personScope?.personId || params.get('personId') || 'patient';
   const kind: NoteKind =
     initialKind === 'person'
       ? 'person'
@@ -97,13 +100,14 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
   const listQuery = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (!historical) listQuery.set('kind', kind);
   if (kind === 'person') listQuery.set('excludeSelf', '1');
+  else listQuery.set('personId', ownerPersonId);
   for (const key of [
     'visibility',
     'q',
     'filters',
     'typeLabel',
     'status',
-    ...(historical ? ['source'] : kind === 'person' ? ['tag'] : []),
+    ...(historical ? ['source', 'personId'] : kind === 'person' ? ['tag'] : []),
   ])
     if (params.get(key)) listQuery.set(key, params.get(key)!);
   const notes = useResource<Note[]>(historical ? null : `/notes?${listQuery}`);
@@ -123,7 +127,9 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
     kind === 'person' ? '/person-filter-options' : null,
   );
   const historicalOptions = useResource<HistoricalNoteOptions>(
-    historical ? '/historical-note-options' : null,
+    historical
+      ? `/historical-note-options?${new URLSearchParams({ personId: params.get('personId') || 'patient' })}`
+      : null,
   );
   const list = historical ? historicalNotes : notes;
   const selected = historical ? selectedHistorical : selectedNote;
@@ -210,6 +216,7 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
     const nextId = `note:${crypto.randomUUID()}`;
     navigate({
       new: '1',
+      personId: kind === 'person' ? null : ownerPersonId,
       id: nextId,
       targetType: null,
       targetId: null,
@@ -225,6 +232,7 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
   }
   function afterSaved(note: Note, message: string) {
     setSavedInEditor(note);
+    if (note.kind === 'person') personScope?.reload();
     if (message) notifySuccess(message);
     notes.reload();
     historicalNotes.reload();
@@ -298,7 +306,7 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
             {KINDS.filter((item) => item.value !== 'person').map(({ value, label, icon: Icon }) => (
               <Link
                 key={value}
-                to={`?kind=${value}`}
+                to={`?kind=${value}&personId=${encodeURIComponent(ownerPersonId)}`}
                 aria-current={kind === value ? 'page' : undefined}
                 onClick={(event) => {
                   event.preventDefault();
@@ -559,19 +567,22 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
                 selectedHistorical.reload();
               }}
             />
-          ) : personalNote || creating ? (
-            <NoteEditor
-              key={personalNote?.id || editorId}
-              creationId={personalNote?.id || editorId}
-              prelinkType={params.get('targetType')}
-              prelinkId={params.get('targetId')}
-              initial={personalNote}
-              initialKind={kind}
-              types={noteTypes.data || ['Therapy', 'Primary care', 'Specialist']}
-              personOptions={personFilters.data || undefined}
-              onSaved={afterSaved}
-              onRefresh={handleNoteRefresh}
-            />
+          ) : personalNote || (creating && !personScope?.pending && !personScope?.error) ? (
+            <>
+              <NoteEditor
+                key={`${personalNote?.id || editorId}:${personalNote?.ownerPersonId || ownerPersonId}`}
+                creationId={personalNote?.id || editorId}
+                prelinkType={params.get('targetType')}
+                prelinkId={params.get('targetId')}
+                initial={personalNote}
+                initialOwnerPersonId={ownerPersonId}
+                initialKind={kind}
+                types={noteTypes.data || ['Therapy', 'Primary care', 'Specialist']}
+                personOptions={personFilters.data || undefined}
+                onSaved={afterSaved}
+                onRefresh={handleNoteRefresh}
+              />
+            </>
           ) : (
             <div className="panel note-detail notes-empty">
               <BookOpen size={32} />

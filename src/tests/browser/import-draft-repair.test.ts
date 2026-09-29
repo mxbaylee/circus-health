@@ -19,11 +19,11 @@ test(
   { timeout: 90000 },
   async (t) => {
     fictionalModel(t);
-    const priorHealthDev = process.env.HEALTH_DEV;
-    process.env.HEALTH_DEV = '1';
+    const priorHealthDev = process.env.CRS_DEV;
+    process.env.CRS_DEV = '1';
     t.after(() => {
-      if (priorHealthDev === undefined) delete process.env.HEALTH_DEV;
-      else process.env.HEALTH_DEV = priorHealthDev;
+      if (priorHealthDev === undefined) delete process.env.CRS_DEV;
+      else process.env.CRS_DEV = priorHealthDev;
     });
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-draft-repair-'));
     mkdirSync(resolve(root, 'data'));
@@ -213,9 +213,8 @@ test(
     assert(proposedResponse.ok(), JSON.stringify(proposedBody));
     await page.goto(url + '/#/import');
     await page.reload();
-    await page.waitForTimeout(1500);
-    assert.match(await page.locator('body').innerText(), /Fictional original-only date/);
     await page.getByText('Fictional original-only date', { exact: true }).waitFor();
+    assert.match(await page.locator('body').innerText(), /Fictional original-only date/);
     await page
       .getByRole('checkbox', { name: 'Select Fictional original-only date', exact: true })
       .check();

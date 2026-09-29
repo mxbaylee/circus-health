@@ -173,11 +173,11 @@ for (const fallback of [false, true])
     });
     const bridge = new ProxyModelBridge({
       config: modelConfig({
-        HEALTH_AI_MODEL: 'fictional-repair-model',
-        HEALTH_AI_BASE_URL: 'http://litellm:4000',
-        HEALTH_AI_API_KEY: 'fictional-key',
-        HEALTH_AI_PROXY_IMAGES: String(fallback),
-        HEALTH_AI_PROXY_PDF: 'true',
+        CRS_AI_MODEL: 'fictional-repair-model',
+        CRS_AI_BASE_URL: 'http://litellm:4000',
+        CRS_AI_API_KEY: 'fictional-key',
+        CRS_AI_PROXY_IMAGES: String(fallback),
+        CRS_AI_PROXY_PDF: 'true',
       }),
       resolveHost: async () => [{ address: '127.0.0.1', family: 4 }],
       fetchImpl: async (_url, init) => {

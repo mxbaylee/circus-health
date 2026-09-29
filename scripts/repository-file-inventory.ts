@@ -115,7 +115,7 @@ const exact: Record<string, Classification> = {
     category: 'server-test',
     role: 'obsolete opt-in integration test',
     purpose:
-      'Retains an older native-provider workflow gated by `HEALTH_AI_NATIVE_WORKFLOW_TEST=1` that conflicts with current LiteLLM-only config.',
+      'Retains an older native-provider workflow gated by `CRS_AI_NATIVE_WORKFLOW_TEST=1` that conflicts with current LiteLLM-only config.',
   },
   'src/server/test/archive-rebuild.integration.test.ts': {
     category: 'server-test',
@@ -125,17 +125,17 @@ const exact: Record<string, Classification> = {
   'src/server/test/launch.integration.test.ts': {
     category: 'server-test',
     role: 'opt-in Docker integration test',
-    purpose: 'Runs the full launcher workflow only when `HEALTH_LAUNCH_TEST=1`.',
+    purpose: 'Runs the full launcher workflow only when `CRS_LAUNCH_TEST=1`.',
   },
   'src/server/test/model-providers.integration.test.ts': {
     category: 'server-test',
     role: 'opt-in live-provider test',
-    purpose: 'Checks a configured live model only when `HEALTH_AI_LIVE_TEST=1`.',
+    purpose: 'Checks a configured live model only when `CRS_AI_LIVE_TEST=1`.',
   },
   'src/server/test/proxy-model-bridge.integration.test.ts': {
     category: 'server-test',
     role: 'opt-in Docker integration test',
-    purpose: 'Checks the LiteLLM container bridge only when `HEALTH_LITELLM_INTEGRATION_TEST=1`.',
+    purpose: 'Checks the LiteLLM container bridge only when `CRS_LITELLM_INTEGRATION_TEST=1`.',
   },
   'src/server/assistant-instructions.md': {
     category: 'runtime-instruction',

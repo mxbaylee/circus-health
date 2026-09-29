@@ -44,7 +44,7 @@ test(
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
-    const visuals = process.env.HEALTH_PROFILE_VISUAL_DIR;
+    const visuals = process.env.CRS_PROFILE_VISUAL_DIR;
     async function capture(prefix: string) {
       if (!visuals) return;
       assert(!resolve(visuals).startsWith(fileURLToPath(new URL('../../../', import.meta.url))));
@@ -125,7 +125,7 @@ test(
     );
     await page.getByRole('button', { name: 'Create profile', exact: true }).click();
     await page.getByLabel('Display name', { exact: true }).fill('Fictional Apricot');
-    await page.getByLabel('Full name on health records').fill('Fictional Apricot');
+    await page.getByLabel('Your name').fill('Fictional Apricot');
     await page.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
     await page.getByRole('button', { name: 'Continue to recovery key' }).click();
     const firstRecovery = await page.getByLabel('Recovery key', { exact: true }).inputValue();
@@ -136,10 +136,8 @@ test(
     const recoveryChoice = page.getByRole('dialog', { name: 'Recovery unlocked', exact: true });
     await recoveryChoice.getByRole('button', { name: 'Add passkey', exact: true }).waitFor();
     await recoveryChoice.getByRole('button', { name: 'Skip', exact: true }).click();
-    const onboarding = page.getByRole('dialog', { name: 'A little about you' });
-    await onboarding.getByRole('heading', { name: 'About you', exact: true }).waitFor();
-    await onboarding.getByLabel('Pronouns', { exact: true }).fill('they/them');
-    await onboarding.getByRole('button', { name: 'Save and continue' }).click();
+    const onboarding = page.getByRole('dialog', { name: 'Care contacts' });
+    assert.equal(await onboarding.getByLabel('Pronouns', { exact: true }).count(), 0);
     await onboarding.getByRole('heading', { name: 'Primary care provider', exact: true }).waitFor();
     assert.equal(await onboarding.getByLabel('Scheduling URL').count(), 0);
     const stagedProfile = (await api('/api/profiles'))[0];
@@ -179,6 +177,9 @@ test(
         person: {
           ...stagedSelf.person,
           onboarding: {
+            completedSteps: ['about-you'],
+            skippedSteps: [],
+            finished: false,
             ...stagedSelf.person.onboarding,
             careTeam: { primaryCareId: priorPrimary, emergencyContactId: priorEmergency },
           },

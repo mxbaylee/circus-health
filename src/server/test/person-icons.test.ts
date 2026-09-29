@@ -80,3 +80,61 @@ test('Self icon publishes versioned identity, restores append-only and survives 
   assert.equal(page.selected?.collection, 'people');
   assert.equal(page.selected?.id, 'patient');
 });
+
+test('new people get durable varied defaults and cannot share a display name and icon', (t) => {
+  const root = mkdtempSync(resolve(tmpdir(), 'health-person-defaults-'));
+  const db = openDatabase(resolve(root, 'test.sqlite'), 'fictional');
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const input = { id: `note:${randomUUID()}`, kind: 'person', title: 'Cookie Doe' };
+  const first = createNote(db, input);
+  assert.ok(first.person.icon?.startsWith('lucide:'));
+  assert.equal(
+    createNote(db, input).person.icon,
+    first.person.icon,
+    'retry preserves random selection',
+  );
+  const second = createNote(db, { kind: 'person', title: 'Cookie Doe' });
+  assert.notEqual(second.person.icon, first.person.icon, 'same-name defaults cannot collide');
+  assert.throws(
+    () =>
+      createNote(db, {
+        kind: 'person',
+        title: ' cookie   DOE ',
+        person: { icon: first.person.icon },
+      }),
+    /display name and icon/,
+  );
+  assert.throws(
+    () =>
+      saveNote(db, second.id, { ...second, person: { ...second.person, icon: first.person.icon } }),
+    /display name and icon/,
+  );
+  assert.equal(getNote(db, second.id).person.icon, second.person.icon, 'failed save is atomic');
+  const third = createNote(db, { kind: 'person', title: 'Another Doe', person: { icon: 'star' } });
+  assert.throws(
+    () => createNote(db, { kind: 'person', title: third.title, person: { icon: 'lucide:star' } }),
+    /display name and icon/,
+  );
+  createNote(db, { kind: 'person', title: 'Cookie Alarm', person: { icon: 'lucide:alarm-check' } });
+  assert.throws(
+    () =>
+      createNote(db, {
+        kind: 'person',
+        title: 'COOKIE ALARM',
+        person: { icon: 'lucide:alarm-clock-check' },
+      }),
+    /display name and icon/,
+  );
+  const self = getNote(db, 'patient');
+  assert.throws(
+    () =>
+      saveNote(db, self.id, {
+        ...self,
+        person: { ...self.person, name: third.title, icon: 'star' },
+      }),
+    /display name and icon/,
+  );
+});

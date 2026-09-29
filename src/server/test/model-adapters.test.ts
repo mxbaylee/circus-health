@@ -28,9 +28,9 @@ const receipt = (value: Record<string, unknown>): AvailabilityReceipt =>
   value as unknown as AvailabilityReceipt;
 
 const env = {
-  HEALTH_AI_MODEL: 'fictional-alias',
-  HEALTH_AI_BASE_URL: 'http://litellm:4000',
-  HEALTH_AI_API_KEY: 'fictional-secret',
+  CRS_AI_MODEL: 'fictional-alias',
+  CRS_AI_BASE_URL: 'http://litellm:4000',
+  CRS_AI_API_KEY: 'fictional-secret',
 };
 const config = (extra: NodeJS.ProcessEnv = {}) => modelConfig({ ...env, ...extra });
 const roundTrip: BridgeFactory = (callbacks) => ({
@@ -58,7 +58,7 @@ test('configuration defaults to LiteLLM and rejects every legacy backend', () =>
   assert.equal(config().backend, 'litellm');
   assert.ok(createModelBridge({ config: config() }) instanceof ProxyModelBridge);
   for (const backend of ['codex', 'anthropic', 'ollama', 'agent', 'other']) {
-    assert.throws(() => config({ HEALTH_AI_BACKEND: backend }), /Only LiteLLM Proxy/);
+    assert.throws(() => config({ CRS_AI_BACKEND: backend }), /Only LiteLLM Proxy/);
     assert.throws(
       // @ts-expect-error Deliberately exercise runtime rejection of legacy backends.
       () => createModelBridge({ config: { ...config(), backend } }),
@@ -74,16 +74,16 @@ test('credentials stay outside the archive and public configuration redacts them
   mkdirSync(data);
   const file = join(dir, 'key');
   writeFileSync(file, 'mounted-fictional-key\n');
-  const c = config({ DATA_DIR: data, HEALTH_AI_API_KEY: '', HEALTH_AI_API_KEY_FILE: file });
+  const c = config({ CRS_DATA_DIR: data, CRS_AI_API_KEY: '', CRS_AI_API_KEY_FILE: file });
   assert.equal(c.apiKey, 'mounted-fictional-key');
   assert.ok(!JSON.stringify(publicModelConfig(c)).includes('mounted-fictional-key'));
   const nested = join(data, 'key');
   writeFileSync(nested, 'fictional');
   assert.throws(
-    () => config({ DATA_DIR: data, HEALTH_AI_API_KEY: '', HEALTH_AI_API_KEY_FILE: nested }),
+    () => config({ CRS_DATA_DIR: data, CRS_AI_API_KEY: '', CRS_AI_API_KEY_FILE: nested }),
     /outside/,
   );
-  assert.throws(() => config({ HEALTH_AI_API_KEY_FILE: file }), /only one/);
+  assert.throws(() => config({ CRS_AI_API_KEY_FILE: file }), /only one/);
 });
 
 test('advertised proxy capabilities do not establish readiness without a fictional round trip', async () => {
@@ -105,7 +105,7 @@ test('advertised proxy capabilities do not establish readiness without a fiction
 });
 
 test('declared PDF input is exposed separately from fictional connection proof', async () => {
-  const c = config({ HEALTH_AI_MODEL: 'fictional-pdf-declaration', HEALTH_AI_PROXY_PDF: 'true' });
+  const c = config({ CRS_AI_MODEL: 'fictional-pdf-declaration', CRS_AI_PROXY_PDF: 'true' });
   assert.deepEqual(publicModelConfig(c).declaredCapabilities, { pdf: true });
   const initial = await modelAvailability({ config: c });
   assert.equal(initial.available, false);
@@ -118,9 +118,9 @@ test('declared PDF input is exposed separately from fictional connection proof',
 
 test('PDF declarations alone cannot establish native readiness', async () => {
   const c = config({
-    HEALTH_AI_MODEL: 'fictional-pdf-only-preflight',
-    HEALTH_AI_PROXY_PDF: 'true',
-    HEALTH_AI_PROXY_IMAGES: 'false',
+    CRS_AI_MODEL: 'fictional-pdf-only-preflight',
+    CRS_AI_PROXY_PDF: 'true',
+    CRS_AI_PROXY_IMAGES: 'false',
   });
   const factory: BridgeFactory = (callbacks) => ({
     ...roundTrip(callbacks),
@@ -133,7 +133,7 @@ test('PDF declarations alone cannot establish native readiness', async () => {
 });
 
 test('answers without the tool response revoke readiness; image configuration alone cannot prove vision', async () => {
-  const c = config({ HEALTH_AI_MODEL: 'failure-fixture' });
+  const c = config({ CRS_AI_MODEL: 'failure-fixture' });
   await testModelConnection({ config: c, bridgeFactory: roundTrip });
   await assert.rejects(
     testModelConnection({
@@ -150,7 +150,7 @@ test('answers without the tool response revoke readiness; image configuration al
     /did not demonstrate/,
   );
   assert.equal((await modelAvailability({ config: c })).available, false);
-  const vision = config({ HEALTH_AI_MODEL: 'vision-fixture', HEALTH_AI_PROXY_IMAGES: 'true' });
+  const vision = config({ CRS_AI_MODEL: 'vision-fixture', CRS_AI_PROXY_IMAGES: 'true' });
   await assert.rejects(
     testModelConnection({ config: vision, image: true, bridgeFactory: roundTrip }),
     /image reading/,
@@ -160,7 +160,7 @@ test('answers without the tool response revoke readiness; image configuration al
 
 test('automatic preflight shares fictional probes, reuses proof and rechecks changed configuration', async () => {
   let probes = 0;
-  const c = config({ HEALTH_AI_MODEL: 'automatic-preflight' });
+  const c = config({ CRS_AI_MODEL: 'automatic-preflight' });
   const factory: BridgeFactory = (callbacks) => {
     probes++;
     return roundTrip(callbacks);
@@ -187,7 +187,7 @@ test('automatic preflight shares fictional probes, reuses proof and rechecks cha
 
 test('connection proof and in-flight probes remain profile scoped', async () => {
   let probes = 0;
-  const c = config({ HEALTH_AI_MODEL: 'profile-scoped-preflight' });
+  const c = config({ CRS_AI_MODEL: 'profile-scoped-preflight' });
   const factory: BridgeFactory = (callbacks: BridgeCallbacks) => {
     probes++;
     const bridge = roundTrip(callbacks);
@@ -221,7 +221,7 @@ test('connection proof and in-flight probes remain profile scoped', async () => 
 });
 
 test('a failed automatic preflight is retryable and never establishes readiness', async () => {
-  const c = config({ HEALTH_AI_MODEL: 'automatic-retry' });
+  const c = config({ CRS_AI_MODEL: 'automatic-retry' });
   await assert.rejects(
     ensureModelConnection({
       config: c,

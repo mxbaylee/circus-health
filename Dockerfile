@@ -10,17 +10,19 @@ RUN mkdir -p /app/src/assets /app/src/app/components /app/src/public
 ENTRYPOINT ["node", "src/scripts/generate-brand-assets.ts"]
 
 FROM dependencies AS build
+ARG CRS_BUILD_REVISION=unknown
+ARG CRS_BUILD_WORKTREE=unknown
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY deploy/*.ts ./deploy/
 COPY tsconfig*.json vite.config.ts vitest.config.ts commitlint.config.ts ./
 COPY .prettierrc.json .prettierignore /app/
-RUN npm run build -- --logLevel warn && npm prune --omit=dev --no-fund --no-audit
+RUN CRS_BUILD_REVISION="$CRS_BUILD_REVISION" CRS_BUILD_WORKTREE="$CRS_BUILD_WORKTREE" npm run build -- --logLevel warn && npm prune --omit=dev --no-fund --no-audit
 
 FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df AS runtime
-ENV NODE_ENV=production DATA_DIR=/archive/data HEALTH_RUNTIME_DIR=/run/health PORT=3001 PLAYWRIGHT_BROWSERS_PATH=/opt/playwright HEALTH_AI_BACKEND=litellm
+ENV NODE_ENV=production CRS_DATA_DIR=/archive/data CRS_RUNTIME_DIR=/run/health CRS_PORT=3001 PLAYWRIGHT_BROWSERS_PATH=/opt/playwright CRS_AI_BACKEND=litellm
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends qpdf && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends qpdf tesseract-ocr tesseract-ocr-eng && rm -rf /var/lib/apt/lists/*
 COPY LICENSE THIRD-PARTY-NOTICES.md /app/
 COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules

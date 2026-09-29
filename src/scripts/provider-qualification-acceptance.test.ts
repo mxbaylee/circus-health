@@ -103,14 +103,24 @@ test(
       const anchor =
         lines.find((line) => line.includes('FICTIONAL'))?.trim() ??
         'FICTIONAL CLINICAL QUALIFICATION REPORT';
-      const subject =
+      const subjectLine =
         lines.find((line) => line.includes('Patient:'))?.trim() ??
         `Patient: ${qualificationPerson}.`;
       const birth =
         lines.find((line) => line.includes('DOB:'))?.trim() ??
         `Patient DOB: ${qualificationBirthDate}.`;
-      const fullName = /Patient:\s*(.*?)\./.exec(subject)![1]!;
-      identityByPage.set(page, { anchor, subject, textAnchor: `${subject}\n${birth}`, fullName });
+      const patientField = /Patient:\s*(.*?)\./.exec(subjectLine)!;
+      const fullName = patientField[1]!;
+      // This independently generated proposal selects the literal patient field,
+      // not the surrounding page counter/sentence as a supposed personal name.
+      const subject = patientField[0].slice(0, -1);
+      assert.ok(subjectLine.includes(subject));
+      identityByPage.set(page, {
+        anchor,
+        subject,
+        textAnchor: `${subjectLine}\n${birth}`,
+        fullName,
+      });
     }
     const proposals: HealthRecordEnvelope[] = qualificationAnswers.map((answer) => ({
       format: 'health-record-v1',

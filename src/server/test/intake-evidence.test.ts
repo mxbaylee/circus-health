@@ -233,11 +233,11 @@ test('native PDF package evidence and fallback preserve the exact member and sel
 
 test('PDF range session reads retained files above the whole-document extraction gate without whole-file buffers', async (t) => {
   const f = fixture(t);
-  const previousLimit = process.env.HEALTH_INTAKE_EXTRACTION_MIB;
-  process.env.HEALTH_INTAKE_EXTRACTION_MIB = '1';
+  const previousLimit = process.env.CRS_INTAKE_EXTRACTION_MIB;
+  process.env.CRS_INTAKE_EXTRACTION_MIB = '1';
   t.after(async () => {
-    if (previousLimit === undefined) delete process.env.HEALTH_INTAKE_EXTRACTION_MIB;
-    else process.env.HEALTH_INTAKE_EXTRACTION_MIB = previousLimit;
+    if (previousLimit === undefined) delete process.env.CRS_INTAKE_EXTRACTION_MIB;
+    else process.env.CRS_INTAKE_EXTRACTION_MIB = previousLimit;
     await disposePdfEvidenceSessions(f.profileId);
   });
   const bytes = syntheticPdf(

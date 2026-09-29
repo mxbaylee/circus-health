@@ -274,8 +274,8 @@ test(
     assert.equal(added.action, 'add');
     assert.notEqual(added.noteId, existing.id);
     await juniperReview.getByRole('link', { name: 'Open saved person', exact: true }).click();
-    await page.getByLabel('Full name', { exact: true }).waitFor();
-    assert.equal(await page.getByLabel('Full name', { exact: true }).inputValue(), 'Juniper Vale');
+    await page.getByRole('combobox', { name: 'Names', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Remove name Juniper Vale', exact: true }).waitFor();
     assert.match(page.url(), new RegExp(`[#/]people\\?id=${encodeURIComponent(added.noteId)}`));
     const importedEvidence = page.getByRole('region', { name: 'Imported source evidence' });
     await importedEvidence.getByText('No saved health entry cites this exact source.').waitFor();

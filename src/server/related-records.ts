@@ -129,7 +129,8 @@ export function relatedRecordIds(
       SELECT id, ${exactCode} AS same_code, ${exactLabel} AS same_label, ${labelTerms} AS label_terms,
         ${searchMatch} AS search_match, ${sameDate} AS same_date, ${sameIssuer} AS same_issuer
       FROM ${tables[input.kind]}
-      WHERE COALESCE(json_extract(extra_json,'$.import.identity'),'')!=${parameter(input.identity)}
+      WHERE ${input.kind === 'document' ? "COALESCE(json_extract(extra_json,'$.import.personId'),'patient')" : 'person_id'}=${parameter(input.mapping.personId || (input.mapping.subject === 'self' ? 'patient' : 'unassigned'))}
+        AND COALESCE(json_extract(extra_json,'$.import.identity'),'')!=${parameter(input.identity)}
         AND EXISTS(SELECT 1 FROM evidence e JOIN source_records s ON s.id=e.source_record_id WHERE e.entity_type=${parameter(input.kind)} AND e.entity_id=${tables[input.kind]}.id)
     )
     SELECT * FROM candidates WHERE ${query ? 'search_match' : '(same_code OR same_label OR label_terms)'}

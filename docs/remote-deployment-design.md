@@ -220,7 +220,7 @@ emits one, the whole of A2 reduces to reading a header in `proxy-model-bridge.ts
 reads no response headers at all. Do not build the callback before answering this.
 
 If no such header exists, the callback pattern is already established. A second `CustomLogger`
-module, gated by a new `CIRCUS_LITELLM_TIMING` flag validated exactly like the two existing flags
+module, gated by a new `CRS_LITELLM_TIMING` flag validated exactly like the two existing flags
 at [configure.py:110](../deploy/litellm/configure.py), recording `start_time`, `end_time`, model and
 a correlation identifier. Never bodies, never prompts. Note that `litellm_settings['callbacks']` is
 assigned rather than appended, so enabling more than one project callback requires building that
@@ -253,7 +253,7 @@ Permitted, with four constraints.
 
 Three, as tests and startup assertions rather than documentation.
 
-- **Raw response capture is off.** `CIRCUS_LITELLM_CAPTURE_RESPONSE` must be `false` and
+- **Raw response capture is off.** `CRS_LITELLM_CAPTURE_RESPONSE` must be `false` and
   `/tmp/circus-litellm-response-body.txt` must not exist. This is the one place plaintext clinical
   content reaches disk today: [response_diagnostics.py](../deploy/litellm/response_diagnostics.py)
   writes up to 8 MiB of raw model response body under that flag. It is already default-off, mode
@@ -262,7 +262,7 @@ Three, as tests and startup assertions rather than documentation.
 - **Loopback gating is not a host header.** `runtime.ts` currently returns 403 unless the `Host`
   header matches `127.0.0.1` or `localhost`. Behind any reverse proxy that rejects the healthcheck
   and the deploy feedback loop; worse, a request to a public interface carrying `Host: localhost`
-  passes it. Today the compose binding `127.0.0.1:${PORT}:3001` provides the real protection, and
+  passes it. Today the compose binding `127.0.0.1:${CRS_PORT}:3001` provides the real protection, and
   hosting removes that binding. Replace the header test with a trusted-peer or explicit
   allowed-origin check before any remote exposure.
 - **Pre-login disclosure is a decision, not an inheritance.** `GET /api/profiles` exposes display
@@ -326,11 +326,11 @@ Not bandwidth. With fast symmetric residential service the transport cost is not
 100 MiB at 500 Mbit/s is roughly 1.6 seconds and 31 round trips at 20 ms is roughly 1.2 seconds,
 against a measured 923-second import. The real items are:
 
-- **Provider authentication state moves.** `CIRCUS_AUTH_DIR` holds the ChatGPT `auth.json` and is
+- **Provider authentication state moves.** `CRS_AUTH_DIR` holds the ChatGPT `auth.json` and is
   bind-mounted into the proxy container. Hosted, it lives on the server, and `npm run login:chatgpt`
   must target the remote. This is the largest piece of work in this section.
 - **Shared master key.** Currently generated per run and mounted as a Docker secret from
-  `CIRCUS_PROXY_KEY`. Both the local app and the hosted app need the same value, provisioned
+  `CRS_PROXY_KEY`. Both the local app and the hosted app need the same value, provisioned
   deliberately.
 - **Offline capability regresses** in mode 1 whenever connectivity is lost. The additive
   `LITELLM_URL` design preserves the local fallback.
@@ -416,7 +416,7 @@ at home. The first two are one vendor and one account, so they share failure mod
 compromise, billing suspension, a deletion with a shared token — which is exactly what the third
 copy answers. Scope the object-storage key to write without delete.
 
-Back up `DATA_DIR` specifically. Whole-disk server snapshots are not a substitute: they sweep up
+Back up `CRS_DATA_DIR` specifically. Whole-disk server snapshots are not a substitute: they sweep up
 provider credentials and the proxy key alongside the archive, which `home-cloud-deployment.md`
 warns against. Provider authentication state is backed up separately.
 
@@ -498,7 +498,7 @@ The mechanism that solves this already exists. CRS-039 implemented continuation:
 retain unconsumed evidence for a later slice, the conversion checkpoint is durable, and Stop and
 lock are immediate. The deploy sequence is therefore **drain, stop, swap, restart, resume**, where
 draining stops new work from starting and allows the in-flight provider request to complete within
-`HEALTH_AI_PROXY_TIMEOUT_SECONDS` rather than cancelling it and discarding tokens already spent.
+`CRS_AI_PROXY_TIMEOUT_SECONDS` rather than cancelling it and discarding tokens already spent.
 Size the drain deadline against that request timeout rather than the swap window; 60 seconds is a
 reasonable starting point, since waiting the full 300 seconds makes every deployment potentially
 five minutes long to save one request's tokens.

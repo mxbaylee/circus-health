@@ -25,9 +25,13 @@ import '../clinical.css';
 export function SourcePreview({
   file,
   label = 'Open original file',
+  initialPage,
+  compact = false,
 }: {
   file: Pick<SourceFile, 'archived' | 'id' | 'contentUrl' | 'bytes' | 'mimeType' | 'path'>;
   label?: string;
+  initialPage?: number;
+  compact?: boolean;
 }) {
   const [failed, setFailed] = useState(false);
   useEffect(() => setFailed(false), [file.id, file.contentUrl]);
@@ -35,12 +39,14 @@ export function SourcePreview({
   return (
     <div className="source-preview">
       {file.archived && <span className="soft-badge">Archived file</span>}
-      <p>
-        <a className="text-link" href={file.contentUrl} target="_blank" rel="noreferrer">
-          {label} <ExternalLink size={15} />
-        </a>{' '}
-        <span className="muted">{formatBytes(file.bytes)}</span>
-      </p>
+      {(!compact || file.mimeType !== 'application/pdf') && (
+        <p>
+          <a className="text-link" href={file.contentUrl} target="_blank" rel="noreferrer">
+            {label} <ExternalLink size={15} />
+          </a>{' '}
+          <span className="muted">{formatBytes(file.bytes)}</span>
+        </p>
+      )}
       {isImage && !failed && (
         <a href={file.contentUrl} target="_blank" rel="noreferrer">
           <img
@@ -52,6 +58,8 @@ export function SourcePreview({
       )}
       {file.mimeType === 'application/pdf' && (
         <PdfPreview
+          compact={compact}
+          initialPage={initialPage}
           contentUrl={file.contentUrl}
           filename={file.path.split('/').pop() ?? 'Source PDF'}
         />

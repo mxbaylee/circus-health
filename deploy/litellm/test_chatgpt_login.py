@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from litellm.llms.chatgpt.authenticator import Authenticator
 
-script = Path(os.environ.get('CIRCUS_LOGIN_SCRIPT', Path(__file__).parent / 'login.py'))
+script = Path(os.environ.get('CRS_LOGIN_SCRIPT', Path(__file__).parent / 'login.py'))
 spec = importlib.util.spec_from_file_location('circus_login', script)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)

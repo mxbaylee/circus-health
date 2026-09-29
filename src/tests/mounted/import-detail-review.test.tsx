@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';
 import { StrictMode } from 'react';
@@ -18,6 +18,14 @@ import { replaceProfiles, selectProfile } from '../../app/data/profile';
 vi.mock('../../app/components/SourceDialog', () => ({
   SourcePreview: () => <div>Retained original preview</div>,
 }));
+
+async function openPersonContext() {
+  fireEvent.click(await screen.findByRole('button', { name: /person for this report/ }));
+}
+
+async function openSourceContext() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Change source for this report' }));
+}
 
 const intake = {
   id: 'fictional-intake',
@@ -208,6 +216,7 @@ it.each([true, false])(
   async (readyAfterRefresh) => {
     selectProfile({ id: 'fictional-grounding-detail', name: 'Rowan', placebo: true });
     let detailReads = 0;
+    const onBack = vi.fn();
     const prior: IntakeIdentityReview = {
       ...identityReview,
       status: 'prior_confirmation',
@@ -263,7 +272,7 @@ it.each([true, false])(
       <MemoryRouter>
         <ImportDetailReview
           selection={{ groupId: 'fictional-report' }}
-          onBack={() => {}}
+          onBack={onBack}
           onChanged={() => {}}
           onUseSource={() => {}}
         />
@@ -274,7 +283,11 @@ it.each([true, false])(
       await new Promise((resolve) => setTimeout(resolve, 30));
     });
     expect(detailReads).toBe(2);
+    await openPersonContext();
     expect(await screen.findByText('This report already matches Self.')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(onBack).toHaveBeenCalledOnce();
     expect(requests.some((url) => url.endsWith('/identity-scope'))).toBe(false);
     expect(requests.some((url) => url.includes('/report-acceptance'))).toBe(false);
   },
@@ -1090,6 +1103,7 @@ it('keeps uncertain metadata edits across refresh and blocks navigation until re
 
   await user.click(screen.getByRole('button', { name: 'Back to Import' }));
   expect(onBack).not.toHaveBeenCalled();
+  await openPersonContext();
   await user.click(screen.getByRole('button', { name: 'This is me and add selected details' }));
   await waitFor(() => expect(identitySaved).toBe(true));
   expect(await screen.findByRole('button', { name: 'Save file details' })).toBeInTheDocument();
@@ -1152,8 +1166,9 @@ it('keeps exact identity and selected blank Self fields in one deep-linked Impor
     </StrictMode>,
   );
 
+  await openPersonContext();
   await waitFor(() => {
-    expect(screen.getByRole('checkbox', { name: /Full name/ })).toBeChecked();
+    expect(screen.queryByRole('checkbox', { name: /Full name/ })).toBeNull();
     expect(screen.getByRole('checkbox', { name: /Date of birth/ })).toBeChecked();
   });
   await user.click(screen.getByRole('button', { name: 'This is me and add selected details' }));
@@ -1165,12 +1180,14 @@ it('keeps exact identity and selected blank Self fields in one deep-linked Impor
         return (
           value.outcome === 'this_is_me' &&
           value.selfUpdate?.expectedVersion === 4 &&
-          value.selfUpdate?.fields.fullName === 'Rowan Ellis' &&
+          value.selfUpdate?.fields.fullName === undefined &&
           value.selfUpdate?.fields.birthDate === '1988-04-12'
         );
       }),
     ).toBe(true),
   );
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  await openPersonContext();
   expect(
     await screen.findByText(
       'Identity and the selected blank Self details were confirmed in one action. Clinical records are not saved yet.',
@@ -1183,11 +1200,11 @@ it('keeps exact identity and selected blank Self fields in one deep-linked Impor
   ).toHaveLength(1);
 });
 
-it('preserves a declined Self field when a new field arrives in the same deep-linked report', async () => {
+it('preserves a declined date of birth when a name offer arrives in the same deep-linked report', async () => {
   selectProfile({ id: 'fictional-profile', name: 'Rowan', placebo: true });
-  const fullNameOnly: IntakeIdentityReview = {
+  const birthDateOnly: IntakeIdentityReview = {
     ...identityReview,
-    offeredSelfFields: { fullName: 'Rowan Ellis' },
+    offeredSelfFields: { birthDate: '1988-04-12' },
   };
   let identityReads = 0;
   const identityPosts: Record<string, unknown>[] = [];
@@ -1198,7 +1215,7 @@ it('preserves a declined Self field when a new field arrives in the same deep-li
       if (url.includes('/intakes/report-queue/fictional-report')) return response(reportDetail);
       if (url.includes('/identity-review')) {
         identityReads += 1;
-        return response(identityReads === 1 ? fullNameOnly : identityReview);
+        return response(identityReads === 1 ? birthDateOnly : identityReview);
       }
       if (url.includes('/intakes/people/fictional-report'))
         return response({
@@ -1224,10 +1241,11 @@ it('preserves a declined Self field when a new field arrives in the same deep-li
     />,
   );
 
-  const fullName = await screen.findByRole('checkbox', { name: /Full name/ });
-  await waitFor(() => expect(fullName).toBeChecked());
-  await user.click(fullName);
-  expect(fullName).not.toBeChecked();
+  await openPersonContext();
+  const birthDate = await screen.findByRole('checkbox', { name: /Date of birth/ });
+  await waitFor(() => expect(birthDate).toBeChecked());
+  await user.click(birthDate);
+  expect(birthDate).not.toBeChecked();
 
   const refreshIdentity = () => {
     const restored = new Event('pageshow');
@@ -1237,23 +1255,20 @@ it('preserves a declined Self field when a new field arrives in the same deep-li
   refreshIdentity();
   await waitFor(() => expect(identityReads).toBe(2));
   await waitFor(() => {
-    expect(screen.getByRole('checkbox', { name: /Full name/ })).not.toBeChecked();
-    expect(screen.getByRole('checkbox', { name: /Date of birth/ })).toBeChecked();
+    expect(screen.queryByRole('checkbox', { name: /Full name/ })).toBeNull();
+    expect(screen.getByRole('checkbox', { name: /Date of birth/ })).not.toBeChecked();
   });
 
   refreshIdentity();
   await waitFor(() => expect(identityReads).toBe(3));
   await waitFor(() => {
-    expect(screen.getByRole('checkbox', { name: /Full name/ })).not.toBeChecked();
-    expect(screen.getByRole('checkbox', { name: /Date of birth/ })).toBeChecked();
+    expect(screen.queryByRole('checkbox', { name: /Full name/ })).toBeNull();
+    expect(screen.getByRole('checkbox', { name: /Date of birth/ })).not.toBeChecked();
   });
 
   await user.click(screen.getByRole('button', { name: 'This is me and add selected details' }));
   await waitFor(() => expect(identityPosts).toHaveLength(1));
-  expect(identityPosts[0]!.selfUpdate).toEqual({
-    expectedVersion: identityReview.self.version,
-    fields: { birthDate: '1988-04-12' },
-  });
+  expect(identityPosts[0]!.selfUpdate).toBeUndefined();
 });
 
 it('completes one deep-linked identity action after exact late-reading freshness validation', async () => {
@@ -1308,9 +1323,12 @@ it('completes one deep-linked identity action after exact late-reading freshness
     />,
   );
 
+  await openPersonContext();
   await user.click(
     await screen.findByRole('button', { name: 'This is me and add selected details' }),
   );
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  await openPersonContext();
   expect(
     await screen.findByText(
       'Identity and the selected blank Self details were confirmed in one action. Clinical records are not saved yet.',
@@ -1323,9 +1341,9 @@ it('completes one deep-linked identity action after exact late-reading freshness
   expect((identityPosts[1]!.scope as { scopeToken: string }).scopeToken).toBe(
     'fictional-fresh-scope-token',
   );
-  expect((identityPosts[1]!.selfUpdate as { fields: object }).fields).toEqual(
-    identityReview.offeredSelfFields,
-  );
+  expect((identityPosts[1]!.selfUpdate as { fields: object }).fields).toEqual({
+    birthDate: identityReview.offeredSelfFields.birthDate,
+  });
 });
 
 it('recovers the exact uncertain second identity request without a third operation', async () => {
@@ -1380,6 +1398,7 @@ it('recovers the exact uncertain second identity request without a third operati
     />,
   );
 
+  await openPersonContext();
   const action = await screen.findByRole('button', {
     name: 'This is me and add selected details',
   });
@@ -1389,6 +1408,8 @@ it('recovers the exact uncertain second identity request without a third operati
     await screen.findByText('Fictional connection ended after the retry was sent'),
   ).toBeVisible();
   await user.click(action);
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  await openPersonContext();
   expect(
     await screen.findByText(
       'Identity and the selected blank Self details were confirmed in one action. Clinical records are not saved yet.',
@@ -1445,11 +1466,14 @@ it('never reuses a retained uncertain identity request in another profile', asyn
     />,
   );
 
+  await openPersonContext();
   await user.click(
     await screen.findByRole('button', { name: 'This is me and add selected details' }),
   );
   expect(await screen.findByText('Fictional uncertain first response')).toBeVisible();
-  selectProfile({ id: 'fictional-profile-b', name: 'Rowan B', placebo: true });
+  await act(async () => {
+    selectProfile({ id: 'fictional-profile-b', name: 'Rowan B', placebo: true });
+  });
   await waitFor(() =>
     expect(
       screen.getByRole('button', { name: 'This is me and add selected details' }),
@@ -1516,6 +1540,7 @@ it('does not retry when a BFCache restore invalidates the action during its fres
     />,
   );
 
+  await openPersonContext();
   await user.click(
     await screen.findByRole('button', { name: 'This is me and add selected details' }),
   );
@@ -1585,6 +1610,7 @@ it('does not retry after the deep-link selection changes during its fresh read',
     />,
   );
 
+  await openPersonContext();
   await user.click(
     await screen.findByRole('button', { name: 'This is me and add selected details' }),
   );
@@ -1660,6 +1686,7 @@ it('does not publish or retry after the deep-linked view unmounts during its fre
     />,
   );
 
+  await openPersonContext();
   await user.click(
     await screen.findByRole('button', { name: 'This is me and add selected details' }),
   );
@@ -1742,9 +1769,12 @@ it('refreshes an already-resolved identity race without asking for another confi
     />,
   );
 
+  await openPersonContext();
   await user.click(
     await screen.findByRole('button', { name: 'This is me and add selected details' }),
   );
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  await openPersonContext();
   expect(
     await screen.findByText(
       'This report identity was already confirmed. No additional confirmation was recorded.',
@@ -1790,6 +1820,7 @@ it('disables deep-linked identity confirmation while a restored page refreshes c
       onUseSource={() => {}}
     />,
   );
+  await openPersonContext();
   expect(
     await screen.findByRole('button', { name: 'This is me and add selected details' }),
   ).toBeEnabled();
@@ -1881,6 +1912,7 @@ it('keeps a restored stale identity action unavailable when refresh fails', asyn
       onUseSource={() => {}}
     />,
   );
+  await openPersonContext();
   expect(
     await screen.findByRole('button', { name: 'This is me and add selected details' }),
   ).toBeEnabled();
@@ -2028,6 +2060,7 @@ it('keeps report-scoped source confirmation available from exact Import detail',
     />,
   );
 
+  await openSourceContext();
   const label = await screen.findByLabelText('Report label');
   expect(
     screen.getByText(/Add a source for this report and eligible results you save/),
@@ -2154,6 +2187,7 @@ it('does not install a late failed-action source preflight into another report',
     />,
   );
   const user = userEvent.setup();
+  await openSourceContext();
   const label = await screen.findByLabelText('Report label');
   await user.type(label, 'Fictional source A');
   await user.click(await screen.findByRole('button', { name: 'Use report label for 1 record' }));
@@ -2174,4 +2208,267 @@ it('does not install a late failed-action source preflight into another report',
   await waitFor(() =>
     expect(screen.queryByRole('button', { name: 'Use report label for 2 records' })).toBeNull(),
   );
+});
+
+it('shows the applied source consistently over a retained original issuer and old suggestion', async () => {
+  selectProfile({ id: 'fictional-profile', name: 'Cookie', placebo: true });
+  const coverage = {
+    total: 1,
+    covered: 1,
+    uncovered: 0,
+    status: 'single' as const,
+    bySource: [{ source: 'Cookie Clinic', count: 1 }],
+  };
+  const sourceDetail: IntakeReportQueueDetail = {
+    ...reportDetail,
+    group: {
+      ...reportDetail.group,
+      source: 'Fictional original issuer',
+      sourceSuggestion: {
+        value: 'Fictional old suggestion',
+        contextId: 'fictional-context',
+        evidence: { label: 'Original issuer', locator: 'page 1' },
+      },
+      sourceCoverage: {
+        current: coverage,
+        saved: { total: 0, covered: 0, uncovered: 0, status: 'empty', bySource: [] },
+      },
+    },
+  };
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/intakes/report-queue/fictional-report')) return response(sourceDetail);
+      if (url.includes('/identity-review')) return response(identityReview);
+      if (url.includes('/report-source-review'))
+        return response({ targets: [], coverage, sourceEvidence: ['Fictional original issuer'] });
+      if (url.includes('/intakes/people/fictional-report'))
+        return response({
+          groupId: 'fictional-report',
+          people: [],
+          totalPeople: 0,
+          peopleNextCursor: null,
+        });
+      return response(intake);
+    }),
+  );
+  const onUseSource = vi.fn();
+  render(
+    <ImportDetailReview
+      selection={{ groupId: 'fictional-report', intakeId: intake.id }}
+      onBack={() => {}}
+      onChanged={() => {}}
+      onUseSource={onUseSource}
+    />,
+  );
+  const change = await screen.findByRole('button', { name: 'Change source for this report' });
+  expect(change).toHaveTextContent('Cookie Clinic');
+  expect(change).not.toHaveTextContent('Suggested');
+  fireEvent.click(change);
+  expect(await screen.findByLabelText('Report label')).toHaveValue('Cookie Clinic');
+  expect(screen.getByText(/Reviewed source: Cookie Clinic\./)).toBeVisible();
+  expect(screen.queryByText(/Suggested source—not applied yet/)).toBeNull();
+  expect(onUseSource).not.toHaveBeenCalled();
+});
+
+it('keeps a detailed dirty source transcription open and blocks acceptance, later and close', async () => {
+  selectProfile({ id: 'fictional-profile', name: 'Cookie Doe', placebo: true });
+  const posts: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = String(input);
+      if (init?.method === 'POST') {
+        posts.push(url);
+        return response(intake);
+      }
+      if (url.includes('/source-preview'))
+        return response({ text: 'Cookie Doe original unit 5.8 mg.' });
+      if (url.endsWith('/source-text'))
+        return response({
+          status: 'available',
+          summary: {
+            pages: 1,
+            spans: 1,
+            unresolved: 1,
+            exceptions: 0,
+            inspectedPages: 0,
+            status: 'needs-review',
+          },
+          revision: {
+            format: 'intake-source-text-v1',
+            id: 'cookie-text-one',
+            parentRevisionId: null,
+            profileId: 'fictional-profile',
+            intakeId: intake.id,
+            sourceHash: 'a'.repeat(64),
+            createdAt: '2026-09-27T00:00:00Z',
+            adapter: { name: 'fictional', version: '1' },
+            pages: [{ page: 1, disposition: 'extracted', inspected: false }],
+            spans: [
+              {
+                id: 'cookie-span',
+                text: 'Cookie Doe original unit 5.8 mg.',
+                region: { page: 1 },
+                provenance: 'native',
+              },
+            ],
+            issues: [],
+            relations: [],
+            protectedPages: [],
+            review: null,
+          },
+        });
+      if (url.includes('/intakes/report-queue/')) return response(reportDetail);
+      if (url.includes('/identity-review'))
+        return response({
+          ...identityReview,
+          status: 'evidenced_match',
+          blocking: false,
+          offeredSelfFields: {},
+        });
+      if (url.includes('/intakes/people/'))
+        return response({
+          groupId: 'fictional-report',
+          people: [],
+          totalPeople: 0,
+          peopleNextCursor: null,
+        });
+      if (url.includes('/review')) return response(review);
+      if (url.includes('/related-records')) return response({ records: [], nextCursor: null });
+      if (url.endsWith('/intakes/fictional-intake')) return response(intake);
+      return response([]);
+    }),
+  );
+  const onBack = vi.fn();
+  render(
+    <ImportDetailReview
+      selection={{
+        groupId: 'fictional-report',
+        intakeId: intake.id,
+        proposalId: block.proposalId,
+        recordId: record.id,
+      }}
+      onBack={onBack}
+      onChanged={() => {}}
+      onUseSource={() => {}}
+    />,
+  );
+  const accept = await screen.findByRole('button', { name: 'Confirm and save record' });
+  expect(accept).toBeEnabled();
+  const disclosure = screen.getByText('Extracted text & corrections').closest('details')!;
+  disclosure.open = true;
+  fireEvent(disclosure, new Event('toggle'));
+  fireEvent.change(await screen.findByRole('textbox', { name: 'Passage 1 · native' }), {
+    target: { value: 'Cookie Doe unsaved correction 5.8 g.' },
+  });
+  await waitFor(() => expect(accept).toBeDisabled());
+  await userEvent.click(
+    within(accept.parentElement!).getByRole('button', { name: 'Review later' }),
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Back to Import' }));
+  expect(screen.getByDisplayValue('Cookie Doe unsaved correction 5.8 g.')).toBeVisible();
+  expect(screen.getByText('Save or discard the source text draft before leaving.')).toBeVisible();
+  expect(onBack).not.toHaveBeenCalled();
+  expect(posts.filter((url) => !url.endsWith('/import-diagnostics'))).toEqual([]);
+});
+
+it('shows all core fields and resolves only the edited uncertainty without accepting or changing identity', async () => {
+  selectProfile({ id: 'fictional-profile', name: 'Cookie Doe', placebo: true });
+  const pending = {
+    ...record,
+    issues: [
+      {
+        id: 'cookie-value',
+        kind: 'uncertain_reading' as const,
+        field: 'valueText',
+        prompt: 'Verify this result.',
+        blocking: true,
+        status: 'unresolved' as const,
+        locator: 'page 2',
+        questionId: null,
+      },
+      {
+        id: 'cookie-date',
+        kind: 'date' as const,
+        field: 'date',
+        prompt: 'Verify the date.',
+        blocking: true,
+        status: 'unresolved' as const,
+        locator: 'page 2',
+        questionId: null,
+      },
+      {
+        id: 'cookie-identity',
+        kind: 'identity' as const,
+        field: 'subject',
+        prompt: 'Does this record belong to you?',
+        blocking: true,
+        status: 'unresolved' as const,
+        locator: 'page 2',
+        questionId: null,
+      },
+    ],
+  };
+  const writes: { url: string; body: any }[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = String(input);
+      if (init?.method === 'POST') {
+        writes.push({ url, body: JSON.parse(String(init.body)) });
+        return response({ ...intake, version: 8 });
+      }
+      if (url.includes('/intakes/report-queue/'))
+        return response({ ...reportDetail, blocks: [{ ...block, records: [pending] }] });
+      if (url.includes('/identity-review')) return response(identityReview);
+      if (url.includes('/intakes/people/'))
+        return response({
+          groupId: 'fictional-report',
+          people: [],
+          totalPeople: 0,
+          peopleNextCursor: null,
+        });
+      if (url.includes('/review')) return response({ ...review, records: [pending] });
+      if (url.endsWith('/intakes/fictional-intake')) return response(intake);
+      return response([]);
+    }),
+  );
+  const onBack = vi.fn();
+  render(
+    <ImportDetailReview
+      embedded
+      selection={{
+        groupId: 'fictional-report',
+        intakeId: intake.id,
+        proposalId: block.proposalId,
+        recordId: record.id,
+      }}
+      onBack={onBack}
+      onChanged={() => {}}
+      onUseSource={() => {}}
+    />,
+  );
+  const result = await screen.findByRole('textbox', { name: 'Result' });
+  expect(screen.getByRole('textbox', { name: 'Test name' })).toHaveValue('Ferritin');
+  expect(screen.getByRole('textbox', { name: 'Unit' })).toHaveValue('ng/mL');
+  expect(screen.getByLabelText('Date', { exact: true })).toHaveAttribute('type', 'date');
+  expect(screen.queryByText('Does this record belong to you?')).toBeNull();
+  expect(screen.queryByText('Extracted text & corrections')).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Confirm and save record' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Review later' })).toBeNull();
+  fireEvent.change(result, { target: { value: '43' } });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  expect(writes.filter((write) => write.url.endsWith('/review-draft'))).toHaveLength(0);
+  fireEvent.click(screen.getByRole('button', { name: 'Update' }));
+  await waitFor(() => expect(onBack).toHaveBeenCalledTimes(1));
+  const draftWrites = writes.filter((write) => write.url.endsWith('/review-draft'));
+  expect(draftWrites).toHaveLength(1);
+  expect(draftWrites[0].body.mapping.valueText).toBe('43');
+  expect(draftWrites[0].body.mapping.unit).toBe('ng/mL');
+  expect(draftWrites[0].body.resolutions).toEqual([
+    { issueId: 'cookie-value', outcome: 'corrected', mapping: { valueText: '43' } },
+  ]);
+  expect(writes.some((write) => /accept|identity-scope/.test(write.url))).toBe(false);
 });

@@ -5,7 +5,15 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { HttpError, openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
-import { uploadIntake, reviewIntake, importIntake, saveIntakeReviewDraft } from '../intake.ts';
+import {
+  uploadIntake,
+  reviewIntake,
+  importIntake,
+  saveIntakeReviewDraft,
+  getIntake,
+  proposeConversion,
+} from '../intake.ts';
+import { createNote, getNote, saveNote } from '../notes.ts';
 import { rebuildProfile } from '../portable.ts';
 import { randomUUID } from 'node:crypto';
 import {
@@ -87,7 +95,9 @@ async function prepare(f: Fixture, id: string) {
         operationId: randomUUID(),
         scope: state.scope,
         outcome: 'this_is_me',
-        attestation: 'confirmed_displayed_report_subject',
+        attestation: state.scope.questions?.length
+          ? 'confirmed_displayed_identity_questions'
+          : 'confirmed_displayed_report_subject',
       });
       review = reviewIntake(f.db, f.root, f.profile, id);
     }
@@ -159,7 +169,25 @@ for (const [name, second] of [
 
 test('same-request collision refuses all selected rows before any projection', async (t) => {
   const f = fixture(t);
-  await refuses(f, upload(f, [envelope(), envelope('Fictional Morgan Fern')]).id);
+  const item = upload(f, [envelope(), envelope('Fictional Morgan Fern')]);
+  const review = reviewIntake(f.db, f.root, f.profile, item.id);
+  const before = snapshot(f);
+  // Do not manufacture two Self answers for competing patient claims just to
+  // reach the source-collision check; acceptance must reject the request itself.
+  assert.throws(
+    () =>
+      importIntake(f.db, f.root, f.profile, item.id, {
+        version: review.version,
+        reviewToken: review.reviewToken,
+        decisions: review.records.map((record) => ({
+          recordId: record.id,
+          action: 'accept' as const,
+          mapping: {},
+        })),
+      }),
+    { code: 'CLINICAL_SOURCE_SCOPE_COLLISION' },
+  );
+  assert.deepEqual(snapshot(f), before);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
 });
 
@@ -320,7 +348,7 @@ test('an indirect context claim cannot use the unscoped exact-envelope fallback'
   await refuses(f, upload(f, [linked], 'context-copy.jsonl').id);
 });
 
-test('a nonliteral subject needs existing original-review authority before reuse', async (t) => {
+test('an original JSONL report header supplies source scope without copying it into each clinical payload', async (t) => {
   const f = fixture(t);
   const value = { ...envelope(), payload: 'Fictional report with no patient evidence' };
   await accept(f, upload(f, [value]).id);
@@ -331,7 +359,7 @@ test('a nonliteral subject needs existing original-review authority before reuse
   );
   assert.equal(
     reviewIntake(f.db, f.root, f.profile, second.id).records[0]!.classification,
-    'unsupported',
+    'addition',
   );
   await accept(f, second.id);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
@@ -514,3 +542,152 @@ test('raw numeric token wrappers cannot supply literal report or patient text', 
     'Numeric wrappers are preserved tokens, never printed text grounding',
   );
 });
+
+for (const family of [false, true])
+  test(`host-grounded ${family ? 'Person' : 'Self'} source authority survives a cold rebuild without another identity confirmation`, async (t) => {
+    const f = fixture(t);
+    const name = 'Fictional Avery Orchid';
+    let personId = 'patient';
+    if (family)
+      personId = createNote(f.db, {
+        kind: 'person',
+        title: 'Fictional family display',
+        person: { fullName: name },
+      }).personId!;
+    else {
+      const self = getNote(f.db, 'person-note:self');
+      saveNote(f.db, self.id, { version: self.version, person: { fullName: name } });
+    }
+    const value = {
+      ...envelope(name),
+      payload: 'Fictional measurement only; header retained elsewhere on original.',
+    };
+    const proposedOriginal = (target: Fixture, label: string, row: unknown) => {
+      const item = uploadIntake(target.db, target.root, target.profile, {
+        filename: label + '.txt',
+        newProviderName: 'Fictional clinic',
+        bytes: Buffer.from(
+          'Fictional laboratory report\n' + name + '\nFictional original ' + label,
+        ),
+      });
+      return proposeConversion(target.db, target.root, target.profile, item.id, {
+        version: item.version,
+        summary: 'Fictional bounded conversion',
+        jsonlText: JSON.stringify(row),
+      });
+    };
+    const first = proposedOriginal(f, 'first-original', value);
+    const firstProposal = first.proposals[0]!.id;
+    const firstIdentity = await getIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profile,
+      first.id,
+      first.workflow!.reportGroups![0]!.id,
+    );
+    assert.equal(firstIdentity.status, 'evidenced_match');
+    const firstReview = reviewIntake(f.db, f.root, f.profile, first.id, firstProposal);
+    assert.ok(firstReview.records[0]!.identityAttribution?.originalSubjectFingerprint);
+    assert.equal(
+      firstReview.records[0]!.identityAttribution?.basis,
+      family ? 'matched_saved_person' : 'matched_saved_self',
+    );
+    importIntake(f.db, f.root, f.profile, first.id, {
+      version: firstReview.version,
+      proposalId: firstProposal,
+      reviewToken: firstReview.reviewToken,
+      decisions: [{ recordId: firstReview.records[0]!.id, action: 'accept', mapping: {} }],
+    });
+    assert.equal(
+      getIntake(f.db, f.root, f.profile, first.id).workflow!.identityConfirmations?.length || 0,
+      0,
+    );
+    const destination = resolve(f.root, 'cold-auto-owner');
+    const rebuilt = rebuildProfile(f.root, f.profile, destination);
+    const db = openDatabase(rebuilt.database, f.profile);
+    try {
+      const restored = { ...f, db, root: destination };
+      const laterValue = {
+        ...value,
+        clinical: { ...value.clinical, valueText: '99' },
+        identityAttribution: {
+          basis: 'matched_saved_self',
+          originalSubjectFingerprint:
+            firstReview.records[0]!.identityAttribution!.originalSubjectFingerprint,
+        },
+      };
+      const second = proposedOriginal(restored, 'second-original', laterValue);
+      const secondProposal = second.proposals[0]!.id;
+      const row = () =>
+        db.prepare('SELECT * FROM source_files WHERE id=?').get(second.id) as {
+          id: string;
+          sha256: string;
+          mime_type: string;
+          details_json: string;
+        };
+      const entry = validateJSONL(Buffer.from(JSON.stringify(laterValue))).entries![0]!;
+      assert.ok(
+        clinicalSourceScopeCheck(db, row(), [entry], secondProposal)(entry),
+        'a model-supplied marker cannot substitute for the new original preview',
+      );
+      assert.equal(
+        reviewIntake(db, destination, f.profile, second.id, secondProposal).records[0]!
+          .identityAttribution,
+        undefined,
+      );
+      const state = await getIntakeIdentityReview(
+        db,
+        destination,
+        f.profile,
+        second.id,
+        second.workflow!.reportGroups![0]!.id,
+      );
+      assert.equal(state.status, 'evidenced_match');
+      assert.equal(
+        clinicalSourceScopeCheck(db, row(), [entry], secondProposal)(entry),
+        null,
+        'accepted historical proof and current original proof work after cache loss',
+      );
+      const prior = String(
+        db.prepare('SELECT details_json FROM source_files WHERE id=?').get(first.id)!.details_json,
+      );
+      for (const marker of [undefined, 'different-original-fingerprint']) {
+        const altered = JSON.parse(prior);
+        for (const batch of [altered.intake.imported, ...(altered.intake.importHistory || [])])
+          for (const record of batch?.clinical?.records || [])
+            if (record.identityAttribution)
+              record.identityAttribution.originalSubjectFingerprint = marker;
+        db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
+          JSON.stringify(altered),
+          first.id,
+        );
+        assert.ok(
+          clinicalSourceScopeCheck(db, row(), [entry], secondProposal)(entry),
+          'legacy or different-original marker is not accepted authority',
+        );
+      }
+      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(prior, first.id);
+      const ready = reviewIntake(db, destination, f.profile, second.id, secondProposal);
+      importIntake(db, destination, f.profile, second.id, {
+        version: ready.version,
+        proposalId: secondProposal,
+        reviewToken: ready.reviewToken,
+        decisions: [{ recordId: ready.records[0]!.id, action: 'accept', mapping: {} }],
+      });
+      assert.deepEqual(
+        db
+          .prepare('SELECT DISTINCT person_id FROM observations')
+          .all()
+          .map((row) => row.person_id),
+        [personId],
+      );
+      assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
+      assert.equal(
+        getIntake(db, destination, f.profile, second.id).workflow!.identityConfirmations?.length ||
+          0,
+        0,
+      );
+    } finally {
+      db.close();
+    }
+  });

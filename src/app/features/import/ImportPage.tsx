@@ -1,5 +1,8 @@
+import type { ImportPersonSelection } from './ImportPersonChoice';
+import type { ManualSourceRecordResult } from '../../../shared/intake-manual-source-record';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { X } from 'lucide-react';
 import type {
   Intake,
   IntakeAcceptedRecord,
@@ -48,7 +51,7 @@ import {
   type ImportReviewStatus,
 } from './ImportReviewPresentation';
 import { ImportDetailReview, type ImportDetailSelection } from './ImportDetailReview';
-import { ImportDiagnosticsControl } from './ImportDiagnosticsControl';
+import { ImportSourceTextBrowser } from './ImportSourceTextBrowser';
 import { ImportSaveStatus } from './ImportSaveStatus';
 import { possibleSavedOverlapCount } from './possible-overlaps';
 import {
@@ -158,7 +161,7 @@ function recordValue(record: IntakeImportFeedRecord) {
     const literal = eyes.filter(Boolean).join(' · ');
     return { value: literal || 'Vision prescription', unit: '' };
   }
-  return { value: mapping.valueText || mapping.status || 'Value to review', unit: mapping.unit };
+  return { value: mapping.valueText || 'Value to review', unit: mapping.unit };
 }
 
 function recordSaveBlockReason(record: IntakeImportFeedRecord): string | undefined {
@@ -198,6 +201,20 @@ function detailUrl(
 
 export function ImportPage() {
   const profile = useProfile();
+  const closeInlineReview = useRef<(() => Promise<boolean>) | null>(null);
+  const pendingSourceReviews = useRef(new Set<string>());
+  const [preserveSourceReview, setPreserveSourceReview] = useState(false);
+  function sourceReviewPending(key: string, pending: boolean) {
+    if (pending) pendingSourceReviews.current.add(key);
+    else pendingSourceReviews.current.delete(key);
+    setPreserveSourceReview(pendingSourceReviews.current.size > 0);
+  }
+  const [manualReview, setManualReview] = useState<ManualSourceRecordResult | null>(null);
+  useEffect(() => {
+    setManualReview(null);
+    pendingSourceReviews.current.clear();
+    setPreserveSourceReview(false);
+  }, [profile?.id]);
   const [searchParams, setSearchParams] = useSearchParams();
   const selectionQuery = searchParams.toString();
   const [filters, setFilters] = useState<NonNullable<ImportReviewModel['filters']>>({
@@ -217,12 +234,22 @@ export function ImportPage() {
           : filters.view === 'saved'
             ? 'accepted'
             : 'kept_original';
+    const selection = new URLSearchParams(selectionQuery);
+    const groupId = selection.get('group') || selection.get('report');
+    const intakeId = selection.get('intake');
     const params = new URLSearchParams({ view, state, limit: '100' });
+    if ((groupId || intakeId) && !selection.has('person')) {
+      params.set('view', 'all');
+      params.delete('state');
+      if (groupId) params.set('groupId', groupId);
+      if (intakeId) params.set('intakeId', intakeId);
+      if (selection.get('record')) params.set('recordId', selection.get('record')!);
+    }
     if (filters.query) params.set('q', filters.query);
     if (filters.kind !== 'All') params.set('kind', feedKind[filters.kind] || 'unsupported');
     if (filters.editedOnly && filters.kind !== 'People') params.set('edited', 'true');
     return `/intakes/import-feed?${params}`;
-  }, [filters]);
+  }, [filters, selectionQuery]);
   const feed = useResource<IntakeImportFeed>(feedPath, 'review_open');
   const [pagedFeed, setPagedFeed] = useState<IntakeImportFeed | null>(null);
   const [pagedFeedScope, setPagedFeedScope] = useState('');
@@ -244,7 +271,6 @@ export function ImportPage() {
   const [draftRepairUndo, setDraftRepairUndo] = useState<DraftRepairUndo | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [recentSaved, setRecentSaved] = useState<IntakeAcceptedRecord[]>([]);
   const [recentSavedPeople, setRecentSavedPeople] = useState<SavedPersonDestination[]>([]);
   const [savedDestinationsError, setSavedDestinationsError] = useState('');
   const [savedDestinations, setSavedDestinations] = useState<Map<string, IntakeAcceptedRecord>>(
@@ -288,7 +314,6 @@ export function ImportPage() {
     identityReviewLoads.current.clear();
     setError('');
     setNotice('');
-    setRecentSaved([]);
     setRecentSavedPeople([]);
     setSavedDestinationsError('');
     setSavedDestinations(new Map());
@@ -390,6 +415,7 @@ export function ImportPage() {
           )
             return;
           identityReviewLoads.current.set(group.groupId, { ...load, pending: false });
+          recordIdentityReviewDiagnostic(review);
           setIdentityReviews((reviews) => new Map(reviews).set(group.groupId, review));
           const groundingRefreshKey = JSON.stringify([
             signature,
@@ -399,7 +425,7 @@ export function ImportPage() {
               .map((block) => block.reviewToken),
           ]);
           if (
-            review.status === 'prior_confirmation' &&
+            ['prior_confirmation', 'evidenced_match'].includes(review.status) &&
             !review.blocking &&
             identityGroundingRefreshes.current.get(group.groupId) !== groundingRefreshKey &&
             data.blocks.some(
@@ -443,9 +469,8 @@ export function ImportPage() {
 
   const acceptance = useReportAcceptance(profile?.id || '', (result) => {
     setBusy(false);
-    setRecentSaved(result.receipt.receipts.flatMap((receipt) => receipt.records));
     setNotice(
-      `${result.receipt.acceptedCount} ${result.receipt.acceptedCount === 1 ? 'result was' : 'results were'} saved to your profile.`,
+      `Imported ${result.receipt.acceptedCount} ${result.receipt.acceptedCount === 1 ? 'record' : 'records'}`,
     );
     feed.reload();
   });
@@ -699,9 +724,15 @@ export function ImportPage() {
       ];
       const identityReview = identityReviews.get(group.groupId);
       const identityStatus = identityReview?.status;
-      const subjectLabel = identityReview?.evidencedIdentity?.fullName || profile?.name || 'Self';
+      const subjectLabel =
+        identityReview?.assignedPerson?.fullName ||
+        identityReview?.evidencedIdentity?.fullName ||
+        profile?.name ||
+        'Self';
       return {
         id: group.groupId,
+        sourceIntakeId: group.intakeId,
+        filename: group.original.filename,
         source:
           group.sourceSuggestion && !sourceConfirmed
             ? group.sourceSuggestion.value
@@ -721,6 +752,8 @@ export function ImportPage() {
           confirmed:
             identityStatus === 'evidenced_match' || identityStatus === 'prior_confirmation',
           identityStatus,
+          selfBirthDateConflict: identityReview?.selfBirthDateConflict,
+          defaultPerson: identityReview?.defaultPerson,
           identityMessage:
             identityReview?.message ||
             (identityReviewErrors.has(group.groupId)
@@ -728,17 +761,19 @@ export function ImportPage() {
               : 'Checking the retained identity evidence…'),
           blocking: identityReview?.blocking ?? identityReviewErrors.has(group.groupId),
           offeredSelfFields: identityReview?.offeredSelfFields || {},
+          people: identityReview?.people,
+          peopleTruncated: identityReview?.peopleTruncated,
+          assignedPerson: identityReview?.assignedPerson,
+          printedName: identityReview?.evidencedIdentity.fullName,
+          printedNameRequired:
+            !!identityReview?.scope && !identityReview.evidencedIdentity.fullName,
           selfDisplayName: profile?.name || 'Self',
           evidenceText:
             identityReview?.scope?.subject.text || identityReview?.evidencedIdentity?.fullName,
           questions: identityReview?.scope?.questions,
-          targetCount: identityReview?.scope?.targets.length,
-          scopeReady:
-            identityStatus === 'confirmation_required'
-              ? !!identityReview?.scope
-              : identityStatus
-                ? true
-                : false,
+          targetCount: (identityReview?.scope?.assignmentTargets || identityReview?.scope?.targets)
+            ?.length,
+          scopeReady: !!identityReview?.scope,
           scopeError: identityReviewErrors.get(group.groupId),
           conflicts: identityReview?.conflicts || [],
           reviewUrl: `/import?${new URLSearchParams({ group: group.groupId, intake: group.intakeId })}`,
@@ -766,6 +801,13 @@ export function ImportPage() {
             status: status(record.queueState),
             eligible: record.selectable,
             saveBlockReason: recordSaveBlockReason(record),
+            saveBlockReview:
+              !hasUnreviewedPairChoices(record) &&
+              (record.identityReview?.blocking ||
+                record.issues?.find((issue) => issue.blocking && issue.status !== 'resolved')
+                  ?.kind === 'identity')
+                ? ('identity' as const)
+                : undefined,
             manuallyEdited: record.manuallyEdited,
             possibleOverlap: possibleSavedOverlapCount(record, mapping) > 0,
             relatedMatch:
@@ -865,24 +907,31 @@ export function ImportPage() {
     const pausedItem = batch.batch?.items.find(hasPausedIntakeReading);
     const currentItem =
       batch.batch?.items.find((item) => ['running', 'starting'].includes(item.status)) ||
-      pausedItem ||
-      batch.batch?.items.find((item) => item.status === 'queued');
+      batch.batch?.items.find((item) => item.status === 'queued') ||
+      pausedItem;
     const reading = currentItem?.reading;
     const readingDetail =
-      currentItem?.reason === 'continuing'
-        ? 'Starting the next reading pass automatically. Your progress is saved.'
-        : reading?.phase === 'indexing_source'
-          ? 'Indexing the retained source before extraction can continue.'
-          : reading?.phase === 'reading_source'
-            ? 'Opening and reading source evidence. Results appear as they are ready.'
-            : reading?.phase === 'preparing_results'
-              ? 'Checking and preparing extracted results for your review.'
-              : reading?.phase === 'waiting_for_model'
-                ? 'Waiting for the model to finish its current response. You can leave this page.'
-                : 'Preparing the next reading step. Your retained work is kept.';
+      currentItem?.reason === 'waiting_for_provider'
+        ? 'Moxie is waiting to continue. Your progress is saved.'
+        : currentItem?.reason === 'waiting_for_local_capacity'
+          ? 'Moxie will continue when the app is ready. Your progress is saved.'
+          : currentItem?.reason === 'extracting_source_text'
+            ? 'Moxie is getting your files ready.'
+            : currentItem?.reason === 'continuing'
+              ? 'Moxie is continuing to read. Your progress is saved.'
+              : reading?.phase === 'indexing_source'
+                ? 'Moxie is getting your files ready.'
+                : reading?.phase === 'reading_source'
+                  ? 'Results appear here as Moxie reads.'
+                  : reading?.phase === 'preparing_results'
+                    ? 'Moxie is preparing the records for your review.'
+                    : reading?.phase === 'waiting_for_model'
+                      ? 'Results appear here as Moxie reads. You can leave this page.'
+                      : 'Moxie is getting ready to read. Your progress is saved.';
     const paused = !!pausedItem || !!data?.activity.pausedFiles;
     return {
       contextKey: `${profile?.id || ''}:${feedPath}`,
+      loading: !data,
       reports,
       records,
       counts: data
@@ -920,24 +969,33 @@ export function ImportPage() {
         activeFiles,
         uploading: !!uploadStatus,
         controlsBusy: batch.busy,
+        detailIsImportant:
+          !!uploadStatus ||
+          ['waiting_for_provider', 'waiting_for_local_capacity'].includes(
+            currentItem?.reason || '',
+          ),
         resumeLabel: pausedItem?.reason === 'job_limit' ? 'Continue reading' : 'Resume reading',
-        progress:
-          reading && currentItem
-            ? {
-                accounted: reading.accountedUnits || 0,
-                total: reading.totalUnits || 0,
-                readyRecords: reading.readyRecords,
-                readWindows: reading.readWindows || 0,
-                activeMs: currentItem.readingJob?.activeMs || 0,
-                sliceStartedAt: currentItem.readingJob?.sliceStartedAt || null,
-                lastProgressAt:
-                  [currentItem.readingJob?.lastProgressAt, reading.pageTiming?.lastCompletedAt]
-                    .filter((value): value is string => !!value)
-                    .sort()
-                    .at(-1) || null,
-                pageTiming: reading.pageTiming,
-              }
-            : undefined,
+        progress: batch.batch
+          ? {
+              elapsedStartedAt: batch.batch.createdAt,
+              elapsedEndedAt: batch.batch.status === 'running' ? null : batch.batch.updatedAt,
+              accounted: reading?.accountedUnits || 0,
+              total: reading?.totalUnits || 0,
+              readyRecords: batch.batch.items.reduce(
+                (total, item) => total + (item.reading?.readyRecords || 0),
+                0,
+              ),
+              readWindows: reading?.readWindows || 0,
+              activeMs: currentItem?.readingJob?.activeMs || 0,
+              sliceStartedAt: currentItem?.readingJob?.sliceStartedAt || null,
+              lastProgressAt:
+                [currentItem?.readingJob?.lastProgressAt, reading?.pageTiming?.lastCompletedAt]
+                  .filter((value): value is string => !!value)
+                  .sort()
+                  .at(-1) || null,
+              pageTiming: reading?.pageTiming,
+            }
+          : undefined,
         label:
           uploadStatus ||
           (activeFiles
@@ -961,7 +1019,12 @@ export function ImportPage() {
           : activeFiles
             ? readingDetail
             : pausedItem
-              ? intakeReadingPauseLabel(pausedItem.reading?.reason || pausedItem.reason)
+              ? intakeReadingPauseLabel(
+                  ['source_review_required', 'source_changed'].includes(pausedItem.reason || '') ||
+                    pausedItem.reason?.startsWith('provider_')
+                    ? pausedItem.reason
+                    : pausedItem.reading?.reason || pausedItem.reason,
+                )
               : paused
                 ? 'Reading stopped before every report finished. Completed results and originals are kept.'
                 : data?.activity.readingAccounting?.sourceCount === 0
@@ -971,7 +1034,7 @@ export function ImportPage() {
       },
     };
   }, [
-    batch.batch?.items,
+    batch.batch,
     batch.busy,
     displayedFeed,
     filters,
@@ -1172,7 +1235,7 @@ export function ImportPage() {
   }
 
   function save(ids: string[]) {
-    void perform(
+    return perform(
       async ({ prefix, current, operationId, request: requestApi }) => {
         setOperationStatus(
           `Preparing ${ids.length} selected ${ids.length === 1 ? 'item' : 'items'}…`,
@@ -1570,19 +1633,16 @@ export function ImportPage() {
     return completed ? null : actionError || 'The source label was not applied. Try again.';
   }
 
-  function identity(reportId: string, selectedFields: { fullName?: string; birthDate?: string }) {
+  function identity(
+    reportId: string,
+    selectedFields: { fullName?: string; birthDate?: string },
+    personSelection?: ImportPersonSelection,
+    printedName?: string,
+  ) {
     const group = displayedFeed?.groups.find((item) => item.groupId === reportId);
     const displayedReview = identityReviews.get(reportId);
     const displayedScope = displayedReview?.scope;
-    if (
-      !group ||
-      !displayedReview ||
-      !['confirmation_required', 'evidenced_match', 'prior_confirmation'].includes(
-        displayedReview.status,
-      ) ||
-      !displayedScope
-    )
-      return;
+    if (!group || !displayedReview || !displayedScope) return;
     void perform(async ({ prefix, current: profileCurrent, request: requestApi }) => {
       let operationKey = '';
       const actionGeneration = identityReviewGeneration.current;
@@ -1597,19 +1657,20 @@ export function ImportPage() {
         actionPageCurrent() && identityReviewGeneration.current === actionGeneration;
       const offered = displayedReview.offeredSelfFields;
       const fields = Object.fromEntries(
-        Object.entries(selectedFields).filter(
+        Object.entries(personSelection ? {} : selectedFields).filter(
           ([field, value]) => !!value && offered[field as keyof typeof offered] === value,
         ),
       ) as { fullName?: string; birthDate?: string };
-      if (displayedReview.status !== 'confirmation_required' && !Object.keys(fields).length) return;
       try {
-        operationKey = `identity:${displayedScope.groupId}:${displayedScope.groupVersionId}:${displayedScope.intakeVersion}:${JSON.stringify(fields)}`;
+        operationKey = `identity:${displayedScope.groupId}:${displayedScope.groupVersionId}:${displayedScope.intakeVersion}:${JSON.stringify([fields, personSelection, printedName])}`;
         const request = (pendingOperations.current.get(operationKey) as
           IntakeIdentityConfirmation | undefined) || {
           version: displayedScope.intakeVersion,
           operationId: crypto.randomUUID(),
           scope: displayedScope,
-          outcome: 'this_is_me',
+          outcome: personSelection ? 'this_is_person' : 'this_is_me',
+          ...(personSelection ? { personSelection } : {}),
+          ...(printedName ? { printedName } : {}),
           attestation: displayedScope.questions?.length
             ? 'confirmed_displayed_identity_questions'
             : 'confirmed_displayed_report_subject',
@@ -1735,11 +1796,13 @@ export function ImportPage() {
         return;
       feed.reload();
       setNotice(
-        Object.keys(fields).length
-          ? displayedReview.status === 'confirmation_required'
-            ? 'Identity confirmed and the selected blank Self details were filled in the same action.'
-            : 'The selected blank Self details were added. This report was already allowed by retained identity evidence.'
-          : 'Identity confirmed for this report. Nothing was saved yet.',
+        personSelection
+          ? 'The report is assigned to the selected person in People. Clinical records remain in review.'
+          : Object.keys(fields).length
+            ? displayedReview.status === 'confirmation_required'
+              ? 'Identity confirmed and the selected blank Self details were filled in the same action.'
+              : 'The selected blank Self details were added. This report was already allowed by retained identity evidence.'
+            : 'This report is confirmed as yours and its supported name is retained in your saved names. Clinical records remain in review.',
       );
     });
   }
@@ -1817,6 +1880,34 @@ export function ImportPage() {
     }
   }
 
+  const sourceReviewProps = {
+    onChanged: feed.reload,
+    onManualCreated: (result: ManualSourceRecordResult) => {
+      feed.reload();
+      void (async () => {
+        if (closeInlineReview.current && !(await closeInlineReview.current())) return;
+        setFilters({ view: 'review', kind: 'All', query: '', editedOnly: false });
+        setManualReview(result);
+      })();
+    },
+    readingBlocked: batch.loading
+      ? 'Checking saved reading requests…'
+      : batch.pendingCreate
+        ? 'Use Retry reading above to confirm the earlier reading request first.'
+        : batch.busy
+          ? 'Wait for the current reading request to finish.'
+          : batch.batch?.status === 'running'
+            ? 'Wait for the active reading batch to finish, or stop it before starting a fresh reading.'
+            : undefined,
+    onRead: async (intakeId: string) => {
+      const result = await batch.create([intakeId]);
+      if (!result)
+        throw new Error(
+          'Clinical reading did not start. Try again when the current request finishes.',
+        );
+    },
+  };
+
   return (
     <div className="page import-page">
       {(error || acceptance.error || batch.error) && (
@@ -1837,9 +1928,16 @@ export function ImportPage() {
               Undo draft correction
             </button>
           )}
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Dismiss notification"
+            onClick={() => setNotice('')}
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
         </div>
       )}
-      <SavedRecordDestinations records={recentSaved} label="Just saved destinations" />
       <SavedPersonDestinations destinations={recentSavedPeople} />
       <SavedRecordDestinations records={[]} error={savedDestinationsError} onRetry={feed.reload} />
       {batch.pendingCreate && (
@@ -1871,7 +1969,12 @@ export function ImportPage() {
       {feed.loading && !feed.data && (
         <LoadingIndicator label="Opening import review…" layout="centered" />
       )}
-      <ImportDiagnosticsControl />
+      {detailSelection && !detailSelection.personId && (
+        <button className="text-link" type="button" onClick={closeDetail}>
+          All imports
+        </button>
+      )}
+
       {historicalSelectionKey && !activeHistoricalSelection ? (
         <LoadingIndicator label="Opening the report from this historical link…" layout="centered" />
       ) : activeHistoricalSelection?.loading ? (
@@ -1883,7 +1986,7 @@ export function ImportPage() {
             Open Import
           </button>
         </section>
-      ) : detailSelection ? (
+      ) : detailSelection?.personId ? (
         <ImportDetailReview
           selection={detailSelection}
           onBack={closeDetail}
@@ -1892,6 +1995,72 @@ export function ImportPage() {
         />
       ) : (
         <ImportReviewPresentation
+          requestedRecordId={
+            manualReview
+              ? [...lookup].find(
+                  ([, row]) =>
+                    row.block.intakeId === manualReview.intake.id &&
+                    row.block.proposalId === manualReview.proposalId &&
+                    row.record.id === manualReview.recordId,
+                )?.[0]
+              : detailSelection
+                ? model.records.find(
+                    (record) =>
+                      record.reportId === detailSelection.groupId &&
+                      (!detailSelection.recordId ||
+                        lookup.get(record.id)?.record.id === detailSelection.recordId),
+                  )?.id
+                : undefined
+          }
+          preserveSourceReview={preserveSourceReview}
+          beforeReviewChange={async () => {
+            if (pendingSourceReviews.current.size) {
+              setNotice('Save or discard the source review draft before changing the review view.');
+              return false;
+            }
+            return (await closeInlineReview.current?.()) ?? true;
+          }}
+          renderRecordReview={(record, close) => {
+            if (!record.detailUrl) return null;
+            const params = new URLSearchParams(record.detailUrl.split('?')[1]);
+            const groupId = params.get('group');
+            const recordId = params.get('record');
+            if (!groupId || !recordId) return null;
+            return (
+              <ImportDetailReview
+                key={record.id}
+                embedded
+                beforeCloseRef={closeInlineReview}
+                selection={{
+                  groupId,
+                  recordId,
+                  intakeId: params.get('intake') || undefined,
+                  proposalId: params.get('proposal') === 'original' ? null : params.get('proposal'),
+                }}
+                onBack={close}
+                onChanged={feed.reload}
+                onUseSource={source}
+              />
+            );
+          }}
+          renderSourceAttention={(onCount) => (
+            <ImportSourceTextBrowser
+              attentionRows
+              onAttentionCount={onCount}
+              attentionRefreshKey={feed.data}
+              {...sourceReviewProps}
+              onPendingChange={(pending) => sourceReviewPending('source-attention', pending)}
+            />
+          )}
+          renderReportSourceReview={(report) =>
+            report.sourceIntakeId ? (
+              <ImportSourceTextBrowser
+                {...sourceReviewProps}
+                intakeId={report.sourceIntakeId}
+                onPendingChange={(pending) => sourceReviewPending(report.id, pending)}
+              />
+            ) : null
+          }
           model={model}
           actions={{
             busy:
@@ -1916,7 +2085,9 @@ export function ImportPage() {
                   }
                 : undefined,
             onResumeReading:
-              batch.batch?.status !== 'running' && batch.batch?.items.some(hasPausedIntakeReading)
+              batch.batch?.status !== 'running' &&
+              batch.batch?.items.some(hasPausedIntakeReading) &&
+              !batch.batch?.items.some((item) => item.providerWait?.outcome === 'unknown')
                 ? async () => {
                     await batch.resume();
                   }
@@ -1927,3 +2098,4 @@ export function ImportPage() {
     </div>
   );
 }
+import { recordIdentityReviewDiagnostic } from '../../data/import-diagnostics';

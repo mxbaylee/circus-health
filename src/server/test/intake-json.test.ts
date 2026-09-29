@@ -241,7 +241,7 @@ test('an oversized value behind an overlong escaped key retains a parent-literal
 });
 
 // The tests below cover the always-on document-level yield counters
-// (distinctReads, proposalsProduced). They run with HEALTH_IMPORT_DIAGNOSTICS
+// (distinctReads, proposalsProduced). They run with CRS_IMPORT_DIAGNOSTICS
 // unset, like the rest of this file, because these counters must work without
 // diagnostics enabled. recordsAccepted was dropped (see task-6-report.md,
 // "Fix report"): it read 0 for the entire normal import flow, which is

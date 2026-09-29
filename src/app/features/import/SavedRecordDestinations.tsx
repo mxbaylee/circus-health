@@ -30,14 +30,20 @@ export type AcceptedRecordScope = {
 
 export function acceptedRecordDestination(record: IntakeAcceptedRecord) {
   const id = encodeURIComponent(record.entityId);
+  const personId = record.identityAttribution?.assignedPerson?.personId;
+  const owner =
+    personId && personId !== 'patient' ? `&personId=${encodeURIComponent(personId)}` : '';
   if (record.kind === 'document' && record.optical)
-    return { label: 'Vision prescription', to: `/tests?view=vision&document=${id}&visibility=all` };
+    return {
+      label: 'Vision prescription',
+      to: `/tests?view=vision&document=${id}&visibility=all${owner}`,
+    };
   if (record.kind === 'observation')
-    return { label: 'Test result', to: `/tests?result=${id}&visibility=all` };
+    return { label: 'Test result', to: `/tests?result=${id}&visibility=all${owner}` };
   if (record.kind === 'medication')
-    return { label: 'Prescription', to: `/medications?id=${id}&status=all` };
+    return { label: 'Prescription', to: `/medications?id=${id}&status=all${owner}` };
   if (record.kind === 'procedure')
-    return { label: 'Procedure', to: `/procedures?id=${id}&category=all&visibility=all` };
+    return { label: 'Procedure', to: `/procedures?id=${id}&category=all&visibility=all${owner}` };
   return { label: 'Provider document', to: `/sources?document=${id}` };
 }
 

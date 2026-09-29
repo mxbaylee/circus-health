@@ -14,7 +14,7 @@ import { restoreBackup } from '../recovery.ts';
 
 const root = '/archive';
 const profileId = 'cedar';
-assert.equal(process.env.CIRCUS_FICTIONAL_CONSUMER_CHECK, '1');
+assert.equal(process.env.CRS_FICTIONAL_CONSUMER_CHECK, '1');
 assert.equal(readdirSync(join(root, 'data')).length, 0, 'Use an empty disposable archive');
 const status = readFileSync('/proc/self/status', 'utf8');
 assert.match(status, /NoNewPrivs:\s+1/);
@@ -66,7 +66,7 @@ db.close();
 
 const beforeTemporary = readdirSync('/tmp').sort();
 const output = execFileSync(process.execPath, ['server/recovery-cli.ts', 'backup', profileId], {
-  env: { ...process.env, DATA_DIR: join(root, 'data'), TMPDIR: '/tmp' },
+  env: { ...process.env, CRS_DATA_DIR: join(root, 'data'), TMPDIR: '/tmp' },
   encoding: 'utf8',
   timeout: 120000,
 });

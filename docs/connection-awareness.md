@@ -10,7 +10,7 @@ The control starts at Checking. Successful runtime responses show Connected. Tra
 
 ## Updates and refreshing
 
-[`createBuildIdentity`](../src/scripts/build-identity.ts) generates one UUID per production build. Vite embeds it in the client and emits `dist/build-info.json`. [`readBuildId`](../src/server/build-identity.ts) loads the manifest once on server startup, and readiness responses include the same ID. Restarting the same built image does not create an update. Missing or invalid IDs are `null` and do not cause mismatch notices.
+[`createBuildIdentity`](../src/scripts/build-identity.ts) generates one UUID per production build. Vite embeds it in the client and emits `dist/build-info.json`. [`readBuildId`](../src/server/build-identity.ts) loads the manifest once on server startup, and readiness responses include the same ID. The manifest and browser bundle also include the build-time Git revision and clean/dirty/unknown worktree state, passed through the supported npm launcher into Docker. Unknown metadata stays unknown; a dirty build is not asserted to equal its base revision. No paths or branch names are exposed. Restarting the same built image does not create an update. Missing or invalid IDs are `null` and do not cause mismatch notices.
 
 [`ConnectionNotices`](../src/app/components/ConnectionStatus.tsx) shows a persistent update notice when both IDs are known and differ. Dismissal is held in this tab's memory for that client/server pair; a different build pair produces another notice. There is no automatic refresh.
 

@@ -218,9 +218,6 @@ export function RecordCorrectionDialog({
             <p role="status">The correction is saved and durable publication is still finishing.</p>
           )}
           <div className="note-dialog-actions">
-            <Link className="button secondary" to={result.destination.appUrl}>
-              Open corrected record and history
-            </Link>
             <button type="button" className="button primary" onClick={() => onOpenChange(false)}>
               {returnLabel}
             </button>

@@ -1,4 +1,8 @@
 import {
+  RecordCorrectionBadges,
+  RecordCorrectionHistory,
+} from '../components/RecordCorrectionHistory';
+import {
   ClinicalRedirect,
   isReclassifiedRecord,
   currentClinicalRecord,
@@ -62,7 +66,9 @@ export function TestResults() {
       value ? next.set(key, value) : next.delete(key);
     setParams(next, { replace });
   };
+  const personId = params.get('personId') || 'patient';
   const filters = {
+    personId,
     ...(vision && params.get('document') ? { documentId: params.get('document')! } : {}),
     visibility: params.get('visibility') || 'visible',
     q: query,
@@ -81,7 +87,7 @@ export function TestResults() {
   const selectedTypeId = byTest ? (params.get('type') ?? types.data?.[0]?.id) : undefined;
   const latest = useResource<Observation[]>(
     byTest && selectedTypeId
-      ? `/tests?${queryString({ visibility: 'all', testTypeId: selectedTypeId, providerId, from, to, limit: 1, sort: 'newest' })}`
+      ? `/tests?${queryString({ personId, visibility: 'all', testTypeId: selectedTypeId, providerId, from, to, limit: 1, sort: 'newest' })}`
       : null,
   );
   const selectedResultId = byTest
@@ -93,6 +99,15 @@ export function TestResults() {
     selectedResultId ? `/tests/${encodeURIComponent(selectedResultId)}` : null,
   );
   const currentDetail = currentClinicalRecord(detail.data);
+  useEffect(() => {
+    if (currentDetail?.personId && currentDetail.personId !== personId && params.get('result')) {
+      const next = new URLSearchParams(params);
+      next.set('personId', currentDetail.personId);
+      next.delete('compare');
+      next.delete('offset');
+      setParams(next, { replace: true });
+    }
+  }, [currentDetail?.personId, personId, params, setParams]);
   const primaryId = byTest ? selectedTypeId : currentDetail?.testTypeId;
   useAssistantSelection(
     byTest && selectedTypeId
@@ -320,8 +335,11 @@ export function TestResults() {
                         onClick={() => openResult(result.id)}
                       >
                         <span className="row-copy">
-                          <strong>{result.label}</strong>
-                          {result.archived && <span className="soft-badge">Inactive</span>}
+                          <span className="result-name-and-badges">
+                            <strong>{result.label}</strong>
+                            {result.archived && <span className="soft-badge">Inactive</span>}
+                            <RecordCorrectionBadges extra={result.extra} />
+                          </span>
                           <span>{formatDate(result.date)}</span>
                           <span className="type-date">
                             {result.provider ?? 'Provider not recorded'}
@@ -376,9 +394,12 @@ export function TestResults() {
                         title={result.label}
                         headingRef={detailHeading}
                         badges={
-                          (byTest
-                            ? types.data?.find((type) => type.id === result.testTypeId)?.archived
-                            : result.archived) && <span className="soft-badge">Inactive</span>
+                          <>
+                            <RecordCorrectionBadges extra={result.extra} />
+                            {(byTest
+                              ? types.data?.find((type) => type.id === result.testTypeId)?.archived
+                              : result.archived) && <span className="soft-badge">Inactive</span>}
+                          </>
                         }
                         metadata={
                           <>
@@ -473,11 +494,13 @@ export function TestResults() {
                           </div>
                         ) : null}
                       </dl>
+                      <RecordCorrectionHistory extra={result.extra} open />
                       <div className="detail-chart">
                         <div className="section-heading">
                           <h3>Over time</h3>
                           <span className="helper-text">Includes inactive results</span>
                           <ComparePicker
+                            personId={result.personId || personId}
                             selected={ids}
                             onAdd={(id) => setComparisons([...comparisons, id])}
                           />
@@ -487,6 +510,7 @@ export function TestResults() {
                           {...{
                             revision: `${String(detail.meta?.revision ?? 'unknown')}:${measurementRevision}`,
                           }}
+                          personId={result.personId || personId}
                           ids={ids}
                           from={from}
                           to={to}

@@ -148,7 +148,7 @@ test('People-only report stays separate, opens original evidence, and saves by e
   assert.match((await original.getAttribute('href')) || '', /\/sources\/.+\/content/);
   assert.equal(await page.getByRole('button', { name: 'Add as new person' }).count(), 1);
 
-  const screenshots = process.env.CIRCUS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
+  const screenshots = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
   mkdirSync(screenshots, { recursive: true });
   await page.screenshot({
     animations: 'disabled',
@@ -184,5 +184,5 @@ test('People-only report stays separate, opens original evidence, and saves by e
   const savedPersonLink = page.getByRole('link', { name: 'Open saved person', exact: true });
   await savedPersonLink.waitFor();
   await savedPersonLink.click();
-  assert.equal(await page.getByLabel('Full name', { exact: true }).inputValue(), 'Rowan Finch');
+  await page.getByRole('button', { name: 'Remove name Rowan Finch', exact: true }).waitFor();
 });

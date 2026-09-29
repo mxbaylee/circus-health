@@ -150,7 +150,7 @@ configuration, or loud and recorded. Do not delete the capability; it is a real 
 - **Hosted admission.** [`src/server/runtime.ts:106`](../src/server/runtime.ts#L106) rejects any
   request whose `Host` header is not `127.0.0.1` or `localhost`. This blocks serving a real hostname,
   but there is no hostname to allow until deployment is decided, and the effective control today is
-  the Compose binding `127.0.0.1:${PORT:-3001}:3001`, which is sound. The header check is redundant
+  the Compose binding `127.0.0.1:${CRS_PORT:-3001}:3001`, which is sound. The header check is redundant
   with a correct control, not a live weakness. Worth one comment so nobody later removes the binding
   believing the header check covers it — nothing more.
 - **CRS-088, profile-less passkey unlock.** A first-class feature in its own right, and it would

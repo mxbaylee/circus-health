@@ -11,6 +11,7 @@ import {
   proxyCapabilities,
   proxyConfig,
   proxyRequest,
+  proxyRetryAfterMs,
 } from '../proxy-model-bridge.ts';
 import type { HealthTool, ProxyConfig, ProxyModelBridgeOptions } from '../proxy-model-bridge.ts';
 import { createImportDiagnostics, measureImportPhase } from '../import-diagnostics.ts';
@@ -177,9 +178,9 @@ const intakeReadReplies = (pages: number[]) =>
   }));
 const config = (extra: NodeJS.ProcessEnv = {}) =>
   proxyConfig({
-    HEALTH_AI_MODEL: 'fictional-proxy-alias',
-    HEALTH_AI_BASE_URL: 'http://proxy.test:4000',
-    HEALTH_AI_API_KEY: 'fictional-proxy-key',
+    CRS_AI_MODEL: 'fictional-proxy-alias',
+    CRS_AI_BASE_URL: 'http://proxy.test:4000',
+    CRS_AI_API_KEY: 'fictional-proxy-key',
     ...extra,
   });
 const json = (value: unknown) => new Response(JSON.stringify(value));
@@ -224,13 +225,10 @@ const answer = {
 test('proxy inference deadline defaults to five minutes and validates bounded overrides', () => {
   assert.equal(config().timeoutSeconds, 300);
   for (const seconds of ['30', '600'])
-    assert.equal(
-      config({ HEALTH_AI_PROXY_TIMEOUT_SECONDS: seconds }).timeoutSeconds,
-      Number(seconds),
-    );
+    assert.equal(config({ CRS_AI_PROXY_TIMEOUT_SECONDS: seconds }).timeoutSeconds, Number(seconds));
   for (const seconds of ['', '29', '601', '300.5', 'Infinity', '-1', '3e2', ' 300 '])
     assert.throws(
-      () => config({ HEALTH_AI_PROXY_TIMEOUT_SECONDS: seconds }),
+      () => config({ CRS_AI_PROXY_TIMEOUT_SECONDS: seconds }),
       /integer from 30 to 600/,
     );
 });
@@ -246,11 +244,11 @@ test('proxy request uses inference override only for cancellable work, keeping s
   };
   await proxyRequest(config(), {}, { ...options, signal: new AbortController().signal });
   await proxyRequest(
-    config({ HEALTH_AI_PROXY_TIMEOUT_SECONDS: '600' }),
+    config({ CRS_AI_PROXY_TIMEOUT_SECONDS: '600' }),
     {},
     { ...options, signal: new AbortController().signal },
   );
-  await proxyRequest(config({ HEALTH_AI_PROXY_TIMEOUT_SECONDS: '600' }), {}, options);
+  await proxyRequest(config({ CRS_AI_PROXY_TIMEOUT_SECONDS: '600' }), {}, options);
   assert.deepEqual(durations, [300000, 600000, 15000]);
 });
 
@@ -414,7 +412,12 @@ test('response-reader failures terminate provider diagnostics inside failed proc
     { status: 204, locked: false, classification: 'empty_response', message: /empty response/ },
     { status: 200, locked: false, classification: 'empty_response', message: /empty response/ },
     { status: 200, locked: true, classification: 'transport', message: /connection failed/ },
-    { status: 401, locked: true, classification: 'unclassified', message: /authentication failed/ },
+    {
+      status: 401,
+      locked: true,
+      classification: 'authentication',
+      message: /authentication failed/,
+    },
     { status: 503, locked: true, classification: 'transient_availability', message: /HTTP 503/ },
     {
       status: 200,
@@ -894,37 +897,37 @@ test('LiteLLM proxy parser requires exact endpoint, model and external virtual k
   writeFileSync(key, 'fictional-file-key\n');
   assert.equal(
     proxyConfig({
-      HEALTH_AI_MODEL: 'alias',
-      HEALTH_AI_BASE_URL: 'https://proxy.test',
-      HEALTH_AI_API_KEY_FILE: key,
+      CRS_AI_MODEL: 'alias',
+      CRS_AI_BASE_URL: 'https://proxy.test',
+      CRS_AI_API_KEY_FILE: key,
     }).apiKey,
     'fictional-file-key',
   );
   for (const env of [
-    { HEALTH_AI_MODEL: 'alias' },
-    { HEALTH_AI_BASE_URL: 'http://proxy.test', HEALTH_AI_API_KEY: 'key' },
+    { CRS_AI_MODEL: 'alias' },
+    { CRS_AI_BASE_URL: 'http://proxy.test', CRS_AI_API_KEY: 'key' },
     {
-      HEALTH_AI_MODEL: 'alias',
-      HEALTH_AI_BASE_URL: 'http://credential@proxy.test',
-      HEALTH_AI_API_KEY: 'key',
+      CRS_AI_MODEL: 'alias',
+      CRS_AI_BASE_URL: 'http://credential@proxy.test',
+      CRS_AI_API_KEY: 'key',
     },
     {
-      HEALTH_AI_MODEL: 'alias',
-      HEALTH_AI_BASE_URL: 'http://proxy.test',
-      HEALTH_AI_API_KEY: 'key',
-      HEALTH_AI_PROXY_LOCAL_ONLY: 'true',
+      CRS_AI_MODEL: 'alias',
+      CRS_AI_BASE_URL: 'http://proxy.test',
+      CRS_AI_API_KEY: 'key',
+      CRS_AI_PROXY_LOCAL_ONLY: 'true',
     },
     {
-      HEALTH_AI_MODEL: 'alias',
-      HEALTH_AI_BASE_URL: 'http://proxy.test',
-      HEALTH_AI_API_KEY: 'key',
-      HEALTH_AI_PROXY_IMAGES: 'probably',
+      CRS_AI_MODEL: 'alias',
+      CRS_AI_BASE_URL: 'http://proxy.test',
+      CRS_AI_API_KEY: 'key',
+      CRS_AI_PROXY_IMAGES: 'probably',
     },
     {
-      HEALTH_AI_MODEL: 'alias',
-      HEALTH_AI_BASE_URL: 'http://proxy.test',
-      HEALTH_AI_API_KEY: 'key',
-      HEALTH_AI_PROXY_PROMPT_CACHE: 'probably',
+      CRS_AI_MODEL: 'alias',
+      CRS_AI_BASE_URL: 'http://proxy.test',
+      CRS_AI_API_KEY: 'key',
+      CRS_AI_PROXY_PROMPT_CACHE: 'probably',
     },
   ])
     assert.throws(
@@ -932,16 +935,16 @@ test('LiteLLM proxy parser requires exact endpoint, model and external virtual k
       (error: unknown) => !errorText(error).includes('credential@'),
     );
   const local = config({
-    HEALTH_AI_PROXY_LOCAL_ONLY: 'true',
-    HEALTH_AI_PROXY_RESOLVED_MODEL: 'llama3.1:8b',
+    CRS_AI_PROXY_LOCAL_ONLY: 'true',
+    CRS_AI_PROXY_RESOLVED_MODEL: 'llama3.1:8b',
   });
   assert.equal(local.localOnly, true);
   assert.equal(local.resolvedModel, 'llama3.1:8b');
   assert.throws(
     () =>
       config({
-        HEALTH_AI_PROXY_LOCAL_ONLY: 'true',
-        HEALTH_AI_PROXY_RESOLVED_MODEL: 'openai/gpt-fake',
+        CRS_AI_PROXY_LOCAL_ONLY: 'true',
+        CRS_AI_PROXY_RESOLVED_MODEL: 'openai/gpt-fake',
       }),
     /local Ollama/,
   );
@@ -949,8 +952,8 @@ test('LiteLLM proxy parser requires exact endpoint, model and external virtual k
 
 test('local-only LiteLLM Proxy pins a verified private endpoint before a request', async () => {
   const local = config({
-    HEALTH_AI_PROXY_LOCAL_ONLY: 'true',
-    HEALTH_AI_PROXY_RESOLVED_MODEL: 'llama3.1:8b',
+    CRS_AI_PROXY_LOCAL_ONLY: 'true',
+    CRS_AI_PROXY_RESOLVED_MODEL: 'llama3.1:8b',
   });
   const privateDns = async () => [{ address: '10.7.0.8' }];
   assert.deepEqual(await localProxyTransport(local, privateDns), {
@@ -1802,7 +1805,7 @@ test('LiteLLM proxy rejects substituted models, errors and late tool calls after
 
 test('the cache breakpoint follows the static instructions so it includes tools and system', async () => {
   const fixture = harness([answer], {
-    config: config({ HEALTH_AI_PROXY_PROMPT_CACHE: 'true' }),
+    config: config({ CRS_AI_PROXY_PROMPT_CACHE: 'true' }),
   });
 
   await run(fixture);
@@ -1820,7 +1823,7 @@ test('the cache breakpoint follows the static instructions so it includes tools 
 
 test('no cache breakpoint is sent when the proxy does not declare support', async () => {
   const fixture = harness([json({ choices: [{ message: { content: 'done' } }] })], {
-    config: config({ HEALTH_AI_PROXY_PROMPT_CACHE: 'false' }),
+    config: config({ CRS_AI_PROXY_PROMPT_CACHE: 'false' }),
   });
 
   await run(fixture);
@@ -1830,7 +1833,7 @@ test('no cache breakpoint is sent when the proxy does not declare support', asyn
 
 test('prompt caching keeps the system message byte-identical across rounds, off-path bytes unchanged', async () => {
   const cached = harness([toolCall, answer], {
-    config: config({ HEALTH_AI_PROXY_PROMPT_CACHE: 'true' }),
+    config: config({ CRS_AI_PROXY_PROMPT_CACHE: 'true' }),
   });
   await run(cached);
   assert.equal(cached.requests.length, 2);
@@ -1845,7 +1848,7 @@ test('prompt caching keeps the system message byte-identical across rounds, off-
   assert.match(textContent(cached.requests[1]!.body.messages[1]), /continues the same response/);
 
   const uncached = harness([toolCall, answer], {
-    config: config({ HEALTH_AI_PROXY_PROMPT_CACHE: 'false' }),
+    config: config({ CRS_AI_PROXY_PROMPT_CACHE: 'false' }),
   });
   await run(uncached);
   assert.equal(uncached.requests.length, 2);
@@ -1867,7 +1870,7 @@ test('an opaque proxy rejection naming cache_control gets an actionable message,
   const diagnostics: string[] = [];
   await assert.rejects(
     proxyRequest(
-      config({ HEALTH_AI_PROXY_PROMPT_CACHE: 'true' }),
+      config({ CRS_AI_PROXY_PROMPT_CACHE: 'true' }),
       {},
       {
         fetchImpl: async () =>
@@ -1885,7 +1888,7 @@ test('an opaque proxy rejection naming cache_control gets an actionable message,
       },
     ),
     (error: unknown) => {
-      assert.match(errorText(error), /HEALTH_AI_PROXY_PROMPT_CACHE=false/);
+      assert.match(errorText(error), /CRS_AI_PROXY_PROMPT_CACHE=false/);
       assert.match(errorText(error), /Reference: 00000000-0000-4000-8000-000000000002/);
       return true;
     },
@@ -1894,7 +1897,7 @@ test('an opaque proxy rejection naming cache_control gets an actionable message,
 });
 
 test('LiteLLM proxy image evidence uses standard chat image parts only when explicit alias capability permits it', async () => {
-  const imageConfig = config({ HEALTH_AI_PROXY_IMAGES: 'true' });
+  const imageConfig = config({ CRS_AI_PROXY_IMAGES: 'true' });
   const f = harness([toolCall, answer], {
     config: imageConfig,
     onTool: async () => ({
@@ -1920,9 +1923,9 @@ const fictionalPng = 'data:image/png;base64,aGVsbG8=';
 
 test('native PDF evidence uses inline file parts and keeps host callbacks off the wire', async () => {
   assert.equal(config().pdf, false);
-  assert.throws(() => config({ HEALTH_AI_PROXY_PDF: 'maybe' }), /must be true or false/);
+  assert.throws(() => config({ CRS_AI_PROXY_PDF: 'maybe' }), /must be true or false/);
   const f = harness([toolCall, answer], {
-    config: config({ HEALTH_AI_PROXY_PDF: 'true' }),
+    config: config({ CRS_AI_PROXY_PDF: 'true' }),
     onTool: async ({ pdf }) => {
       assert.equal(pdf, true);
       return {
@@ -1958,7 +1961,7 @@ test('native PDF evidence uses inline file parts and keeps host callbacks off th
     'data:application/pdf;base64,aGVsbG8=',
   ]) {
     const blocked = harness([toolCall], {
-      config: config({ HEALTH_AI_PROXY_PDF: pdfContent === fictionalPdf ? 'false' : 'true' }),
+      config: config({ CRS_AI_PROXY_PDF: pdfContent === fictionalPdf ? 'false' : 'true' }),
       onTool: async () => ({ pdfContent, metadata: {} }),
     });
     await run(blocked);
@@ -1988,7 +1991,7 @@ test('explicit PDF rejection retries scoped images on the same route without rep
       answer,
     ],
     {
-      config: config({ HEALTH_AI_PROXY_PDF: 'true', HEALTH_AI_PROXY_IMAGES: 'true' }),
+      config: config({ CRS_AI_PROXY_PDF: 'true', CRS_AI_PROXY_IMAGES: 'true' }),
       onTool: async ({ arguments: args, pdf }) => {
         const page = Number(args.page);
         const metadata = { original: { page } };
@@ -2047,7 +2050,7 @@ test('PDF fallback never retries generic failures or routes without image suppor
     const f = harness(
       [toolCall, () => new Response(JSON.stringify({ error: { message } }), { status })],
       {
-        config: config({ HEALTH_AI_PROXY_PDF: 'true', HEALTH_AI_PROXY_IMAGES: String(images) }),
+        config: config({ CRS_AI_PROXY_PDF: 'true', CRS_AI_PROXY_IMAGES: String(images) }),
         onTool: async () => ({
           pdfContent: fictionalPdf,
           metadata: {},
@@ -2065,7 +2068,7 @@ test('PDF fallback never retries generic failures or routes without image suppor
 
 test('consumed native PDFs compact into receipts while recent pages retain native bytes', async () => {
   const f = harness([...intakeReadReplies([1, 2, 3]), answer], {
-    config: config({ HEALTH_AI_PROXY_PDF: 'true' }),
+    config: config({ CRS_AI_PROXY_PDF: 'true' }),
     onTool: async ({ arguments: args }) => ({
       pdfContent: fictionalPdf,
       metadata: fictionalReadResult(Number(args.page)),
@@ -2099,7 +2102,7 @@ test('consumed native PDFs compact into receipts while recent pages retain nativ
 });
 
 test('consumed image wires compact while two recent evidence messages remain intact', async () => {
-  const imageConfig = config({ HEALTH_AI_PROXY_IMAGES: 'true' });
+  const imageConfig = config({ CRS_AI_PROXY_IMAGES: 'true' });
   const replies = ['image-one', 'image-two', 'image-three'].map((id, index) => ({
     ...structuredClone(toolCall),
     choices: [
@@ -2320,7 +2323,7 @@ const packageReadResult = (page: number) => ({
 for (const representation of ['text', 'image', 'pdf'] as const)
   test(`consumed package-member ${representation} text is evicted without losing member/page metadata or inventing schema removal`, async () => {
     const f = harness([...packageReadReplies(), answer], {
-      config: config({ HEALTH_AI_PROXY_IMAGES: 'true', HEALTH_AI_PROXY_PDF: 'true' }),
+      config: config({ CRS_AI_PROXY_IMAGES: 'true', CRS_AI_PROXY_PDF: 'true' }),
       onTool: async ({ arguments: args }) => {
         const metadata = packageReadResult(Number(args.page));
         return representation === 'text'
@@ -2414,7 +2417,7 @@ test('package PDF compatibility fallback preserves read qualification for later 
       answer,
     ],
     {
-      config: config({ HEALTH_AI_PROXY_IMAGES: 'true', HEALTH_AI_PROXY_PDF: 'true' }),
+      config: config({ CRS_AI_PROXY_IMAGES: 'true', CRS_AI_PROXY_PDF: 'true' }),
       onTool: async ({ arguments: args, pdf }) => {
         const metadata = packageReadResult(Number(args.page));
         return pdf
@@ -2478,7 +2481,7 @@ test('repeated compaction passes neither re-wrap a compacted read nor evict the 
 
 test('compaction never rewrites the cached static prefix', async () => {
   const f = harness([...intakeReadReplies([1, 2, 3]), answer], {
-    config: config({ HEALTH_AI_PROXY_PROMPT_CACHE: 'true' }),
+    config: config({ CRS_AI_PROXY_PROMPT_CACHE: 'true' }),
     onTool: async ({ arguments: args }) => fictionalReadResult(Number(args.page)),
   });
 
@@ -2690,7 +2693,7 @@ test('LiteLLM proxy bounds untrusted error bodies and never reports their conten
 });
 
 test('explicit upstream response identity is allowed while other model substitutions remain blocked', async () => {
-  const mapped = config({ HEALTH_AI_PROXY_RESOLVED_MODEL: 'claude-fictional-20260101' });
+  const mapped = config({ CRS_AI_PROXY_RESOLVED_MODEL: 'claude-fictional-20260101' });
   const f = harness(
     [
       { ...toolCall, model: mapped.resolvedModel },
@@ -2864,4 +2867,47 @@ test('plan-create version feedback stays exact without unrelated proposal advice
     error: message,
   });
   assert.doesNotMatch(textContent(result), /proposal structure|records were accepted/);
+});
+
+test('physical provider receipts distinguish known rejections from unknown outcomes and preserve request-fit uncertainty', async () => {
+  for (const [status, outcome, classification] of [
+    [429, 'rejected', 'quota'],
+    [401, 'rejected', 'authentication'],
+    [408, 'unknown', 'unknown'],
+    [500, 'unknown', 'unknown'],
+    [503, 'rejected', 'transient'],
+  ] as const) {
+    const f = harness([
+      () => new Response('fictional response', { status, headers: { 'retry-after': '120' } }),
+    ]);
+    await run(f);
+    assert.equal(f.requests.length, 1);
+    const start = f.events.find((e) => e.method === 'model/requestStarted')!.params;
+    assert.match(String(start.requestDigest), /^[a-f0-9]{64}$/);
+    assert.ok(Number(start.requestBytes) > 0);
+    assert.equal((start.requestFit as JsonRecord).qualified, false);
+    assert.equal((start.requestFit as JsonRecord).inputTokens, null);
+    const finish = f.events.find((e) => e.method === 'model/requestFinished')!.params;
+    assert.equal(finish.outcome, outcome);
+    assert.equal(finish.classification, classification);
+    assert.equal(finish.status, status);
+    assert.equal(finish.usage, null);
+    if (status === 429 || status === 503)
+      assert.ok(Date.parse(String(finish.retryAt)) > Date.now() + 110_000);
+    else assert.equal(finish.retryAt, null);
+  }
+  const f = harness([
+    () => {
+      throw Error('fictional disconnected transport');
+    },
+  ]);
+  await run(f);
+  assert.equal(f.requests.length, 1);
+  assert.equal(
+    f.events.find((e) => e.method === 'model/requestFinished')!.params.outcome,
+    'unknown',
+  );
+  assert.equal(proxyRetryAfterMs('120', 0), 120_000);
+  assert.equal(proxyRetryAfterMs('Thu, 01 Jan 1970 00:02:00 GMT', 0), 120_000);
+  assert.equal(proxyRetryAfterMs('invalid', 0), undefined);
 });

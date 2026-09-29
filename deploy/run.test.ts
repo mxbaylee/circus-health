@@ -39,10 +39,10 @@ function fixture(t: { after(fn: () => void): void }) {
   writeFileSync(config, 'model_list: []\n');
   const state = join(root, 'state');
   const env = {
-    DATA_DIR: data,
-    STATE_DIR: state,
-    LITELLM_CONFIG: config,
-    MODEL: 'fictional-alias',
+    CRS_DATA_DIR: data,
+    CRS_STATE_DIR: state,
+    CRS_LITELLM_CONFIG: config,
+    CRS_MODEL: 'fictional-alias',
   };
   return { root, data, config, state, env };
 }
@@ -70,19 +70,27 @@ class FakeDocker extends Docker {
 test('launcher preserves credentials, validates runtime, derives archive image and tears down its own stack', async (t) => {
   const f = fixture(t),
     docker = new FakeDocker();
-  await main('run', { ...f.env, PORT: '5180' }, () => docker);
+  await main('run', { ...f.env, CRS_PORT: '5180', CRS_IMPORT_DIAGNOSTICS: 'true' }, () => docker);
   const key = readFileSync(join(f.state, 'proxy-key'), 'utf8');
   assert.equal(statSync(join(f.state, 'proxy-key')).mode & 0o777, 0o600);
   assert.ok(!JSON.stringify(docker.calls).includes(key.trim()));
   const up = docker.calls.find((c) => c.args.includes('up'))!;
-  assert.equal(up.env!.DATA_DIR, f.data);
-  assert.equal(up.env!.MODEL, 'fictional-alias');
-  assert.equal(up.env!.RESPONSE_MODEL, 'fictional-upstream');
-  assert.equal(up.env!.IMAGES, 'false');
-  assert.equal(up.env!.PROMPT_CACHE, 'false');
-  assert.equal(up.env!.PDF, 'auto');
-  assert.equal(up.env!.HEALTH_PUBLIC_ORIGIN, 'http://localhost:5180');
-  assert.match(up.env!.HEALTH_IMAGE!, /^circus-health:[a-f0-9]{12}$/u);
+  assert.equal(up.env!.CRS_DATA_DIR, f.data);
+  assert.equal(up.env!.CRS_MODEL, 'fictional-alias');
+  assert.equal(up.env!.CRS_IMPORT_DIAGNOSTICS, 'true');
+  assert.equal(up.env!.CRS_STATE_DIR, f.state);
+  assert.equal(up.env!.CRS_LITELLM_CONFIG, f.config);
+  assert.match(up.env!.CRS_BUILD_REVISION!, /^(?:[a-f0-9]{40}|[a-f0-9]{64}|unknown)$/);
+  assert.ok(['clean', 'dirty', 'unknown'].includes(up.env!.CRS_BUILD_WORKTREE!));
+  const build = docker.calls.find((c) => c.args.includes('build') && c.args.includes('health'))!;
+  assert.equal(build.env!.CRS_BUILD_REVISION, up.env!.CRS_BUILD_REVISION);
+  assert.equal(build.env!.CRS_BUILD_WORKTREE, up.env!.CRS_BUILD_WORKTREE);
+  assert.equal(up.env!.CRS_RESPONSE_MODEL, 'fictional-upstream');
+  assert.equal(up.env!.CRS_IMAGES, 'false');
+  assert.equal(up.env!.CRS_PROMPT_CACHE, 'false');
+  assert.equal(up.env!.CRS_PDF, 'auto');
+  assert.equal(up.env!.CRS_PUBLIC_ORIGIN, 'http://localhost:5180');
+  assert.match(up.env!.CRS_IMAGE!, /^circus-health:[a-f0-9]{12}$/u);
   assert.ok(up.args.includes('--abort-on-container-exit'));
   const preflight = docker.calls.find((c) =>
     c.args.some((arg) => arg.includes('validateRuntimeDirectory')),
@@ -91,11 +99,11 @@ test('launcher preserves credentials, validates runtime, derives archive image a
   assert.ok(docker.calls.indexOf(preflight) < docker.calls.indexOf(up));
   assert.ok(docker.calls.at(-1)!.args.includes('down'));
   for (const pdf of ['auto', 'true', 'false'])
-    await main('run', { ...f.env, PDF: pdf }, () => docker);
+    await main('run', { ...f.env, CRS_PDF: pdf }, () => docker);
   assert.equal(readFileSync(join(f.state, 'proxy-key'), 'utf8'), key);
   await assert.rejects(
-    main('run', { ...f.env, PDF: 'maybe' }, () => docker),
-    /PDF must/,
+    main('run', { ...f.env, CRS_PDF: 'maybe' }, () => docker),
+    /CRS_PDF must/,
   );
 });
 
@@ -120,7 +128,7 @@ test('failed daemon preflight never transfers writer domain; runtime failure sti
 test('ChatGPT login isolates auth, never opens an archive or forwards provider env', async (t) => {
   const f = fixture(t),
     docker = new FakeDocker();
-  await main('login-chatgpt', { STATE_DIR: f.state }, () => docker);
+  await main('login-chatgpt', { CRS_STATE_DIR: f.state }, () => docker);
   assert.equal(docker.calls.length, 1);
   const args = docker.calls[0]!.args;
   for (const flag of ['--read-only', '--cap-drop', '--pids-limit', '--cpus', '--security-opt'])
@@ -141,7 +149,7 @@ test('path validation rejects Git trees, symlink escapes and overlapping secrets
   mkdirSync(join(code, 'data'));
   const link = join(f.root, 'data');
   symlinkSync(join(code, 'data'), link);
-  assert.throws(() => dataDirectory({ DATA_DIR: link }), /outside Git/);
+  assert.throws(() => dataDirectory({ CRS_DATA_DIR: link }), /outside Git/);
   writeFileSync(join(f.data, 'secret'), 'fictional');
   assert.throws(() => external(join(f.data, 'secret'), 'secret', { data: f.data }), /separate/);
   assert.throws(
@@ -154,7 +162,7 @@ test('path validation rejects Git trees, symlink escapes and overlapping secrets
 test('origins, image tags and retired settings fail closed', async () => {
   assert.equal(publicOrigin({}, '5180'), 'http://localhost:5180');
   assert.equal(
-    publicOrigin({ HEALTH_PUBLIC_ORIGIN: 'https://circus.example.test' }, '5180'),
+    publicOrigin({ CRS_PUBLIC_ORIGIN: 'https://circus.example.test' }, '5180'),
     'https://circus.example.test',
   );
   for (const origin of [
@@ -167,10 +175,10 @@ test('origins, image tags and retired settings fail closed', async () => {
     'https://circus.example.test:65536',
     'https://CIRCUS.example.test',
   ])
-    assert.throws(() => publicOrigin({ HEALTH_PUBLIC_ORIGIN: origin }, '5180'));
+    assert.throws(() => publicOrigin({ CRS_PUBLIC_ORIGIN: origin }, '5180'));
   assert.equal(applicationImage({}, 'build'), 'circus-health:build');
   for (const image of ['bad tag', '--option', 'https://example.test/image', 'image@sha256:abc'])
-    assert.throws(() => applicationImage({ HEALTH_IMAGE: image }, 'build'));
+    assert.throws(() => applicationImage({ CRS_IMAGE: image }, 'build'));
   await assert.rejects(main('run', { RUNTIME: 'docker' }), /Retired options/);
 });
 
@@ -178,7 +186,7 @@ test('nonempty incidental env and symlinked proxy keys cannot override Compose',
   const f = fixture(t),
     docker = new FakeDocker();
   mkdirSync(f.state);
-  writeFileSync(join(f.state, 'empty.env'), 'PORT=1\n');
+  writeFileSync(join(f.state, 'empty.env'), 'CRS_PORT=1\n');
   await assert.rejects(
     main('run', f.env, () => docker),
     /empty regular file/,
@@ -295,7 +303,7 @@ test('signals reach Docker descendants; repeated terminal signals cannot interru
 
 test('root npm commands expose help and validate an archive without invoking Docker', (t) => {
   const f = fixture(t);
-  const env = { ...process.env, DATA_DIR: f.data, DOCKER: join(f.root, 'not-installed') };
+  const env = { ...process.env, CRS_DATA_DIR: f.data, CRS_DOCKER: join(f.root, 'not-installed') };
   for (const key of ['RUNTIME', 'AI', 'AI_URL', 'KEY_FILE', 'AUTH_DIR', 'ENV_FILE', 'STACK'])
     delete env[key as keyof typeof env];
   const help = spawnSync('npm', ['run', 'help'], {
@@ -316,7 +324,7 @@ test('root npm commands expose help and validate an archive without invoking Doc
   assert.match(valid.stdout, /Archive mount location valid/u);
   const invalid = spawnSync('npm', ['run', 'check:data'], {
     cwd: ROOT,
-    env: { ...env, DATA_DIR: 'relative' },
+    env: { ...env, CRS_DATA_DIR: 'relative' },
     encoding: 'utf8',
     timeout: 20_000,
   });
@@ -378,7 +386,7 @@ test(
 import fs from 'node:fs'; import path from 'node:path'; import {spawn} from 'node:child_process';
 const action=path.basename(process.argv[1] || '');
 if(['info','run','compose'].includes(action)) {
- const marker=name=>path.join(process.env.CIRCUS_SIGNAL_ROOT,name);
+ const marker=name=>path.join(process.env.CRS_SIGNAL_ROOT,name);
  if(action==='info') { console.log('fictional'); process.exit(0); }
  if(action==='run') { console.log(JSON.stringify({response_model:'fictional-upstream',images:false,promptCache:false})); process.exit(0); }
  if(process.argv.includes('up')) {
@@ -396,9 +404,9 @@ if(['info','run','compose'].includes(action)) {
       const env: NodeJS.ProcessEnv = {
         ...process.env,
         ...f.env,
-        DOCKER: process.execPath,
+        CRS_DOCKER: process.execPath,
         NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
-        CIRCUS_SIGNAL_ROOT: root,
+        CRS_SIGNAL_ROOT: root,
       };
       for (const key of [
         'RUNTIME',
@@ -408,10 +416,10 @@ if(['info','run','compose'].includes(action)) {
         'AUTH_DIR',
         'ENV_FILE',
         'STACK',
-        'PDF',
-        'IMAGES',
-        'RESPONSE_MODEL',
-        'PROMPT_CACHE',
+        'CRS_PDF',
+        'CRS_IMAGES',
+        'CRS_RESPONSE_MODEL',
+        'CRS_PROMPT_CACHE',
       ])
         delete env[key];
       const child = spawn('npm', ['run', 'start'], {
@@ -466,3 +474,61 @@ if(['info','run','compose'].includes(action)) {
     }
   },
 );
+
+test('image build propagates repository metadata instead of accepting caller identity claims', async () => {
+  const docker = new FakeDocker();
+  await main(
+    'build',
+    { CRS_BUILD_REVISION: '/fictional/not-a-revision', CRS_BUILD_WORKTREE: 'clean' },
+    () => docker,
+  );
+  const args = docker.calls[0]!.args;
+  assert.equal(args[0], 'build');
+  assert.ok(
+    args.some((arg) => /^CRS_BUILD_REVISION=(?:[a-f0-9]{40}|[a-f0-9]{64}|unknown)$/.test(arg)),
+  );
+  assert.ok(args.some((arg) => /^CRS_BUILD_WORKTREE=(?:clean|dirty|unknown)$/.test(arg)));
+  assert.equal(
+    args.some((arg) => arg.includes('/fictional')),
+    false,
+  );
+  const compose = readFileSync(join(ROOT, 'compose.yaml'), 'utf8');
+  const dockerfile = readFileSync(join(ROOT, 'Dockerfile'), 'utf8');
+  for (const field of ['CRS_BUILD_REVISION', 'CRS_BUILD_WORKTREE']) {
+    assert.ok(compose.includes(field + ': ${' + field + ':-unknown}'));
+    assert.ok(dockerfile.includes('ARG ' + field + '=unknown'));
+  }
+});
+
+test('legacy launcher settings require migration instead of selecting another archive or auth directory', async (t) => {
+  const f = fixture(t);
+  for (const [oldKey, newKey] of [
+    ['DATA_DIR', 'CRS_DATA_DIR'],
+    ['STATE_DIR', 'CRS_STATE_DIR'],
+    ['MODEL', 'CRS_MODEL'],
+    ['HEALTH_IMPORT_DIAGNOSTICS', 'CRS_IMPORT_DIAGNOSTICS'],
+  ]) {
+    const env: NodeJS.ProcessEnv = { ...f.env, [oldKey!]: 'old-setting' };
+    delete env[newKey!];
+    const docker = new FakeDocker();
+    await assert.rejects(
+      main('run', env, () => docker),
+      new RegExp(newKey!),
+    );
+    assert.equal(docker.calls.length, 0);
+  }
+  const docker = new FakeDocker();
+  await main(
+    'run',
+    {
+      ...f.env,
+      STATE_DIR: '/unused-old-state',
+      HEALTH_IMPORT_DIAGNOSTICS: 'false',
+      CRS_IMPORT_DIAGNOSTICS: 'true',
+    },
+    () => docker,
+  );
+  const up = docker.calls.find((call) => call.args.includes('up'))!;
+  assert.equal(up.env!.CRS_STATE_DIR, f.state);
+  assert.equal(up.env!.CRS_IMPORT_DIAGNOSTICS, 'true');
+});

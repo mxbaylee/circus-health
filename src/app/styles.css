@@ -795,7 +795,8 @@ select {
   min-width: 0;
   flex: 1;
 }
-.row-copy > strong {
+.row-copy > strong,
+.result-name-and-badges > strong {
   font-size: 1rem;
   font-weight: 550;
   line-height: 1.35;
@@ -1160,7 +1161,8 @@ select {
     padding: 18px 15px;
     gap: 8px;
   }
-  .row-copy > strong {
+  .row-copy > strong,
+  .result-name-and-badges > strong {
     font-size: 0.94rem;
   }
   .row-number {
@@ -1271,7 +1273,8 @@ select {
   .result-row > svg {
     display: none;
   }
-  .row-copy > strong {
+  .row-copy > strong,
+  .result-name-and-badges > strong {
     font-size: 0.875rem;
   }
   .row-copy > span {
@@ -1421,7 +1424,8 @@ select {
     padding: 19px 17px;
     gap: 12px;
   }
-  .row-copy > strong {
+  .row-copy > strong,
+  .result-name-and-badges > strong {
     font-size: 1rem;
   }
   .row-copy > span {

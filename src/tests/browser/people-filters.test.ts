@@ -59,7 +59,7 @@ test(
       return response.body.data;
     }
     async function capture(prefix: string) {
-      const visuals = process.env.HEALTH_PEOPLE_VISUAL_DIR;
+      const visuals = process.env.CRS_PEOPLE_VISUAL_DIR;
       if (!visuals) return;
       assert(!resolve(visuals).startsWith(fileURLToPath(new URL('../../../', import.meta.url))));
       mkdirSync(visuals, { recursive: true });
@@ -92,7 +92,7 @@ test(
     );
     await page.getByRole('button', { name: 'Create profile', exact: true }).click();
     await page.getByLabel('Display name', { exact: true }).fill('Fictional Shortbread');
-    await page.getByLabel('Full name on health records').fill('Fictional Shortbread');
+    await page.getByLabel('Your name').fill('Fictional Shortbread');
     await page.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
     await page.getByRole('button', { name: 'Continue to recovery key' }).click();
     const recovery = await page.getByLabel('Recovery key', { exact: true }).inputValue();
@@ -104,13 +104,13 @@ test(
       .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
       .getByRole('button', { name: 'Skip', exact: true })
       .click();
-    for (const step of ['About you', 'Primary care provider', 'Emergency contact']) {
+    for (const step of ['Primary care provider', 'Emergency contact']) {
       await page
-        .getByRole('dialog', { name: 'A little about you' })
+        .getByRole('dialog', { name: 'Care contacts' })
         .getByRole('heading', { name: step, exact: true })
         .waitFor();
       await page
-        .getByRole('dialog', { name: 'A little about you' })
+        .getByRole('dialog', { name: 'Care contacts' })
         .getByRole('button', { name: 'Skip for now' })
         .click();
     }

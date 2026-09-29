@@ -420,7 +420,9 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
     />,
   );
 
-  await user.click(await screen.findByRole('button', { name: 'Review Fictional BodySpec' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
+  );
   await user.click(
     await screen.findByRole('button', { name: 'Use Fictional BodySpec for 1 record' }),
   );
@@ -430,7 +432,9 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
   expect(sourcePosts[1]!.version).toBe(2);
   expect(sourcePosts[1]!.scopeToken).toBe(sameScopeRefresh.scopeToken);
 
-  await user.click(await screen.findByRole('button', { name: 'Review Fictional BodySpec' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
+  );
   await user.click(
     await screen.findByRole('button', { name: 'Use Fictional BodySpec for 1 record' }),
   );
@@ -443,7 +447,9 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
   expect(sourcePosts[3]!.operationId).not.toBe(sourcePosts[2]!.operationId);
   expect(sourcePosts[3]!.scopeToken).toBe(changedScopeRefresh.scopeToken);
 
-  await user.click(await screen.findByRole('button', { name: 'Review Fictional BodySpec' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
+  );
   await user.click(
     await screen.findByRole('button', { name: 'Use Fictional BodySpec for 1 record' }),
   );
@@ -463,11 +469,12 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
   expect(sourcePosts).toHaveLength(5);
 });
 
-it('honors an explicit original selector, then stays on the overview after Back', async () => {
+it('keeps an explicit original selector in the import view and can return to all imports', async () => {
   const user = userEvent.setup();
   const router = mount('/import?intake=fictional-intake&proposal=original');
-  expect(await screen.findByRole('region', { name: 'Exact selected report' })).toBeVisible();
-  await user.click(screen.getByRole('button', { name: 'Back to overview' }));
+  expect(await screen.findByRole('heading', { name: 'Review reports' })).toBeVisible();
+  expect(screen.queryByRole('region', { name: 'Exact selected report' })).toBeNull();
+  await user.click(await screen.findByRole('button', { name: 'All imports' }));
   expect(await screen.findByRole('heading', { name: 'Review reports' })).toBeVisible();
   expect(router.state.location.search).toBe('');
 });
@@ -638,17 +645,13 @@ it('publishes a completed report identity without waiting for an unrelated slow 
   );
 
   await waitFor(() => expect(releaseSlow).toHaveLength(1));
-  expect(
-    await screen.findByText('This report identifies “Fast Fictional Person”. Is it yours?'),
-  ).toBeVisible();
+  expect(await screen.findByText('Fast Fictional Person')).toBeVisible();
 
   const restored = new Event('pageshow');
   Object.defineProperty(restored, 'persisted', { value: true });
   fireEvent(window, restored);
   await waitFor(() => expect(fastReads).toBe(2));
-  expect(
-    await screen.findByText('This report identifies “Fast Fictional Person”. Is it yours?'),
-  ).toBeVisible();
+  expect(await screen.findByText('Fast Fictional Person')).toBeVisible();
 
   for (const release of releaseSlow)
     release(
@@ -662,10 +665,15 @@ it('publishes a completed report identity without waiting for an unrelated slow 
         { status: 503, headers: { 'Content-Type': 'application/json' } },
       ),
     );
+  await waitFor(() =>
+    expect(
+      screen.getByRole('button', { name: 'Review person for Fictional report slow' }),
+    ).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Review person for Fictional report slow' }));
   expect(await screen.findByText('Fictional identity unavailable.')).toBeVisible();
-  expect(
-    screen.getByText('This report identifies “Fast Fictional Person”. Is it yours?'),
-  ).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+  expect(screen.getByText('Fast Fictional Person')).toBeVisible();
 });
 
 it('does not publish a late identity response for an older exact report signature', async () => {
@@ -793,15 +801,11 @@ it('does not publish a late identity response for an older exact report signatur
   const restored = new Event('pageshow');
   Object.defineProperty(restored, 'persisted', { value: true });
   fireEvent(window, restored);
-  expect(
-    await screen.findByText('This report identifies “Fresh Fictional Person”. Is it yours?'),
-  ).toBeVisible();
+  expect(await screen.findByText('Fresh Fictional Person')).toBeVisible();
 
   releaseOld(response(identityFor(versionOne, 'Stale Fictional Person')));
   await waitFor(() => expect(screen.queryByText(/Stale Fictional Person/)).toBeNull());
-  expect(
-    screen.getByText('This report identifies “Fresh Fictional Person”. Is it yours?'),
-  ).toBeVisible();
+  expect(screen.getByText('Fresh Fictional Person')).toBeVisible();
 });
 
 it('retains one identical in-flight identity read across ordinary feed search churn', async () => {
@@ -934,9 +938,7 @@ it('retains one identical in-flight identity read across ordinary feed search ch
   expect(identityReleases).toHaveLength(1);
 
   identityReleases[0](response(identity));
-  expect(
-    await screen.findByText('This report identifies “Stable Fictional Person”. Is it yours?'),
-  ).toBeVisible();
+  expect(await screen.findByText('Stable Fictional Person')).toBeVisible();
   expect(identityReleases).toHaveLength(1);
 });
 
@@ -1078,13 +1080,9 @@ it('does not reuse an old identity error after a report disappears and is re-add
   await waitFor(() => expect(identityReleases).toHaveLength(2));
 
   identityReleases[1](response(freshIdentity));
-  expect(
-    await screen.findByText('This report identifies “Re-added Fictional Person”. Is it yours?'),
-  ).toBeVisible();
+  expect(await screen.findByText('Re-added Fictional Person')).toBeVisible();
   await waitFor(() => expect(screen.queryByText('Old fictional identity error.')).toBeNull());
-  expect(
-    screen.getByText('This report identifies “Re-added Fictional Person”. Is it yours?'),
-  ).toBeVisible();
+  expect(screen.getByText('Re-added Fictional Person')).toBeVisible();
 });
 
 it('clears a retained identity action before refreshing a back-forward cached Import page', async () => {
@@ -1203,13 +1201,18 @@ it('clears a retained identity action before refreshing a back-forward cached Im
       })}
     />,
   );
-  expect(await screen.findByRole('button', { name: 'This is me' })).toBeEnabled();
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: /Review person for/ })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  expect(screen.getByRole('button', { name: 'This is me' })).toBeEnabled();
 
   const restored = new Event('pageshow');
   Object.defineProperty(restored, 'persisted', { value: true });
   fireEvent(window, restored);
-  await waitFor(() => expect(screen.queryByRole('button', { name: 'This is me' })).toBeNull());
-  expect(screen.getByRole('button', { name: 'Checking…' })).toBeDisabled();
+  await waitFor(() => expect(screen.getByRole('button', { name: 'This is me' })).toBeDisabled());
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+  expect(screen.getByRole('button', { name: /Review person for/ })).toBeEnabled();
 
   releaseRestoredFeed(response(clinicalFeed));
   await waitFor(() => expect(identityReads).toBe(2));
@@ -1342,7 +1345,10 @@ it('completes one overview identity action after exact late-reading freshness va
     />,
   );
 
-  await user.click(await screen.findByRole('button', { name: 'Review identity' }));
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: /Review person for/ })).toBeEnabled(),
+  );
+  await user.click(screen.getByRole('button', { name: /Review person for/ }));
   await user.click(screen.getByRole('button', { name: 'This is me' }));
   expect(
     await screen.findByText(
@@ -1356,12 +1362,12 @@ it('completes one overview identity action after exact late-reading freshness va
   expect((identityPosts[1]!.scope as { scopeToken: string }).scopeToken).toBe(
     'fictional-scope-token-v2',
   );
-  expect((identityPosts[1]!.selfUpdate as { fields: object }).fields).toEqual(
-    displayedIdentity.offeredSelfFields,
-  );
+  expect((identityPosts[1]!.selfUpdate as { fields: object }).fields).toEqual({
+    birthDate: displayedIdentity.offeredSelfFields.birthDate,
+  });
 });
 
-it('refreshes record readiness and suppresses an exhausted identity action after a Self fill', async () => {
+it('refreshes record readiness and suppresses an exhausted identity action after retaining a name', async () => {
   const profileId = 'fictional-import-exhausted-identity';
   selectProfile({
     id: profileId,
@@ -1556,13 +1562,18 @@ it('refreshes record readiness and suppresses an exhausted identity action after
     />,
   );
 
-  expect(await screen.findByText('Confirm this fictional report subject.')).toBeVisible();
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: /Review person for/ })).toBeEnabled(),
+  );
+  await user.click(screen.getByRole('button', { name: /Review person for/ }));
+  expect((await screen.findAllByText('Confirm this fictional report subject.'))[0]).toBeVisible();
   expect(
     screen.queryByText(
       'This item is kept with its original and cannot be saved as a structured record.',
     ),
   ).toBeNull();
-  await user.click(await screen.findByRole('button', { name: 'Review identity' }));
+  expect(screen.queryByRole('button', { name: 'Review identity' })).toBeNull();
+  expect(screen.queryByRole('checkbox', { name: /Full name/ })).toBeNull();
   await user.click(screen.getByRole('button', { name: 'This is me' }));
 
   await waitFor(() => expect(identityPosts).toBe(1));
@@ -1701,15 +1712,22 @@ it('recovers the exact uncertain overview retry on a second explicit action', as
     />,
   );
 
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: /Review person for/ })).toBeEnabled(),
+  );
+  await user.click(screen.getByRole('button', { name: /Review person for/ }));
   const action = await screen.findByRole('button', { name: 'This is me' });
   await user.click(action);
   await waitFor(() => expect(identityPosts).toHaveLength(2));
   expect(
     await screen.findByText('Fictional connection ended after the overview retry was sent'),
   ).toBeVisible();
-  await user.click(action);
+  await user.click(screen.getByRole('button', { name: /Review person for/ }));
+  await user.click(screen.getByRole('button', { name: 'This is me' }));
   expect(
-    await screen.findByText('Identity confirmed for this report. Nothing was saved yet.'),
+    await screen.findByText(
+      'This report is confirmed as yours and its supported name is retained in your saved names. Clinical records remain in review.',
+    ),
   ).toBeVisible();
   expect(identityPosts).toHaveLength(3);
   expect(identityPosts[2]).toEqual(identityPosts[1]);
@@ -1837,6 +1855,10 @@ it('does not retry after the overview unmounts during its identity freshness rea
     />,
   );
 
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: /Review person for/ })).toBeEnabled(),
+  );
+  await user.click(screen.getByRole('button', { name: /Review person for/ }));
   await user.click(await screen.findByRole('button', { name: 'This is me' }));
   await waitFor(() => expect(identityReads).toBe(2));
   mounted.unmount();

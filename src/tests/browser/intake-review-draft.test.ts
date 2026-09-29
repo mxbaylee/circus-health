@@ -165,6 +165,20 @@ test(
       await page.goto(url + '/#/import?intake=' + encodeURIComponent(item.id));
       await page.reload();
       await page.locator('.import-detail-record-link').first().click();
+      // No shared printed subject exists in this fixture. Its header review is
+      // informational; the explicit record-level identity answer stays separate.
+      await page
+        .getByRole('button', { name: 'Review person for this report', exact: true })
+        .click();
+      const personSidebar = page.getByRole('dialog', { name: 'Who is this report for?' });
+      await personSidebar
+        .getByText('Identity is not printed clearly in this report.', { exact: true })
+        .waitFor();
+      assert.equal(
+        await personSidebar.getByRole('button', { name: 'This is me', exact: true }).count(),
+        0,
+      );
+      await personSidebar.getByRole('button', { name: 'Close', exact: true }).click();
       await page.getByRole('button', { name: 'This is me', exact: true }).click();
       await page.getByRole('button', { name: 'Keep unconfirmed', exact: true }).click();
       await page.getByRole('button', { name: 'Leave uncertain', exact: true }).click();

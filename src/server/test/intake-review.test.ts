@@ -1577,11 +1577,11 @@ test('source, date and Self suggestions require their exact evidence and proper 
       reportSubject: 'Patient: Fictional Rowan Example. DOB: 1990-03',
     },
   );
-  assert.equal(
+  assert.deepEqual(
     otherPerson.find(
       (issue) => issue.prompt === 'Does the printed patient identity belong to you?',
     )!.selfSuggestion,
-    undefined,
+    { fullName: 'Fictional Rowan Example', birthDate: '1990-03' },
   );
 
   const directReportConflict = structuredClone(value);

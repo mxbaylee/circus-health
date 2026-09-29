@@ -167,7 +167,7 @@ export function validateRuntimeDirectory(runtimeDirectory?: string): void {
   // Filesystem type numbers are platform-specific. Native non-Linux runs are
   // contributor checks, outside the supported deployment's tmpfs guarantee.
   if (process.platform !== 'linux') return;
-  const requirement = 'HEALTH_RUNTIME_DIR must be an existing absolute directory on a tmpfs';
+  const requirement = 'CRS_RUNTIME_DIR must be an existing absolute directory on a tmpfs';
   try {
     if (
       !runtimeDirectory ||
@@ -191,11 +191,11 @@ export function validateDataDirectory(
     !existsSync(dataDirectory) ||
     !statSync(dataDirectory).isDirectory()
   )
-    throw new Error('DATA_DIR must be an existing absolute durable data directory');
+    throw new Error('CRS_DATA_DIR must be an existing absolute durable data directory');
   // Docker mounts any operator directory at this stable internal path, keeping
   // archived data/profiles/... references independent of host/code locations.
   if (basename(dataDirectory) !== 'data')
-    throw new Error('Runtime DATA_DIR must be mounted as <archive-root>/data');
+    throw new Error('Runtime CRS_DATA_DIR must be mounted as <archive-root>/data');
   const root = dirname(realpathSync(dataDirectory));
   for (const profileId of profileIds ||
     readProfileRegistry(root).profiles.map((p: { id: string }) => p.id)) {

@@ -265,7 +265,7 @@ it('a failed recovery action after discard retains the same draft and can retry 
   expect(fields[0]).toHaveValue('Unsaved fictional edit 0');
   await user.click(screen.getByRole('button', { name: 'Close dialog' }));
   failSave = false;
-  await user.click(screen.getByRole('button', { name: 'Save now' }));
+  await user.click(screen.getByRole('button', { name: 'Retry save' }));
   await waitFor(() => expect(notes.get(original.id)?.content).toBe('Unsaved fictional edit 0'));
 });
 it('blocks transition on pending attachment associations, even with no text changes', async () => {
@@ -358,10 +358,7 @@ it.each(['new', 'copy', 'resume', 'unlocked'])(
       } else {
         await user.click(screen.getByRole('button', { name: 'Create profile' }));
         await user.type(screen.getByLabelText('Display name'), 'Fictional new profile');
-        await user.type(
-          screen.getByLabelText('Full name on health records'),
-          'Fictional Casey Example',
-        );
+        await user.type(screen.getByLabelText('Your name'), 'Fictional Casey Example');
         fireEvent.change(screen.getByLabelText('Date of birth'), {
           target: { value: '1982-04-17' },
         });

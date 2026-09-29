@@ -67,6 +67,8 @@ beforeEach(() => {
       const q = (url.searchParams.get('q') || '').toLowerCase();
       let data: unknown;
       if (endpoint === '/providers') data = [];
+      else if (endpoint.startsWith('/clinical-person/'))
+        data = { name: 'Rowan Example', noteId: 'rowan-note' };
       else if (endpoint === '/test-types')
         data = types.filter((type) => type.label.toLowerCase().includes(q));
       else if (endpoint === '/tests')
@@ -146,6 +148,22 @@ function mount(url: string) {
 }
 
 describe('Test Results comparison navigation', () => {
+  it('keeps family history and comparison requests scoped to the selected person', async () => {
+    const user = userEvent.setup();
+    mount('/tests?personId=rowan-person');
+    await screen.findByRole('heading', { level: 2, name: 'Total Cholesterol' });
+    // Person indication now lives in the shared shell, not a second content banner.
+    expect(screen.queryByRole('link', { name: 'Open person' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Compare' }));
+    await screen.findByRole('button', { name: /HDL Cholesterol.*numeric/ });
+    for (const path of ['/tests', '/test-types', '/trends']) {
+      const relevant = requests.filter((request) => request.pathname.endsWith(path));
+      expect(relevant.length).toBeGreaterThan(0);
+      expect(
+        relevant.every((request) => request.searchParams.get('personId') === 'rowan-person'),
+      ).toBe(true);
+    }
+  });
   it('offers correction for an individual saved result', async () => {
     const user = userEvent.setup();
     mount('/tests?result=total-new&detail=1');

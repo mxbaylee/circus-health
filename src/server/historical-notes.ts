@@ -44,6 +44,7 @@ export const CLINICIAN_NOTE_TYPES = Object.freeze([
 interface HistoricalRow extends SqliteRow {
   id: string;
   origin: 'personal' | 'provider';
+  person_id: string;
   archived: number;
   title: string;
   type_label: string | null;
@@ -77,7 +78,7 @@ const reviewed = (key: string): string => textField('$.historicalNote.' + key);
 const original = (key: string): string => textField('$.sourceFields.' + key);
 function collection(): string {
   return `WITH historical AS (
-    SELECT n.id,'personal' AS origin,n.title,n.note_type AS type_label,
+    SELECT n.id,COALESCE(json_extract(n.profile_json,'$.recordOwnerPersonId'),'patient') AS person_id,'personal' AS origin,n.title,n.note_type AS type_label,
       COALESCE(n.event_date,n.created_at) AS date,n.event_date,NULL AS record_date,
       CASE WHEN n.event_date IS NULL THEN 'Note creation date' ELSE 'Event date' END AS date_basis,
       n.status,'personal' AS source_id,'Personal notes' AS source_label,
@@ -86,7 +87,7 @@ function collection(): string {
       n.topics || ' ' || n.raw_thoughts AS search_extra, ${noteVisibilitySQL('n')} AS archived
     FROM notes n WHERE n.kind='historical' 
     UNION ALL
-    SELECT d.id,'provider',COALESCE(${reviewed('title')},d.title),
+    SELECT d.id,COALESCE(json_extract(d.extra_json,'$.import.personId'),'patient'),'provider',COALESCE(${reviewed('title')},d.title),
       COALESCE(${reviewed('typeLabel')},${original('type')}),
       COALESCE(${reviewed('eventDate')},d.effective_at),${reviewed('eventDate')},d.effective_at,
       COALESCE(${reviewed('dateBasis')},CASE WHEN ${reviewed('eventDate')} IS NULL THEN 'Source record date' ELSE 'Reviewed event date' END),
@@ -103,6 +104,7 @@ function collection(): string {
 function historicalNote(db: Database, row: HistoricalRow): HistoricalNote {
   const common = {
     id: row.id,
+    personId: row.person_id,
     origin: row.origin,
     archived: Boolean(row.archived),
     title: row.title,
@@ -168,8 +170,8 @@ export function historicalNotes(db: Database, params: URLSearchParams) {
   const status = params.get('status') || 'all';
   if (!['all', 'draft', 'finished', 'provider'].includes(status))
     throw new HttpError(400, 'INVALID_INPUT', 'Unknown historical note status');
-  const conditions = [visibilityCondition(params, 'archived')],
-    args: string[] = [...CLINICIAN_NOTE_TYPES];
+  const conditions = ['person_id=?', visibilityCondition(params, 'archived')],
+    args: string[] = [...CLINICIAN_NOTE_TYPES, params.get('personId') || 'patient'];
   if (status !== 'all') {
     conditions.push('status=?');
     args.push(status);
@@ -235,13 +237,16 @@ export function getHistoricalNote(db: Database, id: string): HistoricalNote {
   );
   return historicalNote(db, row);
 }
-export function historicalNoteOptions(db: Database): HistoricalNoteOptions {
+export function historicalNoteOptions(
+  db: Database,
+  params = new URLSearchParams(),
+): HistoricalNoteOptions {
   const rows = db
     .prepare(
       collection() +
-        ' SELECT origin,source_id,source_label,type_label,acquisition_source_id,acquisition_source_label FROM historical WHERE archived=0 ORDER BY source_label,id',
+        ' SELECT origin,source_id,source_label,type_label,acquisition_source_id,acquisition_source_label FROM historical WHERE archived=0 AND person_id=? ORDER BY source_label,id',
     )
-    .all(...CLINICIAN_NOTE_TYPES) as OptionRow[];
+    .all(...CLINICIAN_NOTE_TYPES, params.get('personId') || 'patient') as OptionRow[];
   const personal = rows.filter((row) => row.origin === 'personal').length;
   const sources = [
     { id: 'all', label: 'All sources', count: rows.length },

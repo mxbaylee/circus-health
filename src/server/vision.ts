@@ -30,10 +30,11 @@ export function visionPrescriptions(
   offset: number;
 } {
   const where = [
+    "COALESCE(json_extract(d.extra_json,'$.import.personId'),'patient')=?",
     "json_type(d.extra_json, '$.import.acceptedMapping.opticalPrescription')='object'",
     visibilityCondition(params, visibilitySQL("'document'", 'd.id')),
   ];
-  const args: string[] = [];
+  const args: string[] = [params.get('personId') || 'patient'];
   for (const [parameter, column, operator] of [
     ['documentId', 'd.id', '='],
     ['providerId', 'd.provider_id', '='],

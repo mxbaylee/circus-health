@@ -20,6 +20,7 @@
 }
 .pdf-page-controls {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 8px;
@@ -33,14 +34,14 @@
 }
 .pdf-page-frame {
   display: flex;
-  justify-content: center;
+  justify-content: flex-start;
   width: 100%;
   min-width: 0;
-  overflow: hidden;
+  overflow: auto;
 }
 .pdf-page-canvas {
   display: block;
-  max-width: 100%;
+  flex: none;
   background: white;
 }
 .pdf-preview-status,

@@ -119,7 +119,8 @@ export interface IntakeReportSourceCoverageEntry {
   };
 }
 export interface IntakeReportSourceConfirmation {
-  basis?: 'manual_report_label' | 'explicit_current_members';
+  /** suggested_report_label is a derived default, never a human confirmation. */
+  basis?: 'manual_report_label' | 'explicit_current_members' | 'suggested_report_label';
   operationId: string;
   groupId: string;
   groupVersionId: string;
@@ -207,6 +208,8 @@ export interface IntakeDurability {
   error: string | null;
 }
 export interface IntakeProposal {
+  /** Host-retained human authorship; never supplied by a model envelope. */
+  manualSourceRecord?: import('./intake-manual-source-record.ts').ManualSourceRecordReceipt;
   id: string;
   fileId: string;
   summary: string;
@@ -214,6 +217,9 @@ export interface IntakeProposal {
   runId: string | null;
   validation: IntakeValidation;
   contentUrl: string;
+  /** Material source-text revision used to create this proposal; absent on legacy originals. */
+  sourceTextRevisionId?: string | null;
+  sourceTextDependencyToken?: string | null;
 }
 export interface IntakeAcceptedRecord {
   recordId: string;
@@ -224,6 +230,7 @@ export interface IntakeAcceptedRecord {
   identityAttribution?: IntakeClinicalIdentityAttribution;
   outcome: 'added' | 'matched' | 'updated';
   reviewedSource?: {
+    basis?: IntakeReportSourceConfirmation['basis'];
     source: string;
     sourceProviderId: string;
     confirmationOperationId: string;
@@ -236,19 +243,26 @@ export interface IntakeAcceptedRecord {
   };
 }
 
-/** Durable explanation for why an accepted clinical mapping belongs to active Self. */
+/** Durable host-derived explanation for the accepted clinical mapping's person. */
 export interface IntakeClinicalIdentityAttribution {
+  assignedPerson?: import('./intake-identity.ts').IntakeIdentityPerson;
   confidence?: IntakeIdentityConfidence;
   status: Exclude<IntakeIdentityReviewStatus, 'confirmation_required' | 'conflict'>;
   basis:
+    | 'explicit_manual_source_record'
+    | 'explicit_person_confirmation'
     | 'matched_saved_self'
+    | 'matched_saved_person'
     | 'same_original_person_confirmation'
     | 'explicit_report_confirmation'
     | 'reviewed_active_profile_missing_identity';
   groupId: string | null;
   groupVersionId: string | null;
   personFingerprint?: string;
+  /** Host verification of the exact original subject; absent on older auto matches. */
+  originalSubjectFingerprint?: string;
   confirmationOperationId?: string;
+  manualSourceRecord?: import('./intake-manual-source-record.ts').ManualSourceRecordReceipt;
   evidencedIdentity?: IntakeEvidencedIdentity;
 }
 export interface Intake {
@@ -336,6 +350,8 @@ export interface IntakeEvidenceLocator {
   contentUrl?: string;
 }
 export interface IntakeClinicalMapping {
+  /** Server-derived reviewed person identity; never accepted from model output. */
+  personId?: string;
   kind?: ReviewRecordKind;
   label?: string;
   date?: string;
@@ -411,6 +427,7 @@ export interface IntakeReviewRecord {
   };
   mapping: IntakeClinicalMapping;
   identityReview?: {
+    assignedPerson?: import('./intake-identity.ts').IntakeIdentityPerson;
     confidence?: IntakeIdentityConfidence;
     status: IntakeIdentityReviewStatus;
     blocking: boolean;
@@ -450,6 +467,7 @@ export interface IntakeReview {
   records: IntakeReviewRecord[];
   sourceContext?: IntakeSourceContext[];
   coverageGaps: IntakeCoverageGap[];
+  sourceTextStale?: boolean;
 }
 export interface IntakeMappingRule {
   match: { kind: ReviewRecordKind; label: string };
@@ -490,7 +508,15 @@ export interface IntakeIssueResolution {
   at?: string;
   operationId?: string;
 }
+export interface IntakeImportCorrection {
+  operationId: string;
+  at: string;
+  reason: string;
+  before: Partial<IntakeClinicalMapping>;
+  after: Partial<IntakeClinicalMapping>;
+}
 export interface IntakeReviewDraft {
+  corrections?: IntakeImportCorrection[];
   id: string;
   proposalId: string | null;
   recordId: string;
@@ -504,6 +530,7 @@ export interface IntakeReviewDraft {
   at: string;
 }
 export interface IntakeReviewDraftUpdate {
+  correctionReason?: string;
   version: number;
   operationId: string;
   proposalId: string | null;

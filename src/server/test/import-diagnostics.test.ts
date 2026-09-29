@@ -322,9 +322,9 @@ test('HTTP disconnect records one aborted terminal event', async (t) => {
 test('model transport failure records only safe bounded metadata', async () => {
   const diagnostics = createImportDiagnostics({ enabled: true });
   const config = proxyConfig({
-    HEALTH_AI_MODEL: 'fictional-model',
-    HEALTH_AI_BASE_URL: 'http://proxy.invalid',
-    HEALTH_AI_API_KEY: 'fictional-credential',
+    CRS_AI_MODEL: 'fictional-model',
+    CRS_AI_BASE_URL: 'http://proxy.invalid',
+    CRS_AI_API_KEY: 'fictional-credential',
   });
   await assert.rejects(
     diagnostics.run({ profileId: 'fictional-profile', runId: 'fictional-run' }, () =>
@@ -404,9 +404,9 @@ test('model and tool tracing retains usage and structural sizes but no request o
   } satisfies HealthTool;
   const bridge = new ProxyModelBridge({
     config: proxyConfig({
-      HEALTH_AI_MODEL: 'fictional-model',
-      HEALTH_AI_BASE_URL: 'http://proxy.invalid',
-      HEALTH_AI_API_KEY: 'fictional-credential',
+      CRS_AI_MODEL: 'fictional-model',
+      CRS_AI_BASE_URL: 'http://proxy.invalid',
+      CRS_AI_API_KEY: 'fictional-credential',
     }),
     diagnostics,
     fetchImpl: async () =>

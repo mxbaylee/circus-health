@@ -15,6 +15,7 @@ import { createBackup } from '../recovery.ts';
 import { rebuildProfile } from '../portable.ts';
 import { fictionalModel } from './fictional-model.ts';
 import { getNote, saveNote } from '../notes.ts';
+import { getIntakeIdentityReview } from '../intake-identity.ts';
 import type {
   HealthRecordEnvelope,
   Intake,
@@ -316,7 +317,21 @@ function assertEveryReviewedResult(
   );
 }
 
-function resolveProposalIdentity(f: Fixture, item: Intake, proposalId: string | null): Intake {
+async function resolveProposalIdentity(
+  f: Fixture,
+  item: Intake,
+  proposalId: string | null,
+): Promise<Intake> {
+  for (const group of item.workflow?.reportGroups || []) {
+    if (
+      group.versions
+        .at(-1)
+        ?.members.some((member) =>
+          member.occurrences.some((occurrence) => occurrence.proposalId === proposalId),
+        )
+    )
+      await getIntakeIdentityReview(f.db, f.root, f.profileId, item.id, group.id);
+  }
   const review = intake.reviewIntake(f.db, f.root, f.profileId, item.id, proposalId);
   assert.ok(
     review.records.every((record) => record.identityReview?.blocking !== true),
@@ -371,7 +386,7 @@ test('counted report acceptance carries a reviewed source to unchanged later rep
   const stable = structuredClone(item.workflow);
   item = propose(f, item, [later]);
   assert.deepEqual(item.workflow, stable);
-  item = resolveProposalIdentity(f, item, item.proposals.at(-1)!.id);
+  item = await resolveProposalIdentity(f, item, item.proposals.at(-1)!.id);
   const currentGroup = listIntakeReportQueue(f.db, f.root, f.profileId).groups.find(
     (group) => group.intakeId === item.id,
   )!;
@@ -427,7 +442,7 @@ test('counted report acceptance carries a reviewed source to unchanged later rep
   }
 });
 
-test('a changed linked source context does not inherit or later backfill an earlier reviewed source', (t) => {
+test('a changed linked source context does not inherit or later backfill an earlier reviewed source', async (t) => {
   const f = fixture(t);
   let item = upload(f, [
     context('Fictional Body Studio'),
@@ -439,7 +454,7 @@ test('a changed linked source context does not inherit or later backfill an earl
     measurement('second', { contextId: 'fictional-context', page: 2 }),
   ]);
   const changedProposalId = item.proposals.at(-1)!.id;
-  item = resolveProposalIdentity(f, item, changedProposalId);
+  item = await resolveProposalIdentity(f, item, changedProposalId);
   const group = listIntakeReportQueue(f.db, f.root, f.profileId).groups.find(
     (candidate) => candidate.intakeId === item.id,
   )!;
@@ -450,7 +465,7 @@ test('a changed linked source context does not inherit or later backfill an earl
     measurement('third', { contextId: 'fictional-context', page: 3 }),
   ]);
   const returnedProposalId = item.proposals.at(-1)!.id;
-  item = resolveProposalIdentity(f, item, returnedProposalId);
+  item = await resolveProposalIdentity(f, item, returnedProposalId);
   const mixed = listIntakeReportQueue(f.db, f.root, f.profileId).groups.find(
     (candidate) => candidate.intakeId === item.id,
   )!;
@@ -484,31 +499,34 @@ test('a changed linked source context does not inherit or later backfill an earl
       covered: finished.sourceCoverage?.saved.covered,
       uncovered: finished.sourceCoverage?.saved.uncovered,
     },
-    { total: 2, covered: 1, uncovered: 1 },
+    { total: 2, covered: 2, uncovered: 0 },
   );
   assert.deepEqual(
     Object.fromEntries(
       observations(f.db, new URLSearchParams(), true).data.map((row) => [row.label, row.provider]),
     ),
     {
-      'Fictional result second': 'Unknown source',
+      'Fictional result second': 'Different Fictional Clinic',
       'Fictional result third': 'Fictional Body Studio',
     },
   );
 });
 
-test('a repeated candidate version is attributed by its exact occurrence context', (t) => {
+test('a repeated candidate version is attributed by its exact occurrence context', async (t) => {
   const f = fixture(t),
     repeated = measurement('repeated', { contextId: 'fictional-context' });
   let item = upload(f, [context('Fictional Body Studio'), repeated]);
   item = confirmSuggestedSource(f, item, 'Fictional Body Studio');
   item = propose(f, item, [context('Different Fictional Clinic'), repeated]);
   const proposalId = item.proposals.at(-1)!.id;
-  item = resolveProposalIdentity(f, item, proposalId);
+  item = await resolveProposalIdentity(f, item, proposalId);
   const current = intake.reviewIntake(f.db, f.root, f.profileId, item.id, proposalId);
-  assert.equal(current.records[0]!.provider, 'Unknown source');
+  assert.equal(current.records[0]!.provider, 'Unknown source'); // Original acquisition remains unchanged.
   accept(f, [block(f, item.id, proposalId)]);
-  assert.equal(observations(f.db, new URLSearchParams(), true).data[0]!.provider, 'Unknown source');
+  assert.equal(
+    observations(f.db, new URLSearchParams(), true).data[0]!.provider,
+    'Different Fictional Clinic',
+  );
 });
 
 test('explicit review retains every occurrence of one candidate version and its first context', (t) => {
@@ -601,16 +619,25 @@ test('one proposal with mixed report contexts cannot receive a shared manual sou
   );
 });
 
-test('source carryover never crosses a changed report anchor, subject or source system', (t) => {
+test('source carryover never crosses a changed report anchor, subject or source system', async (t) => {
   const f = fixture(t);
-  let item = upload(f, [measurement('original', { report: report() })]);
-  item = confirmManualSource(f, item);
   const differentAnchor = report('Different fictional report FC-88');
   const differentPatient = report('Fictional composition report FC-77', 'Fictional Fern Example');
   const alternateSubjectHeader = report(
     'Fictional composition report FC-77',
-    'Fictional Rowan Example — alternate printed header',
+    'Patient: Fictional Rowan Example',
   );
+  const original = measurement('original', { report: report() });
+  original.payload = {
+    ...(original.payload as object),
+    laterPrintedHeaders: [
+      differentAnchor.anchor.text,
+      differentPatient.subject!.text,
+      alternateSubjectHeader.subject!.text,
+    ],
+  };
+  let item = upload(f, [original]);
+  item = confirmManualSource(f, item);
   item = propose(f, item, [
     measurement('different-anchor', { report: differentAnchor, page: 2 }),
     measurement('different-patient', { report: differentPatient, page: 2 }),
@@ -622,6 +649,8 @@ test('source carryover never crosses a changed report anchor, subject or source 
     }),
   ]);
   const proposalId = item.proposals.at(-1)!.id;
+  for (const group of item.workflow!.reportGroups!)
+    await getIntakeIdentityReview(f.db, f.root, f.profileId, item.id, group.id);
   const proposalRecords = intake.reviewIntake(
     f.db,
     f.root,
@@ -635,8 +664,18 @@ test('source carryover never crosses a changed report anchor, subject or source 
   assert.equal(conflictingPatient.identityReview?.status, 'conflict');
   assert.equal(conflictingPatient.identityReview?.blocking, true);
   assert.equal(conflictingPatient.provider, 'Unknown source');
-  const ready = proposalRecords.filter((record) => record !== conflictingPatient);
-  assert.ok(ready.every((record) => record.identityReview?.blocking === false));
+  // Competing patient claims at one report boundary cannot be silently accepted,
+  // even when one of those claims matches Self. The distinct report remains readable.
+  const ready = proposalRecords.filter((record) => record.identityReview?.blocking === false);
+  assert.deepEqual(
+    ready.map((record) => record.mapping.testLabel),
+    ['Fictional result different-anchor'],
+  );
+  assert.ok(
+    proposalRecords
+      .filter((record) => record !== ready[0])
+      .every((record) => record.identityReview?.blocking === true),
+  );
   assert.ok(proposalRecords.every((record) => record.provider !== 'Fictional Body Studio'));
   accept(f, [block(f, item.id, proposalId, new Set(ready.map((record) => record.candidateId!)))]);
   assert.equal(
@@ -766,7 +805,7 @@ test(
       },
       { total: 190, covered: 190, source: 'Fictional Body Studio' },
     );
-    for (const proposalId of proposalIds) item = resolveProposalIdentity(f, item, proposalId);
+    for (const proposalId of proposalIds) item = await resolveProposalIdentity(f, item, proposalId);
     const accepted = accept(
       f,
       proposalIds.map((proposalId) => block(f, item.id, proposalId)),
@@ -949,7 +988,7 @@ test('same-context extension does not sweep in an older deferred occurrence', (t
   );
 });
 
-test('saved source fallback does not label uncovered current or mixed saved report scope', (t) => {
+test('saved source fallback does not label uncovered current or mixed saved report scope', async (t) => {
   const f = fixture(t);
   let item = upload(f, [
     context('Fictional Body Studio'),
@@ -971,6 +1010,7 @@ test('saved source fallback does not label uncovered current or mixed saved repo
   assert.notEqual(group.sourceScope, 'report');
 
   item = confirmSuggestedSource(f, item, 'Different Fictional Clinic');
+  item = await resolveProposalIdentity(f, item, item.proposals.at(-1)!.id);
   accept(f, [block(f, item.id, item.proposals.at(-1)!.id)]);
   group = listIntakeReportQueue(f.db, f.root, f.profileId, { view: 'all' }).groups.find(
     (candidate) => candidate.intakeId === item.id,
@@ -1055,7 +1095,9 @@ test(
     const f = fixture(t);
     let item: Intake = intake.uploadIntake(f.db, f.root, f.profileId, {
       filename: 'fictional-batched-report.txt',
-      bytes: Buffer.from('Fictional report evidence retained independently of these test rows.'),
+      bytes: Buffer.from(
+        'Fictional report evidence retained independently of these test rows.\nFictional composition report FC-77\nFictional Rowan Example',
+      ),
     });
     item = await intake.createIntakePlan(f.db, f.root, f.profileId, item.id, {
       version: item.version,
@@ -1081,7 +1123,7 @@ test(
     ]);
     item = confirmSuggestedSource(f, item, 'Fictional First Studio');
     const initialProposalId = item.proposals.at(-1)!.id;
-    item = resolveProposalIdentity(f, item, initialProposalId);
+    item = await resolveProposalIdentity(f, item, initialProposalId);
     accept(f, [block(f, item.id, initialProposalId)]);
 
     item = intake.getIntake(f.db, f.root, f.profileId, item.id);
@@ -1092,14 +1134,22 @@ test(
       ),
     ]);
     const laterProposalId = item.proposals.at(-1)!.id;
-    item = resolveProposalIdentity(f, item, laterProposalId);
+    item = await resolveProposalIdentity(f, item, laterProposalId);
     const laterReview = intake.reviewIntake(f.db, f.root, f.profileId, item.id, laterProposalId);
     const beforeConfirmation = new Set([laterReview.records[0]!.candidateId!]);
     const unconfirmed = accept(f, [block(f, item.id, laterProposalId, beforeConfirmation)]);
-    assert.equal(unconfirmed.receipt.receipts[0]!.records[0]!.reviewedSource, undefined);
+    assert.equal(
+      unconfirmed.receipt.receipts[0]!.records[0]!.reviewedSource?.source,
+      'Fictional Later Studio',
+    );
+    assert.equal(
+      unconfirmed.receipt.receipts[0]!.records[0]!.reviewedSource?.basis,
+      'suggested_report_label',
+    );
 
     item = intake.getIntake(f.db, f.root, f.profileId, item.id);
     item = confirmSuggestedSource(f, item, 'Fictional Later Studio');
+    item = await resolveProposalIdentity(f, item, laterProposalId);
     const pending = intake
       .reviewIntake(f.db, f.root, f.profileId, item.id, laterProposalId)
       .records.filter((record) => record.reviewState === 'pending');
@@ -1142,7 +1192,7 @@ test(
       ),
       {
         'Fictional result initial': 'Fictional First Studio',
-        'Fictional result later-0': 'Unknown source',
+        'Fictional result later-0': 'Fictional Later Studio',
         'Fictional result later-1': 'Fictional Later Studio',
         'Fictional result later-2': 'Fictional Later Studio',
         'Fictional result later-3': 'Fictional Later Studio',
@@ -1292,5 +1342,58 @@ test('exact reuse never replaces a known source while retaining reviewed source 
         .get(saved.id)!.n,
     ),
     2,
+  );
+});
+
+test('linked report source is a default on acceptance, without fabricating a human label receipt', (t) => {
+  const f = fixture(t);
+  const item = upload(f, [
+    context('Meadowglass Laboratory'),
+    measurement('cookie-potassium', { contextId: 'fictional-context' }),
+  ]);
+  const result = accept(f, [block(f, item.id, null)]);
+  const receipt = result.receipt.receipts[0]!.records[0]!;
+  assert.equal(receipt.reviewedSource?.source, 'Meadowglass Laboratory');
+  assert.equal(receipt.reviewedSource?.basis, 'suggested_report_label');
+  assert.equal(
+    observations(f.db, new URLSearchParams(), true).data[0]!.provider,
+    'Meadowglass Laboratory',
+  );
+  const savedExtra = JSON.parse(
+    String(f.db.prepare('SELECT extra_json FROM observations').get()!.extra_json),
+  );
+  assert.equal(savedExtra.import.manuallyEdited, false);
+  assert.equal(
+    intake.getIntake(f.db, f.root, f.profileId, item.id).workflow?.reportSourceConfirmations
+      ?.length || 0,
+    0,
+  );
+});
+
+test('a historical import feed link scopes the exact profile-local intake, report and record', (t) => {
+  const f = fixture(t);
+  const first = upload(f, [measurement('cookie-first', { report: report() })]);
+  upload(
+    f,
+    [measurement('cookie-second', { report: report('Cookie Doe second report') })],
+    'cookie-second.jsonl',
+  );
+  const all = listIntakeImportFeed(f.db, f.root, f.profileId, { view: 'all' });
+  const selected = all.blocks.find((entry) => entry.intakeId === first.id)!;
+  const scoped = listIntakeImportFeed(f.db, f.root, f.profileId, {
+    view: 'all',
+    intakeId: first.id,
+    groupId: selected.groupId,
+    recordId: selected.records[0]!.id,
+  });
+  assert.equal(scoped.totalRecords, 1);
+  assert.equal(scoped.blocks[0]!.records[0]!.id, selected.records[0]!.id);
+  assert.equal(
+    listIntakeImportFeed(f.db, f.root, f.profileId, {
+      view: 'all',
+      intakeId: 'unavailable-intake',
+      groupId: selected.groupId,
+    }).totalRecords,
+    0,
   );
 });

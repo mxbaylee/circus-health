@@ -1,3 +1,5 @@
+import { PersonScopeProvider, PersonScopeIndicator, PersonScopeContent } from './PersonScope';
+import { ImportDiagnosticsControl } from '../features/import/ImportDiagnosticsControl';
 import { ConnectionStatus } from './ConnectionStatus';
 import { PersonIcon } from './PersonIcon';
 import { StorageNotice } from './StorageNotice';
@@ -88,12 +90,20 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 function SidebarFooter({ onBack, backLabel }: { onBack?: () => void; backLabel?: string }) {
   return (
     <div className="sidebar-footer">
+      <ImportDiagnosticsControl />
       <ProfileSwitcher onBack={onBack} backLabel={backLabel} />
     </div>
   );
 }
 
 export function Shell() {
+  return (
+    <PersonScopeProvider>
+      <ShellContent />
+    </PersonScopeProvider>
+  );
+}
+function ShellContent() {
   const [menuOpen, setMenuOpen] = useState(false);
   const profile = useProfile();
   return (
@@ -150,6 +160,7 @@ export function Shell() {
               </Dialog.Root>
               <Brand compact />
             </div>
+            <PersonScopeIndicator />
             <div className="theme-area">
               <AssistantLauncher />
               <ConnectionStatus />
@@ -158,7 +169,9 @@ export function Shell() {
           </header>
           <main id="main-content" tabIndex={-1}>
             <StorageNotice />
-            <Outlet />
+            <PersonScopeContent>
+              <Outlet />
+            </PersonScopeContent>
           </main>
           <footer className="page-footer">
             <span>

@@ -34,11 +34,11 @@ import type {
 test('encrypted runtime authorizes related discovery and reviewed corrections without changing originals or accepting incoming evidence', async (t) => {
   fictionalModel(t);
   const origin = 'http://localhost:5180';
-  const previous = process.env.HEALTH_PUBLIC_ORIGIN;
-  process.env.HEALTH_PUBLIC_ORIGIN = origin;
+  const previous = process.env.CRS_PUBLIC_ORIGIN;
+  process.env.CRS_PUBLIC_ORIGIN = origin;
   t.after(() => {
-    if (previous === undefined) delete process.env.HEALTH_PUBLIC_ORIGIN;
-    else process.env.HEALTH_PUBLIC_ORIGIN = previous;
+    if (previous === undefined) delete process.env.CRS_PUBLIC_ORIGIN;
+    else process.env.CRS_PUBLIC_ORIGIN = previous;
   });
   const base = mkdtempSync(join(tmpdir(), 'fictional-clinical-review-http-'));
   mkdirSync(join(base, 'data'));

@@ -1,3 +1,4 @@
+import { ModelToolValidationError } from '../model-tool-validation.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import { fictionalModel } from './fictional-model.ts';
 import test from 'node:test';
@@ -17,7 +18,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { openDatabase } from '../database.ts';
 import { transaction } from '../database.ts';
 import { createAssistant } from '../assistant.ts';
@@ -36,7 +37,11 @@ import { openVault } from '../vault-store.ts';
 import type { VaultRecordStorage } from '../vault-store.ts';
 import { createBackup, restoreBackup } from '../recovery.ts';
 import { createApp } from '../index.ts';
-import { createImportDiagnostics } from '../import-diagnostics.ts';
+import {
+  createImportDiagnostics,
+  beginImportPhase,
+  diagnosticFailureFields,
+} from '../import-diagnostics.ts';
 import { createPrivateImportTrace } from '../import-private-trace.ts';
 import { listIntakeReportQueue } from '../intake-report-queue.ts';
 import { ModelContextLimitError } from '../model-config.ts';
@@ -57,6 +62,7 @@ import { uploadAsset } from '../assets.ts';
 import { vaultFixture, newProfile } from './helpers/vault-fixture.ts';
 import type { HealthTool } from '../proxy-model-bridge.ts';
 import type { Intake } from '../../shared/intake.ts';
+import type { ProposalSourceTextHandoff } from '../../shared/intake-source-text.ts';
 import { getIntakeIdentityScope, confirmIntakeIdentityScope } from '../intake-identity.ts';
 
 type AssistantOptions = Parameters<typeof createAssistant>[0];
@@ -2937,7 +2943,7 @@ test('current page resolves automatic selections in this profile and refreshes o
     title: 'Synthetic contact',
     person: { tags: ['Professional'] },
   });
-  assistant.send('cookie-dough', chat.id, {
+  assistant.create('cookie-dough', {
     message: 'How about this one?',
     context: {
       route: `/people?id=${encodeURIComponent(person.id)}&tag=Professional`,
@@ -2947,7 +2953,16 @@ test('current page resolves automatic selections in this profile and refreshes o
   await tick();
   assert.equal(bridges[1].prompt.page.selected.record.id, person.id);
   assert.equal(bridges[1].prompt.page.filters.tag, 'Professional');
-  assert.equal(bridges[1].prompt.messages[0].context.selection.id, id);
+  assert.equal(bridges[0].prompt.messages[0].context.selection.id, id);
+  assert.equal(
+    assistant.get('cookie-dough', chat.id).messages.filter((m) => m.role === 'user').length,
+    1,
+  );
+  assert.equal(
+    bridges[1].prompt.messages.length,
+    1,
+    'A different person starts a separate conversation',
+  );
   assert.equal(required(bridges[1].prompt.messages.at(-1)).context.selection.id, person.id);
   complete(bridges[1]);
 });
@@ -3364,6 +3379,7 @@ test('Moxie acquaintance is profile-scoped and never repeats across new chats or
 
 test('assistant procedure exceptions survive general rules, repeated deliveries, distinct edits and rebuild', async (t) => {
   const { reviewIntake, importIntake } = await import('../intake.ts');
+  const { getIntakeIdentityReview } = await import('../intake-identity.ts');
   const { previewMappingChange } = await import('../clinical-import.ts');
   const { applyMappingChange } = await import('../mapping-actions.ts');
   const { assistant, bridges, root, db } = fixture(t);
@@ -3408,20 +3424,23 @@ test('assistant procedure exceptions survive general rules, repeated deliveries,
     target: ReturnType<typeof getIntake>,
   ): Promise<ReturnType<typeof getIntake>> {
     if (!target.imported) {
-      const scope = await getIntakeIdentityScope(
+      const identity = await getIntakeIdentityReview(
         db,
         root,
         'cedar',
         target.id,
         target.workflow!.reportGroups![0]!.id,
       );
-      await confirmIntakeIdentityScope(db, root, 'cedar', target.id, {
-        version: scope.intakeVersion,
-        operationId: `fictional-source-confirm-${target.id}`,
-        scope,
-        outcome: 'this_is_me',
-        attestation: 'reviewed_original_and_membership',
-      });
+      if (identity.blocking) {
+        const scope = required(identity.scope);
+        await confirmIntakeIdentityScope(db, root, 'cedar', target.id, {
+          version: scope.intakeVersion,
+          operationId: `fictional-source-confirm-${target.id}`,
+          scope,
+          outcome: 'this_is_me',
+          attestation: 'reviewed_original_and_membership',
+        });
+      }
     }
     const review = reviewIntake(db, root, 'cedar', target.id);
     importIntake(db, root, 'cedar', target.id, {
@@ -4581,8 +4600,14 @@ async function linkedFictionalBatchConversion(
     required(planned.workflow).plans.find((entry) => entry.status === 'active'),
   );
   await call(bridge, 'intake_read', { id: item.id });
+  // Encrypted fixtures also retain durable source text. Exercise the same read
+  // and exact revision pin required of production readers before proposing.
+  const sourceTextRevisionId = recordStorage
+    ? (await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })).revisionId
+    : undefined;
   const batch = {
     id: item.id,
+    ...(sourceTextRevisionId ? { sourceTextRevisionId } : {}),
     version: getIntake(f.db, f.root, 'cedar', item.id).version,
     planId: plan.id,
     operationId: 'fictional-review-race-batch',
@@ -4620,9 +4645,217 @@ async function linkedFictionalBatchConversion(
   return { ...f, item, chat, bridge, batch, plan };
 }
 
+test('host source capture advances multi-page reads without waiving fresh passages or human revision guards', async (t) => {
+  const f = await linkedFictionalBatchConversion(
+    t,
+    {},
+    'Fictional retained section. '.repeat(2500),
+    encryptedRecordStorage(t),
+  );
+  const { getIntakeSourceText, reviewIntakeSourceText } = await import('../intake-source-text.ts');
+  const first = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+  assert.ok(first.issues.some((issue) => issue.id === 'p3-pending'));
+  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await call(f.bridge, 'intake_read', { id: f.item.id, offset: 12000 });
+  const next = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+  assert.notEqual(next.id, first.id);
+  assert.ok(!next.issues.some((issue) => issue.id === 'p3-pending'));
+  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await call(f.bridge, 'intake_source_text', { id: f.item.id, revisionId: next.id });
+  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  reviewIntakeSourceText(
+    f.db,
+    f.root,
+    'cedar',
+    f.item.id,
+    {
+      operationId: randomUUID(),
+      expectedRevisionId: next.id,
+      sourceHash: next.sourceHash,
+      action: 'correct',
+      scope: { page: 1 },
+      spans: [
+        {
+          id: 'human-correction',
+          text: 'Fictional corrected source.',
+          provenance: 'human',
+          region: { page: 1 },
+        },
+      ],
+    },
+    'fictional-owner',
+  );
+  assert.throws(() => f.bridge.callbacks.beforeRequest?.(), /Source text changed/);
+});
+
+test('host source capture cannot rebase a human correction that preceded its next page read', async (t) => {
+  const f = await linkedFictionalBatchConversion(
+    t,
+    {},
+    'Fictional retained section. '.repeat(3500),
+    encryptedRecordStorage(t),
+  );
+  const { getIntakeSourceText, reviewIntakeSourceText } = await import('../intake-source-text.ts');
+  const first = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+  const corrected = reviewIntakeSourceText(
+    f.db,
+    f.root,
+    'cedar',
+    f.item.id,
+    {
+      operationId: randomUUID(),
+      expectedRevisionId: first.id,
+      sourceHash: first.sourceHash,
+      action: 'correct',
+      scope: { page: 1 },
+      spans: [
+        {
+          id: 'human-correction',
+          text: 'Fictional human correction before the next page.',
+          provenance: 'human',
+          region: { page: 1 },
+        },
+      ],
+    },
+    'fictional-owner',
+  );
+  await call(f.bridge, 'intake_read', { id: f.item.id, offset: 12000 });
+  const next = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+  assert.notEqual(next.id, corrected.revision!.id);
+  assert.deepEqual(
+    next.spans.filter((span) => span.region.page === 1),
+    corrected.revision!.spans.filter((span) => span.region.page === 1),
+  );
+  assert.throws(() => f.bridge.callbacks.beforeRequest?.(), /Source text changed/);
+});
+
+test('host source capture does not substitute for reading the new durable passage before proposing', async (t) => {
+  const f = await linkedFictionalBatchConversion(
+    t,
+    {},
+    'Fictional retained section. '.repeat(2500),
+    encryptedRecordStorage(t),
+  );
+  const { getIntakeSourceText } = await import('../intake-source-text.ts');
+  await call(f.bridge, 'intake_read', { id: f.item.id, offset: 12000 });
+  const next = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await assert.rejects(
+    call(f.bridge, 'intake_propose', {
+      id: f.item.id,
+      sourceTextRevisionId: next.id,
+      version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+      summary: 'Fictional current proposal',
+      jsonlText: f.batch.jsonlText,
+    }),
+    (error: unknown) => hasCode(error, 'SOURCE_TEXT_REQUIRED'),
+  );
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+});
+
+for (const extension of ['txt', 'json'])
+  test(`host source capture advances a retained ZIP ${extension} member without losing the next-request guard`, async (t) => {
+    fictionalModel(t);
+    const f = fixture(t, {}, encryptedRecordStorage(t));
+    const source = uploadIntake(f.db, f.root, 'cedar', {
+      filename: 'fictional-long-member.zip',
+      bytes: zipFixture([
+        {
+          name: `fictional-member.${extension}`,
+          data:
+            extension === 'json'
+              ? JSON.stringify({ literal: 'Fictional retained member. '.repeat(2500) })
+              : 'Fictional retained member. '.repeat(2500),
+        },
+      ]),
+    });
+    f.assistant.create('cedar', { message: 'Inspect the fictional archive' });
+    await tick();
+    const bridge = f.bridges[0];
+    const inventory = await call(bridge, 'intake_package', { id: source.id, action: 'inventory' });
+    const memberId = inventory.members[0].memberId;
+    const first = await call<{ sourceFileId: string; sourceText: { revisionId: string } }>(
+      bridge,
+      'intake_package',
+      {
+        id: source.id,
+        action: 'read_member',
+        memberId,
+      },
+    );
+    const { getIntakeSourceText } = await import('../intake-source-text.ts');
+    const initial = getIntakeSourceText(f.db, f.root, 'cedar', first.sourceFileId).revision!;
+    assert.equal(first.sourceText.revisionId, initial.id);
+    assert.ok(
+      initial.issues.some((issue) => issue.id === 'p3-pending'),
+      'one member read captures at most two pages',
+    );
+    const read = await call<{ revisionId: string }>(bridge, 'intake_source_text', {
+      id: first.sourceFileId,
+    });
+    await call(bridge, 'intake_package', {
+      id: source.id,
+      action: 'read_member',
+      memberId,
+      offset: 12000,
+    });
+    const current = getIntakeSourceText(f.db, f.root, 'cedar', first.sourceFileId).revision!;
+    assert.notEqual(current.id, read.revisionId);
+    assert.ok(!current.issues.some((issue) => /^p\d+-pending$/.test(issue.id)));
+    assert.doesNotThrow(() => bridge.callbacks.beforeRequest?.());
+  });
+
+test('default-on diagnostics retain the precise wrapped batch validation failure without document text', async (t) => {
+  const diagnostics = createImportDiagnostics({ enabled: false });
+  t.after(() => diagnostics.close());
+  const f = await linkedFictionalBatchConversion(t, { diagnostics });
+  const phase = beginImportPhase(
+    'model_tool',
+    { toolName: 'health_intake_batch' },
+    {
+      profileId: 'cedar',
+      importId: f.item.id,
+      runId: f.chat.id,
+    },
+    diagnostics,
+  );
+  await assert.rejects(
+    phase.run(async () => {
+      try {
+        await call(f.bridge, 'intake_batch', {
+          ...f.batch,
+          jsonlText: JSON.stringify({
+            format: 'health-record-v1',
+            id: 'fictional-private-id',
+            kind: 'record',
+            payload: { text: 'FICTIONAL_MEDICAL_VALUE_MUST_NOT_EXPORT' },
+          }),
+        });
+      } catch (error) {
+        phase.fail(error);
+        throw error;
+      }
+    }),
+    (error: unknown) => hasCode(error, 'INVALID_JSONL'),
+  );
+  const exported = diagnostics.exportSnapshot('cedar');
+  const failure = exported
+    .recentPerformance!.operations.map((op) => op.latestValidationFailure)
+    .find((entry) => entry?.fields.toolName === 'health_intake_batch');
+  assert.equal(failure?.fields.reasonCode, 'invalid_jsonl');
+  assert.equal(failure?.fields.errorType, 'model_tool_validation');
+  assert.equal(failure?.fields.validationCode, 'invalid_provenance');
+  assert.equal(failure?.fields.validationPath, 'arguments.jsonlText[].provenance');
+  assert.equal(failure?.fields.validationLine, 1);
+  assert.doesNotMatch(
+    JSON.stringify(exported),
+    /FICTIONAL_MEDICAL_VALUE_MUST_NOT_EXPORT|fictional-private-id/,
+  );
+});
+
 test('always-on document-level yield counter tracks proposals produced, unset diagnostics included, and survives a reload', async (t) => {
   const f = await linkedFictionalBatchConversion(t);
-  assert.equal(process.env.HEALTH_IMPORT_DIAGNOSTICS, undefined);
+  assert.equal(process.env.CRS_IMPORT_DIAGNOSTICS, undefined);
   assert.equal(required(f.chat.reading).proposalsProduced, 0);
 
   await call(f.bridge, 'intake_batch', f.batch);
@@ -4759,6 +4992,7 @@ async function eligibleCountedAcceptanceRace(
   const preparedVersion = getIntake(f.db, f.root, 'cedar', f.item.id).version;
   const secondBatch = {
     id: f.item.id,
+    ...(f.batch.sourceTextRevisionId ? { sourceTextRevisionId: f.batch.sourceTextRevisionId } : {}),
     version: preparedVersion,
     planId: plan.id,
     operationId: 'fictional-later-section-batch',
@@ -4991,6 +5225,7 @@ test('one host request retains an exact later-unit batch across disjoint counted
   const preparedVersion = getIntake(f.db, f.root, 'cedar', f.item.id).version;
   const secondBatch = {
     id: f.item.id,
+    ...(f.batch.sourceTextRevisionId ? { sourceTextRevisionId: f.batch.sourceTextRevisionId } : {}),
     version: preparedVersion,
     planId: plan.id,
     operationId: 'fictional-second-section-batch',
@@ -5110,7 +5345,13 @@ test('one host request retains an exact later-unit batch across disjoint counted
 
   const retained = getIntake(f.db, f.root, 'cedar', f.item.id);
   assert.equal(f.bridges.length, 1);
-  assert.deepEqual(retryInputs, [{ ...secondBatch, runId: f.chat.id }]);
+  // The source revision is a host admission pin, not a submitted batch field.
+  // Preserve exact equality for every retained batch field and separately prove
+  // that the resulting proposal remains bound to the very same source revision.
+  const { sourceTextRevisionId, ...secondBatchPayload } = secondBatch;
+  assert.ok(sourceTextRevisionId);
+  assert.deepEqual(retryInputs, [{ ...secondBatchPayload, runId: f.chat.id }]);
+  assert.equal(retained.proposals.at(-1)!.sourceTextRevisionId, sourceTextRevisionId);
   assert.equal(required(f.chat.reading).modelRequests, modelRequestsBefore + 1);
   assert.equal(retained.proposals.length, 2);
   assert.equal(retained.workflow!.candidates.length, 3);
@@ -5982,4 +6223,367 @@ test('plan creation exposes host indexing while the tool is pending, then restor
   await pending;
   assert.equal(required(f.chat.reading).phase, 'waiting_for_model');
   f.assistant.cancel('cedar', f.chat.id);
+});
+
+test('assistant clinical queries default to Self and can explicitly reach a Person clinical record', async (t) => {
+  const { assistant, db, bridges } = fixture(t);
+  const person = createNote(db, {
+    kind: 'person',
+    title: 'Rowan Example',
+    person: { fullName: 'Rowan Example' },
+  });
+  db.exec(
+    "INSERT INTO source_files(id,path,sha256,bytes) VALUES('family-file','fictional-family.json','fictional',1); INSERT INTO source_records(id,source_file_id,raw_json) VALUES('family-raw','family-file','{}')",
+  );
+  db.prepare(
+    "INSERT INTO documents(id,source_record_id,title,extra_json) VALUES('family-doc','family-raw','Rowan fictional report',?)",
+  ).run(JSON.stringify({ import: { personId: person.personId } }));
+  assistant.create('cedar', { message: 'Read fictional family records' });
+  await tick();
+  const bridge = bridges[0];
+  const queryTool = bridge.tools.find((item) => item.name === 'health_query');
+  assert.ok(queryTool?.inputSchema.properties?.personId);
+  const self = await call(bridge, 'query', { collection: 'documents' });
+  assert.equal(self.data.length, 0);
+  const family = await call<{ data: { id: string; personId: string }[] }>(bridge, 'query', {
+    collection: 'documents',
+    personId: person.personId,
+  });
+  assert.equal(family.data[0].id, 'family-doc');
+  assert.equal(family.data[0].personId, person.personId);
+  const detail = await call(bridge, 'read', { collection: 'documents', id: 'family-doc' });
+  assert.equal(detail.personId, person.personId);
+  complete(bridge);
+});
+
+test('default diagnostics explain stale batch refresh and repeated window stop without source identifiers', async (t) => {
+  const diagnostics = createImportDiagnostics({ enabled: false });
+  t.after(() => diagnostics.close());
+  const f = await linkedFictionalBatchConversion(t, { diagnostics });
+  const before = getIntake(f.db, f.root, 'cedar', f.item.id);
+  askIntakeQuestion(f.db, f.root, 'cedar', f.item.id, {
+    version: before.version,
+    operationId: 'private-change-id',
+    key: 'private-question-key',
+    prompt: 'PRIVATE_FICTIONAL_MEDICAL_QUESTION',
+    locator: 'PRIVATE_FICTIONAL_LOCATOR',
+  });
+  const after = getIntake(f.db, f.root, 'cedar', f.item.id);
+  await assert.rejects(call(f.bridge, 'intake_batch', f.batch), (error: unknown) => {
+    const facts = diagnosticFailureFields(error);
+    assert.equal(facts.expectedVersion, f.batch.version);
+    assert.equal(facts.currentVersion, after.version);
+    assert.equal(facts.lastChangeCategory, 'question');
+    assert.equal(facts.versionHistoryComplete, true);
+    return hasCode(error, 'VERSION_CONFLICT');
+  });
+  await call(f.bridge, 'intake_plan', {
+    id: f.item.id,
+    action: 'read',
+    version: after.version,
+    mappingVersion: f.plan.pins.mappingVersion,
+  });
+  let stopped = false;
+  for (let count = 0; count < 6; count++) {
+    try {
+      await call(f.bridge, 'intake_read', { id: f.item.id });
+    } catch (error) {
+      const facts = diagnosticFailureFields(error);
+      assert.equal(facts.reasonCode, 'conversion_no_progress');
+      assert.equal(facts.repeatedWindowCount, 3);
+      assert.equal(facts.repeatedWindowLimit, 3);
+      assert.equal(typeof facts.baselineReadWindows, 'number');
+      assert.equal(typeof facts.windowOrdinal, 'number');
+      stopped = true;
+      break;
+    }
+  }
+  assert.equal(stopped, true);
+  const exported = diagnostics.exportSnapshot('cedar');
+  const steps = exported.recentPerformance!.operations.flatMap(
+    (operation) => operation.recoverySequence || [],
+  );
+  assert.ok(steps.some((step) => step.fields.recoveryAction === 'refresh_context'));
+  assert.ok(steps.some((step) => step.fields.recoveryAction === 'context_read'));
+  assert.ok(steps.some((step) => step.fields.repeatedWindowCount === 3));
+  assert.doesNotMatch(
+    JSON.stringify(exported),
+    /PRIVATE_FICTIONAL|private-question-key|private-change-id/,
+  );
+});
+
+test('throwing optional recovery diagnostics cannot fail a retained batch or bypass the repeated-read guard', async (t) => {
+  const diagnostics = createImportDiagnostics({ enabled: false });
+  t.after(() => diagnostics.close());
+  const start = diagnostics.startActive.bind(diagnostics);
+  diagnostics.startActive = (...args) => {
+    const scope = start(...args);
+    return {
+      ...scope,
+      record(event, fields, context) {
+        if (fields?.recoveryAction) throw new Error('Fictional unavailable diagnostic sink');
+        scope.record(event, fields, context);
+      },
+    };
+  };
+  const f = await linkedFictionalBatchConversion(t, { diagnostics });
+  await call(f.bridge, 'intake_batch', f.batch);
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
+  let stopped = false;
+  for (let count = 0; count < 6; count++) {
+    try {
+      await call(f.bridge, 'intake_read', { id: f.item.id });
+    } catch (error) {
+      assert.ok(hasCode(error, 'CONVERSION_NO_PROGRESS'));
+      stopped = true;
+      break;
+    }
+  }
+  assert.equal(stopped, true);
+  assert.equal(f.chat.reading?.reason, 'no_progress');
+});
+
+test('missing source revision pin is repairable before publication and reading continues', async (t) => {
+  const f = await linkedFictionalBatchConversion(t, {}, undefined, encryptedRecordStorage(t));
+  const { sourceTextRevisionId: _pin, ...missingPin } = f.batch;
+  await assert.rejects(call(f.bridge, 'intake_batch', missingPin), (error: unknown) => {
+    const facts = diagnosticFailureFields(error);
+    assert.equal(facts.hasSuppliedSourceTextRevision, false);
+    assert.equal(facts.suppliedSourceTextRevisionMatches, false);
+    assert.equal(facts.currentSourceTextRead, true);
+    assert.equal(facts.sourceTextChangedSinceRead, false);
+    assert.equal(facts.sourceTextRepairable, true);
+    return error instanceof ModelToolValidationError && error.code === 'SOURCE_TEXT_REQUIRED';
+  });
+  assert.equal(f.chat.status, 'running');
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  const passage = await call<{ revisionId: string }>(f.bridge, 'intake_source_text', {
+    id: f.item.id,
+  });
+  const retained = await call<{
+    version: number;
+    proposalSourceText: ProposalSourceTextHandoff;
+  }>(f.bridge, 'intake_batch', {
+    ...f.batch,
+    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    sourceTextRevisionId: passage.revisionId,
+  });
+  assert.equal(retained.proposalSourceText.currentRevisionId, passage.revisionId);
+  assert.equal(retained.proposalSourceText.sourceTextRevisionId, passage.revisionId);
+  assert.equal(retained.proposalSourceText.readRequired, false);
+  assert.equal(f.chat.status, 'running');
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
+  await call(f.bridge, 'intake_batch', {
+    ...f.batch,
+    operationId: 'cookie-second-batch',
+    version: retained.version,
+    sourceTextRevisionId: retained.proposalSourceText.sourceTextRevisionId,
+    jsonlText: JSON.stringify({ ...JSON.parse(f.batch.jsonlText), id: 'cookie-second-record' }),
+  });
+  assert.equal(f.chat.status, 'running');
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 2);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
+});
+
+test('source revision preflight repair has a finite budget even with successful intervening reads', async (t) => {
+  const f = await linkedFictionalBatchConversion(t, {}, undefined, encryptedRecordStorage(t));
+  const { sourceTextRevisionId: _pin, ...missingPin } = f.batch;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await call(f.bridge, 'intake_source_text', { id: f.item.id });
+    await assert.rejects(
+      call(f.bridge, 'intake_batch', missingPin),
+      (error: unknown) =>
+        error instanceof ModelToolValidationError && error.code === 'SOURCE_TEXT_REQUIRED',
+    );
+    assert.equal(f.chat.status, attempt < 2 ? 'running' : 'idle');
+  }
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+});
+
+test('external text correction remains terminal even if the model supplies its new pin', async (t) => {
+  const f = await linkedFictionalBatchConversion(t, {}, undefined, encryptedRecordStorage(t));
+  const { getIntakeSourceText, reviewIntakeSourceText } = await import('../intake-source-text.ts');
+  const prior = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+  const updated = reviewIntakeSourceText(
+    f.db,
+    f.root,
+    'cedar',
+    f.item.id,
+    {
+      operationId: randomUUID(),
+      expectedRevisionId: prior.id,
+      sourceHash: prior.sourceHash,
+      action: 'correct',
+      scope: { page: 1 },
+      spans: [
+        {
+          id: 'cookie-correction',
+          text: 'Cookie Doe corrected source.',
+          provenance: 'human',
+          region: { page: 1 },
+        },
+      ],
+    },
+    'fictional-owner',
+  );
+  await assert.rejects(
+    call(f.bridge, 'intake_batch', {
+      ...f.batch,
+      version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+      sourceTextRevisionId: updated.revision!.id,
+    }),
+    (error: unknown) =>
+      hasCode(error, 'SOURCE_TEXT_CHANGED') && !(error instanceof ModelToolValidationError),
+  );
+  assert.equal(f.chat.status, 'idle');
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+});
+
+test('a passage read cannot erase a human correction that arrived during a provider response', async (t) => {
+  const f = await linkedFictionalBatchConversion(t, {}, undefined, encryptedRecordStorage(t));
+  const { getIntakeSourceText, reviewIntakeSourceText } = await import('../intake-source-text.ts');
+  const prior = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  reviewIntakeSourceText(
+    f.db,
+    f.root,
+    'cedar',
+    f.item.id,
+    {
+      operationId: randomUUID(),
+      expectedRevisionId: prior.id,
+      sourceHash: prior.sourceHash,
+      action: 'correct',
+      scope: { page: 1 },
+      spans: [
+        {
+          id: 'cookie-mid-response',
+          text: 'Cookie Doe corrected source.',
+          provenance: 'human',
+          region: { page: 1 },
+        },
+      ],
+    },
+    'fictional-owner',
+  );
+  await assert.rejects(
+    call(f.bridge, 'intake_source_text', { id: f.item.id }),
+    (error: unknown) => {
+      assert.equal(diagnosticFailureFields(error).sourceTextChangedSinceRead, true);
+      assert.equal(diagnosticFailureFields(error).sourceTextRepairable, false);
+      return hasCode(error, 'SOURCE_TEXT_CHANGED') && !(error instanceof ModelToolValidationError);
+    },
+  );
+  assert.equal(f.chat.status, 'idle');
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+});
+
+for (const resolvesCoverage of [false, true])
+  test(`read-but-unaccounted candidates get one bounded reconciliation turn: ${resolvesCoverage ? 'resolved' : 'still blocked'}`, async (t) => {
+    const diagnostics = createImportDiagnostics({
+      enabled: true,
+      capacity: 1000,
+      resourceIntervalMs: 0,
+    });
+    t.after(() => diagnostics.close());
+    const f = await linkedFictionalBatchConversion(t, { diagnostics });
+    await call(f.bridge, 'intake_batch', f.batch);
+    complete(f.bridge);
+    await tick();
+    assert.equal(f.bridges.length, 2);
+    assert.equal(f.chat.reading?.pendingReadWindows, 0);
+    assert.equal(f.chat.reading?.remainingUnits, 1);
+    complete(f.bridges[1]!);
+    await tick();
+    assert.equal(
+      f.bridges.length,
+      3,
+      'one extra pass reconciles pending coverage without an owner resume',
+    );
+    assert.equal(f.chat.status, 'running');
+    assert.equal(f.chat.reading?.remainingUnits, 1, 'the host does not invent a coverage decision');
+    if (resolvesCoverage) {
+      await call(f.bridges[2]!, 'intake_batch', {
+        ...f.batch,
+        version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+        operationId: 'fictional-complete-coverage',
+        coverage: [
+          {
+            unitId: f.plan.units[0]!.id,
+            kind: 'extracted',
+            notes: 'All fictional source content is represented by the retained result.',
+          },
+        ],
+      });
+    }
+    complete(f.bridges[2]!);
+    await tick();
+    assert.equal(f.bridges.length, 3, 'no unbounded retry loop');
+    assert.equal(f.chat.reading?.reason, resolvesCoverage ? 'reading_exhausted' : 'no_progress');
+    assert.equal(f.chat.reading?.remainingUnits, resolvesCoverage ? 0 : 1);
+    assert.equal(f.chat.runs?.length, 1, 'the recovery shares all existing run budgets');
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM observations').get()!.n, 0);
+    assert.ok(
+      diagnostics
+        .exportSnapshot('cedar')
+        .events.some((event) => event.fields.recoveryAction === 'reconcile_coverage'),
+    );
+  });
+
+test('a person-scoped conversation cannot switch subjects and its note proposal retains its owner', async (t) => {
+  const { assistant, bridges, db } = fixture(t);
+  const cookie = createNote(db, { kind: 'person', title: 'Cookie Doe' });
+  const self = createNote(db, { title: 'Self only', content: 'Private context' });
+  const chat = assistant.create('cedar', {
+    message: 'Draft a note for Cookie',
+    context: { route: `/notes?personId=${encodeURIComponent(cookie.personId!)}` },
+  });
+  await tick();
+  await assert.rejects(
+    call(bridges[0], 'read', { collection: 'notes', id: self.id }),
+    /different person/,
+  );
+  const proposal = await call(bridges[0], 'propose_note', {
+    title: 'Cookie context',
+    content: 'Fictional family note',
+    reason: 'Requested note',
+  });
+  complete(bridges[0]);
+  assert.throws(
+    () =>
+      assistant.send('cedar', chat.id, {
+        message: 'Now discuss Self',
+        context: { route: '/notes?personId=patient' },
+      }),
+    /new conversation/,
+  );
+  const retained = assistant
+    .get('cedar', chat.id)
+    .proposals.find((item) => item.id === proposal.id);
+  assert.equal(retained?.changes.ownerPersonId, cookie.personId);
+});
+
+test('approving unchanged source text during conversion neither restarts reading nor rejects the existing batch', async (t) => {
+  const f = await linkedFictionalBatchConversion(t, {}, undefined, encryptedRecordStorage(t));
+  const { getIntakeSourceText, reviewIntakeSourceText } = await import('../intake-source-text.ts');
+  const prior = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+  const approved = reviewIntakeSourceText(
+    f.db,
+    f.root,
+    'cedar',
+    f.item.id,
+    {
+      operationId: randomUUID(),
+      expectedRevisionId: prior.id,
+      sourceHash: prior.sourceHash,
+      action: 'confirm',
+      scope: { page: 1 },
+    },
+    'fictional-owner',
+  );
+  assert.notEqual(approved.revision!.id, prior.id);
+  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await call(f.bridge, 'intake_batch', f.batch);
+  assert.equal(f.chat.status, 'running');
+  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
 });

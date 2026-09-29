@@ -37,7 +37,7 @@ it('keeps source tabs separate from filters and preserves URL filters across key
     screen.getByText('Inactive', { selector: '.people-filter-pill > span' }),
   );
   within(tabs).getByRole('tab', { name: 'Files' }).focus();
-  await user.keyboard('{End}');
+  await user.keyboard('{ArrowRight}');
   expect(within(tabs).getByRole('tab', { name: 'Records' })).toHaveFocus();
   expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'source-records-tab');
   expect(router.state.location.search).toContain('view=records');
@@ -55,6 +55,9 @@ it('keeps source tabs separate from filters and preserves URL filters across key
       ),
     ).toBe(true),
   );
+  await user.keyboard('{End}');
+  expect(within(tabs).getByRole('tab', { name: 'Documents' })).toHaveFocus();
+  expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'source-documents-tab');
   await user.keyboard('{Home}');
   expect(within(tabs).getByRole('tab', { name: 'Files' })).toHaveFocus();
   expect(router.state.location.search).not.toContain('view=');
@@ -265,4 +268,49 @@ it('keeps a present source-record date scoped in the records list and detail', a
   expect(screen.queryByText('Date not recorded')).toBeNull();
   await userEvent.setup().click(screen.getByText('Files, evidence and health records'));
   expect(screen.getByText(/source record date is an optional summary/i)).toBeVisible();
+});
+
+it('keeps source review inside the selected original without a second inventory banner', async () => {
+  selectProfile({ id: 'fictional-empty-import', name: 'Cookie Doe', placebo: true });
+  const requests: string[] = [];
+  const file = {
+    id: 'empty-source',
+    path: 'cookie-empty.pdf',
+    filename: 'cookie-empty.pdf',
+    kind: 'original',
+    coverageStatus: 'unknown',
+    mimeType: 'text/plain',
+    proposals: [],
+    bytes: 100,
+    details: {},
+    sha256: 'fictional',
+    contentUrl: '/api/sources/empty-source/content',
+  };
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      requests.push(url);
+      const data = url.includes('/source-issues?')
+        ? { status: 'unavailable', issues: [], summary: { specificIssues: 0 }, nextOffset: null }
+        : url.endsWith('/sources/empty-source') || url.endsWith('/intakes/empty-source')
+          ? file
+          : url.includes('/sources?')
+            ? [file]
+            : [];
+      return new Response(JSON.stringify({ data, meta: { revision: 1, complete: true } }));
+    }),
+  );
+  const router = createMemoryRouter([{ path: '/sources', element: <Sources /> }], {
+    initialEntries: ['/sources'],
+  });
+  render(<RouterProvider router={router} />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('button', { name: 'cookie-empty.pdf' }));
+  expect(screen.getByRole('button', { name: 'Review source text' })).toBeVisible();
+  expect(screen.queryByRole('heading', { name: 'Originals and source review' })).toBeNull();
+  expect(screen.queryByRole('heading', { name: 'Source areas to review' })).toBeNull();
+  expect(requests.some((url) => url.includes('/intakes?'))).toBe(false);
+  await user.click(screen.getByRole('tab', { name: 'Documents' }));
+  expect(screen.queryByRole('button', { name: 'Review source text' })).toBeNull();
 });

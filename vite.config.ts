@@ -11,7 +11,12 @@ export default defineConfig(({ command }) => {
   const identity = command === 'build' ? createBuildIdentity() : null;
   return {
     root: sourceRoot,
-    define: { __CIRCUS_BUILD_ID__: JSON.stringify(identity?.buildId ?? null) },
+    define: {
+      __CIRCUS_BUILD_ID__: JSON.stringify(identity?.buildId ?? null),
+      __CIRCUS_BUILD_SOURCE__: JSON.stringify(
+        identity ? { revision: identity.revision, worktree: identity.worktree } : null,
+      ),
+    },
     plugins: [react(), ...(identity ? [buildIdentityPlugin(identity)] : [])],
     server: {
       proxy: { '/api': 'http://127.0.0.1:3001' },

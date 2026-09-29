@@ -3,6 +3,12 @@ import {
   CLINICAL_OPTICAL_LITERAL_INSTRUCTIONS,
 } from './clinical-instructions.ts';
 import { HttpError } from './database.ts';
+import {
+  diagnosticValidation,
+  copyDiagnosticValidation,
+  diagnosticValidationError,
+  withDiagnosticValidation,
+} from './import-diagnostic-error.ts';
 import type { HealthRecordEnvelope, IntakeValidation } from '../shared/intake.ts';
 import {
   INTAKE_PEOPLE_EVIDENCE_INSTRUCTIONS,
@@ -143,15 +149,27 @@ function nullableText(value: unknown): value is string | null {
 
 function envelope(value: unknown): HealthRecordEnvelope {
   if (!isObject(value) || value.format !== INTAKE_FORMAT)
-    throw new Error('Expected a health-record-v1 envelope');
+    throw diagnosticValidationError(
+      'Expected a health-record-v1 envelope',
+      'invalid_envelope',
+      'arguments.jsonlText[].format',
+    );
   if (typeof value.id !== 'string' || !value.id.trim() || value.id.length > 2000)
-    throw new Error('Record id must be nonempty text of at most 2000 characters');
+    throw diagnosticValidationError(
+      'Record id must be nonempty text of at most 2000 characters',
+      'invalid_id',
+      'arguments.jsonlText[].id',
+    );
   if (
     typeof value.kind !== 'string' ||
     !['record', 'document', 'context', 'unrecognized'].includes(value.kind) ||
     !Object.hasOwn(value, 'payload')
   )
-    throw new Error('Record needs a supported kind and literal payload');
+    throw diagnosticValidationError(
+      'Record needs a supported kind and literal payload',
+      'invalid_kind_or_payload',
+      'arguments.jsonlText[].kind',
+    );
   const p = value.provenance,
     c = value.coverage;
   if (
@@ -166,7 +184,11 @@ function envelope(value: unknown): HealthRecordEnvelope {
       p.evidenceClass,
     )
   )
-    throw new Error('Record provenance is incomplete');
+    throw diagnosticValidationError(
+      'Record provenance is incomplete',
+      'invalid_provenance',
+      'arguments.jsonlText[].provenance',
+    );
   if (
     !isObject(c) ||
     typeof c.status !== 'string' ||
@@ -174,14 +196,22 @@ function envelope(value: unknown): HealthRecordEnvelope {
     !Array.isArray(c.notes) ||
     !c.notes.every((x) => typeof x === 'string')
   )
-    throw new Error('Record coverage must include status and notes');
+    throw diagnosticValidationError(
+      'Record coverage must include status and notes',
+      'invalid_coverage',
+      'arguments.jsonlText[].coverage',
+    );
   if (
     Object.hasOwn(value, 'contextId') &&
     (typeof value.contextId !== 'string' ||
       !value.contextId.trim() ||
       value.contextId.length > 2000)
   )
-    throw new Error('Context id must be nonempty text of at most 2000 characters');
+    throw diagnosticValidationError(
+      'Context id must be nonempty text of at most 2000 characters',
+      'invalid_context_id',
+      'arguments.jsonlText[].contextId',
+    );
   if (Object.hasOwn(value, 'report')) {
     const report = value.report;
     const text = (v: unknown, max: number): boolean =>
@@ -201,12 +231,23 @@ function envelope(value: unknown): HealthRecordEnvelope {
           !text(report.section.title, 1000) ||
           !anchor(report.section.anchor)))
     )
-      throw new Error(
+      throw diagnosticValidationError(
         'Report reference requires bounded source anchors, title, key and explicit subject evidence or null',
+        'invalid_report',
+        'arguments.jsonlText[].report',
       );
   }
   const result = value as unknown as HealthRecordEnvelope;
-  validatedIntakePeople(result);
+  try {
+    validatedIntakePeople(result);
+  } catch (error) {
+    if (error instanceof Error)
+      withDiagnosticValidation(error, {
+        code: 'invalid_people',
+        path: 'arguments.jsonlText[].people',
+      });
+    throw error;
+  }
   return result;
 }
 export function validateJSONL(bytes: Uint8Array): IntakeValidationResult {
@@ -226,11 +267,14 @@ export function validateJSONL(bytes: Uint8Array): IntakeValidationResult {
   try {
     text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
-    return {
-      ...result,
-      valid: false,
-      issues: [{ line: 0, message: 'Original is not UTF-8 JSONL; conversion is pending' }],
-    };
+    return withDiagnosticValidation(
+      {
+        ...result,
+        valid: false,
+        issues: [{ line: 0, message: 'Original is not UTF-8 JSONL; conversion is pending' }],
+      },
+      { code: 'invalid_encoding', path: 'arguments.jsonlText', line: 0 },
+    );
   }
   const entries: IntakeEntry[] = [],
     seen = new Set();
@@ -240,6 +284,12 @@ export function validateJSONL(bytes: Uint8Array): IntakeValidationResult {
     if (++result.rows > MAX_INTAKE_ROWS) {
       result.valid = false;
       result.issues.push({ line: index + 1, message: 'File exceeds 50,000 records' });
+      if (!diagnosticValidation(result))
+        withDiagnosticValidation(result, {
+          code: 'row_limit',
+          path: 'arguments.jsonlText',
+          line: index + 1,
+        });
       break;
     }
     try {
@@ -259,6 +309,11 @@ export function validateJSONL(bytes: Uint8Array): IntakeValidationResult {
         });
     } catch (error: unknown) {
       result.valid = false;
+      if (!diagnosticValidation(result))
+        withDiagnosticValidation(result, {
+          ...(diagnosticValidation(error) || { code: 'invalid_json', path: 'arguments.jsonlText' }),
+          line: index + 1,
+        });
       if (result.issues.length < 20)
         result.issues.push({
           line: index + 1,
@@ -269,11 +324,12 @@ export function validateJSONL(bytes: Uint8Array): IntakeValidationResult {
   if (!result.rows) {
     result.valid = false;
     result.issues.push({ line: 0, message: 'File has no JSONL records' });
+    withDiagnosticValidation(result, { code: 'empty_input', path: 'arguments.jsonlText', line: 0 });
   }
   result.previewComplete = result.rows <= 5 && result.preview.every((p) => p.text.length < 4000);
   return result.valid
     ? { ...result, valid: true, entries }
-    : { ...result, valid: false, entries: [] };
+    : copyDiagnosticValidation({ ...result, valid: false as const, entries: [] }, result);
 }
 export const validationSummary = (result: IntakeValidationResult): IntakeValidation => {
   const { entries, ...summary } = result;

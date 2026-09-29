@@ -145,6 +145,7 @@ export type AssistantProposal = {
   | { kind: 'note' | 'classification' | 'attachment'; preview?: unknown }
 );
 export type AssistantChat = AssistantChatSummary & {
+  context?: AssistantContext;
   messages: AssistantMessage[];
   error?: string;
   proposals?: AssistantProposal[];

@@ -431,7 +431,10 @@ test('explicit report confirmation clears exact identity-question accounting and
   assert.equal(convergedReview.status, 'prior_confirmation');
   assert.equal(convergedReview.blocking, false);
   assert.equal(convergedReview.scope!.targets.length, 0);
-  assert.deepEqual(convergedReview.offeredSelfFields, {});
+  assert.deepEqual(convergedReview.offeredSelfFields, {
+    fullName: 'Fictional Iris Meadow',
+    birthDate: '1990-03-08',
+  });
   assert.equal(
     listIntakeImportFeed(f.db, f.root, f.profileId, { view: 'all' }).blocks[0]!.records[0]!
       .selectable,
@@ -768,7 +771,7 @@ test('unchanged explicit identity authority survives cumulative report membershi
   );
   assert.equal(
     exactCurrentIdentityResolutionOperationId({
-      receipts: [{ ...receipt, scope: { ...receipt.scope, targets: [] } }],
+      receipts: [{ ...receipt, scope: { ...receipt.scope, targets: [], assignmentTargets: [] } }],
       occurrences: [occurrence],
       receiptApplies: (candidate) => identityReceiptAppliesToCurrentBoundary(candidate, boundary),
     }),
@@ -930,7 +933,7 @@ test('compact report-subject confirmation records its attestation and later same
         operationId: 'new-click-old-scope',
         version: intake.getIntake(f.db, f.root, f.profileId, f.item.id).version,
       }),
-    { code: 'IDENTITY_SCOPE' },
+    { code: 'SELF_VERSION_CONFLICT' },
   );
 });
 
@@ -1007,8 +1010,8 @@ test('running identity headers reuse a confirmation across report groups without
   assert.equal(secondReview.status, 'prior_confirmation');
   assert.equal(secondReview.blocking, false);
   assert.equal(workflow(f).identityConfirmations!.length, 1);
-  assert.equal(secondReview.evidencedIdentity.fullName, undefined);
-  assert.equal(secondReview.evidencedIdentity.birthDate, undefined);
+  assert.equal(secondReview.evidencedIdentity.fullName, 'Fictional Iris Meadow');
+  assert.equal(secondReview.evidencedIdentity.birthDate, fictionalBirthDate);
 });
 
 for (const acceptance of ['record', 'report'] as const)
@@ -1167,6 +1170,8 @@ for (const outcome of ['unknown', 'other_person'] as const)
     const proposed = f.propose([envelope('generic-only-first'), later]);
     const groups = workflow(f).reportGroups!;
     await f.confirm(await f.preview(f.item.id, groups[0]!.id));
+    // The second report has its own original header; recheck it before receipt reuse.
+    await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, groups[1]!.id);
     const review = intake.reviewIntake(
       f.db,
       f.root,
@@ -1298,7 +1303,10 @@ for (const variation of [
     const proposed = f.propose([later], target);
     const groupId = proposed.workflow!.reportGroups!.at(-1)!.id;
     const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, target, groupId);
-    assert.equal(review.status, 'confirmation_required');
+    assert.equal(
+      review.status,
+      variation === 'other-subject' ? 'conflict' : 'confirmation_required',
+    );
     assert.equal(review.blocking, true);
     assert.equal(workflow(f).identityConfirmations!.length, 1);
   });
@@ -1346,7 +1354,7 @@ for (const change of ['append', 'version', 'occurrence'] as const)
     assert.equal(workflow(f).reviewDrafts!.length, 0);
   });
 
-for (const variation of ['missing', 'unmatched', 'different-subject', 'other-person'] as const)
+for (const variation of ['missing', 'unmatched', 'different-subject'] as const)
   test(`${variation} evidence does not authorize common confirmation`, async (t) => {
     const f = fixture(t);
     const a = envelope('a'),
@@ -1355,7 +1363,6 @@ for (const variation of ['missing', 'unmatched', 'different-subject', 'other-per
     if (variation === 'unmatched') a.report!.subject!.text = 'Unprinted Fictional Person';
     if (variation === 'different-subject')
       b.report!.subject!.text = 'Patient: Fictional Rowan Pebble';
-    if (variation === 'other-person') b.clinical = { ...(b.clinical as object), subject: 'other' };
     f.propose([a, b]);
     await assert.rejects(() => f.preview(), { code: 'IDENTITY_SCOPE' });
     assert.equal(workflow(f).reviewDrafts!.length, 0);
@@ -1497,7 +1504,8 @@ test('changed question claims and previous other-person decisions cannot inherit
       },
     ],
   });
-  await assert.rejects(() => f.preview(), { code: 'IDENTITY_SCOPE' });
+  const reassignment = await f.preview();
+  assert.ok(reassignment.targets.length > 0);
   assert.equal(workflow(f).identityConfirmations?.length || 0, 0);
 });
 
@@ -1652,7 +1660,7 @@ test('an evidenced match auto-allows records and one optional action atomically 
   assert.deepEqual(committed.workflow!.identityConfirmations![0]!.selfUpdate, {
     noteId: 'person-note:self',
     versionBefore: review.self.version,
-    versionAfter: review.self.version + 1,
+    versionAfter: review.self.version + 2,
     fields: { birthDate: fictionalBirthDate },
   });
   attachPersonalDurability(f.db, {
@@ -2089,7 +2097,7 @@ test('a changed linked report context makes earlier Self suggestions stale and w
 });
 
 for (const conflict of ['fullName', 'birthDate'] as const)
-  test(`a contradictory evidenced ${conflict} blocks report and generic candidate confirmation`, async (t) => {
+  test(`a contradictory evidenced ${conflict} offers explicit person choice while blocking generic bypass`, async (t) => {
     const f = fixture(t);
     setSelf(f, {
       fullName: conflict === 'fullName' ? 'Fictional Different Self' : 'Fictional Iris Meadow',
@@ -2106,9 +2114,9 @@ for (const conflict of ['fullName', 'birthDate'] as const)
     );
     assert.equal(identityReview.status, 'conflict');
     assert.equal(identityReview.blocking, true);
-    assert.equal(identityReview.scope, null);
+    assert.ok(identityReview.scope);
     assert.equal(identityReview.conflicts[0]!.field, conflict);
-    await assert.rejects(() => f.preview(), { code: 'IDENTITY_SCOPE' });
+    assert.deepEqual(await f.preview(), identityReview.scope);
 
     const candidateReview = intake.reviewIntake(
       f.db,
@@ -2243,7 +2251,9 @@ test('a changed evidenced person on the same original cannot inherit an earlier 
   ]);
   const groupId = workflow(f).reportGroups![0]!.id;
   const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, groupId);
-  assert.equal(review.status, 'confirmation_required');
+  assert.equal(review.status, 'conflict');
+  assert.ok(review.conflicts.some((conflict) => conflict.reason === 'evidence_disagreement'));
+  assert.equal(review.scope, null);
   assert.equal(review.blocking, true);
   assert.notEqual(
     review.evidencedIdentity.personFingerprint,
@@ -2774,4 +2784,824 @@ test('an explicit known Self name matches in record review, survives rebuild, an
   }
   setSelf(f, { knownNames: [] });
   assert.equal(review().records[0]!.identityReview?.status, 'conflict');
+});
+
+for (const destination of ['new', 'existing'] as const)
+  test(`an explicitly selected ${destination} family person owns accepted mismatched clinical results`, async (t) => {
+    const f = fixture(t);
+    setSelf(f, { fullName: 'Fictional Separate Self', birthDate: '1982-01-03' });
+    let personSelection: NonNullable<IntakeIdentityConfirmation['personSelection']>;
+    if (destination === 'existing') {
+      const { createNote } = await import('../notes.ts');
+      const person = createNote(f.db, {
+        kind: 'person',
+        title: 'Fictional Family Iris',
+        content: '',
+        person: { fullName: 'Fictional Family Iris', tags: ['Family'] },
+      });
+      personSelection = { noteId: person.id, expectedVersion: person.version };
+    } else
+      personSelection = {
+        newPerson: { fullName: 'Fictional Family Iris', relationship: 'Sibling' },
+      };
+    const proposed = f.propose([withIdentityEvidence(envelope('family-owned'))]);
+    const scope = await f.preview();
+    const input: IntakeIdentityConfirmation = {
+      ...request(scope, `fictional-family-${destination}`),
+      outcome: 'this_is_person',
+      attestation: 'confirmed_displayed_identity_questions',
+      personSelection,
+    };
+    const saved = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input);
+    const assigned = saved.workflow!.identityConfirmations!.at(-1)!.assignedPerson!;
+    assert.ok(assigned.personId);
+    assert.notEqual(assigned.personId, 'patient');
+    assert.equal(getNote(f.db, 'person-note:self').person.fullName, 'Fictional Separate Self');
+    assert.equal(f.db.prepare('SELECT COUNT(*) n FROM observations').get()!.n, 0);
+    assert.deepEqual(
+      (await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input)).workflow,
+      saved.workflow,
+    );
+    assert.equal(
+      f.db
+        .prepare("SELECT COUNT(*) n FROM notes WHERE kind='person' AND person_id!='patient'")
+        .get()!.n,
+      1,
+    );
+    const review = intake.reviewIntake(
+      f.db,
+      f.root,
+      f.profileId,
+      f.item.id,
+      proposed.proposals.at(-1)!.id,
+    );
+    assert.equal(review.records[0]!.identityReview!.blocking, false);
+    assert.equal(review.records[0]!.mapping.personId, assigned.personId);
+    assert.equal(review.records[0]!.mapping.subject, 'other');
+    intake.importIntake(f.db, f.root, f.profileId, f.item.id, {
+      version: review.version,
+      proposalId: review.proposalId,
+      reviewToken: review.reviewToken,
+      decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+    });
+    assert.equal(
+      f.db.prepare('SELECT person_id FROM observations').get()!.person_id,
+      assigned.personId,
+    );
+    assert.equal(
+      f.db.prepare("SELECT COUNT(*) n FROM observations WHERE person_id='patient'").get()!.n,
+      0,
+    );
+    const refreshed = await getIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.item.id,
+      scope.groupId,
+    );
+    assert.equal(refreshed.assignedPerson?.personId, assigned.personId);
+  });
+
+test('explicit Self choice with a matching DOB adds the evidenced alias once', async (t) => {
+  const f = fixture(t);
+  setSelf(f, { fullName: 'Fictional Other Name', birthDate: fictionalBirthDate });
+  const proposed = f.propose([withIdentityEvidence(envelope('alias-self'))]);
+  const scope = await f.preview();
+  const input: IntakeIdentityConfirmation = {
+    ...request(scope, 'fictional-explicit-alias'),
+    attestation: 'confirmed_displayed_identity_questions',
+  };
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input);
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input);
+  const self = getNote(f.db, 'person-note:self');
+  assert.equal(self.person.fullName, 'Fictional Other Name');
+  assert.equal(self.person.birthDate, fictionalBirthDate);
+  assert.deepEqual(self.person.knownNames, ['Fictional Iris Meadow']);
+  const review = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  assert.equal(review.records[0]!.identityReview!.blocking, false);
+  intake.importIntake(f.db, f.root, f.profileId, f.item.id, {
+    version: review.version,
+    proposalId: review.proposalId,
+    reviewToken: review.reviewToken,
+    decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+  });
+  assert.equal(f.db.prepare('SELECT person_id FROM observations').get()!.person_id, 'patient');
+});
+
+test('an automatic Self match can instead be explicitly assigned to a family person', async (t) => {
+  const f = fixture(t);
+  setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: fictionalBirthDate });
+  const proposed = f.propose([withIdentityEvidence(envelope('same-named-family'))]);
+  const scope = await f.preview();
+  assert.equal(scope.targets.length, 0);
+  assert.equal(scope.assignmentTargets?.length, 1);
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'fictional-same-named-family'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_report_subject',
+    personSelection: { newPerson: { fullName: 'Fictional Iris Meadow Junior' } },
+  });
+  const review = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  assert.equal(review.records[0]!.identityReview!.blocking, false);
+  assert.equal(review.records[0]!.mapping.subject, 'other');
+  assert.notEqual(review.records[0]!.mapping.personId, 'patient');
+});
+
+test('new Person creation rolls back with failed identity publication and stale existing Person versions reject', async (t) => {
+  const f = fixture(t);
+  f.propose([withIdentityEvidence(envelope('family-rollback'))]);
+  const scope = await f.preview();
+  const input: IntakeIdentityConfirmation = {
+    ...request(scope, 'family-rollback'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { newPerson: { fullName: 'Fictional Rollback Family' } },
+  };
+  f.db.exec(
+    "CREATE TEMP TRIGGER reject_family BEFORE UPDATE ON source_files BEGIN SELECT RAISE(ABORT, 'fictional family publication failure'); END",
+  );
+  await assert.rejects(
+    () => confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input),
+    /fictional family publication failure/,
+  );
+  assert.equal(
+    f.db.prepare("SELECT COUNT(*) n FROM notes WHERE kind='person' AND person_id!='patient'").get()!
+      .n,
+    0,
+  );
+  assert.equal(workflow(f).identityConfirmations?.length || 0, 0);
+  f.db.exec('DROP TRIGGER reject_family');
+  const { createNote } = await import('../notes.ts');
+  const person = createNote(f.db, {
+    kind: 'person',
+    title: 'Fictional Existing Family',
+    content: '',
+    person: { tags: ['Family'] },
+  });
+  saveNote(f.db, person.id, { version: person.version, title: 'Fictional Renamed Family' });
+  await assert.rejects(
+    () =>
+      confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+        ...input,
+        personSelection: { noteId: person.id, expectedVersion: person.version },
+      }),
+    { code: 'PERSON_VERSION_CONFLICT' },
+  );
+  assert.equal(workflow(f).identityConfirmations?.length || 0, 0);
+});
+
+test('pending report can be reassigned Self to family and back without losing alias or moving accepted history', async (t) => {
+  const f = fixture(t);
+  const proposed = f.propose([withIdentityEvidence(envelope('reassign-family'))]);
+  let scope = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'reassign-self-first'),
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  scope = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'reassign-family-next'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { newPerson: { fullName: 'Fictional Alternative Person' } },
+  });
+  scope = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'reassign-self-final'),
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  const review = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  assert.equal(review.records[0]!.mapping.subject, 'self');
+  assert.equal(review.records[0]!.mapping.personId, undefined);
+  assert.equal(review.records[0]!.identityReview!.blocking, false);
+  assert.deepEqual(getNote(f.db, 'person-note:self').person.knownNames, ['Fictional Iris Meadow']);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM observations').get()!.n, 0);
+});
+
+test('encrypted cache-loss rebuild retains all clinical Person owners, aliases and exact assignment receipts', async (t) => {
+  const { newProfile, vaultFixture } = await import('./helpers/vault-fixture.ts');
+  const { manager } = vaultFixture(t);
+  const created = await newProfile(manager, 'Fictional Vault Self');
+  const profileId = created.profile.id;
+  let state = manager.opened.get(profileId)!;
+  const savedSelf = getNote(state.db, 'person-note:self');
+  saveNote(state.db, savedSelf.id, {
+    version: savedSelf.version,
+    person: { ...savedSelf.person, birthDate: fictionalBirthDate },
+  });
+  const original = intake.uploadIntake(state.db, state.root, profileId, {
+    filename: 'fictional-family.txt',
+    bytes: Buffer.from(originalText),
+    newProviderName: 'Invented Clinic',
+  });
+  const values = ['observation', 'medication', 'procedure', 'document'].map((kind) => {
+    const value = withIdentityEvidence(envelope('vault-' + kind));
+    value.clinical = {
+      ...(value.clinical as object),
+      kind,
+      medicationName: 'Fictional medication',
+      medicationKind: 'reported_use',
+      procedureLabel: 'Fictional procedure',
+      procedureCategory: 'unspecified',
+      documentTitle: 'Fictional document',
+      text: 'Fictional retained document',
+    };
+    return value;
+  });
+  let source = intake.proposeConversion(state.db, state.root, profileId, original.id, {
+    version: original.version,
+    summary: 'Fictional family clinical records',
+    jsonlText: values.map((value) => JSON.stringify(value)).join('\n'),
+  });
+  let scope = await getIntakeIdentityScope(
+    state.db,
+    state.root,
+    profileId,
+    original.id,
+    source.workflow!.reportGroups![0]!.id,
+  );
+  await confirmIntakeIdentityScope(state.db, state.root, profileId, original.id, {
+    ...request(scope, 'vault-self-alias'),
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  scope = await getIntakeIdentityScope(
+    state.db,
+    state.root,
+    profileId,
+    original.id,
+    source.workflow!.reportGroups![0]!.id,
+  );
+  const input: IntakeIdentityConfirmation = {
+    ...request(scope, 'vault-family-assignment'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { newPerson: { fullName: 'Fictional Vault Family' } },
+  };
+  source = await confirmIntakeIdentityScope(state.db, state.root, profileId, original.id, input);
+  const assigned = source.workflow!.identityConfirmations!.at(-1)!.assignedPerson!;
+  const review = intake.reviewIntake(
+    state.db,
+    state.root,
+    profileId,
+    original.id,
+    source.proposals.at(-1)!.id,
+  );
+  intake.importIntake(state.db, state.root, profileId, original.id, {
+    version: review.version,
+    proposalId: review.proposalId,
+    reviewToken: review.reviewToken,
+    decisions: review.records.map((record) => ({
+      recordId: record.id,
+      action: 'accept',
+      mapping: {},
+    })),
+  });
+  const receipts = intake.getIntake(state.db, state.root, profileId, original.id).workflow!
+    .identityConfirmations;
+  const sourceNames = [
+    getNote(state.db, 'person-note:self'),
+    getNote(state.db, assigned.noteId),
+  ].map((note) => note.person.sourceKnownNames);
+  manager.lock(profileId);
+  rmSync(join(manager.pathFor(profileId), 'cache'), { recursive: true, force: true });
+  manager.unlock(profileId, created.recoveryKit);
+  state = manager.opened.get(profileId)!;
+  for (const table of ['observations', 'medications', 'procedures'])
+    assert.equal(
+      state.db.prepare(`SELECT person_id FROM ${table}`).get()!.person_id,
+      assigned.personId,
+    );
+  assert.equal(
+    state.db
+      .prepare("SELECT json_extract(extra_json,'$.import.personId') owner FROM documents")
+      .get()!.owner,
+    assigned.personId,
+  );
+  assert.deepEqual(getNote(state.db, 'person-note:self').person.knownNames, [
+    'Fictional Iris Meadow',
+  ]);
+  assert.equal(getNote(state.db, assigned.noteId).personId, assigned.personId);
+  assert.deepEqual(
+    [getNote(state.db, 'person-note:self'), getNote(state.db, assigned.noteId)].map(
+      (note) => note.person.sourceKnownNames,
+    ),
+    sourceNames,
+  );
+  assert.deepEqual(
+    intake.getIntake(state.db, state.root, profileId, original.id).workflow!.identityConfirmations,
+    receipts,
+  );
+  assert.deepEqual(
+    (await confirmIntakeIdentityScope(state.db, state.root, profileId, original.id, input))
+      .workflow!.identityConfirmations,
+    receipts,
+  );
+  const document = state.db.prepare('SELECT id FROM documents').get()!;
+  const { transaction } = await import('../database.ts');
+  const { correctClinicalRecord } = await import('../record-corrections.ts');
+  transaction(state.db, () =>
+    correctClinicalRecord(
+      state.db,
+      {
+        kind: 'document',
+        recordId: document.id,
+        set: { kind: 'procedure', procedureLabel: 'Fictional reviewed procedure' },
+        reason: 'Fictional human reclassification',
+      },
+      'fictional-family-reclassification',
+      { root: state.root, profileId },
+    ),
+  );
+  assert.equal(
+    state.db.prepare('SELECT person_id FROM procedures WHERE id=?').get(document.id)!.person_id,
+    assigned.personId,
+  );
+  transaction(state.db, () =>
+    correctClinicalRecord(
+      state.db,
+      {
+        kind: 'procedure',
+        recordId: document.id,
+        set: { kind: 'document', documentTitle: 'Fictional reviewed document' },
+        reason: 'Fictional reverse reclassification',
+      },
+      'fictional-family-reclassification-back',
+      { root: state.root, profileId },
+    ),
+  );
+  assert.equal(
+    state.db
+      .prepare(
+        "SELECT json_extract(extra_json,'$.import.personId') owner FROM documents WHERE id=?",
+      )
+      .get(document.id)!.owner,
+    assigned.personId,
+  );
+});
+
+test('a report-wide family choice includes auto-matched and unresolved pending records together', async (t) => {
+  const f = fixture(t);
+  setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: fictionalBirthDate });
+  const proposed = f.propose([
+    withIdentityEvidence(envelope('auto-match')),
+    withAnchorOnlyIdentity(envelope('explicit-question')),
+  ]);
+  const scope = await f.preview();
+  assert.equal(scope.targets.length, 1);
+  assert.equal(scope.assignmentTargets?.length, 2);
+  const saved = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'mixed-report-family'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { newPerson: { fullName: 'Fictional Chosen Family' } },
+  });
+  const person = saved.workflow!.identityConfirmations!.at(-1)!.assignedPerson!;
+  const review = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  assert.equal(review.records.length, 2);
+  assert.ok(
+    review.records.every(
+      (record) =>
+        record.mapping.personId === person.personId && record.identityReview?.blocking === false,
+    ),
+  );
+});
+
+test('new report rows cannot reuse superseded Self assignment and explicit Self choice covers all pending rows', async (t) => {
+  const f = fixture(t);
+  const initialValue = withIdentityEvidence(envelope('earlier-family-row'));
+  f.propose([initialValue]);
+  let scope = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'superseded-self'),
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  scope = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'current-family'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { newPerson: { fullName: 'Fictional Current Family' } },
+  });
+  const proposed = f.propose([initialValue, withIdentityEvidence(envelope('new-report-row'))]);
+  let review = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  assert.ok(review.records.every((record) => record.identityReview?.blocking === true));
+  scope = await f.preview();
+  assert.equal(scope.assignmentTargets?.length, 3);
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'whole-current-report-self'),
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  review = intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, proposed.proposals.at(-1)!.id);
+  assert.ok(
+    review.records.every(
+      (record) =>
+        record.mapping.subject === 'self' &&
+        !record.mapping.personId &&
+        record.identityReview?.blocking === false,
+    ),
+  );
+});
+
+test('an exact family assignment resolves identity-question accounting without accepting records', async (t) => {
+  const f = fixture(t);
+  const proposed = f.propose([withIdentityEvidence(envelope('family-question-accounting'))]);
+  const record = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals[0]!.id,
+  ).records[0]!;
+  let current = intake.getIntake(f.db, f.root, f.profileId, f.item.id);
+  current = intake.askIntakeQuestion(f.db, f.root, f.profileId, f.item.id, {
+    version: current.version,
+    key: 'family-subject',
+    candidateId: record.candidateId,
+    candidateVersionId: record.candidateVersionId,
+    field: 'subject',
+    prompt: 'Who is the fictional patient?',
+    locator: record.evidence[0]!.locator,
+  });
+  assert.ok((current.unansweredCount || 0) > 0);
+  const scope = await f.preview();
+  current = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'family-question-accounting'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { newPerson: { fullName: 'Fictional Question Owner' } },
+  });
+  assert.equal(current.unansweredCount, 0);
+  assert.equal(current.workflow!.decisions.length, 0);
+});
+
+test('a new identity question on a family-assigned candidate requires a fresh explicit person choice', async (t) => {
+  const f = fixture(t);
+  const proposed = f.propose([withIdentityEvidence(envelope('family-new-question'))]);
+  let scope = await f.preview();
+  let current = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'first-family-question-scope'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { newPerson: { fullName: 'Fictional Question Family' } },
+  });
+  const person = current.workflow!.identityConfirmations!.at(-1)!.assignedPerson!;
+  let review = intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, proposed.proposals[0]!.id);
+  const record = review.records[0]!;
+  current = intake.askIntakeQuestion(f.db, f.root, f.profileId, f.item.id, {
+    version: current.version,
+    key: 'new-family-identity-clue',
+    candidateId: record.candidateId,
+    candidateVersionId: record.candidateVersionId,
+    field: 'subject',
+    prompt: 'Does this new fictional subject clue identify the same person?',
+    locator: record.evidence[0]!.locator,
+  });
+  review = intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, proposed.proposals[0]!.id);
+  assert.equal(review.records[0]!.identityReview?.blocking, true);
+  assert.ok(
+    review.records[0]!.issues!.some(
+      (issue) =>
+        issue.prompt.includes('new fictional subject clue') && issue.status === 'unresolved',
+    ),
+  );
+  assert.ok((current.unansweredCount || 0) > 0);
+  scope = await f.preview();
+  assert.ok(
+    scope.questions?.some((question) => question.prompt.includes('new fictional subject clue')),
+  );
+  current = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope, 'second-family-question-scope'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { noteId: person.noteId, expectedVersion: person.version },
+  });
+  assert.equal(current.unansweredCount, 0);
+  review = intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, proposed.proposals[0]!.id);
+  assert.equal(review.records[0]!.identityReview?.blocking, false);
+  assert.equal(review.records[0]!.mapping.personId, person.personId);
+});
+
+for (const owner of ['self', 'family'] as const)
+  test(`a subject-only confirmed name is immutable source-backed evidence for ${owner}`, async (t) => {
+    const f = fixture(t);
+    f.propose([envelope('subject-only-alias')]);
+    const scope = await f.preview();
+    assert.equal(scope.evidencedIdentity?.fullName, 'Fictional Iris Meadow');
+    const input: IntakeIdentityConfirmation = {
+      ...request(scope, `protected-source-name-${owner}`),
+      ...(owner === 'family'
+        ? {
+            outcome: 'this_is_person',
+            personSelection: { newPerson: { fullName: 'Fictional Family Display' } },
+          }
+        : {}),
+    };
+    const result = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input);
+    const receipt = result.workflow!.identityConfirmations!.at(-1)!;
+    assert.equal(receipt.confirmedPrintedName, 'Fictional Iris Meadow');
+    const noteId = receipt.assignedPerson?.noteId || 'person-note:self';
+    const note = getNote(f.db, noteId);
+    assert.deepEqual(note.person.knownNames, ['Fictional Iris Meadow']);
+    assert.equal(note.person.sourceKnownNames?.[0]?.sourceHash, f.item.sha256);
+    const edited = saveNote(f.db, noteId, {
+      version: note.version,
+      person: { ...note.person, knownNames: [], sourceKnownNames: [] },
+    });
+    assert.deepEqual(edited.person.knownNames, ['Fictional Iris Meadow']);
+    assert.deepEqual(edited.person.sourceKnownNames, note.person.sourceKnownNames);
+    await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input);
+    assert.equal(getNote(f.db, noteId).person.sourceKnownNames!.length, 1);
+  });
+
+test('ambiguous printed subject needs an explicit literal name selection and stores only that name', async (t) => {
+  const ambiguous = 'For Fictional Iris Meadow and Fictional Orin Pine';
+  const f = fixture(t, Buffer.from(`${heading}\n${ambiguous}\nFictional result A 12.00`));
+  const value = envelope('ambiguous-name');
+  value.report!.subject!.text = ambiguous;
+  f.propose([value]);
+  const scope = await f.preview();
+  assert.equal(scope.evidencedIdentity?.fullName, undefined);
+  const input = request(scope, 'selected-literal-name');
+  await assert.rejects(
+    () => confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input),
+    { code: 'IDENTITY_PRINTED_NAME' },
+  );
+  await assert.rejects(
+    () =>
+      confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+        ...input,
+        printedName: ambiguous,
+      }),
+    { code: 'IDENTITY_PRINTED_NAME' },
+  );
+  await assert.rejects(
+    () =>
+      confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+        ...input,
+        printedName: 'Fictional Invented Name',
+      }),
+    { code: 'IDENTITY_PRINTED_NAME' },
+  );
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...input,
+    printedName: 'Fictional Iris Meadow',
+  });
+  assert.deepEqual(getNote(f.db, 'person-note:self').person.knownNames, ['Fictional Iris Meadow']);
+  // Simulate a pre-upgrade confirmation whose Person projection lacks the new
+  // source-name authority. A fresh explicit selection must repair it.
+  f.db
+    .prepare(
+      "UPDATE notes SET profile_json=json_remove(profile_json,'$.sourceKnownNames','$.knownNames') WHERE id='person-note:self'",
+    )
+    .run();
+  const current = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(current, 'legacy-confirmation-name-repair'),
+    printedName: 'Fictional Iris Meadow',
+  });
+  assert.equal(
+    getNote(f.db, 'person-note:self').person.sourceKnownNames?.[0]?.name,
+    'Fictional Iris Meadow',
+  );
+});
+
+test('source spellings survive a full manual-name list and canonical-equivalent printed variants', async (t) => {
+  const { transaction } = await import('../database.ts');
+  const { rememberSourceNameInTransaction } = await import('../notes.ts');
+  const f = fixture(t);
+  setSelf(f, { knownNames: Array.from({ length: 32 }, (_, index) => `Fictional Manual ${index}`) });
+  const proof = {
+    operationId: 'fictional-source-name',
+    intakeId: f.item.id,
+    sourceHash: f.item.sha256,
+    groupId: 'fictional-group',
+    subjectText: 'Patient: Fictional Iris Meadow',
+  };
+  transaction(f.db, () => {
+    rememberSourceNameInTransaction(f.db, 'person-note:self', {
+      ...proof,
+      name: 'Fictional Iris Meadow',
+    });
+    rememberSourceNameInTransaction(f.db, 'person-note:self', {
+      ...proof,
+      name: 'Meadow, Fictional Iris',
+    });
+  });
+  const note = getNote(f.db, 'person-note:self');
+  assert.equal(note.person.knownNames!.length, 33);
+  assert.deepEqual(
+    note.person.sourceKnownNames!.map((entry) => entry.name),
+    ['Fictional Iris Meadow', 'Meadow, Fictional Iris'],
+  );
+  const saved = saveNote(f.db, note.id, {
+    version: note.version,
+    person: {
+      ...note.person,
+      knownNames: [],
+      sourceKnownNames: [{ ...proof, name: 'Forged Name' }],
+    },
+  });
+  assert.deepEqual(saved.person.knownNames, ['Fictional Iris Meadow']);
+  assert.deepEqual(saved.person.sourceKnownNames, note.person.sourceKnownNames);
+});
+
+test('a mismatching evidenced DOB rejects Self and permits a new person without trapping a value draft', async (t) => {
+  const f = fixture(t);
+  setSelf(f, { fullName: 'Cookie Doe', birthDate: '1986-02-14' });
+  const proposed = f.propose([withIdentityEvidence(envelope('dob-conflict'))]);
+  const scope = await f.preview();
+  await assert.rejects(
+    confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+      ...request(scope, 'cookie-wrong-self'),
+      attestation: 'confirmed_displayed_identity_questions',
+    }),
+    /birth date differs from Self/,
+  );
+  const review = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  const record = review.records[0]!;
+  intake.saveIntakeReviewDraft(f.db, f.root, f.profileId, f.item.id, {
+    version: review.version,
+    operationId: 'cookie-value-draft',
+    proposalId: review.proposalId,
+    recordId: record.id,
+    candidateVersionId: record.candidateVersionId!,
+    mapping: { ...record.mapping, valueText: '4.1' },
+  });
+  const nextScope = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(nextScope, 'cookie-new-person'),
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    personSelection: { newPerson: { fullName: 'Cookie Meadow' } },
+  });
+  const ready = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  assert.equal(ready.records[0]!.mapping.subject, 'other');
+  assert.equal(ready.records[0]!.mapping.valueText, '4.1');
+  assert.equal(ready.records[0]!.identityReview!.blocking, false);
+});
+
+test('a same-name other-person role stays separate from a confirmed report group', async (t) => {
+  const f = fixture(t);
+  const a = envelope('a'),
+    b = envelope('b');
+  b.clinical = { ...(b.clinical as object), subject: 'other' };
+  const proposed = f.propose([a, b]);
+  const scope = await f.preview();
+  assert.equal(scope.targets.length, 1, 'confirmation covers only its own extraction group');
+  await f.confirm(scope);
+  const review = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals[0]!.id,
+  );
+  assert.equal(review.records[0]!.identityReview?.blocking, false);
+  assert.equal(
+    review.records[1]!.identityReview?.blocking,
+    true,
+    'a receipt never assigns another group',
+  );
+  assert.throws(() =>
+    intake.importIntake(f.db, f.root, f.profileId, f.item.id, {
+      version: review.version,
+      proposalId: review.proposalId,
+      reviewToken: review.reviewToken,
+      decisions: [
+        { recordId: review.records[1]!.id, action: 'accept', mapping: review.records[1]!.mapping },
+      ],
+    }),
+  );
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM observations').get()!.n, 0);
+});
+
+for (const includeModelDob of [true, false])
+  test(`labelled DOB survives multi-date identity evidence (model DOB ${includeModelDob})`, async (t) => {
+    const anchor = `${subject}\nDate of birth: ${fictionalBirthDate}\nCollected: 2026-09-20\nReported: 2026-09-21`;
+    const f = fixture(t, Buffer.from(`${originalText}\n${anchor}`));
+    setSelf(f, { fullName: 'Cookie Doe', birthDate: '1986-02-14' });
+    const value = withIdentityEvidence(envelope('multi-date'));
+    value.payload = { literal: 'Result A', transcript: anchor };
+    value.reviewIssues = [
+      {
+        kind: 'identity',
+        field: 'subject',
+        prompt: 'Who is this report for?',
+        textAnchor: anchor,
+        selfSuggestion: {
+          fullName: 'Fictional Iris Meadow',
+          ...(includeModelDob ? { birthDate: fictionalBirthDate } : {}),
+        },
+      },
+    ];
+    f.propose([value]);
+    const scope = await f.preview();
+    await assert.rejects(
+      confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+        ...request(scope, 'multi-date-self'),
+        attestation: 'confirmed_displayed_identity_questions',
+      }),
+      /birth date differs from Self/,
+    );
+  });
+
+for (const identityText of [
+  `${subject}\nDOB: 03/08/1990\nReported: 2026-09-21`,
+  `${subject}\nMother DOB: 1990-03-08\nReported: 2026-09-21`,
+])
+  test(`DOB inference does not guess from ${identityText.includes('Mother') ? 'a relative' : 'an ambiguous numeric date'}`, async (t) => {
+    const f = fixture(t, Buffer.from(`${heading}\n${identityText}\nResult A`));
+    setSelf(f, { fullName: 'Cookie Doe', birthDate: '1990-03-08' });
+    const value = withIdentityEvidence(envelope('ambiguous-birth'));
+    value.payload = { literal: 'Result A', transcript: identityText };
+    value.reviewIssues = [
+      {
+        kind: 'identity',
+        field: 'subject',
+        prompt: 'Who is this report for?',
+        textAnchor: identityText,
+        selfSuggestion: { fullName: 'Fictional Iris Meadow', birthDate: '1990-03-08' },
+      },
+    ];
+    f.propose([value]);
+    if (identityText.includes('Mother')) {
+      const scope = await f.preview();
+      assert.equal(scope.evidencedIdentity?.birthDate, undefined);
+    } else {
+      const review = await getIntakeIdentityReview(
+        f.db,
+        f.root,
+        f.profileId,
+        f.item.id,
+        workflow(f).reportGroups![0]!.id,
+      );
+      assert.equal(review.evidencedIdentity.birthDate, undefined);
+      assert.equal(review.blocking, true);
+      assert.equal(review.scope, null);
+    }
+  });
+
+test('native PDF DOB blocks Self without a model DOB and with a repeated name footer', async (t) => {
+  const f = fixture(
+    t,
+    pdf([
+      `${heading} ${subject} Date of birth: ${fictionalBirthDate} Collected: 2026-09-20 ${subject}`,
+    ]),
+    'fictional-cookie.pdf',
+  );
+  setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: '1986-02-14' });
+  f.propose([envelope('no-model-birthday')]);
+  const review = await getIntakeIdentityReview(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    workflow(f).reportGroups![0]!.id,
+  );
+  assert.equal(review.evidencedIdentity.birthDate, fictionalBirthDate);
+  assert.equal(review.selfBirthDateConflict, true);
+  assert.ok(review.scope);
+  await assert.rejects(f.confirm(review.scope), { code: 'IDENTITY_CONFLICT' });
 });

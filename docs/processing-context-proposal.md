@@ -939,7 +939,7 @@ Parallelism's losses are not mainly tokens:
   offline 800-page run spent about 0.34 seconds of host work per request with instant replies,
   against roughly 30 seconds per live request. CPU bursts come from PNG rasterization and from
   serializing multi-megabyte bodies, which the one-CPU LiteLLM proxy re-parses in Python
-  ([Compose](../compose.yaml) sets `LITELLM_CPUS` default 1, app `HEALTH_CPUS` default 2). These
+  ([Compose](../compose.yaml) sets `CRS_LITELLM_CPUS` default 1, app `CRS_CPUS` default 2). These
   matter only at high worker counts (T9).
 
 The knobs, each scalable in both directions:
@@ -1009,8 +1009,8 @@ A human is never needed to renew an allowance, outlast an outage or wait out a r
 
 ### Question compaction
 
-Questions must be recorded and deferred, **and** compacted. A person named "Baylee Schmeisser" whose
-900-page chart prints "Baylee F Schmeisser" on every report should face one decision, not hundreds.
+Questions must be recorded and deferred, **and** compacted. A person named "Cookie Doe" whose
+900-page chart prints "Cookie F Doe" on every report should face one decision, not hundreds.
 
 Current contract: identity confirmation receipts are exact per original, report group and printed
 subject ([INTAKE.md](../src/server/INTAKE.md#common-report-identity-review)). Compatible additions
@@ -1021,7 +1021,7 @@ unmeasured.
 
 Proposed direction, preserving the exact-target rule:
 
-- **Group questions by answer, not by occurrence.** "'Baylee F Schmeisser', date of birth matching,
+- **Group questions by answer, not by occurrence.** "'Cookie F Doe', date of birth matching,
   appears as the subject of 312 reports in this original. Is this you?" One action creates one
   receipt that **enumerates every covered report group**. It remains exact and is never broadened
   later; a new original or a changed subject asks again.
@@ -1279,7 +1279,7 @@ Identity review already uses them ([identity policy](../src/server/intake-identi
 
 - An exact match (after Unicode, whitespace and case normalization) against the Self name or any
   known name yields `evidenced_match`, which does not block.
-- "Baylee F Schmeisser" against a saved "Baylee Schmeisser" is only a _possible_ name. It yields
+- "Cookie F Doe" against a saved "Cookie Doe" is only a _possible_ name. It yields
   `confirmation_required`, and the prompt tells the person to add another known name in Self only
   if they have used it.
 
@@ -2310,3 +2310,36 @@ Complete text extraction is required, including administrative and repeated text
 This settles the completeness question left open by the four-hour investigation. F9's thirty-three administrative pages omitted from proposal text now identify a relevant unmet requirement, not an acceptable omission simply because their clinical yield is zero. The measured endpoint examined proposal payloads; it does not mandate that all text live inside clinical proposals. A separate durable complete-text representation can satisfy the product requirement and support bounded model requests. Historical F8/F9 scores remain unchanged; no new implementation or verification is claimed.
 
 A/B/G may compact working context only while preserving and retrieving complete durable source text. K may use compact facts as an intermediate working representation, but cannot make them the sole retained extraction. J's adapter choice must cover all readable text, including visible text missing from a PDF text layer, while respecting retain-only format exclusions. H may remove redundant instruction copies without deleting document content. Revised L may label repeated passages but must preserve complete text coverage for each distinct imported original. Strategy qualification must test durable text completeness separately from clinical accuracy, context size and page traversal.
+
+### Implementations ruled out by complete text extraction
+
+The following six exclusions make the owner decision explicit. They are incompatibilities with
+the product requirement, not claims that every strategy family has experimentally failed.
+
+1. **Summary-only retained extraction (K).** Compact facts or summaries cannot be the only retained
+   output. K remains eligible when complete source-linked text is retained separately.
+2. **Text-layer-only extraction without checking visible coverage (J).** Selectable PDF text is
+   insufficient when scans, annotations or handwriting are missing from that layer. Those regions
+   must be extracted or recorded as located exceptions.
+3. **Unverified OCR treated as complete truth.** OCR that silently omits or alters content is
+   unacceptable. Qualification needs source-based coverage and fidelity checks plus explicit
+   uncertainty; average character accuracy or OCR confidence alone cannot establish completeness.
+4. **Destructive cleanup of the only retained text (B/H/K/L).** Removing repeated headers,
+   footers or administrative passages from the retained extraction violates completeness. Derived
+   normalized search indexes and compact working views remain allowed when complete source text
+   and its locations survive. Deduplicating instructions is separate from deleting source content.
+5. **Extraction retained only in model history or temporary caches (A/B/G/K).** Text must survive
+   reload and recovery and support authorized retrieval without another AI extraction. Keeping
+   the original alone does not satisfy this requirement either.
+6. **Page traversal used as proof of complete extraction (all candidates).** Reading every page
+   does not establish that its text was retained. Track durable text coverage and located unresolved
+   regions separately from page visits and clinical proposal/acceptance counts.
+
+Batching, bounded contexts, caching, parallelism and selective clinical proposals remain eligible
+when they preserve the complete durable text layer. The intended separation is complete extraction
+and retention, selective retrieval, and separately reviewed structured clinical records. None of
+these exclusions changes historical experiment criteria or restarts the closed studies.
+
+## Composed strategy investigation — 2026-09-26
+
+The owner requests a composed strategy set: source adapters and compatible extraction, context, scheduling and review components, with explicit routing and fallback rules. No single universal winner is assumed. The [independent design brainstorm and proposed tests](import-processing-design-review.md) separate requirement-driven shared contracts from unproven choices. Three designers first worked from the customer specification without the earlier strategy list, experiment outcomes or one another's reports; a separate agent then designed discriminating tests. Their agreement is design evidence, not measured validation. Component checks and composition/adapter-seam checks are both required. This adds no live result, changes no historical criterion and does not restart completed experiments.

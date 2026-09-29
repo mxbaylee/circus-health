@@ -275,10 +275,6 @@ describe('RecordCorrectionDialog', () => {
       operationId: expect.any(String),
     });
     expect(onApplied).toHaveBeenCalledOnce();
-    expect(screen.getByRole('link', { name: 'Open corrected record and history' })).toHaveAttribute(
-      'href',
-      '/tests/fictional-saved-record',
-    );
     expect(screen.getByRole('button', { name: 'Return to comparison' })).toBeVisible();
   });
 });

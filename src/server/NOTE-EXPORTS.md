@@ -55,3 +55,7 @@ pdftoppm -png /absolute/path/outside/repo/pdfs/synthetic-export.pdf /absolute/pa
 ```
 
 Inspect the resulting pages, including the long laboratory section, chart and source appendix. The renderer produces page numbering and internal contents links. There are no embedded original images/files, OCR, clinical interpretations, AI calls, email or external uploads in this flow.
+
+## Notes owned by another person
+
+An ordinary or Historical Note can now belong to a saved person other than Self. Starting a brief or provider packet from that note derives the subject from its immutable `ownerPersonId`. The packet's identity, clinical queries, notes and test-series expansion use that same owner. Explicit mixed-owner note or clinical selections fail with `EXPORT_SUBJECT`; linked originals remain evidence and do not change ownership. A family packet does not inherit Self's care contacts or the Self-only fallback for otherwise unrepresented raw clinical assertions. Legacy notes remain Self. Starting directly from another person's Person profile or provider document remains unavailable; use their owned note to create the packet. Existing Self exports keep their behavior.

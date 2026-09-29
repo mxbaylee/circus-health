@@ -852,3 +852,50 @@ test('the batch automatically starts another productive slice then exposes the c
   assert.equal(manager.get(profileId, batch.id).status, 'stopped');
   assert.equal(sends, 3);
 });
+
+test('new productive-window policy continues beyond total guards without erasing cumulative work', () => {
+  const file = item(),
+    limits = {
+      mode: 'progress-window' as const,
+      activeMs: 1000,
+      slices: 2,
+      turns: 2,
+      requests: 2,
+      measuredTokens: 50,
+    };
+  for (let i = 0; i < 8; i++) {
+    const at = new Date(Date.parse('2026-01-01T00:00:00Z') + i * 2000).toISOString();
+    beginReadingSlice(file, at, limits);
+    const reading = state({
+      readWindows: i + 1,
+      turns: i + 1,
+      modelRequests: (i + 1) * 2,
+      measuredModelTokens: (i + 1) * 50,
+    });
+    assert.equal(
+      finishReadingSlice(file, reading, new Date(Date.parse(at) + 1000).toISOString()),
+      true,
+    );
+    file.reading = reading;
+    assert.equal(
+      readingBudgetReached(file, new Date(Date.parse(at) + 1000).toISOString(), limits),
+      false,
+    );
+  }
+  assert.equal(file.readingJob!.slices, 8);
+  assert.equal(file.readingJob!.activeMs, 8000);
+  assert.equal(file.reading?.modelRequests, 16);
+  assert.equal(file.reading?.measuredModelTokens, 400);
+  assert.equal(file.readingJob!.extensions, 0);
+  beginReadingSlice(file, '2026-01-01T00:01:00Z', limits);
+  assert.equal(
+    readingModelRequestBudgetReached(
+      file,
+      { ...file.reading!, modelRequests: 18 },
+      '2026-01-01T00:01:01Z',
+      limits,
+    ),
+    true,
+    'no-progress work still stops',
+  );
+});

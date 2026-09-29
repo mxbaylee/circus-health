@@ -681,6 +681,7 @@ export function intakeDraftRepairAssistantExtensions() {
           ...(window.kind === 'pdf_page' ? { page: window.page, offset: 0 } : {}),
           ...(window.kind === 'text' ? { offset: window.offset } : {}),
           modelContext: true,
+          captureSourceText: false,
           pdf: context.pdf === true && window.kind === 'pdf_page',
           assertRunning: assertRunning as () => void,
         });

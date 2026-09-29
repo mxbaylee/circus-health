@@ -1064,3 +1064,26 @@
     font-size: clamp(2rem, 8vw, 2.5rem);
   }
 }
+
+.note-actions:has(.autosave-status) {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: var(--surface);
+  padding: 0.75rem;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.person-health-records {
+  padding-block: 1rem;
+  border-top: 1px solid var(--border);
+}
+.person-health-records nav {
+  display: flex;
+  gap: 0.75rem 1.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+.person-health-records ul {
+  padding-left: 1.25rem;
+}

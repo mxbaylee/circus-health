@@ -26,7 +26,7 @@ def login(authenticator=None):
     if not token or saved.get('access_token') != token or not saved.get('refresh_token'):
         raise ValueError('Authentication was not saved for reuse.')
     path.chmod(0o600)
-    print('ChatGPT authentication saved. Start Circus Health with this same STATE_DIR.')
+    print('ChatGPT authentication saved. Start Circus Health with this same CRS_STATE_DIR.')
 
 
 if __name__ == '__main__':
@@ -36,5 +36,5 @@ if __name__ == '__main__':
         print('ChatGPT login cancelled. No model request was sent.', file=sys.stderr)
         sys.exit(130)
     except Exception:
-        print('ChatGPT login did not complete or its token file could not be saved. Check device-login permission, network access and STATE_DIR permissions, then retry. Do not share codes or token files.', file=sys.stderr)
+        print('ChatGPT login did not complete or its token file could not be saved. Check device-login permission, network access and CRS_STATE_DIR permissions, then retry. Do not share codes or token files.', file=sys.stderr)
         sys.exit(1)

@@ -99,7 +99,9 @@ test('tag filtering composes with search, totals and pagination and treats legac
   assert.equal(self.person.tags, undefined);
   assert.deepEqual(self.links, []);
   assert.ok(!personTags(db).includes('legacy self only'));
-  const all = listNotes(db, new URLSearchParams({ tag: ' fAmIlY ', limit: '1' }));
+  // A People tag cannot turn the default Self notes query into a People query.
+  assert.equal(listNotes(db, new URLSearchParams({ tag: 'Family' })).total, 0);
+  const all = listNotes(db, new URLSearchParams({ kind: 'person', tag: ' fAmIlY ', limit: '1' }));
   assert.equal(all.total, 2);
   assert.equal(all.data.length, 1);
   assert.equal(all.complete, false);

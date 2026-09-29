@@ -47,8 +47,10 @@ Circus Health requires Node.js 24.19 or newer, npm, and Docker with Compose v2.3
 Follow the [installation guide](docs/installation.md) for a new private archive and model connection. The [deployment and operations guide](docs/deployment.md) covers updates, shutdown, backup, recovery, HTTPS, and troubleshooting.
 
 ```sh
-DATA_DIR=/absolute/path/to/archive/data MODEL=health-primary LITELLM_CONFIG=/absolute/path/to/proxy/config/litellm.yaml STATE_DIR=/absolute/path/to/proxy/state npm run start
+CRS_DATA_DIR=/absolute/path/to/archive/data CRS_MODEL=health-primary CRS_LITELLM_CONFIG=/absolute/path/to/proxy/config/litellm.yaml CRS_STATE_DIR=/absolute/path/to/proxy/state npm run start
 ```
+
+The [environment reference](docs/environment.md) documents `CRS_*` settings, loading an external env file, and enabling diagnostics.
 
 The default address is `http://localhost:3001`. Keep the data, LiteLLM configuration, provider credentials, and proxy state outside Git and in separate external locations.
 

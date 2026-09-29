@@ -11,6 +11,7 @@ export function VisionHistory({
 }: {
   filters: {
     documentId?: string;
+    personId?: string;
     q: string;
     providerId: string;
     from: string;
@@ -34,7 +35,10 @@ export function VisionHistory({
     >
       <h2>Vision prescription history</h2>
       {filters.documentId && (
-        <Link className="button secondary" to="/tests?view=vision">
+        <Link
+          className="button secondary"
+          to={`/tests?${queryString({ view: 'vision', personId: filters.personId })}`}
+        >
           All vision prescriptions
         </Link>
       )}

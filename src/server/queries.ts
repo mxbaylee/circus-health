@@ -9,10 +9,12 @@ import {
   visibilityState,
   visibilitySQL,
   visibilityCondition,
+  noteVisibilitySQL,
 } from './visibility.ts';
 import { json, required, HttpError, managedTimestamp, transaction } from './database.ts';
 import type { Database, SqliteRow } from './database.ts';
 import type {
+  ClinicalPersonOption,
   ClinicalEvidenceEntityType,
   Evidence,
   Medication,
@@ -32,6 +34,7 @@ import type {
 } from '../shared/api.ts';
 
 interface ObservationRow extends SqliteRow {
+  person_id: string;
   id: string;
   test_type_id: string;
   label: string;
@@ -63,6 +66,7 @@ interface TestTypeRow extends SqliteRow {
   last_date: string | null;
 }
 interface MedicationRow extends SqliteRow {
+  person_id: string;
   id: string;
   label: string;
   kind: Medication['kind'];
@@ -82,6 +86,7 @@ interface MedicationRow extends SqliteRow {
   extra_json: string | null;
 }
 interface ProcedureRow extends SqliteRow {
+  person_id: string;
   id: string;
   label: string;
   category: ProcedureCategory;
@@ -169,6 +174,63 @@ export function pagination(params: URLSearchParams): { limit: number; offset: nu
     offset: Math.max(0, Number(params.get('offset')) || 0),
   };
 }
+export function documentPersonId(extra: unknown): string {
+  const imported = nested(typeof extra === 'string' ? json(extra) : extra, 'import');
+  return typeof imported.personId === 'string' && imported.personId ? imported.personId : 'patient';
+}
+export function clinicalPeople(db: Database): ClinicalPersonOption[] {
+  return db
+    .prepare(
+      `SELECT n.id,n.person_id,n.title,json_extract(n.profile_json,'$.birthDate') AS birth_date,json_extract(n.profile_json,'$.icon') AS icon FROM notes n WHERE n.kind='person' AND n.person_id <> 'patient' AND ${noteVisibilitySQL('n')}=0 ORDER BY n.title COLLATE NOCASE,n.id`,
+    )
+    .all()
+    .map((row) => ({
+      personId: String(row.person_id),
+      noteId: String(row.id),
+      name: String(row.title),
+      birthDate: typeof row.birth_date === 'string' ? row.birth_date : null,
+      icon: typeof row.icon === 'string' ? row.icon : null,
+    }));
+}
+export function clinicalPerson(db: Database, personId: string) {
+  if (personId === 'patient') return { personId, noteId: null, name: 'Self' };
+  const row = required(
+    db
+      .prepare("SELECT id,title FROM notes WHERE kind='person' AND person_id=? ORDER BY id LIMIT 1")
+      .get(personId),
+    'Person not found',
+  );
+  return { personId, noteId: String(row.id), name: String(row.title) };
+}
+export function documents(db: Database, params: URLSearchParams) {
+  const personId = params.get('personId') || 'patient';
+  const conditions = [
+    "COALESCE(json_extract(extra_json,'$.import.personId'),'patient')=?",
+    visibilityCondition(params, visibilitySQL("'document'", 'documents.id')),
+  ];
+  const args = [personId];
+  if (params.get('q')) {
+    conditions.push('(title LIKE ? OR text_content LIKE ?)');
+    args.push('%' + params.get('q') + '%', '%' + params.get('q') + '%');
+  }
+  const where = ' WHERE ' + conditions.join(' AND ');
+  const page = pagination(params);
+  const rows = db
+    .prepare('SELECT * FROM documents' + where + ' ORDER BY effective_at DESC,id LIMIT ? OFFSET ?')
+    .all(...args, page.limit, page.offset);
+  const total = count(db, 'SELECT count(*) AS n FROM documents' + where, args);
+  return {
+    data: rows.map((row) => ({
+      id: String(row.id),
+      personId,
+      title: String(row.title),
+      date: row.effective_at,
+    })),
+    total,
+    ...page,
+    complete: page.offset === 0 && rows.length === total,
+  };
+}
 export const providerList = (db: Database): Provider[] =>
   db
     .prepare('SELECT id,name FROM providers ORDER BY name')
@@ -177,6 +239,7 @@ export const providerList = (db: Database): Provider[] =>
 export function observation(row: ObservationRow): ObservationDTO {
   return {
     id: row.id,
+    personId: row.person_id,
     testTypeId: row.test_type_id,
     label: row.label,
     date: row.effective_at,
@@ -198,10 +261,10 @@ const obsSelect =
   'SELECT o.*, p.name AS provider_name FROM observations o LEFT JOIN providers p ON p.id=o.provider_id';
 function obsWhere(params: URLSearchParams, prefix = 'o'): { sql: string; args: string[] } {
   const conditions = [
-      `${prefix}.person_id='patient'`,
+      `${prefix}.person_id=?`,
       visibilityCondition(params, visibilitySQL("'observation'", `${prefix}.id`)),
     ],
-    args: string[] = [];
+    args: string[] = [params.get('personId') || 'patient'];
   for (const [param, column, operator] of [
     ['testTypeId', 'test_type_id', '='],
     ['providerId', 'provider_id', '='],
@@ -269,8 +332,8 @@ export function testTypes(db: Database, params: URLSearchParams): TestType[] {
     conditions.push('(t.label LIKE ? OR t.category LIKE ? OR t.aliases_json LIKE ?)');
     args.push(...Array(3).fill('%' + params.get('q') + '%'));
   }
-  let join = "LEFT JOIN observations o ON o.test_type_id=t.id AND o.person_id='patient'";
-  const joinArgs: string[] = [];
+  let join = 'LEFT JOIN observations o ON o.test_type_id=t.id AND o.person_id=?';
+  const joinArgs: string[] = [params.get('personId') || 'patient'];
   for (const [param, col, op] of [
     ['providerId', 'provider_id', '='],
     ['from', 'effective_at', '>='],
@@ -314,7 +377,10 @@ export function trends(
     throw new HttpError(400, 'MEASUREMENT_UNIT', 'Choose a supported display unit');
   const ids = [...new Set((params.get('ids') || '').split(',').filter(Boolean))];
   if (ids.length > 12) throw new Error('Choose at most 12 measurements');
-  const types = testTypes(db, new URLSearchParams({ visibility: 'all' }));
+  const types = testTypes(
+    db,
+    new URLSearchParams({ visibility: 'all', personId: params.get('personId') || 'patient' }),
+  );
   const result = ids.map((id) => {
     const test = required(
       types.find((t) => t.id === id),
@@ -404,6 +470,7 @@ export function medication(
   ].find((value) => typeof value === 'string' && value.trim());
   return {
     id: r.id,
+    personId: r.person_id,
     label: r.label,
     kind: r.kind,
     status: r.status,
@@ -425,6 +492,7 @@ export function medication(
 export function procedure(r: ProcedureRow): Omit<Procedure, 'archived'> & Record<string, unknown> {
   return {
     id: r.id,
+    personId: r.person_id,
     label: r.label,
     category: r.category,
     date: r.effective_at,
@@ -504,8 +572,8 @@ export function clinicalList(
       required(db.prepare(select + base + ' WHERE r.id=?').get(id) as ClinicalRow | undefined),
       true,
     );
-  const args: string[] = [],
-    w = ["r.person_id='patient'"];
+  const args: string[] = [params.get('personId') || 'patient'],
+    w = ['r.person_id=?'];
   if (table === 'procedures')
     w.push(visibilityCondition(params, visibilitySQL("'procedure'", 'r.id')));
   if (table === 'medications') {
@@ -522,7 +590,7 @@ export function clinicalList(
     const archived = `(${visibilitySQL("'medication'", 'r.id')}=1 OR COALESCE(mp.status,'unknown')='not_current')`;
     if (status === 'current') w.push(`mp.status='current' AND NOT ${archived}`);
     else if (status === 'archived')
-      w.push(`${archived} OR COALESCE(mp.status,'unknown')='unknown'`);
+      w.push(`(${archived} OR COALESCE(mp.status,'unknown')='unknown')`);
     else if (status !== 'all')
       throw new HttpError(
         400,

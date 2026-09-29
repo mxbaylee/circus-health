@@ -1,3 +1,4 @@
+import { recordOwner } from './record-owner.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -11,7 +12,7 @@ import type { Database, SqliteRow } from './database.ts';
 import type { Attachment } from '../shared/api.ts';
 import { chartPoint, chartDate } from '../app/data/clinical.ts';
 import { dateNumber } from '../app/data/format.ts';
-import { observation } from './queries.ts';
+import { documentPersonId, observation } from './queries.ts';
 import { getNote, attachments } from './notes.ts';
 import type { NoteDTO } from './notes.ts';
 
@@ -367,7 +368,18 @@ function citations(db: Database, type: ExportRecordType, id: string, row: Export
     };
   });
 }
-function record(db: Database, requestedType: unknown, requestedId: unknown): ExportRecord {
+function exportPerson(db: Database, input: NoteExportInput): string {
+  if (['note', 'person'].includes(input.type))
+    return recordOwner(db, input.type, input.id) || 'patient';
+  // Preserve the existing requirement to start family exports from their owned note.
+  return 'patient';
+}
+function record(
+  db: Database,
+  requestedType: unknown,
+  requestedId: unknown,
+  personId = 'patient',
+): ExportRecord {
   if (!isExportRecordType(requestedType) || typeof requestedId !== 'string')
     throw new HttpError(400, 'INVALID_EXPORT', 'Unknown export record type.');
   let type = requestedType;
@@ -382,15 +394,21 @@ function record(db: Database, requestedType: unknown, requestedId: unknown): Exp
   )
     type = 'source_file';
   let row = rowFor(db, type, id);
-  if (['observation', 'medication', 'procedure'].includes(type) && row.person_id !== 'patient')
+  if (
+    (['observation', 'medication', 'procedure'].includes(type) && row.person_id !== personId) ||
+    (type === 'document' && documentPersonId(row.extra_json) !== personId) ||
+    (type === 'note' &&
+      row.kind !== 'person' &&
+      (parsedRecord(row.profile_json).recordOwnerPersonId || 'patient') !== personId)
+  )
     throw new HttpError(
       400,
       'EXPORT_SUBJECT',
-      'Clinical exports are scoped to Self. Select a personal or family-history note for another person.',
+      'An export can contain clinical records and authored notes for only its selected person.',
     );
   if (type === 'person') {
     const note = db.prepare('SELECT id FROM notes WHERE person_id=?').get(id);
-    if (note) return record(db, 'note', note.id);
+    if (note) return record(db, 'note', note.id, personId);
   }
   const result: ExportRecord = {
     key: `${type}:${id}`,
@@ -435,7 +453,8 @@ function record(db: Database, requestedType: unknown, requestedId: unknown): Exp
 }
 export function exportOptions(db: Database, value: unknown) {
   const input = inputRecord(value);
-  const main = record(db, input.type, input.id);
+  const personId = exportPerson(db, input);
+  const main = record(db, input.type, input.id, personId);
   if (
     !['note', 'document'].includes(main.type) ||
     (input.type === 'person' && input.id !== 'patient')
@@ -452,9 +471,13 @@ export function exportOptions(db: Database, value: unknown) {
     if (type === 'person' || type === 'source') continue;
     for (const row of db
       .prepare(
-        `SELECT * FROM ${table}${['observation', 'medication', 'procedure'].includes(type) ? " WHERE person_id='patient'" : ''} ORDER BY id`,
+        `SELECT * FROM ${table}${['observation', 'medication', 'procedure'].includes(type) ? ' WHERE person_id=?' : type === 'document' ? " WHERE COALESCE(json_extract(extra_json,'$.import.personId'),'patient')=?" : type === 'note' ? " WHERE kind<>'person' AND COALESCE(json_extract(profile_json,'$.recordOwnerPersonId'),'patient')=?" : ''} ORDER BY id`,
       )
-      .all() as unknown as ExportRow[]) {
+      .all(
+        ...(['observation', 'medication', 'procedure', 'document', 'note'].includes(type)
+          ? [personId]
+          : []),
+      ) as unknown as ExportRow[]) {
       const key = `${type}:${row.id}`;
       if (key === main.key) continue;
       const extra = parsedRecord(row.extra_json);
@@ -513,7 +536,7 @@ export function exportOptions(db: Database, value: unknown) {
     if (key === main.key) continue;
     let unavailable = link.missing;
     try {
-      record(db, type, link.targetId);
+      record(db, type, link.targetId, personId);
     } catch {
       unavailable = true;
     }
@@ -538,7 +561,14 @@ export function exportOptions(db: Database, value: unknown) {
   return {
     noteVersion: main.note?.version ?? hash(main),
     choices,
-    assets: assetChoices,
+    assets: assetChoices.filter((asset) => {
+      try {
+        record(db, asset.ownerType, asset.ownerId, personId);
+        return true;
+      } catch {
+        return false;
+      }
+    }),
     noteTitle: main.title,
   };
 }
@@ -555,12 +585,13 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
       'noteIds',
     ].some((key) => Object.hasOwn(input, key));
   if (!simple) return input;
-  const main = record(db, input.type, input.id);
+  const personId = exportPerson(db, input);
+  const main = record(db, input.type, input.id, personId);
   const selected = new Set<string>(),
     assetIds = new Set<string>(),
     seeds: ExportRecord[] = [];
   const add = (type: unknown, id: unknown): ExportRecord => {
-    const r = record(db, type, id);
+    const r = record(db, type, id, personId);
     if (r.key !== main.key) selected.add(r.key);
     return r;
   };
@@ -568,7 +599,7 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
   if (input.noteIds !== undefined && (!Array.isArray(input.noteIds) || input.noteIds.length > 2000))
     throw new HttpError(400, 'INVALID_EXPORT', 'Choose a list of notes.');
   for (const id of input.noteIds || []) {
-    const r = record(db, 'note', id);
+    const r = record(db, 'note', id, personId);
     if (r.note?.kind === 'person')
       throw new HttpError(400, 'INVALID_EXPORT', 'Choose notes rather than people.');
     seeds.push(add('note', id));
@@ -598,11 +629,11 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
       continue;
     const where =
       type === 'document'
-        ? " WHERE provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))"
-        : " WHERE person_id='patient'";
+        ? " WHERE COALESCE(json_extract(extra_json,'$.import.personId'),'patient')=? AND provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))"
+        : ' WHERE person_id=?';
     for (const row of db
       .prepare(`SELECT id FROM ${table}${where} ORDER BY id`)
-      .all() as unknown as ExportRow[]) {
+      .all(personId) as unknown as ExportRow[]) {
       if (typeof row.id !== 'string') continue;
       if (
         !provider &&
@@ -618,7 +649,7 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
   }
   // Conditions, allergies, visits and immunizations have no normalized table yet.
   // Include their retained clinical assertions, never all raw personal-source files.
-  if (provider) {
+  if (provider && personId === 'patient') {
     const represented = new Set(
       db
         .prepare(
@@ -654,7 +685,7 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
     mode: provider ? 'provider' : 'brief',
   };
 }
-function patientInformation(db: Database): PatientInformation {
+function patientInformation(db: Database, personId = 'patient'): PatientInformation {
   const fieldsToShare = [
     'fullName',
     'name',
@@ -672,9 +703,9 @@ function patientInformation(db: Database): PatientInformation {
   ];
   const self = db
     .prepare(
-      "SELECT p.display_name,n.profile_json FROM people p LEFT JOIN notes n ON n.person_id=p.id WHERE p.id='patient'",
+      'SELECT p.display_name,n.profile_json FROM people p LEFT JOIN notes n ON n.person_id=p.id WHERE p.id=?',
     )
-    .get();
+    .get(personId);
   const profile = parsedRecord(self?.profile_json);
   const details = Object.fromEntries(
     fieldsToShare.filter((k) => profile[k] !== undefined).map((k) => [k, profile[k]]),
@@ -692,7 +723,7 @@ function patientInformation(db: Database): PatientInformation {
           typeof t === 'string' &&
           ['Professional', 'Primary Care Provider', 'Emergency Contact'].includes(t),
       );
-    if (roles.length)
+    if (roles.length && personId === 'patient')
       contacts.push({
         name: row.display_name,
         roles,
@@ -718,7 +749,8 @@ export function exportSnapshot(
   if (!['note', 'document', 'person'].includes(input.type))
     throw new HttpError(400, 'INVALID_EXPORT', 'Invalid export options.');
   input = { ...input, mode: input.mode || 'brief' };
-  const main = record(db, input.type, input.id);
+  const personId = exportPerson(db, input);
+  const main = record(db, input.type, input.id, personId);
   if ((main.note?.version ?? hash(main)) !== input.noteVersion)
     throw new HttpError(409, 'EXPORT_STALE', 'The note changed. Save and refresh the preview.');
   if (input.type === 'person' && (input.id !== 'patient' || input.mode !== 'provider'))
@@ -745,7 +777,7 @@ export function exportSnapshot(
   const records = new Map<string, ExportRecord>();
   for (const key of selected) {
     const index = key.indexOf(':');
-    const r = record(db, key.slice(0, index), key.slice(index + 1));
+    const r = record(db, key.slice(0, index), key.slice(index + 1), personId);
     if (r.archived && !input.includeArchived)
       throw new HttpError(
         400,
@@ -761,10 +793,10 @@ export function exportSnapshot(
     if (r.type === 'test_type') {
       for (const item of db
         .prepare(
-          "SELECT id FROM observations WHERE test_type_id=? AND person_id='patient' ORDER BY effective_at,id",
+          'SELECT id FROM observations WHERE test_type_id=? AND person_id=? ORDER BY effective_at,id',
         )
-        .all(r.id)) {
-        const observation = record(db, 'observation', item.id);
+        .all(r.id, personId)) {
+        const observation = record(db, 'observation', item.id, personId);
         if (inRange(observation) && (!observation.archived || input.includeArchived))
           records.set(observation.key, observation);
         if (records.size > (input.mode === 'provider' ? 100000 : 2000))
@@ -803,7 +835,16 @@ export function exportSnapshot(
       .all(id) as unknown as ExportOwner[];
     const allowed = owners.filter(
       (owner) =>
-        !input.normalizedSelection || allowedOwners.has(`${owner.owner_type}:${owner.owner_id}`),
+        (!input.normalizedSelection ||
+          allowedOwners.has(`${owner.owner_type}:${owner.owner_id}`)) &&
+        (() => {
+          try {
+            record(db, owner.owner_type, owner.owner_id, personId);
+            return true;
+          } catch {
+            return false;
+          }
+        })(),
     );
     if (
       (input.from || input.to) &&
@@ -872,9 +913,9 @@ export function exportSnapshot(
     );
   const self = db
     .prepare(
-      "SELECT p.display_name,n.profile_json,n.version FROM people p LEFT JOIN notes n ON n.person_id=p.id WHERE p.id='patient'",
+      'SELECT p.display_name,n.profile_json,n.version FROM people p LEFT JOIN notes n ON n.person_id=p.id WHERE p.id=?',
     )
-    .get();
+    .get(personId);
   const selfFields = parsedRecord(self?.profile_json);
   const identity = {
     name: typeof self?.display_name === 'string' ? self.display_name : 'Name not recorded',
@@ -882,7 +923,8 @@ export function exportSnapshot(
     pronouns: selfFields.pronouns || null,
     version: self?.version || null,
   };
-  const patient = input.mode === 'provider' || input.includePatient ? patientInformation(db) : null;
+  const patient =
+    input.mode === 'provider' || input.includePatient ? patientInformation(db, personId) : null;
   if (input.type === 'person') {
     main.row = { ...main.row, content: '', topics: '', raw_thoughts: '', profile_json: '{}' };
     if (!main.note)

@@ -72,7 +72,7 @@ class ResponseDiagnosticsTests(unittest.TestCase):
         with (tempfile.TemporaryDirectory(prefix='circus-capture-') as temporary,
               patch.object(diagnostics, 'MAX_RAW_CHARACTERS', len(terminal)),
               patch.object(diagnostics, 'RESPONSE_BODY_PATH', Path(temporary) / 'body.txt'),
-              patch.dict('os.environ', {'CIRCUS_LITELLM_CAPTURE_RESPONSE': 'true'})):
+              patch.dict('os.environ', {'CRS_LITELLM_CAPTURE_RESPONSE': 'true'})):
             summary = diagnostics.summarize_response(event('response.created') + terminal)
             summary.update(diagnostics._capture_response(event('response.created') + terminal))
             captured = (Path(temporary) / 'body.txt').read_text()
@@ -128,7 +128,7 @@ class ResponseDiagnosticsTests(unittest.TestCase):
                 litellm._async_failure_callback = []
                 with (patch.object(diagnostics, 'DIAGNOSTIC_PATH', output),
                       patch.object(diagnostics, 'RESPONSE_BODY_PATH', body_output),
-                      patch.dict('os.environ', {'CIRCUS_LITELLM_CAPTURE_RESPONSE': 'true'}),
+                      patch.dict('os.environ', {'CRS_LITELLM_CAPTURE_RESPONSE': 'true'}),
                       contextlib.redirect_stderr(stderr)):
                     with self.assertRaises(Exception):
                         asyncio.run(litellm.acompletion(

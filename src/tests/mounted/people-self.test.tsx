@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { PersonContacts } from '../../app/features/notes/PersonContacts';
+import { PersonNames } from '../../app/features/notes/PersonNames';
 import { PeopleTags } from '../../app/features/notes/PeopleTags';
 import { NoteEditor } from '../../app/features/notes/NoteEditor';
 import { NotesPage } from '../../app/features/notes/NotesPage';
@@ -210,7 +211,7 @@ it('People tags are inline identity-style badges alongside the name', async () =
   }
 });
 
-it('adopts four onboarding saves behind the modal and immediately saves Self with the latest revision', async () => {
+it('adopts care-contact onboarding saves behind the modal and immediately saves Self with the latest revision', async () => {
   const profile = { id: 'cookie-dough', name: 'Cookie Dough', placebo: true, locked: false };
   replaceProfiles([profile]);
   selectProfile(profile);
@@ -266,8 +267,8 @@ it('adopts four onboarding saves behind the modal and immediately saves Self wit
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
   await user.click(await screen.findByRole('button', { name: 'Resume setup' }));
-  await screen.findByRole('heading', { name: 'About you' });
-  for (let step = 0; step < 3; step++) {
+  await screen.findByRole('heading', { name: 'Primary care provider' });
+  for (let step = 0; step < 2; step++) {
     await user.click(screen.getByRole('button', { name: 'Skip for now' }));
     await waitFor(() => expect(writes).toHaveLength(step + 1));
   }
@@ -275,14 +276,10 @@ it('adopts four onboarding saves behind the modal and immediately saves Self wit
   await user.clear(screen.getByLabelText('Display name'));
   await user.type(screen.getByLabelText('Display name'), 'New Self name');
   await user.click(screen.getByRole('button', { name: 'Save now' }));
-  await waitFor(() => expect(writes).toHaveLength(4));
-  expect(writes[3].version).toBe(4);
-  expect(saved.version).toBe(5);
-  expect(saved.person.onboarding?.skippedSteps).toEqual([
-    'about-you',
-    'primary-care',
-    'emergency-contact',
-  ]);
+  await waitFor(() => expect(writes).toHaveLength(3));
+  expect(writes[2].version).toBe(3);
+  expect(saved.version).toBe(4);
+  expect(saved.person.onboarding?.skippedSteps).toEqual(['primary-care', 'emergency-contact']);
   expect(screen.queryByText(/Couldn’t save:/)).not.toBeInTheDocument();
 });
 
@@ -377,10 +374,7 @@ it('Self commits known names explicitly and preserves them in the human save pay
   ]);
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
-  await user.type(
-    screen.getByRole('combobox', { name: 'Other names on my health records' }),
-    'Fictional Former Meadow',
-  );
+  await user.type(screen.getByRole('combobox', { name: 'Names' }), 'Fictional Former Meadow');
   expect(screen.getByRole('button', { name: 'Save now' })).toBeDisabled();
   await user.keyboard('{Enter}');
   await user.click(screen.getByRole('button', { name: 'Save now' }));
@@ -389,4 +383,57 @@ it('Self commits known names explicitly and preserves them in the human save pay
   );
   const saved = fetch.mock.calls.find(([, init]) => init?.method === 'PUT')![1]!;
   expect(JSON.parse(String(saved.body)).person.knownNames).toEqual(['Fictional Former Meadow']);
+});
+
+it('uses one Names list for a person and retains report-backed spellings without delete controls', async () => {
+  const onChange = vi.fn();
+  const person: PersonProfile = {
+    name: 'Cookie',
+    fullName: 'Cookie Doe',
+    knownNames: ['Cookie Crumb', 'Doe, Cookie'],
+    sourceKnownNames: [
+      {
+        name: 'Doe, Cookie',
+        operationId: 'fictional-confirmation',
+        intakeId: 'fictional-intake',
+        sourceHash: 'fictional-hash',
+        groupId: 'fictional-report',
+        subjectText: 'Patient: Doe, Cookie',
+      },
+    ],
+  };
+  render(
+    <RouterProvider
+      router={createMemoryRouter([
+        {
+          path: '*',
+          element: <PersonNames person={person} disabled={false} onChange={onChange} />,
+        },
+      ])}
+    />,
+  );
+  expect(screen.getByRole('combobox', { name: 'Names' })).toBeVisible();
+  expect(screen.queryByLabelText('Full name')).toBeNull();
+  expect(screen.getByText('Doe, Cookie')).toBeVisible();
+  expect(screen.getByText('Cookie Crumb').closest('.selection-chip')).not.toBeNull();
+  expect(screen.getByText('Doe, Cookie').closest('.selection-chip')).not.toBeNull();
+  expect(
+    screen.getByRole('list', { name: 'Names retained from confirmed reports' }),
+  ).toHaveAccessibleDescription(
+    'Confirmed report names cannot be removed here. Select a confirmed name to view its report.',
+  );
+  expect(screen.queryByRole('button', { name: 'Remove name Doe, Cookie' })).toBeNull();
+  expect(screen.getByRole('link', { name: 'View report confirming Doe, Cookie' })).toHaveAttribute(
+    'href',
+    '/import?intake=fictional-intake&group=fictional-report',
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Remove name Cookie Crumb' }));
+  expect(onChange).toHaveBeenCalledWith(
+    expect.objectContaining({
+      name: 'Cookie',
+      fullName: 'Cookie Doe',
+      knownNames: ['Doe, Cookie'],
+      sourceKnownNames: person.sourceKnownNames,
+    }),
+  );
 });

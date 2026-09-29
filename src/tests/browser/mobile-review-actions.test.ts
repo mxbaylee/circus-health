@@ -177,7 +177,7 @@ test('Import detail keeps a readable record and reachable explicit actions on mo
     'desktop keeps review fields and the retained original side by side',
   );
 
-  const screenshots = process.env.CIRCUS_TEST_SCREENSHOTS;
+  const screenshots = process.env.CRS_TEST_SCREENSHOTS;
   if (screenshots) mkdirSync(screenshots, { recursive: true });
   for (const [name, viewport] of [
     ['portrait', { width: 390, height: 844 }],

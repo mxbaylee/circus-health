@@ -27,6 +27,7 @@ export function leavesNoteEditor(current: NoteLocation, next: NoteLocation): boo
   // Unsaved new forms are keyed by kind; existing notes are keyed by stable ID.
   return (
     currentQuery.get('new') === '1' &&
-    (currentQuery.get('kind') || 'note') !== (nextQuery.get('kind') || 'note')
+    ((currentQuery.get('kind') || 'note') !== (nextQuery.get('kind') || 'note') ||
+      (currentQuery.get('personId') || 'patient') !== (nextQuery.get('personId') || 'patient'))
   );
 }

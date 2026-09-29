@@ -1,3 +1,4 @@
+import { ClinicalOwner } from '../../components/ClinicalOwner';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ExternalLink, Link2, Plus, Search, X } from 'lucide-react';
@@ -56,6 +57,7 @@ function CurrentLinkedNote({ link }: { link: NoteLink }) {
       )}
       {resource.data && (
         <>
+          <ClinicalOwner personId={resource.data.ownerPersonId || 'patient'} />
           <p>
             <strong>{resource.data.title}</strong>
             <br />

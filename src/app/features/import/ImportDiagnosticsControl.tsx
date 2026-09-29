@@ -1,9 +1,15 @@
+import { CLIENT_BUILD_IDENTITY } from '../../data/build';
 import { browserImportPerformance } from '../../data/import-performance';
 import { useState } from 'react';
-import { api } from '../../data/api';
-import { browserImportDiagnostics } from '../../data/import-diagnostics';
+import { api, useResource } from '../../data/api';
+import {
+  reviewEditorDiagnostics,
+  browserImportDiagnostics,
+  identityReviewDiagnostics,
+} from '../../data/import-diagnostics';
 
 export function ImportDiagnosticsControl() {
+  const enabled = useResource<{ enabled: boolean }>('/import-diagnostics/status');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   async function download() {
@@ -11,6 +17,7 @@ export function ImportDiagnosticsControl() {
     setMessage(null);
     try {
       const browser = browserImportDiagnostics();
+      const reviewEditors = reviewEditorDiagnostics();
       const response = await api<{ enabled: boolean; droppedEvents: number; events: unknown[] }>(
         '/import-diagnostics',
       );
@@ -19,7 +26,10 @@ export function ImportDiagnosticsControl() {
         exportedAt: new Date().toISOString(),
         coverage:
           'Bounded metadata only. No medical text, filenames, profile identity, credentials or raw model payloads. Source reading is not clinical completeness.',
+        clientBuild: CLIENT_BUILD_IDENTITY,
         browser,
+        reviewEditors,
+        identityReviews: identityReviewDiagnostics(),
         browserOperations: browserImportPerformance(),
         server: response.data,
       };
@@ -33,10 +43,10 @@ export function ImportDiagnosticsControl() {
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       setMessage(
         !response.data.enabled
-          ? 'Performance summaries downloaded. Detailed server events are off; enable HEALTH_IMPORT_DIAGNOSTICS=true for a more detailed reproduction.'
+          ? 'Performance summaries downloaded. Detailed server events are off; enable CRS_IMPORT_DIAGNOSTICS=true for a more detailed reproduction.'
           : response.data.droppedEvents
             ? `Diagnostics downloaded. ${response.data.droppedEvents} older server events exceeded the buffer and are not included.`
-            : 'Diagnostics downloaded. It contains timings, request references, resource samples and progress—not medical content.',
+            : 'Diagnostics downloaded. Timings and activity metadata can be sensitive; review the file before sharing.',
       );
     } catch (error) {
       setMessage(
@@ -46,6 +56,7 @@ export function ImportDiagnosticsControl() {
       setBusy(false);
     }
   }
+  if (!enabled.data?.enabled) return null;
   return (
     <div className="import-diagnostics-control">
       <button

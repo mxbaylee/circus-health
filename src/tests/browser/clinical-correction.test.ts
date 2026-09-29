@@ -27,7 +27,7 @@ test(
     const browser = await chromium.launch({ headless: true });
     t.after(async () => {
       if (!completed && !page.isClosed()) {
-        const path = process.env.CIRCUS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
+        const path = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
         mkdirSync(path, { recursive: true });
         writeFileSync(resolve(path, 'failure.txt'), await page.locator('body').innerText());
         await page.screenshot({ path: resolve(path, 'failure.png'), fullPage: false });
@@ -115,8 +115,10 @@ test(
     });
     await page.goto(url + '/#/import?intake=' + encodeURIComponent(seed.incomingId));
     await page.reload();
-    await page.locator('.import-detail-record-link').first().click();
-    await page.getByText('Review 1 possible related saved record', { exact: true }).click();
+    const related = page.locator('.intake-related-disclosure');
+    await related.waitFor();
+    if (!(await related.evaluate((element) => element.hasAttribute('open'))))
+      await page.getByText('Review 1 possible related saved record', { exact: true }).click();
     const comparison = page.getByRole('region', { name: 'Paired evidence review' });
     await comparison.locator('details > summary').first().click();
     await comparison.getByRole('button', { name: 'Correct this saved record' }).click();
@@ -127,7 +129,7 @@ test(
       .fill('The fictional original prints 14.00 mg.');
     await dialog.getByRole('button', { name: 'Review before and after' }).click();
     await page.getByRole('dialog', { name: 'Review correction' }).waitFor();
-    const visuals = process.env.CIRCUS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
+    const visuals = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
     mkdirSync(visuals, { recursive: true });
     for (const theme of ['light', 'dark']) {
       for (const mobile of [false, true]) {
@@ -148,12 +150,6 @@ test(
     }
     await page.getByRole('button', { name: 'Apply reviewed correction' }).click();
     await page.getByRole('dialog', { name: 'Correction saved' }).waitFor();
-    assert.match(
-      (await page
-        .getByRole('link', { name: 'Open corrected record and history' })
-        .getAttribute('href')) || '',
-      /^#\/tests\?/,
-    );
     await page.getByRole('button', { name: 'Return to import review' }).click();
     assert.equal(new URL(page.url()).hash.includes(encodeURIComponent(seed.incomingId)), true);
     const get = async (path: string) => {

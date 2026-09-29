@@ -1,4 +1,11 @@
 import { HttpError } from './database.ts';
+import { isRetainOnlyIntake } from './intake-source-policy.ts';
+import { currentIntakeSourceTextRevisionId, getIntakeSourceText } from './intake-source-text.ts';
+import { recordDurabilityStatus } from './record-versions.ts';
+import {
+  extractIntakeSourceText,
+  sourceTextExtractionPending,
+} from './intake-source-extraction.ts';
 import { createHash } from 'node:crypto';
 import {
   htmlNavigationIndex,
@@ -32,6 +39,11 @@ import {
 import type { DatabaseSync } from 'node:sqlite';
 import type { NavigationIndex } from './intake-navigation.ts';
 
+export interface SourceTextCaptureTransition {
+  intakeId: string;
+  priorRevisionId: string | null;
+  revisionId: string | null;
+}
 interface EvidenceContext {
   db: DatabaseSync;
   root: string;
@@ -41,6 +53,10 @@ interface EvidenceContext {
   offset?: unknown;
   assertRunning?: () => void;
   modelContext?: boolean;
+  /** Read-only scoped repair must not mutate its pinned source/version snapshot. */
+  captureSourceText?: boolean;
+  /** Host-only notification: a bounded local capture changed the source snapshot. */
+  onSourceTextCaptured?: (transition: SourceTextCaptureTransition) => void;
   /** Host-negotiated PDF support; direct UI reads leave this disabled. */
   pdf?: boolean;
   diagnostics?: ImportDiagnosticSink;
@@ -66,6 +82,49 @@ const literalWindow = ({ intake: _intake, ...window }: ReturnType<typeof readInt
 // encoding in @napi-rs/canvas; JPEG 100 minimizes additional quantization.
 const UPLOADED_IMAGE_QUALITY = 100;
 
+export async function captureIntakeSourceTextForRead({
+  db,
+  root,
+  profileId,
+  id,
+  assertRunning = () => {},
+  modelContext = false,
+  captureSourceText = true,
+  onSourceTextCaptured,
+}: EvidenceContext) {
+  // Container members can first enter processing through this reader rather
+  // than a top-level batch. Capture bounded local evidence before taking the
+  // metadata/version snapshot, while leaving original preview reads read-only.
+  if (modelContext && captureSourceText && recordDurabilityStatus(db)) {
+    const prior = getIntakeSourceText(db, root, profileId, id);
+    if (sourceTextExtractionPending(prior)) {
+      assertRunning();
+      const captured = await extractIntakeSourceText({
+        db,
+        root,
+        profileId,
+        id,
+        maxPages: 2,
+        assertRunning,
+      });
+      assertRunning();
+      onSourceTextCaptured?.({
+        intakeId: id,
+        priorRevisionId: prior.revision?.id ?? null,
+        revisionId: captured.sourceText.revision?.id ?? null,
+      });
+    }
+  }
+}
+
+export function sourceTextReadMetadata(db: DatabaseSync, profileId: string, id: string) {
+  return {
+    revisionId: currentIntakeSourceTextRevisionId(db, profileId, id),
+    tool: 'health_intake_source_text',
+    note: 'When available, retrieve durable source text before interpreting. It retains corrections, provenance and uncertainty. Original/native text below is unchanged evidence and may disagree. After reading the relevant current durable passages, pass their revisionId as sourceTextRevisionId on every intake_batch or intake_propose. Reading another original page may advance the durable revision. Text review is not clinical acceptance.',
+  };
+}
+
 export async function readIntakeEvidence({
   db,
   root,
@@ -75,9 +134,27 @@ export async function readIntakeEvidence({
   offset = 0,
   assertRunning = () => {},
   modelContext = false,
+  captureSourceText = true,
+  onSourceTextCaptured,
   pdf = false,
 }: EvidenceContext) {
+  await captureIntakeSourceTextForRead({
+    db,
+    root,
+    profileId,
+    id,
+    assertRunning,
+    modelContext,
+    captureSourceText,
+    onSourceTextCaptured,
+  });
   const intake = getIntake(db, root, profileId, id);
+  if (modelContext && isRetainOnlyIntake(intake))
+    throw new HttpError(
+      409,
+      'INTAKE_RETAIN_ONLY',
+      'This source is retained for access but is excluded from model interpretation',
+    );
   const mappingRules = activeMappingRules(db, intake.providerId);
   const mappingRulesVersion = createHash('sha256')
     .update(JSON.stringify(mappingRules))
@@ -104,6 +181,7 @@ export async function readIntakeEvidence({
   const file = isPdf ? null : getIntakeOriginal(db, root, profileId, id);
   const metadata = {
     instructions: INTAKE_SCHEMA_INSTRUCTIONS,
+    sourceText: sourceTextReadMetadata(db, profileId, id),
     mappingRules: modelContext ? modelMappingRules : mappingRules,
     intake: modelContext
       ? modelIntakeEvidenceContext(intake, { mappingRules, mappingRulesVersion })

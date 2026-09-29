@@ -11,6 +11,7 @@ import {
 import { workflowHash } from './intake-workflow.ts';
 import { HttpError } from './database.ts';
 import { readJSONStructure } from './intake-json.ts';
+import { isRetainOnlyIntake } from './intake-source-policy.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { Intake, IntakePackageInventory, IntakePackageRole } from '../shared/intake.ts';
 import type { EvidenceIndex, IndexedPackageMember } from './intake-plan.ts';
@@ -23,6 +24,9 @@ interface PackageContext {
   id: string;
   assertRunning?: () => void;
   modelContext?: boolean;
+  onSourceTextCaptured?: (
+    transition: import('./intake-evidence.ts').SourceTextCaptureTransition,
+  ) => void;
   /** Host-negotiated model PDF support, never a package tool argument. */
   pdf?: boolean;
   offset?: number;
@@ -84,6 +88,7 @@ interface MemberEnvelope {
   complete: false;
   note: string;
   structureIssue?: string;
+  sourceText: ReturnType<typeof import('./intake-evidence.ts').sourceTextReadMetadata>;
 }
 
 const object = (value: unknown): value is Record<string, unknown> =>
@@ -371,6 +376,17 @@ export async function readIntakePackageMember(context: PackageContext) {
     { filename: member.filename, locator: member.locator, bytes },
   ]);
   const retainedChild = child!;
+  const { captureIntakeSourceTextForRead, sourceTextReadMetadata, readIntakeEvidence } =
+    await import('./intake-evidence.ts');
+  await captureIntakeSourceTextForRead({ ...context, id: retainedChild.id });
+  // A JSON-looking member must not bypass the same host media policy that
+  // applies to direct reads. Capture only local accounting before this gate.
+  if (context.modelContext && isRetainOnlyIntake(retainedChild))
+    throw new HttpError(
+      409,
+      'INTAKE_RETAIN_ONLY',
+      'This member is retained but excluded from model interpretation',
+    );
   const envelope: MemberEnvelope = {
     member,
     sourceFileId: retainedChild.id,
@@ -379,6 +395,7 @@ export async function readIntakePackageMember(context: PackageContext) {
     coverage: 'read_only',
     complete: false,
     note,
+    sourceText: sourceTextReadMetadata(context.db, context.profileId, retainedChild.id),
   };
   let text;
   try {
@@ -393,7 +410,6 @@ export async function readIntakePackageMember(context: PackageContext) {
         'Not safely indexable JSON: ' + (error as { message: string }).message;
     }
   }
-  const { readIntakeEvidence } = await import('./intake-evidence.ts');
   // Nested ZIPs require a subsequent explicit inventory call for the child.
   if (retainedChild.mimeType === 'application/zip')
     return {
@@ -402,7 +418,11 @@ export async function readIntakePackageMember(context: PackageContext) {
       nextAction: 'inventory',
       note: 'Nested archive retained, not recursively expanded. Inventory this sourceFileId explicitly.',
     };
-  const evidence = await readIntakeEvidence({ ...context, id: retainedChild.id });
+  const evidence = await readIntakeEvidence({
+    ...context,
+    id: retainedChild.id,
+    captureSourceText: false,
+  });
   if ('pdfContent' in evidence && evidence.pdfContent)
     return {
       pdfContent: evidence.pdfContent,

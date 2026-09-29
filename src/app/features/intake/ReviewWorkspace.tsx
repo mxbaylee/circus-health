@@ -8,10 +8,12 @@ import type {
   IntakeMetadata,
   IntakeReviewIssue,
   IntakeReviewRecord,
+  IntakeEvidenceLocator,
 } from '../../../shared/intake';
 import type { SourceFile } from '../../../shared/api';
 import { CreatableCombobox } from '../../components/CreatableCombobox';
 import { SourcePreview } from '../../components/SourceDialog';
+import { apiUrl } from '../../data/api';
 
 export interface IntakeMetadataSuggestions {
   source: string[];
@@ -36,13 +38,65 @@ export function intakeOriginal(intake: Intake): SourceFile {
   };
 }
 
-export function ReviewLayout({ intake, children }: { intake: Intake; children: ReactNode }) {
+export function intakeEvidencePage(
+  intake: Intake,
+  evidence: IntakeEvidenceLocator[],
+): number | undefined {
+  const sameOriginal = (url?: string) => {
+    if (!url) return false;
+    const base = url.split('#')[0];
+    const original = intake.contentUrl.split('#')[0];
+    if (base === original) return true;
+    try {
+      return apiUrl(base) === apiUrl(original);
+    } catch {
+      return false;
+    }
+  };
+  const reference = evidence.find(
+    (item) =>
+      sameOriginal(item.contentUrl) && /^page=[1-9]\d*$/.test(item.contentUrl?.split('#')[1] || ''),
+  );
+  const page = reference ? Number(reference.contentUrl!.split('#page=')[1]) : undefined;
+  if (page && Number.isSafeInteger(page)) return page;
+  // Older proposals locate pages in prose instead of URL fragments. Treat a
+  // single same-original page mention as a navigation hint, never region proof.
+  const pages = new Set(
+    evidence
+      .filter((item) => sameOriginal(item.contentUrl))
+      .flatMap((item) =>
+        [...item.locator.matchAll(/\bpage\s+([1-9]\d*)\b/gi)].map((match) => Number(match[1])),
+      ),
+  );
+  if (pages.size !== 1) return undefined;
+  const hint = [...pages][0];
+  return Number.isSafeInteger(hint) ? hint : undefined;
+}
+
+export function ReviewLayout({
+  intake,
+  children,
+  evidence = [],
+  sideBySide = false,
+}: {
+  intake: Intake;
+  children: ReactNode;
+  evidence?: IntakeEvidenceLocator[];
+  sideBySide?: boolean;
+}) {
+  // Only use locations attached to this original, never another package member.
+  const initialPage = intakeEvidencePage(intake, evidence);
   const [tab, setTab] = useState<'details' | 'original'>('details');
   const id = useId();
   useEffect(() => setTab('details'), [intake.id]);
   return (
     <>
-      <div className="intake-mobile-tabs" role="tablist" aria-label="Review workspace">
+      <div
+        className="intake-mobile-tabs"
+        role="tablist"
+        aria-label="Review workspace"
+        hidden={sideBySide}
+      >
         {(['details', 'original'] as const).map((value) => (
           <button
             key={value}
@@ -78,7 +132,7 @@ export function ReviewLayout({ intake, children }: { intake: Intake; children: R
           style={{ minWidth: 0, overflowWrap: 'anywhere' }}
           role="tabpanel"
           aria-labelledby={`${id}-details-tab`}
-          hidden={tab !== 'details'}
+          hidden={!sideBySide && tab !== 'details'}
         >
           {children}
         </div>
@@ -87,7 +141,7 @@ export function ReviewLayout({ intake, children }: { intake: Intake; children: R
           className="intake-original-pane"
           role="tabpanel"
           aria-labelledby={`${id}-original-tab`}
-          hidden={tab !== 'original'}
+          hidden={!sideBySide && tab !== 'original'}
         >
           <div className="intake-original-heading">
             <h3>Original</h3>
@@ -101,7 +155,22 @@ export function ReviewLayout({ intake, children }: { intake: Intake; children: R
               Back to report
             </button>
           </div>
-          <SourcePreview key={intake.id} file={intakeOriginal(intake)} />
+          {evidence.length > 0 && (
+            <ul className="intake-evidence-locations">
+              {evidence.map((item, index) => (
+                <li key={index}>
+                  {item.contentUrl ? (
+                    <a href={item.contentUrl} target="_blank" rel="noreferrer">
+                      {item.label}: {item.locator}
+                    </a>
+                  ) : (
+                    `${item.label}: ${item.locator}`
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          <SourcePreview key={intake.id} file={intakeOriginal(intake)} initialPage={initialPage} />
           <p className="helper-text">
             Your original stays retained, including anything left out of clinical records.
           </p>
@@ -593,14 +662,19 @@ export function ReviewIssue({
 function NavigationGuard({
   pending,
   flush,
+  anyLocationChange,
 }: {
   pending: () => boolean;
   flush: () => Promise<boolean>;
+  anyLocationChange?: boolean;
 }) {
   const blocker = useBlocker(
     ({ currentLocation, nextLocation }) =>
       pending() &&
-      (currentLocation.pathname !== nextLocation.pathname ||
+      ((anyLocationChange &&
+        (currentLocation.search !== nextLocation.search ||
+          currentLocation.hash !== nextLocation.hash)) ||
+        currentLocation.pathname !== nextLocation.pathname ||
         new URLSearchParams(nextLocation.search).get('view') !== 'import'),
   );
   const latest = useRef(flush);
@@ -639,6 +713,7 @@ function NavigationGuard({
   );
 }
 export function ReviewNavigationGuard(props: {
+  anyLocationChange?: boolean;
   pending: () => boolean;
   flush: () => Promise<boolean>;
 }) {

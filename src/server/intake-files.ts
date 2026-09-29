@@ -57,8 +57,8 @@ function limit(env: NodeJS.ProcessEnv, key: string, fallback: number, maximum: n
 }
 export function intakeLimits(env = process.env) {
   return {
-    uploadBytes: limit(env, 'HEALTH_INTAKE_UPLOAD_MIB', 128, 1024),
-    extractionBytes: limit(env, 'HEALTH_INTAKE_EXTRACTION_MIB', 64, 256),
+    uploadBytes: limit(env, 'CRS_INTAKE_UPLOAD_MIB', 128, 1024),
+    extractionBytes: limit(env, 'CRS_INTAKE_EXTRACTION_MIB', 64, 256),
   };
 }
 // Hash and text inspection keep one bounded file chunk; originals are never rewritten.

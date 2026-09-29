@@ -112,6 +112,35 @@
 .import-reading-progress {
   margin-top: 8px;
 }
+.import-reading-dots {
+  display: inline-block;
+}
+.import-reading-dots > span {
+  animation: import-reading-second-dot 2s steps(1, end) infinite;
+}
+.import-reading-dots > span:last-child {
+  animation-name: import-reading-third-dot;
+}
+@keyframes import-reading-second-dot {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  25%,
+  75% {
+    opacity: 1;
+  }
+}
+@keyframes import-reading-third-dot {
+  0%,
+  75%,
+  100% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+}
 .import-reading-progress progress {
   display: block;
   width: min(100%, 380px);
@@ -291,6 +320,42 @@
   color: var(--blue);
   font-weight: 650;
 }
+.import-source-control {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.import-source-control:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.import-source-control:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.import-source-control .import-source {
+  overflow-wrap: anywhere;
+}
+.import-source-action {
+  color: var(--blue);
+}
+.import-person-choice-pending {
+  padding: 10px 12px 0;
+}
+.import-report-person > span {
+  margin-left: 4px;
+  color: var(--blue);
+}
 .import-suggested {
   border-radius: 999px;
   padding: 2px 6px;
@@ -373,31 +438,6 @@
   background: var(--blue-fill);
   color: var(--muted);
   font-size: 0.72rem;
-}
-.import-source-question {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 0 12px 10px;
-  color: var(--muted);
-  font-size: 0.75rem;
-}
-.import-source-question > div {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.import-source-question > span {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  flex-wrap: wrap;
-}
-.import-source-question > span a {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
 }
 .import-record {
   border-top: 1px solid var(--border);
@@ -930,14 +970,6 @@
     align-items: flex-start;
     flex-direction: column;
   }
-  .import-source-question {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-  .import-source-question > div {
-    align-self: stretch;
-    justify-content: flex-end;
-  }
   .import-identity-question {
     grid-template-columns: 28px minmax(0, 1fr);
   }
@@ -961,8 +993,282 @@
   }
 }
 @media (prefers-reduced-motion: reduce) {
+  .import-reading-dots > span,
+  .import-reading-dots > span:last-child {
+    animation: none;
+  }
   .import-sheet,
   .import-sheet-overlay {
     animation: none;
   }
+}
+.import-person-choice {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+  margin-block: 1rem;
+}
+
+.import-person-choice label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.import-person-choice input,
+.import-person-choice select {
+  width: 100%;
+  min-width: 0;
+}
+
+/* Source and person are two views of the same report context. */
+.import-report-title {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  flex: 1 0 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 13px 14px;
+  color: var(--text);
+  background: var(--surface);
+}
+.import-report-title::after {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  pointer-events: none;
+  opacity: var(--harlequin-header-opacity);
+  background-image: var(--harlequin-pattern);
+  background-size: 224px 384px;
+  background-position: right -22px top -72px;
+  mask-image: linear-gradient(to right, transparent 25%, #000b 70%, #000 100%);
+}
+.import-report-title > span {
+  flex: 1 0 100%;
+  color: var(--muted);
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+.import-report-title > strong {
+  font-size: 1rem;
+  font-weight: 650;
+}
+.import-report-title > time {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+.import-report-header {
+  padding: 0;
+  gap: 0;
+}
+.import-report-context {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  width: 100%;
+  min-width: 0;
+}
+.import-report-context .import-report-person {
+  margin-left: 0;
+}
+.import-report-context .import-source-control {
+  border-radius: 999px;
+  padding: 6px 11px;
+  background: var(--surface);
+  font-size: 0.76rem;
+}
+.import-report-context .import-source-control > span {
+  overflow-wrap: anywhere;
+}
+.import-context-tabs {
+  display: flex;
+  gap: 6px;
+  margin: 14px 0;
+  padding: 4px;
+  border-radius: 9px;
+  background: var(--background);
+}
+.import-context-tabs button {
+  flex: 1;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.import-context-tabs button[aria-pressed='true'] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 3px #0001;
+}
+.import-context-sheet .import-identity-question,
+.import-context-sheet .import-source-question {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 16px;
+  margin: 0;
+  padding: 14px;
+}
+.import-context-sheet .import-identity-question > div,
+.import-context-sheet .import-source-question > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.import-context-sheet .import-detail-source-controls {
+  display: grid;
+  gap: 10px;
+}
+.import-context-sheet input,
+.import-context-sheet select {
+  max-width: 100%;
+}
+.import-detail-heading.import-report-title {
+  border-radius: 10px;
+  margin-bottom: 0;
+}
+.import-detail-heading.import-report-title h2 {
+  font-size: 1.2rem;
+}
+.import-detail-context {
+  padding-inline: 0;
+}
+.import-report-title > strong,
+.import-detail-heading.import-report-title h2 {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 1.25rem;
+}
+.import-sheet-card.import-context-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  overflow-wrap: anywhere;
+}
+.import-sheet-card.import-context-card span {
+  text-align: left;
+}
+.import-context-card ul {
+  margin: 0;
+  padding-left: 18px;
+}
+.import-context-card q {
+  display: block;
+  margin-top: 4px;
+}
+
+.import-record-accordion {
+  border-top: 1px solid var(--border);
+  padding: 18px;
+  background: var(--background);
+  min-width: 0;
+}
+.import-record-accordion .import-detail.is-embedded {
+  margin: 0;
+  padding: 0;
+}
+.import-record-accordion .import-detail-heading h2 {
+  font-size: 1.25rem;
+}
+.import-record-accordion .intake-review-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas: 'original details';
+}
+.import-record-accordion .intake-review-layout > div {
+  grid-area: details;
+}
+.import-record-accordion .intake-original-pane {
+  grid-area: original;
+  position: static;
+  max-height: none;
+}
+.import-record-accordion .intake-mobile-tabs[hidden] {
+  display: none;
+}
+@media (max-width: 760px) {
+  .import-record-accordion {
+    padding: 12px;
+  }
+  .import-record-accordion .intake-review-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: 'original' 'details';
+  }
+}
+
+.import-field-correction {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(15rem, 1fr);
+  gap: 1.5rem;
+  align-items: start;
+}
+.import-correction-evidence,
+.import-correction-form {
+  min-width: 0;
+}
+.import-correction-form {
+  display: grid;
+  gap: 1rem;
+  position: sticky;
+  top: 1rem;
+}
+.import-correction-form h3 {
+  margin: 0;
+}
+.import-correction-form label {
+  display: grid;
+  gap: 0.5rem;
+}
+.import-correction-form input,
+.import-correction-form textarea {
+  width: 100%;
+}
+.import-correction-form textarea {
+  min-height: 10rem;
+}
+.import-correction-evidence .local-pdf-preview {
+  margin: 0;
+}
+@media (max-width: 700px) {
+  .import-field-correction {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .import-correction-form {
+    position: static;
+  }
+}
+
+/* The label is information; the tinted action makes the whole pill discoverable. */
+.import-source-control .import-source-action {
+  border-radius: 999px;
+  padding: 0.15rem 0.4rem;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+.import-source-control:hover .import-source-action,
+.import-source-control:focus-visible .import-source-action {
+  background: var(--pink-fill);
+  color: var(--pink);
+  text-decoration: underline;
+}
+
+.import-correction-form label.needs-review {
+  border-left: 3px solid var(--pink);
+  padding-left: 0.75rem;
+}
+.import-correction-form label .text-link {
+  justify-self: start;
+}
+.import-upload-card.is-dragging {
+  outline: 2px dashed var(--pink);
+  outline-offset: 3px;
+  background: var(--selection);
 }

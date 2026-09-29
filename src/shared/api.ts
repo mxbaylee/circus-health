@@ -42,6 +42,7 @@ export interface TestType {
   lastDate: string | null;
 }
 export interface Observation {
+  personId?: string;
   /** Optional derived display requested explicitly; original fields below never change. */
   measurement?: import('./measurement.ts').DerivedMeasurement;
   relationship?: {
@@ -78,6 +79,7 @@ export interface Trend {
 }
 export type MedicationCurrentStatus = 'current' | 'not_current' | 'unknown';
 export interface Medication {
+  personId?: string;
   archived?: boolean;
   id: string;
   label: string;
@@ -110,6 +112,7 @@ export interface Medication {
 export type ProcedureCategory =
   'surgery' | 'clinical_procedure' | 'imaging' | 'laboratory' | 'pathology' | 'unspecified';
 export interface Procedure {
+  personId?: string;
   archived?: boolean;
   category: ProcedureCategory;
   id: string;
@@ -229,6 +232,15 @@ export interface PersonProfile {
   fullName?: string;
   /** Names explicitly saved by the person, never inferred from imported records. */
   knownNames?: string[];
+  /** Server-owned, source-backed names retained by explicit report confirmation. */
+  sourceKnownNames?: {
+    name: string;
+    operationId: string;
+    intakeId: string;
+    sourceHash: string;
+    groupId: string;
+    subjectText: string;
+  }[];
   pronouns?: string;
   birthDate?: string;
   deathDate?: string;
@@ -260,7 +272,16 @@ export interface NoteLink extends NoteLinkInput {
 export type NoteTextFormat = 'plain-v1' | 'markdown-v1';
 export type NoteTextField = 'content' | 'topics' | 'rawThoughts' | 'medicalHistory';
 export type NoteTextFormats = Partial<Record<NoteTextField, NoteTextFormat>>;
+export interface ClinicalPersonOption {
+  personId: string;
+  noteId: string;
+  name: string;
+  birthDate: string | null;
+  icon: string | null;
+}
 export interface Note {
+  /** Clinical owner; personId separately identifies a Person profile. Legacy notes belong to Self. */
+  ownerPersonId?: string;
   isSelf?: boolean;
   id: string;
   kind: NoteKind;
@@ -286,6 +307,7 @@ export interface Note {
   attachments: Attachment[];
 }
 export interface HistoricalNoteBase {
+  personId?: string;
   archived?: boolean;
   id: string;
   title: string;
@@ -326,6 +348,7 @@ export interface HistoricalNoteOptions {
   types: string[];
 }
 export interface NoteInput {
+  ownerPersonId?: string;
   id?: string;
   kind?: NoteKind;
   title: string;

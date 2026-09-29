@@ -1,0 +1,20 @@
+.import-manual-source-record form,
+.import-manual-source-record fieldset,
+.import-manual-source-record label {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.import-manual-source-record fieldset {
+  gap: 14px;
+  border: 0;
+  padding: 0;
+  margin: 0 0 16px;
+}
+.import-manual-source-record input,
+.import-manual-source-record select,
+.import-manual-source-record textarea {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}

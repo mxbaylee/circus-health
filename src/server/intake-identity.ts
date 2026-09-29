@@ -1,4 +1,7 @@
+import { originalSubjectBirthDates } from './intake-evidence-dates.ts';
+import { noteVisibilitySQL } from './visibility.ts';
 import { savedKnownNames } from '../shared/self-identity.ts';
+import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
@@ -22,9 +25,17 @@ import {
   identityReceiptAppliesToCurrentBoundary,
   identityOriginalFingerprint,
   identityPersonFingerprint,
+  printedIdentityName,
+  isGenericNameConfirmation,
+  competingIdentityBoundaries,
 } from './intake-identity-policy.ts';
 import { retainIdentityGrounding } from './intake-identity-grounding.ts';
-import { getNote, updateBlankSelfIdentityFieldsInTransaction } from './notes.ts';
+import {
+  getNote,
+  updateBlankSelfIdentityFieldsInTransaction,
+  createIntakeFamilyPersonInTransaction,
+  rememberSourceNameInTransaction,
+} from './notes.ts';
 import type {
   Intake,
   IntakeReview,
@@ -32,6 +43,7 @@ import type {
   IntakeReviewIssue,
 } from '../shared/intake.ts';
 import type {
+  IntakeIdentityPerson,
   IntakeIdentityConfirmation,
   IntakeIdentityConflict,
   IntakeIdentityReview,
@@ -146,6 +158,7 @@ interface BuiltScope {
   explicitlyConfirmedOperationId?: string;
   currentRefusal?: 'unknown' | 'other_person';
   groundedQuestions: { issue: IntakeReviewIssue; receipt: IntakeIdentityReceipt }[];
+  groundedNameQuestions: IntakeReviewIssue[];
 }
 
 interface ExplicitIdentityOccurrence {
@@ -176,14 +189,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   if (!latest || latest.members.length > 1000)
     return reject('Review a bounded report with at most 1000 candidate versions');
   // A competing subject claim at the same printed report boundary prevents common confirmation.
-  if (
-    intake.workflow!.reportGroups!.some(
-      (other) =>
-        other.id !== group.id &&
-        other.memberId === group.memberId &&
-        canonicalLiteral(other.report?.anchor) === canonicalLiteral(group.report!.anchor),
-    )
-  )
+  if (competingIdentityBoundaries(group, intake.workflow!.reportGroups!).length)
     return reject(
       'This report boundary has conflicting subject claims; resolve identity individually',
     );
@@ -197,7 +203,11 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   )
     return reject('Resolve the delivery identity question before common confirmation');
   const reviews = new Map<string | null, IntakeReview>();
+  const groundedNameQuestions: IntakeReviewIssue[] = [];
+  const currentSelf = selfSnapshot(db);
+  const currentPeople = identityPeopleSnapshots(db);
   const targets: IntakeIdentityScope['targets'] = [];
+  const assignmentTargets: IntakeIdentityScope['targets'] = [];
   const questions = new Map<string, NonNullable<IntakeIdentityScope['questions']>[number]>();
   const identityIssues: NonNullable<IntakeReview['records'][number]['issues']> = [];
   const explicitOccurrences: ExplicitIdentityOccurrence[] = [];
@@ -228,18 +238,33 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
           .digest('hex');
       const identity = (record.issues || []).filter((issue) => issue.kind === 'identity');
       identityIssues.push(...identity);
-      // Subject mappings and previous explicit other-person answers remain hard boundaries.
-      if (
-        (record.mapping.subject && !['self', 'unknown'].includes(record.mapping.subject)) ||
-        record.draft?.resolutions.some((resolution) => resolution.outcome === 'other_person')
-      )
-        return reject(
-          'This member has additional or contradictory identity clues; review it individually',
-        );
+      if (record.reviewState === 'pending')
+        assignmentTargets.push({
+          candidateId: candidate.id,
+          candidateVersionId: version.id,
+          proposalId: occurrence.proposalId,
+          recordId: record.id,
+          title: record.title,
+          issueId:
+            identity.find((issue) => issue.id === genericId)?.id || identity[0]?.id || genericId,
+          ...(identity.length ? { issueIds: identity.map((issue) => issue.id) } : {}),
+        });
       const unresolved = identity.filter((issue) => issue.status === 'unresolved');
       const explicitIssues = identity
         .filter((issue) => issue.id !== genericId && !issue.selfSuggestion)
         .filter((issue) => {
+          if (
+            evidence.pageText?.includes(issue.textAnchor || '\u0000') &&
+            isGenericNameConfirmation(
+              issue,
+              group.report?.subject?.text,
+              currentSelf,
+              currentPeople,
+            )
+          ) {
+            groundedNameQuestions.push(issue);
+            return false;
+          }
           const receipt = repeatedIdentityQuestionReceipt({
             issue,
             group,
@@ -307,7 +332,15 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   }
   if (targets.length > 1000)
     return reject('Review a bounded report with at most 1000 pending identity questions');
-  const collected = collectEvidencedIdentity(identityIssues);
+  const collected = collectEvidencedIdentity(
+    identityIssues,
+    group.report?.subject?.text,
+    originalSubjectBirthDates(
+      evidence.pageText,
+      group.report!.subject!.text,
+      group.report!.anchor.text,
+    ),
+  );
   const personFingerprint = identityPersonFingerprint(
     evidence.originalFingerprint,
     collected.evidence,
@@ -318,7 +351,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
     ...(personFingerprint ? { personFingerprint } : {}),
   };
   const receiptApplies = (receipt: IntakeIdentityReceipt) =>
-    !!receipt.scope.targets.length &&
+    !!(receipt.scope.assignmentTargets || receipt.scope.targets).length &&
     identityReceiptAppliesToCurrentBoundary(receipt, {
       profileId,
       intakeId: id,
@@ -378,12 +411,13 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
         questions.set(canonicalLiteral(question), question);
       }
   }
-  if (targets.length > 1000 || questions.size > 100)
+  if (targets.length > 1000 || assignmentTargets.length > 1000 || questions.size > 100)
     return reject('Review these identity questions individually; the displayed scope is too large');
   const snapshot = {
     profileId,
     intakeId: id,
     intakeVersion: intake.version,
+    selfVersion: selfSnapshot(db).version,
     groupId: group.id,
     groupVersionId: latest.id,
     sourceHash: intake.sha256,
@@ -396,6 +430,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
     evidenceOriginalFingerprint: evidence.originalFingerprint,
     membership: structuredClone(latest.members),
     targets,
+    assignmentTargets,
     ...(questions.size ? { questions: [...questions.values()] } : {}),
   };
   const scope: IntakeIdentityScope = {
@@ -415,6 +450,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
     hasUnstructuredIdentityQuestion,
     currentRefusal: currentIdentityRefusal(identityIssues),
     groundedQuestions,
+    groundedNameQuestions,
     ...(explicitlyConfirmedOperationId ? { explicitlyConfirmedOperationId } : {}),
   };
 }
@@ -489,7 +525,7 @@ function groupRecordIdentity(
       );
     }
   }
-  const collected = collectEvidencedIdentity(issues);
+  const collected = collectEvidencedIdentity(issues, group.report?.subject?.text);
   const hasIdentityContext = !!(
     group.report?.subject ||
     collected.evidence.fullName ||
@@ -523,7 +559,72 @@ export async function getIntakeIdentityReview(
 ): Promise<IntakeIdentityReview> {
   return measureImportPhase(
     'review_identity_grounding',
-    () => getIntakeIdentityReviewInternal(db, root, profileId, id, groupId),
+    async () => {
+      const review = await getIntakeIdentityReviewInternal(db, root, profileId, id, groupId);
+      const rows = db
+        .prepare(
+          `SELECT n.id FROM notes n WHERE n.kind='person' AND n.person_id!='patient' AND ${noteVisibilitySQL('n')}=0 ORDER BY n.title,n.id LIMIT 101`,
+        )
+        .all();
+      const people = rows.slice(0, 100).map((row) => {
+        const note = getNote(db, String(row.id));
+        return {
+          noteId: note.id,
+          personId: note.personId!,
+          version: note.version,
+          fullName:
+            typeof note.person.fullName === 'string' && note.person.fullName.trim()
+              ? note.person.fullName.trim()
+              : note.title,
+        };
+      });
+      const intake = getIntake(db, root, profileId, id);
+      const group = intake.workflow?.reportGroups?.find((item) => item.id === groupId);
+      const members = group?.versions.at(-1)?.members || [];
+      const reviewedProposals = new Map<string | null, IntakeReview>();
+      const assigned = members.flatMap((member) =>
+        member.occurrences.map((occurrence) => {
+          let proposalReview = reviewedProposals.get(occurrence.proposalId);
+          if (!proposalReview) {
+            proposalReview = reviewIntake(db, root, profileId, id, occurrence.proposalId);
+            reviewedProposals.set(occurrence.proposalId, proposalReview);
+          }
+          const record = proposalReview.records.find(
+            (item) =>
+              item.id === occurrence.recordId &&
+              item.candidateVersionId === member.candidateVersionId,
+          );
+          return {
+            person: record?.identityAttribution?.assignedPerson,
+            status: record?.identityReview?.status,
+          };
+        }),
+      );
+      const assignedPerson =
+        assigned.length &&
+        assigned.every((item) => item.person?.personId === assigned[0]?.person?.personId)
+          ? assigned[0]?.person
+          : undefined;
+      return {
+        ...review,
+        people,
+        peopleTruncated: rows.length > 100,
+        ...(assignedPerson
+          ? {
+              assignedPerson,
+              status: assigned.every((item) => item.status === 'evidenced_match')
+                ? ('evidenced_match' as const)
+                : ('prior_confirmation' as const),
+              blocking: false,
+              message: assigned.every((item) => item.status === 'evidenced_match')
+                ? 'The printed name uniquely matches a saved name for ' +
+                  assignedPerson.fullName +
+                  '.'
+                : 'This report was assigned to ' + assignedPerson.fullName + '.',
+            }
+          : {}),
+      };
+    },
     {},
     { profileId, importId: id },
   );
@@ -551,6 +652,8 @@ async function getIntakeIdentityReviewInternal(
   if (group.basis !== 'report_anchor' || !group.report?.subject) {
     const assessment = assessIdentityPolicy({
       self,
+      people: identityPeopleSnapshots(db),
+      nameEvidenceGrounded: false,
       evidence: groupIdentity.evidence,
       evidenceConflicts: groupIdentity.conflicts,
       group,
@@ -562,12 +665,7 @@ async function getIntakeIdentityReviewInternal(
     });
     return { ...assessment, scope: null, self };
   }
-  const competing = intake.workflow!.reportGroups!.some(
-    (other) =>
-      other.id !== group.id &&
-      other.memberId === group.memberId &&
-      canonicalLiteral(other.report?.anchor) === canonicalLiteral(group.report!.anchor),
-  );
+  const competing = competingIdentityBoundaries(group, intake.workflow!.reportGroups!).length > 0;
   if (competing)
     return {
       status: 'conflict',
@@ -594,10 +692,17 @@ async function getIntakeIdentityReviewInternal(
       },
       groupFor(current, groupId),
       built.groundedQuestions,
+      built.scope.verificationMode === 'literal_text_match',
+      built.groundedNameQuestions,
+      originalSubjectBirthDates(
+        evidence.pageText,
+        group.report!.subject!.text,
+        group.report!.anchor.text,
+      ),
     );
     // Record review and its token must observe the same verified authority as
     // this preview. No draft, human receipt or page text is persisted here.
-    if (built.groundedQuestions.length) built = buildScope(context, evidence);
+    built = buildScope(context, evidence);
   } catch (error) {
     if (!(error instanceof HttpError) || error.code !== 'IDENTITY_SCOPE') throw error;
     return {
@@ -613,6 +718,8 @@ async function getIntakeIdentityReviewInternal(
   }
   const assessment = assessIdentityPolicy({
     self,
+    people: identityPeopleSnapshots(db),
+    nameEvidenceGrounded: built.scope.verificationMode === 'literal_text_match',
     evidence: built.scope.evidencedIdentity || {},
     evidenceConflicts: built.evidenceConflicts,
     group,
@@ -625,7 +732,9 @@ async function getIntakeIdentityReviewInternal(
   });
   return {
     ...assessment,
-    scope: assessment.status === 'conflict' ? null : built.scope,
+    scope: assessment.conflicts.some((conflict) => conflict.reason === 'evidence_disagreement')
+      ? null
+      : built.scope,
     self,
   };
 }
@@ -657,7 +766,7 @@ export async function confirmIntakeIdentityScope(
   if (
     !input?.operationId ||
     !input.scope ||
-    input.outcome !== 'this_is_me' ||
+    !['this_is_me', 'this_is_person'].includes(input.outcome) ||
     ![
       'reviewed_original_and_membership',
       'confirmed_displayed_report_subject',
@@ -687,6 +796,8 @@ export async function confirmIntakeIdentityScope(
     const currentSelf = selfSnapshot(db);
     const assessment = assessIdentityPolicy({
       self: currentSelf,
+      people: identityPeopleSnapshots(db),
+      nameEvidenceGrounded: built.scope.verificationMode === 'literal_text_match',
       evidence: current.evidencedIdentity || {},
       evidenceConflicts: built.evidenceConflicts,
       group: groupFor(getIntake(db, root, profileId, id), current.groupId),
@@ -697,13 +808,36 @@ export async function confirmIntakeIdentityScope(
       explicitlyConfirmedOperationId: built.explicitlyConfirmedOperationId,
       currentRefusal: built.currentRefusal,
     });
-    if (assessment.status === 'conflict')
+    if (input.outcome === 'this_is_me' && assessment.selfBirthDateConflict)
       throw new HttpError(
         409,
         'IDENTITY_CONFLICT',
-        'The evidenced name or date of birth conflicts with Self and cannot be bypassed',
+        'The report birth date differs from Self. Choose another person or add a new person.',
       );
-    if (assessment.status === 'confirmation_required' && !current.targets.length)
+    if (assessment.conflicts.some((conflict) => conflict.reason === 'evidence_disagreement'))
+      throw new HttpError(
+        409,
+        'IDENTITY_CONFLICT',
+        'The report contains contradictory identity evidence; review its individual entries first',
+      );
+    if (input.scope.selfVersion !== undefined && input.scope.selfVersion !== currentSelf.version)
+      throw new HttpError(
+        409,
+        'SELF_VERSION_CONFLICT',
+        'Self changed while identity was being reviewed; refresh before confirming',
+      );
+    if (
+      input.outcome === 'this_is_me' &&
+      assessment.status === 'confirmation_required' &&
+      !current.targets.length
+    )
+      throw new HttpError(
+        409,
+        'IDENTITY_SCOPE_EMPTY',
+        'Identity confirmation requires a current displayed identity question',
+      );
+    const confirmationTargets = current.assignmentTargets || current.targets;
+    if (!confirmationTargets.length && input.outcome === 'this_is_person')
       throw new HttpError(
         409,
         'IDENTITY_SCOPE_EMPTY',
@@ -732,14 +866,131 @@ export async function confirmIntakeIdentityScope(
         'IDENTITY_CONFIRMATION',
         'Read and explicitly confirm every displayed identity question for this report',
       );
+    const confirmedPrintedName =
+      current.evidencedIdentity?.fullName ||
+      (typeof input.printedName === 'string' ? input.printedName.trim() : undefined);
+    if (
+      !confirmedPrintedName ||
+      (input.printedName !== undefined &&
+        (typeof input.printedName !== 'string' ||
+          (current.evidencedIdentity?.fullName
+            ? input.printedName.trim() !== current.evidencedIdentity.fullName
+            : !current.subject.text.includes(input.printedName.trim())))) ||
+      (!current.evidencedIdentity?.fullName &&
+        printedIdentityName(confirmedPrintedName) !== confirmedPrintedName)
+    )
+      throw new HttpError(
+        400,
+        'IDENTITY_PRINTED_NAME',
+        'Select the exact printed person name from the displayed subject before confirming; demographic sentences are not names',
+      );
     if (
       ['prior_confirmation', 'evidenced_match'].includes(assessment.status) &&
-      input.selfUpdate === undefined
+      input.selfUpdate === undefined &&
+      input.outcome === 'this_is_me' &&
+      getNote(db, 'person-note:self').person.sourceKnownNames?.some(
+        (entry) => entry.name === confirmedPrintedName,
+      ) &&
+      workflow.identityConfirmations?.some(
+        (receipt) =>
+          receipt.outcome === 'this_is_me' &&
+          identityReceiptAppliesToCurrentBoundary(receipt, {
+            ...current,
+            evidenceOriginalFingerprint: current.evidenceOriginalFingerprint || null,
+          }) &&
+          (current.assignmentTargets || current.targets).every((target) =>
+            (receipt.scope.assignmentTargets || receipt.scope.targets).some(
+              (prior) =>
+                prior.candidateId === target.candidateId &&
+                prior.candidateVersionId === target.candidateVersionId &&
+                prior.proposalId === target.proposalId &&
+                prior.recordId === target.recordId,
+            ),
+          ),
+      )
     )
       throw new HttpError(
         409,
         'IDENTITY_ALREADY_RESOLVED',
         'This report identity is already resolved; no additional confirmation is needed',
+      );
+    let assignedPerson: IntakeIdentityPerson | undefined;
+    if (input.outcome === 'this_is_person') {
+      if (input.selfUpdate !== undefined)
+        throw new HttpError(
+          400,
+          'IDENTITY_SELECTION',
+          'Self fields cannot be changed when assigning another person',
+        );
+      const selection = input.personSelection;
+      if (!selection || typeof selection !== 'object')
+        throw new HttpError(
+          400,
+          'IDENTITY_SELECTION',
+          'Choose an existing person or create a family person',
+        );
+      let note;
+      if ('noteId' in selection && !('newPerson' in selection)) {
+        if (
+          typeof selection.noteId !== 'string' ||
+          !Number.isSafeInteger(selection.expectedVersion)
+        )
+          throw new HttpError(400, 'IDENTITY_SELECTION', 'Choose the displayed person version');
+        note = getNote(db, selection.noteId);
+        if (
+          note.kind !== 'person' ||
+          !note.personId ||
+          note.personId === 'patient' ||
+          note.archived
+        )
+          throw new HttpError(
+            400,
+            'IDENTITY_SELECTION',
+            'Choose an available person other than Self',
+          );
+        if (note.version !== selection.expectedVersion)
+          throw new HttpError(
+            409,
+            'PERSON_VERSION_CONFLICT',
+            'This person changed; review the current person before confirming',
+          );
+      } else if ('newPerson' in selection && !('noteId' in selection)) {
+        const person = selection.newPerson;
+        if (
+          !person ||
+          typeof person.fullName !== 'string' ||
+          !person.fullName.trim() ||
+          person.fullName.trim().length > 200 ||
+          /[\x00-\x1f]/.test(person.fullName) ||
+          (person.relationship !== undefined &&
+            (typeof person.relationship !== 'string' || person.relationship.length > 200))
+        )
+          throw new HttpError(
+            400,
+            'IDENTITY_SELECTION',
+            'Enter a name and an optional relationship for this family person',
+          );
+        note = createIntakeFamilyPersonInTransaction(
+          db,
+          person.fullName.trim(),
+          person.relationship?.trim(),
+        );
+      } else
+        throw new HttpError(400, 'IDENTITY_SELECTION', 'Choose exactly one person destination');
+      assignedPerson = {
+        noteId: note.id,
+        personId: note.personId!,
+        version: note.version,
+        fullName:
+          typeof note.person.fullName === 'string' && note.person.fullName.trim()
+            ? note.person.fullName.trim()
+            : note.title,
+      };
+    } else if (input.personSelection !== undefined)
+      throw new HttpError(
+        400,
+        'IDENTITY_SELECTION',
+        'A separate person cannot be selected when confirming Self',
       );
     let selfUpdate:
       | {
@@ -795,10 +1046,24 @@ export async function confirmIntakeIdentityScope(
         fields: structuredClone(selected.fields),
       };
     }
+    const knownNameAdded = rememberSourceNameInTransaction(
+      db,
+      assignedPerson?.noteId || 'person-note:self',
+      {
+        name: confirmedPrintedName,
+        operationId: input.operationId,
+        intakeId: id,
+        sourceHash: current.sourceHash,
+        groupId: current.groupId,
+        subjectText: current.subject.text,
+      },
+    );
+    if (assignedPerson) assignedPerson.version = getNote(db, assignedPerson.noteId).version;
+    if (selfUpdate) selfUpdate.versionAfter = getNote(db, 'person-note:self').version;
     const at = now();
     const draftIds: string[] = [];
     // All validation precedes mutation; one durable transaction appends every exact draft and receipt.
-    for (const target of current.targets) {
+    for (const target of confirmationTargets) {
       const previous = currentReviewDraft(
         workflow,
         target.proposalId,
@@ -806,7 +1071,9 @@ export async function confirmIntakeIdentityScope(
         target.candidateVersionId,
       );
       const draftId = input.operationId + ':' + hash(target);
-      const correction = { subject: 'self' };
+      const correction = assignedPerson
+        ? { subject: 'other', personId: assignedPerson.personId }
+        : { subject: 'self', personId: undefined };
       workflow.reviewDrafts.push({
         ...previous,
         id: draftId,
@@ -819,7 +1086,7 @@ export async function confirmIntakeIdentityScope(
           ...(previous?.resolutions || []),
           ...(target.issueIds || [target.issueId]).map((issueId) => ({
             issueId,
-            outcome: 'this_is_me' as const,
+            outcome: assignedPerson ? ('other_person' as const) : ('this_is_me' as const),
             mapping: correction,
             at,
             operationId: input.operationId,
@@ -837,6 +1104,9 @@ export async function confirmIntakeIdentityScope(
       outcome: input.outcome,
       attestation: input.attestation,
       draftIds,
+      ...(assignedPerson ? { assignedPerson } : {}),
+      ...(knownNameAdded ? { knownNameAdded } : {}),
+      confirmedPrintedName,
       ...(selfUpdate ? { selfUpdate } : {}),
     });
   });

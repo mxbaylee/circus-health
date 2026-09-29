@@ -23,9 +23,9 @@ type Message = {
 };
 const config = (name: string, extra: NodeJS.ProcessEnv = {}) =>
   modelConfig({
-    HEALTH_AI_MODEL: name,
-    HEALTH_AI_BASE_URL: 'http://fictional-proxy:4000',
-    HEALTH_AI_API_KEY: 'fictional-key',
+    CRS_AI_MODEL: name,
+    CRS_AI_BASE_URL: 'http://fictional-proxy:4000',
+    CRS_AI_API_KEY: 'fictional-key',
     ...extra,
   });
 
@@ -152,7 +152,7 @@ test('automatic connection checks discover PDF support without a static declarat
 });
 
 test('declared support never bypasses a fictional PDF reading proof', async () => {
-  const c = config('fictional-declared-unverified', { HEALTH_AI_PROXY_PDF: 'true' });
+  const c = config('fictional-declared-unverified', { CRS_AI_PROXY_PDF: 'true' });
   assert.equal(createModelBridge({ config: c }).config.pdf, false);
   const f = upstream(c, { wrongPdf: true });
   await assert.rejects(
@@ -164,7 +164,7 @@ test('declared support never bypasses a fictional PDF reading proof', async () =
 
 test('explicit PDF rejection verifies PNG fallback once and retains the negative PDF result', async (t) => {
   t.mock.method(Math, 'random', () => 0.5);
-  const c = config('fictional-native-rejected', { HEALTH_AI_PROXY_IMAGES: 'true' });
+  const c = config('fictional-native-rejected', { CRS_AI_PROXY_IMAGES: 'true' });
   const f = upstream(c, { rejectPdf: true, images: true });
   const ready = await ensureModelConnection({ config: c, pdf: true, fetchImpl: f.fetchImpl });
   assert.deepEqual(ready.capabilities, { tools: true, images: true, pdf: false });
@@ -180,7 +180,7 @@ test('explicit PDF rejection verifies PNG fallback once and retains the negative
 
 test('authentication and transient failures do not become negative PDF capability proof', async () => {
   for (const status of [401, 429, 500]) {
-    const c = config(`fictional-native-error-${status}`, { HEALTH_AI_PROXY_IMAGES: 'true' });
+    const c = config(`fictional-native-error-${status}`, { CRS_AI_PROXY_IMAGES: 'true' });
     const f = upstream(c, { rejectPdf: true, status });
     await assert.rejects(ensureModelConnection({ config: c, pdf: true, fetchImpl: f.fetchImpl }));
     assert.equal(f.requests.length, 2);
@@ -192,8 +192,8 @@ test('authentication and transient failures do not become negative PDF capabilit
 test('operator PDF opt-out uses only a verified image and sends no PDF probe', async (t) => {
   t.mock.method(Math, 'random', () => 0.5);
   const c = config('fictional-pdf-disabled', {
-    HEALTH_AI_PROXY_PDF: 'false',
-    HEALTH_AI_PROXY_IMAGES: 'true',
+    CRS_AI_PROXY_PDF: 'false',
+    CRS_AI_PROXY_IMAGES: 'true',
   });
   const f = upstream(c, { images: true });
   const ready = await ensureModelConnection({ config: c, pdf: true, fetchImpl: f.fetchImpl });
@@ -238,14 +238,14 @@ test('a manual tools-only result leaves automatic evidence readiness pending', a
   assert.equal((await modelAvailability({ config: c })).readiness, 'tested');
   assert.equal(createModelBridge({ config: c }).config.pdf, true);
 
-  const text = config('fictional-operator-text-only', { HEALTH_AI_PROXY_PDF: 'false' });
+  const text = config('fictional-operator-text-only', { CRS_AI_PROXY_PDF: 'false' });
   await testModelConnection({ config: text, fetchImpl: upstream(text).fetchImpl });
   assert.equal((await modelAvailability({ config: text })).available, true);
   assert.equal((await modelAvailability({ config: text })).readiness, 'tested');
 });
 
 test('verified PDF reading remains ready when configured image reading proves unavailable', async () => {
-  const c = config('fictional-pdf-without-image-reading', { HEALTH_AI_PROXY_IMAGES: 'true' });
+  const c = config('fictional-pdf-without-image-reading', { CRS_AI_PROXY_IMAGES: 'true' });
   const f = upstream(c);
   const ready = await ensureModelConnection({ config: c, pdf: true, fetchImpl: f.fetchImpl });
   assert.deepEqual(ready.capabilities, { tools: true, images: false, pdf: true });
@@ -264,7 +264,7 @@ test('verified PDF reading remains ready when configured image reading proves un
 for (const status of [400, 422])
   test(`explicit image input rejection ${status} settles inability without revoking native PDF`, async () => {
     const c = config(`fictional-pdf-image-http-rejection-${status}`, {
-      HEALTH_AI_PROXY_IMAGES: 'true',
+      CRS_AI_PROXY_IMAGES: 'true',
     });
     const f = upstream(c, { rejectImage: true, status });
     const ready = await ensureModelConnection({ config: c, pdf: true, fetchImpl: f.fetchImpl });
@@ -279,7 +279,7 @@ for (const status of [400, 422])
 
 test('image authentication, size, rate and server failures still revoke native PDF readiness', async () => {
   for (const status of [401, 403, 413, 429, 500, 503]) {
-    const c = config(`fictional-pdf-image-error-${status}`, { HEALTH_AI_PROXY_IMAGES: 'true' });
+    const c = config(`fictional-pdf-image-error-${status}`, { CRS_AI_PROXY_IMAGES: 'true' });
     const f = upstream(c, { rejectImage: true, status });
     await assert.rejects(
       ensureModelConnection({

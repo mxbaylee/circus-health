@@ -112,7 +112,7 @@ test('labels cannot be moved between credentials or profiles, and corruption doe
   ring.passkeys[0].id = 'different-credential';
   manager.writeKeyring(profile.id, ring);
   assert.throws(() => passkeys.list(profile.id), { code: 'PASSKEY_LABEL_UNAVAILABLE' });
-  const { profile: other } = await newProfile(manager);
+  const { profile: other } = await newProfile(manager, 'Cookie Doe second profile');
   addKey(manager, other.id, credentialId);
   const otherRing = manager.keyring(other.id);
   otherRing.passkeys[0]!.encryptedLabel = ciphertext;

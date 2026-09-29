@@ -641,6 +641,9 @@ export function getIntakeReportQueueGroup(
 }
 
 interface FeedOptions extends QueueOptions {
+  groupId?: string | null;
+  intakeId?: string | null;
+  recordId?: string | null;
   state?: string | null;
   q?: string | null;
   kind?: string | null;
@@ -698,6 +701,9 @@ export function listIntakeImportFeed(
     input.kind || null,
     edited,
     input.state || null,
+    input.groupId || null,
+    input.intakeId || null,
+    input.recordId || null,
   ]);
   const window = options(input, profileId, scope, 50);
   const peopleWindow = options(
@@ -707,7 +713,11 @@ export function listIntakeImportFeed(
     50,
   );
   const intakes = allIntakes(db, root, profileId);
-  const entries = collect(db, root, profileId, intakes);
+  const entries = collect(db, root, profileId, intakes).filter(
+    (entry) =>
+      (!input.groupId || entry.group.id === input.groupId) &&
+      (!input.intakeId || entry.intake.id === input.intakeId),
+  );
   const read = reader(db, root, profileId);
   const summaries = new Map(entries.map((entry) => [entry.group.id, summarize(entry, read)]));
   const tally = counts();
@@ -747,6 +757,7 @@ export function listIntakeImportFeed(
         feedKind: feedKind(raw),
         manuallyEdited: raw.manuallyEdited === true,
       };
+      if (input.recordId && record.id !== input.recordId) continue;
       if (edited && !record.manuallyEdited) continue;
       const searchable = [
         record.title,

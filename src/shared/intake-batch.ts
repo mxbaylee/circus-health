@@ -1,4 +1,43 @@
+export interface IntakeProviderWait {
+  requestId: string;
+  outcome: 'rejected' | 'unknown';
+  classification:
+    | 'quota'
+    | 'transient'
+    | 'authentication'
+    | 'context_limit'
+    | 'unsupported'
+    | 'invalid_request'
+    | 'unknown';
+  /** Absolute provider/server wait, persisted before scheduling. Never authorizes a retry of unknown work. */
+  retryAt: string | null;
+}
+export interface IntakeModelAttempt {
+  requestFit?: {
+    policy: 'proxy-byte-envelope-v1';
+    qualified: false;
+    textCharacters: number;
+    mediaBytes: number;
+    maxTextCharacters: number;
+    maxMediaBytes: number;
+    inputTokens: null;
+    outputReserveTokens: null;
+    maxResponseBytes: number;
+  };
+  requestId: string;
+  startedAt: string;
+  finishedAt: string | null;
+  outcome: 'dispatched' | 'response' | 'rejected' | 'unknown';
+  classification: IntakeProviderWait['classification'] | null;
+  status: number | null;
+  retryAt: string | null;
+  requestDigest: string;
+  requestBytes: number;
+  model: string;
+  usage: Record<string, number | null> | null;
+}
 export interface IntakeBatchReadingState {
+  providerWait?: IntakeProviderWait | null;
   status: 'running' | 'paused';
   reason: string | null;
   turns: number;
@@ -58,12 +97,35 @@ export interface IntakeBatchItem {
   chatId: string | null;
   proposalIds: string[];
   reading: IntakeBatchReadingState | null;
+  /** Durable local extraction budget; explicit continuation adds an allowance, never erases costs. */
+  sourceExtraction?: {
+    steps: number;
+    spentMs: number;
+    allowanceId: string;
+    stepsAtAllowance: number;
+    spentMsAtAllowance: number;
+    operationId: string | null;
+    expectedRevisionId: string | null;
+    startedAt: string | null;
+    initialDone: boolean;
+    draining: boolean;
+  };
   startedAt: string | null;
   endedAt: string | null;
   /** Diagnostics only. Reset on explicit resume so user pauses are not queue delay. */
   queuedAt?: string | null;
   /** Cumulative work survives automatic slices and explicit budget extensions. */
   readingJob?: {
+    /** Legacy saved jobs remain cumulative. New production jobs use progress windows. */
+    limitPolicy?: 'cumulative' | 'progress-window';
+    limits?: {
+      activeMs: number;
+      slices: number;
+      turns: number;
+      requests?: number;
+      measuredTokens?: number;
+    };
+    progressWindows?: number;
     slices: number;
     activeMs: number;
     sliceStartedAt: string | null;
@@ -77,6 +139,7 @@ export interface IntakeBatchItem {
     budgetAtTokens?: number;
     extensions: number;
   };
+  providerWait?: IntakeProviderWait & { attempts: number; lastWaitAt: string };
 }
 
 export interface IntakeBatch {

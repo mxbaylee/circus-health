@@ -1,3 +1,6 @@
+import { fileURLToPath } from 'node:url';
+import { readBuildIdentity } from './build-identity.ts';
+import { sanitizeBuildIdentity, type BuildIdentity } from '../shared/build-identity.ts';
 import {
   clientOperationKinds,
   clientPerformancePhases,
@@ -31,6 +34,11 @@ interface Lifecycle {
 interface Operation {
   id: string;
   events: ImportDiagnosticEvent[];
+  recoverySequence?: ImportDiagnosticEvent[];
+  recoverySequenceDropped?: number;
+  firstFailure?: ImportDiagnosticEvent;
+  latestFailure?: ImportDiagnosticEvent;
+  latestValidationFailure?: ImportDiagnosticEvent;
   client?: ClientOperationSummary;
   updatedAt: string;
   dropped: number;
@@ -175,6 +183,19 @@ function eventPhase(e: ImportDiagnosticEvent): string | null {
               ? 'operation_active'
               : 'processing_active'
             : null;
+}
+
+function failureSummary(
+  event: ImportDiagnosticEvent | undefined,
+): RecentOperationTimeline['firstFailure'] {
+  return event
+    ? {
+        sequence: event.sequence,
+        timestamp: event.timestamp,
+        event: event.event,
+        fields: { ...event.fields },
+      }
+    : undefined;
 }
 function eventSpanKey(e: ImportDiagnosticEvent, phase: string): string {
   return JSON.stringify([
@@ -434,6 +455,11 @@ function timeline(op: Operation, now: number): RecentOperationTimeline {
       lifecycle.open.at(-1)?.phase ||
       (status === 'interrupted' ? lifecycle.interruptedStage : null),
     lifecycleIncomplete: lifecycle.incomplete,
+    recoverySequence: op.recoverySequence?.map((event) => failureSummary(event)!),
+    recoverySequenceDropped: op.recoverySequenceDropped,
+    firstFailure: failureSummary(op.firstFailure),
+    latestFailure: failureSummary(op.latestFailure),
+    latestValidationFailure: failureSummary(op.latestValidationFailure),
     spans,
     client: op.client,
     measuredServerMs: measured,
@@ -452,7 +478,9 @@ function timeline(op: Operation, now: number): RecentOperationTimeline {
 export function createRecentPerformance(
   now: () => Date,
   sanitize: (event: ImportDiagnosticEvent) => ImportDiagnosticEvent | null,
+  artifact: BuildIdentity = readBuildIdentity(fileURLToPath(new URL('../../', import.meta.url))),
 ) {
+  const buildIdentity = sanitizeBuildIdentity(artifact);
   const profiles = new Map<string, State>();
   const state = (profileId: string) => {
     let s = profiles.get(profileId);
@@ -601,6 +629,22 @@ export function createRecentPerformance(
         op.updatedAt = event.timestamp;
         const lifecycle = lifecycleFor(op);
         event = { ...event, sequence: lifecycle.sequence + 1 };
+        if (event.event.endsWith('.failed')) {
+          op.firstFailure ||= event;
+          op.latestFailure = event;
+          if (event.fields.errorCategory === 'validation') op.latestValidationFailure = event;
+        }
+        if (
+          event.event.endsWith('.failed') ||
+          event.fields.recoveryAction ||
+          (op.firstFailure && event.event === 'model.tool.completed')
+        ) {
+          (op.recoverySequence ||= []).push(event);
+          if (op.recoverySequence.length > 48) {
+            op.recoverySequence.shift();
+            op.recoverySequenceDropped = (op.recoverySequenceDropped || 0) + 1;
+          }
+        }
         observeLifecycle(lifecycle, event);
         op.interrupted = lifecycle.status === 'interrupted';
         if (
@@ -788,6 +832,37 @@ export function createRecentPerformance(
                   : null,
             });
             const restored = loaded.at(-1)!;
+            for (const name of [
+              'firstFailure',
+              'latestFailure',
+              'latestValidationFailure',
+            ] as const) {
+              const retained = raw[name] ? sanitize(raw[name]) : null;
+              if (
+                retained?.event.endsWith('.failed') &&
+                (name !== 'latestValidationFailure' ||
+                  retained.fields.errorCategory === 'validation')
+              )
+                restored[name] = retained;
+            }
+            if (Array.isArray(raw.recoverySequence)) {
+              restored.recoverySequence = raw.recoverySequence
+                .slice(-48)
+                .map(sanitize)
+                .filter(
+                  (event: ImportDiagnosticEvent | null): event is ImportDiagnosticEvent =>
+                    !!event &&
+                    (event.event.endsWith('.failed') ||
+                      !!event.fields.recoveryAction ||
+                      event.event === 'model.tool.completed'),
+                );
+              restored.recoverySequenceDropped =
+                Number.isSafeInteger(raw.recoverySequenceDropped) &&
+                Number(raw.recoverySequenceDropped) >= 0
+                  ? Number(raw.recoverySequenceDropped)
+                  : 0;
+              restored.recoverySequenceDropped += Math.max(0, raw.recoverySequence.length - 48);
+            }
             restored.lifecycle = restoredLifecycle(raw.lifecycle, restored);
             interruptLifecycle(restored);
           }
@@ -840,7 +915,7 @@ export function createRecentPerformance(
           node: process.version,
           platform: process.platform,
           architecture: process.arch,
-          buildId: null,
+          ...buildIdentity,
         },
       };
     },

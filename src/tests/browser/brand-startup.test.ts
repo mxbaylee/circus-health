@@ -42,7 +42,7 @@ test('startup branding follows saved appearance across cold load and keyboard en
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
   const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
-  const visuals = process.env.HEALTH_BRAND_VISUAL_DIR;
+  const visuals = process.env.CRS_BRAND_VISUAL_DIR;
   if (visuals) {
     assert(!resolve(visuals).startsWith(fileURLToPath(new URL('../../../', import.meta.url))));
     mkdirSync(visuals, { recursive: true });

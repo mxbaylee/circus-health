@@ -306,8 +306,11 @@ test('HTTP profile isolation, content URL scope and origin protection', async (t
   const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
   let response = await fetch(base + '/api/profiles/cookie-dough/notes');
   let payload = (await response.json()) as { data: Array<{ id: string }> };
-  assert.equal(payload.data.length, 2);
-  assert.equal(payload.data[0].id, fake.id);
+  // The notes collection excludes the separate Self/People entries.
+  assert.deepEqual(
+    payload.data.map((note) => note.id),
+    [fake.id],
+  );
   response = await fetch(base + '/api/profiles/cookie-dough/notes/' + encodeURIComponent(real.id));
   assert.equal(response.status, 404);
   response = await fetch(base + '/api/notes');

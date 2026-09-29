@@ -212,7 +212,9 @@
 }
 .intake-mapping input,
 .intake-mapping select,
-.intake-mapping textarea {
+.intake-mapping textarea,
+.import-correction-form input,
+.import-correction-form textarea {
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
@@ -223,7 +225,8 @@
   color: var(--ink);
   font: inherit;
 }
-.intake-mapping textarea {
+.intake-mapping textarea,
+.import-correction-form textarea {
   resize: vertical;
   line-height: 1.45;
 }

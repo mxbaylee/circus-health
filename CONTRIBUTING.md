@@ -37,7 +37,7 @@ npm test
 
 Use the narrowest meaningful test while iterating, then run the relevant complete suite before submitting. Browser tests build the app and may require additional local dependencies; see [src/README.md](src/README.md). Deployment changes also need `npm run test:deploy`; proxy Python tests run only inside the pinned LiteLLM container as shown in CI.
 
-`npm test` and CI include `npm run test:tools` for the qualification/benchmark oracles and `npm run test:continuation` for the controlled 100-page automatic-continuation regression. The latter explicitly sets `HEALTH_PDF_CONTROLLED_TEST=1` and requires qpdf. These use fictional local fixtures and a scripted upstream; real-provider qualification remains a separate opt-in command described in [import performance diagnostics](docs/import-performance.md#representative-provider-qualification).
+`npm test` and CI include `npm run test:tools` for the qualification/benchmark oracles and `npm run test:continuation` for the controlled 100-page automatic-continuation regression. The latter explicitly sets `CRS_PDF_CONTROLLED_TEST=1` and requires qpdf. These use fictional local fixtures and a scripted upstream; real-provider qualification remains a separate opt-in command described in [import performance diagnostics](docs/import-performance.md#representative-provider-qualification).
 
 CI also builds the pinned LiteLLM compatibility image and runs its response, native PDF translation, diagnostics and fictional OAuth tests without external network access. These test the adapter and persistence logic, not real account authentication or provider PDF acceptance. The application Docker workflow and real-provider checks remain separately enabled integration gates.
 

@@ -7,7 +7,7 @@ The application is a React client and Node server for a local, profile-scoped he
 The supported application is the repository's Docker Compose stack:
 
 ```sh
-DATA_DIR=/absolute/path/to/archive/data MODEL=health-primary LITELLM_CONFIG=/absolute/path/to/proxy/config/litellm.yaml STATE_DIR=/absolute/path/to/proxy/state npm run start
+CRS_DATA_DIR=/absolute/path/to/archive/data CRS_MODEL=health-primary CRS_LITELLM_CONFIG=/absolute/path/to/proxy/config/litellm.yaml CRS_STATE_DIR=/absolute/path/to/proxy/state npm run start
 ```
 
 Run commands from the repository root, which owns `package.json`, the lockfile and tool configuration. The host needs Node 24.19 or newer, npm, and Docker Compose v2.30 or newer. Run `npm ci` once before using the npm commands. Python is confined to the LiteLLM proxy container. Native server/browser contributor checks also need qpdf on `PATH`; see [Contributing](../CONTRIBUTING.md). The application image includes qpdf.

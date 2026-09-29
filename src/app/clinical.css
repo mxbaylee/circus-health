@@ -795,3 +795,56 @@ button:disabled {
     display: none;
   }
 }
+
+.result-name-and-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.soft-badge.correction-pill {
+  border-radius: 999px;
+  background: var(--surface);
+  font-weight: 500;
+  font-family: inherit;
+}
+.record-correction-history {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow-wrap: anywhere;
+}
+.record-correction-history summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.record-correction-history ol {
+  padding-left: 20px;
+}
+.record-correction-history li + li {
+  margin-top: 16px;
+}
+.record-correction-history p {
+  margin: 6px 0;
+}
+.record-correction-history dl {
+  margin: 8px 0 0;
+}
+.record-correction-history dl > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 4px 0;
+}
+.record-correction-history dt {
+  color: var(--muted);
+  min-width: 5rem;
+}
+.record-correction-history dd {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.result-name-and-badges > strong {
+  color: var(--ink);
+}

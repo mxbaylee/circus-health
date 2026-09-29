@@ -31,6 +31,27 @@ const accepted = (
 });
 
 describe('saved Import destinations', () => {
+  it('keeps assigned family ownership on clinical and optical destinations', () => {
+    for (const kind of ['observation', 'medication', 'procedure', 'document'] as const) {
+      const record = accepted(
+        'family-source',
+        'family-entry',
+        kind,
+        'Fictional family record',
+        kind === 'document',
+      );
+      record.identityAttribution!.assignedPerson = {
+        noteId: 'rowan-note',
+        personId: 'rowan-person',
+        version: 1,
+        fullName: 'Rowan Example',
+      };
+      const destination = acceptedRecordDestination(record);
+      expect(new URL(destination.to, 'http://fictional.test').searchParams.get('personId')).toBe(
+        'rowan-person',
+      );
+    }
+  });
   it('routes every durable accepted entity to its real profile destination', () => {
     const records = [
       accepted('observation-row', 'observation-entity', 'observation', 'Fictional ferritin'),

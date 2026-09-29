@@ -14,6 +14,7 @@ import {
 } from './review-draft-pair-scope';
 
 export type LocalReviewDraft = {
+  correctionReason?: string;
   decision: IntakeReviewDecision;
   resolutions: IntakeIssueResolution[];
   disposition: 'pending' | 'review_later' | 'keep_original_only';
@@ -266,6 +267,7 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
         disposition: next.disposition,
         decision: next.decision,
         answers: next.answers,
+        correctionReason: next.correctionReason,
       },
     });
   }

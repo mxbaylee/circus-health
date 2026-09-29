@@ -304,7 +304,7 @@ test('recovery CLI accepts Fictional Orchid without writing another profile or a
   const invoke = (...args: string[]) =>
     spawnSync(process.execPath, [resolve(root, 'src/server/recovery-cli.ts'), ...args], {
       encoding: 'utf8',
-      env: { ...process.env, DATA_DIR: resolve(root, 'data') },
+      env: { ...process.env, CRS_DATA_DIR: resolve(root, 'data') },
     });
   let result = invoke('backup', 'orchid');
   assert.equal(result.status, 0, result.stderr);

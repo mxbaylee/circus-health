@@ -1,3 +1,5 @@
+import { useEffect } from 'react';
+import userEvent from '@testing-library/user-event';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
@@ -332,7 +334,7 @@ it('keeps an earlier confirmed Person destination when a later save has no recei
 it('highlights file drags and sends dropped files to the upload action', () => {
   const onFiles = vi.fn();
   render(<ImportReviewPresentation model={model()} actions={{ onFiles }} />);
-  const dropzone = screen.getByText('Drop reports here').closest('label');
+  const dropzone = screen.getByText('Drop reports here').closest('.import-upload-card');
   expect(dropzone).not.toBeNull();
 
   const file = new File(['fictional report'], 'fictional-report.pdf', {
@@ -512,9 +514,9 @@ it.each(['review', 'later', 'saved'] as const)(
 );
 
 it.each([
-  [0, '0 source entries found'],
-  [1, '1 source entry found'],
-  [2, '2 source entries found'],
+  [0, 'Discovered 0 records.'],
+  [1, 'Discovered 1 record.'],
+  [2, 'Discovered 2 records.'],
 ] as const)('labels %i retained candidates as %s', (readyRecords, expected) => {
   const active = model(1);
   active.activity!.progress = {
@@ -527,7 +529,7 @@ it.each([
     lastProgressAt: null,
   };
   render(<ImportReviewPresentation model={active} />);
-  expect(screen.getByText(`${expected} · 1 source window read`)).toBeVisible();
+  expect(screen.getByText(expected)).toBeVisible();
 });
 
 it('keeps one source entry distinct from its clinical and People review items', () => {
@@ -545,10 +547,10 @@ it('keeps one source entry distinct from its clinical and People review items', 
     lastProgressAt: null,
   };
   render(<ImportReviewPresentation model={active} />);
-  expect(screen.getByText('1 source entry found · 1 source window read')).toBeVisible();
+  expect(screen.getByText('Discovered 1 record.')).toBeVisible();
   expect(screen.getByRole('tab', { name: 'Vision1' })).toBeVisible();
   expect(screen.getByRole('tab', { name: 'People1' })).toBeVisible();
-  expect(screen.queryByText(/2 source entries found/)).toBeNull();
+  expect(screen.queryByText(/Discovered 2 records/)).toBeNull();
 });
 
 it('keeps real progress and Stop beside Moxie without a redundant Reading details sheet', () => {
@@ -565,9 +567,9 @@ it('keeps real progress and Stop beside Moxie without a redundant Reading detail
   };
   render(<ImportReviewPresentation model={active} actions={{ onStopReading }} />);
   expect(screen.queryByRole('progressbar')).toBeNull();
-  expect(screen.getByText('2 of 7 source sections accounted for')).toBeVisible();
-  expect(screen.getByText('30 source entries found · 3 source windows read')).toBeVisible();
-  expect(screen.getByText(/Active reading 2m 0s/)).toBeVisible();
+  expect(screen.queryByText(/source sections accounted/)).toBeNull();
+  expect(screen.getByText('Discovered 30 records.')).toBeVisible();
+  expect(screen.getByText(/Rough estimate:/)).toBeVisible();
   expect(screen.queryByRole('button', { name: /Reading details/ })).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: 'Stop reading' }));
   expect(onStopReading).toHaveBeenCalledOnce();
@@ -594,7 +596,7 @@ it('shows a failed reading action and leaves its control retryable', async () =>
   expect(screen.getByRole('button', { name: 'Resume reading' })).not.toBeDisabled();
 });
 
-it('confirms identity and both selected blank Self fields in one action', () => {
+it('confirms identity and optional birth date without a separate primary-name choice', () => {
   const onConfirmIdentity = vi.fn();
   render(
     <ImportReviewPresentation
@@ -637,19 +639,17 @@ it('confirms identity and both selected blank Self fields in one action', () => 
       actions={{ onConfirmIdentity }}
     />,
   );
-  fireEvent.click(screen.getByRole('button', { name: 'Review blank Self details' }));
-  expect(screen.getByText('Full name:')).toBeVisible();
-  expect(screen.getByText('Rowan Ellis')).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  expect(screen.queryByRole('checkbox', { name: /Full name/ })).toBeNull();
   expect(screen.getByText('Date of birth:')).toBeVisible();
   expect(screen.getByText('1988-04-12')).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'This is me' }));
   expect(onConfirmIdentity).toHaveBeenCalledWith('fictional-report', {
-    fullName: 'Rowan Ellis',
     birthDate: '1988-04-12',
   });
 });
 
-it('preserves declined Self fields while selecting newly offered fields in an open identity sheet', async () => {
+it('preserves a declined birthday through refreshed name evidence and resets it on reopening', async () => {
   const onConfirmIdentity = vi.fn();
   const initial: ImportReviewModel = {
     reports: [
@@ -668,7 +668,7 @@ it('preserves declined Self fields while selecting newly offered fields in an op
           evidenceText: 'Rowan Ellis',
           scopeReady: true,
           targetCount: 1,
-          offeredSelfFields: { fullName: 'Rowan Ellis' },
+          offeredSelfFields: { birthDate: '1988-04-12' },
         },
       },
     ],
@@ -688,8 +688,8 @@ it('preserves declined Self fields while selecting newly offered fields in an op
   const { rerender } = render(
     <ImportReviewPresentation model={initial} actions={{ onConfirmIdentity }} />,
   );
-  fireEvent.click(screen.getByRole('button', { name: 'Review blank Self details' }));
-  const fullName = screen.getByRole('checkbox', { name: /Full name/ });
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  const fullName = screen.getByRole('checkbox', { name: /Date of birth/ });
   expect(fullName).toBeChecked();
   fireEvent.click(fullName);
   expect(fullName).not.toBeChecked();
@@ -708,8 +708,8 @@ it('preserves declined Self fields while selecting newly offered fields in an op
   };
   rerender(<ImportReviewPresentation model={withBirthDate} actions={{ onConfirmIdentity }} />);
 
-  expect(screen.getByRole('checkbox', { name: /Full name/ })).not.toBeChecked();
-  expect(await screen.findByRole('checkbox', { name: /Date of birth/ })).toBeChecked();
+  expect(screen.getByRole('checkbox', { name: /Date of birth/ })).not.toBeChecked();
+  expect(screen.queryByRole('checkbox', { name: /Full name/ })).toBeNull();
   rerender(
     <ImportReviewPresentation
       model={{
@@ -725,14 +725,11 @@ it('preserves declined Self fields while selecting newly offered fields in an op
       actions={{ onConfirmIdentity }}
     />,
   );
-  expect(screen.getByRole('checkbox', { name: /Full name/ })).not.toBeChecked();
-  expect(screen.getByRole('checkbox', { name: /Date of birth/ })).toBeChecked();
+  expect(screen.getByRole('checkbox', { name: /Date of birth/ })).not.toBeChecked();
 
   fireEvent.click(screen.getByRole('button', { name: 'Close' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Review blank Self details' }));
-  expect(screen.getByRole('checkbox', { name: /Full name/ })).toBeChecked();
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
   expect(screen.getByRole('checkbox', { name: /Date of birth/ })).toBeChecked();
-  fireEvent.click(screen.getByRole('checkbox', { name: /Full name/ }));
   fireEvent.click(screen.getByRole('button', { name: 'This is me' }));
   expect(onConfirmIdentity).toHaveBeenCalledWith('fictional-late-identity', {
     birthDate: '1988-04-12',
@@ -760,9 +757,9 @@ it('preserves declined Self fields while selecting newly offered fields in an op
       actions={{ onConfirmIdentity }}
     />,
   );
-  fireEvent.click(await screen.findByRole('button', { name: 'Review optional Self details' }));
+  fireEvent.click(await screen.findByRole('button', { name: /Change person for/ }));
   expect(screen.getByRole('dialog')).toHaveTextContent(
-    'This report is already allowed by retained identity evidence.',
+    'Review who this report belongs to. Accepted records keep their existing attribution.',
   );
   expect(screen.queryByText(/This applies to 0 records/)).toBeNull();
 });
@@ -798,6 +795,8 @@ it('shows missing identity as a warning and conflicts as blocking without confir
               evidence: 'named',
               confirmed: false,
               identityStatus: 'conflict',
+              scopeReady: false,
+              scopeError: 'Review the conflicting report evidence.',
               identityMessage: 'The evidenced birthday differs from Self.',
               blocking: true,
               conflicts: [
@@ -837,10 +836,14 @@ it('shows missing identity as a warning and conflicts as blocking without confir
       }}
     />,
   );
+  fireEvent.click(screen.getByRole('button', { name: 'Review person for Unsigned result' }));
   expect(screen.getByText('Identity is not printed clearly in this report.')).toBeVisible();
-  expect(screen.getByText('This report conflicts with Self.')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'This is me' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Review person for Conflicting result' }));
+  expect(screen.getByText('Report identity could not be established.')).toBeVisible();
   expect(screen.getByText(/Self has 1988-04-12; report evidence has 1991-09-03/)).toBeVisible();
-  expect(screen.queryByRole('button', { name: 'This is me' })).toBeNull();
+  expect(screen.getByRole('button', { name: 'This is me' })).toBeDisabled();
 });
 
 it('keeps an evidenced match saveable while offering a separate optional Self fill', () => {
@@ -861,7 +864,7 @@ it('keeps an evidenced match saveable while offering a separate optional Self fi
               confirmed: true,
               identityStatus: 'evidenced_match',
               identityMessage: 'The retained birthday matches Self.',
-              offeredSelfFields: { fullName: 'Rowan Ellis' },
+              offeredSelfFields: { birthDate: '1988-04-12' },
               selfDisplayName: 'Rowan',
             },
           },
@@ -884,9 +887,9 @@ it('keeps an evidenced match saveable while offering a separate optional Self fi
   );
   expect(screen.getByRole('button', { name: 'Confirm & save' })).not.toBeDisabled();
   expect(screen.queryByRole('button', { name: 'This is me' })).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: 'Review optional Self details' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Add selected details to Self' }));
-  expect(onConfirmIdentity).toHaveBeenCalledWith('matched', { fullName: 'Rowan Ellis' });
+  fireEvent.click(screen.getByRole('button', { name: /Change person for/ }));
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+  expect(onConfirmIdentity).toHaveBeenCalledWith('matched', { birthDate: '1988-04-12' });
 });
 
 it('explains the real review blocker beside a disabled save action', () => {
@@ -927,10 +930,8 @@ it('explains the real review blocker beside a disabled save action', () => {
   const reason = screen.getByText('Resolve the uncertain reading before saving this record.');
   expect(save).toBeDisabled();
   expect(save).toHaveAttribute('aria-describedby', reason.closest('.import-save-blocker')!.id);
-  expect(screen.getByRole('link', { name: /Open review/ })).toHaveAttribute(
-    'href',
-    '#/import?group=fictional-blocked-report&intake=fictional-intake',
-  );
+  expect(screen.getByRole('button', { name: /Open review/ })).toBeEnabled();
+  expect(screen.queryByRole('link', { name: /Open review/ })).toBeNull();
   expect(screen.queryByText(/source.*required|required.*source/i)).toBeNull();
 });
 
@@ -1130,7 +1131,7 @@ it('closes a cached identity sheet when refreshed state says confirmation is alr
   const { rerender } = render(
     <ImportReviewPresentation model={pending} actions={{ onConfirmIdentity }} />,
   );
-  fireEvent.click(screen.getByRole('button', { name: 'Review identity' }));
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
   expect(screen.getByRole('dialog')).toBeVisible();
 
   rerender(
@@ -1199,7 +1200,7 @@ it('keeps an entered fictional source label and explains a refreshed scope that 
   expect(screen.getByRole('dialog')).toHaveTextContent(
     /eligible results you save.*Original issuer and upload history stay unchanged/,
   );
-  expect(screen.getByText(/Suggestions are not applied until you choose Use source/)).toBeVisible();
+  expect(screen.getByText(/This source is used when you save records/)).toBeVisible();
   const input = screen.getByRole('textbox', { name: 'Source' });
   fireEvent.change(input, { target: { value: 'Fictional Vision Center' } });
   fireEvent.click(screen.getByRole('button', { name: 'Use source' }));
@@ -1211,7 +1212,7 @@ it('keeps an entered fictional source label and explains a refreshed scope that 
   expect(onUseSource).toHaveBeenCalledOnce();
 });
 
-it('distinguishes a source suggestion from a reviewed label before applying it', async () => {
+it('presents the default source as one editable pill without an unapplied warning', async () => {
   render(
     <ImportReviewPresentation
       model={{
@@ -1244,16 +1245,22 @@ it('distinguishes a source suggestion from a reviewed label before applying it',
     />,
   );
 
-  expect(screen.getByText(/Suggested source—not applied yet/)).toBeVisible();
-  expect(screen.getByText(/Use it for this report and eligible results you save/)).toBeVisible();
-  fireEvent.click(screen.getByRole('button', { name: 'Review Fictional Imaging Center' }));
+  expect(screen.queryByText('Suggested · not applied')).toBeNull();
+  expect(
+    screen.getAllByRole('button', { name: 'Change source: Fictional Imaging Center' }),
+  ).toHaveLength(1);
+  expect(screen.queryByRole('button', { name: 'Change' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
   expect(screen.getByRole('dialog')).toBeVisible();
+  expect(
+    screen.getByText(/Use this label for the report and eligible results you save/),
+  ).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'Use source' }));
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   expect(
     screen.getByText('Source changed to “Fictional Imaging Center”. Nothing has been saved yet.'),
   ).toBeVisible();
-  expect(screen.queryByText(/Suggested source—not applied yet/)).toBeNull();
+  expect(screen.queryByText('Suggested · not applied')).toBeNull();
 });
 
 it('shows the exact source scope and submits it through one confirmation while the action is pending', async () => {
@@ -1265,7 +1272,7 @@ it('shows the exact source scope and submits it through one confirmation while t
     <ImportReviewPresentation model={sourceModel()} actions={{ onReviewSource, onUseSource }} />,
   );
 
-  fireEvent.click(screen.getByRole('button', { name: 'Review Fictional Imaging Center' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
   expect(screen.getByRole('button', { name: 'Use source' })).toBeDisabled();
   await waitFor(() => expect(screen.getByText(/2 records will use/)).toBeVisible());
   expect(screen.getByText(/1 already have a reviewed source; 1 do not/)).toBeVisible();
@@ -1320,7 +1327,7 @@ it('retries a failed initial source preflight without losing the entered label o
     <ImportReviewPresentation model={sourceModel()} actions={{ onReviewSource, onUseSource }} />,
   );
 
-  fireEvent.click(screen.getByRole('button', { name: 'Review Fictional Imaging Center' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
   const input = screen.getByRole('textbox', { name: 'Source' });
   fireEvent.change(input, { target: { value: 'Fictional Entered Source' } });
   await waitFor(() =>
@@ -1386,7 +1393,7 @@ it('keeps an uncertain source action visible when its refresh fails and retries 
     />,
   );
 
-  fireEvent.click(screen.getByRole('button', { name: 'Review Fictional Imaging Center' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
   const confirm = await screen.findByRole('button', {
     name: 'Use Fictional Imaging Center for 2 records',
   });
@@ -1452,7 +1459,7 @@ it('keeps a failed source action reviewable and allows a deliberate retry', asyn
     />,
   );
 
-  fireEvent.click(screen.getByRole('button', { name: 'Review Fictional Imaging Center' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
   const confirm = await screen.findByRole('button', {
     name: 'Use Fictional Imaging Center for 2 records',
   });
@@ -1492,13 +1499,13 @@ it('discards source preflights after close and after profile or view context cha
     />,
   );
 
-  fireEvent.click(screen.getByRole('button', { name: 'Review Fictional Imaging Center' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
   expect(screen.getByText('Loading affected records…')).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'Close' }));
   first.resolve(sourceReview('active'));
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 
-  fireEvent.click(screen.getByRole('button', { name: 'Review Fictional Imaging Center' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
   expect(onReviewSource).toHaveBeenCalledTimes(2);
   rerender(
     <ImportReviewPresentation
@@ -1534,6 +1541,7 @@ it('shows compatible future source coverage without asking for another confirmat
     ],
   };
   const { rerender } = render(<ImportReviewPresentation model={confirmed} />);
+  fireEvent.click(screen.getByRole('button', { name: /Change source for/ }));
   expect(screen.getByText(/Current 2\/2 source-labeled/)).toBeVisible();
 
   rerender(
@@ -1559,10 +1567,12 @@ it('shows compatible future source coverage without asking for another confirmat
     />,
   );
   expect(screen.getByText(/Current 3\/3 source-labeled/)).toBeVisible();
-  expect(screen.queryByRole('button', { name: /Review Fictional Imaging Center/ })).toBeNull();
+  expect(
+    screen.queryByRole('button', { name: /Change source: Fictional Imaging Center/ }),
+  ).toBeNull();
 });
 
-it('shows recent observed page timing and resets it on a new model context without an ETA', () => {
+it('keeps technical page timing and model passes out of simple progress', () => {
   const active = model(1);
   active.activity!.progress = {
     accounted: 2,
@@ -1581,13 +1591,9 @@ it('shows recent observed page timing and resets it on a new model context witho
     },
   };
   const view = render(<ImportReviewPresentation model={active} />);
-  expect(
-    screen.getByText(/Recent interval between page reads 12s on average across 2 intervals/),
-  ).toBeVisible();
-  expect(
-    screen.getByText(/Includes repeat reads, model and tool work; not a completion estimate/),
-  ).toBeVisible();
-  expect(screen.getByText('Last page prepared in 3s.')).toBeVisible();
+  expect(screen.getByText('Calculating remaining time')).toBeVisible();
+  expect(screen.queryByText(/Recent interval between page reads/)).toBeNull();
+  expect(screen.queryByText(/Last page prepared/)).toBeNull();
   expect(screen.queryByRole('progressbar')).toBeNull();
   active.activity!.progress!.pageTiming = {
     turn: 2,
@@ -1597,7 +1603,578 @@ it('shows recent observed page timing and resets it on a new model context witho
     lastCompletedAt: null,
   };
   view.rerender(<ImportReviewPresentation model={{ ...active }} />);
-  expect(screen.getByText(/Model context restarted · Pass 2/)).toBeVisible();
+  expect(screen.queryByText(/Model context restarted/)).toBeNull();
   expect(screen.queryByText(/Recent interval between page reads/)).toBeNull();
   expect(screen.queryByText(/Last page prepared/)).toBeNull();
 });
+
+function personChoiceModel(): ImportReviewModel {
+  const current = sourceModel();
+  current.reports[0].subject = {
+    label: 'Jordan Example',
+    evidence: 'named',
+    confirmed: false,
+    identityStatus: 'confirmation_required',
+    scopeReady: true,
+    printedName: 'Jordan Example',
+    evidenceText: 'Jordan Example',
+    offeredSelfFields: { fullName: 'Jordan Example' },
+    people: [
+      {
+        noteId: 'person-note:fictional-parent',
+        personId: 'fictional-parent',
+        version: 3,
+        fullName: 'Avery Example',
+      },
+    ],
+  };
+  return current;
+}
+
+it('assigns a mismatched report to a new family person without selecting Self fields or accepting results', () => {
+  const onConfirmIdentity = vi.fn();
+  const onSave = vi.fn();
+  render(
+    <ImportReviewPresentation
+      model={personChoiceModel()}
+      actions={{ onConfirmIdentity, onSave }}
+    />,
+  );
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  fireEvent.change(screen.getByRole('combobox', { name: 'Person for this report' }), {
+    target: { value: 'new' },
+  });
+  expect(screen.getByRole('textbox', { name: 'New person name' })).toHaveValue('Jordan Example');
+  fireEvent.change(screen.getByRole('textbox', { name: 'New person name' }), {
+    target: { value: ' ' },
+  });
+  expect(screen.getByRole('button', { name: 'Confirm person' })).toBeDisabled();
+  fireEvent.change(screen.getByRole('textbox', { name: 'New person name' }), {
+    target: { value: 'Jordan Example' },
+  });
+  fireEvent.change(screen.getByRole('textbox', { name: 'New person relationship' }), {
+    target: { value: 'Sibling' },
+  });
+  expect(screen.queryByRole('checkbox', { name: /Full name/ })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm person' }));
+  expect(onConfirmIdentity).toHaveBeenCalledWith(
+    'fictional-source-scope',
+    {},
+    { newPerson: { fullName: 'Jordan Example', relationship: 'Sibling' } },
+  );
+  expect(onSave).not.toHaveBeenCalled();
+});
+
+it('pins the selected existing person version and leaves results in review', () => {
+  const onConfirmIdentity = vi.fn();
+  const onSave = vi.fn();
+  render(
+    <ImportReviewPresentation
+      model={personChoiceModel()}
+      actions={{ onConfirmIdentity, onSave }}
+    />,
+  );
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  fireEvent.change(screen.getByRole('combobox', { name: 'Person for this report' }), {
+    target: { value: 'person-note:fictional-parent' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm person' }));
+  expect(onConfirmIdentity).toHaveBeenCalledWith(
+    'fictional-source-scope',
+    {},
+    { noteId: 'person-note:fictional-parent', expectedVersion: 3 },
+  );
+  expect(onSave).not.toHaveBeenCalled();
+});
+
+it('explains that Self confirmation retains the printed name without replacing primary identity', () => {
+  const current = personChoiceModel();
+  current.reports[0].subject.offeredSelfFields = {};
+  const onConfirmIdentity = vi.fn();
+  render(<ImportReviewPresentation model={current} actions={{ onConfirmIdentity }} />);
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  expect(screen.getByText(/Confirming retains “Jordan Example” in your Names/)).toBeVisible();
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'This is me' }));
+  expect(onConfirmIdentity).toHaveBeenCalledWith('fictional-source-scope', {});
+});
+
+it('requires an explicit printed name when report identity lacks a separated name field', () => {
+  const current = personChoiceModel();
+  current.reports[0].subject.printedName = undefined;
+  current.reports[0].subject.printedNameRequired = true;
+  current.reports[0].subject.evidenceText = 'Patient: Fictional Jordan Example; member 42';
+  current.reports[0].subject.offeredSelfFields = {};
+  const onConfirmIdentity = vi.fn();
+  render(<ImportReviewPresentation model={current} actions={{ onConfirmIdentity }} />);
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  const confirm = within(screen.getByRole('dialog')).getByRole('button', { name: 'This is me' });
+  expect(confirm).toBeDisabled();
+  fireEvent.change(screen.getByRole('textbox', { name: /Name printed on this report/ }), {
+    target: { value: 'Name absent from the source' },
+  });
+  expect(confirm).toBeDisabled();
+  fireEvent.change(screen.getByRole('textbox', { name: /Name printed on this report/ }), {
+    target: { value: 'Fictional Jordan Example' },
+  });
+  fireEvent.click(confirm);
+  expect(onConfirmIdentity).toHaveBeenCalledWith(
+    'fictional-source-scope',
+    {},
+    undefined,
+    'Fictional Jordan Example',
+  );
+});
+
+it('keeps the current family assignment visible when the bounded People list omits it', () => {
+  const current = personChoiceModel();
+  current.reports[0].subject.confirmed = true;
+  current.reports[0].subject.identityStatus = 'prior_confirmation';
+  current.reports[0].subject.assignedPerson = {
+    noteId: 'person-note:fictional-assigned',
+    personId: 'fictional-assigned',
+    version: 8,
+    fullName: 'Jordan Example',
+  };
+  current.reports[0].subject.peopleTruncated = true;
+  render(<ImportReviewPresentation model={current} actions={{ onConfirmIdentity: vi.fn() }} />);
+  expect(screen.queryByRole('button', { name: /Review person for/ })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: /Change person for/ }));
+  expect(screen.getByRole('combobox', { name: 'Person for this report' })).toHaveValue(
+    'person-note:fictional-assigned',
+  );
+  expect(screen.getByText(/The first 100 people are listed/)).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Done' })).toBeVisible();
+});
+
+it('uses one header source review control and keeps retained source evidence in its sheet', () => {
+  const current = sourceModel();
+  current.reports[0].sourceEvidence = {
+    label: 'Cookie Doe retained report',
+    contentUrl: '/fictional-cookie-doe-report',
+  };
+  const { container } = render(<ImportReviewPresentation model={current} />);
+  const header = container.querySelector('.import-report-header')!;
+  expect(
+    within(header as HTMLElement).getAllByRole('button', {
+      name: 'Change source: Fictional Imaging Center',
+    }),
+  ).toHaveLength(1);
+  expect(container.querySelector('.import-source-question')).toBeNull();
+  expect(screen.queryByRole('link', { name: /Cookie Doe retained report/ })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
+  expect(
+    within(screen.getByRole('dialog')).getByRole('link', { name: /Cookie Doe retained report/ }),
+  ).toHaveAttribute('href', '/fictional-cookie-doe-report');
+});
+
+it('keeps pending and confirmed person actions in the same compact header', () => {
+  const current = personChoiceModel();
+  current.reports[0].subject.label = 'Cookie Doe';
+  current.reports[0].subject.printedName = 'Cookie Doe';
+  const { container, rerender } = render(<ImportReviewPresentation model={current} />);
+  const pending = screen.getByRole('button', { name: /Review person for/ });
+  expect(container.querySelector('.import-report-header')).toContainElement(pending);
+  expect(container.querySelector('.import-person-choice-pending')).toBeNull();
+  current.reports[0].subject.confirmed = true;
+  current.reports[0].subject.identityStatus = 'prior_confirmation';
+  rerender(<ImportReviewPresentation model={{ ...current }} />);
+  expect(screen.queryByRole('button', { name: /Review person for/ })).toBeNull();
+  const change = screen.getByRole('button', { name: /Change person for/ });
+  expect(change).toHaveTextContent('Cookie Doe');
+  expect(container.querySelector('.import-report-header')).toContainElement(change);
+  fireEvent.click(change);
+  expect(screen.getByRole('dialog')).toBeVisible();
+});
+
+it('uses one source/person sidebar, keeps a draft label while switching tabs, and closes unchanged identity without another confirmation', () => {
+  const current = personChoiceModel();
+  current.reports[0].filename = 'cookie-doe-report.pdf';
+  current.reports[0].subject.printedName = 'Cookie Doe';
+  current.reports[0].subject.confirmed = true;
+  current.reports[0].subject.identityStatus = 'prior_confirmation';
+  current.reports[0].subject.offeredSelfFields = {};
+  const onConfirmIdentity = vi.fn();
+  const onUseSource = vi.fn();
+  const { container } = render(
+    <ImportReviewPresentation model={current} actions={{ onConfirmIdentity, onUseSource }} />,
+  );
+  expect(screen.getByText('New Import Source: cookie-doe-report.pdf')).toBeVisible();
+  expect(screen.getByRole('button', { name: /Change person for/ })).toHaveTextContent(
+    'Cookie Doe (you)',
+  );
+  expect(container.querySelector('.import-identity-question')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Change source: Fictional Imaging Center' }));
+  fireEvent.change(screen.getByRole('textbox', { name: 'Source' }), {
+    target: { value: 'Cookie Clinic' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Person' }));
+  expect(screen.queryByRole('button', { name: 'Confirm as me' })).toBeNull();
+  expect(screen.getByRole('button', { name: 'Done' })).toBeEnabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Source' }));
+  expect(screen.getByRole('textbox', { name: 'Source' })).toHaveValue('Cookie Clinic');
+  expect(onUseSource).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Person' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(onConfirmIdentity).not.toHaveBeenCalled();
+});
+
+it('opens the record editor directly beneath its row and preserves it when draft flush fails', async () => {
+  const value = sourceModel();
+  const beforeReviewChange = vi.fn().mockResolvedValue(true);
+  const onFiltersChange = vi.fn();
+  render(
+    <ImportReviewPresentation
+      model={value}
+      beforeReviewChange={beforeReviewChange}
+      actions={{ onFiltersChange }}
+      renderRecordReview={(record, close) => (
+        <section aria-label={`Inline editor for ${record.label}`}>
+          <label>
+            Reviewed value
+            <input defaultValue="Cookie Doe's fictional result" />
+          </label>
+          <button onClick={close}>Finish inline review</button>
+        </section>
+      )}
+    />,
+  );
+  const trigger = screen.getByRole('button', { name: 'Review' });
+  expect(trigger).toHaveAttribute('aria-expanded', 'false');
+  fireEvent.click(trigger);
+  const editor = await screen.findByRole('region', { name: /Inline editor/ });
+  expect(editor.closest('.import-record')).toBe(trigger.closest('.import-record'));
+  expect(screen.queryByRole('dialog')).toBeNull();
+  fireEvent.change(screen.getByLabelText('Reviewed value'), {
+    target: { value: 'Human correction' },
+  });
+  beforeReviewChange.mockResolvedValue(false);
+  fireEvent.click(screen.getByRole('button', { name: 'Close review' }));
+  await waitFor(() => expect(beforeReviewChange).toHaveBeenCalledTimes(2));
+  expect(screen.getByLabelText('Reviewed value')).toHaveValue('Human correction');
+  fireEvent.change(screen.getByRole('combobox', { name: 'Review status' }), {
+    target: { value: 'later' },
+  });
+  await waitFor(() => expect(beforeReviewChange).toHaveBeenCalledTimes(3));
+  expect(onFiltersChange).not.toHaveBeenCalled();
+  expect(screen.getByLabelText('Reviewed value')).toHaveValue('Human correction');
+  beforeReviewChange.mockResolvedValue(true);
+  fireEvent.click(screen.getByRole('button', { name: 'Close review' }));
+  await waitFor(() => expect(screen.queryByLabelText('Reviewed value')).toBeNull());
+});
+
+it('keeps the open draft mounted when a background feed removes its record version', async () => {
+  const original = sourceModel();
+  const props = {
+    beforeReviewChange: async () => true,
+    renderRecordReview: () => (
+      <label>
+        Unfinished record
+        <input defaultValue="Draft" />
+      </label>
+    ),
+  };
+  const view = render(<ImportReviewPresentation model={original} {...props} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+  fireEvent.change(await screen.findByLabelText('Unfinished record'), {
+    target: { value: 'Keep this correction' },
+  });
+  view.rerender(
+    <ImportReviewPresentation model={{ ...original, reports: [], records: [] }} {...props} />,
+  );
+  expect(screen.getByLabelText('Unfinished record')).toHaveValue('Keep this correction');
+  fireEvent.click(screen.getByRole('button', { name: 'Close review' }));
+  await waitFor(() => expect(screen.queryByLabelText('Unfinished record')).toBeNull());
+  await waitFor(() => expect(screen.queryByText('Fictional eyewear prescription')).toBeNull());
+});
+
+it('removes an open row when the feed confirms it was saved', async () => {
+  const original = sourceModel();
+  const props = {
+    renderRecordReview: () => <input aria-label="Pinned correction" defaultValue="Draft" />,
+  };
+  const view = render(<ImportReviewPresentation model={original} {...props} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+  fireEvent.change(await screen.findByLabelText('Pinned correction'), {
+    target: { value: 'Cookie Doe correction' },
+  });
+  view.rerender(
+    <ImportReviewPresentation
+      {...props}
+      model={{
+        ...original,
+        records: original.records.map((record) => ({
+          ...record,
+          status: 'saved',
+          kind: 'Documents',
+          manuallyEdited: true,
+        })),
+      }}
+    />,
+  );
+
+  await waitFor(() => expect(screen.queryByLabelText('Pinned correction')).toBeNull());
+  await waitFor(() => expect(screen.queryByText('Fictional eyewear prescription')).toBeNull());
+});
+
+it('retains a dirty report source editor across feed replacement but not profile changes', () => {
+  const original = { ...sourceModel(), contextKey: 'cookie-profile' };
+  const props = {
+    preserveSourceReview: true,
+    renderReportSourceReview: () => <input aria-label="Source correction" defaultValue="Draft" />,
+  };
+  const view = render(<ImportReviewPresentation {...props} model={original} />);
+  fireEvent.change(screen.getByLabelText('Source correction'), { target: { value: 'Keep text' } });
+  const empty = { ...original, reports: [], records: [] };
+  view.rerender(<ImportReviewPresentation {...props} model={empty} />);
+  expect(screen.getByLabelText('Source correction')).toHaveValue('Keep text');
+  view.rerender(
+    <ImportReviewPresentation {...props} model={{ ...empty, contextKey: 'other-profile' }} />,
+  );
+  expect(screen.queryByLabelText('Source correction')).toBeNull();
+});
+
+it('defaults a conflicting DOB to a new person and makes Self unavailable in the report pill sidebar', () => {
+  const current = personChoiceModel();
+  Object.assign(current.reports[0].subject, {
+    printedName: 'Cookie Doe',
+    label: 'Cookie Doe',
+    defaultPerson: 'new',
+    selfBirthDateConflict: true,
+  });
+  const confirm = vi.fn();
+  render(<ImportReviewPresentation model={current} actions={{ onConfirmIdentity: confirm }} />);
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  expect(screen.getByRole('combobox', { name: 'Person for this report' })).toHaveValue('new');
+  expect(screen.getByRole('option', { name: 'Me (Self)' })).toBeDisabled();
+  expect(screen.getByRole('textbox', { name: 'New person name' })).toHaveValue('Cookie Doe');
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm person' }));
+  expect(confirm).toHaveBeenCalledWith(
+    current.reports[0].id,
+    {},
+    { newPerson: { fullName: 'Cookie Doe' } },
+  );
+  expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+it('opens the same accordion from the blocker and row edit action without a navigation link', async () => {
+  const current = sourceModel();
+  Object.assign(current.records[0], {
+    detailUrl: '/import?group=cookie&record=result',
+    saveBlockReason: 'Check value',
+  });
+  render(
+    <ImportReviewPresentation
+      model={current}
+      renderRecordReview={(_, close) => (
+        <section aria-label="Cookie correction">
+          <button onClick={close}>Close correction</button>
+        </section>
+      )}
+    />,
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Open review' }));
+  await screen.findByRole('region', { name: 'Cookie correction' });
+  fireEvent.click(screen.getByRole('button', { name: 'Close correction' }));
+  await waitFor(() =>
+    expect(screen.queryByRole('region', { name: 'Cookie correction' })).toBeNull(),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+  await screen.findByRole('region', { name: 'Cookie correction' });
+  expect(screen.queryByRole('link', { name: 'Open review' })).toBeNull();
+});
+
+for (const scopeReady of [true, false])
+  it(`routes an identity blocker to the person sidebar (scope ready: ${scopeReady})`, async () => {
+    const current = sourceModel();
+    Object.assign(current.reports[0]!.subject, {
+      confirmed: false,
+      blocking: true,
+      scopeReady,
+      identityStatus: scopeReady ? 'confirmation_required' : 'conflict',
+      identityMessage: scopeReady ? 'Choose the report person.' : 'Conflicting extracted subjects.',
+    });
+    Object.assign(current.records[0]!, {
+      detailUrl: '/import?group=cookie&record=result',
+      saveBlockReason: 'Review report identity',
+      saveBlockReview: 'identity',
+    });
+    const renderCorrection = vi.fn(() => <div>Value correction</div>);
+    render(<ImportReviewPresentation model={current} renderRecordReview={renderCorrection} />);
+    const save = screen.getByRole('button', { name: 'Confirm & save' });
+    expect(save).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Review person' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(renderCorrection).not.toHaveBeenCalled();
+    expect(screen.queryByText('Value correction')).toBeNull();
+    if (!scopeReady)
+      expect(
+        within(dialog).getByText(/Editing a result cannot resolve this issue/),
+      ).toBeInTheDocument();
+    expect(save).toBeDisabled();
+  });
+
+for (const succeeds of [true, false])
+  it(`only removes an expanded row after an acknowledged save: ${succeeds}`, async () => {
+    const value = sourceModel();
+    value.records[0]!.eligible = true;
+    const save = controlledPromise<boolean>();
+    const props = {
+      model: value,
+      actions: { onSave: () => save.promise },
+      renderRecordReview: () => <input aria-label="Open correction" />,
+    };
+    const rendered = render(<ImportReviewPresentation {...props} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    await screen.findByLabelText('Open correction');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm & save' }));
+    expect(screen.getByLabelText('Open correction')).toBeVisible();
+    save.resolve(succeeds);
+    if (succeeds) {
+      await waitFor(() => expect(screen.queryByLabelText('Open correction')).toBeNull());
+      rendered.rerender(<ImportReviewPresentation {...props} model={{ ...value }} />);
+      expect(screen.queryByText('Fictional eyewear prescription')).toBeNull();
+    } else await waitFor(() => expect(screen.getByLabelText('Open correction')).toBeVisible());
+  });
+
+function AttentionMock({
+  onCount,
+  count = 2,
+}: {
+  onCount: (count: number) => void;
+  count?: number;
+}) {
+  useEffect(() => onCount(count), [count, onCount]);
+  return count ? <button>Add record from this section</button> : null;
+}
+
+it('shows source attention on Import even with zero proposals and guards a dirty review before leaving', async () => {
+  const guard = vi.fn().mockResolvedValue(true);
+  render(
+    <ImportReviewPresentation
+      model={model()}
+      beforeReviewChange={guard}
+      renderSourceAttention={(onCount) => <AttentionMock onCount={onCount} />}
+    />,
+  );
+  await userEvent.click(screen.getByRole('tab', { name: /^Needs attention/ }));
+  expect(screen.getByRole('button', { name: 'Add record from this section' })).toBeVisible();
+  expect(screen.queryByRole('searchbox', { name: 'Search records' })).toBeNull();
+  guard.mockResolvedValue(false);
+  await userEvent.click(screen.getByRole('tab', { name: /^All/ }));
+  expect(screen.getByRole('tab', { name: /^Needs attention/ })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  guard.mockResolvedValue(true);
+  await userEvent.click(screen.getByRole('tab', { name: /^All/ }));
+  expect(screen.getByRole('button', { name: 'Add record from this section' })).toBeVisible();
+});
+
+it('counts source sections in All and returns to All when attention becomes empty', async () => {
+  const value = sourceModel();
+  const view = render(
+    <ImportReviewPresentation
+      model={value}
+      renderSourceAttention={(onCount) => <AttentionMock onCount={onCount} count={3} />}
+    />,
+  );
+  await screen.findByRole('tab', { name: 'Needs attention 3' });
+  expect(screen.getByRole('tab', { name: 'All' + (value.records.length + 3) })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  expect(screen.getByRole('button', { name: 'Add record from this section' })).toBeVisible();
+  await userEvent.click(screen.getByRole('tab', { name: 'Needs attention 3' }));
+  view.rerender(
+    <ImportReviewPresentation
+      model={value}
+      renderSourceAttention={(onCount) => <AttentionMock onCount={onCount} count={0} />}
+    />,
+  );
+  await waitFor(() => expect(screen.queryByRole('tab', { name: /Needs attention/ })).toBeNull());
+  expect(screen.getByRole('tab', { name: /^All/ })).toHaveAttribute('aria-selected', 'true');
+});
+
+it('returns from an emptied Documents tab to All without changing the status view', async () => {
+  const value = sourceModel();
+  value.records = [
+    { ...value.records[0], id: 'cookie-document', kind: 'Documents' },
+    ...value.records,
+  ];
+  const filters = vi.fn();
+  const view = render(
+    <ImportReviewPresentation model={value} actions={{ onFiltersChange: filters }} />,
+  );
+  await userEvent.click(screen.getByRole('tab', { name: /^Documents/ }));
+  expect(screen.getByRole('tab', { name: /^Documents/ })).toHaveAttribute('aria-selected', 'true');
+  view.rerender(
+    <ImportReviewPresentation
+      model={{
+        ...value,
+        records: value.records.filter((record) => record.id !== 'cookie-document'),
+        filters: { ...value.filters!, kind: 'Documents' },
+      }}
+      actions={{ onFiltersChange: filters }}
+    />,
+  );
+  await waitFor(() =>
+    expect(screen.getByRole('tab', { name: /^All/ })).toHaveAttribute('aria-selected', 'true'),
+  );
+  expect(screen.queryByRole('tab', { name: /^Documents/ })).toBeNull();
+  expect(filters).toHaveBeenLastCalledWith(
+    expect.objectContaining({ kind: 'All', view: 'review' }),
+  );
+});
+
+it.each(['Documents', 'Test results'] as const)(
+  'keeps %s selected while its server-filtered feed loads, then returns to All only when settled empty',
+  async (kind) => {
+    const initial = sourceModel();
+    const target = { ...initial.records[0], id: 'target', kind };
+    const value = {
+      ...initial,
+      records: [...initial.records, target],
+      kindCounts: { All: 2, Vision: 1, [kind]: 1 },
+    };
+    const filters = vi.fn();
+    const view = render(
+      <ImportReviewPresentation model={value} actions={{ onFiltersChange: filters }} />,
+    );
+    await userEvent.click(screen.getByRole('tab', { name: new RegExp('^' + kind) }));
+    const requested = { ...value.filters!, kind };
+    const loading = {
+      ...value,
+      contextKey: 'fictional-profile:requested-' + kind,
+      filters: requested,
+      loading: true,
+      records: [],
+      kindCounts: undefined,
+    };
+    view.rerender(
+      <ImportReviewPresentation model={loading} actions={{ onFiltersChange: filters }} />,
+    );
+    expect(screen.getByText('Loading records…')).toBeVisible();
+    expect(screen.getByRole('tab', { name: new RegExp('^' + kind) })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    expect(filters).toHaveBeenCalledTimes(1);
+    const loaded = { ...loading, loading: false, records: [target], kindCounts: value.kindCounts };
+    view.rerender(
+      <ImportReviewPresentation model={loaded} actions={{ onFiltersChange: filters }} />,
+    );
+    expect(screen.getByRole('tab', { name: new RegExp('^' + kind) })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    expect(filters).toHaveBeenCalledTimes(1);
+    view.rerender(
+      <ImportReviewPresentation
+        model={{ ...loaded, records: [], kindCounts: { All: 1, Vision: 1, [kind]: 0 } }}
+        actions={{ onFiltersChange: filters }}
+      />,
+    );
+    await waitFor(() => expect(filters).toHaveBeenLastCalledWith({ ...requested, kind: 'All' }));
+  },
+);

@@ -25,7 +25,7 @@ declare global {
 
 // Default: production UI and encrypted runtime. Opt-in: the actual built app
 // image and Compose health service, isolated from all existing user archives.
-const dockerMode = process.env.HEALTH_PASSKEY_DOCKER_TEST === '1';
+const dockerMode = process.env.CRS_PASSKEY_DOCKER_TEST === '1';
 for (const prfOutput of ['buffer', 'array'])
   test(
     `automatic passkey confirmation and default restart unlock with ${prfOutput} PRF; cancellation and missing PRF preserve recovery`,
@@ -51,16 +51,16 @@ for (const prfOutput of ['buffer', 'array'])
       const runtimeDirectory = createTestRuntimeDirectory();
       const env = {
         ...process.env,
-        DATA_DIR: data,
-        PORT: String(port),
-        HEALTH_PUBLIC_ORIGIN: origin,
-        CIRCUS_AUTH_DIR: resolve(root, 'auth'),
-        CIRCUS_PROXY_KEY: resolve(root, 'key'),
-        LITELLM_CONFIG: resolve(root, 'config.yaml'),
-        LITELLM_ENV_FILE: resolve(root, 'empty.env'),
-        MODEL: 'fictional-only',
-        RESPONSE_MODEL: 'fictional-only',
-        IMAGES: 'false',
+        CRS_DATA_DIR: data,
+        CRS_PORT: String(port),
+        CRS_PUBLIC_ORIGIN: origin,
+        CRS_AUTH_DIR: resolve(root, 'auth'),
+        CRS_PROXY_KEY: resolve(root, 'key'),
+        CRS_LITELLM_CONFIG: resolve(root, 'config.yaml'),
+        CRS_LITELLM_ENV_FILE: resolve(root, 'empty.env'),
+        CRS_MODEL: 'fictional-only',
+        CRS_RESPONSE_MODEL: 'fictional-only',
+        CRS_IMAGES: 'false',
       };
       const compose = [
         'compose',
@@ -129,7 +129,7 @@ for (const prfOutput of ['buffer', 'array'])
       page.on('request', (request) => {
         if (request.url().endsWith('/passkeys/confirm')) savedRequests.push(request.url());
       });
-      const visuals = process.env.HEALTH_PASSKEY_VISUAL_DIR;
+      const visuals = process.env.CRS_PASSKEY_VISUAL_DIR;
       async function capture(prefix: string) {
         if (!visuals || prfOutput !== 'buffer') return;
         assert(
@@ -253,7 +253,7 @@ for (const prfOutput of ['buffer', 'array'])
       assert.deepEqual((await api('/api/profiles')).value.data, []);
       await page.getByRole('button', { name: 'Create profile', exact: true }).click();
       await page.getByLabel('Display name', { exact: true }).fill('Fictional Passkey Robin');
-      await page.getByLabel('Full name on health records').fill('Fictional Passkey Robin');
+      await page.getByLabel('Your name').fill('Fictional Passkey Robin');
       await page.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
       await page.getByRole('button', { name: 'Continue to recovery key' }).click();
       const recovery = await page.getByLabel('Recovery key', { exact: true }).inputValue();
@@ -308,8 +308,8 @@ for (const prfOutput of ['buffer', 'array'])
       );
       await page.evaluate(() => window.releaseConfirmation!());
       assert.equal((await confirmationResponse).status(), 200);
-      for (const step of ['About you', 'Primary care provider', 'Emergency contact']) {
-        const setup = page.getByRole('dialog', { name: 'A little about you' });
+      for (const step of ['Primary care provider', 'Emergency contact']) {
+        const setup = page.getByRole('dialog', { name: 'Care contacts' });
         await setup.getByRole('heading', { name: step, exact: true }).waitFor();
         await setup.getByRole('button', { name: 'Skip for now' }).click();
       }

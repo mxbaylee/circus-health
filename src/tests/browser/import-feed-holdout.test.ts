@@ -19,6 +19,7 @@ import type {
 import type { IntakePeopleQueue, IntakePersonApplyRequest } from '../../shared/intake-people.ts';
 import type {
   IntakeIdentityConfirmation,
+  IntakeIdentityReview,
   IntakeIdentityScope,
 } from '../../shared/intake-identity.ts';
 import type { VisionPrescriptionRecord } from '../../shared/vision.ts';
@@ -173,7 +174,7 @@ test(
     const runtime = await startRuntime({
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
-      codeRoot: process.env.CIRCUS_TEST_CODE_ROOT,
+      codeRoot: process.env.CRS_TEST_CODE_ROOT,
       port: 0,
       host: '127.0.0.1',
       assistantOptions: { availability: () => ({ available: false }) },
@@ -188,6 +189,38 @@ test(
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     page.setDefaultTimeout(15000);
+    async function captureControls(stage: string) {
+      if (!process.env.CRS_TEST_SCREENSHOTS) return;
+      mkdirSync(process.env.CRS_TEST_SCREENSHOTS, { recursive: true });
+      const viewport = page.viewportSize();
+      for (const width of [1440, 390]) {
+        await page.setViewportSize({ width, height: 1000 });
+        assert.ok(
+          await page.evaluate(
+            () => globalThis.document.documentElement.scrollWidth <= window.innerWidth + 1,
+          ),
+          'Import controls do not overflow the viewport',
+        );
+        if (await page.getByRole('dialog').count()) {
+          const rect = await page.getByRole('dialog').evaluate((element) => {
+            const box = element.getBoundingClientRect();
+            return { top: box.top, height: box.height, width: box.width };
+          });
+          assert.ok(
+            Math.abs(rect.top) < 1 && Math.abs(rect.height - 1000) < 1,
+            'Sidebar occupies the viewport height from its top',
+          );
+          if (width === 390)
+            assert.ok(Math.abs(rect.width - 390) < 1, 'Mobile sidebar uses the available width');
+        }
+        await page.screenshot({
+          path: resolve(process.env.CRS_TEST_SCREENSHOTS, `${stage}-${width}.png`),
+          fullPage: (await page.getByRole('dialog').count()) === 0,
+          animations: 'disabled',
+        });
+      }
+      if (viewport) await page.setViewportSize(viewport);
+    }
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
     await page.goto(url);
     const profileId = await page.evaluate(async () => {
@@ -241,7 +274,11 @@ test(
     const initial = await readFeed();
     assert.equal(initial.counts.pending, 5);
     assert.equal(initial.counts.blocked, 5, 'every printed-subject clinical row awaits review');
-    assert.equal(initial.counts.questions, 6, 'five identity issues plus one uncertain reading');
+    assert.equal(
+      initial.counts.questions,
+      11,
+      'five identity prompts, five saved-name conflicts, and one uncertain reading',
+    );
     const initialClinicalRecords = initial.blocks.flatMap((block) => block.records);
     assert.equal(initialClinicalRecords.length, 5);
     assert.equal(
@@ -250,13 +287,13 @@ test(
       'no printed-subject clinical record is selectable before identity review',
     );
     for (const record of initialClinicalRecords) {
-      assert.equal(record.identityReview?.status, 'confirmation_required');
+      assert.equal(record.identityReview?.status, 'conflict');
       assert.equal(record.identityReview?.blocking, true);
       assert.equal(
         record.issues?.filter(
           (issue) => issue.kind === 'identity' && issue.blocking && issue.status === 'unresolved',
         ).length,
-        1,
+        2,
       );
       assert.deepEqual(
         record.issues
@@ -264,8 +301,8 @@ test(
           .map((issue) => issue.kind)
           .sort(),
         record.title === 'Fictional Linden unclear result'
-          ? ['identity', 'uncertain_reading']
-          : ['identity'],
+          ? ['identity', 'identity', 'uncertain_reading']
+          : ['identity', 'identity'],
       );
     }
     assert.equal(initial.people.counts.pending, 2);
@@ -277,9 +314,34 @@ test(
     const laboratoryReport = page.getByRole('region', {
       name: /Fictional Linden laboratory report/,
     });
-    await laboratoryReport
-      .getByText('This report identifies “Fictional Sol Linden”. Is it yours?', { exact: true })
+    await laboratoryReport.getByRole('button', { name: /Review person for/ }).waitFor();
+    await captureControls('import-person-pending');
+    await laboratoryReport.getByRole('button', { name: /Review person for/ }).click();
+    await page
+      .getByRole('dialog')
+      .getByText('Choose who this report belongs to.', { exact: true })
       .waitFor();
+    await captureControls('import-person-sidebar');
+    if (process.env.CRS_TEST_SCREENSHOTS) {
+      await page.getByRole('dialog').getByRole('button', { name: 'Source', exact: true }).click();
+      await captureControls('import-source-sidebar');
+      await page.getByRole('dialog').getByRole('button', { name: 'Person', exact: true }).click();
+      await page
+        .getByRole('dialog')
+        .getByRole('link', { name: 'Review retained report evidence' })
+        .click();
+      await page
+        .getByRole('button', { name: 'Review person for this report', exact: true })
+        .click();
+      await page
+        .getByRole('dialog')
+        .getByRole('combobox', { name: 'Person for this report' })
+        .waitFor();
+      await captureControls('import-direct-person-sidebar');
+      await page.goto(url + '/#/import');
+      await page.reload();
+      await laboratoryReport.getByRole('button', { name: /Review person for/ }).click();
+    }
     const initialIdentityPosts: IntakeIdentityConfirmation[] = [];
     const captureInitialIdentity = (request: Request) => {
       if (request.method() === 'POST' && request.url().endsWith('/identity-scope'))
@@ -290,13 +352,13 @@ test(
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
-    await laboratoryReport.getByRole('button', { name: 'This is me', exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
     const initialIdentity = await initialIdentityResponse;
     assert.equal(initialIdentity.status(), 200, await initialIdentity.text());
     const initialIdentityRequest = initialIdentity
       .request()
       .postDataJSON() as IntakeIdentityConfirmation;
-    assert.equal(initialIdentityRequest.attestation, 'confirmed_displayed_report_subject');
+    assert.equal(initialIdentityRequest.attestation, 'confirmed_displayed_identity_questions');
     assert.equal(
       initialIdentityRequest.scope.groupId,
       initial.groups.find((group) => group.title === 'Fictional Linden laboratory report')!.groupId,
@@ -320,6 +382,11 @@ test(
     assert.equal(identityReady.counts.pending, 5);
     assert.equal(identityReady.counts.accepted, 0, 'identity confirmation does not accept records');
     assert.equal(identityReady.counts.questions, 1);
+    const selfAfterIdentity = await request<Note>('/notes/person-note%3Aself');
+    assert.equal(selfAfterIdentity.person.fullName, selfBefore.person.fullName);
+    assert.equal(selfAfterIdentity.person.birthDate, selfBefore.person.birthDate);
+    assert.deepEqual(selfAfterIdentity.person.knownNames, ['Fictional Sol Linden']);
+    assert.equal(selfAfterIdentity.person.sourceKnownNames?.[0]?.name, 'Fictional Sol Linden');
     const identityReadyRecords = identityReady.blocks.flatMap((block) => block.records);
     assert.equal(identityReadyRecords.filter((record) => record.selectable).length, 4);
     const stillBlocked = identityReadyRecords.filter((record) => !record.selectable);
@@ -344,6 +411,7 @@ test(
     await page.reload();
     await page.getByRole('tab', { name: /^All\s*7$/ }).waitFor();
     await page.getByRole('tab', { name: /^People\s*2$/ }).waitFor();
+    await captureControls('import-person-confirmed');
     await until(
       () => page.locator('.import-record').count(),
       (count) => count === 7,
@@ -594,7 +662,7 @@ test(
     }
     assert.deepEqual(
       (await request<Note>('/notes/person-note%3Aself')).person,
-      selfBefore.person,
+      selfAfterIdentity.person,
       'relative history and clinician contact never modify Self',
     );
     for (const original of [clinical, people]) {
@@ -616,11 +684,38 @@ test(
       valueText: '+02.00',
       unit: 'arb',
     });
+    const matchedOriginal = await upload([identityRow], 'fictional-linden-alias-match.jsonl');
+    const matchedGroup = matchedOriginal.intake.workflow!.reportGroups![0]!;
+    const matchedIdentity = await request<IntakeIdentityReview>(
+      `/intakes/${encodeURIComponent(matchedOriginal.intake.id)}/identity-review?groupId=${encodeURIComponent(matchedGroup.id)}`,
+    );
+    assert.equal(matchedIdentity.status, 'evidenced_match');
+    assert.equal(matchedIdentity.blocking, false);
+    assert.equal(matchedIdentity.evidencedIdentity.fullName, 'Fictional Sol Linden');
+    assert.equal(
+      (await request<Intake>(`/intakes/${encodeURIComponent(matchedOriginal.intake.id)}`)).workflow
+        ?.identityConfirmations?.length || 0,
+      0,
+    );
+    // A new fictional alias requires an explicit choice; the earlier confirmed
+    // spelling now correctly matches without repeating identity questions.
+    identityRow.report!.subject!.text = 'Fictional Sol Birch';
+    identityRow.payload = String(identityRow.payload).replaceAll(
+      'Fictional Sol Linden',
+      'Fictional Sol Birch',
+    );
     const identity = await upload([identityRow], 'fictional-linden-identity.jsonl');
     await page.goto(url + '/#/import');
     await page.reload();
+    const staleIdentityReport = page
+      .getByRole('region', {
+        name: /Fictional Linden identity holdout/,
+      })
+      .filter({ hasText: 'New Import Source: fictional-linden-identity.jsonl' });
+    await staleIdentityReport.getByRole('button', { name: /Review person for/ }).click();
     await page
-      .getByText('This report identifies “Fictional Sol Linden”. Is it yours?', { exact: true })
+      .getByRole('dialog')
+      .getByText(/report evidence has Fictional Sol Birch/)
       .waitFor();
     const identityFeed = await request<IntakeImportFeed>('/intakes/import-feed');
     const group = identityFeed.groups.find((item) => item.intakeId === identity.intake.id)!;
@@ -657,7 +752,7 @@ test(
         response.status() === 200,
     );
     page.on('request', captureIdentity);
-    await page.getByRole('button', { name: 'This is me', exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
     const firstIdentity = await firstIdentityResponse;
     assert.equal(firstIdentity.status(), 409, await firstIdentity.text());
     assert.equal((await firstIdentity.json()).error.code, 'VERSION_CONFLICT');
@@ -675,7 +770,7 @@ test(
       displayedScope,
       'first send is exactly what was displayed',
     );
-    assert.equal(identityPosts[0]!.attestation, 'confirmed_displayed_report_subject');
+    assert.equal(identityPosts[0]!.attestation, 'confirmed_displayed_identity_questions');
     assert.equal(identityPosts[1]!.operationId, identityPosts[0]!.operationId);
     const {
       intakeVersion: _oldVersion,
@@ -721,6 +816,10 @@ test(
     }));
     const questionsOriginal = await upload(questionRows, 'fictional-explicit-subject.jsonl');
     await page.reload();
+    await page
+      .getByRole('region', { name: /Fictional explicit subject report/ })
+      .getByRole('button', { name: /Review person for/ })
+      .click();
     await page.getByText(questionPrompt, { exact: true }).waitFor();
     assert.equal(
       await page.getByText(questionPrompt, { exact: true }).count(),
@@ -776,10 +875,20 @@ test(
     const anonymousOriginal = await upload([anonymous], 'fictional-anonymous.jsonl');
     await page.reload();
     const anonymousCard = page.getByRole('region', { name: /Fictional anonymous report/ });
-    await anonymousCard.getByRole('link', { name: 'Review report', exact: true }).click();
+    await anonymousCard.getByRole('button', { name: /Review person for/ }).click();
+    await page
+      .getByRole('dialog')
+      .getByText('Identity is not printed clearly in this report.', { exact: true })
+      .waitFor();
+    await page
+      .getByRole('dialog')
+      .getByRole('link', { name: 'Review retained report evidence' })
+      .click();
+    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
+    await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
     const anonymousReview = await request<IntakeReview>(
       `/intakes/${encodeURIComponent(anonymousOriginal.intake.id)}/review`,
     );

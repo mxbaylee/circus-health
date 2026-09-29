@@ -120,6 +120,7 @@ function EvidenceSide({
   mapping,
   evidence,
   onCorrect,
+  disabled = false,
 }: {
   heading: string;
   label: string;
@@ -127,6 +128,7 @@ function EvidenceSide({
   mapping: IntakeClinicalMapping;
   evidence: IntakeReviewRecord['evidence'];
   onCorrect?: () => void;
+  disabled?: boolean;
 }) {
   return (
     <section>
@@ -155,7 +157,7 @@ function EvidenceSide({
         <p>No original locator was supplied.</p>
       )}
       {onCorrect && (
-        <button type="button" className="button secondary" onClick={onCorrect}>
+        <button type="button" className="button secondary" onClick={onCorrect} disabled={disabled}>
           Correct this saved record
         </button>
       )}
@@ -200,7 +202,7 @@ export function RelatedRecordReview({
   ]);
 
   const discover = async (search: RelatedRecordSearch, append: boolean) => {
-    if (!onDiscover || loading) return;
+    if (!onDiscover || loading || disabled) return;
     setLoading(true);
     setError('');
     try {
@@ -232,7 +234,7 @@ export function RelatedRecordReview({
     comparison: IntakeEvidenceComparison,
     patch: Pick<IntakePairDecision, 'outcome'> | Pick<IntakePairDecision, 'reason'>,
   ) => {
-    if (!comparison.scope) return;
+    if (!comparison.scope || disabled) return;
     const saved = currentChoice(decision, comparison);
     const next: IntakePairDecision = {
       otherRecordId: comparison.id,
@@ -329,6 +331,7 @@ export function RelatedRecordReview({
                 mapping={other.mapping}
                 evidence={other.evidence}
                 onCorrect={onCorrectSaved ? () => onCorrectSaved(other) : undefined}
+                disabled={disabled}
               />
             </div>
             {other.previousDecision && (

@@ -1,3 +1,4 @@
+import { RecordCorrectionBadges, RecordCorrectionHistory } from './RecordCorrectionHistory';
 import { useEffect, useRef, useState } from 'react';
 import { Search, X, Plus } from 'lucide-react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
@@ -15,16 +16,18 @@ import { clinicalReferenceText } from './clinicalReference';
 
 export function ComparePicker({
   selected,
+  personId,
   onAdd,
 }: {
   selected: string[];
+  personId?: string;
   onAdd: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [offset, setOffset] = useState(0);
   const resource = useResource<TestType[]>(
-    open ? `/test-types?${queryString({ q: query, limit: 30, offset })}` : null,
+    open ? `/test-types?${queryString({ q: query, limit: 30, offset, personId })}` : null,
   );
   return (
     <div className="compare-picker">
@@ -117,6 +120,7 @@ export function MeasurementCharts({
   from,
   to,
   providerId,
+  personId,
   selectedId,
   onSelect,
   onRemove,
@@ -126,6 +130,7 @@ export function MeasurementCharts({
   from?: string;
   to?: string;
   providerId?: string;
+  personId?: string;
   selectedId?: string;
   onSelect?: (id: string) => void;
   onRemove?: (id: string) => void;
@@ -136,7 +141,7 @@ export function MeasurementCharts({
   const unit = params.get('compareUnit') || '';
   const resource = useResource<Trend[]>(
     ids.length
-      ? `/trends?${queryString({ ids: ids.join(','), from, to, providerId, unit })}`
+      ? `/trends?${queryString({ ids: ids.join(','), from, to, providerId, personId, unit })}`
       : null,
   );
   const previousRevision = useRef(revision);
@@ -144,7 +149,10 @@ export function MeasurementCharts({
     if (previousRevision.current !== revision) resource.reload();
     previousRevision.current = revision;
   }, [revision, resource.reload]);
-  const selectResult = onSelect ?? ((id: string) => navigate(resultLink(id)));
+  const ownedResultLink = (id: string) =>
+    resultLink(id) +
+    (personId && personId !== 'patient' ? `&personId=${encodeURIComponent(personId)}` : '');
+  const selectResult = onSelect ?? ((id: string) => navigate(ownedResultLink(id)));
   return (
     <>
       <div className="section-heading">
@@ -264,7 +272,11 @@ export function MeasurementCharts({
                             ' An alternative to a reviewed preferred result may also be left off this chart.'}
                         </p>
                         {omitted.map((point) => (
-                          <Link className="unplotted-row" key={point.id} to={resultLink(point.id)}>
+                          <Link
+                            className="unplotted-row"
+                            key={point.id}
+                            to={ownedResultLink(point.id)}
+                          >
                             <span>{formatDate(point.date)}</span>
                             <strong>{measurementChartDetails(point).originalDisplay}</strong>
                             <span>
@@ -278,43 +290,49 @@ export function MeasurementCharts({
                       <summary>Recorded values ({trend.points.length})</summary>
                       {trend.points.length ? (
                         trend.points.map((point) => (
-                          <Link className="unplotted-row" key={point.id} to={resultLink(point.id)}>
-                            <span>
-                              {formatDate(point.date)}
-                              <small>{point.datePrecision}</small>
-                            </span>
-                            <strong>
-                              {resultValue(point)} {resultUnit(point)}
-                            </strong>
-                            <span>{point.provider ?? 'Provider not recorded'}</span>
-                            <span>{point.status ?? 'Status not recorded'}</span>
-                            {unit && (
+                          <div key={point.id}>
+                            <Link className="unplotted-row" to={resultLink(point.id)}>
                               <span>
-                                {measurementChartDetails(point).convertedDisplay && (
-                                  <strong>{measurementChartDetails(point).convertedDisplay}</strong>
-                                )}
-                                {measurementChartDetails(point).conversionLabel ||
-                                  measurementChartDetails(point).reason}
-                                {clinicalReferenceText(point.reference) && (
-                                  <small>
-                                    Reference range (original, not converted):{' '}
-                                    {clinicalReferenceText(point.reference)}
-                                  </small>
-                                )}
+                                {formatDate(point.date)}
+                                <small>{point.datePrecision}</small>
                               </span>
-                            )}
-                            {point.relationship && (
-                              <span>
-                                {point.relationship.display.requiresReview
-                                  ? 'Relationship needs review'
-                                  : point.relationship.hasProviderAmendment
-                                    ? 'Reviewed provider amendment'
-                                    : point.relationship.display.oneReviewedEvent
-                                      ? 'Shares one reviewed event'
-                                      : 'Relationship history'}
-                              </span>
-                            )}
-                          </Link>
+                              <strong>
+                                {resultValue(point)} {resultUnit(point)}
+                              </strong>
+                              <span>{point.provider ?? 'Provider not recorded'}</span>
+                              <span>{point.status ?? 'Status not recorded'}</span>
+                              {unit && (
+                                <span>
+                                  {measurementChartDetails(point).convertedDisplay && (
+                                    <strong>
+                                      {measurementChartDetails(point).convertedDisplay}
+                                    </strong>
+                                  )}
+                                  {measurementChartDetails(point).conversionLabel ||
+                                    measurementChartDetails(point).reason}
+                                  {clinicalReferenceText(point.reference) && (
+                                    <small>
+                                      Reference range (original, not converted):{' '}
+                                      {clinicalReferenceText(point.reference)}
+                                    </small>
+                                  )}
+                                </span>
+                              )}
+                              {point.relationship && (
+                                <span>
+                                  {point.relationship.display.requiresReview
+                                    ? 'Relationship needs review'
+                                    : point.relationship.hasProviderAmendment
+                                      ? 'Reviewed provider amendment'
+                                      : point.relationship.display.oneReviewedEvent
+                                        ? 'Shares one reviewed event'
+                                        : 'Relationship history'}
+                                </span>
+                              )}
+                              <RecordCorrectionBadges extra={point.extra} />
+                            </Link>
+                            <RecordCorrectionHistory extra={point.extra} />
+                          </div>
                         ))
                       ) : (
                         <p className="helper-text">

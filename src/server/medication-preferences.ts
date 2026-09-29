@@ -14,10 +14,7 @@ export function appendMedicationPreference(db: Database, id: string, input: unkn
     input.version < 0
   )
     throw new HttpError(400, 'INVALID_INPUT', 'Supply a personal status and its current version');
-  required(
-    db.prepare("SELECT id FROM medications WHERE id=? AND person_id='patient'").get(id),
-    'Medication not found',
-  );
+  required(db.prepare('SELECT id FROM medications WHERE id=?').get(id), 'Medication not found');
   const current = db.prepare('SELECT * FROM medication_preferences WHERE medication_id=?').get(id);
   if ((current?.version ?? 0) !== input.version)
     throw new HttpError(

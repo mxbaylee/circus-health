@@ -21,13 +21,13 @@ import {
   type FictionalPdfKind,
 } from './fictional-pdf-benchmark-fixture.ts';
 
-const pages = Number(process.env.HEALTH_PDF_BENCHMARK_PAGES || 100);
-const targetBytes = Number(process.env.HEALTH_PDF_BENCHMARK_BYTES || 0);
-const kind = process.env.HEALTH_PDF_BENCHMARK_FIXTURE || 'mixed';
-const format = process.env.HEALTH_PDF_BENCHMARK_FORMAT || 'both';
-const order = process.env.HEALTH_PDF_BENCHMARK_ORDER || 'pdf,image';
-const keep = process.env.HEALTH_PDF_BENCHMARK_KEEP === '1';
-const readAll = process.env.HEALTH_PDF_BENCHMARK_READ_ALL === '1';
+const pages = Number(process.env.CRS_PDF_BENCHMARK_PAGES || 100);
+const targetBytes = Number(process.env.CRS_PDF_BENCHMARK_BYTES || 0);
+const kind = process.env.CRS_PDF_BENCHMARK_FIXTURE || 'mixed';
+const format = process.env.CRS_PDF_BENCHMARK_FORMAT || 'both';
+const order = process.env.CRS_PDF_BENCHMARK_ORDER || 'pdf,image';
+const keep = process.env.CRS_PDF_BENCHMARK_KEEP === '1';
+const readAll = process.env.CRS_PDF_BENCHMARK_READ_ALL === '1';
 if (
   !Number.isSafeInteger(pages) ||
   pages < 1 ||

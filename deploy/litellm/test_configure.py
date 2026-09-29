@@ -1,7 +1,7 @@
 """Offline tests for the app's LiteLLM configuration boundary.
 
 Run in the pinned LiteLLM image (which supplies PyYAML), with this file and
-configure.py mounted read-only. Set CIRCUS_CONFIGURE_SCRIPT to that script path.
+configure.py mounted read-only. Set CRS_CONFIGURE_SCRIPT to that script path.
 All configuration and generated files are fictional temporary fixtures.
 """
 import contextlib
@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import yaml
 
-SCRIPT = Path(os.environ.get('CIRCUS_CONFIGURE_SCRIPT', Path(__file__).parent / 'configure.py'))
+SCRIPT = Path(os.environ.get('CRS_CONFIGURE_SCRIPT', Path(__file__).parent / 'configure.py'))
 
 
 def sample():
@@ -75,7 +75,7 @@ class ConfigureTests(unittest.TestCase):
                     raise AssertionError('Metadata preflight imported LiteLLM')
                 return real_import(name, *args, **kwargs)
             stdout, stderr, status = io.StringIO(), io.StringIO(), 0
-            env = {'CIRCUS_MODEL': alias, 'FICTIONAL_KEY': 'fictional-private-value', **(extra_env or {})}
+            env = {'CRS_MODEL': alias, 'FICTIONAL_KEY': 'fictional-private-value', **(extra_env or {})}
             with patch.object(importlib.util, 'find_spec', return_value=None if spec_missing else SimpleNamespace(origin=str(Path(temporary) / '__init__.py'))) as package_spec, patch.object(builtins, '__import__', guarded_import), patch.object(socket, 'socket', no_network), patch.object(socket, 'create_connection', no_network), patch.object(Path, 'open', local_open), patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', [str(SCRIPT)] + (['check'] if check else [])), patch.object(Path, 'read_text', read), patch.object(Path, 'write_text', write), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 try:
                     runpy.run_path(str(SCRIPT), run_name='__main__')
@@ -240,12 +240,12 @@ class ConfigureTests(unittest.TestCase):
         self.assertNotIn('error', self.invoke(config)['settings'])
 
     def test_only_fixed_project_diagnostics_callback_can_be_enabled(self):
-        result = self.invoke(check=False, extra_env={'CIRCUS_LITELLM_RESPONSE_DIAGNOSTICS': 'true'})
+        result = self.invoke(check=False, extra_env={'CRS_LITELLM_RESPONSE_DIAGNOSTICS': 'true'})
         self.assertEqual(result['generated']['litellm_settings']['callbacks'],
                          ['response_diagnostics.response_diagnostics'])
-        invalid = self.invoke(extra_env={'CIRCUS_LITELLM_RESPONSE_DIAGNOSTICS': 'verbose'})
+        invalid = self.invoke(extra_env={'CRS_LITELLM_RESPONSE_DIAGNOSTICS': 'verbose'})
         self.assertIn('must be true or false', invalid['settings']['error'])
-        captured = self.invoke(check=False, extra_env={'CIRCUS_LITELLM_CAPTURE_RESPONSE': 'true'})
+        captured = self.invoke(check=False, extra_env={'CRS_LITELLM_CAPTURE_RESPONSE': 'true'})
         self.assertEqual(captured['generated']['litellm_settings']['callbacks'],
                          ['response_diagnostics.response_diagnostics'])
 

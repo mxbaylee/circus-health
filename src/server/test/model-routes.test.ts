@@ -18,10 +18,10 @@ interface ProfileResponse {
 
 test('setup uses the application proxy and retired agent attachment routes are unavailable', async (t) => {
   const env = {
-    HEALTH_AI_BACKEND: 'litellm',
-    HEALTH_AI_MODEL: 'fictional-route-alias',
-    HEALTH_AI_BASE_URL: 'http://litellm:4000',
-    HEALTH_AI_API_KEY: 'fictional-key',
+    CRS_AI_BACKEND: 'litellm',
+    CRS_AI_MODEL: 'fictional-route-alias',
+    CRS_AI_BASE_URL: 'http://litellm:4000',
+    CRS_AI_API_KEY: 'fictional-key',
   };
   const prior = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
   Object.assign(process.env, env);
@@ -47,7 +47,7 @@ test('setup uses the application proxy and retired agent attachment routes are u
     const challenge = challengeMatch[1];
     return new Response(
       JSON.stringify({
-        model: env.HEALTH_AI_MODEL,
+        model: env.CRS_AI_MODEL,
         choices: [
           {
             index: 0,

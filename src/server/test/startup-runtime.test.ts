@@ -74,7 +74,7 @@ function removeWorking(f: Fixture) {
 
 test('startup requires existing durable inputs and a separate disposable database root', (t) => {
   const f = fixture(t);
-  assert.throws(() => validateDataDirectory(), /DATA_DIR/);
+  assert.throws(() => validateDataDirectory(), /CRS_DATA_DIR/);
   assert.throws(() => validateDataDirectory('relative'), /absolute/);
   assert.throws(
     () => rebuildStartup({ ...f, runtimeDirectory: resolve(f.dataDirectory, 'working') }),
@@ -98,7 +98,7 @@ test('both runtime entry points reject disk-backed Linux runtime storage before 
           throw new Error('Runtime reached the writer before validating its storage');
         },
       }),
-      /HEALTH_RUNTIME_DIR.*tmpfs/,
+      /CRS_RUNTIME_DIR.*tmpfs/,
     );
   }
   assert.equal(lockAttempts, 0);
@@ -132,11 +132,11 @@ test('Linux runtime validation accepts tmpfs and rejects missing, relative, and 
     resolve(root, 'missing'),
     resolve(root, 'file'),
   ])
-    assert.throws(() => validateRuntimeDirectory(directory), /HEALTH_RUNTIME_DIR.*tmpfs/);
+    assert.throws(() => validateRuntimeDirectory(directory), /CRS_RUNTIME_DIR.*tmpfs/);
   probe.mock.mockImplementation(() => {
     throw new Error('statfs unavailable');
   });
-  assert.throws(() => validateRuntimeDirectory(root), /HEALTH_RUNTIME_DIR.*tmpfs/);
+  assert.throws(() => validateRuntimeDirectory(root), /CRS_RUNTIME_DIR.*tmpfs/);
 });
 
 for (const platform of ['darwin', 'win32'] as const)

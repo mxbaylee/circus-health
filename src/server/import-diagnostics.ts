@@ -4,6 +4,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import { HttpError } from './database.ts';
+import { ModelToolValidationError } from './model-tool-validation.ts';
+import {
+  diagnosticContext,
+  diagnosticValidation,
+  diagnosticValidationPath,
+  safeDiagnosticValidationCode,
+} from './import-diagnostic-error.ts';
 import { pdfEvidenceSessionDiagnostics } from './intake-pdf-session.ts';
 import { createRecentPerformance, type PerformanceSummaryStore } from './import-performance.ts';
 import { isDiagnosticRoute } from '../shared/import-diagnostic-route.ts';
@@ -171,12 +178,64 @@ const MiB = 1024 * 1024;
 const diagnosticCodePattern = /^[a-z][a-z0-9_.:-]{0,79}$/;
 
 function safeStringField(key: string, value: string): boolean {
+  if (key === 'lastChangeCategory')
+    return [
+      'identity_confirmation',
+      'proposal',
+      'acceptance',
+      'source_text',
+      'review',
+      'question',
+      'plan',
+      'workflow_update',
+      'unknown',
+    ].includes(value);
+  if (key === 'recoveryAction')
+    return [
+      'refresh_context',
+      'pause',
+      'context_read',
+      'batch_progress',
+      'source_read',
+      'reconcile_coverage',
+    ].includes(value);
+  if (key === 'contextSection')
+    return [
+      'plan',
+      'units',
+      'candidates',
+      'occurrences',
+      'report_scopes',
+      'questions',
+      'question_answers',
+      'proposals',
+      'decisions',
+      'batches',
+      'operations',
+      'acceptances',
+      'mapping_rules',
+      'missing_assets',
+      'unknown',
+    ].includes(value);
   if (key === 'method') return /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$/.test(value);
   if (key === 'route') return isDiagnosticRoute(value);
   if (key === 'scope') return value === 'process';
   if (key === 'toolName') return /^health_[a-z][a-z0-9_]{0,79}$/.test(value);
   if (key === 'model') return /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,159}$/.test(value);
   if (key === 'errorCode') return value === 'tool_rejected_after_close';
+  if (key === 'validationPath') return diagnosticValidationPath(value) === value;
+  if (key === 'validationCode') return safeDiagnosticValidationCode(value);
+  if (key === 'errorType')
+    return [
+      'http_error',
+      'model_tool_validation',
+      'type_error',
+      'syntax_error',
+      'range_error',
+      'error',
+      'non_error',
+    ].includes(value);
+  if (key === 'errorCategory') return ['validation', 'http', 'unexpected'].includes(value);
   if (key.endsWith('Kind'))
     return /^(array|bigint|boolean|bytes|function|null|number|object|string|symbol|undefined)$/.test(
       value,
@@ -190,6 +249,7 @@ function safeStringField(key: string, value: string): boolean {
  * The one `reasonCode` derivation for an `import.phase.failed` event, shared by
  * every phase so the coercion cannot be right at one call site and wrong at another.
  *
+ * Host HttpError and wrapped ModelToolValidationError codes are retained.
  * `HttpError.code` is *typed* `string` but is never coerced, and a PDF worker error
  * can carry a number: pdf.js sets `PasswordException.code` to the numeric
  * `PasswordResponses.NEED_PASSWORD` on a password-protected PDF, the worker's
@@ -201,9 +261,54 @@ function safeStringField(key: string, value: string): boolean {
  * event ships with no reason at all. Both cases resolve to 'unexpected_error'.
  */
 export function diagnosticReasonCode(error: unknown): string {
-  if (!(error instanceof HttpError) || typeof error.code !== 'string') return 'unexpected_error';
+  if (
+    !(error instanceof HttpError || error instanceof ModelToolValidationError) ||
+    typeof error.code !== 'string'
+  )
+    return 'unexpected_error';
   const code = error.code.toLowerCase();
   return diagnosticCodePattern.test(code) ? code : 'unexpected_error';
+}
+
+export function diagnosticFailureFields(error: unknown): ImportDiagnosticFields {
+  const validation = diagnosticValidation(error);
+  return {
+    ...diagnosticContext(error),
+    reasonCode: diagnosticReasonCode(error),
+    errorType:
+      error instanceof ModelToolValidationError
+        ? 'model_tool_validation'
+        : error instanceof HttpError
+          ? 'http_error'
+          : error instanceof TypeError
+            ? 'type_error'
+            : error instanceof SyntaxError
+              ? 'syntax_error'
+              : error instanceof RangeError
+                ? 'range_error'
+                : error instanceof Error
+                  ? 'error'
+                  : 'non_error',
+    errorCategory:
+      validation || error instanceof ModelToolValidationError
+        ? 'validation'
+        : error instanceof HttpError
+          ? 'http'
+          : 'unexpected',
+    ...(error instanceof HttpError &&
+    Number.isInteger(error.status) &&
+    error.status >= 400 &&
+    error.status <= 599
+      ? { status: error.status }
+      : {}),
+    ...(validation
+      ? {
+          validationCode: validation.code,
+          validationPath: validation.path,
+          ...(validation.line !== undefined ? { validationLine: validation.line } : {}),
+        }
+      : {}),
+  };
 }
 
 function boundedInteger(value: number, fallback: number, minimum: number, maximum: number): number {
@@ -560,7 +665,7 @@ export function createImportDiagnostics({
         return null;
       }
     };
-    void Promise.all([read(process.env.HEALTH_RUNTIME_DIR || '/run/health'), read(tmpdir())])
+    void Promise.all([read(process.env.CRS_RUNTIME_DIR || '/run/health'), read(tmpdir())])
       .then(([runtimeAvailableBytes, tempAvailableBytes]) => {
         if (!closed) {
           filesystemCapacity = { runtimeAvailableBytes, tempAvailableBytes };
@@ -895,7 +1000,7 @@ export function beginImportPhase(
       end('import.phase.completed', additions);
     },
     fail(error: unknown, additions: ImportDiagnosticFields = {}) {
-      end('import.phase.failed', { ...additions, reasonCode: diagnosticReasonCode(error) });
+      end('import.phase.failed', { ...additions, ...diagnosticFailureFields(error) });
     },
     cancel(additions: ImportDiagnosticFields = {}) {
       end('import.phase.cancelled', { ...additions, outcome: 'cancelled' });
@@ -955,9 +1060,9 @@ function environmentLimit(
 export function privateTraceEnvironmentOptions(
   env: NodeJS.ProcessEnv = process.env,
 ): PrivateTraceEnvironmentOptions {
-  const totalMiB = environmentLimit(env, 'HEALTH_IMPORT_PRIVATE_TRACE_MAX_TOTAL_MIB', 512, 2048);
-  const entryMiB = environmentLimit(env, 'HEALTH_IMPORT_PRIVATE_TRACE_MAX_ENTRY_MIB', 24, 32);
-  const entries = environmentLimit(env, 'HEALTH_IMPORT_PRIVATE_TRACE_MAX_ENTRIES', 8192, 16384);
+  const totalMiB = environmentLimit(env, 'CRS_IMPORT_PRIVATE_TRACE_MAX_TOTAL_MIB', 512, 2048);
+  const entryMiB = environmentLimit(env, 'CRS_IMPORT_PRIVATE_TRACE_MAX_ENTRY_MIB', 24, 32);
+  const entries = environmentLimit(env, 'CRS_IMPORT_PRIVATE_TRACE_MAX_ENTRIES', 8192, 16384);
   if (totalMiB === null || entryMiB === null || entries === null)
     return { configurationError: 'invalid_limits' };
   return {
@@ -968,22 +1073,22 @@ export function privateTraceEnvironmentOptions(
 }
 
 function diagnosticsEnabled(env: NodeJS.ProcessEnv): boolean {
-  return env.HEALTH_IMPORT_DIAGNOSTICS === 'true';
+  return env.CRS_IMPORT_DIAGNOSTICS === 'true';
 }
 
 export const importDiagnostics = createImportDiagnostics({
   enabled: diagnosticsEnabled(process.env),
   onEvent:
-    process.env.HEALTH_IMPORT_DIAGNOSTICS_CONSOLE === 'true'
+    process.env.CRS_IMPORT_DIAGNOSTICS_CONSOLE === 'true'
       ? (event, consoleScopeId) =>
           console.info('[Circus import]', JSON.stringify({ consoleScopeId, event }))
       : undefined,
   privateTrace: createPrivateImportTrace({
-    directory: process.env.HEALTH_IMPORT_PRIVATE_TRACE_DIR,
-    grantFile: process.env.HEALTH_IMPORT_PRIVATE_TRACE_GRANT_FILE,
+    directory: process.env.CRS_IMPORT_PRIVATE_TRACE_DIR,
+    grantFile: process.env.CRS_IMPORT_PRIVATE_TRACE_GRANT_FILE,
     acknowledged:
       diagnosticsEnabled(process.env) &&
-      process.env.HEALTH_IMPORT_PRIVATE_TRACE === 'contains-health-data',
+      process.env.CRS_IMPORT_PRIVATE_TRACE === 'contains-health-data',
     ...privateTraceEnvironmentOptions(process.env),
   }),
 });

@@ -1,3 +1,4 @@
+import { personDisplayKey } from '../shared/person-display.ts';
 import { onboardingIdentity } from './profile-onboarding.ts';
 import { profileDefinition } from './profiles.ts';
 import { seedSyntheticPlacebo, SYNTHETIC_PLACEBO_SEED } from './synthetic-placebo.ts';
@@ -31,7 +32,7 @@ import {
   durableWrite,
   syncDirectory,
 } from './portable.ts';
-import { selfIdentity, getNote, saveNote } from './notes.ts';
+import { registerProfileDisplayGuard, selfIdentity, getNote, saveNote } from './notes.ts';
 export interface ProfileRegistryEntry {
   id: string;
   placebo: boolean;
@@ -142,6 +143,22 @@ export function createProfileLifecycle({
     (readProfileRegistry(root) as ProfileRegistry).profiles
       .filter((p) => databases.has(p.id))
       .map((p) => profileInfo(databases.get(p.id)!, p));
+  function requireDistinctProfile(name: string, icon?: string, exceptId?: string) {
+    if (
+      list().some(
+        (p) =>
+          p.id !== exceptId && personDisplayKey(p.name, p.icon) === personDisplayKey(name, icon),
+      )
+    )
+      throw new HttpError(
+        409,
+        'DUPLICATE_PROFILE_DISPLAY',
+        'Another profile already has this display name and icon. Choose a different display name or icon.',
+      );
+  }
+  const guard = (id: string, db: Database) =>
+    registerProfileDisplayGuard(db, (name, icon) => requireDistinctProfile(name, icon, id));
+  for (const [id, db] of databases) guard(id, db);
   async function create(input: CreateProfileInput, sourceId?: string): Promise<ProfileInfo> {
     assertOpen();
     const name = nameOf(input?.name),
@@ -162,6 +179,7 @@ export function createProfileLifecycle({
         'PROFILE_BUSY',
         'Wait for this profile’s current work to finish before copying',
       );
+    requireDistinctProfile(name, sourceId ? selfIdentity(databases.get(sourceId)!).icon : 'person');
     if (sourceId) locks.add(sourceId);
     const stage = resolve(root, 'data/operations/profile-staging', id);
     let db: Database | null | undefined,
@@ -239,6 +257,7 @@ export function createProfileLifecycle({
         );
       }
       loadPortable(stage, id);
+      const createdIdentity = selfIdentity(db);
       db.close();
       db = null;
       const final = profilePaths(root, id);
@@ -265,12 +284,14 @@ export function createProfileLifecycle({
       }
       flushTree(paths.root);
       assertOpen();
+      requireDistinctProfile(createdIdentity.name, createdIdentity.icon);
       renameSync(paths.root, final.root);
       syncDirectory(dirname(final.root));
       db = openDatabase(finalDb, id);
       attachPersonalDurability(db, { root, profileId: id });
       const registry = readProfileRegistry(root) as ProfileRegistry;
       writeProfileRegistry(root, [...registry.profiles, { id, placebo }]);
+      guard(id, db);
       registered = true;
       databases.set(id, db);
       const result = profileInfo(db, { id, placebo });

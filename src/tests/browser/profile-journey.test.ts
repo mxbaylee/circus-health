@@ -22,7 +22,7 @@ test(
   { timeout: 90000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-'));
-    const visuals = process.env.CIRCUS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
+    const visuals = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
     mkdirSync(visuals, { recursive: true });
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
@@ -65,9 +65,7 @@ test(
       .getByLabel('Display name', { exact: true })
       .fill('Fictional Browser Person');
     const profileCreation = page.getByRole('dialog', { name: 'Create profile', exact: true });
-    await profileCreation
-      .getByLabel('Full name on health records')
-      .fill('Fictional Browser Person');
+    await profileCreation.getByLabel('Your name').fill('Fictional Browser Person');
     await profileCreation.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
     await page.getByRole('button', { name: 'Continue to recovery key' }).click();
     const recovery = await page.getByLabel('Recovery key', { exact: true }).inputValue();
@@ -110,8 +108,8 @@ test(
     await recoveryChoice.getByRole('button', { name: 'Add passkey', exact: true }).waitFor();
     await recoveryChoice.getByRole('button', { name: 'Skip', exact: true }).click();
     {
-      const setupDialog = page.getByRole('dialog', { name: 'A little about you' });
-      for (const step of ['About you', 'Primary care provider', 'Emergency contact']) {
+      const setupDialog = page.getByRole('dialog', { name: 'Care contacts' });
+      for (const step of ['Primary care provider', 'Emergency contact']) {
         await setupDialog.getByRole('heading', { name: step, exact: true }).waitFor();
         await setupDialog.getByRole('button', { name: 'Skip for now' }).click();
       }
@@ -269,18 +267,9 @@ test(
     assert(uploadResponse.ok(), await uploadResponse.text());
     assert.equal((await uploadResponse.json()).data.state, 'ready');
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
-    await page
-      .getByRole('status')
-      .getByText('1 result was saved to your profile.', { exact: true })
-      .waitFor();
-    assert.match(
-      (await page
-        .getByRole('region', { name: 'Just saved destinations' })
-        .getByRole('link')
-        .filter({ hasText: 'Fictional Example' })
-        .getAttribute('href')) || '',
-      /^#\/tests\?result=.+&visibility=all$/,
-    );
+    await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Dismiss notification' }).click();
+    assert.equal(await page.getByText('Imported 1 record', { exact: true }).count(), 0);
     const profile = (await (await page.request.get(url + '/api/profiles')).json()).data[0];
     const deliveries = (
       await (await page.request.get(`${url}/api/profiles/${profile.id}/intakes`)).json()
@@ -321,12 +310,9 @@ test(
       buffer: prescriptionOriginal,
     });
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
-    const prescriptionDestinations = page.getByRole('region', {
-      name: 'Just saved destinations',
-    });
-    await prescriptionDestinations
-      .getByRole('link', { name: 'Activate prescriptions', exact: true })
-      .click();
+    await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
+    await page.goto(url + '/#/medications');
+    await page.getByRole('button', { name: 'Activate prescriptions', exact: true }).click();
     await page.getByRole('region', { name: 'Activate imported prescriptions' }).waitFor();
     await page.evaluate(() => {
       document.documentElement.dataset.theme = 'light';
@@ -378,18 +364,7 @@ test(
     // A different filename retains a new source occurrence; linking its matching
     // clinical record still requires explicit acceptance.
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
-    await page
-      .getByRole('status')
-      .getByText('1 result was saved to your profile.', { exact: true })
-      .waitFor();
-    assert.match(
-      (await page
-        .getByRole('region', { name: 'Just saved destinations' })
-        .getByRole('link')
-        .filter({ hasText: 'Fictional Browser Medicine' })
-        .getAttribute('href')) || '',
-      /^#\/medications\?id=.+&status=all$/,
-    );
+    await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
     await page
       .getByRole('button', { name: 'Confirm & save', exact: true })
       .waitFor({ state: 'hidden' });
@@ -488,7 +463,7 @@ test(
       .getByRole('dialog')
       .getByLabel('Display name', { exact: true })
       .fill('Second Fictional Person');
-    await profileCreation.getByLabel('Full name on health records').fill('Second Fictional Person');
+    await profileCreation.getByLabel('Your name').fill('Second Fictional Person');
     await profileCreation.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
     await page.getByRole('button', { name: 'Continue to recovery key' }).click();
     const secondRecovery = await page.getByLabel('Recovery key', { exact: true }).inputValue();
@@ -500,8 +475,8 @@ test(
     await recoveryChoice.getByRole('button', { name: 'Add passkey', exact: true }).waitFor();
     await recoveryChoice.getByRole('button', { name: 'Skip', exact: true }).click();
     {
-      const setupDialog = page.getByRole('dialog', { name: 'A little about you' });
-      for (const step of ['About you', 'Primary care provider', 'Emergency contact']) {
+      const setupDialog = page.getByRole('dialog', { name: 'Care contacts' });
+      for (const step of ['Primary care provider', 'Emergency contact']) {
         await setupDialog.getByRole('heading', { name: step, exact: true }).waitFor();
         await setupDialog.getByRole('button', { name: 'Skip for now' }).click();
       }

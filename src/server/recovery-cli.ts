@@ -9,7 +9,8 @@ import { acquireStorageLock } from './storage-lock.ts';
 import { loadPortable, projectPortableDatabase, rebuildProfile } from './portable.ts';
 import type { CompleteLoadedPortable } from './portable.ts';
 const [command, ...args] = process.argv.slice(2);
-const archiveRoot = command === 'restore' ? null : validateDataDirectory(process.env.DATA_DIR, []);
+const archiveRoot =
+  command === 'restore' ? null : validateDataDirectory(process.env.CRS_DATA_DIR, []);
 const lease = ['backup', 'export-sources', 'rebuild'].includes(command)
   ? await acquireStorageLock(resolve(archiveRoot!, 'data'))
   : null;

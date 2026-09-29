@@ -1,0 +1,12 @@
+.person-confirmed-names {
+  padding: 0;
+  list-style: none;
+}
+.person-confirmed-names a {
+  display: inline-flex;
+  max-width: 100%;
+  text-decoration: none;
+}
+.person-confirmed-names li {
+  max-width: 100%;
+}

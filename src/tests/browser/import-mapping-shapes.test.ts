@@ -150,7 +150,7 @@ test(
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     const screenshots =
-      process.env.CIRCUS_TEST_SCREENSHOTS || resolve(tmpdir(), 'circus-import-shapes-visual');
+      process.env.CRS_TEST_SCREENSHOTS || resolve(tmpdir(), 'circus-import-shapes-visual');
     mkdirSync(screenshots, { recursive: true });
     async function capture(stage: string) {
       for (const theme of ['light', 'dark']) {
@@ -219,6 +219,20 @@ test(
       await exactLinks.first().waitFor();
       assert.equal(await exactLinks.count(), 1, 'The report keeps one exact optical record link');
       await exactLinks.first().click();
+      // No shared printed subject exists in this fixture. Its header review is
+      // informational; the explicit record-level identity answer stays separate.
+      await page
+        .getByRole('button', { name: 'Review person for this report', exact: true })
+        .click();
+      const personSidebar = page.getByRole('dialog', { name: 'Who is this report for?' });
+      await personSidebar
+        .getByText('Identity is not printed clearly in this report.', { exact: true })
+        .waitFor();
+      assert.equal(
+        await personSidebar.getByRole('button', { name: 'This is me', exact: true }).count(),
+        0,
+      );
+      await personSidebar.getByRole('button', { name: 'Close', exact: true }).click();
       await page.getByRole('button', { name: 'This is me', exact: true }).waitFor();
       assert.equal(await page.getByRole('article').count(), 1);
       await capture(clinical ? 'proposed-review' : 'top-level-review');

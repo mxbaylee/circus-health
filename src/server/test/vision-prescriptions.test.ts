@@ -38,7 +38,7 @@ import type {
   IntakeReviewRecord,
 } from '../../shared/intake.ts';
 import type { OpticalPrescription } from '../../shared/vision.ts';
-import { getIntakeIdentityScope, confirmIntakeIdentityScope } from '../intake-identity.ts';
+import { getIntakeIdentityReview, confirmIntakeIdentityScope } from '../intake-identity.ts';
 
 const optical: OpticalPrescription = {
   type: 'spectacle',
@@ -847,20 +847,29 @@ test('reviewed literal optical occurrences, corrections and indexed history surv
       newProviderName: 'Fictional optician',
       bytes: Buffer.from(scopedRows.map((row) => JSON.stringify(row)).join('\n')),
     });
-    const scope = await getIntakeIdentityScope(
+    const identity = await getIntakeIdentityReview(
       state.db,
       state.root,
       profile.id,
       intake.id,
       intake.workflow!.reportGroups![0]!.id,
     );
-    await confirmIntakeIdentityScope(state.db, state.root, profile.id, intake.id, {
-      version: scope.intakeVersion,
-      operationId: `fictional-optical-scope-${intake.id}`,
-      scope,
-      outcome: 'this_is_me',
-      attestation: 'reviewed_original_and_membership',
-    });
+    if (identity.blocking) {
+      const scope = identity.scope;
+      assert.ok(scope);
+      await confirmIntakeIdentityScope(state.db, state.root, profile.id, intake.id, {
+        version: scope.intakeVersion,
+        operationId: `fictional-optical-scope-${intake.id}`,
+        scope,
+        outcome: 'this_is_me',
+        attestation: scope.questions?.length
+          ? 'confirmed_displayed_identity_questions'
+          : 'reviewed_original_and_membership',
+      });
+    } else {
+      assert.equal(identity.status, 'evidenced_match');
+      assert.equal(identity.evidencedIdentity.fullName, 'Fictional Iris Cedar');
+    }
     const review = reviewIntake(state.db, state.root, profile.id, intake.id);
     const before = visionPrescriptions(state.db, new URLSearchParams()).total;
     importIntake(state.db, state.root, profile.id, intake.id, {

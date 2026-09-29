@@ -3,6 +3,7 @@ import {
   addWorkflowQuestion,
   workflowSummary,
   intakeCandidateId,
+  intakeCandidateVersionId,
   workflowHash,
 } from './intake-workflow.ts';
 import { canonicalLiteral } from './intake-format.ts';
@@ -189,7 +190,13 @@ export function duplicateRecord(db: DatabaseSync, kind: string, id: string): Dup
     identity: stringValue(imported.identity) || `${kind}:${id}`,
     version: stringValue(imported.version) || hash(row),
     stateHash: scopeHash(row),
-    mapping: Object.keys(acceptedMapping).length ? acceptedMapping : row,
+    mapping: {
+      ...(Object.keys(acceptedMapping).length ? acceptedMapping : row),
+      personId:
+        kind === 'document'
+          ? stringValue(imported.personId) || 'patient'
+          : stringValue(row.person_id) || 'patient',
+    },
     evidence: sources.map((source) => ({
       label: stringValue(source.acquiring_source) || 'Original source',
       locator:
@@ -788,6 +795,12 @@ export function saveDuplicateDecision(
       'DUPLICATE_DECISION',
       'Compare two different records of the same kind and give an evidence-based reason',
     );
+  if (
+    !intakeScope &&
+    duplicateRecord(db, left.kind, left.id).mapping.personId !==
+      duplicateRecord(db, right.kind, right.id).mapping.personId
+  )
+    throw new HttpError(409, 'DUPLICATE_PERSON', 'Both records must belong to the same person');
   if (!left.evidence?.length || !right.evidence?.length)
     throw new HttpError(400, 'DUPLICATE_EVIDENCE', 'Both records need retained original evidence');
   if (
@@ -1106,6 +1119,8 @@ export function previewDuplicateDecision(db: DatabaseSync, input: DuplicatePrevi
       'DUPLICATE_DECISION',
       'Choose two different records, an outcome and an evidence-based reason',
     );
+  if (left.mapping.personId !== right.mapping.personId)
+    throw new HttpError(409, 'DUPLICATE_PERSON', 'Both records must belong to the same person');
   const saved = latestDuplicateDecision(db, left, right);
   return {
     token: hash([revision(db), input, left, right]),
@@ -1144,7 +1159,11 @@ export function syncDuplicateQuestions(db: DatabaseSync, decision: DuplicateDeci
     const envelope = json(source.raw_json) as HealthRecordEnvelope,
       candidateId = intakeCandidateId(file, { value: envelope });
     if (!workflow.candidates.some((candidate) => candidate.id === candidateId)) continue;
-    const candidateVersionId = 'candidate-version:' + workflowHash(canonicalLiteral(envelope));
+    const candidateVersionId = intakeCandidateVersionId(
+      intake as Parameters<typeof intakeCandidateVersionId>[0],
+      source.source_file_id === file.id ? null : String(source.source_file_id),
+      { value: envelope },
+    );
     const question = addWorkflowQuestion(file, workflow, {
       key:
         'duplicate:' +

@@ -1,6 +1,7 @@
 import type { IntakeBatchItem, IntakeBatchReadingState } from '../shared/intake-batch.ts';
 
 export interface IntakeReadingLimits {
+  mode?: 'cumulative' | 'progress-window';
   activeMs: number;
   slices: number;
   turns: number;
@@ -9,6 +10,7 @@ export interface IntakeReadingLimits {
 }
 
 export const DEFAULT_INTAKE_READING_LIMITS: Readonly<IntakeReadingLimits> = {
+  mode: 'progress-window',
   activeMs: 2 * 60 * 60 * 1000,
   slices: 16,
   turns: 256,
@@ -22,8 +24,25 @@ const progress = (reading: IntakeBatchReadingState | null) => ({
   accounted: reading?.accountedUnits || 0,
 });
 
-export function beginReadingSlice(item: IntakeBatchItem, at: string): void {
+export function beginReadingSlice(
+  item: IntakeBatchItem,
+  at: string,
+  limits?: IntakeReadingLimits,
+): void {
   item.readingJob ||= {
+    limitPolicy: limits?.mode || 'cumulative',
+    ...(limits
+      ? {
+          limits: {
+            activeMs: limits.activeMs,
+            slices: limits.slices,
+            turns: limits.turns,
+            requests: limits.requests,
+            measuredTokens: limits.measuredTokens,
+          },
+        }
+      : {}),
+    progressWindows: 0,
     slices: 0,
     activeMs: 0,
     sliceStartedAt: null,
@@ -57,7 +76,12 @@ export function finishReadingSlice(
   const changed = (Object.keys(current) as (keyof typeof current)[]).some(
     (key) => current[key] > job.baseline[key],
   );
-  if (changed) job.lastProgressAt = at;
+  if (changed) {
+    // A fresh coverage/proposal checkpoint renews only an inactivity window.
+    // Cumulative requests, measured tokens, time, slices and unknown usage survive.
+    if (job.limitPolicy === 'progress-window') observeReadingProgress({ ...item, reading }, at);
+    else job.lastProgressAt = at;
+  }
   return changed;
 }
 
@@ -72,8 +96,24 @@ export function observeReadingProgress(item: IntakeBatchItem, at: string): boole
   if (changed) {
     job.lastProgressAt = at;
     job.observed = current;
+    if (job.limitPolicy === 'progress-window') renewProgressWindow(item, item.reading, at);
   }
   return changed;
+}
+function renewProgressWindow(
+  item: IntakeBatchItem,
+  reading: IntakeBatchReadingState | null,
+  at: string,
+) {
+  const job = item.readingJob!;
+  job.budgetAtActiveMs =
+    job.activeMs +
+    (job.sliceStartedAt ? Math.max(0, Date.parse(at) - Date.parse(job.sliceStartedAt)) : 0);
+  job.budgetAtSlices = job.slices;
+  job.budgetAtTurns = reading?.turns || 0;
+  job.budgetAtRequests = reading?.modelRequests || 0;
+  job.budgetAtTokens = reading?.measuredModelTokens || 0;
+  job.progressWindows = (job.progressWindows || 0) + 1;
 }
 
 export function readingBudgetReached(
@@ -83,6 +123,7 @@ export function readingBudgetReached(
 ): boolean {
   const job = item.readingJob;
   if (!job) return false;
+  limits = job.limits || limits;
   const currentMs = job.sliceStartedAt
     ? Math.max(0, Date.parse(at) - Date.parse(job.sliceStartedAt))
     : 0;
@@ -108,6 +149,8 @@ export function readingModelRequestBudgetReached(
   at: string,
   limits: IntakeReadingLimits = DEFAULT_INTAKE_READING_LIMITS,
 ): boolean {
+  if (item.readingJob?.limitPolicy === 'progress-window')
+    observeReadingProgress({ ...item, reading }, at);
   return readingBudgetReached(
     {
       ...item,

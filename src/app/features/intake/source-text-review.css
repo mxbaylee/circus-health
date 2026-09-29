@@ -1,0 +1,151 @@
+.source-text-browser {
+  margin-block: 1.25rem;
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: var(--surface);
+  min-width: 0;
+}
+.source-text-picker > p {
+  margin-block: 1rem;
+  max-width: 75ch;
+}
+.source-text-picker > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-inline-end: 1rem;
+}
+.source-text-picker > ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0;
+  margin-block: 1rem;
+  list-style: none;
+}
+.source-text-picker > ul button {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+.source-text-picker > ul button[aria-current='true'] {
+  background: var(--surface-hover);
+  border-color: currentColor;
+  font-weight: 600;
+}
+.source-text-review {
+  margin-block: 1rem;
+  min-width: 0;
+}
+.source-text-review h3,
+.source-text-review h4 {
+  margin-block: 1.25rem 0.65rem;
+}
+.source-text-review p {
+  margin-block: 0.65rem;
+  line-height: 1.55;
+}
+.source-text-review [role='status'],
+.source-text-review [role='alert'] {
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface-hover);
+  overflow-wrap: anywhere;
+}
+.source-review-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.25rem;
+}
+.source-review-columns section {
+  min-width: 0;
+}
+.source-review-columns {
+  margin-block: 1.25rem;
+  padding-block: 1rem;
+  border-block: 1px solid var(--border);
+}
+.source-review-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+  margin-block: 0.75rem;
+}
+.source-text-review label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-block: 0.65rem;
+}
+.source-text-review textarea {
+  width: 100%;
+  min-height: 3.5rem;
+  resize: vertical;
+  line-height: 1.55;
+  padding: 0.7rem;
+}
+.source-review-span:only-of-type textarea {
+  min-height: 12rem;
+}
+.source-text-review select {
+  max-width: 100%;
+}
+.source-review-span {
+  margin-block: 1rem;
+}
+.source-review-passages {
+  max-height: 60vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-inline: 0.25rem;
+  scrollbar-gutter: stable;
+}
+.source-review-passages:focus-within {
+  outline: 1px solid var(--border);
+  outline-offset: 2px;
+}
+.source-review-scroll {
+  max-height: 70vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 0.5rem;
+}
+.source-review-highlight {
+  position: absolute;
+  pointer-events: none;
+  border: 2px dashed var(--pink);
+  background: transparent;
+}
+.source-review-relation {
+  overflow-wrap: anywhere;
+  margin-block: 0.5rem;
+}
+.source-text-review pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  line-height: 1.65;
+}
+.source-text-review details {
+  margin-block: 1rem;
+}
+.source-text-review details > summary {
+  cursor: pointer;
+  padding-block: 0.5rem;
+}
+@media (max-width: 800px) {
+  .source-text-browser {
+    padding: 0.85rem;
+  }
+  .source-review-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -154,7 +154,7 @@ test(
     assert.equal(await pronouns.getAttribute('data-fictional-retained'), 'yes');
     assert.equal(await pronouns.inputValue(), 'Fictional accepted but unconfirmed');
     assert.equal(mutations, 1, 'reconnecting must not replay the unconfirmed save');
-    const visualOutput = process.env.HEALTH_CONNECTION_VISUAL_DIR;
+    const visualOutput = process.env.CRS_CONNECTION_VISUAL_DIR;
     const visuals = visualOutput ? prepareVisualDirectory(visualOutput) : null;
     if (visuals) {
       for (const theme of ['light', 'dark'])

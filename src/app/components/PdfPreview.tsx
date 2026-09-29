@@ -36,24 +36,53 @@ function binaryFactory(signal: AbortSignal) {
   };
 }
 
-export function PdfPreview({ contentUrl, filename }: { contentUrl: string; filename: string }) {
+export function PdfPreview({
+  contentUrl,
+  filename,
+  initialPage = 1,
+  compact = false,
+}: {
+  contentUrl: string;
+  filename: string;
+  initialPage?: number;
+  compact?: boolean;
+}) {
   const profile = useProfile();
   if (!profile) return null;
   // A changed profile or source cannot reuse the preceding document/canvas.
   return (
-    <PdfDocument key={`${profile.id}:${contentUrl}`} contentUrl={contentUrl} filename={filename} />
+    <PdfDocument
+      key={`${profile.id}:${contentUrl}:${initialPage}`}
+      contentUrl={contentUrl}
+      filename={filename}
+      initialPage={initialPage}
+      compact={compact}
+    />
   );
 }
 
-function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: string }) {
+function PdfDocument({
+  contentUrl,
+  filename,
+  initialPage,
+  compact,
+}: {
+  contentUrl: string;
+  filename: string;
+  initialPage: number;
+  compact: boolean;
+}) {
   const captionId = useId();
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [page, setPage] = useState(1);
+  const [rotation, setRotation] = useState(0);
+  const [zoom, setZoom] = useState(1);
   const [retry, setRetry] = useState(0);
   const [loading, setLoading] = useState(true);
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState('');
   const [pageText, setPageText] = useState('');
+  const [locationNotice, setLocationNotice] = useState('');
   const [width, setWidth] = useState(0);
   const frame = useRef<HTMLDivElement>(null);
   let scopedUrl: string | null = null;
@@ -77,6 +106,7 @@ function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: s
     setPdf(null);
     setPage(1);
     setPageText('');
+    setLocationNotice('');
     setLoading(true);
     setError('');
     frame.current?.replaceChildren();
@@ -136,6 +166,13 @@ function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: s
           return;
         }
         setPdf(document);
+        const validPage =
+          Number.isSafeInteger(initialPage) && initialPage > 0 && initialPage <= document.numPages;
+        setPage(validPage ? initialPage : 1);
+        if (!validPage)
+          setLocationNotice(
+            'The referenced page is unavailable. Showing the first page for context; verify the source location.',
+          );
         setLoading(false);
       } catch (cause) {
         if (controller.signal.aborted) return;
@@ -155,7 +192,7 @@ function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: s
       unsubscribe();
       destroy();
     };
-  }, [scopedUrl, retry]);
+  }, [scopedUrl, retry, initialPage]);
 
   useEffect(() => {
     const host = frame.current;
@@ -170,9 +207,11 @@ function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: s
       try {
         const pdfPage = await pdf.getPage(page);
         if (!active) return;
-        const original = pdfPage.getViewport({ scale: 1 });
+        const displayRotation = (pdfPage.rotate + rotation) % 360;
+        const original = pdfPage.getViewport({ scale: 1, rotation: displayRotation });
         const viewport = pdfPage.getViewport({
-          scale: Math.min(width / original.width, 1400 / original.height),
+          scale: Math.min(width / original.width, 1400 / original.height) * zoom,
+          rotation: displayRotation,
         });
         const outputScale = Math.min(window.devicePixelRatio || 1, 2);
         const canvas = document.createElement('canvas');
@@ -217,7 +256,7 @@ function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: s
       task?.cancel();
       host.replaceChildren();
     };
-  }, [pdf, page, width, filename]);
+  }, [pdf, page, width, filename, rotation, zoom]);
 
   return (
     <figure className="local-pdf-preview" aria-describedby={captionId}>
@@ -225,6 +264,11 @@ function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: s
         <strong>{filename}</strong>
         <span>{pdf ? `Page ${page} of ${pdf.numPages}` : 'PDF preview'}</span>
       </figcaption>
+      {locationNotice && (
+        <p className="pdf-preview-status" role="status">
+          {locationNotice}
+        </p>
+      )}
       <div className="pdf-page-controls">
         <button
           type="button"
@@ -248,6 +292,29 @@ function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: s
           <ChevronRight size={17} />
         </button>
       </div>
+      <div className="pdf-page-controls">
+        <button
+          type="button"
+          className="button secondary"
+          disabled={!pdf}
+          onClick={() => setRotation((value) => (value + 90) % 360)}
+        >
+          Rotate page
+        </button>
+        <label>
+          Zoom{' '}
+          <select
+            aria-label="PDF zoom"
+            value={zoom}
+            onChange={(event) => setZoom(Number(event.target.value))}
+            disabled={!pdf}
+          >
+            <option value={1}>Fit page</option>
+            <option value={1.5}>150%</option>
+            <option value={2}>200%</option>
+          </select>
+        </label>
+      </div>
       {(loading || rendering) && (
         <LoadingIndicator
           className="pdf-preview-status"
@@ -268,7 +335,7 @@ function PdfDocument({ contentUrl, filename }: { contentUrl: string; filename: s
         </div>
       )}
       <div ref={frame} className="pdf-page-frame" aria-busy={loading || rendering} />
-      {pdf && !loading && !rendering && !error && (
+      {!compact && pdf && !loading && !rendering && !error && (
         <details className="pdf-page-text">
           <summary>Extracted text from page {page}</summary>
           <p>

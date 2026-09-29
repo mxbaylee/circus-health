@@ -2,7 +2,10 @@ services:
   health:
     build:
       context: .
-    image: ${HEALTH_IMAGE:?use npm run start}
+      args:
+        CRS_BUILD_REVISION: ${CRS_BUILD_REVISION:-unknown}
+        CRS_BUILD_WORKTREE: ${CRS_BUILD_WORKTREE:-unknown}
+    image: ${CRS_IMAGE:?use npm run start}
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -10,43 +13,43 @@ services:
       - ALL
     ulimits:
       core: 0
-    pids_limit: ${HEALTH_PIDS_LIMIT:-512}
+    pids_limit: ${CRS_PIDS_LIMIT:-512}
     shm_size: 128m
-    cpus: ${HEALTH_CPUS:-2}
+    cpus: ${CRS_CPUS:-2}
     init: true
     depends_on:
       litellm:
         condition: service_healthy
     environment:
-      DATA_DIR: /archive/data
-      HEALTH_RUNTIME_DIR: /run/health
-      HEALTH_PUBLIC_PORT: ${PORT:-3001}
-      HEALTH_PUBLIC_ORIGIN: ${HEALTH_PUBLIC_ORIGIN:-http://localhost:${PORT:-3001}}
-      HEALTH_AI_BACKEND: litellm
-      HEALTH_AI_MODEL: ${MODEL:?use npm run start with MODEL}
-      HEALTH_AI_BASE_URL: http://litellm:4000
-      HEALTH_AI_API_KEY_FILE: /run/secrets/litellm_master_key
-      HEALTH_AI_PROXY_RESOLVED_MODEL: ${RESPONSE_MODEL:?use npm run start}
-      HEALTH_AI_PROXY_IMAGES: ${IMAGES:-false}
-      HEALTH_AI_PROXY_PDF: ${PDF:-auto}
-      HEALTH_AI_PROXY_PROMPT_CACHE: ${PROMPT_CACHE:-false}
-      HEALTH_AI_PROXY_TIMEOUT_SECONDS: ${HEALTH_AI_PROXY_TIMEOUT_SECONDS:-300}
-      HEALTH_INTAKE_UPLOAD_MIB: ${HEALTH_INTAKE_UPLOAD_MIB:-128}
-      HEALTH_INTAKE_EXTRACTION_MIB: ${HEALTH_INTAKE_EXTRACTION_MIB:-64}
-      HEALTH_IMPORT_DIAGNOSTICS: ${HEALTH_IMPORT_DIAGNOSTICS:-false}
+      CRS_DATA_DIR: /archive/data
+      CRS_RUNTIME_DIR: /run/health
+      CRS_PUBLIC_PORT: ${CRS_PORT:-3001}
+      CRS_PUBLIC_ORIGIN: ${CRS_PUBLIC_ORIGIN:-http://localhost:${CRS_PORT:-3001}}
+      CRS_AI_BACKEND: litellm
+      CRS_AI_MODEL: ${CRS_MODEL:?use npm run start with CRS_MODEL}
+      CRS_AI_BASE_URL: http://litellm:4000
+      CRS_AI_API_KEY_FILE: /run/secrets/litellm_master_key
+      CRS_AI_PROXY_RESOLVED_MODEL: ${CRS_RESPONSE_MODEL:?use npm run start}
+      CRS_AI_PROXY_IMAGES: ${CRS_IMAGES:-false}
+      CRS_AI_PROXY_PDF: ${CRS_PDF:-auto}
+      CRS_AI_PROXY_PROMPT_CACHE: ${CRS_PROMPT_CACHE:-false}
+      CRS_AI_PROXY_TIMEOUT_SECONDS: ${CRS_AI_PROXY_TIMEOUT_SECONDS:-300}
+      CRS_INTAKE_UPLOAD_MIB: ${CRS_INTAKE_UPLOAD_MIB:-128}
+      CRS_INTAKE_EXTRACTION_MIB: ${CRS_INTAKE_EXTRACTION_MIB:-64}
+      CRS_IMPORT_DIAGNOSTICS: ${CRS_IMPORT_DIAGNOSTICS:-false}
     ports:
-      - '127.0.0.1:${PORT:-3001}:3001'
+      - '127.0.0.1:${CRS_PORT:-3001}:3001'
     volumes:
       - type: bind
-        source: ${DATA_DIR:?use npm run start with DATA_DIR}
+        source: ${CRS_DATA_DIR:?use npm run start with CRS_DATA_DIR}
         target: /archive/data
         bind:
           create_host_path: false
     secrets:
       - litellm_master_key
     tmpfs:
-      - /run/health:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,size=${HEALTH_RUNTIME_TMPFS_MIB:-1024}m
-      - /tmp:rw,nosuid,nodev,noexec,size=${HEALTH_TMP_TMPFS_MIB:-128}m
+      - /run/health:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,size=${CRS_RUNTIME_TMPFS_MIB:-1024}m
+      - /tmp:rw,nosuid,nodev,noexec,size=${CRS_TMP_TMPFS_MIB:-128}m
     networks:
       - proxy
       - browser
@@ -75,14 +78,14 @@ services:
       - ALL
     ulimits:
       core: 0
-    pids_limit: ${LITELLM_PIDS_LIMIT:-256}
-    cpus: ${LITELLM_CPUS:-1}
+    pids_limit: ${CRS_LITELLM_PIDS_LIMIT:-256}
+    cpus: ${CRS_LITELLM_CPUS:-1}
     entrypoint: ['/bin/sh', '/opt/circus/entrypoint.sh']
     env_file:
-      - path: ${LITELLM_ENV_FILE:?use npm run start}
+      - path: ${CRS_LITELLM_ENV_FILE:?use npm run start}
         format: raw
     environment:
-      CIRCUS_MODEL: ${MODEL:?use npm run start with MODEL}
+      CRS_MODEL: ${CRS_MODEL:?use npm run start with CRS_MODEL}
       CHATGPT_TOKEN_DIR: /var/lib/litellm/chatgpt
       CHATGPT_AUTH_FILE: auth.json
       LITELLM_LOCAL_MODEL_COST_MAP: 'True'
@@ -90,7 +93,7 @@ services:
       LITELLM_MODE: PRODUCTION
     volumes:
       - type: bind
-        source: ${LITELLM_CONFIG:?use npm run start with LITELLM_CONFIG}
+        source: ${CRS_LITELLM_CONFIG:?use npm run start with CRS_LITELLM_CONFIG}
         target: /app/config.yaml
         read_only: true
         bind:
@@ -108,14 +111,14 @@ services:
         target: /tmp/response_diagnostics.py
         read_only: true
       - type: bind
-        source: ${CIRCUS_AUTH_DIR:?use npm run start}
+        source: ${CRS_AUTH_DIR:?use npm run start}
         target: /var/lib/litellm/chatgpt
         bind:
           create_host_path: false
     secrets:
       - litellm_master_key
     tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,mode=1777,size=${HEALTH_TMP_TMPFS_MIB:-128}m
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777,size=${CRS_TMP_TMPFS_MIB:-128}m
     extra_hosts:
       - host.docker.internal:host-gateway
     networks:
@@ -138,7 +141,7 @@ services:
 
 secrets:
   litellm_master_key:
-    file: ${CIRCUS_PROXY_KEY:?use npm run start}
+    file: ${CRS_PROXY_KEY:?use npm run start}
 
 networks:
   proxy:

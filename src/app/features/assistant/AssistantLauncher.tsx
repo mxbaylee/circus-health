@@ -1,9 +1,11 @@
+import { personScopeRoute } from '../../../shared/person-scope';
+import { usePersonScope } from '../../components/PersonScope';
 import { ClinicalReviewPreview } from './ClinicalReviewPreview';
 import { useEffect, useRef, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { MessageCircleMore, Plus, Send, Square, RotateCcw, X } from 'lucide-react';
 import { Link, useLocation } from 'react-router-dom';
-import { api, apiUrl, useResource } from '../../data/api';
+import { api, apiUrl, queryString, useResource } from '../../data/api';
 import { useProfile } from '../../data/profile';
 import type { Profile } from '../../data/profile';
 import { AssistantText, assistantLink } from './AssistantText';
@@ -95,6 +97,7 @@ export function AssistantLauncher() {
 function ProfileAssistant({ profile }: { profile: Profile }) {
   const location = useLocation();
   const page = useAssistantPage();
+  const personScope = usePersonScope();
   const [open, setOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -165,7 +168,11 @@ function ProfileAssistant({ profile }: { profile: Profile }) {
   async function mutate(action: 'send' | 'cancel' | 'retry' | 'apply', proposalId?: string) {
     if (
       pending ||
-      (action === 'send' && (!draft.trim() || running || !available)) ||
+      (action === 'send' &&
+        (!draft.trim() ||
+          running ||
+          !available ||
+          (!selectedId && (personScope?.pending || personScope?.error)))) ||
       (action === 'retry' && !available)
     )
       return;
@@ -230,12 +237,33 @@ function ProfileAssistant({ profile }: { profile: Profile }) {
       setStarters((current) => sampleStarterPrompts(Math.random, current));
   };
   const nextContext: AssistantContext =
-    !selectedId && prefillContext
-      ? prefillContext
-      : {
-          route: `${location.pathname}${location.search}`,
-          ...(page?.selection ? { selection: page.selection } : {}),
-        };
+    selectedId && chat?.context
+      ? chat.context
+      : !selectedId && prefillContext
+        ? prefillContext
+        : {
+            route: `${location.pathname}${location.search}`,
+            ...(page?.selection ? { selection: page.selection } : {}),
+          };
+  const contextUrl = new URL(
+    (nextContext.route || '/').replace(/^#/, ''),
+    'https://circus.invalid',
+  );
+  const contextScope = personScopeRoute(contextUrl.pathname, contextUrl.searchParams);
+  const contextOwner = useResource<{ personId: string | null }>(
+    open && contextScope.target ? `/record-owner?${queryString(contextScope.target)}` : null,
+  );
+  const contextPersonId = nextContext.intakeId
+    ? null
+    : contextOwner.data?.personId ||
+      (contextScope.scoped
+        ? contextUrl.searchParams.get('personId') || (contextScope.target ? null : 'patient')
+        : null);
+  const contextPerson = useResource<{ name: string }>(
+    contextPersonId && contextPersonId !== 'patient'
+      ? `/clinical-person/${encodeURIComponent(contextPersonId)}`
+      : null,
+  );
   const nextContextLabel = contextName(
     nextContext,
     !prefillContext && page?.route === nextContext.route ? page.label : undefined,
@@ -598,7 +626,11 @@ function ProfileAssistant({ profile }: { profile: Profile }) {
               />
             </label>
             <div className="assistant-composer-actions">
-              <span title={nextContext.route}>Next message context · {nextContextLabel}</span>
+              <span title={nextContext.route}>
+                Next message context · {nextContextLabel}
+                {contextPersonId &&
+                  ` · ${contextPersonId === 'patient' ? 'Self' : contextPerson.data?.name || 'Another person'}`}
+              </span>
               {running ? (
                 <button
                   className="button secondary"

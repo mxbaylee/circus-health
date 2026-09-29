@@ -15,13 +15,16 @@ interface UpstreamRequest {
   messages: Array<{ role: string }>;
 }
 const docker = (...args: string[]) =>
-  execFileSync(process.env.DOCKER || 'docker', args, { encoding: 'utf8', timeout: 30000 }).trim();
+  execFileSync(process.env.CRS_DOCKER || 'docker', args, {
+    encoding: 'utf8',
+    timeout: 30000,
+  }).trim();
 const image =
   'docker.io/litellm/litellm:1.99.1@sha256:a53a7d3ffebede1925bd3ee8a21e4a7b9b63e2e68ec883af136edcccb6eeb82c';
 
 test(
   'pinned LiteLLM Proxy completes the OpenAI tool loop against a synthetic upstream',
-  { skip: process.env.HEALTH_LITELLM_INTEGRATION_TEST !== '1', timeout: 150000 },
+  { skip: process.env.CRS_LITELLM_INTEGRATION_TEST !== '1', timeout: 150000 },
   async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'health-litellm-proxy-'));
     const name = `circus-litellm-${randomUUID().slice(0, 8)}`;
@@ -30,7 +33,7 @@ test(
       container = false;
     t.after(() => {
       if (container)
-        spawnSync(process.env.DOCKER || 'docker', ['rm', '-f', name], {
+        spawnSync(process.env.CRS_DOCKER || 'docker', ['rm', '-f', name], {
           encoding: 'utf8',
           timeout: 10000,
         });

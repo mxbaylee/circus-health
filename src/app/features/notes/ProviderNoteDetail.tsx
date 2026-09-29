@@ -1,3 +1,4 @@
+import { ClinicalOwner } from '../../components/ClinicalOwner';
 import { DetailHeader, EntryActions } from '../../components/DetailHeader';
 import { ArchiveControl } from '../../components/ArchiveControl';
 import { NoteExportDialog } from './NoteExportDialog';
@@ -22,6 +23,7 @@ export function ProviderNoteDetail({
 }) {
   return (
     <article className="panel note-detail provider-note-detail">
+      <ClinicalOwner personId={note.personId} />
       <DetailHeader
         eyebrow="PROVIDER NOTE"
         title={note.title}
@@ -42,7 +44,14 @@ export function ProviderNoteDetail({
         }
         actions={
           <>
-            <NoteExportDialog type="document" id={note.id} label="Print" />
+            {!note.personId || note.personId === 'patient' ? (
+              <NoteExportDialog type="document" id={note.id} label="Print" />
+            ) : (
+              <span className="helper-text">
+                Family records are available from their retained originals; clinical print packets
+                currently support Self.
+              </span>
+            )}
             <EntryActions>
               <RecordCorrectionAction
                 target={documentCorrectionTarget(note)}

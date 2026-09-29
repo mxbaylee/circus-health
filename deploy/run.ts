@@ -1,3 +1,4 @@
+import { readBuildSource } from '../src/scripts/build-source.ts';
 /** Docker Compose operator launcher. Secrets are never evaluated as shell input. */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -28,21 +29,23 @@ export const PROXY_IMAGE =
   'docker.io/litellm/litellm:1.99.1@sha256:a53a7d3ffebede1925bd3ee8a21e4a7b9b63e2e68ec883af136edcccb6eeb82c';
 export const HELP = `Circus Health runs in Docker with LiteLLM.
 
-DATA_DIR=/absolute/path/data MODEL=health-primary LITELLM_CONFIG=/absolute/path/litellm.yaml npm start
+CRS_DATA_DIR=/absolute/path/data CRS_MODEL=health-primary CRS_LITELLM_CONFIG=/absolute/path/litellm.yaml npm start
 
-Optional: LITELLM_ENV_FILE=/absolute/path/provider.env (secrets passed only to LiteLLM)
-          STATE_DIR=/absolute/path/state (default: ~/.local/state/circus-health)
-          PORT=3001, RESPONSE_MODEL=exact-returned-model, IMAGES=true|false
-          PDF=auto|true|false (default: auto; fictional connection check before private use)
-          PROMPT_CACHE=true|false (opt-in; requires provider prompt-cache support)
-          HEALTH_IMAGE=repository:tag (default: separate tag for each archive)
-STATE_DIR=/absolute/path/state npm run login:chatgpt
+Optional: CRS_LITELLM_ENV_FILE=/absolute/path/provider.env (secrets passed only to LiteLLM)
+          CRS_STATE_DIR=/absolute/path/state (default: ~/.local/state/circus-health)
+          CRS_PORT=3001, CRS_RESPONSE_MODEL=exact-returned-model, CRS_IMAGES=true|false
+          CRS_PDF=auto|true|false (default: auto; fictional connection check before private use)
+          CRS_PROMPT_CACHE=true|false (opt-in; requires provider prompt-cache support)
+          CRS_IMAGE=repository:tag (default: separate tag for each archive)
+          CRS_IMPORT_DIAGNOSTICS=true (show metadata diagnostics; default: false)
+CRS_STATE_DIR=/absolute/path/state npm run login:chatgpt
 npm run image:build
-DATA_DIR=/absolute/path/data npm run check:data
+CRS_DATA_DIR=/absolute/path/data npm run check:data
 npm run icons
 
 Prerequisites: Node 24, npm, Docker with Compose v2.30 or newer.
-Model/provider settings belong in your LiteLLM configuration. See docs/installation.md.
+Source your external shell env file before launch; .env files are not loaded automatically.
+Model/provider settings belong in your LiteLLM configuration. See docs/installation.md and docs/environment.md.
 Ctrl-C stops both containers. Health data and proxy authentication survive recreation.
 `;
 type Environment = NodeJS.ProcessEnv;
@@ -98,7 +101,7 @@ export function external(
   const path = canonicalPath(value);
   outsideGit(path);
   if (data && (inside(path, data) || (directory && inside(data, path))))
-    throw new Error(`${label} must be separate from DATA_DIR.`);
+    throw new Error(`${label} must be separate from CRS_DATA_DIR.`);
   if (/[,\n\r]/u.test(path)) throw new Error(`${label} cannot contain commas or newlines.`);
   if (create) mkdirSync(path, { recursive: true, mode: 0o700 });
   if (!existsSync(path) || !(directory ? statSync(path).isDirectory() : statSync(path).isFile()))
@@ -106,18 +109,18 @@ export function external(
   return path;
 }
 export function dataDirectory(env: Environment): string {
-  const path = external(env.DATA_DIR, 'DATA_DIR', { directory: true });
-  if (basename(path) !== 'data' || basename(env.DATA_DIR!) !== 'data')
-    throw new Error('DATA_DIR and its resolved target must end in /data.');
+  const path = external(env.CRS_DATA_DIR, 'CRS_DATA_DIR', { directory: true });
+  if (basename(path) !== 'data' || basename(env.CRS_DATA_DIR!) !== 'data')
+    throw new Error('CRS_DATA_DIR and its resolved target must end in /data.');
   return path;
 }
 export function publicOrigin(env: Environment, port: string): string {
-  const origin = env.HEALTH_PUBLIC_ORIGIN || `http://localhost:${port}`;
+  const origin = env.CRS_PUBLIC_ORIGIN || `http://localhost:${port}`;
   let url: URL;
   try {
     url = new URL(origin);
   } catch {
-    throw new Error('HEALTH_PUBLIC_ORIGIN must be an exact HTTP(S) origin.');
+    throw new Error('CRS_PUBLIC_ORIGIN must be an exact HTTP(S) origin.');
   }
   // Exact syntax is required: URL normalization must not silently repair input.
   const match = /^(https?):\/\/([^/?#]+)$/u.exec(origin);
@@ -131,10 +134,10 @@ export function publicOrigin(env: Environment, port: string): string {
     url.port === '0'
   )
     throw new Error(
-      'HEALTH_PUBLIC_ORIGIN must be an exact HTTP(S) origin without credentials, path, query or fragment.',
+      'CRS_PUBLIC_ORIGIN must be an exact HTTP(S) origin without credentials, path, query or fragment.',
     );
   if (url.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(url.hostname))
-    throw new Error('Non-local HEALTH_PUBLIC_ORIGIN must use HTTPS.');
+    throw new Error('Non-local CRS_PUBLIC_ORIGIN must use HTTPS.');
   return origin;
 }
 export function syncDirectory(path: string): void {
@@ -183,7 +186,7 @@ export class Docker {
   killGraceMs = 5_000;
   cleanupTimeoutMs = 60_000;
   private listeners: Array<[NodeJS.Signals, () => void]> = [];
-  constructor(binary = process.env.DOCKER || 'docker', listen = true) {
+  constructor(binary = process.env.CRS_DOCKER || 'docker', listen = true) {
     this.binary = binary;
     if (listen)
       for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
@@ -301,9 +304,9 @@ export class Docker {
   }
 }
 export function applicationImage(env: Environment, suffix: string): string {
-  const image = env.HEALTH_IMAGE || 'circus-health:' + suffix;
+  const image = env.CRS_IMAGE || 'circus-health:' + suffix;
   if (!/^[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$/u.test(image))
-    throw new Error('HEALTH_IMAGE must be a local image repository and optional tag.');
+    throw new Error('CRS_IMAGE must be a local image repository and optional tag.');
   return image;
 }
 
@@ -373,7 +376,7 @@ export function lease(
 export async function main(
   action = process.argv[2] || 'help',
   env: Environment = { ...process.env },
-  createDocker = () => new Docker(env.DOCKER || 'docker'),
+  createDocker = () => new Docker(env.CRS_DOCKER || 'docker'),
 ): Promise<void> {
   if (action === 'help') {
     console.log(HELP);
@@ -381,12 +384,39 @@ export async function main(
   }
   if (!['run', 'build', 'check-data', 'login-chatgpt'].includes(action))
     throw new Error('Unknown command; use npm run help.');
+  // Never silently fall back to a different archive/auth directory during migration.
+  const oldLauncherKeys = new Set([
+    'DATA_DIR',
+    'STATE_DIR',
+    'MODEL',
+    'PORT',
+    'LITELLM_CONFIG',
+    'LITELLM_ENV_FILE',
+    'RESPONSE_MODEL',
+    'IMAGES',
+    'PDF',
+    'PROMPT_CACHE',
+    'DOCKER',
+    'LITELLM_CPUS',
+    'LITELLM_PIDS_LIMIT',
+  ]);
+  for (const key of Object.keys(env)) {
+    const replacement = /^(HEALTH_|CIRCUS_)/.test(key)
+      ? key.replace(/^(HEALTH_|CIRCUS_)/, 'CRS_')
+      : oldLauncherKeys.has(key)
+        ? 'CRS_' + key
+        : null;
+    if (replacement && env[key] !== undefined && env[replacement] === undefined)
+      throw new Error(
+        `Rename ${key} to ${replacement}; legacy environment settings are no longer read.`,
+      );
+  }
   const obsolete = ['RUNTIME', 'AI', 'AI_URL', 'KEY_FILE', 'AUTH_DIR', 'ENV_FILE', 'STACK'].filter(
     (key) => env[key],
   );
   if (obsolete.length)
     throw new Error(
-      `Retired options: ${obsolete.join(', ')}. Use MODEL and LITELLM_CONFIG; Circus Health only runs in Docker through LiteLLM.`,
+      `Retired options: ${obsolete.join(', ')}. Use CRS_MODEL and CRS_LITELLM_CONFIG; Circus Health only runs in Docker through LiteLLM.`,
     );
   if (action === 'check-data') {
     console.log(`Archive mount location valid: ${dataDirectory(env)}`);
@@ -395,18 +425,28 @@ export async function main(
   const docker = createDocker();
   try {
     if (action === 'build') {
-      await docker.run(['build', '-t', applicationImage(env, 'build'), '.']);
+      const source = readBuildSource(ROOT);
+      await docker.run([
+        'build',
+        '--build-arg',
+        `CRS_BUILD_REVISION=${source.revision || 'unknown'}`,
+        '--build-arg',
+        `CRS_BUILD_WORKTREE=${source.worktree}`,
+        '-t',
+        applicationImage(env, 'build'),
+        '.',
+      ]);
       return;
     }
     if (action === 'login-chatgpt') {
-      const data = env.DATA_DIR ? dataDirectory(env) : undefined;
+      const data = env.CRS_DATA_DIR ? dataDirectory(env) : undefined;
       const state = external(
-        env.STATE_DIR || join(homedir(), '.local/state/circus-health'),
-        'STATE_DIR',
+        env.CRS_STATE_DIR || join(homedir(), '.local/state/circus-health'),
+        'CRS_STATE_DIR',
         { directory: true, data, create: true },
       );
       if (lstatSafe(join(state, 'chatgpt'))?.isSymbolicLink())
-        throw new Error('STATE_DIR/chatgpt must be a directory, not a symlink.');
+        throw new Error('CRS_STATE_DIR/chatgpt must be a directory, not a symlink.');
       const auth = external(join(state, 'chatgpt'), 'ChatGPT authentication', {
         directory: true,
         data,
@@ -452,19 +492,19 @@ export async function main(
       return;
     }
     const data = dataDirectory(env);
-    const config = external(env.LITELLM_CONFIG, 'LITELLM_CONFIG', { data });
-    const model = env.MODEL || '';
+    const config = external(env.CRS_LITELLM_CONFIG, 'CRS_LITELLM_CONFIG', { data });
+    const model = env.CRS_MODEL || '';
     if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/u.test(model))
-      throw new Error('MODEL must be an exact model_name alias from LITELLM_CONFIG.');
-    const port = env.PORT || '3001';
+      throw new Error('CRS_MODEL must be an exact model_name alias from CRS_LITELLM_CONFIG.');
+    const port = env.CRS_PORT || '3001';
     if (!/^\d+$/u.test(port) || Number(port) < 1 || Number(port) > 65535)
-      throw new Error('PORT must be an integer from 1 to 65535.');
+      throw new Error('CRS_PORT must be an integer from 1 to 65535.');
     const origin = publicOrigin(env, port);
     // Never transfer a writer domain before Docker's daemon is available.
     await docker.run(['info', '--format', '{{.ServerVersion}}'], { capture: true });
     const state = external(
-      env.STATE_DIR || join(homedir(), '.local/state/circus-health'),
-      'STATE_DIR',
+      env.CRS_STATE_DIR || join(homedir(), '.local/state/circus-health'),
+      'CRS_STATE_DIR',
       { directory: true, data, create: true },
     );
     const auth = external(join(state, 'chatgpt'), 'ChatGPT authentication', {
@@ -477,7 +517,7 @@ export async function main(
     external(key, 'Proxy key', { data });
     if (lstatSync(key).isSymbolicLink() || !/^sk-[0-9a-f]{64}\n?$/u.test(readFileSync(key, 'utf8')))
       throw new Error(
-        'STATE_DIR/proxy-key is invalid; preserve existing credentials and inspect the state directory.',
+        'CRS_STATE_DIR/proxy-key is invalid; preserve existing credentials and inspect the state directory.',
       );
     const emptyEnv = join(state, 'empty.env');
     durableCreate(emptyEnv, '');
@@ -486,8 +526,10 @@ export async function main(
       !statSync(emptyEnv).isFile() ||
       statSync(emptyEnv).size
     )
-      throw new Error('STATE_DIR/empty.env must be an empty regular file.');
-    const providerEnv = external(env.LITELLM_ENV_FILE || emptyEnv, 'LITELLM_ENV_FILE', { data });
+      throw new Error('CRS_STATE_DIR/empty.env must be an empty regular file.');
+    const providerEnv = external(env.CRS_LITELLM_ENV_FILE || emptyEnv, 'CRS_LITELLM_ENV_FILE', {
+      data,
+    });
     const preflight = await docker.run(
       [
         'run',
@@ -500,7 +542,7 @@ export async function main(
         '--env-file',
         providerEnv,
         '-e',
-        'CIRCUS_MODEL',
+        'CRS_MODEL',
         '--mount',
         `type=bind,source=${config},target=/app/config.yaml,readonly`,
         '--mount',
@@ -509,7 +551,7 @@ export async function main(
         '/opt/circus/configure.py',
         'check',
       ],
-      { env: { ...env, CIRCUS_MODEL: model }, capture: true },
+      { env: { ...env, CRS_MODEL: model }, capture: true },
     );
     let settings: {
       error?: string;
@@ -525,35 +567,38 @@ export async function main(
     if (!settings || typeof settings !== 'object')
       throw new Error('Could not read LiteLLM preflight settings.');
     if (settings.error) throw new Error(settings.error);
-    const responseModel = env.RESPONSE_MODEL || settings.response_model || '';
+    const responseModel = env.CRS_RESPONSE_MODEL || settings.response_model || '';
     if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/u.test(responseModel))
-      throw new Error('RESPONSE_MODEL must be an exact returned model identifier.');
-    const images = env.IMAGES || String(settings.images);
-    if (!['true', 'false'].includes(images)) throw new Error('IMAGES must be true or false.');
-    const pdf = env.PDF || 'auto';
+      throw new Error('CRS_RESPONSE_MODEL must be an exact returned model identifier.');
+    const images = env.CRS_IMAGES || String(settings.images);
+    if (!['true', 'false'].includes(images)) throw new Error('CRS_IMAGES must be true or false.');
+    const pdf = env.CRS_PDF || 'auto';
     if (!['auto', 'true', 'false'].includes(pdf))
-      throw new Error('PDF must be true or false, or auto.');
-    const promptCache = env.PROMPT_CACHE || String(settings.promptCache);
+      throw new Error('CRS_PDF must be true or false, or auto.');
+    const promptCache = env.CRS_PROMPT_CACHE || String(settings.promptCache);
     if (!['true', 'false'].includes(promptCache))
-      throw new Error('PROMPT_CACHE must be true or false.');
+      throw new Error('CRS_PROMPT_CACHE must be true or false.');
     const suffix = createHash('sha256').update(data).digest('hex').slice(0, 12);
+    const source = readBuildSource(ROOT);
     const composeEnv = {
       ...env,
-      DATA_DIR: data,
-      STATE_DIR: state,
-      CIRCUS_AUTH_DIR: auth,
-      LITELLM_CONFIG: config,
-      LITELLM_ENV_FILE: providerEnv,
-      CIRCUS_PROXY_KEY: key,
-      MODEL: model,
-      PORT: port,
-      HEALTH_PUBLIC_ORIGIN: origin,
-      RESPONSE_MODEL: responseModel,
-      IMAGES: images,
-      PDF: pdf,
-      PROMPT_CACHE: promptCache,
+      CRS_DATA_DIR: data,
+      CRS_STATE_DIR: state,
+      CRS_BUILD_REVISION: source.revision || 'unknown',
+      CRS_BUILD_WORKTREE: source.worktree,
+      CRS_AUTH_DIR: auth,
+      CRS_LITELLM_CONFIG: config,
+      CRS_LITELLM_ENV_FILE: providerEnv,
+      CRS_PROXY_KEY: key,
+      CRS_MODEL: model,
+      CRS_PORT: port,
+      CRS_PUBLIC_ORIGIN: origin,
+      CRS_RESPONSE_MODEL: responseModel,
+      CRS_IMAGES: images,
+      CRS_PDF: pdf,
+      CRS_PROMPT_CACHE: promptCache,
       COMPOSE_PROJECT_NAME: 'circus-health-' + suffix,
-      HEALTH_IMAGE: applicationImage(env, suffix),
+      CRS_IMAGE: applicationImage(env, suffix),
     };
     const compose = ['compose', '--env-file', emptyEnv, '-f', join(ROOT, 'compose.yaml')];
     const launcherLock = acquireLauncherLock(data);
@@ -576,7 +621,7 @@ export async function main(
             'health',
             '--input-type=module',
             '-e',
-            "import {validateRuntimeDirectory} from './src/server/startup-rebuild.ts'; try { validateRuntimeDirectory(process.env.HEALTH_RUNTIME_DIR); } catch { console.error('Circus Health runtime filesystem preflight failed: HEALTH_RUNTIME_DIR must be an existing absolute directory on tmpfs. Check the Compose runtime mount.'); process.exit(1); }",
+            "import {validateRuntimeDirectory} from './src/server/startup-rebuild.ts'; try { validateRuntimeDirectory(process.env.CRS_RUNTIME_DIR); } catch { console.error('Circus Health runtime filesystem preflight failed: CRS_RUNTIME_DIR must be an existing absolute directory on tmpfs. Check the Compose runtime mount.'); process.exit(1); }",
           ],
           { env: composeEnv },
         );

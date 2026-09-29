@@ -1,3 +1,5 @@
+import { ImportSourceTextBrowser } from '../features/import/ImportSourceTextBrowser';
+import { ClinicalOwner } from '../components/ClinicalOwner';
 import {
   ClinicalRedirect,
   isReclassifiedRecord,
@@ -29,6 +31,7 @@ import { AttachmentPanel } from '../features/notes/AttachmentPanel';
 import '../clinical.css';
 
 type Document = {
+  personId?: string;
   archived?: boolean;
   id: string;
   title: string;
@@ -43,6 +46,12 @@ export function Sources() {
   const offset = Math.max(0, Number(params.get('offset')) || 0);
   const recordOffset = Math.max(0, Number(params.get('recordOffset')) || 0);
   const browsingRecords = params.get('view') === 'records';
+  const browsingDocuments = params.get('view') === 'documents';
+  const documents = useResource<Document[]>(
+    browsingDocuments
+      ? `/documents?${queryString({ personId: params.get('personId') || 'patient', q, visibility: params.get('visibility') || 'visible', limit: 30, offset })}`
+      : null,
+  );
   const importing = params.get('view') === 'import' || params.has('intake');
   const selectedRecord = params.get('record');
   const selectedDocument = params.get('document');
@@ -53,7 +62,7 @@ export function Sources() {
     setParams(next, { replace });
   };
   const files = useResource<SourceFile[]>(
-    !browsingRecords && !importing
+    !browsingRecords && !browsingDocuments && !importing
       ? `/sources?${queryString({ q, visibility: params.get('visibility') || 'visible', limit: 30, offset })}`
       : null,
   );
@@ -64,7 +73,9 @@ export function Sources() {
   );
   const selectedFile =
     params.get('file') ??
-    (!browsingRecords && !selectedRecord && !selectedDocument ? files.data?.[0]?.id : undefined);
+    (!browsingRecords && !browsingDocuments && !selectedRecord && !selectedDocument
+      ? files.data?.[0]?.id
+      : undefined);
   const file = useResource<SourceFile>(
     !importing && selectedFile ? `/sources/${encodeURIComponent(selectedFile)}` : null,
   );
@@ -112,12 +123,30 @@ export function Sources() {
       record: null,
       document: null,
     });
+  const showDocuments = () =>
+    change({
+      view: 'documents',
+      file: null,
+      record: null,
+      document: null,
+      offset: null,
+      recordOffset: null,
+    });
   const tabKeys = (event: React.KeyboardEvent<HTMLButtonElement>) => {
     if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
       event.preventDefault();
-      const next = event.key === 'Home' ? false : event.key === 'End' ? true : !browsingRecords;
-      changeTab(next);
-      window.document.getElementById(next ? 'source-records-tab' : 'source-files-tab')?.focus();
+      const current = browsingDocuments ? 2 : browsingRecords ? 1 : 0;
+      const index =
+        event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? 2
+            : (current + (event.key === 'ArrowRight' ? 1 : 2)) % 3;
+      if (index === 2) showDocuments();
+      else changeTab(index === 1);
+      window.document
+        .getElementById(['source-files-tab', 'source-records-tab', 'source-documents-tab'][index])
+        ?.focus();
     }
   };
   if (importing) {
@@ -168,9 +197,9 @@ export function Sources() {
           role="tab"
           id="source-files-tab"
           aria-controls="sources-panel"
-          aria-selected={!browsingRecords}
-          tabIndex={browsingRecords ? -1 : 0}
-          className={!browsingRecords ? 'selected' : ''}
+          aria-selected={!browsingRecords && !browsingDocuments}
+          tabIndex={browsingRecords || browsingDocuments ? -1 : 0}
+          className={!browsingRecords && !browsingDocuments ? 'selected' : ''}
           onClick={() => changeTab(false)}
           onKeyDown={tabKeys}
         >
@@ -190,11 +219,26 @@ export function Sources() {
           <List size={17} aria-hidden="true" />
           Records
         </button>
+        <button
+          role="tab"
+          id="source-documents-tab"
+          aria-controls="sources-panel"
+          aria-selected={browsingDocuments}
+          tabIndex={browsingDocuments ? 0 : -1}
+          className={browsingDocuments ? 'selected' : ''}
+          onClick={showDocuments}
+          onKeyDown={tabKeys}
+        >
+          <FileText size={17} />
+          Documents
+        </button>
       </CollectionTabs>
       <CollectionToolbar>
         <CollectionFilters
           search={q}
-          searchLabel={browsingRecords ? 'retained records' : 'source files'}
+          searchLabel={
+            browsingDocuments ? 'documents' : browsingRecords ? 'retained records' : 'source files'
+          }
           onSearch={(q) =>
             change({ q, offset: null, file: null, record: null, document: null }, true)
           }
@@ -205,11 +249,47 @@ export function Sources() {
       <div
         id="sources-panel"
         role="tabpanel"
-        aria-labelledby={browsingRecords ? 'source-records-tab' : 'source-files-tab'}
+        aria-labelledby={
+          browsingDocuments
+            ? 'source-documents-tab'
+            : browsingRecords
+              ? 'source-records-tab'
+              : 'source-files-tab'
+        }
         className="clinical-workspace sources-workspace"
       >
         <section className="panel clinical-list">
-          {browsingRecords ? (
+          {browsingDocuments ? (
+            <ResourceState resource={documents} empty="No accepted documents match this search.">
+              {(rows) => (
+                <>
+                  {rows.map((item) => (
+                    <button
+                      key={item.id}
+                      className={`result-row ${selectedDocument === item.id ? 'is-selected' : ''}`}
+                      onClick={() => change({ document: item.id, file: null, record: null })}
+                    >
+                      <FileText size={20} />
+                      <span className="row-copy">
+                        <strong>{item.title}</strong>
+                        {item.date && <span>{formatDate(item.date)}</span>}
+                      </span>
+                      <ChevronRight size={18} />
+                    </button>
+                  ))}
+                  <Pagination
+                    offset={offset}
+                    limit={30}
+                    count={rows.length}
+                    total={
+                      typeof documents.meta?.total === 'number' ? documents.meta.total : undefined
+                    }
+                    onChange={(value) => change({ offset: String(value), document: null })}
+                  />
+                </>
+              )}
+            </ResourceState>
+          ) : browsingRecords ? (
             <ResourceState
               resource={allRecords}
               empty="No retained source records match this search."
@@ -306,6 +386,7 @@ export function Sources() {
                   <ClinicalRedirect record={item} />
                 ) : (
                   <>
+                    <ClinicalOwner personId={item.personId} />
                     <DetailHeader
                       eyebrow="DOCUMENT"
                       title={item.title}
@@ -440,6 +521,7 @@ export function Sources() {
                     </div>
                   </dl>
                   <SourcePreview file={item} />
+                  <ImportSourceTextBrowser intakeId={item.id} onChanged={files.reload} />
                   <details className="retained-details">
                     <summary>Historical extraction details</summary>
                     <dl className="source-fields">

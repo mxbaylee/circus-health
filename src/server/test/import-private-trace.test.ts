@@ -165,9 +165,9 @@ test('operator trace caps keep defaults, accept bounded overrides and fail close
   });
   assert.deepEqual(
     privateTraceEnvironmentOptions({
-      HEALTH_IMPORT_PRIVATE_TRACE_MAX_TOTAL_MIB: '2048',
-      HEALTH_IMPORT_PRIVATE_TRACE_MAX_ENTRY_MIB: '32',
-      HEALTH_IMPORT_PRIVATE_TRACE_MAX_ENTRIES: '16384',
+      CRS_IMPORT_PRIVATE_TRACE_MAX_TOTAL_MIB: '2048',
+      CRS_IMPORT_PRIVATE_TRACE_MAX_ENTRY_MIB: '32',
+      CRS_IMPORT_PRIVATE_TRACE_MAX_ENTRIES: '16384',
     }),
     {
       maxTotalBytes: 2048 * 1024 * 1024,
@@ -176,9 +176,9 @@ test('operator trace caps keep defaults, accept bounded overrides and fail close
     },
   );
   for (const env of [
-    { HEALTH_IMPORT_PRIVATE_TRACE_MAX_TOTAL_MIB: '2049' },
-    { HEALTH_IMPORT_PRIVATE_TRACE_MAX_ENTRY_MIB: '0' },
-    { HEALTH_IMPORT_PRIVATE_TRACE_MAX_ENTRIES: 'many' },
+    { CRS_IMPORT_PRIVATE_TRACE_MAX_TOTAL_MIB: '2049' },
+    { CRS_IMPORT_PRIVATE_TRACE_MAX_ENTRY_MIB: '0' },
+    { CRS_IMPORT_PRIVATE_TRACE_MAX_ENTRIES: 'many' },
   ])
     assert.deepEqual(privateTraceEnvironmentOptions(env), {
       configurationError: 'invalid_limits',
@@ -188,7 +188,7 @@ test('operator trace caps keep defaults, accept bounded overrides and fail close
   grant(grantFile);
   const trace = createPrivateImportTrace({
     ...traceOptions(root, grantFile),
-    ...privateTraceEnvironmentOptions({ HEALTH_IMPORT_PRIVATE_TRACE_MAX_ENTRIES: '16385' }),
+    ...privateTraceEnvironmentOptions({ CRS_IMPORT_PRIVATE_TRACE_MAX_ENTRIES: '16385' }),
   });
   assert.equal(trace.status('fictional').enabled, false);
   assert.equal(trace.status('fictional').reason, 'invalid_limits');

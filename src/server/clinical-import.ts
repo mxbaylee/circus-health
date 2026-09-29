@@ -1,3 +1,5 @@
+import { clinicalDatePrecision } from '../shared/clinical-date.ts';
+import { noteVisibilitySQL } from './visibility.ts';
 import { clinicalSourceIdentityV1 } from './intake-source-identity.ts';
 import { clinicalSourceScopeCheck } from './clinical-source-scope.ts';
 import { appendImportedMedicationDefault } from './medication-preferences.ts';
@@ -80,6 +82,7 @@ interface SqlRow {
 type PartialSqlRow = Partial<SqlRow>;
 
 interface ClinicalMapping {
+  personId?: string;
   eventKind: string;
   observationCategory: string;
   documentCategory: string;
@@ -496,14 +499,8 @@ export function applyRules(mapping: ClinicalMapping, rules: ActiveMappingRule[])
   return result;
 }
 export function datePrecision(date: string): DatePrecision {
-  if (!date) return 'unknown';
-  if (/^\d{4}$/.test(date)) return 'year';
-  if (/^\d{4}-(0[1-9]|1[0-2])$/.test(date)) return 'month';
-  if (/^\d{4}-\d{2}-\d{2}(T.*)?$/.test(date) && Number.isFinite(Date.parse(date))) {
-    const day = date.slice(0, 10);
-    if (new Date(day + 'T00:00:00Z').toISOString().slice(0, 10) === day)
-      return date.includes('T') ? 'datetime' : 'day';
-  }
+  const precision = clinicalDatePrecision(date);
+  if (precision) return precision;
   throw new HttpError(400, 'IMPORT_DATE', 'Keep a valid original date or leave it unknown');
 }
 export function checkClinicalMapping(mapping: ClinicalMapping): string | null {
@@ -520,7 +517,11 @@ export function checkClinicalMapping(mapping: ClinicalMapping): string | null {
     const problem = opticalPrescriptionProblem(mapping.opticalPrescription);
     if (problem) return problem;
   }
-  if (mapping.subject !== 'self') return 'Patient/subject is not established as Self';
+  if (
+    mapping.subject !== 'self' &&
+    !(mapping.subject === 'other' && mapping.personId && mapping.personId !== 'patient')
+  )
+    return 'Choose who this clinical record belongs to';
   if (!labelOf(mapping).trim()) return 'Entry label is missing';
   if (mapping.kind === 'observation' && !mapping.valueText.trim()) return 'Result value is missing';
   if (
@@ -555,6 +556,24 @@ export function refreshClinicalIdentityPolicy(
     sourceScopeProblem?: string | null;
     classification: IntakeReviewRecord['classification'];
   };
+  const assigned = record.identityAttribution?.assignedPerson;
+  if (record.mapping.personId) {
+    const person = db
+      .prepare(
+        `SELECT n.id FROM notes n WHERE n.kind='person' AND n.person_id=? AND ${noteVisibilitySQL('n')}=0`,
+      )
+      .get(record.mapping.personId);
+    if (!assigned || assigned.personId !== record.mapping.personId || !person) {
+      record.identityReview = {
+        ...(record.identityReview || { status: 'conflict', evidencedIdentity: {}, conflicts: [] }),
+        status: 'conflict',
+        blocking: true,
+        message: 'Choose an available person for this exact report before saving.',
+      };
+      delete record.mapping.personId;
+      delete record.identityAttribution;
+    }
+  }
   const problem =
     internal.sourceScopeProblem ||
     checkClinicalMapping(record.mapping as ClinicalMapping) ||
@@ -624,9 +643,19 @@ export function clinicalVersion(mapping: ClinicalMapping): string {
           ? (['text'] as (keyof ClinicalMapping)[])
           : []),
   ];
-  return hash(canonical(Object.fromEntries(keys.map((k) => [k, mapping[k]]))));
+  return hash(
+    canonical({
+      ...Object.fromEntries(keys.map((k) => [k, mapping[k]])),
+      ...(mapping.personId && mapping.personId !== 'patient' ? { personId: mapping.personId } : {}),
+    }),
+  );
 }
-function previous(db: DatabaseSync, identityKey: string, versionKey: string): PriorRecord | null {
+function previous(
+  db: DatabaseSync,
+  identityKey: string,
+  versionKey: string,
+  personId = 'patient',
+): PriorRecord | null {
   let changed: PriorRecord | null = null;
   for (const [table, kind] of Object.entries({
     observations: 'observation',
@@ -636,9 +665,9 @@ function previous(db: DatabaseSync, identityKey: string, versionKey: string): Pr
   })) {
     const rows = db
       .prepare(
-        `SELECT id,source_record_id,extra_json FROM ${table} WHERE json_extract(extra_json,'$.import.identity')=? ORDER BY id`,
+        `SELECT id,source_record_id,extra_json FROM ${table} WHERE json_extract(extra_json,'$.import.identity')=? AND ${table === 'documents' ? "COALESCE(json_extract(extra_json,'$.import.personId'),'patient')" : 'person_id'}=? ORDER BY id`,
       )
-      .all(identityKey) as PartialSqlRow[];
+      .all(identityKey, personId) as PartialSqlRow[];
     const exact = rows.find(
       (row) => parsedObject(parsedObject(row.extra_json).import).version === versionKey,
     );
@@ -795,7 +824,7 @@ export function buildClinicalReview(
         scopeProblem || checkClinicalMapping(mapping) || assetProblem(db, file, mapping),
       identityKey = identity(entry, file),
       versionKey = clinicalVersion(mapping),
-      prior = scopeProblem ? null : previous(db, identityKey, versionKey),
+      prior = scopeProblem ? null : previous(db, identityKey, versionKey, mapping.personId),
       found = scopeProblem
         ? null
         : (prior?.exact ? prior : null) ||
@@ -1500,6 +1529,9 @@ export function projectClinicalReview(
     const reportSource = reportSourceResolution?.confirmation;
     const reviewedReportSource = reportSourceResolution
       ? {
+          ...(reportSourceResolution.confirmation.basis
+            ? { basis: reportSourceResolution.confirmation.basis }
+            : {}),
           source: reportSourceResolution.confirmation.source,
           sourceProviderId: reportSourceResolution.confirmation.sourceProviderId,
           groupId: reportSourceResolution.confirmation.groupId,
@@ -1576,6 +1608,25 @@ export function projectClinicalReview(
       )) {
         // A scoped result from any search page is valid; the default page is not an allowlist.
         const target = duplicateRecord(db, mapping.kind, comparison.otherRecordId);
+        const targetTable = {
+          observation: 'observations',
+          medication: 'medications',
+          procedure: 'procedures',
+          document: 'documents',
+        }[mapping.kind as ClinicalKind];
+        const targetOwner =
+          targetTable &&
+          db
+            .prepare(
+              `SELECT ${targetTable === 'documents' ? "COALESCE(json_extract(extra_json,'$.import.personId'),'patient')" : 'person_id'} AS personId FROM ${targetTable} WHERE id=?`,
+            )
+            .get(target.id)?.personId;
+        if (targetOwner !== (mapping.personId || 'patient'))
+          throw new HttpError(
+            409,
+            'IDENTITY_SELECTION',
+            'Clinical comparisons must stay within the selected person',
+          );
         const left = {
           id: entityId,
           kind: mapping.kind as ClinicalKind,
@@ -1636,6 +1687,15 @@ export function projectClinicalReview(
       continue;
     }
     const mapping = { ...record.mapping };
+    if (
+      mapping.personId &&
+      record.identityAttribution?.assignedPerson?.personId !== mapping.personId
+    )
+      throw new HttpError(
+        409,
+        'IDENTITY_SELECTION',
+        'The selected person requires an exact retained identity confirmation',
+      );
     for (const [k, v] of Object.entries(decision.mapping || {})) {
       if (canonical(v) === canonical((record.mapping as unknown as Record<string, unknown>)[k]))
         continue;
@@ -1711,9 +1771,21 @@ export function projectClinicalReview(
         record.id,
       );
     }
+    if (mapping.personId)
+      db.prepare(
+        "INSERT OR IGNORE INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES(?,'person',?,?,'report_subject',?)",
+      ).run(
+        'identity-person:' + hash([mapping.personId, record.id]),
+        mapping.personId,
+        record.id,
+        JSON.stringify({
+          intakeId: file.id,
+          confirmationOperationId: record.identityAttribution?.confirmationOperationId,
+        }),
+      );
     const identityKey = identity(entry, recordFile),
       versionKey = clinicalVersion(mapping),
-      found = previous(db, identityKey, versionKey);
+      found = previous(db, identityKey, versionKey, mapping.personId);
     const exceptionSet = Object.fromEntries(
       Object.entries(decision.mapping || {}).filter(
         ([key, value]) =>
@@ -1781,6 +1853,11 @@ export function projectClinicalReview(
         let destinationProviderId = String(existingRow.provider_id || ''),
           destinationProvider = String(existingRow.provider_name || 'Unknown source'),
           sourceOutcome: 'enriched_unknown' | 'preserved_known' = 'preserved_known';
+        if (
+          record.manuallyEdited ||
+          clinicalMappingChanged(decision.mapping, record.undraftedMapping)
+        )
+          imported.manuallyEdited = true;
         if (reviewedReportSource) {
           const priorSources = Array.isArray(imported.reviewedReportSources)
             ? imported.reviewedReportSources.filter(
@@ -1805,6 +1882,18 @@ export function projectClinicalReview(
             outcome: sourceOutcome,
           };
         }
+        if (record.draft?.corrections?.length) {
+          const prior = Array.isArray(imported.corrections) ? imported.corrections : [];
+          imported.corrections = [
+            ...prior,
+            ...record.draft.corrections.filter(
+              (correction) =>
+                !prior.some(
+                  (item: { operationId?: string }) => item.operationId === correction.operationId,
+                ),
+            ),
+          ];
+        }
         existing.import = imported;
         db.prepare(`UPDATE ${table} SET provider_id=?,extra_json=? WHERE id=?`).run(
           destinationProviderId || existingRow.provider_id || null,
@@ -1820,8 +1909,13 @@ export function projectClinicalReview(
           identity: identityKey,
           version: versionKey,
           acceptedMapping: mapping,
+          personId: mapping.personId || 'patient',
           originalMapping: mappingFrom(entry),
+          ...(record.draft?.corrections?.length ? { corrections: record.draft.corrections } : {}),
           recordException,
+          manuallyEdited:
+            record.manuallyEdited ||
+            clinicalMappingChanged(decision.mapping, record.undraftedMapping),
           ...(record.identityAttribution
             ? {
                 identityAttribution: record.identityAttribution,
@@ -1879,6 +1973,7 @@ export function projectClinicalReview(
         insert(db, 'observations', {
           id: entityId,
           test_type_id: testId,
+          person_id: mapping.personId || 'patient',
           source_record_id: record.id,
           provider_id: recordFile.provider_id,
           label: mapping.testLabel,
@@ -1895,6 +1990,7 @@ export function projectClinicalReview(
       } else if (mapping.kind === 'medication')
         insert(db, 'medications', {
           id: entityId,
+          person_id: mapping.personId || 'patient',
           source_record_id: record.id,
           provider_id: recordFile.provider_id,
           kind: ['order', 'reported_use', 'dispense', 'administration', 'unknown'].includes(
@@ -1914,6 +2010,7 @@ export function projectClinicalReview(
       else if (mapping.kind === 'procedure')
         insert(db, 'procedures', {
           id: entityId,
+          person_id: mapping.personId || 'patient',
           source_record_id: record.id,
           provider_id: recordFile.provider_id,
           label: mapping.procedureLabel,
@@ -1965,6 +2062,7 @@ export function projectClinicalReview(
       ...(reviewedReportSource && reviewedSourceOutcome
         ? {
             reviewedSource: {
+              ...(reviewedReportSource.basis ? { basis: reviewedReportSource.basis } : {}),
               source: reviewedReportSource.source,
               sourceProviderId: reviewedReportSource.sourceProviderId,
               confirmationOperationId: reviewedReportSource.operationId,

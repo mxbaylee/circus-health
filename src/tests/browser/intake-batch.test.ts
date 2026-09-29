@@ -154,7 +154,7 @@ test(
       assert(response.ok(), JSON.stringify(json));
       return json.data;
     };
-    const screenshots = process.env.CIRCUS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
+    const screenshots = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
     mkdirSync(screenshots, { recursive: true });
     async function capture(stage: string) {
       for (const theme of ['light', 'dark']) {
@@ -237,11 +237,17 @@ test(
     const first = await get(
       `${prefix}/intakes/${encodeURIComponent(initialBatch.items[0].intakeId)}`,
     );
+    const firstText = (await bridges[0].callbacks.onTool!({
+      tool: 'health_intake_source_text',
+      arguments: { id: first.id },
+      callId: 'fictional-first-source-text',
+    })) as { revisionId: string };
     await bridges[0].callbacks.onTool!({
       tool: 'health_intake_propose',
       arguments: {
         id: first.id,
         version: first.version,
+        sourceTextRevisionId: firstText.revisionId,
         jsonlText: proposal(first.id, 'first'),
         summary: 'One fictional bounded section; unread material remains.',
       },
@@ -287,6 +293,7 @@ test(
     });
     assert.equal(await firstSaveAction.count(), 1);
     assert.equal(await firstSaveAction.isDisabled(), false);
+    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
@@ -298,6 +305,10 @@ test(
       0,
       'the warning does not claim that report identity was confirmed',
     );
+    await page
+      .getByRole('dialog', { name: 'Who is this report for?' })
+      .getByRole('button', { name: 'Close', exact: true })
+      .click();
     assert.equal(await page.getByRole('button', { name: 'This is me', exact: true }).count(), 1);
     assert.equal(importRequests.length, 0, 'the first partial proposal remains review-only');
     await capture('batch-reading-partial-review');
@@ -337,11 +348,17 @@ test(
     const resumedSecond = await get(
       `${prefix}/intakes/${encodeURIComponent(initialBatch.items[1].intakeId)}`,
     );
+    const secondText = (await bridges[2].callbacks.onTool!({
+      tool: 'health_intake_source_text',
+      arguments: { id: resumedSecond.id },
+      callId: 'fictional-second-source-text',
+    })) as { revisionId: string };
     await bridges[2].callbacks.onTool!({
       tool: 'health_intake_propose',
       arguments: {
         id: resumedSecond.id,
         version: resumedSecond.version,
+        sourceTextRevisionId: secondText.revisionId,
         jsonlText: proposal(resumedSecond.id, 'second'),
         summary: 'One fictional bounded section; unread material remains.',
       },
@@ -408,9 +425,14 @@ test(
     });
     await secondSaveAction.waitFor();
     assert.equal(await secondSaveAction.isDisabled(), false);
+    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
+    await page
+      .getByRole('dialog', { name: 'Who is this report for?' })
+      .getByRole('button', { name: 'Close', exact: true })
+      .click();
     await page.getByRole('button', { name: 'This is me', exact: true }).click();
     assert.notEqual(
       (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).imported,

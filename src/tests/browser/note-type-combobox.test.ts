@@ -60,7 +60,7 @@ test(
       return response.body.data;
     }
     async function capture(prefix: string, menuLabel = 'Note types') {
-      const visuals = process.env.HEALTH_NOTE_TYPE_VISUAL_DIR;
+      const visuals = process.env.CRS_NOTE_TYPE_VISUAL_DIR;
       if (!visuals) return;
       mkdirSync(visuals, { recursive: true });
       for (const theme of ['light', 'dark'])
@@ -97,7 +97,7 @@ test(
     await page.goto(url);
     await page.getByRole('button', { name: 'Create profile', exact: true }).click();
     await page.getByLabel('Display name', { exact: true }).fill('Fictional Notebook');
-    await page.getByLabel('Full name on health records').fill('Fictional Notebook');
+    await page.getByLabel('Your name').fill('Fictional Notebook');
     await page.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
     await page.getByRole('button', { name: 'Continue to recovery key' }).click();
     const recovery = await page.getByLabel('Recovery key', { exact: true }).inputValue();
@@ -109,8 +109,8 @@ test(
       .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
       .getByRole('button', { name: 'Skip', exact: true })
       .click();
-    const setup = page.getByRole('dialog', { name: 'A little about you' });
-    for (const step of ['About you', 'Primary care provider', 'Emergency contact']) {
+    const setup = page.getByRole('dialog', { name: 'Care contacts' });
+    for (const step of ['Primary care provider', 'Emergency contact']) {
       await setup.getByRole('heading', { name: step, exact: true }).waitFor();
       await setup.getByRole('button', { name: 'Skip for now' }).click();
     }

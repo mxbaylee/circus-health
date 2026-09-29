@@ -237,52 +237,54 @@ export function summarizeQualificationDiagnostics(
 
 async function main() {
   check(
-    process.argv.includes('--run') && process.env.HEALTH_PROVIDER_QUALIFICATION === '1',
-    'Explicit opt-in required: HEALTH_PROVIDER_QUALIFICATION=1 node scripts/qualify-provider-pdf.ts --run. This uses the configured real provider.',
+    process.argv.includes('--run') && process.env.CRS_PROVIDER_QUALIFICATION === '1',
+    'Explicit opt-in required: CRS_PROVIDER_QUALIFICATION=1 node scripts/qualify-provider-pdf.ts --run. This uses the configured real provider.',
   );
   const outputParent = externalDirectory(
-    process.env.HEALTH_QUALIFICATION_OUTPUT_DIR,
-    'HEALTH_QUALIFICATION_OUTPUT_DIR',
+    process.env.CRS_QUALIFICATION_OUTPUT_DIR,
+    'CRS_QUALIFICATION_OUTPUT_DIR',
   );
-  const state = externalDirectory(process.env.STATE_DIR, 'STATE_DIR');
+  const state = externalDirectory(process.env.CRS_STATE_DIR, 'CRS_STATE_DIR');
   check(
-    process.env.MODEL && process.env.LITELLM_CONFIG && isAbsolute(process.env.LITELLM_CONFIG),
-    'Supply MODEL and absolute LITELLM_CONFIG for one operator-owned route.',
+    process.env.CRS_MODEL &&
+      process.env.CRS_LITELLM_CONFIG &&
+      isAbsolute(process.env.CRS_LITELLM_CONFIG),
+    'Supply CRS_MODEL and absolute CRS_LITELLM_CONFIG for one operator-owned route.',
   );
-  check(existsSync(process.env.LITELLM_CONFIG), 'LITELLM_CONFIG must exist.');
-  const repetitions = process.env.HEALTH_QUALIFICATION_REPEAT === '2' ? 2 : 1;
+  check(existsSync(process.env.CRS_LITELLM_CONFIG), 'CRS_LITELLM_CONFIG must exist.');
+  const repetitions = process.env.CRS_QUALIFICATION_REPEAT === '2' ? 2 : 1;
   check(
-    !process.env.HEALTH_QUALIFICATION_REPEAT ||
-      ['1', '2'].includes(process.env.HEALTH_QUALIFICATION_REPEAT),
-    'HEALTH_QUALIFICATION_REPEAT must be 1 or 2.',
+    !process.env.CRS_QUALIFICATION_REPEAT ||
+      ['1', '2'].includes(process.env.CRS_QUALIFICATION_REPEAT),
+    'CRS_QUALIFICATION_REPEAT must be 1 or 2.',
   );
-  const scenario = process.env.HEALTH_QUALIFICATION_SCENARIO ?? 'quick';
+  const scenario = process.env.CRS_QUALIFICATION_SCENARIO ?? 'quick';
   check(
     scenario === 'quick' || scenario === 'long',
-    'HEALTH_QUALIFICATION_SCENARIO must be quick or long.',
+    'CRS_QUALIFICATION_SCENARIO must be quick or long.',
   );
-  const cacheMode = process.env.HEALTH_QUALIFICATION_CACHE ?? 'configured';
+  const cacheMode = process.env.CRS_QUALIFICATION_CACHE ?? 'configured';
   check(
     cacheMode === 'configured' || cacheMode === 'paired',
-    'HEALTH_QUALIFICATION_CACHE must be configured or paired.',
+    'CRS_QUALIFICATION_CACHE must be configured or paired.',
   );
   check(
-    !process.env.PROMPT_CACHE || ['true', 'false'].includes(process.env.PROMPT_CACHE),
-    'PROMPT_CACHE must be true or false.',
+    !process.env.CRS_PROMPT_CACHE || ['true', 'false'].includes(process.env.CRS_PROMPT_CACHE),
+    'CRS_PROMPT_CACHE must be true or false.',
   );
   check(
-    !process.env.HEALTH_QUALIFICATION_ACCEPT || process.env.HEALTH_QUALIFICATION_ACCEPT === '1',
-    'HEALTH_QUALIFICATION_ACCEPT must be 1 when enabled.',
+    !process.env.CRS_QUALIFICATION_ACCEPT || process.env.CRS_QUALIFICATION_ACCEPT === '1',
+    'CRS_QUALIFICATION_ACCEPT must be 1 when enabled.',
   );
-  const accept = process.env.HEALTH_QUALIFICATION_ACCEPT === '1';
-  const format = process.env.HEALTH_QUALIFICATION_FORMAT ?? 'both';
+  const accept = process.env.CRS_QUALIFICATION_ACCEPT === '1';
+  const format = process.env.CRS_QUALIFICATION_FORMAT ?? 'both';
   check(
     format === 'both' || format === 'auto' || format === 'pdf' || format === 'png',
-    'HEALTH_QUALIFICATION_FORMAT must be both, auto, pdf or png.',
+    'CRS_QUALIFICATION_FORMAT must be both, auto, pdf or png.',
   );
   const schedule = qualificationSchedule(
     cacheMode === 'paired',
-    process.env.PROMPT_CACHE === 'true' ? 'on' : 'off',
+    process.env.CRS_PROMPT_CACHE === 'true' ? 'on' : 'off',
     format,
   );
   const root = mkdtempSync(join(outputParent, 'provider-qualification-'));
@@ -613,22 +615,27 @@ async function main() {
       const env = Object.fromEntries(
         Object.entries(process.env).filter(
           ([key]) =>
-            !/^(HEALTH_|CODEX_|LITELLM_|OLLAMA_|DATA_DIR$|AI$|MODEL$|AI_URL$|KEY_FILE$|AUTH_DIR$|ENV_FILE$|STACK$|RUNTIME$|PORT$|IMAGE$|NODE$|STATE_DIR$|RESPONSE_MODEL$|IMAGES$|PDF$|PROMPT_CACHE$)/.test(
+            !/^(CRS_|HEALTH_|CIRCUS_|CODEX_|LITELLM_|OLLAMA_|DATA_DIR$|AI$|MODEL$|AI_URL$|KEY_FILE$|AUTH_DIR$|ENV_FILE$|STACK$|RUNTIME$|PORT$|IMAGE$|NODE$|STATE_DIR$|RESPONSE_MODEL$|IMAGES$|PDF$|PROMPT_CACHE$)/.test(
               key,
             ),
         ),
       );
-      for (const key of ['MODEL', 'LITELLM_CONFIG', 'LITELLM_ENV_FILE', 'RESPONSE_MODEL'])
+      for (const key of [
+        'CRS_MODEL',
+        'CRS_LITELLM_CONFIG',
+        'CRS_LITELLM_ENV_FILE',
+        'CRS_RESPONSE_MODEL',
+      ])
         if (process.env[key]) env[key] = process.env[key];
       Object.assign(env, {
-        DATA_DIR: data,
-        STATE_DIR: state,
-        PORT: String(port),
-        HEALTH_PUBLIC_ORIGIN: base,
-        PDF: mode === 'pdf' ? 'auto' : 'false',
-        PROMPT_CACHE: cache === 'on' ? 'true' : 'false',
-        IMAGES: 'true',
-        HEALTH_IMPORT_DIAGNOSTICS: 'true',
+        CRS_DATA_DIR: data,
+        CRS_STATE_DIR: state,
+        CRS_PORT: String(port),
+        CRS_PUBLIC_ORIGIN: base,
+        CRS_PDF: mode === 'pdf' ? 'auto' : 'false',
+        CRS_PROMPT_CACHE: cache === 'on' ? 'true' : 'false',
+        CRS_IMAGES: 'true',
+        CRS_IMPORT_DIAGNOSTICS: 'true',
       });
       launcher = spawn(process.execPath, ['deploy/run.ts', 'run'], {
         cwd: repository,
@@ -931,7 +938,7 @@ async function main() {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await main().catch(() => {
     process.stderr.write(
-      'Qualification did not finish. Supply explicit opt-in, an existing external output directory, MODEL, LITELLM_CONFIG, and STATE_DIR; inspect any external qualification report for progress.\n',
+      'Qualification did not finish. Supply explicit opt-in, an existing external output directory, CRS_MODEL, CRS_LITELLM_CONFIG, and CRS_STATE_DIR; inspect any external qualification report for progress.\n',
     );
     process.exitCode = 1;
   });

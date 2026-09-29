@@ -218,3 +218,51 @@ test('new private profiles reject missing or invalid identity before creating ar
   assert.deepEqual(manager.list(), []);
   assert.deepEqual(readdirSync(dataDirectory, { recursive: true }).sort(), before);
 });
+
+test('login profile display pairs are unique across creation, setup completion and Self edits', async (t) => {
+  const { manager } = fixture(t);
+  const first = manager.begin({
+    name: 'Cookie Doe',
+    icon: 'cookie',
+    fullName: 'Cookie Doe',
+    birthDate: '1986-02-14',
+  });
+  const racing = manager.begin({
+    name: ' cookie   doe ',
+    icon: 'lucide:cookie',
+    fullName: 'Cookie Doe',
+    birthDate: '1986-02-14',
+  });
+  const profile = await manager.verify(first.setupId, {
+    acknowledged: true,
+    recovery: first.recoveryKit,
+  });
+  assert.throws(
+    () => manager.begin({ name: 'COOKIE DOE', icon: 'lucide:cookie', fullName: 'Cookie Doe' }),
+    { code: 'DUPLICATE_PROFILE_DISPLAY' },
+  );
+  await assert.rejects(
+    manager.verify(racing.setupId, { acknowledged: true, recovery: racing.recoveryKit }),
+    { code: 'DUPLICATE_PROFILE_DISPLAY' },
+  );
+  const other = manager.begin({
+    name: 'Cookie Doe',
+    icon: 'star',
+    fullName: 'Cookie Doe',
+    birthDate: '1986-02-14',
+  });
+  const second = await manager.verify(other.setupId, {
+    acknowledged: true,
+    recovery: other.recoveryKit,
+  });
+  manager.lock(profile.id);
+  const db = opened(manager, second.id).db;
+  const self = getNote(db, 'patient');
+  assert.throws(
+    () =>
+      saveNote(db, self.id, { version: self.version, person: { ...self.person, icon: 'cookie' } }),
+    { code: 'DUPLICATE_PROFILE_DISPLAY' },
+  );
+  assert.equal(getNote(db, 'patient').person.icon, 'star');
+  assert.equal(manager.list().length, 2);
+});

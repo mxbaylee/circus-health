@@ -1,3 +1,11 @@
+import type { IntakeIdentityReview } from '../../../shared/intake-identity';
+import {
+  ImportPersonChoice,
+  ImportPrintedName,
+  printedNameReady,
+  personSelectionReady,
+  type ImportPersonSelection,
+} from './ImportPersonChoice';
 import type { IntakeBatchReadingState } from '../../../shared/intake-batch';
 import * as Dialog from '@radix-ui/react-dialog';
 import {
@@ -19,7 +27,8 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { RefObject } from 'react';
+import type { ReactNode, RefObject } from 'react';
+import { ImportSourceSelection, useSourceSelection } from './import-source-selection';
 import type {
   IntakeAcceptedRecord,
   IntakeDraftRepairField,
@@ -53,6 +62,8 @@ export interface ImportReviewRecord {
   eligible: boolean;
   /** Honest current blocker for an otherwise actionable review row. */
   saveBlockReason?: string;
+  /** Ownership blockers use the report control, never a clinical value editor. */
+  saveBlockReview?: 'identity';
   manuallyEdited?: boolean;
   relatedMatch?: { value: string; source: string; date: string };
   /** Similar literal/date in the same original; does not establish a duplicate. */
@@ -71,6 +82,8 @@ export interface ImportReviewRecord {
 }
 
 export interface ImportReviewReport {
+  sourceIntakeId?: string;
+  filename?: string;
   id: string;
   source: string;
   sourceSuggested?: boolean;
@@ -85,6 +98,8 @@ export interface ImportReviewReport {
     label: string;
     evidence: 'named' | 'missing';
     confirmed: boolean;
+    selfBirthDateConflict?: boolean;
+    defaultPerson?: 'self' | 'new';
     identityStatus?:
       | 'evidenced_match'
       | 'prior_confirmation'
@@ -95,6 +110,11 @@ export interface ImportReviewReport {
     blocking?: boolean;
     offeredSelfFields?: { fullName?: string; birthDate?: string };
     selfDisplayName?: string;
+    people?: IntakeIdentityReview['people'];
+    peopleTruncated?: boolean;
+    assignedPerson?: IntakeIdentityReview['assignedPerson'];
+    printedName?: string;
+    printedNameRequired?: boolean;
     evidenceText?: string;
     questions?: { prompt: string; textAnchor?: string }[];
     targetCount?: number;
@@ -113,6 +133,8 @@ export interface ImportReviewReport {
 
 export interface ImportReviewModel {
   contextKey?: string;
+  /** No settled feed for the requested filters yet; absence is not an empty result. */
+  loading?: boolean;
   reports: ImportReviewReport[];
   records: ImportReviewRecord[];
   counts?: Record<ImportReviewStatus, number>;
@@ -131,11 +153,15 @@ export interface ImportReviewModel {
     activeFiles: number;
     label: string;
     detail: string;
+    detailIsImportant?: boolean;
     paused?: boolean;
     uploading?: boolean;
     controlsBusy?: boolean;
     resumeLabel?: string;
     progress?: {
+      /** Calendar time for this batch, including provider and queue waits. */
+      elapsedStartedAt?: string | null;
+      elapsedEndedAt?: string | null;
       accounted: number;
       total: number;
       readyRecords: number;
@@ -151,7 +177,7 @@ export interface ImportReviewModel {
 export interface ImportReviewActions {
   busy?: boolean;
   onFiles?: (files: File[]) => void | Promise<void>;
-  onSave?: (recordIds: string[]) => void | Promise<void>;
+  onSave?: (recordIds: string[]) => void | boolean | Promise<void | boolean>;
   onLater?: (recordIds: string[]) => void | Promise<void>;
   onExclude?: (recordIds: string[]) => void | Promise<void>;
   onResume?: (recordIds: string[]) => void | Promise<void>;
@@ -164,6 +190,8 @@ export interface ImportReviewActions {
   onConfirmIdentity?: (
     reportId: string,
     fields: { fullName?: string; birthDate?: string },
+    personSelection?: ImportPersonSelection,
+    printedName?: string,
   ) => void | Promise<void>;
   onEdit?: (recordId: string, value: string, unit: string) => void | Promise<void>;
   onResolveMatch?: (recordId: string) => void | Promise<void>;
@@ -231,53 +259,166 @@ function ImportMeasurementValue({
 export function ImportReviewPresentation({
   model,
   actions = {},
+  renderRecordReview,
+  beforeReviewChange,
+  renderReportSourceReview,
+  renderSourceAttention,
+  requestedRecordId,
+  preserveSourceReview = false,
 }: {
+  renderRecordReview?: (record: ImportReviewRecord, close: () => void) => ReactNode;
+  beforeReviewChange?: () => Promise<boolean>;
+  renderReportSourceReview?: (report: ImportReviewReport) => ReactNode;
+  renderSourceAttention?: (onCount: (count: number) => void) => ReactNode;
+  requestedRecordId?: string;
+  preserveSourceReview?: boolean;
   model?: ImportReviewModel;
   actions?: ImportReviewActions;
 }) {
   const [reports, setReports] = useState(model?.reports || []);
   const [records, setRecords] = useState(model?.records || []);
+  const presentedContext = useRef(model?.contextKey);
   const [view, setView] = useState<ImportReviewStatus>('review');
   const [kind, setKind] = useState<ImportReviewKind | 'All'>('All');
   const [query, setQuery] = useState('');
+  const [sourceAttention, setSourceAttention] = useState(false);
+  const [attentionCount, setAttentionCount] = useState<number | null>(null);
+  const sourceSelection = useSourceSelection();
+  const [approvingSections, setApprovingSections] = useState(false);
   const [editedOnly, setEditedOnly] = useState(false);
   const [selected, setSelected] = useState(() => new Set<string>());
   const [sheet, setSheet] = useState<SheetState>(null);
   const sheetReturnFocus = useRef<HTMLElement | null>(null);
+  const lastIdentitySheet = useRef<{ reportId: string; confirmed: boolean } | null>(null);
   const dragDepth = useRef(0);
   const [fileDragActive, setFileDragActive] = useState(false);
   const [notice, setNotice] = useState('');
+  const [expandedRecord, setExpandedRecord] = useState<string | null>(null);
+  const pinnedReview = useRef<{
+    record: ImportReviewRecord;
+    report: ImportReviewReport;
+    contextKey?: string;
+  } | null>(null);
+  const confirmedSaved = useRef(new Set<string>());
+  const reviewChangeGeneration = useRef(0);
+  async function openRecordReview(record: ImportReviewRecord) {
+    const generation = ++reviewChangeGeneration.current;
+    if (beforeReviewChange && !(await beforeReviewChange())) return;
+    if (generation !== reviewChangeGeneration.current) return;
+    const report = reports.find((item) => item.id === record.reportId);
+    if (report) pinnedReview.current = { record, report, contextKey: model?.contextKey };
+    setExpandedRecord((current) => (current === record.id ? null : record.id));
+  }
   useEffect(() => {
     if (!model) return;
-    setReports(model.reports);
-    setRecords(model.records);
+    const contextChanged = presentedContext.current !== model.contextKey;
+    presentedContext.current = model.contextKey;
+    if (contextChanged) {
+      confirmedSaved.current.clear();
+      setSourceAttention(false);
+    }
+    if (preserveSourceReview && !contextChanged) return;
+    // A background feed refresh must not unmount a draft whose version was
+    // superseded. Its existing editor keeps the conflict/acceptance checks.
+    const pinned = pinnedReview.current;
+    const terminal =
+      pinned &&
+      model.records.some(
+        (record) => record.id === pinned.record.id && ['saved', 'excluded'].includes(record.status),
+      );
+    if (terminal) {
+      pinnedReview.current = null;
+      setExpandedRecord(null);
+    }
+    const retain =
+      !terminal &&
+      pinned &&
+      !confirmedSaved.current.has(pinned.record.id) &&
+      pinned.contextKey === model.contextKey &&
+      expandedRecord === pinned.record.id;
+    const currentRecords = model.records.map((record) =>
+      confirmedSaved.current.has(record.id) ? { ...record, status: 'saved' as const } : record,
+    );
+    setReports(
+      retain
+        ? model.reports.some((item) => item.id === pinned.report.id)
+          ? model.reports.map((item) => (item.id === pinned.report.id ? pinned.report : item))
+          : [...model.reports, pinned.report]
+        : model.reports,
+    );
+    setRecords(
+      retain
+        ? currentRecords.some((item) => item.id === pinned.record.id)
+          ? currentRecords.map((item) => (item.id === pinned.record.id ? pinned.record : item))
+          : [...currentRecords, pinned.record]
+        : currentRecords,
+    );
     if (model.filters) {
       setView(model.filters.view);
       setKind(model.filters.kind);
       setQuery(model.filters.query);
       setEditedOnly(model.filters.editedOnly);
     }
-  }, [model]);
+  }, [model, expandedRecord, preserveSourceReview]);
   useEffect(() => {
     if (model?.contextKey) {
       setSelected(new Set());
       setSheet(null);
+      setExpandedRecord(null);
     }
   }, [model?.contextKey]);
+  useEffect(() => {
+    if (requestedRecordId) {
+      setSourceAttention(false);
+      const record = model?.records.find((item) => item.id === requestedRecordId);
+      const report = model?.reports.find((item) => item.id === record?.reportId);
+      if (record && report) {
+        pinnedReview.current = { record, report, contextKey: model?.contextKey };
+        setView(record.status);
+        if (model?.filters && model.filters.view !== record.status)
+          actions.onFiltersChange?.({ ...model.filters, view: record.status });
+      }
+      setExpandedRecord(requestedRecordId);
+    }
+  }, [requestedRecordId]);
   useEffect(() => {
     if (sheet && document.activeElement instanceof HTMLElement)
       sheetReturnFocus.current = document.activeElement;
   }, [sheet]);
   useEffect(() => {
-    if (sheet?.type !== 'identity') return;
+    if (sheet?.type !== 'identity') {
+      lastIdentitySheet.current = null;
+      return;
+    }
     const current = (model?.reports || reports).find((report) => report.id === sheet.reportId);
-    const offered = Object.keys(current?.subject.offeredSelfFields || {}).length > 0;
-    if (!current || (current.subject.identityStatus !== 'confirmation_required' && !offered))
+    const previous = lastIdentitySheet.current;
+    if (
+      !current ||
+      (previous?.reportId === current.id &&
+        !previous.confirmed &&
+        current.subject.confirmed &&
+        !Object.keys(current.subject.offeredSelfFields || {}).length)
+    )
       setSheet(null);
+    lastIdentitySheet.current = current
+      ? { reportId: current.id, confirmed: current.subject.confirmed }
+      : null;
   }, [model, reports, sheet]);
 
-  function changeFilters(patch: Partial<NonNullable<ImportReviewModel['filters']>>) {
+  async function changeFilters(patch: Partial<NonNullable<ImportReviewModel['filters']>>) {
+    if (approvingSections) return;
+    const generation = ++reviewChangeGeneration.current;
+    if (beforeReviewChange && !(await beforeReviewChange())) return;
+    if (generation !== reviewChangeGeneration.current) return;
     const next = { view, kind, query, editedOnly, ...patch };
+    setExpandedRecord(null);
+    setSourceAttention(false);
+    setView(next.view);
+    setKind(next.kind);
+    setQuery(next.query);
+    setEditedOnly(next.editedOnly);
+    setSelected(new Set());
+    sourceSelection.files.forEach((file) => file.select(false));
     actions.onFiltersChange?.(next);
   }
 
@@ -321,7 +462,50 @@ export function ImportReviewPresentation({
     [],
   );
   const visible = scoped.filter((record) => kind === 'All' || record.kind === kind);
-  const visibleSelected = visible.filter((record) => selected.has(record.id));
+  const activeKindCount =
+    kind === 'All'
+      ? null
+      : (model?.kindCounts?.[kind] ?? scoped.filter((record) => record.kind === kind).length);
+  useEffect(() => {
+    if (preserveSourceReview || model?.loading || approvingSections) return;
+    // The model and local tab can differ during a server-filtered request.
+    if (model?.filters && model.filters.kind !== kind) return;
+    if (
+      (sourceAttention && attentionCount === 0) ||
+      (!sourceAttention && kind !== 'All' && activeKindCount === 0)
+    )
+      void changeFilters({ kind: 'All' });
+  }, [
+    sourceAttention,
+    attentionCount,
+    kind,
+    activeKindCount,
+    preserveSourceReview,
+    model?.loading,
+    model?.filters,
+    approvingSections,
+  ]);
+  const sourceCount = view === 'review' ? attentionCount || 0 : 0;
+  const selectableRecords = sourceAttention ? [] : visible;
+  const shownSourceFiles =
+    view === 'review' && (sourceAttention || kind === 'All') ? sourceSelection.files : [];
+  const selectableSections = shownSourceFiles.reduce((sum, file) => sum + file.count, 0);
+  const selectedSections = shownSourceFiles.reduce((sum, file) => sum + file.selected, 0);
+  const sectionPending = approvingSections || shownSourceFiles.some((file) => file.pending);
+  const visibleSelected = selectableRecords.filter((record) => selected.has(record.id));
+  const selectedCount = visibleSelected.length + selectedSections;
+  const selectableCount = selectableRecords.length + selectableSections;
+  async function approveSelectedSections() {
+    if (sectionPending || actions.busy) return;
+    setApprovingSections(true);
+    try {
+      for (const file of shownSourceFiles) {
+        if (file.selected && !(await file.approve())) break;
+      }
+    } finally {
+      setApprovingSections(false);
+    }
+  }
   const readySelected = visibleSelected.filter((record) => record.eligible);
   const readyClinical = readySelected.filter((record) => record.kind !== 'People');
   const readyPeople = readySelected.filter((record) => record.kind === 'People');
@@ -331,7 +515,8 @@ export function ImportReviewPresentation({
     correctableSelected.length > 0 &&
     new Set(correctableSelected.map((record) => record.reportId)).size === 1;
 
-  function move(ids: string[], status: ImportReviewStatus) {
+  async function move(ids: string[], status: ImportReviewStatus) {
+    if (beforeReviewChange && !(await beforeReviewChange())) return;
     const action =
       status === 'saved'
         ? actions.onSave
@@ -341,7 +526,19 @@ export function ImportReviewPresentation({
             ? actions.onExclude
             : actions.onResume;
     if (model && action) {
-      void action(ids);
+      const context = model.contextKey;
+      const succeeded = await action(ids);
+      if (status === 'saved' && succeeded === true && presentedContext.current === context) {
+        for (const id of ids) confirmedSaved.current.add(id);
+        if (pinnedReview.current && ids.includes(pinnedReview.current.record.id)) {
+          pinnedReview.current = null;
+          setExpandedRecord(null);
+        }
+        setRecords((current) =>
+          current.map((record) => (ids.includes(record.id) ? { ...record, status } : record)),
+        );
+        setSelected((current) => new Set([...current].filter((id) => !ids.includes(id))));
+      }
       return;
     }
     setRecords((current) =>
@@ -362,17 +559,18 @@ export function ImportReviewPresentation({
   function confirmReportIdentity(
     reportId: string,
     fields: { fullName?: string; birthDate?: string } = {},
+    personSelection?: ImportPersonSelection,
+    printedName?: string,
   ) {
     const report = reports.find((item) => item.id === reportId);
     if (!report || actions.busy) return;
-    if (
-      report.subject.identityStatus !== 'confirmation_required' &&
-      Object.keys(fields).length === 0
-    )
-      return;
+    if (!personSelectionReady(personSelection)) return;
     if (model && actions.onConfirmIdentity) {
       setSheet(null);
-      void actions.onConfirmIdentity(reportId, fields);
+      if (printedName)
+        void actions.onConfirmIdentity(reportId, fields, personSelection, printedName);
+      else if (personSelection) void actions.onConfirmIdentity(reportId, fields, personSelection);
+      else void actions.onConfirmIdentity(reportId, fields);
       return;
     }
     setReports((current) =>
@@ -415,34 +613,35 @@ export function ImportReviewPresentation({
         </div>
       </header>
 
-      <section className="import-upload-card" aria-label="Upload reports">
-        <label
-          className={`import-dropzone${fileDragActive ? ' is-dragging' : ''}`}
-          onDragEnter={(event) => {
-            if (!hasDraggedFiles(event.dataTransfer)) return;
-            event.preventDefault();
-            dragDepth.current += 1;
-            setFileDragActive(true);
-          }}
-          onDragOver={(event) => {
-            if (!hasDraggedFiles(event.dataTransfer)) return;
-            event.preventDefault();
-            event.dataTransfer.dropEffect = 'copy';
-            setFileDragActive(true);
-          }}
-          onDragLeave={(event) => {
-            if (!fileDragActive) return;
-            event.preventDefault();
-            dragDepth.current = Math.max(0, dragDepth.current - 1);
-            if (dragDepth.current === 0) setFileDragActive(false);
-          }}
-          onDrop={(event) => {
-            event.preventDefault();
-            dragDepth.current = 0;
-            setFileDragActive(false);
-            submitFiles(Array.from(event.dataTransfer.files));
-          }}
-        >
+      <section
+        className={`import-upload-card${fileDragActive ? ' is-dragging' : ''}`}
+        aria-label="Upload reports"
+        onDragEnter={(event) => {
+          if (!hasDraggedFiles(event.dataTransfer)) return;
+          event.preventDefault();
+          dragDepth.current += 1;
+          setFileDragActive(true);
+        }}
+        onDragOver={(event) => {
+          if (!hasDraggedFiles(event.dataTransfer)) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = 'copy';
+          setFileDragActive(true);
+        }}
+        onDragLeave={(event) => {
+          if (!fileDragActive) return;
+          event.preventDefault();
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (dragDepth.current === 0) setFileDragActive(false);
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          dragDepth.current = 0;
+          setFileDragActive(false);
+          submitFiles(Array.from(event.dataTransfer.files));
+        }}
+      >
+        <label className={`import-dropzone${fileDragActive ? ' is-dragging' : ''}`}>
           <input
             type="file"
             multiple
@@ -473,21 +672,29 @@ export function ImportReviewPresentation({
       <section aria-labelledby="import-review-title">
         <div className="import-queue-heading">
           <h2 id="import-review-title">
-            {statusLabels[view]} <span>{counts[view]}</span>
+            {sourceAttention ? (
+              <>
+                Needs attention <span>{attentionCount || 0}</span>
+              </>
+            ) : (
+              <>
+                {statusLabels[view]} <span>{counts[view] + sourceCount}</span>
+              </>
+            )}
           </h2>
           <label>
             <span className="sr-only">Review status</span>
             <select
               value={view}
+              disabled={sourceAttention}
               onChange={(event) => {
-                setView(event.target.value as ImportReviewStatus);
-                setSelected(new Set());
-                changeFilters({ view: event.target.value as ImportReviewStatus });
+                void changeFilters({ view: event.target.value as ImportReviewStatus });
               }}
             >
               {(Object.keys(statusLabels) as ImportReviewStatus[]).map((status) => (
                 <option value={status} key={status}>
-                  {statusLabels[status]} ({counts[status]})
+                  {statusLabels[status]} (
+                  {counts[status] + (status === 'review' ? attentionCount || 0 : 0)})
                 </option>
               ))}
             </select>
@@ -497,6 +704,7 @@ export function ImportReviewPresentation({
           {kinds
             .filter((item) => {
               if (item === 'All') return true;
+              if (model?.loading && item === kind) return true;
               const count =
                 model?.kindCounts?.[item] ?? scoped.filter((record) => record.kind === item).length;
               return count > 0;
@@ -511,91 +719,128 @@ export function ImportReviewPresentation({
                 <button
                   type="button"
                   role="tab"
-                  aria-selected={kind === item}
+                  disabled={approvingSections}
+                  aria-selected={!sourceAttention && kind === item}
                   onClick={() => {
-                    setKind(item);
-                    setSelected(new Set());
-                    changeFilters({ kind: item });
+                    void changeFilters({ kind: item });
                   }}
                   key={item}
                 >
                   <Icon size={15} />
                   {item}
-                  <span>{model?.kindCounts?.[item] ?? count}</span>
+                  <span>
+                    {model?.loading
+                      ? '…'
+                      : (model?.kindCounts?.[item] ?? count) + (item === 'All' ? sourceCount : 0)}
+                  </span>
                 </button>
               );
             })}
-        </div>
-        {visible.some((record) => record.kind === 'Documents') && (
-          <p className="import-upload-note">
-            Find saved documents in <a href="#/sources">Sources</a>. Clinician notes may also appear
-            in Historical notes. Unsupported items stay with the original.
-          </p>
-        )}
-        <div className="import-filters">
-          <label className="import-search">
-            <Search size={16} />
-            <span className="sr-only">Search records</span>
-            <input
-              value={query}
-              onChange={(event) => {
-                setQuery(event.target.value);
-                setSelected(new Set());
-                changeFilters({ query: event.target.value });
-              }}
-              type="search"
-              placeholder="Search records…"
-            />
-          </label>
-          <label className="import-check-label">
-            <input
-              type="checkbox"
-              checked={editedOnly}
-              onChange={(event) => {
-                setEditedOnly(event.target.checked);
-                setSelected(new Set());
-                changeFilters({ editedOnly: event.target.checked });
-              }}
-            />
-            Manually edited
-          </label>
-        </div>
-        {notice && (
-          <div className="import-notice" role="status">
-            <span>{notice}</span>
+          {renderSourceAttention && view === 'review' && (attentionCount ?? 0) > 0 && (
             <button
-              className="icon-button"
               type="button"
-              aria-label="Dismiss"
-              onClick={() => setNotice('')}
+              role="tab"
+              disabled={approvingSections}
+              aria-selected={sourceAttention}
+              onClick={() =>
+                void (async () => {
+                  if (beforeReviewChange && !(await beforeReviewChange())) return;
+                  setExpandedRecord(null);
+                  setSelected(new Set());
+                  sourceSelection.files.forEach((file) => file.select(false));
+                  setSourceAttention(true);
+                })()
+              }
             >
-              <X size={16} />
+              <FileSearch size={15} />
+              Needs attention <span>{attentionCount}</span>
             </button>
-          </div>
+          )}
+        </div>
+        {!sourceAttention && (
+          <>
+            {visible.some((record) => record.kind === 'Documents') && (
+              <p className="import-upload-note">
+                Find saved documents in <a href="#/sources">Sources</a>. Clinician notes may also
+                appear in Historical notes. Unsupported items stay with the original.
+              </p>
+            )}
+            <div className="import-filters">
+              <label className="import-search">
+                <Search size={16} />
+                <span className="sr-only">Search records</span>
+                <input
+                  value={query}
+                  onChange={(event) => {
+                    void changeFilters({ query: event.target.value });
+                  }}
+                  type="search"
+                  placeholder="Search records…"
+                />
+              </label>
+              <label className="import-check-label">
+                <input
+                  type="checkbox"
+                  checked={editedOnly}
+                  onChange={(event) => {
+                    void changeFilters({ editedOnly: event.target.checked });
+                  }}
+                />
+                Manually edited
+              </label>
+            </div>
+            {notice && (
+              <div className="import-notice" role="status">
+                <span>{notice}</span>
+                <button
+                  className="icon-button"
+                  type="button"
+                  aria-label="Dismiss"
+                  onClick={() => setNotice('')}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            )}
+          </>
         )}
-        {(view === 'review' || view === 'later') && visible.length > 0 && (
+        {(view === 'review' || view === 'later') && selectableCount > 0 && (
           <div className="import-bulk-bar">
             <label className="import-check-label">
               <input
                 type="checkbox"
-                checked={visibleSelected.length === visible.length}
+                disabled={sectionPending || actions.busy}
+                checked={selectedCount === selectableCount}
                 ref={(input) => {
                   if (input)
-                    input.indeterminate =
-                      visibleSelected.length > 0 && visibleSelected.length < visible.length;
+                    input.indeterminate = selectedCount > 0 && selectedCount < selectableCount;
                 }}
-                onChange={() =>
+                onChange={() => {
+                  const all = selectedCount !== selectableCount;
+                  shownSourceFiles.forEach((file) => file.select(all));
                   setSelected(
-                    visibleSelected.length === visible.length
+                    !all
                       ? new Set(
-                          [...selected].filter((id) => !visible.some((record) => record.id === id)),
+                          [...selected].filter(
+                            (id) => !selectableRecords.some((record) => record.id === id),
+                          ),
                         )
-                      : new Set([...selected, ...visible.map((record) => record.id)]),
-                  )
-                }
+                      : new Set([...selected, ...selectableRecords.map((record) => record.id)]),
+                  );
+                }}
               />
-              {visibleSelected.length ? `${visibleSelected.length} selected` : 'Select all shown'}
+              {selectedCount ? `${selectedCount} selected` : 'Select all shown'}
             </label>
+            {selectedSections > 0 && (
+              <button
+                className="button primary"
+                type="button"
+                disabled={sectionPending || actions.busy}
+                onClick={() => void approveSelectedSections()}
+              >
+                Approve {selectedSections} text {selectedSections === 1 ? 'section' : 'sections'}
+              </button>
+            )}
             {visibleSelected.length > 0 && (
               <>
                 <span className="import-bulk-hint">
@@ -688,394 +933,314 @@ export function ImportReviewPresentation({
             )}
           </div>
         )}
-
-        <div className="import-report-list">
-          {[...new Set(visible.map((record) => record.reportId))].map((reportId) => {
-            const report = reports.find((item) => item.id === reportId)!;
-            const reportRecords = visible.filter((record) => record.reportId === reportId);
-            const showIdentity =
-              !report.subject.hidden && reportRecords.some((record) => record.kind !== 'People');
-            return (
-              <section
-                className="import-report"
-                key={report.id}
-                aria-label={`${report.source} ${report.reportType}`}
-              >
-                <header className="import-report-header">
-                  <span className="import-source">{report.source}</span>
-                  {report.sourceLabelAvailable &&
-                    !report.sourceNeedsLabel &&
-                    !report.sourceSuggested && (
-                      <button
-                        className="text-link"
-                        type="button"
-                        aria-label={`Change source for ${report.reportType}`}
-                        onClick={() => setSheet({ type: 'source', reportId: report.id })}
-                      >
-                        Change
-                      </button>
-                    )}
-                  {report.sourceSuggested && <span className="import-suggested">suggested</span>}
-                  <span>
-                    · {report.reportType} · {report.date}
-                  </span>
-                  {report.sourceCoverage && (
-                    <span className="import-source-coverage">
-                      · Current {report.sourceCoverage.current.covered}/
-                      {report.sourceCoverage.current.total} source-labeled · Saved{' '}
-                      {report.sourceCoverage.saved.covered}/{report.sourceCoverage.saved.total}
-                    </span>
-                  )}
-                  {showIdentity && report.subject.confirmed && (
-                    <span className="import-report-person">
-                      For {report.subject.label} <Check size={12} />
-                    </span>
-                  )}
-                </header>
-                {showIdentity &&
-                  report.subject.confirmed &&
-                  !!Object.keys(report.subject.offeredSelfFields || {}).length && (
-                    <div className="import-self-offer">
-                      <span>
-                        This report already matches Self. It also offers an exact value for a blank
-                        Self field; saving records does not require adding it.
-                      </span>
-                      <button
-                        className="text-link"
-                        type="button"
-                        disabled={actions.busy}
-                        onClick={() => setSheet({ type: 'identity', reportId: report.id })}
-                      >
-                        Review optional Self details
-                      </button>
-                    </div>
-                  )}
-                {showIdentity && report.subject.identityStatus === 'missing_warning' && (
-                  <div className="import-identity-question is-warning" role="status">
-                    <span className="import-identity-icon">
-                      <UserRound size={16} />
-                    </span>
-                    <div>
-                      <strong>Identity is not printed clearly in this report.</strong>
-                      <small>{report.subject.identityMessage}</small>
-                    </div>
-                    {report.subject.reviewUrl && (
-                      <a className="button secondary" href={`#${report.subject.reviewUrl}`}>
-                        Review report
-                      </a>
-                    )}
-                  </div>
-                )}
-                {showIdentity && report.subject.identityStatus === 'conflict' && (
-                  <div className="import-identity-question is-conflict" role="alert">
-                    <span className="import-identity-icon">
-                      <UserRound size={16} />
-                    </span>
-                    <div>
-                      <strong>This report conflicts with Self.</strong>
-                      <small>{report.subject.identityMessage}</small>
-                      {report.subject.conflicts?.map((conflict) => (
-                        <small key={`${conflict.field}:${conflict.evidencedValue || ''}`}>
-                          {conflict.field === 'fullName' ? 'Full name' : 'Date of birth'}: Self has{' '}
-                          {conflict.selfValue || 'no value'}; report evidence has{' '}
-                          {conflict.evidencedValue || 'different retained claims'}.
-                        </small>
-                      ))}
-                    </div>
-                    {report.subject.reviewUrl && (
-                      <a className="button secondary" href={`#${report.subject.reviewUrl}`}>
-                        Review evidence
-                      </a>
-                    )}
-                  </div>
-                )}
-                {showIdentity &&
-                  !report.subject.confirmed &&
-                  report.subject.identityStatus !== 'missing_warning' &&
-                  report.subject.identityStatus !== 'conflict' && (
-                    <div className="import-identity-question">
-                      <span className="import-identity-icon">
-                        <UserRound size={16} />
-                      </span>
-                      <div>
-                        <strong>
-                          {report.subject.evidenceText
-                            ? `This report identifies “${report.subject.evidenceText}”. Is it yours?`
-                            : report.subject.scopeError
-                              ? 'Identity could not be confirmed from this report.'
-                              : 'Checking who this report identifies…'}
-                        </strong>
-                        {report.subject.scopeError && <small>{report.subject.scopeError}</small>}
-                        {report.subject.targetCount !== undefined && (
-                          <small>
-                            Your answer applies to {report.subject.targetCount}{' '}
-                            {report.subject.targetCount === 1 ? 'record' : 'records'} in this
-                            report.
-                          </small>
-                        )}
-                        {report.subject.questions?.map((question) => (
-                          <div
-                            className="import-identity-evidence"
-                            key={`${question.prompt}:${question.textAnchor || ''}`}
-                          >
-                            <span>{question.prompt}</span>
-                            {question.textAnchor && <q>{question.textAnchor}</q>}
-                          </div>
-                        ))}
-                        {!!Object.keys(report.subject.offeredSelfFields || {}).length && (
+        {!sourceAttention && (
+          <>
+            <div className="import-report-list">
+              {[...new Set(visible.map((record) => record.reportId))].map((reportId) => {
+                const report = reports.find((item) => item.id === reportId)!;
+                const reportRecords = visible.filter((record) => record.reportId === reportId);
+                const showIdentity =
+                  !report.subject.hidden &&
+                  reportRecords.some((record) => record.kind !== 'People');
+                return (
+                  <section
+                    className="import-report"
+                    key={report.id}
+                    aria-label={`${report.source} ${report.reportType}`}
+                  >
+                    <header className="import-report-header">
+                      <div className="import-report-title">
+                        <span>
+                          New Import Source{report.filename ? `: ${report.filename}` : ''}
+                        </span>
+                        <strong>{report.reportType}</strong>
+                        <time>{report.date}</time>
+                      </div>
+                      <div className="import-report-context">
+                        {report.sourceLabelAvailable || report.sourceSuggested ? (
                           <button
-                            className="text-link"
+                            className="import-source-control"
                             type="button"
                             disabled={actions.busy}
-                            onClick={() => setSheet({ type: 'identity', reportId: report.id })}
-                          >
-                            Review blank Self details
-                          </button>
-                        )}
-                      </div>
-                      <button
-                        className="button secondary"
-                        type="button"
-                        disabled={
-                          actions.busy ||
-                          (report.subject.scopeReady === false && !report.subject.scopeError)
-                        }
-                        onClick={() => {
-                          if (report.subject.scopeError && report.subject.reviewUrl) {
-                            window.location.assign(`#${report.subject.reviewUrl}`);
-                            return;
-                          }
-                          if (Object.keys(report.subject.offeredSelfFields || {}).length) {
-                            setSheet({ type: 'identity', reportId: report.id });
-                            return;
-                          }
-                          confirmReportIdentity(report.id);
-                        }}
-                      >
-                        {report.subject.scopeError
-                          ? 'Review evidence'
-                          : report.subject.scopeReady === false
-                            ? 'Checking…'
-                            : Object.keys(report.subject.offeredSelfFields || {}).length
-                              ? 'Review identity'
-                              : 'This is me'}
-                      </button>
-                    </div>
-                  )}
-                {(report.sourceSuggested ||
-                  (report.sourceLabelAvailable && report.sourceNeedsLabel)) &&
-                  !report.sourceConfirmed && (
-                    <div className="import-source-question">
-                      <span>
-                        {report.sourceSuggested
-                          ? 'Suggested source—not applied yet.'
-                          : 'Add a source for this report.'}
-                        {
-                          ' Use it for this report and eligible results you save. Original issuer and upload history stay unchanged.'
-                        }
-                        {report.sourceEvidence?.contentUrl && (
-                          <a
-                            href={report.sourceEvidence.contentUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Review {report.sourceEvidence.label} <ArrowUpRight size={12} />
-                          </a>
-                        )}
-                      </span>
-                      <div>
-                        {report.sourceSuggested && (
-                          <button
-                            className="button secondary"
-                            type="button"
+                            aria-label={
+                              report.sourceSuggested
+                                ? `Change source: ${report.source}`
+                                : report.sourceNeedsLabel
+                                  ? 'Add source'
+                                  : `Change source for ${report.reportType}`
+                            }
                             onClick={() => setSheet({ type: 'source', reportId: report.id })}
                           >
-                            Review {report.source}
+                            <span className="import-source">{report.source}</span>
+                            <span className="import-source-action">
+                              {report.sourceNeedsLabel ? 'Add source' : 'Change'}
+                            </span>
+                          </button>
+                        ) : (
+                          <span className="import-source">{report.source}</span>
+                        )}
+
+                        {showIdentity && (
+                          <button
+                            className="import-source-control import-report-person"
+                            type="button"
+                            disabled={actions.busy}
+                            aria-label={`${report.subject.confirmed ? 'Change' : 'Review'} person for ${report.reportType}`}
+                            onClick={() => setSheet({ type: 'identity', reportId: report.id })}
+                          >
+                            <UserRound size={14} aria-hidden="true" />
+                            <span className="import-source">
+                              {report.subject.printedName || report.subject.label}
+                              {report.subject.confirmed &&
+                              (!report.subject.assignedPerson ||
+                                report.subject.assignedPerson.personId === 'patient')
+                                ? ' (you)'
+                                : report.subject.defaultPerson === 'new' &&
+                                    !report.subject.confirmed
+                                  ? ' (new)'
+                                  : ''}
+                            </span>
+                            <span className="import-source-action">
+                              {report.subject.confirmed ? 'Change' : 'Review'}
+                            </span>
                           </button>
                         )}
-                        <button
-                          className="text-link"
-                          type="button"
-                          onClick={() => setSheet({ type: 'source', reportId: report.id })}
-                        >
-                          {report.sourceSuggested ? 'Change' : 'Add source'}
-                        </button>
                       </div>
-                    </div>
-                  )}
-                {reportRecords.map((record) => (
-                  <article className="import-record" key={record.id}>
-                    <div className="import-record-row">
-                      {view === 'review' || view === 'later' ? (
-                        <input
-                          type="checkbox"
-                          checked={selected.has(record.id)}
-                          onChange={() => toggle(record.id)}
-                          aria-label={`Select ${record.label}`}
-                        />
-                      ) : (
-                        <span />
-                      )}
-                      <div className="import-record-name">
-                        <strong>
-                          {record.label}
-                          {record.manuallyEdited && <span>Edited</span>}
-                        </strong>
-                        <button
-                          className="text-link"
-                          type="button"
-                          onClick={() => setSheet({ type: 'original', recordId: record.id })}
-                        >
-                          Original <ArrowUpRight size={12} />
-                        </button>
-                        {record.date && <small className="import-record-date">{record.date}</small>}
-                      </div>
-                      <div
-                        className={`import-record-value${record.value.length > 18 ? ' is-text' : ''}`}
-                      >
-                        <ImportMeasurementValue
-                          value={record.value}
-                          unit={record.unit}
-                          compactUnit
-                        />
-                      </div>
-                      <div className="import-record-actions">
-                        {(view === 'review' || view === 'later') && (
-                          <>
+                    </header>
+                    {renderReportSourceReview &&
+                      !reports.some(
+                        (previous) =>
+                          previous.id !== report.id &&
+                          previous.sourceIntakeId === report.sourceIntakeId &&
+                          reports.indexOf(previous) < reports.indexOf(report) &&
+                          visible.some((row) => row.reportId === previous.id),
+                      ) &&
+                      renderReportSourceReview(report)}
+                    {reportRecords.map((record) => (
+                      <article className="import-record" key={record.id}>
+                        <div className="import-record-row">
+                          {view === 'review' || view === 'later' ? (
+                            <input
+                              type="checkbox"
+                              checked={selected.has(record.id)}
+                              onChange={() => toggle(record.id)}
+                              aria-label={`Select ${record.label}`}
+                            />
+                          ) : (
+                            <span />
+                          )}
+                          <div className="import-record-name">
+                            <strong>
+                              {record.label}
+                              {record.manuallyEdited && <span>Edited</span>}
+                            </strong>
                             <button
                               className="text-link"
                               type="button"
-                              onClick={() =>
-                                move([record.id], view === 'later' ? 'review' : 'later')
-                              }
+                              onClick={() => setSheet({ type: 'original', recordId: record.id })}
                             >
-                              {view === 'later' ? 'Return to review' : 'Later'}
+                              Original <ArrowUpRight size={12} />
                             </button>
-                            <button
-                              className="button primary"
-                              type="button"
-                              disabled={!record.eligible || actions.busy}
-                              aria-describedby={
-                                !record.eligible && record.saveBlockReason
-                                  ? saveBlockDescriptionId(record.id)
-                                  : undefined
-                              }
-                              onClick={() => move([record.id], 'saved')}
-                            >
-                              <Check size={15} /> Confirm & save
-                            </button>
-                          </>
-                        )}
-                        {view === 'excluded' && (
-                          <button
-                            className="button secondary"
-                            type="button"
-                            onClick={() => move([record.id], 'review')}
+                            {record.date && (
+                              <small className="import-record-date">{record.date}</small>
+                            )}
+                          </div>
+                          <div
+                            className={`import-record-value${record.value.length > 18 ? ' is-text' : ''}`}
                           >
-                            Restore
-                          </button>
-                        )}
-                        {view === 'saved' && (
-                          <span className="import-saved">
-                            <Check size={15} /> Saved
-                          </span>
-                        )}
-                        <button
-                          className="icon-button"
-                          type="button"
-                          aria-label={`More actions for ${record.label}`}
-                          onClick={() => setSheet({ type: 'edit', recordId: record.id })}
-                        >
-                          <Ellipsis size={18} />
-                        </button>
-                      </div>
-                    </div>
-                    {!record.eligible &&
-                      record.saveBlockReason &&
-                      (view === 'review' || view === 'later') && (
-                        <div
-                          className="import-match import-save-blocker"
-                          id={saveBlockDescriptionId(record.id)}
-                        >
-                          <span>
-                            <FileSearch size={15} /> {record.saveBlockReason}
-                          </span>
-                          {record.detailUrl && (
-                            <a className="text-link" href={`#${record.detailUrl}`}>
-                              Open review <ArrowRight size={14} />
-                            </a>
+                            <ImportMeasurementValue
+                              value={record.value}
+                              unit={record.unit}
+                              compactUnit
+                            />
+                          </div>
+                          <div className="import-record-actions">
+                            {renderRecordReview && record.kind !== 'People' && (
+                              <button
+                                className="text-link"
+                                type="button"
+                                aria-expanded={expandedRecord === record.id}
+                                aria-controls={`record-review-${encodeURIComponent(record.id)}`}
+                                onClick={() => void openRecordReview(record)}
+                              >
+                                {expandedRecord === record.id ? 'Close review' : 'Review'}
+                              </button>
+                            )}
+                            {(view === 'review' || view === 'later') && (
+                              <>
+                                <button
+                                  className="text-link"
+                                  type="button"
+                                  onClick={() =>
+                                    move([record.id], view === 'later' ? 'review' : 'later')
+                                  }
+                                >
+                                  {view === 'later' ? 'Return to review' : 'Later'}
+                                </button>
+                                <button
+                                  className="button primary"
+                                  type="button"
+                                  disabled={!record.eligible || actions.busy}
+                                  aria-describedby={
+                                    !record.eligible && record.saveBlockReason
+                                      ? saveBlockDescriptionId(record.id)
+                                      : undefined
+                                  }
+                                  onClick={() => move([record.id], 'saved')}
+                                >
+                                  <Check size={15} /> Confirm & save
+                                </button>
+                              </>
+                            )}
+                            {view === 'excluded' && (
+                              <button
+                                className="button secondary"
+                                type="button"
+                                onClick={() => move([record.id], 'review')}
+                              >
+                                Restore
+                              </button>
+                            )}
+                            {view === 'saved' && (
+                              <span className="import-saved">
+                                <Check size={15} /> Saved
+                              </span>
+                            )}
+                            <button
+                              className="icon-button"
+                              type="button"
+                              aria-label={`More actions for ${record.label}`}
+                              onClick={() => {
+                                if (renderRecordReview && record.kind !== 'People')
+                                  void openRecordReview(record);
+                                else setSheet({ type: 'edit', recordId: record.id });
+                              }}
+                            >
+                              <Ellipsis size={18} />
+                            </button>
+                          </div>
+                        </div>
+                        {!record.eligible &&
+                          record.saveBlockReason &&
+                          (view === 'review' || view === 'later') && (
+                            <div
+                              className="import-match import-save-blocker"
+                              id={saveBlockDescriptionId(record.id)}
+                            >
+                              <span>
+                                <FileSearch size={15} /> {record.saveBlockReason}
+                              </span>
+                              {(record.saveBlockReview === 'identity' || record.detailUrl) && (
+                                <button
+                                  className="text-link"
+                                  type="button"
+                                  onClick={() =>
+                                    record.saveBlockReview === 'identity'
+                                      ? setSheet({ type: 'identity', reportId: report.id })
+                                      : void openRecordReview(record)
+                                  }
+                                >
+                                  {record.saveBlockReview === 'identity'
+                                    ? 'Review person'
+                                    : 'Open review'}{' '}
+                                  <ArrowRight size={14} />
+                                </button>
+                              )}
+                            </div>
                           )}
-                        </div>
-                      )}
-                    {record.relatedMatch && view !== 'saved' && (
-                      <div className="import-match">
-                        <span>
-                          <Link2 size={15} /> Possible match:{' '}
-                          <strong>{record.relatedMatch.value}</strong> from{' '}
-                          {record.relatedMatch.source}
-                        </span>
-                        <button
-                          className="text-link"
-                          type="button"
-                          onClick={() => setSheet({ type: 'compare', recordId: record.id })}
-                        >
-                          Compare <ArrowRight size={14} />
-                        </button>
-                      </div>
-                    )}
-                    {!record.relatedMatch &&
-                      record.possibleOverlap &&
-                      record.detailUrl &&
-                      (view === 'review' || view === 'later') && (
-                        <div className="import-match">
-                          <span>
-                            <Link2 size={15} /> A saved result has this value and date in the same
-                            file. Matching numbers alone do not mean it is the same measurement.
-                            Compare the test name, date, and body region before excluding it.
-                          </span>
-                          <a className="text-link" href={`#${record.detailUrl}`}>
-                            Check possible overlap <ArrowRight size={14} />
-                          </a>
-                        </div>
-                      )}
-                    {view === 'saved' && record.savedDestination && (
-                      <div className="import-record-destination">
-                        <SavedRecordDestinationLink record={record.savedDestination} />
-                      </div>
-                    )}
-                    {view === 'saved' && record.savedPersonDestination && (
-                      <div className="import-record-destination">
-                        <SavedPersonDestinationLink destination={record.savedPersonDestination} />
-                      </div>
-                    )}
-                  </article>
-                ))}
-              </section>
-            );
-          })}
-          {visible.length === 0 && <div className="import-empty">No records match this view.</div>}
-        </div>
-        {(model?.activity?.activeFiles || model?.activity?.paused) && (
-          <p className="import-feed-note">
-            Showing records found so far. More may appear while Moxie reads.
-          </p>
+                        {record.relatedMatch && view !== 'saved' && (
+                          <div className="import-match">
+                            <span>
+                              <Link2 size={15} /> Possible match:{' '}
+                              <strong>{record.relatedMatch.value}</strong> from{' '}
+                              {record.relatedMatch.source}
+                            </span>
+                            <button
+                              className="text-link"
+                              type="button"
+                              onClick={() => setSheet({ type: 'compare', recordId: record.id })}
+                            >
+                              Compare <ArrowRight size={14} />
+                            </button>
+                          </div>
+                        )}
+                        {!record.relatedMatch &&
+                          record.possibleOverlap &&
+                          record.detailUrl &&
+                          (view === 'review' || view === 'later') && (
+                            <div className="import-match">
+                              <span>
+                                <Link2 size={15} /> A saved result has this value and date in the
+                                same file. Matching numbers alone do not mean it is the same
+                                measurement. Compare the test name, date, and body region before
+                                excluding it.
+                              </span>
+                              <a className="text-link" href={`#${record.detailUrl}`}>
+                                Check possible overlap <ArrowRight size={14} />
+                              </a>
+                            </div>
+                          )}
+                        {view === 'saved' && record.savedDestination && (
+                          <div className="import-record-destination">
+                            <SavedRecordDestinationLink record={record.savedDestination} />
+                          </div>
+                        )}
+                        {view === 'saved' && record.savedPersonDestination && (
+                          <div className="import-record-destination">
+                            <SavedPersonDestinationLink
+                              destination={record.savedPersonDestination}
+                            />
+                          </div>
+                        )}
+                        {expandedRecord === record.id && renderRecordReview && (
+                          <div
+                            className="import-record-accordion"
+                            id={`record-review-${encodeURIComponent(record.id)}`}
+                          >
+                            {renderRecordReview(record, () => setExpandedRecord(null))}
+                          </div>
+                        )}
+                      </article>
+                    ))}
+                  </section>
+                );
+              })}
+              {visible.length === 0 && !(kind === 'All' && sourceCount > 0) && (
+                <div className="import-empty">
+                  {model?.loading ? 'Loading records…' : 'No records match this view.'}
+                </div>
+              )}
+            </div>
+            {(model?.activity?.activeFiles || model?.activity?.paused) && (
+              <p className="import-feed-note">
+                Showing records found so far. More may appear while Moxie reads.
+              </p>
+            )}
+            {model?.hasMore && (
+              <div className="import-load-more">
+                <button
+                  className="button secondary"
+                  type="button"
+                  disabled={model.loadingMore}
+                  onClick={() => void actions.onLoadMore?.()}
+                >
+                  {model.loadingMore ? 'Loading…' : 'Load more records'}
+                </button>
+              </div>
+            )}
+            {model?.operationStatus && (
+              <p className="import-feed-note" role="status">
+                {model.operationStatus}
+              </p>
+            )}
+          </>
         )}
-        {model?.hasMore && (
-          <div className="import-load-more">
-            <button
-              className="button secondary"
-              type="button"
-              disabled={model.loadingMore}
-              onClick={() => void actions.onLoadMore?.()}
-            >
-              {model.loadingMore ? 'Loading…' : 'Load more records'}
-            </button>
+        {renderSourceAttention && (
+          <div hidden={!(view === 'review' && (sourceAttention || kind === 'All'))}>
+            <ImportSourceSelection.Provider value={sourceSelection.register}>
+              {renderSourceAttention(setAttentionCount)}
+            </ImportSourceSelection.Provider>
           </div>
-        )}
-        {model?.operationStatus && (
-          <p className="import-feed-note" role="status">
-            {model.operationStatus}
-          </p>
         )}
       </section>
       <ImportSheet
@@ -1087,8 +1252,8 @@ export function ImportReviewPresentation({
         busy={!!actions.busy}
         reviewSource={actions.onReviewSource}
         close={() => setSheet(null)}
-        confirmIdentity={(reportId, fields) => {
-          confirmReportIdentity(reportId, fields);
+        confirmIdentity={(reportId, fields, personSelection, printedName) => {
+          confirmReportIdentity(reportId, fields, personSelection, printedName);
         }}
         changeSource={async (reportId, source, review) => {
           if (model && actions.onUseSource) {
@@ -1349,7 +1514,7 @@ function DraftCorrectionForm({
 }
 
 function ImportSheet({
-  sheet,
+  sheet: initialSheet,
   reports,
   records,
   returnFocus,
@@ -1371,7 +1536,12 @@ function ImportSheet({
   busy: boolean;
   reviewSource?: (reportId: string) => Promise<IntakeReportSourceReview>;
   close: () => void;
-  confirmIdentity: (reportId: string, fields: { fullName?: string; birthDate?: string }) => void;
+  confirmIdentity: (
+    reportId: string,
+    fields: { fullName?: string; birthDate?: string },
+    personSelection?: ImportPersonSelection,
+    printedName?: string,
+  ) => void;
   changeSource: (
     reportId: string,
     source: string,
@@ -1383,6 +1553,13 @@ function ImportSheet({
   correctDrafts?: ImportReviewActions['onCorrectDrafts'];
   askDraftRepair?: ImportReviewActions['onAskDraftRepair'];
 }) {
+  const [metadataTab, setMetadataTab] = useState<'identity' | 'source'>(
+    initialSheet?.type === 'source' ? 'source' : 'identity',
+  );
+  const sheet =
+    initialSheet && (initialSheet.type === 'source' || initialSheet.type === 'identity')
+      ? { ...initialSheet, type: metadataTab }
+      : initialSheet;
   const record =
     sheet && 'recordId' in sheet ? records.find((item) => item.id === sheet.recordId) : undefined;
   const report =
@@ -1398,7 +1575,22 @@ function ImportSheet({
           return candidate?.draftRepair ? [candidate] : [];
         })
       : [];
-  const offeredSelfFields = report?.subject.offeredSelfFields || {};
+  const [personSelection, setPersonSelection] = useState<ImportPersonSelection>(() =>
+    report?.subject.assignedPerson && report.subject.assignedPerson.personId !== 'patient'
+      ? {
+          noteId: report.subject.assignedPerson.noteId,
+          expectedVersion: report.subject.assignedPerson.version,
+        }
+      : report?.subject.defaultPerson === 'new'
+        ? { newPerson: { fullName: report.subject.printedName || '' } }
+        : undefined,
+  );
+  const [selectedPrintedName, setSelectedPrintedName] = useState('');
+  const needsPrintedName = !!report?.subject.printedNameRequired;
+  const offeredSelfFields: { fullName?: string; birthDate?: string } = report?.subject
+    .offeredSelfFields?.birthDate
+    ? { birthDate: report.subject.offeredSelfFields.birthDate }
+    : {};
   const offeredFullName = offeredSelfFields.fullName;
   const offeredBirthDate = offeredSelfFields.birthDate;
   const selfFieldSelectionScope = report ? `${report.id}:${sheet?.type || ''}` : null;
@@ -1517,6 +1709,28 @@ function ImportSheet({
               <X size={18} />
             </Dialog.Close>
           </div>
+          {(sheet?.type === 'identity' || sheet?.type === 'source') && report && (
+            <nav className="import-context-tabs" aria-label="Report details">
+              <button
+                type="button"
+                aria-pressed={sheet.type === 'source'}
+                disabled={
+                  busy || sourceBusy || !(report.sourceLabelAvailable || report.sourceSuggested)
+                }
+                onClick={() => setMetadataTab('source')}
+              >
+                Source
+              </button>
+              <button
+                type="button"
+                aria-pressed={sheet.type === 'identity'}
+                disabled={busy || sourceBusy}
+                onClick={() => setMetadataTab('identity')}
+              >
+                Person
+              </button>
+            </nav>
+          )}
           {sheet?.type === 'original' && record && report && (
             <>
               <Dialog.Description>
@@ -1563,17 +1777,44 @@ function ImportSheet({
           {sheet?.type === 'identity' && report && (
             <>
               <Dialog.Description>
-                {report.subject.confirmed
-                  ? 'This report is already allowed by retained identity evidence. Adding a blank Self detail is optional and does not save clinical records.'
-                  : 'Confirm identity once for every record supported by this report.'}
+                {report.subject.identityStatus === 'conflict' && report.subject.scopeReady === false
+                  ? 'Processing could not establish a consistent report identity. Editing a result cannot resolve this issue, and these records cannot be approved yet.'
+                  : report.subject.confirmed
+                    ? 'Review who this report belongs to. Accepted records keep their existing attribution.'
+                    : 'Choose yourself or another person for the records in this report. Clinical results remain in review.'}
               </Dialog.Description>
-              <div className="import-sheet-card">
-                <strong>This is my report</strong>
+              <div className="import-sheet-card import-context-card">
+                <strong>
+                  {report.subject.identityStatus === 'missing_warning'
+                    ? 'Identity is not printed clearly in this report.'
+                    : report.subject.identityStatus === 'conflict'
+                      ? report.subject.scopeReady === false
+                        ? 'Report identity could not be established.'
+                        : 'Choose who this report belongs to.'
+                      : 'Report subject'}
+                </strong>
                 <span>
                   {report.subject.evidenceText
                     ? `The report identifies “${report.subject.evidenceText}”.`
                     : 'Check the retained report before confirming identity.'}
                 </span>
+                {report.subject.identityMessage &&
+                  !report.subject.questions?.some(
+                    (question) => question.prompt === report.subject.identityMessage,
+                  ) && <span>{report.subject.identityMessage}</span>}
+                {report.subject.scopeError && <span role="alert">{report.subject.scopeError}</span>}
+                {report.subject.conflicts?.map((conflict) => (
+                  <span key={`${conflict.field}:${conflict.evidencedValue}`}>
+                    {conflict.field === 'fullName' ? 'Full name' : 'Date of birth'}: Self has{' '}
+                    {conflict.selfValue || 'no value'}; report evidence has{' '}
+                    {conflict.evidencedValue || 'different retained claims'}.
+                  </span>
+                ))}
+                {report.subject.scopeReady === false &&
+                  !report.subject.scopeError &&
+                  !report.subject.identityStatus && (
+                    <span>Checking retained identity evidence…</span>
+                  )}
                 {!report.subject.confirmed && report.subject.targetCount !== undefined && (
                   <span>
                     This applies to {report.subject.targetCount}{' '}
@@ -1582,12 +1823,30 @@ function ImportSheet({
                 )}
                 {report.subject.questions?.map((question) => (
                   <span key={`${question.prompt}:${question.textAnchor || ''}`}>
-                    {question.prompt}
-                    {question.textAnchor ? ` — “${question.textAnchor}”` : ''}
+                    <span>{question.prompt}</span>
+                    {question.textAnchor && <q>{question.textAnchor}</q>}
                   </span>
                 ))}
               </div>
-              {!!Object.keys(offeredSelfFields).length && (
+              {needsPrintedName && (
+                <ImportPrintedName
+                  value={selectedPrintedName}
+                  subjectText={report.subject.evidenceText || ''}
+                  onChange={setSelectedPrintedName}
+                  disabled={busy}
+                />
+              )}
+              <ImportPersonChoice
+                selfDisabled={report.subject.selfBirthDateConflict}
+                people={report.subject.people}
+                peopleTruncated={report.subject.peopleTruncated}
+                assignedPerson={report.subject.assignedPerson}
+                printedName={report.subject.printedName || selectedPrintedName}
+                selection={personSelection}
+                onChange={setPersonSelection}
+                disabled={busy || report.subject.scopeReady === false}
+              />
+              {!personSelection && !!Object.keys(offeredSelfFields).length && (
                 <fieldset className="import-fill-name">
                   <legend>Fill selected blank Self details in this same action</legend>
                   <p className="import-sheet-note">
@@ -1631,22 +1890,56 @@ function ImportSheet({
                   type="button"
                   disabled={
                     busy ||
-                    (report.subject.identityStatus !== 'confirmation_required' &&
-                      selectedSelfFields.size === 0)
+                    report.subject.scopeReady === false ||
+                    report.subject.identityStatus === 'missing_warning' ||
+                    (!personSelection && !!report.subject.selfBirthDateConflict) ||
+                    !personSelectionReady(personSelection) ||
+                    (needsPrintedName &&
+                      !printedNameReady(selectedPrintedName, report.subject.evidenceText || ''))
                   }
-                  onClick={() =>
+                  onClick={() => {
+                    if (
+                      report.subject.confirmed &&
+                      !needsPrintedName &&
+                      (!personSelection
+                        ? !report.subject.assignedPerson ||
+                          report.subject.assignedPerson.personId === 'patient'
+                        : 'noteId' in personSelection &&
+                          personSelection.noteId === report.subject.assignedPerson?.noteId) &&
+                      (!offeredBirthDate || !selectedSelfFields.has('birthDate'))
+                    ) {
+                      close();
+                      return;
+                    }
                     confirmIdentity(
                       report.id,
-                      Object.fromEntries(
-                        [...selectedSelfFields].flatMap((field) => {
-                          const value = offeredSelfFields[field];
-                          return value ? [[field, value]] : [];
-                        }),
-                      ),
-                    )
-                  }
+                      personSelection
+                        ? {}
+                        : Object.fromEntries(
+                            [...selectedSelfFields].flatMap((field) => {
+                              const value = offeredSelfFields[field];
+                              return value ? [[field, value]] : [];
+                            }),
+                          ),
+                      personSelection,
+                      needsPrintedName ? selectedPrintedName.trim() : undefined,
+                    );
+                  }}
                 >
-                  {report.subject.confirmed ? 'Add selected details to Self' : 'This is me'}
+                  {report.subject.confirmed &&
+                  !needsPrintedName &&
+                  (!personSelection
+                    ? !report.subject.assignedPerson ||
+                      report.subject.assignedPerson.personId === 'patient'
+                    : 'noteId' in personSelection &&
+                      personSelection.noteId === report.subject.assignedPerson?.noteId) &&
+                  (!offeredBirthDate || !selectedSelfFields.has('birthDate'))
+                    ? 'Done'
+                    : personSelection
+                      ? 'Confirm person'
+                      : report.subject.confirmed
+                        ? 'Save changes'
+                        : 'This is me'}
                 </button>
               </div>
             </>
@@ -1657,6 +1950,16 @@ function ImportSheet({
                 Use this label for the report and eligible results you save. Original issuer and
                 upload history stay unchanged.
               </Dialog.Description>
+              {report.sourceEvidence?.contentUrl && (
+                <a
+                  className="button secondary import-open-original"
+                  href={report.sourceEvidence.contentUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Review {report.sourceEvidence.label} <ArrowUpRight size={12} />
+                </a>
+              )}
               <label>
                 Source
                 <input
@@ -1666,13 +1969,20 @@ function ImportSheet({
                 />
               </label>
               <p className="import-sheet-note">
-                Suggestions are not applied until you choose Use source.
+                This source is used when you save records. Change it here if needed.
               </p>
+              {report.sourceCoverage && (
+                <p className="import-sheet-note">
+                  Current {report.sourceCoverage.current.covered}/
+                  {report.sourceCoverage.current.total} source-labeled · Saved{' '}
+                  {report.sourceCoverage.saved.covered}/{report.sourceCoverage.saved.total}
+                </p>
+              )}
               {sourceReviewLoading && (
                 <p className="import-sheet-note">Loading affected records…</p>
               )}
               {sourceReview && (
-                <div className="import-sheet-card">
+                <div className="import-sheet-card import-context-card">
                   <strong>
                     {sourceReview.targets.length}{' '}
                     {sourceReview.targets.length === 1 ? 'record' : 'records'} will use “

@@ -171,7 +171,7 @@ test('DEXA queue counts 28 results independently and counts accepted, deferred, 
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
 });
 
-test('newest candidate version replaces stale pending history while unrelated earlier proposal rows remain actionable', (t) => {
+test('newest candidate version replaces stale pending history while unrelated earlier proposal rows remain actionable', async (t) => {
   const f = fixture(t),
     original = envelope('versioned'),
     other = envelope('independent');
@@ -207,8 +207,11 @@ test('newest candidate version replaces stale pending history while unrelated ea
   });
   assert.deepEqual(queue(f), stable);
   let newBlock = current.blocks.find((block) => block.proposalId !== null)!;
-  assert.equal(newBlock.records[0]!.identityReview?.status, 'evidenced_match');
+  assert.equal(newBlock.records[0]!.identityReview?.blocking, true);
+  const identity = await getIntakeIdentityReview(f.db, f.root, f.profileId, item.id, groupId);
+  assert.equal(identity.status, 'evidenced_match');
   newBlock = detail(f, groupId).blocks.find((block) => block.proposalId !== null)!;
+  assert.equal(newBlock.records[0]!.identityReview?.status, 'evidenced_match');
   intake.importIntake(f.db, f.root, f.profileId, item.id, {
     version: newBlock.intakeVersion,
     proposalId: newBlock.proposalId,

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 
 test(
   'hardened application image exports a note PDF and backs up originals larger than temporary storage',
-  { skip: !process.env.HEALTH_CONSUMER_TEST_IMAGE, timeout: 240000 },
+  { skip: !process.env.CRS_CONSUMER_TEST_IMAGE, timeout: 240000 },
   (t) => {
     const root = mkdtempSync(join(tmpdir(), 'fictional-container-consumers-'));
     chmodSync(root, 0o777);
@@ -41,10 +41,10 @@ test(
         '--mount',
         `type=bind,source=${root},target=/archive`,
         '-e',
-        'CIRCUS_FICTIONAL_CONSUMER_CHECK=1',
+        'CRS_FICTIONAL_CONSUMER_CHECK=1',
         '--entrypoint',
         'node',
-        process.env.HEALTH_CONSUMER_TEST_IMAGE!,
+        process.env.CRS_CONSUMER_TEST_IMAGE!,
         'src/server/test/hardened-consumers-fixture.ts',
       ],
       { encoding: 'utf8', timeout: 210000, maxBuffer: 1024 * 1024 },

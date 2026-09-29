@@ -1,10 +1,22 @@
+import { identityPeopleSnapshots } from './intake-identity-people.ts';
+import { observeIntakeVersion, intakeVersionConflictFacts } from './import-version-diagnostics.ts';
 import {
   measureImportPhase,
   beginImportPhase,
   recordImportProgress,
 } from './import-diagnostics.ts';
 import { stampNewReportGroups } from './intake-report-discovery.ts';
-import { identityGroundingLookup } from './intake-identity-grounding.ts';
+import {
+  copyDiagnosticValidation,
+  withDiagnosticValidation,
+  withDiagnosticContext,
+} from './import-diagnostic-error.ts';
+import {
+  identityOriginalBirthDatesLookup,
+  identityGroundingLookup,
+  identitySubjectGroundingLookup,
+  identityNameQuestionGroundingLookup,
+} from './intake-identity-grounding.ts';
 import {
   intakeReportSourceCoverageCounts,
   intakeReportSourceForMember,
@@ -13,10 +25,15 @@ import {
   priorIntakeReportSourceExtensions,
 } from './intake-report-source.ts';
 import { receiveIntakeUpload } from './intake-upload.ts';
+import {
+  assertCurrentProposalSourceText,
+  sourceTextProposalId,
+} from './intake-source-text-dependencies.ts';
 import { inspectIntakeFile, intakeLimits, assertExtractionSize } from './intake-files.ts';
 import {
   intakeWorkflow,
   recordCandidateVersions,
+  intakeCandidateVersionId,
   addWorkflowQuestion,
   workflowReview,
   workflowSummary,
@@ -122,6 +139,9 @@ interface InternalProposal extends IntakeProposal {
 }
 
 interface IntakeDetails {
+  sourceTextRevisionId?: string | null;
+  sourceTextDependencyToken?: string | null;
+  sourceTextRequiresInterpretation?: boolean;
   originalName: string;
   acquisition?: { providerId: string; provider: string };
   metadata?: IntakeMetadata;
@@ -148,6 +168,8 @@ interface IntakeDetails {
 }
 
 interface PersistenceOptions {
+  /** Host-only receipt supplied by the authorized manual creation path. */
+  manualSourceRecord?: import('../shared/intake-manual-source-record.ts').ManualSourceRecordReceipt;
   exportFn?: typeof exportCuration;
   workflowBatch?: {
     planId: string;
@@ -435,12 +457,11 @@ function row(db: DatabaseSync, id: string): SourceFileRow {
 function details(file: SourceFileRow): IntakeDetails {
   return (json(file.details_json) as { intake: IntakeDetails }).intake;
 }
-function checkVersion(file: SourceFileRow, version: unknown): void {
+function checkVersion(db: DatabaseSync, file: SourceFileRow, version: unknown): void {
   if (!Number.isSafeInteger(version) || version !== details(file).version)
-    throw new HttpError(
-      409,
-      'VERSION_CONFLICT',
-      'This intake changed. Reload it before continuing.',
+    throw withDiagnosticContext(
+      new HttpError(409, 'VERSION_CONFLICT', 'This intake changed. Reload it before continuing.'),
+      intakeVersionConflictFacts(db, file.id, version, details(file).version, file.details_json),
     );
 }
 const sourceContextVersionCache = new Map<string, Set<string>>();
@@ -493,7 +514,9 @@ function cachedSourceContextVersions(
         if (parsed.valid)
           for (const entry of parsed.entries)
             if (sourceContextEnvelope(entry.value))
-              retained.add('candidate-version:' + workflowHash(canonicalLiteral(entry.value)));
+              retained.add(
+                intakeCandidateVersionId(d, sourceId === file.id ? null : sourceId, entry),
+              );
       } catch {
         // DTO reads do not replace explicit source verification or review errors.
         continue;
@@ -789,7 +812,7 @@ function saveOriginal(
   }
   return true;
 }
-function mime(bytes: Buffer, name: string): string {
+function mime(bytes: Buffer, name: string, retainedBytes = bytes.length): string {
   if (bytes.subarray(0, 5).toString() === '%PDF-') return 'application/pdf';
   if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])))
     return 'image/png';
@@ -801,6 +824,49 @@ function mime(bytes: Buffer, name: string): string {
   )
     return 'image/webp';
   if (bytes.subarray(0, 2).toString() === 'PK') return 'application/zip';
+  // Retain-only eligibility must survive renaming. Recognize common media
+  // signatures before extension hints; unsupported variants remain explicit.
+  if (bytes.length >= 132 && bytes.subarray(128, 132).toString() === 'DICM')
+    return 'application/dicom';
+  if (bytes.subarray(0, 4).toString() === 'RIFF') {
+    if (bytes.subarray(8, 12).toString() === 'WAVE') return 'audio/wav';
+    if (bytes.subarray(8, 12).toString() === 'AVI ') return 'video/x-msvideo';
+  }
+  if (bytes.subarray(0, 3).toString() === 'ID3') return 'audio/mpeg';
+  if (bytes.subarray(0, 4).toString() === 'fLaC') return 'audio/flac';
+  if (bytes.subarray(0, 4).toString() === 'OggS') return 'audio/ogg';
+  // Sync bits alone also match arbitrary binary. ADTS needs a complete header,
+  // a defined sample rate and a frame length consistent with the retained file.
+  if (bytes.length >= 7 && bytes[0] === 0xff && (bytes[1]! & 0xf6) === 0xf0) {
+    const headerBytes = bytes[1]! & 1 ? 7 : 9;
+    const frameBytes = ((bytes[3]! & 3) << 11) | (bytes[4]! << 3) | (bytes[5]! >> 5);
+    if (((bytes[2]! >> 2) & 15) <= 12 && frameBytes >= headerBytes && frameBytes <= retainedBytes)
+      return 'audio/aac';
+  }
+  // MPEG audio reserves one version, layer zero, bitrate index 15 and sample
+  // rate index 3. Keep valid free-format bitrate zero eligible as MPEG audio.
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0xff &&
+    (bytes[1]! & 0xe0) === 0xe0 &&
+    (bytes[1]! & 0x18) !== 0x08 &&
+    (bytes[1]! & 0x06) !== 0 &&
+    (bytes[2]! & 0xf0) !== 0xf0 &&
+    (bytes[2]! & 0x0c) !== 0x0c &&
+    (bytes[3]! & 0x03) !== 0x02
+  )
+    return 'audio/mpeg';
+  if (bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) return 'video/x-matroska';
+  if (bytes.subarray(4, 8).toString() === 'ftyp') {
+    const brand = bytes.subarray(8, 12).toString();
+    if (['M4A ', 'M4B ', 'M4P '].includes(brand)) return 'audio/mp4';
+    if (
+      ['isom', 'iso2', 'avc1', 'mp41', 'mp42', 'M4V ', 'qt  ', '3gp4', '3gp5', '3g2a'].includes(
+        brand,
+      )
+    )
+      return 'video/mp4';
+  }
   if (/\.(jsonl|ndjson)$/i.test(name)) return 'application/x-ndjson';
   if (/\.json$/i.test(name)) return 'application/json';
   return 'application/octet-stream';
@@ -943,7 +1009,7 @@ function publishIntakeInternal(
     };
   }
   const path = `${profilePaths(root, profileId).relativeRoot}/sources/${encodeURIComponent(p.id)}/intake/${key}/${name}`;
-  const mimeType = mime(staged?.prefix || input.bytes!, name);
+  const mimeType = mime(staged?.prefix || input.bytes!, name, staged?.bytes ?? input.bytes!.length);
   const binary = [
     'application/pdf',
     'image/png',
@@ -1035,8 +1101,30 @@ function publishIntakeInternal(
 }
 function update(db: DatabaseSync, file: SourceFileRow, d: IntakeDetails): void {
   const all = json(file.details_json) as Record<string, unknown>;
+  const before = details(file);
   all.intake = d;
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(JSON.stringify(all), file.id);
+  const raw = JSON.stringify(all);
+  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(raw, file.id);
+  try {
+    observeIntakeVersion(db, file.id, before, d, raw, file.details_json);
+  } catch {
+    /* Diagnostics do not change publication. */
+  }
+}
+/** Readiness uses dependency pins, not merely the presence of an old proposal. */
+export function currentIntakeInterpretations(db: DatabaseSync, profileId: string, id: string) {
+  owner(db, profileId);
+  const d = details(row(db, id));
+  return {
+    original: !d.sourceTextRequiresInterpretation,
+    proposalIds: d.proposals
+      .filter(
+        (p) =>
+          (p.sourceTextRevisionId || null) === (d.sourceTextRevisionId || null) &&
+          (p.sourceTextDependencyToken || null) === (d.sourceTextDependencyToken || null),
+      )
+      .map((p) => p.id),
+  };
 }
 export function proposeConversion(
   db: DatabaseSync,
@@ -1051,23 +1139,42 @@ export function proposeConversion(
     d = details(file);
   safeText(input.jsonlText, 'JSONL proposal', MAX_INTAKE_BYTES);
   const bytes = Buffer.from(input.jsonlText),
-    proposalId = 'proposal:' + hash(id + '\0' + hash(bytes));
+    proposalId = sourceTextProposalId(
+      id,
+      hash(bytes),
+      d.sourceTextRevisionId,
+      d.sourceTextDependencyToken,
+    );
   const existingProposal = d.proposals.some((p) => p.id === proposalId);
+  if (
+    existingProposal &&
+    options?.manualSourceRecord &&
+    d.proposals.find((p) => p.id === proposalId)?.manualSourceRecord?.fingerprint !==
+      options.manualSourceRecord.fingerprint
+  )
+    throw new HttpError(
+      409,
+      'OPERATION_CONFLICT',
+      'This source proposal already has different authorship',
+    );
   if (existingProposal && !options?.workflowBatch)
     return {
       ...getIntake(db, root, profileId, id),
       durability: flushIntake(db, root, profileId, options),
     };
-  checkVersion(file, input.version);
+  checkVersion(db, file, input.version);
   verifyIntakeOriginal(db, root, profileId, id);
   const parsed = validateJSONL(bytes),
     validation = validationSummary(parsed);
   if (!validation.valid)
-    throw new HttpError(
-      400,
-      'INVALID_JSONL',
-      'Proposal is not valid health-record-v1 JSONL: ' +
-        validation.issues.map((i) => `line ${i.line}: ${i.message}`).join('; '),
+    throw copyDiagnosticValidation(
+      new HttpError(
+        400,
+        'INVALID_JSONL',
+        'Proposal is not valid health-record-v1 JSONL: ' +
+          validation.issues.map((i) => `line ${i.line}: ${i.message}`).join('; '),
+      ),
+      parsed,
     );
   const summary = safeText(input.summary, 'conversion summary', 10000),
     runId = input.runId == null ? null : safeText(input.runId, 'assistant run ID', 200);
@@ -1085,7 +1192,7 @@ export function proposeConversion(
   saveOriginal(root, profileId, path, bytes);
   // Preserve this original if a commit response is uncertain: a durable intent may already reference it.
   mutate(db, () => {
-    checkVersion(row(db, id), input.version);
+    checkVersion(db, row(db, id), input.version);
     if (!existingProposal)
       registerFile(db, {
         id: proposalId,
@@ -1103,6 +1210,11 @@ export function proposeConversion(
           summary,
           validation,
           clinicalProjection: 'none',
+          ...(options?.manualSourceRecord
+            ? { manualSourceRecord: options.manualSourceRecord }
+            : {}),
+          sourceTextRevisionId: d.sourceTextRevisionId || null,
+          sourceTextDependencyToken: d.sourceTextDependencyToken || null,
         },
       });
     if (!existingProposal)
@@ -1114,7 +1226,10 @@ export function proposeConversion(
         runId,
         modelIdentity,
         validation,
+        ...(options?.manualSourceRecord ? { manualSourceRecord: options.manualSourceRecord } : {}),
         contentUrl: `/api/sources/${encodeURIComponent(proposalId)}/content`,
+        sourceTextRevisionId: d.sourceTextRevisionId || null,
+        sourceTextDependencyToken: d.sourceTextDependencyToken || null,
       });
     const existingGroupIds = new Set(
       workflowSummary(d).workflow.reportGroups.map((group) => group.id),
@@ -1209,7 +1324,7 @@ export function reviewIntake(
             intakeWorkflow(d),
             proposalId,
             `${inputFile.id}:line:${entry.line}`,
-            'candidate-version:' + workflowHash(canonicalLiteral(entry.value)),
+            intakeCandidateVersionId(d, proposalId, entry),
           ),
         )
         .filter(Boolean) as IntakeReviewDraft[],
@@ -1230,6 +1345,25 @@ export function reviewIntake(
     },
     {
       profileId,
+      people: identityPeopleSnapshots(db),
+      nameQuestionGrounded: identityNameQuestionGroundingLookup(db, {
+        profileId,
+        intakeId: id,
+        sourceHash: file.sha256,
+        workflow: intakeWorkflow(d),
+      }),
+      originalBirthDates: identityOriginalBirthDatesLookup(db, {
+        profileId,
+        intakeId: id,
+        sourceHash: file.sha256,
+        workflow: intakeWorkflow(d),
+      }),
+      subjectGrounded: identitySubjectGroundingLookup(db, {
+        profileId,
+        intakeId: id,
+        sourceHash: file.sha256,
+        workflow: intakeWorkflow(d),
+      }),
       grounded: identityGroundingLookup(db, {
         profileId,
         intakeId: id,
@@ -1275,6 +1409,20 @@ export function reviewIntake(
         .join('; '),
       evidence: record.evidence,
     }));
+  if (proposalId || d.sourceTextRequiresInterpretation) {
+    const proposal = d.proposals.find((item) => item.id === proposalId);
+    review.sourceTextStale =
+      (!proposalId && !!d.sourceTextRequiresInterpretation) ||
+      (proposal?.sourceTextRevisionId || null) !== (d.sourceTextRevisionId || null) ||
+      (proposal?.sourceTextDependencyToken || null) !== (d.sourceTextDependencyToken || null);
+    if (review.sourceTextStale)
+      review.coverageGaps.push({
+        id: 'source-text-changed',
+        label: 'Source text changed',
+        detail:
+          'This proposal uses earlier source text. Read the corrected source and create a new proposal before acceptance.',
+      });
+  }
   return review;
 }
 
@@ -1398,10 +1546,11 @@ function prepareIntakeImportInternal(
   const decisionFingerprint = hash(
     canonicalLiteral({ proposalId: selected, decisions: input.decisions || [] }),
   );
-  checkVersion(file, input.version);
+  checkVersion(db, file, input.version);
   verifyIntakeOriginal(db, root, profileId, id);
   if (selected && !d.proposals.some((p) => p.id === selected))
     throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
+  assertCurrentProposalSourceText(d, selected);
   const inputFile: SourceFileRow = selected
     ? required(
         db.prepare('SELECT * FROM source_files WHERE id=?').get(selected) as
@@ -1537,7 +1686,7 @@ function prepareIntakeImportInternal(
     apply(expectedVersion: number, occurrenceAuthorityFinalizers?: OccurrenceAuthorityFinalizer[]) {
       const file = row(db, id),
         d = details(file);
-      checkVersion(file, expectedVersion);
+      checkVersion(db, file, expectedVersion);
       const insert = db.prepare(
         'INSERT OR IGNORE INTO source_records(id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
       );
@@ -1568,7 +1717,7 @@ function prepareIntakeImportInternal(
       ).n;
       const clinical = clinicalReview
         ? (projectClinicalReview as unknown as ProjectClinicalReview)(db, {
-            file: reviewedSource(db, file, d),
+            file: reviewedSource(db, file, d, true),
             inputFile,
             entries: validation.entries!,
             review: clinicalReview,
@@ -1744,10 +1893,10 @@ export function workflowMutation<T extends WorkflowMutationInput>(
       };
     }
   }
-  checkVersion(file, version);
+  checkVersion(db, file, version);
   verifyIntakeOriginal(db, root, profileId, id);
   mutate(db, () => {
-    checkVersion(row(db, id), version);
+    checkVersion(db, row(db, id), version);
     callback(workflow, file, d);
     if (operationId) workflow.operations.push({ id: operationId, fingerprint, at: now() });
     d.version++;
@@ -2168,8 +2317,47 @@ function reviewedSource(
   db: DatabaseSync,
   file: SourceFileRow,
   d: IntakeDetails,
+  materialize = false,
 ): ReviewedSourceRow {
-  for (const confirmation of d.workflow?.reportSourceConfirmations || []) {
+  // Defaults are derived from the exact linked context/version, not a filename or
+  // another package member. Manual choices take precedence. Accepted snapshots
+  // retain the selection basis without inventing a human confirmation receipt.
+  const defaults: IntakeReportSourceConfirmation[] = (d.workflow?.reportGroups || []).flatMap(
+    (group) =>
+      group.versions.flatMap((version) => {
+        const context = version.context;
+        if (
+          group.basis !== 'report_anchor' ||
+          version.contextState === 'mixed' ||
+          context?.status !== 'linked' ||
+          !context.sourceSuggestion
+        )
+          return [];
+        const source = context.sourceSuggestion.value.trim();
+        if (!source) return [];
+        const selected = provider(db, { newProviderName: source });
+        return [
+          {
+            basis: 'suggested_report_label' as const,
+            operationId:
+              'default-report-source:' +
+              workflowHash([group.id, version.id, context.contextId, source]),
+            groupId: group.id,
+            groupVersionId: version.id,
+            contextId: context.contextId,
+            source: selected.name,
+            sourceProviderId: selected.id,
+            members: version.members.map(({ candidateId, candidateVersionId }) => ({
+              candidateId,
+              candidateVersionId,
+            })),
+            at: '',
+          },
+        ];
+      }),
+  );
+  const reportSources = [...defaults, ...(d.workflow?.reportSourceConfirmations || [])];
+  for (const confirmation of reportSources) {
     const existing = db
       .prepare('SELECT name FROM providers WHERE id=?')
       .get(confirmation.sourceProviderId) as { name: string } | undefined;
@@ -2179,7 +2367,7 @@ function reviewedSource(
         'REPORT_SOURCE_SCOPE',
         'The retained report source no longer matches its provider identity',
       );
-    if (!existing)
+    if (!existing && materialize)
       db.prepare('INSERT INTO providers(id,name) VALUES(?,?)').run(
         confirmation.sourceProviderId,
         confirmation.source,
@@ -2190,7 +2378,7 @@ function reviewedSource(
     provider_id: d.metadata?.sourceProviderId || file.provider_id,
     provider: d.metadata?.source || file.provider,
     reviewedMetadata: d.metadata || null,
-    reportSourceConfirmations: d.workflow?.reportSourceConfirmations || [],
+    reportSourceConfirmations: reportSources,
   };
 }
 
@@ -2268,7 +2456,7 @@ function retainTerminalPairDecision(
     retained.batchId,
   );
   (projectClinicalReview as unknown as ProjectClinicalReview)(db, {
-    file: reviewedSource(db, file, d),
+    file: reviewedSource(db, file, d, true),
     inputFile,
     entries: [entry],
     review: { ...review, records: [record] },
@@ -2323,15 +2511,6 @@ export function saveIntakeReviewDraft(
       input.decision === undefined
         ? previous?.decision
         : (validateDraftDecision as unknown as ValidateDraftDecision)(input.decision, record);
-    if (
-      record.identityReview?.status === 'conflict' &&
-      (mapping.subject === 'self' || decision?.mapping?.subject === 'self')
-    )
-      throw new HttpError(
-        409,
-        'IDENTITY_CONFLICT',
-        'The evidenced name or date of birth conflicts with Self and cannot be bypassed',
-      );
     const answers = { ...previous?.answers };
     if (input.answers !== undefined) {
       if (
@@ -2477,7 +2656,39 @@ export function saveIntakeReviewDraft(
         question.status = 'answered';
       }
     }
+    if (
+      input.correctionReason !== undefined &&
+      (typeof input.correctionReason !== 'string' ||
+        !input.correctionReason.trim() ||
+        input.correctionReason.length > 10000)
+    )
+      throw new HttpError(
+        400,
+        'CORRECTION_REASON',
+        'Supply a correction reason of at most 10000 characters',
+      );
+    const corrections = [...(previous?.corrections || [])];
+    const correctedMapping = { ...record.mapping, ...mapping, ...decision?.mapping };
+    const changedFields = Object.keys(correctedMapping).filter(
+      (key) =>
+        !['subject', 'personId', 'sourceSystem'].includes(key) &&
+        canonicalLiteral(correctedMapping[key as keyof IntakeClinicalMapping]) !==
+          canonicalLiteral(record.mapping[key as keyof IntakeClinicalMapping]),
+    );
+    if (input.correctionReason && changedFields.length)
+      corrections.push({
+        operationId: input.operationId,
+        at,
+        reason: input.correctionReason.trim(),
+        before: Object.fromEntries(
+          changedFields.map((key) => [key, record.mapping[key as keyof IntakeClinicalMapping]]),
+        ),
+        after: Object.fromEntries(
+          changedFields.map((key) => [key, correctedMapping[key as keyof IntakeClinicalMapping]]),
+        ),
+      });
     const draft: IntakeReviewDraft = {
+      ...(corrections.length ? { corrections } : {}),
       id: input.operationId,
       proposalId,
       recordId: record.id,
@@ -2662,6 +2873,7 @@ export function saveIntakeDraftRepair(
         candidateId: record.candidateId!,
         candidateVersionId: record.candidateVersionId!,
         mapping,
+        ...(previous?.corrections ? { corrections: previous.corrections } : {}),
         resolutions: previous?.resolutions || [],
         disposition: previous?.disposition || 'pending',
         ...(decision ? { decision } : {}),
@@ -2707,7 +2919,7 @@ export async function createIntakePlan(
 ) {
   owner(db, profileId);
   const initial = row(db, id);
-  checkVersion(initial, input.version);
+  checkVersion(db, initial, input.version);
   const { indexIntakeEvidence } = await import('./intake-evidence.ts');
   const index = (await indexIntakeEvidence({
     db,
@@ -2852,7 +3064,7 @@ export function submitIntakeBatch(
       );
     return getIntake(db, root, profileId, id);
   }
-  checkVersion(file, version);
+  checkVersion(db, file, version);
   const plan = required(
     workflow.plans.find((p) => p.id === input.planId && p.status === 'active'),
     'Active extraction plan not found',
@@ -2880,10 +3092,13 @@ export function submitIntakeBatch(
         c.notes.length > 4000,
     )
   )
-    throw new HttpError(
-      400,
-      'BATCH_COVERAGE',
-      'Supply distinct plan units with explicit extracted/context/inspected/unreadable coverage and notes',
+    throw withDiagnosticValidation(
+      new HttpError(
+        400,
+        'BATCH_COVERAGE',
+        'Supply distinct plan units with explicit extracted/context/inspected/unreadable coverage and notes',
+      ),
+      { code: 'invalid_batch_coverage', path: 'arguments.coverage' },
     );
   return proposeConversion(
     db,

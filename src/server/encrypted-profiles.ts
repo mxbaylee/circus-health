@@ -1,3 +1,4 @@
+import { personDisplayKey } from '../shared/person-display.ts';
 import { randomUUID, randomBytes } from 'node:crypto';
 import {
   mkdirSync,
@@ -21,7 +22,13 @@ import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
 import type { Server, ServerResponse } from 'node:http';
 import { openDatabase, HttpError, LATEST_SCHEMA_VERSION, type Database } from './database.ts';
 import { durableWrite, attachPersonalDurability } from './portable.ts';
-import { selfIdentity, getNote, saveNote, createNote } from './notes.ts';
+import {
+  registerProfileDisplayGuard,
+  selfIdentity,
+  getNote,
+  saveNote,
+  createNote,
+} from './notes.ts';
 import { ensureProfileDirectories, registerProfileOriginalResolver } from './profile-storage.ts';
 import { importStorageEstimate, runtimeCapacity } from './archive-storage.ts';
 import { intakeLimits } from './intake-files.ts';
@@ -41,6 +48,7 @@ import { openVault, hashFile, type Vault, type VaultRecordStorage } from './vaul
 import { onboardingIdentity } from './profile-onboarding.ts';
 import { validPersonIcon } from '../shared/person-icon.ts';
 import { rebuildRecordDatabase, type DurableRecordVersion } from './record-versions.ts';
+import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
 export interface EncryptedLabel {
   algorithm: 'xchacha20poly1305-ietf';
   nonce: string;
@@ -403,6 +411,7 @@ export function createEncryptedProfiles({
               copied
                 .prepare(`UPDATE ${table} SET ${column}=replace(${column},?,?)`)
                 .run(`data/profiles/${copyState.id}/`, `data/profiles/${id}/`);
+            rebindCopiedIntakeSourceText(copied, copyState.id, id);
             for (const t of copied
               .prepare(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '__record_%'",
@@ -557,6 +566,9 @@ export function createEncryptedProfiles({
         closing: false,
         disposeOriginalResolver,
       };
+      registerProfileDisplayGuard(state.db, (name, icon) =>
+        requireDistinctProfile(name, icon, state.id),
+      );
       refreshCard(state);
       opened.set(id, state);
       diagnostics.attachSummaryStore(id, {
@@ -573,6 +585,22 @@ export function createEncryptedProfiles({
       throw e;
     }
   }
+  function requireDistinctProfile(name: string, icon: string | undefined, exceptId?: string) {
+    const pair = personDisplayKey(name, icon);
+    if (
+      registry.profiles.some((entry) => {
+        if (entry.id === exceptId) return false;
+        const state = opened.get(entry.id);
+        const current = state ? selfIdentity(state.db) : entry;
+        return personDisplayKey(current.name, current.icon) === pair;
+      })
+    )
+      throw new HttpError(
+        409,
+        'DUPLICATE_PROFILE_DISPLAY',
+        'Another profile already has this display name and icon. Choose a different display name or icon.',
+      );
+  }
   function begin(input: BeginInput) {
     const name = nameOf(input.name);
     if (input.icon !== undefined && !validPersonIcon(input.icon))
@@ -584,6 +612,7 @@ export function createEncryptedProfiles({
     const copyState = input.copyFrom ? opened.get(input.copyFrom) : null;
     if (input.copyFrom && !copyState)
       throw new HttpError(423, 'PROFILE_LOCKED', 'Unlock the source profile before copying');
+    requireDistinctProfile(name, input.icon || 'person');
     const identity = !input.copyFrom && input.placebo !== true ? onboardingIdentity(input) : {};
     const id = `p-${randomUUID()}`,
       setupId = randomBytes(32).toString('base64url'),
@@ -657,6 +686,12 @@ export function createEncryptedProfiles({
     const vault = openVault({ directory: pathFor(setup.id), profileId: setup.id, key });
     const details = JSON.parse(vault.readFile('setup.json') as unknown as string) as SetupDetails;
     vault.close();
+    try {
+      requireDistinctProfile(details.name, details.icon || 'person', setup.id);
+    } catch (error) {
+      key.fill(0);
+      throw error;
+    }
     let copyState;
     if (details.copyFrom) {
       copyState = opened.get(details.copyFrom);

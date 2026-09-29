@@ -1,3 +1,5 @@
+import { PersonFilter } from './PersonFilter';
+import { usePersonScope } from './PersonScope';
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Pencil, Plus, Search, SlidersHorizontal, X } from 'lucide-react';
 import '../features/notes/compact-filters.css';
@@ -163,6 +165,7 @@ export function CollectionFilters({
   definitions: FilterDefinition[];
   onApply: (key: string, value: string) => void;
 }) {
+  const personScope = usePersonScope();
   const applied = definitions.filter((definition) => definition.applied(definition.value));
   const [expanded, setExpanded] = useState(false);
   const [editing, setEditing] = useState<{
@@ -222,7 +225,7 @@ export function CollectionFilters({
           {applied.length > 0 && <span className="filter-count">{applied.length}</span>}
         </button>
       </div>
-      {applied.length > 0 && (
+      {(applied.length > 0 || personScope?.filterable) && (
         <ul className="people-filter-pills" aria-label="Saved filters">
           {applied.map((item) => {
             const label = item.valid(item.value)
@@ -252,6 +255,7 @@ export function CollectionFilters({
               </li>
             );
           })}
+          <PersonFilter disabled={!!editing} />
         </ul>
       )}
       {expanded && (

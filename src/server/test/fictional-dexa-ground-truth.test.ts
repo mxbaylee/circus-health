@@ -88,6 +88,11 @@ async function acceptDexaAndSkipOtherSubject(
     (candidate) => candidate.report?.subject?.text === 'Subject: Fern Example',
   )) {
     const identity = await getIntakeIdentityReview(db, root, profileId, intake.id, group.id);
+    if (!identity.blocking) {
+      assert.equal(identity.status, 'evidenced_match');
+      assert.equal(identity.evidencedIdentity.fullName, 'Fern Example');
+      continue;
+    }
     assert.equal(identity.status, 'confirmation_required');
     assert.ok(identity.scope && identity.scope.targets.length > 0);
     current = await confirmIntakeIdentityScope(db, root, profileId, intake.id, {
@@ -95,7 +100,9 @@ async function acceptDexaAndSkipOtherSubject(
       operationId: `confirm-fictional-dexa-${group.id}`,
       scope: identity.scope,
       outcome: 'this_is_me',
-      attestation: 'reviewed_original_and_membership',
+      attestation: identity.scope.questions?.length
+        ? 'confirmed_displayed_identity_questions'
+        : 'reviewed_original_and_membership',
     });
   }
   const review = reviewIntake(db, root, profileId, intake.id, proposalId);

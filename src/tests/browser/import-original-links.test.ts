@@ -82,6 +82,14 @@ test(
           valueText: '8',
           unit: 'mm',
           date: '2032-03-04',
+          reviewIssues: [
+            {
+              id: 'value-check',
+              kind: 'uncertain_reading',
+              field: 'valueText',
+              prompt: 'Verify the fictional measurement value.',
+            },
+          ],
         },
         provenance: {
           capturedVia: 'Prepared fictional link test',
@@ -124,22 +132,63 @@ test(
       }
       assert.equal(page.url(), openerUrl);
     };
-    await openAndCheck(page.getByRole('link', { name: /Review .*original/i }));
+    await page
+      .locator('.import-report-header')
+      .getByRole('button', {
+        name: /^(Add source|Change source: |Change source for )/,
+      })
+      .click();
+    const sourceReview = page.getByRole('dialog');
+    await openAndCheck(sourceReview.getByRole('link', { name: /Review .*original/i }));
+    await sourceReview.getByRole('button', { name: 'Cancel', exact: true }).click();
     await page.getByRole('button', { name: 'Original', exact: true }).click();
     const dialog = page.getByRole('dialog', { name: 'Original report' });
     await openAndCheck(dialog.getByRole('link', { name: 'Open retained original' }));
     await dialog.getByRole('button', { name: 'Close', exact: true }).click();
     assert.equal(await page.getByText('Fictional link measure', { exact: true }).count(), 1);
 
+    // The same durable editor is reachable in the record row without navigating away.
+    const reviewUrl = page.url();
+    await page.getByRole('button', { name: 'Review', exact: true }).click();
+    const inline = page.locator('.import-record-accordion');
+    await inline.getByRole('textbox', { name: 'Result', exact: true }).waitFor();
+    assert.equal(page.url(), reviewUrl);
+    assert.equal(await inline.locator('.import-correction-evidence').isVisible(), true);
+    await inline.getByRole('textbox', { name: 'Result', exact: true }).fill('9');
+    await inline.getByRole('button', { name: 'Update', exact: true }).click();
+    await inline.waitFor({ state: 'detached' });
+    await page.reload();
+    await page.getByRole('button', { name: 'Review', exact: true }).click();
+    await inline.getByRole('textbox', { name: 'Result', exact: true }).waitFor();
+    assert.equal(
+      await inline.getByRole('textbox', { name: 'Result', exact: true }).inputValue(),
+      '9',
+    );
+    const screenshots = process.env.CRS_SCREENSHOTS_DIR;
+    if (screenshots) {
+      mkdirSync(screenshots, { recursive: true });
+      await page.screenshot({
+        path: resolve(screenshots, 'inline-record-desktop.png'),
+        fullPage: true,
+      });
+      await page.setViewportSize({ width: 390, height: 844 });
+      assert.equal(
+        await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),
+        false,
+      );
+      await page.screenshot({
+        path: resolve(screenshots, 'inline-record-mobile.png'),
+        fullPage: true,
+      });
+      await page.setViewportSize({ width: 1280, height: 900 });
+    }
+    await inline.getByRole('button', { name: 'Close review', exact: true }).click();
+    await inline.waitFor({ state: 'detached' });
+
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
-    await page
-      .getByRole('status')
-      .getByText('1 result was saved to your profile.', { exact: true })
-      .waitFor();
-    const destination = page
-      .getByRole('region', { name: 'Just saved destinations' })
-      .getByRole('link')
-      .filter({ hasText: 'Fictional link measure' });
+    await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
+    await page.getByRole('combobox', { name: 'Review status' }).selectOption('saved');
+    const destination = page.getByRole('link').filter({ hasText: 'Fictional link measure' });
     await destination.click();
     await page.waitForURL(/#\/tests\?result=/);
     const selected = page.getByRole('region', { name: 'Selected result' });

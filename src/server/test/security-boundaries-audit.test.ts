@@ -29,13 +29,13 @@ test('anonymous allowed-origin connection tests reach the configured model, but 
   await new Promise<void>((done) => app.server.listen(0, '127.0.0.1', done));
   const realFetch = globalThis.fetch;
   const settings = {
-    HEALTH_AI_BACKEND: 'litellm',
-    HEALTH_AI_MODEL: 'fictional-security-test',
-    HEALTH_AI_BASE_URL: 'http://fictional-model.invalid',
-    HEALTH_AI_API_KEY: 'fictional-key-only',
-    HEALTH_AI_API_KEY_FILE: undefined,
-    HEALTH_AI_PROXY_LOCAL_ONLY: 'false',
-    HEALTH_AI_REASONING_EFFORT: undefined,
+    CRS_AI_BACKEND: 'litellm',
+    CRS_AI_MODEL: 'fictional-security-test',
+    CRS_AI_BASE_URL: 'http://fictional-model.invalid',
+    CRS_AI_API_KEY: 'fictional-key-only',
+    CRS_AI_API_KEY_FILE: undefined,
+    CRS_AI_PROXY_LOCAL_ONLY: 'false',
+    CRS_AI_REASONING_EFFORT: undefined,
   };
   const previous = Object.fromEntries(Object.keys(settings).map((key) => [key, process.env[key]]));
   for (const [key, value] of Object.entries(settings)) {

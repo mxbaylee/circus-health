@@ -12,12 +12,13 @@ enters their record. **Must** is mandatory; **should** is a strong default.
 
 - A personal health record. Each **profile** belongs to one person, **Self**, with a required full
   name and complete birth date, and optional **known names** (other spellings or earlier names
-  confirmed as Self). Someone who looks after a child or parent has a separate profile for each and
-  switches between them; profiles never share access.
+  confirmed as Self). An unlocked profile can also retain family records assigned to people in its
+  People list. Separate encrypted profiles remain separate access boundaries; adding a person
+  does not grant them access or create another profile.
 - Profiles are encrypted; the person unlocks one to use it.
 - Saved records by kind: **test results** (measurements, including vision), **medications**,
   **procedures**, **documents** (letters, visit notes, reports) and **notes**. **People** holds
-  relatives and clinicians, with contact details and a free-text medical or family history.
+  relatives and clinicians, with contact details, medical or family history, and explicitly assigned clinical records.
 - An **AI reader** reads uploads and **proposes** records; it never saves. A separate **assistant**
   answers questions over the saved record (for example "help me prepare for my annual physical");
   imports must leave the record complete and dated enough for it to answer well.
@@ -43,7 +44,7 @@ A design that breaks one is rejected, not traded off.
 | P3  | **Never drop silently.** Every page is read, or listed with the reason it wasn't and can be read later in one action.        |
 | P4  | **Never overwrite.** A changed value becomes a new version; every version stays, with its source.                            |
 | P5  | **Never merge on a hunch.** Equal values or dates alone don't make records the same. A match is linked, never collapsed.     |
-| P6  | **Never file someone else's record as mine.** The birth date is the anchor, and a mismatch stops early.                      |
+| P6  | **Never file someone else's record as mine.** A mismatch asks who the report belongs to; reading continues.                      |
 | P7  | **Always show where it came from.** Every saved value leads back to each original and location that reported it.             |
 | P8  | **AI is additive.** No shortcut trades accuracy or a safeguard for speed or cost; the saved record never needs AI re-run.    |
 | P9  | **Interruptions lose nothing.** A closed tab, crash or provider outage keeps finished work and continues without duplicates. |
@@ -78,19 +79,15 @@ person validates it.
 | Imaging package with a report               | The report is read; the images are kept                                               |
 | Anything unrecognized                       | Kept and listed afterward: "Saved, but we don't recognize this file type."            |
 
-### Identity, before reading
+### Identity and person assignment
 
-- Printed patient name and birth date **must** be checked as early as possible, before AI reading
-  where the text allows.
-- A printed **patient** birth date that differs from Self's stops that file before reading, showing
-  the printed date with "Upload the right file" and "Read it anyway". Other files continue. Only a
-  birth date labeled as the patient's counts; a policyholder's, guarantor's, parent's or emergency
-  contact's does not.
-- A matching name with no printed birth date passes silently. No name and no birth date asks for
-  confirmation.
-- A matching birth date with a different name asks once: "Is this you under another name?" On yes
-  the spelling becomes a known name. A spelling becomes a known name only from a document printing
-  a complete birth date equal to Self's.
+Owner revision, 2026-09-27: a name or patient birth-date mismatch does not reject a file or stop reading.
+
+- Retain patient identity evidence while reading and preserve unresolved attribution in proposals.
+- Ask the person to assign the displayed report to Self, an existing person in People, or a new person. Never silently merge equal names or assign a relative's measurements to Self.
+- **This is me** is also a durable profile update: add the supported printed name to Self's known names, without replacing the primary name or existing birth date. Explicit confirmation, rather than an equal-birthday requirement, authorizes the name.
+- Choosing another person links the report's pending records to that person. Creating a person and assigning the scope is one durable operation; clinical results still require separate approval.
+- Changed source evidence, contradictory subject claims or stale scope require refreshed review. They do not justify rejecting a readable file because it differs from Self.
 
 ### Reading
 
@@ -135,6 +132,9 @@ in [CRS-115](application-todo.md#crs-115).
 - Account separately for pages read, text retained, unresolved regions and clinical records
   proposed or accepted. Fully retained text does not prove complete clinical extraction. The
   retain-only format exclusions above remain in force.
+
+The processing proposal lists the [six incompatible implementation variants](processing-context-proposal.md#implementations-ruled-out-by-complete-text-extraction)
+explicitly; [CRS-115](application-todo.md#crs-115) owns implementation and verification status.
 
 ### Reconciling with what is already saved
 
@@ -196,11 +196,8 @@ in [CRS-115](application-todo.md#crs-115).
 ### Other people
 
 - A report about someone else **must never** add clinical records to Self.
-- A relative's report uploaded on purpose is **reference material**: the relative appears in People,
-  the finding is summarized into their history with a link to the original ("Thyroid antibodies
-  positive, 2025"), and each document that refers to a person adds a note about them.
-- The relationship is optional and never prompted for. A named person is never merged into an
-  existing Person automatically; an exact-name match is offered as a choice.
+- A relative's report can produce reviewable clinical records assigned to that person, with links to their retained originals. These records are reachable from People and do not enter Self's lists or trends. Reference-only retention remains an option rather than the only family-record model.
+- Relationship is optional. A named person is never merged into an existing Person automatically; the user chooses the person explicitly.
 
 ### Notes and handwriting
 
@@ -253,11 +250,11 @@ Each is a story and the checks a build must pass. The requirements above are the
 | 3   | **A small delta.** Last week's two-page result, or a photo of it.                     | Re-uploading the identical file creates nothing. A confirmed spelling raises no question. "Select all" covers new results and nothing needing an answer. HEIC is read.                                                                                                                                                                         |
 | 4   | **The annual re-export.** One new year and nine I already saved, before my physical.  | Every page is read. Already-saved records clear in one action and gain the re-export as a source. "Hgb 13.5 g/dL" matches saved "Hemoglobin 13.5 g/dL" on the same date; "HbA1c" never matches "Hemoglobin". Glucose 90 mg/dL matches 5.0 mmol/L, marked converted. Changed values go to "Differs". A date filter narrows review, not reading. |
 | 5   | **A corrected report.** The potassium was re-run and changed.                         | Both versions kept with sources. The later-issued one is current regardless of upload order. The chart shows it on the line and lists the old one below as outdated.                                                                                                                                                                           |
-| 6   | **A file that isn't mine.** My partner's report, by mistake.                          | A different patient birth date stops it before AI reading; other files continue. My report printing a spouse's birth date as policyholder is not stopped. "Read it anyway" continues to identity review.                                                                                                                                       |
+| 6   | **A file that isn't mine.** My partner's report, by mistake.                          | Reading continues. Choose Self, an existing person or a new person before accepting the report for that person; a mismatch does not reject the file.                                                                                                                                       |
 | 7   | **I changed my name.** New records use my married surname.                            | Matching birth date, different surname asks once. Afterward, that name passes silently.                                                                                                                                                                                                                                                        |
 | 8   | **Odd files.** A HEIC photo, a TIFF fax, an MRI CD folder.                            | HEIC and multi-page TIFF are read. DICOM is kept and never sent to AI. An unrecognized file is kept and listed, with no question before reading.                                                                                                                                                                                               |
 | 9   | **Something interrupts.** Sleep, provider outage, server restart.                     | No proposal lost or duplicated. Reading continues once the provider is back or the person unlocks, and says why it paused.                                                                                                                                                                                                                     |
-| 10  | **A relative's result, on purpose.** My sister's Hashimoto's test.                    | No clinical record added to Self. A Person proposed with a history summary and a note per referring document. No relationship prompt.                                                                                                                                                                                                          |
+| 10  | **A relative's result, on purpose.** My sister's Hashimoto's test.                    | Choose or create the sister in People, then approve her clinical records with their original evidence. Her records stay separate from Self. Relationship is optional.                                                                                                                                                                                                          |
 | 11  | **Dates missing or partial.** A result with no date; another dated only "2019".       | Neither saves without a full, approved date. "2019" is proposed as 1 January 2019 with "2019" shown as printed. Dismissing keeps the original.                                                                                                                                                                                                 |
 | 12  | **Handwriting and my own photo.** A doctor's handwritten note; a photo of my vitals.  | The note appears in Notes and as a document. The readings become test results sourced to the photo.                                                                                                                                                                                                                                            |
 | 13  | **A medication list that disagrees.** Lists one I stopped, omits one I started.       | Approval shows only medications not already on my list; Advil matches ibuprofen. Switching one on and leaving one off yields my list plus the one switched on. No import removes or deactivates anything. An explicit "discontinued" offers "mark as not taking?" and changes nothing until approved.                                          |

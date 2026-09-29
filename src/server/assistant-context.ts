@@ -189,6 +189,7 @@ export function resolveAssistantPage(
         'from',
         'to',
         'providerId',
+        'personId',
       ]
         .filter((key) => params.has(key))
         .map((key) => [key, params.get(key)!]),

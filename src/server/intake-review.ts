@@ -1,3 +1,4 @@
+import { labelledBirthDates, supportedDateValues } from './intake-evidence-dates.ts';
 import { createHash } from 'node:crypto';
 import { HttpError } from './database.ts';
 import { clinicalFields, clinicalMappingEnvelope, datePrecision } from './clinical-import.ts';
@@ -121,90 +122,6 @@ export function evidenceScopedSourceSuggestion(
   return suggestion && textAnchor ? { value: suggestion, textAnchor } : null;
 }
 
-const padded = (value: number): string => String(value).padStart(2, '0');
-function calendarDate(year: number, month?: number, day?: number): string | null {
-  if (!Number.isSafeInteger(year) || year < 1 || year > 9999) return null;
-  if (month === undefined) return String(year).padStart(4, '0');
-  if (!Number.isSafeInteger(month) || month < 1 || month > 12) return null;
-  if (day === undefined) return `${String(year).padStart(4, '0')}-${padded(month)}`;
-  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  if (!Number.isSafeInteger(day) || day < 1 || day > days[month - 1]!) return null;
-  return `${String(year).padStart(4, '0')}-${padded(month)}-${padded(day)}`;
-}
-
-const monthNumbers = new Map(
-  [
-    'january',
-    'february',
-    'march',
-    'april',
-    'may',
-    'june',
-    'july',
-    'august',
-    'september',
-    'october',
-    'november',
-    'december',
-  ].map((month, index) => [month, index + 1]),
-);
-const monthPattern = [...monthNumbers.keys()].join('|');
-function supportedDateValues(anchor: string): Set<string> {
-  const values = new Set<string>();
-  let sawStructuredDate = /\b\d{4}-\d{2}-\d{2}T[0-9:.+\-]+Z?/i.test(anchor);
-  const source = anchor.replace(/\b\d{4}-\d{2}-\d{2}T[0-9:.+\-]+Z?/gi, ' ');
-  const add = (year: string, month?: string, day?: string) => {
-    const value = calendarDate(
-      Number(year),
-      month === undefined ? undefined : Number(month),
-      day === undefined ? undefined : Number(day),
-    );
-    if (value) values.add(value);
-  };
-  for (const match of source.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) {
-    sawStructuredDate = true;
-    add(match[1]!, match[2]!, match[3]!);
-  }
-  for (const match of source.matchAll(/\b(\d{4})-(\d{2})(?!-\d{2})\b/g)) {
-    sawStructuredDate = true;
-    add(match[1]!, match[2]!);
-  }
-  for (const match of source.matchAll(/\b(\d{4})[/.](\d{1,2})[/.](\d{1,2})\b/g)) {
-    sawStructuredDate = true;
-    add(match[1]!, match[2]!, match[3]!);
-  }
-  for (const match of source.matchAll(/\b(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})\b/g)) {
-    sawStructuredDate = true;
-    add(match[3]!, match[1]!, match[2]!);
-    if (match[1] !== match[2]) add(match[3]!, match[2]!, match[1]!);
-  }
-  const namedFirst = new RegExp(
-    `\\b(${monthPattern})\\s+(\\d{1,2})(?:st|nd|rd|th)?[,]?\\s+(\\d{4})\\b`,
-    'gi',
-  );
-  for (const match of source.matchAll(namedFirst)) {
-    sawStructuredDate = true;
-    add(match[3]!, String(monthNumbers.get(match[1]!.toLowerCase())), match[2]!);
-  }
-  const dayFirst = new RegExp(
-    `\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${monthPattern})[,]?\\s+(\\d{4})\\b`,
-    'gi',
-  );
-  for (const match of source.matchAll(dayFirst)) {
-    sawStructuredDate = true;
-    add(match[3]!, String(monthNumbers.get(match[2]!.toLowerCase())), match[1]!);
-  }
-  const namedMonth = new RegExp(`\\b(${monthPattern})\\s+(\\d{4})\\b`, 'gi');
-  for (const match of source.matchAll(namedMonth)) {
-    sawStructuredDate = true;
-    add(match[2]!, String(monthNumbers.get(match[1]!.toLowerCase())));
-  }
-  if (!values.size && !sawStructuredDate)
-    for (const match of source.matchAll(/\b(\d{4})\b/g)) add(match[1]!);
-  return values;
-}
-
 function containsExactDateTime(anchor: string, value: string): boolean {
   let offset = 0;
   while ((offset = anchor.indexOf(value, offset)) >= 0) {
@@ -271,13 +188,12 @@ function scopedDateChoices(
 function scopedSelfSuggestion(
   item: ReviewIssueSource,
   value: IntakeEntry['value'],
-  record: ReviewRecordInput,
+  _record: ReviewRecordInput,
   scope: SuggestionEvidenceScope,
 ): IntakeReviewIssue['selfSuggestion'] | null {
   if (
     item.kind !== 'identity' ||
     item.field !== 'subject' ||
-    record.undraftedMapping?.subject === 'other' ||
     !object(item.selfSuggestion) ||
     Object.keys(item.selfSuggestion).some((key) => !['fullName', 'birthDate'].includes(key))
   )
@@ -300,7 +216,21 @@ function scopedSelfSuggestion(
     const nameEvidence = reportSubject || anchor;
     if (fullName && nameEvidence.includes(fullName)) result.fullName = fullName;
   }
-  if (Object.hasOwn(input, 'birthDate')) {
+  // A labelled patient DOB is independent of collection/report dates elsewhere
+  // in the same literal evidence. Never resolve an ambiguous DOB against Self.
+  const labelledDates = new Set<string>();
+  const dobSource =
+    reportSubject && anchor.includes(reportSubject)
+      ? anchor.slice(anchor.indexOf(reportSubject))
+      : anchor;
+  // An anchor containing multiple people is not evidence of one person's DOB.
+  const mixedPeople =
+    /\b(?:mother|father|sibling|spouse|child|family history)\b/i.test(dobSource) ||
+    [...dobSource.matchAll(/\b(?:patient|subject)\s*:/gi)].length > 1;
+  if (!mixedPeople) for (const date of labelledBirthDates(dobSource)) labelledDates.add(date);
+  if (labelledDates.size === 1) {
+    result.birthDate = [...labelledDates][0]!;
+  } else if (!mixedPeople && labelledDates.size === 0 && Object.hasOwn(input, 'birthDate')) {
     const birthDate = metadataLabel(input.birthDate);
     if (birthDate && birthDate.toLowerCase() !== 'unknown') {
       const subjectDates = reportSubject ? supportedDateValues(reportSubject) : new Set<string>();
@@ -533,6 +463,9 @@ export function validateDraftMapping(
       'IMPORT_MAPPING',
       'Draft mapping must contain supported record fields',
     );
+  for (const [key, value] of Object.entries(mapping))
+    if (dateFields.includes(key) && value !== (baseline as UnknownRecord)[key])
+      datePrecision(value as string);
   return Object.fromEntries(
     Object.entries(mapping).filter(([key]) => fields.has(key)),
   ) as Partial<IntakeClinicalMapping>;

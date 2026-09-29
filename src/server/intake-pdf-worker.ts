@@ -412,6 +412,34 @@ async function readPage(
   const textStarted = performance.now();
   const content = await page.getTextContent();
   const text = textWindow(content.items as ({ str: string; hasEOL?: boolean } | object)[], offset);
+  const viewport = page.getViewport({ scale: 1 });
+  const locatedText = content.items.flatMap((item) => {
+    if (!('str' in item) || !item.str) return [];
+    const [a, b, , , x, y] = item.transform;
+    const length = Math.hypot(a, b) || 1;
+    const ux = a / length,
+      uy = b / length;
+    const h = Math.abs(item.height) || length;
+    const corners = [
+      [x, y],
+      [x + ux * item.width, y + uy * item.width],
+      [x - uy * h, y + ux * h],
+      [x + ux * item.width - uy * h, y + uy * item.width + ux * h],
+    ].map(([px, py]) => viewport.convertToViewportPoint(px, py));
+    const left = Math.max(0, Math.min(...corners.map(([px]) => px)) / viewport.width);
+    const top = Math.max(0, Math.min(...corners.map(([, py]) => py)) / viewport.height);
+    const right = Math.min(1, Math.max(...corners.map(([px]) => px)) / viewport.width);
+    const bottom = Math.min(1, Math.max(...corners.map(([, py]) => py)) / viewport.height);
+    return [
+      {
+        text: item.str,
+        x: Math.min(1, left),
+        y: Math.min(1, top),
+        width: Math.max(0, right - left),
+        height: Math.max(0, bottom - top),
+      },
+    ];
+  });
   const textMs = since(textStarted);
 
   const annotationStarted = performance.now();
@@ -434,6 +462,7 @@ async function readPage(
       const nativePdfMs = since(nativeStarted);
       const outputBytes =
         pdf.byteLength +
+        Buffer.byteLength(JSON.stringify(locatedText)) +
         Buffer.byteLength(text.text) +
         embedded.reduce((total, attachment) => total + attachment.bytes.byteLength, 0);
       if (outputBytes > INTAKE_PDF_BOUNDS.maxPageOutputBytes) {
@@ -443,6 +472,7 @@ async function readPage(
       }
       return {
         ...text,
+        locatedText,
         totalPages: doc.numPages,
         nextPage: pageNumber < doc.numPages ? pageNumber + 1 : null,
         pdf: Uint8Array.from(pdf),
@@ -483,6 +513,7 @@ async function readPage(
 
   const outputBytes =
     rendered.image.byteLength +
+    Buffer.byteLength(JSON.stringify(locatedText)) +
     Buffer.byteLength(text.text) +
     embedded.reduce((total, attachment) => total + attachment.bytes.byteLength, 0);
   if (outputBytes > INTAKE_PDF_BOUNDS.maxPageOutputBytes) {
@@ -493,6 +524,7 @@ async function readPage(
   page.cleanup();
   return {
     ...text,
+    locatedText,
     totalPages: doc.numPages,
     nextPage: pageNumber < doc.numPages ? pageNumber + 1 : null,
     image: Uint8Array.from(rendered.image),

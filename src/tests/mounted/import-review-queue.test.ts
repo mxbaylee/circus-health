@@ -60,7 +60,7 @@ describe('active Import reading and detail helpers', () => {
         pauseReasons: [{ reason: 'reading_exhausted', files: 1 }],
       },
     });
-    expect(label).toBe('All found reports reviewed · source reading accounted for');
+    expect(label).toBe('Reading finished · originals remain available');
     expect(label).not.toMatch(/extraction complete|reading is complete/i);
   });
 
@@ -94,4 +94,26 @@ describe('active Import reading and detail helpers', () => {
     expect(intakeReadingPauseLabel('job_limit')).toContain('another bounded reading budget');
     expect(intakeReadingPauseLabel('time_limit')).toContain('without enough new progress');
   });
+});
+
+it('distinguishes local review, bounded provider waits, authentication and unknown outcomes', () => {
+  expect(intakeReadingPauseLabel('retain_only')).toBe(
+    'Original retained; this format is not interpreted.',
+  );
+  expect(intakeReadingPauseLabel('waiting_for_local_capacity')).toContain('start automatically');
+  expect(intakeReadingPauseLabel('source_changed')).toContain('integrity problem');
+  expect(intakeReadingPauseLabel('source_review_required')).toContain(
+    'Expand the affected source section',
+  );
+  expect(intakeReadingPauseLabel('extracting_source_text')).toContain('locally');
+  expect(intakeReadingPauseLabel('waiting_for_provider')).toContain('within its existing limits');
+  expect(intakeReadingPauseLabel('provider_authentication')).toContain(
+    'Restore the provider connection',
+  );
+  expect(intakeReadingPauseLabel('provider_outcome_unknown')).toContain('must be reconciled');
+  expect(intakeReadingPauseLabel('provider_outcome_unknown')).toContain('unknown usage');
+  expect(intakeReadingPauseLabel('provider_retry_limit')).toContain(
+    'bounded provider retry allowance',
+  );
+  expect(intakeReadingPauseLabel('provider_rejected')).toContain('rejected this request');
 });

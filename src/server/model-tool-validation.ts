@@ -1,11 +1,13 @@
+import { copyDiagnosticValidation } from './import-diagnostic-error.ts';
 /** Explicit host-approved validation feedback; arbitrary application errors never use this path. */
 export class ModelToolValidationError extends Error {
   readonly code: string;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, original?: unknown) {
     super(message.slice(0, 4000));
     this.name = 'ModelToolValidationError';
     this.code = code;
+    copyDiagnosticValidation(this, original);
   }
 }
 

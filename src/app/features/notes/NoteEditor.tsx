@@ -1,3 +1,5 @@
+import { PersonClinicalRecords } from './PersonClinicalRecords';
+import { SaveStatus } from '../../components/SaveStatus';
 import { DetailHeader, EntryActions } from '../../components/DetailHeader';
 import { PersonIconPicker } from '../../components/PersonIcon';
 import { ArchiveControl } from '../../components/ArchiveControl';
@@ -42,6 +44,7 @@ import { canonicalizesEditor, leavesNoteEditor } from './navigation';
 import { personContactError } from '../../../shared/person-care';
 import { PeopleTags } from './PeopleTags';
 import { PersonContacts } from './PersonContacts';
+import { PersonNames } from './PersonNames';
 import { NoteHistoryPanel } from './NoteHistoryPanel';
 import { NoteText } from './NoteText';
 import { NoteTypeCombobox } from './NoteTypeCombobox';
@@ -75,6 +78,7 @@ function validForm(form: FormState, kind: NoteKind) {
 export function NoteEditor({
   initial,
   initialKind,
+  initialOwnerPersonId = 'patient',
   types,
   personOptions,
   onSaved,
@@ -85,6 +89,7 @@ export function NoteEditor({
 }: {
   initial: Note | null;
   initialKind: NoteKind;
+  initialOwnerPersonId?: string;
   types: string[];
   personOptions?: FilterOptions;
   onSaved: (note: Note, message: string) => void;
@@ -94,7 +99,11 @@ export function NoteEditor({
   prelinkId: string | null;
 }) {
   const formId = useId();
+  const ownerPersonId = useRef(initial?.ownerPersonId || initialOwnerPersonId).current;
   const [note, setNote] = useState(initial);
+  const [savedAt, setSavedAt] = useState<string | null>(null);
+  const [savedBy, setSavedBy] = useState<'manual' | 'auto'>('auto');
+  const manualSave = useRef(false);
   const [editingSessionId] = useState(() => crypto.randomUUID());
   const [form, setForm] = useState(() => formFor(initial));
   const [baseline, setBaseline] = useState(() =>
@@ -216,6 +225,7 @@ export function NoteEditor({
             body: JSON.stringify({
               ...inputFor(snapshot, kindRef.current, base?.version),
               editingSessionId,
+              ...(kindRef.current === 'person' ? {} : { ownerPersonId }),
               ...(base ? {} : { id: creationId }),
             }),
           },
@@ -225,6 +235,8 @@ export function NoteEditor({
       accepted: (saved, snapshot) => {
         if (!mounted.current) return;
         setNote(saved);
+        setSavedAt(saved.updatedAt);
+        setSavedBy(manualSave.current ? 'manual' : 'auto');
         setBaseline(keyFor(snapshot, saved.kind));
         // Preserve keystrokes, links and unknown profile fields added during the request.
         if (keyFor(formRef.current, saved.kind) === keyFor(snapshot, saved.kind)) {
@@ -258,7 +270,10 @@ export function NoteEditor({
     saveState === 'saving' ||
     prelinkLoading ||
     Boolean(prelinkError) ||
-    !hasSaveWork;
+    !hasSaveWork ||
+    !datesValid ||
+    !nameValid ||
+    !contactsValid;
   useEffect(() => {
     mounted.current = true;
     writer.activate();
@@ -483,12 +498,15 @@ export function NoteEditor({
   }
   async function save() {
     if (saveDisabled) return;
+    manualSave.current = true;
     autosaveAllowed.current = true;
     try {
       await writer.flush(true);
       setConflicted(false);
     } catch {
       /* Writer retains the failed snapshot and local edits. */
+    } finally {
+      manualSave.current = false;
     }
   }
   async function reloadSaved() {
@@ -847,48 +865,23 @@ export function NoteEditor({
                   onChange={(tags) => personChange('tags', tags)}
                 />
               )}
-              <div className="note-fields-pair">
-                <label className="note-field">
-                  Full name
-                  <input
-                    value={text(form.person.fullName)}
-                    disabled={busy}
-                    onChange={(event) => personChange('fullName', event.target.value)}
-                    placeholder="Full name, if known"
-                  />
-                </label>
-                <label className="note-field">
-                  Pronouns
-                  <input
-                    value={text(form.person.pronouns)}
-                    disabled={busy}
-                    onChange={(event) => personChange('pronouns', event.target.value)}
-                    placeholder="Optional, in their own words"
-                  />
-                </label>
-              </div>
-              {isSelf && (
-                <div className="note-field">
-                  <CreatableCombobox
-                    label="Other names on my health records"
-                    values={Array.isArray(form.person.knownNames) ? form.person.knownNames : []}
-                    options={[]}
-                    multiple
-                    maxLength={200}
-                    disabled={busy}
-                    placeholder="Add a name you have used"
-                    createNoun="known name"
-                    listLabel="Known names"
-                    onChange={(values) => {
-                      personChange('knownNames', values);
-                    }}
-                  />
-                  <small>
-                    Only add names you have used, such as a former name. Imported names are never
-                    added automatically. Up to 32 names.
-                  </small>
-                </div>
-              )}
+              <PersonNames
+                person={form.person}
+                disabled={busy}
+                onChange={(person) => {
+                  autosaveAllowed.current = true;
+                  setForm((current) => ({ ...current, person }));
+                }}
+              />
+              <label className="note-field">
+                Pronouns
+                <input
+                  value={text(form.person.pronouns)}
+                  disabled={busy}
+                  onChange={(event) => personChange('pronouns', event.target.value)}
+                  placeholder="Optional, in their own words"
+                />
+              </label>
               {!isSelf && (
                 <CreatableCombobox
                   label="Relationship / context"
@@ -1025,6 +1018,9 @@ export function NoteEditor({
         />
       )}
       {kind === 'person' && note?.personId && (
+        <PersonClinicalRecords key={note.personId} person={note} />
+      )}
+      {kind === 'person' && note?.personId && (
         <PersonSourceEvidence noteId={note.id} noteVersion={note.version} />
       )}
       <AttachmentPanel
@@ -1090,23 +1086,24 @@ export function NoteEditor({
           </>
         ) : (
           <>
-            <span
-              className={`quiet-badge autosave-status ${saveState}`}
-              role="status"
-              aria-live="polite"
-            >
-              {saveState === 'error'
-                ? 'Couldn’t save'
-                : !nameValid
+            <SaveStatus
+              exists={!!note}
+              dirty={dirty}
+              state={saveState}
+              savedAt={savedAt}
+              savedBy={savedBy}
+              attachmentPending={attachmentBusy || !!prelinkLoading || !!prelinkError}
+              portablePending={portablePending}
+              validation={
+                !nameValid
                   ? 'Display name is required'
                   : !contactsValid
                     ? 'Contact details need correction'
                     : !datesValid
                       ? 'Date needs correction'
-                      : portablePending
-                        ? 'Saved locally · portable copy needs retry'
-                        : ''}
-            </span>
+                      : undefined
+              }
+            />
             <div>
               <button
                 type="submit"
@@ -1115,7 +1112,11 @@ export function NoteEditor({
                 disabled={saveDisabled}
               >
                 <Save size={16} />
-                {kind === 'historical' ? 'Save draft' : 'Save now'}
+                {saveState === 'error' && !conflicted
+                  ? 'Retry'
+                  : kind === 'historical'
+                    ? 'Save draft'
+                    : 'Save now'}
               </button>
             </div>
           </>

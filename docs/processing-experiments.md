@@ -1033,7 +1033,7 @@ _None yet._
 
 - Method: read the isolated `t14-prototype.ts` against the recorded reconstruction and current
   identity policy, then fully reran it with
-  `node /Users/mxbaylee/projects/circus-health-experiments/t14/t14-prototype.ts /tmp/circus-t14-verifier-20260924`
+  `node ~/projects/circus-health-experiments/t14/t14-prototype.ts /tmp/circus-t14-verifier-20260924`
   using a separate external output directory and fresh state.
 - Agreement: **agree** with all reported prototype counts. Initial match/confirmation/group/
   conflict counts were 13/25/3/2; after the middle spelling they were 25/13/2/2; after all
@@ -1492,7 +1492,7 @@ _None yet._
 
 - Method: read the fixture generator, classifier, PDF-worker input path and ZIP member loop,
   then fully reran
-  `node /Users/mxbaylee/projects/circus-health-experiments/t21/t21-prototype.ts /tmp/circus-t21-verifier-20260924 > /tmp/circus-t21-verifier-20260924.json`.
+  `node ~/projects/circus-health-experiments/t21/t21-prototype.ts /tmp/circus-t21-verifier-20260924 > /tmp/circus-t21-verifier-20260924.json`.
   Independently compared the entire returned JSON with the runner's receipt, including actual
   extracted text and each member decision.
 - Agreement: **agree**; all output rows were identical. The rerun measured zero false stops

@@ -59,22 +59,22 @@ interface WorkflowDto {
 // Opt-in incurs real provider usage: one connection turn, one source-conversion
 // turn and one correction turn. No bridge mocks, authentication-file inspection,
 // model repair retries, Docker claims or representative format-quality claims.
-// Run with HEALTH_AI_NATIVE_WORKFLOW_TEST=1 HEALTH_AI_BACKEND=codex
-// HEALTH_AI_REASONING_EFFORT=medium node --test <this file>.
+// Run with CRS_AI_NATIVE_WORKFLOW_TEST=1 CRS_AI_BACKEND=codex
+// CRS_AI_REASONING_EFFORT=medium node --test <this file>.
 test(
   'native Codex converts fictional evidence through encrypted HTTP review, correction and cache-loss rebuild',
   {
-    skip: process.env.HEALTH_AI_NATIVE_WORKFLOW_TEST !== '1',
+    skip: process.env.CRS_AI_NATIVE_WORKFLOW_TEST !== '1',
     timeout: 420000,
   },
   async (t) => {
     assert.equal(
-      process.env.HEALTH_AI_BACKEND,
+      process.env.CRS_AI_BACKEND,
       'codex',
       'This bounded gate is specifically for native Codex',
     );
     assert.equal(
-      process.env.HEALTH_AI_REASONING_EFFORT,
+      process.env.CRS_AI_REASONING_EFFORT,
       'medium',
       'Keep the opt-in live check economical',
     );

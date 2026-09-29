@@ -45,6 +45,9 @@ export interface PdfNativePhaseTimings {
 
 export interface PdfEvidencePage {
   text: string;
+  /** Complete native items for this page, in PDF content order; geometry is normalized
+   * to the displayed (rotation-aware) page. Native order is not a semantic guarantee. */
+  locatedText?: { text: string; x: number; y: number; width: number; height: number }[];
   offset: number;
   nextOffset: number | null;
   totalCharacters: number;

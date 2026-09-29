@@ -133,7 +133,7 @@ function ClinicalRecords({ kind }: { kind: 'medications' | 'procedures' }) {
         ? 'all'
         : 'current';
   const list = useResource<ClinicalRecord[]>(
-    `/${kind}?${queryString({ q, visibility: kind === 'procedures' ? params.get('visibility') || 'visible' : undefined, limit: 40, offset, category: kind === 'procedures' ? category : undefined, status: kind === 'medications' ? status : undefined })}`,
+    `/${kind}?${queryString({ personId: params.get('personId') || 'patient', q, visibility: kind === 'procedures' ? params.get('visibility') || 'visible' : undefined, limit: 40, offset, category: kind === 'procedures' ? category : undefined, status: kind === 'medications' ? status : undefined })}`,
   );
   // A source/evidence deep link remains available even outside the list's filter.
   const id = params.get('id') ?? list.data?.[0]?.id;
@@ -141,6 +141,18 @@ function ClinicalRecords({ kind }: { kind: 'medications' | 'procedures' }) {
     id ? `/${kind}/${encodeURIComponent(id)}` : null,
   );
   const currentDetail = currentClinicalRecord(detail.data);
+  useEffect(() => {
+    if (
+      currentDetail?.personId &&
+      currentDetail.personId !== (params.get('personId') || 'patient') &&
+      params.get('id')
+    ) {
+      const next = new URLSearchParams(params);
+      next.set('personId', currentDetail.personId);
+      next.delete('offset');
+      setParams(next, { replace: true });
+    }
+  }, [currentDetail?.personId, params, setParams]);
   useAssistantSelection(id ? { collection: kind, id } : undefined, currentDetail?.label);
   const change = (changes: Record<string, string | null>, replace = false) => {
     const next = new URLSearchParams(params);

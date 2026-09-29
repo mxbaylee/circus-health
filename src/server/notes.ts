@@ -1,4 +1,8 @@
-import { knownNamesError } from '../shared/self-identity.ts';
+import {
+  canonicalIdentityName,
+  savedKnownNames,
+  knownNamesError,
+} from '../shared/self-identity.ts';
 import {
   resolveClinicalReference,
   clinicalReferenceKinds,
@@ -6,9 +10,11 @@ import {
 } from './clinical-references.ts';
 import { requireMedicationSetupReview } from './medication-preferences.ts';
 import { validPersonIcon } from '../shared/person-icon.ts';
+import { personDisplayKey } from '../shared/person-display.ts';
+import personIconCatalog from '../shared/person-icon-catalog.json' with { type: 'json' };
 import { visibilityState, noteVisibilitySQL, visibilityCondition } from './visibility.ts';
 import { collectionPredicates } from './collection-filters.ts';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomInt } from 'node:crypto';
 import {
   canonicalPersonTag,
   selfTagError,
@@ -358,6 +364,10 @@ export function getNote(db: Database, id: string): NoteDTO {
     topics: r.topics,
     rawThoughts: r.raw_thoughts,
     personId: r.person_id,
+    ownerPersonId:
+      r.kind === 'person'
+        ? r.person_id || 'patient'
+        : String(storedPerson(r.profile_json).recordOwnerPersonId || 'patient'),
     person:
       r.kind === 'person' && r.person_id === 'patient'
         ? { ...withoutPersonTags(storedPerson(r.profile_json)), name: selfIdentity(db).name }
@@ -390,6 +400,12 @@ export function listNotes(db: Database, params: URLSearchParams) {
     if (!value) continue;
     w.push(col + '=? COLLATE NOCASE');
     args.push(value);
+  }
+  if (params.get('kind') !== 'person') {
+    w.push(
+      "kind<>'person' AND COALESCE(json_extract(profile_json,'$.recordOwnerPersonId'),'patient')=?",
+    );
+    args.push(params.get('personId') || 'patient');
   }
   if (params.get('kind') === 'person' && params.get('excludeSelf') === '1')
     w.push("COALESCE(person_id,'') <> 'patient'");
@@ -499,6 +515,28 @@ function validateInput(
     JSON.stringify(person).length > 1000000
   )
     throw new HttpError(400, 'INVALID_INPUT', 'Person profile must be an object');
+  const retainedNames = storedPerson(current.profile_json).sourceKnownNames || [];
+  // Evidence names are server-owned. Ordinary edits and historical field
+  // restoration may edit manual names, but cannot remove or forge evidence.
+  person = { ...person };
+  delete person.sourceKnownNames;
+  if (retainedNames.length) {
+    person.sourceKnownNames = retainedNames;
+    const submitted = person.knownNames === undefined ? [] : person.knownNames;
+    if (!Array.isArray(submitted))
+      throw new HttpError(400, 'INVALID_INPUT', 'Known names must be a list');
+    const names = [...submitted] as unknown[];
+    for (const entry of retainedNames)
+      if (
+        !names.some(
+          (name) =>
+            typeof name === 'string' &&
+            canonicalIdentityName(name) === canonicalIdentityName(entry.name),
+        )
+      )
+        names.push(entry.name);
+    person.knownNames = names;
+  }
   const selfError = selfTagError(
     isRecord(input.person) ? input.person : undefined,
     current.person_id === 'patient',
@@ -533,6 +571,25 @@ function validateInput(
   for (const key of ['pinned', 'archived'])
     if (input[key] != null && typeof input[key] !== 'boolean')
       throw new HttpError(400, 'INVALID_INPUT', key + ' must be boolean');
+  // The metadata key is server-owned. Absence in legacy versions retains Self.
+  const noteKind = current.kind || input.kind || 'note';
+  const storedOwner = storedPerson(current.profile_json).recordOwnerPersonId;
+  if (noteKind !== 'person') {
+    if (current.id) {
+      if (input.ownerPersonId !== undefined && input.ownerPersonId !== (storedOwner || 'patient'))
+        throw new HttpError(
+          400,
+          'NOTE_OWNER_IMMUTABLE',
+          'Changing the view cannot reassign an existing note.',
+        );
+      delete person.recordOwnerPersonId;
+      if (storedOwner) person.recordOwnerPersonId = storedOwner;
+    } else {
+      person.recordOwnerPersonId = validatedNoteOwner(db, input.ownerPersonId);
+    }
+  } else {
+    delete person.recordOwnerPersonId;
+  }
   const validatedPerson = person as PersonProfile;
   return {
     title,
@@ -600,6 +657,50 @@ function replaceLinks(db: Database, id: string, value: unknown): void {
       'INSERT OR IGNORE INTO note_links(id,note_id,target_type,target_id,relation) VALUES (?,?,?,?,?)',
     ).run(newId('link'), id, l.targetType, l.targetId, l.relation || 'related');
 }
+function validatedNoteOwner(db: Database, value: unknown): string {
+  const owner = value === undefined ? 'patient' : safeText(value, 'ownerPersonId', 500);
+  if (!owner || !db.prepare('SELECT id FROM people WHERE id=?').get(owner))
+    throw new HttpError(400, 'INVALID_PERSON', 'The record owner does not exist in this profile.');
+  return owner;
+}
+function personDisplayIdentities(db: Database, exceptId?: string): Set<string> {
+  return new Set(
+    (db.prepare("SELECT * FROM notes WHERE kind='person'").all() as NoteRow[])
+      .filter((row) => row.id !== exceptId)
+      .map((row) => {
+        const person = storedPerson(row.profile_json);
+        return personDisplayKey(row.title, person.icon);
+      }),
+  );
+}
+// Installed by the profile owner; validates Self against the login picker catalog.
+const profileDisplayGuards = new WeakMap<Database, (name: string, icon?: string) => void>();
+export function registerProfileDisplayGuard(
+  db: Database,
+  guard: (name: string, icon?: string) => void,
+) {
+  profileDisplayGuards.set(db, guard);
+}
+function requireDistinctPerson(
+  db: Database,
+  name: string,
+  icon: string | undefined,
+  row?: NoteRow,
+): void {
+  const identity = personDisplayKey(name, icon);
+  // Keep legacy duplicates editable unless the identifying pair is changed.
+  if (row) {
+    const old = storedPerson(row.profile_json);
+    if (identity === personDisplayKey(row.title, old.icon)) return;
+  }
+  if (row?.person_id === 'patient') profileDisplayGuards.get(db)?.(name, icon);
+  if (personDisplayIdentities(db, row?.id).has(identity))
+    throw new HttpError(
+      409,
+      'DUPLICATE_PERSON_DISPLAY',
+      'Another person already has this display name and icon. Choose a different display name or icon.',
+    );
+}
 function createInner(db: Database, input: NoteValues): string {
   const kind = input.kind ?? 'note';
   if (typeof kind !== 'string' || !['note', 'historical', 'person'].includes(kind))
@@ -608,6 +709,23 @@ function createInner(db: Database, input: NoteValues): string {
     id = input.id === undefined ? newId('note') : safeText(input.id, 'id'),
     personId = kind === 'person' ? newId('person') : null,
     t = now();
+  if (personId) {
+    const name = v.title;
+    if (!v.person.icon) {
+      const used = personDisplayIdentities(db);
+      const choices = personIconCatalog.icons
+        .map((icon) => `lucide:${icon.name}`)
+        .filter((icon) => !used.has(personDisplayKey(name, icon)));
+      if (!choices.length)
+        throw new HttpError(
+          409,
+          'DUPLICATE_PERSON_DISPLAY',
+          'Choose a different display name or a distinct emoji.',
+        );
+      v.person.icon = choices[randomInt(choices.length)]!;
+    }
+    requireDistinctPerson(db, name, v.person.icon);
+  }
   if (personId)
     db.prepare('INSERT INTO people(id,display_name,relationship) VALUES(?,?,?)').run(
       personId,
@@ -666,6 +784,8 @@ export function createNote(
       NoteRow | undefined;
     if (existing) {
       const v = validateInput(db, input, { profile_json: '{}' });
+      if (existing.kind === 'person' && !v.person.icon)
+        v.person.icon = storedPerson(existing.profile_json).icon;
       const links = noteLinks(input.links || [])
         .map((l) => [l.targetType, l.targetId, l.relation || 'related'].join('\u0000'))
         .sort();
@@ -679,6 +799,9 @@ export function createNote(
         .sort();
       if (
         existing.kind !== (input.kind || 'note') ||
+        (existing.kind !== 'person' &&
+          String(storedPerson(existing.profile_json).recordOwnerPersonId || 'patient') !==
+            validatedNoteOwner(db, input.ownerPersonId)) ||
         existing.title !== v.title ||
         existing.content !== v.content ||
         existing.note_type !== v.typeLabel ||
@@ -712,6 +835,18 @@ export function createNote(
 }
 function saveInner(db: Database, row: NoteRow, input: NoteValues): void {
   checkEditable(row, input.version);
+  if (
+    input.ownerPersonId !== undefined &&
+    input.ownerPersonId !==
+      (row.kind === 'person'
+        ? row.person_id
+        : String(storedPerson(row.profile_json).recordOwnerPersonId || 'patient'))
+  )
+    throw new HttpError(
+      400,
+      'NOTE_OWNER_IMMUTABLE',
+      'Changing the view cannot reassign an existing note.',
+    );
   if (input.kind && input.kind !== row.kind)
     throw new HttpError(400, 'INVALID_INPUT', 'Use the convert command to change note kind');
   const v = validateInput(db, input, row);
@@ -738,6 +873,7 @@ function saveInner(db: Database, row: NoteRow, input: NoteValues): void {
     v.person = { ...v.person, name, relationship: 'Self' };
     v.title = name;
   }
+  if (row.kind === 'person') requireDistinctPerson(db, v.title, v.person.icon, row);
   if (input.archived !== undefined) {
     const visibility = visibilityState(db, 'note', row.id);
     if (Boolean(input.archived) !== visibility.archived)
@@ -771,6 +907,60 @@ function saveInner(db: Database, row: NoteRow, input: NoteValues): void {
       v.person.relationship || null,
       row.person_id,
     );
+}
+
+/** Identity-scope caller owns the existing durable workflow transaction. */
+export function createIntakeFamilyPersonInTransaction(
+  db: Database,
+  fullName: string,
+  relationship?: string,
+) {
+  const id = createInner(db, {
+    kind: 'person',
+    title: fullName,
+    content: '',
+    person: {
+      fullName,
+      name: fullName,
+      tags: ['Family'],
+      ...(relationship ? { relationship } : {}),
+    },
+  });
+  return getNote(db, id);
+}
+
+/** Explicit report-to-Self confirmation adds a name without replacing existing demographics. */
+export function rememberSourceNameInTransaction(
+  db: Database,
+  noteId: string,
+  evidence: NonNullable<PersonProfile['sourceKnownNames']>[number],
+): string | undefined {
+  const row = noteRow(db, noteId);
+  const current = getNote(db, row.id);
+  const sources = current.person.sourceKnownNames || [];
+  if (sources.some((source) => source.name === evidence.name)) return;
+  if (sources.length >= 1024)
+    throw new HttpError(
+      409,
+      'SOURCE_NAMES_CAPACITY',
+      'This person has reached the retained source-name limit; no confirmation was saved',
+    );
+  const names = savedKnownNames(current.person.knownNames);
+  const already = names.some(
+    (known) => canonicalIdentityName(known) === canonicalIdentityName(evidence.name),
+  );
+  const next = already ? names : [...names, evidence.name];
+  // Install the authority inside the caller's existing journal transaction,
+  // then use ordinary save validation/versioning for the mirrored name list.
+  db.prepare('UPDATE notes SET profile_json=? WHERE id=?').run(
+    JSON.stringify({ ...current.person, sourceKnownNames: [...sources, evidence] }),
+    row.id,
+  );
+  saveInner(db, noteRow(db, row.id), {
+    version: row.version,
+    person: { ...current.person, knownNames: next },
+  });
+  return already ? undefined : evidence.name;
 }
 
 /** Used only by an existing outer transaction that also retains the identity receipt. */
@@ -895,6 +1085,7 @@ export function correctionNote(db: Database, id: string, value: unknown): Note {
   return createNote(db, {
     id: input.id,
     kind: 'historical',
+    ownerPersonId: String(storedPerson(original.profile_json).recordOwnerPersonId || 'patient'),
     title: input.title || 'Correction: ' + original.title,
     content: input.content || '',
     typeLabel: original.note_type,
@@ -1043,7 +1234,22 @@ export function linkTargets(db: Database, params: URLSearchParams): LinkTarget[]
 function validatePerson(person: Record<string, unknown>, previous: Record<string, unknown>): void {
   if (person.icon != null && !validPersonIcon(person.icon))
     throw new HttpError(400, 'INVALID_INPUT', 'Choose a person icon or a single emoji');
-  const aliasError = knownNamesError(person.knownNames);
+  const protectedNames = Array.isArray(person.sourceKnownNames)
+    ? (person.sourceKnownNames as NonNullable<PersonProfile['sourceKnownNames']>)
+    : [];
+  const aliasError =
+    knownNamesError(person.knownNames, 1056) ||
+    knownNamesError(
+      Array.isArray(person.knownNames)
+        ? person.knownNames.filter(
+            (name) =>
+              typeof name !== 'string' ||
+              !protectedNames.some(
+                (source) => canonicalIdentityName(source.name) === canonicalIdentityName(name),
+              ),
+          )
+        : person.knownNames,
+    );
   if (aliasError) throw new HttpError(400, 'INVALID_INPUT', aliasError);
   const bloodTypes = ['', 'unknown', 'Unknown', 'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
   if (

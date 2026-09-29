@@ -76,10 +76,10 @@ def configured():
     config = yaml.safe_load(Path('/app/config.yaml').read_text())
     if not isinstance(config, dict) or not isinstance(config.get('model_list'), list):
         raise ValueError('LiteLLM config must contain model_list.')
-    model = os.environ.get('CIRCUS_MODEL', '')
+    model = os.environ.get('CRS_MODEL', '')
     matches = [entry for entry in config['model_list'] if isinstance(entry, dict) and entry.get('model_name') == model]
     if len(matches) != 1:
-        raise ValueError('MODEL must select exactly one model_list entry; wildcard aliases and duplicate deployments are unsupported.')
+        raise ValueError('CRS_MODEL must select exactly one model_list entry; wildcard aliases and duplicate deployments are unsupported.')
     # Fail closed rather than retaining callbacks/caches or fallback routes that
     # could duplicate a private archive or change the user's provider selection.
     forbidden = {'fallbacks', 'default_fallbacks', 'context_window_fallbacks', 'content_policy_fallbacks',
@@ -107,12 +107,12 @@ def configured():
     config.setdefault('general_settings', {})['master_key'] = 'os.environ/LITELLM_MASTER_KEY'
     litellm_settings = config.setdefault('litellm_settings', {})
     litellm_settings.update({'set_verbose': False, 'num_retries': 0, 'cache': False})
-    diagnostics = os.environ.get('CIRCUS_LITELLM_RESPONSE_DIAGNOSTICS', 'false').lower()
+    diagnostics = os.environ.get('CRS_LITELLM_RESPONSE_DIAGNOSTICS', 'false').lower()
     if diagnostics not in ('true', 'false'):
-        raise ValueError('CIRCUS_LITELLM_RESPONSE_DIAGNOSTICS must be true or false.')
-    capture = os.environ.get('CIRCUS_LITELLM_CAPTURE_RESPONSE', 'false').lower()
+        raise ValueError('CRS_LITELLM_RESPONSE_DIAGNOSTICS must be true or false.')
+    capture = os.environ.get('CRS_LITELLM_CAPTURE_RESPONSE', 'false').lower()
     if capture not in ('true', 'false'):
-        raise ValueError('CIRCUS_LITELLM_CAPTURE_RESPONSE must be true or false.')
+        raise ValueError('CRS_LITELLM_CAPTURE_RESPONSE must be true or false.')
     if diagnostics == 'true' or capture == 'true':
         # This project-owned callback is fixed here after operator callbacks have
         # been rejected above. Raw response capture requires a separate explicit

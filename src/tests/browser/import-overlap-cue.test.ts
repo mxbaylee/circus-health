@@ -110,7 +110,7 @@ test(
       await page.locator('body').innerText(),
       /Matching numbers alone do not mean it is the same measurement/,
     );
-    const path = process.env.CIRCUS_TEST_SCREENSHOTS;
+    const path = process.env.CRS_TEST_SCREENSHOTS;
     if (path) {
       mkdirSync(path, { recursive: true });
       await page.screenshot({ path: resolve(path, 'same-original-overlap.png'), fullPage: true });

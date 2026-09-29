@@ -1,3 +1,4 @@
+import { originalSubjectBirthDates } from './intake-evidence-dates.ts';
 import {
   canonicalIdentityName,
   possiblySameIdentityName,
@@ -21,10 +22,43 @@ import type {
   IntakeIdentityReviewStatus,
   IntakeIdentityScope,
   IntakeIdentitySelfSnapshot,
+  IntakeIdentityPerson,
 } from '../shared/intake-identity.ts';
+
+export interface IdentityPolicyPersonSnapshot extends IntakeIdentityPerson {
+  knownNames: string[];
+  birthDate: string | null;
+}
 
 const hash = (value: unknown): string =>
   createHash('sha256').update(canonicalLiteral(value)).digest('hex');
+
+export function competingIdentityBoundaries(
+  group: IntakeReportGroup,
+  groups: IntakeReportGroup[],
+): IntakeReportGroup[] {
+  // Separate model groups are not separate people. A header with no subject,
+  // a different subject locator, or self/unknown role tags are not contradictory
+  // printed identity. Keep each group's grounding/receipts independent.
+  const subject = group.report?.subject?.text.trim();
+  if (!group.report?.anchor || !subject) return [];
+  const claim = (text: string) =>
+    canonicalIdentityName(
+      text.replace(/^(?:(?:patient|client)(?:\s+name)?|name|subject)\s*:\s*/i, ''),
+    );
+  const currentClaim = claim(subject);
+  return groups.filter(
+    (other) =>
+      other.id !== group.id &&
+      !!other.report?.anchor &&
+      !!other.report.subject?.text.trim() &&
+      claim(other.report.subject.text.trim()) !== currentClaim &&
+      other.sourceFileId === group.sourceFileId &&
+      other.sourceHash === group.sourceHash &&
+      other.memberId === group.memberId &&
+      canonicalLiteral(other.report?.anchor) === canonicalLiteral(group.report?.anchor),
+  );
+}
 
 const clean = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -73,7 +107,7 @@ export function repeatedIdentityQuestionReceipt({
     (receipt) =>
       receipt.outcome === 'this_is_me' &&
       receipt.attestation === 'confirmed_displayed_identity_questions' &&
-      receipt.scope.targets.length > 0 &&
+      (receipt.scope.targets.length > 0 || !!receipt.scope.assignmentTargets?.length) &&
       receipt.scope.profileId === profileId &&
       receipt.scope.intakeId === intakeId &&
       receipt.scope.sourceHash === sourceHash &&
@@ -133,20 +167,146 @@ export function identityPersonFingerprint(
   ]);
 }
 
+/** Conservative extraction of a name field, never an entire demographic sentence. */
+export function printedIdentityName(subject: string | null | undefined): string | undefined {
+  if (!subject) return;
+  const text = subject.trim();
+  const labeled =
+    /^(?:(?:patient|client)(?:\s+name)?|name|subject)\s*:\s*([^\n;|]+)(?:[\n;|]|$)/i.exec(text);
+  let name = (labeled?.[1] || text).trim();
+  // A name column followed by an explicit sex column and numeric date is a
+  // demographic header, not a name containing measurements or dates.
+  const columns = /^(.*?)\s{2,}(?:Female|Male)\s{2,}\d{1,4}[/-]\d{1,2}[/-]\d{1,4}(.*)$/i.exec(name);
+  if (columns && /^(?:\s+(?:\d+(?:[./:-]\d+)*|in\.?|lbs\.?|cm|kg|ft\.?))*\s*$/i.test(columns[2]!))
+    name = columns[1]!.trim();
+  if (labeled)
+    name = name.split(/\s+(?:DOB|date of birth|birth\s*date|MRN|patient\s*ID)\s*:/i)[0]!.trim();
+  if (
+    !name ||
+    name.length > 200 ||
+    !/^[\p{L}\p{M} ,.’'-]+$/u.test(name) ||
+    /^patient(?:\s|$)/i.test(name) ||
+    /\b(?:unknown|unidentified|name|dob|report|results?|born|for|and|or)\b/i.test(name) ||
+    name.split(',').length > 2
+  )
+    return;
+  return name;
+}
+
+/** Only routine model ownership questions can defer to independently grounded
+ * exact-name matching. Human answers and questions about specific uncertainty
+ * remain separate review work. This never normalizes an ambiguous printed DOB. */
+export function isGenericNameConfirmation(
+  issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor' | 'field' | 'questionId' | 'resolution'>,
+  subjectText: string | undefined,
+  self: IntakeIdentitySelfSnapshot,
+  people: IdentityPolicyPersonSnapshot[],
+): boolean {
+  if (issue.field !== 'subject' || issue.resolution || !issue.textAnchor) return false;
+  const name = printedIdentityName(subjectText);
+  const anchorName = printedIdentityName(issue.textAnchor);
+  if (!name || !anchorName || canonicalIdentityName(name) !== canonicalIdentityName(anchorName))
+    return false;
+  const prompt =
+    /^Does (?:this|the) (?:report|record|result)(?: for (.+?))? belong to you(?: or another person)?\?$/i.exec(
+      issue.prompt.trim(),
+    );
+  const routineConfirmation =
+    /^(?:Confirm (?:that )?(?:the displayed |this |the )?report subject is Self(?: before saving(?: (?:its )?records)?).?|Does this record belong to you?)$/i.test(
+      issue.prompt.trim(),
+    );
+  if (!prompt && !routineConfirmation) return false;
+  let promptName = prompt?.[1]?.replace(/,\s*$/, '').trim();
+  const dateClaim =
+    promptName &&
+    /,?\s+(?:birth date|date of birth|DOB)\s*:?\s*(\d{1,4}[/-]\d{1,2}[/-]\d{1,4})$/i.exec(
+      promptName,
+    );
+  if (dateClaim) promptName = promptName!.slice(0, dateClaim.index).replace(/,\s*$/, '').trim();
+  if (promptName && canonicalIdentityName(promptName) !== canonicalIdentityName(name)) return false;
+  const anchorDate =
+    /\b(?:DOB|birth date|date of birth)\s*:?\s*(\d{1,4}[/-]\d{1,2}[/-]\d{1,4})/i.exec(
+      issue.textAnchor,
+    )?.[1] ||
+    /\s{2,}(?:Female|Male)\s{2,}(\d{1,4}[/-]\d{1,2}[/-]\d{1,4})/i.exec(issue.textAnchor)?.[1];
+  const rawDate = dateClaim?.[1] || anchorDate;
+  if (
+    dateClaim &&
+    (!issue.textAnchor.includes(dateClaim[1]!) || (anchorDate && anchorDate !== dateClaim[1]))
+  )
+    return false;
+  if (!rawDate) return true;
+  const alternatives: string[] = [];
+  const addDate = (year: string, month: string, day: string) => {
+    const iso = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+    const parsed = new Date(iso + 'T00:00:00Z');
+    if (Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === iso)
+      alternatives.push(iso);
+  };
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(rawDate);
+  const numeric = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(rawDate);
+  if (iso) addDate(iso[1]!, iso[2]!, iso[3]!);
+  else if (numeric) {
+    addDate(numeric[3]!, numeric[1]!, numeric[2]!);
+    addDate(numeric[3]!, numeric[2]!, numeric[1]!);
+  }
+  if (!alternatives.length) return false;
+  const owners = [
+    { fullName: self.fullName, knownNames: self.knownNames, birthDate: self.birthDate },
+    ...people,
+  ];
+  const matching = owners.filter((owner) =>
+    [owner.fullName, ...savedKnownNames(owner.knownNames)].some(
+      (saved) => saved && canonicalIdentityName(saved) === canonicalIdentityName(name),
+    ),
+  );
+  return (
+    matching.length === 1 &&
+    (!matching[0]!.birthDate ||
+      alternatives.some((date) => compatibleBirthDates(date, matching[0]!.birthDate!)))
+  );
+}
+
 export function collectEvidencedIdentity(
   issues: Iterable<Pick<IntakeReviewIssue, 'selfSuggestion'>>,
+  subjectText?: string | null,
+  originalBirthDates: string[] = [],
 ): { evidence: IntakeEvidencedIdentity; conflicts: IntakeIdentityConflict[] } {
   const names: string[] = [];
-  const dates: string[] = [];
+  const dates: string[] = [
+    ...new Set([
+      ...originalBirthDates,
+      ...(printedIdentityName(subjectText)
+        ? originalSubjectBirthDates(subjectText!, subjectText!)
+        : []),
+    ]),
+  ];
   for (const issue of issues) {
     const name = clean(issue.selfSuggestion?.fullName);
     const date = clean(issue.selfSuggestion?.birthDate);
     if (
       name &&
+      printedIdentityName(name) === name &&
       !names.some((value) => canonicalIdentityName(value) === canonicalIdentityName(name))
     )
       names.push(name);
     if (date && !dates.some((value) => value === date)) dates.push(date);
+  }
+  if (names.length && subjectText !== undefined && subjectText !== null) {
+    const printed = printedIdentityName(subjectText);
+    if (
+      !printed ||
+      names.some((name) => canonicalIdentityName(name) !== canonicalIdentityName(printed))
+    ) {
+      // A literal name elsewhere in a multi-person subject is not the patient.
+      // Leave exact name selection to the displayed confirmation instead of
+      // retaining a relative's name or offering their demographics as Self.
+      names.length = 0;
+      dates.length = 0;
+    }
+  } else if (!names.length) {
+    const printed = printedIdentityName(subjectText);
+    if (printed) names.push(printed);
   }
   const conflicts: IntakeIdentityConflict[] = [];
   if (names.length > 1)
@@ -176,6 +336,8 @@ export function collectEvidencedIdentity(
 }
 
 export interface IdentityPolicyAssessment {
+  selfBirthDateConflict?: boolean;
+  defaultPerson?: 'self' | 'new';
   confidence: IntakeIdentityConfidence;
   status: IntakeIdentityReviewStatus;
   blocking: boolean;
@@ -297,6 +459,53 @@ export function identityReceiptAppliesToCurrentBoundary(
  * receipt target that wrote it. Separate later questions may therefore be
  * confirmed separately without allowing an older operation to cover them.
  */
+/** A family assignment is exact per retained candidate occurrence, never inferred from a name. */
+export function confirmedPersonReceipt({
+  receipts,
+  boundary,
+  candidateId,
+  candidateVersionId,
+  proposalId,
+  recordId,
+  resolutions,
+  requiredIssueIds,
+}: {
+  receipts?: IntakeIdentityReceipt[];
+  boundary: CurrentIdentityReceiptBoundary;
+  candidateId: string;
+  candidateVersionId: string;
+  proposalId: string | null;
+  recordId: string;
+  resolutions: IntakeIssueResolution[];
+  requiredIssueIds: string[];
+}): IntakeIdentityReceipt | undefined {
+  return receipts?.findLast((receipt) => {
+    if (
+      receipt.outcome !== 'this_is_person' ||
+      !receipt.assignedPerson ||
+      !identityReceiptAppliesToCurrentBoundary(receipt, boundary)
+    )
+      return false;
+    const target = (receipt.scope.assignmentTargets || receipt.scope.targets).find(
+      (item) =>
+        item.candidateId === candidateId &&
+        item.candidateVersionId === candidateVersionId &&
+        item.proposalId === proposalId &&
+        item.recordId === recordId,
+    );
+    return (
+      !!target &&
+      requiredIssueIds.every((issueId) =>
+        (target.issueIds || [target.issueId]).includes(issueId),
+      ) &&
+      (target.issueIds || [target.issueId]).every((issueId) => {
+        const answer = resolutions.findLast((item) => item.issueId === issueId);
+        return answer?.operationId === receipt.operationId && answer.outcome === 'other_person';
+      })
+    );
+  });
+}
+
 export function exactCurrentIdentityResolutionOperationId({
   receipts,
   occurrences,
@@ -318,7 +527,7 @@ export function exactCurrentIdentityResolutionOperationId({
         receipts?.findLastIndex((receipt) => {
           if (receipt.operationId !== resolution.operationId || !receiptApplies(receipt))
             return false;
-          const target = receipt.scope.targets.find(
+          const target = (receipt.scope.assignmentTargets || receipt.scope.targets).find(
             (item) =>
               item.candidateId === occurrence.candidateId &&
               item.candidateVersionId === occurrence.candidateVersionId &&
@@ -384,6 +593,7 @@ function receiptFor(
 
 export function assessIdentityPolicy({
   self,
+  people = [],
   evidence,
   evidenceConflicts = [],
   group,
@@ -393,8 +603,11 @@ export function assessIdentityPolicy({
   hasUnstructuredIdentityQuestion,
   explicitlyConfirmedOperationId,
   currentRefusal,
+  nameEvidenceGrounded = true,
+  originalEvidenceChecked = true,
 }: {
   self: IntakeIdentitySelfSnapshot;
+  people?: IdentityPolicyPersonSnapshot[];
   evidence: IntakeEvidencedIdentity;
   evidenceConflicts?: IntakeIdentityConflict[];
   group: IntakeReportGroup | null;
@@ -404,6 +617,8 @@ export function assessIdentityPolicy({
   hasUnstructuredIdentityQuestion?: boolean;
   explicitlyConfirmedOperationId?: string;
   currentRefusal?: 'unknown' | 'other_person';
+  nameEvidenceGrounded?: boolean;
+  originalEvidenceChecked?: boolean;
 }): IdentityPolicyAssessment {
   const fullName = clean(evidence.fullName);
   const birthDate = clean(evidence.birthDate);
@@ -423,18 +638,41 @@ export function assessIdentityPolicy({
   const conflicts = [...evidenceConflicts];
   const selfName = clean(self.fullName);
   const selfBirthDate = clean(self.birthDate);
-  const savedNames = [selfName, ...savedKnownNames(self.knownNames)].filter(
+  const selfNames = [selfName, ...savedKnownNames(self.knownNames)].filter(
     (name): name is string => !!name,
   );
-  const nameMatches =
-    !!fullName &&
-    savedNames.some((name) => canonicalIdentityName(fullName) === canonicalIdentityName(name));
+  const owners = [
+    {
+      personId: 'patient',
+      names: selfNames,
+      birthDate: selfBirthDate,
+      person: undefined as IdentityPolicyPersonSnapshot | undefined,
+    },
+    ...people
+      .filter((person) => person.personId !== 'patient')
+      .map((person) => ({
+        personId: person.personId,
+        names: [person.fullName, ...person.knownNames].filter(Boolean),
+        birthDate: clean(person.birthDate),
+        person,
+      })),
+  ];
+  const exactOwners = fullName
+    ? owners.filter((owner) =>
+        owner.names.some((name) => canonicalIdentityName(name) === canonicalIdentityName(fullName)),
+      )
+    : [];
+  const distinctOwners = [...new Map(exactOwners.map((owner) => [owner.personId, owner])).values()];
+  const matchedOwner = distinctOwners.length === 1 ? distinctOwners[0] : undefined;
+  const savedNames = matchedOwner?.names || selfNames;
+  const matchedBirthDate = matchedOwner ? matchedOwner.birthDate : selfBirthDate;
+  const nameMatches = !!matchedOwner;
   const possibleName =
     !!fullName &&
     !nameMatches &&
-    savedNames.some((name) => possiblySameIdentityName(fullName, name));
+    owners.some((owner) => owner.names.some((name) => possiblySameIdentityName(fullName, name)));
   const birthDateMatches =
-    !!birthDate && !!selfBirthDate && compatibleBirthDates(birthDate, selfBirthDate);
+    !!birthDate && !!matchedBirthDate && compatibleBirthDates(birthDate, matchedBirthDate);
   if (fullName && savedNames.length && !nameMatches && !possibleName)
     conflicts.push({
       field: 'fullName',
@@ -442,10 +680,10 @@ export function assessIdentityPolicy({
       evidencedValue: fullName,
       reason: 'self_mismatch',
     });
-  if (birthDate && selfBirthDate && !compatibleBirthDates(birthDate, selfBirthDate))
+  if (birthDate && matchedBirthDate && !compatibleBirthDates(birthDate, matchedBirthDate))
     conflicts.push({
       field: 'birthDate',
-      selfValue: selfBirthDate,
+      selfValue: matchedBirthDate,
       evidencedValue: birthDate,
       reason: 'self_mismatch',
     });
@@ -457,20 +695,25 @@ export function assessIdentityPolicy({
     ? 'none'
     : possibleName
       ? 'possible'
-      : nameMatches && birthDateMatches && birthDate?.length === 10 && selfBirthDate?.length === 10
+      : nameMatches &&
+          birthDateMatches &&
+          birthDate?.length === 10 &&
+          matchedBirthDate?.length === 10
         ? 'strong'
         : nameMatches || birthDateMatches
           ? 'limited'
           : 'none';
-  const common = { evidencedIdentity, offeredSelfFields, conflicts, confidence };
-  if (conflicts.length)
-    return {
-      ...common,
-      status: 'conflict',
-      blocking: true,
-      message:
-        'The report identity conflicts with Self. Correct or resolve the contradictory name or date of birth before saving.',
-    };
+  const selfBirthDateConflict =
+    !!birthDate && !!selfBirthDate && !compatibleBirthDates(birthDate, selfBirthDate);
+  const defaultPerson = selfBirthDateConflict ? ('new' as const) : ('self' as const);
+  const common = {
+    evidencedIdentity,
+    offeredSelfFields,
+    conflicts,
+    confidence,
+    selfBirthDateConflict,
+    defaultPerson,
+  };
   if (currentRefusal)
     return {
       ...common,
@@ -482,7 +725,7 @@ export function assessIdentityPolicy({
           ? 'A current identity answer attributes this record to another person. Resolve that answer before saving into Self.'
           : 'A current identity answer is unknown. Review that answer before saving this record into Self.',
     };
-  const receipt =
+  const latestPersonChoice =
     group && groupVersionId
       ? receiptFor(
           receipts,
@@ -494,6 +737,19 @@ export function assessIdentityPolicy({
           group.report?.subject?.text || null,
         )
       : undefined;
+  if (
+    latestPersonChoice?.outcome === 'this_is_person' &&
+    (matchedOwner?.personId !== latestPersonChoice.assignedPerson?.personId ||
+      hasUnstructuredIdentityQuestion)
+  )
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'This report was assigned to another person. Confirm who these current records belong to.',
+    };
+  const receipt = latestPersonChoice?.outcome === 'this_is_me' ? latestPersonChoice : undefined;
   const explicitReceipt =
     explicitlyConfirmedOperationId && group && groupVersionId
       ? receiptFor(
@@ -509,7 +765,19 @@ export function assessIdentityPolicy({
   const resolutionOperationId =
     explicitReceipt?.operationId ||
     (!hasUnstructuredIdentityQuestion ? receipt?.operationId : undefined);
-  if (resolutionOperationId)
+  if (resolutionOperationId && !birthDate && !originalEvidenceChecked)
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'Recheck this report’s original identity before reusing a confirmation that contains no birth date.',
+    };
+  if (
+    resolutionOperationId &&
+    !selfBirthDateConflict &&
+    !conflicts.some((conflict) => conflict.reason === 'evidence_disagreement')
+  )
     return {
       ...common,
       status: 'prior_confirmation',
@@ -525,6 +793,23 @@ export function assessIdentityPolicy({
         ...(Object.keys(evidencedIdentity).length ? { evidencedIdentity } : {}),
       },
     };
+  if (distinctOwners.length > 1)
+    return {
+      ...common,
+      confidence: 'none',
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'This printed name is saved for more than one person. Choose who this report belongs to; a shared name or birth date cannot choose for you.',
+    };
+  if (conflicts.length)
+    return {
+      ...common,
+      status: 'conflict',
+      blocking: true,
+      message:
+        'The report identity conflicts with saved identity. Choose who this report belongs to before saving.',
+    };
   if (possibleName)
     return {
       ...common,
@@ -533,18 +818,49 @@ export function assessIdentityPolicy({
       message:
         'The printed name resembles a saved name, but initials or omitted names do not prove identity. Confirm the report subject before saving; add another known name in Self only if you have used it.',
     };
-  if ((nameMatches || birthDateMatches) && !hasUnstructuredIdentityQuestion)
+  if (
+    birthDate &&
+    receipts?.some(
+      (prior) =>
+        prior.scope.evidenceOriginalFingerprint === originalFingerprint &&
+        prior.scope.evidencedIdentity?.birthDate &&
+        !compatibleBirthDates(prior.scope.evidencedIdentity.birthDate, birthDate),
+    )
+  )
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'This report has a different evidenced birth date from an earlier confirmed report. Choose who it belongs to.',
+    };
+  if (nameMatches && !hasUnstructuredIdentityQuestion && nameEvidenceGrounded)
     return {
       ...common,
       status: 'evidenced_match',
       blocking: false,
-      message: 'The report identity matches saved Self identity.',
+      message: matchedOwner?.person
+        ? `The report identity matches saved names for ${matchedOwner.person.fullName}.`
+        : 'The report identity matches saved Self identity.',
       attribution: {
         status: 'evidenced_match',
-        basis: 'matched_saved_self',
+        basis: matchedOwner?.person ? 'matched_saved_person' : 'matched_saved_self',
+        ...(matchedOwner?.person
+          ? {
+              assignedPerson: {
+                noteId: matchedOwner.person.noteId,
+                personId: matchedOwner.person.personId,
+                version: matchedOwner.person.version,
+                fullName: matchedOwner.person.fullName,
+              },
+            }
+          : {}),
         confidence,
         groupId: group?.id || null,
         groupVersionId,
+        ...(group && originalFingerprint
+          ? { originalSubjectFingerprint: originalFingerprint }
+          : {}),
         ...(personFingerprint ? { personFingerprint } : {}),
         evidencedIdentity,
       },

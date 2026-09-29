@@ -2,6 +2,11 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { expect, it, vi } from 'vitest';
+import {
+  PersonScopeProvider,
+  PersonScopeIndicator,
+  PersonScopeContent,
+} from '../../app/components/PersonScope';
 import { TestResults } from '../../app/pages/TestResults';
 import { selectProfile } from '../../app/data/profile';
 
@@ -75,4 +80,54 @@ it('Vision tab compares every literal source entry with original links and unkno
   expect(requests.some((url) => /\/(tests|trends)$/.test(url.pathname))).toBe(false);
   await userEvent.setup().click(screen.getByRole('tab', { name: 'History' }));
   expect(router.state.location.search).not.toContain('view=vision');
+});
+
+it('resolves a direct family vision document before continuing within that person history', async () => {
+  selectProfile({ id: 'fictional-family-vision', name: 'Fictional family', placebo: true });
+  const requests: URL[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (path: string) => {
+      const url = new URL(path, 'http://health.test');
+      requests.push(url);
+      const data = url.pathname.endsWith('/record-owner')
+        ? { personId: 'rowan-person' }
+        : url.pathname.endsWith('/clinical-person/rowan-person')
+          ? { name: 'Rowan Example', noteId: 'rowan-note' }
+          : [];
+      return new Response(JSON.stringify({ data, meta: { revision: 1 } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }),
+  );
+  const router = createMemoryRouter(
+    [
+      {
+        path: '/tests',
+        element: (
+          <PersonScopeProvider>
+            <PersonScopeIndicator />
+            <PersonScopeContent>
+              <TestResults />
+            </PersonScopeContent>
+          </PersonScopeProvider>
+        ),
+      },
+    ],
+    {
+      initialEntries: ['/tests?view=vision&document=family-lenses'],
+    },
+  );
+  render(<RouterProvider router={router} />);
+  await screen.findByRole('link', { name: 'View person' });
+  expect(router.state.location.search).toContain('personId=rowan-person');
+  await userEvent.setup().click(screen.getByRole('tab', { name: 'History' }));
+  expect(router.state.location.search).toContain('personId=rowan-person');
+  expect(
+    requests.some(
+      (url) =>
+        url.pathname.endsWith('/vision-prescriptions') &&
+        url.searchParams.get('personId') === 'rowan-person',
+    ),
+  ).toBe(true);
 });

@@ -87,7 +87,7 @@ test(
         'X-Filename': 'fictional-self-evidence.txt',
       },
       data: Buffer.from(
-        'Fictional source evidence. Printed name: Fictional Source Rowan. Printed birth date: 1990-03.',
+        'Fictional source evidence. Patient: Fictional Source Rowan; DOB: 1990-03.',
       ),
     });
     assert.equal(uploaded.status(), 201);
@@ -102,7 +102,7 @@ test(
         subject: 'unknown',
         payload: {
           literal: 'Fictional ferritin 18 ng/mL',
-          transcript: 'Printed name: Fictional Source Rowan. Printed birth date: 1990-03.',
+          transcript: 'Patient: Fictional Source Rowan; DOB: 1990-03.',
         },
         clinical: {
           kind: 'observation',
@@ -128,7 +128,7 @@ test(
           },
           subject: {
             locator: 'fictional-self-evidence.txt',
-            text: 'Fictional Source Rowan. Printed birth date: 1990-03.',
+            text: 'Patient: Fictional Source Rowan; DOB: 1990-03.',
           },
         },
         coverage: { status: 'complete_response', notes: ['One supplied fictional passage'] },
@@ -138,7 +138,7 @@ test(
             kind: 'identity',
             field: 'subject',
             prompt: 'Does the printed identity belong to you?',
-            textAnchor: 'Printed name: Fictional Source Rowan. Printed birth date: 1990-03.',
+            textAnchor: 'Patient: Fictional Source Rowan; DOB: 1990-03.',
             selfSuggestion: {
               fullName: 'Fictional Source Rowan',
               birthDate: '1990-03',
@@ -180,43 +180,83 @@ test(
         response.request().method() === 'POST' &&
         response.ok(),
     );
+    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
     await page
+      .getByRole('dialog', { name: 'Who is this report for?' })
       .getByRole('button', { name: 'This is me and add selected details', exact: true })
       .click();
     const submitted = (await identityRequest).postDataJSON();
     await updated;
     assert.equal(submitted.selfUpdate.expectedVersion, initialSelf.version);
     assert.deepEqual(submitted.selfUpdate.fields, {
-      fullName: 'Fictional Source Rowan',
       birthDate: '1990-03',
     });
-    await page
-      .getByText(
-        'Identity and the selected blank Self details were confirmed in one action. Clinical records are not saved yet.',
-        { exact: true },
-      )
-      .waitFor();
+    await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
+    assert.equal(
+      await page.getByRole('dialog').count(),
+      0,
+      'successful person review closes the sidebar and returns to Import',
+    );
+    await page.goto(
+      url +
+        '/#/import?intake=' +
+        encodeURIComponent(intake.id) +
+        '&proposal=' +
+        encodeURIComponent(proposalId),
+    );
+    await page.getByRole('button', { name: 'Change person for this report', exact: true }).click();
     await page.getByText('This report already matches Self.', { exact: true }).waitFor();
     assert.equal(
       await page.getByRole('button', { name: /This is me|Self details/ }).count(),
       0,
-      'the refreshed detail has no second confirmation control after both blank fields were filled',
+      'the refreshed detail has no second confirmation control after the name was retained and the selected birth date was filled',
     );
 
     const originalUrl =
       url + prefix + intake.contentUrl.slice(intake.contentUrl.startsWith('/api/') ? 4 : 0);
     await page.goto(originalUrl);
     await page.goBack({ waitUntil: 'domcontentloaded' });
+    await page.getByRole('button', { name: 'Change person for this report', exact: true }).click();
     await page.getByText('This report already matches Self.', { exact: true }).waitFor();
     assert.equal(
       await page.getByRole('button', { name: /This is me|Self details/ }).count(),
       0,
       'same-tab retained-original Back does not restore a stale confirmation control',
     );
-    assert.equal(identityPosts, 1, 'only the deliberate identity confirmation was submitted');
+    await page
+      .getByRole('dialog', { name: 'Who is this report for?' })
+      .getByRole('button', { name: 'Done', exact: true })
+      .click();
+    await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
+    assert.equal(
+      identityPosts,
+      1,
+      'unchanged Done and retained-original Back do not submit another identity confirmation',
+    );
 
     const reloadedSelf = await request(prefix + '/notes/person-note%3Aself');
-    assert.equal(reloadedSelf.person.fullName, 'Fictional Source Rowan');
+    assert.equal(
+      reloadedSelf.person.fullName,
+      '',
+      'retaining a report name does not choose a primary name',
+    );
+    assert.ok(reloadedSelf.person.knownNames.includes('Fictional Source Rowan'));
+    assert.ok(
+      reloadedSelf.person.sourceKnownNames.some(
+        (entry: { name: string }) => entry.name === 'Fictional Source Rowan',
+      ),
+    );
+    await page.goto(url + '/#/');
+    await page
+      .getByRole('list', { name: 'Names retained from confirmed reports' })
+      .getByText('Fictional Source Rowan', { exact: true })
+      .waitFor();
+    assert.equal(
+      await page
+        .getByRole('button', { name: 'Remove name Fictional Source Rowan', exact: true })
+        .count(),
+      0,
+    );
     assert.equal(reloadedSelf.person.birthDate, '1990-03');
   },
 );

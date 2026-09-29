@@ -410,8 +410,8 @@ export function previewClinicalRelationship(
   ) {
     const person = (record: DuplicateRecord): string | null =>
       record.kind === 'document'
-        ? record.mapping.subject === 'self'
-          ? 'patient'
+        ? typeof record.mapping.personId === 'string'
+          ? record.mapping.personId
           : null
         : String(
             db

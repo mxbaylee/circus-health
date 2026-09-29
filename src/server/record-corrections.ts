@@ -369,6 +369,13 @@ export function correctClinicalRecord(
   const preview = previewRecordCorrection(db, input, context);
   const { table, row, extra, mapping, evidence } = clinicalRecord(db, kind, recordId);
   const targetKind = preview.targetKind;
+  const personId =
+    kind === 'document'
+      ? typeof extra.import.personId === 'string'
+        ? extra.import.personId
+        : 'patient'
+      : row.person_id || 'patient';
+  extra.import.personId = personId;
   const accepted = { ...mapping, ...(set as Partial<ClinicalMapping>) },
     prior = extra.import.recordException;
   const exception = {
@@ -499,7 +506,7 @@ export function correctClinicalRecord(
       id: recordId,
       source_record_id: row.source_record_id,
       provider_id: row.provider_id,
-      ...(targetKind !== 'document' ? { person_id: row.person_id || 'patient' } : {}),
+      ...(targetKind !== 'document' ? { person_id: personId } : {}),
       ...values,
     } as Record<string, SQLInputValue>;
     const keys = Object.keys(next);

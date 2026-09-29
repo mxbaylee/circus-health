@@ -137,7 +137,7 @@ def summarize_response(raw, phase='post_api_call'):
 
 
 def _capture_response(raw):
-    enabled = os.environ.get('CIRCUS_LITELLM_CAPTURE_RESPONSE', 'false').lower() == 'true'
+    enabled = os.environ.get('CRS_LITELLM_CAPTURE_RESPONSE', 'false').lower() == 'true'
     result = {'capture_enabled': enabled, 'capture_written': False, 'capture_truncated': False}
     if not enabled:
         return result

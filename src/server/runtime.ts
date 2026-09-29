@@ -17,7 +17,7 @@ import {
   recordStartupMetrics,
 } from './startup-rebuild.ts';
 import { createVaultApp } from './vault-app.ts';
-import { readBuildId } from './build-identity.ts';
+import { readBuildIdentity } from './build-identity.ts';
 import { writeChat } from './assistant-journal.ts';
 
 interface RuntimeOptions {
@@ -82,16 +82,16 @@ function staticFile(req: IncomingMessage, res: ServerResponse, staticRoot: strin
   else createReadStream(file).pipe(res);
 }
 export async function startLegacyRuntime({
-  dataDirectory = process.env.DATA_DIR,
-  runtimeDirectory = process.env.HEALTH_RUNTIME_DIR || '/run/health',
+  dataDirectory = process.env.CRS_DATA_DIR,
+  runtimeDirectory = process.env.CRS_RUNTIME_DIR || '/run/health',
   codeRoot = REPO_ROOT,
-  port = Number(process.env.PORT) || 3001,
+  port = Number(process.env.CRS_PORT) || 3001,
   host = '0.0.0.0',
   profileIds,
   assistantOptions,
   lockFactory = acquireStorageLock,
 }: RuntimeOptions = {}) {
-  const buildId = readBuildId(codeRoot);
+  const buildIdentity = readBuildIdentity(codeRoot);
   const startupStarted = performance.now();
   const root = validateDataDirectory(dataDirectory, []);
   validateRuntimeDirectory(runtimeDirectory);
@@ -109,7 +109,7 @@ export async function startLegacyRuntime({
       }
       const path = new URL(req.url!, 'http://localhost').pathname;
       if (path === '/health/ready' || path === '/api/runtime') {
-        json(res, status.ready ? 200 : 503, { ...status, buildId });
+        json(res, status.ready ? 200 : 503, { ...status, ...buildIdentity });
         return;
       }
       if (!app || !status.ready) {
@@ -185,7 +185,7 @@ export async function startLegacyRuntime({
             }
             if (!leaseHealthy || closing) throw new Error('Durable storage lock is no longer held');
             const publicPort =
-              Number(process.env.HEALTH_PUBLIC_PORT) || (server.address() as AddressInfo).port;
+              Number(process.env.CRS_PUBLIC_PORT) || (server.address() as AddressInfo).port;
             app = createApp({
               root,
               databaseDirectory: resolve(runtimeDirectory, 'managed-profiles'),
@@ -195,7 +195,7 @@ export async function startLegacyRuntime({
               allowedOrigins: [
                 `http://127.0.0.1:${publicPort}`,
                 `http://localhost:${publicPort}`,
-                ...(process.env.HEALTH_DEV === '1'
+                ...(process.env.CRS_DEV === '1'
                   ? ['http://127.0.0.1:5173', 'http://localhost:5173']
                   : []),
               ],
@@ -251,24 +251,24 @@ export async function startLegacyRuntime({
   }
 }
 export async function startRuntime({
-  dataDirectory = process.env.DATA_DIR,
-  runtimeDirectory = process.env.HEALTH_RUNTIME_DIR || '/run/health',
+  dataDirectory = process.env.CRS_DATA_DIR,
+  runtimeDirectory = process.env.CRS_RUNTIME_DIR || '/run/health',
   codeRoot = REPO_ROOT,
-  port = Number(process.env.PORT) || 3001,
+  port = Number(process.env.CRS_PORT) || 3001,
   host = '0.0.0.0',
   assistantOptions,
   lockFactory = acquireStorageLock,
 }: RuntimeOptions = {}) {
-  const buildId = readBuildId(codeRoot);
+  const buildIdentity = readBuildIdentity(codeRoot);
   const started = performance.now();
   validateDataDirectory(dataDirectory, []);
   validateRuntimeDirectory(runtimeDirectory);
   const lease = await lockFactory(dataDirectory!);
-  const publicOrigin = process.env.HEALTH_PUBLIC_ORIGIN;
+  const publicOrigin = process.env.CRS_PUBLIC_ORIGIN;
   const origins = [
-    `http://127.0.0.1:${Number(process.env.HEALTH_PUBLIC_PORT) || port}`,
-    `http://localhost:${Number(process.env.HEALTH_PUBLIC_PORT) || port}`,
-    ...(process.env.HEALTH_DEV === '1' ? ['http://127.0.0.1:5173', 'http://localhost:5173'] : []),
+    `http://127.0.0.1:${Number(process.env.CRS_PUBLIC_PORT) || port}`,
+    `http://localhost:${Number(process.env.CRS_PUBLIC_PORT) || port}`,
+    ...(process.env.CRS_DEV === '1' ? ['http://127.0.0.1:5173', 'http://localhost:5173'] : []),
     ...(publicOrigin ? [publicOrigin] : []),
   ];
   let app: ReturnType<typeof createVaultApp> | undefined,
@@ -290,7 +290,7 @@ export async function startRuntime({
       }
       const path = new URL(req.url!, 'http://localhost').pathname;
       if (path === '/health/ready' || path === '/api/runtime') {
-        json(res, status.ready ? 200 : 503, { ...status, buildId });
+        json(res, status.ready ? 200 : 503, { ...status, ...buildIdentity });
         return;
       }
       if (!app || !status.ready) {
@@ -389,7 +389,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     });
     await runtime.ready;
     console.log(
-      `Circus Health ready at http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`,
+      `Circus Health ready at http://localhost:${(runtime.server.address() as AddressInfo).port}`,
     );
     const stopped = await runtime.closed;
     if (stopped.outcome === 'failure')

@@ -31,9 +31,22 @@ export type IntakeIdentityReviewStatus =
 
 export type IntakeIdentityConfidence = 'strong' | 'limited' | 'possible' | 'none';
 
+export interface IntakeIdentityPerson {
+  noteId: string;
+  personId: string;
+  version: number;
+  fullName: string;
+}
+
 /** Report-level identity state. Clinical acceptance remains a separate operation. */
 export interface IntakeIdentityReview {
+  people?: IntakeIdentityPerson[];
+  peopleTruncated?: boolean;
+  assignedPerson?: IntakeIdentityPerson;
   confidence?: IntakeIdentityConfidence;
+  /** A contradictory evidenced DOB cannot be assigned to Self. */
+  selfBirthDateConflict?: boolean;
+  defaultPerson?: 'self' | 'new';
   status: IntakeIdentityReviewStatus;
   blocking: boolean;
   message: string;
@@ -50,6 +63,8 @@ export interface IntakeIdentityScope {
   profileId: string;
   intakeId: string;
   intakeVersion: number;
+  /** Pins Self identity while an explicit person choice is reviewed. */
+  selfVersion?: number;
   groupId: string;
   groupVersionId: string;
   sourceHash: string;
@@ -77,6 +92,8 @@ export interface IntakeIdentityScope {
     /** Present when this occurrence also needs an explicit, non-generic identity answer. */
     issueIds?: string[];
   }[];
+  /** All displayed pending records, including automatic matches, eligible for an explicit person choice. */
+  assignmentTargets?: IntakeIdentityScope['targets'];
   scopeToken: string;
 }
 
@@ -90,8 +107,13 @@ export interface IntakeIdentityConfirmation {
   version: number;
   operationId: string;
   scope: IntakeIdentityScope;
-  outcome: 'this_is_me';
+  outcome: 'this_is_me' | 'this_is_person';
   attestation: IntakeIdentityAttestation;
+  /** Exact printed name selected from the displayed subject when no safe name was derived. */
+  printedName?: string;
+  personSelection?:
+    | { noteId: string; expectedVersion: number }
+    | { newPerson: { fullName: string; relationship?: string } };
   /** Optional one-action update; every selected value must equal an offered blank-field value. */
   selfUpdate?: {
     expectedVersion: number;
@@ -103,9 +125,12 @@ export interface IntakeIdentityReceipt {
   operationId: string;
   at: string;
   scope: IntakeIdentityScope;
-  outcome: 'this_is_me';
+  outcome: 'this_is_me' | 'this_is_person';
   attestation: IntakeIdentityAttestation;
   draftIds: string[];
+  assignedPerson?: IntakeIdentityPerson;
+  knownNameAdded?: string;
+  confirmedPrintedName?: string;
   selfUpdate?: {
     noteId: 'person-note:self';
     versionBefore: number;

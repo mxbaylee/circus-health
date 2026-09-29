@@ -8,9 +8,10 @@ These documents describe current contracts. Update the relevant reference when b
 
 - **Contributing and architecture:** [contributing](../CONTRIBUTING.md), [code organization](code-organization.md), [source checks](../src/README.md), [formatting](code-formatting.md), and the [API reference](../src/server/API.md).
 - **Security:** [security model and risk register](security.md), [encrypted profiles](profile-encryption.md), [vault format](vault-format.md), and [vulnerability reporting](../SECURITY.md).
-- **Runtime and models:** [deployment](deployment.md), [Docker runtime](docker-runtime.md), [connection behavior](connection-awareness.md), [LiteLLM boundary](docker-ai.md), and [provider gates](model-providers.md).
+- **Runtime and models:** [environment variables](environment.md), [deployment](deployment.md), [Docker runtime](docker-runtime.md), [connection behavior](connection-awareness.md), [LiteLLM boundary](docker-ai.md), and [provider gates](model-providers.md).
 - **Data and durability:** [data contracts](data-model-contracts.md), [profile storage and rebuild](profile-storage-and-rebuild.md), [record versions](record-version-storage.md), [change review and restoration](change-history.md), and [storage accounting](storage-accounting.md), and [measurement comparison](measurement-comparison.md).
 - **Import and assistant:** [assistant and intake](assistant-and-intake.md), [import and rebuild](import-and-rebuild.md), [reconciliation and limits](import-reconciliation.md), [performance diagnostics](import-performance.md), and the [intake API](../src/server/INTAKE.md).
+- **Import processing design:** [composed processing and source review](import-processing.md), including the implemented baseline, historical rationale and remaining human/provider/security qualification.
 - **Profiles and interface:** [profile management](profile-management.md), [People](people-tags.md), [Notes](../src/app/features/notes/README.md), [search and filters](filter-inventory.md), and [visual design](design/app-design.md).
 
 Source-adjacent references cover [record publication](../src/server/RECORD-VERSIONS.md), [portable data](../src/server/PORTABLE.md), and [note exports](../src/server/NOTE-EXPORTS.md). They describe lower-level contracts used by the encrypted runtime and recovery or test helpers; they are not alternate setup guides.
@@ -29,6 +30,21 @@ Its append-only results preserve the original designs, measured failures and ind
 verification. The [extrapolation register](processing-extrapolated-results.md) distinguishes
 executed tests, conditional estimates and unsupported forecasts. These experiments do not
 establish production behavior or close provider acceptance gates.
+
+[Composed import-processing design and tests](import-processing-design-review.md) records the
+independent architecture brainstorm after the complete-text requirement, shared component
+contracts, proposed adapter combinations and tests to distinguish them. It is a design proposal,
+not a selected implementation or a new experimental result.
+
+[Composed import experiment results](composed-import-experiment-results.md) records the subsequently
+authorized execution, independent verification and scoped component/composition decisions.
+
+[Practical targets and human-assisted completion](import-processing-practical-strategy.md) proposes
+source review, explicit unresolved regions and qualification boundaries. It distinguishes technical
+limits, practical limits, favorable documents and expected messy inputs without removing requirements.
+
+[Error detection and simulated human repair](import-processing-detection-experiments.md) tests which
+component combinations find source errors and how much material they ask a person to review.
 
 [Private home deployment options](home-cloud-deployment.md) records the proposed local/cloud arrangements, access controls, implementation prerequisites and dated DigitalOcean cost estimates. It is planning reference, not an additional supported installation path.
 

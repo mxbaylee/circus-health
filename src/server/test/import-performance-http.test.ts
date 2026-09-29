@@ -24,6 +24,12 @@ test('profile API ingests strict browser summaries without diagnostic feedback a
     rmSync(root, { recursive: true, force: true });
   });
   const url = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}/api/profiles/${profileId}`;
+  const status = await (await fetch(`${url}/import-diagnostics/status`)).json();
+  assert.deepEqual(status, { data: { enabled: false } });
+  assert.equal(
+    (await fetch(url.replace('/fictional', '/missing') + '/import-diagnostics/status')).status,
+    404,
+  );
   const operationId = randomUUID(),
     requestId = randomUUID();
   const request = await fetch(`${url}/notes`, {

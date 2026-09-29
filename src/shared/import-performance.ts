@@ -50,6 +50,13 @@ export interface RecentOperationTimeline {
   currentStage: string | null;
   /** Independent open-span tracking was unavailable in an older summary or exceeded its bound. */
   lifecycleIncomplete: boolean;
+  /** Bounded failure evidence survives detail-ring eviction; these are events, not a causal verdict. */
+  /** Bounded ordered failure/recovery observations; omitted history remains explicit. */
+  recoverySequence?: ImportFailureSummary[];
+  recoverySequenceDropped?: number;
+  firstFailure?: ImportFailureSummary;
+  latestFailure?: ImportFailureSummary;
+  latestValidationFailure?: ImportFailureSummary;
   spans: Array<{
     phase: string;
     spanId?: string;
@@ -88,4 +95,11 @@ export interface RecentOperationTimeline {
     runtimeAvailableBytes: number | null;
     tempAvailableBytes: number | null;
   };
+}
+
+export interface ImportFailureSummary {
+  sequence: number;
+  timestamp: string;
+  event: string;
+  fields: Record<string, string | number | boolean | null>;
 }

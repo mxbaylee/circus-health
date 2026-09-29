@@ -92,8 +92,7 @@ test(
     await page.reload();
     await page.locator('.profile-current').click();
     await page.getByRole('button', { name: 'Resume setup', exact: true }).click();
-    const onboarding = page.getByRole('dialog', { name: 'A little about you' });
-    await onboarding.getByRole('button', { name: 'Save and continue' }).click();
+    const onboarding = page.getByRole('dialog', { name: 'Care contacts' });
     await onboarding
       .getByLabel('Primary care provider', { exact: true })
       .fill('Fictional Dr. Juniper');
@@ -152,7 +151,7 @@ test(
       await onboarding.getByLabel('Emergency contact phone', { exact: true }).inputValue(),
       '555-0199',
     );
-    const visualOutput = process.env.HEALTH_CONTACT_VISUAL_DIR;
+    const visualOutput = process.env.CRS_CONTACT_VISUAL_DIR;
     const visuals = visualOutput ? prepareVisualDirectory(visualOutput) : null;
     for (const screen of ['emergency', 'provider']) {
       if (screen === 'provider')

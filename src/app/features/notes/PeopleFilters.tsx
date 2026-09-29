@@ -1,3 +1,5 @@
+import { usePersonScope } from '../../components/PersonScope';
+import { PersonFilter } from '../../components/PersonFilter';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Pencil, Plus, Search, SlidersHorizontal, X } from 'lucide-react';
 import {
@@ -89,6 +91,7 @@ export function PeopleFilters({
     { value: 'visibility', label: 'Active status', kind: 'set' as const },
     ...FILTER_FIELDS[view],
   ];
+  const personScope = usePersonScope();
   const applied = [
     ...(visibility === 'all'
       ? []
@@ -172,7 +175,7 @@ export function PeopleFilters({
           {applied.length > 0 && <span className="filter-count">{applied.length}</span>}
         </button>
       </div>
-      {applied.length > 0 && (
+      {(applied.length > 0 || personScope?.filterable) && (
         <ul className="people-filter-pills" aria-label="Saved filters">
           {applied.map((row, index) => {
             const label = summary(row, allOptions, fields, view);
@@ -200,6 +203,7 @@ export function PeopleFilters({
               </li>
             );
           })}
+          <PersonFilter disabled={!!editing} />
         </ul>
       )}
       {error && (

@@ -80,3 +80,39 @@ test('new-profile DOB requires real complete nonfuture dates and aliases are bou
   ])
     assert.ok(knownNamesError(names));
 });
+
+test('explicit surname comma given name normalizes without arbitrary ordering or suffix guesses', async () => {
+  const { canonicalIdentityName, savedKnownNames } = await import('../../shared/self-identity.ts');
+  assert.equal(
+    canonicalIdentityName('  MEADOW,  Iris Rowan '),
+    canonicalIdentityName('Iris Rowan Meadow'),
+  );
+  assert.equal(canonicalIdentityName('de la Pine, Iris'), canonicalIdentityName('Iris de la Pine'));
+  assert.notEqual(canonicalIdentityName('Meadow Iris'), canonicalIdentityName('Iris Meadow'));
+  assert.notEqual(
+    canonicalIdentityName('Iris Meadow, Jr.'),
+    canonicalIdentityName('Jr. Iris Meadow'),
+  );
+  assert.notEqual(
+    canonicalIdentityName('Meadow, Iris, Jr.'),
+    canonicalIdentityName('Iris Jr. Meadow'),
+  );
+  assert.deepEqual(savedKnownNames(['Iris Meadow', 'Meadow, Iris']), [
+    'Iris Meadow',
+    'Meadow, Iris',
+  ]);
+});
+
+test('printed name fallback excludes labels and demographics and leaves ambiguous phrases unresolved', async () => {
+  const { printedIdentityName } = await import('../intake-identity-policy.ts');
+  assert.equal(printedIdentityName('Patient: Meadow, Iris DOB: 1990-03-08'), 'Meadow, Iris');
+  assert.equal(printedIdentityName('Patient name: Iris Meadow\nDOB: 1990-03-08'), 'Iris Meadow');
+  assert.equal(printedIdentityName('Iris Meadow'), 'Iris Meadow');
+  for (const value of [
+    'Patient: Unknown',
+    'For Iris Meadow and Orin Pine',
+    'DOB: 1990-03-08',
+    'Iris Meadow born 1990',
+  ])
+    assert.equal(printedIdentityName(value), undefined);
+});

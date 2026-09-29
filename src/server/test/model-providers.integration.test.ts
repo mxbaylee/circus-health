@@ -12,15 +12,14 @@ interface ConnectionReceipt {
 // sent. Supply one connection/model through the documented environment settings.
 test(
   'selected real provider completes a fictional scoped tool round trip',
-  { skip: process.env.HEALTH_AI_LIVE_TEST !== '1', timeout: 90000 },
+  { skip: process.env.CRS_AI_LIVE_TEST !== '1', timeout: 90000 },
   async () => {
     const receipt = (await testModelConnection({
-      image: process.env.HEALTH_AI_LIVE_IMAGE_TEST === '1',
+      image: process.env.CRS_AI_LIVE_IMAGE_TEST === '1',
     })) as unknown as ConnectionReceipt;
     assert.equal(receipt.available, true);
     assert.equal(receipt.connectionTest.fictional, true);
     assert.equal(receipt.capabilities.tools, true);
-    if (process.env.HEALTH_AI_LIVE_IMAGE_TEST === '1')
-      assert.equal(receipt.capabilities.images, true);
+    if (process.env.CRS_AI_LIVE_IMAGE_TEST === '1') assert.equal(receipt.capabilities.images, true);
   },
 );

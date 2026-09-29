@@ -47,7 +47,7 @@ const record = (page: number) =>
 
 test(
   'controlled 100-page PDF run automatically continues across the real 64-round bridge boundary',
-  { skip: process.env.HEALTH_PDF_CONTROLLED_TEST !== '1', timeout: 180_000 },
+  { skip: process.env.CRS_PDF_CONTROLLED_TEST !== '1', timeout: 180_000 },
   async (t) => {
     fictionalModel(t);
     const started = performance.now();
@@ -363,12 +363,10 @@ test(
       acceptedDocuments: 0,
       originalSha256Unchanged: true,
     };
-    if (process.env.HEALTH_PDF_CONTROLLED_REPORT)
-      writeFileSync(
-        process.env.HEALTH_PDF_CONTROLLED_REPORT,
-        JSON.stringify(report, null, 2) + '\n',
-        { flag: 'wx' },
-      );
+    if (process.env.CRS_PDF_CONTROLLED_REPORT)
+      writeFileSync(process.env.CRS_PDF_CONTROLLED_REPORT, JSON.stringify(report, null, 2) + '\n', {
+        flag: 'wx',
+      });
     t.diagnostic(
       JSON.stringify({
         physicalRequests: requests.length,

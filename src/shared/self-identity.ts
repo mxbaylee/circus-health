@@ -1,12 +1,22 @@
 /** Saved names are explicit human assertions. Similar names are suggestions only. */
 export function canonicalIdentityName(value: string): string {
-  return value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US');
+  const normalized = value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US');
+  const parts = normalized.split(',').map((part) => part.trim());
+  // Only the explicit surname, given-name convention is reordered. Multiple
+  // commas and suffixes remain literal, avoiding arbitrary token permutations.
+  if (
+    parts.length === 2 &&
+    parts.every((part) => /^[\p{L}\p{M} .’'-]+$/u.test(part)) &&
+    !parts.some((part) => /^(jr\.?|sr\.?|ii|iii|iv)$/i.test(part))
+  )
+    return parts[1] + ' ' + parts[0];
+  return normalized;
 }
 
-export function knownNamesError(value: unknown): string | null {
+export function knownNamesError(value: unknown, limit = 32): string | null {
   if (value === undefined) return null;
-  if (!Array.isArray(value) || value.length > 32)
-    return 'Known names must be a list of at most 32 names';
+  if (!Array.isArray(value) || value.length > limit)
+    return `Known names must be a list of at most ${limit} names`;
   const seen = new Set<string>();
   for (const name of value) {
     if (
@@ -16,15 +26,19 @@ export function knownNamesError(value: unknown): string | null {
       /[\x00-\x1f]/.test(name)
     )
       return 'Each known name must contain 1–200 characters';
-    const key = canonicalIdentityName(name);
-    if (seen.has(key)) return 'Known names must not contain duplicates';
-    seen.add(key);
+    const literalKey = name
+      .normalize('NFKC')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toLocaleLowerCase('en-US');
+    if (seen.has(literalKey)) return 'Known names must not contain duplicates';
+    seen.add(literalKey);
   }
   return null;
 }
 
 export function savedKnownNames(value: unknown): string[] {
-  return !knownNamesError(value) && Array.isArray(value)
+  return !knownNamesError(value, 1056) && Array.isArray(value)
     ? value.map((name: string) => name.trim())
     : [];
 }

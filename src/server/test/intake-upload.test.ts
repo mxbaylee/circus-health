@@ -13,6 +13,7 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import { receiveIntakeUpload } from '../intake-upload.ts';
 import { intakeLimits, inspectIntakeFile } from '../intake-files.ts';
 import * as intake from '../intake.ts';
+import { readIntakeEvidence } from '../intake-evidence.ts';
 import { rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
 type UploadRequest = IncomingMessage;
@@ -62,6 +63,42 @@ test('streamed originals adopt the completed staging inode without a second plai
   assert.deepEqual(readFileSync(retained.path), original);
   assert.deepEqual(readdirSync(join(f.root, '.upload-staging')), []);
   assert.equal(item.sha256, hash(original));
+});
+
+test('streamed renamed ADTS uses retained file length beyond the sniff prefix and rejects incomplete frames', async (t) => {
+  const f = fixture(t);
+  const frame = Buffer.alloc(1024);
+  // Fictional ADTS header declaring a 1024-byte frame: larger than the
+  // receiver's 512-byte sniff prefix, but present in the complete upload.
+  Buffer.from([0xff, 0xf1, 0x50, 0x80, 0x80, 0x1f, 0xfc]).copy(frame);
+  for (const [index, filename] of ['fictional-renamed.json', 'fictional-renamed.bin'].entries()) {
+    const bytes = Buffer.from(frame);
+    bytes[bytes.length - 1] = index;
+    const item = await intake.uploadIntakeStream(
+      f.db,
+      f.root,
+      f.profileId,
+      { filename, newProviderName: 'Fictional media' },
+      request([bytes.subarray(0, 100), bytes.subarray(100, 800), bytes.subarray(800)], {
+        'content-length': String(bytes.length),
+        'x-content-sha256': hash(bytes),
+      }),
+    );
+    assert.equal(item.mimeType, 'audio/aac');
+    await assert.rejects(readIntakeEvidence({ ...f, id: item.id, modelContext: true }), {
+      code: 'INTAKE_RETAIN_ONLY',
+    });
+    assert.deepEqual(intake.getIntakeOriginal(f.db, f.root, f.profileId, item.id).bytes, bytes);
+  }
+  const incomplete = frame.subarray(0, 600);
+  const unknown = await intake.uploadIntakeStream(
+    f.db,
+    f.root,
+    f.profileId,
+    { filename: 'fictional-incomplete.bin' },
+    request([incomplete]),
+  );
+  assert.equal(unknown.mimeType, 'application/octet-stream');
 });
 
 test('staging adoption still rejects bytes changed after stream hashing before publication', async (t) => {
@@ -241,14 +278,14 @@ test('limits reject invalid configuration and extraction limit leaves original a
   });
   for (const value of ['0', '1.5', 'wrong', '1025'])
     assert.throws(
-      () => intakeLimits({ HEALTH_INTAKE_UPLOAD_MIB: value }),
+      () => intakeLimits({ CRS_INTAKE_UPLOAD_MIB: value }),
       (e: unknown) => e instanceof HttpError && e.code === 'INTAKE_CONFIG',
     );
-  const previous = process.env.HEALTH_INTAKE_EXTRACTION_MIB;
-  process.env.HEALTH_INTAKE_EXTRACTION_MIB = '1';
+  const previous = process.env.CRS_INTAKE_EXTRACTION_MIB;
+  process.env.CRS_INTAKE_EXTRACTION_MIB = '1';
   t.after(() => {
-    if (previous === undefined) delete process.env.HEALTH_INTAKE_EXTRACTION_MIB;
-    else process.env.HEALTH_INTAKE_EXTRACTION_MIB = previous;
+    if (previous === undefined) delete process.env.CRS_INTAKE_EXTRACTION_MIB;
+    else process.env.CRS_INTAKE_EXTRACTION_MIB = previous;
   });
   const f = fixture(t),
     item = intake.uploadIntake(f.db, f.root, f.profileId, {
@@ -329,11 +366,11 @@ test('an upload draining after profile database closure cannot publish into a lo
 });
 
 test('HTTP chunked oversize produces an explicit 413 and leaves no metadata or staged bytes', async (t) => {
-  const previous = process.env.HEALTH_INTAKE_UPLOAD_MIB;
-  process.env.HEALTH_INTAKE_UPLOAD_MIB = '1';
+  const previous = process.env.CRS_INTAKE_UPLOAD_MIB;
+  process.env.CRS_INTAKE_UPLOAD_MIB = '1';
   t.after(() => {
-    if (previous === undefined) delete process.env.HEALTH_INTAKE_UPLOAD_MIB;
-    else process.env.HEALTH_INTAKE_UPLOAD_MIB = previous;
+    if (previous === undefined) delete process.env.CRS_INTAKE_UPLOAD_MIB;
+    else process.env.CRS_INTAKE_UPLOAD_MIB = previous;
   });
   const f = fixture(t),
     { createApp } = await import('../index.ts'),
