@@ -97,11 +97,31 @@ test(
         await page.getByRole('button', { name: 'Done', exact: true }).waitFor();
         await page.reload();
       }
-      await page.getByRole('button', { name: action, exact: true }).click();
-      await page.waitForURL(url + '/#' + prior);
+      // Restoring the selected record checks its owner before revealing the list.
+      // Hold that response so both return actions exercise the pending state.
+      let releaseOwner!: () => void;
+      const ownerGate = new Promise<void>((resolve) => {
+        releaseOwner = resolve;
+      });
+      await page.route(
+        '**/record-owner?**',
+        async (route) => {
+          await ownerGate;
+          await route.continue();
+        },
+        { times: 1 },
+      );
+      try {
+        await page.getByRole('button', { name: action, exact: true }).click();
+        await page.waitForURL(url + '/#' + prior);
+        await page.getByText('Opening person’s records…', { exact: true }).waitFor();
+      } finally {
+        releaseOwner();
+      }
       await page.getByRole('button', { name: action, exact: true }).waitFor({ state: 'hidden' });
       const filters = page.getByRole('list', { name: 'Saved filters' });
       // The mandatory person filter remains when status=all clears activity.
+      await filters.getByRole('button', { name: /^Edit person:/ }).waitFor();
       assert.equal(await filters.getByRole('button', { name: /^Edit person:/ }).count(), 1);
       assert.equal(await filters.getByText('Inactive', { exact: true }).count(), 0);
       assert.equal(await filters.getByText('Active', { exact: true }).count(), 0);
