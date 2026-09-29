@@ -2,20 +2,23 @@
 
 This is the single work list. Keep ordinary items to an ID and a short description here. Add a separate CRS file when an item needs more room: its specification, proposal, owner decisions, open questions and review findings belong there. Fold review feedback into the items it concerns.
 
-Numbers are stable identifiers, not priority. Never renumber or reuse an ID. After skipping active and retired tickets, CRS-133 is next. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
+Numbers are stable identifiers, not priority. Never renumber or reuse an ID. After skipping active and retired tickets, CRS-134 is next. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
 
 Application documentation describes implemented behavior and current limitations; future work, its specifications and its plans live here. Before deleting a ticket, carry its unmet requirements, owner decisions and open questions into a new or existing item.
+
+Keep the reason for a decision as well as its resulting behavior: who it serves, the failure it prevents, its limits and any earlier rule it supersedes. On implementation, move that rationale into maintained behavior documentation before deleting the ticket, and repoint links. Non-obvious regression tests should include a short why comment tied to that rationale; a test's expected value alone is not the product decision record. Import/identity decisions are consolidated in [CRS-126 D5–D8](CRS-126.md#d5-identity-evidence-human-decisions-and-incorrect-printed-dobs-are-different-facts) while open.
 
 The detailed work list and design documents that preceded this index are archived at `2ae9a0f`: the [earlier work list](https://github.com/mxbaylee/circus-health/blob/2ae9a0f6f158bcf274d86b2a771d223bc14e4a6e/docs/application-todo.md), [processing context proposal](https://github.com/mxbaylee/circus-health/blob/2ae9a0f6f158bcf274d86b2a771d223bc14e4a6e/docs/processing-context-proposal.md), [import processing implementation specification](https://github.com/mxbaylee/circus-health/blob/2ae9a0f6f158bcf274d86b2a771d223bc14e4a6e/docs/import-processing.md) and [integrated evidence review draft](https://github.com/mxbaylee/circus-health/blob/2ae9a0f6f158bcf274d86b2a771d223bc14e4a6e/docs/import-evidence-review-draft.md). The deployment designs are linked from [CRS-083](CRS-083.md). They are history; the CRS items below are authoritative.
 
 ## Product and maintenance
 
 - [ ] <a id="crs-132"></a> [CRS-132](CRS-132.md) — Keep incompatible report banners blocked despite another report's confirmation, and handle compatible short-year banners consistently with and without model questions.
+- [ ] <a id="crs-133"></a> [CRS-133](CRS-133.md) — Allow an explicit report-scoped assignment despite an incorrect printed DOB, preserving originals, demographics and the reason for the human exception.
 - [ ] <a id="crs-033"></a> **CRS-033** — Finish Import inbox acceptance after real-use regressions: native drop, accurate long-run activity, and repeated complete-file review.
 - [ ] <a id="crs-037"></a> **CRS-037** — Verify native file drop and truthful indexing, reading, provider-wait and completion states, including multi-file estimates and long runs.
 - [ ] <a id="crs-038"></a> **CRS-038** — Validate bounded, privacy-safe diagnostics against representative real-provider complaints and complete import lifecycles.
-- [ ] <a id="crs-039"></a> [CRS-039](CRS-039.md) — Continue productive imports automatically; replace total capture cutoffs and manual transient-error recovery with checkpointed backoff and stall detection.
-- [ ] <a id="crs-040"></a> **CRS-040** — Finish scoped identity confirmation and contradictory-source recovery; retain explicit clinical acceptance. Blank-Self-field filling is superseded by CRS-112.
+- [ ] <a id="crs-039"></a> [CRS-039](CRS-039.md) — Continue productive imports with checkpointed backoff and stall recovery; supplies the coordinator for CRS-081's required continuation after lock/logout.
+- [ ] <a id="crs-040"></a> **CRS-040** — Finish scoped identity confirmation and contradictory-source recovery; retain explicit clinical acceptance. Printed-DOB exceptions are specified in CRS-133; blank-Self-field filling is superseded by CRS-112.
 - [ ] <a id="crs-041"></a> **CRS-041** — Finish encrypted and real-file parity checks for the self-contained Import route and historical Sources redirects.
 - [ ] <a id="crs-042"></a> **CRS-042** — Explain report splits and preserve report/person/date/header relationships without merging equal-looking clinical events.
 - [ ] <a id="crs-043"></a> **CRS-043** — Verify whole-ingest storage, memory and latency on representative files, with truthful upload limits and progress.
@@ -23,7 +26,7 @@ The detailed work list and design documents that preceded this index are archive
 - [ ] <a id="crs-046"></a> **CRS-046** — Finish subject/member-safe clinical identity and persisted-key migration qualification; never merge records across people.
 - [ ] <a id="crs-079"></a> **CRS-079** — Measure current complete-import request context and end-to-end latency; separate host time, provider waiting, retries and output cost.
 - [ ] <a id="crs-080"></a> **CRS-080** — Add test-only extraction capture/replay for fictional downstream regressions; fresh quality and speed measurements must bypass replay.
-- [ ] <a id="crs-081"></a> [CRS-081](CRS-081.md) — Allow specifically authorized imports to continue after lock/logout while general profile access is revoked.
+- [ ] <a id="crs-081"></a> [CRS-081](CRS-081.md) — Use CRS-039's coordinator with scoped authority after lock/logout/profile switch; both tickets complete the decided background-import experience.
 - [ ] <a id="crs-084"></a> [CRS-084](CRS-084.md) — Prioritize unresolved security risks and mitigations without describing proposed controls as existing protection.
 - [ ] <a id="crs-086"></a> [CRS-086](CRS-086.md) — Implement model-agnostic async artifact processing with bounded context, shared extraction, adaptive concurrency and reviewable aggregation.
 - [ ] <a id="crs-088"></a> [CRS-088](CRS-088.md) — Reduce passkey re-entry to an authenticator gesture while retaining origin checks, profile isolation and locked state after restart.
