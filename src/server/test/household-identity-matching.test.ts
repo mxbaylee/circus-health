@@ -369,6 +369,40 @@ test('report person defaults follow Cookie Doe name and birth-date combinations'
   assert.equal(evaluate('Cookie Meadow').defaultPerson, 'self');
 });
 
+test('an unreadable printed DOB asks instead of matching a name or warning about missing identity', () => {
+  const collected = collectEvidencedIdentity([], 'Patient: Iris Meadow DOB: see attached');
+  assert.equal(collected.unreadableBirthDate, true);
+  assert.equal(collected.evidence.birthDate, undefined);
+  assert.equal(collectEvidencedIdentity([], 'Patient: Iris Meadow').unreadableBirthDate, false);
+  assert.equal(
+    collectEvidencedIdentity([], 'Patient: Iris Meadow', { dates: [], unreadable: true })
+      .unreadableBirthDate,
+    true,
+  );
+  // Without the signal, the matching name alone is an evidenced match.
+  assert.equal(assess({ fullName: 'Iris Meadow' }).status, 'evidenced_match');
+  for (const evidence of [
+    { fullName: 'Iris Meadow' },
+    { fullName: 'Rowan River' },
+    { fullName: 'Iris Meadow', birthDate: self.birthDate },
+    {},
+  ]) {
+    const result = assess(evidence, [person], { unreadableBirthDate: true });
+    assert.equal(result.status, 'confirmation_required', JSON.stringify(evidence));
+    assert.equal(result.blocking, true);
+    assert.equal(result.attribution, undefined);
+    assert.notEqual(result.confidence, 'strong');
+    assert.equal(result.defaultPerson, 'self');
+  }
+  // A contradiction still reports its conflict.
+  assert.equal(
+    assess({ fullName: 'Iris Meadow', birthDate: '1990-01-01' }, [person], {
+      unreadableBirthDate: true,
+    }).status,
+    'conflict',
+  );
+});
+
 test('a DOB in the printed subject survives without a model identity suggestion', () => {
   const result = collectEvidencedIdentity([], 'Patient: Cookie Doe DOB: 1986-02-14');
   assert.equal(result.evidence.birthDate, '1986-02-14');

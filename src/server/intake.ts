@@ -12,7 +12,7 @@ import {
   withDiagnosticContext,
 } from './import-diagnostic-error.ts';
 import {
-  identityOriginalBirthDatesLookup,
+  identityOriginalBirthDateEvidenceLookup,
   identityGroundingLookup,
   identitySubjectGroundingLookup,
   identityNameQuestionGroundingLookup,
@@ -1367,7 +1367,7 @@ export function reviewIntake(
         sourceHash: file.sha256,
         workflow: intakeWorkflow(d),
       }),
-      originalBirthDates: identityOriginalBirthDatesLookup(db, {
+      originalBirthDateEvidence: identityOriginalBirthDateEvidenceLookup(db, {
         profileId,
         intakeId: id,
         sourceHash: file.sha256,

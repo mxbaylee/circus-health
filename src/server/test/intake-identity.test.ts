@@ -3605,3 +3605,131 @@ test('native PDF DOB blocks Self without a model DOB and with a repeated name fo
   assert.ok(review.scope);
   await assert.rejects(f.confirm(review.scope), { code: 'IDENTITY_CONFLICT' });
 });
+
+test('a printed but unreadable, partial or two-digit-year DOB asks even when the name matches Self', async (t) => {
+  const identityFor = async (dobLine: string | null) => {
+    const lines = [heading, subject, ...(dobLine === null ? [] : [dobLine]), 'Fictional result'];
+    const f = fixture(t, Buffer.from(lines.join('\n')));
+    setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: fictionalBirthDate });
+    const proposed = f.propose([envelope('printed-dob')]);
+    const groupId = workflow(f).reportGroups![0]!.id;
+    const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, groupId);
+    const record = () =>
+      intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, proposed.proposals[0]!.id)
+        .records[0]!;
+    return { f, review, record };
+  };
+  // Control: with no birth-date label at all, the matching name alone is an evidenced match.
+  const absent = await identityFor(null);
+  assert.equal(absent.review.status, 'evidenced_match');
+  assert.equal(absent.review.blocking, false);
+  for (const dobLine of [
+    'DOB: ██/██/19██',
+    'DOB: see attached',
+    'DOB: 03/1990',
+    'Date of birth: March 1990',
+    'DOB: 08-MAR-90',
+    'D.O.B. 03/08/90',
+    'Born: unknown',
+  ]) {
+    const { f, review, record } = await identityFor(dobLine);
+    assert.equal(review.status, 'confirmation_required', dobLine);
+    assert.equal(review.blocking, true, dobLine);
+    assert.equal(review.evidencedIdentity.birthDate, undefined, dobLine);
+    assert.equal(review.selfBirthDateConflict, false, dobLine);
+    assert.equal(review.defaultPerson, 'self', dobLine);
+    assert.match(review.message, /birth date/i, dobLine);
+    assert.equal(record().identityReview?.blocking, true, dobLine);
+    assert.equal(record().identityAttribution, undefined, dobLine);
+    // Asking is an answerable choice, never a dead end.
+    assert.ok(review.scope, dobLine);
+    await f.confirm(review.scope, 'fictional-unreadable-dob-self');
+    assert.equal(record().identityReview?.blocking, false, dobLine);
+    assert.equal(record().identityReview?.status, 'prior_confirmation', dobLine);
+  }
+});
+
+test('a Self confirmation of another report on the same original does not answer an unreadable DOB', async (t) => {
+  const secondHeading = 'Fictional report IVY-64';
+  for (const secondDob of [null, 'DOB: see attached']) {
+    const lines = [heading, subject, 'Fictional result A', secondHeading, subject];
+    const f = fixture(
+      t,
+      Buffer.from([...lines, ...(secondDob ? [secondDob] : []), 'Fictional result B'].join('\n')),
+    );
+    const second = envelope('second-report');
+    second.report = {
+      ...second.report!,
+      key: 'second-claim',
+      anchor: { locator: 'page 1 second heading', text: secondHeading },
+    };
+    f.propose([envelope('first-report'), second]);
+    const groups = workflow(f).reportGroups!;
+    assert.equal(groups.length, 2);
+    await f.confirm(await f.preview(f.item.id, groups[0]!.id), 'fictional-first-report-self');
+    const review = await getIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.item.id,
+      groups[1]!.id,
+    );
+    // Control: a readable (here absent) DOB lets the same printed person reuse it.
+    assert.equal(review.status, secondDob ? 'confirmation_required' : 'prior_confirmation');
+    assert.equal(review.blocking, !!secondDob);
+  }
+});
+
+test('newly accepted DOB labels and layouts establish a complete-date match or conflict', async (t) => {
+  for (const [dobLine, selfBirthDate, conflict] of [
+    ['Born: 8 Mar 1990', fictionalBirthDate, false],
+    ['Birthdate: 08-MAR-1990', fictionalBirthDate, false],
+    ['D.O.B. 8-Mar-1990', '1986-02-14', true],
+  ] as const) {
+    const f = fixture(t, Buffer.from(`${heading}\n${subject}\n${dobLine}\nFictional result`));
+    setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: selfBirthDate });
+    f.propose([envelope('new-dob-layout')]);
+    const review = await getIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.item.id,
+      workflow(f).reportGroups![0]!.id,
+    );
+    assert.equal(review.evidencedIdentity.birthDate, fictionalBirthDate, dobLine);
+    assert.equal(review.selfBirthDateConflict, conflict, dobLine);
+    assert.equal(review.blocking, conflict, dobLine);
+    if (!conflict) {
+      assert.equal(review.status, 'evidenced_match', dobLine);
+      assert.equal(review.confidence, 'strong', dobLine);
+    }
+  }
+});
+
+test('a patient banner printed above the report heading keeps its DOB', async (t) => {
+  for (const [bytes, filename] of [
+    [
+      Buffer.from(`${subject}   DOB: ${fictionalBirthDate}\n${heading}\nFictional result\nPage 1`),
+      'fictional-banner.txt',
+    ],
+    [
+      pdf([`${subject} DOB: ${fictionalBirthDate} ${heading} Fictional result`]),
+      'fictional-banner.pdf',
+    ],
+  ] as const) {
+    const f = fixture(t, bytes, filename);
+    setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: '1986-02-14' });
+    f.propose([envelope('banner-dob')]);
+    const review = await getIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.item.id,
+      workflow(f).reportGroups![0]!.id,
+    );
+    assert.equal(review.evidencedIdentity.birthDate, fictionalBirthDate, filename);
+    assert.equal(review.selfBirthDateConflict, true, filename);
+    assert.equal(review.blocking, true, filename);
+    assert.equal(review.defaultPerson, 'new', filename);
+  }
+});

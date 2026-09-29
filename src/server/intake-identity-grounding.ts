@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalLiteral } from './intake-format.ts';
+import type { BirthDateEvidence } from './intake-evidence-dates.ts';
 import {
   identityOriginalFingerprint,
   competingIdentityBoundaries,
@@ -22,14 +23,15 @@ interface Boundary {
 }
 const hash = (value: unknown) => createHash('sha256').update(canonicalLiteral(value)).digest('hex');
 // Ephemeral original-grounding cache, never recovery authority. No page text is retained.
-// Labelled DOB facts are re-derived from the exact original after a cold restart.
+// Labelled DOB facts, including whether a printed DOB label was unreadable, are
+// re-derived from the exact original after a cold restart.
 // Each unlocked database owns at most 256 scopes, each with at most 100 exact
 // question/receipt proofs. Reopening/rebuilding uses a new database and rechecks
 // the scoped original through the existing asynchronous identity review.
 const grounded = new WeakMap<DatabaseSync, Map<string, Set<string>>>();
 const subjectGrounded = new WeakMap<DatabaseSync, Set<string>>();
 const nameQuestionsGrounded = new WeakMap<DatabaseSync, Map<string, Set<string>>>();
-const originalDates = new WeakMap<DatabaseSync, Map<string, string[]>>();
+const originalDates = new WeakMap<DatabaseSync, Map<string, BirthDateEvidence>>();
 const maxGroups = 256;
 const maxQuestions = 100;
 const boundaryKey = (boundary: Boundary, group: IntakeReportGroup) =>
@@ -70,7 +72,7 @@ export function retainIdentityGrounding(
   questions: { issue: Question; receipt: IntakeIdentityReceipt }[],
   verifiedSubject = false,
   verifiedNameQuestions: Question[] = [],
-  birthDates: string[] = [],
+  birthDates: BirthDateEvidence = { dates: [], unreadable: false },
 ): void {
   const proofs = new Set(questions.map(({ issue, receipt }) => questionKey(issue, receipt)));
   if (proofs.size > maxQuestions) throw new Error('Identity grounding scope exceeds its bound');
@@ -81,7 +83,7 @@ export function retainIdentityGrounding(
   if (!dates) originalDates.set(db, (dates = new Map()));
   const dateKey = originalDateKey(boundary, group);
   dates.delete(dateKey);
-  dates.set(dateKey, [...birthDates]);
+  dates.set(dateKey, { dates: [...birthDates.dates], unreadable: birthDates.unreadable });
   while (dates.size > maxGroups) dates.delete(dates.keys().next().value!);
   const nameQuestionProofs = new Set(
     verifiedNameQuestions.map((issue) => hash([issue.prompt, issue.textAnchor])),
@@ -133,9 +135,9 @@ export function identityGroundingLookup(
   };
 }
 
-export function identityOriginalBirthDatesLookup(db: DatabaseSync, boundary: Boundary) {
-  return (group: IntakeReportGroup): string[] | undefined => {
-    const dates = originalDates.get(db)?.get(originalDateKey(boundary, group));
-    return dates ? [...dates] : undefined;
+export function identityOriginalBirthDateEvidenceLookup(db: DatabaseSync, boundary: Boundary) {
+  return (group: IntakeReportGroup): BirthDateEvidence | undefined => {
+    const evidence = originalDates.get(db)?.get(originalDateKey(boundary, group));
+    return evidence ? { dates: [...evidence.dates], unreadable: evidence.unreadable } : undefined;
   };
 }

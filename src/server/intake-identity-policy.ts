@@ -1,4 +1,7 @@
-import { originalSubjectBirthDates } from './intake-evidence-dates.ts';
+import {
+  originalSubjectBirthDateEvidence,
+  type BirthDateEvidence,
+} from './intake-evidence-dates.ts';
 import {
   canonicalIdentityName,
   possiblySameIdentityName,
@@ -270,17 +273,19 @@ export function isGenericNameConfirmation(
 export function collectEvidencedIdentity(
   issues: Iterable<Pick<IntakeReviewIssue, 'selfSuggestion'>>,
   subjectText?: string | null,
-  originalBirthDates: string[] = [],
-): { evidence: IntakeEvidencedIdentity; conflicts: IntakeIdentityConflict[] } {
+  original: BirthDateEvidence = { dates: [], unreadable: false },
+): {
+  evidence: IntakeEvidencedIdentity;
+  conflicts: IntakeIdentityConflict[];
+  /** A printed birth-date label whose value is not one complete date. */
+  unreadableBirthDate: boolean;
+} {
   const names: string[] = [];
-  const dates: string[] = [
-    ...new Set([
-      ...originalBirthDates,
-      ...(printedIdentityName(subjectText)
-        ? originalSubjectBirthDates(subjectText!, subjectText!)
-        : []),
-    ]),
-  ];
+  const subject = printedIdentityName(subjectText)
+    ? originalSubjectBirthDateEvidence(subjectText!, subjectText!)
+    : { dates: [], unreadable: false };
+  const unreadableBirthDate = original.unreadable || subject.unreadable;
+  const dates: string[] = [...new Set([...original.dates, ...subject.dates])];
   for (const issue of issues) {
     const name = clean(issue.selfSuggestion?.fullName);
     const date = clean(issue.selfSuggestion?.birthDate);
@@ -332,6 +337,7 @@ export function collectEvidencedIdentity(
         : {}),
     },
     conflicts,
+    unreadableBirthDate,
   };
 }
 
@@ -605,6 +611,7 @@ export function assessIdentityPolicy({
   currentRefusal,
   nameEvidenceGrounded = true,
   originalEvidenceChecked = true,
+  unreadableBirthDate = false,
 }: {
   self: IntakeIdentitySelfSnapshot;
   people?: IdentityPolicyPersonSnapshot[];
@@ -619,6 +626,8 @@ export function assessIdentityPolicy({
   currentRefusal?: 'unknown' | 'other_person';
   nameEvidenceGrounded?: boolean;
   originalEvidenceChecked?: boolean;
+  /** A printed birth-date label is present but its value is not one complete date. */
+  unreadableBirthDate?: boolean;
 }): IdentityPolicyAssessment {
   const fullName = clean(evidence.fullName);
   const birthDate = clean(evidence.birthDate);
@@ -697,6 +706,7 @@ export function assessIdentityPolicy({
       ? 'possible'
       : nameMatches &&
           birthDateMatches &&
+          !unreadableBirthDate &&
           birthDate?.length === 10 &&
           matchedBirthDate?.length === 10
         ? 'strong'
@@ -749,7 +759,13 @@ export function assessIdentityPolicy({
       message:
         'This report was assigned to another person. Confirm who these current records belong to.',
     };
-  const receipt = latestPersonChoice?.outcome === 'this_is_me' ? latestPersonChoice : undefined;
+  // An unreadable printed DOB is not "no DOB": a Self confirmation of another
+  // report on this original cannot answer it, only one given for this report.
+  const receipt =
+    latestPersonChoice?.outcome === 'this_is_me' &&
+    (!unreadableBirthDate || latestPersonChoice.scope.groupId === group?.id)
+      ? latestPersonChoice
+      : undefined;
   const explicitReceipt =
     explicitlyConfirmedOperationId && group && groupVersionId
       ? receiptFor(
@@ -817,6 +833,15 @@ export function assessIdentityPolicy({
       blocking: true,
       message:
         'The printed name resembles a saved name, but initials or omitted names do not prove identity. Confirm the report subject before saving; add another known name in Self only if you have used it.',
+    };
+  // Never a match, and never the absent-DOB path to a name-only match or warning.
+  if (unreadableBirthDate)
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'This report prints a birth date that could not be read as one complete date. Choose who this report belongs to before saving.',
     };
   if (
     birthDate &&

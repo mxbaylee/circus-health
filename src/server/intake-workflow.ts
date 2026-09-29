@@ -284,9 +284,9 @@ export function workflowReview<T extends IntakeReview>(
     profileId: string;
     grounded: IdentityGroundingLookup;
     people?: IdentityPolicyPersonSnapshot[];
-    originalBirthDates?: (
+    originalBirthDateEvidence?: (
       group: import('../shared/intake.ts').IntakeReportGroup,
-    ) => string[] | undefined;
+    ) => import('./intake-evidence-dates.ts').BirthDateEvidence | undefined;
     subjectGrounded?: (group: import('../shared/intake.ts').IntakeReportGroup) => boolean;
     nameQuestionGrounded?: (
       group: import('../shared/intake.ts').IntakeReportGroup,
@@ -462,10 +462,13 @@ export function workflowReview<T extends IntakeReview>(
       const identityIssues = related.flatMap((candidate) =>
         (candidate.issues || []).filter((issue) => issue.kind === 'identity'),
       );
-      const { evidence, conflicts } = collectEvidencedIdentity(
+      const originalBirthDates = group
+        ? identityContext?.originalBirthDateEvidence?.(group)
+        : undefined;
+      const { evidence, conflicts, unreadableBirthDate } = collectEvidencedIdentity(
         identityIssues,
         group?.report?.subject?.text,
-        group ? identityContext?.originalBirthDates?.(group) : [],
+        originalBirthDates,
       );
       const structuredEvidence = collectEvidencedIdentity(identityIssues).evidence;
       const ownIdentityIssues = (record.issues || []).filter((issue) => issue.kind === 'identity');
@@ -478,6 +481,7 @@ export function workflowReview<T extends IntakeReview>(
         group?.report?.subject ||
         evidence.fullName ||
         evidence.birthDate ||
+        unreadableBirthDate ||
         conflicts.length
       );
       const explicitIssues = ownIdentityIssues.filter(
@@ -559,8 +563,8 @@ export function workflowReview<T extends IntakeReview>(
       const assessment = assessIdentityPolicy({
         self,
         people: identityContext?.people,
-        originalEvidenceChecked:
-          !group || identityContext?.originalBirthDates?.(group) !== undefined,
+        originalEvidenceChecked: !group || originalBirthDates !== undefined,
+        unreadableBirthDate,
         nameEvidenceGrounded:
           (review.proposalId === null && !!structuredEvidence.fullName) ||
           !!(group && identityContext?.subjectGrounded?.(group)),

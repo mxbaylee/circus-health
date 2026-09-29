@@ -1,4 +1,4 @@
-import { originalSubjectBirthDates } from './intake-evidence-dates.ts';
+import { originalSubjectBirthDateEvidence } from './intake-evidence-dates.ts';
 import { noteVisibilitySQL } from './visibility.ts';
 import { savedKnownNames } from '../shared/self-identity.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
@@ -154,6 +154,7 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
 interface BuiltScope {
   scope: IntakeIdentityScope;
   evidenceConflicts: IntakeIdentityConflict[];
+  unreadableBirthDate: boolean;
   hasUnstructuredIdentityQuestion: boolean;
   explicitlyConfirmedOperationId?: string;
   currentRefusal?: 'unknown' | 'other_person';
@@ -335,7 +336,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   const collected = collectEvidencedIdentity(
     identityIssues,
     group.report?.subject?.text,
-    originalSubjectBirthDates(
+    originalSubjectBirthDateEvidence(
       evidence.pageText,
       group.report!.subject!.text,
       group.report!.anchor.text,
@@ -447,6 +448,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   return {
     scope,
     evidenceConflicts: collected.conflicts,
+    unreadableBirthDate: collected.unreadableBirthDate,
     hasUnstructuredIdentityQuestion,
     currentRefusal: currentIdentityRefusal(identityIssues),
     groundedQuestions,
@@ -480,6 +482,7 @@ function groupRecordIdentity(
 ): {
   evidence: ReturnType<typeof collectEvidencedIdentity>['evidence'];
   conflicts: IntakeIdentityConflict[];
+  unreadableBirthDate: boolean;
   hasUnstructuredIdentityQuestion: boolean;
   currentRefusal?: 'unknown' | 'other_person';
 } {
@@ -530,6 +533,7 @@ function groupRecordIdentity(
     group.report?.subject ||
     collected.evidence.fullName ||
     collected.evidence.birthDate ||
+    collected.unreadableBirthDate ||
     collected.conflicts.length
   );
   const hasUnstructuredIdentityQuestion = explicitIssues.some(
@@ -545,6 +549,7 @@ function groupRecordIdentity(
   return {
     evidence: collected.evidence,
     conflicts: collected.conflicts,
+    unreadableBirthDate: collected.unreadableBirthDate,
     hasUnstructuredIdentityQuestion,
     currentRefusal: currentIdentityRefusal(issues),
   };
@@ -656,6 +661,7 @@ async function getIntakeIdentityReviewInternal(
       nameEvidenceGrounded: false,
       evidence: groupIdentity.evidence,
       evidenceConflicts: groupIdentity.conflicts,
+      unreadableBirthDate: groupIdentity.unreadableBirthDate,
       group,
       groupVersionId: latest?.id || null,
       originalFingerprint,
@@ -694,7 +700,7 @@ async function getIntakeIdentityReviewInternal(
       built.groundedQuestions,
       built.scope.verificationMode === 'literal_text_match',
       built.groundedNameQuestions,
-      originalSubjectBirthDates(
+      originalSubjectBirthDateEvidence(
         evidence.pageText,
         group.report!.subject!.text,
         group.report!.anchor.text,
@@ -722,6 +728,7 @@ async function getIntakeIdentityReviewInternal(
     nameEvidenceGrounded: built.scope.verificationMode === 'literal_text_match',
     evidence: built.scope.evidencedIdentity || {},
     evidenceConflicts: built.evidenceConflicts,
+    unreadableBirthDate: built.unreadableBirthDate,
     group,
     groupVersionId: built.scope.groupVersionId,
     originalFingerprint: built.scope.evidenceOriginalFingerprint || originalFingerprint,
@@ -800,6 +807,7 @@ export async function confirmIntakeIdentityScope(
       nameEvidenceGrounded: built.scope.verificationMode === 'literal_text_match',
       evidence: current.evidencedIdentity || {},
       evidenceConflicts: built.evidenceConflicts,
+      unreadableBirthDate: built.unreadableBirthDate,
       group: groupFor(getIntake(db, root, profileId, id), current.groupId),
       groupVersionId: current.groupVersionId,
       originalFingerprint: current.evidenceOriginalFingerprint || evidence.originalFingerprint,
