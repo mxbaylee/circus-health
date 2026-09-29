@@ -2,7 +2,7 @@
 
 This is the single work list. Keep ordinary items to an ID and a short description here. Add a separate CRS file when an item needs more room: its specification, proposal, owner decisions, open questions and review findings belong there. Fold review feedback into the items it concerns.
 
-Numbers are stable identifiers, not priority. Never renumber or reuse an ID. The next unused number is CRS-130. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
+Numbers are stable identifiers, not priority. Never renumber or reuse an ID. The next unused number is CRS-131. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
 
 Application documentation describes implemented behavior and current limitations; future work, its specifications and its plans live here. Before deleting a ticket, carry its unmet requirements, owner decisions and open questions into a new or existing item.
 
@@ -35,6 +35,7 @@ The detailed work list and design documents that preceded this index are archive
 - [ ] <a id="crs-128"></a> [CRS-128](CRS-128.md) — Verify each retained original without a full synchronous hash after every restart: keep verification across restarts and move any full hash that remains off the request path.
 - [ ] <a id="crs-118"></a> [CRS-118](CRS-118.md) — Invalidate only affected unaccepted interpretations using all consumed evidence, including headers, dates and amendments.
 - [ ] <a id="crs-129"></a> [CRS-129](CRS-129.md) — Record which source revision and verification state each proposal and accepted record was built from, separately from the staleness pin.
+- [ ] <a id="crs-130"></a> [CRS-130](CRS-130.md) — Write the personas from what is known now, each with checks against today's app marked verified or unverified.
 - [ ] <a id="crs-119"></a> [CRS-119](CRS-119.md) — Add audited reassignment of accepted records and removal of confirmed aliases while preserving prior versions and attribution.
 - [ ] <a id="crs-120"></a> [CRS-120](CRS-120.md) — Resolve reported bulk-save, draft, person-picker, stale-source and accessibility defects without weakening acceptance guards.
 - [ ] <a id="crs-121"></a> **CRS-121** — Verify additive medication imports, explicit medication-taking status, partial-date precision and private offline terminology/unit checks, as decided in [CRS-126](CRS-126.md#dates), [medications](CRS-126.md#medications) and [standard vocabularies](CRS-126.md#standard-vocabularies).
