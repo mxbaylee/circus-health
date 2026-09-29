@@ -244,7 +244,7 @@ test(
     const afterMira = await api<Array<{ id: string; kind: string; isSelf?: boolean }>>(
       page,
       url,
-      prefix + '/notes',
+      prefix + '/notes?kind=person&excludeSelf=1',
     );
     assert.deepEqual(
       afterMira.filter((note) => note.kind === 'person' && !note.isSelf).map((note) => note.id),
@@ -321,7 +321,7 @@ test(
         title: string;
         person: Record<string, unknown>;
       }>
-    >(page, url, prefix + '/notes');
+    >(page, url, prefix + '/notes?kind=person&excludeSelf=1');
     const savedPeople = savedNotes.filter((note) => note.kind === 'person' && !note.isSelf);
     assert.equal(savedPeople.length, 2);
     const juniper = savedPeople.find((note) => note.id === added.noteId);

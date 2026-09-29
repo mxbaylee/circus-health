@@ -683,7 +683,7 @@ export function ImportPage() {
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current);
-        for (const key of ['group', 'report', 'intake', 'proposal', 'record', 'person'])
+        for (const key of ['group', 'report', 'intake', 'proposal', 'record', 'person', 'review'])
           next.delete(key);
         return next;
       },
@@ -1994,7 +1994,10 @@ export function ImportPage() {
             Open Import
           </button>
         </section>
-      ) : detailSelection?.personId ? (
+      ) : detailSelection &&
+        (!detailSelection.recordId ||
+          detailSelection.personId ||
+          searchParams.get('review') === 'full') ? (
         <ImportDetailReview
           selection={detailSelection}
           onBack={closeDetail}

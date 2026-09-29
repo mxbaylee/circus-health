@@ -469,11 +469,15 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
   expect(sourcePosts).toHaveLength(5);
 });
 
-it('keeps an explicit original selector in the import view and can return to all imports', async () => {
+it.each([
+  '/import?intake=fictional-intake&proposal=original',
+  '/import?group=fictional-report',
+  '/import?group=fictional-report&intake=fictional-intake&proposal=original&record=fictional-record&review=full',
+])('opens explicit full review for %s and can return to all imports', async (path) => {
   const user = userEvent.setup();
-  const router = mount('/import?intake=fictional-intake&proposal=original');
-  expect(await screen.findByRole('heading', { name: 'Review reports' })).toBeVisible();
-  expect(screen.queryByRole('region', { name: 'Exact selected report' })).toBeNull();
+  const router = mount(path);
+  expect(await screen.findByRole('region', { name: 'Exact selected report' })).toBeVisible();
+  expect(screen.queryByRole('heading', { name: 'Review reports' })).toBeNull();
   await user.click(await screen.findByRole('button', { name: 'All imports' }));
   expect(await screen.findByRole('heading', { name: 'Review reports' })).toBeVisible();
   expect(router.state.location.search).toBe('');

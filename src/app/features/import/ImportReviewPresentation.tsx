@@ -1896,6 +1896,11 @@ function ImportSheet({
                 onChange={setPersonSelection}
                 disabled={busy || report.subject.scopeReady === false}
               />
+              {report.subject.reviewUrl && (
+                <a className="text-link" href={`#${report.subject.reviewUrl}`}>
+                  Review retained report evidence <ArrowRight size={15} aria-hidden="true" />
+                </a>
+              )}
               {!personSelection && !!Object.keys(offeredSelfFields).length && (
                 <fieldset className="import-fill-name">
                   <legend>Fill selected blank Self details in this same action</legend>

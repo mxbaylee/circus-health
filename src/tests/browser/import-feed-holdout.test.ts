@@ -319,7 +319,7 @@ test(
     await laboratoryReport.getByRole('button', { name: /Review person for/ }).click();
     await page
       .getByRole('dialog')
-      .getByText('Choose who this report belongs to.', { exact: true })
+      .getByText('The report identifies “Fictional Sol Linden”.', { exact: true })
       .waitFor();
     await captureControls('import-person-sidebar');
     if (process.env.CRS_TEST_SCREENSHOTS) {
@@ -352,6 +352,10 @@ test(
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
+    await page
+      .getByRole('dialog')
+      .getByLabel('Name printed on this report')
+      .fill('Fictional Sol Linden');
     await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
     const initialIdentity = await initialIdentityResponse;
     assert.equal(initialIdentity.status(), 200, await initialIdentity.text());
@@ -367,18 +371,43 @@ test(
       'Fictional Linden copper',
       'Fictional Linden unclear result',
     ]);
+    // JSONL repeats report headings in payload and metadata. It does not establish
+    // one unambiguous original patient header, so each report needs its own choice.
+    const laboratoryReady = await readFeed();
+    assert.equal(laboratoryReady.counts.blocked, 4);
+    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    await page
+      .getByRole('region', { name: /Fictional Linden visit report/ })
+      .getByRole('button', { name: /Review person for/ })
+      .click();
+    await page
+      .getByRole('dialog')
+      .getByLabel('Name printed on this report')
+      .fill('Fictional Sol Linden');
+    const visitIdentityResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
+    );
+    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
+    const visitIdentity = await visitIdentityResponse;
+    assert.equal(visitIdentity.status(), 200, await visitIdentity.text());
     const identityReady = await until(
       readFeed,
       (value) => value.counts.blocked === 1,
-      'one same-original printed-subject confirmation to leave only the uncertain reading blocked',
+      'two report confirmations to leave only the uncertain reading blocked',
     );
     page.off('request', captureInitialIdentity);
     assert.equal(
       initialIdentityPosts.length,
-      1,
-      'one click records exactly one identity operation',
+      2,
+      'each report confirmation records exactly one identity operation',
     );
     assert.deepEqual(initialIdentityPosts[0], initialIdentityRequest);
+    assert.equal(
+      initialIdentityPosts[1]!.scope.groupId,
+      initial.groups.find((group) => group.title === 'Fictional Linden visit report')!.groupId,
+    );
+    assert.equal(initialIdentityPosts[1]!.scope.targets.length, 3);
     assert.equal(identityReady.counts.pending, 5);
     assert.equal(identityReady.counts.accepted, 0, 'identity confirmation does not accept records');
     assert.equal(identityReady.counts.questions, 1);
@@ -406,7 +435,7 @@ test(
             ?.filter((issue) => issue.kind === 'identity')
             .every((issue) => !issue.blocking && issue.status === 'resolved'),
       ),
-      'the exact same-original and printed-person confirmation applies across both reports',
+      'both reports retain their explicit printed-person confirmations',
     );
     await page.reload();
     await page.getByRole('tab', { name: /^All\s*7$/ }).waitFor();
@@ -689,16 +718,16 @@ test(
     const matchedIdentity = await request<IntakeIdentityReview>(
       `/intakes/${encodeURIComponent(matchedOriginal.intake.id)}/identity-review?groupId=${encodeURIComponent(matchedGroup.id)}`,
     );
-    assert.equal(matchedIdentity.status, 'evidenced_match');
-    assert.equal(matchedIdentity.blocking, false);
-    assert.equal(matchedIdentity.evidencedIdentity.fullName, 'Fictional Sol Linden');
+    assert.equal(matchedIdentity.status, 'confirmation_required');
+    assert.equal(matchedIdentity.blocking, true);
+    assert.equal(matchedIdentity.evidencedIdentity.fullName, undefined);
     assert.equal(
       (await request<Intake>(`/intakes/${encodeURIComponent(matchedOriginal.intake.id)}`)).workflow
         ?.identityConfirmations?.length || 0,
       0,
     );
-    // A new fictional alias requires an explicit choice; the earlier confirmed
-    // spelling now correctly matches without repeating identity questions.
+    // Neither a remembered spelling nor a new alias can replace original
+    // patient grounding; this report also requires an explicit choice.
     identityRow.report!.subject!.text = 'Fictional Sol Birch';
     identityRow.payload = String(identityRow.payload).replaceAll(
       'Fictional Sol Linden',
@@ -715,8 +744,12 @@ test(
     await staleIdentityReport.getByRole('button', { name: /Review person for/ }).click();
     await page
       .getByRole('dialog')
-      .getByText(/report evidence has Fictional Sol Birch/)
+      .getByText('The report identifies “Fictional Sol Birch”.', { exact: true })
       .waitFor();
+    await page
+      .getByRole('dialog')
+      .getByLabel('Name printed on this report')
+      .fill('Fictional Sol Birch');
     const identityFeed = await request<IntakeImportFeed>('/intakes/import-feed');
     const group = identityFeed.groups.find((item) => item.intakeId === identity.intake.id)!;
     const displayedScope = await request<IntakeIdentityScope>(
@@ -827,6 +860,10 @@ test(
       'repeated exact identity question is displayed once for this report',
     );
     await page.getByText(questionAnchor, { exact: true }).waitFor();
+    await page
+      .getByRole('dialog')
+      .getByLabel('Name printed on this report')
+      .fill('Fictional Sol Linden');
     const questionResponse = page.waitForResponse(
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),

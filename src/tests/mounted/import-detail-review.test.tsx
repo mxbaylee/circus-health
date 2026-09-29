@@ -627,7 +627,7 @@ it('keeps exact report links inside Import with intake, proposal, and record sel
   const link = await screen.findByRole('link', { name: /Ferritin/ });
   expect(link).toHaveAttribute(
     'href',
-    '#/import?group=fictional-report&intake=fictional-intake&proposal=fictional-proposal&record=fictional-record',
+    '#/import?group=fictional-report&intake=fictional-intake&proposal=fictional-proposal&record=fictional-record&review=full',
   );
   expect(document.querySelector('a[href*="sources?view=import"]')).toBeNull();
 });

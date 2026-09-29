@@ -87,7 +87,7 @@ test(
         'X-Filename': 'fictional-self-evidence.txt',
       },
       data: Buffer.from(
-        'Fictional source evidence. Patient: Fictional Source Rowan; DOB: 1990-03.',
+        'Fictional source evidence. Patient: Fictional Source Rowan; DOB: 1990-03-12.',
       ),
     });
     assert.equal(uploaded.status(), 201);
@@ -102,7 +102,7 @@ test(
         subject: 'unknown',
         payload: {
           literal: 'Fictional ferritin 18 ng/mL',
-          transcript: 'Patient: Fictional Source Rowan; DOB: 1990-03.',
+          transcript: 'Patient: Fictional Source Rowan; DOB: 1990-03-12.',
         },
         clinical: {
           kind: 'observation',
@@ -128,7 +128,7 @@ test(
           },
           subject: {
             locator: 'fictional-self-evidence.txt',
-            text: 'Patient: Fictional Source Rowan; DOB: 1990-03.',
+            text: 'Patient: Fictional Source Rowan; DOB: 1990-03-12.',
           },
         },
         coverage: { status: 'complete_response', notes: ['One supplied fictional passage'] },
@@ -138,10 +138,10 @@ test(
             kind: 'identity',
             field: 'subject',
             prompt: 'Does the printed identity belong to you?',
-            textAnchor: 'Patient: Fictional Source Rowan; DOB: 1990-03.',
+            textAnchor: 'Patient: Fictional Source Rowan; DOB: 1990-03-12.',
             selfSuggestion: {
               fullName: 'Fictional Source Rowan',
-              birthDate: '1990-03',
+              birthDate: '1990-03-12',
             },
           },
         ],
@@ -155,7 +155,7 @@ test(
       review.records[0].issues.find(
         (issue: { prompt: string }) => issue.prompt === 'Does the printed identity belong to you?',
       ).selfSuggestion,
-      { fullName: 'Fictional Source Rowan', birthDate: '1990-03' },
+      { fullName: 'Fictional Source Rowan', birthDate: '1990-03-12' },
     );
 
     await page.goto(
@@ -189,7 +189,7 @@ test(
     await updated;
     assert.equal(submitted.selfUpdate.expectedVersion, initialSelf.version);
     assert.deepEqual(submitted.selfUpdate.fields, {
-      birthDate: '1990-03',
+      birthDate: '1990-03-12',
     });
     await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
     assert.equal(
@@ -257,6 +257,6 @@ test(
         .count(),
       0,
     );
-    assert.equal(reloadedSelf.person.birthDate, '1990-03');
+    assert.equal(reloadedSelf.person.birthDate, '1990-03-12');
   },
 );

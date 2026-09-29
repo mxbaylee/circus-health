@@ -115,6 +115,7 @@ test(
     });
     await page.goto(url + '/#/import?intake=' + encodeURIComponent(seed.incomingId));
     await page.reload();
+    await page.locator('.import-detail-record-link').first().click();
     const related = page.locator('.intake-related-disclosure');
     await related.waitFor();
     if (!(await related.evaluate((element) => element.hasAttribute('open'))))

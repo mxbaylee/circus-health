@@ -247,9 +247,7 @@ test(
     await onboarding.waitFor({ state: 'hidden' });
     const completed = await api(`/api/profiles/${stagedProfile.id}/notes/patient`);
     assert.equal(completed.person.onboarding.finished, true);
-    const people = (await api(`/api/profiles/${stagedProfile.id}/notes`)).filter(
-      (note: Note) => note.kind === 'person' && !note.isSelf,
-    );
+    const people = await api(`/api/profiles/${stagedProfile.id}/notes?kind=person&excludeSelf=1`);
     assert.equal(people.length, 2, 'uncertain create and resumed retry produce exactly two People');
     const provider = await api(
       `/api/profiles/${stagedProfile.id}/notes/${encodeURIComponent(completed.person.onboarding.careTeam.primaryCareId)}`,

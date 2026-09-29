@@ -396,7 +396,7 @@ test(
     await page
       .getByRole('button', { name: 'More actions for Fictional Example', exact: true })
       .click();
-    await page.getByRole('dialog').getByRole('link', { name: 'Open full review' }).click();
+    await page.getByRole('link', { name: 'Open full review' }).click();
     await page.getByRole('region', { name: 'Review actions' }).waitFor();
     const related = page.locator('details.intake-related-disclosure');
     const relatedSummary = related.locator(':scope > summary');

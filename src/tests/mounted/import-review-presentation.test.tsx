@@ -843,6 +843,10 @@ it('shows missing identity as a warning and conflicts as blocking without confir
   fireEvent.click(screen.getByRole('button', { name: 'Review person for Conflicting result' }));
   expect(screen.getByText('Report identity could not be established.')).toBeVisible();
   expect(screen.getByText(/Self has 1988-04-12; report evidence has 1991-09-03/)).toBeVisible();
+  expect(screen.getByRole('link', { name: 'Review retained report evidence' })).toHaveAttribute(
+    'href',
+    '#/import?group=conflict',
+  );
   expect(screen.getByRole('button', { name: 'This is me' })).toBeDisabled();
 });
 

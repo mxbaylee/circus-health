@@ -100,7 +100,11 @@ test(
       await page.getByRole('button', { name: action, exact: true }).click();
       await page.waitForURL(url + '/#' + prior);
       await page.getByRole('button', { name: action, exact: true }).waitFor({ state: 'hidden' });
-      assert.equal(await page.getByRole('list', { name: 'Saved filters' }).count(), 0);
+      const filters = page.getByRole('list', { name: 'Saved filters' });
+      // The mandatory person filter remains when status=all clears activity.
+      assert.equal(await filters.getByRole('button', { name: /^Edit person:/ }).count(), 1);
+      assert.equal(await filters.getByText('Inactive', { exact: true }).count(), 0);
+      assert.equal(await filters.getByText('Active', { exact: true }).count(), 0);
       assert.equal(
         await page.getByRole('textbox', { name: 'Search prescriptions' }).inputValue(),
         'fictional search',

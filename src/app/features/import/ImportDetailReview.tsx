@@ -243,14 +243,15 @@ function recordKey(block: IntakeReportQueueBlock, record: IntakeReportQueueRecor
 
 function detailUrl(
   groupId: string,
-  block: IntakeReportQueueBlock,
-  record: IntakeReportQueueRecord,
+  block: Pick<IntakeReportQueueBlock, 'intakeId' | 'proposalId'>,
+  record: Pick<IntakeReportQueueRecord, 'id'>,
 ) {
   const params = new URLSearchParams({
     group: groupId,
     intake: block.intakeId,
     proposal: block.proposalId || 'original',
     record: record.id,
+    review: 'full',
   });
   return `/import?${params}`;
 }
@@ -2121,6 +2122,9 @@ function ImportRecordDetail({
           pending={() => correctionPending.current || drafts.pending()}
           flush={flushPendingReview}
         />
+        <a className="text-link" href={`#${detailUrl(groupId, block, record)}`}>
+          Open full review <ArrowRight size={15} aria-hidden="true" />
+        </a>
         {(error || drafts.error) && (
           <div className="import-error" role="alert">
             {error || drafts.error}

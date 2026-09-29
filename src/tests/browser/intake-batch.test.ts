@@ -192,7 +192,7 @@ test(
       const record = page.locator('.import-record').filter({ hasText: label }).first();
       await record.waitFor();
       await record.getByRole('button', { name: `More actions for ${label}`, exact: true }).click();
-      await page.getByRole('dialog').getByRole('link', { name: 'Open full review' }).click();
+      await record.getByRole('link', { name: 'Open full review' }).click();
       await page.getByRole('region', { name: 'Review actions' }).waitFor();
     }
 
