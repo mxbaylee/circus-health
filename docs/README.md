@@ -1,53 +1,24 @@
 # Documentation
 
-Start with [installation](installation.md) for a new Circus Health archive. Use [deployment and operations](deployment.md) for updates, shutdown, backup, recovery, remote-access constraints, and troubleshooting. The supported product runtime is npm → Docker Compose → encrypted application plus LiteLLM Proxy.
+Start with [installation](setup/installation.md). The supported runtime is npm → Docker Compose → encrypted application plus LiteLLM Proxy. [Deployment and operations](setup/deployment.md) covers updates, shutdown, backup, recovery and troubleshooting.
 
-## Maintained references
+## Current application references
 
-These documents describe current contracts. Update the relevant reference when behavior changes, and verify claims against code and current tests.
+- **Setup and operation:** [environment](setup/environment.md), [Docker runtime](setup/docker-runtime.md), [LiteLLM boundary](setup/docker-ai.md), [model providers](setup/model-providers.md), [connection behavior](setup/connection-awareness.md).
+- **Security:** [security model and limitations](security/model.md), [profile encryption](security/profile-encryption.md), [vault format](security/vault-format.md), [vulnerability reporting](../SECURITY.md).
+- **Import:** [import and rebuild](import/import-and-rebuild.md), [processing and evidence review](import/processing.md), [reconciliation](import/import-reconciliation.md), [performance diagnostics](import/import-performance.md).
+- **Data:** [data contracts](data/data-model-contracts.md), [profile storage/rebuild](data/profile-storage-and-rebuild.md), [record versions](data/record-version-storage.md), [change history](data/change-history.md), [storage accounting](data/storage-accounting.md), [clinical relationships](data/clinical-relationships.md), [public-profile compatibility](data/public-profile-compatibility.md).
+- **Features:** [assistant and intake](features/assistant-and-intake.md), [profile management](features/profile-management.md), [People](features/people-tags.md), [filters](features/filter-inventory.md), [measurement comparison](features/measurement-comparison.md), [Notes](../src/app/features/notes/README.md), [visual design](design/app-design.md).
+- **Contributors:** [contributing](../CONTRIBUTING.md), [code organization](architecture/code-organization.md), [formatting](architecture/code-formatting.md), [repository scope and handoffs](architecture/workspace-and-handoffs.md), [source checks](../src/README.md).
 
-- **Contributing and architecture:** [contributing](../CONTRIBUTING.md), [code organization](code-organization.md), [source checks](../src/README.md), [formatting](code-formatting.md), and the [API reference](../src/server/API.md).
-- **Security:** [security model and risk register](security.md), [encrypted profiles](profile-encryption.md), [vault format](vault-format.md), and [vulnerability reporting](../SECURITY.md).
-- **Runtime and models:** [environment variables](environment.md), [deployment](deployment.md), [Docker runtime](docker-runtime.md), [connection behavior](connection-awareness.md), [LiteLLM boundary](docker-ai.md), and [provider gates](model-providers.md).
-- **Data and durability:** [data contracts](data-model-contracts.md), [profile storage and rebuild](profile-storage-and-rebuild.md), [record versions](record-version-storage.md), [change review and restoration](change-history.md), and [storage accounting](storage-accounting.md), and [measurement comparison](measurement-comparison.md).
-- **Import and assistant:** [assistant and intake](assistant-and-intake.md), [import and rebuild](import-and-rebuild.md), [reconciliation and limits](import-reconciliation.md), [performance diagnostics](import-performance.md), and the [intake API](../src/server/INTAKE.md).
-- **Import processing design:** [composed processing and source review](import-processing.md), including the implemented baseline, historical rationale and remaining human/provider/security qualification.
-- **Profiles and interface:** [profile management](profile-management.md), [People](people-tags.md), [Notes](../src/app/features/notes/README.md), [search and filters](filter-inventory.md), and [visual design](design/app-design.md).
+Source-adjacent references describe the [API](../src/server/API.md), [intake API](../src/server/INTAKE.md), [record publication](../src/server/RECORD-VERSIONS.md), [portable data](../src/server/PORTABLE.md) and [note exports](../src/server/NOTE-EXPORTS.md).
 
-Source-adjacent references cover [record publication](../src/server/RECORD-VERSIONS.md), [portable data](../src/server/PORTABLE.md), and [note exports](../src/server/NOTE-EXPORTS.md). They describe lower-level contracts used by the encrypted runtime and recovery or test helpers; they are not alternate setup guides.
+## Work tracking
 
-## Work and evidence
+[TODOs](todo/readme.md) hold numbered open work. Most items live directly in the index; a separate CRS file holds an item's specification, proposal, owner decisions, open questions and review findings when it needs more room. The [import specification](todo/CRS-126.md) states required upload behavior and the owner's import decisions. Documentation outside `todo/` describes implemented behavior and current limitations.
 
-[Repository scope and handoffs](workspace-and-handoffs.md) defines included source and documentation, excluded private artifacts, and portable validation evidence.
+## Experiment material
 
-The [application work list](application-todo.md) is the single source for approved open requirements, release checks and deferred ideas, with stable `CRS-###` identifiers. Keep status there; other documents provide design and evidence links. A checked implementation item or old passing test does not prove real-provider compatibility, physical passkeys, a target filesystem, model quality, or other explicitly open acceptance work.
+Existing [experiment material](experiments/README.md) is grouped separately pending a retention discussion. It includes historical results and research plans, not current application guarantees. This reorganization does not change experiment outcomes or authorize additional runs.
 
-[Processing context and unattended continuation](processing-context-proposal.md) records the large-document proposal, corrections to earlier assumptions, offline scaling evidence and criteria for independent review before choosing an implementation. It does not establish live extraction quality or an adaptive-processing speedup. [Processing experiments](processing-experiments.md) holds the briefs and append-only results for the experiments that proposal requires before a design is chosen. The [import specification](import-scenarios.md) states, independently of this implementation, how uploads must behave from the person's side and the record-integrity principles every design must keep. Its gaps against the current tree are listed in the processing proposal.
-
-[Follow-up import experiments](processing-follow-up-experiments.md) records a unit-size sweep,
-live quality comparisons, and targeted OCR and fingerprinting follow-ups from those results.
-Its append-only results preserve the original designs, measured failures and independent
-verification. The [extrapolation register](processing-extrapolated-results.md) distinguishes
-executed tests, conditional estimates and unsupported forecasts. These experiments do not
-establish production behavior or close provider acceptance gates.
-
-[Composed import-processing design and tests](import-processing-design-review.md) records the
-independent architecture brainstorm after the complete-text requirement, shared component
-contracts, proposed adapter combinations and tests to distinguish them. It is a design proposal,
-not a selected implementation or a new experimental result.
-
-[Composed import experiment results](composed-import-experiment-results.md) records the subsequently
-authorized execution, independent verification and scoped component/composition decisions.
-
-[Practical targets and human-assisted completion](import-processing-practical-strategy.md) proposes
-source review, explicit unresolved regions and qualification boundaries. It distinguishes technical
-limits, practical limits, favorable documents and expected messy inputs without removing requirements.
-
-[Error detection and simulated human repair](import-processing-detection-experiments.md) tests which
-component combinations find source errors and how much material they ask a person to review.
-
-[Private home deployment options](home-cloud-deployment.md) records the proposed local/cloud arrangements, access controls, implementation prerequisites and dated DigitalOcean cost estimates. It is planning reference, not an additional supported installation path.
-
-Personal coordination journals, raw validation receipts, generated repository inventories and private reference artwork are excluded from the public repository. Maintained documentation contains the contracts contributors need; ordinary work must not depend on private notes.
-
-Personal records, credentials, recovery material, local logs, runtime databases, and screenshots containing private desktop or browser content belong outside Git. Public examples and fixtures must be independently fictional.
+Health records, credentials, recovery material, private screenshots, raw logs and runtime databases stay outside Git. Public examples and fixtures are independently fictional.

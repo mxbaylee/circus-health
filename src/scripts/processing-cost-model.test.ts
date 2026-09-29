@@ -20,7 +20,7 @@ const near = (actual: number, expected: number, tolerance = 0.005) =>
   );
 
 test('reproduces the figures published in the processing proposal', () => {
-  // docs/processing-context-proposal.md, "Model and calibration" results table.
+  // docs/experiments/processing-experiments.md, preserved "Model and calibration" table.
   assert.equal(run('0', 800).requests, 1222);
   near(run('0', 800).inputTokens, 241e6);
   assert.equal(run('0b', 800).requests, 896);

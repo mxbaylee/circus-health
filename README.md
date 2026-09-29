@@ -38,19 +38,19 @@ stored payload. Both screenshots were generated from a fresh fictional Placebo a
 
 Local storage does not mean all inference is local. Circus Health sends the evidence and profile context needed for a model request through the operator's private LiteLLM Proxy to the configured upstream. A hosted provider can therefore receive plaintext from the unlocked profile for that request. A local Ollama route can keep inference on operator-controlled hardware only when its endpoint and cloud settings are configured and verified that way.
 
-The proxy has no health-archive mount and cannot accept changes into the archive. Model proposals remain pending until the user reviews them and the application records the accepted operation. See the [security model](docs/security.md) and [model boundary](docs/model-providers.md).
+The proxy has no health-archive mount and cannot accept changes into the archive. Model proposals remain pending until the user reviews them and the application records the accepted operation. See the [security model](docs/security/model.md) and [model boundary](docs/setup/model-providers.md).
 
 ## Install
 
 Circus Health requires Node.js 24.19 or newer, npm, and Docker with Compose v2.30 or newer. The supported runtime is Docker Compose with LiteLLM. Run `nvm use` and `npm ci` from the repository root before launching. Python is confined to the proxy container.
 
-Follow the [installation guide](docs/installation.md) for a new private archive and model connection. The [deployment and operations guide](docs/deployment.md) covers updates, shutdown, backup, recovery, HTTPS, and troubleshooting.
+Follow the [installation guide](docs/setup/installation.md) for a new private archive and model connection. The [deployment and operations guide](docs/setup/deployment.md) covers updates, shutdown, backup, recovery, HTTPS, and troubleshooting.
 
 ```sh
 CRS_DATA_DIR=/absolute/path/to/archive/data CRS_MODEL=health-primary CRS_LITELLM_CONFIG=/absolute/path/to/proxy/config/litellm.yaml CRS_STATE_DIR=/absolute/path/to/proxy/state npm run start
 ```
 
-The [environment reference](docs/environment.md) documents `CRS_*` settings, loading an external env file, and enabling diagnostics.
+The [environment reference](docs/setup/environment.md) documents `CRS_*` settings, loading an external env file, and enabling diagnostics.
 
 The default address is `http://localhost:3001`. Keep the data, LiteLLM configuration, provider credentials, and proxy state outside Git and in separate external locations.
 
@@ -58,10 +58,10 @@ The default address is `http://localhost:3001`. Keep the data, LiteLLM configura
 
 Circus Health is prerelease software. Automated checks cover encrypted profile lifecycle, access boundaries, durable record history, imports, and rebuilds with fictional data. Real-provider compatibility, OAuth persistence, representative full-size imports, physical passkeys, target-filesystem behavior, and print review remain acceptance work. A passing connection test does not establish extraction quality or provider privacy.
 
-See the [current work list](docs/application-todo.md#product-work-and-verification) for open requirements and [documentation index](docs/README.md) for maintained contracts.
+See the [current work list](docs/todo/readme.md) for open requirements and [documentation index](docs/README.md) for maintained contracts.
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing the application. The source layout and architectural boundaries are documented in [code organization](docs/code-organization.md); API behavior lives in [the server API reference](src/server/API.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing the application. The source layout and architectural boundaries are documented in [code organization](docs/architecture/code-organization.md); API behavior lives in [the server API reference](src/server/API.md).
 
 Circus Health is available under the [MIT License](LICENSE). See [third-party notices](THIRD-PARTY-NOTICES.md) for dependency, icon, font, and container attribution.

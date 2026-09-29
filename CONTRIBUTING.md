@@ -4,7 +4,7 @@ Thank you for helping improve Circus Health. This repository handles sensitive s
 
 ## Before you start
 
-Install Node.js 24.19 or newer for contributor checks. Root npm commands launch the product through Docker Compose and LiteLLM. Read the [code organization reference](docs/code-organization.md), [security model](docs/security.md), and the maintained contract related to your change.
+Install Node.js 24.19 or newer for contributor checks. Root npm commands launch the product through Docker Compose and LiteLLM. Read the [code organization reference](docs/architecture/code-organization.md), [security model](docs/security/model.md), and the maintained contract related to your change.
 
 Native server and browser checks also require `qpdf` on `PATH` for scoped original PDF extraction: install it with `brew install qpdf` on macOS or `sudo apt-get install qpdf` on Debian/Ubuntu. These checks must exercise native PDF extraction rather than skip it when the executable is missing. The application image includes qpdf, and the Linux test job installs it before the server/browser suites.
 
@@ -22,7 +22,7 @@ Keep changes focused. Preserve original evidence, append-only accepted history, 
 - `deploy/`, `compose.yaml`, `Dockerfile`, and root npm scripts define the supported runtime.
 - `docs/` contains maintained product, operations, architecture, data, and security references.
 
-The complete placement rules and known duplication are in [docs/code-organization.md](docs/code-organization.md).
+The complete placement rules and known duplication are in [docs/architecture/code-organization.md](docs/architecture/code-organization.md).
 
 ## Develop and verify
 
@@ -37,7 +37,7 @@ npm test
 
 Use the narrowest meaningful test while iterating, then run the relevant complete suite before submitting. Browser tests build the app and may require additional local dependencies; see [src/README.md](src/README.md). Deployment changes also need `npm run test:deploy`; proxy Python tests run only inside the pinned LiteLLM container as shown in CI.
 
-`npm test` and CI include `npm run test:tools` for the qualification/benchmark oracles and `npm run test:continuation` for the controlled 100-page automatic-continuation regression. The latter explicitly sets `CRS_PDF_CONTROLLED_TEST=1` and requires qpdf. These use fictional local fixtures and a scripted upstream; real-provider qualification remains a separate opt-in command described in [import performance diagnostics](docs/import-performance.md#representative-provider-qualification).
+`npm test` and CI include `npm run test:tools` for the qualification/benchmark oracles and `npm run test:continuation` for the controlled 100-page automatic-continuation regression. The latter explicitly sets `CRS_PDF_CONTROLLED_TEST=1` and requires qpdf. These use fictional local fixtures and a scripted upstream; real-provider qualification remains a separate opt-in command described in [import performance diagnostics](docs/import/import-performance.md#representative-provider-qualification).
 
 CI also builds the pinned LiteLLM compatibility image and runs its response, native PDF translation, diagnostics and fictional OAuth tests without external network access. These test the adapter and persistence logic, not real account authentication or provider PDF acceptance. The application Docker workflow and real-provider checks remain separately enabled integration gates.
 
@@ -45,7 +45,7 @@ Update documentation with contract changes. Cite current implementation and test
 
 ## Working across computers
 
-Keep requirements and enduring decisions in this repository, using the [single CRS work list](docs/application-todo.md). Use repository-relative paths and reproducible commands when handing off changes. Keep health records, credentials, local paths, raw diagnostics and runtime state out of contributions. Follow [repository scope and handoffs](docs/workspace-and-handoffs.md) when transferring changes or interpreting another computer’s test receipts.
+Keep short open items in the [single CRS work list](docs/todo/readme.md); give an item its own file only when necessary context justifies it. Maintain documentation of current behavior and limitations alongside code. Keep implementation plans and feedback in chats or issues, not repository specifications. Use repository-relative paths and reproducible commands when handing off changes. Keep health records, credentials, local paths, raw diagnostics and runtime state out of contributions. Follow [repository scope and handoffs](docs/architecture/workspace-and-handoffs.md) when transferring changes or interpreting another computer’s test receipts.
 
 ## Commit messages and pull requests
 

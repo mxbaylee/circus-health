@@ -12,6 +12,6 @@ Please allow the maintainer time to reproduce and assess a report before public 
 
 ## Scope and operating assumptions
 
-The default deployment binds to loopback. Remote access, shared-host use, reverse proxies, TLS termination, provider retention, host security, browser extensions, backups, and recovery-kit handling are operator responsibilities. The configured model provider can receive plaintext selected from an unlocked profile. See the [implemented security model and risk register](docs/security.md) before deployment.
+The default deployment binds to loopback. Remote access, shared-host use, reverse proxies, TLS termination, provider retention, host security, browser extensions, backups, and recovery-kit handling are operator responsibilities. The configured model provider can receive plaintext selected from an unlocked profile. See the [implemented security model and risk register](docs/security/model.md) before deployment.
 
 Security recommendations in that audit describe proposed work; they are not implemented controls unless the current code and tests show otherwise.

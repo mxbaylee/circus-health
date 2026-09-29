@@ -45,7 +45,7 @@ npm run icons
 
 Prerequisites: Node 24, npm, Docker with Compose v2.30 or newer.
 Source your external shell env file before launch; .env files are not loaded automatically.
-Model/provider settings belong in your LiteLLM configuration. See docs/installation.md and docs/environment.md.
+Model/provider settings belong in your LiteLLM configuration. See docs/setup/installation.md and docs/setup/environment.md.
 Ctrl-C stops both containers. Health data and proxy authentication survive recreation.
 `;
 type Environment = NodeJS.ProcessEnv;

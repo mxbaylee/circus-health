@@ -457,7 +457,7 @@ async function inspectProxyError(
   // unrecognized/unsupported request parameter is otherwise indistinguishable
   // from any other opaque 400 — see the actionable message this classification
   // enables in proxyRequest. Never used to auto-retry without the field: that
-  // silent reroute is exactly what docs/docker-ai.md forbids.
+  // silent reroute is exactly what docs/setup/docker-ai.md forbids.
   if (
     /cache_control/i.test(text) &&
     /unrecognized|unexpected|unknown|not allowed|unsupported|invalid/i.test(text)

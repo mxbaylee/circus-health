@@ -81,12 +81,12 @@ const exact: Record<string, Classification> = {
     role: 'documentation index',
     purpose: 'Indexes maintained product, operator and contributor references.',
   },
-  'docs/application-todo.md': {
+  'docs/todo/readme.md': {
     category: 'work-tracking',
     role: 'canonical work list',
     purpose: 'Tracks approved requirements, delivered work, and outstanding release checks.',
   },
-  'docs/filter-inventory.md': {
+  'docs/features/filter-inventory.md': {
     category: 'audit-inventory',
     role: 'maintained interface inventory',
     purpose: 'Accounts for routed collection filters and their current interaction contracts.',
@@ -235,6 +235,19 @@ function classify(path: string): Classification {
             ? 'operator example'
             : 'deployment runtime',
       purpose: `${words(path)} for launcher or LiteLLM deployment behavior.`,
+    };
+  if (path.startsWith('docs/todo/'))
+    return {
+      category: 'work-tracking',
+      role: 'concise TODO',
+      purpose:
+        'Tracks open work with stable CRS identifiers, without implementation specifications.',
+    };
+  if (path.startsWith('docs/experiments/'))
+    return {
+      category: 'validation-record',
+      role: 'historical experiment material',
+      purpose: 'Retains research reports and study plans pending a separate retention review.',
     };
   if (path.startsWith('docs/validation/'))
     return {

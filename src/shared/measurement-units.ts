@@ -9,7 +9,7 @@ export interface MeasurementUnit {
   base: string;
   factor: ExactRational;
 }
-// A fixed, case-sensitive subset, not a general UCUM parser. Sources/limits: docs/measurement-comparison.md.
+// A fixed, case-sensitive subset, not a general UCUM parser. Sources/limits: docs/features/measurement-comparison.md.
 const groups: [MeasurementDimension, string, [string, string][]][] = [
   [
     'mass',

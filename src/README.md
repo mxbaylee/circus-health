@@ -39,4 +39,4 @@ Every private data route is scoped to an unlocked `/api/profiles/:profileId`. Th
 
 Runtime profile data is not application source code. Keep sources, generated databases, backups, portable generations, mappings containing private decisions, and assistant journals outside commits intended for sharing.
 
-See [API](server/API.md), [intake](server/INTAKE.md), [portable state](server/PORTABLE.md), [note exports](server/NOTE-EXPORTS.md), and [repository architecture](../docs/code-organization.md).
+See [API](server/API.md), [intake](server/INTAKE.md), [portable state](server/PORTABLE.md), [note exports](server/NOTE-EXPORTS.md), and [repository architecture](../docs/architecture/code-organization.md).

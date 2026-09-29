@@ -1,11 +1,11 @@
 /**
  * Structural cost model for the processing strategies compared in
- * docs/processing-context-proposal.md. It estimates request counts, the
+ * docs/experiments/processing-experiments.md (preserved context-cost calibration). It estimates request counts, the
  * sequential critical path, input and output tokens, and the Resume clicks the
  * current job limits would demand, for any page count and record density.
  *
  * This is a model, not a measurement. Defaults are calibrated to the offline
- * receipts named in the proposal; every parameter can be overridden, and a
+ * historical receipts named in that ledger; every parameter can be overridden, and a
  * harness measurement supersedes any figure printed here. Direction (which
  * strategy sends more) is robust to the parameters; magnitude is not.
  */
