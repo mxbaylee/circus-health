@@ -167,7 +167,9 @@ test('source corrections stale original/proposal review; identical fresh payload
     route('source-extract', { operationId: randomUUID(), expectedRevisionId: text.revision!.id }),
     { code: 'SOURCE_TEXT_CHANGED' },
   );
-  // Even a semantically unchanged confirmation has its own exact source revision.
+  // A confirmation gets its own exact source revision, chained to its parent, but a
+  // confirmation-only revision does not move the material source pin: new proposals
+  // still pin to the last revision that actually changed the text.
   const confirm = () => {
     const latest = getIntakeSourceText(db, root, profileId, original.id);
     return reviewIntakeSourceText(
@@ -185,15 +187,19 @@ test('source corrections stale original/proposal review; identical fresh payload
       'profile-owner',
     );
   };
-  confirm();
+  const firstConfirm = confirm();
   const noOp = confirm();
+  assert.notEqual(firstConfirm.revision!.id, corrected.revision!.id);
+  assert.notEqual(noOp.revision!.id, firstConfirm.revision!.id);
+  assert.equal(firstConfirm.revision!.parentRevisionId, corrected.revision!.id);
+  assert.equal(noOp.revision!.parentRevisionId, firstConfirm.revision!.id);
   const latestOriginal = intake.getIntake(db, root, profileId, original.id);
   const pinned = intake.proposeConversion(db, root, profileId, original.id, {
     version: latestOriginal.version,
     jsonlText,
     summary: 'Fictional exact revision provenance',
   });
-  assert.equal(pinned.proposals.at(-1)!.sourceTextRevisionId, noOp.revision!.id);
+  assert.equal(pinned.proposals.at(-1)!.sourceTextRevisionId, corrected.revision!.id);
   assert.equal(
     intake.reviewIntake(db, root, profileId, original.id, pinned.proposals.at(-1)!.id)
       .sourceTextStale,
