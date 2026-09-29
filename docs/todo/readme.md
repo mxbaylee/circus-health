@@ -2,7 +2,7 @@
 
 This is the single work list. Keep ordinary items to an ID and a short description here. Add a separate CRS file when an item needs more room: its specification, proposal, owner decisions, open questions and review findings belong there. Fold review feedback into the items it concerns.
 
-Numbers are stable identifiers, not priority. Never renumber or reuse an ID. The next unused number is CRS-131. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
+Numbers are stable identifiers, not priority. Never renumber or reuse an ID. The next unused number is CRS-132. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
 
 Application documentation describes implemented behavior and current limitations; future work, its specifications and its plans live here. Before deleting a ticket, carry its unmet requirements, owner decisions and open questions into a new or existing item.
 
@@ -27,7 +27,6 @@ The detailed work list and design documents that preceded this index are archive
 - [ ] <a id="crs-086"></a> [CRS-086](CRS-086.md) — Implement model-agnostic async artifact processing with bounded context, shared extraction, adaptive concurrency and reviewable aggregation.
 - [ ] <a id="crs-088"></a> [CRS-088](CRS-088.md) — Reduce passkey re-entry to an authenticator gesture while retaining origin checks, profile isolation and locked state after restart.
 - [ ] <a id="crs-090"></a> **CRS-090** — Qualify confirmed-name remembering on ambiguous and representative files, preserving primary identity and historical receipts.
-- [ ] <a id="crs-111"></a> [CRS-111](CRS-111.md) — Use early original identity evidence for scoped person assignment; mismatches ask who a report belongs to and never reject the upload.
 - [ ] <a id="crs-112"></a> **CRS-112** — Remove blank-Self-field filling from import confirmation; use normal profile editing/setup and keep old receipts readable.
 - [ ] <a id="crs-114"></a> [CRS-114](CRS-114.md) — Remove the repository inventory checker and separately verified dead code, preserving live dynamic, worker, deployment and test entry points.
 - [ ] <a id="crs-115"></a> [CRS-115](CRS-115.md) — Qualify complete durable source text, located uncertainty, reading order, tables, search and no-AI recovery across difficult document strata.

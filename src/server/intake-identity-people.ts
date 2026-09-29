@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { json } from './database.ts';
-import { savedKnownNames } from '../shared/self-identity.ts';
+import { savedKnownNames, safeSourceIdentityName } from '../shared/self-identity.ts';
 import { noteVisibilitySQL } from './visibility.ts';
 import type { IdentityPolicyPersonSnapshot } from './intake-identity-policy.ts';
 
@@ -20,7 +20,9 @@ export function identityPeopleSnapshots(db: DatabaseSync): IdentityPolicyPersonS
               : [],
           )
         : [];
-      const names = [...savedKnownNames(profile.knownNames), ...sources];
+      const names = [...savedKnownNames(profile.knownNames), ...sources].filter(
+        safeSourceIdentityName,
+      );
       return {
         noteId: String(row.id),
         personId: String(row.person_id),

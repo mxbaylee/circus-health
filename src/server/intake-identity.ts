@@ -1,6 +1,15 @@
-import { originalSubjectBirthDateEvidence } from './intake-evidence-dates.ts';
+import {
+  decodeOriginalIdentityText,
+  originalSubjectBirthDateEvidence,
+  originalSubjectNameGrounded,
+} from './intake-evidence-dates.ts';
 import { noteVisibilitySQL } from './visibility.ts';
-import { savedKnownNames } from '../shared/self-identity.ts';
+import {
+  savedKnownNames,
+  safeSourceIdentityName,
+  compatibleIdentityBirthDates,
+  validOnboardingBirthDate,
+} from '../shared/self-identity.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { createHash } from 'node:crypto';
@@ -28,6 +37,7 @@ import {
   printedIdentityName,
   isGenericNameConfirmation,
   competingIdentityBoundaries,
+  identityBoundaryRepairApplies,
 } from './intake-identity-policy.ts';
 import { retainIdentityGrounding } from './intake-identity-grounding.ts';
 import {
@@ -70,6 +80,7 @@ interface Evidence {
   verificationMode: IntakeIdentityScope['verificationMode'];
   originalFingerprint: string;
   pageText: string | null;
+  patientNameGrounded: boolean;
 }
 const groupFor = (intake: Intake, groupId: string): IntakeReportGroup => {
   const group = intake.workflow?.reportGroups?.find((item) => item.id === groupId);
@@ -126,6 +137,10 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
       } catch {
         return reject('This original needs individual identity review');
       }
+      // Keep decoded JSON keys, roles and object boundaries with the retained
+      // string values. Flattening values alone makes guardian names look like
+      // patient names and hides a structured patient's DOB key.
+      text = decodeOriginalIdentityText(text, reference.filename);
       // Do not match hidden HTML instructions as visible subject evidence.
       if (original.mimeType === 'text/html')
         text = text
@@ -149,6 +164,7 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
     verificationMode: text === null ? 'human_reviewed_original' : 'literal_text_match',
     originalFingerprint: identityOriginalFingerprint(id, intake.sha256, group, intake.workflow!),
     pageText: text?.trim() ? text : null,
+    patientNameGrounded: originalSubjectNameGrounded(text, subject.text, anchor.text),
   };
 }
 interface BuiltScope {
@@ -160,6 +176,7 @@ interface BuiltScope {
   currentRefusal?: 'unknown' | 'other_person';
   groundedQuestions: { issue: IntakeReviewIssue; receipt: IntakeIdentityReceipt }[];
   groundedNameQuestions: IntakeReviewIssue[];
+  patientNameGrounded: boolean;
 }
 
 interface ExplicitIdentityOccurrence {
@@ -189,11 +206,13 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
     return reject('The report changed while its evidence was being read');
   if (!latest || latest.members.length > 1000)
     return reject('Review a bounded report with at most 1000 candidate versions');
-  // A competing subject claim at the same printed report boundary prevents common confirmation.
-  if (competingIdentityBoundaries(group, intake.workflow!.reportGroups!).length)
-    return reject(
-      'This report boundary has conflicting subject claims; resolve identity individually',
-    );
+  const competingSubjects = competingIdentityBoundaries(group, intake.workflow!.reportGroups!)
+    .map((other) => ({
+      groupId: other.id,
+      groupVersionId: other.versions.at(-1)!.id,
+      subject: other.report!.subject!,
+    }))
+    .sort((a, b) => a.groupId.localeCompare(b.groupId));
   if (
     intake.workflow!.questions.some(
       (question) =>
@@ -333,14 +352,15 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   }
   if (targets.length > 1000)
     return reject('Review a bounded report with at most 1000 pending identity questions');
+  const originalDates = originalSubjectBirthDateEvidence(
+    evidence.pageText,
+    group.report!.subject!.text,
+    group.report!.anchor.text,
+  );
   const collected = collectEvidencedIdentity(
     identityIssues,
-    group.report?.subject?.text,
-    originalSubjectBirthDateEvidence(
-      evidence.pageText,
-      group.report!.subject!.text,
-      group.report!.anchor.text,
-    ),
+    evidence.pageText === null || evidence.patientNameGrounded ? group.report?.subject?.text : '',
+    originalDates,
   );
   const personFingerprint = identityPersonFingerprint(
     evidence.originalFingerprint,
@@ -414,6 +434,25 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   }
   if (targets.length > 1000 || assignmentTargets.length > 1000 || questions.size > 100)
     return reject('Review these identity questions individually; the displayed scope is too large');
+  if (competingSubjects.length) {
+    const question = {
+      prompt:
+        'Other extraction claims name a different subject at this same report boundary. Review the original and confirm the displayed subject and person for only the listed records.',
+      textAnchor: competingSubjects.map((claim) => claim.subject.text).join(' / '),
+    };
+    questions.set(canonicalLiteral(question), question);
+    hasUnstructuredIdentityQuestion = true;
+  }
+  if (questions.size > 100 || competingSubjects.length > 100)
+    return reject('Review a bounded set of identity claims.');
+  const birthDateReview =
+    collected.unreadableBirthDate ||
+    collected.conflicts.some((conflict) => conflict.field === 'birthDate')
+      ? {
+          choices: [...new Set([...originalDates.dates, ...(originalDates.suggestions || [])])],
+          ...(originalDates.suggestions?.length ? { suggested: originalDates.suggestions[0] } : {}),
+        }
+      : undefined;
   const snapshot = {
     profileId,
     intakeId: id,
@@ -432,27 +471,43 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
     membership: structuredClone(latest.members),
     targets,
     assignmentTargets,
+    ...(birthDateReview ? { birthDateReview } : {}),
+    ...(competingSubjects.length ? { competingSubjects } : {}),
     ...(questions.size ? { questions: [...questions.values()] } : {}),
   };
   const scope: IntakeIdentityScope = {
     ...snapshot,
     scopeToken: hash([snapshot, evidence.sourceHash]),
   };
-  const explicitlyConfirmedOperationId = scope.targets.length
+  let explicitlyConfirmedOperationId = scope.targets.length
     ? undefined
     : exactCurrentIdentityResolutionOperationId({
         receipts: intake.workflow?.identityConfirmations,
         occurrences: explicitOccurrences,
         receiptApplies,
       });
+  if (competingSubjects.length) {
+    const repair = intake.workflow?.identityConfirmations?.findLast(
+      (receipt) =>
+        receiptApplies(receipt) &&
+        identityBoundaryRepairApplies(
+          receipt,
+          group,
+          intake.workflow!.reportGroups!,
+          assignmentTargets,
+        ),
+    );
+    if (repair) explicitlyConfirmedOperationId = repair.operationId;
+  }
   return {
     scope,
-    evidenceConflicts: collected.conflicts,
-    unreadableBirthDate: collected.unreadableBirthDate,
+    evidenceConflicts: collected.conflicts.filter((conflict) => conflict.field !== 'birthDate'),
+    unreadableBirthDate: !!birthDateReview,
     hasUnstructuredIdentityQuestion,
     currentRefusal: currentIdentityRefusal(identityIssues),
     groundedQuestions,
     groundedNameQuestions,
+    patientNameGrounded: evidence.patientNameGrounded,
     ...(explicitlyConfirmedOperationId ? { explicitlyConfirmedOperationId } : {}),
   };
 }
@@ -577,6 +632,9 @@ export async function getIntakeIdentityReview(
           noteId: note.id,
           personId: note.personId!,
           version: note.version,
+          birthDate: typeof note.person.birthDate === 'string' ? note.person.birthDate : null,
+          relationship:
+            typeof note.person.relationship === 'string' ? note.person.relationship : null,
           fullName:
             typeof note.person.fullName === 'string' && note.person.fullName.trim()
               ? note.person.fullName.trim()
@@ -671,18 +729,6 @@ async function getIntakeIdentityReviewInternal(
     });
     return { ...assessment, scope: null, self };
   }
-  const competing = competingIdentityBoundaries(group, intake.workflow!.reportGroups!).length > 0;
-  if (competing)
-    return {
-      status: 'conflict',
-      blocking: true,
-      message: 'This report boundary has conflicting printed subject claims.',
-      scope: null,
-      evidencedIdentity: groupIdentity.evidence,
-      self,
-      offeredSelfFields: {},
-      conflicts: groupIdentity.conflicts,
-    };
   let built: BuiltScope;
   try {
     const evidence = await identityEvidence(context, groupId);
@@ -698,7 +744,7 @@ async function getIntakeIdentityReviewInternal(
       },
       groupFor(current, groupId),
       built.groundedQuestions,
-      built.scope.verificationMode === 'literal_text_match',
+      built.patientNameGrounded,
       built.groundedNameQuestions,
       originalSubjectBirthDateEvidence(
         evidence.pageText,
@@ -725,7 +771,7 @@ async function getIntakeIdentityReviewInternal(
   const assessment = assessIdentityPolicy({
     self,
     people: identityPeopleSnapshots(db),
-    nameEvidenceGrounded: built.scope.verificationMode === 'literal_text_match',
+    nameEvidenceGrounded: built.patientNameGrounded,
     evidence: built.scope.evidencedIdentity || {},
     evidenceConflicts: built.evidenceConflicts,
     unreadableBirthDate: built.unreadableBirthDate,
@@ -739,9 +785,7 @@ async function getIntakeIdentityReviewInternal(
   });
   return {
     ...assessment,
-    scope: assessment.conflicts.some((conflict) => conflict.reason === 'evidence_disagreement')
-      ? null
-      : built.scope,
+    scope: built.scope,
     self,
   };
 }
@@ -801,10 +845,53 @@ export async function confirmIntakeIdentityScope(
     const built = buildScope(context, evidence);
     const current = built.scope;
     const currentSelf = selfSnapshot(db);
+    const answers = input.identityAnswers;
+    const yearAnswerAllowed =
+      typeof answers?.birthDate === 'string' &&
+      /^\d{4}$/.test(answers.birthDate) &&
+      current.birthDateReview?.choices.some((choice) => /^\d{4}$/.test(choice)) &&
+      Number(answers.birthDate) >= 1 &&
+      answers.birthDate <= new Date().toISOString().slice(0, 4);
+    if (
+      answers !== undefined &&
+      (!answers ||
+        typeof answers !== 'object' ||
+        Array.isArray(answers) ||
+        Object.keys(answers).some((key) => key !== 'birthDate') ||
+        !current.birthDateReview ||
+        (answers.birthDate !== null &&
+          !validOnboardingBirthDate(answers.birthDate) &&
+          !yearAnswerAllowed))
+    )
+      throw new HttpError(
+        400,
+        'IDENTITY_BIRTH_DATE',
+        current.birthDateReview?.choices.some((choice) => /^\d{4}$/.test(choice))
+          ? 'Confirm a birth year from the original, or explicitly keep it unknown.'
+          : 'Confirm a complete birth date from the original, or explicitly keep it unknown.',
+      );
+    if (current.birthDateReview?.choices.length && !Object.hasOwn(answers || {}, 'birthDate'))
+      throw new HttpError(
+        400,
+        'IDENTITY_BIRTH_DATE',
+        'Review the suggested birth date before confirming this report.',
+      );
+    const reviewedBirthDate = answers?.birthDate || current.evidencedIdentity?.birthDate;
+    if (
+      input.outcome === 'this_is_me' &&
+      reviewedBirthDate &&
+      currentSelf.birthDate &&
+      !compatibleIdentityBirthDates(reviewedBirthDate, currentSelf.birthDate)
+    )
+      throw new HttpError(
+        409,
+        'IDENTITY_CONFLICT',
+        'The reviewed birth date differs from Self. Choose another person or add a new person.',
+      );
     const assessment = assessIdentityPolicy({
       self: currentSelf,
       people: identityPeopleSnapshots(db),
-      nameEvidenceGrounded: built.scope.verificationMode === 'literal_text_match',
+      nameEvidenceGrounded: built.patientNameGrounded,
       evidence: current.evidencedIdentity || {},
       evidenceConflicts: built.evidenceConflicts,
       unreadableBirthDate: built.unreadableBirthDate,
@@ -876,7 +963,11 @@ export async function confirmIntakeIdentityScope(
       );
     const confirmedPrintedName =
       current.evidencedIdentity?.fullName ||
-      (typeof input.printedName === 'string' ? input.printedName.trim() : undefined);
+      (typeof input.printedName === 'string'
+        ? input.printedName.trim()
+        : /[;\n]/.test(current.subject.text)
+          ? undefined
+          : printedIdentityName(current.subject.text));
     if (
       !confirmedPrintedName ||
       (input.printedName !== undefined &&
@@ -961,6 +1052,19 @@ export async function confirmIntakeIdentityScope(
             409,
             'PERSON_VERSION_CONFLICT',
             'This person changed; review the current person before confirming',
+          );
+        const printedBirthDate = reviewedBirthDate;
+        const savedBirthDate =
+          typeof note.person.birthDate === 'string' ? note.person.birthDate : null;
+        if (
+          printedBirthDate &&
+          savedBirthDate &&
+          !compatibleIdentityBirthDates(printedBirthDate, savedBirthDate)
+        )
+          throw new HttpError(
+            409,
+            'IDENTITY_CONFLICT',
+            'The report birth date differs from this person. Choose another person or add a new person.',
           );
       } else if ('newPerson' in selection && !('noteId' in selection)) {
         const person = selection.newPerson;
@@ -1054,18 +1158,16 @@ export async function confirmIntakeIdentityScope(
         fields: structuredClone(selected.fields),
       };
     }
-    const knownNameAdded = rememberSourceNameInTransaction(
-      db,
-      assignedPerson?.noteId || 'person-note:self',
-      {
-        name: confirmedPrintedName,
-        operationId: input.operationId,
-        intakeId: id,
-        sourceHash: current.sourceHash,
-        groupId: current.groupId,
-        subjectText: current.subject.text,
-      },
-    );
+    const knownNameAdded = safeSourceIdentityName(confirmedPrintedName)
+      ? rememberSourceNameInTransaction(db, assignedPerson?.noteId || 'person-note:self', {
+          name: confirmedPrintedName,
+          operationId: input.operationId,
+          intakeId: id,
+          sourceHash: current.sourceHash,
+          groupId: current.groupId,
+          subjectText: current.subject.text,
+        })
+      : undefined;
     if (assignedPerson) assignedPerson.version = getNote(db, assignedPerson.noteId).version;
     if (selfUpdate) selfUpdate.versionAfter = getNote(db, 'person-note:self').version;
     const at = now();
@@ -1111,6 +1213,7 @@ export async function confirmIntakeIdentityScope(
       scope: current,
       outcome: input.outcome,
       attestation: input.attestation,
+      ...(answers ? { identityAnswers: structuredClone(answers) } : {}),
       draftIds,
       ...(assignedPerson ? { assignedPerson } : {}),
       ...(knownNameAdded ? { knownNameAdded } : {}),

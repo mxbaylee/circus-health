@@ -1,3 +1,4 @@
+import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { ImportPersonSelection } from './ImportPersonChoice';
 import type { ManualSourceRecordResult } from '../../../shared/intake-manual-source-record';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -752,6 +753,10 @@ export function ImportPage() {
           confirmed:
             identityStatus === 'evidenced_match' || identityStatus === 'prior_confirmation',
           identityStatus,
+          nameOnlyMatch:
+            identityStatus === 'evidenced_match' && !identityReview?.evidencedIdentity.birthDate,
+          birthDate: identityReview?.evidencedIdentity.birthDate,
+          birthDateReview: identityReview?.scope?.birthDateReview,
           selfBirthDateConflict: identityReview?.selfBirthDateConflict,
           defaultPerson: identityReview?.defaultPerson,
           identityMessage:
@@ -1638,6 +1643,7 @@ export function ImportPage() {
     selectedFields: { fullName?: string; birthDate?: string },
     personSelection?: ImportPersonSelection,
     printedName?: string,
+    identityAnswers?: IntakeIdentityAnswers,
   ) {
     const group = displayedFeed?.groups.find((item) => item.groupId === reportId);
     const displayedReview = identityReviews.get(reportId);
@@ -1662,7 +1668,7 @@ export function ImportPage() {
         ),
       ) as { fullName?: string; birthDate?: string };
       try {
-        operationKey = `identity:${displayedScope.groupId}:${displayedScope.groupVersionId}:${displayedScope.intakeVersion}:${JSON.stringify([fields, personSelection, printedName])}`;
+        operationKey = `identity:${displayedScope.groupId}:${displayedScope.groupVersionId}:${displayedScope.intakeVersion}:${JSON.stringify([fields, personSelection, printedName, identityAnswers])}`;
         const request = (pendingOperations.current.get(operationKey) as
           IntakeIdentityConfirmation | undefined) || {
           version: displayedScope.intakeVersion,
@@ -1671,6 +1677,7 @@ export function ImportPage() {
           outcome: personSelection ? 'this_is_person' : 'this_is_me',
           ...(personSelection ? { personSelection } : {}),
           ...(printedName ? { printedName } : {}),
+          ...(identityAnswers ? { identityAnswers } : {}),
           attestation: displayedScope.questions?.length
             ? 'confirmed_displayed_identity_questions'
             : 'confirmed_displayed_report_subject',

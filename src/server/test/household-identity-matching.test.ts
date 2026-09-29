@@ -442,3 +442,41 @@ test('original header DOB blocks Self even when the model supplies only the matc
   );
   assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM observations').get()?.count, 0);
 });
+
+test('a grounded name cannot automatically match without the accompanying original DOB check', () => {
+  const result = assess({ fullName: self.fullName }, [], {
+    nameEvidenceGrounded: true,
+    originalEvidenceChecked: false,
+  });
+  assert.equal(result.blocking, true);
+  assert.notEqual(result.status, 'evidenced_match');
+});
+
+test('an unprinted model DOB does not become evidence or a separate ownership question', () => {
+  const collected = collectEvidencedIdentity(
+    [{ selfSuggestion: { fullName: self.fullName, birthDate: self.birthDate } }],
+    `Patient: ${self.fullName}`,
+    { dates: [], unreadable: false },
+  );
+  assert.equal(collected.evidence.birthDate, undefined);
+  assert.equal(collected.evidence.birthDateHints, undefined);
+  const result = assess(collected.evidence, [], {
+    unreadableBirthDate: collected.unreadableBirthDate,
+  });
+  assert.equal(result.blocking, false);
+  assert.equal(result.offeredSelfFields.birthDate, undefined);
+});
+
+test('printed two-digit DOB still asks even when a model supplies a plausible century', () => {
+  const collected = collectEvidencedIdentity(
+    [{ selfSuggestion: { fullName: self.fullName, birthDate: self.birthDate } }],
+    'Patient: ' + self.fullName,
+    { dates: [], unreadable: true, suggestions: [self.birthDate] },
+  );
+  const result = assess(collected.evidence, [], {
+    unreadableBirthDate: collected.unreadableBirthDate,
+  });
+  assert.equal(collected.evidence.birthDate, undefined);
+  assert.equal(result.blocking, true);
+  assert.equal(result.offeredSelfFields.birthDate, undefined);
+});

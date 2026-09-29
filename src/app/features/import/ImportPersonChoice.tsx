@@ -1,3 +1,7 @@
+import {
+  compatibleIdentityBirthDates,
+  safeSourceIdentityName,
+} from '../../../shared/self-identity';
 import type {
   IntakeIdentityConfirmation,
   IntakeIdentityReview,
@@ -26,8 +30,8 @@ export function ImportPrintedName({
         onChange={(event) => onChange(event.target.value)}
       />
       <small>
-        Copy only the person's name from “{subjectText}”. Confirmation retains this name on their
-        profile.
+        Copy only the person's name from “{subjectText}”. A single name stays in this report’s
+        confirmation; it does not become a reusable alias.
       </small>
     </label>
   );
@@ -39,6 +43,7 @@ export const printedNameReady = (name: string, subjectText: string): boolean =>
 /** A person choice is explicit; a printed name never silently creates or selects People. */
 export function ImportPersonChoice({
   selfDisabled = false,
+  birthDate,
   people = [],
   peopleTruncated,
   assignedPerson,
@@ -48,6 +53,7 @@ export function ImportPersonChoice({
   disabled,
 }: {
   selfDisabled?: boolean;
+  birthDate?: string;
   people?: IntakeIdentityReview['people'];
   peopleTruncated?: boolean;
   assignedPerson?: IntakeIdentityReview['assignedPerson'];
@@ -85,8 +91,32 @@ export function ImportPersonChoice({
             Me (Self)
           </option>
           {choices.map((person) => (
-            <option key={person.noteId} value={person.noteId}>
+            <option
+              key={person.noteId}
+              value={person.noteId}
+              disabled={
+                !!(
+                  birthDate &&
+                  person.birthDate &&
+                  !compatibleIdentityBirthDates(birthDate, person.birthDate)
+                )
+              }
+            >
               {person.fullName}
+              {choices.filter(
+                (item) => item.fullName.toLowerCase() === person.fullName.toLowerCase(),
+              ).length > 1
+                ? ' · ' +
+                  [
+                    person.birthDate ? 'DOB ' + person.birthDate : 'DOB not saved',
+                    person.relationship,
+                    person.personId,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')
+                : person.birthDate
+                  ? ' · DOB ' + person.birthDate
+                  : ''}
             </option>
           ))}
           <option value="new">Add a new person</option>
@@ -131,7 +161,7 @@ export function ImportPersonChoice({
           <small>This adds a person to People. Results stay in review until you save them.</small>
         </>
       )}
-      {!selection && printedName && (
+      {!selection && printedName && safeSourceIdentityName(printedName) && (
         <small>
           Confirming retains “{printedName}” in your Names with this report as evidence. Display
           name and existing date of birth stay unchanged; selected blank details can be filled.
@@ -139,8 +169,9 @@ export function ImportPersonChoice({
       )}
       {selection && !('newPerson' in selection) && (
         <small>
-          This report will belong to the selected person. Its confirmed name is retained in their
-          Names. Results stay in review until you save them.
+          This report will belong to the selected person. Supported names are retained in their
+          Names; a single name is kept only in this report’s confirmation. Results stay in review
+          until you save them.
         </small>
       )}
     </fieldset>
@@ -149,3 +180,46 @@ export function ImportPersonChoice({
 
 export const personSelectionReady = (selection: ImportPersonSelection): boolean =>
   !selection || !('newPerson' in selection) || !!selection.newPerson.fullName.trim();
+
+export function ImportBirthDateReview({
+  review,
+  value,
+  onChange,
+  disabled,
+}: {
+  review: NonNullable<NonNullable<IntakeIdentityReview['scope']>['birthDateReview']>;
+  value: string | null;
+  onChange: (value: string | null) => void;
+  disabled: boolean;
+}) {
+  const yearOnly = review.choices.some((choice) => /^\d{4}$/.test(choice));
+  return (
+    <fieldset disabled={disabled} className="import-identity-self-fields">
+      <legend>Review the birth date on this report</legend>
+      <p>
+        A date reading needs your confirmation. An inferred century is only a suggestion. This
+        answer stays with this report and does not change anyone’s saved birth date.
+      </p>
+      {!!review.choices.length && <p>Possible readings: {review.choices.join(' or ')}.</p>}
+      <label>
+        {yearOnly ? 'Birth year read from the original' : 'Birth date read from the original'}
+        <input
+          type={yearOnly ? 'text' : 'date'}
+          inputMode={yearOnly ? 'numeric' : undefined}
+          maxLength={yearOnly ? 4 : undefined}
+          aria-label={yearOnly ? 'Reviewed report birth year' : 'Reviewed report birth date'}
+          value={value || ''}
+          onChange={(event) => onChange(event.target.value || null)}
+        />
+      </label>
+      <label>
+        <input
+          type="checkbox"
+          checked={value === null}
+          onChange={(event) => onChange(event.target.checked ? null : review.suggested || '')}
+        />
+        I cannot determine the birth date; keep it unknown.
+      </label>
+    </fieldset>
+  );
+}

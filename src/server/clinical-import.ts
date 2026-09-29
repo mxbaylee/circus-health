@@ -568,7 +568,9 @@ export function refreshClinicalIdentityPolicy(
         ...(record.identityReview || { status: 'conflict', evidencedIdentity: {}, conflicts: [] }),
         status: 'conflict',
         blocking: true,
-        message: 'Choose an available person for this exact report before saving.',
+        message: record.identityReview?.blocking
+          ? record.identityReview.message
+          : 'Choose an available person for this exact report before saving.',
       };
       delete record.mapping.personId;
       delete record.identityAttribution;

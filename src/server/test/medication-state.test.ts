@@ -233,3 +233,26 @@ test('current/archive/current survives complete cache loss with originals and bo
   assert.equal(existsSync(resolve(restored.root, path)), false, 'Original plaintext is deferred');
   assert.deepEqual(readFileSync(profileOriginal(restored.root, path, profile.id)), bytes);
 });
+
+test('a relative prescription remains history until the caregiver confirms current use', async (t) => {
+  const { db } = await fixture(t);
+  const { createNote } = await import('../notes.ts');
+  const relative = createNote(db, {
+    kind: 'person',
+    title: 'Fictional Rowan',
+    content: '',
+    person: { fullName: 'Fictional Rowan Meadow', relationship: 'Parent' },
+  });
+  transaction(db, () => {
+    db.prepare("UPDATE medications SET person_id=? WHERE id='med'").run(relative.personId!);
+    appendImportedMedicationDefault(db, 'med');
+  });
+  assert.equal(detail(db).currentStatus, 'not_current');
+  assert.equal(db.prepare("SELECT status FROM medications WHERE id='med'").get()!.status, 'active');
+  select(db, 'current');
+  assert.equal(detail(db).currentStatus, 'current');
+  assert.equal(
+    db.prepare("SELECT person_id FROM medications WHERE id='med'").get()!.person_id,
+    relative.personId,
+  );
+});

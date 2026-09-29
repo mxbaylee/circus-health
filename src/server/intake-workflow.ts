@@ -1,4 +1,5 @@
 import { candidateSourceIdentityV1 } from './intake-source-identity.ts';
+import { compatibleIdentityBirthDates } from '../shared/self-identity.ts';
 import { createHash } from 'node:crypto';
 import { HttpError, now, safeText } from './database.ts';
 import { accountedUnitKind } from './intake-unit-accounting.ts';
@@ -12,6 +13,7 @@ import {
   collectEvidencedIdentity,
   isGenericNameConfirmation,
   competingIdentityBoundaries,
+  identityBoundaryRepairApplies,
   currentIdentityRefusal,
   repeatedIdentityQuestionReceipt,
   exactCurrentIdentityResolutionOperationId,
@@ -565,9 +567,9 @@ export function workflowReview<T extends IntakeReview>(
         people: identityContext?.people,
         originalEvidenceChecked: !group || originalBirthDates !== undefined,
         unreadableBirthDate,
-        nameEvidenceGrounded:
-          (review.proposalId === null && !!structuredEvidence.fullName) ||
-          !!(group && identityContext?.subjectGrounded?.(group)),
+        nameEvidenceGrounded: group
+          ? !!identityContext?.subjectGrounded?.(group)
+          : review.proposalId === null && !!structuredEvidence.fullName,
         evidence,
         evidenceConflicts: conflicts,
         group,
@@ -604,19 +606,51 @@ export function workflowReview<T extends IntakeReview>(
             })
           : undefined;
       if (personReceipt?.assignedPerson) {
-        assessment.status = 'prior_confirmation';
-        assessment.blocking = false;
-        assessment.message =
-          'This report was assigned to ' + personReceipt.assignedPerson.fullName + '.';
-        assessment.attribution = {
-          status: 'prior_confirmation',
-          basis: 'explicit_person_confirmation',
-          groupId: group!.id,
-          groupVersionId: currentVersion,
-          confirmationOperationId: personReceipt.operationId,
-          assignedPerson: personReceipt.assignedPerson,
-          evidencedIdentity: evidence,
-        };
+        const currentPerson = identityContext?.people?.find(
+          (person) =>
+            person.personId === personReceipt.assignedPerson!.personId &&
+            person.noteId === personReceipt.assignedPerson!.noteId,
+        );
+        const reviewedBirthDate =
+          personReceipt.identityAnswers?.birthDate ||
+          evidence.birthDate ||
+          personReceipt.scope.evidencedIdentity?.birthDate;
+        if (
+          reviewedBirthDate &&
+          currentPerson?.birthDate &&
+          !compatibleIdentityBirthDates(reviewedBirthDate, currentPerson.birthDate)
+        ) {
+          // A receipt pins the human choice, not a perpetual exemption from
+          // the selected person's current DOB. Unrelated note edits are harmless.
+          assessment.status = 'conflict';
+          assessment.blocking = true;
+          assessment.message =
+            'The report birth date differs from the assigned person’s current birth date. Review who this report belongs to before saving.';
+          assessment.conflicts = [
+            ...assessment.conflicts.filter((conflict) => conflict.field !== 'birthDate'),
+            {
+              field: 'birthDate',
+              selfValue: currentPerson.birthDate,
+              evidencedValue: reviewedBirthDate,
+              reason: 'self_mismatch',
+            },
+          ];
+          delete assessment.attribution;
+        } else {
+          assessment.status = 'prior_confirmation';
+          assessment.blocking = false;
+          assessment.message =
+            'This report was assigned to ' + personReceipt.assignedPerson.fullName + '.';
+          assessment.attribution = {
+            status: 'prior_confirmation',
+            basis: 'explicit_person_confirmation',
+            groupId: group!.id,
+            groupVersionId: currentVersion,
+            confirmationOperationId: personReceipt.operationId,
+            assignedPerson: personReceipt.assignedPerson,
+            evidencedIdentity: evidence,
+          };
+        }
       }
       // This receipt exists only on a host-created proposal, outside its untrusted JSONL.
       // It assigns this single human-authored record, not other records or printed aliases.
@@ -653,7 +687,27 @@ export function workflowReview<T extends IntakeReview>(
             }
           : undefined;
       }
-      if (group && competingIdentityBoundaries(group, reportGroups).length) {
+      if (
+        group &&
+        competingIdentityBoundaries(group, reportGroups).length &&
+        !identityBoundaryRepairApplies(
+          workflow.identityConfirmations?.find(
+            (receipt) => receipt.operationId === assessment.attribution?.confirmationOperationId,
+          ),
+          group,
+          reportGroups,
+          [
+            {
+              candidateId: record.candidateId!,
+              candidateVersionId: record.candidateVersionId!,
+              proposalId: review.proposalId,
+              recordId: record.id,
+              title: record.title,
+              issueId: genericIdentityIssueId,
+            },
+          ],
+        )
+      ) {
         assessment.status = 'conflict';
         assessment.blocking = true;
         assessment.message =

@@ -85,3 +85,18 @@ export function possiblySameIdentityName(left: string, right: string): boolean {
   }
   return true;
 }
+
+/** Do not turn a report's single given name into a reusable identity alias. */
+export function safeSourceIdentityName(name: string): boolean {
+  return (
+    canonicalIdentityName(name)
+      .split(/\s+/)
+      .filter((part) => /[\p{L}]/u.test(part)).length >= 2
+  );
+}
+
+export function compatibleIdentityBirthDates(left: string, right: string): boolean {
+  const short = left.length <= right.length ? left : right;
+  const long = left.length <= right.length ? right : left;
+  return long === short || long.startsWith(short + '-');
+}

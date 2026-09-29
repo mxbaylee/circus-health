@@ -496,7 +496,7 @@ export interface IntakeReviewIssue {
   /** Evidence-scoped unreviewed labels; persisting one requires a separate user action. */
   metadataSuggestion?: { careArea?: string; documentType?: string; topics?: string[] };
   /** Evidence-scoped missing Self fields; persisting one requires an explicit selected confirmation. */
-  selfSuggestion?: { fullName?: string; birthDate?: string };
+  selfSuggestion?: { fullName?: string; birthDate?: string; birthDateHint?: string };
   /** Evidence-scoped date interpretations; unknown/manual review remain available. */
   choices?: { label: string; value: string }[];
   resolution?: IntakeIssueResolution;

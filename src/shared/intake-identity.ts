@@ -3,6 +3,8 @@ import type { IntakeReportAnchor, IntakeReportGroupMember } from './intake.ts';
 export interface IntakeEvidencedIdentity {
   fullName?: string;
   birthDate?: string;
+  /** Legacy advisory metadata. Never establishes identity or requires a new confirmation. */
+  birthDateHints?: string[];
   /** Exact retained-original/person evidence key. It is not a display name. */
   personFingerprint?: string;
 }
@@ -36,6 +38,8 @@ export interface IntakeIdentityPerson {
   personId: string;
   version: number;
   fullName: string;
+  birthDate?: string | null;
+  relationship?: string | null;
 }
 
 /** Report-level identity state. Clinical acceptance remains a separate operation. */
@@ -58,6 +62,11 @@ export interface IntakeIdentityReview {
   conflicts: IntakeIdentityConflict[];
 }
 
+export interface IntakeIdentityAnswers {
+  /** A human reading for this report only; null explicitly retains uncertainty. */
+  birthDate?: string | null;
+}
+
 /** A human confirms only this displayed snapshot, never future group members. */
 export interface IntakeIdentityScope {
   profileId: string;
@@ -72,6 +81,10 @@ export interface IntakeIdentityScope {
   original: { filename: string; contentUrl: string; page: number | null };
   report: IntakeReportAnchor;
   subject: IntakeReportAnchor;
+  /** Alternative readings and inferred centuries are suggestions requiring human review. */
+  birthDateReview?: { choices: string[]; suggested?: string };
+  /** Claims at this exact report boundary, pinned for an explicit scoped repair. */
+  competingSubjects?: { groupId: string; subject: IntakeReportAnchor; groupVersionId: string }[];
   verificationMode: 'literal_text_match' | 'human_reviewed_original';
   /** Supported identity facts displayed with this exact scope. */
   evidencedIdentity?: IntakeEvidencedIdentity;
@@ -109,6 +122,7 @@ export interface IntakeIdentityConfirmation {
   scope: IntakeIdentityScope;
   outcome: 'this_is_me' | 'this_is_person';
   attestation: IntakeIdentityAttestation;
+  identityAnswers?: IntakeIdentityAnswers;
   /** Exact printed name selected from the displayed subject when no safe name was derived. */
   printedName?: string;
   personSelection?:
@@ -127,6 +141,7 @@ export interface IntakeIdentityReceipt {
   scope: IntakeIdentityScope;
   outcome: 'this_is_me' | 'this_is_person';
   attestation: IntakeIdentityAttestation;
+  identityAnswers?: IntakeIdentityAnswers;
   draftIds: string[];
   assignedPerson?: IntakeIdentityPerson;
   knownNameAdded?: string;

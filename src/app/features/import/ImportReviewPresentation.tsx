@@ -1,6 +1,8 @@
+import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { IntakeIdentityReview } from '../../../shared/intake-identity';
 import {
   ImportPersonChoice,
+  ImportBirthDateReview,
   ImportPrintedName,
   printedNameReady,
   personSelectionReady,
@@ -98,6 +100,9 @@ export interface ImportReviewReport {
     label: string;
     evidence: 'named' | 'missing';
     confirmed: boolean;
+    nameOnlyMatch?: boolean;
+    birthDate?: string;
+    birthDateReview?: NonNullable<IntakeIdentityReview['scope']>['birthDateReview'];
     selfBirthDateConflict?: boolean;
     defaultPerson?: 'self' | 'new';
     identityStatus?:
@@ -192,6 +197,7 @@ export interface ImportReviewActions {
     fields: { fullName?: string; birthDate?: string },
     personSelection?: ImportPersonSelection,
     printedName?: string,
+    identityAnswers?: IntakeIdentityAnswers,
   ) => void | Promise<void>;
   onEdit?: (recordId: string, value: string, unit: string) => void | Promise<void>;
   onResolveMatch?: (recordId: string) => void | Promise<void>;
@@ -561,13 +567,22 @@ export function ImportReviewPresentation({
     fields: { fullName?: string; birthDate?: string } = {},
     personSelection?: ImportPersonSelection,
     printedName?: string,
+    identityAnswers?: IntakeIdentityAnswers,
   ) {
     const report = reports.find((item) => item.id === reportId);
     if (!report || actions.busy) return;
     if (!personSelectionReady(personSelection)) return;
     if (model && actions.onConfirmIdentity) {
       setSheet(null);
-      if (printedName)
+      if (identityAnswers)
+        void actions.onConfirmIdentity(
+          reportId,
+          fields,
+          personSelection,
+          printedName,
+          identityAnswers,
+        );
+      else if (printedName)
         void actions.onConfirmIdentity(reportId, fields, personSelection, printedName);
       else if (personSelection) void actions.onConfirmIdentity(reportId, fields, personSelection);
       else void actions.onConfirmIdentity(reportId, fields);
@@ -985,7 +1000,7 @@ export function ImportReviewPresentation({
                             className="import-source-control import-report-person"
                             type="button"
                             disabled={actions.busy}
-                            aria-label={`${report.subject.confirmed ? 'Change' : 'Review'} person for ${report.reportType}`}
+                            aria-label={`${report.subject.confirmed && !report.subject.nameOnlyMatch ? 'Change' : 'Review'} person for ${report.reportType}`}
                             onClick={() => setSheet({ type: 'identity', reportId: report.id })}
                           >
                             <UserRound size={14} aria-hidden="true" />
@@ -994,14 +1009,20 @@ export function ImportReviewPresentation({
                               {report.subject.confirmed &&
                               (!report.subject.assignedPerson ||
                                 report.subject.assignedPerson.personId === 'patient')
-                                ? ' (you)'
+                                ? report.subject.nameOnlyMatch
+                                  ? ' (you?)'
+                                  : ' (you)'
                                 : report.subject.defaultPerson === 'new' &&
                                     !report.subject.confirmed
                                   ? ' (new)'
-                                  : ''}
+                                  : report.subject.nameOnlyMatch
+                                    ? ' (?)'
+                                    : ''}
                             </span>
                             <span className="import-source-action">
-                              {report.subject.confirmed ? 'Change' : 'Review'}
+                              {report.subject.confirmed && !report.subject.nameOnlyMatch
+                                ? 'Change'
+                                : 'Review'}
                             </span>
                           </button>
                         )}
@@ -1252,8 +1273,8 @@ export function ImportReviewPresentation({
         busy={!!actions.busy}
         reviewSource={actions.onReviewSource}
         close={() => setSheet(null)}
-        confirmIdentity={(reportId, fields, personSelection, printedName) => {
-          confirmReportIdentity(reportId, fields, personSelection, printedName);
+        confirmIdentity={(reportId, fields, personSelection, printedName, identityAnswers) => {
+          confirmReportIdentity(reportId, fields, personSelection, printedName, identityAnswers);
         }}
         changeSource={async (reportId, source, review) => {
           if (model && actions.onUseSource) {
@@ -1541,6 +1562,7 @@ function ImportSheet({
     fields: { fullName?: string; birthDate?: string },
     personSelection?: ImportPersonSelection,
     printedName?: string,
+    identityAnswers?: IntakeIdentityAnswers,
   ) => void;
   changeSource: (
     reportId: string,
@@ -1586,6 +1608,9 @@ function ImportSheet({
         : undefined,
   );
   const [selectedPrintedName, setSelectedPrintedName] = useState('');
+  const [reviewedBirthDate, setReviewedBirthDate] = useState<string | null>(
+    report?.subject.birthDateReview?.suggested || null,
+  );
   const needsPrintedName = !!report?.subject.printedNameRequired;
   const offeredSelfFields: { fullName?: string; birthDate?: string } = report?.subject
     .offeredSelfFields?.birthDate
@@ -1836,8 +1861,17 @@ function ImportSheet({
                   disabled={busy}
                 />
               )}
+              {report.subject.birthDateReview && (
+                <ImportBirthDateReview
+                  review={report.subject.birthDateReview}
+                  value={reviewedBirthDate}
+                  onChange={setReviewedBirthDate}
+                  disabled={busy}
+                />
+              )}
               <ImportPersonChoice
                 selfDisabled={report.subject.selfBirthDateConflict}
+                birthDate={reviewedBirthDate || report.subject.birthDate}
                 people={report.subject.people}
                 peopleTruncated={report.subject.peopleTruncated}
                 assignedPerson={report.subject.assignedPerson}
@@ -1891,6 +1925,7 @@ function ImportSheet({
                   disabled={
                     busy ||
                     report.subject.scopeReady === false ||
+                    reviewedBirthDate === '' ||
                     report.subject.identityStatus === 'missing_warning' ||
                     (!personSelection && !!report.subject.selfBirthDateConflict) ||
                     !personSelectionReady(personSelection) ||
@@ -1900,6 +1935,7 @@ function ImportSheet({
                   onClick={() => {
                     if (
                       report.subject.confirmed &&
+                      !report.subject.nameOnlyMatch &&
                       !needsPrintedName &&
                       (!personSelection
                         ? !report.subject.assignedPerson ||
@@ -1923,10 +1959,12 @@ function ImportSheet({
                           ),
                       personSelection,
                       needsPrintedName ? selectedPrintedName.trim() : undefined,
+                      report.subject.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
                     );
                   }}
                 >
                   {report.subject.confirmed &&
+                  !report.subject.nameOnlyMatch &&
                   !needsPrintedName &&
                   (!personSelection
                     ? !report.subject.assignedPerson ||

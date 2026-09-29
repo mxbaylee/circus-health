@@ -1,3 +1,4 @@
+import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import {
   mappingFields,
   recordCorrectionFields,
@@ -6,6 +7,7 @@ import {
 import * as Dialog from '@radix-ui/react-dialog';
 import {
   ImportPersonChoice,
+  ImportBirthDateReview,
   ImportPrintedName,
   printedNameReady,
   personSelectionReady,
@@ -683,6 +685,7 @@ export function ImportDetailReview({
     fields: { fullName?: string; birthDate?: string },
     personSelection?: ImportPersonSelection,
     printedName?: string,
+    identityAnswers?: IntakeIdentityAnswers,
   ) {
     const group = displayedDetail?.group;
     const review = currentIdentityReview;
@@ -701,7 +704,7 @@ export function ImportDetailReview({
     ) as { fullName?: string; birthDate?: string };
     // Retained uncertain requests are recoverable only inside the exact profile
     // and deep-link selection that created them.
-    const key = `${identityContext}:${review.scope.groupId}:${review.scope.groupVersionId}:${review.scope.intakeVersion}:${JSON.stringify([selected, personSelection, printedName])}`;
+    const key = `${identityContext}:${review.scope.groupId}:${review.scope.groupVersionId}:${review.scope.intakeVersion}:${JSON.stringify([selected, personSelection, printedName, identityAnswers])}`;
     const request: IntakeIdentityConfirmation = identityOperations.current.get(key) || {
       version: review.scope.intakeVersion,
       operationId: crypto.randomUUID(),
@@ -709,6 +712,7 @@ export function ImportDetailReview({
       outcome: personSelection ? 'this_is_person' : 'this_is_me',
       ...(personSelection ? { personSelection } : {}),
       ...(printedName ? { printedName } : {}),
+      ...(identityAnswers ? { identityAnswers } : {}),
       attestation: review.scope.questions?.length
         ? 'confirmed_displayed_identity_questions'
         : 'confirmed_displayed_report_subject',
@@ -817,8 +821,8 @@ export function ImportDetailReview({
         if (!selection.recordId) onBack();
       }}
       onRetry={identity.reload}
-      onConfirm={(fields, personSelection, printedName) =>
-        void confirmIdentity(fields, personSelection, printedName)
+      onConfirm={(fields, personSelection, printedName, identityAnswers) =>
+        void confirmIdentity(fields, personSelection, printedName, identityAnswers)
       }
     />
   );
@@ -1220,10 +1224,14 @@ function ImportIdentityPanel({
     fields: { fullName?: string; birthDate?: string },
     personSelection?: ImportPersonSelection,
     printedName?: string,
+    identityAnswers?: IntakeIdentityAnswers,
   ) => void;
 }) {
   const [personSelection, setPersonSelection] = useState<ImportPersonSelection>();
   const [selectedPrintedName, setSelectedPrintedName] = useState('');
+  const [reviewedBirthDate, setReviewedBirthDate] = useState<string | null>(
+    review?.scope?.birthDateReview?.suggested || null,
+  );
   const offered: { fullName?: string; birthDate?: string } = review?.offeredSelfFields.birthDate
     ? { birthDate: review.offeredSelfFields.birthDate }
     : {};
@@ -1247,7 +1255,10 @@ function ImportIdentityPanel({
   useEffect(() => {
     if (!review || !selectionScope) return;
     const previous = previousOffers.current;
-    if (previous.scope !== selectionScope) setSelectedPrintedName('');
+    if (previous.scope !== selectionScope) {
+      setSelectedPrintedName('');
+      setReviewedBirthDate(review.scope?.birthDateReview?.suggested || null);
+    }
     if (previous.scope !== selectionScope)
       setPersonSelection(
         review.assignedPerson && review.assignedPerson.personId !== 'patient'
@@ -1327,6 +1338,7 @@ function ImportIdentityPanel({
   ).filter((entry): entry is ['fullName' | 'birthDate', string] => !!entry[1]);
   const unchanged =
     confirmed &&
+    !(review.status === 'evidenced_match' && !review.evidencedIdentity.birthDate) &&
     (!personSelection
       ? !review.assignedPerson || review.assignedPerson.personId === 'patient'
       : 'noteId' in personSelection && personSelection.noteId === review.assignedPerson?.noteId) &&
@@ -1378,7 +1390,17 @@ function ImportIdentityPanel({
             disabled={busy}
           />
         )}
+        {review.scope?.birthDateReview && (
+          <ImportBirthDateReview
+            review={review.scope.birthDateReview}
+            value={reviewedBirthDate}
+            onChange={setReviewedBirthDate}
+            disabled={busy}
+          />
+        )}
         <ImportPersonChoice
+          selfDisabled={review.selfBirthDateConflict}
+          birthDate={reviewedBirthDate || review.evidencedIdentity.birthDate}
           people={review.people}
           peopleTruncated={review.peopleTruncated}
           assignedPerson={review.assignedPerson}
@@ -1425,6 +1447,7 @@ function ImportIdentityPanel({
             busy ||
             !review.scope ||
             !personSelectionReady(personSelection) ||
+            reviewedBirthDate === '' ||
             (!review.evidencedIdentity.fullName &&
               !printedNameReady(selectedPrintedName, review.scope.subject.text))
           }
@@ -1444,6 +1467,7 @@ function ImportIdentityPanel({
                   ),
               personSelection,
               !review.evidencedIdentity.fullName ? selectedPrintedName.trim() : undefined,
+              review.scope?.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
             );
           }}
         >

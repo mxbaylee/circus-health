@@ -1392,7 +1392,7 @@ _None yet._
 - Against the criteria: inconclusive; a missing prerequisite is not a candidate pass or fail.
 - Deviations and oddities: Git remains read-only. This entry records why the experiment did not
   run; it is not a simulated result or evidence from owner records.
-- What it decides: T21 and CRS-108 remain open; CRS-111 is not enabled by T14's baseline.
+- What it decides: T21 and CRS-108 remain open; T14's baseline does not qualify production report identity behavior. See [report identity review](../import/identity-review.md) for the implemented behavior.
 
 #### Verification 2026-09-24 — independent verifier, T21 prerequisites only
 
@@ -1463,7 +1463,7 @@ es2023 --strict --skipLibCheck`, listing the three worktree prototype files plus
   `node --test src/server/test/self-identity.test.ts` also passed (4 tests, measured). Those checks
   are runner validation, not independent verification of these results.
 - What it decides: this particular label-proximity gate does not meet the experiment's detection
-  criterion and does not justify enabling CRS-111. Layout-aware patient-field association needs
+  criterion and does not qualify the evaluated label-proximity approach for production use. Layout-aware patient-field association needs
   another independently verified experiment; permissive unknown handling preserved the measured
   safety criterion. Original criteria and open requirements remain intact.
 
@@ -1480,7 +1480,7 @@ es2023 --strict --skipLibCheck`, listing the three worktree prototype files plus
   ZIP decisions again were match for the correct member, unknown for missing DOB and clear
   contradiction for the wrong DOB. This verifies failure of the fixed 90% detection criterion
   despite satisfying the corpus's false-stop criterion. It does not authorize or qualify the
-  production CRS-111 gate, and OCR behavior remains unknown.
+  production use of that experimental gate, and OCR behavior remains unknown.
 
 ### T22: host CPU per page and responsiveness
 

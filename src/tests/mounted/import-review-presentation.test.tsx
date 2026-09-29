@@ -2178,3 +2178,99 @@ it.each(['Documents', 'Test results'] as const)(
     await waitFor(() => expect(filters).toHaveBeenLastCalledWith({ ...requested, kind: 'All' }));
   },
 );
+
+it.each([false, true])(
+  'marks a name-only match for review without removing its automatic assignment (family=%s)',
+  (family) => {
+    const current = personChoiceModel();
+    const subject = current.reports[0].subject;
+    subject.confirmed = true;
+    subject.identityStatus = 'evidenced_match';
+    subject.nameOnlyMatch = true;
+    subject.offeredSelfFields = {};
+    if (family) subject.assignedPerson = subject.people![0];
+    const onConfirmIdentity = vi.fn();
+    render(<ImportReviewPresentation model={current} actions={{ onConfirmIdentity }} />);
+    const control = screen.getByRole('button', { name: /Review person for/ });
+    expect(control).toHaveTextContent(family ? '(?)' : '(you?)');
+    fireEvent.click(control);
+    expect(screen.queryByRole('button', { name: 'Done' })).toBeNull();
+    fireEvent.click(
+      screen.getByRole('button', { name: family ? 'Confirm person' : 'Save changes' }),
+    );
+    expect(onConfirmIdentity).toHaveBeenCalledOnce();
+  },
+);
+
+it('prefills a suggested birth date and sends the human correction with the report confirmation', () => {
+  const current = personChoiceModel();
+  current.reports[0].subject.birthDateReview = {
+    choices: ['1985-03-04', '1985-04-03'],
+    suggested: '1985-03-04',
+  };
+  current.reports[0].subject.offeredSelfFields = {};
+  const onConfirmIdentity = vi.fn();
+  render(<ImportReviewPresentation model={current} actions={{ onConfirmIdentity }} />);
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  const date = screen.getByLabelText('Reviewed report birth date');
+  expect(date).toHaveValue('1985-03-04');
+  fireEvent.change(date, { target: { value: '1985-04-03' } });
+  fireEvent.click(screen.getByRole('button', { name: 'This is me' }));
+  expect(onConfirmIdentity).toHaveBeenCalledWith(
+    'fictional-source-scope',
+    {},
+    undefined,
+    undefined,
+    { birthDate: '1985-04-03' },
+  );
+});
+
+it('prefills a year-only suggestion without inventing a month or day', () => {
+  const current = personChoiceModel();
+  current.reports[0].subject.birthDateReview = {
+    choices: ['1988'],
+    suggested: '1988',
+  };
+  current.reports[0].subject.offeredSelfFields = {};
+  const onConfirmIdentity = vi.fn();
+  render(<ImportReviewPresentation model={current} actions={{ onConfirmIdentity }} />);
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  const year = screen.getByLabelText('Reviewed report birth year');
+  expect(year).toHaveValue('1988');
+  expect(year).toHaveAttribute('maxLength', '4');
+  fireEvent.click(screen.getByRole('button', { name: 'This is me' }));
+  expect(onConfirmIdentity).toHaveBeenCalledWith(
+    'fictional-source-scope',
+    {},
+    undefined,
+    undefined,
+    { birthDate: '1988' },
+  );
+});
+
+it('disambiguates duplicate people and disables an existing person whose DOB differs', () => {
+  const current = personChoiceModel();
+  current.reports[0].subject.birthDate = '1986-02-14';
+  current.reports[0].subject.people = [
+    {
+      noteId: 'person-note:one',
+      personId: 'one',
+      fullName: 'Rowan Meadow',
+      version: 1,
+      birthDate: '1986-02-14',
+      relationship: 'Sibling',
+    },
+    {
+      noteId: 'person-note:two',
+      personId: 'two',
+      fullName: 'Rowan Meadow',
+      version: 1,
+      birthDate: '1950-01-05',
+      relationship: 'Parent',
+    },
+  ];
+  render(<ImportReviewPresentation model={current} />);
+  fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
+  expect(screen.getByRole('option', { name: /Rowan Meadow.*1986-02-14.*Sibling/ })).toBeEnabled();
+  expect(screen.getByRole('option', { name: /Rowan Meadow.*1950-01-05.*Parent/ })).toBeDisabled();
+});

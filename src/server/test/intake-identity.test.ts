@@ -102,6 +102,9 @@ const request = (
   scope,
   outcome: 'this_is_me',
   attestation: 'reviewed_original_and_membership',
+  ...(scope.birthDateReview?.choices.length
+    ? { identityAnswers: { birthDate: scope.birthDateReview.suggested || null } }
+    : {}),
 });
 const workflow = (f: ReturnType<typeof fixture>) =>
   intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!;
@@ -547,7 +550,7 @@ test('a prepared Self report with a printed subject exposes an exact confirmable
   assert.equal(accepted.imported!.clinical!.records!.length, 1);
 });
 
-test('prepared report targets preserve evidenced match, conflict and missing-identity policy', (t) => {
+test('prepared report targets preserve evidenced match, conflict and missing-identity policy after original checking', async (t) => {
   const matchedValue = withIdentityEvidence(envelope('prepared-evidenced-match'));
   matchedValue.clinical = { ...(matchedValue.clinical as object), subject: 'self' };
   const matched = fixture(
@@ -556,6 +559,12 @@ test('prepared report targets preserve evidenced match, conflict and missing-ide
     'fictional-prepared-match.jsonl',
   );
   setSelf(matched, { fullName: 'Fictional Iris Meadow', birthDate: fictionalBirthDate });
+  assert.equal(
+    intake.reviewIntake(matched.db, matched.root, matched.profileId, matched.item.id).records[0]!
+      .identityReview?.blocking,
+    true,
+  );
+  await matched.preview();
   const matchedRecord = intake.reviewIntake(
     matched.db,
     matched.root,
@@ -1303,10 +1312,8 @@ for (const variation of [
     const proposed = f.propose([later], target);
     const groupId = proposed.workflow!.reportGroups!.at(-1)!.id;
     const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, target, groupId);
-    assert.equal(
-      review.status,
-      variation === 'other-subject' ? 'conflict' : 'confirmation_required',
-    );
+    // Two different Patient lines under the later heading need review; neither is a proven match.
+    assert.equal(review.status, 'confirmation_required');
     assert.equal(review.blocking, true);
     assert.equal(workflow(f).identityConfirmations!.length, 1);
   });
@@ -1354,15 +1361,13 @@ for (const change of ['append', 'version', 'occurrence'] as const)
     assert.equal(workflow(f).reviewDrafts!.length, 0);
   });
 
-for (const variation of ['missing', 'unmatched', 'different-subject'] as const)
+for (const variation of ['missing', 'unmatched'] as const)
   test(`${variation} evidence does not authorize common confirmation`, async (t) => {
     const f = fixture(t);
     const a = envelope('a'),
       b = envelope('b');
     if (variation === 'missing') a.report!.subject = null;
     if (variation === 'unmatched') a.report!.subject!.text = 'Unprinted Fictional Person';
-    if (variation === 'different-subject')
-      b.report!.subject!.text = 'Patient: Fictional Rowan Pebble';
     f.propose([a, b]);
     await assert.rejects(() => f.preview(), { code: 'IDENTITY_SCOPE' });
     assert.equal(workflow(f).reviewDrafts!.length, 0);
@@ -2079,21 +2084,14 @@ test('a changed linked report context makes earlier Self suggestions stale and w
     f.item.id,
     changedGroup.id,
   );
-  assert.deepEqual(
-    {
-      status: fresh.status,
-      evidence: fresh.evidencedIdentity,
-      offered: fresh.offeredSelfFields,
-    },
-    {
-      status: 'conflict',
-      evidence: {
-        fullName: 'Fictional Juniper Sample',
-        birthDate: '1991-04-09',
-      },
-      offered: {},
-    },
-  );
+  assert.equal(fresh.blocking, true);
+  assert.equal(fresh.status, 'confirmation_required');
+  // The retained original has two Patient lines under one heading; neither can fill Self.
+  assert.equal(fresh.evidencedIdentity.fullName, undefined);
+  assert.equal(fresh.evidencedIdentity.birthDate, undefined);
+  assert.deepEqual(fresh.offeredSelfFields, {});
+  assert.ok(fresh.scope?.competingSubjects?.length);
+  assert.equal(getNote(f.db, 'person-note:self').person.fullName, '');
 });
 
 for (const conflict of ['fullName', 'birthDate'] as const)
@@ -2234,9 +2232,9 @@ for (const outcome of ['unknown', 'other_person'] as const)
     );
   });
 
-test('a changed evidenced person on the same original cannot inherit an earlier confirmation', async (t) => {
+test('a changed model DOB hint cannot change original evidence or revoke a matching confirmation', async (t) => {
   const otherBirthDate = '1991-04-09';
-  const f = fixture(t, Buffer.from(`${originalText}\n${subject}\nDOB: ${otherBirthDate}`));
+  const f = fixture(t);
   f.propose([
     withIdentityEvidence(envelope('changed-person'), 'Fictional Iris Meadow', fictionalBirthDate),
   ]);
@@ -2251,14 +2249,12 @@ test('a changed evidenced person on the same original cannot inherit an earlier 
   ]);
   const groupId = workflow(f).reportGroups![0]!.id;
   const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, groupId);
-  assert.equal(review.status, 'conflict');
-  assert.ok(review.conflicts.some((conflict) => conflict.reason === 'evidence_disagreement'));
-  assert.equal(review.scope, null);
-  assert.equal(review.blocking, true);
-  assert.notEqual(
-    review.evidencedIdentity.personFingerprint,
-    initial.evidencedIdentity?.personFingerprint,
-  );
+  assert.equal(review.status, 'prior_confirmation');
+  assert.equal(review.blocking, false);
+  assert.equal(review.evidencedIdentity.birthDateHints, undefined);
+  assert.equal(review.evidencedIdentity.birthDate, fictionalBirthDate);
+  assert.ok(review.scope);
+  assert.equal(workflow(f).identityConfirmations!.length, 1);
 });
 
 test('scope cannot cross another original or profile', async (t) => {
@@ -2756,10 +2752,15 @@ test('replaying a completed confirmation after later contradictions returns its 
   const before = structuredClone(workflow(f));
   await f.confirm(scope);
   assert.deepEqual(workflow(f), before);
-  await assert.rejects(() => f.preview(), { code: 'IDENTITY_SCOPE' });
+  const fresh = await f.preview();
+  assert.ok(fresh.competingSubjects?.length);
+  await assert.rejects(() => f.confirm(fresh, 'unreviewed-conflict'), {
+    code: 'IDENTITY_CONFIRMATION',
+  });
+  assert.deepEqual(workflow(f), before);
 });
 
-test('an explicit known Self name matches in record review, survives rebuild, and removing it restores conflict', (t) => {
+test('an explicit known Self name matches after original checking, survives rebuild, and removing it restores conflict', async (t) => {
   const value = withIdentityEvidence(envelope('known-name'));
   value.clinical = { ...(value.clinical as object), subject: 'self' };
   const f = fixture(t, Buffer.from(JSON.stringify(value)), 'fictional-known-name.jsonl');
@@ -2769,6 +2770,8 @@ test('an explicit known Self name matches in record review, survives rebuild, an
     knownNames: ['Fictional Iris Meadow'],
   });
   const review = () => intake.reviewIntake(f.db, f.root, f.profileId, f.item.id);
+  assert.equal(review().records[0]!.identityReview?.blocking, true);
+  await f.preview();
   assert.equal(review().records[0]!.identityReview?.status, 'evidenced_match');
   assert.equal(review().records[0]!.identityReview?.confidence, 'strong');
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
@@ -3579,7 +3582,7 @@ for (const identityText of [
       );
       assert.equal(review.evidencedIdentity.birthDate, undefined);
       assert.equal(review.blocking, true);
-      assert.equal(review.scope, null);
+      assert.deepEqual(review.scope?.birthDateReview?.choices, ['1990-03-08', '1990-08-03']);
     }
   });
 
@@ -3732,4 +3735,173 @@ test('a patient banner printed above the report heading keeps its DOB', async (t
     assert.equal(review.blocking, true, filename);
     assert.equal(review.defaultPerson, 'new', filename);
   }
+});
+
+test('ambiguous DOB asks even when one reading matches Self, records the human reading, and guards acceptance', async (t) => {
+  const f = fixture(
+    t,
+    Buffer.from(`${heading}\n${subject}\nDOB: 03/08/1990\nFictional result A 12.00`),
+  );
+  setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: fictionalBirthDate });
+  const proposed = f.propose([envelope('ambiguous-human-date')]);
+  const scope = await f.preview();
+  assert.equal(scope.evidencedIdentity?.birthDate, undefined);
+  assert.deepEqual(scope.birthDateReview?.choices, ['1990-03-08', '1990-08-03']);
+  const blocked = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals[0]!.id,
+  );
+  assert.equal(blocked.records[0]!.identityReview?.blocking, true);
+  assert.throws(
+    () =>
+      intake.importIntake(f.db, f.root, f.profileId, f.item.id, {
+        version: blocked.version,
+        proposalId: blocked.proposalId,
+        reviewToken: blocked.reviewToken,
+        decisions: [{ recordId: blocked.records[0]!.id, action: 'accept', mapping: {} }],
+      }),
+    { code: 'REVIEW_ISSUES_PENDING' },
+  );
+  const input = {
+    ...request(scope, 'choose-ambiguous-date'),
+    attestation: 'confirmed_displayed_identity_questions' as const,
+  };
+  await assert.rejects(
+    () =>
+      confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+        ...input,
+        identityAnswers: undefined,
+      }),
+    { code: 'IDENTITY_BIRTH_DATE' },
+  );
+  await assert.rejects(
+    () =>
+      confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+        ...input,
+        identityAnswers: { birthDate: '1990-08-03' },
+      }),
+    { code: 'IDENTITY_CONFLICT' },
+  );
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...input,
+    identityAnswers: { birthDate: fictionalBirthDate },
+  });
+  assert.deepEqual(workflow(f).identityConfirmations!.at(-1)!.identityAnswers, {
+    birthDate: fictionalBirthDate,
+  });
+  assert.equal(getNote(f.db, 'person-note:self').person.birthDate, fictionalBirthDate);
+  const ready = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals[0]!.id,
+  );
+  assert.equal(ready.records[0]!.identityReview?.blocking, false);
+});
+
+test('existing-person assignment checks their current DOB without writing drafts or aliases', async (t) => {
+  const f = fixture(t);
+  const { createNote } = await import('../notes.ts');
+  const other = createNote(f.db, {
+    kind: 'person',
+    title: 'Fictional Iris',
+    content: '',
+    person: { fullName: 'Fictional Iris Meadow', birthDate: '1980-01-01' },
+  });
+  f.propose([envelope('existing-dob-mismatch')]);
+  const scope = await f.preview();
+  await assert.rejects(
+    () =>
+      confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+        ...request(scope),
+        outcome: 'this_is_person',
+        attestation: 'confirmed_displayed_identity_questions',
+        personSelection: { noteId: other.id, expectedVersion: other.version },
+      }),
+    { code: 'IDENTITY_CONFLICT' },
+  );
+  assert.equal(workflow(f).identityConfirmations?.length || 0, 0);
+  assert.equal(workflow(f).reviewDrafts!.length, 0);
+  assert.equal(getNote(f.db, other.id).version, other.version);
+});
+
+test('a single printed name can be confirmed for this report without adding an identity alias', async (t) => {
+  const f = fixture(t, Buffer.from(`${heading}\nPatient: Iris\nFictional result A 12.00`));
+  const value = envelope('single-name');
+  value.report!.subject!.text = 'Patient: Iris';
+  f.propose([value]);
+  const scope = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope),
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  assert.equal(workflow(f).identityConfirmations!.at(-1)!.confirmedPrintedName, 'Iris');
+  assert.equal(workflow(f).identityConfirmations!.at(-1)!.knownNameAdded, undefined);
+  assert.ok(!getNote(f.db, 'person-note:self').person.knownNames?.includes('Iris'));
+});
+
+test('conflicting subject claims have an exact human repair without covering the other claim or later records', async (t) => {
+  const f = fixture(t);
+  const other = envelope('contradictory-subject');
+  other.report!.subject!.text = 'Patient: Fictional Rowan Pebble';
+  const proposed = f.propose([envelope('repairable-subject'), other]);
+  const scope = await f.preview();
+  assert.equal(scope.competingSubjects?.length, 1);
+  await assert.rejects(() => f.confirm(scope), { code: 'IDENTITY_CONFIRMATION' });
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope),
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  const reviewed = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals[0]!.id,
+  );
+  assert.equal(reviewed.records[0]!.identityReview?.blocking, false);
+  assert.equal(reviewed.records[1]!.identityReview?.blocking, true);
+  const later = f.propose([envelope('new-unreviewed-record')]);
+  const newReview = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    later.proposals.at(-1)!.id,
+  );
+  assert.equal(newReview.records[0]!.identityReview?.blocking, true);
+});
+
+test('a repaired boundary cannot authorize a newly added identity question on the same occurrence', async (t) => {
+  const f = fixture(t);
+  const other = envelope('competing-question');
+  other.report!.subject!.text = 'Patient: Fictional Rowan Pebble';
+  f.propose([envelope('repair-question'), other]);
+  const scope = await f.preview();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    ...request(scope),
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  const { identityBoundaryRepairApplies } = await import('../intake-identity-policy.ts');
+  const receipt = workflow(f).identityConfirmations!.at(-1)!;
+  const groups = workflow(f).reportGroups!;
+  const group = groups.find((item) => item.id === scope.groupId)!;
+  const targets = scope.assignmentTargets!;
+  assert.equal(identityBoundaryRepairApplies(receipt, group, groups, targets), true);
+  assert.equal(
+    identityBoundaryRepairApplies(
+      receipt,
+      group,
+      groups,
+      targets.map((target) => ({
+        ...target,
+        issueIds: [...(target.issueIds || [target.issueId]), 'new-unreviewed-identity-question'],
+      })),
+    ),
+    false,
+  );
 });

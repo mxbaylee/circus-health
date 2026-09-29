@@ -6,6 +6,7 @@ import {
   canonicalIdentityName,
   possiblySameIdentityName,
   savedKnownNames,
+  safeSourceIdentityName,
 } from '../shared/self-identity.ts';
 export { canonicalIdentityName } from '../shared/self-identity.ts';
 import { createHash } from 'node:crypto';
@@ -266,7 +267,7 @@ export function isGenericNameConfirmation(
   return (
     matching.length === 1 &&
     (!matching[0]!.birthDate ||
-      alternatives.some((date) => compatibleBirthDates(date, matching[0]!.birthDate!)))
+      alternatives.every((date) => compatibleBirthDates(date, matching[0]!.birthDate!)))
   );
 }
 
@@ -288,14 +289,15 @@ export function collectEvidencedIdentity(
   const dates: string[] = [...new Set([...original.dates, ...subject.dates])];
   for (const issue of issues) {
     const name = clean(issue.selfSuggestion?.fullName);
-    const date = clean(issue.selfSuggestion?.birthDate);
     if (
       name &&
       printedIdentityName(name) === name &&
       !names.some((value) => canonicalIdentityName(value) === canonicalIdentityName(name))
     )
       names.push(name);
-    if (date && !dates.some((value) => value === date)) dates.push(date);
+    // A model-provided date is not original evidence. Printed uncertainty is
+    // reviewed with a host-derived suggestion; arbitrary model disagreement
+    // does not create a second birth-date decision.
   }
   if (names.length && subjectText !== undefined && subjectText !== null) {
     const printed = printedIdentityName(subjectText);
@@ -644,12 +646,18 @@ export function assessIdentityPolicy({
     ...(birthDate ? { birthDate } : {}),
     ...(personFingerprint ? { personFingerprint } : {}),
   };
-  const conflicts = [...evidenceConflicts];
+  const conflicts = evidenceConflicts.filter(
+    (conflict) => conflict.field !== 'birthDate' || conflict.reason !== 'evidence_disagreement',
+  );
+  unreadableBirthDate ||= evidenceConflicts.some(
+    (conflict) => conflict.field === 'birthDate' && conflict.reason === 'evidence_disagreement',
+  );
   const selfName = clean(self.fullName);
   const selfBirthDate = clean(self.birthDate);
-  const selfNames = [selfName, ...savedKnownNames(self.knownNames)].filter(
-    (name): name is string => !!name,
-  );
+  const selfNames = [
+    selfName,
+    ...savedKnownNames(self.knownNames).filter(safeSourceIdentityName),
+  ].filter((name): name is string => !!name);
   const owners = [
     {
       personId: 'patient',
@@ -661,7 +669,9 @@ export function assessIdentityPolicy({
       .filter((person) => person.personId !== 'patient')
       .map((person) => ({
         personId: person.personId,
-        names: [person.fullName, ...person.knownNames].filter(Boolean),
+        names: [person.fullName, ...person.knownNames.filter(safeSourceIdentityName)].filter(
+          Boolean,
+        ),
         birthDate: clean(person.birthDate),
         person,
       })),
@@ -781,6 +791,44 @@ export function assessIdentityPolicy({
   const resolutionOperationId =
     explicitReceipt?.operationId ||
     (!hasUnstructuredIdentityQuestion ? receipt?.operationId : undefined);
+  const applicableReceipt = explicitReceipt || receipt;
+  if (
+    resolutionOperationId &&
+    applicableReceipt?.scope.groupId !== group?.id &&
+    !nameEvidenceGrounded
+  )
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'Confirm this report’s patient identity before reusing a confirmation from another report.',
+    };
+  const reviewedBirthDate = applicableReceipt?.identityAnswers?.birthDate;
+  if (
+    resolutionOperationId &&
+    reviewedBirthDate &&
+    selfBirthDate &&
+    !compatibleBirthDates(reviewedBirthDate, selfBirthDate)
+  )
+    return {
+      ...common,
+      selfBirthDateConflict: true,
+      defaultPerson: 'new',
+      status: 'conflict',
+      blocking: true,
+      message:
+        'The reviewed report birth date differs from Self’s current birth date. Choose who this report belongs to before saving.',
+      conflicts: [
+        ...conflicts.filter((conflict) => conflict.field !== 'birthDate'),
+        {
+          field: 'birthDate',
+          selfValue: selfBirthDate,
+          evidencedValue: reviewedBirthDate,
+          reason: 'self_mismatch',
+        },
+      ],
+    };
   if (resolutionOperationId && !birthDate && !originalEvidenceChecked)
     return {
       ...common,
@@ -841,7 +889,7 @@ export function assessIdentityPolicy({
       status: 'confirmation_required',
       blocking: true,
       message:
-        'This report prints a birth date that could not be read as one complete date. Choose who this report belongs to before saving.',
+        'The birth date information for this report needs review; a model suggestion is not original evidence. Choose who this report belongs to before saving.',
     };
   if (
     birthDate &&
@@ -859,7 +907,12 @@ export function assessIdentityPolicy({
       message:
         'This report has a different evidenced birth date from an earlier confirmed report. Choose who it belongs to.',
     };
-  if (nameMatches && !hasUnstructuredIdentityQuestion && nameEvidenceGrounded)
+  if (
+    nameMatches &&
+    !hasUnstructuredIdentityQuestion &&
+    nameEvidenceGrounded &&
+    originalEvidenceChecked
+  )
     return {
       ...common,
       status: 'evidenced_match',
@@ -912,4 +965,44 @@ export function assessIdentityPolicy({
     blocking: true,
     message: 'Confirm that the displayed report subject is Self before saving its records.',
   };
+}
+
+/** A human repair covers only the displayed competing claims and exact pending occurrences. */
+export function identityBoundaryRepairApplies(
+  receipt: IntakeIdentityReceipt | undefined,
+  group: IntakeReportGroup,
+  groups: IntakeReportGroup[],
+  targets: IntakeIdentityScope['targets'],
+): boolean {
+  if (
+    !receipt ||
+    receipt.scope.groupId !== group.id ||
+    receipt.attestation !== 'confirmed_displayed_identity_questions' ||
+    !receipt.scope.competingSubjects?.length
+  )
+    return false;
+  const competing = competingIdentityBoundaries(group, groups)
+    .map((other) => ({
+      groupId: other.id,
+      groupVersionId: other.versions.at(-1)!.id,
+      subject: other.report!.subject!,
+    }))
+    .sort((a, b) => a.groupId.localeCompare(b.groupId));
+  if (canonicalLiteral(competing) !== canonicalLiteral(receipt.scope.competingSubjects))
+    return false;
+  return (
+    targets.length > 0 &&
+    targets.every((target) =>
+      (receipt.scope.assignmentTargets || receipt.scope.targets).some(
+        (prior) =>
+          prior.candidateId === target.candidateId &&
+          prior.candidateVersionId === target.candidateVersionId &&
+          prior.proposalId === target.proposalId &&
+          prior.recordId === target.recordId &&
+          (target.issueIds || [target.issueId]).every((issueId) =>
+            (prior.issueIds || [prior.issueId]).includes(issueId),
+          ),
+      ),
+    )
+  );
 }
