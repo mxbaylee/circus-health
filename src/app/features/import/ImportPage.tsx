@@ -764,6 +764,7 @@ export function ImportPage() {
             (identityReviewErrors.has(group.groupId)
               ? 'Identity status could not load. Retry before saving this report.'
               : 'Checking the retained identity evidence…'),
+          warnings: identityReview?.warnings,
           blocking: identityReview?.blocking ?? identityReviewErrors.has(group.groupId),
           offeredSelfFields: identityReview?.offeredSelfFields || {},
           people: identityReview?.people,

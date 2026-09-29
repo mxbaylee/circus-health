@@ -16,6 +16,7 @@ import {
 import {
   exactCurrentIdentityResolutionOperationId,
   identityReceiptAppliesToCurrentBoundary,
+  modelBirthDateWarnings,
 } from '../intake-identity-policy.ts';
 import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
 import { listIntakeImportFeed } from '../intake-report-queue.ts';
@@ -2251,10 +2252,119 @@ test('a changed model DOB hint cannot change original evidence or revoke a match
   const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, groupId);
   assert.equal(review.status, 'prior_confirmation');
   assert.equal(review.blocking, false);
-  assert.equal(review.evidencedIdentity.birthDateHints, undefined);
+  assert.equal('birthDateHints' in review.evidencedIdentity, false);
   assert.equal(review.evidencedIdentity.birthDate, fictionalBirthDate);
   assert.ok(review.scope);
   assert.equal(workflow(f).identityConfirmations!.length, 1);
+});
+
+test('a model-only DOB mismatch warns on an automatic name match without changing its authority', async (t) => {
+  const f = fixture(t, Buffer.from(`${heading}\n${subject}\nFictional result A`));
+  setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: fictionalBirthDate });
+  const proposed = f.propose([
+    withIdentityEvidence(envelope('model-only-dob'), 'Fictional Iris Meadow', '1991-04-09'),
+  ]);
+  const groupId = workflow(f).reportGroups![0]!.id;
+  const report = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, groupId);
+  const record = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals[0]!.id,
+  ).records[0]!;
+  assert.equal(report.status, 'evidenced_match');
+  assert.equal(report.blocking, false);
+  assert.equal(report.evidencedIdentity.birthDate, undefined);
+  assert.deepEqual(report.warnings, [
+    {
+      kind: 'model_birth_date_mismatch',
+      modelBirthDate: '1991-04-09',
+      savedBirthDate: fictionalBirthDate,
+      personName: 'Fictional Iris Meadow',
+    },
+  ]);
+  assert.deepEqual(record.identityReview?.warnings, report.warnings);
+  assert.equal(record.identityReview?.blocking, false);
+  assert.equal(record.identityAttribution?.status, 'evidenced_match');
+  assert.equal(workflow(f).identityConfirmations?.length || 0, 0);
+});
+
+test('a matching model DOB or a host-readable original DOB does not add a model mismatch warning', async (t) => {
+  for (const originalHasDob of [false, true]) {
+    const f = fixture(
+      t,
+      Buffer.from(
+        `${heading}\n${subject}${originalHasDob ? `\nDOB: ${fictionalBirthDate}` : ''}\nFictional result A`,
+      ),
+    );
+    setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: fictionalBirthDate });
+    f.propose([
+      withIdentityEvidence(
+        envelope(originalHasDob ? 'original-dob' : 'matching-model-dob'),
+        'Fictional Iris Meadow',
+        originalHasDob ? '1991-04-09' : fictionalBirthDate,
+      ),
+    ]);
+    const report = await getIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.item.id,
+      workflow(f).reportGroups![0]!.id,
+    );
+    assert.equal(report.status, 'evidenced_match');
+    assert.equal(report.warnings, undefined);
+    assert.equal(
+      report.evidencedIdentity.birthDate,
+      originalHasDob ? fictionalBirthDate : undefined,
+    );
+  }
+});
+
+test('model date warnings compare the selected person and never replace printed uncertainty', async (t) => {
+  assert.deepEqual(
+    modelBirthDateWarnings({
+      issues: [{ selfSuggestion: { birthDate: '1991-04-09' } }],
+      unreadableBirthDate: false,
+      person: { fullName: 'Fictional Family Member', birthDate: '1986-02-14' },
+    }),
+    [
+      {
+        kind: 'model_birth_date_mismatch',
+        modelBirthDate: '1991-04-09',
+        savedBirthDate: '1986-02-14',
+        personName: 'Fictional Family Member',
+      },
+    ],
+  );
+  assert.deepEqual(
+    modelBirthDateWarnings({
+      issues: [{ selfSuggestion: { birthDate: '2020-99-99' } }],
+      unreadableBirthDate: false,
+      person: { fullName: 'Fictional Family Member', birthDate: '1986-02-14' },
+    }),
+    [],
+  );
+
+  const f = fixture(
+    t,
+    Buffer.from(`${heading}\n${subject}\nDOB: see attached\nFictional result A`),
+  );
+  setSelf(f, { fullName: 'Fictional Iris Meadow', birthDate: fictionalBirthDate });
+  f.propose([
+    withIdentityEvidence(envelope('printed-uncertainty'), 'Fictional Iris Meadow', '1991-04-09'),
+  ]);
+  const report = await getIntakeIdentityReview(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    workflow(f).reportGroups![0]!.id,
+  );
+  assert.equal(report.status, 'confirmation_required');
+  assert.equal(report.blocking, true);
+  assert.equal(report.warnings, undefined);
 });
 
 test('scope cannot cross another original or profile', async (t) => {

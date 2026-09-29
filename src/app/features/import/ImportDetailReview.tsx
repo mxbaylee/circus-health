@@ -1,4 +1,5 @@
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
+import { ImportIdentityWarnings } from './ImportIdentityWarnings';
 import {
   mappingFields,
   recordCorrectionFields,
@@ -432,7 +433,8 @@ export function ImportDetailReview({
       displayedDetail?.blocks.map((block) => block.reviewToken),
     ]);
     if (
-      currentIdentityReview?.status === 'prior_confirmation' &&
+      (currentIdentityReview?.status === 'prior_confirmation' ||
+        currentIdentityReview?.status === 'evidenced_match') &&
       !currentIdentityReview.blocking &&
       blocked &&
       identityGroundingRefresh.current !== key
@@ -934,6 +936,13 @@ export function ImportDetailReview({
   const personConfirmed =
     currentIdentityReview?.status === 'evidenced_match' ||
     currentIdentityReview?.status === 'prior_confirmation';
+  const nameOnlyMatch =
+    currentIdentityReview?.status === 'evidenced_match' &&
+    !currentIdentityReview.evidencedIdentity.birthDate;
+  const personChangeReady = personConfirmed && !nameOnlyMatch;
+  const selfPerson =
+    !currentIdentityReview?.assignedPerson ||
+    currentIdentityReview.assignedPerson.personId === 'patient';
   const personLabel =
     currentIdentityReview?.evidencedIdentity.fullName ||
     currentIdentityReview?.assignedPerson?.fullName ||
@@ -966,20 +975,29 @@ export function ImportDetailReview({
         <button
           type="button"
           className="import-source-control"
-          aria-label={`${personConfirmed ? 'Change' : 'Review'} person for this report`}
+          aria-label={`${personChangeReady ? 'Change' : 'Review'} person for this report`}
           onClick={() => setContextSheet('identity')}
         >
           <span>
             For {personLabel}
-            {personConfirmed &&
-            (!currentIdentityReview?.assignedPerson ||
-              currentIdentityReview.assignedPerson.personId === 'patient')
-              ? ' (you)'
+            {personConfirmed
+              ? selfPerson
+                ? nameOnlyMatch
+                  ? ' (you?)'
+                  : ' (you)'
+                : nameOnlyMatch
+                  ? ' (?)'
+                  : ''
               : ''}
           </span>
-          <span className="import-source-action">{personConfirmed ? 'Change' : 'Review'}</span>
+          <span className="import-source-action">{personChangeReady ? 'Change' : 'Review'}</span>
         </button>
       </div>
+      <ImportIdentityWarnings
+        warnings={currentIdentityReview?.warnings}
+        onReviewPerson={() => setContextSheet('identity')}
+        reviewLabel={personChangeReady ? 'Change person' : 'Review person'}
+      />
       <Dialog.Root
         open={contextSheet !== null}
         onOpenChange={(open) => {
@@ -1360,6 +1378,7 @@ function ImportIdentityPanel({
         {!review.scope?.questions?.some((question) => question.prompt === review.message) && (
           <small>{review.message}</small>
         )}
+        <ImportIdentityWarnings warnings={review.warnings} />
         {review.evidencedIdentity.birthDate && (
           <small>Printed date of birth: {review.evidencedIdentity.birthDate}</small>
         )}

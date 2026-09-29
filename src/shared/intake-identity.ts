@@ -3,8 +3,6 @@ import type { IntakeReportAnchor, IntakeReportGroupMember } from './intake.ts';
 export interface IntakeEvidencedIdentity {
   fullName?: string;
   birthDate?: string;
-  /** Legacy advisory metadata. Never establishes identity or requires a new confirmation. */
-  birthDateHints?: string[];
   /** Exact retained-original/person evidence key. It is not a display name. */
   personFingerprint?: string;
 }
@@ -22,6 +20,14 @@ export interface IntakeIdentityConflict {
   selfValue: string | null;
   evidencedValue: string;
   reason: 'self_mismatch' | 'evidence_disagreement';
+}
+
+/** Advisory model reading only; it never establishes original evidence or blocks assignment. */
+export interface IntakeIdentityWarning {
+  kind: 'model_birth_date_mismatch';
+  modelBirthDate: string;
+  savedBirthDate: string;
+  personName: string;
 }
 
 export type IntakeIdentityReviewStatus =
@@ -60,6 +66,7 @@ export interface IntakeIdentityReview {
   /** Exact evidence values that may be selected only while the Self fields stay blank. */
   offeredSelfFields: Pick<IntakeEvidencedIdentity, 'fullName' | 'birthDate'>;
   conflicts: IntakeIdentityConflict[];
+  warnings?: IntakeIdentityWarning[];
 }
 
 export interface IntakeIdentityAnswers {

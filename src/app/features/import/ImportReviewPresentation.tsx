@@ -40,6 +40,7 @@ import type {
 } from '../../../shared/intake';
 import { measurementValueDisplay } from '../../../shared/measurement-value';
 import { ImportReadingActivity } from './ImportReadingActivity';
+import { ImportIdentityWarnings } from './ImportIdentityWarnings';
 import {
   SavedPersonDestinationLink,
   SavedRecordDestinationLink,
@@ -112,6 +113,7 @@ export interface ImportReviewReport {
       | 'missing_warning'
       | 'conflict';
     identityMessage?: string;
+    warnings?: IntakeIdentityReview['warnings'];
     blocking?: boolean;
     offeredSelfFields?: { fullName?: string; birthDate?: string };
     selfDisplayName?: string;
@@ -1026,6 +1028,19 @@ export function ImportReviewPresentation({
                             </span>
                           </button>
                         )}
+                        {showIdentity && (
+                          <ImportIdentityWarnings
+                            warnings={report.subject.warnings}
+                            onReviewPerson={() =>
+                              setSheet({ type: 'identity', reportId: report.id })
+                            }
+                            reviewLabel={
+                              report.subject.confirmed && !report.subject.nameOnlyMatch
+                                ? 'Change person'
+                                : 'Review person'
+                            }
+                          />
+                        )}
                       </div>
                     </header>
                     {renderReportSourceReview &&
@@ -1827,6 +1842,7 @@ function ImportSheet({
                   !report.subject.questions?.some(
                     (question) => question.prompt === report.subject.identityMessage,
                   ) && <span>{report.subject.identityMessage}</span>}
+                <ImportIdentityWarnings warnings={report.subject.warnings} />
                 {report.subject.scopeError && <span role="alert">{report.subject.scopeError}</span>}
                 {report.subject.conflicts?.map((conflict) => (
                   <span key={`${conflict.field}:${conflict.evidencedValue}`}>

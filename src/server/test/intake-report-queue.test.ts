@@ -109,7 +109,36 @@ function detail(
 function rows(detail: IntakeReportQueueDetail) {
   return detail.blocks.flatMap((block) => block.records);
 }
-function mutateRecord(
+async function confirmFictionalIdentity(f: Fixture, intakeId: string, groupId: string) {
+  const original = intake.getIntakeOriginal(f.db, f.root, f.profileId, intakeId);
+  assert.match(original.bytes.toString('utf8'), /Fictional Fern Patient/);
+  let remaining = rows(detail(f, groupId)).filter(
+    (record) => record.identityReview?.blocking,
+  ).length;
+  while (remaining) {
+    const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, intakeId, groupId);
+    assert.ok(review.scope?.original, 'review must show the retained fictional original');
+    assert.equal(review.scope.subject?.text, 'Fictional Fern Patient');
+    assert.equal(review.blocking, true);
+    await confirmIntakeIdentityScope(f.db, f.root, f.profileId, intakeId, {
+      version: review.scope.intakeVersion,
+      operationId: randomUUID(),
+      scope: review.scope,
+      outcome: 'this_is_me',
+      attestation: 'confirmed_displayed_identity_questions',
+    });
+    const next = rows(detail(f, groupId)).filter(
+      (record) => record.identityReview?.blocking,
+    ).length;
+    assert.ok(next < remaining, 'identity confirmation must resolve an exact current member');
+    remaining = next;
+  }
+}
+async function confirmAllFictionalIdentities(f: Fixture) {
+  for (const group of queue(f, { view: 'all' }).groups)
+    await confirmFictionalIdentity(f, group.intakeId, group.groupId);
+}
+async function mutateRecord(
   f: Fixture,
   groupId: string,
   index: number,
@@ -118,13 +147,18 @@ function mutateRecord(
   const current = detail(f, groupId),
     record = rows(current)[index]!,
     block = current.blocks.find((block) => block.records.some((row) => row.id === record.id))!;
-  if (action === 'accept')
+  if (action === 'accept') {
+    await confirmFictionalIdentity(f, block.intakeId, groupId);
+    const grounded = detail(f, groupId).blocks.find((candidate) =>
+      candidate.records.some((row) => row.id === record.id),
+    )!;
     return intake.importIntake(f.db, f.root, f.profileId, block.intakeId, {
-      version: block.intakeVersion,
-      proposalId: block.proposalId,
-      reviewToken: block.reviewToken,
+      version: grounded.intakeVersion,
+      proposalId: grounded.proposalId,
+      reviewToken: grounded.reviewToken,
       decisions: [{ recordId: record.id, action: 'accept', mapping: {} }],
     });
+  }
   return intake.saveIntakeReviewDraft(f.db, f.root, f.profileId, block.intakeId, {
     version: block.intakeVersion,
     proposalId: block.proposalId,
@@ -135,7 +169,20 @@ function mutateRecord(
   });
 }
 
-test('DEXA queue counts 28 results independently and counts accepted, deferred, blocked and kept versions', (t) => {
+test('confirming a second fictional report retains the first report’s exact identity receipt', async (t) => {
+  const f = fixture(t);
+  const item = upload(f, [envelope('first', 'Report A'), envelope('second', 'Report B')]);
+  const groups = queue(f).groups;
+  assert.equal(groups.length, 2);
+  await confirmFictionalIdentity(f, item.id, groups[0]!.groupId);
+  await confirmFictionalIdentity(f, item.id, groups[1]!.groupId);
+  const records = feed(f).blocks.flatMap((block) => block.records);
+  assert.equal(records.length, 2);
+  assert.ok(records.every((record) => record.identityReview?.status === 'prior_confirmation'));
+  assert.ok(records.every((record) => record.selectable));
+});
+
+test('DEXA queue counts 28 results independently and counts accepted, deferred, blocked and kept versions', async (t) => {
   const f = fixture(t),
     values = Array.from({ length: 28 }, (_, i) => envelope('result-' + i));
   values[27]!.reviewIssues = [
@@ -144,11 +191,12 @@ test('DEXA queue counts 28 results independently and counts accepted, deferred, 
   ];
   upload(f, values);
   const groupId = queue(f).groups[0]!.groupId;
+  await confirmFictionalIdentity(f, queue(f).groups[0]!.intakeId, groupId);
   assert.equal(detail(f, groupId).totalRecords, 28);
   assert.equal(queue(f).groups[0]!.counts.blocked, 1);
-  mutateRecord(f, groupId, 0, 'accept');
-  mutateRecord(f, groupId, 0, 'review_later');
-  mutateRecord(f, groupId, 0, 'keep_original_only');
+  await mutateRecord(f, groupId, 0, 'accept');
+  await mutateRecord(f, groupId, 0, 'review_later');
+  await mutateRecord(f, groupId, 0, 'keep_original_only');
   const group = queue(f).groups[0]!;
   assert.deepEqual(group.counts, {
     pending: 25,
@@ -209,9 +257,29 @@ test('newest candidate version replaces stale pending history while unrelated ea
   let newBlock = current.blocks.find((block) => block.proposalId !== null)!;
   assert.equal(newBlock.records[0]!.identityReview?.blocking, true);
   const identity = await getIntakeIdentityReview(f.db, f.root, f.profileId, item.id, groupId);
-  assert.equal(identity.status, 'evidenced_match');
+  // The retained JSONL repeats the report title in several fields. Until a
+  // single original report boundary grounds its subject, the model's name
+  // suggestion cannot authorize acceptance.
+  const originalText = intake
+    .getIntakeOriginal(f.db, f.root, f.profileId, item.id)
+    .bytes.toString('utf8');
+  assert.ok(originalText.split('\n')[0]!.split('Fictional DEXA A').length > 2);
+  assert.equal(identity.status, 'confirmation_required');
+  assert.equal(identity.evidencedIdentity.fullName, undefined);
+  assert.equal(identity.scope?.subject?.text, 'Fictional Fern Patient');
+  assert.throws(
+    () =>
+      intake.importIntake(f.db, f.root, f.profileId, item.id, {
+        version: newBlock.intakeVersion,
+        proposalId: newBlock.proposalId,
+        reviewToken: newBlock.reviewToken,
+        decisions: [{ recordId: newBlock.records[0]!.id, action: 'accept', mapping: {} }],
+      }),
+    { code: /^(?:QUESTIONS_PENDING|REVIEW_ISSUES_PENDING)$/ },
+  );
+  await confirmFictionalIdentity(f, item.id, groupId);
   newBlock = detail(f, groupId).blocks.find((block) => block.proposalId !== null)!;
-  assert.equal(newBlock.records[0]!.identityReview?.status, 'evidenced_match');
+  assert.equal(newBlock.records[0]!.identityReview?.status, 'prior_confirmation');
   intake.importIntake(f.db, f.root, f.profileId, item.id, {
     version: newBlock.intakeVersion,
     proposalId: newBlock.proposalId,
@@ -223,12 +291,12 @@ test('newest candidate version replaces stale pending history while unrelated ea
   assert.equal(queue(f).groups[0]!.counts.superseded, 1);
 });
 
-test('accepted earlier version stays accepted when a later version needs review, with exact per-proposal receipt', (t) => {
+test('accepted earlier version stays accepted when a later version needs review, with exact per-proposal receipt', async (t) => {
   const f = fixture(t),
     original = envelope('accepted');
   let item = upload(f, [original]);
   const id = queue(f).groups[0]!.groupId;
-  item = mutateRecord(f, id, 0, 'accept');
+  item = await mutateRecord(f, id, 0, 'accept');
   assert.equal(queue(f).totalGroups, 0);
   item = intake.proposeConversion(f.db, f.root, f.profileId, item.id, {
     version: item.version,
@@ -244,7 +312,7 @@ test('accepted earlier version stays accepted when a later version needs review,
   assert.equal(current.blocks[0]!.records[0]!.reviewState, 'pending');
 });
 
-test('new groups in older files append monotonically and cursors survive completed rows disappearing', (t) => {
+test('new groups in older files append monotonically and cursors survive completed rows disappearing', async (t) => {
   const f = fixture(t);
   let older = upload(f, [envelope('old', 'Old report')], 'older.jsonl');
   const firstId = queue(f).groups[0]!.groupId;
@@ -262,7 +330,7 @@ test('new groups in older files append monotonically and cursors survive complet
     ['Old report', 'New report', 'Late report in older file'],
   );
   assert.equal(new Set(list.groups.map((group) => group.discoveryOrder)).size, 3);
-  mutateRecord(f, firstId, 0, 'accept');
+  await mutateRecord(f, firstId, 0, 'accept');
   assert.deepEqual(
     queue(f, { limit: 1, cursor: firstPage.nextCursor }).groups.map((group) => group.title),
     ['New report'],
@@ -272,14 +340,14 @@ test('new groups in older files append monotonically and cursors survive complet
   assert.equal(intake.getIntake(f.db, f.root, f.profileId, older.id).proposals.length, 1);
 });
 
-test('record pagination remains stable after acceptance and newly discovered versions append', (t) => {
+test('record pagination remains stable after acceptance and newly discovered versions append', async (t) => {
   const f = fixture(t),
     values = Array.from({ length: 5 }, (_, i) => envelope('page-' + i));
   const item = upload(f, values),
     groupId = queue(f).groups[0]!.groupId;
   const first = detail(f, groupId, { limit: 2 });
   assert.ok(first.nextCursor);
-  mutateRecord(f, groupId, 0, 'accept');
+  await mutateRecord(f, groupId, 0, 'accept');
   const second = detail(f, groupId, { limit: 2, cursor: first.nextCursor });
   assert.deepEqual(
     rows(second).map((record) => record.mapping.testLabel),
@@ -368,7 +436,7 @@ test('queue state and discovery order survive rebuild and cannot cross profile o
   }
 });
 
-test('reading activity does not equate ready reports or completed batches with complete extraction', (t) => {
+test('reading activity does not equate ready reports or completed batches with complete extraction', async (t) => {
   const f = fixture(t),
     item = upload(f, [envelope('reading')]);
   writeIntakeBatch(
@@ -410,7 +478,7 @@ test('reading activity does not equate ready reports or completed batches with c
     'Fictional test',
   );
   assert.equal(queue(f).activity.runningFiles, 1);
-  mutateRecord(f, queue(f).groups[0]!.groupId, 0, 'accept');
+  await mutateRecord(f, queue(f).groups[0]!.groupId, 0, 'accept');
   assert.equal(queue(f).activity.allCurrentReportsReviewed, true);
   assert.equal(queue(f).activity.runningFiles, 1);
   assert.equal(queue(f).activity.extractionComplete, false);
@@ -680,7 +748,7 @@ function feedRows(value: ReturnType<typeof feed>) {
     .flatMap((block) => block.records)
     .sort((a, b) => (a.feedOrder < b.feedOrder ? -1 : a.feedOrder > b.feedOrder ? 1 : 0));
 }
-test('global feed bounds records across groups and cursors survive earlier deferral with exact keys', (t) => {
+test('global feed bounds records across groups and cursors survive earlier deferral with exact keys', async (t) => {
   const f = fixture(t);
   upload(f, [
     envelope('one', 'Report A'),
@@ -693,7 +761,7 @@ test('global feed bounds records across groups and cursors survive earlier defer
   assert.equal(feedRows(first).length, 2);
   assert.equal(first.kindCounts.test, 3);
   const before = feedRows(first).map((row) => row.feedKey);
-  mutateRecord(f, first.groups[0]!.groupId, 0, 'review_later');
+  await mutateRecord(f, first.groups[0]!.groupId, 0, 'review_later');
   const second = feed(f, { limit: 2, cursor: first.nextCursor });
   assert.deepEqual(
     feedRows(second).map((row) => row.mapping.testLabel),
@@ -710,7 +778,7 @@ test('global feed bounds records across groups and cursors survive earlier defer
   assert.equal(feedRows(second)[0]!.mapping.valueText, '+12.00');
 });
 
-test('global feed counts current blocked records, clinical kinds and retained edits without inflating identity edits', (t) => {
+test('global feed counts current blocked records, clinical kinds and retained edits without inflating identity edits', async (t) => {
   const f = fixture(t);
   const medication = envelope('Fictional medicine', 'Medication report');
   medication.clinical = {
@@ -725,6 +793,7 @@ test('global feed counts current blocked records, clinical kinds and retained ed
     { kind: 'uncertain_reading', field: 'valueText', prompt: 'Is this fictional result 12 or 13?' },
   ];
   upload(f, [envelope('editable result'), blocked, medication]);
+  await confirmAllFictionalIdentities(f);
   const original = feed(f);
   assert.deepEqual(original.kindCounts, {
     test: 2,
@@ -866,7 +935,7 @@ test('global feed discovers bounded People-only groups independently of clinical
   });
 });
 
-test('feed cross-group acceptance preserves literal values, rejects stale snapshots and counts only selected ready versions', (t) => {
+test('feed cross-group acceptance preserves literal values, rejects stale snapshots and counts only selected ready versions', async (t) => {
   const f = fixture(t);
   const blocked = envelope('blocked remaining', 'Report B');
   blocked.reviewIssues = [
@@ -874,6 +943,7 @@ test('feed cross-group acceptance preserves literal values, rejects stale snapsh
     { kind: 'uncertain_reading', field: 'valueText', prompt: 'Is this fictional result 12 or 13?' },
   ];
   upload(f, [envelope('accept A', 'Report A'), envelope('accept B', 'Report B'), blocked]);
+  await confirmAllFictionalIdentities(f);
   const current = feed(f);
   const grouped = new Map<
     string,
@@ -928,7 +998,7 @@ test('feed cross-group acceptance preserves literal values, rejects stale snapsh
   assert.equal(feed(f, { view: 'all', state: 'accepted' }).kindCounts.test, 2);
 });
 
-test('informational repeated subject notes remain evidence without creating feed blockers or question counts', (t) => {
+test('informational repeated subject notes remain evidence without creating feed blockers or question counts', async (t) => {
   const f = fixture(t);
   const value = envelope('subject-note');
   value.uncertainties = ['The patient name is repeated in each report section.'];
@@ -937,6 +1007,7 @@ test('informational repeated subject notes remain evidence without creating feed
     { kind: 'information', prompt: 'The printed patient header is repeated for context.' },
   ];
   upload(f, [value]);
+  await confirmAllFictionalIdentities(f);
   const result = feed(f),
     row = feedRows(result)[0]!;
   assert.equal(result.counts.questions, 0);
@@ -1004,7 +1075,7 @@ test('a changed candidate has a new feed identity while retained original keys a
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
 });
 
-test('full unchanged draft snapshots and Later are not manual edits; changed values retain the badge after acceptance', (t) => {
+test('full unchanged draft snapshots and Later are not manual edits; changed values retain the badge after acceptance', async (t) => {
   const f = fixture(t);
   upload(f, [envelope('full-snapshot')]);
   let current = feed(f),
@@ -1037,6 +1108,7 @@ test('full unchanged draft snapshots and Later are not manual edits; changed val
     disposition: 'pending',
     decision: { recordId: row.id, action: 'accept', mapping: editedMapping },
   });
+  await confirmFictionalIdentity(f, block.intakeId, queue(f).groups[0]!.groupId);
   current = feed(f, { edited: 'true' });
   block = current.blocks[0]!;
   row = block.records[0]!;

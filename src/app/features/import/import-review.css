@@ -423,6 +423,34 @@
   border-color: color-mix(in srgb, var(--brand-butter-fold) 34%, var(--subtle-border));
   background: color-mix(in srgb, var(--brand-butter) 12%, var(--surface));
 }
+.import-model-date-warning {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 0 12px 10px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--brand-butter-fold) 34%, var(--subtle-border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--brand-butter) 12%, var(--surface));
+  font-size: 0.75rem;
+}
+.import-model-date-warning p {
+  margin: 0;
+}
+.import-model-date-warning .text-link {
+  justify-self: start;
+}
+.import-report-context > .import-model-date-warning {
+  flex: 1 1 100%;
+  margin: 0;
+}
+.import-detail-context + .import-model-date-warning {
+  margin: 0 0 10px;
+}
+.import-context-card .import-model-date-warning,
+.import-identity-editor .import-model-date-warning {
+  margin: 0;
+}
 .import-identity-question.is-conflict {
   border-color: color-mix(in srgb, var(--danger, #b42318) 34%, var(--subtle-border));
   background: color-mix(in srgb, var(--danger, #b42318) 6%, var(--surface));

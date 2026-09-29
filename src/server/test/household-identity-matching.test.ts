@@ -459,7 +459,7 @@ test('an unprinted model DOB does not become evidence or a separate ownership qu
     { dates: [], unreadable: false },
   );
   assert.equal(collected.evidence.birthDate, undefined);
-  assert.equal(collected.evidence.birthDateHints, undefined);
+  assert.equal('birthDateHints' in collected.evidence, false);
   const result = assess(collected.evidence, [], {
     unreadableBirthDate: collected.unreadableBirthDate,
   });

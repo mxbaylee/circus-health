@@ -293,6 +293,160 @@ it.each([true, false])(
   },
 );
 
+it('shows the unverified model birth date in direct report review without requiring confirmation', async () => {
+  selectProfile({ id: 'fictional-model-date-detail', name: 'Rowan', placebo: true });
+  const requests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.includes('/intakes/report-queue/fictional-report')) return response(reportDetail);
+      if (url.includes('/identity-review'))
+        return response({
+          ...identityReview,
+          status: 'evidenced_match',
+          blocking: false,
+          evidencedIdentity: { fullName: 'Rowan Ellis' },
+          self: { ...identityReview.self, birthDate: '1989-04-12' },
+          scope: {
+            ...identityReview.scope!,
+            evidencedIdentity: { fullName: 'Rowan Ellis' },
+          },
+          offeredSelfFields: {},
+          warnings: [
+            {
+              kind: 'model_birth_date_mismatch',
+              modelBirthDate: '1988-04-12',
+              savedBirthDate: '1989-04-12',
+              personName: 'Rowan Ellis',
+            },
+          ],
+        } satisfies IntakeIdentityReview);
+      if (url.includes('/intakes/people/fictional-report'))
+        return response({
+          groupId: 'fictional-report',
+          people: [],
+          totalPeople: 0,
+          peopleNextCursor: null,
+        });
+      throw Error(`Unexpected request: ${url}`);
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <ImportDetailReview
+        selection={{ groupId: 'fictional-report' }}
+        onBack={() => {}}
+        onChanged={() => {}}
+        onUseSource={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  const warning = await screen.findByText(/automatic reading suggested a date of birth/);
+  const notice = warning.closest('[role="status"]')!;
+  expect(notice).toHaveTextContent('1988-04-12');
+  expect(notice).toHaveTextContent('1989-04-12');
+  expect(notice).toHaveTextContent('Rowan Ellis');
+  fireEvent.click(within(notice as HTMLElement).getByRole('button', { name: 'Review person' }));
+  expect(screen.getByRole('dialog')).toBeVisible();
+  expect(
+    within(screen.getByRole('dialog')).getByText(/automatic reading suggested a date of birth/),
+  ).toBeVisible();
+  expect(screen.queryByText(/Printed date of birth:/)).toBeNull();
+  expect(requests.some((url) => url.endsWith('/identity-scope'))).toBe(false);
+});
+
+it.each([
+  {
+    label: 'name-only Self match',
+    status: 'evidenced_match' as const,
+    birthDate: undefined,
+    otherPerson: false,
+    cue: 'For Rowan Ellis (you?)',
+    action: 'Review',
+  },
+  {
+    label: 'name-only other-person match',
+    status: 'evidenced_match' as const,
+    birthDate: undefined,
+    otherPerson: true,
+    cue: 'For Rowan Ellis (?)',
+    action: 'Review',
+  },
+  {
+    label: 'birth-date supported Self match',
+    status: 'evidenced_match' as const,
+    birthDate: '1988-04-12',
+    otherPerson: false,
+    cue: 'For Rowan Ellis (you)',
+    action: 'Change',
+  },
+  {
+    label: 'prior Self confirmation',
+    status: 'prior_confirmation' as const,
+    birthDate: undefined,
+    otherPerson: false,
+    cue: 'For Rowan Ellis (you)',
+    action: 'Change',
+  },
+])('shows $label as $action in direct report review', async (state) => {
+  selectProfile({ id: `fictional-person-cue-${state.label}`, name: 'Rowan', placebo: true });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/intakes/report-queue/fictional-report')) return response(reportDetail);
+      if (url.includes('/identity-review'))
+        return response({
+          ...identityReview,
+          status: state.status,
+          blocking: false,
+          evidencedIdentity: {
+            fullName: 'Rowan Ellis',
+            ...(state.birthDate ? { birthDate: state.birthDate } : {}),
+          },
+          offeredSelfFields: {},
+          ...(state.otherPerson
+            ? {
+                assignedPerson: {
+                  noteId: 'person-note:fictional-other',
+                  personId: 'fictional-other',
+                  version: 1,
+                  fullName: 'Rowan Ellis',
+                },
+              }
+            : {}),
+        } satisfies IntakeIdentityReview);
+      if (url.includes('/intakes/people/fictional-report'))
+        return response({
+          groupId: 'fictional-report',
+          people: [],
+          totalPeople: 0,
+          peopleNextCursor: null,
+        });
+      throw Error(`Unexpected request: ${url}`);
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <ImportDetailReview
+        selection={{ groupId: 'fictional-report' }}
+        onBack={() => {}}
+        onChanged={() => {}}
+        onUseSource={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  await waitFor(() =>
+    expect(
+      screen.getByRole('button', { name: `${state.action} person for this report` }),
+    ).toHaveTextContent(state.cue),
+  );
+  const control = screen.getByRole('button', { name: `${state.action} person for this report` });
+  expect(control).toHaveTextContent(state.action);
+});
+
 it('keeps saved records intact and offers retry when their destination receipt cannot load', async () => {
   selectProfile({ id: 'fictional-saved-links', name: 'Rowan', placebo: true });
   let available = false;

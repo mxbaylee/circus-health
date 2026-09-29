@@ -171,6 +171,7 @@ interface BuiltScope {
   scope: IntakeIdentityScope;
   evidenceConflicts: IntakeIdentityConflict[];
   unreadableBirthDate: boolean;
+  bannerBirthDates: string[][];
   hasUnstructuredIdentityQuestion: boolean;
   explicitlyConfirmedOperationId?: string;
   currentRefusal?: 'unknown' | 'other_person';
@@ -503,6 +504,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
     scope,
     evidenceConflicts: collected.conflicts.filter((conflict) => conflict.field !== 'birthDate'),
     unreadableBirthDate: !!birthDateReview,
+    bannerBirthDates: collected.bannerBirthDates,
     hasUnstructuredIdentityQuestion,
     currentRefusal: currentIdentityRefusal(identityIssues),
     groundedQuestions,
@@ -660,6 +662,7 @@ export async function getIntakeIdentityReview(
           return {
             person: record?.identityAttribution?.assignedPerson,
             status: record?.identityReview?.status,
+            warnings: record?.identityReview?.warnings || [],
           };
         }),
       );
@@ -668,8 +671,21 @@ export async function getIntakeIdentityReview(
         assigned.every((item) => item.person?.personId === assigned[0]?.person?.personId)
           ? assigned[0]?.person
           : undefined;
+      const warnings = assigned
+        .flatMap((item) => item.warnings)
+        .filter(
+          (warning, index, all) =>
+            all.findIndex(
+              (candidate) =>
+                candidate.kind === warning.kind &&
+                candidate.modelBirthDate === warning.modelBirthDate &&
+                candidate.savedBirthDate === warning.savedBirthDate &&
+                candidate.personName === warning.personName,
+            ) === index,
+        );
       return {
         ...review,
+        ...(warnings.length ? { warnings } : {}),
         people,
         peopleTruncated: rows.length > 100,
         ...(assignedPerson
@@ -775,6 +791,7 @@ async function getIntakeIdentityReviewInternal(
     evidence: built.scope.evidencedIdentity || {},
     evidenceConflicts: built.evidenceConflicts,
     unreadableBirthDate: built.unreadableBirthDate,
+    bannerBirthDates: built.bannerBirthDates,
     group,
     groupVersionId: built.scope.groupVersionId,
     originalFingerprint: built.scope.evidenceOriginalFingerprint || originalFingerprint,
@@ -895,6 +912,7 @@ export async function confirmIntakeIdentityScope(
       evidence: current.evidencedIdentity || {},
       evidenceConflicts: built.evidenceConflicts,
       unreadableBirthDate: built.unreadableBirthDate,
+      bannerBirthDates: built.bannerBirthDates,
       group: groupFor(getIntake(db, root, profileId, id), current.groupId),
       groupVersionId: current.groupVersionId,
       originalFingerprint: current.evidenceOriginalFingerprint || evidence.originalFingerprint,

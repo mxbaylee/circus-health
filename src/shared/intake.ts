@@ -5,6 +5,7 @@ import type {
   IntakeIdentityConfidence,
   IntakeIdentityReceipt,
   IntakeIdentityReviewStatus,
+  IntakeIdentityWarning,
 } from './intake-identity.ts';
 import type { IntakeReadingAccounting } from './intake-reading-accounting.ts';
 import type { IntakePersonEnvelopeProposal } from './intake-people.ts';
@@ -434,6 +435,7 @@ export interface IntakeReviewRecord {
     message: string;
     evidencedIdentity: IntakeEvidencedIdentity;
     conflicts: IntakeIdentityConflict[];
+    warnings?: IntakeIdentityWarning[];
   };
   /** Derived identity policy for this exact candidate version; it never accepts the record. */
   identityAttribution?: IntakeClinicalIdentityAttribution;
@@ -496,7 +498,7 @@ export interface IntakeReviewIssue {
   /** Evidence-scoped unreviewed labels; persisting one requires a separate user action. */
   metadataSuggestion?: { careArea?: string; documentType?: string; topics?: string[] };
   /** Evidence-scoped missing Self fields; persisting one requires an explicit selected confirmation. */
-  selfSuggestion?: { fullName?: string; birthDate?: string; birthDateHint?: string };
+  selfSuggestion?: { fullName?: string; birthDate?: string };
   /** Evidence-scoped date interpretations; unknown/manual review remain available. */
   choices?: { label: string; value: string }[];
   resolution?: IntakeIssueResolution;

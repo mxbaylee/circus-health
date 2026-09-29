@@ -1,4 +1,6 @@
 import {
+  bannerDatePattern,
+  numericDateReadings,
   originalSubjectBirthDateEvidence,
   type BirthDateEvidence,
 } from './intake-evidence-dates.ts';
@@ -7,6 +9,7 @@ import {
   possiblySameIdentityName,
   savedKnownNames,
   safeSourceIdentityName,
+  validOnboardingBirthDate,
 } from '../shared/self-identity.ts';
 export { canonicalIdentityName } from '../shared/self-identity.ts';
 import { createHash } from 'node:crypto';
@@ -27,6 +30,7 @@ import type {
   IntakeIdentityScope,
   IntakeIdentitySelfSnapshot,
   IntakeIdentityPerson,
+  IntakeIdentityWarning,
 } from '../shared/intake-identity.ts';
 
 export interface IdentityPolicyPersonSnapshot extends IntakeIdentityPerson {
@@ -131,6 +135,50 @@ function compatibleBirthDates(left: string, right: string): boolean {
   return long === short || long.startsWith(short + '-');
 }
 
+function validModelBirthDate(value: string): boolean {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return validOnboardingBirthDate(value);
+  if (/^\d{4}$/.test(value))
+    return Number(value) > 0 && value <= new Date().toISOString().slice(0, 4);
+  if (!/^\d{4}-\d{2}$/.test(value)) return false;
+  const [year, month] = value.split('-').map(Number);
+  return year > 0 && month >= 1 && month <= 12 && value <= new Date().toISOString().slice(0, 7);
+}
+
+/** Compare a model-only DOB suggestion with the person finally assigned to a record.
+ * Original DOB evidence and printed uncertainty are handled by the blocking policy instead. */
+export function modelBirthDateWarnings({
+  issues,
+  originalBirthDate,
+  unreadableBirthDate,
+  person,
+}: {
+  issues: Iterable<Pick<IntakeReviewIssue, 'selfSuggestion'>>;
+  originalBirthDate?: string;
+  unreadableBirthDate: boolean;
+  person?: Pick<IntakeIdentityPerson, 'fullName' | 'birthDate'>;
+}): IntakeIdentityWarning[] {
+  const savedBirthDate = clean(person?.birthDate);
+  if (originalBirthDate || unreadableBirthDate || !savedBirthDate || !person) return [];
+  const warnings: IntakeIdentityWarning[] = [];
+  for (const issue of issues) {
+    const modelBirthDate = clean(issue.selfSuggestion?.birthDate);
+    if (
+      !modelBirthDate ||
+      !validModelBirthDate(modelBirthDate) ||
+      compatibleBirthDates(modelBirthDate, savedBirthDate) ||
+      warnings.some((warning) => warning.modelBirthDate === modelBirthDate)
+    )
+      continue;
+    warnings.push({
+      kind: 'model_birth_date_mismatch',
+      modelBirthDate,
+      savedBirthDate,
+      personName: person.fullName,
+    });
+  }
+  return warnings;
+}
+
 export function identityOriginalFingerprint(
   intakeId: string,
   sourceHash: string,
@@ -228,11 +276,11 @@ export function isGenericNameConfirmation(
     );
   if (dateClaim) promptName = promptName!.slice(0, dateClaim.index).replace(/,\s*$/, '').trim();
   if (promptName && canonicalIdentityName(promptName) !== canonicalIdentityName(name)) return false;
-  const anchorDate =
+  const labelledAnchorDate =
     /\b(?:DOB|birth date|date of birth)\s*:?\s*(\d{1,4}[/-]\d{1,2}[/-]\d{1,4})/i.exec(
       issue.textAnchor,
-    )?.[1] ||
-    /\s{2,}(?:Female|Male)\s{2,}(\d{1,4}[/-]\d{1,2}[/-]\d{1,4})/i.exec(issue.textAnchor)?.[1];
+    )?.[1];
+  const anchorDate = labelledAnchorDate || bannerDatePattern.exec(issue.textAnchor)?.[1];
   const rawDate = dateClaim?.[1] || anchorDate;
   if (
     dateClaim &&
@@ -240,20 +288,7 @@ export function isGenericNameConfirmation(
   )
     return false;
   if (!rawDate) return true;
-  const alternatives: string[] = [];
-  const addDate = (year: string, month: string, day: string) => {
-    const iso = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-    const parsed = new Date(iso + 'T00:00:00Z');
-    if (Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === iso)
-      alternatives.push(iso);
-  };
-  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(rawDate);
-  const numeric = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(rawDate);
-  if (iso) addDate(iso[1]!, iso[2]!, iso[3]!);
-  else if (numeric) {
-    addDate(numeric[3]!, numeric[1]!, numeric[2]!);
-    addDate(numeric[3]!, numeric[2]!, numeric[1]!);
-  }
+  const alternatives = numericDateReadings(rawDate);
   if (!alternatives.length) return false;
   const owners = [
     { fullName: self.fullName, knownNames: self.knownNames, birthDate: self.birthDate },
@@ -264,10 +299,16 @@ export function isGenericNameConfirmation(
       (saved) => saved && canonicalIdentityName(saved) === canonicalIdentityName(name),
     ),
   );
+  // An unlabelled demographic date cannot strengthen a name-only match or
+  // become DOB evidence. Retain the ownership question when none of its
+  // readings fit the saved person; one compatible reading leaves that match
+  // unchanged. Labelled DOB ambiguity still requires its own review.
   return (
     matching.length === 1 &&
     (!matching[0]!.birthDate ||
-      alternatives.every((date) => compatibleBirthDates(date, matching[0]!.birthDate!)))
+      (labelledAnchorDate
+        ? alternatives.every((date) => compatibleBirthDates(date, matching[0]!.birthDate!))
+        : alternatives.some((date) => compatibleBirthDates(date, matching[0]!.birthDate!))))
   );
 }
 
@@ -280,6 +321,8 @@ export function collectEvidencedIdentity(
   conflicts: IntakeIdentityConflict[];
   /** A printed birth-date label whose value is not one complete date. */
   unreadableBirthDate: boolean;
+  /** Readings of each unlabelled banner date; review clues, never evidence. */
+  bannerBirthDates: string[][];
 } {
   const names: string[] = [];
   const subject = printedIdentityName(subjectText)
@@ -287,6 +330,12 @@ export function collectEvidencedIdentity(
     : { dates: [], unreadable: false };
   const unreadableBirthDate = original.unreadable || subject.unreadable;
   const dates: string[] = [...new Set([...original.dates, ...subject.dates])];
+  const bannerBirthDates = new Map(
+    [...(original.bannerDates || []), ...(subject.bannerDates || [])].map((readings) => [
+      readings.join('|'),
+      readings,
+    ]),
+  );
   for (const issue of issues) {
     const name = clean(issue.selfSuggestion?.fullName);
     if (
@@ -310,6 +359,7 @@ export function collectEvidencedIdentity(
       // retaining a relative's name or offering their demographics as Self.
       names.length = 0;
       dates.length = 0;
+      bannerBirthDates.clear();
     }
   } else if (!names.length) {
     const printed = printedIdentityName(subjectText);
@@ -340,6 +390,8 @@ export function collectEvidencedIdentity(
     },
     conflicts,
     unreadableBirthDate,
+    // A labelled or unreadable birth date is the header's own answer.
+    bannerBirthDates: dates.length || unreadableBirthDate ? [] : [...bannerBirthDates.values()],
   };
 }
 
@@ -564,9 +616,12 @@ function receiptFor(
   subjectText: string | null,
 ): IntakeIdentityReceipt | undefined {
   const subject = clean(subjectText);
+  const exactGroup = receipts?.findLast(
+    (receipt) =>
+      receipt.scope.groupId === groupId && receipt.scope.groupVersionId === groupVersionId,
+  );
+  if (exactGroup) return exactGroup;
   return receipts?.findLast((receipt) => {
-    if (receipt.scope.groupId === groupId && receipt.scope.groupVersionId === groupVersionId)
-      return true;
     if (
       personFingerprint &&
       receipt.scope.evidencedIdentity?.personFingerprint === personFingerprint
@@ -614,6 +669,7 @@ export function assessIdentityPolicy({
   nameEvidenceGrounded = true,
   originalEvidenceChecked = true,
   unreadableBirthDate = false,
+  bannerBirthDates = [],
 }: {
   self: IntakeIdentitySelfSnapshot;
   people?: IdentityPolicyPersonSnapshot[];
@@ -630,6 +686,8 @@ export function assessIdentityPolicy({
   originalEvidenceChecked?: boolean;
   /** A printed birth-date label is present but its value is not one complete date. */
   unreadableBirthDate?: boolean;
+  /** Readings of each unlabelled banner date (name, sex, date columns), never DOB evidence. */
+  bannerBirthDates?: string[][];
 }): IdentityPolicyAssessment {
   const fullName = clean(evidence.fullName);
   const birthDate = clean(evidence.birthDate);
@@ -890,6 +948,21 @@ export function assessIdentityPolicy({
       blocking: true,
       message:
         'The birth date information for this report needs review; a model suggestion is not original evidence. Choose who this report belongs to before saving.',
+    };
+  // An unlabelled banner date cannot confirm a match, but one no reading of
+  // which fits the saved person blocks it, whether or not the model asked.
+  if (
+    matchedOwner?.birthDate &&
+    bannerBirthDates.some(
+      (readings) => !readings.some((date) => compatibleBirthDates(date, matchedOwner.birthDate!)),
+    )
+  )
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'The date printed beside the name in this report header does not fit the saved birth date. Confirm who this report belongs to before saving.',
     };
   if (
     birthDate &&

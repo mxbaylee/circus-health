@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
+import { getIntakeIdentityReview, confirmIntakeIdentityScope } from '../intake-identity.ts';
 import { duplicateRecord, saveDuplicateDecision } from '../duplicate-review.ts';
 import {
   applyDirectRecordCorrection,
@@ -79,7 +80,7 @@ function assertion(id: string, value: string, scoped = false): HealthRecordEnvel
     },
   };
 }
-function fixture(t: TestContext, scoped = false) {
+async function fixture(t: TestContext, scoped = false) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-relationships-')),
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId),
@@ -95,12 +96,35 @@ function fixture(t: TestContext, scoped = false) {
     for (const connection of opened) connection.close();
     rmSync(root, { recursive: true, force: true });
   });
-  const add = (id: string, value: string) => {
+  const add = async (id: string, value: string) => {
     const source = intake.uploadIntake(db, root, profileId, {
       filename: 'fictional-' + id + '.jsonl',
       bytes: Buffer.from(JSON.stringify(assertion(id, value, scoped))),
       newProviderName: 'Fictional Larch clinic',
     });
+    // Identity review is separate from the later relationship/preference decision.
+    if (scoped) {
+      const identityOriginal = source;
+      for (const group of identityOriginal.workflow?.reportGroups || []) {
+        const identity = await getIntakeIdentityReview(
+          db,
+          root,
+          profileId,
+          identityOriginal.id,
+          group.id,
+        );
+        assert.ok(identity.scope);
+        assert.equal(identity.scope.subject.text, 'Fictional Avery Larch');
+        if (identity.blocking)
+          await confirmIntakeIdentityScope(db, root, profileId, identityOriginal.id, {
+            version: identity.scope.intakeVersion,
+            operationId: randomUUID(),
+            scope: identity.scope,
+            outcome: 'this_is_me',
+            attestation: 'confirmed_displayed_identity_questions',
+          });
+      }
+    }
     const review = intake.reviewIntake(db, root, profileId, source.id),
       record = review.records[0]!;
     const before = new Set(
@@ -135,9 +159,9 @@ function fixture(t: TestContext, scoped = false) {
       source,
     };
   };
-  const a = add('a', '< 0.040'),
-    b = add('b', '+004.500'),
-    c = add('c', '4.500');
+  const a = await add('a', '< 0.040'),
+    b = await add('b', '+004.500'),
+    c = await add('c', '4.500');
   const preview = (request: ClinicalRelationshipRequest) =>
     previewClinicalRelationship(db, root, profileId, request);
   const input = (request: ClinicalRelationshipRequest): ClinicalRelationshipApplyInput => {
@@ -227,8 +251,8 @@ function fixture(t: TestContext, scoped = false) {
   };
 }
 
-test('provider amendment is directed evidence history and never implicitly prefers, averages or rewrites either assertion', (t) => {
-  const f = fixture(t),
+test('provider amendment is directed evidence history and never implicitly prefers, averages or rewrites either assertion', async (t) => {
+  const f = await fixture(t),
     before = f.db.prepare('SELECT * FROM observations ORDER BY id').all();
   const original = intake.getIntakeOriginal(f.db, f.root, f.profileId, f.b.source.id).bytes;
   const preview = f.preview(f.amend());
@@ -258,8 +282,8 @@ test('provider amendment is directed evidence history and never implicitly prefe
   });
 });
 
-test('explicit same-event preference groups only its pair; show both and immutable withdrawal preserve literal visibility', (t) => {
-  const f = fixture(t);
+test('explicit same-event preference groups only its pair; show both and immutable withdrawal preserve literal visibility', async (t) => {
+  const f = await fixture(t);
   assert.throws(() => f.preview({ ...f.display(), attestation: undefined }), {
     code: 'DISPLAY_ATTESTATION',
   });
@@ -302,8 +326,8 @@ test('explicit same-event preference groups only its pair; show both and immutab
   );
 });
 
-test('overlapping preference and directed amendment cycles require explicit resolution rather than transitive equivalence', (t) => {
-  const f = fixture(t);
+test('overlapping preference and directed amendment cycles require explicit resolution rather than transitive equivalence', async (t) => {
+  const f = await fixture(t);
   f.apply(f.display());
   assert.throws(() => f.preview(f.display(f.b.record, f.c.record)), {
     code: 'DISPLAY_RELATIONSHIP_CONFLICT',
@@ -329,8 +353,8 @@ test('overlapping preference and directed amendment cycles require explicit reso
   );
 });
 
-test('app correction invalidates exact reviewed scope even if literal later returns, and never becomes a provider amendment', (t) => {
-  const f = fixture(t);
+test('app correction invalidates exact reviewed scope even if literal later returns, and never becomes a provider amendment', async (t) => {
+  const f = await fixture(t);
   f.apply(f.display());
   const pinned = f.input(f.display(f.a.record, f.b.record, 'show_both'));
   f.correct(f.a.record, '< 0.050');
@@ -358,9 +382,9 @@ test('app correction invalidates exact reviewed scope even if literal later retu
   assert.equal(f.projection().relationships[0]!.status, 'current');
 });
 
-test('new accepted source version and old changed-version journals cannot inherit preference or provider amendment authority', (t) => {
+test('new accepted source version and old changed-version journals cannot inherit preference or provider amendment authority', async (t) => {
   // Preserve the version/preference oracle with evidenced same-subject scope.
-  const f = fixture(t, true);
+  const f = await fixture(t, true);
   f.apply(f.display());
   transaction(f.db, () =>
     saveDuplicateDecision(
@@ -374,7 +398,7 @@ test('new accepted source version and old changed-version journals cannot inheri
       randomUUID(),
     ),
   );
-  const later = f.add('b', '9.000');
+  const later = await f.add('b', '9.000');
   assert.notEqual(later.record.recordId, f.b.record.recordId);
   assert.equal(f.projection(later.record).display.visibleByDefault, true);
   assert.equal(f.projection(later.record).display.oneReviewedEvent, false);
@@ -385,8 +409,8 @@ test('new accepted source version and old changed-version journals cannot inheri
   );
 });
 
-test('uncertainty on a connected reviewed side restores both pair literals without choosing a substitute', (t) => {
-  const f = fixture(t);
+test('uncertainty on a connected reviewed side restores both pair literals without choosing a substitute', async (t) => {
+  const f = await fixture(t);
   f.apply(f.display());
   f.apply(f.display(f.b.record, f.c.record, 'undecided'));
   for (const item of [f.a, f.b, f.c]) {
@@ -396,8 +420,8 @@ test('uncertainty on a connected reviewed side restores both pair literals witho
   }
 });
 
-test('profile, person, preview version and retained-original tampering reject a new relationship', (t) => {
-  const f = fixture(t),
+test('profile, person, preview version and retained-original tampering reject a new relationship', async (t) => {
+  const f = await fixture(t),
     input = f.input(f.display());
   assert.throws(() => previewClinicalRelationship(f.db, f.root, 'strawberry', f.display()), {
     code: 'PROFILE_BOUNDARY',
@@ -433,8 +457,8 @@ test('profile, person, preview version and retained-original tampering reject a 
   );
 });
 
-test('stable operation receipt is immutable across later reversal, rejects changed content and survives cache rebuild with every original', (t) => {
-  const f = fixture(t);
+test('stable operation receipt is immutable across later reversal, rejects changed content and survives cache rebuild with every original', async (t) => {
+  const f = await fixture(t);
   attachRecordDurability(f.db, { profileId: f.profileId, storage: f.storage });
   const originals = [f.a, f.b, f.c].map(
     (item) => intake.getIntakeOriginal(f.db, f.root, f.profileId, item.source.id).bytes,
@@ -480,8 +504,8 @@ test('stable operation receipt is immutable across later reversal, rejects chang
 });
 
 for (const boundary of ['before_head', 'after_head'] as const)
-  test(`relationship ${boundary} failure has truthful receipts after accepted-history recovery`, (t) => {
-    const f = fixture(t);
+  test(`relationship ${boundary} failure has truthful receipts after accepted-history recovery`, async (t) => {
+    const f = await fixture(t);
     attachRecordDurability(f.db, { profileId: f.profileId, storage: f.storage });
     const input = f.input(f.display()),
       publish = f.storage.publishHead;

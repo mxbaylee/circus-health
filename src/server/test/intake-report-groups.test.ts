@@ -13,6 +13,7 @@ import { rebuildProfile } from '../portable.ts';
 import { listIntakeReportQueue } from '../intake-report-queue.ts';
 import { observations } from '../queries.ts';
 import { getNote, saveNote } from '../notes.ts';
+import { getIntakeIdentityReview, confirmIntakeIdentityScope } from '../intake-identity.ts';
 import type { HealthRecordEnvelope, Intake, IntakeReportReference } from '../../shared/intake.ts';
 
 const report = (
@@ -88,6 +89,28 @@ const file = { id: 'source:fictional', sha256: 'fictional-original-hash' };
 function groups(item: Intake) {
   assert.ok(item.workflow?.reportGroups);
   return item.workflow.reportGroups;
+}
+async function confirmFictionalGroup(
+  db: ReturnType<typeof openDatabase>,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  groupId: string,
+) {
+  const review = await getIntakeIdentityReview(db, root, profileId, intakeId, groupId);
+  assert.ok(review.scope?.original);
+  assert.match(
+    intake.getIntakeOriginal(db, root, profileId, intakeId).bytes.toString('utf8'),
+    /Fictional Fern Example/,
+  );
+  if (review.blocking)
+    await confirmIntakeIdentityScope(db, root, profileId, intakeId, {
+      version: review.scope.intakeVersion,
+      operationId: `confirm-fictional-${groupId}`,
+      scope: review.scope,
+      outcome: 'this_is_me',
+      attestation: 'confirmed_displayed_identity_questions',
+    });
 }
 
 test('one anchored DEXA report keeps 28 independent candidates, sections and retry-stable references', () => {
@@ -295,6 +318,7 @@ test('durable grouped acceptance, changed identity drafts, proposal replay and r
     bytes,
     newProviderName: 'Fictional clinic',
   });
+  await confirmFictionalGroup(db, root, profileId, item.id, groups(item)[0]!.id);
   let review = intake.reviewIntake(db, root, profileId, item.id);
   assert.equal(review.records.length, 28);
   assert.ok(review.records.every((record) => record.reportGroups?.length === 1));
@@ -391,7 +415,7 @@ test('durable grouped acceptance, changed identity drafts, proposal replay and r
   );
 });
 
-test('an optical report remains one Vision document with independently retained right and left fields', (t) => {
+test('an optical report remains one Vision document with independently retained right and left fields', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-optical-report-group-'));
   const profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
@@ -428,6 +452,7 @@ test('an optical report remains one Vision document with independently retained 
     filename: 'fictional-optical.jsonl',
     bytes: Buffer.from(JSON.stringify(value)),
   });
+  await confirmFictionalGroup(db, root, profileId, item.id, groups(item)[0]!.id);
   const review = intake.reviewIntake(db, root, profileId, item.id);
   assert.equal(review.records.length, 1);
   assert.equal(review.records[0]!.kind, 'document');
@@ -919,7 +944,7 @@ test('published report schema and runtime agree on required fields and bounded r
   assert.match(INTAKE_SCHEMA_INSTRUCTIONS, /never proves patient identity, clinical equivalence/);
 });
 
-test('manual report labels work without a model suggestion and stay exact-version scoped', (t) => {
+test('manual report labels work without a model suggestion and stay exact-version scoped', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'health-manual-report-label-'));
   const profileId = 'fictional-manual-source';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
@@ -981,6 +1006,7 @@ test('manual report labels work without a model suggestion and stay exact-versio
   assert.equal(after.find((g) => g.groupId !== group.groupId)!.source, null);
   assert.equal(item.metadata!.source, null);
   assert.deepEqual(intake.getIntakeOriginal(db, root, profileId, item.id).bytes, original);
+  await confirmFictionalGroup(db, root, profileId, item.id, group.groupId);
   const reviewed = intake.reviewIntake(db, root, profileId, item.id);
   const selected = reviewed.records.find((r) =>
     r.reportGroups?.some((g) => g.groupId === group.groupId),

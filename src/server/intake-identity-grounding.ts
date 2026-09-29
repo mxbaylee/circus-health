@@ -54,6 +54,8 @@ const boundaryKey = (boundary: Boundary, group: IntakeReportGroup) =>
       .map((other) => [other.id, other.report?.subject])
       .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
   ]);
+// Keep proof and DOB facts atomic per report group. Separate model groups can
+// share an original anchor, but checking one must not replace the other's proof.
 // A fact read from immutable source bytes survives new candidate membership.
 // Page/member/subject changes still require another original read.
 const originalDateKey = (boundary: Boundary, group: IntakeReportGroup) =>
@@ -62,6 +64,7 @@ const originalDateKey = (boundary: Boundary, group: IntakeReportGroup) =>
     boundary.intakeId,
     boundary.sourceHash,
     identityOriginalFingerprint(boundary.intakeId, boundary.sourceHash, group, boundary.workflow),
+    group.id,
     group.report?.subject,
     group.report?.anchor,
   ]);

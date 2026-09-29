@@ -73,6 +73,51 @@ test('grounding atomically replaces negative proofs and evicts date facts togeth
   }
 });
 
+test('groups sharing one original report anchor keep separate grounded proofs', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    const first = group('first');
+    const second = { ...group('second'), report: first.report };
+    const current = {
+      ...boundary,
+      workflow: { ...boundary.workflow, reportGroups: [first, second] },
+    };
+    const question = {
+      prompt: 'Does this fictional report belong to you?',
+      textAnchor: 'Patient: Iris Meadow',
+    };
+    retainIdentityGrounding(db, current, first, [], true, [question], {
+      dates: ['1986-02-14'],
+      unreadable: false,
+    });
+    retainIdentityGrounding(db, current, second, [], true, [question], {
+      dates: ['1986-02-14'],
+      unreadable: false,
+    });
+    assert.equal(identitySubjectGroundingLookup(db, current)(first), true);
+    assert.equal(identitySubjectGroundingLookup(db, current)(second), true);
+    assert.equal(identityNameQuestionGroundingLookup(db, current)(first, question), true);
+    assert.equal(identityNameQuestionGroundingLookup(db, current)(second, question), true);
+    retainIdentityGrounding(db, current, second, [], false, [], {
+      dates: [],
+      unreadable: true,
+    });
+    assert.equal(identitySubjectGroundingLookup(db, current)(first), true);
+    assert.equal(identityNameQuestionGroundingLookup(db, current)(first, question), true);
+    assert.deepEqual(identityOriginalBirthDateEvidenceLookup(db, current)(first), {
+      dates: ['1986-02-14'],
+      unreadable: false,
+    });
+    assert.equal(identitySubjectGroundingLookup(db, current)(second), false);
+    assert.deepEqual(identityOriginalBirthDateEvidenceLookup(db, current)(second), {
+      dates: [],
+      unreadable: true,
+    });
+  } finally {
+    db.close();
+  }
+});
+
 test('immutable date facts survive membership growth while name proofs and other databases need rechecking', () => {
   const db = new DatabaseSync(':memory:'),
     cold = new DatabaseSync(':memory:');

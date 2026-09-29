@@ -19,6 +19,7 @@ import {
   exactCurrentIdentityResolutionOperationId,
   identityReceiptAppliesToCurrentBoundary,
   identityOriginalFingerprint,
+  modelBirthDateWarnings,
   type IdentityPolicyPersonSnapshot,
 } from './intake-identity-policy.ts';
 import type { IdentityGroundingLookup } from './intake-identity-grounding.ts';
@@ -467,11 +468,8 @@ export function workflowReview<T extends IntakeReview>(
       const originalBirthDates = group
         ? identityContext?.originalBirthDateEvidence?.(group)
         : undefined;
-      const { evidence, conflicts, unreadableBirthDate } = collectEvidencedIdentity(
-        identityIssues,
-        group?.report?.subject?.text,
-        originalBirthDates,
-      );
+      const { evidence, conflicts, unreadableBirthDate, bannerBirthDates } =
+        collectEvidencedIdentity(identityIssues, group?.report?.subject?.text, originalBirthDates);
       const structuredEvidence = collectEvidencedIdentity(identityIssues).evidence;
       const ownIdentityIssues = (record.issues || []).filter((issue) => issue.kind === 'identity');
       const genericIdentityIssueId =
@@ -567,6 +565,7 @@ export function workflowReview<T extends IntakeReview>(
         people: identityContext?.people,
         originalEvidenceChecked: !group || originalBirthDates !== undefined,
         unreadableBirthDate,
+        bannerBirthDates,
         nameEvidenceGrounded: group
           ? !!identityContext?.subjectGrounded?.(group)
           : review.proposalId === null && !!structuredEvidence.fullName,
@@ -725,6 +724,28 @@ export function workflowReview<T extends IntakeReview>(
           'This record is attributed to another person and cannot be accepted into Self.';
         assessment.attribution = undefined;
       }
+      const assignedPerson = assessment.attribution?.assignedPerson;
+      const currentAssignedPerson = assessment.attribution
+        ? assignedPerson && assignedPerson.personId !== 'patient'
+          ? identityContext?.people?.find(
+              (person) =>
+                person.personId === assignedPerson.personId &&
+                person.noteId === assignedPerson.noteId,
+            )
+          : {
+              fullName: self.fullName || assignedPerson?.fullName || 'Self',
+              birthDate: self.birthDate,
+            }
+        : undefined;
+      const warnings =
+        !assessment.blocking && (!group || originalBirthDates !== undefined)
+          ? modelBirthDateWarnings({
+              issues: ownIdentityIssues,
+              originalBirthDate: evidence.birthDate,
+              unreadableBirthDate,
+              person: currentAssignedPerson,
+            })
+          : [];
       record.identityReview = {
         confidence: assessment.confidence,
         status: assessment.status,
@@ -732,6 +753,7 @@ export function workflowReview<T extends IntakeReview>(
         message: assessment.message,
         evidencedIdentity: assessment.evidencedIdentity,
         conflicts: assessment.conflicts,
+        ...(warnings.length ? { warnings } : {}),
         ...(assessment.attribution?.assignedPerson
           ? { assignedPerson: assessment.attribution.assignedPerson }
           : {}),

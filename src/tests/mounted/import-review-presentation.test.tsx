@@ -2202,6 +2202,36 @@ it.each([false, true])(
   },
 );
 
+it('shows an unverified model birth-date mismatch while the matched report remains saveable', () => {
+  const current = personChoiceModel();
+  current.reports[0].subject = {
+    ...current.reports[0].subject,
+    confirmed: true,
+    identityStatus: 'evidenced_match',
+    nameOnlyMatch: false,
+    offeredSelfFields: {},
+    warnings: [
+      {
+        kind: 'model_birth_date_mismatch',
+        modelBirthDate: '1988-04-12',
+        savedBirthDate: '1989-04-12',
+        personName: 'Jordan Example',
+      },
+    ],
+  };
+  current.records[0].eligible = true;
+  render(<ImportReviewPresentation model={current} />);
+  const warning = screen.getByRole('status');
+  expect(warning).toHaveTextContent('1988-04-12');
+  expect(warning).toHaveTextContent('Jordan Example');
+  expect(warning).toHaveTextContent('1989-04-12');
+  expect(warning).toHaveTextContent('has not been verified in the original');
+  expect(screen.getByRole('button', { name: /^Confirm & save$/ })).toBeEnabled();
+  fireEvent.click(within(warning).getByRole('button', { name: 'Change person' }));
+  expect(screen.getByRole('dialog')).toBeVisible();
+  expect(within(screen.getByRole('dialog')).getByText(/1988-04-12/)).toBeVisible();
+});
+
 it('prefills a suggested birth date and sends the human correction with the report confirmation', () => {
   const current = personChoiceModel();
   current.reports[0].subject.birthDateReview = {

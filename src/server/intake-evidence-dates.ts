@@ -93,6 +93,43 @@ export interface BirthDateEvidence {
   unreadable: boolean;
   /** Inferred centuries are display suggestions, never original evidence. */
   suggestions?: string[];
+  /**
+   * Unlabelled demographic banner dates (name, sex, date columns) beside a
+   * header with no labelled birth date, one list of every valid reading per
+   * banner. They are review clues only: they can block a saved person but never
+   * become birth-date evidence or confirm a match.
+   */
+  bannerDates?: string[][];
+}
+
+/** An unlabelled demographic banner: a name column, then sex and a numeric date columns. */
+export const bannerDatePattern = /\s{2,}(?:Female|Male)\s{2,}(\d{1,4}[/-]\d{1,2}[/-]\d{1,4})/i;
+
+/**
+ * Every valid calendar reading of one printed numeric date: ISO, or either
+ * month/day order with a four-digit year. With `shortYear`, a two-digit year is
+ * read in every century, because nothing printed chooses one.
+ */
+export function numericDateReadings(raw: string, shortYear = false): string[] {
+  const readings = new Set<string>();
+  const add = (year: number, month: number, day: number) => {
+    const date = calendarDate(year, month, day);
+    if (date) readings.add(date);
+  };
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (iso) add(Number(iso[1]), Number(iso[2]), Number(iso[3]));
+  const numeric = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(raw);
+  if (numeric) {
+    add(Number(numeric[3]), Number(numeric[1]), Number(numeric[2]));
+    add(Number(numeric[3]), Number(numeric[2]), Number(numeric[1]));
+  }
+  const short = shortYear ? /^(\d{1,2})[/-](\d{1,2})[/-](\d{2})$/.exec(raw) : null;
+  if (short)
+    for (const century of [1800, 1900, 2000]) {
+      add(century + Number(short[3]), Number(short[1]), Number(short[2]));
+      add(century + Number(short[3]), Number(short[2]), Number(short[1]));
+    }
+  return [...readings];
 }
 
 const noLetterOrDigit = '(?![\\p{L}\\p{N}])';
@@ -459,6 +496,7 @@ export function originalSubjectBirthDateEvidence(
   const dates = new Set<string>();
   let unreadable = false;
   const suggestions = new Set<string>();
+  const banners = new Map<string, string[]>();
   if (!text || !subject) return { dates: [], unreadable };
   const window = reportWindow(text, subject, reportAnchor);
   const lines = identityLines(text);
@@ -511,6 +549,15 @@ export function originalSubjectBirthDateEvidence(
     for (const date of evidence.dates) dates.add(date);
     unreadable ||= evidence.unreadable;
     for (const date of evidence.suggestions || []) suggestions.add(date);
+    // An unlabelled banner reads only where no labelled birth date does.
+    if (!evidence.dates.length && !evidence.unreadable) {
+      const lineEnd = text.indexOf('\n', start + subject.length);
+      const banner = bannerDatePattern.exec(text.slice(start, lineEnd < 0 ? text.length : lineEnd));
+      if (banner && banner.index <= subject.length) {
+        const readings = numericDateReadings(banner[1]!, true);
+        banners.set(readings.join('|') || banner[1]!, readings);
+      }
+    }
     return evidence.dates.length > 0 || evidence.unreadable;
   };
   let foundAfterAnchor = false;
@@ -558,6 +605,7 @@ export function originalSubjectBirthDateEvidence(
     dates: [...dates],
     unreadable,
     ...(suggestions.size ? { suggestions: [...suggestions] } : {}),
+    ...(!dates.size && !unreadable && banners.size ? { bannerDates: [...banners.values()] } : {}),
   };
 }
 

@@ -1,5 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,26 +15,35 @@ import {
   importIntake,
   saveIntakeReviewDraft,
 } from '../intake.ts';
-import { getIntakeIdentityReview } from '../intake-identity.ts';
+import { getIntakeIdentityReview, confirmIntakeIdentityScope } from '../intake-identity.ts';
+import { listIntakeImportFeed } from '../intake-report-queue.ts';
+import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
 import { competingIdentityBoundaries, printedIdentityName } from '../intake-identity-policy.ts';
 import type { HealthRecordEnvelope } from '../../shared/intake.ts';
 
 const heading = 'Fictional composition report';
 const name = 'Doe, Cookie';
 const header = 'Doe, Cookie   Female   4/12/1988   64.0 in.   140.0 lbs.   8/11/2025';
+const labelledHeader =
+  'Patient: Doe, Cookie\nDOB: 1988-04-12\nFemale   64.0 in.   140.0 lbs.   2025-08-11';
 const prompt =
   'Does this report for Doe, Cookie, birth date 4/12/1988, belong to you or another person?';
 function fixture(
   t: TestContext,
   options: {
     wholeHeader?: boolean;
+    labelled?: boolean;
+    ambiguousLabel?: boolean;
     family?: boolean;
     collision?: boolean;
     dob?: string;
     forgedAnchor?: boolean;
     specific?: boolean;
     count?: number;
+    distinct?: boolean;
     splitSubjectRoles?: boolean;
+    noQuestion?: boolean;
+    bannerDate?: string;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-name-question-')),
@@ -59,8 +69,18 @@ function fixture(
           person: { fullName: 'Cookie Doe', birthDate: options.dob || '1988-04-12' },
         })
       : undefined;
-  const subject = options.wholeHeader ? header : name;
-  const original = `${heading}\n${options.forgedAnchor ? name : header}\nFictional count 12`;
+  const bannerDate = options.bannerDate || '4/12/1988';
+  const sourceHeader = options.ambiguousLabel
+    ? labelledHeader.replace('1988-04-12', '4/12/1988')
+    : options.labelled
+      ? labelledHeader
+      : header.replace('4/12/1988', bannerDate);
+  const sourcePrompt =
+    options.labelled && !options.ambiguousLabel
+      ? prompt.replace('4/12/1988', '1988-04-12')
+      : prompt.replace('4/12/1988', bannerDate);
+  const subject = options.wholeHeader ? sourceHeader : name;
+  const original = `${heading}\n${options.forgedAnchor ? name : sourceHeader}\nFictional count 12`;
   const item = uploadIntake(db, root, profile, {
     filename: 'fictional-cookie.txt',
     bytes: Buffer.from(original),
@@ -69,7 +89,7 @@ function fixture(
     format: 'health-record-v1',
     id: 'count',
     kind: 'record',
-    payload: `${heading}\n${header}\nFictional count 12`,
+    payload: `${heading}\n${sourceHeader}\nFictional count 12`,
     provenance: {
       capturedVia: null,
       sourceSystem: 'Fictional clinic',
@@ -92,16 +112,18 @@ function fixture(
       anchor: { locator: 'page 1 heading', text: heading },
       subject: { locator: 'page 1 subject', text: subject },
     },
-    reviewIssues: [
-      {
-        kind: 'identity',
-        field: 'subject',
-        prompt: options.specific
-          ? 'Is the corrected patient name reliable, or does this page combine two people?'
-          : prompt,
-        textAnchor: header,
-      },
-    ],
+    reviewIssues: options.noQuestion
+      ? []
+      : [
+          {
+            kind: 'identity',
+            field: 'subject',
+            prompt: options.specific
+              ? 'Is the corrected patient name reliable, or does this page combine two people?'
+              : sourcePrompt,
+            textAnchor: sourceHeader,
+          },
+        ],
   };
   const proposed = proposeConversion(db, root, profile, item.id, {
     version: item.version,
@@ -133,6 +155,12 @@ function fixture(
       : Array.from({ length: options.count || 1 }, (_, index) => ({
           ...value,
           id: index ? `count-${index}` : value.id,
+          ...(options.distinct
+            ? {
+                provenance: { ...value.provenance, sourceRecordId: `count-${index}` },
+                clinical: { ...value.clinical!, testLabel: `Fictional count ${index}` },
+              }
+            : {}),
         }))
     )
       .map((entry) => JSON.stringify(entry))
@@ -154,51 +182,90 @@ function fixture(
   };
 }
 
-for (const wholeHeader of [false, true])
-  for (const family of [false, true])
-    test(`a grounded unique ${family ? 'Person' : 'Self'} name resolves a generic question with ${wholeHeader ? 'demographic' : 'name-only'} subject`, async (t) => {
-      const f = fixture(t, { wholeHeader, family });
-      assert.equal(f.read().records[0]!.identityReview?.blocking, true);
-      const identity = await f.preview();
-      assert.equal(identity.status, 'evidenced_match');
-      assert.equal(identity.blocking, false);
-      assert.equal(identity.evidencedIdentity.fullName, name);
-      assert.equal(
-        identity.evidencedIdentity.birthDate,
-        undefined,
-        'ambiguous numeric DOB is neither normalized nor offered',
-      );
-      const review = f.read(),
-        record = review.records[0]!;
-      assert.equal(record.identityReview?.blocking, false);
-      assert.ok(
-        record
-          .issues!.filter((issue) => issue.kind === 'identity')
-          .every((issue) => !issue.blocking),
-      );
-      assert.equal(
-        record.identityAttribution?.basis,
-        family ? 'matched_saved_person' : 'matched_saved_self',
-      );
-      importIntake(f.db, f.root, f.profile, f.item.id, {
-        version: review.version,
-        proposalId: f.proposal,
-        reviewToken: review.reviewToken,
-        decisions: [{ recordId: record.id, action: 'accept', mapping: {} }],
+for (const labelled of [false, true])
+  for (const wholeHeader of [false, true])
+    for (const family of [false, true])
+      test(`a grounded ${labelled ? 'labelled' : 'unlabelled banner'} unique ${family ? 'Person' : 'Self'} name resolves a generic question with ${wholeHeader ? 'demographic' : 'name-only'} subject`, async (t) => {
+        const f = fixture(t, { wholeHeader, family, labelled });
+        assert.equal(f.read().records[0]!.identityReview?.blocking, true);
+        const identity = await f.preview();
+        assert.equal(identity.status, 'evidenced_match');
+        assert.equal(identity.blocking, false);
+        assert.equal(identity.evidencedIdentity.fullName, name);
+        assert.equal(
+          identity.evidencedIdentity.birthDate,
+          labelled ? '1988-04-12' : undefined,
+          'an unlabelled ambiguous date is never normalized as a DOB',
+        );
+        assert.equal(identity.offeredSelfFields.birthDate, undefined);
+        assert.equal(identity.confidence, labelled ? 'strong' : 'limited');
+        const review = f.read(),
+          record = review.records[0]!;
+        assert.equal(record.identityReview?.blocking, false);
+        assert.ok(
+          record
+            .issues!.filter((issue) => issue.kind === 'identity')
+            .every((issue) => !issue.blocking),
+        );
+        assert.equal(
+          record.identityAttribution?.basis,
+          family ? 'matched_saved_person' : 'matched_saved_self',
+        );
+        importIntake(f.db, f.root, f.profile, f.item.id, {
+          version: review.version,
+          proposalId: f.proposal,
+          reviewToken: review.reviewToken,
+          decisions: [{ recordId: record.id, action: 'accept', mapping: {} }],
+        });
+        assert.equal(
+          f.db.prepare('SELECT person_id FROM observations').get()!.person_id,
+          f.family?.personId || 'patient',
+        );
+        assert.equal(
+          getIntake(f.db, f.root, f.profile, f.item.id).workflow?.identityConfirmations?.length ||
+            0,
+          0,
+        );
       });
-      assert.equal(
-        f.db.prepare('SELECT person_id FROM observations').get()!.person_id,
-        f.family?.personId || 'patient',
-      );
-      assert.equal(
-        getIntake(f.db, f.root, f.profile, f.item.id).workflow?.identityConfirmations?.length || 0,
-        0,
-      );
+
+for (const family of [false, true])
+  test(`unlabelled banner name-only ${family ? 'Person' : 'Self'} matches are selectable and bulk accept without confirmation`, async (t) => {
+    const f = fixture(t, { family, count: 3, distinct: true });
+    await f.preview();
+    const feed = listIntakeImportFeed(f.db, f.root, f.profile);
+    const records = feed.blocks.flatMap((block) => block.records);
+    assert.equal(records.length, 3);
+    assert.ok(records.every((record) => record.selectable));
+    const result = acceptIntakeReportSelection(f.db, f.root, f.profile, {
+      operationId: randomUUID(),
+      blocks: feed.blocks.map((block) => ({
+        ...block,
+        selections: block.records.map((record) => ({
+          recordId: record.id,
+          candidateId: record.candidateId!,
+          candidateVersionId: record.candidateVersionId!,
+          mapping: {},
+        })),
+      })),
     });
+    assert.equal(result.receipt.selectedCount, 3);
+    assert.deepEqual(
+      f.db
+        .prepare('SELECT person_id FROM observations')
+        .all()
+        .map((row) => row.person_id),
+      Array(3).fill(f.family?.personId || 'patient'),
+    );
+    assert.equal(
+      getIntake(f.db, f.root, f.profile, f.item.id).workflow?.identityConfirmations?.length || 0,
+      0,
+    );
+  });
 
 for (const [label, options] of Object.entries({
   collision: { collision: true },
-  'contradictory DOB': { dob: '1970-02-03' },
+  'contradictory labelled DOB': { dob: '1970-02-03', labelled: true },
+  'ambiguous labelled DOB with one matching reading': { ambiguousLabel: true },
   'ungrounded anchor': { forgedAnchor: true },
   'specific uncertainty': { specific: true },
 }))
@@ -208,6 +275,202 @@ for (const [label, options] of Object.entries({
     assert.equal(identity.blocking, true);
     assert.equal(f.read().records[0]!.identityReview?.blocking, true);
   });
+
+for (const family of [false, true])
+  for (const wholeHeader of [false, true])
+    test(`an incompatible banner date preserves the ${family ? 'Person' : 'Self'} question with a ${wholeHeader ? 'demographic' : 'name-only'} subject`, async (t) => {
+      const f = fixture(t, { family, wholeHeader, dob: '1970-02-03' });
+      const identity = await f.preview();
+      assert.equal(identity.status, 'confirmation_required');
+      assert.equal(identity.blocking, true);
+      assert.equal(identity.evidencedIdentity.birthDate, undefined);
+      assert.equal(identity.offeredSelfFields.birthDate, undefined);
+      assert.deepEqual(
+        identity.conflicts,
+        [],
+        'an unlabelled date is a review clue, not verified DOB evidence',
+      );
+      assert.ok(identity.scope!.questions?.some((question) => question.prompt === prompt));
+      const review = f.read();
+      assert.equal(review.records[0]!.identityReview?.blocking, true);
+      const feed = listIntakeImportFeed(f.db, f.root, f.profile);
+      const feedRecords = feed.blocks.flatMap((block) => block.records);
+      assert.equal(feedRecords.length, 1);
+      assert.ok(feedRecords.every((record) => !record.selectable));
+      assert.throws(
+        () =>
+          importIntake(f.db, f.root, f.profile, f.item.id, {
+            version: review.version,
+            proposalId: f.proposal,
+            reviewToken: review.reviewToken,
+            decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+          }),
+        { code: /^(?:QUESTIONS_PENDING|REVIEW_ISSUES_PENDING)$/ },
+      );
+      assert.throws(
+        () =>
+          acceptIntakeReportSelection(f.db, f.root, f.profile, {
+            operationId: randomUUID(),
+            blocks: [
+              {
+                intakeId: f.item.id,
+                proposalId: f.proposal,
+                intakeVersion: review.version,
+                reviewToken: review.reviewToken,
+                selections: review.records.map((record) => ({
+                  recordId: record.id,
+                  candidateId: record.candidateId!,
+                  candidateVersionId: record.candidateVersionId!,
+                  mapping: {},
+                })),
+              },
+            ],
+          }),
+        { code: /^(?:QUESTIONS_PENDING|REVIEW_ISSUES_PENDING)$/ },
+      );
+      assert.equal(f.db.prepare('SELECT count(*) AS n FROM observations').get()!.n, 0);
+      assert.equal(
+        getIntake(f.db, f.root, f.profile, f.item.id).workflow?.identityConfirmations?.length || 0,
+        0,
+      );
+
+      const selected = f.family ? getNote(f.db, f.family.id) : undefined;
+      await confirmIntakeIdentityScope(f.db, f.root, f.profile, f.item.id, {
+        version: identity.scope!.intakeVersion,
+        operationId: randomUUID(),
+        scope: identity.scope!,
+        outcome: selected ? 'this_is_person' : 'this_is_me',
+        attestation: 'confirmed_displayed_identity_questions',
+        ...(selected
+          ? { personSelection: { noteId: selected.id, expectedVersion: selected.version } }
+          : {}),
+      });
+      const confirmed = f.read();
+      assert.equal(confirmed.records[0]!.identityReview?.blocking, false);
+      importIntake(f.db, f.root, f.profile, f.item.id, {
+        version: confirmed.version,
+        proposalId: f.proposal,
+        reviewToken: confirmed.reviewToken,
+        decisions: [{ recordId: confirmed.records[0]!.id, action: 'accept', mapping: {} }],
+      });
+      assert.equal(
+        f.db.prepare('SELECT person_id FROM observations').get()!.person_id,
+        f.family?.personId || 'patient',
+      );
+      assert.equal(
+        getNote(f.db, f.family?.id || 'person-note:self').person?.birthDate,
+        '1970-02-03',
+      );
+      assert.equal(
+        getIntake(f.db, f.root, f.profile, f.item.id).workflow?.identityConfirmations?.length,
+        1,
+      );
+    });
+
+for (const family of [false, true])
+  test(`the other valid banner date reading leaves a ${family ? 'Person' : 'Self'} name-only match`, async (t) => {
+    const f = fixture(t, { family, dob: '1988-12-04' });
+    const identity = await f.preview();
+    assert.equal(identity.status, 'evidenced_match');
+    assert.equal(identity.blocking, false);
+    assert.equal(identity.confidence, 'limited');
+    assert.equal(identity.evidencedIdentity.birthDate, undefined);
+    assert.equal(identity.offeredSelfFields.birthDate, undefined);
+  });
+
+for (const family of [false, true])
+  for (const wholeHeader of [false, true])
+    test(`an incompatible banner date blocks a ${family ? 'Person' : 'Self'} match with a ${wholeHeader ? 'demographic' : 'name-only'} subject when the model raised no identity question`, async (t) => {
+      const f = fixture(t, { family, wholeHeader, dob: '1970-02-03', noQuestion: true });
+      const identity = await f.preview();
+      assert.equal(identity.status, 'confirmation_required');
+      assert.equal(identity.blocking, true);
+      assert.equal(identity.evidencedIdentity.birthDate, undefined);
+      assert.deepEqual(identity.conflicts, [], 'a banner date is a review clue, not DOB evidence');
+      const record = f.read().records[0]!;
+      assert.equal(record.identityReview?.status, 'confirmation_required');
+      assert.equal(record.identityReview?.blocking, true);
+      assert.throws(
+        () => {
+          const review = f.read();
+          importIntake(f.db, f.root, f.profile, f.item.id, {
+            version: review.version,
+            proposalId: f.proposal,
+            reviewToken: review.reviewToken,
+            decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+          });
+        },
+        { code: /^(?:QUESTIONS_PENDING|REVIEW_ISSUES_PENDING|IDENTITY_REVIEW_REQUIRED)$/ },
+      );
+      assert.equal(f.db.prepare('SELECT count(*) AS n FROM observations').get()!.n, 0);
+    });
+
+for (const family of [false, true])
+  test(`a human confirmation resolves a blocked ${family ? 'Person' : 'Self'} banner date conflict without a model question`, async (t) => {
+    const f = fixture(t, { family, dob: '1970-02-03', noQuestion: true });
+    const identity = await f.preview();
+    assert.equal(identity.blocking, true);
+    const selected = f.family ? getNote(f.db, f.family.id) : undefined;
+    await confirmIntakeIdentityScope(f.db, f.root, f.profile, f.item.id, {
+      version: identity.scope!.intakeVersion,
+      operationId: randomUUID(),
+      scope: identity.scope!,
+      outcome: selected ? 'this_is_person' : 'this_is_me',
+      attestation: 'confirmed_displayed_report_subject',
+      ...(selected
+        ? { personSelection: { noteId: selected.id, expectedVersion: selected.version } }
+        : {}),
+    });
+    const confirmed = f.read();
+    assert.equal(confirmed.records[0]!.identityReview?.blocking, false);
+    importIntake(f.db, f.root, f.profile, f.item.id, {
+      version: confirmed.version,
+      proposalId: f.proposal,
+      reviewToken: confirmed.reviewToken,
+      decisions: [{ recordId: confirmed.records[0]!.id, action: 'accept', mapping: {} }],
+    });
+    assert.equal(
+      f.db.prepare('SELECT person_id FROM observations').get()!.person_id,
+      f.family?.personId || 'patient',
+    );
+  });
+
+for (const family of [false, true])
+  for (const dob of ['1988-04-12', '1988-12-04'])
+    test(`a compatible banner date leaves a ${family ? 'Person' : 'Self'} name-only match without a model question (${dob})`, async (t) => {
+      const f = fixture(t, { family, dob, noQuestion: true });
+      const identity = await f.preview();
+      assert.equal(identity.status, 'evidenced_match');
+      assert.equal(identity.blocking, false);
+      assert.equal(identity.confidence, 'limited');
+      assert.equal(identity.evidencedIdentity.birthDate, undefined);
+      assert.equal(identity.offeredSelfFields.birthDate, undefined);
+      const record = f.read().records[0]!;
+      assert.equal(record.identityReview?.blocking, false);
+      assert.equal(
+        record.identityAttribution?.basis,
+        family ? 'matched_saved_person' : 'matched_saved_self',
+      );
+    });
+
+for (const [label, dob, blocking] of [
+  ['compatible', '1988-04-12', false],
+  ['incompatible', '1970-02-03', true],
+] as const)
+  test(`a two-digit-year banner date is ${label} with the saved birth date under any century reading, without a model question`, async (t) => {
+    const f = fixture(t, { dob, noQuestion: true, bannerDate: '4/12/88' });
+    const identity = await f.preview();
+    assert.equal(identity.blocking, blocking);
+    assert.equal(identity.status, blocking ? 'confirmation_required' : 'evidenced_match');
+    assert.equal(f.read().records[0]!.identityReview?.blocking, blocking);
+  });
+
+test('an impossible banner date blocks a name-only match without a model question', async (t) => {
+  const f = fixture(t, { noQuestion: true, bannerDate: '13/32/1988' });
+  const identity = await f.preview();
+  assert.equal(identity.status, 'confirmation_required');
+  assert.equal(identity.blocking, true);
+});
 
 test('human unknown answers and changed report membership revoke a generic question match', async (t) => {
   const f = fixture(t);
@@ -238,8 +501,10 @@ test('human unknown answers and changed report membership revoke a generic quest
 
 test('header parsing does not invent a person from ambiguous names or arbitrary prose', () => {
   assert.equal(printedIdentityName(header), name);
-  assert.equal(printedIdentityName('Cookie Doe and Sample Doe   Female   4/12/1988'), undefined);
+  assert.equal(printedIdentityName(labelledHeader), name);
   assert.equal(printedIdentityName(header + '   Patient: Cookie Sample'), undefined);
+  assert.equal(printedIdentityName('Cookie Doe and Sample Doe   Female   4/12/1988'), undefined);
+  assert.equal(printedIdentityName('Patient: Doe, Cookie   Patient: Cookie Sample'), undefined);
   assert.equal(
     printedIdentityName('Report for Cookie Doe with a birth date of 4/12/1988'),
     undefined,
@@ -345,7 +610,11 @@ test('first upload: one proposal with header, self and unknown roles can be revi
   assert.equal(
     getIntake(f.db, f.root, f.profile, f.item.id).version,
     f.item.version,
-    'rechecking stored groups does not mutate the import',
+    'checking all stored groups does not mutate the import',
+  );
+  assert.equal(
+    getIntake(f.db, f.root, f.profile, f.item.id).workflow?.identityConfirmations?.length || 0,
+    0,
   );
   importIntake(f.db, f.root, f.profile, f.item.id, {
     version: review.version,
@@ -359,6 +628,11 @@ test('first upload: one proposal with header, self and unknown roles can be revi
   });
   assert.equal(f.db.prepare('SELECT count(*) AS n FROM observations').get()!.n, 2);
   assert.equal(f.db.prepare('SELECT count(*) AS n FROM documents').get()!.n, 1);
+  assert.equal(
+    getIntake(f.db, f.root, f.profile, f.item.id).workflow?.identityConfirmations?.length || 0,
+    0,
+    'automatic matching never records a human identity receipt',
+  );
 });
 
 test('competing boundaries require different printed identity in the same original report', (t) => {

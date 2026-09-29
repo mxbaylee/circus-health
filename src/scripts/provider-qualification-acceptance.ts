@@ -197,10 +197,15 @@ export async function performQualificationAcceptance({
   // hash and sole printed patient are known. Model-proposed Self is not authority.
   // Read fresh host identity scopes and refuse conflicting or missing evidence;
   // never repair clinical fields or dismiss non-identity questions.
-  const confirmedGroups = new Set<string>();
-  for (const block of current.blocks) {
+  const confirmedHumanGroups = new Set<string>();
+  const initialBlocks = current.blocks;
+  for (const block of initialBlocks) {
     check(block.intakeId === originalId, 'Qualification contains a different original.');
-    for (const record of block.records) {
+    for (const initialRecord of block.records) {
+      const record = current.blocks
+        .flatMap((candidateBlock) => candidateBlock.records)
+        .find((candidate) => candidate.candidateVersionId === initialRecord.candidateVersionId);
+      check(record, 'Qualification candidate disappeared during identity review.');
       const unresolved = (record.issues ?? []).filter(
         (issue) => issue.blocking && issue.status === 'unresolved',
       );
@@ -218,7 +223,10 @@ export async function performQualificationAcceptance({
             (record.identityReview?.status === 'evidenced_match' ||
               record.identityReview?.status === 'prior_confirmation') &&
             patientName(record.identityReview.evidencedIdentity.fullName) === qualificationPerson &&
-            record.identityReview.evidencedIdentity.birthDate === qualificationBirthDate,
+            (record.identityReview.evidencedIdentity.birthDate === qualificationBirthDate ||
+              (record.identityReview.evidencedIdentity.birthDate === undefined &&
+                record.reportGroups?.length === 1 &&
+                confirmedHumanGroups.has(record.reportGroups[0]!.groupId))),
           'Qualification requires host-evidenced Self or an explicit scoped identity review.',
         );
         continue;
@@ -228,7 +236,6 @@ export async function performQualificationAcceptance({
         'Qualification identity resolution requires one exact report and candidate version.',
       );
       const groupId = record.reportGroups[0]!.groupId;
-      if (confirmedGroups.has(groupId)) continue;
       const review = await request<IntakeIdentityReview>(
         prefix + `/intakes/${originalId}/identity-review?groupId=${encodeURIComponent(groupId)}`,
       );
@@ -237,10 +244,16 @@ export async function performQualificationAcceptance({
         scope &&
           review.status !== 'conflict' &&
           !review.conflicts.length &&
+          !review.selfBirthDateConflict &&
           patientName(review.self.fullName) === qualificationPerson &&
           review.self.birthDate === qualificationBirthDate &&
           patientName(review.evidencedIdentity.fullName) === qualificationPerson &&
-          review.evidencedIdentity.birthDate === qualificationBirthDate &&
+          (review.evidencedIdentity.birthDate === qualificationBirthDate ||
+            (review.evidencedIdentity.birthDate === undefined &&
+              scope.verificationMode === 'human_reviewed_original' &&
+              typeof scope.original?.page === 'number' &&
+              Number.isInteger(scope.original.page) &&
+              scope.original.page > 0)) &&
           scope.profileId === profileId &&
           scope.intakeId === originalId &&
           scope.sourceHash === expectedSha256 &&
@@ -270,7 +283,8 @@ export async function performQualificationAcceptance({
         outcome: 'this_is_me',
         attestation: 'confirmed_displayed_identity_questions',
       });
-      confirmedGroups.add(groupId);
+      if (scope.verificationMode === 'human_reviewed_original') confirmedHumanGroups.add(groupId);
+      current = await collectFeed(prefix);
     }
   }
   const accepted = new Map<

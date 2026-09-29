@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
+import { getIntakeIdentityReview, confirmIntakeIdentityScope } from '../intake-identity.ts';
 import { getIntakeRelatedRecords } from '../related-records.ts';
 import { listIntakeReportQueue, getIntakeReportQueueGroup } from '../intake-report-queue.ts';
 import { duplicateRecord, saveDuplicateDecision } from '../duplicate-review.ts';
@@ -896,7 +897,31 @@ test('legacy pending choices remain visible but unpinned; historical accepted pa
       },
     ],
   });
-  f.accept(f.review(f.upload([scopedSample('legacy-one'), scopedSample('legacy-two')]).id));
+  const reviewSubject = async (id: string) => {
+    const identityOriginal = intake.getIntake(f.db, f.root, f.profileId, id);
+    for (const group of identityOriginal.workflow?.reportGroups || []) {
+      const identity = await getIntakeIdentityReview(
+        f.db,
+        f.root,
+        f.profileId,
+        identityOriginal.id,
+        group.id,
+      );
+      assert.ok(identity.scope);
+      assert.equal(identity.scope.subject.text, 'Fictional Avery Orchid');
+      if (identity.blocking)
+        await confirmIntakeIdentityScope(f.db, f.root, f.profileId, identityOriginal.id, {
+          version: identity.scope.intakeVersion,
+          operationId: randomUUID(),
+          scope: identity.scope,
+          outcome: 'this_is_me',
+          attestation: 'confirmed_displayed_identity_questions',
+        });
+    }
+  };
+  const firstOriginal = f.upload([scopedSample('legacy-one'), scopedSample('legacy-two')]);
+  await reviewSubject(firstOriginal.id);
+  f.accept(f.review(firstOriginal.id));
   const ids = f.db
     .prepare('SELECT id FROM observations ORDER BY id')
     .all()
@@ -919,7 +944,9 @@ test('legacy pending choices remain visible but unpinned; historical accepted pa
     patient,
     delivery: 'A new fictional copy retains the same source assertion.',
   };
-  const pending = f.review(f.upload([copy]).id),
+  const nextOriginal = f.upload([copy]);
+  await reviewSubject(nextOriginal.id);
+  const pending = f.review(nextOriginal.id),
     record = pending.records[0]!;
   const target = record.comparisons!.find((other) => other.previousDecision)!;
   assert.equal(target.previousDecision!.scopeStatus, 'legacy');

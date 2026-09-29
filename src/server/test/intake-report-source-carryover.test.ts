@@ -15,7 +15,7 @@ import { createBackup } from '../recovery.ts';
 import { rebuildProfile } from '../portable.ts';
 import { fictionalModel } from './fictional-model.ts';
 import { getNote, saveNote } from '../notes.ts';
-import { getIntakeIdentityReview } from '../intake-identity.ts';
+import { getIntakeIdentityReview, confirmIntakeIdentityScope } from '../intake-identity.ts';
 import type {
   HealthRecordEnvelope,
   Intake,
@@ -256,10 +256,54 @@ function block(
   };
 }
 
-function accept(f: Fixture, blocks: IntakeReportAcceptanceBlock[]) {
+async function confirmFictionalIdentity(f: Fixture, intakeId: string, groupId: string) {
+  const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, intakeId, groupId);
+  if (review.status === 'conflict' || !review.scope) return;
+  if (!review.scope.subject.text.includes('Fictional Rowan Example')) return;
+  // These originals are JSONL fixtures, not printed patient headers. An exact
+  // scoped confirmation follows inspection of the retained fictional original.
+  assert.match(
+    intake.getIntakeOriginal(f.db, f.root, f.profileId, intakeId).bytes.toString('utf8'),
+    /Fictional Rowan Example/,
+  );
+  if (!review.scope.targets.length) return;
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, intakeId, {
+    version: review.scope.intakeVersion,
+    operationId: randomUUID(),
+    scope: review.scope,
+    outcome: 'this_is_me',
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+}
+
+async function accept(f: Fixture, blocks: IntakeReportAcceptanceBlock[]) {
+  const groupKeys = new Set<string>();
+  for (const block of blocks) {
+    const review = intake.reviewIntake(f.db, f.root, f.profileId, block.intakeId, block.proposalId);
+    for (const selection of block.selections) {
+      const record = review.records.find((candidate) => candidate.id === selection.recordId);
+      assert.ok(record, 'selection belongs to its exact fictional proposal');
+      for (const group of record.reportGroups || [])
+        groupKeys.add(JSON.stringify([block.intakeId, group.groupId]));
+    }
+  }
+  for (const key of groupKeys) {
+    const [intakeId, groupId] = JSON.parse(key) as [string, string];
+    await confirmFictionalIdentity(f, intakeId, groupId);
+  }
+  const freshBlocks = blocks.map((block) => {
+    const current = intake.reviewIntake(
+      f.db,
+      f.root,
+      f.profileId,
+      block.intakeId,
+      block.proposalId,
+    );
+    return { ...block, intakeVersion: current.version, reviewToken: current.reviewToken };
+  });
   return acceptIntakeReportSelection(f.db, f.root, f.profileId, {
     operationId: randomUUID(),
-    blocks,
+    blocks: freshBlocks,
   });
 }
 
@@ -330,24 +374,24 @@ async function resolveProposalIdentity(
           member.occurrences.some((occurrence) => occurrence.proposalId === proposalId),
         )
     )
-      await getIntakeIdentityReview(f.db, f.root, f.profileId, item.id, group.id);
+      await confirmFictionalIdentity(f, item.id, group.id);
   }
   const review = intake.reviewIntake(f.db, f.root, f.profileId, item.id, proposalId);
   assert.ok(
     review.records.every((record) => record.identityReview?.blocking !== true),
-    'source-only fixtures must establish supported Self identity without raw identity drafts',
+    'source-only fixtures establish Self identity through original review and exact scoped confirmation',
   );
-  return item;
+  return intake.getIntake(f.db, f.root, f.profileId, item.id);
 }
 
-test('fresh counted acceptance applies a reviewed report source to every selected result', (t) => {
+test('fresh counted acceptance applies a reviewed report source to every selected result', async (t) => {
   const f = fixture(t);
   let item = upload(f, [
     measurement('fresh-a', { report: report(), page: 1 }),
     measurement('fresh-b', { report: report(), page: 1 }),
   ]);
   item = confirmManualSource(f, item);
-  const result = accept(f, [block(f, item.id, null)]);
+  const result = await accept(f, [block(f, item.id, null)]);
   assert.equal(result.receipt.acceptedCount, 2);
   assert.ok(
     result.receipt.receipts[0]!.records.every(
@@ -393,7 +437,7 @@ test('counted report acceptance carries a reviewed source to unchanged later rep
   assert.equal(currentGroup.source, 'Fictional Body Studio');
   assert.equal(currentGroup.sourceScope, 'report');
   const proposalId = item.proposals.at(-1)!.id;
-  const result = accept(f, [block(f, item.id, null), block(f, item.id, proposalId)]);
+  const result = await accept(f, [block(f, item.id, null), block(f, item.id, proposalId)]);
   assert.equal(result.receipt.acceptedCount, 2);
   assert.ok(
     result.receipt.receipts
@@ -488,7 +532,7 @@ test('a changed linked source context does not inherit or later backfill an earl
           .candidateId,
     ),
   );
-  accept(f, [block(f, item.id, changedProposalId), block(f, item.id, returnedProposalId)]);
+  await accept(f, [block(f, item.id, changedProposalId), block(f, item.id, returnedProposalId)]);
   const finished = listIntakeReportQueue(f.db, f.root, f.profileId, { view: 'all' }).groups.find(
     (candidate) => candidate.intakeId === item.id,
   )!;
@@ -522,7 +566,7 @@ test('a repeated candidate version is attributed by its exact occurrence context
   item = await resolveProposalIdentity(f, item, proposalId);
   const current = intake.reviewIntake(f.db, f.root, f.profileId, item.id, proposalId);
   assert.equal(current.records[0]!.provider, 'Unknown source'); // Original acquisition remains unchanged.
-  accept(f, [block(f, item.id, proposalId)]);
+  await accept(f, [block(f, item.id, proposalId)]);
   assert.equal(
     observations(f.db, new URLSearchParams(), true).data[0]!.provider,
     'Different Fictional Clinic',
@@ -651,6 +695,10 @@ test('source carryover never crosses a changed report anchor, subject or source 
   const proposalId = item.proposals.at(-1)!.id;
   for (const group of item.workflow!.reportGroups!)
     await getIntakeIdentityReview(f.db, f.root, f.profileId, item.id, group.id);
+  const independentGroup = item.workflow!.reportGroups!.find(
+    (group) => group.report?.anchor.text === differentAnchor.anchor.text,
+  )!;
+  await confirmFictionalIdentity(f, item.id, independentGroup.id);
   const proposalRecords = intake.reviewIntake(
     f.db,
     f.root,
@@ -677,7 +725,9 @@ test('source carryover never crosses a changed report anchor, subject or source 
       .every((record) => record.identityReview?.blocking === true),
   );
   assert.ok(proposalRecords.every((record) => record.provider !== 'Fictional Body Studio'));
-  accept(f, [block(f, item.id, proposalId, new Set(ready.map((record) => record.candidateId!)))]);
+  await accept(f, [
+    block(f, item.id, proposalId, new Set(ready.map((record) => record.candidateId!))),
+  ]);
   assert.equal(
     listIntakeImportFeed(f.db, f.root, f.profileId, { view: 'all' })
       .blocks.flatMap((groupBlock) => groupBlock.records)
@@ -696,7 +746,7 @@ test('source carryover never crosses a changed report anchor, subject or source 
   );
 });
 
-test('two same-label report groups retain separate confirmations and exact member coverage', (t) => {
+test('two same-label report groups retain separate confirmations and exact member coverage', async (t) => {
   const f = fixture(t);
   const firstReport = report('Fictional report anchor A'),
     secondReport = report('Fictional report anchor B');
@@ -712,7 +762,7 @@ test('two same-label report groups retain separate confirmations and exact membe
   assert.equal(new Set(groups.map((group) => group.title)).size, 1);
   for (const group of groups)
     item = confirmGroupSource(f, item, group.groupId, 'Fictional Body Studio');
-  const result = accept(f, [block(f, item.id, null)]);
+  const result = await accept(f, [block(f, item.id, null)]);
   assert.equal(result.receipt.acceptedCount, 2);
   assert.equal(
     new Set(result.receipt.receipts[0]!.records.map((record) => record.reviewedSource?.groupId))
@@ -726,7 +776,7 @@ test('two same-label report groups retain separate confirmations and exact membe
   );
 });
 
-test('partial then bulk counted acceptance attributes all 190 fictional rows', (t) => {
+test('partial then bulk counted acceptance attributes all 190 fictional rows', async (t) => {
   const f = fixture(t),
     values = Array.from({ length: 190 }, (_, index) =>
       measurement(`bulk-${String(index).padStart(3, '0')}`, { report: report(), page: 1 }),
@@ -735,10 +785,10 @@ test('partial then bulk counted acceptance attributes all 190 fictional rows', (
   const review = intake.reviewIntake(f.db, f.root, f.profileId, item.id),
     firstTen = new Set(review.records.slice(0, 10).map((record) => record.candidateId!)),
     remaining = new Set(review.records.slice(10).map((record) => record.candidateId!));
-  const partial = accept(f, [block(f, item.id, null, firstTen)]);
+  const partial = await accept(f, [block(f, item.id, null, firstTen)]);
   assert.equal(partial.receipt.acceptedCount, 10);
   item = intake.getIntake(f.db, f.root, f.profileId, item.id);
-  const bulk = accept(f, [block(f, item.id, null, remaining)]);
+  const bulk = await accept(f, [block(f, item.id, null, remaining)]);
   assert.equal(bulk.receipt.acceptedCount, 180);
   const saved = observations(f.db, new URLSearchParams(), true).data;
   assert.equal(saved.length, 190);
@@ -748,7 +798,7 @@ test('partial then bulk counted acceptance attributes all 190 fictional rows', (
 
 test(
   'one explicit current choice covers a sparse nine-version 190-row report and rebuilds exactly',
-  { timeout: 40000 },
+  { timeout: 90000 },
   async (t) => {
     const f = fixture(t),
       increments = [12, 30, 10, 30, 12, 24, 24, 24, 24],
@@ -806,7 +856,7 @@ test(
       { total: 190, covered: 190, source: 'Fictional Body Studio' },
     );
     for (const proposalId of proposalIds) item = await resolveProposalIdentity(f, item, proposalId);
-    const accepted = accept(
+    const accepted = await accept(
       f,
       proposalIds.map((proposalId) => block(f, item.id, proposalId)),
     );
@@ -995,7 +1045,7 @@ test('saved source fallback does not label uncovered current or mixed saved repo
     measurement('saved-scope-first', { contextId: 'fictional-context' }),
   ]);
   item = confirmSuggestedSource(f, item, 'Fictional Body Studio');
-  accept(f, [block(f, item.id, null)]);
+  await accept(f, [block(f, item.id, null)]);
   item = intake.getIntake(f.db, f.root, f.profileId, item.id);
   item = propose(f, item, [
     context('Different Fictional Clinic'),
@@ -1011,7 +1061,7 @@ test('saved source fallback does not label uncovered current or mixed saved repo
 
   item = confirmSuggestedSource(f, item, 'Different Fictional Clinic');
   item = await resolveProposalIdentity(f, item, item.proposals.at(-1)!.id);
-  accept(f, [block(f, item.id, item.proposals.at(-1)!.id)]);
+  await accept(f, [block(f, item.id, item.proposals.at(-1)!.id)]);
   group = listIntakeReportQueue(f.db, f.root, f.profileId, { view: 'all' }).groups.find(
     (candidate) => candidate.intakeId === item.id,
   )!;
@@ -1124,7 +1174,7 @@ test(
     item = confirmSuggestedSource(f, item, 'Fictional First Studio');
     const initialProposalId = item.proposals.at(-1)!.id;
     item = await resolveProposalIdentity(f, item, initialProposalId);
-    accept(f, [block(f, item.id, initialProposalId)]);
+    await accept(f, [block(f, item.id, initialProposalId)]);
 
     item = intake.getIntake(f.db, f.root, f.profileId, item.id);
     item = submit(item, 'fictional-later-batch', [
@@ -1137,7 +1187,7 @@ test(
     item = await resolveProposalIdentity(f, item, laterProposalId);
     const laterReview = intake.reviewIntake(f.db, f.root, f.profileId, item.id, laterProposalId);
     const beforeConfirmation = new Set([laterReview.records[0]!.candidateId!]);
-    const unconfirmed = accept(f, [block(f, item.id, laterProposalId, beforeConfirmation)]);
+    const unconfirmed = await accept(f, [block(f, item.id, laterProposalId, beforeConfirmation)]);
     assert.equal(
       unconfirmed.receipt.receipts[0]!.records[0]!.reviewedSource?.source,
       'Fictional Later Studio',
@@ -1153,7 +1203,7 @@ test(
     const pending = intake
       .reviewIntake(f.db, f.root, f.profileId, item.id, laterProposalId)
       .records.filter((record) => record.reviewState === 'pending');
-    const individual = accept(f, [
+    const individual = await accept(f, [
       block(f, item.id, laterProposalId, new Set([pending[0]!.candidateId!])),
     ]);
     assert.equal(
@@ -1232,11 +1282,12 @@ test('exact reuse enriches only a canonical Unknown source and retains both evid
     sourceRecordId: 'FICT-EXACT-1',
   });
   const first = upload(f, [exact], 'fictional-unknown.jsonl');
-  accept(f, [block(f, first.id, null)]);
+  await accept(f, [block(f, first.id, null)]);
   assert.equal(observations(f.db, new URLSearchParams(), true).data[0]!.provider, 'Unknown source');
 
   let second = upload(f, [exact], 'fictional-reviewed.jsonl');
   second = confirmManualSource(f, second);
+  await confirmFictionalIdentity(f, second.id, second.workflow!.reportGroups![0]!.id);
   const request = {
       operationId: randomUUID(),
       blocks: [block(f, second.id, null)],
@@ -1308,7 +1359,7 @@ test('exact reuse enriches only a canonical Unknown source and retains both evid
   }
 });
 
-test('exact reuse never replaces a known source while retaining reviewed source evidence', (t) => {
+test('exact reuse never replaces a known source while retaining reviewed source evidence', async (t) => {
   const f = fixture(t);
   const exact = measurement('known-assertion', {
     report: report(),
@@ -1316,10 +1367,10 @@ test('exact reuse never replaces a known source while retaining reviewed source 
     sourceRecordId: 'FICT-KNOWN-1',
   });
   const first = upload(f, [exact], 'fictional-known.jsonl', 'Fictional Known Provider');
-  accept(f, [block(f, first.id, null)]);
+  await accept(f, [block(f, first.id, null)]);
   let second = upload(f, [exact], 'fictional-second-source.jsonl');
   second = confirmManualSource(f, second);
-  const result = accept(f, [block(f, second.id, null)]);
+  const result = await accept(f, [block(f, second.id, null)]);
   assert.equal(result.receipt.receipts[0]!.records[0]!.reviewedSource?.outcome, 'preserved_known');
   const saved = observations(f.db, new URLSearchParams(), true).data[0]!;
   assert.equal(saved.provider, 'Fictional Known Provider');
@@ -1345,13 +1396,13 @@ test('exact reuse never replaces a known source while retaining reviewed source 
   );
 });
 
-test('linked report source is a default on acceptance, without fabricating a human label receipt', (t) => {
+test('linked report source is a default on acceptance, without fabricating a human label receipt', async (t) => {
   const f = fixture(t);
   const item = upload(f, [
     context('Meadowglass Laboratory'),
     measurement('cookie-potassium', { contextId: 'fictional-context' }),
   ]);
-  const result = accept(f, [block(f, item.id, null)]);
+  const result = await accept(f, [block(f, item.id, null)]);
   const receipt = result.receipt.receipts[0]!.records[0]!;
   assert.equal(receipt.reviewedSource?.source, 'Meadowglass Laboratory');
   assert.equal(receipt.reviewedSource?.basis, 'suggested_report_label');

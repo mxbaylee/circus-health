@@ -250,10 +250,15 @@ test(
       (response) =>
         response.request().method() === 'PUT' &&
         response.url().endsWith(`/notes/${encodeURIComponent(firstCreate.id)}`) &&
+        response.request().postDataJSON()?.title === 'Fictional Dr. Rowan Updated' &&
         response.ok(),
     );
     releaseCreate();
     await followupSave;
+    await page.waitForFunction(
+      (input) => (input as HTMLInputElement).value === 'Fictional Dr. Rowan Updated',
+      await name.elementHandle(),
+    );
     assert.equal(await name.inputValue(), 'Fictional Dr. Rowan Updated');
     const saved = await api(`${notesPath}/${encodeURIComponent(firstCreate.id)}`);
     assert.equal(saved.personId, firstCreate.personId);

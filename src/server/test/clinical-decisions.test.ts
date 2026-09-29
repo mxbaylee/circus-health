@@ -1,6 +1,8 @@
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { getIntakeIdentityReview, confirmIntakeIdentityScope } from '../intake-identity.ts';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -216,6 +218,29 @@ function accept(
       ...amend(record),
     })),
   });
+}
+async function reviewScopedIdentity(f: Fixture, original: Intake) {
+  // This clinical-version fixture explicitly reviews its retained fictional patient.
+  const identityOriginal = original;
+  for (const group of identityOriginal.workflow?.reportGroups || []) {
+    const identity = await getIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      identityOriginal.id,
+      group.id,
+    );
+    assert.ok(identity.scope);
+    assert.equal(identity.scope.subject.text, 'Fictional Avery Orchid');
+    if (identity.blocking)
+      await confirmIntakeIdentityScope(f.db, f.root, f.profileId, identityOriginal.id, {
+        version: identity.scope.intakeVersion,
+        operationId: randomUUID(),
+        scope: identity.scope,
+        outcome: 'this_is_me',
+        attestation: 'confirmed_displayed_identity_questions',
+      });
+  }
 }
 function correction(
   f: Fixture,
@@ -1133,18 +1158,17 @@ test('actual encrypted profile stores correction and pair histories and rebuilds
   );
 });
 
-test('accepted procedure becomes a lab with stable identity, original references and repeat-delivery exception', (t) => {
+test('accepted procedure becomes a lab with stable identity, original references and repeat-delivery exception', async (t) => {
   // This positive version/correction case provides actual fictional subject
   // scope; changed unscoped assertions are covered by collision-refusal tests.
   const f = fixture(t, true);
-  accept(
-    f,
-    upload(f, 'procedure', 'creatinine', {
-      procedureLabel: 'Creatinine',
-      valueText: '1.20',
-      unit: 'mg/dL',
-    }),
-  );
+  const firstOriginal = upload(f, 'procedure', 'creatinine', {
+    procedureLabel: 'Creatinine',
+    valueText: '1.20',
+    unit: 'mg/dL',
+  });
+  await reviewScopedIdentity(f, firstOriginal);
+  accept(f, firstOriginal);
   const row = f.db.prepare('SELECT * FROM procedures').get()!,
     input = {
       kind: 'procedure',
@@ -1222,6 +1246,7 @@ test('accepted procedure becomes a lab with stable identity, original references
     { procedureLabel: 'Creatinine', valueText: '1.20', unit: 'mg/dL' },
     'Copying clinic',
   );
+  await reviewScopedIdentity(f, repeated);
   const review = typedReviewIntake(f.db, f.root, f.profileId, repeated.id);
   assert.equal(review.records[0].kind, 'observation');
   assert.equal(review.records[0].classification, 'duplicate');
