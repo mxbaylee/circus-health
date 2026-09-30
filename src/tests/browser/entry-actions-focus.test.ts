@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage } from './harness.ts';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -5,7 +6,6 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 import react from '@vitejs/plugin-react';
-import { chromium } from 'playwright';
 
 // Run real focus guards, the browser's focus events and portaled dialogs; jsdom
 // cannot exercise the intermediate focus transitions at a modal boundary.
@@ -45,20 +45,20 @@ test(
       ],
       server: { host: '127.0.0.1', port: 0 },
     });
+    t.after(() => vite.close());
     await vite.listen();
-    const browser = await chromium.launch();
+    const browser = await launchBrowser(t);
     t.after(async () => {
       await browser.close();
       await vite.close();
     });
-    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    const page = await newTestPage(browser, { viewport: { width: 390, height: 844 } });
     await page.goto(
       `http://127.0.0.1:${(vite.httpServer!.address() as AddressInfo).port}/__entry_focus`,
       {
         waitUntil: 'domcontentloaded',
       },
     );
-    page.setDefaultTimeout(5000);
     const trigger = page.locator('.entry-actions-trigger');
     for (let pass = 0; pass < 3; pass++) {
       await trigger.click();

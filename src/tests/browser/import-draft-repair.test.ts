@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AppOptions } from '../../server/index.ts';
@@ -8,14 +9,12 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 import { fictionalModel } from '../../server/test/fictional-model.ts';
 import type { HealthTool } from '../../server/proxy-model-bridge.ts';
 
 test(
   'selected draft repair reads retained original, previews, and applies through the encrypted app',
-  { timeout: 90000 },
+  { timeout: 60000 },
   async (t) => {
     fictionalModel(t);
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-draft-repair-'));
@@ -27,7 +26,7 @@ test(
     let retainedOriginalText = '';
     let modelAvailable = false;
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
@@ -110,9 +109,8 @@ test(
     });
     // Use the built app and isolated runtime port, as other encrypted journeys do.
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
-    page.setDefaultTimeout(15000);
+    browser = await launchBrowser(t);
+    const page = await newTestPage(browser, { viewport: { width: 1440, height: 1000 } });
     await page.goto(url);
     const setup = await page.evaluate(async () => {
       const post = async (path: string, body: unknown) => {

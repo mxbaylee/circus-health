@@ -209,11 +209,11 @@ export function requireCorrectedOwnershipReview(
   record: IntakeReviewRecord,
   identity: string,
   file?: { id: string; sha256: string; details_json?: string },
+  workflow: IntakeWorkflow | undefined = file
+    ? (json(file.details_json) as { intake?: { workflow?: IntakeWorkflow } }).intake?.workflow
+    : undefined,
 ) {
   const source = ownershipSourceAuthority(db, identity);
-  const workflow = file
-    ? (json(file.details_json) as { intake?: { workflow?: IntakeWorkflow } }).intake?.workflow
-    : undefined;
   const group = workflow?.reportGroups?.find((g) =>
     record.reportGroups?.some((r) => r.groupId === g.id),
   );

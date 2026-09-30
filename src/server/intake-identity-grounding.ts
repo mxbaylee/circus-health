@@ -131,3 +131,35 @@ export function identityOriginalBirthDateEvidenceLookup(db: DatabaseSync, bounda
     return entry ? structuredClone(entry.birthDates) : undefined;
   };
 }
+
+/** One synchronous review owns this snapshot. Discard it before any write or await. */
+export function identityReviewGroundingLookups(db: DatabaseSync, boundary: Boundary) {
+  const entries = new Map<IntakeReportGroup, { entry?: Grounding; current: boolean }>();
+  function lookup(group: IntakeReportGroup) {
+    let value = entries.get(group);
+    if (!value) {
+      const entry = grounded.get(db)?.get(originalDateKey(boundary, group));
+      value = { entry, current: !!entry && entry.boundaryKey === boundaryKey(boundary, group) };
+      entries.set(group, value);
+    }
+    return value;
+  }
+  return {
+    subjectGrounded: (group: IntakeReportGroup) => {
+      const { entry, current } = lookup(group);
+      return current && entry?.subject === true;
+    },
+    nameQuestionGrounded: (group: IntakeReportGroup, issue: Question) => {
+      const { entry, current } = lookup(group);
+      return current && entry?.nameQuestions.has(hash([issue.prompt, issue.textAnchor])) === true;
+    },
+    grounded: (group: IntakeReportGroup, issue: Question, receipt: IntakeIdentityReceipt) => {
+      const { entry, current } = lookup(group);
+      return current && entry?.questions.has(questionKey(issue, receipt)) === true;
+    },
+    originalBirthDateEvidence: (group: IntakeReportGroup) => {
+      const { entry } = lookup(group);
+      return entry ? structuredClone(entry.birthDates) : undefined;
+    },
+  };
+}

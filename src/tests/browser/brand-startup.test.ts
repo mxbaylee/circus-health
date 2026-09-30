@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
@@ -6,14 +7,12 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 
 test('startup branding follows saved appearance across cold load and keyboard entry', async (t) => {
   const root = mkdtempSync(resolve(tmpdir(), 'circus-brand-startup-'));
   mkdirSync(resolve(root, 'data'));
   const runtimeDirectory = createTestRuntimeDirectory();
-  const runtime = await startRuntime({
+  const runtime = await startBrowserRuntime(t, {
     dataDirectory: resolve(root, 'data'),
     runtimeDirectory,
     port: 0,
@@ -33,9 +32,9 @@ test('startup branding follows saved appearance across cold load and keyboard en
     rmSync(runtimeDirectory, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
   });
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser(t);
   t.after(() => browser.close());
-  const page = await browser.newPage({
+  const page = await newTestPage(browser, {
     viewport: { width: 1280, height: 850 },
     colorScheme: 'light',
   });

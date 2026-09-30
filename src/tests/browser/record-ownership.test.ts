@@ -1,38 +1,36 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import { fictionalModel } from '../../server/test/fictional-model.ts';
 
 test(
   'encrypted browser previews selected ownership, reconciles a lost response and preserves originals across reload',
-  { timeout: 90000 },
+  { timeout: 60000 },
   async (t) => {
     fictionalModel(t);
     const root = mkdtempSync(resolve(tmpdir(), 'fictional-ownership-browser-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
       host: '127.0.0.1',
       assistantOptions: { availability: () => ({ available: false, readiness: 'unavailable' }) },
     });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await launchBrowser(t);
     t.after(async () => {
       await browser.close();
       await runtime.close();
       rmSync(runtimeDirectory, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     });
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    page.setDefaultTimeout(12000);
+    const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;

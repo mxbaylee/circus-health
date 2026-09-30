@@ -42,6 +42,7 @@ import type {
   IntakeReportGroup,
   IntakeReportSourceConfirmation,
   IntakeSourceContext,
+  IntakeWorkflow,
 } from '../shared/intake.ts';
 import { canonicalLiteral, type IntakeEntry } from './intake-format.ts';
 import { HttpError, json, revision, now } from './database.ts';
@@ -556,6 +557,7 @@ export function refreshClinicalIdentityPolicy(
   db: DatabaseSync,
   file: SourceFileRow,
   record: IntakeReviewRecord,
+  workflow?: IntakeWorkflow,
 ): void {
   const internal = record as IntakeReviewRecord & {
     problem?: string | null;
@@ -564,7 +566,8 @@ export function refreshClinicalIdentityPolicy(
   };
   const clinicalIdentity = (record as IntakeReviewRecord & { ownershipIdentity?: string })
     .ownershipIdentity;
-  if (clinicalIdentity) requireCorrectedOwnershipReview(db, record, clinicalIdentity, file);
+  if (clinicalIdentity)
+    requireCorrectedOwnershipReview(db, record, clinicalIdentity, file, workflow);
   const assigned = record.identityAttribution?.assignedPerson;
   if (record.mapping.personId) {
     const person = db
@@ -1019,6 +1022,7 @@ function occurrenceContext(
   entry: IntakeEntry,
   review: ClinicalReview,
   record: ClinicalReviewRecord,
+  confirmationHashes: Map<IntakeReportSourceConfirmation, string>,
 ): IntakeOccurrenceContext {
   const acquisition = db
     .prepare('SELECT provider_id,sha256,bytes FROM source_files WHERE id=?')
@@ -1031,6 +1035,16 @@ function occurrenceContext(
     record,
     { proposalId: review.proposalId, recordId: record.id },
   );
+  // Hash the entire immutable confirmation once per synchronous pass. Every
+  // field remains pinned, without serializing all report members for every row.
+  let confirmationHash: string | undefined;
+  if (reportSource) {
+    confirmationHash = confirmationHashes.get(reportSource.confirmation);
+    if (!confirmationHash) {
+      confirmationHash = hash(canonical(reportSource.confirmation));
+      confirmationHashes.set(reportSource.confirmation, confirmationHash);
+    }
+  }
   const context = {
     intakeId: review.intakeId,
     proposalId: review.proposalId,
@@ -1043,7 +1057,15 @@ function occurrenceContext(
     identityAttribution: record.identityAttribution || null,
     identityReview: record.identityReview || null,
     reportGroups: record.reportGroups || [],
-    reviewedReportSource: reportSource || null,
+    reviewedReportSource: reportSource
+      ? {
+          confirmationHash,
+          groupVersionId: reportSource.coverage.groupVersionId,
+          contextId: reportSource.coverage.contextId,
+          extensionId: reportSource.coverage.extensionId || null,
+          coverageEntryId: reportSource.coverage.coverageEntryId || null,
+        }
+      : null,
     evidence: record.evidence,
   };
   return {
@@ -1164,6 +1186,7 @@ export function finalizeClinicalPairScopes(
   entries: IntakeEntry[],
   review: ClinicalReview,
 ): void {
+  const confirmationHashes = new Map<IntakeReportSourceConfirmation, string>();
   const entriesByRecordId = new Map(
     entries.map((entry) => [`${inputFile.id}:line:${entry.line}`, entry]),
   );
@@ -1171,7 +1194,15 @@ export function finalizeClinicalPairScopes(
     if (!isClinicalKind(record.kind) || !record.comparisonReference) continue;
     const entry = entriesByRecordId.get(record.id);
     if (!entry) throw new Error('Clinical review entry is missing from its retained proposal');
-    const occurrence = occurrenceContext(db, file, inputFile, entry, review, record);
+    const occurrence = occurrenceContext(
+      db,
+      file,
+      inputFile,
+      entry,
+      review,
+      record,
+      confirmationHashes,
+    );
     record.comparisonContextHash = occurrence.contextHash;
     const incoming = {
       ...record.comparisonReference,
@@ -1436,6 +1467,7 @@ export function validateClinicalPairScopes(
   review: ClinicalReview,
   decisions: IntakeReviewDecision[],
 ): Set<string> {
+  const confirmationHashes = new Map<IntakeReportSourceConfirmation, string>();
   const selected = new Map(decisions.map((decision) => [decision.recordId, decision]));
   assertClinicalSourceScopes(db, file, inputFile, entries, decisions);
   const entriesByRecordId = new Map(
@@ -1446,7 +1478,15 @@ export function validateClinicalPairScopes(
     const entry = entriesByRecordId.get(record.id);
     if (!entry) throw new Error('Clinical review entry is missing from its retained proposal');
     if (!isClinicalKind(record.kind)) continue;
-    const occurrence = occurrenceContext(db, file, inputFile, entry, review, record);
+    const occurrence = occurrenceContext(
+      db,
+      file,
+      inputFile,
+      entry,
+      review,
+      record,
+      confirmationHashes,
+    );
     const incoming = {
       id: record.id,
       kind: record.kind,
@@ -1492,6 +1532,7 @@ export function projectClinicalReview(
     occurrenceAuthorityFinalizers: compoundOccurrenceFinalizers,
   }: ProjectReviewInput,
 ): ProjectionResults {
+  const confirmationHashes = new Map<IntakeReportSourceConfirmation, string>();
   const selected = new Map<string, IntakeReviewDecision>(
     (decisions || []).map((decision) => [decision.recordId, decision]),
   );
@@ -1615,7 +1656,15 @@ export function projectClinicalReview(
         'DUPLICATE_DECISION',
         'Attach one incoming occurrence to at most one reviewed saved record',
       );
-    const recordOccurrence = occurrenceContext(db, file, inputFile, entry, review, record);
+    const recordOccurrence = occurrenceContext(
+      db,
+      file,
+      inputFile,
+      entry,
+      review,
+      record,
+      confirmationHashes,
+    );
     const saveComparisons = (mapping: ClinicalMapping, entityId = record.id): void => {
       for (const comparison of [...recordComparisons].sort(
         (left, right) =>

@@ -15,15 +15,69 @@ concurrency:
 
 jobs:
   checks:
+    if: always()
+    needs: [unit, components, server, continuation, browser, brand-assets, proxy-compatibility]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 2
+    steps:
+      - name: Require every validation lane to pass
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: node -e 'if (Object.values(JSON.parse(process.env.JOB_RESULTS)).some(job => job.result !== "success")) process.exit(1)'
+
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
-      CRS_CODEX_INTEGRATION_TEST: '0'
       HUSKY: '0'
-    defaults:
-      run:
-        working-directory: .
-        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run format:check
+      - run: node scripts/repository-file-inventory.ts --check
+      - run: npm run typecheck
+      - name: Install PDF dependency for benchmark tooling tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qpdf
+      - run: npm run test:deploy
+      - run: npm run test:tools
+      - run: npm run test:state
+
+  components:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HUSKY: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run test:ui
+
+  server:
+    name: Server (${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    env:
+      HUSKY: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -38,26 +92,59 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes qpdf
-      - run: npm run format:check
-      - name: Check tracked-file coverage
-        working-directory: .
-        run: node scripts/repository-file-inventory.ts --check
-      - name: Launcher and icon tooling tests
-        run: npm run test:deploy
-      - run: npm run typecheck
-      - run: npm run build
-      - name: Server tests with temporary synthetic fixtures
-        run: npm run test:server
-      - name: Qualification oracles and host benchmark tests
-        run: npm run test:tools
+      - name: Server tests with isolated fictional fixtures
+        run: npm run test:server -- --test-shard=${{ matrix.shard }}/2
+
+  continuation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HUSKY: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Install scoped PDF extraction dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qpdf
       - name: Controlled 100-page automatic continuation
         run: npm run test:continuation
-      - run: npm run test:state
-      - run: npm run test:ui
-      - name: Install Chromium for the focused browser journey
-        run: npx playwright install --with-deps chromium
-      - name: Browser profile, import and recovery journey
-        run: npm run test:browser
+
+  browser:
+    name: Browser (${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    env:
+      HUSKY: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Install scoped PDF extraction dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qpdf
+      - run: npm run build:assets
+      - run: npx playwright install --with-deps chromium
+      - name: Browser journeys with scripted third-party boundaries
+        run: npm run test:browser:run -- --test-shard=${{ matrix.shard }}/2
 
   brand-assets:
     name: Brand assets (${{ matrix.os }})

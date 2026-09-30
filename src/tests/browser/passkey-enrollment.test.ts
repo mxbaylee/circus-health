@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
 import type { Note } from '../../shared/api.ts';
@@ -11,8 +12,6 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 
 declare global {
   interface Window {
@@ -29,7 +28,7 @@ const dockerMode = process.env.CRS_PASSKEY_DOCKER_TEST === '1';
 for (const prfOutput of ['buffer', 'array'])
   test(
     `automatic passkey confirmation and default restart unlock with ${prfOutput} PRF; cancellation and missing PRF preserve recovery`,
-    { timeout: 120000 },
+    { timeout: 60000 },
     async (t) => {
       const root = realpathSync(mkdtempSync(resolve(tmpdir(), 'circus-passkey-browser-')));
       const repository = fileURLToPath(new URL('../../../', import.meta.url));
@@ -42,7 +41,7 @@ for (const prfOutput of ['buffer', 'array'])
       const origin = `http://localhost:${port}`,
         project = `circus-passkey-test-${process.pid}`,
         container = `${project}-health`;
-      let runtime: Awaited<ReturnType<typeof startRuntime>> | undefined,
+      let runtime: Awaited<ReturnType<typeof startBrowserRuntime>> | undefined,
         browser: Browser | undefined;
       mkdirSync(resolve(root, 'auth'));
       writeFileSync(resolve(root, 'empty.env'), '');
@@ -92,7 +91,7 @@ for (const prfOutput of ['buffer', 'array'])
             'health',
           ]);
         else
-          runtime = await startRuntime({
+          runtime = await startBrowserRuntime(t, {
             dataDirectory: data,
             runtimeDirectory,
             port,
@@ -121,8 +120,8 @@ for (const prfOutput of ['buffer', 'array'])
         rmSync(root, { recursive: true, force: true });
       });
       await start();
-      browser = await chromium.launch({ headless: true });
-      const page = await browser.newPage({ viewport: { width: 1280, height: 900 } }),
+      browser = await launchBrowser(t);
+      const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } }),
         errors: string[] = [],
         savedRequests = [];
       page.on('pageerror', (error) => errors.push(error.message));

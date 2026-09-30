@@ -9,7 +9,7 @@ import { fictionalModel } from './fictional-model.ts';
 
 test(
   'real process loss keeps encrypted automatic intent dormant until unlock; Stop survives and tab-independent dispatch resumes',
-  { timeout: 90000 },
+  { timeout: 30000 },
   async (t) => {
     fictionalModel(t);
     const root = mkdtempSync(join(tmpdir(), 'fictional-intake-process-'));
