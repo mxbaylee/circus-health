@@ -18,3 +18,10 @@ export function accountedUnitKind(
   );
   return receipt ? coverage.kind : null;
 }
+
+/** Both the coordinator's stall streak and the assistant's context use this unit. */
+export function nextPendingReadingUnit(
+  plan: IntakeExtractionPlan,
+): IntakeExtractionUnit | undefined {
+  return plan.units.find((unit) => !accountedUnitKind(plan, unit) && !unit.processingException);
+}

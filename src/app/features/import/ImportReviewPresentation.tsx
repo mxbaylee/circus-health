@@ -184,6 +184,7 @@ export interface ImportReviewModel {
         retryAt: string | null;
         uncertain?: boolean;
         done: boolean;
+        queued?: boolean;
         exceptions: number;
       }[];
       /** Calendar time for this batch, including provider and queue waits. */

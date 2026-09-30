@@ -11,7 +11,10 @@ export function OwnershipSelectionControl({
   onApplied: () => void | Promise<void>;
 }) {
   const profile = useProfile();
-  const routeKey = window.location.hash.split('?')[0] || window.location.pathname;
+  const routeKey =
+    typeof window === 'undefined'
+      ? ''
+      : window.location.hash.split('?')[0] || window.location.pathname;
   const storageKey = `ownership-selected:${profile?.id || ''}:${routeKey}`;
   type SelectedRecord = OwnershipRecordReference & { title: string };
   const readSelection = (): Map<string, SelectedRecord> => {

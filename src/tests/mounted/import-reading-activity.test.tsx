@@ -92,12 +92,16 @@ it('starts a rough estimate after fifteen seconds and keeps one for read-but-una
   const view = render(<ImportReadingActivity activity={reading} />);
   expect(screen.getByText('Estimating…')).toBeVisible();
   act(() => vi.advanceTimersByTime(15_000));
-  expect(screen.getByText('Rough estimate: 1–2 minutes remaining')).toBeVisible();
+  expect(
+    screen.getByText('Rough estimate, narrows as files are read: about 1–2 minutes remaining'),
+  ).toBeVisible();
   reading.progress!.readWindows = 2;
   reading.progress!.readyRecords = 8;
   act(() => vi.advanceTimersByTime(105_000));
   view.rerender(<ImportReadingActivity activity={reading} />);
-  expect(screen.getByText('Rough estimate: 2–6 minutes remaining')).toBeVisible();
+  expect(
+    screen.getByText('Rough estimate, narrows as files are read: about 2–6 minutes remaining'),
+  ).toBeVisible();
   expect(screen.queryByText('Estimating…')).toBeNull();
   reading.progress!.accounted = 2;
   view.rerender(<ImportReadingActivity activity={reading} />);
@@ -117,7 +121,9 @@ it('does not count paused time or page preparation speed toward the estimate', (
     sliceStartedAt: null,
   });
   render(<ImportReadingActivity activity={reading} />);
-  expect(screen.getByText('Rough estimate: 1–2 minutes remaining')).toBeVisible();
+  expect(
+    screen.getByText('Rough estimate, narrows as files are read: about 1–2 minutes remaining'),
+  ).toBeVisible();
 });
 
 it('combines observed file work and known waits in hours but leaves unknown availability uncertain', () => {
@@ -135,11 +141,17 @@ it('combines observed file work and known waits in hours but leaves unknown avai
     exceptions: 0,
   }));
   const view = render(<ImportReadingActivity activity={combined} />);
-  expect(screen.getByText('Rough estimate: 1.8–3.4 hours remaining across files')).toBeVisible();
+  expect(
+    screen.getByText(
+      'Rough estimate, narrows as files are read: about 2–4 hours remaining across files',
+    ),
+  ).toBeVisible();
   combined.progress!.files[1].uncertain = true;
   view.rerender(<ImportReadingActivity activity={combined} />);
-  expect(screen.getByText('Estimating…')).toBeVisible();
-  expect(screen.queryByText(/Rough estimate/)).toBeNull();
+  expect(
+    screen.getByText(/about 2–3 hours remaining across files; 1 file is not yet included/),
+  ).toBeVisible();
+  expect(screen.queryByText('Estimating…')).toBeNull();
 });
 
 it('keeps done with exceptions distinct and exposes an explicit exception retry', async () => {
@@ -153,4 +165,101 @@ it('keeps done with exceptions distinct and exposes an explicit exception retry'
   screen.getByRole('button', { name: 'Retry exceptions' }).click();
   expect(retry).toHaveBeenCalledOnce();
   expect(screen.queryByText('Estimating…')).toBeNull();
+});
+
+// A backlog's unmeasured files are an explicit gap, not grounds for discarding
+// observed work or promising a provider reset; see docs/import/automatic-recovery.md.
+it('estimates measured work in a fifteen-file backlog and names the fourteen queued omissions', () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(start));
+  const backlog = activity();
+  backlog.activeFiles = 15;
+  backlog.progress!.files = Array.from({ length: 15 }, (_, index) => ({
+    accounted: index === 0 ? 2 : 0,
+    total: index === 0 ? 10 : 0,
+    readWindows: index === 0 ? 2 : 0,
+    activeMs: index === 0 ? 360000 : 0,
+    sliceStartedAt: null,
+    retryAt: null,
+    done: false,
+    queued: index > 0,
+    exceptions: 0,
+  }));
+  render(<ImportReadingActivity activity={backlog} />);
+  expect(screen.getByText(/Rough estimate.*14 files are not yet included/)).toBeVisible();
+  expect(screen.getByText('0 of 15 files done · 14 queued')).toBeVisible();
+  expect(screen.queryByText('Estimating…')).not.toBeInTheDocument();
+});
+
+it('uses whole days for a long single file, without implying multiple files', () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(start));
+  const long = activity();
+  long.activeFiles = 1;
+  long.progress!.files = [
+    {
+      accounted: 1,
+      total: 10000,
+      readWindows: 1,
+      activeMs: 600000,
+      sliceStartedAt: null,
+      retryAt: null,
+      done: false,
+      exceptions: 0,
+    },
+  ];
+  render(<ImportReadingActivity activity={long} />);
+  expect(screen.getByText(/about \d+–\d+ days remaining$/)).toBeVisible();
+  expect(screen.queryByText(/across files/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/\d\.\d+ hours/)).not.toBeInTheDocument();
+});
+
+it('keeps an unknown provider reset uncertain despite a local retry deadline', () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(start));
+  const waiting = activity();
+  waiting.activeFiles = 1;
+  waiting.detail = 'Provider availability is unknown; reading will retry automatically.';
+  waiting.detailIsImportant = true;
+  waiting.progress!.files = [
+    {
+      accounted: 2,
+      total: 10,
+      readWindows: 2,
+      activeMs: 360000,
+      sliceStartedAt: null,
+      retryAt: '2026-09-28T12:01:00.000Z',
+      done: false,
+      exceptions: 0,
+      uncertain: true,
+    },
+  ];
+  render(<ImportReadingActivity activity={waiting} />);
+  expect(screen.getByText(waiting.detail)).toBeVisible();
+  expect(screen.getByText('Estimating…')).toBeVisible();
+  expect(screen.queryByText(/Rough estimate/)).not.toBeInTheDocument();
+});
+
+it('explains the queued estimate gap after the first of fifteen files finishes', () => {
+  const backlog = activity();
+  backlog.activeFiles = 14;
+  backlog.progress!.files = Array.from({ length: 15 }, (_, index) => ({
+    accounted: index === 0 ? 10 : 0,
+    total: index === 0 ? 10 : 0,
+    readWindows: index === 0 ? 10 : 0,
+    activeMs: index === 0 ? 360000 : 0,
+    sliceStartedAt: null,
+    retryAt: null,
+    done: index === 0,
+    queued: index > 0,
+    exceptions: 0,
+  }));
+  render(<ImportReadingActivity activity={backlog} />);
+  expect(screen.getByText('1 of 15 files done · 14 queued')).toBeVisible();
+  expect(
+    screen.getByText(
+      /14 files are not yet estimated; 1 completed file took 6 minutes of active reading/,
+    ),
+  ).toBeVisible();
+  expect(screen.queryByText('Estimating…')).not.toBeInTheDocument();
 });

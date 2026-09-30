@@ -56,7 +56,10 @@ export function RecordOwnershipAction({
           .map((record) => `${record.kind}:${record.recordId}`)
           .sort()
           .join('|')}`;
-  const routeKey = window.location.hash.split('?')[0] || window.location.pathname;
+  const routeKey =
+    typeof window === 'undefined'
+      ? ''
+      : window.location.hash.split('?')[0] || window.location.pathname;
   const recoveryKey = `ownership-operation:${profile?.id || ''}:${routeKey}:${label}:${selectionKey}`;
   const contextKey = `${profile?.id || ''}:${dialogId}:${open}`;
   const liveContext = useRef(contextKey);

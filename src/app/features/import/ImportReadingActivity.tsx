@@ -26,24 +26,43 @@ function remainingEstimate(
   const activeMs =
     Math.max(0, progress.activeMs) + (Number.isFinite(slice) ? Math.max(0, now - slice) : 0);
   if (progress.files?.length) {
-    const estimates = progress.files
-      .filter((file) => !file.done)
-      .map((file) => {
-        const elapsed =
-          file.activeMs +
-          (file.sliceStartedAt ? Math.max(0, now - Date.parse(file.sliceStartedAt)) : 0);
-        const completed = Math.max(file.accounted, Math.min(file.total, file.readWindows) / 2);
-        if (file.uncertain || !file.total || !completed || elapsed < 15000) return null;
-        const wait = file.retryAt ? Math.max(0, Date.parse(file.retryAt) - now) : 0;
-        return {
-          work: Math.max(30000, (file.total - completed) * Math.max(15000, elapsed / completed)),
-          wait,
-        };
-      });
-    if (!estimates.length || estimates.some((value) => value === null)) return null;
-    const work = estimates.reduce((sum, value) => sum + value!.work, 0);
-    const wait = Math.max(...estimates.map((value) => value!.wait));
-    return estimateRange(work + wait, work * 3 + wait, true);
+    const pending = progress.files.filter((file) => !file.done);
+    const estimates = pending.map((file) => {
+      const elapsed =
+        file.activeMs +
+        (file.sliceStartedAt ? Math.max(0, now - Date.parse(file.sliceStartedAt)) : 0);
+      const completed = Math.max(file.accounted, Math.min(file.total, file.readWindows) / 2);
+      if (file.uncertain || !file.total || !completed || elapsed < 15000) return null;
+      const wait = file.retryAt ? Math.max(0, Date.parse(file.retryAt) - now) : 0;
+      return {
+        work: Math.max(30000, (file.total - completed) * Math.max(15000, elapsed / completed)),
+        wait,
+      };
+    });
+    const measured = estimates.filter(
+      (value): value is { work: number; wait: number } => value !== null,
+    );
+    if (!measured.length) {
+      const finished = progress.files.filter((file) => file.done && file.activeMs > 0);
+      if (!finished.length) return null;
+      const observed = finished.reduce((sum, file) => sum + file.activeMs, 0);
+      return (
+        pending.length +
+        (pending.length === 1 ? ' file is' : ' files are') +
+        ' not yet estimated; ' +
+        finished.length +
+        (finished.length === 1 ? ' completed file took ' : ' completed files took ') +
+        duration(observed) +
+        ' of active reading. The remaining estimate will narrow as files are read.'
+      );
+    }
+    const work = measured.reduce((sum, value) => sum + value.work, 0);
+    const wait = Math.max(...measured.map((value) => value.wait));
+    const omitted = pending.length - measured.length;
+    return (
+      estimateRange(work + wait, work * 3 + wait, progress.files.length > 1) +
+      (omitted ? `; ${omitted} ${omitted === 1 ? 'file is' : 'files are'} not yet included` : '')
+    );
   }
   if (activeFiles > 1) return null;
   // A batch wall clock is usable only for a single file without an active clock.
@@ -65,22 +84,17 @@ function remainingEstimate(
 }
 
 function estimateRange(lowMs: number, highMs: number, combined = false) {
-  const hours = highMs >= 3600000;
-  const divisor = hours ? 3600000 : 60000;
-  const low = Math.max(
-    hours ? 0.1 : 1,
-    Math.ceil((lowMs / divisor) * (hours ? 10 : 1)) / (hours ? 10 : 1),
-  );
-  const high = Math.max(
-    low + (hours ? 0.1 : 1),
-    Math.ceil((highMs / divisor) * (hours ? 10 : 1)) / (hours ? 10 : 1),
-  );
+  const days = highMs >= 2 * 24 * 3600000;
+  const hours = !days && highMs >= 3600000;
+  const divisor = days ? 24 * 3600000 : hours ? 3600000 : 60000;
+  const low = Math.max(1, Math.ceil(lowMs / divisor));
+  const high = Math.max(low + 1, Math.ceil(highMs / divisor));
   return (
-    'Rough estimate: ' +
+    'Rough estimate, narrows as files are read: about ' +
     low +
     '–' +
     high +
-    (hours ? ' hours' : ' minutes') +
+    (days ? ' days' : hours ? ' hours' : ' minutes') +
     (combined ? ' remaining across files' : ' remaining')
   );
 }
@@ -135,6 +149,11 @@ export function ImportReadingActivity({
         )}
         {progress && (
           <div className="import-reading-progress">
+            <small>
+              {progress.files?.filter((file) => file.done).length || 0} of{' '}
+              {progress.files?.length || 1} files done ·{' '}
+              {progress.files?.filter((file) => file.queued).length || 0} queued
+            </small>
             <small>
               {progress.readWindows} pages/units read · {progress.accounted} of{' '}
               {progress.total || '?'} units accounted for

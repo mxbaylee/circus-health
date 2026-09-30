@@ -19,6 +19,9 @@ interface WorkerRequest {
   requestId: number;
   action: 'index' | 'page' | 'identity' | 'search';
   sourceId?: string;
+  pageStart?: number;
+  pageLimit?: number;
+  pagesOnly?: boolean;
   page?: number;
   offset?: number;
   query?: string;
@@ -335,21 +338,43 @@ async function boundedAttachments(
   return result;
 }
 
-async function indexPdf(sourceId: string) {
+async function indexPdf(sourceId: string, pageStart = 1, pageLimit = 64, pagesOnly = false) {
   assertSameOpenFile();
   const doc = document!;
+  if (pagesOnly) return { pages: doc.numPages, sections: [], references: [] };
   const sections: { id: string; locator: string; page: number }[] = [];
   const references: Record<string, unknown>[] = [];
-  for (let number = 1; number <= doc.numPages; number++) {
+  const overflowPages = new Set<number>();
+  let referenceBytes = 0;
+  // Reserve space for the page inventory and one located capacity marker per
+  // page. Long Unicode destination names can reach the byte bound before 5,000
+  // references; that must not discard the rest of this readable PDF.
+  const referenceOutputLimit = INTAKE_PDF_BOUNDS.maxIndexOutputBytes - 65 * 1024;
+  const capacity = (number: number) => {
+    if (overflowPages.has(number)) return;
+    overflowPages.add(number);
+    references.push({
+      id: `reference-capacity:${sourceId}:${number}`,
+      source: '',
+      locator: `page ${number}, remaining references`,
+      status: 'capacity_exception',
+      note: 'Further references on this page were not indexed; page text remains readable.',
+    });
+  };
+  for (
+    let number = pageStart;
+    number <= Math.min(doc.numPages, pageStart + pageLimit - 1);
+    number++
+  ) {
     sections.push({ id: `page:${number}`, locator: `page ${number}`, page: number });
     const page = await doc.getPage(number);
     const annotations = (await page.getAnnotations()) as PdfAnnotation[];
     for (const annotation of annotations) {
+      if (overflowPages.has(number)) continue;
       if (!annotation.dest && !annotation.url && !annotation.unsafeUrl) continue;
       if (references.length >= INTAKE_PDF_BOUNDS.maxReferences) {
-        const error = new Error('This PDF exceeds 5,000 indexed references; original retained');
-        Object.assign(error, { code: 'REFERENCE_LIMIT' });
-        throw error;
+        capacity(number);
+        continue;
       }
       const reference: Record<string, unknown> = {
         id: 'reference:' + hashValue([sourceId, number, annotation.id]),
@@ -380,6 +405,12 @@ async function indexPdf(sourceId: string) {
           reference.status = 'unresolved_reference';
         }
       }
+      const bytes = Buffer.byteLength(JSON.stringify(reference)) + 1;
+      if (referenceBytes + bytes > referenceOutputLimit) {
+        capacity(number);
+        continue;
+      }
+      referenceBytes += bytes;
       references.push(reference);
     }
     page.cleanup();
@@ -598,7 +629,12 @@ async function handleRequest(request: WorkerRequest) {
   try {
     const result =
       request.action === 'index'
-        ? await indexPdf(String(request.sourceId || ''))
+        ? await indexPdf(
+            String(request.sourceId || ''),
+            Number(request.pageStart || 1),
+            Number(request.pageLimit || 64),
+            request.pagesOnly === true,
+          )
         : request.action === 'identity'
           ? await identityPageText(Number(request.page))
           : request.action === 'search'
