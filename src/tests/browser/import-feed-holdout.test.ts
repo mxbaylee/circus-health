@@ -509,11 +509,7 @@ test(
         exact: true,
       })
       .waitFor();
-    await page
-      .getByText('Save was not confirmed. Check the saved receipt before retrying.', {
-        exact: true,
-      })
-      .waitFor();
+    await page.getByRole('button', { name: 'Check save status', exact: true }).waitFor();
     assert.equal(
       await page.getByRole('button', { name: 'Add 2 people', exact: true }).isDisabled(),
       true,

@@ -266,9 +266,11 @@ test(
     assert(uploadResponse.ok(), await uploadResponse.text());
     assert.equal((await uploadResponse.json()).data.state, 'ready');
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
-    await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
-    await page.getByRole('button', { name: 'Dismiss notification' }).click();
-    assert.equal(await page.getByText('Imported 1 record', { exact: true }).count(), 0);
+    await page
+      .getByRole('region', { name: 'Save outcomes' })
+      .getByRole('status')
+      .getByText('1 saved', { exact: true })
+      .waitFor();
     const profile = (await (await page.request.get(url + '/api/profiles')).json()).data[0];
     const deliveries = (
       await (await page.request.get(`${url}/api/profiles/${profile.id}/intakes`)).json()
@@ -309,7 +311,11 @@ test(
       buffer: prescriptionOriginal,
     });
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
-    await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
+    await page
+      .getByRole('region', { name: 'Save outcomes' })
+      .getByRole('status')
+      .getByText('1 saved', { exact: true })
+      .waitFor();
     await page.goto(url + '/#/medications');
     await page.getByRole('button', { name: 'Activate prescriptions', exact: true }).click();
     await page.getByRole('region', { name: 'Activate imported prescriptions' }).waitFor();
@@ -363,7 +369,11 @@ test(
     // A different filename retains a new source occurrence; linking its matching
     // clinical record still requires explicit acceptance.
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
-    await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
+    await page
+      .getByRole('region', { name: 'Save outcomes' })
+      .getByRole('status')
+      .getByText('1 saved', { exact: true })
+      .waitFor();
     await page
       .getByRole('button', { name: 'Confirm & save', exact: true })
       .waitFor({ state: 'hidden' });

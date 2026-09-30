@@ -234,6 +234,175 @@ function mount(path: string, data = feed, batches: unknown[] = []) {
   return router;
 }
 
+it('saves good selections through ImportPage, then requires a fresh approval for a rejected sibling', async () => {
+  const profileId = 'fictional-mounted-partial-save';
+  selectProfile({ id: profileId, name: 'Fictional Self', placebo: true });
+  const records = [0, 1].map((index) => ({
+    feedKey: JSON.stringify([
+      'fictional-intake',
+      `fictional-candidate-${index}`,
+      `fictional-version-${index}`,
+    ]),
+    feedOrder: `000${index}`,
+    feedKind: 'test' as const,
+    id: `fictional-record-${index}`,
+    classification: 'addition' as const,
+    kind: 'observation' as const,
+    title: `Fictional marker ${index}`,
+    date: '2026-09-01',
+    provider: 'Fictional Clinic',
+    candidateId: `fictional-candidate-${index}`,
+    candidateVersionId: `fictional-version-${index}`,
+    selectionReviewToken: `fictional-token-${index}`,
+    reviewState: 'pending' as const,
+    confidence: 1,
+    uncertainties: [],
+    evidence: [],
+    mapping: {
+      kind: 'observation' as const,
+      subject: 'self',
+      testLabel: `Fictional marker ${index}`,
+      valueText: '7',
+    },
+    supportedFields: ['testLabel', 'valueText'],
+    queueState: 'pending' as const,
+    selectable: true,
+    manuallyEdited: false,
+  })) satisfies IntakeImportFeed['blocks'][number]['records'];
+  const displayed: IntakeImportFeed = {
+    ...feed,
+    groups: [{ ...group, source: 'Fictional Clinic', counts: { ...counts, pending: 2 } }],
+    blocks: [{ ...feed.blocks[0]!, records }],
+    totalRecords: 2,
+    counts: { ...counts, pending: 2 },
+    kindCounts: { ...feed.kindCounts, test: 2 },
+  };
+  let posts = 0;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = String(input);
+      if (url.includes('/intakes/import-feed?')) return response(displayed);
+      if (url.endsWith('/intakes/limits'))
+        return response({ uploadBytes: 1024, extractionBytes: 1024 });
+      if (url.endsWith('/intake-batches')) return response([]);
+      if (url.includes('/identity-review'))
+        return response({
+          status: 'prior_confirmation',
+          blocking: false,
+          message: 'Fictional identity confirmed.',
+          scope: null,
+          evidencedIdentity: {},
+          self: {
+            noteId: 'person-note:self',
+            version: 1,
+            fullName: 'Fictional Self',
+            birthDate: null,
+          },
+          offeredSelfFields: {},
+          conflicts: [],
+        });
+      if (url.endsWith('/people')) return response([]);
+      if (url.includes('/record-owner?')) return response({ personId: 'patient' });
+      if (url.endsWith('/intakes/report-acceptance') && init?.method === 'POST') {
+        posts++;
+        const request = JSON.parse(String(init.body)) as {
+          operationId: string;
+          blocks: Array<{
+            intakeId: string;
+            proposalId: string | null;
+            selections: Array<{
+              recordId: string;
+              candidateId: string;
+              candidateVersionId: string;
+              selectionReviewToken: string;
+            }>;
+          }>;
+        };
+        const selected = request.blocks.flatMap((block) =>
+          block.selections.map((selection) => ({
+            ...selection,
+            intakeId: block.intakeId,
+            proposalId: block.proposalId,
+          })),
+        );
+        const items = selected.map((selection) => ({
+          ...selection,
+          reviewedSelectionHash: 'fictional-hash',
+          operationId: `fictional-child-${posts}-${selection.recordId}`,
+          label: selection.recordId.replace('record', 'marker'),
+          kind: 'observation',
+          personId: 'patient',
+          status: posts === 1 && selection.recordId.endsWith('-1') ? 'needs_review' : 'saved',
+          message: 'Review the current record, then approve again.',
+          ...(posts === 1 && selection.recordId.endsWith('-1')
+            ? {}
+            : {
+                receipt: {
+                  intakeId: selection.intakeId,
+                  proposalId: selection.proposalId,
+                  intakeVersionBefore: 1,
+                  intakeVersionAfter: 2,
+                  reviewToken: 'fictional-review',
+                  records: [
+                    {
+                      recordId: selection.recordId,
+                      candidateId: selection.candidateId,
+                      candidateVersionId: selection.candidateVersionId,
+                      entityId: `fictional-entity-${selection.recordId}`,
+                      kind: 'observation',
+                      title: selection.recordId,
+                      optical: false,
+                      outcome: 'added',
+                    },
+                  ],
+                },
+              }),
+        }));
+        return response({
+          receipt: {
+            version: 1,
+            operationId: request.operationId,
+            status: 'completed',
+            atomic: false,
+            at: '2026-09-01',
+            selectedCount: items.length,
+            acceptedCount: items.filter((item) => item.status === 'saved').length,
+            receipts: items.flatMap((item) => ('receipt' in item ? [item.receipt] : [])),
+            items,
+          },
+          replayed: false,
+          durability: { pending: false, mutationRevision: 1, persistedRevision: 1, error: null },
+        });
+      }
+      throw new Error(`Unexpected fictional request: ${url}`);
+    }),
+  );
+  render(
+    <RouterProvider
+      router={createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
+        initialEntries: ['/import'],
+      })}
+    />,
+  );
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('checkbox', { name: 'Select all shown' }));
+  await user.click(screen.getByRole('button', { name: 'Save 2 records' }));
+  await waitFor(() => expect(posts).toBe(1));
+  expect(await screen.findByText('1 saved, 1 needs review')).toBeVisible();
+  expect(
+    screen
+      .getAllByRole('status')
+      .filter((region) => region.textContent?.includes('1 saved, 1 needs review')),
+  ).toHaveLength(1);
+  expect(screen.getByRole('checkbox', { name: 'Select Fictional marker 1' })).not.toBeChecked();
+  expect(screen.getByText('Review again, then approve.')).toBeVisible();
+  await user.click(screen.getByRole('checkbox', { name: 'Select Fictional marker 1' }));
+  await user.click(screen.getByRole('button', { name: 'Save 1 record' }));
+  await waitFor(() => expect(posts).toBe(2));
+  expect(await screen.findByText('1 saved')).toBeVisible();
+});
+
 it.each(['/import', '/import?q=fictional'])(
   'keeps %s on the overview even when an original-proposal report exists',
   async (path) => {

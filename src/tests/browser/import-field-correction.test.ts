@@ -324,7 +324,11 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
       await inline.waitFor({ state: 'detached' });
       assert.equal(await page.locator('.import-record-row').count(), 0);
-      await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
+      await page
+        .getByRole('region', { name: 'Save outcomes' })
+        .getByRole('status')
+        .getByText('1 saved', { exact: true })
+        .waitFor();
       const accepted = await request(prefix + '/intakes/' + intake.id);
       const saved = accepted.imported.clinical.records[0];
       const observation = await request(prefix + '/tests/' + encodeURIComponent(saved.entityId));

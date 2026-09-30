@@ -11,6 +11,11 @@ import {
 import { SavedRecordDestinationLink } from '../../app/features/import/SavedRecordDestinations';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
 import type { IntakeAcceptedRecord } from '../../shared/intake';
+import {
+  ImportAcceptanceOutcomes,
+  acceptanceSummary,
+} from '../../app/features/import/ImportAcceptanceOutcomes';
+import type { IntakePartialAcceptanceReceipt } from '../../shared/intake';
 
 it('preserves keyboard focus and the exact Person choice through refreshed choices', async () => {
   const person = {
@@ -110,4 +115,97 @@ it('ignores stale source reads and old-profile save responses', () => {
     expect(view.result.current.accept(next, 3, 'profile-one:intake')).toBe(false);
   });
   expect(view.result.current.data?.revision?.id).toBe('one');
+});
+
+it('names same-name owners distinctly in failed outcomes and falls back without raw IDs', async () => {
+  const profile = { id: 'fictional-outcome-profile', name: 'Fictional Self', placebo: true };
+  replaceProfiles([profile]);
+  selectProfile(profile);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      Response.json({
+        data: [
+          {
+            noteId: 'one-note',
+            personId: 'one',
+            version: 1,
+            fullName: 'Rowan Meadow',
+            birthDate: '1980-01-01',
+            relationship: 'Sibling',
+          },
+          {
+            noteId: 'two-note',
+            personId: 'two',
+            version: 1,
+            fullName: 'Rowan Meadow',
+            birthDate: '1950-01-01',
+            relationship: 'Parent',
+          },
+        ],
+      }),
+    ),
+  );
+  const receipt: IntakePartialAcceptanceReceipt = {
+    version: 1,
+    operationId: 'fictional-operation',
+    status: 'completed',
+    atomic: false,
+    at: '2026-09-01',
+    selectedCount: 2,
+    acceptedCount: 0,
+    receipts: [],
+    items: ['one', 'two'].map((personId, index) => ({
+      selectionReviewToken: 'fictional-token',
+      reviewedSelectionHash: 'fictional-hash',
+      intakeId: 'fictional-intake',
+      proposalId: null,
+      recordId: `opaque-record-${index}`,
+      candidateId: `fictional-candidate-${index}`,
+      candidateVersionId: 'fictional-version',
+      operationId: `fictional-child-${index}`,
+      status: 'needs_review' as const,
+      label: `Fictional result ${index}`,
+      kind: 'observation' as const,
+      personId,
+      message: 'Review the current version.',
+    })),
+  };
+  const view = render(
+    <MemoryRouter>
+      <ImportAcceptanceOutcomes receipt={receipt} />
+    </MemoryRouter>,
+  );
+  expect(acceptanceSummary(receipt)).toBe('0 saved, 2 need review');
+  await waitFor(() =>
+    expect(
+      screen.getByRole('link', { name: /Fictional result 0.*Rowan Meadow.*1980-01-01.*Sibling/ }),
+    ).toBeVisible(),
+  );
+  expect(
+    screen.getByRole('link', { name: /Fictional result 1.*Rowan Meadow.*1950-01-01.*Parent/ }),
+  ).toBeVisible();
+  view.rerender(
+    <MemoryRouter>
+      <ImportAcceptanceOutcomes
+        receipt={{
+          ...receipt,
+          items: [
+            {
+              ...receipt.items[0]!,
+              label: undefined,
+              personId: undefined,
+              reportName: 'Fictional report',
+            },
+          ],
+        }}
+      />
+    </MemoryRouter>,
+  );
+  expect(screen.getByRole('link', { name: /Record in Fictional report/ })).not.toHaveTextContent(
+    'opaque-record-0',
+  );
+  expect(screen.getByRole('link', { name: /Record in Fictional report/ })).toHaveTextContent(
+    'Person not confirmed',
+  );
 });

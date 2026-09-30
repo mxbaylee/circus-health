@@ -185,7 +185,11 @@ test(
     await inline.waitFor({ state: 'detached' });
 
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
-    await page.getByRole('status').getByText('Imported 1 record', { exact: true }).waitFor();
+    await page
+      .getByRole('region', { name: 'Save outcomes' })
+      .getByRole('status')
+      .getByText('1 saved', { exact: true })
+      .waitFor();
     await page.getByRole('combobox', { name: 'Review status' }).selectOption('saved');
     const destination = page.getByRole('link').filter({ hasText: 'Fictional link measure' });
     await destination.click();

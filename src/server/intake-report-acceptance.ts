@@ -1,5 +1,6 @@
 import {
   acceptPartialSelection,
+  acceptPartialSelectionAsync,
   getPartialAcceptance,
   hasPartialAcceptance,
 } from './intake-partial-acceptance.ts';
@@ -23,6 +24,7 @@ import type {
   IntakeReportAcceptanceReceipt,
   IntakeAtomicAcceptanceReceipt,
   IntakeReportAcceptanceResult,
+  IntakeReview,
   IntakeWorkflow,
 } from '../shared/intake.ts';
 import {
@@ -104,7 +106,7 @@ function request(value: unknown): IntakeReportAcceptanceRequest {
         throw new HttpError(
           400,
           'REPORT_ACCEPTANCE_INPUT',
-          'Select at most 1000 exact candidate versions with explicit reviewed mappings',
+          'Select at most 1000 exact candidate versions per operation with explicit reviewed mappings. Split larger approvals into sequential operations.',
         );
       const identity = JSON.stringify([block.intakeId, selection.candidateId]);
       if (candidates.has(identity))
@@ -171,6 +173,26 @@ export function acceptIntakeReportSelection(
     { profileId },
   );
 }
+/** HTTP partial saves yield between bounded transactions so reads remain responsive. */
+export async function acceptIntakeReportSelectionAsync(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  input: unknown,
+): Promise<IntakeReportAcceptanceResult> {
+  acceptanceOwner(db, profileId);
+  const selected = request(input);
+  if (selected.mode !== 'partial-v1')
+    return acceptIntakeReportSelection(db, root, profileId, selected);
+  if (retained(db, selected.operationId))
+    throw new HttpError(
+      409,
+      'OPERATION_CONFLICT',
+      'Operation ID already belongs to a different acceptance mode.',
+    );
+  const fingerprint = createHash('sha256').update(canonicalLiteral(selected)).digest('hex');
+  return acceptPartialSelectionAsync(db, root, profileId, selected, fingerprint);
+}
 function acceptIntakeReportSelectionInternal(
   db: DatabaseSync,
   root: string,
@@ -215,6 +237,7 @@ export function applyAcceptanceGroup(
   selected: IntakeReportAcceptanceRequest,
   fingerprint: string,
   retainResult?: (receipt: IntakeAtomicAcceptanceReceipt) => void,
+  reviewed?: Map<string, IntakeReview | null>,
 ): IntakeReportAcceptanceResult {
   const receipt = measureImportPhase(
     'review_acceptance_transaction',
@@ -251,10 +274,9 @@ export function applyAcceptanceGroup(
                 'REPORT_ACCEPTANCE_STALE',
                 'This source has been removed from review',
               );
+            const candidates = new Map(intake.workflow?.candidates.map((item) => [item.id, item]));
             for (const selection of block.selections) {
-              const candidate = intake.workflow?.candidates.find(
-                  (item) => item.id === selection.candidateId,
-                ),
+              const candidate = candidates.get(selection.candidateId),
                 version = candidate?.versions.at(-1);
               if (
                 !version ||
@@ -273,13 +295,22 @@ export function applyAcceptanceGroup(
                   'Select the current pending candidate version from its exact retained proposal',
                 );
             }
+            const pair = canonicalLiteral([block.intakeId, block.proposalId]);
+            if (retainResult && reviewed?.has(pair) && reviewed.get(pair) === null)
+              throw new HttpError(
+                409,
+                'SELECTION_REVIEW_CHANGED',
+                'This selection could not be reviewed. Refresh its exact record before saving.',
+              );
             const fresh = retainResult
-              ? reviewIntake(db, root, profileId, block.intakeId, block.proposalId)
+              ? (reviewed?.get(pair) ??
+                reviewIntake(db, root, profileId, block.intakeId, block.proposalId))
               : null;
             const comparisons = new Map<string, (typeof block.selections)[number]['comparisons']>();
-            if (fresh)
+            if (fresh) {
+              const freshRecords = new Map(fresh.records.map((item) => [item.id, item]));
               for (const selection of block.selections) {
-                const record = fresh.records.find((item) => item.id === selection.recordId);
+                const record = freshRecords.get(selection.recordId);
                 if (!record || record.selectionReviewToken !== selection.selectionReviewToken)
                   throw new HttpError(
                     409,
@@ -319,36 +350,43 @@ export function applyAcceptanceGroup(
                   }),
                 );
               }
-            const result = prepareIntakeImport(db, root, profileId, block.intakeId, {
-              version: fresh?.version ?? block.intakeVersion,
-              proposalId: block.proposalId,
-              reviewToken: fresh?.reviewToken ?? block.reviewToken,
-              decisions: block.selections.map((selection) => ({
-                recordId: selection.recordId,
-                action: 'accept',
-                mapping: selection.mapping,
-                comparisons: fresh ? comparisons.get(selection.recordId) : selection.comparisons,
-              })),
-            });
+            }
+            const result = prepareIntakeImport(
+              db,
+              root,
+              profileId,
+              block.intakeId,
+              {
+                version: retainResult ? intake.version : block.intakeVersion,
+                proposalId: block.proposalId,
+                reviewToken: fresh?.reviewToken ?? block.reviewToken,
+                decisions: block.selections.map((selection) => ({
+                  recordId: selection.recordId,
+                  action: 'accept',
+                  mapping: selection.mapping,
+                  comparisons: fresh ? comparisons.get(selection.recordId) : selection.comparisons,
+                })),
+              },
+              fresh || undefined,
+            );
+            const resultRecords = new Map(result.review?.records.map((item) => [item.id, item]));
             for (const selection of block.selections) {
-              const record = result.review?.records.find(
-                (item) =>
-                  item.id === selection.recordId &&
-                  item.candidateId === selection.candidateId &&
-                  item.candidateVersionId === selection.candidateVersionId,
-              );
+              const record = resultRecords.get(selection.recordId);
               // Preparation validates blockers against the user's exact mappings and
               // comparison decisions. Rechecking the pre-correction classification or
               // questions here would reject valid corrections and relationship choices.
               // Application still validates clinical semantics inside this transaction.
-              if (!record)
+              if (
+                record?.candidateId !== selection.candidateId ||
+                record?.candidateVersionId !== selection.candidateVersionId
+              )
                 throw new HttpError(
                   409,
                   'REPORT_ACCEPTANCE_BLOCKED',
                   'Resolve each selected record before accepting; unselected records stay unchanged',
                 );
             }
-            return { result, version: fresh?.version ?? block.intakeVersion };
+            return { result, version: intake.version };
           });
           const versions = new Map<string, number>(),
             receipts: IntakeReportAcceptanceReceipt['receipts'] = [],
@@ -362,10 +400,11 @@ export function applyAcceptanceGroup(
               { profileId, importId: block.intakeId },
             );
             versions.set(block.intakeId, applied.intakeVersion);
+            const importedRecords = new Map(
+              applied.imported.clinical?.records?.map((record) => [record.recordId, record]),
+            );
             const records = block.selections.map((selection) => {
-              const accepted = applied.imported.clinical?.records?.find(
-                (record) => record.recordId === selection.recordId,
-              );
+              const accepted = importedRecords.get(selection.recordId);
               if (!accepted)
                 throw new Error('Selected acceptance did not produce an exact clinical receipt');
               return {

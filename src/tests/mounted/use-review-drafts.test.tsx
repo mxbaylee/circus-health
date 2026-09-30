@@ -197,3 +197,61 @@ it('binds a coalesced correction reason to its exact patch, retries unchanged, t
   await act(() => view.result.current.flush());
   expect(requests[3].correctionReason).toBeUndefined();
 });
+
+it('keeps an unsent correction reason visible after another field is edited', () => {
+  const view = renderHook(() => useReviewDrafts(profile.id, vi.fn()));
+  const initial = review(7, '42');
+  const row = initial.records[0]!;
+  act(() => {
+    view.result.current.hydrate(initial);
+    view.result.current.update(initial, row, {
+      correctionReason: 'Read the fictional source digit',
+    });
+    const local = view.result.current.current(initial, row);
+    view.result.current.update(initial, row, {
+      decision: { ...local.decision, mapping: { ...local.decision.mapping, unit: 'mg' } },
+    });
+  });
+  expect(view.result.current.current(initial, row).correctionReason).toBe(
+    'Read the fictional source digit',
+  );
+});
+
+it.each(['answers', 'resolutions', 'disposition'] as const)(
+  'keeps an unsent explanation visible without attaching it to an unrelated %s save',
+  async (field) => {
+    const requests: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input, options) => {
+        requests.push(JSON.parse(String(options?.body)));
+        return json({ ...intake, version: 8 });
+      }),
+    );
+    const view = renderHook(() => useReviewDrafts(profile.id, vi.fn()));
+    const initial = review(7, '42');
+    const row = initial.records[0]!;
+    act(() => {
+      view.result.current.hydrate(initial);
+      view.result.current.update(initial, row, {
+        correctionReason: 'Fictional explanation awaiting its correction',
+      });
+      if (field === 'answers')
+        view.result.current.update(initial, row, {
+          answers: { fictional: 'Reviewed the original' },
+        });
+      if (field === 'resolutions')
+        view.result.current.update(initial, row, {
+          resolutions: [{ issueId: 'fictional-issue', outcome: 'acknowledged' }],
+        });
+      if (field === 'disposition')
+        view.result.current.update(initial, row, { disposition: 'review_later' });
+    });
+    await act(() => view.result.current.flush());
+    expect(requests).toHaveLength(1);
+    expect(requests[0].correctionReason).toBeUndefined();
+    expect(view.result.current.current(initial, row).correctionReason).toBe(
+      'Fictional explanation awaiting its correction',
+    );
+  },
+);

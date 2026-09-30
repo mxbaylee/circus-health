@@ -41,6 +41,7 @@ function fixture(
     | 'source-race'
     | 'source-watchdog',
   readingRequests = 1,
+  sourceCopies = 1000,
 ) {
   fictionalModel(t);
   const root = mkdtempSync(join(tmpdir(), 'fictional-automatic-recovery-'));
@@ -70,7 +71,7 @@ function fixture(
         : {
             filename: 'fictional.txt',
             bytes: Buffer.from(
-              'Fictional retained source text. '.repeat(mode === 'source' ? 2000 : 1000),
+              'Fictional retained source text. '.repeat(mode === 'source' ? 2000 : sourceCopies),
             ),
           },
   );
@@ -264,13 +265,16 @@ test('successful model calls without unique progress retry each exact unit three
 
 test('default no-progress windows retain an exception after 48 usable responses per unit', async (t) => {
   const allowance = DEFAULT_INTAKE_READING_LIMITS.requests!;
-  const f = fixture(t, 'model', allowance);
+  // One located unit proves the default 3 × 16 bound; the preceding test
+  // separately covers moving between multiple units and explicit exception retry.
+  const f = fixture(t, 'model', allowance, 1);
   const batch = f.manager.list(f.profileId)[0]!;
   // This synthetic bridge performs no inference; allow its durable host writes to finish.
   await until(() => f.manager.get(f.profileId, batch.id).status === 'complete', 120_000);
   const result = f.manager.get(f.profileId, batch.id);
   assert.equal(result.reason, 'exceptions');
   const units = getIntake(f.db, f.root, f.profileId, f.source.id).workflow!.plans[0].units;
+  assert.equal(units.length, 1);
   for (const unit of units) {
     assert.equal(f.units.filter((id) => id === unit.id).length, 3 * allowance);
     assert.equal(unit.processingException?.reason, 'processing_stalled');

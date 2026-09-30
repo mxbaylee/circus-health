@@ -2,7 +2,7 @@ import { measureImportPhase } from './import-diagnostics.ts';
 import { intakeSourceRoute } from './intake-source-routes.ts';
 import { listSourceAttention } from './intake-source-text.ts';
 import {
-  acceptIntakeReportSelection,
+  acceptIntakeReportSelectionAsync,
   getIntakeReportAcceptance,
 } from './intake-report-acceptance.ts';
 import { HttpError } from './database.ts';
@@ -232,7 +232,7 @@ export async function handleIntakeRoute({
     if (id && action && ['source-text', 'source-extract', 'source-records'].includes(action))
       respond(await intakeSourceRoute({ db, root, profileId, id, action, params, input }));
     else if (id === 'report-acceptance' && !action)
-      respond(acceptIntakeReportSelection(db, root, profileId, input));
+      respond(await acceptIntakeReportSelectionAsync(db, root, profileId, input));
     else if (id === 'people-disposition' && !action)
       respond(
         saveIntakePersonDisposition(

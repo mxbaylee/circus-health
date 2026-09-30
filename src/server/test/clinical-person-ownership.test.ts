@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { AddressInfo } from 'node:net';
 import { openDatabase } from '../database.ts';
+import { createApp } from '../index.ts';
 import { createNote } from '../notes.ts';
 import {
   clinicalList,
@@ -21,9 +23,9 @@ import { relatedRecordIds } from '../related-records.ts';
 import { duplicateRecord, previewDuplicateDecision } from '../duplicate-review.ts';
 import { exportOptions, exportSnapshot } from '../note-exports.ts';
 
-function fixture(t: TestContext) {
+function fixture(t: TestContext, profileId = 'fictional-owner') {
   const root = mkdtempSync(join(tmpdir(), 'fictional-clinical-owner-'));
-  const db = openDatabase(join(root, 'database.sqlite'), 'fictional-owner');
+  const db = openDatabase(join(root, 'database.sqlite'), profileId);
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -73,7 +75,7 @@ function fixture(t: TestContext) {
       "INSERT INTO evidence(id,entity_type,entity_id,source_record_id) VALUES(?,'observation',?,'raw')",
     ).run('evidence-' + suffix, 'obs-' + suffix);
   }
-  return { db, family, person };
+  return { db, family, person, root, profileId };
 }
 
 test('Self collections and trends exclude family records; explicit owner filters and details retain reachability', (t) => {
@@ -140,15 +142,6 @@ test('historical and optical documents use durable import ownership and default 
 
 test('family current medication assertions stay on that record and outside Self collections', (t) => {
   const { db, family } = fixture(t);
-  assert.throws(
-    () =>
-      setMedicationCurrentStatus(db, 'missing-other-profile-record', {
-        status: 'current',
-        version: 0,
-        visibilityVersion: 0,
-      }),
-    { code: 'NOT_FOUND' },
-  );
   setMedicationCurrentStatus(db, 'med-family', {
     status: 'current',
     version: 0,
@@ -169,6 +162,81 @@ test('family current medication assertions stay on that record and outside Self 
       (row) => row.id,
     ),
     ['med-family'],
+  );
+});
+
+// A foreign-profile record must really exist: a missing ID does not prove
+// isolation. Caregiver assertions belong to the relative, not Self; see
+// docs/import/review-reliability.md.
+test('HTTP caregiver medication changes reject foreign and wrong records, pin versions, and count the relative', async (t) => {
+  const local = fixture(t),
+    foreign = fixture(t, 'fictional-foreign');
+  foreign.db.prepare("UPDATE medications SET id='foreign-med' WHERE id='med-family'").run();
+  const beforeForeign = foreign.db
+    .prepare("SELECT * FROM medications WHERE id='foreign-med'")
+    .get();
+  assert.ok(beforeForeign);
+  const app = createApp({
+    root: local.root,
+    databases: new Map([
+      [local.profileId, local.db],
+      [foreign.profileId, foreign.db],
+    ]),
+  });
+  await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    app.intakeBatches.close();
+    app.assistant.close();
+    await new Promise<void>((resolve) => app.server.close(() => resolve()));
+  });
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}/api/profiles/${local.profileId}`;
+  const patch = (id: string, version = 0) =>
+    fetch(`${base}/medications/${id}/current-status`, {
+      method: 'PATCH',
+      headers: { Origin: 'http://127.0.0.1:5173', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'current', version, visibilityVersion: 0 }),
+    });
+  const list = async (personId: string) => {
+    const response = await fetch(
+      `${base}/medications?status=current&personId=${encodeURIComponent(personId)}`,
+    );
+    assert.equal(response.status, 200);
+    return (await response.json()) as {
+      data: Array<{ id: string; personId: string }>;
+      meta: { total: number };
+    };
+  };
+  assert.equal((await list(local.family)).meta.total, 0);
+  for (const id of ['foreign-med', 'obs-family']) {
+    const response = await patch(id);
+    assert.equal(response.status, 404);
+    assert.equal((await response.json()).error.code, 'NOT_FOUND');
+  }
+  const saved = await patch('med-family');
+  assert.equal(saved.status, 200);
+  const value = (await saved.json()).data;
+  assert.equal(value.personId, local.family);
+  assert.equal(value.currentStatus, 'current');
+  const stale = await patch('med-family');
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).error.code, 'VERSION_CONFLICT');
+  const relative = await list(local.family),
+    self = await list('patient');
+  assert.equal(relative.meta.total, relative.data.length);
+  assert.deepEqual(
+    relative.data.map((record) => record.id),
+    ['med-family'],
+  );
+  assert.equal(self.meta.total, 0);
+  assert.deepEqual(self.data, []);
+  assert.deepEqual(
+    foreign.db.prepare("SELECT * FROM medications WHERE id='foreign-med'").get(),
+    beforeForeign,
+  );
+  assert.equal(
+    clinicalList(foreign.db, 'medications', new URLSearchParams({ personId: foreign.family }))
+      .total,
+    0,
   );
 });
 

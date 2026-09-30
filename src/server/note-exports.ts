@@ -16,6 +16,7 @@ import { dateNumber } from '../app/data/format.ts';
 import { documentPersonId, observation } from './queries.ts';
 import { getNote, attachments } from './notes.ts';
 import type { NoteDTO } from './notes.ts';
+import { packetReportReview, type PacketReportReview } from './packet-report-review.ts';
 import type { IntakeExtractionPlan } from '../shared/intake.ts';
 import { accountedUnitKind } from './intake-unit-accounting.ts';
 
@@ -160,6 +161,7 @@ export interface NoteExportInput extends JsonRecord {
 }
 
 export interface NoteExportSnapshot {
+  reportReview: PacketReportReview[];
   readingGaps: {
     sourceFileId: string;
     filename: string;
@@ -1047,6 +1049,12 @@ export function exportSnapshot(
   };
   const rank = (type: ExportRecordType): number => ranks[type] ?? 7;
   const payload = {
+    reportReview: packetReportReview(
+      db,
+      [main, ...records.values()].flatMap((record) =>
+        record.citations.map((citation) => citation.id),
+      ),
+    ),
     patient,
     identity,
     main,
@@ -1310,6 +1318,11 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
     : snapshot.mode === 'brief'
       ? `<p class="meta">Appointment brief · Generated ${esc(snapshot.generatedAt.slice(0, 10))} · ${snapshot.records.length} selected supplements. Date scope: ${esc(snapshot.scope.from || 'any')} to ${esc(snapshot.scope.to || 'any')}. This note and explicitly selected evidence.</p>`
       : `<div class="scope"><strong>${snapshot.mode === 'detailed' ? 'Detailed evidence packet' : 'New provider packet'}${provider ? ' · clinical archive and selected notes' : ' · selected evidence only'}</strong><p>Generated ${esc(snapshot.generatedAt)}. Date scope: ${esc(snapshot.scope.from || 'unbounded')} to ${esc(snapshot.scope.to || 'unbounded')}. Archived supplements: ${snapshot.scope.includeArchived ? 'allowed when selected' : 'excluded'}. ${snapshot.records.length} supplementary records and ${snapshot.assets.length} companion originals selected.</p><p>This is not a complete hospital chart. Missing, unreviewed and conflicting assertions are retained as recorded. No clinical recommendations or medication reconciliation are inferred. Original assets are companion downloads, not embedded pages.</p></div>`;
+  const partialReports = snapshot.reportReview.filter(
+    (report) => report.savedCount < report.totalCount,
+  );
+  if (provider && partialReports.length)
+    body += `<section><h2>Partly reviewed reports</h2>${partialReports.map((report) => `<p><strong>${esc(report.title)}</strong>: ${report.savedCount} of ${report.totalCount} current report items reviewed and saved. Remaining items are not accepted clinical records. These counts describe review of the source report, not how many items are included in this packet.</p>`).join('')}</section>`;
   if (provider && snapshot.readingGaps.length)
     body += `<section><h2>Unread source sections</h2><p>These source sections were not fully read. An absent finding in this packet does not establish absence in the original.</p>${snapshot.readingGaps.map((source) => `<h3>${esc(source.filename)}</h3><ul>${source.gaps.map((gap) => `<li>${esc(gap.locator)}: ${esc(gap.reason)}</li>`).join('')}</ul>`).join('')}</section>`;
   if (snapshot.mode === 'detailed')

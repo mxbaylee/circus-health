@@ -51,6 +51,10 @@ Preview and PDF use the same server-rendered safe HTML. Markdown raw HTML is ski
 
 ## Validation
 
+Provider packets disclose partly reviewed source reports represented by included citations. The PDF/preview says how many current clinical report items are reviewed and saved; the evidence companion retains `reportReview` counts and report identifiers. These are source-report review counts, not packet-membership counts or a claim that reading is complete. Pending or original-only items are not counted as saved, and historical candidate versions, source context and named-People rows do not inflate the clinical total. Unrelated reports are excluded. Saving the remaining items changes the packet fingerprint and requires a fresh preview. Independent clinical records can still be saved before the rest of a report is reviewed.
+
+`node --test src/server/test/note-export-report-review.test.ts` checks a real partial report becoming fully accepted, scoped disclosure and current-version counting. Preview and PDF share the tested HTML renderer.
+
 Focused coverage: `node --test src/server/test/note-exports.test.ts` and `npm run test:ui -- tests/mounted/note-export.test.tsx`. Fixtures are fictional. Tests cover note-only and enriched selection, source citations, exact raw JSON, source-file companions, current-use semantics, Self versus relatives, archive selection, source/provider/finished immutability, date scope, trends, stale revisions, save failures, unsaved note creation and profile changes.
 
 To reproduce PDF layout QA without opening real profile data:

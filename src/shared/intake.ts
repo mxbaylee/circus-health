@@ -997,6 +997,11 @@ export interface IntakeAtomicAcceptanceReceipt {
   }[];
 }
 export interface IntakePartialAcceptanceItem {
+  /** Bounded context for a readable receipt after reload; older receipts omit it. */
+  label?: string;
+  kind?: ReviewRecordKind;
+  personId?: string;
+  reportName?: string;
   selectionReviewToken: string;
   reviewedSelectionHash: string;
   intakeId: string;
