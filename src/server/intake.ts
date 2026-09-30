@@ -1312,13 +1312,64 @@ export function reviewIntake(
   id: string,
   proposalId: string | null = null,
 ): IntakeReview {
+  return createIntakeReviewSession(db, root, profileId, id).review(proposalId);
+}
+/** Prepare one immutable original/workflow/identity context for several exact proposal reviews. */
+export function createIntakeReviewSession(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+) {
+  const context = prepareIntakeReviewContext(db, root, profileId, id);
+  return {
+    filename: context.d.originalName,
+    review: (proposalId: string | null = null): IntakeReview =>
+      reviewIntakePrepared(db, root, profileId, id, proposalId, context),
+  };
+}
+function prepareIntakeReviewContext(db: DatabaseSync, root: string, profileId: string, id: string) {
   reviewCallObserver?.();
   owner(db, profileId);
   const file = row(db, id),
     d = details(file);
+  verifyIntakeOriginal(db, root, profileId, id);
+  const workflow = intakeWorkflow(d);
+  const selfNote = getNote(db, 'person-note:self');
+  const reviewedFile = reviewedSource(db, file, d);
+  const self = {
+    noteId: 'person-note:self' as const,
+    version: selfNote.version,
+    knownNames: effectiveKnownNames(db, selfNote.id, selfNote.person),
+    fullName:
+      typeof selfNote.person.fullName === 'string' && selfNote.person.fullName.trim()
+        ? selfNote.person.fullName.trim()
+        : null,
+    birthDate:
+      typeof selfNote.person.birthDate === 'string' && selfNote.person.birthDate.trim()
+        ? selfNote.person.birthDate.trim()
+        : null,
+  };
+  const people = identityPeopleSnapshots(db);
+  const grounding = identityReviewGroundingLookups(db, {
+    profileId,
+    intakeId: id,
+    sourceHash: file.sha256,
+    workflow,
+  });
+  return { file, d, workflow, self, people, grounding, reviewedFile };
+}
+function reviewIntakePrepared(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  proposalId: string | null,
+  context: ReturnType<typeof prepareIntakeReviewContext>,
+): IntakeReview {
+  const { file, d, workflow, self, people, grounding, reviewedFile } = context;
   if (proposalId && !d.proposals.some((p) => p.id === proposalId))
     throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
-  verifyIntakeOriginal(db, root, profileId, id);
   const inputFile: SourceFileRow = proposalId
     ? required(
         db.prepare('SELECT * FROM source_files WHERE id=?').get(proposalId) as
@@ -1342,8 +1393,6 @@ export function reviewIntake(
   const validation = validateJSONL(bytes);
   if (!validation.valid)
     throw new HttpError(400, 'INVALID_JSONL', 'Convert the original before clinical review');
-  const selfNote = getNote(db, 'person-note:self');
-  const reviewedFile = reviewedSource(db, file, d);
   const review = workflowReview(
     file,
     d,
@@ -1353,11 +1402,11 @@ export function reviewIntake(
       entries: validation.entries!,
       proposalId,
       version: d.version,
-      acceptedDecisions: intakeWorkflow(d).decisions,
+      acceptedDecisions: workflow.decisions,
       drafts: validation
         .entries!.map((entry) =>
           (currentReviewDraft as unknown as CurrentReviewDraft)(
-            intakeWorkflow(d),
+            workflow,
             proposalId,
             `${inputFile.id}:line:${entry.line}`,
             intakeCandidateVersionId(d, proposalId, entry),
@@ -1366,34 +1415,17 @@ export function reviewIntake(
         .filter(Boolean) as IntakeReviewDraft[],
     }),
     validation.entries!,
-    {
-      noteId: 'person-note:self',
-      version: selfNote.version,
-      knownNames: effectiveKnownNames(db, selfNote.id, selfNote.person),
-      fullName:
-        typeof selfNote.person.fullName === 'string' && selfNote.person.fullName.trim()
-          ? selfNote.person.fullName.trim()
-          : null,
-      birthDate:
-        typeof selfNote.person.birthDate === 'string' && selfNote.person.birthDate.trim()
-          ? selfNote.person.birthDate.trim()
-          : null,
-    },
+    self,
     {
       profileId,
-      people: identityPeopleSnapshots(db),
+      people,
       activeReceipts: (receipts) => activeIdentityReceipts(db, receipts),
-      ...identityReviewGroundingLookups(db, {
-        profileId,
-        intakeId: id,
-        sourceHash: file.sha256,
-        workflow: intakeWorkflow(d),
-      }),
+      ...grounding,
     },
   );
   // One immutable workflow snapshot per synchronous review, not a full JSON parse per row.
   for (const record of review.records)
-    refreshClinicalIdentityPolicy(db, reviewedFile, record, intakeWorkflow(d));
+    refreshClinicalIdentityPolicy(db, reviewedFile, record, workflow);
   (
     finalizeClinicalPairScopes as unknown as (
       db: DatabaseSync,

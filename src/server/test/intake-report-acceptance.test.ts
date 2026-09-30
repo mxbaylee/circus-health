@@ -533,6 +533,32 @@ test('partial approval reviews each intake once and journals proportional work',
   assert.ok(large.bytes <= 4 * small.bytes + 32_768, JSON.stringify(metrics));
   t.diagnostic(`partial acceptance work counts: ${JSON.stringify(metrics)}`);
 });
+test('partial approval shares one original review context across distinct proposal blocks', (t) => {
+  const f = fixture(t);
+  const original = upload(f, [envelope('fictional-original')]);
+  const first = confirmedProposal(f, original, envelope('fictional-proposal-one'));
+  const second = confirmedProposal(f, first.item, envelope('fictional-proposal-two'));
+  const input = partial(
+    f,
+    block(f, original.id),
+    block(f, original.id, first.proposalId),
+    block(f, original.id, second.proposalId),
+  );
+  let reviews = 0;
+  const restore = intake.observeIntakeReviewCalls(() => reviews++);
+  let receipt;
+  try {
+    receipt = accept(f, input).receipt;
+  } finally {
+    restore();
+  }
+  // The original and its identity/workflow authority are prepared once; each
+  // distinct proposal still has to validate its own retained source bytes.
+  // Rationale: docs/import/review-reliability.md.
+  assert.equal(reviews, 1);
+  assert.equal(receipt.acceptedCount, 3);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 3);
+});
 test('a 500-item partial save yields to a read and never reconciles live missing items', async (t) => {
   const f = fixture(t);
   const item = upload(

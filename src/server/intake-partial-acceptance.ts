@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError, now } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
-import { flushIntake, getIntake, intakeTransaction, reviewIntake } from './intake.ts';
+import { createIntakeReviewSession, flushIntake, getIntake, intakeTransaction } from './intake.ts';
 import { acceptanceOwner, applyAcceptanceGroup } from './intake-report-acceptance.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { effectiveKnownNames } from './name-associations.ts';
@@ -169,23 +169,29 @@ function initializePartialSelection(
     // Unknown/stale inputs stay conservative and are rejected within their own boundary.
     const reportNames = new Map<string, string>();
     const reviewRecords = new Map<string, Map<string, IntakeReview['records'][number]>>();
+    const sessions = new Map<string, ReturnType<typeof createIntakeReviewSession> | Error>();
     const dependencies = entries.map((entry) => {
       const keys = new Set<string>();
       for (const comparison of entry.selection.comparisons || [])
         keys.add('destination:' + comparison.otherRecordId);
       try {
         const pair = canonicalLiteral([entry.block.intakeId, entry.block.proposalId]);
+        let session = sessions.get(entry.block.intakeId);
+        if (!session) {
+          try {
+            session = createIntakeReviewSession(db, root, profileId, entry.block.intakeId);
+          } catch (error) {
+            if (!(error instanceof Error)) throw error;
+            session = error;
+          }
+          sessions.set(entry.block.intakeId, session);
+        }
+        if (session instanceof Error) throw session;
         if (!reportNames.has(entry.block.intakeId))
-          reportNames.set(
-            entry.block.intakeId,
-            getIntake(db, root, profileId, entry.block.intakeId).filename.slice(0, 160),
-          );
+          reportNames.set(entry.block.intakeId, session.filename.slice(0, 160));
         entry.reportName = reportNames.get(entry.block.intakeId);
         if (!reviews.has(pair)) {
-          reviews.set(
-            pair,
-            reviewIntake(db, root, profileId, entry.block.intakeId, entry.block.proposalId),
-          );
+          reviews.set(pair, session.review(entry.block.proposalId));
           reviewRecords.set(
             pair,
             new Map(reviews.get(pair)?.records.map((item) => [item.id, item])),
