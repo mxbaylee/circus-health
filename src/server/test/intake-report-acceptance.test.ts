@@ -591,14 +591,16 @@ test('a 500-item partial save yields to a read and never reconciles live missing
 });
 test('a source change during a yielded save rejects remaining old approvals', async (t) => {
   const f = fixture(t);
+  // One pending record beyond the 200-item commit boundary proves invalidation.
+  // The separate 500-item test above covers large-save yielding and receipt recovery.
   const item = upload(
     f,
-    Array.from({ length: 500 }, (_, index) => envelope(`fictional-changing-${index}`)),
+    Array.from({ length: 201 }, (_, index) => envelope(`fictional-changing-${index}`)),
   );
   const input = partial(f, block(f, item.id));
   const saving = acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input);
   await Promise.resolve();
-  disposition(f, item, 400, 'review_later');
+  disposition(f, item, 200, 'review_later');
   const result = (await saving).receipt;
   assert.equal(result.atomic, false);
   if (result.atomic) throw Error('Expected partial receipt');
