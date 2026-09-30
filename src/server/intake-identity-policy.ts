@@ -765,11 +765,12 @@ export function assessIdentityPolicy({
       ),
     );
   const matchedOwner = distinctOwners.length === 1 ? distinctOwners[0] : undefined;
-  const incompatibleBanner =
-    !!matchedOwner?.birthDate &&
+  const bannerIncompatibleWith = (owner: (typeof owners)[number] | undefined): boolean =>
+    !!owner?.birthDate &&
     bannerBirthDates.some(
-      (readings) => !readings.some((date) => compatibleBirthDates(date, matchedOwner.birthDate!)),
+      (readings) => !readings.some((date) => compatibleBirthDates(date, owner.birthDate!)),
     );
+  const incompatibleBanner = bannerIncompatibleWith(matchedOwner);
   const savedNames = matchedOwner?.names || selfNames;
   const matchedBirthDate = matchedOwner ? matchedOwner.birthDate : selfBirthDate;
   const nameMatches = !!matchedOwner;
@@ -845,10 +846,17 @@ export function assessIdentityPolicy({
           group.report?.subject?.text || null,
         )
       : undefined;
+  const ownPersonReceipt =
+    latestPersonChoice?.outcome === 'this_is_person' &&
+    latestPersonChoice.scope.groupId === group?.id &&
+    latestPersonChoice.scope.groupVersionId === groupVersionId
+      ? latestPersonChoice
+      : undefined;
   if (
     latestPersonChoice?.outcome === 'this_is_person' &&
-    (matchedOwner?.personId !== latestPersonChoice.assignedPerson?.personId ||
-      hasUnstructuredIdentityQuestion)
+    !ownPersonReceipt &&
+    distinctOwners.length < 2 &&
+    matchedOwner?.personId !== latestPersonChoice.assignedPerson?.personId
   )
     return {
       ...common,
@@ -860,6 +868,7 @@ export function assessIdentityPolicy({
   if (
     latestPersonChoice?.outcome === 'this_is_me' &&
     latestPersonChoice.scope.groupId !== group?.id &&
+    distinctOwners.length < 2 &&
     matchedOwner?.personId !== 'patient'
   )
     return {
@@ -869,13 +878,16 @@ export function assessIdentityPolicy({
       message:
         'The person matched by this report has changed. Confirm who these current records belong to.',
     };
-  // A confirmation belongs to the reviewed report: A cannot answer B's
-  // unreadable DOB or incompatible banner merely because their names match.
-  // B's own applicable confirmation can still resolve its ownership question.
+  // A confirmation belongs to the reviewed report. A borrowed Self answer
+  // cannot decide between same-named owners or override B's banner against
+  // the owner it would actually assign, even when there is no unique match.
+  // B's own applicable confirmation still resolves its ownership question.
+  const borrowedSelfReceipt =
+    latestPersonChoice?.outcome === 'this_is_me' && latestPersonChoice.scope.groupId !== group?.id;
   const receipt =
     latestPersonChoice?.outcome === 'this_is_me' &&
-    ((!unreadableBirthDate && !incompatibleBanner) ||
-      latestPersonChoice.scope.groupId === group?.id)
+    (!borrowedSelfReceipt ||
+      (!unreadableBirthDate && distinctOwners.length <= 1 && !bannerIncompatibleWith(owners[0])))
       ? latestPersonChoice
       : undefined;
   const explicitReceipt =
@@ -890,7 +902,12 @@ export function assessIdentityPolicy({
           group.report?.subject?.text || null,
         )
       : undefined;
-  if (challengedName && !explicitReceipt && !(receipt && receipt.scope.groupId === group?.id))
+  if (
+    challengedName &&
+    !explicitReceipt &&
+    !ownPersonReceipt &&
+    !(receipt && receipt.scope.groupId === group?.id)
+  )
     return {
       ...common,
       confidence: 'none',
@@ -899,12 +916,17 @@ export function assessIdentityPolicy({
       message:
         'An accepted person correction challenged this printed name. Confirm this report’s person and choose whether future reports should use that name or ask each time.',
     };
-  const resolutionOperationId =
-    explicitReceipt?.operationId ||
-    (!hasUnstructuredIdentityQuestion ? receipt?.operationId : undefined);
   const applicableReceipt = explicitReceipt || receipt;
+  // Only a Self answer can resolve a Self match or be compared with Self's
+  // birth date. An explicit Person repair can share this operation channel.
+  const resolutionOperationId =
+    applicableReceipt?.outcome === 'this_is_me'
+      ? explicitReceipt?.operationId ||
+        (!hasUnstructuredIdentityQuestion ? receipt?.operationId : undefined)
+      : undefined;
   if (
     resolutionOperationId &&
+    !ownPersonReceipt &&
     applicableReceipt?.scope.groupId !== group?.id &&
     !nameEvidenceGrounded
   )
@@ -918,6 +940,7 @@ export function assessIdentityPolicy({
   const reviewedBirthDate = applicableReceipt?.identityAnswers?.birthDate;
   if (
     resolutionOperationId &&
+    !ownPersonReceipt &&
     reviewedBirthDate &&
     selfBirthDate &&
     !compatibleBirthDates(reviewedBirthDate, selfBirthDate)
@@ -940,7 +963,7 @@ export function assessIdentityPolicy({
         },
       ],
     };
-  if (resolutionOperationId && !birthDate && !originalEvidenceChecked)
+  if (resolutionOperationId && !ownPersonReceipt && !birthDate && !originalEvidenceChecked)
     return {
       ...common,
       status: 'confirmation_required',
@@ -950,6 +973,7 @@ export function assessIdentityPolicy({
     };
   if (
     resolutionOperationId &&
+    !ownPersonReceipt &&
     !selfBirthDateConflict &&
     !conflicts.some((conflict) => conflict.reason === 'evidence_disagreement')
   )
@@ -968,6 +992,62 @@ export function assessIdentityPolicy({
         ...(Object.keys(evidencedIdentity).length ? { evidencedIdentity } : {}),
       },
     };
+  if (ownPersonReceipt) {
+    const assigned = people.find(
+      (person) =>
+        person.personId === ownPersonReceipt.assignedPerson?.personId &&
+        person.noteId === ownPersonReceipt.assignedPerson?.noteId,
+    );
+    const reviewedDate =
+      clean(ownPersonReceipt.identityAnswers?.birthDate) ||
+      birthDate ||
+      clean(ownPersonReceipt.scope.evidencedIdentity?.birthDate);
+    if (
+      !assigned ||
+      (hasUnstructuredIdentityQuestion &&
+        explicitlyConfirmedOperationId !== ownPersonReceipt.operationId) ||
+      conflicts.some((conflict) => conflict.reason === 'evidence_disagreement') ||
+      (!birthDate && !originalEvidenceChecked)
+    )
+      return {
+        ...common,
+        status: 'confirmation_required',
+        blocking: true,
+        message: 'Confirm who these current records belong to before saving.',
+      };
+    if (
+      reviewedDate &&
+      assigned.birthDate &&
+      !compatibleBirthDates(reviewedDate, assigned.birthDate)
+    )
+      return {
+        ...common,
+        status: 'conflict',
+        blocking: true,
+        message:
+          'The reviewed report birth date differs from the assigned person’s current birth date. Choose who this report belongs to before saving.',
+      };
+    return {
+      ...common,
+      status: 'prior_confirmation',
+      blocking: false,
+      message: `This report was assigned to ${assigned.fullName}.`,
+      attribution: {
+        status: 'prior_confirmation',
+        basis: 'explicit_person_confirmation',
+        groupId: group?.id || null,
+        groupVersionId,
+        confirmationOperationId: ownPersonReceipt.operationId,
+        assignedPerson: {
+          noteId: assigned.noteId,
+          personId: assigned.personId,
+          version: assigned.version,
+          fullName: assigned.fullName,
+        },
+        evidencedIdentity,
+      },
+    };
+  }
   if (distinctOwners.length > 1)
     return {
       ...common,
