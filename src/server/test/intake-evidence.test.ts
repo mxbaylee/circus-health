@@ -24,7 +24,27 @@ import {
   readPdfIdentityPageText,
   readPdfEvidencePage,
   indexPdfEvidence,
+  pdfPageCountEvidence,
 } from '../intake-pdf-session.ts';
+
+test('PDF inventory spans bounded worker chunks without losing later pages', async (t) => {
+  const f = fixture(t);
+  t.after(() => disposePdfEvidenceSessions(f.profileId));
+  const bytes = syntheticPdf(Array.from({ length: 65 }, (_, i) => `Fictional page ${i + 1}`));
+  const item = uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-65-pages.pdf',
+    bytes,
+  });
+  const source = {
+    ...getRetainedIntakeOriginalReference(f.db, f.root, f.profileId, item.id),
+    profileId: f.profileId,
+  };
+  assert.equal(await pdfPageCountEvidence(source), 65);
+  const index = await indexPdfEvidence(source);
+  assert.equal(index.pages, 65);
+  assert.equal(index.sections.length, 65);
+  assert.equal(index.sections.at(-1)?.locator, 'page 65');
+});
 
 function fixture(t: TestContext) {
   const root = mkdtempSync(resolve(tmpdir(), 'health-intake-evidence-'));

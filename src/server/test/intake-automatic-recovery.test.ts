@@ -28,7 +28,17 @@ async function until(check: () => boolean) {
 }
 function fixture(
   t: TestContext,
-  mode: 'model' | 'slice' | 'initial' | 'capacity' | 'pdf' | 'zip' | 'unknown' | 'source',
+  mode:
+    | 'model'
+    | 'slice'
+    | 'initial'
+    | 'capacity'
+    | 'pdf'
+    | 'zip'
+    | 'unknown'
+    | 'source'
+    | 'source-race'
+    | 'source-watchdog',
 ) {
   fictionalModel(t);
   const root = mkdtempSync(join(tmpdir(), 'fictional-automatic-recovery-'));
@@ -172,7 +182,16 @@ function fixture(
     random: () => 0,
     readingLimits: { activeMs: 100, slices: 1, turns: 1 },
     providerPrerequisiteKey: () => prerequisite,
+    ...(mode === 'source-watchdog' ? { sourceStallMs: 20 } : {}),
     extract: async (context) => {
+      if (mode === 'source-watchdog')
+        return new Promise<Awaited<ReturnType<typeof extractIntakeSourceText>>>(() => {});
+      if (mode === 'source-race' && sourceAttempts++ === 0)
+        throw new HttpError(
+          409,
+          'SOURCE_TEXT_CHANGED',
+          'Fictional revision changed before admission',
+        );
       if (mode === 'capacity' && sourceAttempts++ < 4)
         throw new HttpError(429, 'SOURCE_EXTRACTION_BUSY', 'Fictional shared worker busy');
       if (
@@ -239,6 +258,39 @@ test('successful model calls without unique progress retry each exact unit three
   await until(() => f.manager.get(f.profileId, batch.id).status === 'complete');
   assert.equal(f.manager.get(f.profileId, batch.id).items[0].exceptions!.length, units.length);
   for (const unit of units) assert.equal(f.units.filter((id) => id === unit.id).length, 6);
+});
+
+test('source revision races persist an item backoff and retry without review', async (t) => {
+  const f = fixture(t, 'source-race');
+  const batch = f.manager.list(f.profileId)[0]!;
+  await until(() => f.manager.get(f.profileId, batch.id).items[0].reason === 'retrying_extraction');
+  const waiting = readIntakeBatch(f.root, f.profileId, batch.id).items[0];
+  assert.equal(waiting.status, 'queued');
+  assert.ok(waiting.retryAt);
+  assert.notEqual(waiting.reason, 'source_review_required');
+  f.tick(2_000);
+  f.manager.wake(f.profileId);
+  await until(
+    () => (f.manager.get(f.profileId, batch.id).items[0].sourceExtraction?.progress || 0) > 0,
+  );
+  f.manager.stop(f.profileId, batch.id);
+});
+test('non-default local source watchdog locates a stalled inventory after three attempts', async (t) => {
+  const f = fixture(t, 'source-watchdog');
+  const batch = f.manager.list(f.profileId)[0]!;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    f.tick(2_000);
+    f.manager.wake(f.profileId);
+    if (attempt < 3)
+      await until(
+        () =>
+          (f.manager.get(f.profileId, batch.id).items[0].sourceExtraction?.stalls || 0) >= attempt,
+      );
+  }
+  await until(() => !!f.manager.get(f.profileId, batch.id).items[0].exceptions?.length);
+  const item = f.manager.get(f.profileId, batch.id).items[0];
+  assert.equal(item.exceptions?.[0]?.reason, 'processing_stalled');
+  assert.match(item.exceptions?.[0]?.locator || '', /inventory unavailable/);
 });
 
 test('ordinary context slices continue beyond two boundaries without becoming an unsupported context', async (t) => {

@@ -21,6 +21,8 @@ function fixture(
   t: TestContext,
   sourceFailure: boolean | 'retain-only' = false,
   journalFault?: (reason: string) => void,
+  randomValue = 1,
+  retryBaseMs = 5,
 ) {
   const root = mkdtempSync(join(tmpdir(), 'circus-provider-wait-')),
     profileId = 'fictional-wait';
@@ -39,6 +41,7 @@ function fixture(
     filename: sourceFailure === 'retain-only' ? 'fictional.dcm' : 'fictional.txt',
     bytes: Buffer.from('Fictional Rowan source only.'),
   });
+  let prerequisite = 'fictional-credential-1';
   let sends = 0,
     elapsed = 0;
   const dispatchTimes: number[] = [];
@@ -87,8 +90,9 @@ function fixture(
     assistant,
     pollMs: 2,
     clock: () => new Date(Date.now() + elapsed),
-    providerRetryBaseMs: 5,
-    random: () => 1,
+    providerRetryBaseMs: retryBaseMs,
+    providerPrerequisiteKey: () => prerequisite,
+    random: () => randomValue,
     continuationDelayMs: 1,
     journalWriter: (
       root: string,
@@ -122,6 +126,10 @@ function fixture(
     chat,
     batch,
     dispatchTimes,
+    now: () => Date.now() + elapsed,
+    restoreConnection: () => {
+      prerequisite = 'fictional-credential-2';
+    },
     advance: (ms: number) => {
       elapsed += ms;
     },
@@ -138,6 +146,11 @@ function fixture(
     },
     reopen() {
       manager.close('profile_locked');
+      manager = createIntakeBatchManager(options);
+    },
+    reopenWith(batch: Parameters<typeof writeIntakeBatch>[2]) {
+      manager.close('profile_locked');
+      writeIntakeBatch(root, profileId, batch, 'fictional-completed');
       manager = createIntakeBatchManager(options);
     },
   };
@@ -199,6 +212,85 @@ test('unknown outcomes retry automatically while authentication waits for the pr
     f.manager.stop(f.profileId, f.batch.id);
   }
 });
+test('Stop keeps a waiting file resumable even when the cursor has passed it', async (t) => {
+  const f = fixture(t);
+  await waitFor(() => f.sends === 1);
+  const second = uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-finished.txt',
+    bytes: Buffer.from('Fictional second file'),
+  });
+  f.manager.create(f.profileId, {
+    operationId: 'fictional-second-file',
+    intakeIds: [second.id],
+    appendToRunning: true,
+  });
+  f.fail({
+    requestId: 'fictional-waiting',
+    outcome: 'rejected',
+    classification: 'quota',
+    retryAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await waitFor(
+    () => f.manager.get(f.profileId, f.batch.id).items[0].reason === 'waiting_for_provider',
+  );
+  const live = f.manager.get(f.profileId, f.batch.id);
+  live.items[1].status = 'review_ready';
+  live.items[1].automaticRun = false;
+  live.currentIndex = live.items.length;
+  writeIntakeBatch(f.root, f.profileId, live, 'fictional-second-complete');
+  const stopped = f.manager.stop(f.profileId, f.batch.id);
+  assert.equal(stopped.items[0].status, 'paused');
+  assert.equal(stopped.items[0].reason, 'stopped');
+  f.reopen();
+  const resumed = f.manager.resume(f.profileId, f.batch.id);
+  assert.equal(resumed.items[0].automaticRun, true);
+  assert.equal(resumed.items[0].status, 'queued');
+});
+test('create reports whether a stopped or completed selection actually scheduled work', async (t) => {
+  const f = fixture(t);
+  await waitFor(() => f.sends === 1);
+  f.manager.stop(f.profileId, f.batch.id);
+  const restarted = f.manager.create(f.profileId, {
+    operationId: 'fictional-reprocess-stopped',
+    intakeIds: [f.batch.items[0].intakeId],
+  });
+  assert.equal(restarted.scheduled, true);
+  assert.equal(restarted.status, 'running');
+  f.manager.stop(f.profileId, f.batch.id);
+  const completed = f.manager.get(f.profileId, f.batch.id);
+  completed.status = 'complete';
+  completed.items[0].status = 'review_ready';
+  completed.items[0].reason = 'bounded_pass_ready';
+  completed.items[0].resumeAutomaticRun = false;
+  completed.items[0].automaticRun = false;
+  completed.automaticRun = false;
+  f.reopenWith(completed);
+  const noWork = f.manager.create(f.profileId, {
+    operationId: 'fictional-reprocess-complete',
+    intakeIds: [f.batch.items[0].intakeId],
+  });
+  assert.equal(noWork.scheduled, false);
+});
+test('authentication waits for a changed prerequisite after the retry deadline', async (t) => {
+  const f = fixture(t);
+  await waitFor(() => f.sends === 1);
+  f.fail({
+    requestId: 'fictional-auth',
+    outcome: 'rejected',
+    classification: 'authentication',
+    retryAt: null,
+  });
+  await waitFor(
+    () => f.manager.get(f.profileId, f.batch.id).items[0].reason === 'provider_authentication',
+  );
+  f.advance(31_000);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(f.sends, 1, 'a known-rejected credential must not be sent again');
+  f.restoreConnection();
+  f.manager.wake(f.profileId);
+  await waitFor(() => f.sends === 2);
+  f.manager.stop(f.profileId, f.batch.id);
+});
 test('eight consecutive transient rejections recover without spending a local stall allowance', async (t) => {
   const f = fixture(t);
   await waitFor(() => f.sends === 1);
@@ -217,6 +309,32 @@ test('eight consecutive transient rejections recover without spending a local st
   assert.equal(item.stalls?.attempts || 0, 0, 'provider waiting is not failed local work');
   f.manager.stop(f.profileId, f.batch.id);
 });
+test('provider backoff grows with both equal-jitter extremes and reaches its cap', async (t) => {
+  for (const random of [0, 1]) {
+    const f = fixture(t, false, undefined, random, 5_000);
+    await waitFor(() => f.sends === 1);
+    for (let attempt = 1; attempt <= 9; attempt++) {
+      const before = f.now();
+      f.fail({
+        requestId: `fictional-jitter-${random}-${attempt}`,
+        outcome: 'rejected',
+        classification: 'transient',
+        retryAt: null,
+      });
+      await waitFor(
+        () => f.manager.get(f.profileId, f.batch.id).items[0].providerWait?.attempts === attempt,
+      );
+      const wait = f.manager.get(f.profileId, f.batch.id).items[0].providerWait!;
+      const capped = Math.min(300_000, 5_000 * 2 ** Math.min(attempt - 1, 6));
+      const expected = Math.round(capped * (0.5 + random / 2));
+      assert.ok(Math.abs(Date.parse(wait.retryAt!) - before - expected) < 100);
+      f.advance(expected + 100);
+      f.manager.wake(f.profileId);
+      await waitFor(() => f.sends === attempt + 1);
+    }
+    f.manager.stop(f.profileId, f.batch.id);
+  }
+});
 
 test('default production jobs continue productive slices past the former total-slice allowance', async (t) => {
   const f = fixture(t);
@@ -234,6 +352,41 @@ test('default production jobs continue productive slices past the former total-s
   assert.equal(item.readingJob?.extensions, 0);
   assert.ok((item.readingJob?.progressWindows || 0) >= 18);
   f.manager.stop(f.profileId, f.batch.id);
+});
+test('legacy cumulative budget starts a fresh request window after restart', async (t) => {
+  const f = fixture(t);
+  await waitFor(() => f.sends === 1);
+  const saved = f.manager.get(f.profileId, f.batch.id);
+  assert.ok(saved.items[0].readingJob);
+  saved.items[0].readingJob!.limitPolicy = 'cumulative';
+  saved.items[0].readingJob!.activeMs = 900_000;
+  saved.items[0].readingJob!.budgetAtActiveMs = 0;
+  saved.items[0].readingJob!.budgetAtResponses = 0;
+  saved.items[0].stalls = { unitId: 'fictional-unit', locator: 'Page 1', attempts: 0 };
+  f.reopenWith(saved);
+  const recovered = f.manager.get(f.profileId, f.batch.id).items[0];
+  assert.equal(recovered.readingJob?.limitPolicy, 'progress-window');
+  assert.equal(recovered.readingJob?.budgetAtActiveMs, recovered.readingJob?.activeMs);
+  assert.equal(recovered.stalls?.attempts, 0);
+});
+test('a slow productive fake route completes without a model-speed stall', async (t) => {
+  const f = fixture(t);
+  await waitFor(() => f.sends === 1);
+  for (let response = 1; response <= 3; response++) {
+    f.advance(600_000);
+    f.chat.reading.modelRequests = 7 + response;
+    f.chat.reading.usableModelResponses = response;
+    f.chat.reading.readWindows = response;
+    f.chat.reading.reason = response === 3 ? 'reading_exhausted' : 'time_limit';
+    f.chat.reading.remainingUnits = response === 3 ? 0 : 1;
+    f.chat.reading.pendingReadWindows = response === 3 ? 0 : 1;
+    f.chat.status = 'idle';
+    if (response < 3) await waitFor(() => f.sends === response + 1);
+  }
+  await waitFor(() => f.manager.get(f.profileId, f.batch.id).status === 'complete');
+  const item = f.manager.get(f.profileId, f.batch.id).items[0];
+  assert.equal(item.stalls?.attempts || 0, 0);
+  assert.equal(item.exceptions?.length || 0, 0);
 });
 
 test('an extraction failure while queued leaves an actionable paused item, never a stranded queued row', async (t) => {
@@ -287,7 +440,7 @@ test('shared model-tool prerequisite waits never consume the active source-stall
     );
     const item = f.manager.get(f.profileId, f.batch.id).items[0];
     assert.equal(item.stalls?.attempts || 0, 0);
-    assert.ok(item.readingJob!.activeMs - item.readingJob!.budgetAtActiveMs < 1000);
+    assert.equal(item.reading?.usableModelResponses || 0, item.readingJob?.budgetAtResponses || 0);
     f.advance(30001);
     f.manager.wake(f.profileId);
     await waitFor(() => f.sends === cycle + 1);

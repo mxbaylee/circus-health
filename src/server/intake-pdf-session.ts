@@ -527,8 +527,39 @@ export function indexPdfEvidence(
   source: RetainedPdfSource,
   assertRunning: () => void = () => {},
 ): Promise<PdfEvidenceIndex> {
-  return scheduledSource(source, assertRunning, (session, guard) =>
-    session.run<PdfEvidenceIndex>('index', { sourceId: source.id }, guard),
+  return (async () => {
+    const combined: PdfEvidenceIndex = { pages: 0, sections: [], references: [] };
+    for (let pageStart = 1; pageStart === 1 || pageStart <= combined.pages; pageStart += 64) {
+      const chunk = await scheduledSource(source, assertRunning, (session, guard) =>
+        session.run<PdfEvidenceIndex>(
+          'index',
+          { sourceId: source.id, pageStart, pageLimit: 64 },
+          guard,
+        ),
+      );
+      combined.pages = chunk.pages;
+      combined.sections.push(...chunk.sections);
+      combined.references.push(...chunk.references);
+    }
+    return combined;
+  })();
+}
+
+export function pdfPageCountEvidence(
+  source: RetainedPdfSource,
+  assertRunning: () => void = () => {},
+): Promise<number> {
+  return scheduledSource(
+    source,
+    assertRunning,
+    async (session, guard) =>
+      (
+        await session.run<PdfEvidenceIndex>(
+          'index',
+          { sourceId: source.id, pagesOnly: true },
+          guard,
+        )
+      ).pages,
   );
 }
 

@@ -15,6 +15,7 @@ import { dateNumber } from '../app/data/format.ts';
 import { documentPersonId, observation } from './queries.ts';
 import { getNote, attachments } from './notes.ts';
 import type { NoteDTO } from './notes.ts';
+import type { IntakeExtractionUnit } from '../shared/intake.ts';
 
 const tables = {
   note: 'notes',
@@ -156,6 +157,11 @@ export interface NoteExportInput extends JsonRecord {
 }
 
 export interface NoteExportSnapshot {
+  readingGaps: {
+    sourceFileId: string;
+    filename: string;
+    gaps: { locator: string; reason: string }[];
+  }[];
   patient: PatientInformation | null;
   identity: { name: string; birthDate: unknown; pronouns: unknown; version: unknown };
   main: ExportRecord;
@@ -744,6 +750,67 @@ function patientInformation(db: Database, personId = 'patient'): PatientInformat
     contacts,
   };
 }
+function includedReadingGaps(
+  db: Database,
+  records: ExportRecord[],
+): NoteExportSnapshot['readingGaps'] {
+  const citations = new Set(
+    records.flatMap((record) => record.citations.map((citation) => citation.id)),
+  );
+  const sourceFiles = new Set<string>();
+  for (const id of citations) {
+    const row = db.prepare('SELECT source_file_id FROM source_records WHERE id=?').get(id) as
+      { source_file_id?: string } | undefined;
+    if (row?.source_file_id) sourceFiles.add(row.source_file_id);
+  }
+  const result: NoteExportSnapshot['readingGaps'] = [];
+  for (const id of [...sourceFiles].sort()) {
+    let sourceId = id;
+    let row = db.prepare('SELECT id,details_json FROM source_files WHERE id=?').get(sourceId) as
+      { id: string; details_json: string } | undefined;
+    if (!row) continue;
+    let details = parsedRecord(row.details_json).intake as JsonRecord | undefined;
+    if (typeof details?.parentSourceFileId === 'string') {
+      sourceId = details.parentSourceFileId;
+      row = db
+        .prepare('SELECT id,details_json FROM source_files WHERE id=?')
+        .get(sourceId) as typeof row;
+      details = row ? (parsedRecord(row.details_json).intake as JsonRecord | undefined) : undefined;
+    }
+    if (!details || result.some((entry) => entry.sourceFileId === sourceId)) continue;
+    const workflow = details.workflow as
+      { plans?: { status: string; units: IntakeExtractionUnit[] }[] } | undefined;
+    const plan =
+      workflow?.plans?.find((entry) => entry.status === 'active') || workflow?.plans?.at(-1);
+    const gaps =
+      plan?.units
+        ?.filter(
+          (unit) =>
+            unit.status !== 'completed' ||
+            unit.processingException ||
+            unit.coverage?.kind === 'unreadable',
+        )
+        .map((unit) => ({
+          locator: unit.locator || unit.id,
+          reason:
+            unit.processingException?.reason ||
+            (unit.coverage?.kind === 'unreadable' ? 'unreadable' : 'not yet read'),
+        })) || [];
+    if (!plan || !plan.units?.length)
+      gaps.push({
+        locator: 'Retained original',
+        reason: 'reading has not established page coverage',
+      });
+    if (gaps.length)
+      result.push({
+        sourceFileId: sourceId,
+        filename: String(details.originalName || sourceId),
+        gaps,
+      });
+  }
+  return result;
+}
+
 export function exportSnapshot(
   db: Database,
   value: unknown,
@@ -967,6 +1034,8 @@ export function exportSnapshot(
         a.key.localeCompare(b.key),
     ),
     assets,
+    readingGaps:
+      input.mode === 'provider' ? includedReadingGaps(db, [main, ...records.values()]) : [],
     mode: input.mode ?? 'brief',
     trends: !!input.trends,
     scope: {
@@ -1211,6 +1280,8 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
     : snapshot.mode === 'brief'
       ? `<p class="meta">Appointment brief · Generated ${esc(snapshot.generatedAt.slice(0, 10))} · ${snapshot.records.length} selected supplements. Date scope: ${esc(snapshot.scope.from || 'any')} to ${esc(snapshot.scope.to || 'any')}. This note and explicitly selected evidence.</p>`
       : `<div class="scope"><strong>${snapshot.mode === 'detailed' ? 'Detailed evidence packet' : 'New provider packet'}${provider ? ' · clinical archive and selected notes' : ' · selected evidence only'}</strong><p>Generated ${esc(snapshot.generatedAt)}. Date scope: ${esc(snapshot.scope.from || 'unbounded')} to ${esc(snapshot.scope.to || 'unbounded')}. Archived supplements: ${snapshot.scope.includeArchived ? 'allowed when selected' : 'excluded'}. ${snapshot.records.length} supplementary records and ${snapshot.assets.length} companion originals selected.</p><p>This is not a complete hospital chart. Missing, unreviewed and conflicting assertions are retained as recorded. No clinical recommendations or medication reconciliation are inferred. Original assets are companion downloads, not embedded pages.</p></div>`;
+  if (provider && snapshot.readingGaps.length)
+    body += `<section><h2>Unread source sections</h2><p>These source sections were not fully read. An absent finding in this packet does not establish absence in the original.</p>${snapshot.readingGaps.map((source) => `<h3>${esc(source.filename)}</h3><ul>${source.gaps.map((gap) => `<li>${esc(gap.locator)}: ${esc(gap.reason)}</li>`).join('')}</ul>`).join('')}</section>`;
   if (snapshot.mode === 'detailed')
     body += `<section class="section"><h2>Contents and overview</h2><ol><li>Main note: ${esc(snapshot.main.title)}</li>${snapshot.records.map((r, i) => `<li><a href="#record-${i + 1}">${esc(r.type)}: ${esc(r.title)}</a></li>`).join('')}<li><a href="#sources">Sources and companion originals</a></li></ol><h2>Selected chronology</h2>${fields([...all].sort((a, b) => (a.date || '').localeCompare(b.date || '')).map((r) => [missing(r.date), `${r.title} (${r.key})`]))}</section>`;
   if (snapshot.patient)

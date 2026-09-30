@@ -222,14 +222,14 @@ const answer = {
   usage: { prompt_tokens: 20, completion_tokens: 6, total_tokens: 26 },
 };
 
-test('proxy inference deadline defaults to five minutes and validates bounded overrides', () => {
+test('proxy inference deadline defaults to five minutes and accepts slow local routes', () => {
   assert.equal(config().timeoutSeconds, 300);
-  for (const seconds of ['30', '600'])
+  for (const seconds of ['30', '600', '3600'])
     assert.equal(config({ CRS_AI_PROXY_TIMEOUT_SECONDS: seconds }).timeoutSeconds, Number(seconds));
-  for (const seconds of ['', '29', '601', '300.5', 'Infinity', '-1', '3e2', ' 300 '])
+  for (const seconds of ['', '29', '2147484', '300.5', 'Infinity', '-1', '3e2', ' 300 '])
     assert.throws(
       () => config({ CRS_AI_PROXY_TIMEOUT_SECONDS: seconds }),
-      /integer from 30 to 600/,
+      /integer from 30 to 2147483/,
     );
 });
 

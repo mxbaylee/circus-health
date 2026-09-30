@@ -210,7 +210,13 @@ export async function handleIntakeRoute({
       { filename, providerId, newProviderName, mimeType: req.headers['content-type'] },
       req,
     );
-    intakeBatches?.wake(profileId);
+    try {
+      intakeBatches?.wake(profileId);
+    } catch (error) {
+      // The original and enqueue intent are already durable. A later wake
+      // reconciles the intent; this upload must still be acknowledged.
+      console.error('Intake enqueue wake failed after retention', error);
+    }
     respond(retained, {}, 201);
   } else if (method === 'POST') {
     if ((req.headers['content-type'] || '').split(';')[0] !== 'application/json')

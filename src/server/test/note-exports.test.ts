@@ -86,6 +86,43 @@ test('current medication options use personal confirmation, retain doses and pro
   assert.match(html, /&quot;low&quot;:12/);
   assert.match(html, /Pages 2, 3/);
 });
+test('provider packet and evidence companion disclose unread cited source pages', (t) => {
+  const { db, input } = fixture(t);
+  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
+    JSON.stringify({
+      intake: {
+        originalName: 'fictional.pdf',
+        workflow: {
+          plans: [
+            {
+              status: 'active',
+              units: [
+                { id: 'page-2', locator: 'Page 2', status: 'completed' },
+                {
+                  id: 'page-3',
+                  locator: 'Page 3',
+                  status: 'pending',
+                  processingException: { reason: 'processing_stalled', at: '2026-01-01' },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+    'file',
+  );
+  const packet = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.deepEqual(packet.readingGaps, [
+    {
+      sourceFileId: 'file',
+      filename: 'fictional.pdf',
+      gaps: [{ locator: 'Page 3', reason: 'processing_stalled' }],
+    },
+  ]);
+  assert.match(exportHtml(packet), /Unread source sections[\s\S]*Page 3: processing_stalled/);
+  assert.deepEqual(exportEvidence(packet).readingGaps, packet.readingGaps);
+});
 test('an older archived/current conflict is excluded from current prescription packets and summaries', (t) => {
   const { db, input } = fixture(t);
   const original = db.prepare("SELECT * FROM medications WHERE id='current-med'").get();

@@ -19,6 +19,9 @@ interface WorkerRequest {
   requestId: number;
   action: 'index' | 'page' | 'identity' | 'search';
   sourceId?: string;
+  pageStart?: number;
+  pageLimit?: number;
+  pagesOnly?: boolean;
   page?: number;
   offset?: number;
   query?: string;
@@ -335,21 +338,35 @@ async function boundedAttachments(
   return result;
 }
 
-async function indexPdf(sourceId: string) {
+async function indexPdf(sourceId: string, pageStart = 1, pageLimit = 64, pagesOnly = false) {
   assertSameOpenFile();
   const doc = document!;
+  if (pagesOnly) return { pages: doc.numPages, sections: [], references: [] };
   const sections: { id: string; locator: string; page: number }[] = [];
   const references: Record<string, unknown>[] = [];
-  for (let number = 1; number <= doc.numPages; number++) {
+  const overflowPages = new Set<number>();
+  for (
+    let number = pageStart;
+    number <= Math.min(doc.numPages, pageStart + pageLimit - 1);
+    number++
+  ) {
     sections.push({ id: `page:${number}`, locator: `page ${number}`, page: number });
     const page = await doc.getPage(number);
     const annotations = (await page.getAnnotations()) as PdfAnnotation[];
     for (const annotation of annotations) {
       if (!annotation.dest && !annotation.url && !annotation.unsafeUrl) continue;
       if (references.length >= INTAKE_PDF_BOUNDS.maxReferences) {
-        const error = new Error('This PDF exceeds 5,000 indexed references; original retained');
-        Object.assign(error, { code: 'REFERENCE_LIMIT' });
-        throw error;
+        if (!overflowPages.has(number)) {
+          overflowPages.add(number);
+          references.push({
+            id: `reference-capacity:${sourceId}:${number}`,
+            source: '',
+            locator: `page ${number}, remaining references`,
+            status: 'capacity_exception',
+            note: 'Further references on this page were not indexed; page text remains readable.',
+          });
+        }
+        continue;
       }
       const reference: Record<string, unknown> = {
         id: 'reference:' + hashValue([sourceId, number, annotation.id]),
@@ -598,7 +615,12 @@ async function handleRequest(request: WorkerRequest) {
   try {
     const result =
       request.action === 'index'
-        ? await indexPdf(String(request.sourceId || ''))
+        ? await indexPdf(
+            String(request.sourceId || ''),
+            Number(request.pageStart || 1),
+            Number(request.pageLimit || 64),
+            request.pagesOnly === true,
+          )
         : request.action === 'identity'
           ? await identityPageText(Number(request.page))
           : request.action === 'search'

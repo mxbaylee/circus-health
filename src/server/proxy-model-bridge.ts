@@ -582,8 +582,13 @@ export function validateProxyConfig(
       'LiteLLM Proxy reasoning effort must be configured in the selected proxy model; CRS_AI_REASONING_EFFORT is unsupported.',
     );
   const timeoutValue = env.CRS_AI_PROXY_TIMEOUT_SECONDS ?? '300';
-  if (!/^\d+$/.test(timeoutValue) || Number(timeoutValue) < 30 || Number(timeoutValue) > 600)
-    fail('CRS_AI_PROXY_TIMEOUT_SECONDS must be an integer from 30 to 600.');
+  if (
+    !/^\d+$/.test(timeoutValue) ||
+    !Number.isSafeInteger(Number(timeoutValue)) ||
+    Number(timeoutValue) < 30 ||
+    Number(timeoutValue) > 2_147_483
+  )
+    fail('CRS_AI_PROXY_TIMEOUT_SECONDS must be an integer from 30 to 2147483.');
   return Object.freeze({
     backend: 'litellm',
     model,

@@ -14,7 +14,7 @@ export const DEFAULT_INTAKE_READING_LIMITS: Readonly<IntakeReadingLimits> = {
   activeMs: 3 * 60 * 1000,
   slices: 16,
   turns: 256,
-  requests: 2048,
+  requests: 1,
   measuredTokens: 20_000_000,
 };
 
@@ -52,6 +52,7 @@ export function beginReadingSlice(
     budgetAtActiveMs: 0,
     budgetAtTurns: item.reading?.turns || 0,
     budgetAtRequests: item.reading?.modelRequests || 0,
+    budgetAtResponses: item.reading?.usableModelResponses || 0,
     budgetAtTokens: item.reading?.measuredModelTokens || 0,
     extensions: 0,
   };
@@ -112,6 +113,7 @@ function renewProgressWindow(
   job.budgetAtSlices = job.slices;
   job.budgetAtTurns = reading?.turns || 0;
   job.budgetAtRequests = reading?.modelRequests || 0;
+  job.budgetAtResponses = reading?.usableModelResponses || 0;
   job.budgetAtTokens = reading?.measuredModelTokens || 0;
   job.progressWindows = (job.progressWindows || 0) + 1;
 }
@@ -123,11 +125,13 @@ export function readingBudgetReached(
 ): boolean {
   const job = item.readingJob;
   if (!job) return false;
-  // Migrate old cumulative allowances; only active time without unique progress matters.
-  const currentMs = job.sliceStartedAt
-    ? Math.max(0, Date.parse(at) - Date.parse(job.sliceStartedAt))
-    : 0;
-  return job.activeMs + currentMs - job.budgetAtActiveMs >= limits.activeMs;
+  // Elapsed model time is diagnostic: a slow local route can spend hours on a
+  // productive request. Count completed requests without durable progress.
+  void at;
+  return (
+    (item.reading?.usableModelResponses || 0) - (job.budgetAtResponses || 0) >=
+    (limits.requests ?? 1)
+  );
 }
 
 /**
@@ -163,6 +167,7 @@ export function extendReadingBudget(item: IntakeBatchItem): void {
   job.budgetAtSlices = job.slices;
   job.budgetAtTurns = item.reading?.turns || 0;
   job.budgetAtRequests = item.reading?.modelRequests || 0;
+  job.budgetAtResponses = item.reading?.usableModelResponses || 0;
   job.budgetAtTokens = item.reading?.measuredModelTokens || 0;
   job.extensions++;
 }
