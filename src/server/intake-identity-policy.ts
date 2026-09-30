@@ -857,6 +857,18 @@ export function assessIdentityPolicy({
       message:
         'This report was assigned to another person. Confirm who these current records belong to.',
     };
+  if (
+    latestPersonChoice?.outcome === 'this_is_me' &&
+    latestPersonChoice.scope.groupId !== group?.id &&
+    matchedOwner?.personId !== 'patient'
+  )
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'The person matched by this report has changed. Confirm who these current records belong to.',
+    };
   // A confirmation belongs to the reviewed report: A cannot answer B's
   // unreadable DOB or incompatible banner merely because their names match.
   // B's own applicable confirmation can still resolve its ownership question.
