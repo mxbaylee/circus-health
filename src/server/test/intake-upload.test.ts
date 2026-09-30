@@ -13,6 +13,8 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import { receiveIntakeUpload } from '../intake-upload.ts';
 import { intakeLimits, inspectIntakeFile } from '../intake-files.ts';
 import * as intake from '../intake.ts';
+import { handleIntakeRoute } from '../intake-routes.ts';
+import { createIntakeBatchManager } from '../intake-batches.ts';
 import { readIntakeEvidence } from '../intake-evidence.ts';
 import { rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
@@ -63,6 +65,73 @@ test('streamed originals adopt the completed staging inode without a second plai
   assert.deepEqual(readFileSync(retained.path), original);
   assert.deepEqual(readdirSync(join(f.root, '.upload-staging')), []);
   assert.equal(item.sha256, hash(original));
+});
+
+test('a coordinator wake fault after retention still acknowledges upload for later reconciliation', async (t) => {
+  const f = fixture(t);
+  const bytes = Buffer.from('Fictional retained upload');
+  let response: { status: number; data: { id: string } } | undefined;
+  await handleIntakeRoute({
+    resource: 'intakes',
+    method: 'POST',
+    params: new URLSearchParams(),
+    req: request([bytes], {
+      'content-length': String(bytes.length),
+      'x-filename': 'fictional.txt',
+      'content-type': 'text/plain',
+    }),
+    db: f.db,
+    root: f.root,
+    profileId: f.profileId,
+    respond: (data, _options, status) => {
+      response = { status: status || 200, data: data as { id: string } };
+    },
+    list: () => {},
+    body: async () => Buffer.alloc(0),
+    assistant: {} as never,
+    intakeBatches: {
+      wake: () => {
+        throw Error('Fictional wake fault');
+      },
+    } as never,
+  });
+  assert.equal(response?.status, 201);
+  assert.ok(response?.data.id);
+  assert.ok(
+    f.db
+      .prepare('SELECT 1 FROM app_meta WHERE key=?')
+      .get(`intake_enqueue:v1:${response!.data.id}`),
+  );
+  const manager = createIntakeBatchManager({
+    root: f.root,
+    databases: new Map([[f.profileId, f.db]]),
+    assistant: {
+      get: () => {
+        throw Error('Fictional no chat');
+      },
+      isBusy: () => true,
+      create: () => {
+        throw Error('Fictional no chat');
+      },
+      send: () => {
+        throw Error('Fictional no chat');
+      },
+      retry: () => {
+        throw Error('Fictional no chat');
+      },
+      cancel: () => {},
+      attachIntakeReadingRequestGuard: () => false,
+    },
+  });
+  manager.wake(f.profileId);
+  assert.equal(
+    manager
+      .list(f.profileId)
+      .flatMap((batch) => batch.items)
+      .filter((item) => item.intakeId === response!.data.id).length,
+    1,
+  );
+  manager.close();
 });
 
 test('streamed renamed ADTS uses retained file length beyond the sniff prefix and rejects incomplete frames', async (t) => {

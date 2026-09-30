@@ -3,7 +3,9 @@ import { ImportDiagnosticsControl } from '../features/import/ImportDiagnosticsCo
 import { ConnectionStatus } from './ConnectionStatus';
 import { PersonIcon } from './PersonIcon';
 import { StorageNotice } from './StorageNotice';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import type { IntakeBatch } from '../../shared/intake-batch';
+import { api } from '../data/api';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import * as Dialog from '@radix-ui/react-dialog';
 import {
@@ -169,6 +171,7 @@ function ShellContent() {
           </header>
           <main id="main-content" tabIndex={-1}>
             <StorageNotice />
+            <ModelAuthenticationNotice profileId={profile?.id || ''} />
             <PersonScopeContent>
               <Outlet />
             </PersonScopeContent>
@@ -184,4 +187,50 @@ function ShellContent() {
       </div>
     </AssistantPageProvider>
   );
+}
+
+function ModelAuthenticationNotice({ profileId }: { profileId: string }) {
+  const [waiting, setWaiting] = useState(false);
+  useEffect(() => {
+    setWaiting(false);
+    if (!profileId) return;
+    const controller = new AbortController();
+    const check = () =>
+      void api<IntakeBatch[]>(`/api/profiles/${encodeURIComponent(profileId)}/intake-batches`, {
+        signal: controller.signal,
+      })
+        .then(({ data }) => {
+          if (!controller.signal.aborted)
+            setWaiting(
+              data.some(
+                (batch) =>
+                  batch.status === 'running' &&
+                  batch.items.some((item) => item.reason === 'provider_authentication'),
+              ),
+            );
+        })
+        .catch(() => {
+          /* A locked or disconnected profile cannot publish this notice. */
+        });
+    check();
+    const timer = setInterval(check, 15_000);
+    return () => {
+      controller.abort();
+      clearInterval(timer);
+    };
+  }, [profileId]);
+  return waiting ? (
+    <aside className="app-update-notice" aria-label="Model sign-in required" role="status">
+      <div>
+        <strong>Model sign-in needed</strong>
+        <p>Imports are waiting for the provider connection. They will continue after sign-in.</p>
+      </div>
+      <button
+        className="button secondary"
+        onClick={() => window.dispatchEvent(new Event('health:model-connection'))}
+      >
+        Open model connection
+      </button>
+    </aside>
+  ) : null;
 }
