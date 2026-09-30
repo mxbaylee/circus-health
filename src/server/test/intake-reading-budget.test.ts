@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IntakeBatchItem, IntakeBatchReadingState } from '../../shared/intake-batch.ts';
 import {
+  DEFAULT_INTAKE_READING_LIMITS,
   beginReadingSlice,
   finishReadingSlice,
   readingBudgetReached,
@@ -50,6 +51,28 @@ const item = (): IntakeBatchItem => ({
   reading: state(),
   startedAt: null,
   endedAt: null,
+});
+
+test('default stall allowance permits bootstrap tools and remains bounded by completed responses', () => {
+  const file = item();
+  beginReadingSlice(file, '2026-01-01T00:00:00Z', DEFAULT_INTAKE_READING_LIMITS);
+  const limit = DEFAULT_INTAKE_READING_LIMITS.requests!;
+  assert.ok(limit > 2, 'context read and plan creation must fit before the first source window');
+  for (let responses = 1; responses < limit; responses++) {
+    file.reading = state({ modelRequests: responses, usableModelResponses: responses });
+    assert.equal(readingBudgetReached(file, '2026-01-02T00:00:00Z'), false);
+  }
+  file.reading = state({ modelRequests: limit, usableModelResponses: limit });
+  assert.equal(readingBudgetReached(file, '2026-01-02T00:00:00Z'), true);
+  assert.equal(
+    readingModelRequestBudgetReached(
+      file,
+      state({ modelRequests: limit, usableModelResponses: limit, readWindows: 1 }),
+      '2026-01-02T00:00:00Z',
+    ),
+    false,
+    'new source coverage renews the allowance',
+  );
 });
 
 test('only completed requests without unique durable progress can end a reading attempt', () => {

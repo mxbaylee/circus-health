@@ -14,7 +14,8 @@ export const DEFAULT_INTAKE_READING_LIMITS: Readonly<IntakeReadingLimits> = {
   activeMs: 3 * 60 * 1000,
   slices: 16,
   turns: 256,
-  requests: 1,
+  // Allow bounded context/plan setup before a source window is delivered.
+  requests: 16,
   measuredTokens: 20_000_000,
 };
 
@@ -130,12 +131,12 @@ export function readingBudgetReached(
   void at;
   return (
     (item.reading?.usableModelResponses || 0) - (job.budgetAtResponses || 0) >=
-    (limits.requests ?? 1)
+    (limits.requests ?? DEFAULT_INTAKE_READING_LIMITS.requests!)
   );
 }
 
 /**
- * Checks active time without unique progress at the synchronous request boundary.
+ * Checks completed responses without unique progress at the request boundary.
  * The assistant has already reserved the current model turn when this runs, so
  * exclude that reservation while retaining every persisted request/token count.
  */
