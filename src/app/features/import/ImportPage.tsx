@@ -779,6 +779,8 @@ export function ImportPage() {
             (identityReviewErrors.has(group.groupId)
               ? 'Identity status could not load. Retry before saving this report.'
               : 'Checking the retained identity evidence…'),
+          challengedName: identityReview?.challengedName,
+          correctedPerson: identityReview?.correctedPerson,
           warnings: identityReview?.warnings,
           blocking: identityReview?.blocking ?? identityReviewErrors.has(group.groupId),
           offeredSelfFields: identityReview?.offeredSelfFields || {},
@@ -1766,6 +1768,7 @@ export function ImportPage() {
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: NonNullable<IntakeIdentityConfirmation['futureNameOwner']>,
   ) {
     const group = displayedFeed?.groups.find((item) => item.groupId === reportId);
     const displayedReview = identityReviews.get(reportId);
@@ -1790,7 +1793,7 @@ export function ImportPage() {
         ),
       ) as { fullName?: string; birthDate?: string };
       try {
-        operationKey = `identity:${displayedScope.groupId}:${displayedScope.groupVersionId}:${displayedScope.intakeVersion}:${JSON.stringify([fields, personSelection, printedName, identityAnswers])}`;
+        operationKey = `identity:${displayedScope.groupId}:${displayedScope.groupVersionId}:${displayedScope.intakeVersion}:${JSON.stringify([fields, personSelection, printedName, identityAnswers, futureNameOwner])}`;
         const request = (pendingOperations.current.get(operationKey) as
           IntakeIdentityConfirmation | undefined) || {
           version: displayedScope.intakeVersion,
@@ -1800,6 +1803,9 @@ export function ImportPage() {
           ...(personSelection ? { personSelection } : {}),
           ...(printedName ? { printedName } : {}),
           ...(identityAnswers ? { identityAnswers } : {}),
+          ...(displayedReview.challengedName
+            ? { futureNameOwner: futureNameOwner || { outcome: 'ask' } }
+            : {}),
           attestation: displayedScope.questions?.length
             ? 'confirmed_displayed_identity_questions'
             : 'confirmed_displayed_report_subject',

@@ -1,5 +1,5 @@
 import type { Database, SqliteRow } from './database.ts';
-import { json } from './database.ts';
+import { HttpError, json } from './database.ts';
 import { clinicalTables, type ClinicalKind } from './clinical-references.ts';
 import { clinicalSourceIdentityV1 } from './intake-source-identity.ts';
 import {
@@ -49,20 +49,33 @@ export function ownershipContributions(
 ): SourceContribution[] {
   const row = db
     .prepare(`SELECT source_record_id FROM ${clinicalTables[kind]} WHERE id=?`)
-    .get(recordId)!;
+    .get(recordId);
+  if (!row) throw new HttpError(404, 'RECORD_NOT_FOUND', 'Saved record not found in this profile.');
   const ids = new Set<string>([String(row.source_record_id)]);
   for (const e of db
     .prepare('SELECT source_record_id FROM evidence WHERE entity_type=? AND entity_id=?')
     .iterate(kind, recordId))
     ids.add(String(e.source_record_id));
   return [...ids].sort().map((id) => {
-    const source = db.prepare('SELECT * FROM source_records WHERE id=?').get(id)!;
+    const source = db.prepare('SELECT * FROM source_records WHERE id=?').get(id);
+    if (!source)
+      throw new HttpError(
+        409,
+        'OWNERSHIP_CHANGED',
+        'The saved record source changed. Update the correction preview.',
+      );
     const envelope = json(source.raw_json) as HealthRecordEnvelope;
     const locator = json(source.locator_json, {}) as Record<string, unknown>;
     const originalId = String(locator.originalSourceFileId || source.source_file_id);
     const original = db
       .prepare('SELECT sha256,details_json FROM source_files WHERE id=?')
-      .get(originalId)!;
+      .get(originalId);
+    if (!original)
+      throw new HttpError(
+        409,
+        'OWNERSHIP_CHANGED',
+        'The retained original changed. Update the correction preview.',
+      );
     const evidence = db
       .prepare(
         'SELECT * FROM evidence WHERE entity_type=? AND entity_id=? AND source_record_id=? ORDER BY id',

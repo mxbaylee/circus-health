@@ -18,6 +18,10 @@ Provider packets automatically offer **Download evidence JSON** alongside the PD
 
 The companion has format `circus-health-provider-evidence-v1`, the frozen snapshot fingerprint and a stable numbered `citationIndex` matching every PDF [number]. It projects only export records, not UI `getNote` payloads/backlinks; links point only to included entries. Asset ownership metadata is filtered to included owners, so an unselected private note sharing the same asset cannot disclose its caption. The clinical data remains unchanged.
 
+Included clinical records retain `ownershipCorrections` in the evidence companion. Preview and PDF display **Owner corrected on DATE**, the former attribution and any recorded reason, including compact result/prescription/procedure tables and deduplicated document narratives. These corrections are assertions by the profile user; they do not imply a provider amended the original. A fresh packet reflects the current owner and correction history, and a changed correction invalidates an earlier preview fingerprint.
+
+The app does not retain a durable packet-membership or delivery receipt. Its expiring in-memory preview cache cannot establish whether an earlier copy included a particular record or who received it. Ownership correction previews and record history state that limitation so the person can check copies they shared and send corrected packets where needed.
+
 ## API contract and immutable previews
 
 POST `/note-exports/options`: `{type: "note" | "document" | "person", id}`. Person entry is restricted to `patient`. Returns `noteVersion`, `noteTitle`, `choices` (including note `kind`) and legacy asset choices. New UI only uses non-person note choices for additional-note selection.

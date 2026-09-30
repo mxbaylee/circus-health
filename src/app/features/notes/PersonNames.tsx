@@ -1,9 +1,12 @@
 import { Link } from 'react-router-dom';
-import { useId } from 'react';
+import { useId, useState } from 'react';
 import type { PersonProfile } from '../../../shared/api';
 import { canonicalIdentityName } from '../../../shared/self-identity';
 import { CreatableCombobox } from '../../components/CreatableCombobox';
 import { SelectionChip } from '../../components/SelectionChip';
+import { useResource } from '../../data/api';
+import { linkHref } from './NoteLinks';
+import type { OwnershipReceipt } from '../../../shared/record-ownership';
 import './person-names.css';
 
 /** One names list in the UI; legacy fullName remains compatible with retained profiles. */
@@ -78,21 +81,52 @@ export function PersonNames({
         >
           {evidence.map((item) => (
             <li key={item.name}>
-              <Link
-                to={`/import?${new URLSearchParams({ intake: item.intakeId, group: item.groupId })}`}
-                aria-label={`View report confirming ${item.name}`}
-              >
-                <SelectionChip label={item.name} />
-                {person.nameAssociations?.find(
-                  (a) => canonicalIdentityName(a.name) === canonicalIdentityName(item.name),
-                )?.status === 'superseded'
-                  ? ' — historical, corrected'
-                  : person.nameAssociations?.find(
-                        (a) => canonicalIdentityName(a.name) === canonicalIdentityName(item.name),
-                      )?.status === 'unresolved'
-                    ? ' — needs identity review'
-                    : ' — active'}
-              </Link>
+              {(() => {
+                const association = person.nameAssociations?.find(
+                  (candidate) =>
+                    canonicalIdentityName(candidate.name) === canonicalIdentityName(item.name),
+                );
+                const confirmationDate = item.confirmedAt?.slice(0, 10);
+                const correctionKind = association?.origin === 'ownership';
+                return (
+                  <>
+                    <Link
+                      to={`/import?${new URLSearchParams({ intake: item.intakeId, group: item.groupId })}`}
+                      aria-label={`View report confirming ${item.name}`}
+                    >
+                      <SelectionChip label={item.name} />
+                      {association?.status === 'superseded'
+                        ? ' — historical, corrected'
+                        : association?.status === 'unresolved'
+                          ? ' — needs identity review'
+                          : ' — active'}
+                    </Link>
+                    <small>
+                      {' '}
+                      Confirmed in the linked report
+                      {confirmationDate ? ` on ${confirmationDate}` : ''}.
+                      {association
+                        ? ` ${association.status === 'active' ? 'Active' : association.status === 'superseded' ? 'Historical' : 'Needs review'} after ${correctionKind ? 'person correction' : association.origin === 'future' ? 'future-name choice' : 'report reconfirmation'} on ${association.at.slice(0, 10)}.`
+                        : ''}
+                    </small>
+                    {correctionKind && association && (
+                      <NameCorrectionDetails
+                        operationId={association.operationId}
+                        name={item.name}
+                      />
+                    )}
+                    {association?.status === 'unresolved' && (
+                      <p>
+                        <Link
+                          to={`/import?${new URLSearchParams({ intake: item.intakeId, group: item.groupId })}`}
+                        >
+                          Resolve this name in report identity review
+                        </Link>
+                      </p>
+                    )}
+                  </>
+                );
+              })()}
             </li>
           ))}
         </ul>
@@ -104,5 +138,38 @@ export function PersonNames({
         </small>
       )}
     </div>
+  );
+}
+
+function NameCorrectionDetails({ operationId, name }: { operationId: string; name: string }) {
+  const [open, setOpen] = useState(false);
+  const correction = useResource<OwnershipReceipt>(
+    open ? `/record-ownership/${encodeURIComponent(operationId)}` : null,
+  );
+  return (
+    <details onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>View correction for {name}</summary>
+      {correction.error && (
+        <p role="alert">
+          The correction receipt is unavailable. The historical report remains linked above.
+        </p>
+      )}
+      {correction.data && (
+        <>
+          <p>Accepted person correction on {correction.data.at.slice(0, 10)}.</p>
+          <ul>
+            {correction.data.outcomes.map((outcome) => (
+              <li key={outcome.recordId}>
+                <Link
+                  to={linkHref({ targetType: outcome.kind, targetId: outcome.destinationRecordId })}
+                >
+                  Open corrected {outcome.kind} and accepted history
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </details>
   );
 }

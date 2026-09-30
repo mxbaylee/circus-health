@@ -126,10 +126,15 @@ people with the same spelling remain independent. Single-token names remain repo
 A later explicit confirmation can reestablish an association with new support; an old
 receipt or retained historical spelling cannot do so by itself.
 
-Current limitation, open in [CRS-134](../todo/CRS-134.md): an unresolved association is
-removed rather than held for review, and so is an independently entered manual name with
-the same spelling. When another saved person has that name, later reports and unaccepted
-records from the corrected report can match that person without a question.
+An unresolved learned association remains a visible competing claim. A later report with
+that printed name asks for explicit identity review even when only one other saved person
+currently matches. A separately entered primary or manual name retains its own authority;
+the learned association cannot remove it. The correction review can also choose who should
+receive _future_ reports with that name: Self, a named Person, or **Ask each time**. This
+choice governs later matching only. It does not rewrite earlier confirmations or move
+accepted records. A selected-record correction places unaccepted members of the affected
+report on hold until the report itself is confirmed again, even when the old confirmation
+was ordinary and no standing correction default existed.
 
 Original-grounded DOB conflicts remain blocking. Ordinary ownership correction neither
 changes a saved DOB nor grants the separate printed-DOB exception tracked in
@@ -138,7 +143,12 @@ boundaries, unavailable people and new contradictory evidence require review. Co
 original-grounding caches are rebuilt by opening identity review; a cached assignment
 never substitutes for checking the original.
 
-The browser reconciles an uncertain save by its operation ID before permitting another
-correction. Undo is a new preview and correction against current records, sources,
-relationships and names. It preserves intervening edits and never deletes the earlier
-decision or automatically collapses a previous split.
+The browser keeps an uncertain save's operation ID with the exact profile, dialog and
+selection, then reconciles it before permitting another correction. A definite refusal
+requires a fresh preview with its reason displayed. Undo starts a new preview and
+correction against current records, sources, relationships and names; the earlier link or
+split decision is not preselected. It preserves intervening edits and never deletes the
+earlier decision or automatically collapses a previous split. Accepted versions are
+available from the corrected record's history. A new export packet includes the person
+correction in PDF and evidence data; the app has no durable ledger of which earlier
+packets were generated or shared, so a person must check copies they already shared.

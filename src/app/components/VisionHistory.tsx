@@ -4,6 +4,8 @@ import { OpticalPrescriptionPreview } from './OpticalPrescriptionPreview';
 import { Pagination, ResourceState } from './ResourceState';
 import { SourceDialog } from './SourceDialog';
 import { queryString, useResource } from '../data/api';
+import { RecordOwnershipAction } from '../features/clinical-review/RecordOwnershipAction';
+import { OwnershipHistory } from './OwnershipHistory';
 
 export function VisionHistory({
   filters,
@@ -66,6 +68,14 @@ export function VisionHistory({
                   </p>
                   <OpticalPrescriptionPreview prescription={row.opticalPrescription} />
                   <SourceDialog sourceRecordId={row.sourceRecordId} />
+                  <RecordOwnershipAction
+                    selection={{
+                      type: 'records',
+                      records: [{ kind: 'document', recordId: row.id }],
+                    }}
+                    onApplied={history.reload}
+                  />
+                  <OwnershipHistory kind="document" recordId={row.id} />
                 </article>
               ))}
             </div>

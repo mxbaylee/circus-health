@@ -86,7 +86,7 @@ export function ownershipRequest(value: unknown): OwnershipRequest {
         (d) =>
           !object(d) ||
           !text(d.recordId) ||
-          !['keep_both', 'link'].includes(String(d.action)) ||
+          (d.action !== undefined && !['keep_both', 'link'].includes(String(d.action))) ||
           (d.action === 'link' && !text(d.targetRecordId)) ||
           !keys(d, [
             'recordId',

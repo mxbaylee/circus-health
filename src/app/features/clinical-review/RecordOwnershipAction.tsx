@@ -1,9 +1,10 @@
 import { ImportPersonChoice } from '../import/ImportPersonChoice';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../../data/api';
 import { useProfile } from '../../data/profile';
 import { NoteDialog } from '../notes/NoteDialog';
+import { linkHref } from '../notes/NoteLinks';
 import { fieldsByKind } from './RecordCorrectionDialog';
 import type { IntakeClinicalMapping } from '../../../shared/intake';
 import type { IntakeIdentityPerson } from '../../../shared/intake-identity';
@@ -19,15 +20,21 @@ export function RecordOwnershipAction({
   selection,
   onApplied,
   label = 'Change person',
+  initialDestinationNoteId,
+  previewOnOpen = false,
 }: {
   selection: OwnershipSelection;
   onApplied?: () => void | Promise<void>;
   label?: string;
+  initialDestinationNoteId?: string;
+  previewOnOpen?: boolean;
 }) {
   const profile = useProfile();
+  const dialogId = useId();
   const [open, setOpen] = useState(false),
     [busy, setBusy] = useState(false),
     [error, setError] = useState('');
+  const [reviewSelection, setReviewSelection] = useState(selection);
   const [people, setPeople] = useState<IntakeIdentityPerson[]>([]),
     [personId, setPersonId] = useState('');
   const [fullName, setFullName] = useState(''),
@@ -42,32 +49,51 @@ export function RecordOwnershipAction({
     [uncertain, setUncertain] = useState(false);
   const commit = useRef<OwnershipCommit | null>(null);
   const prefix = `/api/profiles/${encodeURIComponent(profile?.id || '')}/record-ownership`;
-  const recoveryKey = `ownership-operation:${profile?.id || ''}`;
+  const selectionKey =
+    selection.type === 'report'
+      ? `report:${selection.intakeId}:${selection.groupId}`
+      : `records:${selection.records
+          .map((record) => `${record.kind}:${record.recordId}`)
+          .sort()
+          .join('|')}`;
+  const routeKey = window.location.hash.split('?')[0] || window.location.pathname;
+  const recoveryKey = `ownership-operation:${profile?.id || ''}:${routeKey}:${label}:${selectionKey}`;
+  const contextKey = `${profile?.id || ''}:${dialogId}:${open}`;
+  const liveContext = useRef(contextKey);
+  liveContext.current = contextKey;
   const message = (e: unknown) =>
     e instanceof Error ? e.message : 'The correction could not be completed.';
-  const completed = async (receipt: OwnershipReceipt) => {
+  const completed = async (receipt: OwnershipReceipt, context: string) => {
+    if (liveContext.current !== context) return;
     sessionStorage.removeItem(recoveryKey);
     setUncertain(false);
     setResult(receipt);
   };
   async function reconcile() {
+    const context = liveContext.current;
     const id = sessionStorage.getItem(recoveryKey);
     if (!id) return;
     setBusy(true);
     setError('');
     try {
-      await completed((await api<OwnershipReceipt>(`${prefix}/${encodeURIComponent(id)}`)).data);
+      await completed(
+        (await api<OwnershipReceipt>(`${prefix}/${encodeURIComponent(id)}`)).data,
+        context,
+      );
     } catch (e) {
+      if (liveContext.current !== context) return;
       if (e instanceof ApiError && e.code === 'OWNERSHIP_NOT_FOUND') {
         setUncertain(false);
         sessionStorage.removeItem(recoveryKey);
-        setError('No correction was published. You can retry the reviewed correction.');
+        commit.current = null;
+        setDirty(true);
+        setError(e.message);
       } else {
         setUncertain(true);
         setError(message(e));
       }
     } finally {
-      setBusy(false);
+      if (liveContext.current === context) setBusy(false);
     }
   }
   useEffect(() => {
@@ -81,12 +107,21 @@ export function RecordOwnershipAction({
     setNames([]);
     setRelationships([]);
     setDirty(false);
+    setReviewSelection(selection);
     commit.current = null;
     api<IntakeIdentityPerson[]>(`${prefix}/people`)
       .then(({ data }) => {
         if (active) {
           setPeople(data);
-          setPersonId(data[0]?.noteId || '');
+          const initial = data.find((person) => person.noteId === initialDestinationNoteId);
+          setPersonId(initial?.noteId || data[0]?.noteId || '');
+          if (previewOnOpen && initial)
+            void loadPreview(
+              selection,
+              { noteId: initial.noteId, expectedVersion: initial.version },
+              'Review reversal of earlier person correction',
+              true,
+            );
         }
       })
       .catch((e) => active && setError(message(e)))
@@ -98,7 +133,7 @@ export function RecordOwnershipAction({
     return () => {
       active = false;
     };
-  }, [open, prefix]);
+  }, [open, prefix, initialDestinationNoteId, previewOnOpen]);
   const changed = () => {
     setDirty(true);
     commit.current = null;
@@ -110,8 +145,14 @@ export function RecordOwnershipAction({
           const p = people.find((p) => p.noteId === personId);
           return p ? { noteId: p.noteId, expectedVersion: p.version } : null;
         })();
-  async function loadPreview() {
-    const dest = destination();
+  async function loadPreview(
+    selectedSelection: OwnershipSelection = reviewSelection,
+    selectedDestination = destination(),
+    selectedReason = reason,
+    clearChoices = false,
+  ) {
+    const context = liveContext.current;
+    const dest = selectedDestination;
     if (!dest) return;
     setBusy(true);
     setError('');
@@ -119,14 +160,15 @@ export function RecordOwnershipAction({
       const { data } = await api<OwnershipPreview>(`${prefix}/preview`, {
         method: 'POST',
         body: JSON.stringify({
-          selection,
+          selection: selectedSelection,
           destination: dest,
-          decisions,
-          nameDecisions: names,
-          relationshipDecisions: relationships,
-          reason,
+          decisions: clearChoices ? [] : decisions,
+          nameDecisions: clearChoices ? [] : names,
+          relationshipDecisions: clearChoices ? [] : relationships,
+          reason: selectedReason,
         }),
       });
+      if (liveContext.current !== context) return;
       setPreview(data);
       setDirty(false);
       commit.current = {
@@ -136,13 +178,15 @@ export function RecordOwnershipAction({
         version: data.version,
       };
     } catch (e) {
+      if (liveContext.current !== context) return;
       setError(message(e));
       setDirty(true);
     } finally {
-      setBusy(false);
+      if (liveContext.current === context) setBusy(false);
     }
   }
   async function save() {
+    const context = liveContext.current;
     if (!commit.current || dirty || uncertain) return;
     setBusy(true);
     setError('');
@@ -155,13 +199,22 @@ export function RecordOwnershipAction({
             body: JSON.stringify(commit.current),
           })
         ).data,
+        context,
       );
     } catch (e) {
+      if (liveContext.current !== context) return;
       setError(message(e));
-      setUncertain(true);
-      await reconcile();
+      if (e instanceof ApiError && [403, 409].includes(e.status) && e.code) {
+        sessionStorage.removeItem(recoveryKey);
+        commit.current = null;
+        setDirty(true);
+        setUncertain(false);
+      } else {
+        setUncertain(true);
+        await reconcile();
+      }
     } finally {
-      setBusy(false);
+      if (liveContext.current === context) setBusy(false);
     }
   }
   function decide(
@@ -172,7 +225,6 @@ export function RecordOwnershipAction({
       ...(old || []).filter((d) => d.recordId !== recordId),
       {
         recordId,
-        action: 'keep_both',
         ...(old || []).find((d) => d.recordId === recordId),
         ...patch,
       },
@@ -180,6 +232,32 @@ export function RecordOwnershipAction({
     changed();
   }
   const blocked = preview?.blockers.length || preview?.records.some((r) => r.blockers.length);
+  function reviewUndo(outcome: OwnershipReceipt['outcomes'][number]) {
+    const previous = preview?.records.find((record) => record.recordId === outcome.recordId);
+    const former = people.find((person) => person.noteId === previous?.owner.noteId);
+    if (!previous || !former) return;
+    const reverseSelection: OwnershipSelection =
+      (outcome.action === 'link' || outcome.action === 'split') && previous.sourceReport
+        ? { type: 'report', ...previous.sourceReport }
+        : {
+            type: 'records',
+            records: [{ kind: outcome.kind, recordId: outcome.destinationRecordId }],
+          };
+    setReviewSelection(reverseSelection);
+    setPersonId(former.noteId);
+    setReason('Review reversal of earlier person correction');
+    setResult(null);
+    setPreview(null);
+    setDecisions([]);
+    setNames([]);
+    setRelationships([]);
+    void loadPreview(
+      reverseSelection,
+      { noteId: former.noteId, expectedVersion: former.version },
+      'Review reversal of earlier person correction',
+      true,
+    );
+  }
   return (
     <>
       <button
@@ -198,12 +276,12 @@ export function RecordOwnershipAction({
         title={
           result
             ? 'Person correction saved'
-            : selection.type === 'report'
+            : reviewSelection.type === 'report'
               ? 'Change person for this report'
               : 'Move these saved records and all their sources'
         }
         description={
-          selection.type === 'report'
+          reviewSelection.type === 'report'
             ? 'This report’s saved records, pending assignments and remembered names are reviewed together. Later records from the unchanged report use this person and still require acceptance.'
             : 'All sources of the selected saved records move together. Other records and report defaults keep their assignments.'
         }
@@ -223,6 +301,33 @@ export function RecordOwnershipAction({
               {result.moved} saved records corrected; {result.pending} pending assignments updated.
               Originals and earlier assignments remain in history.
             </p>
+            {result.outcomes.some((o) => o.kind === 'medication' && o.action !== 'unchanged') && (
+              <p>
+                A moved prescription starts inactive. Open the moved medication to activate it
+                separately if appropriate.
+              </p>
+            )}
+            <ul>
+              {result.outcomes.map((outcome) => (
+                <li key={outcome.recordId}>
+                  <Link
+                    to={linkHref({
+                      targetType: outcome.kind,
+                      targetId: outcome.destinationRecordId,
+                    })}
+                  >
+                    View corrected {outcome.kind} and its history
+                  </Link>{' '}
+                  <button
+                    type="button"
+                    className="button secondary"
+                    onClick={() => reviewUndo(outcome)}
+                  >
+                    Review undo
+                  </button>
+                </li>
+              ))}
+            </ul>
             {result.groups && (
               <ul>
                 {result.groups.map((g, i) => (
@@ -231,7 +336,12 @@ export function RecordOwnershipAction({
                     {g.status === 'committed'
                       ? 'Saved'
                       : 'Not saved — select these records and review a fresh correction'}{' '}
-                    ({g.recordIds.length} records)
+                    {g.status === 'needs_review'
+                      ? ': ' +
+                        g.recordIds
+                          .map((id) => preview?.records.find((r) => r.recordId === id)?.title || id)
+                          .join(', ')
+                      : ` (${g.recordIds.length} records)`}
                   </li>
                 ))}
               </ul>
@@ -325,6 +435,10 @@ export function RecordOwnershipAction({
                     owners.
                   </p>
                 )}
+                <p>
+                  Earlier packet inclusion is not recorded. If you shared a packet containing one of
+                  these records, review the copy you sent and provide a corrected packet.
+                </p>
                 {preview.blockers.map((b) => (
                   <p role="alert" key={b}>
                     {b}
@@ -366,7 +480,7 @@ export function RecordOwnershipAction({
                         </li>
                       ))}
                     </ul>
-                    {selection.type === 'records' && r.sourceReport && (
+                    {reviewSelection.type === 'records' && r.sourceReport && (
                       <p>
                         <Link
                           to={`/import?${new URLSearchParams({ intake: r.sourceReport.intakeId, group: r.sourceReport.groupId })}`}
@@ -383,7 +497,9 @@ export function RecordOwnershipAction({
                           value={
                             decisions?.find((d) => d.recordId === r.recordId)?.action === 'link'
                               ? decisions.find((d) => d.recordId === r.recordId)?.targetRecordId
-                              : decisions?.some((d) => d.recordId === r.recordId)
+                              : decisions?.some(
+                                    (d) => d.recordId === r.recordId && d.action === 'keep_both',
+                                  )
                                 ? 'keep_both'
                                 : ''
                           }
@@ -505,10 +621,24 @@ export function RecordOwnershipAction({
                         changed();
                       }}
                     >
-                      <option value="old">Keep active for the former person</option>
-                      <option value="destination">Use for the destination</option>
+                      <option value="old">
+                        Keep for{' '}
+                        {preview.records.find((r) => r.owner.personId === n.personId)?.owner
+                          .fullName || 'the former person'}
+                      </option>
+                      <option value="destination">
+                        Remove from{' '}
+                        {preview.records.find((r) => r.owner.personId === n.personId)?.owner
+                          .fullName || 'the former person'}{' '}
+                        and use for{' '}
+                        {'personId' in preview.destination
+                          ? preview.destination.fullName
+                          : preview.destination.newPerson.fullName}
+                      </option>
                       <option value="both">Use for both people</option>
-                      <option value="unresolved">Unresolved — require identity review</option>
+                      <option value="unresolved">
+                        Ask each time for later reports with this printed name
+                      </option>
                     </select>
                   </label>
                 ))}

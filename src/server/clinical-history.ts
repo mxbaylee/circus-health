@@ -6,6 +6,7 @@ import {
   resolveClinicalReference,
 } from './clinical-references.ts';
 import { queryRecordHistory } from './record-versions.ts';
+import { ownershipCorrections } from './ownership-history.ts';
 
 interface HistoryOptions {
   profileId?: string;
@@ -78,6 +79,8 @@ export function clinicalRecordHistory(
     navigation: clinicalNavigation(resolved.kind, resolved.recordId),
     kinds,
     entries,
+    ownershipCorrections: ownershipCorrections(db, resolved.kind, resolved.recordId),
+    earlierPacketInclusion: 'not_recorded' as const,
     nextSequence: more ? boundary : null,
   };
 }
