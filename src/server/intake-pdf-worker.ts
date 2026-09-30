@@ -345,6 +345,22 @@ async function indexPdf(sourceId: string, pageStart = 1, pageLimit = 64, pagesOn
   const sections: { id: string; locator: string; page: number }[] = [];
   const references: Record<string, unknown>[] = [];
   const overflowPages = new Set<number>();
+  let referenceBytes = 0;
+  // Reserve space for the page inventory and one located capacity marker per
+  // page. Long Unicode destination names can reach the byte bound before 5,000
+  // references; that must not discard the rest of this readable PDF.
+  const referenceOutputLimit = INTAKE_PDF_BOUNDS.maxIndexOutputBytes - 65 * 1024;
+  const capacity = (number: number) => {
+    if (overflowPages.has(number)) return;
+    overflowPages.add(number);
+    references.push({
+      id: `reference-capacity:${sourceId}:${number}`,
+      source: '',
+      locator: `page ${number}, remaining references`,
+      status: 'capacity_exception',
+      note: 'Further references on this page were not indexed; page text remains readable.',
+    });
+  };
   for (
     let number = pageStart;
     number <= Math.min(doc.numPages, pageStart + pageLimit - 1);
@@ -354,18 +370,10 @@ async function indexPdf(sourceId: string, pageStart = 1, pageLimit = 64, pagesOn
     const page = await doc.getPage(number);
     const annotations = (await page.getAnnotations()) as PdfAnnotation[];
     for (const annotation of annotations) {
+      if (overflowPages.has(number)) continue;
       if (!annotation.dest && !annotation.url && !annotation.unsafeUrl) continue;
       if (references.length >= INTAKE_PDF_BOUNDS.maxReferences) {
-        if (!overflowPages.has(number)) {
-          overflowPages.add(number);
-          references.push({
-            id: `reference-capacity:${sourceId}:${number}`,
-            source: '',
-            locator: `page ${number}, remaining references`,
-            status: 'capacity_exception',
-            note: 'Further references on this page were not indexed; page text remains readable.',
-          });
-        }
+        capacity(number);
         continue;
       }
       const reference: Record<string, unknown> = {
@@ -397,6 +405,12 @@ async function indexPdf(sourceId: string, pageStart = 1, pageLimit = 64, pagesOn
           reference.status = 'unresolved_reference';
         }
       }
+      const bytes = Buffer.byteLength(JSON.stringify(reference)) + 1;
+      if (referenceBytes + bytes > referenceOutputLimit) {
+        capacity(number);
+        continue;
+      }
+      referenceBytes += bytes;
       references.push(reference);
     }
     page.cleanup();

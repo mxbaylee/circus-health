@@ -161,6 +161,26 @@ test('provider packet and evidence companion disclose unread cited source pages'
     { locator: 'Page 3', reason: 'processing_stalled' },
   ]);
   assert.notEqual(unreceipted.fingerprint, converted.fingerprint);
+  details.intake.workflow.plans[0].index = {
+    kind: 'pdf',
+    coverage: 'indexed_only',
+    missingAssets: [],
+    references: [
+      {
+        locator: 'page 2, remaining references',
+        status: 'capacity_exception',
+        note: 'Further references were not indexed; page text remains readable.',
+      },
+    ],
+  };
+  db.prepare("UPDATE source_files SET details_json=? WHERE id='file'").run(JSON.stringify(details));
+  const capacity = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.match(
+    exportHtml(capacity),
+    /page 2, remaining references: capacity exception: Further references were not indexed/,
+  );
+  assert.equal(capacity.readingGaps[0]?.gaps.length, 3);
+  assert.deepEqual(exportEvidence(capacity).readingGaps, capacity.readingGaps);
 });
 test('an older archived/current conflict is excluded from current prescription packets and summaries', (t) => {
   const { db, input } = fixture(t);

@@ -804,6 +804,12 @@ function includedReadingGaps(
         locator: 'Retained original',
         reason: 'reading has not established page coverage',
       });
+    for (const reference of plan?.index?.references || [])
+      if (reference.status === 'capacity_exception')
+        gaps.push({
+          locator: reference.locator,
+          reason: `capacity exception: ${reference.note || 'references were not indexed'}`,
+        });
     if (gaps.length)
       result.push({
         sourceFileId: sourceId,

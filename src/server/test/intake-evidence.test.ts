@@ -59,7 +59,12 @@ function fixture(t: TestContext) {
   });
   return { root, profileId, paths, db };
 }
-function syntheticPdf(pages: string[], links = false, paddingBytes = 0) {
+function syntheticPdf(
+  pages: string[],
+  links = false,
+  paddingBytes = 0,
+  largeLinks?: { count: number; target: string; destination?: boolean },
+) {
   const objects = [
     '',
     '<< /Type /Catalog /Pages 2 0 R >>',
@@ -70,10 +75,26 @@ function syntheticPdf(pages: string[], links = false, paddingBytes = 0) {
       .replaceAll('(', '\\(')
       .replaceAll(')', '\\)');
     objects.push(
-      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents ${4 + i * 2} 0 R ${links && i === 0 ? '/Annots [<< /Type /Annot /Subtype /Link /Rect [0 0 100 100] /Dest [5 0 R /Fit] >> << /Type /Annot /Subtype /Link /Rect [0 0 100 100] /A << /S /URI /URI (https://never.example/file) >> >>]' : ''} >>`,
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents ${4 + i * 2} 0 R ${
+        largeLinks && i === 0
+          ? '/Annots [' +
+            Array(largeLinks.count)
+              .fill(`${3 + pages.length * 2} 0 R`)
+              .join(' ') +
+            ']'
+          : links && i === 0
+            ? '/Annots [<< /Type /Annot /Subtype /Link /Rect [0 0 100 100] /Dest [5 0 R /Fit] >> << /Type /Annot /Subtype /Link /Rect [0 0 100 100] /A << /S /URI /URI (https://never.example/file) >> >>]'
+            : ''
+      } >>`,
     );
     const stream = `BT /F1 12 Tf 72 720 Td (${escaped}) Tj ET`;
     objects.push(`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`);
+  }
+  if (largeLinks) {
+    const encoded = Buffer.from(largeLinks.target, 'utf16le').swap16().toString('hex');
+    objects.push(
+      `<< /Type /Annot /Subtype /Link /Rect [0 0 100 100] ${largeLinks.destination ? `/Dest <feff${encoded}>` : `/A << /S /URI /URI <feff${encoded}> >>`} >>`,
+    );
   }
   if (paddingBytes) {
     const stream = '0'.repeat(paddingBytes);
@@ -93,6 +114,36 @@ function syntheticPdf(pages: string[], links = false, paddingBytes = 0) {
     .join('')}trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
   return Buffer.from(pdf);
 }
+
+test('PDF reference output capacity is located without discarding readable pages', async (t) => {
+  const f = fixture(t);
+  t.after(() => disposePdfEvidenceSessions(f.profileId));
+  const bytes = syntheticPdf(['Fictional reference-heavy page', 'Fictional later page'], false, 0, {
+    count: 4000,
+    target: 'Fictional ' + '界'.repeat(1800),
+    destination: true,
+  });
+  const item = uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-reference-capacity.pdf',
+    bytes,
+  });
+  const source = {
+    ...getRetainedIntakeOriginalReference(f.db, f.root, f.profileId, item.id),
+    profileId: f.profileId,
+  };
+  const index = await indexPdfEvidence(source);
+  assert.equal(index.pages, 2);
+  assert.equal(index.sections.length, 2);
+  assert.ok(
+    index.references.some(
+      (reference) =>
+        reference.status === 'capacity_exception' &&
+        reference.locator === 'page 1, remaining references',
+    ),
+    `References: ${index.references.length}; bytes: ${Buffer.byteLength(JSON.stringify(index))}`,
+  );
+  assert.match((await readPdfEvidencePage(source, 2, 0)).text, /Fictional later page/);
+});
 
 // A password-protected PDF, built the smallest honest way: a /Standard security
 // handler whose /O and /U hashes cannot match the empty user password, so pdf.js
