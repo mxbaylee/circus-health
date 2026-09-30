@@ -16,7 +16,7 @@ concurrency:
 jobs:
   checks:
     if: always()
-    needs: [unit, server, continuation, browser, brand-assets, proxy-compatibility]
+    needs: [unit, components, server, continuation, browser, brand-assets, proxy-compatibility]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -50,6 +50,22 @@ jobs:
       - run: npm run test:deploy
       - run: npm run test:tools
       - run: npm run test:state
+
+  components:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HUSKY: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
       - run: npm run test:ui
 
   server:
