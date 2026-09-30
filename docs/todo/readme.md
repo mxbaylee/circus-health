@@ -14,7 +14,6 @@ The detailed work list and design documents that preceded this index are archive
 
 - [ ] <a id="crs-133"></a> [CRS-133](CRS-133.md) — Allow an explicit report-scoped assignment despite an incorrect printed DOB, preserving originals, demographics and the reason for the human exception.
 - [ ] <a id="crs-134"></a> [CRS-134](CRS-134.md) — Keep unresolved remembered names ambiguous after an ownership correction, show earlier attribution, and finish the ownership-correction review experience and tests left from CRS-119.
-- [ ] <a id="crs-135"></a> [CRS-135](CRS-135.md) — Stop and resume every waiting file, back off transient source-text errors instead of pausing, and finish the automatic-continuation gaps left from CRS-039.
 - [ ] <a id="crs-136"></a> [CRS-136](CRS-136.md) — Make partial review saves scale linearly and retryable from the list, show readable outcomes, and finish the review-reliability items left from CRS-120.
 - [ ] <a id="crs-137"></a> [CRS-137](CRS-137.md) — Stop another report's confirmation answering a report whose printed name is shared by two saved people or whose banner date conflicts, and strengthen the CRS-132 regressions.
 - [ ] <a id="crs-033"></a> **CRS-033** — Finish Import inbox acceptance after real-use regressions: native drop, accurate long-run activity, and repeated complete-file review.
