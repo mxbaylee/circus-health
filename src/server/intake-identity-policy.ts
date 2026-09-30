@@ -765,11 +765,12 @@ export function assessIdentityPolicy({
       ),
     );
   const matchedOwner = distinctOwners.length === 1 ? distinctOwners[0] : undefined;
-  const incompatibleBanner =
-    !!matchedOwner?.birthDate &&
+  const bannerIncompatibleWith = (owner: (typeof owners)[number] | undefined): boolean =>
+    !!owner?.birthDate &&
     bannerBirthDates.some(
-      (readings) => !readings.some((date) => compatibleBirthDates(date, matchedOwner.birthDate!)),
+      (readings) => !readings.some((date) => compatibleBirthDates(date, owner.birthDate!)),
     );
+  const incompatibleBanner = bannerIncompatibleWith(matchedOwner);
   const savedNames = matchedOwner?.names || selfNames;
   const matchedBirthDate = matchedOwner ? matchedOwner.birthDate : selfBirthDate;
   const nameMatches = !!matchedOwner;
@@ -857,13 +858,16 @@ export function assessIdentityPolicy({
       message:
         'This report was assigned to another person. Confirm who these current records belong to.',
     };
-  // A confirmation belongs to the reviewed report: A cannot answer B's
-  // unreadable DOB or incompatible banner merely because their names match.
-  // B's own applicable confirmation can still resolve its ownership question.
+  // A confirmation belongs to the reviewed report. A borrowed Self answer
+  // cannot decide between same-named owners or override B's banner against
+  // the owner it would actually assign, even when there is no unique match.
+  // B's own applicable confirmation still resolves its ownership question.
+  const borrowedSelfReceipt =
+    latestPersonChoice?.outcome === 'this_is_me' && latestPersonChoice.scope.groupId !== group?.id;
   const receipt =
     latestPersonChoice?.outcome === 'this_is_me' &&
-    ((!unreadableBirthDate && !incompatibleBanner) ||
-      latestPersonChoice.scope.groupId === group?.id)
+    (!borrowedSelfReceipt ||
+      (!unreadableBirthDate && distinctOwners.length <= 1 && !bannerIncompatibleWith(owners[0])))
       ? latestPersonChoice
       : undefined;
   const explicitReceipt =

@@ -12,6 +12,8 @@ import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
 import { listIntakeImportFeed } from '../intake-report-queue.ts';
 import { createNote, getNote, saveNote } from '../notes.ts';
 import type { HealthRecordEnvelope } from '../../shared/intake.ts';
+import { canonicalIdentityName } from '../../shared/self-identity.ts';
+import { assessIdentityPolicy } from '../intake-identity-policy.ts';
 
 const heading = 'Fictional Alder report';
 const patient = 'Iris Meadow';
@@ -119,6 +121,460 @@ function fixture(
   const acceptedCount = () => Number(db.prepare('SELECT count(*) AS n FROM observations').get()!.n);
   return { db, root, profileId, item, identity, clinical, individual, bulk, acceptedCount };
 }
+
+function addReport(
+  f: ReturnType<typeof fixture>,
+  reportHeading: string,
+  id: string,
+  issue?: string,
+) {
+  const later = record();
+  later.id = id;
+  later.provenance.sourceRecordId = id;
+  later.report!.key = id;
+  later.report!.title = reportHeading;
+  later.report!.anchor = { locator: `${id} heading`, text: reportHeading };
+  if (issue)
+    later.reviewIssues = [
+      { kind: 'identity', field: 'subject', prompt: issue, textAnchor: patient },
+    ];
+  const current = intake.getIntake(f.db, f.root, f.profileId, f.item.id);
+  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, f.item.id, {
+    version: current.version,
+    summary: 'Independently fictional later observation',
+    jsonlText: JSON.stringify(later),
+  });
+  return {
+    group: proposed.workflow!.reportGroups!.find(
+      (candidate) => candidate.report?.anchor?.text === reportHeading,
+    )!,
+    proposalId: proposed.proposals.at(-1)!.id,
+  };
+}
+
+function blockedReportPaths(f: ReturnType<typeof fixture>, groupId: string, proposalId: string) {
+  const clinical = () => intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, proposalId);
+  const review = clinical();
+  assert.equal(review.records[0]!.identityReview?.blocking, true);
+  const feed = listIntakeImportFeed(f.db, f.root, f.profileId);
+  const feedRecord = feed.blocks
+    .flatMap((block) => block.records)
+    .find((candidate) => candidate.id === review.records[0]!.id);
+  assert.ok(feedRecord);
+  assert.equal(feedRecord.selectable, false);
+  assert.equal(feedRecord.identityReview?.blocking, true);
+  const individual = () => {
+    const current = clinical();
+    intake.importIntake(f.db, f.root, f.profileId, f.item.id, {
+      version: current.version,
+      proposalId,
+      reviewToken: current.reviewToken,
+      decisions: [{ recordId: current.records[0]!.id, action: 'accept', mapping: {} }],
+    });
+  };
+  const bulk = () => {
+    const current = clinical();
+    const selected = current.records[0]!;
+    acceptIntakeReportSelection(f.db, f.root, f.profileId, {
+      operationId: randomUUID(),
+      blocks: [
+        {
+          intakeId: f.item.id,
+          proposalId,
+          intakeVersion: current.version,
+          reviewToken: current.reviewToken,
+          selections: [
+            {
+              recordId: selected.id,
+              candidateId: selected.candidateId!,
+              candidateVersionId: selected.candidateVersionId!,
+              mapping: selected.mapping,
+            },
+          ],
+        },
+      ],
+    });
+  };
+  assert.throws(individual);
+  assert.throws(bulk);
+  assert.equal(f.acceptedCount(), 0, `${groupId} must make no clinical writes`);
+}
+
+for (const modelQuestion of [false, true])
+  test(`ADV5: a Self receipt cannot answer another report after its alias makes two owners match (${modelQuestion ? 'routine question' : 'no question'})`, async (t) => {
+    const secondHeading = 'Fictional Willow report';
+    const thirdHeading = 'Fictional Cedar report';
+    const f = fixture(
+      t,
+      `${heading}\n${patient}   Female   4/17/1982\nFictional count 12.00\n${secondHeading}\n${patient}   Female   4/17/1970\nFictional count 14.00\n${thirdHeading}\n${patient}   Female   4/17/1960\nFictional count 16.00`,
+      'fictional-alder.txt',
+      { fullName: otherPatient, birthDate: selfBirthDate },
+    );
+    const person = createNote(f.db, {
+      kind: 'person',
+      title: patient,
+      person: { fullName: patient, birthDate: selfBirthDate },
+    });
+    const later = record();
+    later.id = 'fictional-second-count';
+    later.provenance.sourceRecordId = later.id;
+    later.report!.key = 'willow';
+    later.report!.title = secondHeading;
+    later.report!.anchor = { locator: 'page 1 later heading', text: secondHeading };
+    if (modelQuestion)
+      later.reviewIssues = [
+        {
+          kind: 'identity',
+          field: 'subject',
+          prompt: 'Does this report belong to you or another person?',
+          textAnchor: `${patient}   Female   4/17/1970`,
+        },
+      ];
+    const current = intake.getIntake(f.db, f.root, f.profileId, f.item.id);
+    const proposed = intake.proposeConversion(f.db, f.root, f.profileId, f.item.id, {
+      version: current.version,
+      summary: 'Independently fictional later observation',
+      jsonlText: JSON.stringify(later),
+    });
+    const group = proposed.workflow!.reportGroups!.find(
+      (candidate) => candidate.report?.anchor?.text === secondHeading,
+    )!;
+    const before = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+    assert.equal(before.blocking, true);
+    const a = await f.identity();
+    await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+      version: a.scope!.intakeVersion,
+      operationId: randomUUID(),
+      scope: a.scope!,
+      outcome: 'this_is_me',
+      attestation: 'confirmed_displayed_report_subject',
+    });
+    const after = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+    assert.deepEqual(getNote(f.db, 'person-note:self').person.knownNames, [patient]);
+    const policy = assessIdentityPolicy({
+      self: { ...after.self, knownNames: [patient] },
+      people: [
+        {
+          noteId: person.id,
+          personId: person.personId!,
+          version: person.version,
+          fullName: patient,
+          knownNames: [],
+          birthDate: selfBirthDate,
+        },
+      ],
+      evidence: after.evidencedIdentity,
+      group,
+      groupVersionId: after.scope!.groupVersionId,
+      originalFingerprint: after.scope!.evidenceOriginalFingerprint || '',
+      receipts: [
+        intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!.identityConfirmations![0]!,
+      ],
+      nameEvidenceGrounded: true,
+      originalEvidenceChecked: true,
+      bannerBirthDates: [['1970-04-17']],
+    });
+    assert.equal(policy.status, 'confirmation_required');
+    const aliasAbsent = assessIdentityPolicy({
+      self: { ...after.self, knownNames: [] },
+      people: [
+        {
+          noteId: person.id,
+          personId: person.personId!,
+          version: person.version,
+          fullName: patient,
+          knownNames: [],
+          birthDate: selfBirthDate,
+        },
+      ],
+      evidence: after.evidencedIdentity,
+      group,
+      groupVersionId: after.scope!.groupVersionId,
+      originalFingerprint: after.scope!.evidenceOriginalFingerprint || '',
+      receipts: [
+        intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!.identityConfirmations![0]!,
+      ],
+      bannerBirthDates: [['1970-04-17']],
+    });
+    assert.equal(
+      aliasAbsent.status,
+      'confirmation_required',
+      'the assigned Self banner still blocks if the alias is absent',
+    );
+    const receipt = intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!
+      .identityConfirmations![0]!;
+    const assignedOwnerGate = (self: typeof after.self, bannerBirthDates: string[][]) =>
+      assessIdentityPolicy({
+        self,
+        people: [
+          {
+            noteId: person.id,
+            personId: person.personId!,
+            version: person.version,
+            fullName: patient,
+            knownNames: [],
+            birthDate: selfBirthDate,
+          },
+        ],
+        evidence: after.evidencedIdentity,
+        group,
+        groupVersionId: after.scope!.groupVersionId,
+        originalFingerprint: after.scope!.evidenceOriginalFingerprint || '',
+        receipts: [receipt],
+        bannerBirthDates,
+      });
+    assert.equal(
+      assignedOwnerGate({ ...after.self, challengedNames: [patient] }, [['1970-04-17']]).status,
+      'confirmation_required',
+      'a challenged alias cannot make the borrowed receipt answer B',
+    );
+    assert.equal(
+      assignedOwnerGate(
+        { ...after.self, futureNameOwners: [{ name: patient, personId: 'patient' }] },
+        [['1970-04-17']],
+      ).status,
+      'confirmation_required',
+      'a reviewed future owner does not override B’s incompatible banner',
+    );
+    assert.equal(
+      assignedOwnerGate(
+        { ...after.self, futureNameOwners: [{ name: patient, personId: 'patient' }] },
+        [['1982-04-17']],
+      ).status,
+      'prior_confirmation',
+      'a reviewed future Self owner permits compatible reuse',
+    );
+    assert.equal(after.status, 'confirmation_required');
+    assert.equal(after.blocking, true);
+    blockedReportPaths(f, group.id, proposed.proposals.at(-1)!.id);
+    await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+      version: after.scope!.intakeVersion,
+      operationId: randomUUID(),
+      scope: after.scope!,
+      outcome: 'this_is_me',
+      attestation: after.scope!.questions?.length
+        ? 'confirmed_displayed_identity_questions'
+        : 'confirmed_displayed_report_subject',
+    });
+    const own = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+    assert.equal(own.blocking, false, own.message);
+    assert.equal(getNote(f.db, 'person-note:self').person.birthDate, selfBirthDate);
+    const third = addReport(f, thirdHeading, 'fictional-third-count');
+    const c = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, third.group.id);
+    assert.equal(c.status, 'confirmation_required', 'B’s own receipt cannot answer C');
+    blockedReportPaths(f, third.group.id, third.proposalId);
+    const self = getNote(f.db, 'person-note:self');
+    saveNote(f.db, self.id, {
+      version: self.version,
+      person: { ...self.person, birthDate: '1990-04-17' },
+    });
+    const edited = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+    assert.equal(
+      edited.status,
+      'prior_confirmation',
+      'B’s own answer survives a later saved DOB edit',
+    );
+    const clinical = intake.reviewIntake(
+      f.db,
+      f.root,
+      f.profileId,
+      f.item.id,
+      proposed.proposals.at(-1)!.id,
+    );
+    const selected = clinical.records[0]!;
+    intake.importIntake(f.db, f.root, f.profileId, f.item.id, {
+      version: clinical.version,
+      proposalId: proposed.proposals.at(-1)!.id,
+      reviewToken: clinical.reviewToken,
+      decisions: [{ recordId: selected.id, action: 'accept', mapping: {} }],
+    });
+    assert.equal(f.acceptedCount(), 1);
+    assert.equal(f.db.prepare('SELECT person_id FROM observations').get()!.person_id, 'patient');
+  });
+
+test('a same-named Person keeps another report from borrowing the Self receipt without a banner', async (t) => {
+  const secondHeading = 'Fictional Willow report';
+  const f = fixture(
+    t,
+    `${heading}\nPatient: ${patient}\nFictional count 12.00\n${secondHeading}\nPatient: ${patient}\nFictional count 14.00`,
+    'fictional-alder.txt',
+  );
+  createNote(f.db, { kind: 'person', title: patient, person: { fullName: patient } });
+  const later = record();
+  later.id = 'fictional-second-count';
+  later.provenance.sourceRecordId = later.id;
+  later.report!.key = 'willow';
+  later.report!.title = secondHeading;
+  later.report!.anchor = { locator: 'page 1 later heading', text: secondHeading };
+  const current = intake.getIntake(f.db, f.root, f.profileId, f.item.id);
+  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, f.item.id, {
+    version: current.version,
+    summary: 'Independently fictional later observation',
+    jsonlText: JSON.stringify(later),
+  });
+  const group = proposed.workflow!.reportGroups!.find(
+    (candidate) => candidate.report?.anchor?.text === secondHeading,
+  )!;
+  const a = await f.identity();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    version: a.scope!.intakeVersion,
+    operationId: randomUUID(),
+    scope: a.scope!,
+    outcome: 'this_is_me',
+    attestation: 'confirmed_displayed_report_subject',
+  });
+  const after = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+  const receipt = intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!
+    .identityConfirmations![0]!;
+  // The policy itself must reject reuse even without a separately raised model
+  // issue. The concrete feed currently raises the same-name issue independently.
+  const policy = assessIdentityPolicy({
+    self: after.self,
+    people: [
+      {
+        noteId: 'fictional-family-note',
+        personId: 'fictional-family',
+        version: 1,
+        fullName: patient,
+        knownNames: [],
+        birthDate: null,
+      },
+    ],
+    evidence: after.evidencedIdentity,
+    group,
+    groupVersionId: after.scope!.groupVersionId,
+    originalFingerprint: after.scope!.evidenceOriginalFingerprint || '',
+    receipts: [receipt],
+    nameEvidenceGrounded: true,
+    originalEvidenceChecked: true,
+  });
+  assert.equal(policy.status, 'confirmation_required');
+  assert.equal(after.status, 'confirmation_required');
+  assert.equal(after.blocking, true);
+  blockedReportPaths(f, group.id, proposed.proposals.at(-1)!.id);
+});
+
+for (const banner of [false, true])
+  for (const confirmedOwner of ['Self', 'Person'] as const)
+    test(`same-name owners block report B without reusing A's ${confirmedOwner} answer (${banner ? 'banner' : 'no banner'})`, async (t) => {
+      const secondHeading = 'Fictional Willow report';
+      const header = (date: string) =>
+        banner ? `${patient}   Female   ${date}` : `Patient: ${patient}`;
+      const f = fixture(
+        t,
+        `${heading}\n${header('4/17/1982')}\nFictional count 12.00\n${secondHeading}\n${header('4/17/1970')}\nFictional count 14.00`,
+        'fictional-alder.txt',
+        { fullName: confirmedOwner === 'Self' ? patient : otherPatient, birthDate: selfBirthDate },
+      );
+      const person = createNote(f.db, {
+        kind: 'person',
+        title: patient,
+        person: { fullName: patient, birthDate: selfBirthDate },
+      });
+      const b = addReport(f, secondHeading, 'fictional-second-count');
+      const a = await f.identity();
+      await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+        version: a.scope!.intakeVersion,
+        operationId: randomUUID(),
+        scope: a.scope!,
+        outcome: confirmedOwner === 'Self' ? 'this_is_me' : 'this_is_person',
+        attestation: 'confirmed_displayed_report_subject',
+        ...(confirmedOwner === 'Person'
+          ? { personSelection: { noteId: person.id, expectedVersion: person.version } }
+          : {}),
+      });
+      if (confirmedOwner === 'Person')
+        createNote(f.db, {
+          kind: 'person',
+          title: `Second ${patient}`,
+          person: { fullName: patient, birthDate: selfBirthDate },
+        });
+      const review = await getIntakeIdentityReview(
+        f.db,
+        f.root,
+        f.profileId,
+        f.item.id,
+        b.group.id,
+      );
+      assert.equal(review.status, 'confirmation_required');
+      assert.equal(review.blocking, true);
+      blockedReportPaths(f, b.group.id, b.proposalId);
+    });
+
+test('confirmation cannot cross an original even when the printed subject is unchanged', async (t) => {
+  const f = fixture(
+    t,
+    `${heading}\nPatient: ${patient}\nFictional count 12.00`,
+    'fictional-alder.txt',
+  );
+  createNote(f.db, { kind: 'person', title: patient, person: { fullName: patient } });
+  const a = await f.identity();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    version: a.scope!.intakeVersion,
+    operationId: randomUUID(),
+    scope: a.scope!,
+    outcome: 'this_is_me',
+    attestation: 'confirmed_displayed_report_subject',
+  });
+  const other = intake.uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-willow.txt',
+    bytes: Buffer.from(`Fictional Willow report\nPatient: ${patient}\nFictional count 14.00`),
+    newProviderName: 'Fictional Willow Clinic',
+  });
+  const later = record();
+  later.id = 'fictional-other-original';
+  later.provenance.sourceRecordId = later.id;
+  later.report!.key = 'willow';
+  later.report!.title = 'Fictional Willow report';
+  later.report!.anchor = { locator: 'page 1 heading', text: 'Fictional Willow report' };
+  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, other.id, {
+    version: other.version,
+    summary: 'Fictional separate original',
+    jsonlText: JSON.stringify(later),
+  });
+  const group = proposed.workflow!.reportGroups![0]!;
+  const b = await getIntakeIdentityReview(f.db, f.root, f.profileId, other.id, group.id);
+  assert.equal(b.status, 'confirmation_required');
+  assert.equal(b.blocking, true);
+  assert.deepEqual(proposed.workflow!.identityConfirmations || [], []);
+  assert.equal(f.acceptedCount(), 0);
+});
+
+for (const label of ['DOB: 04/05/1982', 'DOB: 1970-04-17'])
+  test(`A's receipt does not answer B's labelled ${label.includes('/') ? 'ambiguous' : 'conflicting'} date`, async (t) => {
+    const secondHeading = 'Fictional Willow report';
+    const f = fixture(
+      t,
+      `${heading}\nPatient: ${patient}\nFictional count 12.00\n${secondHeading}\nPatient: ${patient}\n${label}\nFictional count 14.00`,
+      'fictional-alder.txt',
+    );
+    const b = addReport(f, secondHeading, 'fictional-second-count');
+    const a = await f.identity();
+    await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+      version: a.scope!.intakeVersion,
+      operationId: randomUUID(),
+      scope: a.scope!,
+      outcome: 'this_is_me',
+      attestation: 'confirmed_displayed_report_subject',
+    });
+    const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, b.group.id);
+    assert.equal(review.blocking, true);
+    assert.notEqual(review.status, 'prior_confirmation');
+    blockedReportPaths(f, b.group.id, b.proposalId);
+  });
+
+test('canonical identity names retain Jr., Sr., II and III rather than merging generations', () => {
+  const names = ['Robin Lane Jr.', 'Robin Lane Sr.', 'Robin Lane II', 'Robin Lane III'];
+  assert.equal(new Set(names.map(canonicalIdentityName)).size, names.length);
+  assert.equal(
+    canonicalIdentityName('Robin Lane Jr.'),
+    canonicalIdentityName('  ROBIN   LANE JR. '),
+  );
+  assert.notEqual(
+    canonicalIdentityName('Robin Lane, Jr.'),
+    canonicalIdentityName('Robin Lane, Sr.'),
+  );
+});
 
 // A caregiver can upload several people's reports together. Confirmation of A
 // cannot answer B's discrepancy, even with the same name and retained original.

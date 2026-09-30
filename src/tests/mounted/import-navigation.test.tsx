@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { expect, it, vi } from 'vitest';
@@ -1912,4 +1912,120 @@ it('explains provider configuration rejection without promising an available fin
   expect(screen.getByText('Estimating…')).toBeVisible();
   expect(screen.queryByRole('button', { name: 'Resume imports' })).toBeNull();
   expect(screen.getByRole('button', { name: 'Stop imports' })).toBeEnabled();
+});
+
+// Mocked responses prove display only; the boundary suite proves receipt isolation.
+it('keeps report B banner review visible and saving blocked beside confirmed report A', async () => {
+  selectProfile({ id: 'fictional-banner-isolation', name: 'Rowan River', placebo: true });
+  let confirmedB = false;
+  const banner =
+    'The unlabelled banner date does not match Self. Confirm who this report belongs to.';
+  const identity = (id: string): IntakeIdentityReview => ({
+    status: id === 'A' || confirmedB ? 'prior_confirmation' : 'confirmation_required',
+    blocking: id === 'B' && !confirmedB,
+    message: id === 'B' && !confirmedB ? banner : 'This report has its own retained confirmation.',
+    scope: null,
+    evidencedIdentity: { fullName: 'Iris Meadow' },
+    conflicts: [],
+    offeredSelfFields: {},
+    self: {
+      noteId: 'person-note:self',
+      version: 1,
+      fullName: 'Rowan River',
+      birthDate: '1982-04-17',
+    },
+  });
+  const groups = ['A', 'B'].map((id) => ({
+    ...group,
+    groupId: id,
+    groupVersionId: 'version-' + id,
+    title: 'Fictional report ' + id,
+    source: 'Fictional Clinic',
+    counts: { ...counts, pending: 1 },
+  }));
+  const row = (id: string): IntakeImportFeed['blocks'][number]['records'][number] => ({
+    feedKey: 'row-' + id,
+    feedOrder: id,
+    feedKind: 'test',
+    id: 'record-' + id,
+    classification: 'addition',
+    kind: 'observation',
+    title: 'Fictional result ' + id,
+    date: null,
+    provider: 'Fictional Clinic',
+    candidateId: 'candidate-' + id,
+    candidateVersionId: 'candidate-version-' + id,
+    reviewState: 'pending',
+    confidence: 1,
+    uncertainties: [],
+    evidence: [],
+    mapping: {
+      kind: 'observation',
+      subject: 'self',
+      testLabel: 'Fictional result ' + id,
+      valueText: '42',
+      unit: 'ng/mL',
+    },
+    supportedFields: ['testLabel', 'valueText', 'unit'],
+    queueState: 'pending',
+    selectable: !identity(id).blocking,
+    manuallyEdited: false,
+    issues: [],
+    identityReview: identity(id),
+  });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/intakes/import-feed?'))
+        return response({
+          ...feed,
+          groups,
+          totalGroups: 2,
+          totalRecords: 2,
+          counts: { ...counts, pending: 2, blocked: confirmedB ? 0 : 1 },
+          blocks: groups.map((g) => ({
+            ...feed.blocks[0],
+            groupId: g.groupId,
+            proposalId: 'proposal-' + g.groupId,
+            records: [row(g.groupId)],
+          })),
+          kindCounts: { ...feed.kindCounts, test: 2 },
+        });
+      if (url.includes('/identity-review'))
+        return response(
+          identity(new URL(url, 'http://fictional.test').searchParams.get('groupId') || 'B'),
+        );
+      if (url.endsWith('/intakes/limits'))
+        return response({ uploadBytes: 1024, extractionBytes: 1024 });
+      if (url.endsWith('/intake-batches')) return response([]);
+      throw Error('Unexpected fictional request: ' + url);
+    }),
+  );
+  const renderPage = () =>
+    render(
+      <RouterProvider
+        router={createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
+          initialEntries: ['/import'],
+        })}
+      />,
+    );
+  const page = renderPage();
+  const resultA = await screen.findByText('Fictional result A');
+  const resultB = await screen.findByText('Fictional result B');
+  const saveA = within(resultA.closest('article')!).getByRole('button', { name: 'Confirm & save' });
+  const saveB = within(resultB.closest('article')!).getByRole('button', { name: 'Confirm & save' });
+  expect(saveA).toBeEnabled();
+  expect(saveB).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Review person for Fictional report B' }));
+  expect(within(await screen.findByRole('dialog')).getByText(banner)).toBeVisible();
+  expect(saveB).toBeDisabled();
+  page.unmount();
+  // A server refresh after B's own explicit confirmation authorizes only B's row.
+  confirmedB = true;
+  renderPage();
+  const refreshedB = await screen.findByText('Fictional result B');
+  expect(
+    within(refreshedB.closest('article')!).getByRole('button', { name: 'Confirm & save' }),
+  ).toBeEnabled();
 });
