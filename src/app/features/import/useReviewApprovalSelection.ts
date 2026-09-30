@@ -51,10 +51,12 @@ export function useReviewApprovalSelection() {
     });
   };
   const selectShown = (records: ImportReviewRecord[], all: boolean) => {
-    if (all)
+    if (all) {
       for (const record of records)
         if (!selected.has(record.id)) snapshots.current.set(record.id, record);
-        else for (const record of records) snapshots.current.delete(record.id);
+    } else {
+      for (const record of records) snapshots.current.delete(record.id);
+    }
     setSelected((current) =>
       all
         ? new Set([...current, ...records.map((record) => record.id)])

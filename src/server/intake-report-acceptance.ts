@@ -296,6 +296,12 @@ export function applyAcceptanceGroup(
                 );
             }
             const pair = canonicalLiteral([block.intakeId, block.proposalId]);
+            if (retainResult && reviewed?.has(pair) && reviewed.get(pair) === null)
+              throw new HttpError(
+                409,
+                'SELECTION_REVIEW_CHANGED',
+                'This selection could not be reviewed. Refresh its exact record before saving.',
+              );
             const fresh = retainResult
               ? (reviewed?.get(pair) ??
                 reviewIntake(db, root, profileId, block.intakeId, block.proposalId))

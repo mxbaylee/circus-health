@@ -9,6 +9,7 @@ import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
 import {
+  applyAcceptanceGroup,
   acceptIntakeReportSelection,
   acceptIntakeReportSelectionAsync,
   getIntakeReportAcceptance,
@@ -887,5 +888,27 @@ test('partial outcomes do not label an unresolved report owner as Self', (t) => 
   if (result.receipt.atomic) throw Error('Expected partial receipt');
   assert.equal(result.receipt.items[0]?.status, 'needs_review');
   assert.equal(result.receipt.items[0]?.personId, undefined);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
+});
+
+// A failed review cached during initialization is authoritative for this operation.
+test('partial commit groups reject a cached unavailable review instead of rereading it', (t) => {
+  const f = fixture(t);
+  const item = upload(f, [envelope('fictional-unavailable-review')]);
+  const input = partial(f, block(f, item.id));
+  const cached = new Map([[JSON.stringify([item.id, null]), null]]);
+  assert.throws(
+    () =>
+      applyAcceptanceGroup(
+        f.db,
+        f.root,
+        f.profileId,
+        input,
+        'fictional-fingerprint',
+        () => {},
+        cached,
+      ),
+    { code: 'SELECTION_REVIEW_CHANGED' },
+  );
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
 });
