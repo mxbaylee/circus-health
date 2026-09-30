@@ -41,7 +41,7 @@ The shared person chooser retains the exact selected Person and keyboard focus t
 
 ## Regression evidence and implementation boundaries
 
-The reliability requirements are covered by code and independently fictional tests:
+The reliability requirements are addressed by the code and independently fictional tests below. Current limitations, open in [CRS-136](../todo/CRS-136.md): partial saves slow down disproportionately as the selection grows; a record left needing review stays selected with its earlier approval, so saving again cannot succeed until it is deselected and re-approved; outcomes identify records by internal ID; and the R19, R20, R23, R29 and R30 evidence listed here is partial rather than complete.
 
 - Counts/links and owner interpretation (R19/R28): `PersonClinicalRecords`, the existing `/record-owner` resolver, shared `person-scope` helpers and `SavedRecordDestinations`; `clinical-person-ownership.test.ts`, `person-scope.test.ts` and `import-review-reliability.test.tsx`.
 - Caregiver medication activity (R20): existing `setMedicationCurrentStatus`/`appendMedicationPreference` behavior; `clinical-person-ownership.test.ts` and encrypted person-scope browser journeys.
@@ -49,7 +49,7 @@ The reliability requirements are covered by code and independently fictional tes
 - Reason association (R22): `useReviewDrafts`, independent draft validation/journaling; `use-review-drafts.test.tsx` and `intake-generic-name-question.test.ts`.
 - Stable/disambiguated person choices and second-Self checks (R23–R25): `ImportPersonChoice` and shared `matchesSelfIdentityName`; mounted reliability/presentation tests and server identity/People tests.
 - Source revisions (R26): `useSourceAttentionRevision` and `SourceAttentionReview`; mounted source-text tests and encrypted source-text journeys.
-- No production fixture fallback (R27): production presentation defaults to empty arrays; only the explicit development prototype supplies fictional fixtures. Production Vite input is `src/index.html`.
+- No production fixture fallback (R27): production presentation defaults to empty arrays, and no fixture data ships in the app. The unused design prototype and its fixtures were removed on 2026-09-30. Production Vite input is `src/index.html`.
 - Effects, accessibility and boundaries (R29/R30): correction state resets use actual record/scope context rather than recreated props; status announcements and item links use native accessible controls. Identity controls, source revision reconciliation, outcome rendering, destination resolution and durable partial acceptance have separate modules. Existing navigation/draft guards remain at their owning editors. Mounted detail/presentation tests and the keyboard/narrow browser journeys cover those boundaries.
 
 See the [acceptance API](../../src/server/INTAKE.md#counted-report-acceptance) and [reconciliation contract](import-reconciliation.md#atomic-counted-selections-and-reconnect-receipts).

@@ -10,7 +10,7 @@ A patient name in an unlabelled demographic banner can support the same name-onl
 
 ### Banner compatibility and report-scoped decisions
 
-Confirming report A cannot resolve an incompatible banner in report B, even when both reports share a printed name and the same uploaded original. A caregiver may upload several people's reports together; a confirmation records the report the person actually reviewed. B remains blocked in identity preview, the Import feed, individual acceptance and bulk acceptance until its own applicable confirmation resolves ownership. Both Self and another Person can receive that explicit assignment. The receipt remains report-scoped, and the saved birth date and original bytes stay unchanged. Valid confirmation reuse remains available where no unresolved mismatch exists; original grounding, report boundary, membership and explicit question resolutions still have to pass the existing receipt checks at acceptance.
+Confirming report A cannot resolve an incompatible banner in report B, even when both reports share a printed name and the same uploaded original. A caregiver may upload several people's reports together; a confirmation records the report the person actually reviewed. B remains blocked in identity preview, the Import feed, individual acceptance and bulk acceptance until its own applicable confirmation resolves ownership. Both Self and another Person can receive that explicit assignment. The receipt remains report-scoped, and the saved birth date and original bytes stay unchanged. Valid confirmation reuse remains available where no unresolved mismatch exists; original grounding, report boundary, membership and explicit question resolutions still have to pass the existing receipt checks at acceptance. Current limitation: the banner check runs only when exactly one saved person matches the printed name, so once a confirmed alias makes two saved people share it, another report's Self receipt can still answer an incompatible banner ([CRS-137](../todo/CRS-137.md)).
 
 An unlabelled date such as `4/12/88` uses the same compatibility readings whether the model asks a routine ownership question or asks nothing, and whether it quotes the name alone or the full banner. Model phrasing cannot change the meaning of an unchanged original or create extra work for the person reviewing it. Compatibility keeps only the limited name-only match: the date might not be a DOB at all, so it supplies neither DOB evidence nor a demographic update. An incompatible clue still asks about ownership because silently ignoring it could file a family member's report under Self. Making that question permanently unanswerable would instead prevent a legitimate report assignment.
 
@@ -125,6 +125,11 @@ challenged name and supporting receipts; they do not move unselected records. Ot
 people with the same spelling remain independent. Single-token names remain report-scoped.
 A later explicit confirmation can reestablish an association with new support; an old
 receipt or retained historical spelling cannot do so by itself.
+
+Current limitation, open in [CRS-134](../todo/CRS-134.md): an unresolved association is
+removed rather than held for review, and so is an independently entered manual name with
+the same spelling. When another saved person has that name, later reports and unaccepted
+records from the corrected report can match that person without a question.
 
 Original-grounded DOB conflicts remain blocking. Ordinary ownership correction neither
 changes a saved DOB nor grants the separate printed-DOB exception tracked in

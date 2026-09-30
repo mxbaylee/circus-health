@@ -40,6 +40,14 @@ An unknown request stays unknown and possibly billed. If no recoverable result e
 
 The activity explains that retrying an unknown result may use additional provider usage. It distinguishes queued work, extraction/reading, retries, prerequisites, explicit Stop, and Done/Done with exceptions. Waiting is never successful completion. Units read/accounted and exceptions remain separate from proposed clinical records. **Estimating…** remains until observed rates are useful; the broad range combines files and known retry delays, using hours when appropriate. Unknown availability cannot imply a reliable finish time. Estimates and unit accounting are not clinical completeness guarantees.
 
+Current limitations, open in [CRS-135](../todo/CRS-135.md), where independent review found the code falls short of the rules above:
+
+- **Stop:** it can leave a waiting file that is not at the batch cursor unpaused and impossible to resume.
+- **Source-text errors:** a transient one pauses the whole batch with "Source text needs your review" until the next unlock.
+- **Reprocess corrected source:** it can report success without starting anything.
+- **Authentication:** a rejection is re-sent every 30 seconds rather than waiting for sign-in, and `model_unavailable` retries at a fixed interval.
+- **Activity and estimates:** queued files keep a multi-file estimate at **Estimating…**, and queued work has no label of its own.
+
 ## Validation boundaries
 
 Fictional regression tests cover durable retry deadlines, repeated transient failures, unknown replacement and late publication guards, productive continuation past former capture limits, located model/local stalls, bounded batch journal writes, encrypted cache-loss recovery, and real server-process loss followed by authorized unlock. Browser journeys cover automatic multi-file upload, explicit Stop/Resume, preserved originals and independent clinical review. These are deterministic contract checks, not measured extraction accuracy or a qualification of every provider, PDF or clinical layout.
