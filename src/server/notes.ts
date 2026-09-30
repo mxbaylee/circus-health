@@ -1,4 +1,9 @@
 import {
+  rememberNameSupport,
+  rememberManualNameChanges,
+  nameAuthorities,
+} from './name-associations.ts';
+import {
   canonicalIdentityName,
   savedKnownNames,
   knownNamesError,
@@ -6,6 +11,7 @@ import {
 import {
   resolveClinicalReference,
   clinicalReferenceKinds,
+  clinicalReferenceAliases,
   clinicalNavigation,
 } from './clinical-references.ts';
 import { requireMedicationSetupReview } from './medication-preferences.ts';
@@ -114,6 +120,7 @@ interface NoteLinkRow {
   title: string;
 }
 interface RelatedNoteRow extends NoteRow {
+  ownership_redirect: number;
   relations: string;
 }
 interface LinkSearchRow {
@@ -140,6 +147,7 @@ interface ValidatedNoteValues {
   archived: number;
 }
 interface ResolvedLinkTarget {
+  ownershipRedirect?: boolean;
   targetType: LinkTargetType;
   targetId: string;
   title: string;
@@ -226,8 +234,12 @@ export function target(
   type: LinkTargetType,
   id: string,
 ): Omit<NoteLink, 'id' | 'targetType' | 'targetId' | 'relation'> {
+  const originalId = id;
   const resolved = resolveClinicalReference(db, type, id);
-  if (resolved) type = resolved.kind;
+  if (resolved) {
+    type = resolved.kind;
+    id = resolved.recordId;
+  }
   const navigation = resolved ? clinicalNavigation(type, id) : null;
   let r: TargetRow | undefined;
   if (type === 'note')
@@ -270,6 +282,7 @@ export function target(
       : false,
     missing: !r,
     current: true,
+    ...(resolved && resolved.recordId !== originalId ? { ownershipRedirect: true } : {}),
     ...(navigation
       ? { resolvedTargetType: type, appUrl: navigation.appUrl, apiUrl: navigation.apiUrl }
       : {}),
@@ -310,7 +323,11 @@ export function attachmentDTO(db: Database, value: SqliteRow): Attachment {
   };
 }
 export function attachments(db: Database, type: string, id: string): Attachment[] {
-  type = resolveClinicalReference(db, type, id)?.kind || type;
+  const resolved = resolveClinicalReference(db, type, id);
+  if (resolved) {
+    type = resolved.kind;
+    id = resolved.recordId;
+  }
   return db
     .prepare(
       'SELECT * FROM attachments WHERE owner_type=? AND owner_id=? ORDER BY event_date,created_at',
@@ -370,8 +387,15 @@ export function getNote(db: Database, id: string): NoteDTO {
         : String(storedPerson(r.profile_json).recordOwnerPersonId || 'patient'),
     person:
       r.kind === 'person' && r.person_id === 'patient'
-        ? { ...withoutPersonTags(storedPerson(r.profile_json)), name: selfIdentity(db).name }
-        : storedPerson(r.profile_json),
+        ? {
+            ...withoutPersonTags(storedPerson(r.profile_json)),
+            name: selfIdentity(db).name,
+            nameAssociations: nameAuthorities(db, r.id),
+          }
+        : {
+            ...storedPerson(r.profile_json),
+            ...(r.kind === 'person' ? { nameAssociations: nameAuthorities(db, r.id) } : {}),
+          },
     pinned: Boolean(r.pinned),
     archived: visibilityState(db, 'note', r.id).archived,
     createdAt: managedTimestamp(r.created_at),
@@ -520,6 +544,7 @@ function validateInput(
   // restoration may edit manual names, but cannot remove or forge evidence.
   person = { ...person };
   delete person.sourceKnownNames;
+  delete person.nameAssociations;
   if (retainedNames.length) {
     person.sourceKnownNames = retainedNames;
     const submitted = person.knownNames === undefined ? [] : person.knownNames;
@@ -833,7 +858,7 @@ export function createNote(
   );
   return getNote(db, id);
 }
-function saveInner(db: Database, row: NoteRow, input: NoteValues): void {
+function saveInner(db: Database, row: NoteRow, input: NoteValues, manualNames = true): void {
   checkEditable(row, input.version);
   if (
     input.ownerPersonId !== undefined &&
@@ -850,6 +875,8 @@ function saveInner(db: Database, row: NoteRow, input: NoteValues): void {
   if (input.kind && input.kind !== row.kind)
     throw new HttpError(400, 'INVALID_INPUT', 'Use the convert command to change note kind');
   const v = validateInput(db, input, row);
+  if (manualNames && row.kind === 'person')
+    rememberManualNameChanges(db, row.id, storedPerson(row.profile_json), v.person);
   if (row.person_id === 'patient') {
     if (
       v.person.onboarding?.completedSteps?.includes('medications') &&
@@ -937,6 +964,7 @@ export function rememberSourceNameInTransaction(
 ): string | undefined {
   const row = noteRow(db, noteId);
   const current = getNote(db, row.id);
+  rememberNameSupport(db, noteId, current.person, evidence);
   const sources = current.person.sourceKnownNames || [];
   if (sources.some((source) => source.name === evidence.name)) return;
   if (sources.length >= 1024)
@@ -956,10 +984,15 @@ export function rememberSourceNameInTransaction(
     JSON.stringify({ ...current.person, sourceKnownNames: [...sources, evidence] }),
     row.id,
   );
-  saveInner(db, noteRow(db, row.id), {
-    version: row.version,
-    person: { ...current.person, knownNames: next },
-  });
+  saveInner(
+    db,
+    noteRow(db, row.id),
+    {
+      version: row.version,
+      person: { ...current.person, knownNames: next },
+    },
+    false,
+  );
   return already ? undefined : evidence.name;
 }
 
@@ -1144,7 +1177,7 @@ export function relatedNotes(db: Database, type: LinkTargetType, id: string) {
   // that every record in the profile is a personal annotation of Self.
   const clinicalKinds = clinicalReferenceKinds(db, type, id);
   let aliases: string[][] = clinicalKinds.length
-    ? clinicalKinds.map((kind) => [kind, id])
+    ? clinicalReferenceAliases(db, type, id)
     : [[type, id]];
   if (type === 'note' || type === 'person') {
     const r = db.prepare('SELECT id,person_id FROM notes WHERE id=? OR person_id=?').get(id, id) as
@@ -1154,9 +1187,12 @@ export function relatedNotes(db: Database, type: LinkTargetType, id: string) {
   const where = aliases.map(() => '(l.target_type=? AND l.target_id=?)').join(' OR ');
   return db
     .prepare(
-      `SELECT n.*,group_concat(l.relation, ', ') AS relations FROM notes n JOIN note_links l ON l.note_id=n.id WHERE ${where} GROUP BY n.id ORDER BY n.updated_at DESC,n.id`,
+      `SELECT n.*,group_concat(l.relation, ', ') AS relations,${clinicalKinds.length ? 'MAX(CASE WHEN l.target_id<>? THEN 1 ELSE 0 END)' : '0'} AS ownership_redirect FROM notes n JOIN note_links l ON l.note_id=n.id WHERE ${where} GROUP BY n.id ORDER BY n.updated_at DESC,n.id`,
     )
-    .all(...aliases.flat())
+    .all(
+      ...(clinicalKinds.length ? [resolveClinicalReference(db, type, id)!.recordId] : []),
+      ...aliases.flat(),
+    )
     .map((valueRow) => {
       const r = valueRow as RelatedNoteRow;
       return {
@@ -1170,6 +1206,11 @@ export function relatedNotes(db: Database, type: LinkTargetType, id: string) {
         typeLabel: r.note_type,
         updatedAt: managedTimestamp(r.updated_at),
         relations: r.relations,
+        ownerPersonId:
+          r.kind === 'person'
+            ? r.person_id || 'patient'
+            : String(storedPerson(r.profile_json).recordOwnerPersonId || 'patient'),
+        ownershipRedirect: !!r.ownership_redirect,
         attachmentCount:
           db
             .prepare(

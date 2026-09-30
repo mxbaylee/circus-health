@@ -83,6 +83,15 @@ export function PersonNames({
                 aria-label={`View report confirming ${item.name}`}
               >
                 <SelectionChip label={item.name} />
+                {person.nameAssociations?.find(
+                  (a) => canonicalIdentityName(a.name) === canonicalIdentityName(item.name),
+                )?.status === 'superseded'
+                  ? ' — historical, corrected'
+                  : person.nameAssociations?.find(
+                        (a) => canonicalIdentityName(a.name) === canonicalIdentityName(item.name),
+                      )?.status === 'unresolved'
+                    ? ' — needs identity review'
+                    : ' — active'}
               </Link>
             </li>
           ))}
@@ -90,7 +99,8 @@ export function PersonNames({
       )}
       {evidence.length > 0 && (
         <small id={retainedDescriptionId}>
-          Confirmed report names cannot be removed here. Select a confirmed name to view its report.
+          Historical report evidence stays retained. Select a name to view its report and use Change
+          person to review the current association.
         </small>
       )}
     </div>

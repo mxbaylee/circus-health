@@ -386,7 +386,11 @@ function record(
   let id = requestedId;
   // Stored note links retain their original kind. Export the accepted current
   // classification while keeping the original tuple on the originating note.
-  type = resolveClinicalReference(db, type, id)?.kind || type;
+  const resolved = resolveClinicalReference(db, type, id);
+  if (resolved) {
+    type = resolved.kind;
+    id = resolved.recordId;
+  }
   if (
     type === 'source' &&
     !db.prepare('SELECT id FROM source_records WHERE id=?').get(id) &&

@@ -1,3 +1,4 @@
+import { RecordOwnershipAction } from '../clinical-review/RecordOwnershipAction';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { IntakeIdentityReview } from '../../../shared/intake-identity';
 import {
@@ -88,6 +89,7 @@ export interface ImportReviewRecord {
 
 export interface ImportReviewReport {
   sourceIntakeId?: string;
+  ownershipSelection?: import('../../../shared/record-ownership').OwnershipSelection;
   filename?: string;
   id: string;
   source: string;
@@ -1080,6 +1082,12 @@ export function ImportReviewPresentation({
                         )}
                       </div>
                     </header>
+                    {report.ownershipSelection && (
+                      <RecordOwnershipAction
+                        selection={report.ownershipSelection}
+                        label="Change person · saved and pending records"
+                      />
+                    )}
                     {renderReportSourceReview &&
                       !reports.some(
                         (previous) =>

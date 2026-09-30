@@ -1,3 +1,4 @@
+import { ClinicalRedirect } from '../../app/components/ClinicalRedirect';
 import { render, screen, waitFor } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider, MemoryRouter } from 'react-router-dom';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -198,4 +199,53 @@ it('finished note links navigate to current classification while draft input pre
   draft.links = [link];
   const input = inputFor(draft, 'note', 2);
   expect(input.links).toEqual([{ targetType: 'procedure', targetId: id, relation: 'references' }]);
+});
+
+it('explains a historical ownership link before opening the current destination', () => {
+  const link: NoteLink = {
+    id: 'fictional-historic-link',
+    targetType: 'observation',
+    targetId: 'old-record',
+    resolvedTargetType: 'observation',
+    appUrl: '/tests?result=new-record&detail=1',
+    title: 'Fictional result',
+    ownershipRedirect: true,
+    archived: false,
+    missing: false,
+    current: true,
+  };
+  render(
+    <MemoryRouter>
+      <NoteLinks links={[link]} onChange={() => {}} readOnly />
+    </MemoryRouter>,
+  );
+  expect(screen.getByText(/Ownership corrected.*opens the current destination/)).toBeVisible();
+  expect(screen.getByRole('link', { name: 'Fictional result' })).toHaveAttribute(
+    'href',
+    link.appUrl,
+  );
+});
+
+it('an old ownership bookmark explains the correction before opening another person’s current record', () => {
+  render(
+    <MemoryRouter>
+      <ClinicalRedirect
+        record={{
+          id: 'earlier-record',
+          ownershipCorrected: true,
+          reclassifiedTo: {
+            kind: 'observation',
+            recordId: 'destination-record',
+            appUrl: '/tests?result=destination-record',
+            apiUrl: '/api/tests/destination-record',
+          },
+        }}
+      />
+    </MemoryRouter>,
+  );
+  expect(screen.getByRole('heading', { name: 'Person assignment corrected' })).toBeVisible();
+  expect(screen.getByRole('link', { name: 'Open current record' })).toHaveAttribute(
+    'href',
+    '/tests?result=destination-record',
+  );
 });

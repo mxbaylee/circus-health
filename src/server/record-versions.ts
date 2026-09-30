@@ -79,7 +79,7 @@ interface RecordConfig {
 interface IndexedTransaction {
   ref: RecordObjectReference;
   commit: RecordCommit;
-  versions: DurableRecordVersion[];
+  versions: Iterable<DurableRecordVersion>;
 }
 
 interface PendingRecordVersion {
@@ -284,26 +284,44 @@ function committedSince(
     )
       fail('unsupported or wrong-profile commit');
     if (commit.previous !== null && !refValid(commit.previous)) fail('invalid commit ancestry');
-    const chunks: Buffer[] = [];
-    for (const segment of commit.segments) {
-      const bytes = readObject(storage, segment);
-      chunks.push(bytes);
-    }
-    const bytes = Buffer.concat(chunks),
-      text = bytes.toString('utf8');
-    if (!Buffer.from(text).equals(bytes)) fail('invalid UTF-8');
-    if (bytes.length && bytes.at(-1) !== 10) fail('partial final JSONL record');
-    const versions = bytes.length
-      ? text
-          .slice(0, -1)
-          .split('\n')
-          .map((line) => JSON.parse(line) as DurableRecordVersion)
-      : [];
-    if (versions.length !== commit.records) fail('partial transaction');
+    const versions = readSegmentVersions(storage, commit);
     result.push({ ref, commit, versions } as IndexedTransaction);
     ref = commit.previous;
   }
   return { head, transactions: result.reverse() };
+}
+/** Reiterable bounded reader: keep at most a segment plus one logical record in memory. */
+function readSegmentVersions(
+  storage: RecordStorage,
+  commit: RecordCommit,
+): Iterable<DurableRecordVersion> {
+  return {
+    *[Symbol.iterator]() {
+      let pending: Buffer = Buffer.alloc(0),
+        count = 0;
+      for (const ref of commit.segments) {
+        const bytes = readObject(storage, ref);
+        let offset = 0;
+        for (let end = bytes.indexOf(10, offset); end !== -1; end = bytes.indexOf(10, offset)) {
+          const line = pending.length
+            ? Buffer.concat([pending, bytes.subarray(offset, end)])
+            : bytes.subarray(offset, end);
+          const text = line.toString('utf8');
+          if (!Buffer.from(text).equals(line)) fail('invalid UTF-8');
+          yield JSON.parse(text) as DurableRecordVersion;
+          count++;
+          pending = Buffer.alloc(0);
+          offset = end + 1;
+        }
+        if (offset < bytes.length)
+          pending = pending.length
+            ? Buffer.concat([pending, bytes.subarray(offset)])
+            : bytes.subarray(offset);
+      }
+      if (pending.length) fail('partial final JSONL record');
+      if (count !== commit.records) fail('partial transaction');
+    },
+  };
 }
 function values(contents: unknown): Map<string, string | undefined> {
   const found = new Map<string, string | undefined>();
@@ -448,19 +466,23 @@ function indexTransaction(
     JSON.stringify(ref),
   );
 }
-function collect(db: Database, config: RecordConfig, baseline = false): PendingRecordVersion[] {
-  const rows: PendingRecordVersion[] = [];
+function* collect(
+  db: Database,
+  config: RecordConfig,
+  baseline = false,
+): Generator<PendingRecordVersion> {
   const keys = baseline
-    ? config.schema.flatMap((table) =>
-        db
-          .prepare(`SELECT * FROM ${q(table.name)}`)
-          .all()
-          .map((row) => ({
-            entity: table.name,
-            record_id: identity(table, row as Record<string, unknown>),
-          })),
-      )
-    : (db.prepare('SELECT * FROM __record_changed ORDER BY entity,record_id').all() as Array<
+    ? (function* () {
+        for (const table of config.schema)
+          for (const row of db
+            .prepare(`SELECT * FROM ${q(table.name)} ORDER BY ${table.pk.map(q).join(',')}`)
+            .iterate())
+            yield {
+              entity: table.name,
+              record_id: identity(table, row as Record<string, unknown>),
+            };
+      })()
+    : (db.prepare('SELECT * FROM __record_changed ORDER BY entity,record_id').iterate() as Iterable<
         SqliteRow & { entity: string; record_id: string }
       >);
   for (const { entity, record_id: recordId } of keys) {
@@ -474,7 +496,7 @@ function collect(db: Database, config: RecordConfig, baseline = false): PendingR
       .get(...id);
     const previous = current(db, entity, recordId);
     if (!contents && (!previous || previous.deleted)) continue;
-    rows.push({
+    yield {
       entity,
       recordId,
       contents:
@@ -482,16 +504,21 @@ function collect(db: Database, config: RecordConfig, baseline = false): PendingR
         (JSON.parse(previous!.contents_json) as Record<string, unknown>),
       deleted: !contents,
       previousVersion: previous?.version_id ?? null,
-    });
+    };
   }
-  return rows.sort((a, b) =>
-    (a.entity + '\0' + a.recordId).localeCompare(b.entity + '\0' + b.recordId, 'en'),
-  );
+}
+function hasChanges(db: Database, config: RecordConfig) {
+  const changes = collect(db, config);
+  try {
+    return !changes.next().done;
+  } finally {
+    changes.return(undefined);
+  }
 }
 function publish(
   db: Database,
   config: RecordConfig,
-  records: PendingRecordVersion[],
+  records: Iterable<PendingRecordVersion>,
   operation: TransactionOperation = {},
   result: unknown = null,
 ) {
@@ -508,20 +535,7 @@ function publish(
   const sequence = (indexed?.sequence ?? 0) + 1,
     recordedAt = new Date().toISOString();
   const operationId = (operation.operationId ?? randomUUID()) as string;
-  const versions: DurableRecordVersion[] = records.map((record) => ({
-    format: FORMAT,
-    profileId: config.profileId,
-    schemaVersion: config.schemaVersion,
-    sequence,
-    recordedAt,
-    operationId,
-    versionId: randomUUID(),
-    actor: operation.actor ?? null,
-    origin: operation.origin ?? null,
-    references: operation.references ?? null,
-    ...record,
-  }));
-  config.verifyReferences?.(versions);
+  let count = 0;
   const segments: RecordObjectReference[] = [];
   let chunks: Buffer[] = [],
     size = 0;
@@ -530,7 +544,22 @@ function publish(
     chunks = [];
     size = 0;
   };
-  for (const version of versions) {
+  for (const record of records) {
+    const version: DurableRecordVersion = {
+      format: FORMAT,
+      profileId: config.profileId,
+      schemaVersion: config.schemaVersion,
+      sequence,
+      recordedAt,
+      operationId,
+      versionId: randomUUID(),
+      actor: operation.actor ?? null,
+      origin: operation.origin ?? null,
+      references: operation.references ?? null,
+      ...record,
+    };
+    config.verifyReferences?.([version]);
+    count++;
     const bytes = encode(version);
     for (let offset = 0; offset < bytes.length;) {
       const take = Math.min(config.segmentBytes - size, bytes.length - offset);
@@ -553,17 +582,25 @@ function publish(
     result: result ?? null,
     recordedAt,
     segments,
-    records: versions.length,
+    records: count,
   };
   const ref = writeObject(config.storage, encode(commit));
   // All validation/indexing happens before the one acceptance boundary. The
   // SQLite transaction can roll back; the published commit remains recoverable.
-  indexTransaction(db, config, { ref, commit, versions });
+  indexTransaction(db, config, {
+    ref,
+    commit,
+    versions: readSegmentVersions(config.storage, commit),
+  });
   config.storage.publishHead(encode(ref));
   if (!eq(readHead(config.storage), ref)) fail('head publication failed verification');
-  return { sequence, operationId, records: versions.length };
+  return { sequence, operationId, records: count };
 }
-function applyVersions(db: Database, config: RecordConfig, versions: DurableRecordVersion[]): void {
+function applyVersions(
+  db: Database,
+  config: RecordConfig,
+  versions: Iterable<DurableRecordVersion>,
+): void {
   // Values are complete records, never patches or rerun application operations.
   // Delete changed rows first to allow accepted changes to unique associations.
   for (const version of versions) {
@@ -670,7 +707,8 @@ function catchUp(
       const identities = new Set<string>();
       for (const version of tx.versions)
         validateVersion(db, config, tx.commit, version, identities);
-      config.verifyReferences?.(tx.versions);
+      if (config.verifyReferences)
+        for (const version of tx.versions) config.verifyReferences([version]);
       applyVersions(db, config, tx.versions);
       indexTransaction(db, config, tx);
       if (revision(db) !== tx.commit.revision) fail('committed revision record is missing');
@@ -754,7 +792,7 @@ export function attachRecordDurability(
         RecordStateRow | undefined;
       if (!eq(readHead(storage), JSON.parse(indexed!.head_json)))
         fail('cache is behind accepted history; reopen before writing');
-      if (collect(db, config).length)
+      if (hasChanges(db, config))
         fail('uncommitted direct writes bypassed the transaction boundary');
       if (operation.operationId !== undefined) {
         if (
@@ -826,8 +864,7 @@ export function flushRecordDurability(db: Database): RecordDurabilityStatus | nu
   const row = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as RecordStateRow;
   if (!eq(readHead(config!.storage), JSON.parse(row.head_json)))
     fail('projection requires recovery');
-  if (collect(db, config!).length)
-    fail('uncommitted direct writes bypassed the transaction boundary');
+  if (hasChanges(db, config!)) fail('uncommitted direct writes bypassed the transaction boundary');
   return recordDurabilityStatus(db);
 }
 export function rebuildRecordDatabase(

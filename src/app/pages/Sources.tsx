@@ -1,3 +1,4 @@
+import { OwnershipSelectionControl } from '../features/clinical-review/OwnershipSelectionControl';
 import { ImportSourceTextBrowser } from '../features/import/ImportSourceTextBrowser';
 import { ClinicalOwner } from '../components/ClinicalOwner';
 import {
@@ -260,35 +261,48 @@ export function Sources() {
       >
         <section className="panel clinical-list">
           {browsingDocuments ? (
-            <ResourceState resource={documents} empty="No accepted documents match this search.">
-              {(rows) => (
-                <>
-                  {rows.map((item) => (
-                    <button
-                      key={item.id}
-                      className={`result-row ${selectedDocument === item.id ? 'is-selected' : ''}`}
-                      onClick={() => change({ document: item.id, file: null, record: null })}
-                    >
-                      <FileText size={20} />
-                      <span className="row-copy">
-                        <strong>{item.title}</strong>
-                        {item.date && <span>{formatDate(item.date)}</span>}
-                      </span>
-                      <ChevronRight size={18} />
-                    </button>
-                  ))}
-                  <Pagination
-                    offset={offset}
-                    limit={30}
-                    count={rows.length}
-                    total={
-                      typeof documents.meta?.total === 'number' ? documents.meta.total : undefined
-                    }
-                    onChange={(value) => change({ offset: String(value), document: null })}
-                  />
-                </>
-              )}
-            </ResourceState>
+            <>
+              <OwnershipSelectionControl
+                records={(documents.data || []).map((r) => ({
+                  kind: 'document',
+                  recordId: r.id,
+                  title: r.title,
+                }))}
+                onApplied={() => {
+                  documents.reload();
+                  document.reload();
+                }}
+              />
+              <ResourceState resource={documents} empty="No accepted documents match this search.">
+                {(rows) => (
+                  <>
+                    {rows.map((item) => (
+                      <button
+                        key={item.id}
+                        className={`result-row ${selectedDocument === item.id ? 'is-selected' : ''}`}
+                        onClick={() => change({ document: item.id, file: null, record: null })}
+                      >
+                        <FileText size={20} />
+                        <span className="row-copy">
+                          <strong>{item.title}</strong>
+                          {item.date && <span>{formatDate(item.date)}</span>}
+                        </span>
+                        <ChevronRight size={18} />
+                      </button>
+                    ))}
+                    <Pagination
+                      offset={offset}
+                      limit={30}
+                      count={rows.length}
+                      total={
+                        typeof documents.meta?.total === 'number' ? documents.meta.total : undefined
+                      }
+                      onChange={(value) => change({ offset: String(value), document: null })}
+                    />
+                  </>
+                )}
+              </ResourceState>
+            </>
           ) : browsingRecords ? (
             <ResourceState
               resource={allRecords}

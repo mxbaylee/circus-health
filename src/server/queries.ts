@@ -1018,7 +1018,11 @@ export const coverage = (db: Database): Record<string, number> =>
   );
 
 export function evidenceFor(db: Database, entityType: string, entityId: string): Evidence[] {
-  entityType = resolveClinicalReference(db, entityType, entityId)?.kind || entityType;
+  const resolved = resolveClinicalReference(db, entityType, entityId);
+  if (resolved) {
+    entityType = resolved.kind;
+    entityId = resolved.recordId;
+  }
   return db
     .prepare('SELECT * FROM evidence WHERE entity_type=? AND entity_id=? ORDER BY id')
     .all(entityType, entityId)

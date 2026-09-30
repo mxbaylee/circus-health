@@ -1,3 +1,4 @@
+import { effectiveKnownNames, activeIdentityReceipts } from './name-associations.ts';
 import { matchesSelfIdentityName } from '../shared/self-identity.ts';
 import {
   decodeOriginalIdentityText,
@@ -6,7 +7,6 @@ import {
 } from './intake-evidence-dates.ts';
 import { noteVisibilitySQL } from './visibility.ts';
 import {
-  savedKnownNames,
   safeSourceIdentityName,
   compatibleIdentityBirthDates,
   validOnboardingBirthDate,
@@ -290,7 +290,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
           const receipt = repeatedIdentityQuestionReceipt({
             issue,
             group,
-            receipts: intake.workflow?.identityConfirmations,
+            receipts: activeIdentityReceipts(db, intake.workflow?.identityConfirmations),
             profileId,
             intakeId: id,
             sourceHash: intake.sha256,
@@ -398,7 +398,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
     const missingIssueIds = occurrence.issueIds.filter(
       (issueId) =>
         !exactCurrentIdentityResolutionOperationId({
-          receipts: intake.workflow?.identityConfirmations,
+          receipts: activeIdentityReceipts(db, intake.workflow?.identityConfirmations),
           occurrences: [{ ...occurrence, issueIds: [issueId] }],
           receiptApplies,
         }),
@@ -484,12 +484,12 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   let explicitlyConfirmedOperationId = scope.targets.length
     ? undefined
     : exactCurrentIdentityResolutionOperationId({
-        receipts: intake.workflow?.identityConfirmations,
+        receipts: activeIdentityReceipts(db, intake.workflow?.identityConfirmations),
         occurrences: explicitOccurrences,
         receiptApplies,
       });
   if (competingSubjects.length) {
-    const repair = intake.workflow?.identityConfirmations?.findLast(
+    const repair = activeIdentityReceipts(db, intake.workflow?.identityConfirmations)?.findLast(
       (receipt) =>
         receiptApplies(receipt) &&
         identityBoundaryRepairApplies(
@@ -529,7 +529,7 @@ function selfSnapshot(db: DatabaseSync): IntakeIdentitySelfSnapshot {
     noteId: 'person-note:self',
     version: self.version,
     fullName,
-    knownNames: savedKnownNames(self.person.knownNames),
+    knownNames: effectiveKnownNames(db, self.id, self.person),
     birthDate,
   };
 }
@@ -740,7 +740,7 @@ async function getIntakeIdentityReviewInternal(
       group,
       groupVersionId: latest?.id || null,
       originalFingerprint,
-      receipts: intake.workflow?.identityConfirmations,
+      receipts: activeIdentityReceipts(db, intake.workflow?.identityConfirmations),
       hasUnstructuredIdentityQuestion: groupIdentity.hasUnstructuredIdentityQuestion,
       currentRefusal: groupIdentity.currentRefusal,
     });
@@ -796,7 +796,7 @@ async function getIntakeIdentityReviewInternal(
     group,
     groupVersionId: built.scope.groupVersionId,
     originalFingerprint: built.scope.evidenceOriginalFingerprint || originalFingerprint,
-    receipts: intake.workflow?.identityConfirmations,
+    receipts: activeIdentityReceipts(db, intake.workflow?.identityConfirmations),
     hasUnstructuredIdentityQuestion: built.hasUnstructuredIdentityQuestion,
     explicitlyConfirmedOperationId: built.explicitlyConfirmedOperationId,
     currentRefusal: built.currentRefusal,
@@ -917,7 +917,7 @@ export async function confirmIntakeIdentityScope(
       group: groupFor(getIntake(db, root, profileId, id), current.groupId),
       groupVersionId: current.groupVersionId,
       originalFingerprint: current.evidenceOriginalFingerprint || evidence.originalFingerprint,
-      receipts: workflow.identityConfirmations,
+      receipts: activeIdentityReceipts(db, workflow.identityConfirmations),
       hasUnstructuredIdentityQuestion: built.hasUnstructuredIdentityQuestion,
       explicitlyConfirmedOperationId: built.explicitlyConfirmedOperationId,
       currentRefusal: built.currentRefusal,
@@ -1009,7 +1009,7 @@ export async function confirmIntakeIdentityScope(
       getNote(db, 'person-note:self').person.sourceKnownNames?.some(
         (entry) => entry.name === confirmedPrintedName,
       ) &&
-      workflow.identityConfirmations?.some(
+      activeIdentityReceipts(db, workflow.identityConfirmations)?.some(
         (receipt) =>
           receipt.outcome === 'this_is_me' &&
           identityReceiptAppliesToCurrentBoundary(receipt, {
@@ -1105,7 +1105,7 @@ export async function confirmIntakeIdentityScope(
         if (
           matchesSelfIdentityName(person.fullName, [
             String(self.person.fullName || ''),
-            ...savedKnownNames(self.person.knownNames),
+            ...effectiveKnownNames(db, self.id, self.person),
           ])
         )
           throw new HttpError(

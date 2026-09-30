@@ -44,6 +44,7 @@ export const printedNameReady = (name: string, subjectText: string): boolean =>
 
 /** A person choice is explicit; a printed name never silently creates or selects People. */
 export function ImportPersonChoice({
+  purpose = 'report',
   selfDisabled = false,
   selfNames = [],
   birthDate,
@@ -55,6 +56,7 @@ export function ImportPersonChoice({
   printedName,
   disabled,
 }: {
+  purpose?: 'report' | 'ownership';
   selfDisabled?: boolean;
   selfNames?: string[];
   birthDate?: string;
@@ -87,11 +89,11 @@ export function ImportPersonChoice({
   const value = !selection ? 'self' : 'newPerson' in selection ? 'new' : selection.noteId;
   return (
     <fieldset className="import-person-choice" disabled={disabled}>
-      <legend>Who is this report for?</legend>
+      <legend>{purpose === 'ownership' ? 'Destination person' : 'Who is this report for?'}</legend>
       <label>
         Person
         <select
-          aria-label="Person for this report"
+          aria-label={purpose === 'ownership' ? 'Destination person' : 'Person for this report'}
           value={value}
           onChange={(event) => {
             const selected = event.target.value;
@@ -181,7 +183,11 @@ export function ImportPersonChoice({
               This name belongs to Self. Choose Me (Self).
             </p>
           )}
-          <small>This adds a person to People. Results stay in review until you save them.</small>
+          <small>
+            {purpose === 'ownership'
+              ? 'This person is created with the first committed correction group.'
+              : 'This adds a person to People. Results stay in review until you save them.'}
+          </small>
         </>
       )}
       {!selection && printedName && safeSourceIdentityName(printedName) && (
@@ -190,7 +196,7 @@ export function ImportPersonChoice({
           name and existing date of birth stay unchanged; selected blank details can be filled.
         </small>
       )}
-      {selection && !('newPerson' in selection) && (
+      {purpose === 'report' && selection && !('newPerson' in selection) && (
         <small>
           This report will belong to the selected person. Supported names are retained in their
           Names; a single name is kept only in this report’s confirmation. Results stay in review

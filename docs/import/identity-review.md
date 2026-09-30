@@ -41,3 +41,99 @@ Relatives follow the same medication rules as Self. Imported prescriptions remai
 Reference material means an original retained for context with no clinical records for anyone. It is not the classification for a relative's prescription history.
 
 See [processing](processing.md) for the surrounding workflow and [the intake API](../../src/server/INTAKE.md#common-report-identity-review) for scope, receipt and replay contracts.
+
+## Historical attribution and current name authority
+
+A confirmation answers two different questions: who the person assigned the displayed
+report to at that time, and whether its printed full name can help match a later report.
+The original, accepted versions and confirmation receipt retain the first answer.
+Historical linkage alone is not a reason to keep a mistaken name association active
+forever: doing so would turn one mistaken confirmation into repeated wrong-person
+assignments. Any correction of the second answer must preserve the first answer as
+evidence. Primary names and saved birth dates remain separate assertions.
+
+New full-name confirmations retain a separate support entry for each decision and
+report boundary, including repeated confirmations of the same spelling. The compact
+`sourceKnownNames` display list still keeps its original evidence link; it is not a
+complete ledger of support. The first support entry records whether the name already
+had a manual or primary-name assertion before it was mirrored into `knownNames`.
+Legacy names whose origin cannot be established retain unknown provenance. Mirroring
+a learned name into the editable name list does not independently affirm it.
+
+Ownership corrections also record separate destination support for each affected
+source and report boundary. Later corrections follow those contributions, including
+after rebuilding the database; they never copy the first same-spelling report's
+provenance or revoke a sibling contribution merely because both moved together.
+
+The distinction matters for a caregiver correcting a mistaken assignment: moving one
+report cannot silently withdraw another report's independently affirmed association,
+and equal spelling does not merge people. A single printed name remains report-scoped.
+Current name authority follows versioned correction decisions. People distinguishes active,
+historical corrected and unresolved source names, with links back to the originating
+report's audited correction. Ordinary name editing cannot rewrite historical evidence.
+An independently entered unlinked name remains editable. Mirroring a learned name is
+not a new manual assertion; uncertain legacy provenance requires review.
+
+## Correcting accepted person assignments
+
+Use **Change person · saved and pending records** in report review, **Change person**
+on a saved clinical record, or **Select records to change person** in saved collections.
+Self, any active Person, and a Person created by the correction are available destinations.
+The preview pins the displayed membership, records, source contributions, destination,
+matching decisions, relationships and name support. Changed evidence or profile state
+requires a fresh preview. A new Person is created only with the successful correction.
+Unlike ordinary report assignment, this reviewed correction can create the Person
+named by a mistaken learned Self alias: its name effects supersede the mistaken
+authority in the same transaction. Equal spelling alone does not establish one person.
+
+A report correction covers exactly that report's current contributions and pending
+assignments. It also establishes a standing default for later members of the same
+unchanged original/member/report/printed-subject boundary. Later clinical records still
+require acceptance. A selected-record correction covers every source of those saved
+records, leaves other records untouched, and creates no report default. The confirmation
+states this distinction and links back to report correction when only one contribution
+should move. If a selected-record correction contradicts an earlier standing report
+assignment, the preview also revokes that default’s future authority. Other accepted
+records keep their owners; later unaccepted members require renewed report identity
+review instead of silently inheriting either person. A new explicit, valid confirmation
+can resolve this hold.
+
+When reports A and B support one saved record, correcting B keeps A's stable record ID
+and history with its owner. The preview proposes B's contents from its retained accepted
+mapping and shows A's remaining contents and both sets of originals. Both sides require
+explicit clinical review. Missing or incompatible attribution requires an exact reviewed
+mapping; the service does not copy the merged record's contents into B automatically.
+Legacy contributions without an accepted-mapping snapshot require this review too.
+
+Apparent destination matches require an explicit **link** or **keep both** decision.
+Linking preserves the destination's clinical contents and medication activity. A moved
+or newly split prescription starts inactive; the previous person's taking assertion
+remains in history. Relationships that would cross owners require explicit withdrawal
+or a new selection including their dependent records. A withdrawal preserves its earlier
+decision as historical evidence.
+
+Each displayed atomic correction group includes applicable name decisions. Unrelated
+selected reports have separate groups; genuinely shared name support or relationship
+dependencies join their groups. A partial failure leaves saved groups in place and
+identifies unsaved records for a fresh preview.
+
+The correction includes applicable name decisions. When all effective
+support for a learned full name moves, the preview proposes transferring that association.
+If independent support remains or legacy support is uncertain, choose the former person,
+destination, both, or unresolved. Unresolved associations stop automatic reuse of the
+challenged name and supporting receipts; they do not move unselected records. Other
+people with the same spelling remain independent. Single-token names remain report-scoped.
+A later explicit confirmation can reestablish an association with new support; an old
+receipt or retained historical spelling cannot do so by itself.
+
+Original-grounded DOB conflicts remain blocking. Ordinary ownership correction neither
+changes a saved DOB nor grants the separate printed-DOB exception tracked in
+[CRS-133](../todo/CRS-133.md). Explicit unanswered identity questions, refusals, changed
+boundaries, unavailable people and new contradictory evidence require review. Cold
+original-grounding caches are rebuilt by opening identity review; a cached assignment
+never substitutes for checking the original.
+
+The browser reconciles an uncertain save by its operation ID before permitting another
+correction. Undo is a new preview and correction against current records, sources,
+relationships and names. It preserves intervening edits and never deletes the earlier
+decision or automatically collapses a previous split.

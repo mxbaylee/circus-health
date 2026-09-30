@@ -46,6 +46,8 @@ export function formFor(note: Note | null): FormState {
 }
 export function inputFor(form: FormState, kind: NoteKind, version?: number): NoteInput {
   const { isSelf, ...fields } = form;
+  // Derived authority is displayed but must not change draft equality or a lost-save retry.
+  const { nameAssociations: _associations, ...editablePerson } = form.person;
   return {
     ...fields,
     textFormats: Object.fromEntries(
@@ -64,10 +66,10 @@ export function inputFor(form: FormState, kind: NoteKind, version?: number): Not
     person:
       kind === 'person'
         ? normalizedPersonCare({
-            ...(isSelf ? withoutPersonTags(form.person) : form.person),
+            ...(isSelf ? withoutPersonTags(editablePerson) : editablePerson),
             name: form.title.trim() || (isSelf ? '' : 'New person'),
           })
-        : { ...form.person },
+        : { ...editablePerson },
     typeLabel: form.typeLabel.trim() || null,
     eventDate: form.eventDate || null,
     links: form.links

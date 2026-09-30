@@ -1,3 +1,4 @@
+import { handleRecordOwnershipRoute } from './record-ownership-routes.ts';
 import { recordOwner } from './record-owner.ts';
 import { readProfileRegistry, recoverProfileDeletions } from './profile-registry.ts';
 import { diagnosticRoute } from '../shared/import-diagnostic-route.ts';
@@ -380,6 +381,21 @@ export function createApp({
         return;
       }
       if (parts.length > 3) throw new HttpError(404, 'NOT_FOUND', 'API resource not found');
+      if (
+        await handleRecordOwnershipRoute({
+          resource,
+          id,
+          action,
+          method,
+          req,
+          db,
+          root,
+          profileId,
+          body,
+          respond,
+        })
+      )
+        return;
       if (
         await handleClinicalRelationshipRoute({
           resource,

@@ -1,3 +1,4 @@
+import { effectiveKnownNames, activeIdentityReceipts } from './name-associations.ts';
 import { selectionAuthority } from './intake-selection-authority.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { observeIntakeVersion, intakeVersionConflictFacts } from './import-version-diagnostics.ts';
@@ -68,7 +69,6 @@ import {
   datePrecision,
 } from './clinical-import.ts';
 import { getNote } from './notes.ts';
-import { savedKnownNames } from '../shared/self-identity.ts';
 import type { OccurrenceAuthorityFinalizer } from './duplicate-review.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -1364,7 +1364,7 @@ export function reviewIntake(
     {
       noteId: 'person-note:self',
       version: selfNote.version,
-      knownNames: savedKnownNames(selfNote.person.knownNames),
+      knownNames: effectiveKnownNames(db, selfNote.id, selfNote.person),
       fullName:
         typeof selfNote.person.fullName === 'string' && selfNote.person.fullName.trim()
           ? selfNote.person.fullName.trim()
@@ -1377,6 +1377,7 @@ export function reviewIntake(
     {
       profileId,
       people: identityPeopleSnapshots(db),
+      activeReceipts: (receipts) => activeIdentityReceipts(db, receipts),
       nameQuestionGrounded: identityNameQuestionGroundingLookup(db, {
         profileId,
         intakeId: id,

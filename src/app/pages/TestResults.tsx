@@ -1,3 +1,4 @@
+import { OwnershipSelectionControl } from '../features/clinical-review/OwnershipSelectionControl';
 import {
   RecordCorrectionBadges,
   RecordCorrectionHistory,
@@ -247,6 +248,19 @@ export function TestResults() {
               Retry
             </button>
           </p>
+        )}
+        {!byTest && !vision && (
+          <OwnershipSelectionControl
+            records={(history.data || []).map((r) => ({
+              kind: 'observation',
+              recordId: r.id,
+              title: r.label + ' · ' + formatDate(r.date),
+            }))}
+            onApplied={() => {
+              history.reload();
+              window.location.reload();
+            }}
+          />
         )}
         <p className="coverage-caption">
           {vision ? 'Reviewed optical prescriptions only.' : 'Structured results only.'} Additional

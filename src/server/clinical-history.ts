@@ -75,7 +75,7 @@ export function clinicalRecordHistory(
     recordId,
     requestedKind: kind,
     currentKind: resolved.kind,
-    navigation: clinicalNavigation(resolved.kind, recordId),
+    navigation: clinicalNavigation(resolved.kind, resolved.recordId),
     kinds,
     entries,
     nextSequence: more ? boundary : null,

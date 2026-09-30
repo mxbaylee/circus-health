@@ -1,3 +1,4 @@
+import { OwnershipSelectionControl } from '../features/clinical-review/OwnershipSelectionControl';
 import {
   ClinicalRedirect,
   isReclassifiedRecord,
@@ -285,6 +286,17 @@ function ClinicalRecords({ kind }: { kind: 'medications' | 'procedures' }) {
           </div>
         </section>
       )}
+      <OwnershipSelectionControl
+        records={(list.data || []).map((r) => ({
+          kind: kind === 'medications' ? 'medication' : 'procedure',
+          recordId: r.id,
+          title: r.label,
+        }))}
+        onApplied={() => {
+          list.reload();
+          detail.reload();
+        }}
+      />
       <div className="clinical-workspace">
         <section className="panel clinical-list">
           <ResourceState resource={list} empty={empty}>

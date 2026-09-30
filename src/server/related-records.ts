@@ -48,25 +48,7 @@ export function relatedRecordIds(
       'RELATED_RECORD_SEARCH',
       'Use a search of at most 200 characters and a page of 1–50 records',
     );
-  const label = clean(
-    input.kind === 'observation'
-      ? input.mapping.testLabel
-      : input.kind === 'medication'
-        ? input.mapping.medicationName
-        : input.kind === 'procedure'
-          ? input.mapping.procedureLabel
-          : input.mapping.documentTitle,
-  );
-  const terms = [
-    ...new Set(
-      label
-        .toLocaleLowerCase('en-US')
-        .split(/[^\p{L}\p{N}]+/u)
-        .filter((term) => term.length >= 3),
-    ),
-  ].slice(0, 8);
-  const code = clean(input.mapping.code),
-    codeSystem = clean(input.mapping.codeSystem);
+  const { label, terms, code, codeSystem } = relatedMappingFields(input.kind, input.mapping);
   const issuer = clean(input.mapping.sourceSystem),
     date = clean(input.mapping.date);
   const profile = db
@@ -253,4 +235,27 @@ export function getIntakeRelatedRecords(
     comparisons: result.comparisons,
     page: result.comparisonPage,
   };
+}
+
+export function relatedMappingFields(kind: ClinicalReviewKind, mapping: IntakeClinicalMapping) {
+  const label = clean(
+    kind === 'observation'
+      ? mapping.testLabel
+      : kind === 'medication'
+        ? mapping.medicationName
+        : kind === 'procedure'
+          ? mapping.procedureLabel
+          : mapping.documentTitle,
+  );
+  const terms = [
+    ...new Set(
+      label
+        .toLocaleLowerCase('en-US')
+        .split(/[^\p{L}\p{N}]+/u)
+        .filter((term) => term.length >= 3),
+    ),
+  ].slice(0, 8);
+  const code = clean(mapping.code),
+    codeSystem = clean(mapping.codeSystem);
+  return { label, terms, code, codeSystem };
 }

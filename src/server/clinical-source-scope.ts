@@ -1,3 +1,4 @@
+import { latestOwnershipDecision } from './ownership-journal.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { HealthRecordEnvelope, IntakeWorkflow } from '../shared/intake.ts';
 import { createHash } from 'node:crypto';
@@ -442,8 +443,23 @@ export function clinicalSourceScopeCheck(
         // safe merely because their first source happens to match this input.
         for (const evidence of db
           .prepare('SELECT source_record_id FROM evidence WHERE entity_type=? AND entity_id=?')
-          .all(kind, String(row.id)))
+          .all(kind, String(row.id))) {
+          const correction = latestOwnershipDecision<{
+            recordId: string;
+            kind: string;
+            identity: string;
+          }>(db, 'Record ownership source', 'sourceRecordId', String(evidence.source_record_id));
+          // A reviewed contribution with its own identity is not an issuer-ID collision.
+          // The exact retained source still goes through its own scope check on reimport.
+          if (
+            correction &&
+            correction.recordId === String(row.id) &&
+            correction.kind === kind &&
+            correction.identity !== identity
+          )
+            continue;
           ids.add(String(evidence.source_record_id));
+        }
       }
     }
     const result = [...ids].map(retained);

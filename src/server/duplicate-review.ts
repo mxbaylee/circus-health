@@ -1,3 +1,4 @@
+import { latestOwnershipDecision } from './ownership-journal.ts';
 import {
   intakeWorkflow,
   addWorkflowQuestion,
@@ -340,6 +341,14 @@ function latestOccurrenceAttachment(
       (!targetKind || transition.targetKind === targetKind) &&
       (!targetRecordId || transition.targetRecordId === targetRecordId),
   );
+  const correction = latestOwnershipDecision<{ revision: number }>(
+    db,
+    'Record ownership source',
+    'sourceRecordId',
+    incomingSourceRecordId,
+  );
+  const latest = matching.at(-1);
+  if (correction && latest && correction.revision >= latest.appliedRevision) return null;
   return matching.at(-1) || null;
 }
 
@@ -843,8 +852,37 @@ export function saveDuplicateDecision(
       );
   }
   if (input.occurrenceEvidence === 'attach') {
+    const corrected = latestOwnershipDecision<{ recordId: string; kind: string }>(
+      db,
+      'Record ownership source',
+      'sourceRecordId',
+      intakeScope!.incoming.sourceRecordId,
+    );
+    if (
+      corrected &&
+      db
+        .prepare(
+          'SELECT 1 FROM evidence WHERE entity_type=? AND entity_id=? AND source_record_id=?',
+        )
+        .get(corrected.kind, corrected.recordId, intakeScope!.incoming.sourceRecordId)
+    )
+      throw new HttpError(
+        409,
+        corrected.recordId === saved!.id && corrected.kind === saved!.kind
+          ? 'OCCURRENCE_ALREADY_ATTACHED'
+          : 'OCCURRENCE_ATTACHMENT_TARGET',
+        'This corrected contribution already belongs to a saved record. Review another ownership correction to change that assignment.',
+      );
     const activeByTarget = new Map<string, OccurrenceAttachmentTransition>();
-    for (const transition of occurrenceTransitions(db, intakeScope!.incoming.sourceRecordId))
+    for (const transition of occurrenceTransitions(db, intakeScope!.incoming.sourceRecordId).filter(
+      (t) =>
+        latestOccurrenceAttachment(
+          db,
+          intakeScope!.incoming.sourceRecordId,
+          t.targetKind,
+          t.targetRecordId,
+        )?.id === t.id,
+    ))
       activeByTarget.set(`${transition.targetKind}:${transition.targetRecordId}`, transition);
     const other = [...activeByTarget.values()].find(
       (transition) =>

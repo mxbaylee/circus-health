@@ -1,6 +1,7 @@
+import { effectiveKnownNames } from './name-associations.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { json } from './database.ts';
-import { savedKnownNames, safeSourceIdentityName } from '../shared/self-identity.ts';
+import { safeSourceIdentityName } from '../shared/self-identity.ts';
 import { noteVisibilitySQL } from './visibility.ts';
 import type { IdentityPolicyPersonSnapshot } from './intake-identity-policy.ts';
 
@@ -13,16 +14,7 @@ export function identityPeopleSnapshots(db: DatabaseSync): IdentityPolicyPersonS
     .all()
     .map((row) => {
       const profile = json(row.profile_json, {}) as Record<string, unknown>;
-      const sources = Array.isArray(profile.sourceKnownNames)
-        ? profile.sourceKnownNames.flatMap((value) =>
-            value && typeof value === 'object' && 'name' in value && typeof value.name === 'string'
-              ? [value.name]
-              : [],
-          )
-        : [];
-      const names = [...savedKnownNames(profile.knownNames), ...sources].filter(
-        safeSourceIdentityName,
-      );
+      const names = effectiveKnownNames(db, String(row.id), profile).filter(safeSourceIdentityName);
       return {
         noteId: String(row.id),
         personId: String(row.person_id),

@@ -742,6 +742,12 @@ export function ImportPage() {
       return {
         id: group.groupId,
         sourceIntakeId: group.intakeId,
+        ownershipSelection: {
+          type: 'report' as const,
+          intakeId: group.intakeId,
+          groupId: group.groupId,
+          groupVersionId: group.groupVersionId,
+        },
         filename: group.original.filename,
         source:
           group.sourceSuggestion && !sourceConfirmed

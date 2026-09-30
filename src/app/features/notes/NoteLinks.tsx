@@ -180,6 +180,9 @@ export function NoteLinks({
                 <small>
                   {TARGET_LABELS[link.resolvedTargetType || link.targetType] || 'Linked record'} ·{' '}
                   {link.relation === 'corrects' ? 'Corrects earlier note · ' : ''}
+                  {link.ownershipRedirect
+                    ? 'Ownership corrected · opens the current destination; original link retained. '
+                    : ''}
                   {link.missing
                     ? 'Target unavailable; reference preserved'
                     : link.archived

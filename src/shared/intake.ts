@@ -250,6 +250,7 @@ export interface IntakeClinicalIdentityAttribution {
   confidence?: IntakeIdentityConfidence;
   status: Exclude<IntakeIdentityReviewStatus, 'confirmation_required' | 'conflict'>;
   basis:
+    | 'explicit_ownership_correction'
     | 'explicit_manual_source_record'
     | 'explicit_person_confirmation'
     | 'matched_saved_self'

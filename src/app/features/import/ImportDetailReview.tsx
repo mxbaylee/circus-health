@@ -1,3 +1,4 @@
+import { RecordOwnershipAction } from '../clinical-review/RecordOwnershipAction';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import { ImportIdentityWarnings } from './ImportIdentityWarnings';
 import {
@@ -1132,6 +1133,19 @@ export function ImportDetailReview({
           Open original <ExternalLink size={15} aria-hidden="true" />
         </a>
       </header>
+      <RecordOwnershipAction
+        selection={{
+          type: 'report',
+          intakeId: group.intakeId,
+          groupId: group.groupId,
+          groupVersionId: group.groupVersionId,
+        }}
+        label="Change person · saved and pending records"
+        onApplied={() => {
+          detail.reload();
+          onChanged();
+        }}
+      />
       {identityPanel}
       <SourceTextReview
         intakeId={group.intakeId}

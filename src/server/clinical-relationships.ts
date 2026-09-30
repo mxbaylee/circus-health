@@ -188,7 +188,15 @@ const reference = (db: Database, record: DuplicateRecord) => ({
   recordId: record.id,
 });
 function status(db: Database, decision: Decision): ClinicalRelationshipStatus {
-  if (decision.request.mode === 'withdraw') return 'withdrawn';
+  if (
+    decision.request.mode === 'withdraw' ||
+    db
+      .prepare(
+        "SELECT 1 FROM manual_batches WHERE title='Ownership relationship withdrawal' AND json_extract(coverage_json,'$.decisionId')=?",
+      )
+      .get(decision.id)
+  )
+    return 'withdrawn';
   if (decision.request.mode === 'undecided') return 'undecided';
   try {
     if (

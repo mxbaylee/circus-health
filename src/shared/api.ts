@@ -1,4 +1,5 @@
 export interface ReclassifiedRecord {
+  ownershipCorrected?: boolean;
   id: string;
   reclassifiedTo: {
     kind: 'observation' | 'medication' | 'procedure' | 'document';
@@ -217,6 +218,13 @@ export type LinkTargetType =
   | 'source'
   | 'document';
 export interface PersonProfile {
+  /** Current authority is separate from the unchanged historical source evidence. */
+  nameAssociations?: {
+    name: string;
+    status: 'active' | 'superseded' | 'unresolved';
+    operationId: string;
+    at: string;
+  }[];
   onboarding?: {
     completedSteps: string[];
     skippedSteps: string[];
@@ -259,6 +267,7 @@ export interface NoteLinkInput {
   relation?: string;
 }
 export interface NoteLink extends NoteLinkInput {
+  ownershipRedirect?: boolean;
   resolvedTargetType?: LinkTargetType;
   appUrl?: string;
   apiUrl?: string;

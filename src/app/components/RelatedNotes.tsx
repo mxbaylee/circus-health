@@ -1,3 +1,4 @@
+import { ClinicalOwner } from './ClinicalOwner';
 import { Link } from 'react-router-dom';
 import { MessageSquarePlus, Paperclip } from 'lucide-react';
 import { NoteText } from '../features/notes/NoteText';
@@ -14,6 +15,8 @@ type Comment = {
   archived: boolean;
   updatedAt: string;
   attachmentCount: number;
+  ownerPersonId?: string;
+  ownershipRedirect?: boolean;
   textFormats?: NoteTextFormats;
 };
 export function RelatedNotes({
@@ -66,6 +69,13 @@ export function RelatedNotes({
               </>
             )}
           </span>
+          {note.ownerPersonId && <ClinicalOwner personId={note.ownerPersonId} />}
+          {note.ownershipRedirect && (
+            <p className="helper-text">
+              Historical link before the person correction. This note retains its own person
+              assignment.
+            </p>
+          )}
           {note.content && (
             <NoteText label="Content" value={note.content} format="markdown-v1" readOnly />
           )}

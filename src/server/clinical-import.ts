@@ -1,3 +1,9 @@
+import { retainAcceptedContribution } from './ownership-contributions.ts';
+import {
+  requireCorrectedOwnershipReview,
+  correctedOccurrence,
+  ownershipEnvelopeHash,
+} from './record-ownership-authority.ts';
 import { clinicalDatePrecision } from '../shared/clinical-date.ts';
 import { noteVisibilitySQL } from './visibility.ts';
 import { clinicalSourceIdentityV1 } from './intake-source-identity.ts';
@@ -556,6 +562,9 @@ export function refreshClinicalIdentityPolicy(
     sourceScopeProblem?: string | null;
     classification: IntakeReviewRecord['classification'];
   };
+  const clinicalIdentity = (record as IntakeReviewRecord & { ownershipIdentity?: string })
+    .ownershipIdentity;
+  if (clinicalIdentity) requireCorrectedOwnershipReview(db, record, clinicalIdentity, file);
   const assigned = record.identityAttribution?.assignedPerson;
   if (record.mapping.personId) {
     const person = db
@@ -595,7 +604,7 @@ function sourceRoot(db: DatabaseSync, id: string): string {
   }
   return last;
 }
-function assetProblem(
+export function assetProblem(
   db: DatabaseSync,
   file: SourceFileRow,
   mapping: ClinicalMapping,
@@ -826,7 +835,10 @@ export function buildClinicalReview(
         scopeProblem || checkClinicalMapping(mapping) || assetProblem(db, file, mapping),
       identityKey = identity(entry, file),
       versionKey = clinicalVersion(mapping),
-      prior = scopeProblem ? null : previous(db, identityKey, versionKey, mapping.personId),
+      prior = scopeProblem
+        ? null
+        : correctedOccurrence(db, identityKey, file.sha256, entry.value, mapping) ||
+          previous(db, identityKey, versionKey, mapping.personId),
       found = scopeProblem
         ? null
         : (prior?.exact ? prior : null) ||
@@ -864,6 +876,8 @@ export function buildClinicalReview(
     ];
     const result = {
       id,
+      ownershipIdentity: identityKey,
+      ownershipEnvelopeHash: ownershipEnvelopeHash(entry.value),
       identityConfirmationRequired: proposalId !== null,
       classification,
       kind: isClinicalKind(mapping.kind) ? mapping.kind : 'unsupported',
@@ -1745,6 +1759,15 @@ export function projectClinicalReview(
       // The reviewed left side remains the retained incoming occurrence. The
       // matched entity is the right-side target and is returned separately.
       saveComparisons(mapping);
+      retainAcceptedContribution(db, {
+        sourceRecordId: record.id,
+        identity: identity(entry, recordFile),
+        recordId: target.id,
+        kind: target.kind,
+        mapping: mapping as IntakeClinicalMapping,
+        intakeId: file.id,
+        candidateVersionId: record.candidateVersionId || null,
+      });
       results.duplicates++;
       results.records.push({
         recordId: record.id,
@@ -1787,7 +1810,9 @@ export function projectClinicalReview(
       );
     const identityKey = identity(entry, recordFile),
       versionKey = clinicalVersion(mapping),
-      found = previous(db, identityKey, versionKey, mapping.personId);
+      found =
+        correctedOccurrence(db, identityKey, recordFile.sha256, entry.value, mapping) ||
+        previous(db, identityKey, versionKey, mapping.personId);
     const exceptionSet = Object.fromEntries(
       Object.entries(decision.mapping || {}).filter(
         ([key, value]) =>
@@ -1955,82 +1980,7 @@ export function projectClinicalReview(
             }
           : {}),
       };
-      if (mapping.kind === 'observation') {
-        const testId = conceptId(db, mapping);
-        db.prepare(
-          'INSERT OR IGNORE INTO test_types(id,label,category,unit,codes_json,extra_json) VALUES(?,?,?,?,?,?)',
-        ).run(
-          testId,
-          mapping.testLabel,
-          mapping.observationCategory || 'Unspecified',
-          mapping.unit || null,
-          JSON.stringify(mapping.code ? [{ system: mapping.codeSystem, code: mapping.code }] : []),
-          JSON.stringify({
-            specimen: mapping.specimen,
-            method: mapping.method,
-            importConcept: conceptKey(mapping),
-          }),
-        );
-        const number = projectObservationNumber(mapping.valueText, mapping.unit);
-        insert(db, 'observations', {
-          id: entityId,
-          test_type_id: testId,
-          person_id: mapping.personId || 'patient',
-          source_record_id: record.id,
-          provider_id: recordFile.provider_id,
-          label: mapping.testLabel,
-          effective_at: mapping.date || null,
-          date_precision: datePrecision(mapping.date),
-          value_text: mapping.valueText,
-          value_numeric: number?.numeric ?? null,
-          comparator: number?.comparator ?? null,
-          unit: mapping.unit || null,
-          reference_json: JSON.stringify({ text: mapping.referenceText }),
-          status: mapping.status || null,
-          extra_json: JSON.stringify(extra),
-        });
-      } else if (mapping.kind === 'medication')
-        insert(db, 'medications', {
-          id: entityId,
-          person_id: mapping.personId || 'patient',
-          source_record_id: record.id,
-          provider_id: recordFile.provider_id,
-          kind: ['order', 'reported_use', 'dispense', 'administration', 'unknown'].includes(
-            mapping.medicationKind,
-          )
-            ? mapping.medicationKind
-            : 'unknown',
-          label: mapping.medicationName,
-          status: mapping.status || null,
-          dose_text: mapping.doseText || null,
-          route: mapping.route || null,
-          frequency: mapping.frequency || null,
-          start_at: mapping.startDate || (mapping.dateRole === 'start' ? mapping.date : null),
-          end_at: mapping.endDate || null,
-          extra_json: JSON.stringify(extra),
-        });
-      else if (mapping.kind === 'procedure')
-        insert(db, 'procedures', {
-          id: entityId,
-          person_id: mapping.personId || 'patient',
-          source_record_id: record.id,
-          provider_id: recordFile.provider_id,
-          label: mapping.procedureLabel,
-          effective_at: mapping.date || null,
-          status: mapping.status || null,
-          category: mapping.procedureCategory,
-          extra_json: JSON.stringify(extra),
-        });
-      else
-        insert(db, 'documents', {
-          id: entityId,
-          source_record_id: record.id,
-          provider_id: recordFile.provider_id,
-          title: mapping.documentTitle,
-          effective_at: mapping.documentDate || mapping.date || null,
-          text_content: mapping.text,
-          extra_json: JSON.stringify(extra),
-        });
+      insertClinicalProjection(db, entityId, record.id, recordFile.provider_id, mapping, extra);
       if (mapping.kind === 'medication') appendImportedMedicationDefault(db, entityId);
       if (reportSource)
         reviewedSourceOutcome = {
@@ -2052,6 +2002,15 @@ export function projectClinicalReview(
         results.versions++;
       }
     }
+    retainAcceptedContribution(db, {
+      sourceRecordId: record.id,
+      identity: identityKey,
+      recordId: entityId,
+      kind: entityKind,
+      mapping: mapping as IntakeClinicalMapping,
+      intakeId: file.id,
+      candidateVersionId: record.candidateVersionId || null,
+    });
     saveComparisons(mapping, entityId);
     results.records.push({
       recordId: record.id,
@@ -2581,4 +2540,100 @@ export function procedureClassificationException(
     extra.import = imported;
   }
   return extra;
+}
+
+/** Shared literal projection for accepted imports and reviewed contribution splits. */
+export function insertClinicalProjection(
+  db: DatabaseSync,
+  id: string,
+  sourceRecordId: string,
+  providerId: string,
+  mapping: ClinicalMapping,
+  extra: Record<string, unknown>,
+  update = false,
+): void {
+  const write = (table: string, values: Record<string, SqlValue | undefined>) => {
+    if (!update) return insert(db, table, values);
+    const keys = Object.keys(values).filter((k) => k !== 'id');
+    db.prepare(`UPDATE ${table} SET ${keys.map((k) => k + '=?').join(',')} WHERE id=?`).run(
+      ...keys.map((k) => values[k] ?? null),
+      id,
+    );
+  };
+  if (mapping.kind === 'observation') {
+    const testId = conceptId(db, mapping);
+    db.prepare(
+      'INSERT OR IGNORE INTO test_types(id,label,category,unit,codes_json,extra_json) VALUES(?,?,?,?,?,?)',
+    ).run(
+      testId,
+      mapping.testLabel,
+      mapping.observationCategory || 'Unspecified',
+      mapping.unit || null,
+      JSON.stringify(mapping.code ? [{ system: mapping.codeSystem, code: mapping.code }] : []),
+      JSON.stringify({
+        specimen: mapping.specimen,
+        method: mapping.method,
+        importConcept: conceptKey(mapping),
+      }),
+    );
+    const number = projectObservationNumber(mapping.valueText, mapping.unit);
+    write('observations', {
+      id: id,
+      test_type_id: testId,
+      person_id: mapping.personId || 'patient',
+      source_record_id: sourceRecordId,
+      provider_id: providerId,
+      label: mapping.testLabel,
+      effective_at: mapping.date || null,
+      date_precision: datePrecision(mapping.date),
+      value_text: mapping.valueText,
+      value_numeric: number?.numeric ?? null,
+      comparator: number?.comparator ?? null,
+      unit: mapping.unit || null,
+      reference_json: JSON.stringify({ text: mapping.referenceText }),
+      status: mapping.status || null,
+      extra_json: JSON.stringify(extra),
+    });
+  } else if (mapping.kind === 'medication')
+    write('medications', {
+      id: id,
+      person_id: mapping.personId || 'patient',
+      source_record_id: sourceRecordId,
+      provider_id: providerId,
+      kind: ['order', 'reported_use', 'dispense', 'administration', 'unknown'].includes(
+        mapping.medicationKind,
+      )
+        ? mapping.medicationKind
+        : 'unknown',
+      label: mapping.medicationName,
+      status: mapping.status || null,
+      dose_text: mapping.doseText || null,
+      route: mapping.route || null,
+      frequency: mapping.frequency || null,
+      start_at: mapping.startDate || (mapping.dateRole === 'start' ? mapping.date : null),
+      end_at: mapping.endDate || null,
+      extra_json: JSON.stringify(extra),
+    });
+  else if (mapping.kind === 'procedure')
+    write('procedures', {
+      id: id,
+      person_id: mapping.personId || 'patient',
+      source_record_id: sourceRecordId,
+      provider_id: providerId,
+      label: mapping.procedureLabel,
+      effective_at: mapping.date || null,
+      status: mapping.status || null,
+      category: mapping.procedureCategory,
+      extra_json: JSON.stringify(extra),
+    });
+  else
+    write('documents', {
+      id: id,
+      source_record_id: sourceRecordId,
+      provider_id: providerId,
+      title: mapping.documentTitle,
+      effective_at: mapping.documentDate || mapping.date || null,
+      text_content: mapping.text,
+      extra_json: JSON.stringify(extra),
+    });
 }

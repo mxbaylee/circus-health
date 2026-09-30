@@ -22,7 +22,7 @@ const commonFields: CorrectionField[] = [
   { key: 'status', label: 'Status' },
   { key: 'eventKind', label: 'Event type' },
 ];
-const fieldsByKind: Record<CorrectableClinicalKind, CorrectionField[]> = {
+export const fieldsByKind: Record<CorrectableClinicalKind, CorrectionField[]> = {
   observation: [
     ...commonFields,
     { key: 'testLabel', label: 'Measurement' },

@@ -75,3 +75,16 @@ test('Self display name edits update the person name without changing legal name
     'clearing the field must not silently save a placeholder as the name',
   );
 });
+
+test('derived name authority never changes editable draft identity during uncertain-save reconciliation', async () => {
+  const { keyFor } = await import('./note-form.ts');
+  const before = formFor(self);
+  before.person.nameAssociations = [];
+  before.person.pronouns = 'fictional update';
+  const saved = formFor({
+    ...self,
+    person: { ...self.person, pronouns: 'fictional update', nameAssociations: [] },
+  });
+  assert.equal(keyFor(before, 'person'), keyFor(saved, 'person'));
+  assert.equal(inputFor(before, 'person').person!.nameAssociations, undefined);
+});

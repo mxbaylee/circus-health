@@ -291,6 +291,9 @@ export function workflowReview<T extends IntakeReview>(
   self?: IntakeIdentitySelfSnapshot,
   identityContext?: {
     profileId: string;
+    activeReceipts?: (
+      receipts: IntakeWorkflow['identityConfirmations'],
+    ) => IntakeWorkflow['identityConfirmations'];
     grounded: IdentityGroundingLookup;
     people?: IdentityPolicyPersonSnapshot[];
     originalBirthDateEvidence?: (
@@ -303,7 +306,15 @@ export function workflowReview<T extends IntakeReview>(
     ) => boolean;
   },
 ): T {
-  const workflow = intakeWorkflow(details);
+  const retainedWorkflow = intakeWorkflow(details);
+  const workflow = identityContext?.activeReceipts
+    ? {
+        ...retainedWorkflow,
+        identityConfirmations: identityContext.activeReceipts(
+          retainedWorkflow.identityConfirmations,
+        ),
+      }
+    : retainedWorkflow;
   const reportGroups = reportGroupsWithLegacyFallback(workflow);
   const groupReferences = new Map<string, IntakeReviewGroupReference[]>();
   for (const group of reportGroups) {

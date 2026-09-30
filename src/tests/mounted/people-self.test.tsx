@@ -420,7 +420,7 @@ it('uses one Names list for a person and retains report-backed spellings without
   expect(
     screen.getByRole('list', { name: 'Names retained from confirmed reports' }),
   ).toHaveAccessibleDescription(
-    'Confirmed report names cannot be removed here. Select a confirmed name to view its report.',
+    'Historical report evidence stays retained. Select a name to view its report and use Change person to review the current association.',
   );
   expect(screen.queryByRole('button', { name: 'Remove name Doe, Cookie' })).toBeNull();
   expect(screen.getByRole('link', { name: 'View report confirming Doe, Cookie' })).toHaveAttribute(

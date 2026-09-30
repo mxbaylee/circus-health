@@ -25,7 +25,11 @@ export function recordOwner(db: Database, type: string, id: string): string | nu
     );
     return String(row.kind === 'person' ? row.person_id : row.owner_person_id || 'patient');
   }
-  type = resolveClinicalReference(db, type, id)?.kind || type;
+  const resolved = resolveClinicalReference(db, type, id);
+  if (resolved) {
+    type = resolved.kind;
+    id = resolved.recordId;
+  }
   const table = (
     {
       observation: 'observations',
