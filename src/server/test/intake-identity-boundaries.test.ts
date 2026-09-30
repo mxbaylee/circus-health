@@ -13,7 +13,11 @@ import { listIntakeImportFeed } from '../intake-report-queue.ts';
 import { createNote, getNote, saveNote } from '../notes.ts';
 import type { HealthRecordEnvelope } from '../../shared/intake.ts';
 import { canonicalIdentityName } from '../../shared/self-identity.ts';
-import { assessIdentityPolicy } from '../intake-identity-policy.ts';
+import {
+  assessIdentityPolicy,
+  identityBoundaryRepairApplies,
+  identityReceiptAppliesToCurrentBoundary,
+} from '../intake-identity-policy.ts';
 
 const heading = 'Fictional Alder report';
 const patient = 'Iris Meadow';
@@ -615,6 +619,33 @@ for (const banner of [false, true])
           bannerBirthDates: banner ? [['1970-04-17']] : [],
         });
         assert.equal(direct.blocking, false, 'the shared policy must honor B’s own Person choice');
+        const personWithDifferentDate = {
+          ...ownReceipt,
+          identityAnswers: { birthDate: '1970-04-17' },
+        };
+        const repairedPerson = assessIdentityPolicy({
+          self: own.self,
+          people: [person, second].map((saved) => ({
+            noteId: saved.id,
+            personId: saved.personId!,
+            version: saved.version,
+            fullName: patient,
+            knownNames: [],
+            birthDate: saved.id === second.id ? '1970-04-17' : selfBirthDate,
+          })),
+          evidence: own.evidencedIdentity,
+          group: b.group,
+          groupVersionId: own.scope!.groupVersionId,
+          originalFingerprint: own.scope!.evidenceOriginalFingerprint || '',
+          receipts: [personWithDifferentDate],
+          explicitlyConfirmedOperationId: ownReceipt.operationId,
+        });
+        assert.equal(
+          repairedPerson.blocking,
+          false,
+          'an exact Person repair must not compare DOB to Self',
+        );
+        assert.equal(repairedPerson.attribution?.assignedPerson?.personId, second.personId);
         const staleVersion = assessIdentityPolicy({
           self: own.self,
           people: [person, second].map((saved) => ({
@@ -632,6 +663,25 @@ for (const banner of [false, true])
           receipts: [ownReceipt],
         });
         assert.equal(staleVersion.blocking, true, 'a changed report version needs its own review');
+        const staleExplicitPerson = assessIdentityPolicy({
+          self: own.self,
+          people: [person, second].map((saved) => ({
+            noteId: saved.id,
+            personId: saved.personId!,
+            version: saved.version,
+            fullName: patient,
+            knownNames: [],
+            birthDate: saved.id === second.id ? '1970-04-17' : selfBirthDate,
+          })),
+          evidence: own.evidencedIdentity,
+          group: b.group,
+          groupVersionId: `${own.scope!.groupVersionId}-changed-members`,
+          originalFingerprint: own.scope!.evidenceOriginalFingerprint || '',
+          receipts: [personWithDifferentDate],
+          explicitlyConfirmedOperationId: ownReceipt.operationId,
+        });
+        assert.equal(staleExplicitPerson.status, 'confirmation_required');
+        assert.equal(staleExplicitPerson.attribution, undefined);
         const labelledConflict = assessIdentityPolicy({
           self: own.self,
           people: [person, second].map((saved) => ({
@@ -658,6 +708,130 @@ for (const banner of [false, true])
         assert.equal(clinical.records[0]!.mapping.personId, second.personId);
       }
     });
+
+test('a competing-subject Person repair stays assigned to that Person when Self has another birth date', async (t) => {
+  const f = fixture(
+    t,
+    `${heading}\nPatient: ${otherPatient}\nDOB: 1970-04-17\nDOB: 1982-04-17\nFictional count 12.00`,
+    'fictional-competing-people.txt',
+  );
+  const other = createNote(f.db, {
+    kind: 'person',
+    title: otherPatient,
+    person: { fullName: otherPatient, birthDate: '1970-04-17' },
+  });
+  const second = record(otherPatient);
+  second.id = 'fictional-competing-count';
+  second.provenance.sourceRecordId = second.id;
+  const current = intake.getIntake(f.db, f.root, f.profileId, f.item.id);
+  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, f.item.id, {
+    version: current.version,
+    summary: 'Independently fictional competing subject at one report heading',
+    jsonlText: JSON.stringify(second),
+  });
+  const group = proposed.workflow!.reportGroups!.find(
+    (candidate) => candidate.report?.subject?.text === otherPatient,
+  )!;
+  assert.ok(group);
+  const before = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+  assert.ok(
+    before.scope?.competingSubjects?.length,
+    'a second subject shares this report boundary',
+  );
+  assert.ok(before.scope?.birthDateReview?.choices.includes('1970-04-17'));
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    version: before.scope!.intakeVersion,
+    operationId: randomUUID(),
+    scope: before.scope!,
+    outcome: 'this_is_person',
+    attestation: 'confirmed_displayed_identity_questions',
+    ...(before.scope?.birthDateReview ? { identityAnswers: { birthDate: '1970-04-17' } } : {}),
+    personSelection: { noteId: other.id, expectedVersion: other.version },
+  });
+  const after = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+  const workflow = intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!;
+  const receipt = workflow.identityConfirmations!.at(-1)!;
+  assert.equal(receipt.identityAnswers?.birthDate, '1970-04-17');
+  assert.equal(
+    identityBoundaryRepairApplies(
+      receipt,
+      group,
+      workflow.reportGroups!,
+      after.scope!.assignmentTargets || after.scope!.targets,
+    ),
+    true,
+  );
+  assert.equal(
+    identityReceiptAppliesToCurrentBoundary(receipt, {
+      profileId: f.profileId,
+      intakeId: f.item.id,
+      groupId: group.id,
+      groupVersionId: after.scope!.groupVersionId,
+      sourceHash: after.scope!.sourceHash,
+      memberId: after.scope!.memberId,
+      original: after.scope!.original,
+      report: after.scope!.report,
+      subject: after.scope!.subject,
+      verificationMode: after.scope!.verificationMode,
+      evidencedIdentity: after.evidencedIdentity,
+      evidenceOriginalFingerprint: after.scope!.evidenceOriginalFingerprint || null,
+      membership: after.scope!.membership,
+    }),
+    true,
+  );
+  const repaired = assessIdentityPolicy({
+    self: after.self,
+    people: [
+      {
+        noteId: other.id,
+        personId: other.personId!,
+        version: other.version,
+        fullName: otherPatient,
+        knownNames: [],
+        birthDate: '1970-04-17',
+      },
+    ],
+    evidence: after.evidencedIdentity,
+    group,
+    groupVersionId: after.scope!.groupVersionId,
+    originalFingerprint: after.scope!.evidenceOriginalFingerprint || '',
+    receipts: [receipt],
+    hasUnstructuredIdentityQuestion: true,
+    explicitlyConfirmedOperationId: receipt.operationId,
+  });
+  assert.equal(repaired.status, 'prior_confirmation');
+  assert.equal(repaired.attribution?.assignedPerson?.personId, other.personId);
+  const unansweredNewIssue = assessIdentityPolicy({
+    self: after.self,
+    people: [
+      {
+        noteId: other.id,
+        personId: other.personId!,
+        version: other.version,
+        fullName: otherPatient,
+        knownNames: [],
+        birthDate: '1970-04-17',
+      },
+    ],
+    evidence: after.evidencedIdentity,
+    group,
+    groupVersionId: after.scope!.groupVersionId,
+    originalFingerprint: after.scope!.evidenceOriginalFingerprint || '',
+    receipts: [receipt],
+    hasUnstructuredIdentityQuestion: true,
+  });
+  assert.equal(unansweredNewIssue.blocking, true);
+  assert.equal(after.blocking, false, after.message);
+  const clinical = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  assert.equal(clinical.records[0]!.identityReview?.blocking, false);
+  assert.equal(clinical.records[0]!.mapping.personId, other.personId);
+});
 
 test('confirmation cannot cross an original even when the printed subject is unchanged', async (t) => {
   const f = fixture(

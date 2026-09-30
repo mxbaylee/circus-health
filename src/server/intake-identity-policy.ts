@@ -916,12 +916,17 @@ export function assessIdentityPolicy({
       message:
         'An accepted person correction challenged this printed name. Confirm this report’s person and choose whether future reports should use that name or ask each time.',
     };
-  const resolutionOperationId =
-    explicitReceipt?.operationId ||
-    (!hasUnstructuredIdentityQuestion ? receipt?.operationId : undefined);
   const applicableReceipt = explicitReceipt || receipt;
+  // Only a Self answer can resolve a Self match or be compared with Self's
+  // birth date. An explicit Person repair can share this operation channel.
+  const resolutionOperationId =
+    applicableReceipt?.outcome === 'this_is_me'
+      ? explicitReceipt?.operationId ||
+        (!hasUnstructuredIdentityQuestion ? receipt?.operationId : undefined)
+      : undefined;
   if (
     resolutionOperationId &&
+    !ownPersonReceipt &&
     applicableReceipt?.scope.groupId !== group?.id &&
     !nameEvidenceGrounded
   )
@@ -935,6 +940,7 @@ export function assessIdentityPolicy({
   const reviewedBirthDate = applicableReceipt?.identityAnswers?.birthDate;
   if (
     resolutionOperationId &&
+    !ownPersonReceipt &&
     reviewedBirthDate &&
     selfBirthDate &&
     !compatibleBirthDates(reviewedBirthDate, selfBirthDate)
@@ -957,7 +963,7 @@ export function assessIdentityPolicy({
         },
       ],
     };
-  if (resolutionOperationId && !birthDate && !originalEvidenceChecked)
+  if (resolutionOperationId && !ownPersonReceipt && !birthDate && !originalEvidenceChecked)
     return {
       ...common,
       status: 'confirmation_required',
@@ -967,6 +973,7 @@ export function assessIdentityPolicy({
     };
   if (
     resolutionOperationId &&
+    !ownPersonReceipt &&
     !selfBirthDateConflict &&
     !conflicts.some((conflict) => conflict.reason === 'evidence_disagreement')
   )
@@ -997,7 +1004,8 @@ export function assessIdentityPolicy({
       clean(ownPersonReceipt.scope.evidencedIdentity?.birthDate);
     if (
       !assigned ||
-      hasUnstructuredIdentityQuestion ||
+      (hasUnstructuredIdentityQuestion &&
+        explicitlyConfirmedOperationId !== ownPersonReceipt.operationId) ||
       conflicts.some((conflict) => conflict.reason === 'evidence_disagreement') ||
       (!birthDate && !originalEvidenceChecked)
     )
