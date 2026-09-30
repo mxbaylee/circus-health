@@ -1,4 +1,5 @@
 import { recordOwner } from '../record-owner.ts';
+import { ownershipCorrections } from '../ownership-history.ts';
 import { evidenceFor } from '../queries.ts';
 import { linkTarget, relatedNotes, finishNote } from '../notes.ts';
 import { observations, documents, clinicalList, testTypes, trends } from '../queries.ts';
@@ -522,6 +523,14 @@ for (const kind of Object.keys(clinicalTables) as ClinicalKind[])
       if (!['extra_json', 'person_id'].includes(field))
         assert.deepEqual(f.row()[field], value, field);
     assert.equal(JSON.parse(String(f.row().extra_json)).import.personId, 'patient');
+    // Only B's new record changed owner. A's retained record must not claim a
+    // correction in its history or in later packets, and an empty reason is not
+    // shown as the person's reason.
+    assert.deepEqual(ownershipCorrections(f.db, kind, f.recordId), []);
+    const corrected = ownershipCorrections(f.db, kind, destination);
+    assert.equal(corrected.length, 1);
+    assert.equal(corrected[0]!.action, 'split');
+    assert.equal(corrected[0]!.reason, null);
     assert.equal(f.db.prepare(`SELECT COUNT(*) n FROM ${clinicalTables[kind]}`).get()!.n, 2);
     assert.equal(
       f.db
@@ -1189,6 +1198,9 @@ for (const kind of Object.keys(clinicalTables) as ClinicalKind[])
     );
     const extra = JSON.parse(String(f.row().extra_json));
     assert.equal(extra.import.personId, 'patient');
+    // A kept its owner; only the linked target received B's contribution.
+    assert.deepEqual(ownershipCorrections(f.db, kind, f.recordId), []);
+    assert.equal(ownershipCorrections(f.db, kind, target).at(-1)?.action, 'link');
     assert.equal(extra.import.identityAttributions, undefined);
     assert.equal(extra.import.reviewedReportSources, undefined);
     assert.equal(extra.import.corrections, undefined);

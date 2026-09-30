@@ -58,6 +58,7 @@ export function beginReadingSlice(
     extensions: 0,
   };
   const job = item.readingJob;
+  restoreReadingJobBaseline(item);
   if (job.sliceStartedAt) return;
   job.baseline = progress(item.reading);
   job.observed ||= job.baseline;
@@ -117,6 +118,17 @@ function renewProgressWindow(
   job.budgetAtResponses = reading?.usableModelResponses || 0;
   job.budgetAtTokens = reading?.measuredModelTokens || 0;
   job.progressWindows = (job.progressWindows || 0) + 1;
+}
+
+/**
+ * A job journaled before the no-progress window counted responses has no
+ * response baseline. Treating it as zero would count every earlier response
+ * as unproductive and spend a stall attempt before any new request is sent.
+ */
+export function restoreReadingJobBaseline(item: IntakeBatchItem): void {
+  const job = item.readingJob;
+  if (job && job.budgetAtResponses === undefined)
+    job.budgetAtResponses = item.reading?.usableModelResponses || 0;
 }
 
 export function readingBudgetReached(

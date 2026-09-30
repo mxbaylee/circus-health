@@ -40,7 +40,14 @@ An unknown request stays unknown and possibly billed. If no recoverable result e
 
 The activity explains that retrying an unknown result may use additional provider usage. It distinguishes queued work, extraction/reading, retries, prerequisites, explicit Stop, and Done/Done with exceptions. Waiting is never successful completion. Units read/accounted and exceptions remain separate from proposed clinical records. A broad estimate uses measured files and names queued files it excludes; whole hours become days for long runs. If the only measured file has finished, the activity states its observed active reading time and explicitly says the queued files are not yet estimated. Provider waits without a reset receipt leave the estimate uncertain. A first estimate narrows as files are read. Estimates and unit accounting are not clinical completeness guarantees.
 
-Provider authentication waits for a changed credential/configuration or successful connection-check receipt. A notice on every profile page links to model connection details while imports wait, then clears when reading resumes. `model_unavailable` uses capped exponential backoff. Provider packets and evidence companions list unread or stalled sections of cited or directly included intake originals, so omitted findings are not mistaken for absent findings.
+Provider authentication waits for a changed credential/configuration or successful connection-check receipt. Signing in again at a provider behind the proxy changes neither, so the notice asks the person to run a connection test after signing in. A notice on every profile page links to model connection details while imports wait, then clears when reading resumes. `model_unavailable` uses capped exponential backoff. Provider packets and evidence companions list unread or stalled sections of cited or directly included intake originals, so omitted findings are not mistaken for absent findings.
+
+Current limitations, open in [CRS-140](../todo/CRS-140.md):
+
+- A unit whose request keeps timing out is retried as an unknown outcome without limit, and each retry may be billed.
+- Signing in again at the provider is not detected; a successful connection test is needed.
+- An authentication wait journals an entry on every check, even when nothing changed.
+- Reprocess on one stopped file resumes every stopped file in its batch.
 
 ## Validation boundaries
 

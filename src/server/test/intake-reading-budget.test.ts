@@ -13,6 +13,7 @@ import {
   readingModelRequestBudgetReached,
   extendReadingBudget,
   canContinueReadingSlice,
+  restoreReadingJobBaseline,
 } from '../intake-reading-budget.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { createAssistant } from '../assistant.ts';
@@ -176,6 +177,27 @@ test('legacy cumulative budgets cannot restore a manual pause', () => {
     assert.equal(canContinueReadingSlice(state({ reason }), false), true);
   for (const reason of ['stopped', 'profile_locked', 'reading_exhausted'])
     assert.equal(canContinueReadingSlice(state({ reason }), false), false);
+});
+test('a progress-window job saved before response baselines spends no stall attempt on restore', () => {
+  // Jobs journaled by CRS-039 lack budgetAtResponses; a zero baseline would
+  // count all earlier responses as unproductive before any new request.
+  const limits = { ...DEFAULT_INTAKE_READING_LIMITS, requests: 16 };
+  const file = item();
+  beginReadingSlice(file, '2026-01-01T00:00:00Z', limits);
+  file.reading = state({ modelRequests: 40, usableModelResponses: 40, readWindows: 12 });
+  delete file.readingJob!.budgetAtResponses;
+  restoreReadingJobBaseline(file);
+  assert.equal(readingBudgetReached(file, '2026-01-01T00:00:01Z', limits), false);
+  file.reading = state({ modelRequests: 56, usableModelResponses: 56, readWindows: 12 });
+  assert.equal(readingBudgetReached(file, '2026-01-01T00:00:02Z', limits), true);
+
+  const sliced = item();
+  beginReadingSlice(sliced, '2026-01-01T00:00:00Z', limits);
+  finishReadingSlice(sliced, sliced.reading, '2026-01-01T00:00:01Z');
+  sliced.reading = state({ modelRequests: 40, usableModelResponses: 40 });
+  delete sliced.readingJob!.budgetAtResponses;
+  beginReadingSlice(sliced, '2026-01-01T00:00:02Z', limits);
+  assert.equal(readingBudgetReached(sliced, '2026-01-01T00:00:03Z', limits), false);
 });
 test('explicit Stop still aborts an admitted provider request immediately', async (t) => {
   fictionalModel(t);

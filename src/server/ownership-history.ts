@@ -1,5 +1,6 @@
 import { json, type Database } from './database.ts';
 import type { ClinicalKind } from './clinical-references.ts';
+import { DEFAULT_OWNERSHIP_REASON } from './ownership-journal.ts';
 
 export interface OwnershipCorrectionHistory {
   operationId: string;
@@ -14,7 +15,13 @@ export interface OwnershipCorrectionHistory {
   actor: 'profile-user';
 }
 
-/** One compact event per correction; historical packet delivery is not retained. */
+/**
+ * One compact event per correction; historical packet delivery is not retained.
+ * Only the destination record changed owner: a move keeps its ID, a link names
+ * the existing target, and a split names its new record. A split's retained
+ * record appears as the event's `recordId` but kept its owner, so match on the
+ * destination alone. Every event since ownership correction shipped records it.
+ */
 export function ownershipCorrections(
   db: Database,
   kind: ClinicalKind,
@@ -22,9 +29,9 @@ export function ownershipCorrections(
 ): OwnershipCorrectionHistory[] {
   return db
     .prepare(
-      "SELECT coverage_json,created_at,notes FROM manual_batches WHERE title='Record ownership event' AND json_extract(coverage_json,'$.kind')=? AND (json_extract(coverage_json,'$.recordId')=? OR json_extract(coverage_json,'$.destinationRecordId')=?) ORDER BY created_at,id",
+      "SELECT coverage_json,created_at,notes FROM manual_batches WHERE title='Record ownership event' AND json_extract(coverage_json,'$.kind')=? AND json_extract(coverage_json,'$.destinationRecordId')=? ORDER BY created_at,id",
     )
-    .all(kind, recordId, recordId)
+    .all(kind, recordId)
     .map((row) => {
       const event = json(row.coverage_json) as {
         operationId: string;
@@ -61,7 +68,12 @@ export function ownershipCorrections(
         fromPersonName: former,
         toPersonId: event.toPersonId,
         ...(event.sourceReport ? { sourceReport: event.sourceReport } : {}),
-        reason: typeof row.notes === 'string' && row.notes.trim() ? row.notes : null,
+        reason:
+          typeof row.notes === 'string' &&
+          row.notes.trim() &&
+          row.notes.trim() !== DEFAULT_OWNERSHIP_REASON
+            ? row.notes
+            : null,
         actor: 'profile-user' as const,
       };
     });

@@ -47,6 +47,13 @@ it('plans over-cap approvals as ordered operations of at most 200 selections', (
   ).toBe('fictional-record-1000');
 });
 
+it('sends a selection within the server caps as one operation so coupled selections stay together', () => {
+  const selected = Array.from({ length: 1000 }, (_, index) => id(index));
+  const plan = planPartialSave(selected, null, [block(1000)]);
+  expect(plan.chunks).toHaveLength(1);
+  expect(plan.chunks[0]!.flatMap((part) => part.selections)).toHaveLength(1000);
+});
+
 it('explains every selected ID absent from exact approvals without submitting an empty request', () => {
   const shown = {
     blocks: [{ records: [{ feedKey: id(0), title: 'Fictional result', selectable: false }] }],

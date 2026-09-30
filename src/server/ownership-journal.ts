@@ -4,12 +4,14 @@ import { canonicalLiteral } from './intake-format.ts';
 
 export const ownershipHash = (value: unknown) =>
   createHash('sha256').update(canonicalLiteral(value)).digest('hex');
+/** Stored when the person gave no reason; history must not present it as theirs. */
+export const DEFAULT_OWNERSHIP_REASON = 'Corrected person assignment';
 export function appendOwnershipDecision(
   db: Database,
   id: string,
   title: string,
   value: object,
-  reason = 'Corrected person assignment',
+  reason = DEFAULT_OWNERSHIP_REASON,
 ) {
   const at = now();
   db.prepare(

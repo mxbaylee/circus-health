@@ -170,7 +170,11 @@ unique spelling silently assigns the remaining records.
 
 Record details for observations, medications, procedures and provider documents show
 earlier person attribution, correction date and reason, with access to accepted version
-history. Moves retain that history even when the record ID stays the same. The actor is
+history. Moves retain that history even when the record ID stays the same. After a
+contribution split, only the record that received the contribution shows the
+correction: a new record for the destination person, or the existing record it was
+linked to. The retained record kept its owner and shows none. A correction saved
+without a reason shows no reason. The actor is
 the profile user: the correction is a patient-side assertion, not a provider amendment.
 **Review undo** prepares another correction toward the former person using current
 versions. It still requires a reviewed preview and explicit confirmation; it does not

@@ -53,6 +53,11 @@ it('shows provider sign-in on other pages, opens connection settings, and clears
   );
   render(<RouterProvider router={router} />);
   expect(await screen.findByRole('status', { name: 'Model sign-in required' })).toBeVisible();
+  // A credential changed behind the proxy is not detectable; only a successful
+  // connection test changes the prerequisite, so the notice must say to run one.
+  expect(screen.getByRole('status', { name: 'Model sign-in required' })).toHaveTextContent(
+    /run a test; imports continue automatically once it succeeds/,
+  );
   expect(screen.getByRole('heading', { name: 'Family people' })).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'Open model connection' }));
   expect(await screen.findByRole('dialog', { name: 'Moxie connection' })).toBeVisible();

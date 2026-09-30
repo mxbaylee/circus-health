@@ -223,7 +223,10 @@ function ModelAuthenticationNotice({ profileId }: { profileId: string }) {
     <aside className="app-update-notice" aria-label="Model sign-in required" role="status">
       <div>
         <strong>Model sign-in needed</strong>
-        <p>Imports are waiting for the provider connection. They will continue after sign-in.</p>
+        <p>
+          Imports are waiting for the provider connection. After signing in, open the model
+          connection and run a test; imports continue automatically once it succeeds.
+        </p>
       </div>
       <button
         className="button secondary"

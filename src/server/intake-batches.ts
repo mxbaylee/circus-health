@@ -40,6 +40,7 @@ import {
   observeReadingProgress,
   readingBudgetReached,
   readingModelRequestBudgetReached,
+  restoreReadingJobBaseline,
   type IntakeReadingLimits,
 } from './intake-reading-budget.ts';
 import type {
@@ -321,6 +322,7 @@ export function createIntakeBatchManager({
             item.reason = 'stopped';
           }
       for (const item of batch.items) {
+        restoreReadingJobBaseline(item);
         item.automaticRun ??=
           batch.automaticRun &&
           (['queued', 'starting', 'running'].includes(item.status) ||

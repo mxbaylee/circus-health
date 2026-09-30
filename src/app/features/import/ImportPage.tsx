@@ -984,7 +984,7 @@ export function ImportPage() {
         : currentItem?.reason === 'provider_rejected'
           ? intakeReadingPauseLabel('provider_rejected')
           : currentItem?.reason === 'provider_authentication'
-            ? 'Sign in to the configured provider. Eligible imports will continue automatically.'
+            ? 'Sign in to the configured provider, then run a model connection test. Eligible imports continue automatically once it succeeds.'
             : currentItem?.reason === 'retrying_extraction'
               ? 'Retrying the interrupted source section from saved progress.'
               : currentItem?.reason === 'model_unavailable'

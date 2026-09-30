@@ -2,7 +2,7 @@
 
 This is the single work list. Keep ordinary items to an ID and a short description here. Add a separate CRS file when an item needs more room: its specification, proposal, owner decisions, open questions and review findings belong there. Fold review feedback into the items it concerns.
 
-Numbers are stable identifiers, not priority. Never renumber or reuse an ID. After skipping active and retired tickets, CRS-138 is next. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
+Numbers are stable identifiers, not priority. Never renumber or reuse an ID. After skipping active and retired tickets, CRS-142 is next. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
 
 Application documentation describes implemented behavior and current limitations; future work, its specifications and its plans live here. Before deleting a ticket, carry its unmet requirements, owner decisions and open questions into a new or existing item.
 
@@ -12,6 +12,10 @@ The detailed work list and design documents that preceded this index are archive
 
 ## Product and maintenance
 
+- [ ] <a id="crs-138"></a> [CRS-138](CRS-138.md) — Ask instead of reusing another report's confirmation when a saved name differs from the printed name only by a Jr./Sr./II/III suffix (remainder of CRS-137).
+- [ ] <a id="crs-139"></a> [CRS-139](CRS-139.md) — Make remembered name owners visible, revocable and unable to outrank another person's own name; release holds on later whole-report corrections; finish ownership-correction tests (remainder of CRS-134).
+- [ ] <a id="crs-140"></a> [CRS-140](CRS-140.md) — End repeated timeouts on one unit in a located exception, detect provider sign-in without a click, stop journaling unchanged waits, and finish continuation tests (remainder of CRS-135).
+- [ ] <a id="crs-141"></a> [CRS-141](CRS-141.md) — Keep partial saves linear on large intakes, keep coupled groups together above the cap, name the person on saved outcomes, and finish coverage (remainder of CRS-136).
 - [ ] <a id="crs-133"></a> [CRS-133](CRS-133.md) — Allow an explicit report-scoped assignment despite an incorrect printed DOB, preserving originals, demographics and the reason for the human exception.
 - [ ] <a id="crs-033"></a> **CRS-033** — Finish Import inbox acceptance after real-use regressions: native drop, accurate long-run activity, and repeated complete-file review.
 - [ ] <a id="crs-037"></a> **CRS-037** — Verify native file drop and truthful indexing, reading, provider-wait and completion states, including multi-file estimates and long runs.
@@ -155,7 +159,7 @@ The [experiment material](../experiments/README.md) is retained separately. No b
 
 ## Legacy IDs
 
-The aliases below refer to the old backlog namespace. They are separate from security risk IDs and the later reliability review’s R1–R52 labels, whose open requirements are recorded in CRS-086, 118, 122, 123, 126, 127 and 134–136. Implemented import recovery behavior and rationale live in [automatic import recovery](../import/automatic-recovery.md).
+The aliases below refer to the old backlog namespace. They are separate from security risk IDs and the later reliability review’s R1–R52 labels, whose open requirements are recorded in CRS-086, 118, 122, 123, 126, 127 and 139–141. Implemented import recovery behavior and rationale live in [automatic import recovery](../import/automatic-recovery.md).
 
 - `R1` → [CRS-001](#crs-001); `R2` → [CRS-002](#crs-002); `R3` → [CRS-003](#crs-003); `R4` → [CRS-004](#crs-004); `R5` → [CRS-005](#crs-005); `R6` → [CRS-006](#crs-006); `R7` → [CRS-007](#crs-007).
 - `U1` → [CRS-008](#crs-008); `U2` → [CRS-009](#crs-009); `U3` → [CRS-010](#crs-010); `U4` → [CRS-011](#crs-011); `U5` → [CRS-012](#crs-012); `U6` → [CRS-013](#crs-013); `U7` → [CRS-014](#crs-014); `U8` → [CRS-015](#crs-015).

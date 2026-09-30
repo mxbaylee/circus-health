@@ -143,6 +143,10 @@ export function planPartialSave(
           : 'This record needs review before it can be saved.'
         : 'This record is no longer on the displayed page. Return to it and approve its current version.',
     }));
+  // Within the server's caps, one operation lets the server keep coupled selections together.
+  // Only an over-cap selection is split, in chunks of 200 (owner decision, 2026-09-30).
+  if (sent.size <= 1000 && blocks.length <= 100)
+    return { chunks: blocks.length ? [blocks] : [], sent, unsent };
   const chunks: IntakeReportAcceptanceBlock[][] = [];
   let chunk: IntakeReportAcceptanceBlock[] = [];
   let count = 0;

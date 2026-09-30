@@ -14,6 +14,8 @@ A patient name in an unlabelled demographic banner can support the same name-onl
 
 Confirming report A cannot resolve an incompatible banner in report B, even when both reports share a printed name and the same uploaded original. A caregiver may upload several people's reports together; a confirmation records the report the person actually reviewed. For a Self receipt borrowed from A, Import compares B's unlabelled banner with Self's saved birth date—the owner that receipt would assign—whether or not the printed name uniquely matches Self. If more than one saved owner matches B's printed name, another report's receipt cannot choose among them. B remains blocked in identity preview, the Import feed, individual acceptance and bulk acceptance until its own applicable confirmation resolves ownership. Both Self and another Person can receive an explicit assignment; B's own Self receipt remains valid after an unrelated saved birth-date edit when B has no verified DOB conflict. The receipt remains report-scoped, and a confirmation does not change the saved birth date or original bytes. Valid confirmation reuse remains available where no unresolved mismatch or competing owner exists; original grounding, report boundary, membership and explicit question resolutions still have to pass the existing receipt checks at acceptance. A confirmed alias that becomes disputed or inactive does not make a borrowed receipt override B's incompatible banner.
 
+Current limitation, open in [CRS-138](../todo/CRS-138.md): names are compared with their generational suffix, so a saved "Robin Lane Jr." does not compete with Self's alias "Robin Lane". Another report's Self receipt can then answer a report printed only as "Robin Lane" without a question.
+
 An unlabelled date such as `4/12/88` uses the same compatibility readings whether the model asks a routine ownership question or asks nothing, and whether it quotes the name alone or the full banner. Model phrasing cannot change the meaning of an unchanged original or create extra work for the person reviewing it. Compatibility keeps only the limited name-only match: the date might not be a DOB at all, so it supplies neither DOB evidence nor a demographic update. An incompatible clue still asks about ownership because silently ignoring it could file a family member's report under Self. Making that question permanently unanswerable would instead prevent a legitimate report assignment.
 
 This resolvable banner question is distinct from interpretation of a labelled ambiguous or two-digit DOB, which still needs review, and from an exception for a verified but incorrectly printed DOB. The latter requires the separately approved explicit human attribution action tracked in [CRS-133](../todo/CRS-133.md); banner confirmation does not introduce that exception. Model-only DOB discrepancies remain advisory for the reasons below. Permanent regressions in `src/server/test/intake-generic-name-question.test.ts` and `src/server/test/intake-identity-boundaries.test.ts` exercise these distinctions.
@@ -127,6 +129,11 @@ challenged name and supporting receipts; they do not move unselected records. Ot
 people with the same spelling remain independent. Single-token names remain report-scoped.
 A later explicit confirmation can reestablish an association with new support; an old
 receipt or retained historical spelling cannot do so by itself.
+
+Current limitation, open in [CRS-139](../todo/CRS-139.md): an "Always …" future-name
+choice is applied before other owners are compared, so it can outrank another saved
+person's own name. It is not shown in People, cannot be revoked there, and a later
+correction does not end it.
 
 An unresolved learned association remains a visible competing claim. A later report with
 that printed name asks for explicit identity review even when only one other saved person
