@@ -22,10 +22,6 @@ Included clinical records retain `ownershipCorrections` in the evidence companio
 
 The app does not retain a durable packet-membership or delivery receipt. Its expiring in-memory preview cache cannot establish whether an earlier copy included a particular record or who received it. Ownership correction previews and record history state that limitation so the person can check copies they shared and send corrected packets where needed.
 
-Included clinical records retain `ownershipCorrections` in the evidence companion. Preview and PDF display **Owner corrected on DATE**, the former attribution and any recorded reason, including compact result/prescription/procedure tables and deduplicated document narratives. These corrections are assertions by the profile user; they do not imply a provider amended the original. A fresh packet reflects the current owner and correction history, and a changed correction invalidates an earlier preview fingerprint.
-
-The app does not retain a durable packet-membership or delivery receipt. Its expiring in-memory preview cache cannot establish whether an earlier copy included a particular record or who received it. Ownership correction previews and record history state that limitation so the person can check copies they shared and send corrected packets where needed.
-
 ## API contract and immutable previews
 
 Converted proposal citations follow their retained original pointer, including source/package parents. A unit counts as read only with its matching retained coverage receipt; a completed status alone is insufficient. A retained original without an active reading plan is not established as fully read. This disclosure does not create a packet-delivery journal or identify who received an earlier packet.
