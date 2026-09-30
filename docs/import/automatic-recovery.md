@@ -2,7 +2,7 @@
 
 ## Rationale and authorization
 
-A person importing a long clinical history should not have to babysit arbitrary reading allowances. Productive work continues; recovery isolates the exact work that is stuck while retaining evidence and useful proposals. This implements CRS-126's D2/D3 owner decisions. Provider waiting means unavailable service, not a failed source page, and cannot consume the local stall streak.
+A person importing a long clinical history should not have to babysit arbitrary reading allowances. Productive work continues; recovery isolates the exact work that is stuck while retaining evidence and useful proposals. These rules are owner decisions (2026-09-28): reading has no size or time limits and stuckness is detected instead, and waits are backoffs, never pauses. Provider waiting means unavailable service, not a failed source page, and cannot consume the local stall streak.
 
 Durable automatic-run intent is scheduling state, not an unlock credential. The coordinator checks current permission for the exact profile/import operation at dispatch and publication, independently of browser selection. Generation and source-dependency guards also apply. Closing a tab does not stop authorized work. Lock/logout/profile switch revoke the ordinary runtime; authorized unlock restores eligible automatic work without Resume. Explicit Stop survives restart and unlock.
 
@@ -44,7 +44,7 @@ Provider authentication waits for a changed credential/configuration or successf
 
 Current limitations, open in [CRS-140](../todo/CRS-140.md):
 
-- A unit whose request keeps timing out is retried as an unknown outcome without limit, and each retry may be billed.
+- A unit whose request keeps timing out is retried as an unknown outcome at the normal pace, and each retry may be billed. There is deliberately no attempt cap (owner decision, 2026-09-30); the missing part is cooling: per-unit backoff, lower concurrency or a longer deadline, with a status that never needs the person to act.
 - Signing in again at the provider is not detected; a successful connection test is needed.
 - An authentication wait journals an entry on every check, even when nothing changed.
 - Reprocess on one stopped file resumes every stopped file in its batch.

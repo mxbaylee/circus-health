@@ -32,7 +32,7 @@ JSONL is the logical representation after decryption. Durable storage uses bound
 
 ## Source-text write amplification
 
-Bytes written for one operation must be proportional to what that operation changed ([CRS-126 D4](../todo/CRS-126.md#d4-storage-writes-scale-with-what-changed), owner decision 2026-09-28). Anything else is incorrect behavior, not a tuning choice.
+Bytes written for one operation must be proportional to what that operation changed (owner decision 2026-09-28; `AGENTS.md` states the same rule for all durable writes). Anything else is incorrect behavior, not a tuning choice.
 
 - **Incorrect:** a write that copies the complete current document, revision, table or corpus into the journal, a transaction result, an operation receipt or a cache entry, so that storage grows with document size times the number of writes.
 - **Correct:** store the changed records or blobs plus a small receipt (identifiers, hashes, counts). Readers fetch content by reference. The same rule applies to repeated reads and hashing: work per operation scales with the change, not with the whole original on every call.
