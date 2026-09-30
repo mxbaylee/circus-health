@@ -53,3 +53,5 @@ The implementation and independently fictional tests below cover the current con
 - Effects, accessibility and boundaries (R29/R30): correction state resets use actual record/scope context rather than recreated props; the mixed-save summary uses one live region and item links use native accessible controls. Overview approval state, identity/source sheet controls, outcome rendering, destination resolution and durable partial acceptance have separate modules. Existing navigation/draft guards remain at their owning editors. Mounted detail/presentation tests and the keyboard/narrow real-restart browser journey cover those boundaries.
 
 See the [acceptance API](../../src/server/INTAKE.md#counted-report-acceptance) and [reconciliation contract](import-reconciliation.md#atomic-counted-selections-and-reconnect-receipts).
+
+Failed outcome labels do not infer Self from missing ownership. An unresolved report identity is shown as “Person not confirmed” until the report has an applicable ownership decision.

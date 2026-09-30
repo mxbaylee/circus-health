@@ -1560,7 +1560,7 @@ it('shares one selection bar across records and source files, with distinct appr
   await userEvent.click(screen.getByRole('tab', { name: /^Needs attention/ }));
   await userEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
   expect(screen.getByRole('checkbox', { name: '2 selected' })).toBeChecked();
-  expect(screen.queryByRole('button', { name: /Save 1 records/ })).toBeNull();
+  expect(screen.queryByRole('button', { name: /Save 1 record/ })).toBeNull();
   await userEvent.click(screen.getByRole('tab', { name: /^All/ }));
   await userEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
   expect(screen.getByRole('checkbox', { name: '3 selected' })).toBeChecked();
@@ -1569,7 +1569,7 @@ it('shares one selection bar across records and source files, with distinct appr
   await waitFor(() => expect(screen.getByRole('checkbox', { name: '1 selected' })).toBeChecked());
   expect(saveRecords).not.toHaveBeenCalled();
   expect(writes.every((request) => request.action === 'confirm')).toBe(true);
-  await userEvent.click(screen.getByRole('button', { name: 'Save 1 records' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Save 1 record' }));
   expect(saveRecords).toHaveBeenCalledWith(['test']);
 });
 

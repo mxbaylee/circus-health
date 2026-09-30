@@ -190,12 +190,22 @@ it('names same-name owners distinctly in failed outcomes and falls back without 
       <ImportAcceptanceOutcomes
         receipt={{
           ...receipt,
-          items: [{ ...receipt.items[0]!, label: undefined, reportName: 'Fictional report' }],
+          items: [
+            {
+              ...receipt.items[0]!,
+              label: undefined,
+              personId: undefined,
+              reportName: 'Fictional report',
+            },
+          ],
         }}
       />
     </MemoryRouter>,
   );
   expect(screen.getByRole('link', { name: /Record in Fictional report/ })).not.toHaveTextContent(
     'opaque-record-0',
+  );
+  expect(screen.getByRole('link', { name: /Record in Fictional report/ })).toHaveTextContent(
+    'Person not confirmed',
   );
 });

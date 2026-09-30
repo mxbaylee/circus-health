@@ -860,3 +860,32 @@ test('same-label same-date distinct source events remain independent approvals',
     ['saved', 'needs_review'],
   );
 });
+
+// An identity question is not an assignment to Self; outcome labels must retain that distinction.
+test('partial outcomes do not label an unresolved report owner as Self', (t) => {
+  const f = fixture(t);
+  const value = envelope('fictional-unassigned');
+  value.clinical = { ...(value.clinical as Record<string, unknown>), subject: 'unknown' };
+  value.reviewIssues = [
+    { kind: 'identity', field: 'subject', prompt: 'Who does this fictional report belong to?' },
+  ];
+  value.report!.subject = { locator: 'page 1 patient', text: 'Fictional Iris Meadow' };
+  const item = intake.uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-unassigned.txt',
+    bytes: Buffer.from('DEXA FICT-DXA\nFictional Iris Meadow\nFictional count +14.00 mg'),
+  });
+  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, item.id, {
+    version: item.version,
+    jsonlText: JSON.stringify(value),
+    summary: 'Fictional unresolved ownership',
+  });
+  const proposalId = proposed.proposals.at(-1)!.id;
+  const current = intake.reviewIntake(f.db, f.root, f.profileId, item.id, proposalId);
+  assert.equal(current.records[0]!.identityReview?.blocking, true);
+  const result = accept(f, partial(f, block(f, item.id, proposalId)));
+  assert.equal(result.receipt.atomic, false);
+  if (result.receipt.atomic) throw Error('Expected partial receipt');
+  assert.equal(result.receipt.items[0]?.status, 'needs_review');
+  assert.equal(result.receipt.items[0]?.personId, undefined);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
+});

@@ -194,8 +194,11 @@ function initializePartialSelection(
         const record = reviewRecords.get(pair)?.get(entry.selection.recordId);
         entry.label = record?.title?.slice(0, 160);
         entry.kind = record?.kind;
-        entry.personId =
-          record?.identityReview?.assignedPerson?.personId || record?.mapping.personId || 'patient';
+        entry.personId = record?.identityReview?.blocking
+          ? undefined
+          : record?.identityReview?.assignedPerson?.personId ||
+            record?.mapping.personId ||
+            (record?.mapping.subject === 'self' ? 'patient' : undefined);
         entry.personNoteId = record?.identityReview?.assignedPerson?.noteId || 'person-note:self';
         entry.identityName = record?.identityReview?.evidencedIdentity.fullName?.trim();
         if (entry.identityName && !identityStamps.has(entry.identityName)) {

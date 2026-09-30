@@ -28,7 +28,8 @@ export function ImportAcceptanceOutcomes({
   const people = useResource<IntakeIdentityPerson[]>(receipt && !receipt.atomic ? '/people' : null);
   if (!receipt && !unsent.length) return null;
   const name = (personId?: string) => {
-    if (!personId || personId === 'patient') return 'Self';
+    if (!personId) return 'Person not confirmed';
+    if (personId === 'patient') return 'Self';
     const person = people.data?.find((entry) => entry.personId === personId);
     return person
       ? [person.fullName, person.birthDate, person.relationship].filter(Boolean).join(' · ')
