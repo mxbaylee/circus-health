@@ -1892,7 +1892,7 @@ it('keeps the open draft mounted when a background feed removes its record versi
   await waitFor(() => expect(screen.queryByText('Fictional eyewear prescription')).toBeNull());
 });
 
-it('removes an open row when the feed confirms it was saved', async () => {
+it('retains a newer open correction when background refresh says the record was saved', async () => {
   const original = sourceModel();
   const props = {
     renderRecordReview: () => <input aria-label="Pinned correction" defaultValue="Draft" />,
@@ -1917,8 +1917,10 @@ it('removes an open row when the feed confirms it was saved', async () => {
     />,
   );
 
-  await waitFor(() => expect(screen.queryByLabelText('Pinned correction')).toBeNull());
-  await waitFor(() => expect(screen.queryByText('Fictional eyewear prescription')).toBeNull());
+  // A background status is not acknowledgement of this local edit.
+  // See docs/import/review-reliability.md. Keep it for explicit reconciliation.
+  expect(screen.getByLabelText('Pinned correction')).toHaveValue('Cookie Doe correction');
+  expect(screen.getByText('Fictional eyewear prescription')).toBeVisible();
 });
 
 it('retains a dirty report source editor across feed replacement but not profile changes', () => {
@@ -2307,4 +2309,19 @@ it('disambiguates duplicate people and disables an existing person whose DOB dif
   fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
   expect(screen.getByRole('option', { name: /Rowan Meadow.*1986-02-14.*Sibling/ })).toBeEnabled();
   expect(screen.getByRole('option', { name: /Rowan Meadow.*1950-01-05.*Parent/ })).toBeDisabled();
+});
+
+it('removes only confirmed saved selections after an itemized partial result', async () => {
+  const original = sourceModel();
+  original.records = original.records.flatMap((row) => [
+    { ...row, id: 'saved-row', eligible: true },
+    { ...row, id: 'retained-row', label: 'Retained fictional record', eligible: true },
+  ]);
+  const save = vi.fn().mockResolvedValue({ savedIds: ['saved-row'] });
+  render(<ImportReviewPresentation model={original} actions={{ onSave: save }} />);
+  await userEvent.click(screen.getByRole('checkbox', { name: /Select all shown/ }));
+  await userEvent.click(screen.getByRole('button', { name: /Save 2 records/ }));
+  await waitFor(() => expect(save).toHaveBeenCalledWith(['saved-row', 'retained-row']));
+  expect(screen.getByRole('checkbox', { name: /Retained fictional record/ })).toBeChecked();
+  expect(screen.getByText('1 selected')).toBeVisible();
 });

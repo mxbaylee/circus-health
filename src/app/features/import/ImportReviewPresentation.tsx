@@ -33,6 +33,7 @@ import type { ReactNode, RefObject } from 'react';
 import { ImportSourceSelection, useSourceSelection } from './import-source-selection';
 import type {
   IntakeAcceptedRecord,
+  IntakeReportAcceptanceBlock,
   IntakeDraftRepairField,
   IntakeDraftRepairSelection,
   IntakeReportSourceCoverage,
@@ -53,6 +54,7 @@ export type ImportReviewKind =
   'Test results' | 'Prescriptions' | 'Vision' | 'Procedures' | 'Documents' | 'People';
 
 export interface ImportReviewRecord {
+  approval?: IntakeReportAcceptanceBlock;
   id: string;
   reportId: string;
   kind: ImportReviewKind;
@@ -117,6 +119,7 @@ export interface ImportReviewReport {
     blocking?: boolean;
     offeredSelfFields?: { fullName?: string; birthDate?: string };
     selfDisplayName?: string;
+    selfNames?: string[];
     people?: IntakeIdentityReview['people'];
     peopleTruncated?: boolean;
     assignedPerson?: IntakeIdentityReview['assignedPerson'];
@@ -142,6 +145,7 @@ export interface ImportReviewModel {
   contextKey?: string;
   /** No settled feed for the requested filters yet; absence is not an empty result. */
   loading?: boolean;
+  confirmedSavedIds?: string[];
   reports: ImportReviewReport[];
   records: ImportReviewRecord[];
   counts?: Record<ImportReviewStatus, number>;
@@ -184,7 +188,10 @@ export interface ImportReviewModel {
 export interface ImportReviewActions {
   busy?: boolean;
   onFiles?: (files: File[]) => void | Promise<void>;
-  onSave?: (recordIds: string[]) => void | boolean | Promise<void | boolean>;
+  onSave?: (
+    recordIds: string[],
+    approvals?: IntakeReportAcceptanceBlock[],
+  ) => void | boolean | { savedIds: string[] } | Promise<void | boolean | { savedIds: string[] }>;
   onLater?: (recordIds: string[]) => void | Promise<void>;
   onExclude?: (recordIds: string[]) => void | Promise<void>;
   onResume?: (recordIds: string[]) => void | Promise<void>;
@@ -294,6 +301,7 @@ export function ImportReviewPresentation({
   const sourceSelection = useSourceSelection();
   const [approvingSections, setApprovingSections] = useState(false);
   const [editedOnly, setEditedOnly] = useState(false);
+  const selectedSnapshots = useRef(new Map<string, ImportReviewRecord>());
   const [selected, setSelected] = useState(() => new Set<string>());
   const [sheet, setSheet] = useState<SheetState>(null);
   const sheetReturnFocus = useRef<HTMLElement | null>(null);
@@ -323,27 +331,17 @@ export function ImportReviewPresentation({
     presentedContext.current = model.contextKey;
     if (contextChanged) {
       confirmedSaved.current.clear();
+      selectedSnapshots.current.clear();
       setSourceAttention(false);
     }
     if (preserveSourceReview && !contextChanged) return;
+    for (const id of model.confirmedSavedIds || []) confirmedSaved.current.add(id);
+    setSelected((current) => new Set([...current].filter((id) => !confirmedSaved.current.has(id))));
     // A background feed refresh must not unmount a draft whose version was
     // superseded. Its existing editor keeps the conflict/acceptance checks.
     const pinned = pinnedReview.current;
-    const terminal =
-      pinned &&
-      model.records.some(
-        (record) => record.id === pinned.record.id && ['saved', 'excluded'].includes(record.status),
-      );
-    if (terminal) {
-      pinnedReview.current = null;
-      setExpandedRecord(null);
-    }
     const retain =
-      !terminal &&
-      pinned &&
-      !confirmedSaved.current.has(pinned.record.id) &&
-      pinned.contextKey === model.contextKey &&
-      expandedRecord === pinned.record.id;
+      pinned && pinned.contextKey === model.contextKey && expandedRecord === pinned.record.id;
     const currentRecords = model.records.map((record) =>
       confirmedSaved.current.has(record.id) ? { ...record, status: 'saved' as const } : record,
     );
@@ -535,17 +533,35 @@ export function ImportReviewPresentation({
             : actions.onResume;
     if (model && action) {
       const context = model.contextKey;
-      const succeeded = await action(ids);
-      if (status === 'saved' && succeeded === true && presentedContext.current === context) {
-        for (const id of ids) confirmedSaved.current.add(id);
-        if (pinnedReview.current && ids.includes(pinnedReview.current.record.id)) {
+      const approvals = ids.flatMap((id) =>
+        selectedSnapshots.current.get(id)?.approval
+          ? [selectedSnapshots.current.get(id)!.approval!]
+          : [],
+      );
+      const succeeded =
+        status === 'saved'
+          ? await (approvals.length ? actions.onSave?.(ids, approvals) : actions.onSave?.(ids))
+          : await action(ids);
+      const savedIds =
+        succeeded && typeof succeeded === 'object'
+          ? succeeded.savedIds
+          : succeeded === true
+            ? ids
+            : [];
+      if (status === 'saved' && savedIds.length && presentedContext.current === context) {
+        for (const id of savedIds) confirmedSaved.current.add(id);
+        if (
+          pinnedReview.current &&
+          savedIds.includes(pinnedReview.current.record.id) &&
+          (!beforeReviewChange || (await beforeReviewChange()))
+        ) {
           pinnedReview.current = null;
           setExpandedRecord(null);
         }
         setRecords((current) =>
-          current.map((record) => (ids.includes(record.id) ? { ...record, status } : record)),
+          current.map((record) => (savedIds.includes(record.id) ? { ...record, status } : record)),
         );
-        setSelected((current) => new Set([...current].filter((id) => !ids.includes(id))));
+        setSelected((current) => new Set([...current].filter((id) => !savedIds.includes(id))));
       }
       return;
     }
@@ -559,7 +575,11 @@ export function ImportReviewPresentation({
     setSelected((current) => {
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
-      else next.add(id);
+      else {
+        next.add(id);
+        const record = records.find((record) => record.id === id);
+        if (record) selectedSnapshots.current.set(id, record);
+      }
       return next;
     });
   }
@@ -835,6 +855,10 @@ export function ImportReviewPresentation({
                 onChange={() => {
                   const all = selectedCount !== selectableCount;
                   shownSourceFiles.forEach((file) => file.select(all));
+                  if (all)
+                    for (const record of selectableRecords)
+                      if (!selected.has(record.id))
+                        selectedSnapshots.current.set(record.id, record);
                   setSelected(
                     !all
                       ? new Set(
@@ -1886,6 +1910,7 @@ function ImportSheet({
                 />
               )}
               <ImportPersonChoice
+                selfNames={report.subject.selfNames}
                 selfDisabled={report.subject.selfBirthDateConflict}
                 birthDate={reviewedBirthDate || report.subject.birthDate}
                 people={report.subject.people}
@@ -1949,7 +1974,7 @@ function ImportSheet({
                     reviewedBirthDate === '' ||
                     report.subject.identityStatus === 'missing_warning' ||
                     (!personSelection && !!report.subject.selfBirthDateConflict) ||
-                    !personSelectionReady(personSelection) ||
+                    !personSelectionReady(personSelection, report.subject.selfNames) ||
                     (needsPrintedName &&
                       !printedNameReady(selectedPrintedName, report.subject.evidenceText || ''))
                   }

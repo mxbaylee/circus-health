@@ -3,7 +3,7 @@ import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import { UsersRound } from 'lucide-react';
 import { useProfile } from '../data/profile';
 import { queryString, useResource } from '../data/api';
-import { personScopeRoute } from '../../shared/person-scope';
+import { clinicalPersonId, personScopeRoute } from '../../shared/person-scope';
 import { LoadingIndicator } from './LoadingIndicator';
 import './person-scope.css';
 
@@ -28,7 +28,8 @@ export function PersonScopeProvider({ children }: { children: ReactNode }) {
   const owner = useResource<{ personId: string | null }>(
     route.target ? `/record-owner?${queryString(route.target)}` : null,
   );
-  const requested = location.pathname === '/' ? 'patient' : params.get('personId') || 'patient';
+  const requested =
+    location.pathname === '/' ? 'patient' : clinicalPersonId(params.get('personId'));
   const personId = owner.data?.personId || requested;
   const person = useResource<{ name: string; noteId: string | null }>(
     route.scoped && personId !== 'patient' && (!route.target || owner.data)

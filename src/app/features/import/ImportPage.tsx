@@ -1,3 +1,5 @@
+import { ImportAcceptanceOutcomes, acceptanceSummary } from './ImportAcceptanceOutcomes';
+import type { IntakeReportAcceptanceReceipt } from '../../../shared/intake';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { ImportPersonSelection } from './ImportPersonChoice';
 import type { ManualSourceRecordResult } from '../../../shared/intake-manual-source-record';
@@ -468,10 +470,17 @@ export function ImportPage() {
     }
   }, [displayedFeed, profile?.id, profileIdentitySignature, feed.reload]);
 
+  const [acceptanceReceipt, setAcceptanceReceipt] = useState<IntakeReportAcceptanceReceipt | null>(
+    null,
+  );
+  useEffect(() => setAcceptanceReceipt(null), [profile?.id]);
   const acceptance = useReportAcceptance(profile?.id || '', (result) => {
     setBusy(false);
+    setAcceptanceReceipt(result.receipt);
     setNotice(
-      `Imported ${result.receipt.acceptedCount} ${result.receipt.acceptedCount === 1 ? 'record' : 'records'}`,
+      result.receipt.acceptedCount === result.receipt.selectedCount
+        ? `Imported ${result.receipt.acceptedCount} ${result.receipt.acceptedCount === 1 ? 'record' : 'records'}`
+        : acceptanceSummary(result.receipt),
     );
     feed.reload();
   });
@@ -774,6 +783,9 @@ export function ImportPage() {
           printedNameRequired:
             !!identityReview?.scope && !identityReview.evidencedIdentity.fullName,
           selfDisplayName: profile?.name || 'Self',
+          selfNames: identityReview
+            ? [identityReview.self.fullName || '', ...(identityReview.self.knownNames || [])]
+            : [],
           evidenceText:
             identityReview?.scope?.subject.text || identityReview?.evidencedIdentity?.fullName,
           questions: identityReview?.scope?.questions,
@@ -796,6 +808,25 @@ export function ImportPage() {
           const mapping = initialDraft(record).decision.mapping;
           return {
             id: record.feedKey,
+            approval:
+              record.candidateId && record.candidateVersionId
+                ? {
+                    intakeId: block.intakeId,
+                    proposalId: block.proposalId,
+                    intakeVersion: block.intakeVersion,
+                    reviewToken: block.reviewToken,
+                    selections: [
+                      {
+                        recordId: record.id,
+                        candidateId: record.candidateId,
+                        candidateVersionId: record.candidateVersionId,
+                        selectionReviewToken: record.selectionReviewToken,
+                        mapping: initialDraft(record).decision.mapping,
+                        comparisons: initialDraft(record).decision.comparisons,
+                      },
+                    ],
+                  }
+                : undefined,
             reportId: group.groupId,
             kind: kind[record.feedKind],
             label: recordLabel(record),
@@ -936,6 +967,11 @@ export function ImportPage() {
                       : 'Moxie is getting ready to read. Your progress is saved.';
     const paused = !!pausedItem || !!data?.activity.pausedFiles;
     return {
+      confirmedSavedIds: acceptanceReceipt?.receipts.flatMap((block) =>
+        block.records.map((record) =>
+          JSON.stringify([block.intakeId, record.candidateId, record.candidateVersionId]),
+        ),
+      ),
       contextKey: `${profile?.id || ''}:${feedPath}`,
       loading: !data,
       reports,
@@ -1040,6 +1076,7 @@ export function ImportPage() {
       },
     };
   }, [
+    acceptanceReceipt,
     batch.batch,
     batch.busy,
     displayedFeed,
@@ -1240,14 +1277,15 @@ export function ImportPage() {
     });
   }
 
-  function save(ids: string[]) {
-    return perform(
+  async function save(ids: string[], approvals?: IntakeReportAcceptanceRequest['blocks']) {
+    const savedIds: string[] = [];
+    await perform(
       async ({ prefix, current, operationId, request: requestApi }) => {
         setOperationStatus(
           `Preparing ${ids.length} selected ${ids.length === 1 ? 'item' : 'items'}…`,
         );
         const personIds = ids.filter((id) => personFor(id));
-        const clinical = ids.filter((id) => lookup.has(id));
+        const clinical = ids.filter((id) => !id.startsWith('person:'));
         let savedPeople = 0;
         if (personIds.length && clinical.length)
           throw new Error(
@@ -1285,6 +1323,7 @@ export function ImportPage() {
             }),
           );
           savedPeople += 1;
+          savedIds.push(id);
           setOperationStatus(`Saved ${index + 1} of ${personIds.length} selected people.`);
           setNotice(
             `${savedPeople} ${savedPeople === 1 ? 'person was' : 'people were'} saved. Open the exact ${savedPeople === 1 ? 'entry' : 'entries'} below.`,
@@ -1306,6 +1345,7 @@ export function ImportPage() {
               const decision = initialDraft(record).decision;
               return [
                 {
+                  selectionReviewToken: record.selectionReviewToken,
                   recordId: record.id,
                   candidateId: record.candidateId,
                   candidateVersionId: record.candidateVersionId,
@@ -1333,8 +1373,18 @@ export function ImportPage() {
                 selections,
               });
           }
+          if (approvals?.length) {
+            grouped.clear();
+            for (const snapshot of approvals) {
+              const key = JSON.stringify([snapshot.intakeId, snapshot.proposalId]);
+              const prior = grouped.get(key);
+              if (prior) prior.selections.push(...snapshot.selections);
+              else grouped.set(key, structuredClone(snapshot));
+            }
+          }
           const blocks = [...grouped.values()];
           const request: IntakeReportAcceptanceRequest = {
+            mode: 'partial-v1',
             operationId: crypto.randomUUID(),
             blocks,
           };
@@ -1344,7 +1394,14 @@ export function ImportPage() {
               acceptance.error ||
                 'Save was not confirmed. Check the saved receipt before retrying.',
             );
-          setOperationStatus(`Saved ${clinical.length} selected clinical records.`);
+          savedIds.push(
+            ...result.receipt.receipts.flatMap((block) =>
+              block.records.map((record) =>
+                JSON.stringify([block.intakeId, record.candidateId, record.candidateVersionId]),
+              ),
+            ),
+          );
+          setOperationStatus(acceptanceSummary(result.receipt));
         } else {
           feed.reload();
         }
@@ -1353,6 +1410,7 @@ export function ImportPage() {
       'review_save',
       { selected: ids.length, actions: 1 },
     );
+    return { savedIds };
   }
 
   async function correctDrafts(
@@ -1923,6 +1981,7 @@ export function ImportPage() {
           {error || acceptance.error || batch.error}
         </div>
       )}
+      <ImportAcceptanceOutcomes receipt={acceptanceReceipt} />
       {notice && (
         <div className="import-page-notice" role="status">
           <span>{notice}</span>

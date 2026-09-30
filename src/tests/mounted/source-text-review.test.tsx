@@ -1653,3 +1653,118 @@ it('inline source correction requires a reason, preserves the draft, and remains
   });
   expect(screen.getByRole('button', { name: 'Approve section' })).toBeEnabled();
 });
+
+for (const dirty of [false, true])
+  it(`source attention follows current revisions while ${dirty ? 'retaining a dirty draft for comparison' : 'updating a pristine editor'}`, async () => {
+    const { fetcher } = setup();
+    let current = { ...revision };
+    let sequence = 1;
+    fetcher.mockImplementation(async () =>
+      Response.json({ data: available(current), meta: { revision: sequence } }),
+    );
+    const item = {
+      id: 'fictional-source',
+      filename: 'cookie.pdf',
+      version: 1,
+    } as import('../../shared/intake').Intake;
+    const view = render(<SourceAttentionReview intake={item} onChanged={() => {}} />);
+    await screen.findByText('Page 1 · Source text');
+    await userEvent.click(screen.getAllByRole('button', { name: /^Review$/ })[0]);
+    const editor = await screen.findByLabelText('Extracted text on page 1');
+    if (dirty) fireEvent.change(editor, { target: { value: 'My retained correction' } });
+    current = {
+      ...current,
+      id: 'new-current',
+      parentRevisionId: current.id,
+      spans: current.spans.map((s) =>
+        s.region.page === 1 ? { ...s, text: 'New current transcription' } : s,
+      ),
+    };
+    sequence++;
+    view.rerender(<SourceAttentionReview intake={{ ...item, version: 2 }} onChanged={() => {}} />);
+    if (dirty) {
+      expect(await screen.findByText(/Source text changed. Your draft is retained/)).toBeVisible();
+      expect(editor).toHaveValue('My retained correction');
+      expect(screen.getByRole('button', { name: /^Update$/ })).toBeDisabled();
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Keep my draft against this revision' }),
+      );
+      expect(screen.getByRole('button', { name: /^Update$/ })).toBeEnabled();
+    } else await waitFor(() => expect(editor).toHaveValue('New current transcription'));
+  });
+
+it('source attention rejects an older save response after a newer revision arrives in flight', async () => {
+  const { fetcher } = setup();
+  let current = { ...revision };
+  let sequence = 1;
+  let settle!: (response: Response) => void;
+  fetcher.mockImplementation(async (_input, options) => {
+    if (options?.method === 'POST')
+      return new Promise<Response>((resolve) => {
+        settle = resolve;
+      });
+    return Response.json({ data: available(current), meta: { revision: sequence } });
+  });
+  const item = {
+    id: 'fictional-source',
+    filename: 'cookie.pdf',
+    version: 1,
+  } as import('../../shared/intake').Intake;
+  const view = render(<SourceAttentionReview intake={item} onChanged={() => {}} />);
+  await screen.findByText('Page 1 · Source text');
+  await userEvent.click(screen.getAllByRole('button', { name: /^Review$/ })[0]);
+  const editor = await screen.findByLabelText('Extracted text on page 1');
+  fireEvent.change(editor, { target: { value: 'My retained correction' } });
+  await userEvent.click(screen.getByRole('button', { name: /^Update$/ }));
+  await waitFor(() => expect(settle).toBeTypeOf('function'));
+  const old = { ...revision, id: 'own-save', parentRevisionId: revision.id };
+  current = {
+    ...revision,
+    id: 'newer-save',
+    parentRevisionId: 'own-save',
+    spans: revision.spans.map((s) =>
+      s.region.page === 1 ? { ...s, text: 'Newer source text' } : s,
+    ),
+  };
+  sequence = 3;
+  view.rerender(<SourceAttentionReview intake={{ ...item, version: 3 }} onChanged={() => {}} />);
+  await waitFor(() =>
+    expect(screen.getByLabelText('Current source text')).toHaveTextContent('Newer source text'),
+  );
+  settle(Response.json({ data: available(old), meta: { revision: 2 } }));
+  expect(await screen.findByText(/A newer source revision arrived during save/)).toBeVisible();
+  expect(editor).toHaveValue('My retained correction');
+  expect(screen.getByLabelText('Current source text')).toHaveTextContent('Newer source text');
+  expect(screen.getByRole('button', { name: /^Update$/ })).toBeDisabled();
+});
+
+it('an old intake save cannot leave the next intake busy or publish its error there', async () => {
+  const { fetcher } = setup();
+  let reject!: (error: Error) => void;
+  fetcher.mockImplementation(async (_input, options) => {
+    if (options?.method === 'POST')
+      return new Promise<Response>((_resolve, fail) => {
+        reject = fail;
+      });
+    return Response.json({ data: available(revision), meta: { revision: 1 } });
+  });
+  const item = {
+    id: 'fictional-source',
+    filename: 'cookie.pdf',
+    version: 1,
+  } as import('../../shared/intake').Intake;
+  const view = render(<SourceAttentionReview intake={item} onChanged={() => {}} />);
+  await screen.findByText('Page 1 · Source text');
+  await userEvent.click(screen.getAllByRole('button', { name: 'Approve section' })[0]);
+  await waitFor(() => expect(reject).toBeTypeOf('function'));
+  view.rerender(
+    <SourceAttentionReview
+      intake={{ ...item, id: 'fictional-next', filename: 'next.pdf' }}
+      onChanged={() => {}}
+    />,
+  );
+  await waitFor(() => expect(screen.getAllByRole('button', { name: /^Review$/ })[0]).toBeEnabled());
+  reject(Error('Old private intake failure'));
+  await waitFor(() => expect(screen.queryByText(/Old private intake failure/)).toBeNull());
+  expect(screen.getAllByRole('button', { name: 'Approve section' })[0]).toBeEnabled();
+});

@@ -152,3 +152,48 @@ it('does not install a stale saved draft when choosing the current fields', asyn
   );
   expect(writes).toBe(1);
 });
+
+it('binds a coalesced correction reason to its exact patch, retries unchanged, then clears it before unrelated edits', async () => {
+  const requests: Record<string, unknown>[] = [];
+  let fail = true;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_input, options) => {
+      requests.push(JSON.parse(String(options?.body)));
+      if (fail) {
+        fail = false;
+        throw new TypeError('Lost fictional response');
+      }
+      return json({ ...intake, version: requests.length + 7 });
+    }),
+  );
+  const view = renderHook(() => useReviewDrafts(profile.id, () => {}));
+  const initial = review(7, '42'),
+    row = initial.records[0]!;
+  act(() => view.result.current.hydrate(initial));
+  act(() => {
+    const local = view.result.current.current(initial, row);
+    view.result.current.update(initial, row, {
+      decision: { ...local.decision, mapping: { ...local.decision.mapping, valueText: '43' } },
+      correctionReason: 'Read the original digit',
+    });
+    view.result.current.update(initial, row, { disposition: 'review_later' });
+  });
+  await act(() => view.result.current.flush());
+  expect(requests[0].correctionReason).toBe('Read the original digit');
+  expect(requests[0].correctionPatch).toEqual({ valueText: '43' });
+  await act(() => view.result.current.retry());
+  expect(requests[1]).toEqual(requests[0]);
+  expect(view.result.current.current(initial, row).correctionReason).toBeUndefined();
+  act(() => view.result.current.update(initial, row, { disposition: 'pending' }));
+  await act(() => view.result.current.flush());
+  expect(requests[2].correctionReason).toBeUndefined();
+  act(() => {
+    const local = view.result.current.current(initial, row);
+    view.result.current.update(initial, row, {
+      decision: { ...local.decision, mapping: { ...local.decision.mapping, unit: 'mg' } },
+    });
+  });
+  await act(() => view.result.current.flush());
+  expect(requests[3].correctionReason).toBeUndefined();
+});

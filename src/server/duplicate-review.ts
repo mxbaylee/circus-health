@@ -566,7 +566,7 @@ export function intakePairScope(
   db: DatabaseSync,
   incoming: IntakePairIncoming,
   saved: DuplicateRecord,
-  occurrence?: IntakeOccurrenceContext,
+  occurrence?: Pick<IntakeOccurrenceContext, 'intakeVersion' | 'contextHash'>,
 ): IntakePairScope {
   const profileId = String(
     db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value || '',

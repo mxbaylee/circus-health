@@ -437,3 +437,17 @@ it('ignores a manual receipt lookup that settles after switching profiles', asyn
     request.operationId,
   );
 });
+
+it('keeps an absent receipt unknown after reload instead of enabling a fresh operation', async () => {
+  sessionStorage.setItem(`circus-health:report-acceptance:${profile.id}`, request.operationId);
+  const fetcher = vi.fn().mockResolvedValue(json({ code: 'REPORT_ACCEPTANCE_NOT_FOUND' }, 404));
+  vi.stubGlobal('fetch', fetcher);
+  const view = renderHook(() => useReportAcceptance(profile.id, vi.fn()));
+  await waitFor(() => expect(view.result.current.recovering).toBe(false));
+  expect(view.result.current.recoveryOperationId).toBe(request.operationId);
+  expect(view.result.current.error).toContain('Checking save status');
+  await act(() =>
+    view.result.current.submit({ ...request, operationId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }),
+  );
+  expect(fetcher).toHaveBeenCalledTimes(1);
+});

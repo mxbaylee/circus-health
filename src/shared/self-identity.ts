@@ -100,3 +100,13 @@ export function compatibleIdentityBirthDates(left: string, right: string): boole
   const long = left.length <= right.length ? right : left;
   return long === short || long.startsWith(short + '-');
 }
+
+/** One rule for Self-versus-new-Person choices in review and server publication. */
+export function matchesSelfIdentityName(fullName: string, names: readonly string[]): boolean {
+  return (
+    !!fullName.trim() &&
+    names.some(
+      (name) => !!name.trim() && canonicalIdentityName(name) === canonicalIdentityName(fullName),
+    )
+  );
+}

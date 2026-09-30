@@ -721,9 +721,21 @@ test('import corrections retain per-update reasons and before/after values throu
       }),
     { code: 'IMPORT_DATE' },
   );
+  assert.throws(
+    () =>
+      saveIntakeReviewDraft(f.db, f.root, f.profile, f.item.id, {
+        ...base,
+        operationId: 'wrong-reason-patch',
+        mapping: { valueText: '18' },
+        correctionReason: 'Old unit reason',
+        correctionPatch: { unit: 'count' },
+      }),
+    { code: 'CORRECTION_PATCH_CHANGED' },
+  );
   const update = {
     ...base,
     operationId: 'cookie-value-correction',
+    correctionPatch: { valueText: '18' },
     mapping: { valueText: '18' },
     correctionReason: 'Read the value in the original',
   };

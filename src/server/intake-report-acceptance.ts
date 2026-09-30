@@ -1,3 +1,9 @@
+import {
+  acceptPartialSelection,
+  getPartialAcceptance,
+  hasPartialAcceptance,
+} from './intake-partial-acceptance.ts';
+import { durableSelectionInputs } from './intake-selection-authority.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { createHash } from 'node:crypto';
 import { HttpError, now } from './database.ts';
@@ -9,15 +15,19 @@ import {
   intakeTransaction,
   listIntakes,
   prepareIntakeImport,
+  reviewIntake,
 } from './intake.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type {
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceReceipt,
+  IntakeAtomicAcceptanceReceipt,
   IntakeReportAcceptanceResult,
   IntakeWorkflow,
 } from '../shared/intake.ts';
 import {
+  duplicateRecord,
+  intakePairScope,
   refreshOccurrenceAttachmentAuthorities,
   type OccurrenceAuthorityFinalizer,
 } from './duplicate-review.ts';
@@ -30,6 +40,7 @@ const text = (value: unknown): value is string =>
 function request(value: unknown): IntakeReportAcceptanceRequest {
   if (
     !object(value) ||
+    (value.mode !== undefined && value.mode !== 'partial-v1') ||
     typeof value.operationId !== 'string' ||
     !uuid.test(value.operationId) ||
     !Array.isArray(value.blocks) ||
@@ -73,15 +84,21 @@ function request(value: unknown): IntakeReportAcceptanceRequest {
         ++count > 1000 ||
         !object(selection) ||
         !text(selection.recordId) ||
+        (value.mode === 'partial-v1' && !text(selection.selectionReviewToken)) ||
         !text(selection.candidateId) ||
         !text(selection.candidateVersionId) ||
         !object(selection.mapping) ||
         (selection.comparisons !== undefined && !Array.isArray(selection.comparisons)) ||
         Object.keys(selection).some(
           (key) =>
-            !['recordId', 'candidateId', 'candidateVersionId', 'mapping', 'comparisons'].includes(
-              key,
-            ),
+            ![
+              'recordId',
+              'candidateId',
+              'candidateVersionId',
+              'mapping',
+              'comparisons',
+              'selectionReviewToken',
+            ].includes(key),
         )
       )
         throw new HttpError(
@@ -102,7 +119,7 @@ function request(value: unknown): IntakeReportAcceptanceRequest {
   // Retain the caller's exact reviewed request independently of later object mutation.
   return structuredClone(value) as unknown as IntakeReportAcceptanceRequest;
 }
-function owner(db: DatabaseSync, profileId: string): void {
+export function acceptanceOwner(db: DatabaseSync, profileId: string): void {
   listIntakes(db, profileId, { limit: 1 });
   const durability = personalDurabilityStatus(db);
   if (durability.conflicted || (durability.dirty && durability.lastError))
@@ -131,9 +148,11 @@ export function getIntakeReportAcceptance(
   profileId: string,
   operationId: string,
 ): IntakeReportAcceptanceResult {
-  owner(db, profileId);
+  acceptanceOwner(db, profileId);
   if (!uuid.test(operationId))
     throw new HttpError(400, 'REPORT_ACCEPTANCE_INPUT', 'Supply the acceptance operation UUID');
+  const partial = getPartialAcceptance(db, root, profileId, operationId);
+  if (partial) return partial;
   const saved = retained(db, operationId);
   if (!saved)
     throw new HttpError(404, 'REPORT_ACCEPTANCE_NOT_FOUND', 'Acceptance operation not found');
@@ -158,10 +177,21 @@ function acceptIntakeReportSelectionInternal(
   profileId: string,
   input: unknown,
 ): IntakeReportAcceptanceResult {
-  owner(db, profileId);
+  acceptanceOwner(db, profileId);
   const selected = request(input),
     fingerprint = createHash('sha256').update(canonicalLiteral(selected)).digest('hex');
   const previous = retained(db, selected.operationId);
+  if (
+    (selected.mode === 'partial-v1' && previous) ||
+    (selected.mode !== 'partial-v1' && hasPartialAcceptance(db, selected.operationId))
+  )
+    throw new HttpError(
+      409,
+      'OPERATION_CONFLICT',
+      'Operation ID already belongs to a different acceptance mode.',
+    );
+  if (selected.mode === 'partial-v1')
+    return acceptPartialSelection(db, root, profileId, selected, fingerprint);
   if (previous) {
     if (previous.fingerprint !== fingerprint)
       throw new HttpError(
@@ -175,6 +205,17 @@ function acceptIntakeReportSelectionInternal(
       durability: flushIntake(db, root, profileId),
     };
   }
+  return applyAcceptanceGroup(db, root, profileId, selected, fingerprint);
+}
+
+export function applyAcceptanceGroup(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  selected: IntakeReportAcceptanceRequest,
+  fingerprint: string,
+  retainResult?: (receipt: IntakeAtomicAcceptanceReceipt) => void,
+): IntakeReportAcceptanceResult {
   const receipt = measureImportPhase(
     'review_acceptance_transaction',
     () =>
@@ -232,15 +273,61 @@ function acceptIntakeReportSelectionInternal(
                   'Select the current pending candidate version from its exact retained proposal',
                 );
             }
+            const fresh = retainResult
+              ? reviewIntake(db, root, profileId, block.intakeId, block.proposalId)
+              : null;
+            const comparisons = new Map<string, (typeof block.selections)[number]['comparisons']>();
+            if (fresh)
+              for (const selection of block.selections) {
+                const record = fresh.records.find((item) => item.id === selection.recordId);
+                if (!record || record.selectionReviewToken !== selection.selectionReviewToken)
+                  throw new HttpError(
+                    409,
+                    'SELECTION_REVIEW_CHANGED',
+                    'This record or its source/person dependencies changed. Review this exact record again.',
+                  );
+                comparisons.set(
+                  selection.recordId,
+                  selection.comparisons?.map((decision) => {
+                    // Discovery is paginated and searchable, not an authority list.
+                    // Resolve the exact reviewed target even when it is off this page.
+                    const incoming = record.comparisonReference;
+                    const current = incoming
+                      ? intakePairScope(
+                          db,
+                          { ...incoming, id: record.id, evidence: record.evidence },
+                          duplicateRecord(db, incoming.kind, decision.otherRecordId),
+                          record.comparisonContextHash
+                            ? {
+                                intakeVersion: fresh.version,
+                                contextHash: record.comparisonContextHash,
+                              }
+                            : undefined,
+                        )
+                      : undefined;
+                    if (
+                      !current ||
+                      canonicalLiteral(durableSelectionInputs(decision.scope)) !==
+                        canonicalLiteral(durableSelectionInputs(current))
+                    )
+                      throw new HttpError(
+                        409,
+                        'DUPLICATE_SCOPE_CHANGED',
+                        'Compare the changed destination record again.',
+                      );
+                    return { ...decision, scope: current };
+                  }),
+                );
+              }
             const result = prepareIntakeImport(db, root, profileId, block.intakeId, {
-              version: block.intakeVersion,
+              version: fresh?.version ?? block.intakeVersion,
               proposalId: block.proposalId,
-              reviewToken: block.reviewToken,
+              reviewToken: fresh?.reviewToken ?? block.reviewToken,
               decisions: block.selections.map((selection) => ({
                 recordId: selection.recordId,
                 action: 'accept',
                 mapping: selection.mapping,
-                comparisons: selection.comparisons,
+                comparisons: fresh ? comparisons.get(selection.recordId) : selection.comparisons,
               })),
             });
             for (const selection of block.selections) {
@@ -261,16 +348,16 @@ function acceptIntakeReportSelectionInternal(
                   'Resolve each selected record before accepting; unselected records stay unchanged',
                 );
             }
-            return result;
+            return { result, version: fresh?.version ?? block.intakeVersion };
           });
           const versions = new Map<string, number>(),
             receipts: IntakeReportAcceptanceReceipt['receipts'] = [],
             occurrenceAuthorityFinalizers: OccurrenceAuthorityFinalizer[] = [];
           for (const [index, block] of selected.blocks.entries()) {
-            const before = versions.get(block.intakeId) ?? block.intakeVersion;
+            const before = versions.get(block.intakeId) ?? prepared[index]!.version;
             const applied = measureImportPhase(
               'review_acceptance_apply',
-              () => prepared[index]!.apply(before, occurrenceAuthorityFinalizers),
+              () => prepared[index]!.result.apply(before, occurrenceAuthorityFinalizers),
               { selectedCount: block.selections.length },
               { profileId, importId: block.intakeId },
             );
@@ -298,7 +385,7 @@ function acceptIntakeReportSelectionInternal(
           }
           refreshOccurrenceAttachmentAuthorities(db, occurrenceAuthorityFinalizers);
           const count = selected.blocks.reduce((sum, block) => sum + block.selections.length, 0);
-          const result: IntakeReportAcceptanceReceipt = {
+          const result: IntakeAtomicAcceptanceReceipt = {
             operationId: selected.operationId,
             status: 'accepted',
             atomic: true,
@@ -307,6 +394,10 @@ function acceptIntakeReportSelectionInternal(
             acceptedCount: receipts.reduce((sum, receipt) => sum + receipt.records.length, 0),
             receipts,
           };
+          if (retainResult) {
+            retainResult(result);
+            return result;
+          }
           const coordinator = selected.blocks[0]!.intakeId;
           const row = db
             .prepare('SELECT details_json FROM source_files WHERE id=?')

@@ -107,6 +107,7 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
       answers?: Record<string, string>;
     };
     version?: number;
+    reasonMapping?: IntakeReviewDecision['mapping'];
   };
   const queue = useRef(new Map<string, Work>());
   const pairCommits = useRef(new Map<string, ReviewDraftPairCommit>());
@@ -190,6 +191,19 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
             ? [failedWork.current.key, failedWork.current.work]
             : queue.current.entries().next().value!;
           // Preserve the exact operation/version on an uncertain transport failure.
+          if (work.version === undefined && work.body.correctionReason && work.reasonMapping) {
+            const baseline = baselines.current.get(key) || {};
+            work.body.correctionPatch = Object.fromEntries(
+              Object.entries(work.reasonMapping).filter(
+                ([field, value]) =>
+                  !['subject', 'personId', 'sourceSystem'].includes(field) &&
+                  JSON.stringify(value) !==
+                    JSON.stringify(baseline[field as keyof typeof baseline]),
+              ),
+            );
+            if (!Object.keys(work.body.correctionPatch).length)
+              work.body.correctionReason = undefined;
+          }
           work.version ??= versions.current.get(work.intakeId) || 0;
           failedWork.current = { key, work };
           pairCommits.current.delete(key);
@@ -217,6 +231,19 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
               revision: result.meta.revision,
             });
           observe(result.data);
+          baselines.current.set(key, { ...work.body.mapping });
+          const local = draftsRef.current[key];
+          if (
+            local &&
+            local.correctionReason === work.body.correctionReason &&
+            JSON.stringify(local.decision.mapping) === JSON.stringify(work.body.mapping)
+          ) {
+            draftsRef.current = {
+              ...draftsRef.current,
+              [key]: { ...local, correctionReason: undefined },
+            };
+            setDrafts(draftsRef.current);
+          }
           if (queue.current.get(key) === work) queue.current.delete(key);
           failedWork.current = null;
           savedCallback.current(result.data);
@@ -249,14 +276,25 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     record: IntakeReviewRecord,
     patch: Partial<LocalReviewDraft>,
   ) {
-    const key = draftKey(review, record),
-      next = { ...current(review, record), ...patch };
+    const key = draftKey(review, record);
+    const prior = current(review, record);
+    const mappingChanged =
+      patch.decision &&
+      JSON.stringify(patch.decision.mapping) !== JSON.stringify(prior.decision.mapping);
+    const unsent = queue.current.get(key);
+    const reason =
+      patch.correctionReason ??
+      (!mappingChanged && unsent && unsent !== failedWork.current?.work
+        ? prior.correctionReason
+        : undefined);
+    const next = { ...prior, ...patch, correctionReason: reason };
     draftsRef.current = { ...draftsRef.current, [key]: next };
     setDrafts(draftsRef.current);
     if (!record.candidateVersionId) return;
     queue.current.set(key, {
       intakeId: review.intakeId,
       candidateId: record.candidateId,
+      reasonMapping: reason ? structuredClone(next.decision.mapping) : undefined,
       body: {
         operationId: crypto.randomUUID(),
         proposalId: review.proposalId,

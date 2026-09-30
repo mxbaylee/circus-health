@@ -1,3 +1,4 @@
+import { selectionAuthority } from './intake-selection-authority.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { observeIntakeVersion, intakeVersionConflictFacts } from './import-version-diagnostics.ts';
 import {
@@ -1438,6 +1439,20 @@ export function reviewIntake(
           'This proposal uses earlier source text. Read the corrected source and create a new proposal before acceptance.',
       });
   }
+  for (const record of review.records)
+    record.selectionReviewToken = selectionAuthority({
+      profileId,
+      intakeId: id,
+      proposalId,
+      originalHash: file.sha256,
+      proposalHash: inputFile.sha256,
+      sourceTextRevisionId: d.sourceTextRevisionId || null,
+      sourceTextDependencyToken: d.sourceTextDependencyToken || null,
+      sourceTextStale: review.sourceTextStale || false,
+      // Discovery suggestions are not approvals. Exact chosen comparison scopes are
+      // independently validated inside acceptance; duplicate classification remains pinned.
+      record: { ...record, comparisons: undefined },
+    });
   return review;
 }
 
@@ -2690,6 +2705,24 @@ export function saveIntakeReviewDraft(
         canonicalLiteral(correctedMapping[key as keyof IntakeClinicalMapping]) !==
           canonicalLiteral(record.mapping[key as keyof IntakeClinicalMapping]),
     );
+    if (
+      input.correctionPatch !== undefined &&
+      (!input.correctionReason ||
+        canonicalLiteral(input.correctionPatch) !==
+          canonicalLiteral(
+            Object.fromEntries(
+              changedFields.map((key) => [
+                key,
+                correctedMapping[key as keyof IntakeClinicalMapping],
+              ]),
+            ),
+          ))
+    )
+      throw new HttpError(
+        409,
+        'CORRECTION_PATCH_CHANGED',
+        'The correction reason must describe exactly these changed fields and values. Review the patch and its reason again.',
+      );
     if (input.correctionReason && changedFields.length)
       corrections.push({
         operationId: input.operationId,

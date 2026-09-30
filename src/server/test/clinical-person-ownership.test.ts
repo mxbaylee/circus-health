@@ -140,11 +140,29 @@ test('historical and optical documents use durable import ownership and default 
 
 test('family current medication assertions stay on that record and outside Self collections', (t) => {
   const { db, family } = fixture(t);
+  assert.throws(
+    () =>
+      setMedicationCurrentStatus(db, 'missing-other-profile-record', {
+        status: 'current',
+        version: 0,
+        visibilityVersion: 0,
+      }),
+    { code: 'NOT_FOUND' },
+  );
   setMedicationCurrentStatus(db, 'med-family', {
     status: 'current',
     version: 0,
     visibilityVersion: 0,
   });
+  assert.throws(
+    () =>
+      setMedicationCurrentStatus(db, 'med-family', {
+        status: 'not_current',
+        version: 0,
+        visibilityVersion: 0,
+      }),
+    { code: 'VERSION_CONFLICT' },
+  );
   assert.equal(clinicalList(db, 'medications', new URLSearchParams()).total, 0);
   assert.deepEqual(
     clinicalList(db, 'medications', new URLSearchParams({ personId: family })).data.map(

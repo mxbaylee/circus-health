@@ -391,6 +391,8 @@ export interface IntakeClinicalMapping {
 }
 export interface IntakeReviewRecord {
   id: string;
+  /** Exact per-occurrence authority, independent of unrelated transport revisions. */
+  selectionReviewToken?: string;
   classification: ReviewClassification;
   kind: ReviewRecordKind;
   title: string;
@@ -532,6 +534,8 @@ export interface IntakeReviewDraft {
   at: string;
 }
 export interface IntakeReviewDraftUpdate {
+  /** Literal fields/values explained by this reason; independently checked against the changed patch. */
+  correctionPatch?: Partial<IntakeClinicalMapping>;
   correctionReason?: string;
   version: number;
   operationId: string;
@@ -941,6 +945,7 @@ export interface IntakeImportFeed {
 }
 
 export interface IntakeReportAcceptanceSelection {
+  selectionReviewToken?: string;
   recordId: string;
   candidateId: string;
   candidateVersionId: string;
@@ -955,10 +960,11 @@ export interface IntakeReportAcceptanceBlock {
   selections: IntakeReportAcceptanceSelection[];
 }
 export interface IntakeReportAcceptanceRequest {
+  mode?: 'partial-v1';
   operationId: string;
   blocks: IntakeReportAcceptanceBlock[];
 }
-export interface IntakeReportAcceptanceReceipt {
+export interface IntakeAtomicAcceptanceReceipt {
   operationId: string;
   status: 'accepted';
   atomic: true;
@@ -974,6 +980,33 @@ export interface IntakeReportAcceptanceReceipt {
     records: (IntakeAcceptedRecord & { candidateId: string; candidateVersionId: string })[];
   }[];
 }
+export interface IntakePartialAcceptanceItem {
+  selectionReviewToken: string;
+  reviewedSelectionHash: string;
+  intakeId: string;
+  proposalId: string | null;
+  recordId: string;
+  candidateId: string;
+  candidateVersionId: string;
+  operationId: string;
+  status: 'saved' | 'needs_review' | 'failed' | 'not_attempted';
+  reasonCode?: string;
+  message?: string;
+  receipt?: IntakeAtomicAcceptanceReceipt['receipts'][number];
+}
+export interface IntakePartialAcceptanceReceipt {
+  version: 1;
+  operationId: string;
+  status: 'completed';
+  atomic: false;
+  at: string;
+  selectedCount: number;
+  acceptedCount: number;
+  receipts: IntakeAtomicAcceptanceReceipt['receipts'];
+  items: IntakePartialAcceptanceItem[];
+}
+export type IntakeReportAcceptanceReceipt =
+  IntakeAtomicAcceptanceReceipt | IntakePartialAcceptanceReceipt;
 export interface IntakeReportAcceptanceResult {
   receipt: IntakeReportAcceptanceReceipt;
   replayed: boolean;

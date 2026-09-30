@@ -91,6 +91,7 @@ function block(
     selections: review.records
       .filter((_record, index) => !indices || indices.includes(index))
       .map((record) => ({
+        selectionReviewToken: record.selectionReviewToken,
         recordId: record.id,
         candidateId: record.candidateId!,
         candidateVersionId: record.candidateVersionId!,
@@ -421,4 +422,202 @@ test('kept and repeated candidate selections are rejected and aggregate review b
   f.db.prepare('UPDATE source_files SET bytes=? WHERE id=?').run(65 * 1024 * 1024, other.id);
   assert.throws(() => accept(f, input), { code: 'REPORT_ACCEPTANCE_LIMIT' });
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
+});
+
+function partial(
+  f: Fixture,
+  ...blocks: IntakeReportAcceptanceBlock[]
+): IntakeReportAcceptanceRequest {
+  for (const block of blocks) {
+    const review = intake.reviewIntake(f.db, f.root, f.profileId, block.intakeId, block.proposalId);
+    for (const selection of block.selections)
+      selection.mapping = {
+        ...review.records.find((r) => r.id === selection.recordId)!.mapping,
+        ...selection.mapping,
+      };
+  }
+  return { ...request(...blocks), mode: 'partial-v1' };
+}
+test('partial v1 saves independent valid approvals and retains stale, blocked and invalid outcomes', (t) => {
+  const f = fixture(t),
+    blocked = envelope('blocked-partial');
+  blocked.reviewIssues = [
+    { kind: 'uncertain_reading', field: 'valueText', prompt: 'Confirm reading?' },
+  ];
+  const item = upload(f, [
+    envelope('valid-a'),
+    envelope('valid-b'),
+    envelope('stale'),
+    blocked,
+    envelope('invalid'),
+  ]);
+  const input = partial(f, block(f, item.id));
+  input.blocks[0]!.selections[2]!.selectionReviewToken = 'stale';
+  (input.blocks[0]!.selections[4]!.mapping as Record<string, unknown>).unit = 123;
+  const result = accept(f, input);
+  assert.equal(result.receipt.atomic, false);
+  if (result.receipt.atomic) throw Error('Expected partial receipt');
+  // An unchanged sibling remains approvable: another save is not a new human review.
+  // Rationale: docs/import/review-reliability.md.
+  assert.deepEqual(
+    result.receipt.items.map((i) => i.status),
+    ['saved', 'saved', 'needs_review', 'needs_review', 'needs_review'],
+  );
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
+  assert.deepEqual(accept(f, input).receipt, result.receipt);
+  const changed = structuredClone(input);
+  changed.blocks[0]!.selections[0]!.mapping.unit = 'g';
+  assert.throws(() => accept(f, changed), { code: 'OPERATION_CONFLICT' });
+});
+test('partial v1 pins exact records while unrelated intake changes do not invalidate approvals', (t) => {
+  const f = fixture(t),
+    item = upload(f, [envelope('one'), envelope('two')]);
+  const input = partial(f, block(f, item.id, null, [0]));
+  disposition(f, item, 1, 'review_later');
+  assert.equal(accept(f, input).receipt.acceptedCount, 1);
+  const other = upload(f, [envelope('substitute')], 'substitute.jsonl');
+  const swapped = partial(f, block(f, other.id));
+  swapped.blocks[0]!.selections[0]!.selectionReviewToken =
+    input.blocks[0]!.selections[0]!.selectionReviewToken;
+  const result = accept(f, swapped);
+  assert.equal(result.receipt.acceptedCount, 0);
+});
+test('partial v1 manifest and bounded item receipts survive backup and rebuild without duplicate publication', async (t) => {
+  const f = fixture(t),
+    item = upload(f, [envelope('durable-a'), envelope('durable-b')]);
+  const input = partial(f, block(f, item.id));
+  input.blocks[0]!.selections[1]!.selectionReviewToken = 'stale';
+  const original = accept(f, input).receipt;
+  const backup = await createBackup(f.db, f.root, f.profileId),
+    target = join(f.root, 'partial-rebuilt');
+  const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
+    db = openDatabase(rebuilt.database, f.profileId);
+  try {
+    assert.deepEqual(
+      getIntakeReportAcceptance(db, target, f.profileId, input.operationId).receipt,
+      original,
+    );
+    assert.deepEqual(acceptIntakeReportSelection(db, target, f.profileId, input).receipt, original);
+    assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('partial children reconcile lost publication acknowledgement after earlier saves and reopen', (t) => {
+  const f = fixture(t),
+    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma')]);
+  const objects = new Map<string, Buffer>();
+  let publishes = 0,
+    failAt = Infinity;
+  const storage: RecordStorage = {
+    read: (name) => objects.get(name) || null,
+    writeImmutable(name, bytes) {
+      objects.set(name, Buffer.from(bytes));
+    },
+    publishHead(bytes) {
+      objects.set('head', Buffer.from(bytes));
+      if (++publishes === failAt) throw Error('Lost acknowledgement after publication');
+    },
+  };
+  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  const input = partial(f, block(f, item.id));
+  failAt = publishes + 3;
+  assert.throws(() => accept(f, input), { code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED' });
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+  assert.throws(() => getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId), {
+    code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED',
+  });
+  // A lost response does not justify a new operation: recover the original journal.
+  // Rationale: docs/import/review-reliability.md.
+  failAt = Infinity;
+  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  const recovered = getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId);
+  assert.equal(recovered.receipt.acceptedCount, 2);
+  assert.equal(!recovered.receipt.atomic && recovered.receipt.items[2]!.status, 'not_attempted');
+  assert.deepEqual(accept(f, input).receipt, recovered.receipt);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
+});
+test('partial shared storage failure stops later children with explicit terminal outcomes', (t) => {
+  const f = fixture(t),
+    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma')]);
+  const objects = new Map<string, Buffer>();
+  let publishes = 0,
+    stopAfter = Infinity,
+    failed = false;
+  const storage: RecordStorage = {
+    read: (name) => objects.get(name) || null,
+    writeImmutable(name, bytes) {
+      if (publishes === stopAfter && !failed) {
+        failed = true;
+        throw Error('Storage write failed before publication');
+      }
+      objects.set(name, Buffer.from(bytes));
+    },
+    publishHead(bytes) {
+      objects.set('head', Buffer.from(bytes));
+      publishes++;
+    },
+  };
+  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  const input = partial(f, block(f, item.id));
+  stopAfter = publishes + 2;
+  const result = accept(f, input);
+  if (result.receipt.atomic) throw Error('Expected partial');
+  assert.deepEqual(
+    result.receipt.items.map((i) => i.status),
+    ['saved', 'failed', 'not_attempted'],
+  );
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+  assert.deepEqual(accept(f, input).receipt, result.receipt);
+});
+test('partial coupled identical assertions reject together while an independent item saves', (t) => {
+  const f = fixture(t),
+    first = envelope('same'),
+    second = { ...envelope('same'), id: 'same-other' },
+    third = envelope('independent');
+  second.payload = { literal: 'same source assertion in a second delivery' };
+  const item = upload(f, [first, third]),
+    other = upload(f, [second], 'second.jsonl');
+  const input = partial(f, block(f, item.id), block(f, other.id));
+  input.blocks[1]!.selections[0]!.selectionReviewToken = 'stale';
+  const result = accept(f, input);
+  if (result.receipt.atomic) throw Error('Expected partial');
+  assert.deepEqual(
+    result.receipt.items.map((i) => i.status),
+    ['needs_review', 'saved', 'needs_review'],
+  );
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+});
+
+test('operation IDs cannot change between atomic and partial modes', (t) => {
+  const f = fixture(t),
+    item = upload(f, [envelope('one'), envelope('two')]);
+  const atomic = request(block(f, item.id, null, [0]));
+  accept(f, atomic);
+  const altered = partial(f, block(f, item.id, null, [1]));
+  altered.operationId = atomic.operationId;
+  assert.throws(() => accept(f, altered), { code: 'OPERATION_CONFLICT' });
+  const next = partial(f, block(f, item.id, null, [1]));
+  accept(f, next);
+  const legacy = structuredClone(next);
+  delete legacy.mode;
+  assert.throws(() => accept(f, legacy), { code: 'OPERATION_CONFLICT' });
+});
+test('same-label same-date distinct source events remain independent approvals', (t) => {
+  const f = fixture(t),
+    one = envelope('same-label'),
+    two = envelope('same-label');
+  two.id = 'distinct-event';
+  two.provenance.sourceRecordId = 'distinct-event';
+  two.clinical = { ...(two.clinical as object), valueText: '19' };
+  const item = upload(f, [one, two]);
+  const input = partial(f, block(f, item.id));
+  input.blocks[0]!.selections[1]!.selectionReviewToken = 'stale';
+  const result = accept(f, input);
+  if (result.receipt.atomic) throw Error('Expected partial');
+  assert.deepEqual(
+    result.receipt.items.map((i) => i.status),
+    ['saved', 'needs_review'],
+  );
 });

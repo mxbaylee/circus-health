@@ -1,4 +1,5 @@
-import { canonicalIdentityName, savedKnownNames } from '../shared/self-identity.ts';
+import { matchesSelfIdentityName } from '../shared/self-identity.ts';
+import { savedKnownNames } from '../shared/self-identity.ts';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
@@ -194,9 +195,7 @@ function exactMatches(
 function canonicalSelfMatch(db: DatabaseSync, fullName: string): boolean {
   const self = getNote(db, 'patient');
   const canonical = typeof self.person.fullName === 'string' ? self.person.fullName.trim() : '';
-  return [canonical, ...savedKnownNames(self.person.knownNames)].some(
-    (name) => !!name && canonicalIdentityName(name) === canonicalIdentityName(fullName),
-  );
+  return matchesSelfIdentityName(fullName, [canonical, ...savedKnownNames(self.person.knownNames)]);
 }
 
 function groupsForRecord(

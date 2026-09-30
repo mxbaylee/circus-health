@@ -11,6 +11,7 @@ import { attachRecordDurability } from '../record-versions.ts';
 import * as intake from '../intake.ts';
 import { intakeSourceRoute } from '../intake-source-routes.ts';
 import { getIntakeSourceText, reviewIntakeSourceText } from '../intake-source-text.ts';
+import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
 import { fictionalModel } from './fictional-model.ts';
 
 test('source corrections stale original/proposal review; identical fresh payload needs a new candidate review', async (t) => {
@@ -131,6 +132,33 @@ test('source corrections stale original/proposal review; identical fresh payload
     'profile-owner',
   );
   assert.throws(() => prepared.apply(before.version), /version|changed|reload/i);
+  // A real source correction invalidates the earlier approval, even when its clinical
+  // payload still looks identical. Transport refresh cannot grant new approval.
+  const partial = acceptIntakeReportSelection(db, root, profileId, {
+    operationId: randomUUID(),
+    mode: 'partial-v1',
+    blocks: [
+      {
+        intakeId: original.id,
+        proposalId,
+        intakeVersion: before.version,
+        reviewToken: before.reviewToken,
+        selections: before.records.map((record) => ({
+          recordId: record.id,
+          candidateId: record.candidateId!,
+          candidateVersionId: record.candidateVersionId!,
+          selectionReviewToken: record.selectionReviewToken,
+          mapping: record.mapping,
+        })),
+      },
+    ],
+  }).receipt;
+  assert.equal(partial.atomic, false);
+  if (partial.atomic) throw new Error('Expected partial receipt');
+  assert.equal(partial.acceptedCount, 0);
+  assert.equal(partial.items[0]!.status, 'needs_review');
+  assert.equal(partial.items[0]!.reasonCode, 'SELECTION_REVIEW_CHANGED');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM observations').get()!.n, 0);
   for (const selected of [null, proposalId]) {
     const stale = intake.reviewIntake(db, root, profileId, original.id, selected);
     assert.equal(stale.sourceTextStale, true);

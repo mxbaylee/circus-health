@@ -1420,6 +1420,7 @@ function ImportIdentityPanel({
           />
         )}
         <ImportPersonChoice
+          selfNames={[review.self.fullName || '', ...(review.self.knownNames || [])]}
           selfDisabled={review.selfBirthDateConflict}
           birthDate={reviewedBirthDate || review.evidencedIdentity.birthDate}
           people={review.people}
@@ -1467,7 +1468,10 @@ function ImportIdentityPanel({
           disabled={
             busy ||
             !review.scope ||
-            !personSelectionReady(personSelection) ||
+            !personSelectionReady(personSelection, [
+              review.self.fullName || '',
+              ...(review.self.knownNames || []),
+            ]) ||
             reviewedBirthDate === '' ||
             (!review.evidencedIdentity.fullName &&
               !printedNameReady(selectedPrintedName, review.scope.subject.text))
@@ -1573,14 +1577,27 @@ function ImportRecordDetail({
   const acceptance = useReportAcceptance(profile?.id || '', (result) => {
     if (activeDetailScope.current !== detailScope) return;
     const receipt = result.receipt.receipts.find(
-      (item) => item.intakeId === block.intakeId && item.proposalId === block.proposalId,
+      (item) =>
+        item.intakeId === block.intakeId &&
+        item.proposalId === block.proposalId &&
+        item.records.some((accepted) => accepted.recordId === recordId),
     );
     const acceptedRecord = receipt?.records.find((item) => item.recordId === recordId);
     setRecentAcceptance(
       acceptedRecord ? { scope: detailScope, record: acceptedRecord } : undefined,
     );
     setError('');
-    setNotice('This exact record was saved to your profile.');
+    const saved = receipt?.records.some((item) => item.recordId === recordId);
+    const failure = !result.receipt.atomic
+      ? result.receipt.items.find(
+          (item) =>
+            item.intakeId === block.intakeId &&
+            item.proposalId === block.proposalId &&
+            item.recordId === recordId,
+        )
+      : null;
+    setNotice(saved ? 'This exact record was saved to your profile.' : '');
+    if (!saved) setError(failure?.message || 'This record needs review before saving.');
     review.reload();
     intake.reload();
     onChanged();
@@ -1690,7 +1707,13 @@ function ImportRecordDetail({
   }, [review.data]);
   const acceptanceBlocked =
     !!acceptance.recoveryOperationId || acceptance.recovering || !!review.data?.sourceTextStale;
+  // Approval must use the review the person can see after their own write.
+  // Otherwise an answer/autosave acknowledgement races its resource refresh.
   const canSave =
+    !drafts.pending() &&
+    !drafts.error &&
+    !!review.data &&
+    review.data.version >= (drafts.version(block.intakeId) || 0) &&
     !!record &&
     !!decision &&
     draft?.disposition === 'pending' &&
@@ -1737,10 +1760,11 @@ function ImportRecordDetail({
             answer: value,
           }),
         );
-      await api<Intake>(`/intakes/${encodeURIComponent(block.intakeId)}/answers`, {
+      const answered = await api<Intake>(`/intakes/${encodeURIComponent(block.intakeId)}/answers`, {
         method: 'POST',
         body: answerOperations.current.get(key),
       });
+      drafts.observe(answered.data);
       answerOperations.current.delete(key);
       review.reload();
       intake.reload();
@@ -1988,7 +2012,11 @@ function ImportRecordDetail({
         (item) =>
           item.id === exactRecord.id && item.candidateVersionId === exactRecord.candidateVersionId,
       );
-      if (!current?.candidateId || !current.candidateVersionId)
+      if (
+        !current?.candidateId ||
+        !current.candidateVersionId ||
+        current.selectionReviewToken !== exactRecord.selectionReviewToken
+      )
         throw new Error('This exact record changed. Review the current proposal before saving.');
       const currentDraft = drafts.afterOwnSave(fresh, current);
       if (
@@ -2002,6 +2030,7 @@ function ImportRecordDetail({
         );
       const result = await acceptance.submit(
         {
+          mode: 'partial-v1',
           operationId: crypto.randomUUID(),
           blocks: [
             {
@@ -2011,6 +2040,7 @@ function ImportRecordDetail({
               reviewToken: fresh.reviewToken,
               selections: [
                 {
+                  selectionReviewToken: current.selectionReviewToken,
                   recordId: current.id,
                   candidateId: current.candidateId,
                   candidateVersionId: current.candidateVersionId,
@@ -2027,7 +2057,7 @@ function ImportRecordDetail({
         throw new Error(
           acceptance.error || 'Save was not confirmed. Check the exact receipt before retrying.',
         );
-      if (embedded) onBack();
+      if (embedded && result.receipt.acceptedCount === 1) onBack();
     }, 'review_save');
   }
 

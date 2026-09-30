@@ -107,10 +107,10 @@ export function useReportAcceptance(
         .then((result) => {
           if (generation !== epoch.current) return;
           if (result) confirmed(result, operationId);
-          else if (clearPending(profileId, operationId)) {
-            setPending(null);
-            setRecoveryOperationId(null);
-          }
+          else
+            setError(
+              'Checking save status. No durable outcome is available yet; retain this operation before retrying.',
+            );
         })
         .catch((cause) => {
           if (generation !== epoch.current) return;
@@ -169,11 +169,10 @@ export function useReportAcceptance(
       const result = await readReceipt(recoveryOperationId);
       if (generation !== epoch.current) return null;
       if (result) confirmed(result, recoveryOperationId);
-      else if (clearPending(profileId, recoveryOperationId)) {
-        setPending(null);
-        setRecoveryOperationId(null);
-        setError('No saved receipt was found. Review and select the results again.');
-      }
+      else
+        setError(
+          'Checking save status. No durable outcome is available yet; retry only this exact operation.',
+        );
       return result;
     } catch (cause) {
       if (generation === epoch.current)

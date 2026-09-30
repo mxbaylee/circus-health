@@ -2630,3 +2630,212 @@ it('shows all core fields and resolves only the edited uncertainty without accep
   ]);
   expect(writes.some((write) => /accept|identity-scope/.test(write.url))).toBe(false);
 });
+
+for (const foreignChange of [false, true])
+  it(`waits for the displayed own-draft authority before approval, preserving foreign-change rejection (${foreignChange})`, async () => {
+    selectProfile({ id: 'fictional-approval-refresh', name: 'Rowan', placebo: true });
+    let updated = false;
+    let holdRefresh = true;
+    let substituteForeign = false;
+    const releases: (() => void)[] = [];
+    const acceptanceBodies: {
+      operationId: string;
+      blocks: { selections: { selectionReviewToken: string; mapping: { valueText: string } }[] }[];
+    }[] = [];
+    const currentReview = () => ({
+      ...review,
+      version: updated ? 8 : 7,
+      records: [
+        {
+          ...record,
+          selectionReviewToken: substituteForeign
+            ? 'foreign-source-token'
+            : updated
+              ? 'reviewed-own-patch'
+              : 'original-token',
+          mapping: { ...record.mapping, valueText: updated ? '43' : '42' },
+        },
+      ],
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith('/review-draft') && init?.method === 'POST') {
+          updated = true;
+          return response({ ...intake, version: 8 });
+        }
+        if (url.includes('/intakes/fictional-intake/review')) {
+          if (updated && holdRefresh) await new Promise<void>((resolve) => releases.push(resolve));
+          return response(currentReview());
+        }
+        if (url.endsWith('/intakes/report-acceptance')) {
+          const body = JSON.parse(String(init?.body));
+          acceptanceBodies.push(body);
+          return response(acceptedResult(body.operationId));
+        }
+        if (url.includes('/intakes/report-queue/')) return response(reportDetail);
+        if (url.includes('/identity-review'))
+          return response({
+            ...identityReview,
+            status: 'evidenced_match',
+            blocking: false,
+            offeredSelfFields: {},
+          });
+        if (url.includes('/intakes/people/'))
+          return response({
+            groupId: 'fictional-report',
+            people: [],
+            totalPeople: 0,
+            peopleNextCursor: null,
+          });
+        if (url.endsWith('/intakes/fictional-intake'))
+          return response({ ...intake, version: updated ? 8 : 7 });
+        return response([]);
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <ImportDetailReview
+          selection={{
+            groupId: 'fictional-report',
+            intakeId: intake.id,
+            proposalId: block.proposalId,
+            recordId: record.id,
+          }}
+          onBack={() => {}}
+          onChanged={() => {}}
+          onUseSource={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const save = await screen.findByRole('button', { name: 'Confirm and save record' });
+    expect(save).toBeEnabled();
+    fireEvent.change(screen.getByLabelText('Result', { exact: true }), { target: { value: '43' } });
+    await waitFor(() => expect(releases.length).toBeGreaterThan(0));
+    // An acknowledged autosave is not yet displayed approval authority. Do not
+    // invite an approval click while its old token is still on screen.
+    expect(save).toBeDisabled();
+    expect(acceptanceBodies).toHaveLength(0);
+    await act(async () => {
+      holdRefresh = false;
+      for (const release of releases) release();
+    });
+    await waitFor(() => expect(save).toBeEnabled());
+    substituteForeign = foreignChange;
+    await userEvent.click(save);
+    if (foreignChange) {
+      expect(
+        await screen.findByText(
+          'This exact record changed. Review the current proposal before saving.',
+        ),
+      ).toBeVisible();
+      expect(acceptanceBodies).toHaveLength(0);
+    } else {
+      expect(await screen.findByText('This exact record was saved to your profile.')).toBeVisible();
+      expect(acceptanceBodies).toHaveLength(1);
+      expect(acceptanceBodies[0]!.blocks[0]!.selections[0]!).toMatchObject({
+        selectionReviewToken: 'reviewed-own-patch',
+        mapping: { valueText: '43' },
+      });
+    }
+  });
+
+it('recovers the exact second saved sibling from a partial bulk receipt before review refresh catches up', async () => {
+  const profileId = 'fictional-second-sibling-recovery';
+  selectProfile({ id: profileId, name: 'Rowan', placebo: true });
+  const operationId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  sessionStorage.setItem(`circus-health:report-acceptance:${profileId}`, operationId);
+  const base = acceptedResult(operationId);
+  const second = base.receipt.receipts[0]!;
+  const first = {
+    ...second,
+    records: [
+      {
+        ...second.records[0]!,
+        recordId: 'first-sibling',
+        candidateId: 'first-candidate',
+        candidateVersionId: 'first-version',
+        entityId: 'first-saved-entity',
+        title: 'First fictional sibling',
+      },
+    ],
+  };
+  const recovered: IntakeReportAcceptanceResult = {
+    ...base,
+    replayed: true,
+    receipt: {
+      ...base.receipt,
+      version: 1,
+      atomic: false,
+      status: 'completed',
+      selectedCount: 2,
+      acceptedCount: 2,
+      receipts: [first, second],
+      items: [first, second].map((receipt, i) => ({
+        status: 'saved',
+        intakeId: receipt.intakeId,
+        proposalId: receipt.proposalId,
+        recordId: receipt.records[0]!.recordId,
+        candidateId: receipt.records[0]!.candidateId,
+        candidateVersionId: receipt.records[0]!.candidateVersionId,
+        operationId: `fictional-child-${i}`,
+        selectionReviewToken: 'fictional-token',
+        reviewedSelectionHash: 'fictional-hash',
+        receipt,
+      })),
+    },
+  };
+  let acceptancePosts = 0;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/intakes/report-acceptance') && init?.method === 'POST') acceptancePosts++;
+      if (url.includes('/intakes/report-acceptance/')) return response(recovered);
+      if (url.includes('/intakes/report-queue/')) return response(reportDetail);
+      if (url.includes('/identity-review'))
+        return response({
+          ...identityReview,
+          status: 'evidenced_match',
+          blocking: false,
+          offeredSelfFields: {},
+        });
+      if (url.includes('/intakes/people/'))
+        return response({
+          groupId: 'fictional-report',
+          people: [],
+          totalPeople: 0,
+          peopleNextCursor: null,
+        });
+      if (url.includes('/intakes/fictional-intake/review')) return response(review);
+      if (url.endsWith('/intakes/fictional-intake')) return response(intake);
+      if (url.includes('/record-owner')) return response({ personId: 'patient' });
+      return response([]);
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <ImportDetailReview
+        selection={{
+          groupId: 'fictional-report',
+          intakeId: intake.id,
+          proposalId: block.proposalId,
+          recordId: record.id,
+        }}
+        onBack={() => {}}
+        onChanged={() => {}}
+        onUseSource={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  expect(await screen.findByText('This exact record was saved to your profile.')).toBeVisible();
+  const destination = await screen.findByRole('region', { name: 'Saved destination' });
+  expect(within(destination).getByRole('link')).toHaveAttribute(
+    'href',
+    '/tests?result=fictional-saved-ferritin&visibility=all',
+  );
+  expect(screen.queryByRole('button', { name: 'Confirm and save record' })).toBeNull();
+  expect(screen.queryByText('This record needs review before saving.')).toBeNull();
+  expect(acceptancePosts).toBe(0);
+});

@@ -1,5 +1,6 @@
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import test from 'node:test';
+import { randomUUID } from 'node:crypto';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -3083,6 +3084,13 @@ test('pending report can be reassigned Self to family and back without losing al
     ...request(scope, 'reassign-self-first'),
     attestation: 'confirmed_displayed_identity_questions',
   });
+  const approved = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
   scope = await f.preview();
   await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
     ...request(scope, 'reassign-family-next'),
@@ -3090,6 +3098,31 @@ test('pending report can be reassigned Self to family and back without losing al
     attestation: 'confirmed_displayed_identity_questions',
     personSelection: { newPerson: { fullName: 'Fictional Alternative Person' } },
   });
+  // Moving this report to a different Person cannot reuse an approval of Self.
+  const partial = acceptIntakeReportSelection(f.db, f.root, f.profileId, {
+    operationId: randomUUID(),
+    mode: 'partial-v1',
+    blocks: [
+      {
+        intakeId: f.item.id,
+        proposalId: approved.proposalId,
+        intakeVersion: approved.version,
+        reviewToken: approved.reviewToken,
+        selections: approved.records.map((record) => ({
+          recordId: record.id,
+          candidateId: record.candidateId!,
+          candidateVersionId: record.candidateVersionId!,
+          selectionReviewToken: record.selectionReviewToken,
+          mapping: record.mapping,
+        })),
+      },
+    ],
+  }).receipt;
+  assert.equal(partial.atomic, false);
+  if (partial.atomic) throw new Error('Expected partial receipt');
+  assert.equal(partial.acceptedCount, 0);
+  assert.equal(partial.items[0]!.status, 'needs_review');
+  assert.equal(partial.items[0]!.reasonCode, 'SELECTION_REVIEW_CHANGED');
   scope = await f.preview();
   await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
     ...request(scope, 'reassign-self-final'),
@@ -4013,5 +4046,28 @@ test('a repaired boundary cannot authorize a newly added identity question on th
       })),
     ),
     false,
+  );
+});
+
+test('report new-Person assignment rejects canonical Self names and saved aliases', async (t) => {
+  const f = fixture(t);
+  setSelf(f, { fullName: 'Fictional Separate Self', knownNames: ['Fictional Former Self'] });
+  f.propose([withIdentityEvidence(envelope('self-duplicate-guard'))]);
+  const scope = await f.preview();
+  for (const fullName of ['Fictional Separate Self', '  fictional former self  '])
+    await assert.rejects(
+      () =>
+        confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+          ...request(scope, 'duplicate-self-' + fullName),
+          outcome: 'this_is_person',
+          attestation: 'confirmed_displayed_identity_questions',
+          personSelection: { newPerson: { fullName } },
+        }),
+      { code: 'INTAKE_PERSON_SELF' },
+    );
+  assert.equal(
+    f.db.prepare("SELECT count(*) n FROM notes WHERE kind='person' AND person_id!='patient'").get()!
+      .n,
+    0,
   );
 });

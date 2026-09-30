@@ -1,3 +1,5 @@
+import { useRef } from 'react';
+import { matchesSelfIdentityName } from '../../../shared/self-identity';
 import {
   compatibleIdentityBirthDates,
   safeSourceIdentityName,
@@ -43,6 +45,7 @@ export const printedNameReady = (name: string, subjectText: string): boolean =>
 /** A person choice is explicit; a printed name never silently creates or selects People. */
 export function ImportPersonChoice({
   selfDisabled = false,
+  selfNames = [],
   birthDate,
   people = [],
   peopleTruncated,
@@ -53,6 +56,7 @@ export function ImportPersonChoice({
   disabled,
 }: {
   selfDisabled?: boolean;
+  selfNames?: string[];
   birthDate?: string;
   people?: IntakeIdentityReview['people'];
   peopleTruncated?: boolean;
@@ -62,6 +66,18 @@ export function ImportPersonChoice({
   printedName?: string;
   disabled?: boolean;
 }) {
+  const retainedPeople = useRef(
+    new Map<string, NonNullable<IntakeIdentityReview['people']>[number]>(),
+  );
+  for (const person of people) retainedPeople.current.set(person.noteId, person);
+  const priorSelection =
+    selection && 'noteId' in selection ? retainedPeople.current.get(selection.noteId) : undefined;
+  if (priorSelection && !people.some((person) => person.noteId === priorSelection.noteId))
+    people = [...people, priorSelection];
+  const selfNameConflict =
+    selection &&
+    'newPerson' in selection &&
+    matchesSelfIdentityName(selection.newPerson.fullName, selfNames);
   const choices =
     assignedPerson &&
     assignedPerson.personId !== 'patient' &&
@@ -139,6 +155,8 @@ export function ImportPersonChoice({
             Person’s name
             <input
               aria-label="New person name"
+              aria-invalid={!!selfNameConflict}
+              aria-describedby={selfNameConflict ? 'new-person-self-conflict' : undefined}
               value={selection.newPerson.fullName}
               onChange={(event) =>
                 onChange({ newPerson: { ...selection.newPerson, fullName: event.target.value } })
@@ -158,6 +176,11 @@ export function ImportPersonChoice({
               }
             />
           </label>
+          {selfNameConflict && (
+            <p role="alert" id="new-person-self-conflict">
+              This name belongs to Self. Choose Me (Self).
+            </p>
+          )}
           <small>This adds a person to People. Results stay in review until you save them.</small>
         </>
       )}
@@ -178,8 +201,14 @@ export function ImportPersonChoice({
   );
 }
 
-export const personSelectionReady = (selection: ImportPersonSelection): boolean =>
-  !selection || !('newPerson' in selection) || !!selection.newPerson.fullName.trim();
+export const personSelectionReady = (
+  selection: ImportPersonSelection,
+  selfNames: string[] = [],
+): boolean =>
+  !selection ||
+  !('newPerson' in selection) ||
+  (!!selection.newPerson.fullName.trim() &&
+    !matchesSelfIdentityName(selection.newPerson.fullName, selfNames));
 
 export function ImportBirthDateReview({
   review,

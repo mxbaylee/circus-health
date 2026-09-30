@@ -38,3 +38,10 @@ export function personSelectionQuery(params: URLSearchParams, personId: string) 
   next.set('personId', personId);
   return next;
 }
+
+/** Canonical Self owner and URL suffix shared by lists, charts, and exact links. */
+export const clinicalPersonId = (personId?: string | null) => personId || 'patient';
+export const clinicalPersonQuery = (personId?: string | null) =>
+  clinicalPersonId(personId) === 'patient'
+    ? ''
+    : '&personId=' + encodeURIComponent(clinicalPersonId(personId));

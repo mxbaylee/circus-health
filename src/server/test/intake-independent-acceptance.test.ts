@@ -78,6 +78,7 @@ function fixture(t: TestContext) {
         recordId: record.id,
         candidateId: record.candidateId!,
         candidateVersionId: record.candidateVersionId!,
+        selectionReviewToken: record.selectionReviewToken,
         mapping: {},
       })),
     };
@@ -353,4 +354,51 @@ for (const boundary of ['before_head', 'after_head'] as const)
       saved.receipt,
     );
     assert.equal(recovered.prepare('SELECT count(*) AS n FROM evidence').get()!.n, 2);
+  });
+
+for (const stale of [false, true])
+  test(`partial selections sharing an explicit comparison destination commit together (stale: ${stale})`, (t) => {
+    const f = fixture(t);
+    const destination = f.upload('shared-destination', '4.50');
+    acceptIntakeReportSelection(f.db, f.root, f.profileId, {
+      operationId: randomUUID(),
+      blocks: [f.block(destination.item.id)],
+    });
+    const incoming = [f.upload('shared-one', '4.50'), f.upload('shared-two', '4.50')];
+    const unrelated = f.upload('independent-third', '7.00', '2024-01');
+    const blocks = incoming.map(({ item }) => {
+      const review = intake.reviewIntake(f.db, f.root, f.profileId, item.id);
+      const target = review.records[0]!.comparisons![0]!;
+      assert.ok(target);
+      const block = f.block(item.id, review);
+      block.selections[0]!.comparisons = [
+        {
+          otherRecordId: target.id,
+          scope: target.scope,
+          outcome: 'same_event',
+          occurrenceEvidence: 'attach',
+          reason: 'Both fictional deliveries describe the reviewed original event.',
+        },
+      ];
+      return block;
+    });
+    assert.equal(
+      blocks[0]!.selections[0]!.comparisons![0]!.otherRecordId,
+      blocks[1]!.selections[0]!.comparisons![0]!.otherRecordId,
+    );
+    if (stale) blocks[1]!.selections[0]!.selectionReviewToken = 'stale-selected-authority';
+    blocks.push(f.block(unrelated.item.id));
+    const receipt = acceptIntakeReportSelection(f.db, f.root, f.profileId, {
+      operationId: randomUUID(),
+      mode: 'partial-v1',
+      blocks,
+    }).receipt;
+    assert.equal(receipt.atomic, false);
+    if (receipt.atomic) throw new Error('Expected partial receipt');
+    assert.deepEqual(
+      receipt.items.map((item) => item.status),
+      stale ? ['needs_review', 'needs_review', 'saved'] : ['saved', 'saved', 'saved'],
+    );
+    assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
+    assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, stale ? 2 : 4);
   });

@@ -1,3 +1,4 @@
+import { useSourceAttentionRevision } from './useSourceAttentionRevision';
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ImportSourceSelection } from './import-source-selection';
 import type { Intake } from '../../../shared/intake';
@@ -44,12 +45,19 @@ export function SourceAttentionReview({
   const paused = useRef(false);
   const path = `/intakes/${encodeURIComponent(intake.id)}/source-text`;
   const resource = useResource<IntakeSourceText>(path);
-  const [saved, setSaved] = useState<IntakeSourceText | null>(null);
-  const data = saved || resource.data;
+  const scope = JSON.stringify([profile?.id, intake.id]);
+  const source = useSourceAttentionRevision(
+    scope,
+    resource.data,
+    typeof resource.meta?.revision === 'number' ? resource.meta.revision : undefined,
+  );
+  const data = source.data;
+  useEffect(() => resource.reload(), [scope, intake.version]);
   const revision = data?.revision;
   const [selected, setSelected] = useState<number[]>([]);
   const [open, setOpen] = useState<number | null>(null);
   const [draft, setDraft] = useState('');
+  const [baseline, setBaseline] = useState<{ id: string; text: string } | null>(null);
   const [reason, setReason] = useState('Corrected source transcription during import');
   const [busy, setBusy] = useState(false);
   const [manualPending, setManualPending] = useState(false);
@@ -60,7 +68,27 @@ export function SourceAttentionReview({
   const [notice, setNotice] = useState('');
   const alive = useRef(true);
   const lock = useRef(false);
-  const dirty = !!revision && open !== null && draft !== pageText(revision, open);
+  const dirty = !!baseline && open !== null && draft !== baseline.text;
+  const sourceConflict = !!baseline && !!revision && baseline.id !== revision.id && dirty;
+  useEffect(() => {
+    lock.current = false;
+    setBusy(false);
+    setManualPending(false);
+    setAdvancedPending(false);
+    setAdvanced(false);
+    setOpen(null);
+    setBaseline(null);
+    setDraft('');
+    setSelected([]);
+    setError('');
+    setNotice('');
+  }, [scope]);
+  useEffect(() => {
+    if (!revision || open === null || dirty || busy) return;
+    const text = pageText(revision, open);
+    setDraft(text);
+    setBaseline({ id: revision.id, text });
+  }, [revision?.id, open, busy]);
   const pending = busy || dirty || extraPending;
   const state = useRef({ pending, busy });
   state.current = { pending, busy };
@@ -108,12 +136,18 @@ export function SourceAttentionReview({
     };
   }, []);
   const pages =
+    revision?.pages.filter(
+      (p) =>
+        p.page === open ||
+        revision.issues.some((i) => i.region.page === p.page && unresolved(i.status)),
+    ) || [];
+  const remainingCount =
     revision?.pages.filter((p) =>
       revision.issues.some((i) => i.region.page === p.page && unresolved(i.status)),
-    ) || [];
+    ).length || 0;
   useEffect(() => {
-    if (revision) onRemainingChange?.(pages.length);
-  }, [revision, pages.length, onRemainingChange]);
+    if (revision) onRemainingChange?.(remainingCount);
+  }, [revision, remainingCount, onRemainingChange]);
   // Missing extraction and truly unreadable material cannot be approved into legibility.
   const eligible = (page: number) =>
     !!revision &&
@@ -151,7 +185,11 @@ export function SourceAttentionReview({
   function toggle(page: number) {
     if (pending) return;
     setOpen(open === page ? null : page);
-    if (revision) setDraft(pageText(revision, page));
+    if (revision) {
+      const text = pageText(revision, page);
+      setDraft(text);
+      setBaseline({ id: revision.id, text });
+    }
     setAdvanced(false);
     setError('');
   }
@@ -162,6 +200,7 @@ export function SourceAttentionReview({
       paused.current ||
       lock.current ||
       extraPending ||
+      sourceConflict ||
       (action === 'confirm' && dirty)
     )
       return false;
@@ -170,11 +209,12 @@ export function SourceAttentionReview({
     setBusy(true);
     setError('');
     setNotice('');
+    const requestedScope = scope;
     let current = revision;
     let completed = 0;
     try {
       for (const page of pagesToSave) {
-        if (!alive.current) break;
+        if (!alive.current || !source.current(requestedScope)) break;
         const request: SourceTextReviewRequest = {
           operationId: crypto.randomUUID(),
           expectedRevisionId: current.id,
@@ -204,12 +244,26 @@ export function SourceAttentionReview({
         current = result.data.revision;
         completed++;
         if (!alive.current) break;
-        setSaved(result.data);
+        if (
+          !source.accept(
+            result.data,
+            typeof result.meta?.revision === 'number' ? result.meta.revision : undefined,
+            requestedScope,
+          )
+        ) {
+          throw new Error(
+            'A newer source revision arrived during save. Compare it before continuing.',
+          );
+        }
         setSelected((items) => items.filter((item) => item !== page));
         if (action === 'confirm') setOpen((value) => (value === page ? null : value));
-        else setDraft(pageText(current, page));
+        else {
+          const text = pageText(current, page);
+          setDraft(text);
+          setBaseline({ id: current.id, text });
+        }
       }
-      if (alive.current)
+      if (alive.current && source.current(requestedScope))
         setNotice(
           action === 'confirm'
             ? `${completed} ${completed === 1 ? 'section approved' : 'sections approved'}.`
@@ -217,14 +271,14 @@ export function SourceAttentionReview({
         );
       return completed === pagesToSave.length;
     } catch (cause) {
-      if (alive.current)
+      if (alive.current && source.current(requestedScope))
         setError(
           `${completed ? `${completed} sections saved. ` : ''}${cause instanceof Error ? cause.message : 'Could not save source review.'} Remaining sections were not approved.`,
         );
       return false;
     } finally {
-      lock.current = false;
-      if (alive.current) {
+      if (alive.current && source.current(requestedScope)) {
+        lock.current = false;
         setBusy(false);
         onChanged();
       }
@@ -242,7 +296,7 @@ export function SourceAttentionReview({
             className="text-link"
             disabled={pending}
             onClick={() => {
-              setSaved(null);
+              source.clear();
               setSelected([]);
               resource.reload();
               setError('');
@@ -256,7 +310,7 @@ export function SourceAttentionReview({
       {revision && (
         <>
           <h4>
-            {pages.length} {pages.length === 1 ? 'section' : 'sections'} not reviewed
+            {remainingCount} {remainingCount === 1 ? 'section' : 'sections'} not reviewed
           </h4>
           {!registerSelection && (
             <div className="import-bulk-bar">
@@ -290,7 +344,7 @@ export function SourceAttentionReview({
             Trust the extracted text, or review it against the original. Approval only clears text
             checks; it does not save clinical records.
           </p>
-          {!pages.length && <p>No source sections awaiting review.</p>}
+          {!remainingCount && <p>No source sections awaiting review.</p>}
           <ul className="import-source-issue-list">
             {pages.map(({ page }) => {
               const text = pageText(revision, page);
@@ -338,12 +392,41 @@ export function SourceAttentionReview({
                             Extracted text
                             <textarea
                               aria-label={`Extracted text on page ${page}`}
+                              aria-describedby={
+                                sourceConflict ? 'source-revision-conflict' : undefined
+                              }
                               rows={12}
                               value={draft}
                               disabled={busy || extraPending}
                               onChange={(e) => setDraft(e.target.value)}
                             />
                           </label>
+                          {sourceConflict && (
+                            <div role="alert" id="source-revision-conflict">
+                              <p>
+                                Source text changed. Your draft is retained. Compare the current
+                                text before saving.
+                              </p>
+                              <pre aria-label="Current source text">{text}</pre>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => setBaseline({ id: revision.id, text })}
+                              >
+                                Keep my draft against this revision
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => {
+                                  setDraft(text);
+                                  setBaseline({ id: revision.id, text });
+                                }}
+                              >
+                                Use current text
+                              </button>
+                            </div>
+                          )}
                           {dirty && (
                             <label>
                               Correction reason
@@ -358,7 +441,12 @@ export function SourceAttentionReview({
                             <button
                               className="button primary"
                               disabled={
-                                !dirty || busy || extraPending || !draft.trim() || !reason.trim()
+                                !dirty ||
+                                sourceConflict ||
+                                busy ||
+                                extraPending ||
+                                !draft.trim() ||
+                                !reason.trim()
                               }
                               onClick={() => void save([page], 'correct')}
                             >
@@ -430,7 +518,7 @@ export function SourceAttentionReview({
                                 pageNavigationBlocked={dirty || busy}
                                 onPendingChange={setAdvancedPending}
                                 onChanged={() => {
-                                  setSaved(null);
+                                  source.clear();
                                   setOpen(null);
                                   setAdvanced(false);
                                   setSelected([]);

@@ -1,3 +1,4 @@
+import { matchesSelfIdentityName } from '../shared/self-identity.ts';
 import {
   decodeOriginalIdentityText,
   originalSubjectBirthDateEvidence,
@@ -1099,6 +1100,18 @@ export async function confirmIntakeIdentityScope(
             400,
             'IDENTITY_SELECTION',
             'Enter a name and an optional relationship for this family person',
+          );
+        const self = getNote(db, 'patient');
+        if (
+          matchesSelfIdentityName(person.fullName, [
+            String(self.person.fullName || ''),
+            ...savedKnownNames(self.person.knownNames),
+          ])
+        )
+          throw new HttpError(
+            409,
+            'INTAKE_PERSON_SELF',
+            'This name belongs to Self. Choose Me (Self) rather than creating another Person.',
           );
         note = createIntakeFamilyPersonInTransaction(
           db,

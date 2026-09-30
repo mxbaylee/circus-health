@@ -1,3 +1,4 @@
+import { clinicalPersonQuery } from '../../shared/person-scope';
 import { RecordCorrectionBadges, RecordCorrectionHistory } from './RecordCorrectionHistory';
 import { useEffect, useRef, useState } from 'react';
 import { Search, X, Plus } from 'lucide-react';
@@ -149,9 +150,7 @@ export function MeasurementCharts({
     if (previousRevision.current !== revision) resource.reload();
     previousRevision.current = revision;
   }, [revision, resource.reload]);
-  const ownedResultLink = (id: string) =>
-    resultLink(id) +
-    (personId && personId !== 'patient' ? `&personId=${encodeURIComponent(personId)}` : '');
+  const ownedResultLink = (id: string) => resultLink(id) + clinicalPersonQuery(personId);
   const selectResult = onSelect ?? ((id: string) => navigate(ownedResultLink(id)));
   return (
     <>

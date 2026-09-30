@@ -1053,3 +1053,63 @@ test('legacy pending choices remain visible but unpinned; historical accepted pa
     db.close();
   }
 });
+
+for (const discovery of ['later-page', 'explicit-search'] as const)
+  for (const changed of [false, true])
+    test(`partial approval resolves ${discovery} destinations and preserves changed authority rejection (${changed})`, (t) => {
+      const f = fixture(t);
+      f.accept(
+        f.review(
+          f.upload([
+            ...Array.from({ length: 24 }, (_, i) => sample('saved-' + i)),
+            sample('search-only-destination', 'Zircon marker', 'OTHER-CODE'),
+          ]).id,
+        ),
+      );
+      const pending = f.review(f.upload([sample('incoming-selected')]).id);
+      const first = f.search(pending, { limit: 20 });
+      const target = (
+        discovery === 'later-page'
+          ? f.search(pending, { limit: 20, cursor: first.page.nextCursor })
+          : f.search(pending, { query: 'search-only-destination' })
+      ).comparisons[0]!;
+      assert.ok(target);
+      assert.ok(!pending.records[0]!.comparisons!.some((item) => item.id === target.id));
+      const independent = f.review(
+        f.upload([sample('independent-selected', 'Separate gamma', 'OTHER-GAMMA')]).id,
+      );
+      const blockFor = (review: IntakeReview, comparisons?: IntakePairDecision[]) => ({
+        intakeId: review.intakeId,
+        proposalId: review.proposalId,
+        intakeVersion: review.version,
+        reviewToken: review.reviewToken,
+        selections: review.records.map((record) => ({
+          recordId: record.id,
+          candidateId: record.candidateId!,
+          candidateVersionId: record.candidateVersionId!,
+          selectionReviewToken: record.selectionReviewToken,
+          mapping: record.mapping,
+          comparisons,
+        })),
+      });
+      if (changed) f.correct(target.id, '0.125');
+      // The first independent commit advances transport revisions, not the person's
+      // approval of this exact off-page destination. A real correction still rejects it.
+      const result = acceptIntakeReportSelection(f.db, f.root, f.profileId, {
+        mode: 'partial-v1',
+        operationId: randomUUID(),
+        blocks: [blockFor(independent), blockFor(pending, [choose(target)])],
+      }).receipt;
+      assert.equal(result.atomic, false);
+      if (result.atomic) throw Error('Expected partial receipt');
+      assert.deepEqual(
+        result.items.map((item) => item.status),
+        ['saved', changed ? 'needs_review' : 'saved'],
+      );
+      assert.equal(result.acceptedCount, changed ? 1 : 2);
+      if (changed) assert.equal(result.items[1]!.reasonCode, 'DUPLICATE_SCOPE_CHANGED');
+      assert.equal(
+        f.db.prepare('SELECT count(*) AS n FROM observations').get()!.n,
+        changed ? 26 : 27,
+      );
+    });

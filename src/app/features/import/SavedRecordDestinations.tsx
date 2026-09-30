@@ -1,3 +1,5 @@
+import { useResource, queryString } from '../../data/api';
+import { clinicalPersonQuery } from '../../../shared/person-scope';
 import { Check, ExternalLink } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { Intake, IntakeAcceptedRecord } from '../../../shared/intake';
@@ -28,11 +30,11 @@ export type AcceptedRecordScope = {
   recordIds: Iterable<string>;
 };
 
-export function acceptedRecordDestination(record: IntakeAcceptedRecord) {
+function destinationForOwner(record: IntakeAcceptedRecord, currentPersonId?: string | null) {
   const id = encodeURIComponent(record.entityId);
-  const personId = record.identityAttribution?.assignedPerson?.personId;
-  const owner =
-    personId && personId !== 'patient' ? `&personId=${encodeURIComponent(personId)}` : '';
+  const owner = clinicalPersonQuery(
+    currentPersonId ?? record.identityAttribution?.assignedPerson?.personId,
+  );
   if (record.kind === 'document' && record.optical)
     return {
       label: 'Vision prescription',
@@ -44,8 +46,11 @@ export function acceptedRecordDestination(record: IntakeAcceptedRecord) {
     return { label: 'Prescription', to: `/medications?id=${id}&status=all${owner}` };
   if (record.kind === 'procedure')
     return { label: 'Procedure', to: `/procedures?id=${id}&category=all&visibility=all${owner}` };
-  return { label: 'Provider document', to: `/sources?document=${id}` };
+  return { label: 'Provider document', to: `/sources?document=${id}${owner}` };
 }
+
+export const acceptedRecordDestination = (record: IntakeAcceptedRecord) =>
+  destinationForOwner(record);
 
 /**
  * Resolve destinations only from durable import receipts for the exact proposal
@@ -83,7 +88,12 @@ function displayTitle(record: IntakeAcceptedRecord, fallback: string) {
 }
 
 export function SavedRecordDestinationLink({ record }: { record: IntakeAcceptedRecord }) {
-  const destination = acceptedRecordDestination(record);
+  const owner = useResource<{ personId: string | null }>(
+    '/record-owner?' + queryString({ type: record.kind, id: record.entityId }),
+  );
+  const destination = destinationForOwner(record, owner.data?.personId ?? 'patient');
+  // Receipt entity IDs remain exact. Current ownership is resolved independently
+  // because a later coupled ownership correction never rewrites old receipts.
   return (
     <Link
       className="import-detail-record-link"
