@@ -965,7 +965,10 @@ export function ImportPage() {
             : currentItem?.reason === 'retrying_extraction'
               ? 'Retrying the interrupted source section from saved progress.'
               : currentItem?.reason === 'model_unavailable'
-                ? 'Waiting for the model connection. Your progress is saved.'
+                ? 'The model is unavailable. Reading retries automatically' +
+                  (currentItem.retryAt
+                    ? ` at ${new Date(currentItem.retryAt).toLocaleTimeString()}.`
+                    : '. Your progress is saved.')
                 : currentItem?.reason === 'waiting_for_provider'
                   ? (currentItem.providerWait?.outcome === 'unknown'
                       ? "The previous request's result is unknown; retrying may use additional provider usage."
@@ -1072,8 +1075,10 @@ export function ImportPage() {
                   'provider_authentication',
                   'provider_rejected',
                   'model_unavailable',
+                  'waiting_for_provider',
                 ].includes(item.reason || ''),
-                done: !item.automaticRun,
+                done: ['review_ready', 'skipped'].includes(item.status),
+                queued: item.status === 'queued',
                 exceptions: item.exceptions?.length || 0,
               })),
               readyRecords: batch.batch.items.reduce(
@@ -1607,6 +1612,7 @@ export function ImportPage() {
             `The upload limit is ${limits.data.uploadBytes / 1024 / 1024} MiB per file. Choose a smaller file, or ask the operator to raise the upload and runtime storage limits together.`,
           );
         const uploaded: string[] = [];
+        const reused: string[] = [];
         const failed: string[] = [];
         for (const [index, file] of files.entries()) {
           if (!current()) throw new Error('Profile changed. Remaining files were not uploaded.');
@@ -1628,6 +1634,8 @@ export function ImportPage() {
               body: file,
             });
             uploaded.push(intake.data.id);
+            if (intake.data.repeatedUpload)
+              reused.push(`${file.name} (${intake.data.state.replaceAll('_', ' ')})`);
           } catch (cause) {
             if (!current()) throw cause;
             failed.push(`${file.name}: ${errorMessage(cause)}`);
@@ -1640,7 +1648,9 @@ export function ImportPage() {
           );
         feed.reload();
         setNotice(
-          `${uploaded.length} ${uploaded.length === 1 ? 'file was' : 'files were'} retained and queued for reading.`,
+          reused.length === uploaded.length
+            ? `Already retained: ${reused.join(', ')}. Current reading state is shown below.`
+            : `${uploaded.length - reused.length} new ${uploaded.length - reused.length === 1 ? 'file was' : 'files were'} retained for reading.${reused.length ? ` Already retained: ${reused.join(', ')}.` : ''} Current reading state is shown below.`,
         );
       },
       'upload',
@@ -2040,6 +2050,10 @@ export function ImportPage() {
         throw new Error(
           'Clinical reading did not start. Try again when the current request finishes.',
         );
+      if (result.scheduled === false)
+        throw new Error(
+          'No new reading pass was scheduled. The existing result remains available for review. A corrected completed source can be read again when reopening completed work is supported.',
+        );
     },
   };
 
@@ -2234,7 +2248,9 @@ export function ImportPage() {
                 (batch.batch?.status === 'paused' &&
                   batch.batch.reason !== 'needs_user_action' &&
                   !batch.batch.automaticRun)) &&
-              batch.batch?.items.some(hasPausedIntakeReading)
+              batch.batch?.items.some(
+                (item) => hasPausedIntakeReading(item) || !!item.resumeAutomaticRun,
+              )
                 ? async () => {
                     await batch.resume();
                   }

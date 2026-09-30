@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IntakeBatchItem, IntakeBatchReadingState } from '../../shared/intake-batch.ts';
 import {
+  DEFAULT_INTAKE_READING_LIMITS,
   beginReadingSlice,
   finishReadingSlice,
   readingBudgetReached,
@@ -52,24 +53,55 @@ const item = (): IntakeBatchItem => ({
   endedAt: null,
 });
 
-test('only active time without unique durable progress can end a reading attempt', () => {
+test('default stall allowance permits bootstrap tools and remains bounded by completed responses', () => {
   const file = item();
-  const limits = { activeMs: 1000, slices: 1, turns: 1, requests: 1, measuredTokens: 1 };
+  beginReadingSlice(file, '2026-01-01T00:00:00Z', DEFAULT_INTAKE_READING_LIMITS);
+  const limit = DEFAULT_INTAKE_READING_LIMITS.requests!;
+  assert.ok(limit > 2, 'context read and plan creation must fit before the first source window');
+  for (let responses = 1; responses < limit; responses++) {
+    file.reading = state({ modelRequests: responses, usableModelResponses: responses });
+    assert.equal(readingBudgetReached(file, '2026-01-02T00:00:00Z'), false);
+  }
+  file.reading = state({ modelRequests: limit, usableModelResponses: limit });
+  assert.equal(readingBudgetReached(file, '2026-01-02T00:00:00Z'), true);
+  assert.equal(
+    readingModelRequestBudgetReached(
+      file,
+      state({ modelRequests: limit, usableModelResponses: limit, readWindows: 1 }),
+      '2026-01-02T00:00:00Z',
+    ),
+    false,
+    'new source coverage renews the allowance',
+  );
+});
+
+test('only completed requests without unique durable progress can end a reading attempt', () => {
+  const file = item();
+  const limits = { activeMs: 1000, slices: 1, turns: 1, requests: 3, measuredTokens: 1 };
   beginReadingSlice(file, '2026-01-01T00:00:00Z', limits);
   assert.equal(
     readingModelRequestBudgetReached(
       file,
-      state({ turns: 100, modelRequests: 1000, measuredModelTokens: 999999 }),
-      '2026-01-01T00:00:00.999Z',
+      state({ turns: 100, modelRequests: 2, usableModelResponses: 2, measuredModelTokens: 999999 }),
+      '2026-01-01T00:10:00Z',
       limits,
     ),
     false,
   );
   assert.equal(
-    readingModelRequestBudgetReached(file, state(), '2026-01-01T00:00:01Z', limits),
+    readingModelRequestBudgetReached(
+      file,
+      state({ modelRequests: 3, usableModelResponses: 3 }),
+      '2026-01-01T00:20:00Z',
+      limits,
+    ),
     true,
   );
-  finishReadingSlice(file, state(), '2026-01-01T00:00:01Z');
+  finishReadingSlice(
+    file,
+    state({ modelRequests: 3, usableModelResponses: 3 }),
+    '2026-01-01T00:20:00Z',
+  );
   extendReadingBudget(file);
   beginReadingSlice(file, '2026-01-02T00:00:00Z', limits);
   assert.equal(
@@ -77,20 +109,54 @@ test('only active time without unique durable progress can end a reading attempt
     false,
     'dormant/queued time is not active work',
   );
-  assert.equal(file.readingJob!.activeMs, 1000);
+  assert.equal(file.readingJob!.activeMs, 20 * 60_000);
+});
+test('slow completed model requests do not spend a stall attempt when the next request progresses', () => {
+  const file = item();
+  const limits = { activeMs: 1000, slices: 16, turns: 16, requests: 3, measuredTokens: 10000 };
+  beginReadingSlice(file, '2026-01-01T00:00:00Z', limits);
+  assert.equal(
+    readingModelRequestBudgetReached(
+      file,
+      state({ modelRequests: 1, usableModelResponses: 1 }),
+      '2026-01-01T00:10:00Z',
+      limits,
+    ),
+    false,
+  );
+  assert.equal(
+    readingModelRequestBudgetReached(
+      file,
+      state({ modelRequests: 2, usableModelResponses: 2, readWindows: 1 }),
+      '2026-01-01T00:20:00Z',
+      limits,
+    ),
+    false,
+  );
 });
 test('substantive versions renew progress; identical versions and reads do not', () => {
   const file = item(),
-    limits = { activeMs: 1000, slices: 1, turns: 1 };
+    limits = { activeMs: 1000, slices: 1, turns: 1, requests: 1 };
   file.reading = state({ readyRecords: 1, substantiveVersions: 1, readWindows: 1 });
   beginReadingSlice(file, '2026-01-01T00:00:00Z', limits);
-  const newVersion = state({ readyRecords: 1, substantiveVersions: 2, readWindows: 1 });
+  const newVersion = state({
+    readyRecords: 1,
+    substantiveVersions: 2,
+    readWindows: 1,
+    modelRequests: 1,
+    usableModelResponses: 1,
+  });
   assert.equal(
     readingModelRequestBudgetReached(file, newVersion, '2026-01-01T00:00:01Z', limits),
     false,
   );
   assert.equal(
-    readingModelRequestBudgetReached(file, newVersion, '2026-01-01T00:00:02Z', limits),
+    readingModelRequestBudgetReached(
+      file,
+      { ...newVersion, modelRequests: 2, usableModelResponses: 2 },
+      '2026-01-01T00:00:02Z',
+      limits,
+    ),
     true,
   );
 });
@@ -103,6 +169,8 @@ test('legacy cumulative budgets cannot restore a manual pause', () => {
     turns: 1,
   });
   file.reading = state({ turns: 100, modelRequests: 10000, measuredModelTokens: 99999999 });
+  file.readingJob!.limitPolicy = 'progress-window';
+  extendReadingBudget(file);
   assert.equal(readingBudgetReached(file, '2026-01-01T00:00:01Z'), false);
   for (const reason of ['job_limit', 'no_progress', 'time_limit', 'context_limit'])
     assert.equal(canContinueReadingSlice(state({ reason }), false), true);
@@ -204,6 +272,7 @@ test('new productive-window policy continues beyond total guards without erasing
       readWindows: i + 1,
       turns: i + 1,
       modelRequests: (i + 1) * 2,
+      usableModelResponses: (i + 1) * 2,
       measuredModelTokens: (i + 1) * 50,
     });
     assert.equal(
@@ -225,7 +294,7 @@ test('new productive-window policy continues beyond total guards without erasing
   assert.equal(
     readingModelRequestBudgetReached(
       file,
-      { ...file.reading!, modelRequests: 18 },
+      { ...file.reading!, modelRequests: 18, usableModelResponses: 18 },
       '2026-01-01T00:01:01Z',
       limits,
     ),

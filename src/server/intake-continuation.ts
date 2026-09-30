@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { HttpError } from './database.ts';
-import { accountedUnitKind } from './intake-unit-accounting.ts';
+import { accountedUnitKind, nextPendingReadingUnit } from './intake-unit-accounting.ts';
 import type { Intake, IntakeExtractionCoverage, IntakeExtractionUnit } from '../shared/intake.ts';
 import type { IntakeBatchReadingState } from '../shared/intake-batch.ts';
 import { ensureIntakeAttribution, type IntakeAttribution } from './intake-attribution.ts';
@@ -653,9 +653,7 @@ export function conversionReadingState(
   const plan = intake.workflow.plans.find((item) => item.status === 'active');
   return {
     workUnit: (() => {
-      const unit = plan?.units.find(
-        (unit) => !accountedUnitKind(plan, unit) && !unit.processingException,
-      );
+      const unit = plan ? nextPendingReadingUnit(plan) : undefined;
       return unit
         ? { id: unit.id, locator: unit.locator || unit.pages?.join(', ') || unit.id }
         : null;

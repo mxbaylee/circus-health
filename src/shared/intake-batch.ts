@@ -95,11 +95,19 @@ export interface IntakeBatchItem {
   /** Intent revoked by Stop, restored only by explicit batch Resume. */
   resumeAutomaticRun?: boolean;
   retryAt?: string | null;
+  modelRetryAttempts?: number;
+  sourceRetryAttempts?: number;
+  sourceRetryUnit?: string;
   exceptionEpoch?: number;
   /** Wait for changed configuration or a successful connection check before retrying rejected input. */
   prerequisiteKey?: string;
   stalls?: { unitId: string; locator: string; attempts: number };
-  exceptions?: { unitId: string; locator: string; reason: 'processing_stalled' }[];
+  exceptions?: {
+    unitId: string;
+    locator: string;
+    reason: 'processing_stalled' | 'technical_error';
+    reasonCode?: string;
+  }[];
   intakeId: string;
   sourceHash: string;
   filename: string;
@@ -152,6 +160,7 @@ export interface IntakeBatchItem {
     budgetAtActiveMs: number;
     budgetAtTurns: number;
     budgetAtRequests?: number;
+    budgetAtResponses?: number;
     budgetAtTokens?: number;
     extensions: number;
   };
@@ -163,6 +172,8 @@ export interface IntakeBatchItem {
 }
 
 export interface IntakeBatch {
+  /** Response-only signal for create: this request scheduled new reading work. */
+  scheduled?: boolean;
   id: string;
   profileId: string;
   operationId: string;
@@ -194,6 +205,7 @@ export interface CreateIntakeBatchInput {
 // Exhausted read windows are not a resumable pause or proof of extraction quality.
 export function hasPausedIntakeReading(item: IntakeBatchItem): boolean {
   return (
+    item.reason === 'stopped' ||
     item.status === 'paused' ||
     (item.status === 'review_ready' &&
       ((item.reading?.status === 'paused' && item.reading.reason !== 'reading_exhausted') ||
