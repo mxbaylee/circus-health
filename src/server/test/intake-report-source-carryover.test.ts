@@ -283,8 +283,12 @@ async function accept(f: Fixture, blocks: IntakeReportAcceptanceBlock[]) {
     for (const selection of block.selections) {
       const record = review.records.find((candidate) => candidate.id === selection.recordId);
       assert.ok(record, 'selection belongs to its exact fictional proposal');
-      for (const group of record.reportGroups || [])
-        groupKeys.add(JSON.stringify([block.intakeId, group.groupId]));
+      // A previous partial acceptance already confirmed the whole report.
+      // Do not repeat original grounding and every proposal review for rows
+      // whose current identity policy is already satisfied.
+      if (record.identityReview?.blocking)
+        for (const group of record.reportGroups || [])
+          groupKeys.add(JSON.stringify([block.intakeId, group.groupId]));
     }
   }
   for (const key of groupKeys) {
