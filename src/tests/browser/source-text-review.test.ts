@@ -270,13 +270,47 @@ test(
       },
     );
     assert(resolvedImage.ok(), await resolvedImage.text());
-    await page.reload();
-    await page.getByRole('tab', { name: /^Needs attention/ }).waitFor();
+    // The queue count can arrive before the separate source-file request.
+    // Hold that request so the browser test covers this response ordering.
+    const intakeRoute = '**' + prefix + '/intakes/' + encodeURIComponent(intake.id);
+    let releaseSource!: () => void;
+    const heldSource = new Promise<void>((resolve) => {
+      releaseSource = resolve;
+    });
+    let sourceRequested!: () => void;
+    const requestedSource = new Promise<void>((resolve) => {
+      sourceRequested = resolve;
+    });
+    const sourceRequests: Promise<void>[] = [];
+    await page.route(intakeRoute, (route) => {
+      sourceRequested();
+      const pending = heldSource.then(() => route.continue());
+      sourceRequests.push(pending);
+      return pending;
+    });
     const attentionInAll = page.getByRole('region', {
       name: 'Text review for fictional-source-review.txt',
       exact: true,
     });
-    assert(await attentionInAll.isVisible(), 'Source sections are visible in All');
+    try {
+      await page.reload();
+      await page.getByRole('tab', { name: /^Needs attention/ }).waitFor();
+      await requestedSource;
+      assert.equal(
+        await attentionInAll.isVisible(),
+        false,
+        'Queue count does not imply the source section has loaded',
+      );
+      releaseSource();
+      await attentionInAll.waitFor({ state: 'visible' });
+      assert(await attentionInAll.isVisible(), 'Source sections are visible in All');
+    } finally {
+      releaseSource();
+      await Promise.all(sourceRequests);
+      await page.unroute(intakeRoute);
+    }
+    await attentionInAll.getByText('1 section not reviewed', { exact: true }).waitFor();
+    await page.getByRole('checkbox', { name: 'Select all shown' }).waitFor();
     assert.equal(await page.getByRole('checkbox', { name: 'Select all shown' }).count(), 1);
     // Hold a real filtered read so its empty loading state cannot be mistaken
     // for the last record having been approved.

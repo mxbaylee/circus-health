@@ -135,23 +135,68 @@ test(
         // Navigation can dispose an otherwise completed response body.
       }
     });
-    // Start one cold document so a hash navigation and reload cannot race feed requests.
-    await page.goto('about:blank');
-    await page.goto(url + '/#/import');
-    const save = page.getByRole('button', { name: 'Confirm & save', exact: true });
-    await save.waitFor();
-    const deadline = Date.now() + 15000;
-    while (seenFeeds.length < 2 && Date.now() < deadline)
-      await new Promise((resolve) => setTimeout(resolve, 30));
-    assert.equal(await save.isEnabled(), true, 'browser enables acceptance after host check');
-    assert.ok(seenIdentityReviews.length >= 1, 'browser requested the host identity check');
-    assert.ok(seenFeeds.length >= 2, 'browser reloaded the feed after host check');
-    const refreshed = seenFeeds.at(-1)!;
-    const ready = refreshed.blocks.flatMap((block) => block.records);
-    assert.equal(ready[0]?.identityReview?.blocking, false);
-    assert.equal(ready[0]?.selectable, true);
-    assert.notEqual(refreshed.blocks[0]?.reviewToken, before.blocks[0]?.reviewToken);
-    assert.equal(seenFeeds.length, 2, 'one successful check causes one feed reload');
+    // Batch initialization and identity grounding each have a legitimate refresh.
+    // Order them explicitly so this assertion measures the identity check alone.
+    let releaseBatch!: () => void;
+    let releaseIdentity!: () => void;
+    const heldBatch = new Promise<void>((resolve) => {
+      releaseBatch = resolve;
+    });
+    const heldIdentity = new Promise<void>((resolve) => {
+      releaseIdentity = resolve;
+    });
+    const batchHistoryRoute = '**' + prefix + '/intake-batches';
+    const initialIdentityRoute = '**/identity-review?**';
+    const initializationRequests: Promise<void>[] = [];
+    await page.route(batchHistoryRoute, (route) => {
+      const pending = heldBatch.then(() => route.continue());
+      initializationRequests.push(pending);
+      return pending;
+    });
+    await page.route(initialIdentityRoute, (route) => {
+      const pending = heldIdentity.then(() => route.continue());
+      initializationRequests.push(pending);
+      return pending;
+    });
+    const waitForFeeds = async (count: number) => {
+      const deadline = Date.now() + 15000;
+      while (seenFeeds.length < count && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(seenFeeds.length, count);
+    };
+    try {
+      await page.goto('about:blank');
+      await page.goto(url + '/#/import');
+      const save = page.getByRole('button', { name: 'Confirm & save', exact: true });
+      await save.waitFor();
+      await waitForFeeds(1);
+      assert.equal(await save.isEnabled(), false, 'identity is still ungrounded');
+      releaseBatch();
+      await waitForFeeds(2);
+      assert.equal(seenIdentityReviews.length, 0, 'identity result is still held');
+      const initialFeedCount = seenFeeds.length;
+      releaseIdentity();
+      await waitForFeeds(initialFeedCount + 1);
+      await save.and(page.locator(':enabled')).waitFor();
+      assert.equal(await save.isEnabled(), true, 'browser enables acceptance after host check');
+      assert.ok(seenIdentityReviews.length >= 1, 'browser requested the host identity check');
+      const refreshed = seenFeeds.at(-1)!;
+      const ready = refreshed.blocks.flatMap((block) => block.records);
+      assert.equal(ready[0]?.identityReview?.blocking, false);
+      assert.equal(ready[0]?.selectable, true);
+      assert.notEqual(refreshed.blocks[0]?.reviewToken, before.blocks[0]?.reviewToken);
+      assert.equal(
+        seenFeeds.length - initialFeedCount,
+        1,
+        'one successful check causes one feed reload',
+      );
+    } finally {
+      releaseBatch();
+      releaseIdentity();
+      await Promise.all(initializationRequests);
+      await page.unroute(batchHistoryRoute);
+      await page.unroute(initialIdentityRoute);
+    }
 
     const directUpload = await page.request.post(url + prefix + '/intakes', {
       headers: {
