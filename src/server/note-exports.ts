@@ -15,7 +15,8 @@ import { dateNumber } from '../app/data/format.ts';
 import { documentPersonId, observation } from './queries.ts';
 import { getNote, attachments } from './notes.ts';
 import type { NoteDTO } from './notes.ts';
-import type { IntakeExtractionUnit } from '../shared/intake.ts';
+import type { IntakeExtractionPlan } from '../shared/intake.ts';
+import { accountedUnitKind } from './intake-unit-accounting.ts';
 
 const tables = {
   note: 'notes',
@@ -764,38 +765,40 @@ function includedReadingGaps(
     if (row?.source_file_id) sourceFiles.add(row.source_file_id);
   }
   const result: NoteExportSnapshot['readingGaps'] = [];
-  for (const id of [...sourceFiles].sort()) {
-    let sourceId = id;
-    let row = db.prepare('SELECT id,details_json FROM source_files WHERE id=?').get(sourceId) as
-      { id: string; details_json: string } | undefined;
+  const visited = new Set<string>();
+  const pending = [...sourceFiles].sort();
+  while (pending.length) {
+    const sourceId = pending.shift()!;
+    if (visited.has(sourceId)) continue;
+    visited.add(sourceId);
+    const row = db.prepare('SELECT details_json FROM source_files WHERE id=?').get(sourceId);
     if (!row) continue;
-    let details = parsedRecord(row.details_json).intake as JsonRecord | undefined;
-    if (typeof details?.parentSourceFileId === 'string') {
-      sourceId = details.parentSourceFileId;
-      row = db
-        .prepare('SELECT id,details_json FROM source_files WHERE id=?')
-        .get(sourceId) as typeof row;
-      details = row ? (parsedRecord(row.details_json).intake as JsonRecord | undefined) : undefined;
-    }
-    if (!details || result.some((entry) => entry.sourceFileId === sourceId)) continue;
-    const workflow = details.workflow as
-      { plans?: { status: string; units: IntakeExtractionUnit[] }[] } | undefined;
-    const plan =
-      workflow?.plans?.find((entry) => entry.status === 'active') || workflow?.plans?.at(-1);
+    const metadata = parsedRecord(row.details_json);
+    // Accepted conversions cite a proposal; source/package children can also
+    // point at a parent original. Follow retained pointers without guessing paths.
+    if (typeof metadata.originalSourceFileId === 'string')
+      pending.push(metadata.originalSourceFileId);
+    const details = isRecord(metadata.intake) ? metadata.intake : null;
+    if (!details) continue;
+    if (typeof details.parentSourceFileId === 'string') pending.push(details.parentSourceFileId);
+    const workflow = details.workflow as { plans?: IntakeExtractionPlan[] } | undefined;
+    const plan = workflow?.plans?.find((entry) => entry.status === 'active');
     const gaps =
-      plan?.units
-        ?.filter(
-          (unit) =>
-            unit.status !== 'completed' ||
-            unit.processingException ||
-            unit.coverage?.kind === 'unreadable',
-        )
-        .map((unit) => ({
-          locator: unit.locator || unit.id,
-          reason:
-            unit.processingException?.reason ||
-            (unit.coverage?.kind === 'unreadable' ? 'unreadable' : 'not yet read'),
-        })) || [];
+      plan?.units?.flatMap((unit) => {
+        const kind = accountedUnitKind(
+          { ...plan, batches: plan.batches || [] },
+          { ...unit, attempts: unit.attempts || [] },
+        );
+        if (!unit.processingException && kind && kind !== 'unreadable') return [];
+        return [
+          {
+            locator: unit.locator || unit.id,
+            reason:
+              unit.processingException?.reason ||
+              (kind === 'unreadable' ? 'unreadable' : 'not yet read'),
+          },
+        ];
+      }) || [];
     if (!plan || !plan.units?.length)
       gaps.push({
         locator: 'Retained original',
@@ -808,6 +811,7 @@ function includedReadingGaps(
         gaps,
       });
   }
+  result.sort((a, b) => a.sourceFileId.localeCompare(b.sourceFileId));
   return result;
 }
 

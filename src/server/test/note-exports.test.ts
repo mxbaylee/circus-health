@@ -96,8 +96,26 @@ test('provider packet and evidence companion disclose unread cited source pages'
           plans: [
             {
               status: 'active',
+              batches: [
+                {
+                  id: 'fictional-reading',
+                  coverage: [
+                    { unitId: 'page-2', kind: 'extracted', notes: 'Fictional retained reading' },
+                  ],
+                },
+              ],
               units: [
-                { id: 'page-2', locator: 'Page 2', status: 'completed' },
+                {
+                  id: 'page-2',
+                  locator: 'Page 2',
+                  status: 'completed',
+                  attempts: ['fictional-reading'],
+                  coverage: {
+                    unitId: 'page-2',
+                    kind: 'extracted',
+                    notes: 'Fictional retained reading',
+                  },
+                },
                 {
                   id: 'page-3',
                   locator: 'Page 3',
@@ -122,6 +140,27 @@ test('provider packet and evidence companion disclose unread cited source pages'
   ]);
   assert.match(exportHtml(packet), /Unread source sections[\s\S]*Page 3: processing_stalled/);
   assert.deepEqual(exportEvidence(packet).readingGaps, packet.readingGaps);
+  // Converted clinical evidence cites the proposal file. Its root-level original
+  // pointer must still disclose the retained PDF's unread sections.
+  db.prepare(
+    "INSERT INTO source_files(id,provider_id,path,sha256,bytes,kind,details_json) VALUES('fictional-proposal','capture','fictional-proposal.jsonl','proposal-hash',100,'intake_proposal',?)",
+  ).run(JSON.stringify({ originalSourceFileId: 'file' }));
+  db.prepare("UPDATE source_records SET source_file_id='fictional-proposal' WHERE id='raw'").run();
+  const converted = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.deepEqual(converted.readingGaps, packet.readingGaps);
+  assert.match(exportHtml(converted), /Page 3: processing_stalled/);
+
+  const details = JSON.parse(
+    String(db.prepare("SELECT details_json FROM source_files WHERE id='file'").get()!.details_json),
+  );
+  details.intake.workflow.plans[0].batches = [];
+  db.prepare("UPDATE source_files SET details_json=? WHERE id='file'").run(JSON.stringify(details));
+  const unreceipted = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.deepEqual(unreceipted.readingGaps[0]!.gaps, [
+    { locator: 'Page 2', reason: 'not yet read' },
+    { locator: 'Page 3', reason: 'processing_stalled' },
+  ]);
+  assert.notEqual(unreceipted.fingerprint, converted.fingerprint);
 });
 test('an older archived/current conflict is excluded from current prescription packets and summaries', (t) => {
   const { db, input } = fixture(t);

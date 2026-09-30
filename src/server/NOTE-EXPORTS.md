@@ -20,6 +20,8 @@ The companion has format `circus-health-provider-evidence-v1`, the frozen snapsh
 
 ## API contract and immutable previews
 
+Converted proposal citations follow their retained original pointer, including source/package parents. A unit counts as read only with its matching retained coverage receipt; a completed status alone is insufficient. A retained original without an active reading plan is not established as fully read. This disclosure does not create a packet-delivery journal or identify who received an earlier packet.
+
 POST `/note-exports/options`: `{type: "note" | "document" | "person", id}`. Person entry is restricted to `patient`. Returns `noteVersion`, `noteTitle`, `choices` (including note `kind`) and legacy asset choices. New UI only uses non-person note choices for additional-note selection.
 
 POST `/note-exports/preview`: same origin plus `noteVersion`, `mode: "brief" | "provider"`, `noteIds: string[]`, and brief flags `includeLinked`, `includeAttachments`, `includeProcedures`, `includePrescriptions`, `includePatient`. Provider mode ignores false brief flags and builds its standard packet. Self origin only accepts provider mode. Preview responses include `evidenceAvailable` for provider packets. POST `/note-exports/:token/evidence` downloads `application/json` with filename `provider-evidence.json`; it uses the same profile-scoped token, expiry and current-fingerprint validation as PDF download, and rejects brief previews. Additional-note IDs must identify non-person notes in the active profile. Missing links fail visibly rather than disappearing. The simplified flows include chosen archived history, labeled as archived, without a further toggle; care-contact summary excludes archived contacts.
