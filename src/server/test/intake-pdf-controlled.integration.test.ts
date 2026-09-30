@@ -13,7 +13,7 @@ import { disposePdfEvidenceSessions } from '../intake-pdf-session.ts';
 import { getIntake, getIntakeOriginal, uploadIntake } from '../intake.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { profilePaths } from '../profile-storage.ts';
-import { ProxyModelBridge } from '../proxy-model-bridge.ts';
+import { PROXY_MAX_TOOL_ROUNDS, ProxyModelBridge } from '../proxy-model-bridge.ts';
 import { PROXY_TRANSCRIPT_LIMITS, proxyTranscriptSize } from '../proxy-transcript.ts';
 import { fictionalModel } from './fictional-model.ts';
 
@@ -299,11 +299,21 @@ test(
       [...pagesDelivered].sort((a, b) => a - b),
       pagesRead,
     );
-    assert.equal(boundaries.length, 1);
-    assert.equal(boundaries[0]!.reason, 'context_limit');
-    assert.ok(boundaries[0]!.readWindows > 0 && boundaries[0]!.proposals > 0);
-    assert.equal(requests.filter((value) => value.slice === 1).length, 64);
-    assert.equal(item.readingJob?.slices, 2);
+    assert.ok(boundaries.length > 0, 'The run must cross a productive reading boundary');
+    for (const [index, boundary] of boundaries.entries()) {
+      assert.equal(boundary.reason, 'time_limit');
+      assert.ok(boundary.readWindows > (boundaries[index - 1]?.readWindows || 0));
+      assert.ok(boundary.proposals > (boundaries[index - 1]?.proposals || 0));
+    }
+    assert.equal(requests.filter((value) => value.slice === 1).length, PROXY_MAX_TOOL_ROUNDS);
+    // After the round boundary, fresh contexts bind to pending units and can
+    // finish at those unit boundaries before reaching the round cap again.
+    for (let current = 1; current <= slice; current++) {
+      const count = requests.filter((value) => value.slice === current).length;
+      assert.ok(count > 0 && count <= PROXY_MAX_TOOL_ROUNDS);
+    }
+    assert.equal(slice, boundaries.length + 1);
+    assert.equal(item.readingJob?.slices, slice);
     assert.equal(item.reading?.pendingReadWindows, 0);
     assert.equal(item.reading?.readWindows, 100);
     assert.equal(item.reading?.accountedUnits, 10);

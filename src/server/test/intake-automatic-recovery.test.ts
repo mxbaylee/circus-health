@@ -151,7 +151,9 @@ function fixture(
             usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
           });
           if (mode === 'slice')
-            callbacks.onExit?.(new ModelContextLimitError('Fictional bounded slice ended'));
+            callbacks.onExit?.(
+              new ModelContextLimitError('Fictional bounded slice ended', 'slice'),
+            );
           else callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
         },
         async cancel() {},
@@ -553,7 +555,7 @@ test('automatic PDF units after page one can read their exact unit and source pa
       selected.processingException = { reason: 'processing_stalled', at: new Date().toISOString() };
     },
   );
-  f.calls[0].onExit?.(new ModelContextLimitError('Fictional bounded slice ended'));
+  f.calls[0].onExit?.(new ModelContextLimitError('Fictional bounded slice ended', 'slice'));
   await until(() => {
     f.tick();
     return f.calls.length === 2;

@@ -17,7 +17,7 @@
     "typecheck:tools": "tsc --noEmit -p tsconfig.tools.json",
     "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",
     "build": "npm run brand:check && npm run typecheck && vite build",
-    "test:server": "node --test src/server/test/*.test.ts",
+    "test:server": "node --test --test-concurrency=2 src/server/test/*.test.ts",
     "test:tools": "node --test src/scripts/*.test.ts",
     "test:continuation": "CRS_PDF_CONTROLLED_TEST=1 node --test src/server/test/intake-pdf-controlled.integration.test.ts",
     "test:ui": "vitest run --config vitest.config.ts",

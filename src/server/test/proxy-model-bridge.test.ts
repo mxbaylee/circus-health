@@ -657,7 +657,7 @@ test('a host request boundary preserves an in-flight tool result and blocks the 
     beforeRequest: () => {
       boundaryChecks++;
       if (deadlineReached)
-        throw new ModelContextLimitError('Fictional host reading deadline reached');
+        throw new ModelContextLimitError('Fictional host reading deadline reached', 'slice');
     },
   });
 
@@ -686,7 +686,7 @@ test('a host request boundary preserves an in-flight tool result and blocks the 
 test('a host request boundary can reject the first provider request without transport activity', async () => {
   const f = harness([answer], {
     beforeRequest: () => {
-      throw new ModelContextLimitError('Fictional pre-request reading deadline');
+      throw new ModelContextLimitError('Fictional pre-request reading deadline', 'slice');
     },
   });
 
@@ -877,7 +877,7 @@ test('the host deadline gate blocks a 503 retry before request accounting or tra
     beforeRequest: () => {
       boundaryChecks++;
       if (boundaryChecks === 2)
-        throw new ModelContextLimitError('Fictional host deadline before provider retry');
+        throw new ModelContextLimitError('Fictional host deadline before provider retry', 'slice');
     },
     retryDelay: async () => {},
   });

@@ -9,7 +9,7 @@ import { MemoryRouter } from 'react-router-dom';
 test('personal current use stays separate from an active provider order and its recorded date', async () => {
   const server = await createServer({
     root: fileURLToPath(new URL('../', import.meta.url)),
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false, ws: false },
     appType: 'custom',
   });
   try {

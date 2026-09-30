@@ -10,6 +10,8 @@ import { rebuildProfile } from '../portable.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import type { HealthTool, ProxyModelBridgeOptions } from '../proxy-model-bridge.ts';
 import type { AssistantChat } from '../assistant.ts';
+import type { IntakeBatch } from '../../shared/intake-batch.ts';
+import { setTimeout as delay } from 'node:timers/promises';
 
 interface WorkflowEvidence {
   imageContent: string;
@@ -76,13 +78,13 @@ function syntheticPdf(text: string) {
   return Buffer.from(pdf);
 }
 
-async function waitFor<T>(read: () => Promise<T | null>, description: string): Promise<T> {
-  for (let attempt = 0; attempt < 100; attempt++) {
+async function waitFor<T>(read: () => Promise<T | null>, signal: AbortSignal): Promise<T> {
+  while (!signal.aborted) {
     const value = await read();
     if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await delay(10, undefined, { signal });
   }
-  assert.fail(`Timed out waiting for ${description}`);
+  throw signal.reason;
 }
 
 test(
@@ -238,15 +240,22 @@ test(
     assert.equal(uploaded.state, 'pending_conversion');
     assert.equal(db.prepare('SELECT count(*) n FROM observations').get()?.n, 0);
 
-    const conversion = await request(`/intakes/${encodeURIComponent(uploaded.id)}/convert`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ version: uploaded.version }),
-    });
-    const conversionChat = await waitFor(async () => {
-      const chat = await request<AssistantChat>(`/assistant/chats/${conversion.chatId}`);
-      return chat.status === 'idle' ? chat : null;
-    }, 'assistant conversion');
+    // Upload already queues an automatic conversion. A competing /convert call
+    // races that owner and can correctly return ASSISTANT_BUSY.
+    const conversion = await waitFor(async () => {
+      const batches = await request<IntakeBatch[]>('/intake-batches');
+      const batch = batches.find((batch) =>
+        batch.items.some((item) => item.intakeId === uploaded.id),
+      );
+      if (!batch || batch.status === 'running') return null;
+      assert.equal(batch.status, 'complete');
+      const item = batch.items.find((item) => item.intakeId === uploaded.id)!;
+      assert.equal(item.status, 'review_ready');
+      assert.ok(item.chatId);
+      return item;
+    }, t.signal);
+    const conversionChat = await request<AssistantChat>(`/assistant/chats/${conversion.chatId}`);
+    assert.equal(conversionChat.status, 'idle');
     assert.deepEqual(conversionChat.context, {
       route: `#/import?intake=${encodeURIComponent(uploaded.id)}`,
       intakeId: uploaded.id,
@@ -363,7 +372,7 @@ test(
     const mappedChat = await waitFor(async () => {
       const chat = await request(`/assistant/chats/${mappingChat.id}`);
       return chat.status === 'idle' ? chat : null;
-    }, 'assistant mapping proposal');
+    }, t.signal);
     assert.equal(bridgeState.prompts[1]?.profileId, profileId);
     assert.equal(mappedChat.proposals.length, 1);
     const mappedProposal = mappedChat.proposals[0];

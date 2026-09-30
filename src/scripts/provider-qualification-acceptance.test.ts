@@ -13,6 +13,7 @@ import {
   reviewIntake,
 } from '../server/intake.ts';
 import type { IntakeIdentityReview } from '../shared/intake-identity.ts';
+import type { IntakeBatch } from '../shared/intake-batch.ts';
 import type { HealthRecordEnvelope, Intake, IntakeImportFeed } from '../shared/intake.ts';
 import {
   qualificationAnswers,
@@ -34,7 +35,11 @@ test(
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'fictional-qualification-recovery-')));
     const dataDirectory = join(root, 'data');
     mkdirSync(dataDirectory);
-    const app = createVaultApp({ dataDirectory, runtimeDirectory: join(root, 'runtime') });
+    const app = createVaultApp({
+      dataDirectory,
+      runtimeDirectory: join(root, 'runtime'),
+      assistantOptions: { availability: async () => ({ available: false }) },
+    });
     t.after(() => {
       app.close();
       rmSync(root, { recursive: true, force: true });
@@ -86,6 +91,15 @@ test(
     const path = join(root, 'fictional.pdf');
     const fixture = writeProviderQualificationPdf(path);
     const uploaded = await request<Intake>(prefix + '/intakes', undefined, readFileSync(path));
+    // This fixture supplies its own proposals. Revoke automatic processing before
+    // inspecting evidence so a background capture cannot change their source pin.
+    const batches = await request<IntakeBatch[]>(prefix + '/intake-batches');
+    const owned = batches.filter((batch) =>
+      batch.items.some((item) => item.intakeId === uploaded.id),
+    );
+    assert.equal(owned.length, 1);
+    const stopped = await request<IntakeBatch>(prefix + `/intake-batches/${owned[0]!.id}/stop`, {});
+    assert.equal(stopped.status, 'stopped');
     const state = app.manager.opened.get(profile.id)!;
     const identityByPage = new Map<
       number,
@@ -166,7 +180,7 @@ test(
       },
     }));
     const proposed = proposeConversion(state.db, state.root, profile.id, uploaded.id, {
-      version: uploaded.version,
+      version: getIntake(state.db, state.root, profile.id, uploaded.id).version,
       jsonlText: proposals.map((item) => JSON.stringify(item)).join('\n'),
       summary: 'Independently fictional test proposals',
     });

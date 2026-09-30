@@ -123,7 +123,11 @@ const DRAFT_REPAIR_TOOLS = new Set([
   'health_intake_draft_repair_read',
   'health_intake_draft_repair_review',
 ]);
-class ReadingDeadlineError extends ModelContextLimitError {}
+class ReadingDeadlineError extends ModelContextLimitError {
+  constructor(message: string) {
+    super(message, 'slice');
+  }
+}
 class ReadingJobLimitError extends ModelError {}
 const hostImagePlanOperationId = (chatId: string, sourceHash: string) =>
   `${HOST_IMAGE_PLAN_OPERATION_PREFIX}${chatId}:${sourceHash}`;

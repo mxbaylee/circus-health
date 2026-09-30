@@ -664,7 +664,7 @@ test('conversion pauses on repeated reads and retains checkpoints across resume 
   assert.equal(f.bridges.length, 3, 'late completion after Stop never schedules another turn');
 });
 
-test('productive host context boundaries are resumable while provider errors stay failures', async (t) => {
+test('productive host slice boundaries are resumable while provider errors stay failures', async (t) => {
   fictionalModel(t);
   const f = fixture(t);
   const item = uploadIntake(f.db, f.root, 'cedar', {
@@ -677,10 +677,15 @@ test('productive host context boundaries are resumable while provider errors sta
   await tick();
   await call(f.bridges[0], 'intake_read', { id: item.id });
   f.bridges[0].callbacks.onExit?.(
-    new ModelContextLimitError('Fictional local transcript boundary'),
+    new ModelContextLimitError('Fictional local transcript boundary', 'slice'),
   );
   assert.equal(chat.status, 'idle');
-  assert.equal(chat.reading?.reason, 'context_limit');
+  assert.equal(chat.reading?.reason, 'time_limit');
+  assert.equal(
+    chat.conversionCheckpoint?.initialContextFailures || 0,
+    0,
+    'a normal slice must not exhaust provider context recovery',
+  );
   assert.ok(chat.reading!.pendingReadWindows > 0);
   f.assistant.send('cedar', chat.id, {
     message: 'Continue retained evidence',
@@ -838,7 +843,9 @@ test('a genuine context limit keeps precedence after the soft reading deadline',
   assert.ok(bridge);
 
   t.mock.timers.tick(15 * 60 * 1000);
-  bridge.callbacks.onExit?.(new ModelContextLimitError('Fictional provider context boundary'));
+  bridge.callbacks.onExit?.(
+    new ModelContextLimitError('Fictional provider context boundary', 'provider'),
+  );
 
   assert.equal(chat.status, 'idle');
   assert.equal(chat.reading?.reason, 'context_limit');
@@ -4854,6 +4861,12 @@ test('default-on diagnostics retain the precise wrapped batch validation failure
 });
 
 test('always-on document-level yield counter tracks proposals produced, unset diagnostics included, and survives a reload', async (t) => {
+  const previous = process.env.CRS_IMPORT_DIAGNOSTICS;
+  delete process.env.CRS_IMPORT_DIAGNOSTICS;
+  t.after(() => {
+    if (previous === undefined) delete process.env.CRS_IMPORT_DIAGNOSTICS;
+    else process.env.CRS_IMPORT_DIAGNOSTICS = previous;
+  });
   const f = await linkedFictionalBatchConversion(t);
   assert.equal(process.env.CRS_IMPORT_DIAGNOSTICS, undefined);
   assert.equal(required(f.chat.reading).proposalsProduced, 0);

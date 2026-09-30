@@ -6,7 +6,7 @@ test('server profile revocation clears selected private UI state while ordinary 
   const { createServer } = await import('vite');
   const server = await createServer({
     root: fileURLToPath(new URL('../../', import.meta.url)),
-    server: { middlewareMode: true, hmr: false },
+    server: { middlewareMode: true, hmr: false, ws: false },
     appType: 'custom',
   });
   t.after(() => server.close());

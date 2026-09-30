@@ -12,6 +12,8 @@ Restricted import authority after general session access ends remains [CRS-081](
 
 Accepted uploads retain an enqueue intent in the same durable transaction as their original metadata. The server reconciles that intent into one batch item, including after a crash between retention and queue creation. Older client enqueue calls reconcile with retained items. Upload and authorized runtime restoration wake the coordinator; browser GETs do not own scheduling.
 
+This reconciliation also returns a retained completed batch. Source corrections invalidate stale review output, but re-enqueueing an original does not itself reopen a completed `review_ready` item. The post-completion invalidation and rereading transition remains part of [precise source dependencies](../todo/CRS-118.md#terminal-batch-invalidation).
+
 Eligible items rotate while other files wait. Absolute retry deadlines survive restart. The initial batch snapshot is followed by field deltas proportional to the changed state. Original bytes, proposals, candidate versions and provider receipts retain their separate authorities. A saved explicit Stop stays stopped; recognized historical machine interruptions migrate to automatic continuation, while unrecognized historical pauses stay visible for explicit review.
 
 ## Productive work and stalled units
@@ -31,6 +33,8 @@ Source text uses partitioned immutable page/list storage instead of a total page
 ## Provider outcomes
 
 Structured transient/quota failures and unknown outcomes use equal-jitter exponential backoff, starting at five seconds and capped at five minutes before a later provider Retry-After is applied. The actual deadline is durable; retries have no attempt cap. A usable response resets provider backoff separately from unique document progress. Authentication waits for its prerequisite; malformed requests and unsupported capabilities retain automatic intent while waiting for a configuration change or successful explicit connection check. Unchanged rejected input is not sent again on every polling tick. Context-size failures retry with reduced bounded context rather than repeatedly submitting full conversation history.
+
+Context-boundary errors explicitly identify their origin. A normal local reading slice ends with `time_limit` and does not consume initial-context recovery attempts. An initial or provider context rejection ends with `context_limit`, including when a soft reading deadline has also elapsed. Callers must supply this distinction; it is not inferred from error-message wording.
 
 An unknown request stays unknown and possibly billed. If no recoverable result exists, a durable recovery decision authorizes one replacement request and links it to the predecessor and work unit. Late responses update their actual attempt's accounting; superseded callbacks cannot publish. Retry permission is not proof that the earlier request was free or unsuccessful. No automatic credit purchase, provider switch or clinical acceptance is implied.
 

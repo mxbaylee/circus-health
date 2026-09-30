@@ -5,10 +5,10 @@ import { validateProxyConfig } from './proxy-model-bridge.ts';
 import type { ProxyConfig } from './proxy-model-bridge.ts';
 
 export class ModelError extends Error {}
-/** A local bounded transcript/round boundary, not a provider/authentication failure. */
+/** Distinguish a local reading slice from an initial or provider context rejection. */
 export class ModelContextLimitError extends ModelError {
   readonly origin: 'slice' | 'initial' | 'provider';
-  constructor(message: string, origin: 'slice' | 'initial' | 'provider' = 'slice') {
+  constructor(message: string, origin: 'slice' | 'initial' | 'provider') {
     super(message);
     this.origin = origin;
   }

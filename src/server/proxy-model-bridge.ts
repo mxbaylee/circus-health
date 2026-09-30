@@ -1607,6 +1607,7 @@ export class ProxyModelBridge {
       if (round === PROXY_MAX_TOOL_ROUNDS - 1)
         throw new ModelContextLimitError(
           'AI reached the bounded tool-call limit before dispatching another tool group. Partial work is retained. Productive import reading can continue with a fresh context.',
+          'slice',
         );
       const assistantMessage = {
         role: 'assistant',
@@ -1806,6 +1807,7 @@ export class ProxyModelBridge {
     }
     throw new ModelContextLimitError(
       'AI reached the bounded tool-call limit. Partial work is retained. Productive import reading can continue with a fresh context.',
+      'slice',
     );
   }
   async cancel(): Promise<void> {
