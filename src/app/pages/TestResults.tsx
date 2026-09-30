@@ -1,4 +1,6 @@
 import { OwnershipSelectionControl } from '../features/clinical-review/OwnershipSelectionControl';
+import { RecordOwnershipAction } from '../features/clinical-review/RecordOwnershipAction';
+import { OwnershipHistory } from '../components/OwnershipHistory';
 import {
   RecordCorrectionBadges,
   RecordCorrectionHistory,
@@ -249,7 +251,7 @@ export function TestResults() {
             </button>
           </p>
         )}
-        {!byTest && !vision && (
+        {!vision && (
           <OwnershipSelectionControl
             records={(history.data || []).map((r) => ({
               kind: 'observation',
@@ -423,6 +425,18 @@ export function TestResults() {
                         }
                         actions={
                           <EntryActions>
+                            <RecordOwnershipAction
+                              selection={{
+                                type: 'records',
+                                records: [{ kind: 'observation', recordId: result.id }],
+                              }}
+                              onApplied={() => {
+                                detail.reload();
+                                history.reload();
+                                types.reload();
+                                latest.reload();
+                              }}
+                            />
                             {!byTest && (
                               <RecordCorrectionAction
                                 target={observationCorrectionTarget(result)}
@@ -453,6 +467,7 @@ export function TestResults() {
                           </EntryActions>
                         }
                       />
+                      <OwnershipHistory kind="observation" recordId={result.id} />
                       <div className="detail-value-row">
                         <div>
                           <span className="display-value result-text-value">

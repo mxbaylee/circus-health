@@ -712,6 +712,19 @@ export interface IntakeExtractionPlan {
   index: {
     kind: string;
     coverage: string;
+    references?: {
+      id: string;
+      source: string;
+      locator: string;
+      status: string;
+      note: string;
+      asset?: boolean;
+      sourceFileId?: string;
+      contentUrl?: string;
+      memberId?: string;
+      intakeId?: string;
+      fragment?: string;
+    }[];
     inventoryVersion?: 1;
     members?: IntakePackageMember[];
     totalMembers?: number;

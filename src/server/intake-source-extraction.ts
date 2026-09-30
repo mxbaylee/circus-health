@@ -9,7 +9,7 @@ import type {
   SourceTextIssue,
 } from '../shared/intake-source-text.ts';
 import { getIntakeOriginal, getRetainedIntakeOriginalReference, readIntake } from './intake.ts';
-import { indexPdfEvidence, readPdfEvidencePage } from './intake-pdf-session.ts';
+import { pdfPageCountEvidence, readPdfEvidencePage } from './intake-pdf-session.ts';
 import { getIntakeSourceText, publishIntakeSourceText } from './intake-source-text.ts';
 import { composeSourceReadings } from './intake-source-ocr.ts';
 import type { LocatedNativeText, SourceOcrResult } from './intake-source-ocr.ts';
@@ -228,7 +228,7 @@ async function extractSourceStep({
       return { sourceText: current, morePending: false, processedPages: 0 };
     }
     let pages = 1;
-    if (pdf) pages = (await indexPdfEvidence({ ...original, profileId }, assertRunning)).pages;
+    if (pdf) pages = await pdfPageCountEvidence({ ...original, profileId }, assertRunning);
     else if (!image) {
       const window = readIntake(db, root, profileId, id, { limit: TEXT_WINDOW });
       pages = Math.max(1, Math.ceil((window.totalCharacters || 0) / TEXT_WINDOW));

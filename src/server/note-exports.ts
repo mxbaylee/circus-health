@@ -1,5 +1,6 @@
 import { recordOwner } from './record-owner.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
+import { ownershipCorrections, type OwnershipCorrectionHistory } from './ownership-history.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { SQLOutputValue } from 'node:sqlite';
@@ -16,6 +17,8 @@ import { documentPersonId, observation } from './queries.ts';
 import { getNote, attachments } from './notes.ts';
 import type { NoteDTO } from './notes.ts';
 import { packetReportReview, type PacketReportReview } from './packet-report-review.ts';
+import type { IntakeExtractionPlan } from '../shared/intake.ts';
+import { accountedUnitKind } from './intake-unit-accounting.ts';
 
 const tables = {
   note: 'notes',
@@ -111,6 +114,7 @@ interface ExportRecord {
   attachments: Attachment[];
   note?: NoteDTO;
   currentUse?: MedicationPreference | null;
+  ownershipCorrections?: OwnershipCorrectionHistory[];
 }
 
 interface ExportOwner extends SqliteRow {
@@ -158,6 +162,11 @@ export interface NoteExportInput extends JsonRecord {
 
 export interface NoteExportSnapshot {
   reportReview: PacketReportReview[];
+  readingGaps: {
+    sourceFileId: string;
+    filename: string;
+    gaps: { locator: string; reason: string }[];
+  }[];
   patient: PatientInformation | null;
   identity: { name: string; birthDate: unknown; pronouns: unknown; version: unknown };
   main: ExportRecord;
@@ -431,6 +440,15 @@ function record(
     )
       ? attachments(db, type, id)
       : [],
+    ...(['observation', 'medication', 'procedure', 'document'].includes(type)
+      ? {
+          ownershipCorrections: ownershipCorrections(
+            db,
+            type as 'observation' | 'medication' | 'procedure' | 'document',
+            id,
+          ),
+        }
+      : {}),
   };
   if (type === 'note') {
     result.note = getNote(db, id);
@@ -746,6 +764,78 @@ function patientInformation(db: Database, personId = 'patient'): PatientInformat
     contacts,
   };
 }
+function includedReadingGaps(
+  db: Database,
+  records: ExportRecord[],
+): NoteExportSnapshot['readingGaps'] {
+  const citations = new Set(
+    records.flatMap((record) => record.citations.map((citation) => citation.id)),
+  );
+  const sourceFiles = new Set(
+    records.filter((record) => record.type === 'source_file').map((record) => record.id),
+  );
+  for (const id of citations) {
+    const row = db.prepare('SELECT source_file_id FROM source_records WHERE id=?').get(id) as
+      { source_file_id?: string } | undefined;
+    if (row?.source_file_id) sourceFiles.add(row.source_file_id);
+  }
+  const result: NoteExportSnapshot['readingGaps'] = [];
+  const visited = new Set<string>();
+  const pending = [...sourceFiles].sort();
+  while (pending.length) {
+    const sourceId = pending.shift()!;
+    if (visited.has(sourceId)) continue;
+    visited.add(sourceId);
+    const row = db.prepare('SELECT details_json FROM source_files WHERE id=?').get(sourceId);
+    if (!row) continue;
+    const metadata = parsedRecord(row.details_json);
+    // Accepted conversions cite a proposal; source/package children can also
+    // point at a parent original. Follow retained pointers without guessing paths.
+    if (typeof metadata.originalSourceFileId === 'string')
+      pending.push(metadata.originalSourceFileId);
+    const details = isRecord(metadata.intake) ? metadata.intake : null;
+    if (!details) continue;
+    if (typeof details.parentSourceFileId === 'string') pending.push(details.parentSourceFileId);
+    const workflow = details.workflow as { plans?: IntakeExtractionPlan[] } | undefined;
+    const plan = workflow?.plans?.find((entry) => entry.status === 'active');
+    const gaps =
+      plan?.units?.flatMap((unit) => {
+        const kind = accountedUnitKind(
+          { ...plan, batches: plan.batches || [] },
+          { ...unit, attempts: unit.attempts || [] },
+        );
+        if (!unit.processingException && kind && kind !== 'unreadable') return [];
+        return [
+          {
+            locator: unit.locator || unit.id,
+            reason:
+              unit.processingException?.reason ||
+              (kind === 'unreadable' ? 'unreadable' : 'not yet read'),
+          },
+        ];
+      }) || [];
+    if (!plan || !plan.units?.length)
+      gaps.push({
+        locator: 'Retained original',
+        reason: 'reading has not established page coverage',
+      });
+    for (const reference of plan?.index?.references || [])
+      if (reference.status === 'capacity_exception')
+        gaps.push({
+          locator: reference.locator,
+          reason: `capacity exception: ${reference.note || 'references were not indexed'}`,
+        });
+    if (gaps.length)
+      result.push({
+        sourceFileId: sourceId,
+        filename: String(details.originalName || sourceId),
+        gaps,
+      });
+  }
+  result.sort((a, b) => a.sourceFileId.localeCompare(b.sourceFileId));
+  return result;
+}
+
 export function exportSnapshot(
   db: Database,
   value: unknown,
@@ -975,6 +1065,8 @@ export function exportSnapshot(
         a.key.localeCompare(b.key),
     ),
     assets,
+    readingGaps:
+      input.mode === 'provider' ? includedReadingGaps(db, [main, ...records.values()]) : [],
     mode: input.mode ?? 'brief',
     trends: !!input.trends,
     scope: {
@@ -1207,8 +1299,15 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
     });
   const renderRecord = (r: ExportRecord, index: number, main = false): string => {
     const numbers = citationNumbers(r);
-    return `<section id="record-${index}"><${main ? 'h1' : 'h3'}>${esc(r.title)}</${main ? 'h1' : 'h3'}><p class="meta">${esc(provenance(r))}${r.archived ? ' ARCHIVED.' : ''}<br>${snapshot.mode === 'detailed' ? 'Record ' + esc(r.key) + ' · ' : ''}${r.currentUse?.status === 'current' && !r.archived ? 'Personal confirmation date' : 'Date'}: ${esc(missing(r.date))}${numbers.length ? ' · Sources ' + numbers.map((n) => `[${n}]`).join(', ') : ' · Source citation not recorded.'}</p>${content(r, snapshot.mode)}</section>`;
+    return `<section id="record-${index}"><${main ? 'h1' : 'h3'}>${esc(r.title)}</${main ? 'h1' : 'h3'}><p class="meta">${esc(provenance(r))}${r.archived ? ' ARCHIVED.' : ''}<br>${snapshot.mode === 'detailed' ? 'Record ' + esc(r.key) + ' · ' : ''}${r.currentUse?.status === 'current' && !r.archived ? 'Personal confirmation date' : 'Date'}: ${esc(missing(r.date))}${numbers.length ? ' · Sources ' + numbers.map((n) => `[${n}]`).join(', ') : ' · Source citation not recorded.'}</p>${r.ownershipCorrections?.map((correction) => `<p class="meta">Owner corrected on ${esc(correction.at.slice(0, 10))}. Previously attributed to ${esc(correction.fromPersonName)}; corrected by the profile user as a patient-side assertion.${correction.reason ? ' Reason: ' + esc(correction.reason) : ''}</p>`).join('') || ''}${content(r, snapshot.mode)}</section>`;
   };
+  const ownerCorrection = (r: ExportRecord) =>
+    r.ownershipCorrections
+      ?.map(
+        (correction) =>
+          `Owner corrected on ${esc(correction.at.slice(0, 10))}. Previously attributed to ${esc(correction.fromPersonName)}; corrected by the profile user as a patient-side assertion.${correction.reason ? ' Reason: ' + esc(correction.reason) : ''}`,
+      )
+      .join(' ') || '';
   let body =
     `<p class="meta"><strong>${esc(snapshot.identity.name)}</strong>${snapshot.identity.birthDate ? ' · DOB ' + esc(snapshot.identity.birthDate) : ''}${snapshot.identity.pronouns ? ' · ' + esc(snapshot.identity.pronouns) : ''}</p>` +
     (provider && snapshot.main.row.person_id === 'patient'
@@ -1224,6 +1323,8 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
   );
   if (provider && partialReports.length)
     body += `<section><h2>Partly reviewed reports</h2>${partialReports.map((report) => `<p><strong>${esc(report.title)}</strong>: ${report.savedCount} of ${report.totalCount} current report items reviewed and saved. Remaining items are not accepted clinical records. These counts describe review of the source report, not how many items are included in this packet.</p>`).join('')}</section>`;
+  if (provider && snapshot.readingGaps.length)
+    body += `<section><h2>Unread source sections</h2><p>These source sections were not fully read. An absent finding in this packet does not establish absence in the original.</p>${snapshot.readingGaps.map((source) => `<h3>${esc(source.filename)}</h3><ul>${source.gaps.map((gap) => `<li>${esc(gap.locator)}: ${esc(gap.reason)}</li>`).join('')}</ul>`).join('')}</section>`;
   if (snapshot.mode === 'detailed')
     body += `<section class="section"><h2>Contents and overview</h2><ol><li>Main note: ${esc(snapshot.main.title)}</li>${snapshot.records.map((r, i) => `<li><a href="#record-${i + 1}">${esc(r.type)}: ${esc(r.title)}</a></li>`).join('')}<li><a href="#sources">Sources and companion originals</a></li></ol><h2>Selected chronology</h2>${fields([...all].sort((a, b) => (a.date || '').localeCompare(b.date || '')).map((r) => [missing(r.date), `${r.title} (${r.key})`]))}</section>`;
   if (snapshot.patient)
@@ -1254,7 +1355,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
           return `<h3>${esc(group[0].title)}${group[0].row.unit ? ' · ' + esc(group[0].row.unit) : ''}</h3><table class="result-table"><thead><tr><th colspan="5">${esc(group[0].title)}${group[0].row.unit ? ' · ' + esc(group[0].row.unit) : ''}<br>Date precision: ${precisions.map((p, i) => `${precisions.length > 1 ? 'P' + (i + 1) + ': ' : ''}${esc(p)}`).join('; ')}</th></tr><tr><th>Date / precision</th><th>Result</th><th>Reference</th><th>Status</th><th>Sources</th></tr></thead><tbody>${group
             .map(
               (r) =>
-                `<tr id="record-${snapshot.records.indexOf(r) + 1}"><td>${esc(missing(r.date))}${precisions.length > 1 ? '<br>P' + (precisions.indexOf(missing(r.row.date_precision)) + 1) : ''}</td><td>${String(r.row.value_text).length > 160 ? 'Narrative below' : esc(r.row.value_text)}</td><td>${esc(missing(reference(r.row.reference_json)))}</td><td>${esc(missing(r.row.status))}${r.archived ? '; archived' : ''}</td><td>${
+                `<tr id="record-${snapshot.records.indexOf(r) + 1}"><td>${esc(missing(r.date))}${precisions.length > 1 ? '<br>P' + (precisions.indexOf(missing(r.row.date_precision)) + 1) : ''}</td><td>${String(r.row.value_text).length > 160 ? 'Narrative below' : esc(r.row.value_text)}</td><td>${esc(missing(reference(r.row.reference_json)))}</td><td>${esc(missing(r.row.status))}${r.archived ? '; archived' : ''}${ownerCorrection(r) ? '<br>' + ownerCorrection(r) : ''}</td><td>${
                   citationNumbers(r)
                     .map((n) => `[${n}]`)
                     .join(' ') || 'Not recorded'
@@ -1299,7 +1400,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
           type === 'medication'
             ? `Personal state: ${r.archived ? 'Archived' : r.currentUse?.status === 'current' ? 'Current' : 'Inactive'}<br>Source status: ${esc(missing(row.status))}<br>Source kind: ${esc(missing(row.kind))}`
             : esc(missing(row.status));
-        return `<tr id="record-${snapshot.records.indexOf(r) + 1}"><td><strong>${esc(r.title)}</strong><br>${esc(missing(r.date))}</td><td>${details}</td><td>${status}${r.archived ? '<br>Archived' : ''}<br>${numbers.length ? 'Sources ' + numbers.map((n) => `[${n}]`).join(', ') : 'Source citation not recorded'}</td></tr>`;
+        return `<tr id="record-${snapshot.records.indexOf(r) + 1}"><td><strong>${esc(r.title)}</strong><br>${esc(missing(r.date))}</td><td>${details}</td><td>${status}${r.archived ? '<br>Archived' : ''}<br>${numbers.length ? 'Sources ' + numbers.map((n) => `[${n}]`).join(', ') : 'Source citation not recorded'}${ownerCorrection(r) ? '<br>' + ownerCorrection(r) : ''}</td></tr>`;
       })
       .join('')}</tbody></table>`;
   };
@@ -1356,7 +1457,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
           .map((n) => `[${n}]`)
           .join(
             ', ',
-          )}. Structured source document retained in full in the evidence JSON companion; normalized clinical entries are above.</p>`;
+          )}. Structured source document retained in full in the evidence JSON companion; normalized clinical entries are above. ${ownerCorrection(r)}</p>`;
         return;
       }
       if (renderedNarratives.has(r.row.text_content)) return;
@@ -1366,7 +1467,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
         body += `<h2>${esc(r.title)}</h2><p>Identical narrative retained once below. Recorded in ${group.length} entries:</p><ul>${group
           .map(
             (item) =>
-              `<li>${esc(item.title)} · ${esc(missing(item.date))} · ${esc(provenance(item))} · Sources ${
+              `<li>${esc(item.title)} · ${esc(missing(item.date))} · ${esc(provenance(item))} · ${ownerCorrection(item)} · Sources ${
                 citationNumbers(item)
                   .map((n) => `[${n}]`)
                   .join(', ') || 'not recorded'

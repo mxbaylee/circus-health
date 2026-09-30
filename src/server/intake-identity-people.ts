@@ -1,4 +1,4 @@
-import { effectiveKnownNames } from './name-associations.ts';
+import { challengedKnownNames, effectiveKnownNames } from './name-associations.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { json } from './database.ts';
 import { safeSourceIdentityName } from '../shared/self-identity.ts';
@@ -23,6 +23,7 @@ export function identityPeopleSnapshots(db: DatabaseSync): IdentityPolicyPersonS
         fullName:
           (typeof profile.fullName === 'string' ? profile.fullName.trim() : '') || names[0] || '',
         knownNames: names,
+        challengedNames: challengedKnownNames(db, String(row.id)),
         birthDate:
           typeof profile.birthDate === 'string' && profile.birthDate.trim()
             ? profile.birthDate.trim()

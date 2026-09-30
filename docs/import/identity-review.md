@@ -4,6 +4,8 @@ Identity assignment applies to each report. A name or birth-date mismatch never 
 
 ## Automatic matches and human confirmation
 
+Reusing a Self confirmation from another report requires the current printed name still to match Self, rather than a different saved person. The confirmed report's own receipt remains applicable after a later name change; a different report asks for an explicit owner.
+
 A unique saved-name match requires the host to check the retained original and its patient birth-date evidence. The Import list and direct detail view run this check and refresh record eligibility and review tokens when it completes, including after a server restart. A record that remains blocked does not trigger a repeated refresh loop. A name-only match remains automatically assigned and eligible for **Select all**, but its person control says **Jordan Rivera (you?) · Review**, or **(?) · Review** for another person. A name-and-birth-date match and an earlier human confirmation use **Change**. Opening **Review** and confirming creates a human receipt even when the destination stays the same. An exact current-report confirmation takes precedence over confirmations of other reports. Reusing a Self confirmation from another report requires patient-name evidence in the current report; a narrative mention of the name does not qualify.
 
 A patient name in an unlabelled demographic banner can support the same name-only match when the host grounds it to one report. An unlabelled date column is not verified DOB evidence and cannot strengthen the match, fill a profile field or supply a DOB answer. When a routine ownership question quotes a grounded name/sex/date banner, any reading compatible with the saved person leaves the name-only match unchanged. If no valid reading matches the saved DOB, the question remains blocking until the person reviews it and confirms or changes the report assignment. The host reads the same banner from the retained original itself, so a date that fits no saved-person reading (any month/day order, or any century for a two-digit year) blocks the name-only match with a confirmation request even when the model raised no identity question; a compatible date leaves it unchanged. This is a reason to ask about ownership, not an assertion that the column is a birth date. Specific identity uncertainty questions remain blocking; labelled DOBs still follow the original-date review rules below.
@@ -126,10 +128,15 @@ people with the same spelling remain independent. Single-token names remain repo
 A later explicit confirmation can reestablish an association with new support; an old
 receipt or retained historical spelling cannot do so by itself.
 
-Current limitation, open in [CRS-134](../todo/CRS-134.md): an unresolved association is
-removed rather than held for review, and so is an independently entered manual name with
-the same spelling. When another saved person has that name, later reports and unaccepted
-records from the corrected report can match that person without a question.
+An unresolved learned association remains a visible competing claim. A later report with
+that printed name asks for explicit identity review even when only one other saved person
+currently matches. A separately entered primary or manual name retains its own authority;
+the learned association cannot remove it. The correction review can also choose who should
+receive _future_ reports with that name: Self, a named Person, or **Ask each time**. This
+choice governs later matching only. It does not rewrite earlier confirmations or move
+accepted records. A selected-record correction places unaccepted members of the affected
+report on hold until the report itself is confirmed again, even when the old confirmation
+was ordinary and no standing correction default existed.
 
 Original-grounded DOB conflicts remain blocking. Ordinary ownership correction neither
 changes a saved DOB nor grants the separate printed-DOB exception tracked in
@@ -138,7 +145,12 @@ boundaries, unavailable people and new contradictory evidence require review. Co
 original-grounding caches are rebuilt by opening identity review; a cached assignment
 never substitutes for checking the original.
 
-The browser reconciles an uncertain save by its operation ID before permitting another
-correction. Undo is a new preview and correction against current records, sources,
-relationships and names. It preserves intervening edits and never deletes the earlier
-decision or automatically collapses a previous split.
+The browser keeps an uncertain save's operation ID with the exact profile, dialog and
+selection, then reconciles it before permitting another correction. A definite refusal
+requires a fresh preview with its reason displayed. Undo starts a new preview and
+correction against current records, sources, relationships and names; the earlier link or
+split decision is not preselected. It preserves intervening edits and never deletes the
+earlier decision or automatically collapses a previous split. Accepted versions are
+available from the corrected record's history. A new export packet includes the person
+correction in PDF and evidence data; the app has no durable ledger of which earlier
+packets were generated or shared, so a person must check copies they already shared.

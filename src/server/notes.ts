@@ -2,6 +2,7 @@ import {
   rememberNameSupport,
   rememberManualNameChanges,
   nameAuthorities,
+  sourceNameConfirmationDate,
 } from './name-associations.ts';
 import {
   canonicalIdentityName,
@@ -337,6 +338,17 @@ export function attachments(db: Database, type: string, id: string): Attachment[
 }
 export function getNote(db: Database, id: string): NoteDTO {
   const r = noteRow(db, id);
+  const storedProfile = storedPerson(r.profile_json);
+  const displayProfile =
+    r.kind === 'person'
+      ? {
+          ...storedProfile,
+          sourceKnownNames: storedProfile.sourceKnownNames?.map((source) => ({
+            ...source,
+            confirmedAt: sourceNameConfirmationDate(db, r.id, source.operationId, source.name),
+          })),
+        }
+      : storedProfile;
   const links = db
     .prepare('SELECT * FROM note_links WHERE note_id=? ORDER BY id')
     .all(r.id)
@@ -388,12 +400,12 @@ export function getNote(db: Database, id: string): NoteDTO {
     person:
       r.kind === 'person' && r.person_id === 'patient'
         ? {
-            ...withoutPersonTags(storedPerson(r.profile_json)),
+            ...withoutPersonTags(displayProfile),
             name: selfIdentity(db).name,
             nameAssociations: nameAuthorities(db, r.id),
           }
         : {
-            ...storedPerson(r.profile_json),
+            ...displayProfile,
             ...(r.kind === 'person' ? { nameAssociations: nameAuthorities(db, r.id) } : {}),
           },
     pinned: Boolean(r.pinned),

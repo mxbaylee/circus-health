@@ -159,7 +159,12 @@ function ProfileAssistant({ profile }: { profile: Profile }) {
       setOpen(true);
     }
     window.addEventListener('health:ask', prefill);
-    return () => window.removeEventListener('health:ask', prefill);
+    const connection = () => setDiagnosticsOpen(true);
+    window.addEventListener('health:model-connection', connection);
+    return () => {
+      window.removeEventListener('health:ask', prefill);
+      window.removeEventListener('health:model-connection', connection);
+    };
   }, [location.pathname, location.search]);
   useEffect(() => {
     if (open) bottom.current?.scrollIntoView({ block: 'nearest' });

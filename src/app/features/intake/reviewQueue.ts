@@ -38,6 +38,12 @@ export function intakeReadingPauseLabel(reason: string | null | undefined) {
       return 'Extracting and retaining source text locally. Completed pages and corrections are kept.';
     case 'source_review_required':
       return 'Source text needs your review. Expand the affected source section below, resolve the unfinished page, then resume reading.';
+    case 'durability_conflict':
+      return 'The profile journal has a durability conflict. Resolve the storage problem before reading can continue.';
+    case 'source_technical_error':
+      return 'A located source-text error interrupted this file. Other files can continue; inspect the saved exception.';
+    case 'processing_stalled':
+      return 'This source section stopped making progress. Its location is saved as an exception; other sections can continue.';
     case 'waiting_for_provider':
       return 'Waiting for the provider retry window. Reading will retry automatically; completed source work is kept.';
     case 'provider_authentication':
@@ -49,7 +55,7 @@ export function intakeReadingPauseLabel(reason: string | null | undefined) {
     case 'provider_rejected':
       return 'The provider rejected this request. Fix the provider configuration and check the connection; reading then continues automatically.';
     case 'model_unavailable':
-      return 'The model provider was unavailable. Completed work and originals are kept.';
+      return 'The model provider was unavailable. Reading retries automatically after backoff; completed work and originals are kept.';
     case 'assistant_busy':
       return 'Waiting for another request to finish; reading continues automatically.';
     case 'no_progress':

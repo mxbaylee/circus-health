@@ -225,12 +225,12 @@ export function requireCorrectedOwnershipReview(
         group.id,
       )
     : null;
-  const reportHold = report
+  const reportHold = group
     ? latestOwnershipDecision<OwnershipReportHold>(
         db,
         'Report ownership default hold',
-        'defaultOperationId',
-        report.operationId,
+        'groupId',
+        group.id,
       )
     : null;
   const exactSource =
@@ -252,7 +252,7 @@ export function requireCorrectedOwnershipReview(
       : exactReport
         ? report
         : null;
-  if (!source && !report) return;
+  if (!source && !report && !reportHold) return;
   const before = identityBeforeOwnershipHold(record);
   // A new explicit confirmation can replace the challenged default after ordinary scope checks.
   const confirmation = workflow?.identityConfirmations?.find(
@@ -297,6 +297,8 @@ export function requireCorrectedOwnershipReview(
     );
   if (!authority || !person || blockers.length) {
     delete record.identityAttribution;
+    delete record.mapping.personId;
+    record.mapping.subject = 'unknown';
     const hold = {
       ...(before || { evidencedIdentity: {}, conflicts: [] }),
       status: 'confirmation_required' as const,
@@ -370,28 +372,54 @@ export function ownershipReportHolds(
           'groupId',
           groupId,
         );
+        const file = db
+          .prepare('SELECT details_json FROM source_files WHERE id=?')
+          .get(c.sourceFileId);
+        const intake = file
+          ? (
+              json(file.details_json) as {
+                intake?: { version?: number; workflow?: IntakeWorkflow };
+              }
+            ).intake
+          : undefined;
+        const group = intake?.workflow?.reportGroups?.find((g) => g.id === groupId);
+        const selectedSources = new Set(
+          records.flatMap((r) =>
+            r.contributions
+              .filter((contribution) => contribution.selected)
+              .map((contribution) => contribution.sourceRecordId),
+          ),
+        );
+        const remaining = group?.versions
+          .at(-1)
+          ?.members.some((m) => m.occurrences.some((o) => !selectedSources.has(o.recordId)));
+        if (!remaining) continue;
+        const receipt = intake?.workflow?.identityConfirmations
+          ?.filter(
+            (r) =>
+              r.scope.groupId === groupId &&
+              (r.assignedPerson?.personId === record.owner.personId ||
+                (r.outcome === 'this_is_me' && record.owner.personId === 'patient')),
+          )
+          .at(-1);
+        const defaultOperationId =
+          authority?.personId === record.owner.personId && authority.intakeId === c.sourceFileId
+            ? authority.operationId
+            : receipt?.operationId;
+        if (!defaultOperationId || !intake?.version) continue;
         if (
-          !authority ||
-          authority.personId !== record.owner.personId ||
-          authority.intakeId !== c.sourceFileId ||
           latestOwnershipDecision(
             db,
             'Report ownership default hold',
             'defaultOperationId',
-            authority.operationId,
+            defaultOperationId,
           )
         )
           continue;
-        result.set(authority.operationId, {
-          intakeVersion: Number(
-            db
-              .prepare(
-                "SELECT json_extract(details_json,'$.intake.version') version FROM source_files WHERE id=?",
-              )
-              .get(authority.intakeId)!.version,
-          ),
-          defaultOperationId: authority.operationId,
-          intakeId: authority.intakeId,
+        result.set(defaultOperationId, {
+          intakeVersion: intake.version,
+          defaultOperationId,
+          intakeId: c.sourceFileId,
           groupId,
         });
       }

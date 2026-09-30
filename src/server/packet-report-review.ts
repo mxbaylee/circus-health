@@ -30,7 +30,11 @@ export function packetReportReview(db: Database, sourceIds: string[]): PacketRep
     const details = JSON.parse(String(file.get(intakeId)?.details_json || '{}'));
     const workflow = details?.intake?.workflow as IntakeWorkflow | undefined;
     if (!workflow) continue;
-    const candidates = new Map(workflow.candidates.map((candidate) => [candidate.id, candidate]));
+    // Older retained workflows and source-only reading plans may not have
+    // clinical candidates. They cannot establish report completion counts.
+    const candidates = new Map(
+      (workflow.candidates || []).map((candidate) => [candidate.id, candidate]),
+    );
     for (const group of workflow.reportGroups || []) {
       if (group.basis !== 'report_anchor') continue;
       const latest = group.versions.at(-1);

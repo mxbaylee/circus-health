@@ -12,6 +12,7 @@ import {
   type ImportPersonSelection,
 } from './ImportPersonChoice';
 import { ImportIdentityWarnings } from './ImportIdentityWarnings';
+import { ImportFutureNameChoice, type FutureNameChoice } from './ImportFutureNameChoice';
 
 export function ImportIdentitySheetControls({
   report,
@@ -26,6 +27,8 @@ export function ImportIdentitySheetControls({
   setReviewedBirthDate,
   selectedSelfFields,
   setSelectedSelfFields,
+  futureNameOwner,
+  setFutureNameOwner,
 }: {
   report: ImportReviewReport;
   busy: boolean;
@@ -36,6 +39,7 @@ export function ImportIdentitySheetControls({
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: FutureNameChoice,
   ) => void;
   personSelection: ImportPersonSelection;
   setPersonSelection: Dispatch<SetStateAction<ImportPersonSelection>>;
@@ -45,6 +49,8 @@ export function ImportIdentitySheetControls({
   setReviewedBirthDate: Dispatch<SetStateAction<string | null>>;
   selectedSelfFields: Set<'fullName' | 'birthDate'>;
   setSelectedSelfFields: Dispatch<SetStateAction<Set<'fullName' | 'birthDate'>>>;
+  futureNameOwner: FutureNameChoice;
+  setFutureNameOwner: Dispatch<SetStateAction<FutureNameChoice>>;
 }) {
   const needsPrintedName = !!report.subject.printedNameRequired;
   const offeredSelfFields: { fullName?: string; birthDate?: string } = report.subject
@@ -133,6 +139,15 @@ export function ImportIdentitySheetControls({
         onChange={setPersonSelection}
         disabled={busy || report.subject.scopeReady === false}
       />
+      {report.subject.challengedName && (
+        <ImportFutureNameChoice
+          name={report.subject.challengedName}
+          people={report.subject.people}
+          value={futureNameOwner}
+          onChange={setFutureNameOwner}
+          disabled={busy}
+        />
+      )}
       {report.subject.reviewUrl && (
         <a className="text-link" href={`#${report.subject.reviewUrl}`}>
           Review retained report evidence <ArrowRight size={15} aria-hidden="true" />
@@ -192,6 +207,7 @@ export function ImportIdentitySheetControls({
             if (
               report.subject.confirmed &&
               !report.subject.nameOnlyMatch &&
+              !report.subject.challengedName &&
               !needsPrintedName &&
               (!personSelection
                 ? !report.subject.assignedPerson ||
@@ -216,11 +232,13 @@ export function ImportIdentitySheetControls({
               personSelection,
               needsPrintedName ? selectedPrintedName.trim() : undefined,
               report.subject.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
+              report.subject.challengedName ? futureNameOwner : undefined,
             );
           }}
         >
           {report.subject.confirmed &&
           !report.subject.nameOnlyMatch &&
+          !report.subject.challengedName &&
           !needsPrintedName &&
           (!personSelection
             ? !report.subject.assignedPerson || report.subject.assignedPerson.personId === 'patient'

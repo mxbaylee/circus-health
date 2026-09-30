@@ -253,6 +253,7 @@ export function commitOwnershipNames(
             : 'superseded',
         operationId,
         supportOperations: [],
+        origin: 'ownership',
       },
     );
     for (const support of effect.support) {
@@ -304,6 +305,7 @@ export function commitOwnershipNames(
           status: 'active',
           operationId,
           supportOperations,
+          origin: 'ownership',
         },
       );
     }

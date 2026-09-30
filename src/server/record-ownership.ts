@@ -366,7 +366,7 @@ export function previewRecordOwnership(
         cursor = page.page.nextCursor || undefined;
       } while (cursor);
     }
-    if (matches.length && !decision)
+    if (matches.length && !decision?.action)
       blockers.push('Choose whether to link a destination match or keep both.');
     if (decision?.action === 'link' && !matches.some((m) => m.recordId === decision.targetRecordId))
       blockers.push('The selected match is not a current destination record.');
@@ -884,7 +884,10 @@ function commitOwnershipUnit(
             action: item.action,
             previousVersion: item.version,
             fromPersonId: item.owner.personId,
+            fromNoteId: item.owner.noteId,
+            fromPersonName: item.owner.fullName,
             toPersonId: destination.personId,
+            sourceReport: item.sourceReport,
           },
           selected.reason?.trim(),
         );

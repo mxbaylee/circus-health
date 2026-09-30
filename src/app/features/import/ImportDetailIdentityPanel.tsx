@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { IntakeIdentityAnswers, IntakeIdentityReview } from '../../../shared/intake-identity';
 import { LoadingIndicator } from '../../components/LoadingIndicator';
 import { ImportIdentityWarnings } from './ImportIdentityWarnings';
+import { ImportFutureNameChoice, type FutureNameChoice } from './ImportFutureNameChoice';
 import {
   ImportPersonChoice,
   ImportBirthDateReview,
@@ -35,9 +36,11 @@ export function ImportDetailIdentityPanel({
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: FutureNameChoice,
   ) => void;
 }) {
   const [personSelection, setPersonSelection] = useState<ImportPersonSelection>();
+  const [futureNameOwner, setFutureNameOwner] = useState<FutureNameChoice>({ outcome: 'ask' });
   const [selectedPrintedName, setSelectedPrintedName] = useState('');
   const [reviewedBirthDate, setReviewedBirthDate] = useState<string | null>(
     review?.scope?.birthDateReview?.suggested || null,
@@ -67,6 +70,7 @@ export function ImportDetailIdentityPanel({
     const previous = previousOffers.current;
     if (previous.scope !== selectionScope) {
       setSelectedPrintedName('');
+      setFutureNameOwner({ outcome: 'ask' });
       setReviewedBirthDate(review.scope?.birthDateReview?.suggested || null);
     }
     if (previous.scope !== selectionScope)
@@ -148,6 +152,7 @@ export function ImportDetailIdentityPanel({
   ).filter((entry): entry is ['fullName' | 'birthDate', string] => !!entry[1]);
   const unchanged =
     confirmed &&
+    !review.challengedName &&
     !(review.status === 'evidenced_match' && !review.evidencedIdentity.birthDate) &&
     (!personSelection
       ? !review.assignedPerson || review.assignedPerson.personId === 'patient'
@@ -221,6 +226,15 @@ export function ImportDetailIdentityPanel({
           onChange={setPersonSelection}
           disabled={busy || !review.scope}
         />
+        {review.challengedName && (
+          <ImportFutureNameChoice
+            name={review.challengedName}
+            people={review.people}
+            value={futureNameOwner}
+            onChange={setFutureNameOwner}
+            disabled={busy}
+          />
+        )}
         {!personSelection && offeredEntries.length > 0 && (
           <fieldset className="import-identity-self-fields">
             <legend>
@@ -283,6 +297,7 @@ export function ImportDetailIdentityPanel({
               personSelection,
               !review.evidencedIdentity.fullName ? selectedPrintedName.trim() : undefined,
               review.scope?.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
+              review.challengedName ? futureNameOwner : undefined,
             );
           }}
         >

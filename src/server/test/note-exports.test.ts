@@ -86,6 +86,102 @@ test('current medication options use personal confirmation, retain doses and pro
   assert.match(html, /&quot;low&quot;:12/);
   assert.match(html, /Pages 2, 3/);
 });
+test('provider packet and evidence companion disclose unread cited source pages', (t) => {
+  const { db, input } = fixture(t);
+  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
+    JSON.stringify({
+      intake: {
+        originalName: 'fictional.pdf',
+        workflow: {
+          plans: [
+            {
+              status: 'active',
+              batches: [
+                {
+                  id: 'fictional-reading',
+                  coverage: [
+                    { unitId: 'page-2', kind: 'extracted', notes: 'Fictional retained reading' },
+                  ],
+                },
+              ],
+              units: [
+                {
+                  id: 'page-2',
+                  locator: 'Page 2',
+                  status: 'completed',
+                  attempts: ['fictional-reading'],
+                  coverage: {
+                    unitId: 'page-2',
+                    kind: 'extracted',
+                    notes: 'Fictional retained reading',
+                  },
+                },
+                {
+                  id: 'page-3',
+                  locator: 'Page 3',
+                  status: 'pending',
+                  processingException: { reason: 'processing_stalled', at: '2026-01-01' },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+    'file',
+  );
+  const packet = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.deepEqual(packet.readingGaps, [
+    {
+      sourceFileId: 'file',
+      filename: 'fictional.pdf',
+      gaps: [{ locator: 'Page 3', reason: 'processing_stalled' }],
+    },
+  ]);
+  assert.match(exportHtml(packet), /Unread source sections[\s\S]*Page 3: processing_stalled/);
+  assert.deepEqual(exportEvidence(packet).readingGaps, packet.readingGaps);
+  // Converted clinical evidence cites the proposal file. Its root-level original
+  // pointer must still disclose the retained PDF's unread sections.
+  db.prepare(
+    "INSERT INTO source_files(id,provider_id,path,sha256,bytes,kind,details_json) VALUES('fictional-proposal','capture','fictional-proposal.jsonl','proposal-hash',100,'intake_proposal',?)",
+  ).run(JSON.stringify({ originalSourceFileId: 'file' }));
+  db.prepare("UPDATE source_records SET source_file_id='fictional-proposal' WHERE id='raw'").run();
+  const converted = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.deepEqual(converted.readingGaps, packet.readingGaps);
+  assert.match(exportHtml(converted), /Page 3: processing_stalled/);
+
+  const details = JSON.parse(
+    String(db.prepare("SELECT details_json FROM source_files WHERE id='file'").get()!.details_json),
+  );
+  details.intake.workflow.plans[0].batches = [];
+  db.prepare("UPDATE source_files SET details_json=? WHERE id='file'").run(JSON.stringify(details));
+  const unreceipted = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.deepEqual(unreceipted.readingGaps[0]!.gaps, [
+    { locator: 'Page 2', reason: 'not yet read' },
+    { locator: 'Page 3', reason: 'processing_stalled' },
+  ]);
+  assert.notEqual(unreceipted.fingerprint, converted.fingerprint);
+  details.intake.workflow.plans[0].index = {
+    kind: 'pdf',
+    coverage: 'indexed_only',
+    missingAssets: [],
+    references: [
+      {
+        locator: 'page 2, remaining references',
+        status: 'capacity_exception',
+        note: 'Further references were not indexed; page text remains readable.',
+      },
+    ],
+  };
+  db.prepare("UPDATE source_files SET details_json=? WHERE id='file'").run(JSON.stringify(details));
+  const capacity = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.match(
+    exportHtml(capacity),
+    /page 2, remaining references: capacity exception: Further references were not indexed/,
+  );
+  assert.equal(capacity.readingGaps[0]?.gaps.length, 3);
+  assert.deepEqual(exportEvidence(capacity).readingGaps, capacity.readingGaps);
+});
 test('an older archived/current conflict is excluded from current prescription packets and summaries', (t) => {
   const { db, input } = fixture(t);
   const original = db.prepare("SELECT * FROM medications WHERE id='current-med'").get();
@@ -742,4 +838,46 @@ test('finished note exports resolve old clinical kinds while preserving link att
   assert.deepEqual(db.prepare('SELECT * FROM note_links WHERE note_id=?').all(note.id), oldLinks);
   assert.deepEqual(db.prepare('SELECT * FROM source_records').all(), oldSources);
   assert.deepEqual(db.prepare('SELECT * FROM source_files').all(), oldFiles);
+});
+
+// A directly linked original is included even without any accepted clinical citation.
+test('provider packets disclose unread pages of directly included originals', (t) => {
+  const { db, input, note } = fixture(t);
+  db.prepare(
+    "INSERT INTO source_files(id,provider_id,path,sha256,bytes,details_json) VALUES('direct-original','capture','fictional-direct.pdf','fictional-direct-hash',100,?)",
+  ).run(
+    JSON.stringify({
+      intake: {
+        originalName: 'fictional-direct.pdf',
+        workflow: {
+          plans: [
+            {
+              status: 'active',
+              batches: [],
+              units: [{ id: 'direct-page', locator: 'Page 7', status: 'pending' }],
+            },
+          ],
+        },
+      },
+    }),
+  );
+  const updated = saveNote(db, note.id, {
+    version: note.version,
+    links: [{ targetType: 'source', targetId: 'direct-original', relation: 'references' }],
+  });
+  const packet = exportSnapshot(db, { ...input, noteVersion: updated.version, mode: 'provider' });
+  assert.ok(
+    packet.records.some(
+      (record) =>
+        record.type === 'source_file' &&
+        record.id === 'direct-original' &&
+        record.citations.length === 0,
+    ),
+  );
+  assert.deepEqual(
+    packet.readingGaps.find((source) => source.sourceFileId === 'direct-original')?.gaps,
+    [{ locator: 'Page 7', reason: 'not yet read' }],
+  );
+  assert.match(exportHtml(packet), /fictional-direct.pdf[\s\S]*Page 7: not yet read/);
+  assert.deepEqual(exportEvidence(packet).readingGaps, packet.readingGaps);
 });

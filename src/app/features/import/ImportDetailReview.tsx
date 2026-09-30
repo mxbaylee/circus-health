@@ -1,5 +1,6 @@
 import { RecordOwnershipAction } from '../clinical-review/RecordOwnershipAction';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
+import type { FutureNameChoice } from './ImportFutureNameChoice';
 import { ImportIdentityWarnings } from './ImportIdentityWarnings';
 import {
   mappingFields,
@@ -685,6 +686,7 @@ export function ImportDetailReview({
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: FutureNameChoice,
   ) {
     const group = displayedDetail?.group;
     const review = currentIdentityReview;
@@ -703,7 +705,7 @@ export function ImportDetailReview({
     ) as { fullName?: string; birthDate?: string };
     // Retained uncertain requests are recoverable only inside the exact profile
     // and deep-link selection that created them.
-    const key = `${identityContext}:${review.scope.groupId}:${review.scope.groupVersionId}:${review.scope.intakeVersion}:${JSON.stringify([selected, personSelection, printedName, identityAnswers])}`;
+    const key = `${identityContext}:${review.scope.groupId}:${review.scope.groupVersionId}:${review.scope.intakeVersion}:${JSON.stringify([selected, personSelection, printedName, identityAnswers, futureNameOwner])}`;
     const request: IntakeIdentityConfirmation = identityOperations.current.get(key) || {
       version: review.scope.intakeVersion,
       operationId: crypto.randomUUID(),
@@ -712,6 +714,7 @@ export function ImportDetailReview({
       ...(personSelection ? { personSelection } : {}),
       ...(printedName ? { printedName } : {}),
       ...(identityAnswers ? { identityAnswers } : {}),
+      ...(review.challengedName ? { futureNameOwner: futureNameOwner || { outcome: 'ask' } } : {}),
       attestation: review.scope.questions?.length
         ? 'confirmed_displayed_identity_questions'
         : 'confirmed_displayed_report_subject',
@@ -820,8 +823,8 @@ export function ImportDetailReview({
         if (!selection.recordId) onBack();
       }}
       onRetry={identity.reload}
-      onConfirm={(fields, personSelection, printedName, identityAnswers) =>
-        void confirmIdentity(fields, personSelection, printedName, identityAnswers)
+      onConfirm={(fields, personSelection, printedName, identityAnswers, futureNameOwner) =>
+        void confirmIdentity(fields, personSelection, printedName, identityAnswers, futureNameOwner)
       }
     />
   );
@@ -976,8 +979,10 @@ export function ImportDetailReview({
           onClick={() => setContextSheet('identity')}
         >
           <span>
-            For {personLabel}
-            {personConfirmed
+            {currentIdentityReview?.correctedPerson
+              ? `Corrected to ${currentIdentityReview.correctedPerson.fullName}`
+              : `For ${personLabel}`}
+            {!currentIdentityReview?.correctedPerson && personConfirmed
               ? selfPerson
                 ? nameOnlyMatch
                   ? ' (you?)'

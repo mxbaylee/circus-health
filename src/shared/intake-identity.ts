@@ -12,6 +12,8 @@ export interface IntakeIdentitySelfSnapshot {
   version: number;
   fullName: string | null;
   knownNames?: string[];
+  challengedNames?: string[];
+  futureNameOwners?: { name: string; personId: string }[];
   birthDate: string | null;
 }
 
@@ -60,6 +62,9 @@ export interface IntakeIdentityReview {
   status: IntakeIdentityReviewStatus;
   blocking: boolean;
   message: string;
+  /** A corrected association for this printed name needs a separate future-use choice. */
+  challengedName?: string;
+  correctedPerson?: { personId: string; fullName: string };
   scope: IntakeIdentityScope | null;
   evidencedIdentity: IntakeEvidencedIdentity;
   self: IntakeIdentitySelfSnapshot;
@@ -132,6 +137,11 @@ export interface IntakeIdentityConfirmation {
   identityAnswers?: IntakeIdentityAnswers;
   /** Exact printed name selected from the displayed subject when no safe name was derived. */
   printedName?: string;
+  futureNameOwner?: {
+    outcome: 'self' | 'person' | 'ask';
+    noteId?: string;
+    expectedVersion?: number;
+  };
   personSelection?:
     | { noteId: string; expectedVersion: number }
     | { newPerson: { fullName: string; relationship?: string } };

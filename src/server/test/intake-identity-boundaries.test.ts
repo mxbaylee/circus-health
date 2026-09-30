@@ -18,6 +18,62 @@ const patient = 'Iris Meadow';
 const otherPatient = 'Rowan River';
 const selfBirthDate = '1982-04-17';
 
+test('another report cannot reuse a Self confirmation after its printed name uniquely names a different person', async (t) => {
+  const secondHeading = 'Fictional Willow report';
+  const f = fixture(
+    t,
+    `${heading}\nPatient: ${patient}\nFictional count 12.00\n${secondHeading}\nPatient: ${patient}\nFictional count 14.00`,
+    'fictional-alder.txt',
+  );
+  const first = await f.identity();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    version: first.scope!.intakeVersion,
+    operationId: randomUUID(),
+    scope: first.scope!,
+    outcome: 'this_is_me',
+    attestation: 'confirmed_displayed_report_subject',
+  });
+  const self = getNote(f.db, 'person-note:self');
+  saveNote(f.db, self.id, {
+    version: self.version,
+    person: { ...self.person, fullName: 'Fictional Other Self' },
+  });
+  createNote(f.db, {
+    kind: 'person',
+    title: patient,
+    person: { fullName: patient, birthDate: selfBirthDate },
+  });
+  const own = await f.identity();
+  assert.equal(own.status, 'prior_confirmation');
+  assert.equal(own.blocking, false);
+  const later = record();
+  later.id = 'fictional-second-count';
+  later.provenance.sourceRecordId = later.id;
+  later.report!.key = 'willow';
+  later.report!.title = secondHeading;
+  later.report!.anchor = { locator: 'page 1 later heading', text: secondHeading };
+  const current = intake.getIntake(f.db, f.root, f.profileId, f.item.id);
+  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, f.item.id, {
+    version: current.version,
+    summary: 'Independently fictional later observation',
+    jsonlText: JSON.stringify(later),
+  });
+  const group = proposed.workflow!.reportGroups!.find(
+    (candidate) => candidate.report?.anchor?.text === secondHeading,
+  )!;
+  const second = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, group.id);
+  assert.equal(second.status, 'confirmation_required');
+  assert.equal(second.blocking, true);
+  const pending = intake.reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    f.item.id,
+    proposed.proposals.at(-1)!.id,
+  );
+  assert.equal(pending.records[0]!.identityReview?.blocking, true);
+});
+
 function record(subject = patient): HealthRecordEnvelope {
   return {
     format: 'health-record-v1',

@@ -1,4 +1,6 @@
 import { OwnershipSelectionControl } from '../features/clinical-review/OwnershipSelectionControl';
+import { RecordOwnershipAction } from '../features/clinical-review/RecordOwnershipAction';
+import { OwnershipHistory } from '../components/OwnershipHistory';
 import {
   ClinicalRedirect,
   isReclassifiedRecord,
@@ -441,6 +443,13 @@ export function ClinicalRecordDetail({
         actions={
           medication && activation ? undefined : (
             <EntryActions>
+              <RecordOwnershipAction
+                selection={{
+                  type: 'records',
+                  records: [{ kind: medication ? 'medication' : 'procedure', recordId: record.id }],
+                }}
+                onApplied={onCorrected}
+              />
               <RecordCorrectionAction
                 target={
                   medication
@@ -463,6 +472,7 @@ export function ClinicalRecordDetail({
           )
         }
       />
+      <OwnershipHistory kind={medication ? 'medication' : 'procedure'} recordId={record.id} />
       {medication && activation && (
         <MedicationStatusEditor record={record} onSaved={onStatusSaved} />
       )}

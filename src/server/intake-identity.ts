@@ -1,4 +1,11 @@
-import { effectiveKnownNames, activeIdentityReceipts } from './name-associations.ts';
+import {
+  effectiveKnownNames,
+  challengedKnownNames,
+  challengedNameNoteIds,
+  futureNameOwners,
+  rememberFutureNameOwner,
+  activeIdentityReceipts,
+} from './name-associations.ts';
 import { matchesSelfIdentityName } from '../shared/self-identity.ts';
 import {
   decodeOriginalIdentityText,
@@ -15,7 +22,7 @@ import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError, now } from './database.ts';
+import { HttpError, json, now } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import {
   getIntake,
@@ -530,6 +537,8 @@ function selfSnapshot(db: DatabaseSync): IntakeIdentitySelfSnapshot {
     version: self.version,
     fullName,
     knownNames: effectiveKnownNames(db, self.id, self.person),
+    challengedNames: challengedKnownNames(db, self.id),
+    futureNameOwners: futureNameOwners(db),
     birthDate,
   };
 }
@@ -721,6 +730,22 @@ async function getIntakeIdentityReviewInternal(
   const group = intake.workflow?.reportGroups?.find((item) => item.id === groupId);
   if (!group) throw new HttpError(404, 'REPORT_GROUP_NOT_FOUND', 'Report group not found');
   const self = selfSnapshot(db);
+  const correctionRow = db
+    .prepare(
+      "SELECT coverage_json FROM manual_batches WHERE title='Report ownership default' AND json_extract(coverage_json,'$.intakeId')=? AND json_extract(coverage_json,'$.groupId')=? ORDER BY json_extract(coverage_json,'$.revision') DESC,id DESC LIMIT 1",
+    )
+    .get(id, groupId);
+  const correctedAuthority = correctionRow
+    ? (json(correctionRow.coverage_json) as { personId: string; noteId: string })
+    : null;
+  const correctedNote = correctedAuthority ? getNote(db, correctedAuthority.noteId) : null;
+  const correctedPerson =
+    correctedAuthority && correctedNote
+      ? {
+          personId: correctedAuthority.personId,
+          fullName: correctedNote.person.fullName || correctedNote.title,
+        }
+      : undefined;
   const groupIdentity = groupRecordIdentity(context, group);
   const latest = group.versions.at(-1);
   const originalFingerprint = identityOriginalFingerprint(
@@ -744,7 +769,7 @@ async function getIntakeIdentityReviewInternal(
       hasUnstructuredIdentityQuestion: groupIdentity.hasUnstructuredIdentityQuestion,
       currentRefusal: groupIdentity.currentRefusal,
     });
-    return { ...assessment, scope: null, self };
+    return { ...assessment, scope: null, self, correctedPerson };
   }
   let built: BuiltScope;
   try {
@@ -781,6 +806,7 @@ async function getIntakeIdentityReviewInternal(
       scope: null,
       evidencedIdentity: groupIdentity.evidence,
       self,
+      correctedPerson,
       offeredSelfFields: {},
       conflicts: groupIdentity.conflicts,
     };
@@ -805,6 +831,7 @@ async function getIntakeIdentityReviewInternal(
     ...assessment,
     scope: built.scope,
     self,
+    correctedPerson,
   };
 }
 
@@ -1002,6 +1029,43 @@ export async function confirmIntakeIdentityScope(
         'IDENTITY_PRINTED_NAME',
         'Select the exact printed person name from the displayed subject before confirming; demographic sentences are not names',
       );
+    const futureChoice = input.futureNameOwner || { outcome: 'ask' as const };
+    if (
+      input.futureNameOwner &&
+      (!assessment.challengedName ||
+        !['self', 'person', 'ask'].includes(futureChoice.outcome) ||
+        (futureChoice.outcome === 'person' &&
+          (typeof futureChoice.noteId !== 'string' ||
+            !Number.isSafeInteger(futureChoice.expectedVersion))) ||
+        (futureChoice.outcome !== 'person' && futureChoice.noteId !== undefined))
+    )
+      throw new HttpError(
+        400,
+        'IDENTITY_NAME_CHOICE',
+        'Choose how later reports should use the challenged printed name.',
+      );
+    let futureTarget: { noteId: string; personId: string } | null = null;
+    if (assessment.challengedName && futureChoice.outcome === 'self')
+      futureTarget = { noteId: 'person-note:self', personId: 'patient' };
+    if (assessment.challengedName && futureChoice.outcome === 'person') {
+      const note = getNote(db, futureChoice.noteId!);
+      if (
+        note.kind !== 'person' ||
+        note.archived ||
+        note.version !== futureChoice.expectedVersion ||
+        !note.personId ||
+        note.personId === 'patient'
+      )
+        throw new HttpError(
+          409,
+          'IDENTITY_NAME_CHOICE',
+          'The selected future name owner changed. Refresh the identity review.',
+        );
+      futureTarget = { noteId: note.id, personId: note.personId };
+    }
+    const challengedNotes = assessment.challengedName
+      ? challengedNameNoteIds(db, confirmedPrintedName)
+      : [];
     if (
       ['prior_confirmation', 'evidenced_match'].includes(assessment.status) &&
       input.selfUpdate === undefined &&
@@ -1199,6 +1263,14 @@ export async function confirmIntakeIdentityScope(
           subjectText: current.subject.text,
         })
       : undefined;
+    if (assessment.challengedName && safeSourceIdentityName(confirmedPrintedName))
+      rememberFutureNameOwner(
+        db,
+        confirmedPrintedName,
+        futureTarget,
+        input.operationId,
+        challengedNotes,
+      );
     if (assignedPerson) assignedPerson.version = getNote(db, assignedPerson.noteId).version;
     if (selfUpdate) selfUpdate.versionAfter = getNote(db, 'person-note:self').version;
     const at = now();
