@@ -14,7 +14,6 @@ The detailed work list and design documents that preceded this index are archive
 
 - [ ] <a id="crs-133"></a> [CRS-133](CRS-133.md) — Allow an explicit report-scoped assignment despite an incorrect printed DOB, preserving originals, demographics and the reason for the human exception.
 - [ ] <a id="crs-136"></a> [CRS-136](CRS-136.md) — Make partial review saves scale linearly and retryable from the list, show readable outcomes, and finish the review-reliability items left from CRS-120.
-- [ ] <a id="crs-137"></a> [CRS-137](CRS-137.md) — Stop another report's confirmation answering a report whose printed name is shared by two saved people or whose banner date conflicts, and strengthen the CRS-132 regressions.
 - [ ] <a id="crs-033"></a> **CRS-033** — Finish Import inbox acceptance after real-use regressions: native drop, accurate long-run activity, and repeated complete-file review.
 - [ ] <a id="crs-037"></a> **CRS-037** — Verify native file drop and truthful indexing, reading, provider-wait and completion states, including multi-file estimates and long runs.
 - [ ] <a id="crs-038"></a> **CRS-038** — Validate bounded, privacy-safe diagnostics against representative real-provider complaints and complete import lifecycles.
