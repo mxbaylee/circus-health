@@ -15,6 +15,17 @@ concurrency:
 
 jobs:
   checks:
+    if: always()
+    needs: [unit, server, continuation, browser, brand-assets, proxy-compatibility]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every validation lane to pass
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: node -e 'if (Object.values(JSON.parse(process.env.JOB_RESULTS)).some(job => job.result !== "success")) process.exit(1)'
+
+  unit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
