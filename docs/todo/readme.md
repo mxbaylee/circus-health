@@ -12,7 +12,6 @@ The detailed work list and design documents that preceded this index are archive
 
 ## Product and maintenance
 
-- [ ] <a id="crs-134"></a> [CRS-134](CRS-134.md) — Make routine tests fast, deterministic and independent of third-party services.
 
 - [ ] <a id="crs-133"></a> [CRS-133](CRS-133.md) — Allow an explicit report-scoped assignment despite an incorrect printed DOB, preserving originals, demographics and the reason for the human exception.
 - [ ] <a id="crs-033"></a> **CRS-033** — Finish Import inbox acceptance after real-use regressions: native drop, accurate long-run activity, and repeated complete-file review.
