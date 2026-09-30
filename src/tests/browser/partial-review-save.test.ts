@@ -1,11 +1,11 @@
-import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { launchBrowser, newTestPage } from './harness.ts';
+import { startProcessRuntime } from './process-runtime.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import type { AddressInfo } from 'node:net';
 import type { Browser } from 'playwright';
 import type {
   IntakeReportAcceptanceRequest,
@@ -13,19 +13,19 @@ import type {
 } from '../../shared/intake.ts';
 
 test(
-  'encrypted narrow browser retains an unsaved selection and reconciles a lost partial-save reply once',
+  'encrypted narrow browser requires fresh approval and replays a lost partial save across a real process restart',
   { timeout: 60000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'fictional-partial-review-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startBrowserRuntime(t, {
+    const runtimeOptions = {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
       host: '127.0.0.1',
-      assistantOptions: { availability: () => ({ available: false }) },
-    });
+    };
+    let runtime = await startProcessRuntime(t, runtimeOptions);
     let browser: Browser | undefined;
     t.after(async () => {
       await browser?.close();
@@ -35,9 +35,9 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser, { viewport: { width: 390, height: 844 } });
-    const origin = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
+    const origin = `http://127.0.0.1:${runtime.port}`;
     await page.goto(origin);
-    const profileId = await page.evaluate(async () => {
+    const setup = await page.evaluate(async () => {
       async function post(path: string, body: unknown) {
         const response = await fetch(path, {
           method: 'POST',
@@ -56,9 +56,9 @@ test(
         acknowledged: true,
         recovery: setup.recoveryKit,
       });
-      return profile.id as string;
+      return { profileId: profile.id as string, recovery: setup.recoveryKit };
     });
-    const prefix = `/api/profiles/${profileId}`;
+    const prefix = `/api/profiles/${setup.profileId}`;
     const values = ['Alpha marker', 'Beta marker'].map((label, index) => ({
       format: 'health-record-v1',
       id: `fictional-${index}`,
@@ -92,6 +92,7 @@ test(
     assert.equal(upload.status(), 201, await upload.text());
     let originalOperation = '';
     let intercepted = 0;
+    let originalRequest: IntakeReportAcceptanceRequest | undefined;
     await page.route('**/intakes/report-acceptance', async (route) => {
       if (route.request().method() !== 'POST') return route.continue();
       intercepted++;
@@ -99,6 +100,7 @@ test(
       assert.equal(request.mode, 'partial-v1');
       originalOperation = request.operationId;
       request.blocks[0]!.selections[1]!.selectionReviewToken = 'fictional-stale-authority';
+      originalRequest = structuredClone(request);
       const response = await route.fetch({ postData: JSON.stringify(request) });
       assert.equal(response.status(), 200);
       const result = (await response.json()).data as IntakeReportAcceptanceResult;
@@ -114,7 +116,9 @@ test(
     const outcomes = page.getByRole('region', { name: 'Save outcomes' });
     await outcomes.getByText('1 saved, 1 needs review', { exact: true }).waitFor();
     assert.equal(intercepted, 1);
-    assert.equal(await page.getByRole('checkbox', { name: /Beta marker/ }).isChecked(), true);
+    assert.equal(await page.getByRole('checkbox', { name: /Beta marker/ }).isChecked(), false);
+    await page.getByText('Review again, then approve.', { exact: false }).first().waitFor();
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
     const status = await page.request.get(
       origin + prefix + '/intakes/report-acceptance/' + originalOperation,
     );
@@ -125,5 +129,48 @@ test(
     const records = await page.request.get(origin + prefix + '/tests?personId=patient');
     assert.equal(records.status(), 200);
     assert.equal((await records.json()).meta.total, 1);
+
+    const priorPid = runtime.pid;
+    const port = runtime.port;
+    await runtime.close();
+    runtime = await startProcessRuntime(t, { ...runtimeOptions, port });
+    assert.notEqual(runtime.pid, priorPid, 'all server memory belongs to a new process');
+    const unlocked = await page.request.post(origin + prefix + '/unlock', {
+      headers: { Origin: origin },
+      data: { recovery: setup.recovery },
+    });
+    assert.equal(unlocked.status(), 200, await unlocked.text());
+    const replay = await page.request.post(origin + prefix + '/intakes/report-acceptance', {
+      headers: { Origin: origin },
+      data: originalRequest,
+    });
+    assert.equal(replay.status(), 200, await replay.text());
+    const replayed = (await replay.json()).data as IntakeReportAcceptanceResult;
+    assert.equal(replayed.receipt.acceptedCount, 1);
+    assert.equal(replayed.replayed, true);
+    const afterRestart = await page.request.get(origin + prefix + '/tests?personId=patient');
+    assert.equal(
+      (await afterRestart.json()).meta.total,
+      1,
+      'original operation never duplicates a save',
+    );
+    await page.unroute('**/intakes/report-acceptance');
+    await page.goto(origin + '/#/import');
+    await page.reload();
+    const beta = page.getByRole('checkbox', { name: /Beta marker/ });
+    await beta.focus();
+    await page.keyboard.press('Space');
+    assert.equal(await beta.isChecked(), true);
+    await page.getByRole('button', { name: 'Save 1 record', exact: true }).click();
+    await page
+      .getByRole('region', { name: 'Save outcomes' })
+      .getByText('1 saved', { exact: true })
+      .waitFor();
+    const finalRecords = await page.request.get(origin + prefix + '/tests?personId=patient');
+    assert.equal(
+      (await finalRecords.json()).meta.total,
+      2,
+      'fresh approval saves the previously rejected item',
+    );
   },
 );

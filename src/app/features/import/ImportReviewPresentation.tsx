@@ -1,14 +1,7 @@
 import { RecordOwnershipAction } from '../clinical-review/RecordOwnershipAction';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { IntakeIdentityReview } from '../../../shared/intake-identity';
-import {
-  ImportPersonChoice,
-  ImportBirthDateReview,
-  ImportPrintedName,
-  printedNameReady,
-  personSelectionReady,
-  type ImportPersonSelection,
-} from './ImportPersonChoice';
+import { personSelectionReady, type ImportPersonSelection } from './ImportPersonChoice';
 import type { IntakeBatchReadingState } from '../../../shared/intake-batch';
 import * as Dialog from '@radix-ui/react-dialog';
 import {
@@ -42,7 +35,10 @@ import type {
 } from '../../../shared/intake';
 import { measurementValueDisplay } from '../../../shared/measurement-value';
 import { ImportReadingActivity } from './ImportReadingActivity';
+import { useReviewApprovalSelection } from './useReviewApprovalSelection';
+import { ImportIdentitySheetControls } from './ImportIdentitySheetControls';
 import { ImportIdentityWarnings } from './ImportIdentityWarnings';
+import { ImportSourceSheetControls } from './ImportSourceSheetControls';
 import {
   SavedPersonDestinationLink,
   SavedRecordDestinationLink,
@@ -204,7 +200,11 @@ export interface ImportReviewActions {
   onSave?: (
     recordIds: string[],
     approvals?: IntakeReportAcceptanceBlock[],
-  ) => void | boolean | { savedIds: string[] } | Promise<void | boolean | { savedIds: string[] }>;
+  ) =>
+    | void
+    | boolean
+    | { savedIds: string[]; rejectedIds?: string[] }
+    | Promise<void | boolean | { savedIds: string[]; rejectedIds?: string[] }>;
   onLater?: (recordIds: string[]) => void | Promise<void>;
   onExclude?: (recordIds: string[]) => void | Promise<void>;
   onResume?: (recordIds: string[]) => void | Promise<void>;
@@ -315,8 +315,8 @@ export function ImportReviewPresentation({
   const sourceSelection = useSourceSelection();
   const [approvingSections, setApprovingSections] = useState(false);
   const [editedOnly, setEditedOnly] = useState(false);
-  const selectedSnapshots = useRef(new Map<string, ImportReviewRecord>());
-  const [selected, setSelected] = useState(() => new Set<string>());
+  const approvalSelection = useReviewApprovalSelection();
+  const { selected, needsApproval } = approvalSelection;
   const [sheet, setSheet] = useState<SheetState>(null);
   const sheetReturnFocus = useRef<HTMLElement | null>(null);
   const lastIdentitySheet = useRef<{ reportId: string; confirmed: boolean } | null>(null);
@@ -345,12 +345,12 @@ export function ImportReviewPresentation({
     presentedContext.current = model.contextKey;
     if (contextChanged) {
       confirmedSaved.current.clear();
-      selectedSnapshots.current.clear();
+      approvalSelection.clearContext();
       setSourceAttention(false);
     }
     if (preserveSourceReview && !contextChanged) return;
     for (const id of model.confirmedSavedIds || []) confirmedSaved.current.add(id);
-    setSelected((current) => new Set([...current].filter((id) => !confirmedSaved.current.has(id))));
+    approvalSelection.removeSaved([...confirmedSaved.current]);
     // A background feed refresh must not unmount a draft whose version was
     // superseded. Its existing editor keeps the conflict/acceptance checks.
     const pinned = pinnedReview.current;
@@ -359,6 +359,12 @@ export function ImportReviewPresentation({
     const currentRecords = model.records.map((record) =>
       confirmedSaved.current.has(record.id) ? { ...record, status: 'saved' as const } : record,
     );
+    const changedCount = approvalSelection.revokeChanged(currentRecords);
+    if (changedCount) {
+      setNotice(
+        `${changedCount} selected ${changedCount === 1 ? 'item changed' : 'items changed'} while you were reviewing; approve ${changedCount === 1 ? 'it' : 'them'} again.`,
+      );
+    }
     setReports(
       retain
         ? model.reports.some((item) => item.id === pinned.report.id)
@@ -382,7 +388,7 @@ export function ImportReviewPresentation({
   }, [model, expandedRecord, preserveSourceReview]);
   useEffect(() => {
     if (model?.contextKey) {
-      setSelected(new Set());
+      approvalSelection.clearSelected();
       setSheet(null);
       setExpandedRecord(null);
     }
@@ -437,7 +443,7 @@ export function ImportReviewPresentation({
     setKind(next.kind);
     setQuery(next.query);
     setEditedOnly(next.editedOnly);
-    setSelected(new Set());
+    approvalSelection.clearSelected();
     sourceSelection.files.forEach((file) => file.select(false));
     actions.onFiltersChange?.(next);
   }
@@ -547,11 +553,7 @@ export function ImportReviewPresentation({
             : actions.onResume;
     if (model && action) {
       const context = model.contextKey;
-      const approvals = ids.flatMap((id) =>
-        selectedSnapshots.current.get(id)?.approval
-          ? [selectedSnapshots.current.get(id)!.approval!]
-          : [],
-      );
+      const approvals = approvalSelection.approvals(ids);
       const succeeded =
         status === 'saved'
           ? await (approvals.length ? actions.onSave?.(ids, approvals) : actions.onSave?.(ids))
@@ -562,6 +564,11 @@ export function ImportReviewPresentation({
           : succeeded === true
             ? ids
             : [];
+      const rejectedIds =
+        succeeded && typeof succeeded === 'object' ? succeeded.rejectedIds || [] : [];
+      if (status === 'saved' && rejectedIds.length && presentedContext.current === context) {
+        approvalSelection.reject(rejectedIds);
+      }
       if (status === 'saved' && savedIds.length && presentedContext.current === context) {
         for (const id of savedIds) confirmedSaved.current.add(id);
         if (
@@ -575,27 +582,18 @@ export function ImportReviewPresentation({
         setRecords((current) =>
           current.map((record) => (savedIds.includes(record.id) ? { ...record, status } : record)),
         );
-        setSelected((current) => new Set([...current].filter((id) => !savedIds.includes(id))));
+        approvalSelection.removeSaved(savedIds);
       }
       return;
     }
     setRecords((current) =>
       current.map((record) => (ids.includes(record.id) ? { ...record, status } : record)),
     );
-    setSelected((current) => new Set([...current].filter((id) => !ids.includes(id))));
+    approvalSelection.removeSaved(ids);
   }
 
   function toggle(id: string) {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else {
-        next.add(id);
-        const record = records.find((record) => record.id === id);
-        if (record) selectedSnapshots.current.set(id, record);
-      }
-      return next;
-    });
+    approvalSelection.toggle(id, records);
   }
 
   function confirmReportIdentity(
@@ -798,7 +796,7 @@ export function ImportReviewPresentation({
                 void (async () => {
                   if (beforeReviewChange && !(await beforeReviewChange())) return;
                   setExpandedRecord(null);
-                  setSelected(new Set());
+                  approvalSelection.clearSelected();
                   sourceSelection.files.forEach((file) => file.select(false));
                   setSourceAttention(true);
                 })()
@@ -870,19 +868,7 @@ export function ImportReviewPresentation({
                 onChange={() => {
                   const all = selectedCount !== selectableCount;
                   shownSourceFiles.forEach((file) => file.select(all));
-                  if (all)
-                    for (const record of selectableRecords)
-                      if (!selected.has(record.id))
-                        selectedSnapshots.current.set(record.id, record);
-                  setSelected(
-                    !all
-                      ? new Set(
-                          [...selected].filter(
-                            (id) => !selectableRecords.some((record) => record.id === id),
-                          ),
-                        )
-                      : new Set([...selected, ...selectableRecords.map((record) => record.id)]),
-                  );
+                  approvalSelection.selectShown(selectableRecords, all);
                 }}
               />
               {selectedCount ? `${selectedCount} selected` : 'Select all shown'}
@@ -945,7 +931,8 @@ export function ImportReviewPresentation({
                           )
                         }
                       >
-                        Save {readyClinical.length} records
+                        Save {readyClinical.length}{' '}
+                        {readyClinical.length === 1 ? 'record' : 'records'}
                       </button>
                     )}
                     {readyPeople.length > 0 && (
@@ -1115,6 +1102,9 @@ export function ImportReviewPresentation({
                               {record.label}
                               {record.manuallyEdited && <span>Edited</span>}
                             </strong>
+                            {needsApproval.has(record.id) && (
+                              <small>Review again, then approve.</small>
+                            )}
                             <button
                               className="text-link"
                               type="button"
@@ -1671,7 +1661,6 @@ function ImportSheet({
   const [reviewedBirthDate, setReviewedBirthDate] = useState<string | null>(
     report?.subject.birthDateReview?.suggested || null,
   );
-  const needsPrintedName = !!report?.subject.printedNameRequired;
   const offeredSelfFields: { fullName?: string; birthDate?: string } = report?.subject
     .offeredSelfFields?.birthDate
     ? { birthDate: report.subject.offeredSelfFields.birthDate }
@@ -1719,43 +1708,7 @@ function ImportSheet({
   }, [offeredBirthDate, offeredFullName, selfFieldSelectionScope]);
   const [value, setValue] = useState(record?.value || '');
   const [unit, setUnit] = useState(record?.unit || '');
-  const [source, setSource] = useState(report?.sourceNeedsLabel ? '' : report?.source || '');
-  const [sourceError, setSourceError] = useState('');
-  const [sourceReviewError, setSourceReviewError] = useState('');
   const [sourceBusy, setSourceBusy] = useState(false);
-  const [sourceReview, setSourceReview] = useState<IntakeReportSourceReview | null>(null);
-  const [sourceReviewLoading, setSourceReviewLoading] = useState(false);
-  const sourceReviewGeneration = useRef(0);
-  const sourceSheetGeneration = useRef(0);
-  const reviewSourceAction = useRef(reviewSource);
-  reviewSourceAction.current = reviewSource;
-  const loadSourceReview = async (preserveActionError = false) => {
-    const action = reviewSourceAction.current;
-    if (sheet?.type !== 'source' || !report || !action) return;
-    const generation = ++sourceReviewGeneration.current;
-    setSourceReview(null);
-    if (!preserveActionError) setSourceError('');
-    setSourceReviewError('');
-    setSourceReviewLoading(true);
-    try {
-      const review = await action(report.id);
-      if (generation === sourceReviewGeneration.current) setSourceReview(review);
-    } catch (cause) {
-      if (generation === sourceReviewGeneration.current)
-        setSourceReviewError(
-          cause instanceof Error ? cause.message : 'The affected source records could not load.',
-        );
-    } finally {
-      if (generation === sourceReviewGeneration.current) setSourceReviewLoading(false);
-    }
-  };
-  useEffect(() => {
-    void loadSourceReview();
-    return () => {
-      sourceReviewGeneration.current += 1;
-      sourceSheetGeneration.current += 1;
-    };
-  }, [report?.id, sheet?.type]);
   return (
     <Dialog.Root
       open={Boolean(sheet)}
@@ -1860,326 +1813,32 @@ function ImportSheet({
             />
           )}
           {sheet?.type === 'identity' && report && (
-            <>
-              <Dialog.Description>
-                {report.subject.identityStatus === 'conflict' && report.subject.scopeReady === false
-                  ? 'Processing could not establish a consistent report identity. Editing a result cannot resolve this issue, and these records cannot be approved yet.'
-                  : report.subject.confirmed
-                    ? 'Review who this report belongs to. Accepted records keep their existing attribution.'
-                    : 'Choose yourself or another person for the records in this report. Clinical results remain in review.'}
-              </Dialog.Description>
-              <div className="import-sheet-card import-context-card">
-                <strong>
-                  {report.subject.identityStatus === 'missing_warning'
-                    ? 'Identity is not printed clearly in this report.'
-                    : report.subject.identityStatus === 'conflict'
-                      ? report.subject.scopeReady === false
-                        ? 'Report identity could not be established.'
-                        : 'Choose who this report belongs to.'
-                      : 'Report subject'}
-                </strong>
-                <span>
-                  {report.subject.evidenceText
-                    ? `The report identifies “${report.subject.evidenceText}”.`
-                    : 'Check the retained report before confirming identity.'}
-                </span>
-                {report.subject.identityMessage &&
-                  !report.subject.questions?.some(
-                    (question) => question.prompt === report.subject.identityMessage,
-                  ) && <span>{report.subject.identityMessage}</span>}
-                <ImportIdentityWarnings warnings={report.subject.warnings} />
-                {report.subject.scopeError && <span role="alert">{report.subject.scopeError}</span>}
-                {report.subject.conflicts?.map((conflict) => (
-                  <span key={`${conflict.field}:${conflict.evidencedValue}`}>
-                    {conflict.field === 'fullName' ? 'Full name' : 'Date of birth'}: Self has{' '}
-                    {conflict.selfValue || 'no value'}; report evidence has{' '}
-                    {conflict.evidencedValue || 'different retained claims'}.
-                  </span>
-                ))}
-                {report.subject.scopeReady === false &&
-                  !report.subject.scopeError &&
-                  !report.subject.identityStatus && (
-                    <span>Checking retained identity evidence…</span>
-                  )}
-                {!report.subject.confirmed && report.subject.targetCount !== undefined && (
-                  <span>
-                    This applies to {report.subject.targetCount}{' '}
-                    {report.subject.targetCount === 1 ? 'record' : 'records'} in this report.
-                  </span>
-                )}
-                {report.subject.questions?.map((question) => (
-                  <span key={`${question.prompt}:${question.textAnchor || ''}`}>
-                    <span>{question.prompt}</span>
-                    {question.textAnchor && <q>{question.textAnchor}</q>}
-                  </span>
-                ))}
-              </div>
-              {needsPrintedName && (
-                <ImportPrintedName
-                  value={selectedPrintedName}
-                  subjectText={report.subject.evidenceText || ''}
-                  onChange={setSelectedPrintedName}
-                  disabled={busy}
-                />
-              )}
-              {report.subject.birthDateReview && (
-                <ImportBirthDateReview
-                  review={report.subject.birthDateReview}
-                  value={reviewedBirthDate}
-                  onChange={setReviewedBirthDate}
-                  disabled={busy}
-                />
-              )}
-              <ImportPersonChoice
-                selfNames={report.subject.selfNames}
-                selfDisabled={report.subject.selfBirthDateConflict}
-                birthDate={reviewedBirthDate || report.subject.birthDate}
-                people={report.subject.people}
-                peopleTruncated={report.subject.peopleTruncated}
-                assignedPerson={report.subject.assignedPerson}
-                printedName={report.subject.printedName || selectedPrintedName}
-                selection={personSelection}
-                onChange={setPersonSelection}
-                disabled={busy || report.subject.scopeReady === false}
-              />
-              {report.subject.reviewUrl && (
-                <a className="text-link" href={`#${report.subject.reviewUrl}`}>
-                  Review retained report evidence <ArrowRight size={15} aria-hidden="true" />
-                </a>
-              )}
-              {!personSelection && !!Object.keys(offeredSelfFields).length && (
-                <fieldset className="import-fill-name">
-                  <legend>Fill selected blank Self details in this same action</legend>
-                  <p className="import-sheet-note">
-                    These exact values came from retained report evidence. Existing Self fields are
-                    never overwritten.
-                  </p>
-                  {(['fullName', 'birthDate'] as const).flatMap((field) => {
-                    const value = offeredSelfFields[field];
-                    if (!value) return [];
-                    return [
-                      <label className="import-check-label" key={field}>
-                        <input
-                          type="checkbox"
-                          checked={selectedSelfFields.has(field)}
-                          onChange={(event) =>
-                            setSelectedSelfFields((current) => {
-                              const next = new Set(current);
-                              if (event.target.checked) next.add(field);
-                              else next.delete(field);
-                              return next;
-                            })
-                          }
-                        />
-                        {field === 'fullName' ? 'Full name' : 'Date of birth'}:{' '}
-                        <strong>{value}</strong>
-                      </label>,
-                    ];
-                  })}
-                  <small>
-                    Self display name stays “
-                    {report.subject.selfDisplayName || report.subject.label}”.
-                  </small>
-                </fieldset>
-              )}
-              <div className="import-sheet-actions">
-                <button className="button secondary" type="button" onClick={close}>
-                  Cancel
-                </button>
-                <button
-                  className="button primary"
-                  type="button"
-                  disabled={
-                    busy ||
-                    report.subject.scopeReady === false ||
-                    reviewedBirthDate === '' ||
-                    report.subject.identityStatus === 'missing_warning' ||
-                    (!personSelection && !!report.subject.selfBirthDateConflict) ||
-                    !personSelectionReady(personSelection, report.subject.selfNames) ||
-                    (needsPrintedName &&
-                      !printedNameReady(selectedPrintedName, report.subject.evidenceText || ''))
-                  }
-                  onClick={() => {
-                    if (
-                      report.subject.confirmed &&
-                      !report.subject.nameOnlyMatch &&
-                      !needsPrintedName &&
-                      (!personSelection
-                        ? !report.subject.assignedPerson ||
-                          report.subject.assignedPerson.personId === 'patient'
-                        : 'noteId' in personSelection &&
-                          personSelection.noteId === report.subject.assignedPerson?.noteId) &&
-                      (!offeredBirthDate || !selectedSelfFields.has('birthDate'))
-                    ) {
-                      close();
-                      return;
-                    }
-                    confirmIdentity(
-                      report.id,
-                      personSelection
-                        ? {}
-                        : Object.fromEntries(
-                            [...selectedSelfFields].flatMap((field) => {
-                              const value = offeredSelfFields[field];
-                              return value ? [[field, value]] : [];
-                            }),
-                          ),
-                      personSelection,
-                      needsPrintedName ? selectedPrintedName.trim() : undefined,
-                      report.subject.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
-                    );
-                  }}
-                >
-                  {report.subject.confirmed &&
-                  !report.subject.nameOnlyMatch &&
-                  !needsPrintedName &&
-                  (!personSelection
-                    ? !report.subject.assignedPerson ||
-                      report.subject.assignedPerson.personId === 'patient'
-                    : 'noteId' in personSelection &&
-                      personSelection.noteId === report.subject.assignedPerson?.noteId) &&
-                  (!offeredBirthDate || !selectedSelfFields.has('birthDate'))
-                    ? 'Done'
-                    : personSelection
-                      ? 'Confirm person'
-                      : report.subject.confirmed
-                        ? 'Save changes'
-                        : 'This is me'}
-                </button>
-              </div>
-            </>
+            <ImportIdentitySheetControls
+              report={report}
+              busy={busy}
+              close={close}
+              confirmIdentity={confirmIdentity}
+              personSelection={personSelection}
+              setPersonSelection={setPersonSelection}
+              selectedPrintedName={selectedPrintedName}
+              setSelectedPrintedName={setSelectedPrintedName}
+              reviewedBirthDate={reviewedBirthDate}
+              setReviewedBirthDate={setReviewedBirthDate}
+              selectedSelfFields={selectedSelfFields}
+              setSelectedSelfFields={setSelectedSelfFields}
+            />
           )}
-          {sheet?.type === 'source' && report && (
-            <>
-              <Dialog.Description>
-                Use this label for the report and eligible results you save. Original issuer and
-                upload history stay unchanged.
-              </Dialog.Description>
-              {report.sourceEvidence?.contentUrl && (
-                <a
-                  className="button secondary import-open-original"
-                  href={report.sourceEvidence.contentUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  Review {report.sourceEvidence.label} <ArrowUpRight size={12} />
-                </a>
-              )}
-              <label>
-                Source
-                <input
-                  value={source}
-                  placeholder="Clinic, lab, or archive name"
-                  onChange={(event) => setSource(event.target.value)}
-                />
-              </label>
-              <p className="import-sheet-note">
-                This source is used when you save records. Change it here if needed.
-              </p>
-              {report.sourceCoverage && (
-                <p className="import-sheet-note">
-                  Current {report.sourceCoverage.current.covered}/
-                  {report.sourceCoverage.current.total} source-labeled · Saved{' '}
-                  {report.sourceCoverage.saved.covered}/{report.sourceCoverage.saved.total}
-                </p>
-              )}
-              {sourceReviewLoading && (
-                <p className="import-sheet-note">Loading affected records…</p>
-              )}
-              {sourceReview && (
-                <div className="import-sheet-card import-context-card">
-                  <strong>
-                    {sourceReview.targets.length}{' '}
-                    {sourceReview.targets.length === 1 ? 'record' : 'records'} will use “
-                    {source.trim() || 'this source'}”
-                  </strong>
-                  <span>
-                    {sourceReview.coverage.covered} already have a reviewed source;{' '}
-                    {sourceReview.coverage.uncovered} do not.
-                  </span>
-                  {!!sourceReview.sourceEvidence.length && (
-                    <span>Retained source evidence: {sourceReview.sourceEvidence.join(', ')}.</span>
-                  )}
-                  {sourceReview.warning && <span role="alert">{sourceReview.warning}</span>}
-                  {source.trim() &&
-                    sourceReview.sourceEvidence.some((value) => value !== source.trim()) && (
-                      <span role="alert">
-                        “{source.trim()}” differs from retained source evidence. Check the original
-                        before confirming this one label.
-                      </span>
-                    )}
-                  <ul>
-                    {sourceReview.targets.map((target) => (
-                      <li key={target.id}>
-                        {target.title}
-                        {target.date ? ` · ${target.date}` : ''} · {target.occurrence.locator}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {sourceError && <p role="alert">{sourceError}</p>}
-              {sourceReviewError && <p role="alert">{sourceReviewError}</p>}
-              <div className="import-sheet-actions">
-                <button className="button secondary" type="button" onClick={close}>
-                  Cancel
-                </button>
-                <button
-                  className="button primary"
-                  type="button"
-                  disabled={
-                    sourceBusy ||
-                    sourceReviewLoading ||
-                    (!sourceReview && !!reviewSource
-                      ? !(sourceError || sourceReviewError)
-                      : !source.trim())
-                  }
-                  onClick={() => {
-                    if (!sourceReview && reviewSource && (sourceError || sourceReviewError)) {
-                      void loadSourceReview(true);
-                      return;
-                    }
-                    const submittedGeneration = sourceSheetGeneration.current;
-                    setSourceBusy(true);
-                    setSourceError('');
-                    setSourceReviewError('');
-                    void changeSource(report.id, source.trim(), sourceReview || undefined)
-                      .then(async (message) => {
-                        if (submittedGeneration !== sourceSheetGeneration.current) return;
-                        if (!message) {
-                          close();
-                          return;
-                        }
-                        setSourceError(message);
-                        await loadSourceReview(true);
-                      })
-                      .catch(async (cause) => {
-                        if (submittedGeneration !== sourceSheetGeneration.current) return;
-                        setSourceError(
-                          cause instanceof Error
-                            ? cause.message
-                            : 'The source label could not be applied.',
-                        );
-                        await loadSourceReview(true);
-                      })
-                      .finally(() => {
-                        if (submittedGeneration === sourceSheetGeneration.current)
-                          setSourceBusy(false);
-                      });
-                  }}
-                >
-                  {sourceBusy
-                    ? 'Using source…'
-                    : !sourceReview && reviewSource && (sourceError || sourceReviewError)
-                      ? 'Retry affected records'
-                      : sourceReview
-                        ? `Use ${source.trim()} for ${sourceReview.targets.length} ${
-                            sourceReview.targets.length === 1 ? 'record' : 'records'
-                          }`
-                        : 'Use source'}
-                </button>
-              </div>
-            </>
+          {(sheet?.type === 'source' || sheet?.type === 'identity') && report && (
+            <ImportSourceSheetControls
+              key={report.id}
+              active={sheet.type === 'source'}
+              report={report}
+              reviewSource={reviewSource}
+              changeSource={changeSource}
+              close={close}
+              sourceBusy={sourceBusy}
+              setSourceBusy={setSourceBusy}
+            />
           )}
           {sheet?.type === 'edit' && record && (
             <>

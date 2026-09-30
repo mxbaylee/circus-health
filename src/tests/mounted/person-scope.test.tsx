@@ -1,4 +1,5 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { createMemoryRouter, RouterProvider, Outlet } from 'react-router-dom';
 import { beforeEach, it, expect, vi } from 'vitest';
 import {
@@ -11,7 +12,12 @@ import { selectProfile } from '../../app/data/profile';
 import { personSelectionQuery } from '../../shared/person-scope';
 function Content() {
   const scope = usePersonScope()!;
-  return <div data-testid="content">{scope.personId}</div>;
+  return (
+    <div data-testid="content">
+      {scope.personId}
+      <button onClick={scope.reload}>Refresh person</button>
+    </div>
+  );
 }
 function mount(route: string) {
   const router = createMemoryRouter(
@@ -122,4 +128,40 @@ it('does not flash an ownership check while navigating between default Self list
   expect(screen.queryByRole('status')).not.toBeInTheDocument();
   expect(mutations.some((text) => text.includes('Checking record owner'))).toBe(false);
   expect(fetch).not.toHaveBeenCalled();
+});
+
+// A caregiver's keyboard position must survive a same-owner refresh; see
+// docs/import/review-reliability.md. A different profile still hides stale data.
+it('keeps the focused control visible during a same-owner refresh and holds a new profile', async () => {
+  let delay = false;
+  const pending: Array<() => void> = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const data = String(input).includes('record-owner')
+        ? { personId: 'cookie' }
+        : { name: 'Cookie Doe', noteId: 'cookie-note' };
+      if (!delay) return response(data);
+      return new Promise<Response>((resolve) => pending.push(() => resolve(response(data))));
+    }),
+  );
+  mount('/notes?id=note-cookie&personId=cookie');
+  await screen.findByText('Cookie Doe', { selector: 'strong' });
+  const button = screen.getByRole('button', { name: 'Refresh person' });
+  delay = true;
+  await userEvent.setup().click(button);
+  await waitFor(() => expect(pending).toHaveLength(2));
+  expect(button).toHaveFocus();
+  expect(button).toBeVisible();
+  expect(screen.queryByText('Opening person’s records…')).not.toBeInTheDocument();
+  await act(async () => pending.splice(0).forEach((finish) => finish()));
+  expect(button).toHaveFocus();
+  expect(button).toBeVisible();
+  await act(async () =>
+    selectProfile({ id: 'fictional-second', name: 'Other fictional profile', placebo: true }),
+  );
+  expect(screen.getByTestId('content')).not.toBeVisible();
+  await act(async () => pending.splice(0).forEach((finish) => finish()));
+  await act(async () => pending.splice(0).forEach((finish) => finish()));
+  expect(await screen.findByText('Cookie Doe', { selector: 'strong' })).toBeVisible();
 });

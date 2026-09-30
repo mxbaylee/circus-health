@@ -197,3 +197,22 @@ it('binds a coalesced correction reason to its exact patch, retries unchanged, t
   await act(() => view.result.current.flush());
   expect(requests[3].correctionReason).toBeUndefined();
 });
+
+it('keeps an unsent correction reason visible after another field is edited', () => {
+  const view = renderHook(() => useReviewDrafts(profile.id, vi.fn()));
+  const initial = review(7, '42');
+  const row = initial.records[0]!;
+  act(() => {
+    view.result.current.hydrate(initial);
+    view.result.current.update(initial, row, {
+      correctionReason: 'Read the fictional source digit',
+    });
+    const local = view.result.current.current(initial, row);
+    view.result.current.update(initial, row, {
+      decision: { ...local.decision, mapping: { ...local.decision.mapping, unit: 'mg' } },
+    });
+  });
+  expect(view.result.current.current(initial, row).correctionReason).toBe(
+    'Read the fictional source digit',
+  );
+});

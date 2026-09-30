@@ -10,13 +10,15 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
 import {
   acceptIntakeReportSelection,
+  acceptIntakeReportSelectionAsync,
   getIntakeReportAcceptance,
 } from '../intake-report-acceptance.ts';
 import { createBackup } from '../recovery.ts';
 import { rebuildProfile } from '../portable.ts';
-import { attachRecordDurability } from '../record-versions.ts';
+import { attachRecordDurability, rebuildRecordDatabase } from '../record-versions.ts';
 import type { RecordStorage } from '../record-versions.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
+import { createNote, getNote, saveNote } from '../notes.ts';
 import { vaultFixture, newProfile } from './helpers/vault-fixture.ts';
 import type {
   HealthRecordEnvelope,
@@ -463,11 +465,248 @@ test('partial v1 saves independent valid approvals and retains stale, blocked an
     result.receipt.items.map((i) => i.status),
     ['saved', 'saved', 'needs_review', 'needs_review', 'needs_review'],
   );
+  assert.equal(result.receipt.items[2]?.label, 'stale');
+  assert.equal(result.receipt.items[2]?.kind, 'observation');
+  assert.equal(result.receipt.items[2]?.personId, 'patient');
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
   assert.deepEqual(accept(f, input).receipt, result.receipt);
   const changed = structuredClone(input);
   changed.blocks[0]!.selections[0]!.mapping.unit = 'g';
   assert.throws(() => accept(f, changed), { code: 'OPERATION_CONFLICT' });
+});
+test('partial approval reviews each intake once and journals proportional work', async (t) => {
+  const metrics: Array<{
+    n: number;
+    reviews: number;
+    writes: number;
+    bytes: number;
+    rows: number;
+  }> = [];
+  for (const n of [10, 50, 200]) {
+    await t.test(`N=${n}`, (scope) => {
+      const f = fixture(scope);
+      const item = upload(
+        f,
+        Array.from({ length: n }, (_, index) => envelope(`fictional-scale-${index}`)),
+      );
+      const input = partial(f, block(f, item.id));
+      const objects = new Map<string, Buffer>();
+      let writes = 0,
+        bytes = 0,
+        reviews = 0;
+      const storage: RecordStorage = {
+        read: (name) => objects.get(name) || null,
+        writeImmutable(name, value) {
+          objects.set(name, Buffer.from(value));
+          writes++;
+          bytes += value.length;
+        },
+        publishHead(value) {
+          objects.set('head', Buffer.from(value));
+        },
+      };
+      attachRecordDurability(f.db, { profileId: f.profileId, storage });
+      writes = 0;
+      bytes = 0;
+      const before = Number(f.db.prepare('SELECT count(*) n FROM __record_versions').get()!.n);
+      const restore = intake.observeIntakeReviewCalls(() => reviews++);
+      let receipt;
+      try {
+        receipt = accept(f, input).receipt;
+      } finally {
+        restore();
+      }
+      const rows =
+        Number(f.db.prepare('SELECT count(*) n FROM __record_versions').get()!.n) - before;
+      assert.equal(receipt.acceptedCount, n);
+      assert.equal(reviews, 1);
+      metrics.push({ n, reviews, writes, bytes, rows });
+    });
+  }
+  const small = metrics.find((item) => item.n === 50)!;
+  const large = metrics.find((item) => item.n === 200)!;
+  // Journal growth follows changed selections; no cumulative copies of earlier receipts.
+  // See docs/data/record-version-storage.md and docs/import/review-reliability.md.
+  assert.ok(large.writes <= 4 * small.writes + 4, JSON.stringify(metrics));
+  assert.ok(large.rows <= 4 * small.rows + 12, JSON.stringify(metrics));
+  assert.ok(large.bytes <= 4 * small.bytes + 32_768, JSON.stringify(metrics));
+  t.diagnostic(`partial acceptance work counts: ${JSON.stringify(metrics)}`);
+});
+test('a 500-item partial save yields to a read and never reconciles live missing items', async (t) => {
+  const f = fixture(t);
+  const item = upload(
+    f,
+    Array.from({ length: 500 }, (_, index) => envelope(`fictional-yield-${index}`)),
+  );
+  const input = partial(f, block(f, item.id));
+  let finished = false;
+  const saving = acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input).then(
+    (result) => {
+      finished = true;
+      return result;
+    },
+  );
+  // The first bounded transaction has returned to the event loop. A parallel
+  // feed read can answer before the final result, without treating live work as interrupted.
+  await Promise.resolve();
+  const read = intake.getIntake(f.db, f.root, f.profileId, item.id);
+  assert.equal(read.id, item.id);
+  assert.equal(finished, false);
+  assert.throws(() => getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId), {
+    code: 'REPORT_ACCEPTANCE_IN_PROGRESS',
+  });
+  const result = await saving;
+  assert.equal(result.receipt.acceptedCount, 500);
+  assert.equal(
+    getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId).receipt.acceptedCount,
+    500,
+  );
+});
+test('a source change during a yielded save rejects remaining old approvals', async (t) => {
+  const f = fixture(t);
+  const item = upload(
+    f,
+    Array.from({ length: 500 }, (_, index) => envelope(`fictional-changing-${index}`)),
+  );
+  const input = partial(f, block(f, item.id));
+  const saving = acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input);
+  await Promise.resolve();
+  disposition(f, item, 400, 'review_later');
+  const result = (await saving).receipt;
+  assert.equal(result.atomic, false);
+  if (result.atomic) throw Error('Expected partial receipt');
+  assert.equal(result.acceptedCount, 200);
+  assert.deepEqual(
+    new Set(result.items.slice(200).map((entry) => entry.status)),
+    new Set(['needs_review']),
+  );
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
+});
+test('a new same-named person during a yielded save invalidates cached identity review', async (t) => {
+  const f = fixture(t);
+  const self = getNote(f.db, 'person-note:self');
+  saveNote(f.db, self.id, {
+    version: self.version,
+    person: { ...self.person, fullName: 'Fictional Iris Meadow' },
+  });
+  const values = Array.from({ length: 201 }, (_, index) => {
+    const value = envelope(`fictional-identity-yield-${index}`);
+    if (index === 200)
+      value.report!.subject = { locator: 'page 1 patient', text: 'Fictional Iris Meadow' };
+    return value;
+  });
+  const item = upload(f, values);
+  assert.equal(
+    intake.reviewIntake(f.db, f.root, f.profileId, item.id).records[200]?.identityReview
+      ?.evidencedIdentity.fullName,
+    'Fictional Iris Meadow',
+  );
+  const input = partial(f, block(f, item.id));
+  const saving = acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input);
+  await Promise.resolve();
+  createNote(f.db, {
+    kind: 'person',
+    title: 'Fictional Iris Meadow',
+    person: { fullName: 'Fictional Iris Meadow' },
+  });
+  const receipt = (await saving).receipt;
+  if (receipt.atomic) throw Error('Expected partial receipt');
+  assert.equal(receipt.acceptedCount, 200);
+  assert.deepEqual(
+    new Set(receipt.items.slice(200).map((entry) => entry.status)),
+    new Set(['needs_review']),
+  );
+  assert.equal(receipt.items[200]?.reasonCode, 'IDENTITY_REVIEW_CHANGED');
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
+});
+test('locking the profile between bounded commits stops the save and recovers committed children', async (t) => {
+  const f = vaultFixture(t);
+  const { profile, recoveryKit } = await newProfile(f.manager, 'Fictional yielded lock');
+  const opened = f.manager.opened.get(profile.id)!;
+  const local = { db: opened.db, root: opened.root, profileId: profile.id };
+  const item = upload(
+    local,
+    Array.from({ length: 201 }, (_, index) => envelope(`fictional-lock-${index}`)),
+  );
+  const input = partial(local, block(local, item.id));
+  const saving = acceptIntakeReportSelectionAsync(local.db, local.root, local.profileId, input);
+  await Promise.resolve();
+  f.manager.lock(profile.id);
+  await assert.rejects(saving);
+  await f.manager.unlock(profile.id, recoveryKit);
+  const restored = f.manager.opened.get(profile.id)!;
+  const recovered = getIntakeReportAcceptance(
+    restored.db,
+    restored.root,
+    profile.id,
+    input.operationId,
+  ).receipt;
+  if (recovered.atomic) throw Error('Expected partial receipt');
+  assert.equal(recovered.acceptedCount, 200);
+  assert.equal(recovered.items[200]?.status, 'not_attempted');
+  assert.equal(restored.db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
+});
+test('one stale approval in a bounded batch leaves every independent sibling saved', (t) => {
+  const f = fixture(t);
+  const item = upload(
+    f,
+    Array.from({ length: 200 }, (_, index) => envelope(`fictional-batch-${index}`)),
+  );
+  const input = partial(f, block(f, item.id));
+  input.blocks[0]!.selections[73]!.selectionReviewToken = 'fictional-stale-token';
+  const result = accept(f, input).receipt;
+  assert.equal(result.atomic, false);
+  if (result.atomic) throw Error('Expected partial receipt');
+  assert.equal(result.acceptedCount, 199);
+  assert.equal(result.items[73]?.status, 'needs_review');
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 199);
+});
+test('a lost acknowledgement for 200 batched approvals rebuilds once under the original operation', async (t) => {
+  const f = fixture(t);
+  const item = upload(
+    f,
+    Array.from({ length: 200 }, (_, index) => envelope(`fictional-rebuild-${index}`)),
+  );
+  const input = partial(f, block(f, item.id));
+  const objects = new Map<string, Buffer>();
+  let publications = 0;
+  let failAt = Infinity;
+  const storage: RecordStorage = {
+    read: (name) => objects.get(name) || null,
+    writeImmutable(name, bytes) {
+      objects.set(name, Buffer.from(bytes));
+    },
+    publishHead(bytes) {
+      objects.set('head', Buffer.from(bytes));
+      if (++publications === failAt) throw Error('Fictional lost batch acknowledgement');
+    },
+  };
+  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  failAt = publications + 2; // manifest, then one bounded clinical transaction
+  assert.throws(() => accept(f, input), { code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED' });
+  failAt = Infinity;
+  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  const recovered = getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId);
+  assert.equal(recovered.receipt.acceptedCount, 200);
+  assert.equal(accept(f, input).receipt.acceptedCount, 200);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
+  const target = join(f.root, 'partial-200-rebuilt.sqlite');
+  rebuildRecordDatabase(target, { profileId: f.profileId, storage });
+  const db = openDatabase(target, f.profileId);
+  attachRecordDurability(db, { profileId: f.profileId, storage });
+  try {
+    assert.equal(
+      getIntakeReportAcceptance(db, f.root, f.profileId, input.operationId).receipt.acceptedCount,
+      200,
+    );
+    assert.equal(
+      acceptIntakeReportSelection(db, f.root, f.profileId, input).receipt.acceptedCount,
+      200,
+    );
+    assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
+  } finally {
+    db.close();
+  }
 });
 test('partial v1 pins exact records while unrelated intake changes do not invalidate approvals', (t) => {
   const f = fixture(t),

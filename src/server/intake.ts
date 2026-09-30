@@ -1296,6 +1296,15 @@ export function linkIntakeConversion(
   });
   flushIntake(db, root, profileId);
 }
+let reviewCallObserver: (() => void) | null = null;
+/** Scoped work counter for regression tests; counts reviews without timing model or host work. */
+export function observeIntakeReviewCalls(observer: (() => void) | null) {
+  const previous = reviewCallObserver;
+  reviewCallObserver = observer;
+  return () => {
+    reviewCallObserver = previous;
+  };
+}
 export function reviewIntake(
   db: DatabaseSync,
   root: string,
@@ -1303,6 +1312,7 @@ export function reviewIntake(
   id: string,
   proposalId: string | null = null,
 ): IntakeReview {
+  reviewCallObserver?.();
   owner(db, profileId);
   const file = row(db, id),
     d = details(file);
@@ -1549,10 +1559,11 @@ export function prepareIntakeImport(
   profileId: string,
   id: string,
   input: ImportIntakeInput,
+  reviewed?: IntakeReview,
 ) {
   return measureImportPhase(
     'review_acceptance_validation',
-    () => prepareIntakeImportInternal(db, root, profileId, id, input),
+    () => prepareIntakeImportInternal(db, root, profileId, id, input, reviewed),
     {},
     { profileId, importId: id },
   );
@@ -1563,6 +1574,7 @@ function prepareIntakeImportInternal(
   profileId: string,
   id: string,
   input: ImportIntakeInput,
+  reviewed?: IntakeReview,
 ) {
   owner(db, profileId);
   const file = row(db, id),
@@ -1603,7 +1615,9 @@ function prepareIntakeImportInternal(
       'INVALID_JSONL',
       'The original needs conversion before it can be imported',
     );
-  const clinicalReview = input.reviewToken ? reviewIntake(db, root, profileId, id, selected) : null;
+  const clinicalReview = input.reviewToken
+    ? (reviewed ?? reviewIntake(db, root, profileId, id, selected))
+    : null;
   if (clinicalReview && clinicalReview.reviewToken !== input.reviewToken)
     throw new HttpError(
       409,

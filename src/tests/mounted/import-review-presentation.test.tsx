@@ -2311,17 +2311,94 @@ it('disambiguates duplicate people and disables an existing person whose DOB dif
   expect(screen.getByRole('option', { name: /Rowan Meadow.*1950-01-05.*Parent/ })).toBeDisabled();
 });
 
-it('removes only confirmed saved selections after an itemized partial result', async () => {
+it('clears a failed approval so the current record can be approved again', async () => {
   const original = sourceModel();
   original.records = original.records.flatMap((row) => [
     { ...row, id: 'saved-row', eligible: true },
     { ...row, id: 'retained-row', label: 'Retained fictional record', eligible: true },
   ]);
-  const save = vi.fn().mockResolvedValue({ savedIds: ['saved-row'] });
+  const save = vi
+    .fn()
+    .mockResolvedValue({ savedIds: ['saved-row'], rejectedIds: ['retained-row'] });
   render(<ImportReviewPresentation model={original} actions={{ onSave: save }} />);
   await userEvent.click(screen.getByRole('checkbox', { name: /Select all shown/ }));
   await userEvent.click(screen.getByRole('button', { name: /Save 2 records/ }));
   await waitFor(() => expect(save).toHaveBeenCalledWith(['saved-row', 'retained-row']));
-  expect(screen.getByRole('checkbox', { name: /Retained fictional record/ })).toBeChecked();
-  expect(screen.getByText('1 selected')).toBeVisible();
+  expect(screen.getByRole('checkbox', { name: /Retained fictional record/ })).not.toBeChecked();
+  expect(screen.getByText('Review again, then approve.')).toBeVisible();
+});
+
+it('keeps selection through an unrelated block refresh but revokes it when its exact token changes', async () => {
+  const current = sourceModel();
+  current.records = [
+    {
+      ...current.records[0]!,
+      eligible: true,
+      approval: {
+        intakeId: 'fictional-intake',
+        proposalId: null,
+        intakeVersion: 1,
+        reviewToken: 'block-1',
+        selections: [
+          {
+            recordId: 'fictional-result',
+            candidateId: 'fictional-candidate',
+            candidateVersionId: 'fictional-version',
+            selectionReviewToken: 'exact-1',
+            mapping: { kind: 'observation' },
+          },
+        ],
+      },
+    },
+  ];
+  const view = render(<ImportReviewPresentation model={current} actions={{ onSave: vi.fn() }} />);
+  await userEvent.click(
+    screen.getByRole('checkbox', { name: /Select Fictional eyewear prescription/ }),
+  );
+  const unrelated = structuredClone(current);
+  unrelated.records[0]!.approval!.reviewToken = 'block-2';
+  unrelated.records[0]!.approval!.intakeVersion = 2;
+  view.rerender(<ImportReviewPresentation model={unrelated} actions={{ onSave: vi.fn() }} />);
+  expect(
+    screen.getByRole('checkbox', { name: /Select Fictional eyewear prescription/ }),
+  ).toBeChecked();
+  const changed = structuredClone(unrelated);
+  changed.records[0]!.approval!.selections[0]!.selectionReviewToken = 'exact-2';
+  view.rerender(<ImportReviewPresentation model={changed} actions={{ onSave: vi.fn() }} />);
+  await waitFor(() =>
+    expect(
+      screen.getByRole('checkbox', { name: /Select Fictional eyewear prescription/ }),
+    ).not.toBeChecked(),
+  );
+  expect(screen.getByText('Review again, then approve.')).toBeVisible();
+  expect(screen.getByText(/1 selected item changed while you were reviewing/)).toBeVisible();
+});
+
+it('selects newly paginated rows only after they are shown and scopes approval to the current filter', async () => {
+  const first = sourceModel();
+  first.records = [{ ...first.records[0]!, id: 'fictional-page-one', eligible: true }];
+  const save = vi.fn().mockResolvedValue({ savedIds: ['fictional-page-one'] });
+  const view = render(<ImportReviewPresentation model={first} actions={{ onSave: save }} />);
+  await userEvent.click(screen.getByRole('checkbox', { name: /Select all shown/ }));
+  expect(screen.getByRole('checkbox', { name: /fictional eyewear prescription/i })).toBeChecked();
+  const second = structuredClone(first);
+  second.records.push({
+    ...first.records[0]!,
+    id: 'fictional-page-two',
+    label: 'Fictional second result',
+  });
+  view.rerender(<ImportReviewPresentation model={second} actions={{ onSave: save }} />);
+  expect(screen.getByRole('checkbox', { name: /Fictional second result/ })).not.toBeChecked();
+  await userEvent.click(screen.getByRole('checkbox', { name: '1 selected' }));
+  expect(screen.getByRole('checkbox', { name: /Fictional second result/ })).toBeChecked();
+  const filtered = {
+    ...second,
+    contextKey: 'fictional-profile:filtered',
+    filters: { ...second.filters!, query: 'second' },
+    records: [second.records[1]!],
+  };
+  view.rerender(<ImportReviewPresentation model={filtered} actions={{ onSave: save }} />);
+  await waitFor(() =>
+    expect(screen.getByRole('checkbox', { name: /Fictional second result/ })).not.toBeChecked(),
+  );
 });

@@ -88,6 +88,17 @@ function Harness({
 }
 
 describe('document date question rollup', () => {
+  it('reaches the native retained-question history control by keyboard', async () => {
+    const user = userEvent.setup();
+    render(<Harness onSave={() => {}} />);
+    const history = screen.getByText('3 related questions');
+    for (let step = 0; step < 20 && document.activeElement !== history; step++) await user.tab();
+    expect(history).toHaveFocus();
+    expect(history.tagName).toBe('SUMMARY');
+    await user.click(history);
+    expect(history.parentElement).toHaveAttribute('open');
+    expect(within(history.parentElement!).getAllByRole('listitem')).toHaveLength(3);
+  });
   it.each([
     ['July 12, 2026', 'corrected', '2026-07-12'],
     ['Keep unconfirmed', 'unknown', ''],

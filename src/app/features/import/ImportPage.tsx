@@ -1,5 +1,8 @@
-import { ImportAcceptanceOutcomes, acceptanceSummary } from './ImportAcceptanceOutcomes';
-import type { IntakeReportAcceptanceReceipt } from '../../../shared/intake';
+import { ImportAcceptanceOutcomes } from './ImportAcceptanceOutcomes';
+import type {
+  IntakePartialAcceptanceReceipt,
+  IntakeReportAcceptanceReceipt,
+} from '../../../shared/intake';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { ImportPersonSelection } from './ImportPersonChoice';
 import type { ManualSourceRecordResult } from '../../../shared/intake-manual-source-record';
@@ -56,6 +59,14 @@ import {
 import { ImportDetailReview, type ImportDetailSelection } from './ImportDetailReview';
 import { ImportSourceTextBrowser } from './ImportSourceTextBrowser';
 import { ImportSaveStatus } from './ImportSaveStatus';
+import {
+  combinePartialReceipts,
+  confirmedSelectionIds,
+  planPartialSave,
+  rejectedSelectionIds,
+  stoppedChildSelections,
+  type UnsentSelection,
+} from './partial-save-plan';
 import { possibleSavedOverlapCount } from './possible-overlaps';
 import {
   acceptedRecordsForScope,
@@ -473,15 +484,27 @@ export function ImportPage() {
   const [acceptanceReceipt, setAcceptanceReceipt] = useState<IntakeReportAcceptanceReceipt | null>(
     null,
   );
-  useEffect(() => setAcceptanceReceipt(null), [profile?.id]);
+  const [unsentSelections, setUnsentSelections] = useState<UnsentSelection[]>([]);
+  const savingChunks = useRef(false);
+  const confirmedPartialReceipts = useRef<IntakePartialAcceptanceReceipt[]>([]);
+  useEffect(() => {
+    setAcceptanceReceipt(null);
+    setUnsentSelections([]);
+    confirmedPartialReceipts.current = [];
+  }, [profile?.id]);
   const acceptance = useReportAcceptance(profile?.id || '', (result) => {
-    setBusy(false);
-    setAcceptanceReceipt(result.receipt);
-    setNotice(
-      result.receipt.acceptedCount === result.receipt.selectedCount
-        ? `Imported ${result.receipt.acceptedCount} ${result.receipt.acceptedCount === 1 ? 'record' : 'records'}`
-        : acceptanceSummary(result.receipt),
-    );
+    if (!savingChunks.current) setBusy(false);
+    if (result.receipt.atomic) setAcceptanceReceipt(result.receipt);
+    else {
+      confirmedPartialReceipts.current = [
+        ...confirmedPartialReceipts.current.filter(
+          (receipt) => receipt.operationId !== result.receipt.operationId,
+        ),
+        result.receipt,
+      ];
+      setAcceptanceReceipt(combinePartialReceipts(confirmedPartialReceipts.current));
+    }
+    setNotice('');
     feed.reload();
   });
 
@@ -1351,6 +1374,7 @@ export function ImportPage() {
 
   async function save(ids: string[], approvals?: IntakeReportAcceptanceRequest['blocks']) {
     const savedIds: string[] = [];
+    const rejectedIds: string[] = [];
     await perform(
       async ({ prefix, current, operationId, request: requestApi }) => {
         setOperationStatus(
@@ -1403,77 +1427,34 @@ export function ImportPage() {
           feed.reload();
         }
         if (clinical.length) {
+          savingChunks.current = true;
+          confirmedPartialReceipts.current = [];
+          setAcceptanceReceipt(null);
           setOperationStatus(`Checking ${clinical.length} selected clinical records…`);
-          const grouped = new Map<string, IntakeReportAcceptanceRequest['blocks'][number]>();
-          for (const block of displayedFeed?.blocks || []) {
-            const selections = block.records.flatMap((record) => {
-              if (
-                !clinical.includes(record.feedKey) ||
-                !record.selectable ||
-                !record.candidateId ||
-                !record.candidateVersionId
-              )
-                return [];
-              const decision = initialDraft(record).decision;
-              return [
-                {
-                  selectionReviewToken: record.selectionReviewToken,
-                  recordId: record.id,
-                  candidateId: record.candidateId,
-                  candidateVersionId: record.candidateVersionId,
-                  mapping: decision.mapping,
-                  comparisons: decision.comparisons,
-                },
-              ];
-            });
-            if (!selections.length) continue;
-            const key = JSON.stringify([block.intakeId, block.proposalId]);
-            const prior = grouped.get(key);
-            if (prior) {
-              if (
-                prior.intakeVersion !== block.intakeVersion ||
-                prior.reviewToken !== block.reviewToken
-              )
-                throw new Error('These results changed. Reload and review the current versions.');
-              prior.selections.push(...selections);
-            } else
-              grouped.set(key, {
-                intakeId: block.intakeId,
-                proposalId: block.proposalId,
-                intakeVersion: block.intakeVersion,
-                reviewToken: block.reviewToken,
-                selections,
-              });
-          }
-          if (approvals?.length) {
-            grouped.clear();
-            for (const snapshot of approvals) {
-              const key = JSON.stringify([snapshot.intakeId, snapshot.proposalId]);
-              const prior = grouped.get(key);
-              if (prior) prior.selections.push(...snapshot.selections);
-              else grouped.set(key, structuredClone(snapshot));
+          const plan = planPartialSave(clinical, displayedFeed, approvals);
+          setUnsentSelections(plan.unsent);
+          for (const [index, blocks] of plan.chunks.entries()) {
+            if (!current()) break;
+            const request: IntakeReportAcceptanceRequest = {
+              mode: 'partial-v1',
+              operationId: crypto.randomUUID(),
+              blocks,
+            };
+            const result = await acceptance.submit(request, operationId);
+            if (!result) {
+              // An uncertain child operation blocks every later child. Its ID remains
+              // available to the reconciliation hook, and no new approval is inferred.
+              setUnsentSelections((prior) => [
+                ...prior,
+                ...stoppedChildSelections(plan.chunks.slice(index + 1)),
+              ]);
+              break;
             }
+            rejectedIds.push(...rejectedSelectionIds(result.receipt));
+            savedIds.push(...confirmedSelectionIds(result.receipt));
+            setOperationStatus(`Checked ${index + 1} of ${plan.chunks.length} save groups…`);
           }
-          const blocks = [...grouped.values()];
-          const request: IntakeReportAcceptanceRequest = {
-            mode: 'partial-v1',
-            operationId: crypto.randomUUID(),
-            blocks,
-          };
-          const result = await acceptance.submit(request, operationId);
-          if (!result)
-            throw new Error(
-              acceptance.error ||
-                'Save was not confirmed. Check the saved receipt before retrying.',
-            );
-          savedIds.push(
-            ...result.receipt.receipts.flatMap((block) =>
-              block.records.map((record) =>
-                JSON.stringify([block.intakeId, record.candidateId, record.candidateVersionId]),
-              ),
-            ),
-          );
-          setOperationStatus(acceptanceSummary(result.receipt));
+          savingChunks.current = false;
         } else {
           feed.reload();
         }
@@ -1482,7 +1463,8 @@ export function ImportPage() {
       'review_save',
       { selected: ids.length, actions: 1 },
     );
-    return { savedIds };
+    savingChunks.current = false;
+    return { savedIds, rejectedIds };
   }
 
   async function correctDrafts(
@@ -2044,7 +2026,7 @@ export function ImportPage() {
           {error || acceptance.error || batch.error}
         </div>
       )}
-      <ImportAcceptanceOutcomes receipt={acceptanceReceipt} />
+      <ImportAcceptanceOutcomes receipt={acceptanceReceipt} unsent={unsentSelections} />
       {notice && (
         <div className="import-page-notice" role="status">
           <span>{notice}</span>

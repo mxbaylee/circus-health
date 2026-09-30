@@ -281,12 +281,10 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     const mappingChanged =
       patch.decision &&
       JSON.stringify(patch.decision.mapping) !== JSON.stringify(prior.decision.mapping);
-    const unsent = queue.current.get(key);
-    const reason =
-      patch.correctionReason ??
-      (!mappingChanged && unsent && unsent !== failedWork.current?.work
-        ? prior.correctionReason
-        : undefined);
+    const reason = patch.correctionReason ?? prior.correctionReason;
+    // A reason typed for one mapping remains in its field, but an unrelated
+    // edit cannot attach that explanation to a different patch.
+    const sendReason = mappingChanged && patch.correctionReason === undefined ? undefined : reason;
     const next = { ...prior, ...patch, correctionReason: reason };
     draftsRef.current = { ...draftsRef.current, [key]: next };
     setDrafts(draftsRef.current);
@@ -294,7 +292,7 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     queue.current.set(key, {
       intakeId: review.intakeId,
       candidateId: record.candidateId,
-      reasonMapping: reason ? structuredClone(next.decision.mapping) : undefined,
+      reasonMapping: sendReason ? structuredClone(next.decision.mapping) : undefined,
       body: {
         operationId: crypto.randomUUID(),
         proposalId: review.proposalId,
@@ -305,7 +303,7 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
         disposition: next.disposition,
         decision: next.decision,
         answers: next.answers,
-        correctionReason: next.correctionReason,
+        correctionReason: sendReason,
       },
     });
   }
