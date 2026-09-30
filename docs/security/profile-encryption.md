@@ -68,3 +68,7 @@ Keep working decrypted SQLite, WAL/SHM, extraction previews and other temporary 
 Controlled fictional tests exercise recovery verification, invalid/wrong-profile kits, setup interruptions, independent keys, encryption authentication, locked-profile routes and cache-loss rebuild. These checks do not establish physical authenticator/PRF support or password-manager behavior on every browser. [Device acceptance](../todo/readme.md#crs-072) remains open.
 
 Encryption does not retroactively protect earlier plaintext backups, exports, downloads or Git history. Recovery verification proves the submitted secret works; it cannot prove that an independent copy remains available.
+
+## Import recovery authority
+
+Durable automatic-run intent never unlocks an archive. The coordinator checks the exact profile/import dispatch and publication permissions. Lock/logout/profile switch revoke the ordinary runtime; authorized unlock recovers eligible work automatically, while explicit Stop survives. See [automatic recovery rationale and the CRS-081 boundary](../import/automatic-recovery.md#rationale-and-authorization). Restricted post-logout processing remains separate work; clinical acceptance, identity confirmation and browsing require a live session.

@@ -53,6 +53,8 @@ export async function extractIntakeSourceText(context: ExtractionContext) {
 }
 let workerQueue: Promise<unknown> = Promise.resolve();
 let queuedRasterJobs = 0;
+let ocrPrerequisiteUntil = 0;
+let ocrPrerequisitePath: string | undefined;
 /** One local raster worker globally. Never allow an HTTP burst to spawn unbounded OCR. */
 export function runSourceRasterWorker(
   bytes: Uint8Array,
@@ -60,6 +62,15 @@ export function runSourceRasterWorker(
   native: LocatedNativeText[],
   assertRunning: () => void = () => {},
 ): Promise<SourceOcrResult> {
+  if (process.env.PATH !== ocrPrerequisitePath) ocrPrerequisiteUntil = 0;
+  if (Date.now() < ocrPrerequisiteUntil)
+    return Promise.reject(
+      new HttpError(
+        503,
+        'SOURCE_OCR_PREREQUISITE',
+        'Local OCR is unavailable; waiting for its shared prerequisite.',
+      ),
+    );
   if (queuedRasterJobs >= 2)
     return Promise.reject(
       new HttpError(
@@ -166,7 +177,7 @@ function replacePage(
 export function sourceTextExtractionPending(source: IntakeSourceText) {
   return source.status === 'unavailable' || source.revision.issues.some(isPending);
 }
-function isPending(issue: SourceTextIssue) {
+export function isPending(issue: SourceTextIssue) {
   return /^p\d+-pending$/.test(issue.id) && ['open', 'later'].includes(issue.status);
 }
 /** A bounded, resumable extraction step. Every publication is an immutable version;
@@ -263,25 +274,44 @@ async function extractSourceStep({
           // Preserve native work before OCR dispatch. Keep pending so an interrupted
           // OCR attempt can resume instead of silently appearing accounted.
           const partial = composeSourceReadings(page, native, []);
-          partial.issues.push(pending(page));
+          partial.issues.push(
+            pending(page),
+            ...evidence.issues.filter((i) => i.id === `p${page}-failed`),
+          );
           publish(replacePage(evidence, page, partial, result.width, result.height));
           evidence = current.revision!;
         } else bytes = getIntakeOriginal(db, root, profileId, id).bytes;
         const result = await runSourceRasterWorker(bytes, page, native, assertRunning);
+        if (result.errorCode === 'OCR_UNAVAILABLE') {
+          ocrPrerequisitePath = process.env.PATH;
+          ocrPrerequisiteUntil = Date.now() + 30000;
+          result.issues.push(pending(page));
+          publish(replacePage(evidence, page, result, result.width, result.height));
+          throw new HttpError(
+            503,
+            'SOURCE_OCR_PREREQUISITE',
+            'Local OCR is unavailable; waiting for its shared prerequisite.',
+          );
+        }
+        if (result.errorCode) throw Error(result.errorCode);
         publish(replacePage(evidence, page, result, result.width, result.height));
       } catch (error) {
+        if (error instanceof HttpError && error.code === 'SOURCE_OCR_PREREQUISITE') throw error;
         assertRunning(); // Cancellation never converts pending work into a terminal exception.
         const code =
           error instanceof Error && /^[A-Z_]+$/.test(error.message)
             ? error.message
             : 'SOURCE_EXTRACTION_FAILED';
         const partial = composeSourceReadings(page, native, []);
+        const priorFailure = evidence.issues.find((i) => i.id === `p${page}-failed`);
+        const attempts = Number(priorFailure?.detail.match(/attempt (\d+)/)?.[1] || 0) + 1;
+        if (attempts < 3) partial.issues.push(pending(page));
         partial.issues.push({
           id: `p${page}-failed`,
           region: { page },
           kind: 'unreadable',
           status: 'open',
-          detail: `This page could not be fully extracted (${code}). The original and any native text remain available for review.`,
+          detail: `This page could not be fully extracted (${code}; attempt ${attempts}). The original and any native text remain available for review.`,
         });
         // Never swallow a stale or integrity publication error by publishing another snapshot.
         if (
@@ -362,4 +392,82 @@ async function extractSourceStep({
     processedPages,
     blockedByReview,
   };
+}
+
+export function locateSourceExtractionProgress(source: IntakeSourceText) {
+  if (source.status === 'unavailable') return { done: 0, page: 1 };
+  const pending = new Set(source.revision.issues.filter(isPending).map((i) => i.region.page));
+  return {
+    done: source.revision.pages.filter((p) => !pending.has(p.page)).length,
+    page: [...pending][0] || 0,
+  };
+}
+export function retainSourceStall(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  page: number,
+) {
+  const source = getIntakeSourceText(db, root, profileId, id);
+  if (source.status !== 'available') return;
+  const evidence = source.revision;
+  publishIntakeSourceText(db, root, profileId, id, {
+    operationId: randomUUID(),
+    expectedRevisionId: evidence.id,
+    sourceHash: evidence.sourceHash,
+    evidence: {
+      ...evidence,
+      issues: [
+        ...evidence.issues.filter((i) => !(i.region.page === page && isPending(i))),
+        {
+          id: 'p' + page + '-processing-stalled',
+          region: { page },
+          kind: 'coverage',
+          status: 'open',
+          detail:
+            'Processing stalled after three attempts. This scope remains unresolved; the original is retained for retry.',
+        },
+      ],
+    },
+  });
+}
+
+/** Explicit retry reopens only unresolved machine failures, preserving human-reviewed scopes. */
+export function retrySourceExceptions(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+) {
+  const source = getIntakeSourceText(db, root, profileId, id);
+  if (source.status !== 'available') return;
+  const revision = source.revision;
+  const pages = new Set(
+    revision.issues
+      .filter(
+        (issue) =>
+          ['open', 'later'].includes(issue.status) &&
+          /-(failed|processing-stalled|ocr-unavailable)$/.test(issue.id) &&
+          !revision.protectedPages.includes(issue.region.page),
+      )
+      .map((issue) => issue.region.page),
+  );
+  if (!pages.size) return;
+  publishIntakeSourceText(db, root, profileId, id, {
+    operationId: randomUUID(),
+    expectedRevisionId: revision.id,
+    sourceHash: revision.sourceHash,
+    evidence: {
+      ...revision,
+      issues: [
+        ...revision.issues.filter(
+          (issue) =>
+            !pages.has(issue.region.page) ||
+            !/-(failed|processing-stalled|ocr-unavailable|pending)$/.test(issue.id),
+        ),
+        ...[...pages].map(pending),
+      ],
+    },
+  });
 }

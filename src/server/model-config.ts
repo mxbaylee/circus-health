@@ -6,7 +6,13 @@ import type { ProxyConfig } from './proxy-model-bridge.ts';
 
 export class ModelError extends Error {}
 /** A local bounded transcript/round boundary, not a provider/authentication failure. */
-export class ModelContextLimitError extends ModelError {}
+export class ModelContextLimitError extends ModelError {
+  readonly origin: 'slice' | 'initial' | 'provider';
+  constructor(message: string, origin: 'slice' | 'initial' | 'provider' = 'slice') {
+    super(message);
+    this.origin = origin;
+  }
+}
 const fail = (message: string): never => {
   throw new ModelError(message);
 };

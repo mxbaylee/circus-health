@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { fictionalModel } from './fictional-model.ts';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import {
@@ -66,7 +67,7 @@ function runtime(vault: VaultManager, state: OpenedProfile) {
   return { assistant, batches };
 }
 
-test('encrypted profile acknowledges batch journals only after vault publication and restores a pause', async (t) => {
+test('encrypted profile acknowledges batch journals only after vault publication and restores automatic intent', async (t) => {
   const f = vaultFixture(t);
   const created = await newProfile(f.manager, 'Fictional encrypted batch person');
   const profileId = created.profile.id;
@@ -111,13 +112,16 @@ test('encrypted profile acknowledges batch journals only after vault publication
     secondRuntime.assistant.close();
   });
   const restored = secondRuntime.batches.get(profileId, batch.id);
-  assert.equal(restored.status, 'paused');
-  assert.equal(restored.reason, 'profile_locked');
+  assert.equal(restored.status, 'running');
+  assert.equal(restored.reason, null);
   assert.equal(restored.items[0].sourceHash, intake.sha256);
   assert.equal(restored.items[0].filename, filename);
+  secondRuntime.batches.close();
+  secondRuntime.assistant.close();
 });
 
 test('encrypted HTTP batch route survives profile lock and complete SQLite cache loss', async (t) => {
+  fictionalModel(t);
   const base = mkdtempSync(resolve(tmpdir(), 'batch-http-'));
   const dataDirectory = resolve(base, 'data');
   const runtimeDirectory = resolve(base, 'runtime');
@@ -218,8 +222,8 @@ test('encrypted HTTP batch route survives profile lock and complete SQLite cache
   );
   const restored = await jsonRequest(`/api/profiles/${profileId}/intake-batches/${batch.id}`);
   assert.equal(restored.status, 200);
-  assert.equal(restored.data.status, 'paused');
-  assert.equal(restored.data.reason, 'profile_locked');
+  assert.equal(restored.data.status, 'running');
+  assert.equal(restored.data.reason, null);
   assert.equal(restored.data.items[0].sourceHash, intake.sha256);
   assert.equal(restored.data.items[0].filename, filename);
 });

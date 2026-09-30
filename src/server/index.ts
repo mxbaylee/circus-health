@@ -443,6 +443,7 @@ export function createApp({
         return;
       if (
         await handleIntakeRoute({
+          intakeBatches,
           resource,
           id,
           action,

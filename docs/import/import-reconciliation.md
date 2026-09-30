@@ -10,7 +10,7 @@ After the upload has completed and the server has accepted a reading job, leavin
 
 Resume is a recovery action, not a required step between normal pages or model windows. Reading pauses on an explicit Stop, provider/tool failure, no progress, a time/context limit, or a profile/server interruption. These bounds prevent repeated work and unbounded model requests; they do not mean that available proposals were lost. The UI must explain the pause reason and distinguish resumable partial work from exhausted read windows. Exhausted windows do not prove complete clinical extraction.
 
-Locking a profile, including switching to another profile, stops its reader and assistant before the decrypted database is closed, key material is cleared and the decrypted working cache is removed. Completed proposals and checkpoints remain in the encrypted archive. Unlocking does not itself authorize another model request: resuming paused reading is explicit. The application does not secretly keep a locked profile open until a task finishes.
+Locking a profile, including switching to another profile, stops its reader and assistant before the decrypted database is closed, key material is cleared and the decrypted working cache is removed. Completed proposals and checkpoints remain in the encrypted archive. Authorized unlock restores durable automatic-run intent; explicitly stopped jobs remain stopped. See [automatic recovery](automatic-recovery.md) for the separate CRS-081 authority boundary. The application does not secretly keep a locked profile open until a task finishes.
 
 ## Clinical imports and People proposals
 

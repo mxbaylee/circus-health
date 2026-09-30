@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -71,7 +72,7 @@ test(
       data: Buffer.from(original),
     });
     assert.equal(uploaded.status(), 201, await uploaded.text());
-    const intake = (await uploaded.json()).data as Intake;
+    const intake = await stopFixtureImport(page, url, prefix, (await uploaded.json()).data.id);
     const entry = {
       format: 'health-record-v1',
       id: 'fictional-iris-copper',
@@ -134,8 +135,9 @@ test(
         // Navigation can dispose an otherwise completed response body.
       }
     });
+    // Start one cold document so a hash navigation and reload cannot race feed requests.
+    await page.goto('about:blank');
     await page.goto(url + '/#/import');
-    await page.reload();
     const save = page.getByRole('button', { name: 'Confirm & save', exact: true });
     await save.waitFor();
     const deadline = Date.now() + 15000;
@@ -160,7 +162,12 @@ test(
       data: Buffer.from(original),
     });
     assert.equal(directUpload.status(), 201, await directUpload.text());
-    const directIntake = (await directUpload.json()).data as Intake;
+    const directIntake = await stopFixtureImport(
+      page,
+      url,
+      prefix,
+      (await directUpload.json()).data.id,
+    );
     const directProposal = await page.request.post(
       url + prefix + `/intakes/${directIntake.id}/proposals`,
       {
@@ -242,8 +249,9 @@ test(
       'restart loses only the in-memory grounding proof',
     );
     const restartFeedOffset = seenFeeds.length;
+    // Start one cold document so a hash navigation and reload cannot race feed requests.
+    await page.goto('about:blank');
     await page.goto(url + '/#/import');
-    await page.reload();
     const restartDeadline = Date.now() + 15000;
     while (Date.now() < restartDeadline) {
       const last = seenFeeds.at(-1);

@@ -5,6 +5,7 @@ import {
   finishIntakeModelAttempt,
   recoverIntakeModelAttempts,
   intakeAttemptWait,
+  authorizeIntakeAttemptRecovery,
   intakeAttemptAccounting,
   type IntakeAttemptScope,
   type RecordedIntakeModelAttempt,
@@ -141,17 +142,17 @@ test('transport timeout and ambiguous server failures never become retry permiss
   }
 });
 
-test('restart marks dispatched requests unknown and late conflicting results require explicit reconciliation', () => {
+test('restart keeps unknown accounting and records late success without publication authority', () => {
   const initial = startIntakeModelAttempt([], start(), scope, at),
     entries = recoverIntakeModelAttempts(initial, end);
   assert.equal(entries[0].outcome, 'unknown');
   assert.deepEqual(entries[0].interruption, { at: end, reason: 'unfinished-after-recovery' });
   assert.equal(initial[0].outcome, 'dispatched', 'caller can persist new state atomically');
   assert.deepEqual(recoverIntakeModelAttempts(entries, '2026-09-27T00:00:00Z'), entries);
-  assert.throws(
-    () => finishIntakeModelAttempt(entries, finished(), end),
-    /explicit provider reconciliation/,
-  );
+  const late = finishIntakeModelAttempt(entries, finished(), end);
+  assert.equal(late[0].outcome, 'unknown');
+  assert.equal(late[0].lateResponse?.at, end);
+  assert.equal(intakeAttemptAccounting(late).unknownOutcomes, 1);
 });
 
 test('any unresolved old request remains visible even after a separate later success', () => {
@@ -217,4 +218,41 @@ test('request-fit receipts retain byte policy without claiming token qualificati
       ),
     /Invalid request-fit/,
   );
+});
+
+test('repeated recovery reuses one replacement decision while unknown costs remain', () => {
+  const original = recoverIntakeModelAttempts(startIntakeModelAttempt([], start(), scope, at), end);
+  const allowed = authorizeIntakeAttemptRecovery(original, end, 'fictional-unit-1');
+  assert.deepEqual(authorizeIntakeAttemptRecovery(allowed, at, 'fictional-unit-1'), allowed);
+  // A crash after the decision but before dispatch must reuse the same decision.
+  const restoredDecision = JSON.parse(JSON.stringify(allowed));
+  assert.deepEqual(
+    authorizeIntakeAttemptRecovery(restoredDecision, end, 'fictional-unit-1'),
+    allowed,
+  );
+  const next = startIntakeModelAttempt(
+    restoredDecision,
+    start('replacement'),
+    { ...scope, runId: 'recovery-run' },
+    end,
+  );
+  assert.equal(next[0].recovery?.replacementRequestId, 'replacement');
+  assert.throws(() => startIntakeModelAttempt(next, start('concurrent'), scope, end), {
+    code: 'INTAKE_ATTEMPT_UNRESOLVED',
+  });
+  const dispatchedAgain = startIntakeModelAttempt(
+    JSON.parse(JSON.stringify(next)),
+    start('replacement'),
+    { ...scope, runId: 'recovery-run' },
+    end,
+  );
+  assert.deepEqual(
+    dispatchedAgain,
+    next,
+    'replayed durable replacement dispatch is not another request',
+  );
+  const success = finishIntakeModelAttempt(dispatchedAgain, finished('replacement'), end);
+  assert.equal(intakeAttemptWait(success), null);
+  assert.equal(intakeAttemptAccounting(success).unknownOutcomes, 1);
+  assert.equal(intakeAttemptAccounting(success).unknownUsage, 1);
 });

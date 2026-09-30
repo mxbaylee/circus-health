@@ -122,6 +122,7 @@ export interface ProxyModelBridgeOptions {
   config: ProxyConfig;
   /** Host-only budget gate evaluated immediately before each provider request. */
   beforeRequest?: () => void;
+  durableRetries?: boolean;
   onEvent?: BridgeEventHandler;
   onTool?: BridgeToolHandler;
   onExit?: (error: ModelError) => void;
@@ -882,6 +883,7 @@ export async function proxyRequest(
     if (classification === 'context_limit' && [400, 413].includes(receivedResponse.status)) {
       const error = new ModelContextLimitError(
         `The selected model reached its context limit. Completed work is kept; productive import reading can continue with a fresh context.${reference}`,
+        'provider',
       );
       proxyRequestFailures.set(error, { status: receivedResponse.status, classification });
       throw error;
@@ -1099,6 +1101,7 @@ export class ProxyModelBridge {
   readonly onEvent: BridgeEventHandler;
   readonly onTool: BridgeToolHandler;
   readonly onExit: (error: ModelError) => void;
+  readonly durableRetries: boolean;
   readonly beforeRequest: (() => void) | undefined;
   readonly fetchImpl: typeof fetch | undefined;
   readonly resolveHost: ResolveHost | undefined;
@@ -1120,6 +1123,7 @@ export class ProxyModelBridge {
   constructor({
     config,
     beforeRequest,
+    durableRetries = false,
     onEvent = () => {},
     onTool = async () => {},
     onExit = () => {},
@@ -1132,6 +1136,7 @@ export class ProxyModelBridge {
   }: ProxyModelBridgeOptions) {
     this.config = config;
     this.beforeRequest = beforeRequest;
+    this.durableRetries = durableRetries;
     this.onEvent = onEvent;
     this.onTool = onTool;
     this.onExit = onExit;
@@ -1284,6 +1289,7 @@ export class ProxyModelBridge {
           baseDelay === undefined ? undefined : Math.max(baseDelay, failure?.retryAfterMs || 0);
         if (
           this.closed ||
+          this.durableRetries ||
           delay === undefined ||
           delay > 60_000 ||
           failure?.status !== 503 ||
@@ -1390,11 +1396,13 @@ export class ProxyModelBridge {
         disable_fallbacks: true,
       };
       const limit = proxyTranscriptLimit(request);
-      if (limit) throw new ModelContextLimitError(limit.message);
+      if (limit) throw new ModelContextLimitError(limit.message, round === 0 ? 'initial' : 'slice');
       let rawResult: unknown;
       try {
         rawResult = await this.request(request, exposedCallIds());
       } catch (error) {
+        if (error instanceof ModelContextLimitError)
+          throw new ModelContextLimitError(error.message, round === 0 ? 'initial' : 'slice');
         const failure = error instanceof ModelError ? proxyRequestFailures.get(error) : undefined;
         const fallbacks = history
           .filter((group) => !group.imageCompacted)
@@ -1438,8 +1446,18 @@ export class ProxyModelBridge {
           durationMs: Math.max(0, performance.now() - fallbackStartedAt),
         });
         const fallbackLimit = proxyTranscriptLimit(request);
-        if (fallbackLimit) throw new ModelContextLimitError(fallbackLimit.message);
-        rawResult = await this.request(request, exposedCallIds());
+        if (fallbackLimit)
+          throw new ModelContextLimitError(
+            fallbackLimit.message,
+            round === 0 ? 'initial' : 'slice',
+          );
+        try {
+          rawResult = await this.request(request, exposedCallIds());
+        } catch (error) {
+          if (error instanceof ModelContextLimitError)
+            throw new ModelContextLimitError(error.message, round === 0 ? 'initial' : 'slice');
+          throw error;
+        }
       }
       if (this.closed) return;
       const result = object(rawResult)

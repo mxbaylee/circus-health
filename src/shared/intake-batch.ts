@@ -9,7 +9,7 @@ export interface IntakeProviderWait {
     | 'unsupported'
     | 'invalid_request'
     | 'unknown';
-  /** Absolute provider/server wait, persisted before scheduling. Never authorizes a retry of unknown work. */
+  /** Absolute provider/server wait, persisted before scheduling. Retained across coordinator recovery. */
   retryAt: string | null;
 }
 export interface IntakeModelAttempt {
@@ -37,7 +37,9 @@ export interface IntakeModelAttempt {
   usage: Record<string, number | null> | null;
 }
 export interface IntakeBatchReadingState {
+  usableModelResponses?: number;
   providerWait?: IntakeProviderWait | null;
+  workUnit?: { id: string; locator: string } | null;
   status: 'running' | 'paused';
   reason: string | null;
   turns: number;
@@ -45,6 +47,7 @@ export interface IntakeBatchReadingState {
   measuredModelTokens?: number;
   modelUsageIncomplete?: boolean;
   readyRecords: number;
+  substantiveVersions?: number;
   remainingUnits: number;
   pendingReadWindows: number;
   /** Unique retained read windows, not a claim that every clinical record was extracted. */
@@ -88,6 +91,15 @@ export type IntakeBatchItemStatus =
   'queued' | 'starting' | 'running' | 'review_ready' | 'skipped' | 'paused';
 
 export interface IntakeBatchItem {
+  automaticRun?: boolean;
+  /** Intent revoked by Stop, restored only by explicit batch Resume. */
+  resumeAutomaticRun?: boolean;
+  retryAt?: string | null;
+  exceptionEpoch?: number;
+  /** Wait for changed configuration or a successful connection check before retrying rejected input. */
+  prerequisiteKey?: string;
+  stalls?: { unitId: string; locator: string; attempts: number };
+  exceptions?: { unitId: string; locator: string; reason: 'processing_stalled' }[];
   intakeId: string;
   sourceHash: string;
   filename: string;
@@ -97,8 +109,12 @@ export interface IntakeBatchItem {
   chatId: string | null;
   proposalIds: string[];
   reading: IntakeBatchReadingState | null;
-  /** Durable local extraction budget; explicit continuation adds an allowance, never erases costs. */
+  /** Durable local extraction checkpoint; historical allowance fields remain decodable. */
   sourceExtraction?: {
+    progress?: number;
+    lastProgressAt?: string;
+    stalls?: number;
+    unitPage?: number;
     steps: number;
     spentMs: number;
     allowanceId: string;
@@ -139,7 +155,11 @@ export interface IntakeBatchItem {
     budgetAtTokens?: number;
     extensions: number;
   };
-  providerWait?: IntakeProviderWait & { attempts: number; lastWaitAt: string };
+  providerWait?: IntakeProviderWait & {
+    attempts: number;
+    lastWaitAt: string;
+    responsesAtWait?: number;
+  };
 }
 
 export interface IntakeBatch {
@@ -153,7 +173,14 @@ export interface IntakeBatch {
   updatedAt: string;
   items: IntakeBatchItem[];
   /** Durable exact selections added after initial creation, for idempotent upload retries. */
-  appendOperations?: { operationId: string; intakeIds: string[]; at: string }[];
+  automaticRun?: boolean;
+  selectionIntakeIds?: string[];
+  appendOperations?: {
+    operationId: string;
+    intakeIds: string[];
+    selectionIntakeIds?: string[];
+    at: string;
+  }[];
 }
 
 export interface CreateIntakeBatchInput {

@@ -1018,6 +1018,17 @@ function publishIntakeInternal(
     .get(p.id, digest, originalName) as { id: string } | undefined;
   if (existing) {
     verifyIntakeOriginal(db, root, profileId, existing.id);
+    if (!db.prepare('SELECT 1 FROM app_meta WHERE key=?').get('intake_enqueue:v1:' + existing.id))
+      mutate(db, () =>
+        db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
+          'intake_enqueue:v1:' + existing.id,
+          JSON.stringify({
+            intakeId: existing.id,
+            sourceHash: digest,
+            operationId: 'upload:' + existing.id,
+          }),
+        ),
+      );
     return {
       ...getIntake(db, root, profileId, existing.id),
       repeatedUpload: true,
@@ -1095,6 +1106,10 @@ function publishIntakeInternal(
         rawPreserved: true,
         clinicalProjection: 'none',
       }),
+    );
+    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
+      'intake_enqueue:v1:' + id,
+      JSON.stringify({ intakeId: id, sourceHash: digest, operationId: 'upload:' + id }),
     );
     registerFile(db, {
       id,

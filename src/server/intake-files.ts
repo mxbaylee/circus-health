@@ -13,7 +13,7 @@ export const INTAKE_PDF_BOUNDS = Object.freeze({
   rangeChunkBytes: 256 * 1024,
   maxRangeRequestBytes: 32 * MiB,
   verificationChunkBytes: 256 * 1024,
-  maxPages: 10_000,
+  maxPages: Number.MAX_SAFE_INTEGER,
   maxReferences: 5_000,
   maxIndexOutputBytes: 16 * MiB,
   maxTextCharactersPerRead: 24_000,

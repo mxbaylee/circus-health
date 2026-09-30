@@ -16,7 +16,6 @@ The detailed work list and design documents that preceded this index are archive
 - [ ] <a id="crs-033"></a> **CRS-033** — Finish Import inbox acceptance after real-use regressions: native drop, accurate long-run activity, and repeated complete-file review.
 - [ ] <a id="crs-037"></a> **CRS-037** — Verify native file drop and truthful indexing, reading, provider-wait and completion states, including multi-file estimates and long runs.
 - [ ] <a id="crs-038"></a> **CRS-038** — Validate bounded, privacy-safe diagnostics against representative real-provider complaints and complete import lifecycles.
-- [ ] <a id="crs-039"></a> [CRS-039](CRS-039.md) — Continue productive imports with checkpointed backoff and stall recovery; supplies the coordinator for CRS-081's required continuation after lock/logout.
 - [ ] <a id="crs-040"></a> **CRS-040** — Finish scoped identity confirmation and contradictory-source recovery; retain explicit clinical acceptance. Printed-DOB exceptions are specified in CRS-133; blank-Self-field filling is superseded by CRS-112.
 - [ ] <a id="crs-041"></a> **CRS-041** — Finish encrypted and real-file parity checks for the self-contained Import route and historical Sources redirects.
 - [ ] <a id="crs-042"></a> **CRS-042** — Explain report splits and preserve report/person/date/header relationships without merging equal-looking clinical events.
@@ -25,7 +24,7 @@ The detailed work list and design documents that preceded this index are archive
 - [ ] <a id="crs-046"></a> **CRS-046** — Finish subject/member-safe clinical identity and persisted-key migration qualification; never merge records across people.
 - [ ] <a id="crs-079"></a> **CRS-079** — Measure current complete-import request context and end-to-end latency; separate host time, provider waiting, retries and output cost.
 - [ ] <a id="crs-080"></a> **CRS-080** — Add test-only extraction capture/replay for fictional downstream regressions; fresh quality and speed measurements must bypass replay.
-- [ ] <a id="crs-081"></a> [CRS-081](CRS-081.md) — Use CRS-039's coordinator with scoped authority after lock/logout/profile switch; both tickets complete the decided background-import experience.
+- [ ] <a id="crs-081"></a> [CRS-081](CRS-081.md) — Extend the implemented automatic coordinator with scoped authority after lock/logout/profile switch to complete the decided background-import experience.
 - [ ] <a id="crs-084"></a> [CRS-084](CRS-084.md) — Prioritize unresolved security risks and mitigations without describing proposed controls as existing protection.
 - [ ] <a id="crs-086"></a> [CRS-086](CRS-086.md) — Implement model-agnostic async artifact processing with bounded context, shared extraction, adaptive concurrency and reviewable aggregation.
 - [ ] <a id="crs-088"></a> [CRS-088](CRS-088.md) — Reduce passkey re-entry to an authenticator gesture while retaining origin checks, profile isolation and locked state after restart.
@@ -157,13 +156,13 @@ The [experiment material](../experiments/README.md) is retained separately. No b
 
 ## Legacy IDs
 
-The aliases below refer to the old backlog namespace. They are separate from security risk IDs and the later reliability review’s R1–R52 labels, which are recorded in the CRS files that took them over (CRS-039, 086, 111, 117–120, 122, 123, 126 and 127).
+The aliases below refer to the old backlog namespace. They are separate from security risk IDs and the later reliability review’s R1–R52 labels, whose open requirements are recorded in CRS-086, 111, 117–120, 122, 123, 126 and 127. Implemented import recovery behavior and rationale live in [automatic import recovery](../import/automatic-recovery.md).
 
 - `R1` → [CRS-001](#crs-001); `R2` → [CRS-002](#crs-002); `R3` → [CRS-003](#crs-003); `R4` → [CRS-004](#crs-004); `R5` → [CRS-005](#crs-005); `R6` → [CRS-006](#crs-006); `R7` → [CRS-007](#crs-007).
 - `U1` → [CRS-008](#crs-008); `U2` → [CRS-009](#crs-009); `U3` → [CRS-010](#crs-010); `U4` → [CRS-011](#crs-011); `U5` → [CRS-012](#crs-012); `U6` → [CRS-013](#crs-013); `U7` → [CRS-014](#crs-014); `U8` → [CRS-015](#crs-015).
 - `M1` → [CRS-016](#crs-016); `M2` → [CRS-017](#crs-017); `M3` → [CRS-018](#crs-018); `M4` → [CRS-019](#crs-019).
 - `P1` → [CRS-020](#crs-020); `P3` → [CRS-021](#crs-021); `P2` → [CRS-022](#crs-022).
-- `I1` → [CRS-023](#crs-023); `I2` → [CRS-024](#crs-024); `I3` → [CRS-025](#crs-025); `I4` → [CRS-026](#crs-026); `I5` → [CRS-027](#crs-027); `I6` → [CRS-028](#crs-028); `I7` → [CRS-029](#crs-029); `I8` → [CRS-030](#crs-030); `I9` → [CRS-031](#crs-031); `I10` → [CRS-032](#crs-032); `I11` → [CRS-033](#crs-033); `I12` → [CRS-034](#crs-034); `I13` → [CRS-035](#crs-035); `I14` → [CRS-036](#crs-036); `I15` → [CRS-037](#crs-037); `I16` → [CRS-038](#crs-038); `I17` → [CRS-039](#crs-039); `I18` → [CRS-040](#crs-040); `I19` → [CRS-041](#crs-041); `I20` → [CRS-042](#crs-042); `I22` → [CRS-043](#crs-043); `I23` → [CRS-044](#crs-044); `I21` → [CRS-045](#crs-045); `I24` → [CRS-046](#crs-046); `I25` → [CRS-047](#crs-047).
+- `I1` → [CRS-023](#crs-023); `I2` → [CRS-024](#crs-024); `I3` → [CRS-025](#crs-025); `I4` → [CRS-026](#crs-026); `I5` → [CRS-027](#crs-027); `I6` → [CRS-028](#crs-028); `I7` → [CRS-029](#crs-029); `I8` → [CRS-030](#crs-030); `I9` → [CRS-031](#crs-031); `I10` → [CRS-032](#crs-032); `I11` → [CRS-033](#crs-033); `I12` → [CRS-034](#crs-034); `I13` → [CRS-035](#crs-035); `I14` → [CRS-036](#crs-036); `I15` → [CRS-037](#crs-037); `I16` → [CRS-038](#crs-038); `I17` → [automatic recovery](../import/automatic-recovery.md); `I18` → [CRS-040](#crs-040); `I19` → [CRS-041](#crs-041); `I20` → [CRS-042](#crs-042); `I22` → [CRS-043](#crs-043); `I23` → [CRS-044](#crs-044); `I21` → [CRS-045](#crs-045); `I24` → [CRS-046](#crs-046); `I25` → [CRS-047](#crs-047).
 - `C1` → [CRS-048](#crs-048); `C2` → [CRS-049](#crs-049); `C3` → [CRS-050](#crs-050); `C4` → [CRS-051](#crs-051).
 - `N1` → [CRS-052](#crs-052); `N2` → [CRS-053](#crs-053); `N3` → [CRS-054](#crs-054).
 - `T1` → [CRS-055](#crs-055); `T2` → [CRS-056](#crs-056); `T3` → [CRS-057](#crs-057); `T4` → [CRS-058](#crs-058); `T5` → [CRS-059](#crs-059); `T6` → [CRS-060](#crs-060); `T7` → [CRS-061](#crs-061); `T8` → [CRS-062](#crs-062).

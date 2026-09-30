@@ -39,33 +39,33 @@ export function intakeReadingPauseLabel(reason: string | null | undefined) {
     case 'source_review_required':
       return 'Source text needs your review. Expand the affected source section below, resolve the unfinished page, then resume reading.';
     case 'waiting_for_provider':
-      return 'Waiting for the provider retry window. Reading will retry automatically within its existing limits; completed source work is kept.';
+      return 'Waiting for the provider retry window. Reading will retry automatically; completed source work is kept.';
     case 'provider_authentication':
-      return 'The provider rejected authentication. Restore the provider connection, then resume reading. Source work is kept.';
+      return 'The provider rejected authentication. Restore the provider connection; reading then continues automatically. Source work is kept.';
     case 'provider_outcome_unknown':
-      return 'The provider request outcome is unknown. Its attempt must be reconciled before another request can start. Completed work and unknown usage are retained.';
+      return 'The provider request outcome is unknown. Retrying may use additional provider usage. Completed work and unknown usage are retained.';
     case 'provider_retry_limit':
-      return 'The bounded provider retry allowance was reached. Check the provider connection before choosing to resume.';
+      return 'Waiting for the provider. Reading will retry automatically; completed source work is kept.';
     case 'provider_rejected':
-      return 'The provider rejected this request. Review the provider error before resuming; completed source work is kept.';
+      return 'The provider rejected this request. Fix the provider configuration and check the connection; reading then continues automatically.';
     case 'model_unavailable':
       return 'The model provider was unavailable. Completed work and originals are kept.';
     case 'assistant_busy':
-      return 'Moxie was busy with another request. Resume when that request is finished.';
+      return 'Waiting for another request to finish; reading continues automatically.';
     case 'no_progress':
       return 'Moxie paused after it could not make more reading progress.';
     case 'time_limit':
-      return 'This 15-minute reading pass ended without enough new progress to continue automatically. Completed work is kept.';
+      return 'Reading is continuing from the saved checkpoint.';
     case 'context_limit':
       return 'This model context filled before reading finished. Completed work is kept.';
     case 'job_limit':
-      return 'Reading reached its overall work budget (up to 2 hours). Completed work is kept. Continue to grant another bounded reading budget.';
+      return 'Reading is retrying the current section from its saved checkpoint.';
     case 'tool_error':
     case 'runner_error':
     case 'error':
       return 'Reading paused after an unexpected provider or reading error.';
     case 'profile_locked':
-      return 'Reading stopped when the profile locked. Unlock it, then resume explicitly.';
+      return 'Waiting for unlock. Reading continues automatically after authorized unlock.';
     case 'interrupted':
       return 'Reading was interrupted by a restart. Completed work is kept.';
     case 'stopped':

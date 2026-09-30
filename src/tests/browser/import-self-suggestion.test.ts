@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
 import type { AddressInfo } from 'node:net';
@@ -91,7 +92,7 @@ test(
       ),
     });
     assert.equal(uploaded.status(), 201);
-    let intake = (await uploaded.json()).data;
+    let intake = await stopFixtureImport(page, url, prefix, (await uploaded.json()).data.id);
     intake = await request(`${prefix}/intakes/${encodeURIComponent(intake.id)}/proposals`, 'POST', {
       version: intake.version,
       summary: 'One fictional evidence-backed result for explicit review.',
@@ -147,7 +148,7 @@ test(
         ],
       }),
     });
-    const proposalId = intake.proposals.at(-1).id;
+    const proposalId = intake.proposals.at(-1)!.id;
     const review = await request(
       `${prefix}/intakes/${encodeURIComponent(intake.id)}/review?proposalId=${encodeURIComponent(proposalId)}`,
     );

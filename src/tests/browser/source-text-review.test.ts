@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -71,7 +72,7 @@ test(
       data: Buffer.from(original),
     });
     assert.equal(upload.status(), 201);
-    const intake = (await upload.json()).data;
+    const intake = await stopFixtureImport(page, url, prefix, (await upload.json()).data.id);
     const get = async (path: string) => {
       const response = await page.request.get(url + prefix + path);
       assert(response.ok(), await response.text());
@@ -91,7 +92,8 @@ test(
       await target.getByRole('button', { name: 'Review source text', exact: true }).click();
     };
     await open(page);
-    await page.getByRole('button', { name: 'Extract source text locally', exact: true }).click();
+    const extract = page.getByRole('button', { name: 'Extract source text locally', exact: true });
+    if (await extract.count()) await extract.click();
     const passage = page.getByRole('textbox', { name: /Passage 1/ });
     await passage.waitFor();
     const initial = await get(`/intakes/${encodeURIComponent(intake.id)}/source-text`);
@@ -158,7 +160,12 @@ test(
         .count(),
       0,
     );
-    assert.equal((await get('/intake-batches')).length, 0);
+    assert.ok(
+      (await get('/intake-batches')).every(
+        (batch: { status: string }) => batch.status === 'stopped',
+      ),
+      'source review does not restart the stopped upload job',
+    );
     assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
     // A real non-square image exercises browser layout/rotation. OCR availability is
     // not asserted here; the retained pixel view and explicit exceptions suffice.
@@ -178,9 +185,18 @@ test(
       data: canvas.toBuffer('image/png'),
     });
     assert.equal(imageUpload.status(), 201);
-    const imageIntake = (await imageUpload.json()).data;
+    const imageIntake = await stopFixtureImport(
+      page,
+      url,
+      prefix,
+      (await imageUpload.json()).data.id,
+    );
     await open(page, 'fictional-source-image.png');
-    await page.getByRole('button', { name: 'Extract source text locally', exact: true }).click();
+    const extractImage = page.getByRole('button', {
+      name: 'Extract source text locally',
+      exact: true,
+    });
+    if (await extractImage.count()) await extractImage.click();
     const image = page.getByRole('img', { name: 'Original page 1', exact: true });
     await image.waitFor();
     await page.getByRole('button', { name: 'Rotate source clockwise', exact: true }).click();
@@ -326,7 +342,12 @@ test(
     const afterApproval = await get('/intakes/' + encodeURIComponent(intake.id));
     assert.equal(afterApproval.version, beforeApproval.version);
     assert.equal(afterApproval.imported, null);
-    assert.equal((await get('/intake-batches')).length, 0);
+    assert.equal(
+      (await get('/intake-batches')).filter(
+        (batch: { status: string }) => batch.status === 'running',
+      ).length,
+      0,
+    );
     assert.deepEqual(errors, []);
   },
 );

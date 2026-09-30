@@ -90,13 +90,15 @@ describe('active Import reading and detail helpers', () => {
     ]);
   });
 
-  it('distinguishes cumulative budgets from a stalled slice', () => {
-    expect(intakeReadingPauseLabel('job_limit')).toContain('another bounded reading budget');
-    expect(intakeReadingPauseLabel('time_limit')).toContain('without enough new progress');
+  it('describes automatic continuation at historical allowance and slice boundaries', () => {
+    expect(intakeReadingPauseLabel('job_limit')).toContain(
+      'retrying the current section from its saved checkpoint',
+    );
+    expect(intakeReadingPauseLabel('time_limit')).toContain('continuing from the saved checkpoint');
   });
 });
 
-it('distinguishes local review, bounded provider waits, authentication and unknown outcomes', () => {
+it('distinguishes local review, automatic provider waits, authentication and unknown outcomes', () => {
   expect(intakeReadingPauseLabel('retain_only')).toBe(
     'Original retained; this format is not interpreted.',
   );
@@ -106,14 +108,14 @@ it('distinguishes local review, bounded provider waits, authentication and unkno
     'Expand the affected source section',
   );
   expect(intakeReadingPauseLabel('extracting_source_text')).toContain('locally');
-  expect(intakeReadingPauseLabel('waiting_for_provider')).toContain('within its existing limits');
+  expect(intakeReadingPauseLabel('waiting_for_provider')).toContain('retry automatically');
   expect(intakeReadingPauseLabel('provider_authentication')).toContain(
     'Restore the provider connection',
   );
-  expect(intakeReadingPauseLabel('provider_outcome_unknown')).toContain('must be reconciled');
-  expect(intakeReadingPauseLabel('provider_outcome_unknown')).toContain('unknown usage');
-  expect(intakeReadingPauseLabel('provider_retry_limit')).toContain(
-    'bounded provider retry allowance',
+  expect(intakeReadingPauseLabel('provider_outcome_unknown')).toContain(
+    'may use additional provider usage',
   );
+  expect(intakeReadingPauseLabel('provider_outcome_unknown')).toContain('unknown usage');
+  expect(intakeReadingPauseLabel('provider_retry_limit')).toContain('retry automatically');
   expect(intakeReadingPauseLabel('provider_rejected')).toContain('rejected this request');
 });

@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { modelRecoveryKey } from './model-bridge.ts';
+import { INTAKE_PDF_BOUNDS } from './intake-files.ts';
 import {
   importDiagnostics,
   beginImportPhase,
@@ -6,12 +8,24 @@ import {
   type ImportDiagnosticSink,
 } from './import-diagnostics.ts';
 import { HttpError, required } from './database.ts';
-import { getIntake, linkIntakeConversion, currentIntakeInterpretations } from './intake.ts';
+import {
+  getIntake,
+  linkIntakeConversion,
+  currentIntakeInterpretations,
+  createIntakePlan,
+  workflowMutation,
+} from './intake.ts';
 import { isRetainOnlyIntake } from './intake-source-policy.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import { runIntakeSourceExtractionOperation } from './intake-source-extraction-operation.ts';
 import { getIntakeSourceText } from './intake-source-text.ts';
-import { sourceTextExtractionPending } from './intake-source-extraction.ts';
+import {
+  sourceTextExtractionPending,
+  locateSourceExtractionProgress,
+  extractIntakeSourceText,
+  retainSourceStall,
+  retrySourceExceptions,
+} from './intake-source-extraction.ts';
 import { listIntakeBatches, readIntakeBatch, writeIntakeBatch } from './intake-batch-journal.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { Intake } from '../shared/intake.ts';
@@ -71,12 +85,17 @@ interface BatchAssistant {
 
 interface BatchAssistantRunOptions {
   beforeModelRequest?: (reading: IntakeBatchReadingState) => boolean;
+  assertAuthorized?: (operation: 'dispatch' | 'publish') => void;
 }
 
-export const AUTOMATIC_SOURCE_CAPTURE_LIMITS = Object.freeze({ steps: 10, elapsedMs: 120_000 });
+export const SOURCE_STALL_MS = Math.max(180_000, 2 * INTAKE_PDF_BOUNDS.indexTimeoutMs);
 interface BatchManagerOptions {
-  /** Deterministic tests only; production uses the declared cumulative local allowance. */
-  sourceCaptureLimits?: { steps: number; elapsedMs: number };
+  /** Deprecated fixture input; automatic capture has no cumulative allowance. */
+  sourceCaptureLimits?: { steps: number; elapsedMs: number }; // Legacy test input, no longer a document allowance.
+  sourceStallMs?: number;
+  extract?: typeof extractIntakeSourceText;
+  random?: () => number;
+  authorized?: (profileId: string, intakeId: string, operation: 'dispatch' | 'publish') => boolean;
   diagnostics?: ImportDiagnosticSink;
   root: string;
   databases: Map<string, DatabaseSync>;
@@ -88,14 +107,17 @@ interface BatchManagerOptions {
   readingLimits?: IntakeReadingLimits;
   /** Injectable for deterministic coordinator tests; production persists absolute deadlines. */
   providerRetryBaseMs?: number;
+  providerPrerequisiteKey?: (profileId: string) => string;
 }
 
 export interface IntakeBatchManager {
+  wake(profileId: string): void;
   create(profileId: string, input: Partial<CreateIntakeBatchInput> | null): IntakeBatch;
   list(profileId: string): IntakeBatch[];
   get(profileId: string, id: string): IntakeBatch;
   stop(profileId: string, batchId: string): IntakeBatch;
   resume(profileId: string, batchId: string): IntakeBatch;
+  retryExceptions(profileId: string, batchId: string): IntakeBatch;
   close(reason?: string): void;
   isBusy(profileId: string): boolean;
 }
@@ -118,12 +140,7 @@ const op = (value: unknown): string => {
 function modelFailure(error: unknown): boolean {
   const value =
     error !== null && typeof error === 'object' ? (error as Record<string, unknown>) : {};
-  return (
-    value.code === 'MODEL_UNAVAILABLE' ||
-    /\b(model|provider|proxy|connection|authentication|credential|oauth|unauthorized|forbidden|timeout|timed out|rate limit|overloaded)\b/i.test(
-      typeof value.message === 'string' ? value.message : '',
-    )
-  );
+  return value.code === 'MODEL_UNAVAILABLE';
 }
 
 function publicBatch(batch: IntakeBatch): IntakeBatch {
@@ -139,12 +156,22 @@ export function createIntakeBatchManager({
   pollMs = 100,
   continuationDelayMs = 250,
   readingLimits = DEFAULT_INTAKE_READING_LIMITS,
-  sourceCaptureLimits = AUTOMATIC_SOURCE_CAPTURE_LIMITS,
+  sourceStallMs = SOURCE_STALL_MS,
+  extract = extractIntakeSourceText,
+  random = Math.random,
+  authorized = (profileId) => databases.has(profileId),
   providerRetryBaseMs = 5_000,
+  providerPrerequisiteKey = modelRecoveryKey,
   diagnostics = importDiagnostics,
 }: BatchManagerOptions): IntakeBatchManager {
   const batches = new Map<string, IntakeBatch>();
-  const timers = new Map<string, { timer: ReturnType<typeof setTimeout>; batchId: string }>();
+  const timers = new Map<
+    string,
+    { timer: ReturnType<typeof setTimeout>; batchId: string; at: number }
+  >();
+  const pumping = new Set<string>();
+  const pumpBatches = new Map<string, string>();
+  const pendingWake = new Map<string, string>();
   const generations = new Map<string, number>();
   const retryItems = new Set<string>();
   const progressSavedAt = new Map<string, number>();
@@ -157,7 +184,7 @@ export function createIntakeBatchManager({
     required(databases.get(profileId), 'Profile not found');
   const generation = (profileId: string): number => generations.get(profileId) || 0;
   const live = (profileId: string, value: number): boolean =>
-    !closed && generation(profileId) === value;
+    !closed && databases.has(profileId) && generation(profileId) === value;
 
   const backgroundContext = (profileId: string, batch: IntakeBatch, item: IntakeBatchItem) => ({
     profileId,
@@ -252,18 +279,44 @@ export function createIntakeBatchManager({
     if ([...batches.keys()].some((item) => item.startsWith(prefix))) return;
     for (const saved of listIntakeBatches(root, profileId)) {
       const batch = structuredClone(saved);
-      const activeItem = batch.items.find((item) => ['starting', 'running'].includes(item.status));
-      if (batch.status === 'running' || activeItem) {
-        batch.status = 'paused';
-        batch.reason = 'interrupted';
-        if (activeItem) {
-          // Only account through the last durable observation, never process downtime.
-          finishReadingSlice(activeItem, activeItem.reading, batch.updatedAt);
-          activeItem.status = 'paused';
-          activeItem.reason = 'interrupted';
-          activeItem.endedAt ||= now();
+      const recoverable = new Set([
+        'interrupted',
+        'profile_locked',
+        'waiting_for_provider',
+        'provider_outcome_unknown',
+        'provider_retry_limit',
+        'assistant_busy',
+        'job_limit',
+        'time_limit',
+        'context_limit',
+        'continuing',
+      ]);
+      batch.automaticRun ??=
+        batch.status === 'running' ||
+        (batch.status !== 'stopped' && recoverable.has(batch.reason || ''));
+      for (const item of batch.items) {
+        item.automaticRun ??=
+          batch.automaticRun &&
+          (['queued', 'starting', 'running'].includes(item.status) ||
+            recoverable.has(item.reason || '') ||
+            recoverable.has(item.reading?.reason || ''));
+        if (item.automaticRun) {
+          finishReadingSlice(item, item.reading, batch.updatedAt);
+          item.status = 'queued';
+          if (!item.providerWait?.retryAt) item.reason = 'continuing';
+          if (item.chatId) retryItems.add(key(profileId, batch.id + '/' + item.intakeId));
+          if (item.readingJob) item.readingJob.limitPolicy = 'progress-window';
         }
-        save(profileId, batch, 'interrupted-after-restart');
+      }
+      if (batch.automaticRun && batch.items.some((i) => i.automaticRun)) {
+        batch.status = 'running';
+        batch.reason = null;
+        batch.currentIndex = Math.max(
+          0,
+          batch.items.findIndex((i) => i.automaticRun),
+        );
+        save(profileId, batch, 'automatic-recovery');
+        schedule(profileId, batch.id);
       } else batches.set(key(profileId, batch.id), batch);
     }
   }
@@ -284,64 +337,89 @@ export function createIntakeBatchManager({
   }
 
   function schedule(profileId: string, batchId: string, delay = 0): void {
-    if (closed || timers.has(profileId)) return;
+    if (closed) return;
+    const at = clock().getTime() + Math.max(0, delay);
+    const previous = timers.get(profileId);
+    if (previous && previous.at <= at && previous.at > clock().getTime()) return;
+    if (previous) clear(profileId);
     const expected = generation(profileId);
     const timer = setTimeout(
       () => {
         timers.delete(profileId);
         if (!live(profileId, expected)) return;
-        void pump(profileId, batchId, expected).catch((error: unknown) => {
-          if (!live(profileId, expected)) return;
-          const batch = batches.get(key(profileId, batchId));
-          if (!batch || batch.status !== 'running') return;
-          const current = batch.items[batch.currentIndex];
-          if (
-            error instanceof HttpError &&
-            ['SOURCE_EXTRACTION_BUSY', 'SOURCE_TEXT_EXTRACTION_ACTIVE'].includes(error.code) &&
-            current?.status === 'queued'
-          ) {
-            current.reason = 'waiting_for_local_capacity';
-            try {
-              save(profileId, batch, 'source-extraction-capacity-wait');
-              schedule(profileId, batch.id, 1000);
-              return;
-            } catch (journalError) {
-              // Never dispatch again unless the waiting checkpoint is durable.
-              // Fall through to the guarded pause path if its write failed.
-              error = journalError;
+        if (pumping.has(profileId)) {
+          pendingWake.set(profileId, batchId);
+          return;
+        }
+        pumping.add(profileId);
+        void pump(profileId, batchId, expected)
+          .catch((error: unknown) => {
+            if (!live(profileId, expected)) return;
+            const batch = batches.get(key(profileId, pumpBatches.get(profileId) || batchId));
+            if (!batch || batch.status !== 'running') return;
+            const current = batch.items[batch.currentIndex];
+            if (
+              error instanceof HttpError &&
+              ['SOURCE_EXTRACTION_BUSY', 'SOURCE_TEXT_EXTRACTION_ACTIVE'].includes(error.code) &&
+              current?.status === 'queued'
+            ) {
+              current.reason = 'waiting_for_local_capacity';
+              current.retryAt = new Date(clock().getTime() + 1000).toISOString();
+              try {
+                save(profileId, batch, 'source-extraction-capacity-wait');
+                schedule(profileId, batch.id, 1000);
+                return;
+              } catch (journalError) {
+                // Never dispatch again unless the waiting checkpoint is durable.
+                // Fall through to the guarded pause path if its write failed.
+                error = journalError;
+              }
             }
-          }
-          generations.set(profileId, generation(profileId) + 1);
-          const item = batch.items[batch.currentIndex];
-          if (item?.chatId && ['starting', 'running'].includes(item.status))
+            clear(profileId);
+            generations.set(profileId, generation(profileId) + 1);
+            const item = batch.items[batch.currentIndex];
+            if (item?.chatId && ['starting', 'running'].includes(item.status))
+              try {
+                assistant.cancel(profileId, item.chatId);
+              } catch {
+                // Persist the paused generation even if the linked chat is already gone.
+              }
+            if (item && ['queued', 'starting', 'running'].includes(item.status)) {
+              item.status = 'paused';
+              item.reason =
+                error instanceof HttpError && error.code === 'SOURCE_CHANGED'
+                  ? 'source_changed'
+                  : error instanceof HttpError && error.code.startsWith('SOURCE_TEXT_')
+                    ? 'source_review_required'
+                    : 'runner_error';
+              item.endedAt = now();
+            }
+            batch.status = 'paused';
+            batch.reason = modelFailure(error)
+              ? 'model_unavailable'
+              : item?.reason || 'runner_error';
             try {
-              assistant.cancel(profileId, item.chatId);
+              save(profileId, batch, 'runner-paused');
+              rescheduleOtherBatches(profileId, batch.id);
             } catch {
-              // Persist the paused generation even if the linked chat is already gone.
+              // The journal failure is already the authoritative reason work cannot continue.
             }
-          if (item && ['queued', 'starting', 'running'].includes(item.status)) {
-            item.status = 'paused';
-            item.reason =
-              error instanceof HttpError && error.code === 'SOURCE_CHANGED'
-                ? 'source_changed'
-                : error instanceof HttpError && error.code.startsWith('SOURCE_TEXT_')
-                  ? 'source_review_required'
-                  : 'runner_error';
-            item.endedAt = now();
-          }
-          batch.status = 'paused';
-          batch.reason = modelFailure(error) ? 'model_unavailable' : item?.reason || 'runner_error';
-          try {
-            save(profileId, batch, 'runner-paused');
-          } catch {
-            // The journal failure is already the authoritative reason work cannot continue.
-          }
-        });
+          })
+          .finally(() => {
+            pumping.delete(profileId);
+            pumpBatches.delete(profileId);
+            const pending = pendingWake.get(profileId);
+            pendingWake.delete(profileId);
+            if (pending && !closed && databases.has(profileId)) {
+              const target = batches.get(key(profileId, pending));
+              if (target?.automaticRun && target.status === 'running') schedule(profileId, pending);
+            }
+          });
       },
       Math.max(0, delay),
     );
     timer.unref?.();
-    timers.set(profileId, { timer, batchId });
+    timers.set(profileId, { timer, batchId, at });
   }
 
   function finishItem(
@@ -354,6 +432,23 @@ export function createIntakeBatchManager({
     chat: AssistantChat | null,
   ): void {
     finishReadingSlice(item, chat?.reading || item.reading, now());
+    item.automaticRun = false;
+    if (recordDurabilityStatus(dbFor(profileId))) {
+      const source = getIntakeSourceText(dbFor(profileId), root, profileId, item.intakeId);
+      if (source.status === 'available')
+        for (const issue of source.revision.issues.filter(
+          (i) =>
+            ['open', 'later'].includes(i.status) &&
+            /-(failed|processing-stalled|ocr-unavailable)$/.test(i.id),
+        )) {
+          if (!(item.exceptions || []).some((e) => e.unitId === issue.id))
+            (item.exceptions ||= []).push({
+              unitId: issue.id,
+              locator: 'Page ' + issue.region.page,
+              reason: 'processing_stalled',
+            });
+        }
+    }
     item.status = status;
     item.reason = reason;
     item.endedAt = now();
@@ -361,6 +456,14 @@ export function createIntakeBatchManager({
     item.reading = chat?.reading ? structuredClone(chat.reading) : item.reading;
     batch.currentIndex = Math.min(batch.items.length, batch.currentIndex + 1);
     save(profileId, batch, `item-${status}`);
+  }
+
+  function prerequisiteRevision(profileId: string): string {
+    try {
+      return providerPrerequisiteKey(profileId);
+    } catch {
+      return 'unavailable';
+    }
   }
 
   function retainProviderWait(
@@ -375,9 +478,8 @@ export function createIntakeBatchManager({
       (item.providerWait?.attempts || 0) +
       (item.providerWait?.requestId === wait.requestId ? 0 : 1);
     const safeRetry =
-      wait.outcome === 'rejected' &&
-      ['quota', 'transient'].includes(wait.classification) &&
-      attempts <= 5;
+      wait.outcome === 'unknown' ||
+      ['quota', 'transient', 'context_limit'].includes(wait.classification);
     const minimumDelay = Math.min(
       300_000,
       Math.max(1, providerRetryBaseMs) * 2 ** Math.min(attempts - 1, 6),
@@ -386,12 +488,19 @@ export function createIntakeBatchManager({
     const retryAt = safeRetry
       ? new Date(
           Math.max(
-            clock().getTime() + minimumDelay,
+            clock().getTime() +
+              Math.round(minimumDelay * (0.5 + Math.max(0, Math.min(1, random())) / 2)),
             Number.isFinite(providerTime) ? providerTime : 0,
           ),
         ).toISOString()
       : null;
-    item.providerWait = { ...wait, retryAt, attempts, lastWaitAt: now() };
+    item.providerWait = {
+      ...wait,
+      retryAt,
+      attempts,
+      lastWaitAt: now(),
+      responsesAtWait: chat.reading?.usableModelResponses || 0,
+    };
     item.reading = chat.reading ? structuredClone(chat.reading) : item.reading;
     if (safeRetry) {
       item.status = 'queued';
@@ -399,11 +508,8 @@ export function createIntakeBatchManager({
       item.endedAt = null;
       retryItems.add(key(profileId, `${batch.id}/${item.intakeId}`));
       save(profileId, batch, 'provider-wait-recorded');
-      schedule(
-        profileId,
-        batch.id,
-        Math.min(2_147_483_647, Date.parse(retryAt!) - clock().getTime()),
-      );
+      batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
+      schedule(profileId, batch.id);
     } else {
       item.status = 'paused';
       item.endedAt = now();
@@ -412,28 +518,82 @@ export function createIntakeBatchManager({
           ? 'provider_outcome_unknown'
           : wait.classification === 'authentication'
             ? 'provider_authentication'
-            : attempts > 5
-              ? 'provider_retry_limit'
-              : 'provider_rejected';
-      batch.status = 'paused';
-      batch.reason = item.reason;
+            : 'provider_rejected';
+      item.retryAt = new Date(clock().getTime() + 30000).toISOString();
+      item.automaticRun = true;
+      if (wait.classification !== 'authentication')
+        item.prerequisiteKey = prerequisiteRevision(profileId);
       save(profileId, batch, 'provider-intervention-required');
+      batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
+      schedule(profileId, batch.id);
     }
     return true;
   }
 
+  function scheduleNextProfile(profileId: string): void {
+    const time = clock().getTime();
+    const candidates = [...batches.values()]
+      .filter((batch) => batch.profileId === profileId && batch.status === 'running')
+      .map((batch) => {
+        const runnable = batch.items.filter(
+          (item) =>
+            item.automaticRun !== false &&
+            (['queued', 'running', 'starting'].includes(item.status) ||
+              (item.status === 'paused' && !!item.retryAt)),
+        );
+        const at = runnable.length
+          ? Math.min(
+              ...runnable.map((item) =>
+                item.status === 'running'
+                  ? time + pollMs
+                  : Date.parse(item.retryAt || item.providerWait?.retryAt || '') || time,
+              ),
+            )
+          : time;
+        return { batch, at };
+      })
+      .sort((a, b) => a.at - b.at);
+    const next = candidates[0];
+    if (next)
+      schedule(profileId, next.batch.id, Math.min(2_147_483_647, Math.max(0, next.at - time)));
+  }
+
   function completeIfDone(profileId: string, batch: IntakeBatch): boolean {
-    const next = batch.items.findIndex(
-      (item, index) => index >= batch.currentIndex && item.status === 'queued',
+    const eligible = batch.items
+      .map((_, offset) => {
+        const index = (batch.currentIndex + offset) % batch.items.length;
+        return { item: batch.items[index], index };
+      })
+      .filter(
+        ({ item }) =>
+          item.automaticRun !== false &&
+          (item.status === 'queued' || (item.status === 'paused' && !!item.retryAt)),
+      );
+    const next = eligible.find(
+      ({ item }) =>
+        Date.parse(item.retryAt || item.providerWait?.retryAt || '') <= clock().getTime() ||
+        !(item.retryAt || item.providerWait?.retryAt),
     );
-    if (next >= 0) {
-      batch.currentIndex = next;
+    if (next) {
+      batch.currentIndex = next.index;
+      next.item.status = 'queued';
       return false;
     }
-    batch.status = 'complete';
-    batch.reason = batch.items.some(hasPausedIntakeReading) ? 'items_paused' : null;
+    if (eligible.length) {
+      scheduleNextProfile(profileId);
+      return true;
+    }
+    const action = batch.items.some((i) => i.status === 'paused');
+    batch.status = action ? 'paused' : 'complete';
+    batch.reason = action
+      ? 'needs_user_action'
+      : batch.items.some((i) => i.exceptions?.length || i.reason === 'retain_only')
+        ? 'exceptions'
+        : null;
+    batch.automaticRun = action && batch.items.some((i) => i.automaticRun);
     batch.currentIndex = batch.items.length;
-    save(profileId, batch, 'batch-complete');
+    save(profileId, batch, action ? 'batch-needs-action' : 'batch-complete');
+    scheduleNextProfile(profileId);
     return true;
   }
 
@@ -462,12 +622,12 @@ export function createIntakeBatchManager({
     } catch (error) {
       if (!live(profileId, expected)) return false;
       if (modelFailure(error)) {
-        item.status = 'paused';
+        item.status = 'queued';
         item.reason = 'model_unavailable';
-        item.endedAt = now();
-        batch.status = 'paused';
-        batch.reason = 'model_unavailable';
+        item.retryAt = new Date(clock().getTime() + providerRetryBaseMs).toISOString();
         save(profileId, batch, 'model-unavailable');
+        batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
+        schedule(profileId, batch.id);
         return false;
       }
       throw error;
@@ -501,12 +661,6 @@ export function createIntakeBatchManager({
       initialDone: false,
       draining: false,
     });
-    if (
-      !state.operationId &&
-      (state.steps - state.stepsAtAllowance >= sourceCaptureLimits.steps ||
-        state.spentMs - state.spentMsAtAllowance >= sourceCaptureLimits.elapsedMs)
-    )
-      return 'blocked';
     item.reason = 'extracting_source_text';
     item.startedAt ||= now();
     if (!state.operationId) {
@@ -516,30 +670,106 @@ export function createIntakeBatchManager({
       state.steps++;
     }
     save(profileId, batch, 'source-extraction-started');
-    const result = await runIntakeSourceExtractionOperation({
-      db,
-      root,
-      profileId,
-      id: item.intakeId,
-      operationId: state.operationId,
-      expectedRevisionId: state.expectedRevisionId,
-      assertRunning: () => {
-        if (!live(profileId, expected) || batch.status !== 'running')
-          throw Error('SOURCE_EXTRACTION_CANCELLED');
-      },
+    const checkpoint = locateSourceExtractionProgress(before);
+    let expired = false;
+    let expire!: (error: Error) => void;
+    const deadline = new Promise<never>((_, reject) => {
+      expire = reject;
     });
+    const watchdog = setTimeout(() => {
+      expired = true;
+      expire(Error('SOURCE_EXTRACTION_STALLED'));
+    }, sourceStallMs);
+    let result: Awaited<ReturnType<typeof runIntakeSourceExtractionOperation>>;
+    try {
+      result = await runIntakeSourceExtractionOperation({
+        db,
+        root,
+        profileId,
+        id: item.intakeId,
+        operationId: state.operationId,
+        expectedRevisionId: state.expectedRevisionId,
+        extract: (context) =>
+          Promise.race([
+            extract({
+              ...context,
+              maxPages: 1,
+              assertRunning: () => {
+                context.assertRunning?.();
+                if (expired) throw Error('SOURCE_EXTRACTION_STALLED');
+              },
+            }),
+            deadline,
+          ]),
+        assertRunning: () => {
+          if (
+            !live(profileId, expected) ||
+            batch.status !== 'running' ||
+            !authorized(profileId, item.intakeId, 'publish')
+          )
+            throw Error('SOURCE_EXTRACTION_CANCELLED');
+        },
+      });
+    } finally {
+      clearTimeout(watchdog);
+    }
     if (!live(profileId, expected) || batch.status !== 'running') return 'blocked';
     state.spentMs += Math.max(0, clock().getTime() - Date.parse(state.startedAt || now()));
     state.operationId = null;
     state.startedAt = null;
-    state.initialDone = true;
+    state.initialDone = false;
     const after = getIntakeSourceText(db, root, profileId, item.intakeId);
     item.reason = null;
     save(profileId, batch, 'source-extraction-accounted');
-    if (result.operation.status === 'interrupted') return 'blocked';
-    if (!sourceTextExtractionPending(after)) return 'complete';
-    if (after.revision?.id === before.revision?.id) return 'blocked';
-    return 'pending';
+    const next = locateSourceExtractionProgress(after);
+    if (
+      [
+        'SOURCE_OCR_PREREQUISITE',
+        'SOURCE_EXTRACTION_BUSY',
+        'SOURCE_TEXT_EXTRACTION_ACTIVE',
+      ].includes(result.operation.reasonCode || '')
+    ) {
+      const prerequisite = result.operation.reasonCode === 'SOURCE_OCR_PREREQUISITE';
+      item.reason = prerequisite ? 'source_prerequisite' : 'waiting_for_local_capacity';
+      item.retryAt = new Date(clock().getTime() + (prerequisite ? 30000 : 1000)).toISOString();
+      save(profileId, batch, 'source-prerequisite');
+      return 'pending';
+    }
+    if (after.status === 'unavailable') {
+      state.stalls = (state.stalls || 0) + 1;
+      if (state.stalls >= 3) {
+        (item.exceptions ||= []).push({
+          unitId: 'source:' + item.intakeId,
+          locator: 'Retained file (page inventory unavailable)',
+          reason: 'processing_stalled',
+        });
+        return 'blocked';
+      }
+      item.reason = 'retrying_extraction';
+      item.retryAt = new Date(clock().getTime() + providerRetryBaseMs).toISOString();
+      save(profileId, batch, 'source-inventory-retry');
+      return 'pending';
+    }
+    if (next.done > checkpoint.done) {
+      state.progress = next.done;
+      state.lastProgressAt = now();
+      state.stalls = 0;
+    } else if (result.operation.status === 'interrupted' || next.page === checkpoint.page) {
+      state.stalls = state.unitPage === next.page ? (state.stalls || 0) + 1 : 1;
+      state.unitPage = next.page;
+      if (state.stalls >= 3 && next.page) {
+        retainSourceStall(db, root, profileId, item.intakeId, next.page);
+        state.stalls = 0;
+      } else {
+        item.reason = 'retrying_extraction';
+        item.retryAt = new Date(clock().getTime() + providerRetryBaseMs).toISOString();
+      }
+    }
+    save(profileId, batch, 'source-checkpoint');
+    state.initialDone = !sourceTextExtractionPending(
+      getIntakeSourceText(db, root, profileId, item.intakeId),
+    );
+    return state.initialDone ? 'complete' : 'pending';
   }
 
   async function drainRecordlessSource(
@@ -561,7 +791,7 @@ export function createIntakeBatchManager({
         profileId,
         batch,
         item,
-        'paused',
+        outcome === 'complete' ? 'review_ready' : 'paused',
         outcome === 'blocked' ? 'source_review_required' : chat?.reading?.reason || 'no_proposal',
         getIntake(dbFor(profileId), root, profileId, item.intakeId),
         chat,
@@ -604,40 +834,25 @@ export function createIntakeBatchManager({
     }
     item.chatId = linkedChat?.id || item.chatId;
     item.reading = linkedChat?.reading ? structuredClone(linkedChat.reading) : item.reading;
+    if (
+      linkedChat?.status === 'failed' &&
+      linkedChat.reading?.providerWait &&
+      item.providerWait?.requestId !== linkedChat.reading.providerWait.requestId
+    ) {
+      retainProviderWait(profileId, batch, item, linkedChat);
+      return;
+    }
 
     // A linked authorized conversion owns the profile's single model slot until
     // it reaches a terminal pass, even if that pass has already retained an
     // early proposal. Observe it instead of declaring the file finished.
     if (linkedChat?.status === 'running') {
-      beginReadingSlice(item, now(), readingLimits);
-      const attached = assistant.attachIntakeReadingRequestGuard(
-        profileId,
-        linkedChat.id,
-        (reading) => readingModelRequestBudgetReached(item, reading, now(), readingLimits),
-      );
-      if (!attached) {
-        finishReadingSlice(item, item.reading, now());
-        const current = assistant.get(profileId, linkedChat.id);
-        if (current.status !== 'running') {
-          item.status = 'queued';
-          item.reason = null;
-          save(profileId, batch, 'linked-conversion-finished-during-attachment');
-          schedule(profileId, batch.id);
-          return;
-        }
-        item.status = 'paused';
-        item.reason = 'existing_conversion_paused';
-        item.endedAt = now();
-        batch.status = 'paused';
-        batch.reason = 'existing_conversion_paused';
-        save(profileId, batch, 'linked-conversion-guard-unavailable');
-        return;
-      }
-      item.status = 'running';
-      item.reason = null;
-      item.startedAt ||= now();
-      save(profileId, batch, 'attached-running-conversion');
-      schedule(profileId, batch.id, pollMs);
+      assistant.cancel(profileId, linkedChat.id);
+      item.status = 'queued';
+      item.reason = 'continuing';
+      retryItems.add(key(profileId, batch.id + '/' + item.intakeId));
+      save(profileId, batch, 'linked-conversion-adopted');
+      schedule(profileId, batch.id);
       return;
     }
     if (isRetainOnlyIntake(intake)) {
@@ -653,7 +868,9 @@ export function createIntakeBatchManager({
       !interpretations.proposalIds.length &&
       ((!interpretations.original && !!intake.validation?.valid) || intake.proposals.length > 0);
     const retry =
-      retryItems.delete(key(profileId, `${batch.id}/${item.intakeId}`)) || staleInterpretation;
+      retryItems.delete(key(profileId, `${batch.id}/${item.intakeId}`)) ||
+      (item.automaticRun === true && !!item.chatId) ||
+      staleInterpretation;
     if (intake.state === 'ready' && intake.validation?.valid && interpretations.original) {
       finishItem(profileId, batch, item, 'review_ready', 'prepared_jsonl', intake, linkedChat);
       schedule(profileId, batch.id);
@@ -676,8 +893,7 @@ export function createIntakeBatchManager({
       return;
     }
     // Never mutate source-text pins after an existing reviewable proposal.
-    // One bounded local step makes initial source issues visible without delaying
-    // clinical work behind whole-document OCR. Model source reads can continue capture.
+    // Finish pending capture before a new clinical interpretation pins the source revision.
     if (item.sourceExtraction?.draining) {
       await drainRecordlessSource(profileId, batch, item, expected, linkedChat);
       return;
@@ -686,10 +902,26 @@ export function createIntakeBatchManager({
       const outcome = await captureSourceStep(profileId, batch, item, expected);
       if (!live(profileId, expected) || batch.status !== 'running') return;
       intake = getIntake(db, root, profileId, item.intakeId);
-      // An operation error needs explicit reconciliation; ordinary pending pages
-      // never stop ready clinical portions from being processed.
+      if (outcome === 'pending') {
+        item.status = 'queued';
+        item.reason ||= 'extracting_source_text';
+        save(profileId, batch, 'source-extraction-progress');
+        batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
+        schedule(profileId, batch.id);
+        return;
+      }
       if (outcome === 'blocked') {
-        finishItem(profileId, batch, item, 'paused', 'source_review_required', intake, linkedChat);
+        finishItem(
+          profileId,
+          batch,
+          item,
+          item.exceptions?.some((exception) => exception.unitId === 'source:' + item.intakeId)
+            ? 'review_ready'
+            : 'paused',
+          'source_review_required',
+          intake,
+          linkedChat,
+        );
         schedule(profileId, batch.id);
         return;
       }
@@ -722,11 +954,11 @@ export function createIntakeBatchManager({
     save(profileId, batch, 'item-starting');
     if (!(await ensureReady(profileId, batch, item, intake, expected))) return;
     if (assistant.isBusy(profileId)) {
-      item.status = 'paused';
-      item.reason = 'assistant_busy';
-      batch.status = 'paused';
-      batch.reason = 'assistant_busy';
+      item.status = 'queued';
+      item.reason = 'waiting_for_local_capacity';
+      item.retryAt = new Date(clock().getTime() + 1000).toISOString();
       save(profileId, batch, 'assistant-busy');
+      schedule(profileId, batch.id, 1000);
       return;
     }
     intake = getIntake(db, root, profileId, item.intakeId);
@@ -736,11 +968,48 @@ export function createIntakeBatchManager({
       return;
     }
 
+    if (recordDurabilityStatus(db) && !intake.workflow?.plans.some((p) => p.status === 'active')) {
+      intake = await createIntakePlan(db, root, profileId, intake.id, {
+        version: intake.version,
+        assertRunning: () => {
+          if (!live(profileId, expected) || !authorized(profileId, item.intakeId, 'publish'))
+            throw Error('SOURCE_EXTRACTION_CANCELLED');
+        },
+      });
+    }
+    const unit = intake.workflow?.plans
+      .find((p) => p.status === 'active')
+      ?.units.find(
+        (u) =>
+          !u.processingException &&
+          u.status !== 'completed' &&
+          !['context', 'unreadable'].includes(u.coverage?.kind || ''),
+      );
+    if (unit && item.stalls?.unitId !== unit.id)
+      item.stalls = { unitId: unit.id, locator: unit.locator || unit.id, attempts: 0 };
     beginReadingSlice(item, now(), readingLimits);
     save(profileId, batch, 'reading-slice-started');
     const runOptions: BatchAssistantRunOptions = {
-      beforeModelRequest: (reading) =>
-        readingModelRequestBudgetReached(item, reading, now(), readingLimits),
+      assertAuthorized: (operation) => {
+        if (
+          !live(profileId, expected) ||
+          !item.automaticRun ||
+          batch.status !== 'running' ||
+          !authorized(profileId, item.intakeId, operation)
+        )
+          throw Error('Import processing authorization ended');
+      },
+      beforeModelRequest: (reading) => {
+        if (reading.workUnit && item.stalls?.unitId !== reading.workUnit.id)
+          item.stalls = {
+            unitId: reading.workUnit.id,
+            locator: reading.workUnit.locator,
+            attempts: 0,
+          };
+        const reached = readingModelRequestBudgetReached(item, reading, now(), readingLimits);
+        save(profileId, batch, 'reading-request-checkpoint');
+        return reached;
+      },
     };
     let chat: AssistantChat | null = linkedChat;
     try {
@@ -786,20 +1055,22 @@ export function createIntakeBatchManager({
       if (!live(profileId, expected)) return;
       if (modelFailure(error)) {
         finishReadingSlice(item, item.reading, now());
-        item.status = 'paused';
+        item.status = 'queued';
         item.reason = 'model_unavailable';
-        batch.status = 'paused';
-        batch.reason = 'model_unavailable';
+        item.retryAt = new Date(clock().getTime() + providerRetryBaseMs).toISOString();
         save(profileId, batch, 'model-unavailable-after-start');
+        batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
+        schedule(profileId, batch.id);
         return;
       }
       if (error instanceof HttpError && error.code === 'ASSISTANT_BUSY') {
         finishReadingSlice(item, item.reading, now());
-        item.status = 'paused';
-        item.reason = 'assistant_busy';
-        batch.status = 'paused';
-        batch.reason = 'assistant_busy';
+        item.status = 'queued';
+        item.reason = 'waiting_for_local_capacity';
+        item.retryAt = new Date(clock().getTime() + providerRetryBaseMs).toISOString();
         save(profileId, batch, 'assistant-busy-after-start');
+        batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
+        schedule(profileId, batch.id);
         return;
       }
       finishItem(profileId, batch, item, 'paused', 'conversion_start_error', intake, chat);
@@ -843,13 +1114,14 @@ export function createIntakeBatchManager({
         dirtyProgress.delete(progressKey);
         progressSavedAt.set(progressKey, clock().getTime());
       }
-      // Whole-job limits govern the next physical provider request. Do not
+      // The active no-progress window governs the next physical provider request. Do not
       // cancel a request or guarded tool result already admitted by that gate.
       schedule(profileId, batch.id, pollMs);
       return;
     }
     if (!live(profileId, expected)) return;
     const intake = getIntake(dbFor(profileId), root, profileId, item.intakeId) as Intake;
+    const activeBefore = item.readingJob?.activeMs || 0;
     const madeProgress = finishReadingSlice(item, chat.reading || item.reading, now());
     item.reading = chat.reading ? structuredClone(chat.reading) : item.reading;
     if (intake.sha256 !== item.sourceHash) {
@@ -857,28 +1129,113 @@ export function createIntakeBatchManager({
       schedule(profileId, batch.id);
       return;
     }
-    if (madeProgress) delete item.providerWait;
-    if (chat.status === 'idle' && item.reading?.reason === 'job_limit') {
-      finishItem(profileId, batch, item, 'paused', 'job_limit', intake, chat);
-      schedule(profileId, batch.id);
+    if (
+      madeProgress ||
+      chat.status === 'idle' ||
+      (chat.reading?.usableModelResponses || 0) > (item.providerWait?.responsesAtWait || 0)
+    )
+      delete item.providerWait;
+    if (chat.reading?.reason === 'source_prerequisite') {
+      // A missing shared service is not evidence that this source unit is stuck.
+      if (item.readingJob)
+        item.readingJob.budgetAtActiveMs += item.readingJob.activeMs - activeBefore;
+      item.status = 'queued';
+      item.reason = 'source_prerequisite';
+      item.retryAt = new Date(clock().getTime() + 30000).toISOString();
+      save(profileId, batch, 'model-source-prerequisite');
+      scheduleNextProfile(profileId);
       return;
     }
-    if (chat.status === 'idle' && canContinueReadingSlice(item.reading, madeProgress)) {
+    if (chat.reading?.reason === 'unsupported_context') {
+      item.status = 'paused';
+      item.reason = 'provider_rejected';
+      item.automaticRun = true;
+      item.prerequisiteKey = prerequisiteRevision(profileId);
+      item.retryAt = new Date(clock().getTime() + 30000).toISOString();
+      save(profileId, batch, 'context-prerequisite-required');
+      scheduleNextProfile(profileId);
+      return;
+    }
+    if (
+      chat.reading?.providerWait?.classification === 'context_limit' ||
+      (chat.reading?.reason === 'context_limit' &&
+        chat.reading?.providerWait?.classification === 'unsupported')
+    ) {
+      if (retainProviderWait(profileId, batch, item, chat)) return;
+    }
+    if (
+      chat.status === 'idle' &&
+      (canContinueReadingSlice(item.reading, madeProgress) || item.reading?.reason === 'job_limit')
+    ) {
       if (readingBudgetReached(item, now(), readingLimits)) {
-        const reading = { ...item.reading!, status: 'paused' as const, reason: 'job_limit' };
-        finishItem(profileId, batch, item, 'paused', 'job_limit', intake, { ...chat, reading });
-        schedule(profileId, batch.id);
-        return;
+        const scope =
+          item.stalls ||
+          (item.reading?.workUnit
+            ? {
+                unitId: item.reading.workUnit.id,
+                locator: item.reading.workUnit.locator,
+                attempts: 0,
+              }
+            : null);
+        if (!scope) {
+          finishItem(profileId, batch, item, 'paused', 'source_scope_unavailable', intake, chat);
+          schedule(profileId, batch.id);
+          return;
+        }
+        scope.attempts++;
+        item.stalls = scope;
+        extendReadingBudget(item);
+        if (scope.attempts >= 3) {
+          const exception = {
+            unitId: scope.unitId,
+            locator: scope.locator,
+            reason: 'processing_stalled' as const,
+          };
+          (item.exceptions ||= []).push(exception);
+          workflowMutation(
+            dbFor(profileId),
+            root,
+            profileId,
+            intake.id,
+            {
+              version: intake.version,
+              operationId:
+                'stall:' + batch.id + ':' + scope.unitId + ':' + (item.exceptionEpoch || 0),
+            },
+            (workflow) => {
+              const unit = workflow.plans
+                .find((p) => p.status === 'active')
+                ?.units.find((u) => u.id === scope.unitId);
+              if (unit) unit.processingException = { reason: 'processing_stalled', at: now() };
+            },
+          );
+          const remaining = getIntake(dbFor(profileId), root, profileId, intake.id)
+            .workflow?.plans.find((p) => p.status === 'active')
+            ?.units.some((u) => !u.processingException && u.status !== 'completed');
+          if (!remaining) {
+            finishItem(profileId, batch, item, 'review_ready', 'processing_stalled', intake, chat);
+            schedule(profileId, batch.id);
+            return;
+          }
+        }
       }
       item.status = 'queued';
       item.reason = 'continuing';
       item.proposalIds = intake.proposals.map((proposal) => proposal.id);
-      retryItems.add(key(profileId, `${batch.id}/${item.intakeId}`));
+      item.retryAt = new Date(clock().getTime() + continuationDelayMs).toISOString();
+      retryItems.add(key(profileId, batch.id + '/' + item.intakeId));
       save(profileId, batch, 'productive-slice-continued');
-      schedule(profileId, batch.id, continuationDelayMs);
+      batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
+      schedule(profileId, batch.id);
       return;
     }
-    if (chat.status === 'failed' && retainProviderWait(profileId, batch, item, chat)) return;
+    item.proposalIds = intake.proposals.map((proposal) => proposal.id);
+    if (chat.status === 'failed' && chat.reading?.providerWait) {
+      // Provider unavailability is not local stuckness, even when a request timed out.
+      if (item.readingJob)
+        item.readingJob.budgetAtActiveMs += item.readingJob.activeMs - activeBefore;
+      if (retainProviderWait(profileId, batch, item, chat)) return;
+    }
     if (chat.status === 'failed' && modelFailure({ message: chat.error })) {
       item.status = currentIntakeInterpretations(dbFor(profileId), profileId, item.intakeId)
         .proposalIds.length
@@ -897,7 +1254,18 @@ export function createIntakeBatchManager({
     if (
       currentIntakeInterpretations(dbFor(profileId), profileId, item.intakeId).proposalIds.length
     ) {
-      finishItem(profileId, batch, item, 'review_ready', 'bounded_pass_ready', intake, chat);
+      finishItem(
+        profileId,
+        batch,
+        item,
+        intake.workflow?.plans.length &&
+          (item.reading?.remainingUnits || item.reading?.pendingReadWindows)
+          ? 'paused'
+          : 'review_ready',
+        'bounded_pass_ready',
+        intake,
+        chat,
+      );
       schedule(profileId, batch.id);
       return;
     }
@@ -915,7 +1283,7 @@ export function createIntakeBatchManager({
       profileId,
       batch,
       item,
-      'paused',
+      chat.reading?.reason === 'reading_exhausted' ? 'review_ready' : 'paused',
       chat.reading?.reason || (chat.status === 'cancelled' ? 'stopped' : 'no_proposal'),
       intake,
       chat,
@@ -925,29 +1293,49 @@ export function createIntakeBatchManager({
 
   async function pump(profileId: string, batchId: string, expected: number): Promise<void> {
     if (!live(profileId, expected)) return;
-    const batch = get(profileId, batchId);
-    if (batch.status !== 'running') return;
-    const item = batch.items[batch.currentIndex];
-    if (!item) {
-      completeIfDone(profileId, batch);
+    let batch = get(profileId, batchId);
+    const active = [...batches.values()].filter(
+      (b) => b.profileId === profileId && b.status === 'running',
+    );
+    const running = active.find((b) => b.items.some((i) => i.status === 'running'));
+    const ready = active.find((b) =>
+      b.items.some(
+        (i) =>
+          i.automaticRun !== false &&
+          (i.status === 'queued' || (i.status === 'paused' && i.retryAt)) &&
+          (!(i.retryAt || i.providerWait?.retryAt) ||
+            Date.parse(i.retryAt || i.providerWait?.retryAt || '') <= clock().getTime()),
+      ),
+    );
+    batch =
+      running ||
+      (batch.status === 'running' &&
+      batch.items.some((i) => i.status === 'queued' && !(i.retryAt || i.providerWait?.retryAt))
+        ? batch
+        : ready || batch);
+    pumpBatches.set(profileId, batch.id);
+    if (batch.status !== 'running') {
+      scheduleNextProfile(profileId);
       return;
     }
-    if (item.status === 'running') {
+    let item = batch.items[batch.currentIndex];
+    if (item?.status === 'running') {
       await inspectRunning(profileId, batch, item, expected);
       return;
     }
-    if (item.status !== 'queued') {
-      batch.currentIndex++;
-      if (!completeIfDone(profileId, batch)) schedule(profileId, batch.id);
+    if (completeIfDone(profileId, batch)) return;
+    item = batch.items[batch.currentIndex];
+    if (!authorized(profileId, item.intakeId, 'dispatch')) return;
+    if (item.prerequisiteKey && item.prerequisiteKey === prerequisiteRevision(profileId)) {
+      item.status = 'paused';
+      item.retryAt = new Date(clock().getTime() + 30000).toISOString();
+      save(profileId, batch, 'provider-prerequisite-wait');
+      scheduleNextProfile(profileId);
       return;
     }
-    if (item.providerWait?.retryAt) {
-      const delay = Date.parse(item.providerWait.retryAt) - clock().getTime();
-      if (delay > 0) {
-        schedule(profileId, batch.id, Math.min(2_147_483_647, delay));
-        return;
-      }
-    }
+    delete item.prerequisiteKey;
+    item.retryAt = null;
+
     await beginItem(profileId, batch, item, expected);
   }
 
@@ -980,8 +1368,14 @@ export function createIntakeBatchManager({
         appended.reduce((sum, operation) => sum + operation.intakeIds.length, 0);
       const selection =
         existing.operationId === operationId
-          ? existing.items.slice(0, originalCount).map((item) => item.intakeId)
-          : appended.find((operation) => operation.operationId === operationId)!.intakeIds;
+          ? existing.selectionIntakeIds ||
+            existing.items.slice(0, originalCount).map((item) => item.intakeId)
+          : (() => {
+              const operation = appended.find(
+                (operation) => operation.operationId === operationId,
+              )!;
+              return operation.selectionIntakeIds || operation.intakeIds;
+            })();
       if (
         selection.length !== intakeIds.length ||
         selection.some((id, index) => id !== intakeIds[index])
@@ -993,23 +1387,21 @@ export function createIntakeBatchManager({
         );
       return publicBatch(existing);
     }
+    const owned = [...batches.values()].filter((batch) => batch.profileId === profileId);
+    const newIntakeIds = intakeIds.filter(
+      (id) => !owned.some((batch) => batch.items.some((item) => item.intakeId === id)),
+    );
+    if (!newIntakeIds.length)
+      return publicBatch(
+        owned.find((batch) => batch.items.some((item) => intakeIds.includes(item.intakeId)))!,
+      );
     const running = [...batches.values()].find(
       (batch) => batch.profileId === profileId && batch.status === 'running',
     );
     if (running && input.appendToRunning !== true)
       throw new HttpError(409, 'INTAKE_BATCH_BUSY', 'A reading batch is already running');
-    if (
-      running &&
-      (running.items.length + intakeIds.length > 100 ||
-        intakeIds.some((id) => running.items.some((item) => item.intakeId === id)))
-    )
-      throw new HttpError(
-        400,
-        'INTAKE_BATCH_SELECTION',
-        'Keep at most 100 distinct originals in one reading batch; an original already queued cannot be added twice',
-      );
     const db = dbFor(profileId);
-    const items: IntakeBatchItem[] = intakeIds.map((intakeId) => {
+    const items: IntakeBatchItem[] = newIntakeIds.map((intakeId) => {
       const intake = getIntake(db, root, profileId, intakeId);
       if (intake.parentSourceFileId)
         throw new HttpError(
@@ -1022,6 +1414,7 @@ export function createIntakeBatchManager({
         sourceHash: intake.sha256,
         filename: intake.filename,
         mimeType: intake.mimeType,
+        automaticRun: true,
         status: 'queued',
         reason: null,
         chatId: null,
@@ -1040,7 +1433,7 @@ export function createIntakeBatchManager({
         items: [...structuredClone(running.items), ...items],
         appendOperations: [
           ...(running.appendOperations || []),
-          { operationId, intakeIds: [...intakeIds], at },
+          { operationId, intakeIds: [...newIntakeIds], selectionIntakeIds: [...intakeIds], at },
         ],
       };
       const applyAppend = () => {
@@ -1062,7 +1455,11 @@ export function createIntakeBatchManager({
           const receipt = retained.appendOperations?.find(
             (entry) => entry.operationId === operationId,
           );
-          if (receipt && JSON.stringify(receipt.intakeIds) === JSON.stringify(intakeIds))
+          if (
+            receipt &&
+            JSON.stringify(receipt.selectionIntakeIds || receipt.intakeIds) ===
+              JSON.stringify(intakeIds)
+          )
             applyAppend();
         } catch {
           // No confirmed journal head: new work remains unqueued in memory.
@@ -1070,12 +1467,15 @@ export function createIntakeBatchManager({
         throw error;
       }
       applyAppend();
+      schedule(profileId, running.id);
       return publicBatch(running);
     }
     const batch: IntakeBatch = {
       id: randomUUID(),
       profileId,
       operationId,
+      selectionIntakeIds: [...intakeIds],
+      automaticRun: true,
       status: 'running',
       reason: null,
       currentIndex: 0,
@@ -1097,8 +1497,29 @@ export function createIntakeBatchManager({
       .map(publicBatch);
   }
 
+  function rescheduleOtherBatches(profileId: string, excludedId: string): void {
+    for (const other of batches.values()) {
+      if (other.profileId !== profileId || other.id === excludedId || other.status !== 'running')
+        continue;
+      for (const item of other.items) {
+        if (!['starting', 'running'].includes(item.status)) continue;
+        if (item.chatId) assistant.cancel(profileId, item.chatId);
+        finishReadingSlice(item, item.reading, now());
+        item.status = 'queued';
+        item.reason = 'continuing';
+      }
+      save(profileId, other, 'coordinator-generation-restored');
+      schedule(profileId, other.id);
+    }
+  }
+
   function stop(profileId: string, batchId: string): IntakeBatch {
     const batch = get(profileId, batchId);
+    batch.automaticRun = false;
+    for (const entry of batch.items) {
+      if (batch.status !== 'stopped') entry.resumeAutomaticRun = entry.automaticRun === true;
+      entry.automaticRun = false;
+    }
     if (batch.status !== 'running') {
       if (batch.status !== 'stopped') {
         const item = batch.items[batch.currentIndex];
@@ -1114,7 +1535,7 @@ export function createIntakeBatchManager({
       }
       return publicBatch(batch);
     }
-    clear(profileId, batch.id);
+    clear(profileId);
     generations.set(profileId, generation(profileId) + 1);
     const item = batch.items[batch.currentIndex];
     if (item?.chatId && item.status === 'running') assistant.cancel(profileId, item.chatId);
@@ -1127,6 +1548,7 @@ export function createIntakeBatchManager({
     batch.status = 'stopped';
     batch.reason = 'stopped';
     save(profileId, batch, 'stopped');
+    rescheduleOtherBatches(profileId, batch.id);
     return publicBatch(batch);
   }
 
@@ -1156,12 +1578,6 @@ export function createIntakeBatchManager({
     if (index < 0)
       throw new HttpError(409, 'INTAKE_BATCH_RESUME', 'No paused delivery needs another pass');
     const item = batch.items[index];
-    if (item.providerWait?.outcome === 'unknown')
-      throw new HttpError(
-        409,
-        'INTAKE_REQUEST_OUTCOME_UNKNOWN',
-        'The previous provider request has an unknown outcome. Reconcile its attempt receipt before dispatching it again. Completed source work is retained.',
-      );
     if (hasPausedIntakeReading(item)) {
       if (item.sourceExtraction?.draining) {
         item.sourceExtraction.allowanceId = randomUUID();
@@ -1176,12 +1592,58 @@ export function createIntakeBatchManager({
       if (item.chatId && !item.sourceExtraction?.draining)
         retryItems.add(key(profileId, `${batch.id}/${item.intakeId}`));
     }
+    batch.automaticRun = true;
+    item.automaticRun = true;
+    for (const queued of batch.items) {
+      if (queued.status === 'queued' || queued.resumeAutomaticRun) queued.automaticRun = true;
+      delete queued.resumeAutomaticRun;
+    }
     batch.currentIndex = index;
     batch.status = 'running';
     batch.reason = null;
     for (const queued of batch.items) if (queued.status === 'queued') queued.queuedAt = now();
     generations.set(profileId, generation(profileId) + 1);
     save(profileId, batch, 'resumed');
+    schedule(profileId, batch.id);
+    return publicBatch(batch);
+  }
+
+  function retryExceptions(profileId: string, batchId: string): IntakeBatch {
+    const batch = get(profileId, batchId);
+    const db = dbFor(profileId);
+    for (const item of batch.items) {
+      if (!item.exceptions?.length) continue;
+      if (!authorized(profileId, item.intakeId, 'publish'))
+        throw new HttpError(403, 'PROFILE_SCOPE', 'Unlock this profile before retrying imports');
+      retrySourceExceptions(db, root, profileId, item.intakeId);
+      const intake = getIntake(db, root, profileId, item.intakeId);
+      workflowMutation(
+        db,
+        root,
+        profileId,
+        item.intakeId,
+        { version: intake.version, operationId: randomUUID() },
+        (workflow) => {
+          for (const plan of workflow.plans.filter((plan) => plan.status === 'active'))
+            for (const unit of plan.units) delete unit.processingException;
+        },
+      );
+      item.exceptionEpoch = (item.exceptionEpoch || 0) + 1;
+      item.exceptions = [];
+      item.stalls = undefined;
+      item.sourceExtraction = undefined;
+      item.automaticRun = true;
+      item.status = 'queued';
+      item.reason = 'continuing';
+      item.retryAt = null;
+      extendReadingBudget(item);
+      retryItems.add(key(profileId, batch.id + '/' + item.intakeId));
+    }
+    batch.currentIndex = 0;
+    batch.status = 'running';
+    batch.automaticRun = true;
+    batch.reason = null;
+    save(profileId, batch, 'exceptions-retried');
     schedule(profileId, batch.id);
     return publicBatch(batch);
   }
@@ -1210,16 +1672,42 @@ export function createIntakeBatchManager({
     }
   }
 
-  // Recreated applications never leave a durable "running" claim behind and
-  // never start model work until the user explicitly resumes the paused batch.
-  for (const profileId of databases.keys()) loadProfile(profileId);
+  function wake(profileId: string) {
+    if (closed || !databases.has(profileId)) return;
+    loadProfile(profileId);
+    const owned = new Set(
+      [...batches.values()]
+        .filter((b) => b.profileId === profileId)
+        .flatMap((b) => b.items.map((i) => i.intakeId)),
+    );
+    const pending = dbFor(profileId)
+      .prepare("SELECT value FROM app_meta WHERE key LIKE 'intake_enqueue:v1:%'")
+      .all()
+      .map((row) => JSON.parse(String(row.value)) as { intakeId: string; operationId: string })
+      .filter((intent) => !owned.has(intent.intakeId));
+    for (const intent of pending) {
+      if (!authorized(profileId, intent.intakeId, 'dispatch')) continue;
+      create(profileId, {
+        operationId: intent.operationId,
+        intakeIds: [intent.intakeId],
+        appendToRunning: true,
+      });
+    }
+    for (const batch of batches.values())
+      if (batch.profileId === profileId && batch.automaticRun && batch.status === 'running')
+        schedule(profileId, batch.id);
+  }
+  // Instantiation follows authorized runtime restoration, never a browser GET.
+  for (const profileId of databases.keys()) wake(profileId);
 
   return {
+    wake,
     create,
     list,
     get: (profileId: string, id: string) => publicBatch(get(profileId, id)),
     stop,
     resume,
+    retryExceptions,
     close,
     isBusy(profileId: string): boolean {
       loadProfile(profileId);

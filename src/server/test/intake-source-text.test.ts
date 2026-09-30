@@ -1349,3 +1349,51 @@ test('the first pinned revision continues the dependency chain kept in older int
     pinned.version + 1,
   );
 });
+
+test('a confirmed human transcription resolves only its matching OCR-unavailable issue', (t) => {
+  const f = fixture(t),
+    ev = evidence();
+  ev.issues.push(
+    {
+      id: 'p1-ocr-unavailable',
+      region: { page: 1 },
+      kind: 'unsupported',
+      detail: 'Fictional OCR prerequisite missing',
+      status: 'open',
+    },
+    {
+      id: 'p2-unsupported',
+      region: { page: 2 },
+      kind: 'unsupported',
+      detail: 'Fictional unsupported source',
+      status: 'open',
+    },
+  );
+  const initial = publish(f, ev);
+  assert.throws(
+    () => review(f, initial, { resolveIssueIds: ['p1-ocr-unavailable'] }),
+    code('SOURCE_TEXT_INVALID'),
+  );
+  const corrected = review(f, initial, {
+    action: 'correct',
+    spans: [
+      {
+        id: 'human-page',
+        text: 'Fictional full-page transcription.',
+        region: { page: 1 },
+        provenance: 'human',
+      },
+    ],
+  });
+  const confirmed = review(f, corrected, { resolveIssueIds: ['p1-ocr-unavailable'] });
+  assert.equal(
+    confirmed.issues.find((issue) => issue.id === 'p1-ocr-unavailable')?.status,
+    'confirmed',
+  );
+  assert.equal(confirmed.issues.find((issue) => issue.id === 'p2-unsupported')?.status, 'open');
+  assert.equal(confirmed.spans.find((span) => span.id === 'human-page')?.provenance, 'human');
+  assert.deepEqual(
+    confirmed.spans.filter((span) => span.region.page === 2),
+    initial.spans.filter((span) => span.region.page === 2),
+  );
+});

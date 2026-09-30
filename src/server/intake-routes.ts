@@ -43,6 +43,7 @@ interface IntakeRouteContext {
   list: (result: { data: unknown; [key: string]: unknown }) => void;
   body: (req: IncomingMessage, max?: number) => Promise<Buffer>;
   assistant: ReturnType<typeof createAssistant>;
+  intakeBatches?: import('./intake-batches.ts').IntakeBatchManager;
 }
 
 export async function handleIntakeRoute({
@@ -59,6 +60,7 @@ export async function handleIntakeRoute({
   list,
   body,
   assistant,
+  intakeBatches,
 }: IntakeRouteContext): Promise<boolean> {
   if (resource !== 'intakes') return false;
   if (
@@ -201,22 +203,15 @@ export async function handleIntakeRoute({
     } catch {
       throw new HttpError(400, 'INVALID_INPUT', 'Invalid upload header encoding');
     }
-    respond(
-      await intake.uploadIntakeStream(
-        db,
-        root,
-        profileId,
-        {
-          filename,
-          providerId,
-          newProviderName,
-          mimeType: req.headers['content-type'],
-        },
-        req,
-      ),
-      {},
-      201,
+    const retained = await intake.uploadIntakeStream(
+      db,
+      root,
+      profileId,
+      { filename, providerId, newProviderName, mimeType: req.headers['content-type'] },
+      req,
     );
+    intakeBatches?.wake(profileId);
+    respond(retained, {}, 201);
   } else if (method === 'POST') {
     if ((req.headers['content-type'] || '').split(';')[0] !== 'application/json')
       throw new HttpError(415, 'CONTENT_TYPE', 'Use application/json');

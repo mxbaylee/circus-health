@@ -25,6 +25,27 @@ function remainingEstimate(
   const slice = progress.sliceStartedAt ? Date.parse(progress.sliceStartedAt) : NaN;
   const activeMs =
     Math.max(0, progress.activeMs) + (Number.isFinite(slice) ? Math.max(0, now - slice) : 0);
+  if (progress.files?.length) {
+    const estimates = progress.files
+      .filter((file) => !file.done)
+      .map((file) => {
+        const elapsed =
+          file.activeMs +
+          (file.sliceStartedAt ? Math.max(0, now - Date.parse(file.sliceStartedAt)) : 0);
+        const completed = Math.max(file.accounted, Math.min(file.total, file.readWindows) / 2);
+        if (file.uncertain || !file.total || !completed || elapsed < 15000) return null;
+        const wait = file.retryAt ? Math.max(0, Date.parse(file.retryAt) - now) : 0;
+        return {
+          work: Math.max(30000, (file.total - completed) * Math.max(15000, elapsed / completed)),
+          wait,
+        };
+      });
+    if (!estimates.length || estimates.some((value) => value === null)) return null;
+    const work = estimates.reduce((sum, value) => sum + value!.work, 0);
+    const wait = Math.max(...estimates.map((value) => value!.wait));
+    return estimateRange(work + wait, work * 3 + wait, true);
+  }
+  if (activeFiles > 1) return null;
   // A batch wall clock is usable only for a single file without an active clock.
   // Never multiply the current file's pace by unrelated queued files.
   const spent = activeMs || (activeFiles === 1 ? elapsedMs : null);
@@ -40,17 +61,39 @@ function remainingEstimate(
   const remaining = Math.max(30_000, (progress.total - completed) * perUnit);
   const low = Math.max(1, Math.ceil(remaining / 60_000));
   const high = Math.max(low + 1, Math.ceil((remaining * 3) / 60_000));
-  return `${activeFiles > 1 ? 'Current file: ' : ''}Rough estimate: ${low}–${high} minutes remaining`;
+  return estimateRange(low * 60000, high * 60000);
 }
 
+function estimateRange(lowMs: number, highMs: number, combined = false) {
+  const hours = highMs >= 3600000;
+  const divisor = hours ? 3600000 : 60000;
+  const low = Math.max(
+    hours ? 0.1 : 1,
+    Math.ceil((lowMs / divisor) * (hours ? 10 : 1)) / (hours ? 10 : 1),
+  );
+  const high = Math.max(
+    low + (hours ? 0.1 : 1),
+    Math.ceil((highMs / divisor) * (hours ? 10 : 1)) / (hours ? 10 : 1),
+  );
+  return (
+    'Rough estimate: ' +
+    low +
+    '–' +
+    high +
+    (hours ? ' hours' : ' minutes') +
+    (combined ? ' remaining across files' : ' remaining')
+  );
+}
 export function ImportReadingActivity({
   activity,
   onStop,
   onResume,
+  onRetryExceptions,
 }: {
   activity?: ImportReviewModel['activity'];
   onStop?: () => void | Promise<void>;
   onResume?: () => void | Promise<void>;
+  onRetryExceptions?: () => void | Promise<void>;
 }) {
   const [now, setNow] = useState(Date.now);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -79,10 +122,9 @@ export function ImportReadingActivity({
   const ended = progress?.elapsedEndedAt ? Date.parse(progress.elapsedEndedAt) : now;
   const elapsedMs =
     Number.isFinite(started) && Number.isFinite(ended) ? Math.max(0, ended - started) : null;
-  const estimate =
-    progress && !activity?.detailIsImportant
-      ? remainingEstimate(progress, now, elapsedMs, activity?.activeFiles || 0)
-      : null;
+  const estimate = progress
+    ? remainingEstimate(progress, now, elapsedMs, activity?.activeFiles || 0)
+    : null;
   return (
     <div className="import-reading">
       <JesterCartwheel className={`import-reading-jester${active ? '' : ' is-idle'}`} />
@@ -94,23 +136,18 @@ export function ImportReadingActivity({
         {progress && (
           <div className="import-reading-progress">
             <small>
+              {progress.readWindows} pages/units read · {progress.accounted} of{' '}
+              {progress.total || '?'} units accounted for
+              {progress.files?.some((file) => file.exceptions)
+                ? ` · ${progress.files.reduce((sum, file) => sum + file.exceptions, 0)} exceptions`
+                : ''}
+            </small>
+            <small>
               Discovered {progress.readyRecords}{' '}
               {progress.readyRecords === 1 ? 'record' : 'records'}
               {elapsedMs !== null ? ` in ${duration(elapsedMs)}` : ''}.
             </small>
-            {active && !activity?.detailIsImportant && (
-              <small>
-                {estimate || (
-                  <>
-                    {progress.total > 0 ? 'Calculating remaining time' : 'Preparing source'}
-                    <span className="import-reading-dots" aria-hidden="true">
-                      .<span>.</span>
-                      <span>.</span>
-                    </span>
-                  </>
-                )}
-              </small>
-            )}
+            {active && <small>{estimate || 'Estimating…'}</small>}
           </div>
         )}
         {!!activity?.activeFiles && !activity?.uploading && (
@@ -126,7 +163,7 @@ export function ImportReadingActivity({
             onClick={() => void runAction(onStop)}
           >
             <Square size={14} />
-            Stop reading
+            Stop imports
           </button>
         )}
         {onResume && !onStop && (
@@ -137,7 +174,17 @@ export function ImportReadingActivity({
             onClick={() => void runAction(onResume)}
           >
             <Play size={14} />
-            {activity?.resumeLabel || 'Resume reading'}
+            {activity?.resumeLabel || 'Resume imports'}
+          </button>
+        )}
+        {onRetryExceptions && (
+          <button
+            className="button secondary"
+            type="button"
+            disabled={acting || activity?.controlsBusy}
+            onClick={() => void runAction(onRetryExceptions)}
+          >
+            Retry exceptions
           </button>
         )}
         {actionError && <p role="alert">{actionError}</p>}

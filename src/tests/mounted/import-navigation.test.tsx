@@ -209,7 +209,7 @@ it.each([true, false])(
   },
 );
 
-function mount(path: string, data = feed) {
+function mount(path: string, data = feed, batches: unknown[] = []) {
   selectProfile({ id: 'fictional-import-navigation', name: 'Rowan', placebo: true });
   vi.stubGlobal(
     'fetch',
@@ -219,7 +219,8 @@ function mount(path: string, data = feed) {
       if (url.includes('/intakes/import-feed?')) result = data;
       else if (url.endsWith('/intakes/limits'))
         result = { uploadBytes: 1024, extractionBytes: 1024 };
-      else if (url.endsWith('/intake-batches')) result = [];
+      else if (url.endsWith('/intake-batches')) result = batches;
+      else if (url.includes('/intake-batches/')) result = batches[0];
       else throw new Error(`Unexpected fictional request: ${url}`);
       return new Response(JSON.stringify({ data: result, meta: { revision: 1 } }), {
         headers: { 'Content-Type': 'application/json' },
@@ -1878,4 +1879,37 @@ it('does not retry after the overview unmounts during its identity freshness rea
   );
   await Promise.resolve();
   expect(identityPosts).toBe(1);
+});
+
+it('explains provider configuration rejection without promising an available finish time', async () => {
+  mount('/import', feed, [
+    {
+      id: 'fictional-rejected-batch',
+      status: 'running',
+      automaticRun: true,
+      reason: null,
+      currentIndex: 0,
+      createdAt: '2026-09-01T12:00:00Z',
+      updatedAt: '2026-09-01T12:01:00Z',
+      items: [
+        {
+          intakeId: group.intakeId,
+          status: 'paused',
+          reason: 'provider_rejected',
+          automaticRun: true,
+          reading: { accountedUnits: 1, totalUnits: 4, distinctReads: 1, readyRecords: 0 },
+          readingJob: { activeMs: 60000, sliceStartedAt: null },
+        },
+      ],
+    },
+  ]);
+  expect(await screen.findByText('Import needs attention')).toBeVisible();
+  expect(
+    screen.getByText(
+      /Fix the provider configuration and check the connection; reading then continues automatically/,
+    ),
+  ).toBeVisible();
+  expect(screen.getByText('Estimating…')).toBeVisible();
+  expect(screen.queryByRole('button', { name: 'Resume imports' })).toBeNull();
+  expect(screen.getByRole('button', { name: 'Stop imports' })).toBeEnabled();
 });

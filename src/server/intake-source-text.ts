@@ -32,7 +32,6 @@ const FORMAT = 'intake-source-text-v1';
 const ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HASH = /^[a-f0-9]{64}$/;
-const LIMIT = 32 * 1024 * 1024;
 const encode = (value: unknown) => JSON.stringify(value);
 const hash = (value: unknown) => createHash('sha256').update(encode(value)).digest('hex');
 function bad(message: string): never {
@@ -142,15 +141,7 @@ export function validateSourceTextEvidence(value: unknown): asserts value is Sou
     !Array.isArray(value.issues)
   )
     bad('Invalid source-text evidence');
-  if (
-    Buffer.byteLength(encode(value)) > LIMIT ||
-    value.pages.length < 1 ||
-    value.pages.length > 10000 ||
-    value.spans.length > 100000 ||
-    value.issues.length > 100000 ||
-    value.relations.length > 200000
-  )
-    bad('Source-text evidence exceeds the supported bound');
+  if (value.pages.length < 1) bad('Source-text evidence exceeds the supported bound');
   const pages = new Set<number>();
   for (const page of value.pages) {
     if (
@@ -280,7 +271,7 @@ interface LoadedRevision {
   relationRefs: string[];
 }
 const PAGE_CHUNK = 64;
-const MAX_PAGES = 10000;
+const MAX_PAGES = Number.MAX_SAFE_INTEGER;
 /**
  * Content-defined boundaries: an insertion or removal changes the chunk it lands in, not every
  * later chunk. Boundaries follow roughly one item in sixteen, capped at max.
@@ -1144,7 +1135,13 @@ export function reviewIntakeSourceText(
         const issue = revision.issues.find((i) => i.id === id);
         if (!issue || !contains(request.scope, issue.region))
           bad('Choose an existing issue inside the inspected scope');
-        if (issue.kind === 'unsupported')
+        if (
+          issue.kind === 'unsupported' &&
+          !(
+            issue.id.endsWith('-ocr-unavailable') &&
+            revision.spans.some((s) => s.provenance === 'human' && contains(s.region, issue.region))
+          )
+        )
           bad('Unsupported format limitations cannot be resolved by source-text confirmation');
         if (
           (issue.kind === 'unreadable' || issue.status === 'unreadable') &&

@@ -948,24 +948,41 @@ export function ImportPage() {
       pausedItem;
     const reading = currentItem?.reading;
     const readingDetail =
-      currentItem?.reason === 'waiting_for_provider'
-        ? 'Moxie is waiting to continue. Your progress is saved.'
-        : currentItem?.reason === 'waiting_for_local_capacity'
-          ? 'Moxie will continue when the app is ready. Your progress is saved.'
-          : currentItem?.reason === 'extracting_source_text'
-            ? 'Moxie is getting your files ready.'
-            : currentItem?.reason === 'continuing'
-              ? 'Moxie is continuing to read. Your progress is saved.'
-              : reading?.phase === 'indexing_source'
-                ? 'Moxie is getting your files ready.'
-                : reading?.phase === 'reading_source'
-                  ? 'Results appear here as Moxie reads.'
-                  : reading?.phase === 'preparing_results'
-                    ? 'Moxie is preparing the records for your review.'
-                    : reading?.phase === 'waiting_for_model'
-                      ? 'Results appear here as Moxie reads. You can leave this page.'
-                      : 'Moxie is getting ready to read. Your progress is saved.';
-    const paused = !!pausedItem || !!data?.activity.pausedFiles;
+      currentItem?.reason === 'source_prerequisite'
+        ? 'Local OCR is unavailable. Processing will retry when the shared prerequisite is restored.'
+        : currentItem?.reason === 'provider_rejected'
+          ? intakeReadingPauseLabel('provider_rejected')
+          : currentItem?.reason === 'provider_authentication'
+            ? 'Sign in to the configured provider. Eligible imports will continue automatically.'
+            : currentItem?.reason === 'retrying_extraction'
+              ? 'Retrying the interrupted source section from saved progress.'
+              : currentItem?.reason === 'model_unavailable'
+                ? 'Waiting for the model connection. Your progress is saved.'
+                : currentItem?.reason === 'waiting_for_provider'
+                  ? (currentItem.providerWait?.outcome === 'unknown'
+                      ? "The previous request's result is unknown; retrying may use additional provider usage."
+                      : 'Waiting for the provider.') +
+                    (currentItem.providerWait?.retryAt
+                      ? ' Next attempt: ' +
+                        new Date(currentItem.providerWait.retryAt).toLocaleTimeString() +
+                        '.'
+                      : ' The finish time is uncertain.')
+                  : currentItem?.reason === 'waiting_for_local_capacity'
+                    ? 'Moxie will continue when the app is ready. Your progress is saved.'
+                    : currentItem?.reason === 'extracting_source_text'
+                      ? 'Moxie is getting your files ready.'
+                      : currentItem?.reason === 'continuing'
+                        ? 'Moxie is continuing to read. Your progress is saved.'
+                        : reading?.phase === 'indexing_source'
+                          ? 'Moxie is getting your files ready.'
+                          : reading?.phase === 'reading_source'
+                            ? 'Results appear here as Moxie reads.'
+                            : reading?.phase === 'preparing_results'
+                              ? 'Moxie is preparing the records for your review.'
+                              : reading?.phase === 'waiting_for_model'
+                                ? 'Results appear here as Moxie reads. You can leave this page.'
+                                : 'Moxie is getting ready to read. Your progress is saved.';
+    const paused = batch.batch?.status === 'stopped' || batch.batch?.status === 'paused';
     return {
       confirmedSavedIds: acceptanceReceipt?.receipts.flatMap((block) =>
         block.records.map((record) =>
@@ -1008,26 +1025,58 @@ export function ImportPage() {
       searchAppliedByModel: true,
       operationStatus: operationStatus || undefined,
       activity: {
-        activeFiles,
+        activeFiles: batch.batch?.status === 'running' ? Math.max(1, activeFiles) : 0,
         uploading: !!uploadStatus,
         controlsBusy: batch.busy,
         detailIsImportant:
           !!uploadStatus ||
-          ['waiting_for_provider', 'waiting_for_local_capacity'].includes(
-            currentItem?.reason || '',
-          ),
-        resumeLabel: pausedItem?.reason === 'job_limit' ? 'Continue reading' : 'Resume reading',
+          [
+            'waiting_for_provider',
+            'waiting_for_local_capacity',
+            'provider_authentication',
+            'provider_rejected',
+            'retrying_extraction',
+            'source_prerequisite',
+            'model_unavailable',
+          ].includes(currentItem?.reason || ''),
+        resumeLabel: 'Resume imports',
         progress: batch.batch
           ? {
               elapsedStartedAt: batch.batch.createdAt,
               elapsedEndedAt: batch.batch.status === 'running' ? null : batch.batch.updatedAt,
-              accounted: reading?.accountedUnits || 0,
-              total: reading?.totalUnits || 0,
+              accounted: batch.batch.items.reduce(
+                (sum, item) => sum + (item.reading?.accountedUnits || 0),
+                0,
+              ),
+              total: batch.batch.items.reduce(
+                (sum, item) => sum + (item.reading?.totalUnits || 0),
+                0,
+              ),
+              files: batch.batch.items.map((item) => ({
+                accounted: item.reading?.accountedUnits || 0,
+                total: item.reading?.totalUnits || 0,
+                readWindows: item.reading?.distinctReads ?? item.reading?.readWindows ?? 0,
+                activeMs: item.readingJob?.activeMs || 0,
+                sliceStartedAt: item.readingJob?.sliceStartedAt || null,
+                retryAt: item.retryAt || item.providerWait?.retryAt || null,
+                uncertain: [
+                  'source_prerequisite',
+                  'provider_authentication',
+                  'provider_rejected',
+                  'model_unavailable',
+                ].includes(item.reason || ''),
+                done: !item.automaticRun,
+                exceptions: item.exceptions?.length || 0,
+              })),
               readyRecords: batch.batch.items.reduce(
                 (total, item) => total + (item.reading?.readyRecords || 0),
                 0,
               ),
-              readWindows: reading?.readWindows || 0,
+              readWindows: batch.batch.items.reduce(
+                (sum, item) =>
+                  sum + (item.reading?.distinctReads ?? item.reading?.readWindows ?? 0),
+                0,
+              ),
               activeMs: currentItem?.readingJob?.activeMs || 0,
               sliceStartedAt: currentItem?.readingJob?.sliceStartedAt || null,
               lastProgressAt:
@@ -1040,25 +1089,42 @@ export function ImportPage() {
           : undefined,
         label:
           uploadStatus ||
-          (activeFiles
-            ? `Moxie is reading ${activeFiles} ${activeFiles === 1 ? 'file' : 'files'}`
-            : paused
-              ? 'Reading paused'
-              : reportActivityLabel(
-                  data?.activity || {
-                    runningFiles: 0,
-                    pausedFiles: 0,
-                    queuedFiles: 0,
-                    filesAwaitingConversion: 0,
-                    remainingUnits: 0,
-                    extractionUnknownFiles: 0,
-                    extractionComplete: false,
-                    allCurrentReportsReviewed: false,
-                  },
-                )),
+          (batch.batch?.status === 'complete'
+            ? batch.batch.reason === 'exceptions'
+              ? 'Done, with exceptions'
+              : 'Done'
+            : batch.batch?.status === 'stopped'
+              ? 'Imports stopped'
+              : currentItem?.reason === 'waiting_for_provider'
+                ? 'Waiting for provider'
+                : currentItem?.reason === 'source_prerequisite'
+                  ? 'Waiting for local extraction'
+                  : currentItem?.reason === 'retrying_extraction'
+                    ? 'Retrying extraction'
+                    : batch.batch?.reason === 'needs_user_action' ||
+                        currentItem?.reason === 'provider_rejected'
+                      ? 'Import needs attention'
+                      : currentItem?.reason === 'provider_authentication'
+                        ? 'Provider sign-in needed'
+                        : activeFiles
+                          ? `Moxie is reading ${activeFiles} ${activeFiles === 1 ? 'file' : 'files'}`
+                          : paused
+                            ? 'Reading paused'
+                            : reportActivityLabel(
+                                data?.activity || {
+                                  runningFiles: 0,
+                                  pausedFiles: 0,
+                                  queuedFiles: 0,
+                                  filesAwaitingConversion: 0,
+                                  remainingUnits: 0,
+                                  extractionUnknownFiles: 0,
+                                  extractionComplete: false,
+                                  allCurrentReportsReviewed: false,
+                                },
+                              )),
         detail: uploadStatus
           ? 'Keep this page open until the original is retained.'
-          : activeFiles
+          : batch.batch?.status === 'running'
             ? readingDetail
             : pausedItem
               ? intakeReadingPauseLabel(
@@ -1559,16 +1625,7 @@ export function ImportPage() {
             failed.push(`${file.name}: ${errorMessage(cause)}`);
           }
         }
-        if (uploaded.length) {
-          try {
-            if (!current()) throw new Error('Profile changed before reading started.');
-            await batch.create(uploaded, { appendToRunning: true });
-          } catch (cause) {
-            throw new Error(
-              `The originals were retained, but reading did not start. Use Retry reading below. ${errorMessage(cause)}`,
-            );
-          }
-        }
+        if (uploaded.length && current()) await batch.refresh();
         if (failed.length)
           throw new Error(
             `${failed.length} ${failed.length === 1 ? 'file' : 'files'} could not upload: ${failed.join(', ')}`,
@@ -2154,10 +2211,18 @@ export function ImportPage() {
                     feed.reload();
                   }
                 : undefined,
+            onRetryExceptions: batch.batch?.items.some((item) => item.exceptions?.length)
+              ? async () => {
+                  await batch.retryExceptions();
+                  feed.reload();
+                }
+              : undefined,
             onResumeReading:
-              batch.batch?.status !== 'running' &&
-              batch.batch?.items.some(hasPausedIntakeReading) &&
-              !batch.batch?.items.some((item) => item.providerWait?.outcome === 'unknown')
+              (batch.batch?.status === 'stopped' ||
+                (batch.batch?.status === 'paused' &&
+                  batch.batch.reason !== 'needs_user_action' &&
+                  !batch.batch.automaticRun)) &&
+              batch.batch?.items.some(hasPausedIntakeReading)
                 ? async () => {
                     await batch.resume();
                   }

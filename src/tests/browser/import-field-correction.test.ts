@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -77,7 +78,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         data: pdf,
       });
       assert.equal(upload.status(), 201);
-      const intake = (await upload.json()).data;
+      const intake = await stopFixtureImport(page, url, prefix, (await upload.json()).data.id);
       await request(`${prefix}/intakes/${intake.id}/proposals`, {
         version: intake.version,
         summary: 'Fictional controlled correction fixture',

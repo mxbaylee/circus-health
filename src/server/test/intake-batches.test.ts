@@ -297,7 +297,7 @@ test('two uploaded originals run sequentially into one durable review queue', as
   assert.equal(f.checks(), 2);
 });
 
-test('an active linked conversion remains attached after its first retained proposal', async (t) => {
+test('an active linked conversion is restarted under coordinator ownership after retaining its proposal', async (t) => {
   const f = setup(t);
   const first = uploadIntake(f.db, f.root, profileId, {
     filename: 'fictional-active-linked.txt',
@@ -329,11 +329,16 @@ test('an active linked conversion remains attached after its first retained prop
     'batch attachment',
   );
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(f.bridges.length, 1, 'the next file cannot start while linked work is active');
+  assert.equal(
+    f.bridges.length,
+    2,
+    'the existing chat restarts with full coordinator authorization',
+  );
+  assert.equal(f.bridges[0].closed, true);
   assert.equal(f.manager.get(profileId, batch.id).items[1].status, 'queued');
 
-  complete(f.bridges[0]);
-  await waitFor(() => f.bridges.length === 2, 'next file after linked terminal pass');
+  complete(f.bridges[1]);
+  await waitFor(() => f.bridges.length === 3, 'next file after linked terminal pass');
   assert.equal(f.manager.get(profileId, batch.id).items[0].status, 'review_ready');
   f.manager.stop(profileId, batch.id);
 });
@@ -419,8 +424,8 @@ test('restart resumes a batch linked immediately before a simulated process cras
     restartedAssistant.close();
   });
   const interrupted = restarted.get(profileId, batch.id);
-  assert.equal(interrupted.status, 'paused');
-  assert.equal(interrupted.reason, 'interrupted');
+  assert.equal(interrupted.status, 'running');
+  assert.equal(interrupted.reason, null);
   const chatId = interrupted.items[0].chatId;
   assert.ok(chatId);
   const restartedChat = restartedAssistant.get(profileId, chatId);
@@ -428,7 +433,6 @@ test('restart resumes a batch linked immediately before a simulated process cras
   assert.ok(restartedChat.context);
   assert.equal(restartedChat.context.intakeId, intake.id);
 
-  restarted.resume(profileId, batch.id);
   await waitFor(() => f.bridges.length === 1, 'single resumed model pass');
   assert.equal(restarted.get(profileId, batch.id).items[0].chatId, chatId);
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -606,7 +610,7 @@ test('a retained partial proposal survives a failed pass and the next original s
   await waitFor(() => f.manager.get(profileId, batch.id).status === 'complete', 'complete batch');
 });
 
-test('a proxy timeout pauses the whole batch while keeping its partial proposal reviewable', async (t) => {
+test('an unknown provider result waits while the next file can run and proposals remain reviewable', async (t) => {
   const f = setup(t);
   const first = uploadIntake(f.db, f.root, profileId, {
     filename: 'fictional-proxy-timeout.txt',
@@ -626,17 +630,28 @@ test('a proxy timeout pauses the whole batch while keeping its partial proposal 
   });
   await waitFor(() => f.bridges.length === 1, 'partial provider pass');
   await propose(f.bridges[0], first);
+  f.bridges[0].callbacks.onEvent?.('model/requestStarted', {
+    requestId: 'fictional-lost',
+    model: 'fictional',
+    attempt: 1,
+    requestDigest: 'a'.repeat(64),
+    requestBytes: 1,
+  });
+  f.bridges[0].callbacks.onEvent?.('model/requestFinished', {
+    requestId: 'fictional-lost',
+    failed: true,
+    outcome: 'unknown',
+  });
   f.bridges[0].callbacks.onExit?.(new Error('Synthetic LiteLLM proxy timeout'));
   const paused = await waitFor(() => {
     const value = f.manager.get(profileId, batch.id);
-    return value.status === 'paused' && value;
+    return value.items[0].reason === 'waiting_for_provider' && value;
   }, 'whole-batch provider pause');
-  assert.equal(f.bridges.length, 1, 'the next file cannot cascade another provider request');
-  assert.equal(paused.reason, 'model_unavailable');
-  assert.equal(paused.items[0].status, 'review_ready');
-  assert.equal(paused.items[0].reason, 'model_unavailable');
+  await waitFor(() => f.bridges.length === 2);
+  assert.equal(paused.status, 'running');
+  assert.equal(paused.items[0].status, 'queued');
+  assert.equal(paused.items[0].providerWait?.outcome, 'unknown');
   assert.equal(paused.items[0].proposalIds.length, 1);
-  assert.equal(paused.items[1].status, 'queued');
 });
 
 test('explicit resume continues a partial review-ready source after recreating the batch manager', async (t) => {
@@ -680,8 +695,8 @@ test('explicit resume continues a partial review-ready source after recreating t
   );
 });
 
-test('the last file remains resumable after a provider failure retained its partial proposal', async (t) => {
-  const f = setup(t);
+test('the last file automatically retries an unknown result and retains its partial proposal', async (t) => {
+  const f = setup(t, {}, { providerRetryBaseMs: 20 });
   const original = uploadIntake(f.db, f.root, profileId, {
     filename: 'fictional-final-timeout.txt',
     bytes: Buffer.from('Fictional partial provider response'),
@@ -692,58 +707,55 @@ test('the last file remains resumable after a provider failure retained its part
   });
   await waitFor(() => f.bridges.length === 1);
   await propose(f.bridges[0], original);
+  f.bridges[0].callbacks.onEvent?.('model/requestStarted', {
+    requestId: 'fictional-lost-last',
+    model: 'fictional',
+    attempt: 1,
+    requestDigest: 'a'.repeat(64),
+    requestBytes: 1,
+  });
+  f.bridges[0].callbacks.onEvent?.('model/requestFinished', {
+    requestId: 'fictional-lost-last',
+    failed: true,
+    outcome: 'unknown',
+  });
   f.bridges[0].callbacks.onExit?.(new Error('Synthetic LiteLLM proxy timeout'));
-  await waitFor(() => f.manager.get(profileId, batch.id).status === 'paused');
-  f.manager.resume(profileId, batch.id);
+
   await waitFor(
     () => f.bridges.length === 2,
     'last partial file retries instead of rejecting resume',
   );
   assert.equal(getIntake(f.db, f.root, profileId, original.id).proposals.length, 1);
+  f.manager.stop(profileId, batch.id);
 });
 
-test('unavailable model pauses the whole batch once per explicit attempt', async (t) => {
-  let checks = 0;
-  const f = setup(t, {
-    connectionCheck: async () => {
-      checks++;
-      return {
-        available: false,
-        readiness: 'unavailable',
-        message: 'Synthetic provider authentication is unavailable',
-      };
+test('unavailable model preflight recovers without Resume when its prerequisite changes', async (t) => {
+  let checks = 0,
+    available = false;
+  const f = setup(
+    t,
+    {
+      connectionCheck: async () => {
+        checks++;
+        return { available, readiness: available ? 'ready' : 'unavailable' };
+      },
     },
-  });
-  const first = uploadIntake(f.db, f.root, profileId, {
-    filename: 'fictional-auth-first.txt',
-    newProviderName: 'Fictional clinic',
-    bytes: Buffer.from('Fictional auth first'),
-  });
-  const second = uploadIntake(f.db, f.root, profileId, {
-    filename: 'fictional-auth-second.txt',
-    newProviderName: 'Fictional clinic',
-    bytes: Buffer.from('Fictional auth second'),
+    { providerRetryBaseMs: 20 },
+  );
+  const source = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-prerequisite.txt',
+    bytes: Buffer.from('fictional prerequisite'),
   });
   const batch = f.manager.create(profileId, {
-    operationId: 'fictional-model-unavailable',
-    intakeIds: [first.id, second.id],
+    operationId: 'fictional-preflight',
+    intakeIds: [source.id],
   });
-  await waitFor(
-    () => f.manager.get(profileId, batch.id).status === 'paused',
-    'model-unavailable pause',
-  );
-  assert.equal(checks, 1);
+  await waitFor(() => checks >= 2);
+  assert.equal(f.manager.get(profileId, batch.id).status, 'running');
   assert.equal(f.bridges.length, 0);
-  assert.deepEqual(
-    f.manager.get(profileId, batch.id).items.map((item) => item.status),
-    ['paused', 'queued'],
-  );
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(checks, 1, 'paused batches do not repeat connection requests');
-  f.manager.resume(profileId, batch.id);
-  await waitFor(() => checks === 2, 'second explicit preflight');
-  assert.equal(f.manager.get(profileId, batch.id).status, 'paused');
-  assert.equal(f.bridges.length, 0);
+  available = true;
+  await waitFor(() => f.bridges.length === 1);
+  f.manager.stop(profileId, batch.id);
 });
 
 test('profile lock during preflight persists a pause and generation-guards the late result', async (t) => {
@@ -782,10 +794,11 @@ test('profile lock during preflight persists a pause and generation-guards the l
   });
   t.after(() => reloaded.close());
   const paused = reloaded.get(profileId, batch.id);
-  assert.equal(paused.status, 'paused');
-  assert.equal(paused.reason, 'profile_locked');
-  assert.equal(paused.items[0].status, 'paused');
-  assert.equal(paused.items[0].reason, 'profile_locked');
+  assert.equal(paused.status, 'running');
+  assert.equal(paused.reason, null);
+  assert.equal(paused.items[0].status, 'queued');
+  await waitFor(() => f.bridges.length === 1, 'unlock automatically restarts the authorized pass');
+  reloaded.close();
 });
 
 test('profile-scoped HTTP routes create, read, stop, and resume the durable queue', async (t) => {
@@ -895,9 +908,10 @@ test('explicit append while preflight is in flight preserves the durable queue a
   assert.throws(() => f.manager.create(profileId, { ...request, intakeIds: [first.id] }), {
     code: 'INTAKE_BATCH_OPERATION',
   });
-  assert.throws(
-    () => f.manager.create(profileId, { ...request, operationId: 'fictional-duplicate-original' }),
-    { code: 'INTAKE_BATCH_SELECTION' },
+  assert.equal(
+    f.manager.create(profileId, { ...request, operationId: 'fictional-duplicate-original' }).id,
+    batch.id,
+    'older client enqueue reconciles the retained original',
   );
   assert.throws(() => f.manager.create('other-profile', request));
   assert.throws(
@@ -907,7 +921,7 @@ test('explicit append while preflight is in flight preserves the durable queue a
         operationId: 'fictional-too-many',
         intakeIds: Array.from({ length: 100 }, (_, i) => `intake:fictional-${i}`),
       }),
-    { code: 'INTAKE_BATCH_SELECTION' },
+    /not found/i,
   );
   assert.deepEqual(
     readIntakeBatch(f.root, profileId, batch.id).items.map((item) => item.intakeId),
@@ -1011,7 +1025,7 @@ test('an append rejected before journal publication leaves the running queue unc
   assert.equal(f.manager.create(profileId, request).items.length, 2);
 });
 
-test('appended selections survive manager restart and operation replay stays paused until explicit resume', async (t) => {
+test('appended selections survive restart and operation replay while automatic work resumes', async (t) => {
   const f = setup(t);
   const first = fictionalAppendOriginal(f, 'restart-first'),
     second = fictionalAppendOriginal(f, 'restart-second');
@@ -1036,7 +1050,7 @@ test('appended selections survive manager restart and operation replay stays pau
     pollMs: 5,
   });
   t.after(() => reloaded.close());
-  assert.equal(reloaded.create(profileId, request).status, 'paused');
+  assert.equal(reloaded.create(profileId, request).status, 'running');
   assert.equal(reloaded.create(profileId, original).items.length, 2);
   assert.deepEqual(reloaded.get(profileId, batch.id).appendOperations?.[0]?.intakeIds, [second.id]);
   assert.equal(f.bridges.length, 1);

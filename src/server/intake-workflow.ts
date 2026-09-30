@@ -177,7 +177,13 @@ export function recordCandidateVersions(
     let version = candidate.versions.find((item) => item.id === versionId);
     if (!version) {
       // New evidence cannot silently close an earlier pending review or its drafts.
-      version = { id: versionId, status: 'pending', createdAt: now(), occurrences: [] };
+      version = {
+        id: versionId,
+        contentDigest: workflowHash(canonicalLiteral(entry.value)),
+        status: 'pending',
+        createdAt: now(),
+        occurrences: [],
+      };
       candidate.versions.push(version);
     }
     const peopleCount = validatedIntakePeople(entry.value).length;

@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AppOptions } from '../../server/index.ts';
 import type { Browser } from 'playwright';
@@ -8,8 +9,6 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { chromium } from 'playwright';
-import { createServer as createViteServer, type ViteDevServer } from 'vite';
-import react from '@vitejs/plugin-react';
 import { startRuntime } from '../../server/runtime.ts';
 import { fictionalModel } from '../../server/test/fictional-model.ts';
 import type { HealthTool } from '../../server/proxy-model-bridge.ts';
@@ -19,12 +18,6 @@ test(
   { timeout: 90000 },
   async (t) => {
     fictionalModel(t);
-    const priorHealthDev = process.env.CRS_DEV;
-    process.env.CRS_DEV = '1';
-    t.after(() => {
-      if (priorHealthDev === undefined) delete process.env.CRS_DEV;
-      else process.env.CRS_DEV = priorHealthDev;
-    });
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-draft-repair-'));
     mkdirSync(resolve(root, 'data'));
     type Callbacks = Parameters<
@@ -32,6 +25,7 @@ test(
     >[0];
     const starts: HealthTool[][] = [];
     let retainedOriginalText = '';
+    let modelAvailable = false;
     const runtimeDirectory = createTestRuntimeDirectory();
     const runtime = await startRuntime({
       dataDirectory: resolve(root, 'data'),
@@ -39,7 +33,7 @@ test(
       port: 0,
       host: '127.0.0.1',
       assistantOptions: {
-        availability: () => ({ available: true, readiness: 'ready' }),
+        availability: () => ({ available: modelAvailable, readiness: 'ready' }),
         connectionCheck: async () => ({ available: true, readiness: 'ready' }),
         bridgeFactory(callbacks: Callbacks) {
           return {
@@ -108,32 +102,17 @@ test(
       },
     });
     let browser: Browser | undefined;
-    let vite: ViteDevServer | undefined;
     t.after(async () => {
       await browser?.close();
-      await vite?.close();
       await runtime.close();
       rmSync(runtimeDirectory, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     });
-    const apiUrl = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
-    vite = await createViteServer({
-      configFile: false,
-      root: resolve(import.meta.dirname, '../..'),
-      define: { __CIRCUS_BUILD_ID__: JSON.stringify(null) },
-      plugins: [react()],
-      server: {
-        host: '127.0.0.1',
-        port: 5173,
-        strictPort: true,
-        proxy: { '/api': apiUrl },
-      },
-    });
-    await vite.listen();
+    // Use the built app and isolated runtime port, as other encrypted journeys do.
+    const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     page.setDefaultTimeout(15000);
-    const url = 'http://127.0.0.1:5173';
     await page.goto(url);
     const setup = await page.evaluate(async () => {
       const post = async (path: string, body: unknown) => {
@@ -171,7 +150,13 @@ test(
       data: original,
     });
     assert.equal(uploadedResponse.status(), 201);
-    const uploaded = (await uploadedResponse.json()).data;
+    const uploaded = await stopFixtureImport(
+      page,
+      url,
+      prefix,
+      (await uploadedResponse.json()).data.id,
+    );
+    modelAvailable = true;
     const proposedResponse = await page.request.post(
       url + prefix + `/intakes/${encodeURIComponent(uploaded.id)}/proposals`,
       {

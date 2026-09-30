@@ -180,8 +180,6 @@ export function extractionUnits(
           filename: member.filename,
           locator: `${member.locator}; ${unit.locator}`,
         });
-        if (units.length > 5000)
-          throw new HttpError(413, 'PLAN_LIMIT', 'The delivery exceeds 5,000 extraction units');
       }
     }
     for (const member of index.unsupportedMembers || [])
@@ -249,7 +247,5 @@ export function extractionUnits(
       'PLAN_UNSUPPORTED',
       'This format has no resumable text/page index yet. Originals remain available.',
     );
-  if (units.length > 5000)
-    throw new HttpError(413, 'PLAN_LIMIT', 'The document exceeds 5,000 extraction units');
   return units;
 }

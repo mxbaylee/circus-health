@@ -36,7 +36,7 @@ it('uses one elapsed batch clock across files and model passes, not local page p
   render(<ImportReadingActivity activity={activity()} />);
   expect(screen.getByText('Moxie is reading 2 files')).toBeVisible();
   expect(screen.getByText('Discovered 37 records in 5 minutes.')).toBeVisible();
-  expect(screen.getByText(/Current file: Rough estimate:/)).toBeVisible();
+  expect(screen.getByText('Estimating…')).toBeVisible();
   expect(screen.queryByText('Results appear here as Moxie reads.')).toBeNull();
   expect(
     screen.queryByText(/page prepared|source windows|source sections|Model context/),
@@ -55,7 +55,7 @@ it('freezes calendar elapsed at the recorded pause or completion', () => {
   expect(screen.getByText('Discovered 37 records in 2 hours 5 minutes.')).toBeVisible();
   act(() => vi.advanceTimersByTime(10000));
   expect(screen.getByText('Discovered 37 records in 2 hours 5 minutes.')).toBeVisible();
-  expect(screen.queryByText('Calculating remaining time')).toBeNull();
+  expect(screen.queryByText('Estimating…')).toBeNull();
 });
 it('does not substitute a tool duration when the batch timestamp is unavailable', () => {
   const unknown = activity();
@@ -90,7 +90,7 @@ it('starts a rough estimate after fifteen seconds and keeps one for read-but-una
     sliceStartedAt: start,
   });
   const view = render(<ImportReadingActivity activity={reading} />);
-  expect(screen.getByText('Calculating remaining time')).toBeVisible();
+  expect(screen.getByText('Estimating…')).toBeVisible();
   act(() => vi.advanceTimersByTime(15_000));
   expect(screen.getByText('Rough estimate: 1–2 minutes remaining')).toBeVisible();
   reading.progress!.readWindows = 2;
@@ -98,7 +98,7 @@ it('starts a rough estimate after fifteen seconds and keeps one for read-but-una
   act(() => vi.advanceTimersByTime(105_000));
   view.rerender(<ImportReadingActivity activity={reading} />);
   expect(screen.getByText('Rough estimate: 2–6 minutes remaining')).toBeVisible();
-  expect(screen.queryByText('Calculating remaining time')).toBeNull();
+  expect(screen.queryByText('Estimating…')).toBeNull();
   reading.progress!.accounted = 2;
   view.rerender(<ImportReadingActivity activity={reading} />);
   expect(screen.getByText('Finishing up…')).toBeVisible();
@@ -118,4 +118,39 @@ it('does not count paused time or page preparation speed toward the estimate', (
   });
   render(<ImportReadingActivity activity={reading} />);
   expect(screen.getByText('Rough estimate: 1–2 minutes remaining')).toBeVisible();
+});
+
+it('combines observed file work and known waits in hours but leaves unknown availability uncertain', () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(start));
+  const combined = activity();
+  combined.progress!.files = [0, 1].map(() => ({
+    accounted: 2,
+    total: 10,
+    readWindows: 2,
+    activeMs: 360000,
+    sliceStartedAt: null,
+    retryAt: '2026-09-28T13:00:00.000Z',
+    done: false,
+    exceptions: 0,
+  }));
+  const view = render(<ImportReadingActivity activity={combined} />);
+  expect(screen.getByText('Rough estimate: 1.8–3.4 hours remaining across files')).toBeVisible();
+  combined.progress!.files[1].uncertain = true;
+  view.rerender(<ImportReadingActivity activity={combined} />);
+  expect(screen.getByText('Estimating…')).toBeVisible();
+  expect(screen.queryByText(/Rough estimate/)).toBeNull();
+});
+
+it('keeps done with exceptions distinct and exposes an explicit exception retry', async () => {
+  const retry = vi.fn();
+  const done = activity();
+  done.activeFiles = 0;
+  done.label = 'Done, with exceptions';
+  done.progress!.elapsedEndedAt = start;
+  render(<ImportReadingActivity activity={done} onRetryExceptions={retry} />);
+  expect(screen.getByText('Done, with exceptions')).toBeVisible();
+  screen.getByRole('button', { name: 'Retry exceptions' }).click();
+  expect(retry).toHaveBeenCalledOnce();
+  expect(screen.queryByText('Estimating…')).toBeNull();
 });

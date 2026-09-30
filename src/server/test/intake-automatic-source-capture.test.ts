@@ -1,4 +1,5 @@
 import test, { type TestContext } from 'node:test';
+import { fictionalModel } from './fictional-model.ts';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,7 +22,8 @@ async function waitFor(check: () => boolean) {
   while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 5));
   assert.ok(check(), 'fictional runner reached checkpoint');
 }
-function fixture(t: TestContext, limits = { steps: 10, elapsedMs: 120000 }) {
+function fixture(t: TestContext, longClock = false) {
+  fictionalModel(t);
   const root = mkdtempSync(join(tmpdir(), 'circus-auto-source-')),
     profileId = 'fictional-auto-source';
   const db = openDatabase(profilePaths(root, profileId).database, profileId);
@@ -37,7 +39,9 @@ function fixture(t: TestContext, limits = { steps: 10, elapsedMs: 120000 }) {
   attachPersonalDurability(db, { root, profileId, recordStorage });
   const long = uploadIntake(db, root, profileId, {
     filename: 'fictional-long.txt',
-    bytes: Buffer.from('Fictional unstructured recordless material. '.repeat(2900)),
+    bytes: Buffer.from(
+      'Fictional unstructured recordless material. '.repeat(longClock ? 8500 : 2900),
+    ),
   });
   const short = uploadIntake(db, root, profileId, {
     filename: 'fictional-short.txt',
@@ -50,14 +54,14 @@ function fixture(t: TestContext, limits = { steps: 10, elapsedMs: 120000 }) {
   const dispatches: { id: string; pending: boolean; pages: number }[] = [];
   const reading: IntakeBatchReadingState = {
     status: 'paused',
-    reason: 'no_progress',
+    reason: 'reading_exhausted',
     turns: 1,
     modelRequests: 1,
     measuredModelTokens: 10,
     modelUsageIncomplete: false,
     readyRecords: 0,
-    remainingUnits: 1,
-    pendingReadWindows: 1,
+    remainingUnits: 0,
+    pendingReadWindows: 0,
     readWindows: 0,
     accountedUnits: 0,
     coverage: 'reading_progress_only',
@@ -89,13 +93,19 @@ function fixture(t: TestContext, limits = { steps: 10, elapsedMs: 120000 }) {
     attachIntakeReadingRequestGuard: () => true,
     cancel: () => {},
   };
+  let now = Date.now();
   const options = {
     root,
     databases: new Map([[profileId, db]]),
     assistant,
     pollMs: 1,
     continuationDelayMs: 1,
-    sourceCaptureLimits: limits,
+    clock: () => new Date(now),
+    extract: async (context: Parameters<typeof extractIntakeSourceText>[0]) => {
+      const result = await extractIntakeSourceText(context);
+      if (longClock) now += 15000;
+      return result;
+    },
   };
   let manager = createIntakeBatchManager(options);
   t.after(() => {
@@ -120,76 +130,38 @@ function fixture(t: TestContext, limits = { steps: 10, elapsedMs: 120000 }) {
   };
 }
 
-test('recordless imports capture two sections before model, then drain locally and continue other files', async (t) => {
+test('local source checkpoints finish fairly before model publication pins are created', async (t) => {
   const f = fixture(t);
-  const batch = f.manager.create(f.profileId, {
-    operationId: 'fictional-auto-drain',
-    intakeIds: [f.long.id, f.short.id],
-  });
+  const batch = f.manager.list(f.profileId)[0]!;
   await waitFor(() => f.manager.get(f.profileId, batch.id).status !== 'running');
   assert.equal(f.dispatches.length, 2);
-  assert.equal(
-    f.dispatches[0].pending,
-    true,
-    'whole-document capture does not gate clinical model start',
-  );
-  assert.ok(f.dispatches[0].pages > 2);
+  assert.ok(f.dispatches.every((dispatch) => !dispatch.pending));
+  assert.equal(f.dispatches[0].id, f.short.id, 'a short file progresses between long-file pages');
   const source = getIntakeSourceText(f.db, f.root, f.profileId, f.long.id);
   assert.equal(sourceTextExtractionPending(source), false);
-  assert.equal(source.summary!.inspectedPages, 0, 'extraction does not attest human inspection');
-  const saved = readIntakeBatch(f.root, f.profileId, batch.id);
   assert.equal(
-    saved.items[0].sourceExtraction!.steps,
-    Math.ceil(source.revision!.pages.length / 2),
+    source.summary!.inspectedPages,
+    0,
+    'machine extraction never attests human inspection',
   );
-  assert.equal(saved.items[0].reason, 'no_progress');
-  assert.equal(saved.items[1].intakeId, f.short.id);
+  const saved = readIntakeBatch(f.root, f.profileId, batch.id);
+  assert.equal(saved.items[0].sourceExtraction!.steps, source.revision!.pages.length);
 });
 
-test('bounded source allowance persists across reload, continues unrelated files and extends only explicitly', async (t) => {
-  const f = fixture(t, { steps: 1, elapsedMs: 120000 });
-  const batch = f.manager.create(f.profileId, {
-    operationId: 'fictional-auto-cap',
-    intakeIds: [f.long.id, f.short.id],
-  });
-  await waitFor(() => f.manager.get(f.profileId, batch.id).status !== 'running');
-  const first = readIntakeBatch(f.root, f.profileId, batch.id).items[0];
-  assert.equal(first.reason, 'source_review_required');
-  assert.equal(first.sourceExtraction!.steps, 1);
-  assert.equal(first.sourceExtraction!.draining, true);
-  assert.equal(f.dispatches.length, 2, 'source cap does not stall unrelated source');
-  assert.equal(
-    sourceTextExtractionPending(getIntakeSourceText(f.db, f.root, f.profileId, f.long.id)),
-    true,
-  );
-  f.reopen();
-  assert.deepEqual(
-    f.manager.get(f.profileId, batch.id).items[0].sourceExtraction,
-    first.sourceExtraction,
-  );
-  // Explicitly queue just the unfinished source; its existing terminal chat must not rerun.
-  const continuation = f.manager.create(f.profileId, {
-    operationId: 'fictional-explicit-source-continuation',
-    intakeIds: [f.long.id],
-  });
-  await waitFor(() => f.manager.get(f.profileId, continuation.id).status !== 'running');
-  assert.equal(
-    f.dispatches.length,
-    2,
-    'existing terminal conversion is not rerun for source capture',
-  );
-  const before = f.manager.get(f.profileId, continuation.id).items[0].sourceExtraction!;
-  f.manager.resume(f.profileId, continuation.id);
-  await waitFor(() => f.manager.get(f.profileId, continuation.id).status !== 'running');
-  const after = f.manager.get(f.profileId, continuation.id).items[0].sourceExtraction!;
-  assert.ok(after.steps > before.steps);
-  assert.ok(after.spentMs >= before.spentMs);
-  assert.notEqual(after.allowanceId, before.allowanceId);
+test('productive local capture exceeds ten steps and 120 seconds without manual Resume', async (t) => {
+  const f = fixture(t, true);
+  const batch = f.manager.list(f.profileId)[0]!;
+  await waitFor(() => f.manager.get(f.profileId, batch.id).status === 'complete');
+  const saved = f.manager.get(f.profileId, batch.id).items[0].sourceExtraction!;
+  assert.ok(saved.steps > 10);
+  assert.ok(saved.spentMs > 120000);
   assert.equal(
     sourceTextExtractionPending(getIntakeSourceText(f.db, f.root, f.profileId, f.long.id)),
     false,
   );
   assert.equal(f.dispatches.length, 2);
+  f.reopen();
+  assert.equal(f.manager.get(f.profileId, batch.id).status, 'complete');
 });
 
 test('an existing reviewable proposal prevents automatic text continuation from staling its pins', async (t) => {
@@ -227,7 +199,7 @@ test('an existing reviewable proposal prevents automatic text continuation from 
     intakeIds: [f.long.id],
   });
   await waitFor(() => f.manager.get(f.profileId, batch.id).status !== 'running');
-  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.dispatches.filter((dispatch) => dispatch.id === f.long.id).length, 0);
   assert.equal(f.manager.get(f.profileId, batch.id).items[0].status, 'review_ready');
   assert.equal(
     getIntakeSourceText(f.db, f.root, f.profileId, f.long.id).revision!.id,

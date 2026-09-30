@@ -170,6 +170,17 @@ export interface ImportReviewModel {
     controlsBusy?: boolean;
     resumeLabel?: string;
     progress?: {
+      files?: {
+        accounted: number;
+        total: number;
+        readWindows: number;
+        activeMs: number;
+        sliceStartedAt: string | null;
+        retryAt: string | null;
+        uncertain?: boolean;
+        done: boolean;
+        exceptions: number;
+      }[];
       /** Calendar time for this batch, including provider and queue waits. */
       elapsedStartedAt?: string | null;
       elapsedEndedAt?: string | null;
@@ -218,6 +229,7 @@ export interface ImportReviewActions {
   onAskDraftRepair?: (selection: IntakeDraftRepairSelection, request: string) => void;
   onFiltersChange?: (filters: NonNullable<ImportReviewModel['filters']>) => void;
   onLoadMore?: () => void | Promise<void>;
+  onRetryExceptions?: () => void | Promise<void>;
   onResumeReading?: () => void | Promise<void>;
   onStopReading?: () => void | Promise<void>;
 }
@@ -700,6 +712,7 @@ export function ImportReviewPresentation({
           activity={model?.activity}
           onStop={actions.onStopReading}
           onResume={actions.onResumeReading}
+          onRetryExceptions={actions.onRetryExceptions}
         />
         <p className="import-upload-note">
           Files upload immediately. Originals stay in your archive.

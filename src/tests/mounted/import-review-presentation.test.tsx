@@ -571,7 +571,7 @@ it('keeps real progress and Stop beside Moxie without a redundant Reading detail
   expect(screen.getByText('Discovered 30 records.')).toBeVisible();
   expect(screen.getByText(/Rough estimate:/)).toBeVisible();
   expect(screen.queryByRole('button', { name: /Reading details/ })).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: 'Stop reading' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Stop imports' }));
   expect(onStopReading).toHaveBeenCalledOnce();
 });
 
@@ -583,17 +583,17 @@ it('offers explicit recovery next to still Moxie only when a resume action is av
     <ImportReviewPresentation model={paused} actions={{ onResumeReading }} />,
   );
   expect(container.querySelector('.import-reading-jester')).toHaveClass('is-idle');
-  fireEvent.click(screen.getByRole('button', { name: 'Resume reading' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Resume imports' }));
   expect(onResumeReading).toHaveBeenCalledOnce();
-  expect(screen.queryByRole('button', { name: 'Stop reading' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Stop imports' })).toBeNull();
 });
 
 it('shows a failed reading action and leaves its control retryable', async () => {
   const onResumeReading = vi.fn().mockRejectedValue(new Error('Connection lost. Try again.'));
   render(<ImportReviewPresentation model={model()} actions={{ onResumeReading }} />);
-  fireEvent.click(screen.getByRole('button', { name: 'Resume reading' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Resume imports' }));
   expect(await screen.findByRole('alert')).toHaveTextContent('Connection lost. Try again.');
-  expect(screen.getByRole('button', { name: 'Resume reading' })).not.toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Resume imports' })).not.toBeDisabled();
 });
 
 it('confirms identity and optional birth date without a separate primary-name choice', () => {
@@ -1595,7 +1595,7 @@ it('keeps technical page timing and model passes out of simple progress', () => 
     },
   };
   const view = render(<ImportReviewPresentation model={active} />);
-  expect(screen.getByText('Calculating remaining time')).toBeVisible();
+  expect(screen.getByText('Estimating…')).toBeVisible();
   expect(screen.queryByText(/Recent interval between page reads/)).toBeNull();
   expect(screen.queryByText(/Last page prepared/)).toBeNull();
   expect(screen.queryByRole('progressbar')).toBeNull();

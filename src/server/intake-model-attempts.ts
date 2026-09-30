@@ -10,8 +10,16 @@ export interface IntakeAttemptScope {
   runId: string;
   backend: string | null;
   instructionVersion: string;
+  workUnit?: { id: string; locator: string } | null;
 }
 export interface RecordedIntakeModelAttempt extends IntakeModelAttempt {
+  recovery?: {
+    decisionId: string;
+    at: string;
+    workUnit: string;
+    replacementRequestId: string | null;
+  };
+  lateResponse?: { at: string; usage: IntakeModelAttempt['usage'] };
   scope: IntakeAttemptScope;
   attempt: number;
   /** Host interruption provenance survives any separately authorized reconciliation. */
@@ -138,6 +146,8 @@ export function startIntakeModelAttempt(
       retryAt: _r,
       usage: _u,
       interruption: _i,
+      recovery: _recovery,
+      lateResponse: _late,
       ...basis
     } = prior;
     const {
@@ -153,14 +163,20 @@ export function startIntakeModelAttempt(
       fail('Provider request identity was reused with different dispatch evidence');
     return attempts;
   }
-  // Unknown execution cannot be made safe by generating another request identity.
-  if (attempts.some((a) => a.outcome === 'unknown' || a.outcome === 'dispatched'))
+  if (attempts.some((a) => a.outcome === 'dispatched' || (a.outcome === 'unknown' && !a.recovery)))
     throw new HttpError(
       409,
       'INTAKE_ATTEMPT_UNRESOLVED',
       'Reconcile the earlier provider attempt before sending another request',
     );
-  return [...attempts, entry];
+  return [
+    ...attempts.map((a) =>
+      a.outcome === 'unknown' && a.recovery && !a.recovery.replacementRequestId
+        ? { ...a, recovery: { ...a.recovery, replacementRequestId: entry.requestId } }
+        : a,
+    ),
+    entry,
+  ];
 }
 const classifications = new Set([
   'quota',
@@ -206,6 +222,19 @@ export function finishIntakeModelAttempt(
     retryAt: rejected && stamp(event.retryAt) ? event.retryAt : null,
     usage: usage(event.usage),
   } as const;
+  // A late success is accounting evidence, never permission to publish a superseded result.
+  if (prior.outcome === 'unknown' && response) {
+    if (prior.lateResponse) {
+      if (!equal(prior.lateResponse.usage, usage(event.usage)))
+        fail('Conflicting late provider usage');
+      return attempts;
+    }
+    return attempts.map((entry, i) =>
+      i === index
+        ? { ...entry, lateResponse: { at, usage: usage(event.usage) }, usage: usage(event.usage) }
+        : entry,
+    );
+  }
   if (prior.outcome !== 'dispatched') {
     const {
       outcome: pOutcome,
@@ -258,7 +287,9 @@ export function recoverIntakeModelAttempts(
 export function intakeAttemptWait(
   attempts: RecordedIntakeModelAttempt[],
 ): IntakeProviderWait | null {
-  const unknown = attempts.find((a) => a.outcome === 'unknown' || a.outcome === 'dispatched');
+  const unknown = attempts.find(
+    (a) => (a.outcome === 'unknown' && !a.recovery) || a.outcome === 'dispatched',
+  );
   if (unknown)
     return {
       requestId: unknown.requestId,
@@ -298,4 +329,25 @@ export function intakeAttemptAccounting(attempts: RecordedIntakeModelAttempt[]) 
       .length,
     completeUsage: unknownUsage === 0,
   };
+}
+
+/** Persist before another dispatch. Recovery permission never rewrites possibly billed evidence. */
+export function authorizeIntakeAttemptRecovery(
+  attempts: RecordedIntakeModelAttempt[],
+  at: string,
+  workUnit: string,
+) {
+  return attempts.map((a) =>
+    a.outcome === 'unknown' && !a.recovery
+      ? {
+          ...a,
+          recovery: {
+            decisionId: a.requestId + ':retry',
+            at,
+            workUnit,
+            replacementRequestId: null,
+          },
+        }
+      : a,
+  );
 }

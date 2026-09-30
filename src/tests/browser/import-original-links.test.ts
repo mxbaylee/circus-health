@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -65,7 +66,7 @@ test(
       data: original,
     });
     assert.equal(upload.status(), 201);
-    const intake = (await upload.json()).data;
+    const intake = await stopFixtureImport(page, url, prefix, (await upload.json()).data.id);
     await request(`${prefix}/intakes/${encodeURIComponent(intake.id)}/proposals`, {
       version: intake.version,
       summary: 'Independently fictional link navigation fixture.',
@@ -149,7 +150,7 @@ test(
 
     // The same durable editor is reachable in the record row without navigating away.
     const reviewUrl = page.url();
-    await page.getByRole('button', { name: 'Review', exact: true }).click();
+    await page.locator('button[aria-controls^="record-review-"]').click();
     const inline = page.locator('.import-record-accordion');
     await inline.getByRole('textbox', { name: 'Result', exact: true }).waitFor();
     assert.equal(page.url(), reviewUrl);
@@ -158,7 +159,7 @@ test(
     await inline.getByRole('button', { name: 'Update', exact: true }).click();
     await inline.waitFor({ state: 'detached' });
     await page.reload();
-    await page.getByRole('button', { name: 'Review', exact: true }).click();
+    await page.locator('button[aria-controls^="record-review-"]').click();
     await inline.getByRole('textbox', { name: 'Result', exact: true }).waitFor();
     assert.equal(
       await inline.getByRole('textbox', { name: 'Result', exact: true }).inputValue(),

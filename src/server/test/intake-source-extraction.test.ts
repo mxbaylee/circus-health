@@ -219,9 +219,14 @@ test('PDF native geometry is durable before unavailable OCR, and no text complet
   t.after(() => {
     process.env.PATH = old;
   });
-  const result = await extractIntakeSourceText({ ...f, id: intake.id });
-  assert.equal(result.morePending, false);
-  const revision = result.sourceText.revision!;
+  await assert.rejects(extractIntakeSourceText({ ...f, id: intake.id }), {
+    code: 'SOURCE_OCR_PREREQUISITE',
+  });
+  const revision = getIntakeSourceText(f.db, f.root, f.profileId, intake.id).revision!;
+  assert.ok(
+    revision.issues.some((issue) => issue.id === 'p1-pending'),
+    'a missing prerequisite preserves unresolved work for automatic recovery',
+  );
   assert.ok(revision.spans.some((s) => s.text.includes('Dose 1.00 mg.')));
   const box = revision.spans[0].region.box!;
   assert.ok(box[0] > 0 && box[1] > 0 && box[2] > 0 && box[3] > 0);

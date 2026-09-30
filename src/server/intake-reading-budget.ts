@@ -11,7 +11,7 @@ export interface IntakeReadingLimits {
 
 export const DEFAULT_INTAKE_READING_LIMITS: Readonly<IntakeReadingLimits> = {
   mode: 'progress-window',
-  activeMs: 2 * 60 * 60 * 1000,
+  activeMs: 3 * 60 * 1000,
   slices: 16,
   turns: 256,
   requests: 2048,
@@ -19,7 +19,7 @@ export const DEFAULT_INTAKE_READING_LIMITS: Readonly<IntakeReadingLimits> = {
 };
 
 const progress = (reading: IntakeBatchReadingState | null) => ({
-  records: reading?.readyRecords || 0,
+  records: reading?.substantiveVersions ?? reading?.readyRecords ?? 0,
   windows: reading?.readWindows || 0,
   accounted: reading?.accountedUnits || 0,
 });
@@ -58,7 +58,7 @@ export function beginReadingSlice(
   const job = item.readingJob;
   if (job.sliceStartedAt) return;
   job.baseline = progress(item.reading);
-  job.observed = job.baseline;
+  job.observed ||= job.baseline;
   job.sliceStartedAt = at;
   job.slices++;
 }
@@ -79,8 +79,7 @@ export function finishReadingSlice(
   if (changed) {
     // A fresh coverage/proposal checkpoint renews only an inactivity window.
     // Cumulative requests, measured tokens, time, slices and unknown usage survive.
-    if (job.limitPolicy === 'progress-window') observeReadingProgress({ ...item, reading }, at);
-    else job.lastProgressAt = at;
+    observeReadingProgress({ ...item, reading }, at);
   }
   return changed;
 }
@@ -96,7 +95,8 @@ export function observeReadingProgress(item: IntakeBatchItem, at: string): boole
   if (changed) {
     job.lastProgressAt = at;
     job.observed = current;
-    if (job.limitPolicy === 'progress-window') renewProgressWindow(item, item.reading, at);
+    renewProgressWindow(item, item.reading, at);
+    if (item.stalls) item.stalls.attempts = 0;
   }
   return changed;
 }
@@ -123,23 +123,15 @@ export function readingBudgetReached(
 ): boolean {
   const job = item.readingJob;
   if (!job) return false;
-  limits = job.limits || limits;
+  // Migrate old cumulative allowances; only active time without unique progress matters.
   const currentMs = job.sliceStartedAt
     ? Math.max(0, Date.parse(at) - Date.parse(job.sliceStartedAt))
     : 0;
-  return (
-    job.activeMs + currentMs - job.budgetAtActiveMs >= limits.activeMs ||
-    (!job.sliceStartedAt && job.slices - job.budgetAtSlices >= limits.slices) ||
-    (item.reading?.turns || 0) - job.budgetAtTurns >= limits.turns ||
-    (item.reading?.modelRequests || 0) - (job.budgetAtRequests || 0) >=
-      (limits.requests ?? DEFAULT_INTAKE_READING_LIMITS.requests!) ||
-    (item.reading?.measuredModelTokens || 0) - (job.budgetAtTokens || 0) >=
-      (limits.measuredTokens ?? DEFAULT_INTAKE_READING_LIMITS.measuredTokens!)
-  );
+  return job.activeMs + currentMs - job.budgetAtActiveMs >= limits.activeMs;
 }
 
 /**
- * Checks the cumulative job budget at the synchronous provider-request boundary.
+ * Checks active time without unique progress at the synchronous request boundary.
  * The assistant has already reserved the current model turn when this runs, so
  * exclude that reservation while retaining every persisted request/token count.
  */
@@ -149,8 +141,7 @@ export function readingModelRequestBudgetReached(
   at: string,
   limits: IntakeReadingLimits = DEFAULT_INTAKE_READING_LIMITS,
 ): boolean {
-  if (item.readingJob?.limitPolicy === 'progress-window')
-    observeReadingProgress({ ...item, reading }, at);
+  observeReadingProgress({ ...item, reading }, at);
   return readingBudgetReached(
     {
       ...item,
@@ -164,7 +155,7 @@ export function readingModelRequestBudgetReached(
   );
 }
 
-/** Only an explicit Resume after the displayed job limit grants another budget. */
+/** Begin a fresh no-progress attempt without erasing lifetime usage. */
 export function extendReadingBudget(item: IntakeBatchItem): void {
   const job = item.readingJob;
   if (!job) return;
@@ -178,12 +169,13 @@ export function extendReadingBudget(item: IntakeBatchItem): void {
 
 export function canContinueReadingSlice(
   reading: IntakeBatchReadingState | null,
-  madeProgress: boolean,
+  _madeProgress: boolean,
 ): boolean {
   return (
-    madeProgress &&
     !!reading &&
-    ['time_limit', 'context_limit'].includes(reading.reason || '') &&
+    ['time_limit', 'context_limit', 'job_limit', 'no_progress', 'model_tool_retry'].includes(
+      reading.reason || '',
+    ) &&
     (reading.pendingReadWindows > 0 || reading.remainingUnits > 0)
   );
 }

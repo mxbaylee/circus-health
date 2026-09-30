@@ -43,6 +43,9 @@ export async function handleIntakeBatchRoute({
   } else if (method === 'POST' && id && action === 'resume') {
     await jsonBody(req);
     respond(intakeBatches.resume(profileId, id));
+  } else if (method === 'POST' && id && action === 'retry-exceptions') {
+    await jsonBody(req);
+    respond(intakeBatches.retryExceptions(profileId, id));
   } else throw new HttpError(404, 'NOT_FOUND', 'Reading batch action not found');
   return true;
 }

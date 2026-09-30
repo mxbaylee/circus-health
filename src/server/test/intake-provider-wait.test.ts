@@ -39,7 +39,8 @@ function fixture(
     filename: sourceFailure === 'retain-only' ? 'fictional.dcm' : 'fictional.txt',
     bytes: Buffer.from('Fictional Rowan source only.'),
   });
-  let sends = 0;
+  let sends = 0,
+    elapsed = 0;
   const dispatchTimes: number[] = [];
   const reading: IntakeBatchReadingState = {
     status: 'paused',
@@ -85,7 +86,9 @@ function fixture(
     databases: new Map([[profileId, db]]),
     assistant,
     pollMs: 2,
+    clock: () => new Date(Date.now() + elapsed),
     providerRetryBaseMs: 5,
+    random: () => 1,
     continuationDelayMs: 1,
     journalWriter: (
       root: string,
@@ -119,6 +122,9 @@ function fixture(
     chat,
     batch,
     dispatchTimes,
+    advance: (ms: number) => {
+      elapsed += ms;
+    },
     get manager() {
       return manager;
     },
@@ -152,7 +158,7 @@ test('known quota rejections persist a wait before retry without resetting unkno
   assert.ok(f.dispatchTimes[1] >= Date.parse(retryAt), 'never dispatch before provider deadline');
   f.manager.stop(f.profileId, f.batch.id);
 });
-test('a retained known rejection resumes only after explicit unlock/resume and its original deadline', async (t) => {
+test('a retained rejection resumes after authorized unlock at its original deadline', async (t) => {
   const f = fixture(t);
   await waitFor(() => f.sends === 1);
   const retryAt = new Date(Date.now() + 300).toISOString();
@@ -166,47 +172,50 @@ test('a retained known rejection resumes only after explicit unlock/resume and i
     () => f.manager.get(f.profileId, f.batch.id).items[0].reason === 'waiting_for_provider',
   );
   f.reopen();
-  assert.equal(f.manager.get(f.profileId, f.batch.id).status, 'paused');
+  assert.equal(f.manager.get(f.profileId, f.batch.id).status, 'running');
   assert.equal(f.sends, 1);
-  f.manager.resume(f.profileId, f.batch.id);
   await waitFor(() => f.sends === 2);
   assert.ok(f.dispatchTimes[1] >= Date.parse(retryAt), 'restart preserves provider deadline');
   assert.equal(f.manager.get(f.profileId, f.batch.id).items[0].reading?.modelRequests, 7);
 });
-test('unknown transport outcomes cannot be blindly resumed; authentication pauses without automatic retry', async (t) => {
+test('unknown outcomes retry automatically while authentication waits for the prerequisite', async (t) => {
   for (const classification of ['unknown', 'authentication'] as const) {
     const f = fixture(t);
     await waitFor(() => f.sends === 1);
     f.fail({
-      requestId: `fictional-${classification}`,
+      requestId: 'fictional-' + classification,
       outcome: classification === 'unknown' ? 'unknown' : 'rejected',
       classification,
       retryAt: null,
     });
-    await waitFor(() => f.manager.get(f.profileId, f.batch.id).status === 'paused');
-    await new Promise((r) => setTimeout(r, 25));
-    assert.equal(f.sends, 1);
-    if (classification === 'unknown')
-      assert.throws(() => f.manager.resume(f.profileId, f.batch.id), {
-        code: 'INTAKE_REQUEST_OUTCOME_UNKNOWN',
-      });
+    if (classification === 'unknown') await waitFor(() => f.sends === 2);
+    else {
+      await waitFor(
+        () => f.manager.get(f.profileId, f.batch.id).items[0].reason === 'provider_authentication',
+      );
+      assert.equal(f.manager.get(f.profileId, f.batch.id).status, 'running');
+      assert.equal(f.sends, 1);
+    }
+    f.manager.stop(f.profileId, f.batch.id);
   }
 });
-test('recurrent rejected attempts reach a named intervention state instead of an endless retry loop', async (t) => {
+test('eight consecutive transient rejections recover without spending a local stall allowance', async (t) => {
   const f = fixture(t);
   await waitFor(() => f.sends === 1);
-  for (let i = 1; i <= 6; i++) {
+  for (let i = 1; i <= 8; i++) {
     f.fail({
-      requestId: `fictional-rejection-${i}`,
+      requestId: 'fictional-rejection-' + i,
       outcome: 'rejected',
       classification: 'transient',
       retryAt: null,
     });
-    if (i < 6) await waitFor(() => f.sends === i + 1);
-    else await waitFor(() => f.manager.get(f.profileId, f.batch.id).status === 'paused');
+    await waitFor(() => f.sends === i + 1);
   }
-  assert.equal(f.sends, 6);
-  assert.equal(f.manager.get(f.profileId, f.batch.id).reason, 'provider_retry_limit');
+  const item = f.manager.get(f.profileId, f.batch.id).items[0];
+  assert.equal(f.sends, 9);
+  assert.equal(item.providerWait?.attempts, 8);
+  assert.equal(item.stalls?.attempts || 0, 0, 'provider waiting is not failed local work');
+  f.manager.stop(f.profileId, f.batch.id);
 });
 
 test('default production jobs continue productive slices past the former total-slice allowance', async (t) => {
@@ -264,4 +273,24 @@ test('retain-only batch sources retain an explicit limitation and never dispatch
   const source = getIntakeSourceText(f.db, f.root, f.profileId, item.intakeId);
   assert.equal(source.revision!.pages[0].disposition, 'unsupported');
   assert.ok(source.revision!.issues.some((i) => i.detail.includes('retain-only')));
+});
+
+test('shared model-tool prerequisite waits never consume the active source-stall window', async (t) => {
+  const f = fixture(t);
+  await waitFor(() => f.sends === 1);
+  for (let cycle = 1; cycle <= 4; cycle++) {
+    f.advance(180001);
+    f.chat.reading.reason = 'source_prerequisite';
+    f.chat.status = 'idle';
+    await waitFor(
+      () => f.manager.get(f.profileId, f.batch.id).items[0].reason === 'source_prerequisite',
+    );
+    const item = f.manager.get(f.profileId, f.batch.id).items[0];
+    assert.equal(item.stalls?.attempts || 0, 0);
+    assert.ok(item.readingJob!.activeMs - item.readingJob!.budgetAtActiveMs < 1000);
+    f.advance(30001);
+    f.manager.wake(f.profileId);
+    await waitFor(() => f.sends === cycle + 1);
+  }
+  assert.ok(f.manager.get(f.profileId, f.batch.id).items[0].readingJob!.activeMs > 4 * 180000);
 });

@@ -26,6 +26,7 @@ export interface SourceOcrResult {
   spans: SourceTextSpan[];
   issues: SourceTextIssue[];
   ocrAvailable: boolean;
+  errorCode?: string;
 }
 /** Inspect dimensions before native decoding can allocate an attacker-sized raster. */
 export function sourceRasterDimensions(bytes: Uint8Array): { width: number; height: number } {
@@ -348,5 +349,5 @@ export async function extractRasterSource(
             'Visible marks are not covered by retained text. Inspect this area; it may be text, a diagram or a non-text mark.',
         });
     }
-  return { width, height, ...combined, ocrAvailable };
+  return { width, height, ...combined, ocrAvailable, ...(reason ? { errorCode: reason } : {}) };
 }

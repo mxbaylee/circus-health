@@ -20,12 +20,6 @@ import type { IntakeBatch } from '../shared/intake-batch.ts';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const EVENT = /^\d{12}-[0-9a-f-]{36}\.json$/;
 
-interface SavedBatchEnvelope {
-  format: 'health-intake-batch-v1';
-  profileId: string;
-  batch: IntakeBatch;
-}
-
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -52,18 +46,38 @@ export function readIntakeBatch(root: string, profileId: string, batchId: string
     .filter((name) => EVENT.test(name))
     .sort();
   if (!events.length) throw new HttpError(404, 'INTAKE_BATCH_NOT_FOUND', 'Reading batch not found');
-  const file = join(directory, events.at(-1)!);
-  if (realpathSync(file) !== file) throw new Error('Reading batch journal cannot be a link');
-  const saved: unknown = JSON.parse(readFileSync(file, 'utf8'));
-  if (
-    !object(saved) ||
-    saved.format !== 'health-intake-batch-v1' ||
-    saved.profileId !== profileId ||
-    !object(saved.batch) ||
-    saved.batch.id !== batchId
-  )
-    throw new Error('Reading batch journal profile mismatch');
-  return (saved as unknown as SavedBatchEnvelope).batch;
+  let batch: IntakeBatch | undefined;
+  for (const name of events) {
+    const file = join(directory, name);
+    if (realpathSync(file) !== file) throw Error('Reading batch journal cannot be a link');
+    const saved = JSON.parse(readFileSync(file, 'utf8'));
+    if (saved.profileId !== profileId) throw Error('Reading batch journal profile mismatch');
+    if (saved.format === 'health-intake-batch-v1' && saved.batch?.id === batchId)
+      batch = saved.batch;
+    else if (
+      saved.format === 'health-intake-batch-delta-v2' &&
+      saved.batchId === batchId &&
+      batch
+    ) {
+      for (const [path, value] of saved.changes as [string[], unknown][]) {
+        let target = batch as unknown as Record<string, unknown>;
+        if (path.some((key) => ['__proto__', 'constructor', 'prototype'].includes(key)))
+          throw Error('Invalid batch delta');
+        for (const key of path.slice(0, -1)) target = target[key] as Record<string, unknown>;
+        target[path.at(-1)!] = value;
+      }
+      for (const path of saved.removed as string[][]) {
+        if (path.some((key) => ['__proto__', 'constructor', 'prototype'].includes(key)))
+          throw Error('Invalid batch delta');
+        let target = batch as unknown as Record<string, unknown>;
+        for (const key of path.slice(0, -1)) target = target[key] as Record<string, unknown>;
+        delete target[path.at(-1)!];
+      }
+    } else throw Error('Reading batch journal profile mismatch');
+  }
+  if (!batch || batch.profileId !== profileId)
+    throw Error('Reading batch journal profile mismatch');
+  return batch;
 }
 
 export function listIntakeBatches(root: string, profileId: string): IntakeBatch[] {
@@ -87,18 +101,40 @@ export function writeIntakeBatch(
     .sort();
   const sequence = names.length ? Number(names.at(-1)!.slice(0, 12)) + 1 : 1;
   const file = join(directory, `${String(sequence).padStart(12, '0')}-${randomUUID()}.json`);
+  const previous = names.length ? readIntakeBatch(root, profileId, batch.id) : null;
+  const changes: [string[], unknown][] = [],
+    removed: string[][] = [];
+  const diff = (before: unknown, after: unknown, path: string[]) => {
+    if (JSON.stringify(before) === JSON.stringify(after)) return;
+    if (
+      before &&
+      after &&
+      typeof before === 'object' &&
+      typeof after === 'object' &&
+      Array.isArray(before) === Array.isArray(after)
+    ) {
+      const a = before as Record<string, unknown>,
+        b = after as Record<string, unknown>;
+      for (const key of Object.keys(a)) if (!(key in b)) removed.push([...path, key]);
+      for (const key of Object.keys(b)) diff(a[key], b[key], [...path, key]);
+      if (Array.isArray(after) && Array.isArray(before) && after.length !== before.length)
+        changes.push([[...path, 'length'], after.length]);
+    } else if (after !== undefined) changes.push([path, after]);
+  };
+  if (previous) diff(previous, batch, []);
   const temporary = file + '.pending';
   const fd = openSync(temporary, 'wx', 0o600);
   try {
     writeFileSync(
       fd,
       JSON.stringify({
-        format: 'health-intake-batch-v1',
+        ...(previous
+          ? { format: 'health-intake-batch-delta-v2', batchId: batch.id, changes, removed }
+          : { format: 'health-intake-batch-v1', batch }),
         profileId,
         sequence,
         reason,
         savedAt: new Date().toISOString(),
-        batch,
       }),
     );
     fsyncSync(fd);
@@ -132,9 +168,12 @@ export function copyIntakeBatchJournals(
       if (
         !object(value) ||
         value.profileId !== profileId ||
-        !object(value.batch) ||
-        value.batch.id !== batch.id ||
-        value.format !== 'health-intake-batch-v1'
+        !(
+          (value.format === 'health-intake-batch-v1' &&
+            object(value.batch) &&
+            value.batch.id === batch.id) ||
+          (value.format === 'health-intake-batch-delta-v2' && value.batchId === batch.id)
+        )
       )
         throw new Error('Reading batch journal profile mismatch');
       const path = `${profilePaths(root, profileId).relativeRoot}/intake-batches/${batch.id}/events/${name}`;

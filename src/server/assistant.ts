@@ -27,6 +27,7 @@ import {
   finishIntakeModelAttempt,
   recoverIntakeModelAttempts,
   intakeAttemptWait,
+  authorizeIntakeAttemptRecovery,
   type RecordedIntakeModelAttempt,
 } from './intake-model-attempts.ts';
 import { accountedUnitKind } from './intake-unit-accounting.ts';
@@ -81,6 +82,7 @@ import { canonicalLiteral, validateJSONL } from './intake-format.ts';
 import { intakeCandidateId, workflowHash } from './intake-workflow.ts';
 import {
   conversionCheckpoint,
+  intakeUnitSourcePages,
   recordConversionRead,
   deferConversionRead,
   conversionResumeContext,
@@ -446,6 +448,8 @@ const intakeWithWorkflow = (intake: ReturnType<typeof getIntake>): IntakeWithWor
   return intake as IntakeWithWorkflow;
 };
 interface ActiveState {
+  /** Child originals obtained by reading this dispatch's exact package member. */
+  workUnitSources?: Set<string>;
   sourceTextReads?: Map<string, string>;
   sourceTextCapturePins?: Map<string, string>;
   diagnosticScope?: ImportDiagnosticActiveScope;
@@ -485,6 +489,7 @@ interface ActiveState {
   readingDeadlineReached?: boolean;
   readingDeadlineAt?: number;
   beforeModelRequest?: (reading: IntakeBatchReadingState) => boolean;
+  assertAuthorized?: (operation: 'dispatch' | 'publish') => void;
 }
 
 interface BatchRevalidationBasis {
@@ -1076,6 +1081,7 @@ interface AssistantService {
 }
 
 interface AssistantRunOptions {
+  assertAuthorized?: (operation: 'dispatch' | 'publish') => void;
   beforeModelRequest?: (reading: IntakeBatchReadingState) => boolean;
 }
 
@@ -1948,12 +1954,86 @@ export function createAssistant({
     generation = state.generation,
   ): Promise<unknown> {
     const assertRunning = () => {
+      state.assertAuthorized?.('publish');
       if (active.get(profileId) !== state || state.generation !== generation)
         throw new Error('This response is no longer running');
     };
     assertRunning();
     const db = dbFor(profileId),
       args = params.arguments;
+    if (state.beforeModelRequest && state.checkpoint?.activeUnitId) {
+      const intake = conversionIntake(profileId, chat);
+      const unit = intake?.workflow.plans
+        .find((plan) => plan.status === 'active')
+        ?.units.find((unit) => unit.id === state.checkpoint!.activeUnitId);
+      if (!unit || unit.processingException)
+        throw new HttpError(
+          409,
+          'INTAKE_WORK_UNIT_CHANGED',
+          'The dispatched source unit is no longer eligible.',
+        );
+      if (params.tool === 'health_intake_read') {
+        if (unit.pages && args.page === undefined) args.page = unit.pages[0];
+        if (unit.start !== undefined) {
+          args.offset ??= unit.start;
+          args.limit = Math.min(
+            Number(args.limit || 12000),
+            Math.max(0, (unit.end || 0) - Number(args.offset)),
+          );
+        }
+      }
+      const sourcePages = intakeUnitSourcePages(unit);
+      if (params.tool === 'health_intake_source_text' && args.page === undefined)
+        args.page = sourcePages[0];
+      if (
+        params.tool === 'health_intake_propose' ||
+        (params.tool === 'health_intake_plan' &&
+          !['read', 'read_unit'].includes(String(args.action))) ||
+        (params.tool === 'health_intake_source_text' &&
+          ((args.action && args.action !== 'passage') ||
+            (!unit.memberId && !sourcePages.includes(Number(args.page)))))
+      )
+        throw new HttpError(
+          409,
+          'INTAKE_WORK_UNIT_SCOPE',
+          'Automatic reading must use the current unit and its supporting source pages, then publish through health_intake_batch with that unit coverage.',
+        );
+      const wrongId =
+        typeof args.id === 'string' &&
+        args.id !== intake!.id &&
+        args.id !== unit.sourceFileId &&
+        !state.workUnitSources?.has(args.id);
+      const read =
+        params.tool === 'health_intake_read' ||
+        (params.tool === 'health_intake_package' && args.action !== 'inventory') ||
+        (params.tool === 'health_intake_plan' && args.action === 'read_unit');
+      if (
+        ((read ||
+          params.tool === 'health_intake_source_text' ||
+          params.tool === 'health_intake_batch') &&
+          wrongId) ||
+        (read &&
+          ((args.unitId && args.unitId !== unit.id) ||
+            (params.tool !== 'health_intake_plan' &&
+              unit.pages &&
+              !unit.pages.includes(Number(args.page || 1))) ||
+            (params.tool === 'health_intake_package' &&
+              unit.memberId &&
+              args.memberId !== unit.memberId) ||
+            (params.tool === 'health_intake_read' &&
+              unit.start !== undefined &&
+              (Number(args.offset || 0) < unit.start ||
+                Number(args.offset || 0) + Number(args.limit || 12000) > (unit.end || 0))))) ||
+        (params.tool === 'health_intake_batch' &&
+          Array.isArray(args.coverage) &&
+          args.coverage.some((c) => !object(c) || c.unitId !== unit.id))
+      )
+        throw new HttpError(
+          409,
+          'INTAKE_WORK_UNIT_SCOPE',
+          'Read and publish only the current dispatched source unit. Other units remain queued.',
+        );
+    }
     const onSourceTextCaptured = ({
       intakeId,
       priorRevisionId,
@@ -2699,6 +2779,7 @@ export function createAssistant({
           id: stringArgument(args, 'id'),
           page: optionalNumberArgument(args, 'page'),
           offset: optionalNumberArgument(args, 'offset'),
+          limit: optionalNumberArgument(args, 'limit'),
           modelContext: true,
           pdf: params.pdf === true,
           assertRunning,
@@ -2812,6 +2893,17 @@ export function createAssistant({
       assertRunning();
     } else throw new Error('Unsupported scoped tool');
     assertRunning();
+    if (
+      state.beforeModelRequest &&
+      params.tool === 'health_intake_package' &&
+      args.action === 'read_member' &&
+      object(result)
+    ) {
+      // Media envelopes nest the same verified member metadata beside their pixels/PDF.
+      const member = object(result.metadata) ? result.metadata : result;
+      if (typeof member.sourceFileId === 'string')
+        (state.workUnitSources ||= new Set()).add(member.sourceFileId);
+    }
     if (state.checkpoint) {
       // Failed validation, scope checks and extraction keep their real error classification.
       // Only a successfully executed read can count toward a repeated-read pause.
@@ -2952,12 +3044,20 @@ export function createAssistant({
   ): AssistantChat {
     if (active.has(profileId))
       throw new HttpError(409, 'ASSISTANT_BUSY', 'A response is already running for this profile');
-    if (intakeAttemptWait(chat.intakeModelAttempts || [])?.outcome === 'unknown')
-      throw new HttpError(
-        409,
-        'INTAKE_REQUEST_OUTCOME_UNKNOWN',
-        'An earlier provider request has an unknown outcome and cost. Its evidence is retained; automatic or blind retry is unavailable until it is reconciled.',
+    if (intakeAttemptWait(chat.intakeModelAttempts || [])?.outcome === 'unknown') {
+      if (!options.beforeModelRequest)
+        throw new HttpError(
+          409,
+          'INTAKE_REQUEST_OUTCOME_UNKNOWN',
+          'Automatic import recovery must schedule this retry.',
+        );
+      chat.intakeModelAttempts = authorizeIntakeAttemptRecovery(
+        chat.intakeModelAttempts || [],
+        clock().toISOString(),
+        chat.reading?.workUnit?.id || chat.context?.intakeId || chat.id,
       );
+      persist(profileId, chat, 'conversion-model-recovery-authorized');
+    }
     if (chat.context?.intakeRepair)
       chat.context.intakeRepair = revalidateIntakeDraftRepairScope(
         dbFor(profileId),
@@ -2971,6 +3071,9 @@ export function createAssistant({
       !chat.runs?.length && !chat.messages.some((message) => message.role === 'assistant');
     const intake = conversionIntake(profileId, chat);
     const checkpoint = intake ? conversionCheckpoint(chat, intake, profileId) : null;
+    if (checkpoint && options.beforeModelRequest) {
+      checkpoint.activeUnitId = conversionReadingState(checkpoint, intake!).workUnit?.id;
+    }
     const firstAcquaintance =
       !checkpoint &&
       firstResponse &&
@@ -3008,6 +3111,7 @@ export function createAssistant({
       checkpoint,
       generation: 0,
       beforeModelRequest: options.beforeModelRequest,
+      assertAuthorized: options.assertAuthorized,
       ...(checkpoint ? { readingDeadlineAt: monotonicNow() + READING_SLICE_MS } : {}),
     };
     if (checkpoint)
@@ -3040,6 +3144,20 @@ export function createAssistant({
       if (state.timer) clearTimeout(state.timer);
       if (state.streamPersistTimer) clearTimeout(state.streamPersistTimer);
       active.delete(profileId);
+      if (checkpoint && readingReason === 'context_limit') {
+        checkpoint.contextTier = 1;
+        checkpoint.initialContextFailures = (checkpoint.initialContextFailures || 0) + 1;
+      }
+      if (
+        checkpoint &&
+        readingReason === 'context_limit' &&
+        (checkpoint.initialContextFailures || 0) > 1
+      ) {
+        status = 'failed';
+        readingReason = 'unsupported_context';
+        error =
+          'The configured model cannot accept the reduced import context. Check model capabilities before retrying.';
+      }
       chat.status = status;
       chat.error = error || null;
       if (checkpoint) {
@@ -3070,6 +3188,12 @@ export function createAssistant({
       runRecord.status = status;
       if (chat.reading)
         chat.reading.providerWait = intakeAttemptWait(chat.intakeModelAttempts || []);
+      if (
+        readingReason === 'unsupported_context' &&
+        (checkpoint?.initialContextFailures || 0) > 1 &&
+        chat.reading?.providerWait?.classification === 'context_limit'
+      )
+        chat.reading.providerWait.classification = 'unsupported';
       runRecord.endedAt = clock().toISOString();
       runRecord.error = error || undefined;
       for (const message of chat.messages)
@@ -3171,10 +3295,12 @@ export function createAssistant({
           return;
         }
         const bridge = bridgeFactory({
+          durableRetries: !!state.beforeModelRequest,
           profileId,
           diagnostics,
           diagnosticContext,
           beforeRequest: () => {
+            state.assertAuthorized?.('dispatch');
             for (const [sourceId, revisionId] of new Map([
               ...(state.sourceTextReads || []),
               ...(state.sourceTextCapturePins || []),
@@ -3189,6 +3315,14 @@ export function createAssistant({
             if (readingDeadlineReached())
               throw new ReadingDeadlineError(
                 'The bounded reading slice reached its time limit before another model request. Productive work is retained.',
+              );
+            if (
+              checkpoint?.activeUnitId &&
+              chat.reading?.workUnit?.id &&
+              checkpoint.activeUnitId !== chat.reading.workUnit.id
+            )
+              throw new ReadingDeadlineError(
+                'The current unit reached a checkpoint; continue with the next queued unit in a fresh context.',
               );
             if (checkpoint && state.beforeModelRequest?.(chat.reading!))
               throw new ReadingJobLimitError(
@@ -3302,6 +3436,24 @@ export function createAssistant({
                       // Optional diagnostics must never alter tool failure handling.
                     }
                     markModelToolTerminalError(thrown);
+                    const code = object(thrown) ? thrown.code : null;
+                    if (state.beforeModelRequest && reason === 'tool_error') {
+                      if (
+                        [
+                          'SOURCE_OCR_PREREQUISITE',
+                          'SOURCE_EXTRACTION_BUSY',
+                          'SOURCE_TEXT_EXTRACTION_ACTIVE',
+                        ].includes(String(code))
+                      )
+                        reason = 'source_prerequisite';
+                      else if (
+                        thrown instanceof ModelToolValidationError ||
+                        ['INTAKE_WORK_UNIT_SCOPE', 'CONVERSION_COVERAGE_PENDING'].includes(
+                          String(code),
+                        )
+                      )
+                        reason = 'model_tool_retry';
+                    }
                     finish('idle', message, reason);
                   };
                   if (object(error) && error.code === 'CONVERSION_NO_PROGRESS') {
@@ -3372,11 +3524,29 @@ export function createAssistant({
                 : checkpoint && error instanceof ReadingDeadlineError
                   ? finish('idle', null, 'time_limit')
                   : checkpoint && error instanceof ModelContextLimitError
-                    ? finish('idle', error.message, 'context_limit')
+                    ? finish(
+                        'idle',
+                        error.message,
+                        error.origin === 'slice' ? 'time_limit' : 'context_limit',
+                      )
                     : finish('failed', error.message);
           },
           onEvent: (method, params) => {
-            if (active.get(profileId) !== state || state.generation !== generation) return;
+            if (active.get(profileId) !== state || state.generation !== generation) {
+              if (
+                method === 'model/requestFinished' &&
+                databases.has(profileId) &&
+                chat.intakeModelAttempts?.some((a) => a.requestId === params.requestId)
+              ) {
+                chat.intakeModelAttempts = finishIntakeModelAttempt(
+                  chat.intakeModelAttempts,
+                  params,
+                  clock().toISOString(),
+                );
+                persist(profileId, chat, 'conversion-late-attempt-accounting');
+              }
+              return;
+            }
             try {
               const turn = object(params.turn) ? params.turn : {};
               const tokenUsage = object(params.tokenUsage) ? params.tokenUsage : {};
@@ -3468,6 +3638,12 @@ export function createAssistant({
                     params,
                     clock().toISOString(),
                   );
+                  if (params.outcome === 'response') {
+                    checkpoint.usableModelResponses = (checkpoint.usableModelResponses || 0) + 1;
+                    checkpoint.initialContextFailures = 0;
+                  }
+                  if (chat.reading)
+                    chat.reading.usableModelResponses = checkpoint.usableModelResponses || 0;
                   if (chat.reading)
                     chat.reading.providerWait = intakeAttemptWait(chat.intakeModelAttempts);
                   persist(profileId, chat, 'conversion-model-attempt-finished');
@@ -3505,6 +3681,7 @@ export function createAssistant({
                       runId: runRecord.id,
                       backend: runRecord.backend || null,
                       instructionVersion: INSTRUCTION_VERSION,
+                      workUnit: chat.reading?.workUnit || null,
                     },
                     clock().toISOString(),
                   );
@@ -3829,7 +4006,7 @@ export function createAssistant({
             openingGreetingAlreadyAttempted: !!checkpoint || !state.firstResponse,
           },
           messages: chat.messages
-            .slice(-30)
+            .slice(-(checkpoint?.contextTier ? 1 : 30))
             .map(({ role, content, status, context }: ChatMessage) => ({
               role,
               content,
@@ -3837,60 +4014,77 @@ export function createAssistant({
               ...(context ? { context } : {}),
             })),
         };
-        const context = chat.context?.intakeRepair
+        const context = checkpoint?.contextTier
           ? {
-              ...sharedContext,
-              mode: 'selected_pending_draft_repair',
-              intakeRepair: chat.context.intakeRepair,
-              proposals: chat.proposals.filter(
-                (proposal) => proposal.kind === 'intake_draft_repair',
-              ),
-              operations: chat.operations
-                .filter((operation) => DRAFT_REPAIR_TOOLS.has(String(operation.tool)))
-                .slice(-20),
-            }
-          : {
-              ...sharedContext,
-              identity: {
-                ...identity,
-                displayName: identity.name,
-                role: 'Profile owner; not necessarily the subject of these records',
+              profileId,
+              intakeId: checkpoint.intakeId,
+              conversion: {
+                ...conversionResumeContext(
+                  checkpoint,
+                  required(conversionIntake(profileId, chat), 'Source missing'),
+                ),
+                retainedCandidates: [],
+                proposalIds: [],
+                currentWindow: null,
+                nextReadWindows: [],
+                instructions:
+                  'Read the dispatched unit using the scoped host tools and supporting source-text pages. Publish only with health_intake_batch and this unit coverage. Retained candidate versions and receipts are available through paginated plan reads. Never accept/import.',
               },
-              recordSubject: assistantPersonScope(dbFor(profileId), chat.context)
-                ? q.clinicalPerson(
-                    dbFor(profileId),
-                    assistantPersonScope(dbFor(profileId), chat.context)!,
-                  )
-                : null,
-              route: chat.context?.route,
-              page: resolveAssistantPage(dbFor(profileId), chat.context, (selection) =>
-                linkResponse(
-                  selection.collection,
-                  scopedRead(
-                    dbFor(profileId),
-                    {
-                      collection: selection.collection,
-                      id: selection.id,
-                    },
-                    assistantPersonScope(dbFor(profileId), chat.context),
+            }
+          : chat.context?.intakeRepair
+            ? {
+                ...sharedContext,
+                mode: 'selected_pending_draft_repair',
+                intakeRepair: chat.context.intakeRepair,
+                proposals: chat.proposals.filter(
+                  (proposal) => proposal.kind === 'intake_draft_repair',
+                ),
+                operations: chat.operations
+                  .filter((operation) => DRAFT_REPAIR_TOOLS.has(String(operation.tool)))
+                  .slice(-20),
+              }
+            : {
+                ...sharedContext,
+                identity: {
+                  ...identity,
+                  displayName: identity.name,
+                  role: 'Profile owner; not necessarily the subject of these records',
+                },
+                recordSubject: assistantPersonScope(dbFor(profileId), chat.context)
+                  ? q.clinicalPerson(
+                      dbFor(profileId),
+                      assistantPersonScope(dbFor(profileId), chat.context)!,
+                    )
+                  : null,
+                route: chat.context?.route,
+                page: resolveAssistantPage(dbFor(profileId), chat.context, (selection) =>
+                  linkResponse(
+                    selection.collection,
+                    scopedRead(
+                      dbFor(profileId),
+                      {
+                        collection: selection.collection,
+                        id: selection.id,
+                      },
+                      assistantPersonScope(dbFor(profileId), chat.context),
+                    ),
                   ),
                 ),
-              ),
-              intakeId: chat.context?.intakeId,
-              ...(checkpoint
-                ? {
-                    conversion: conversionResumeContext(
-                      checkpoint,
-                      required(
-                        conversionIntake(profileId, chat),
-                        'This conversion is no longer linked to the selected delivery',
+                intakeId: chat.context?.intakeId,
+                ...(checkpoint
+                  ? {
+                      conversion: conversionResumeContext(
+                        checkpoint,
+                        required(
+                          conversionIntake(profileId, chat),
+                          'This conversion is no longer linked to the selected delivery',
+                        ),
                       ),
-                    ),
-                  }
-                : {}),
-              proposals: chat.proposals,
-              operations: chat.operations.slice(-20),
-            };
+                    }
+                  : {}),
+                proposals: chat.proposals,
+                operations: chat.operations.slice(-20),
+              };
         await bridge.turn(
           (checkpoint
             ? 'Continue the authorized intake conversion without a greeting. Follow the latest specific user reading priority while retaining unfinished windows; otherwise finish unproposed records in the current window before advancing. Retained cursors describe reading, not extraction. Never accept/import. '
@@ -3910,7 +4104,11 @@ export function createAssistant({
             : checkpoint && error instanceof ReadingDeadlineError
               ? finish('idle', null, 'time_limit')
               : checkpoint && error instanceof ModelContextLimitError
-                ? finish('idle', error.message, 'context_limit')
+                ? finish(
+                    'idle',
+                    error.message,
+                    error.origin === 'slice' ? 'time_limit' : 'context_limit',
+                  )
                 : finish('failed', errorMessage(error));
       }
     };

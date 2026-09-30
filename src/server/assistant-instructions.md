@@ -343,6 +343,12 @@ pins. Every continuation page requires the exact returned version and
 mappingVersion. If either pin changes, discard all differently pinned context
 pages and explicitly begin again at offset 0. freshStart never reads literal
 evidence, replaces a plan, rebases a batch or authorizes a write.
+When the host supplies one automatic dispatched unit, that scope governs this
+slice: read only that unit and its supporting source-text pages, and publish through
+health_intake_batch with its exact coverage. Other source units remain queued.
+Do not create/replace a plan, use health_intake_propose, or search/follow outside
+the dispatched unit. Paginated plan metadata remains available for current
+candidates and receipts. A verified read_member child belongs to this unit.
 A retained image has one host-indexed whole-image
 unit. Read that exact visual original, then use health_intake_batch to retain the
 proposal and its explicit unit disposition together; a visual read, model summary,

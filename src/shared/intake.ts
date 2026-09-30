@@ -601,6 +601,7 @@ export interface IntakeQuestion {
   resolvedByDecisionId?: string;
 }
 export interface IntakeCandidateVersion {
+  contentDigest?: string;
   id: string;
   status: 'pending' | 'accepted' | 'superseded' | 'kept_original';
   createdAt: string;
@@ -628,6 +629,7 @@ export interface IntakeExtractionCoverage {
   notes: string;
 }
 export interface IntakeExtractionUnit {
+  processingException?: { reason: 'processing_stalled'; at: string };
   id: string;
   kind: 'pdf' | 'html' | 'text' | 'package_member' | 'archive' | 'image' | 'unsupported';
   memberId?: string;

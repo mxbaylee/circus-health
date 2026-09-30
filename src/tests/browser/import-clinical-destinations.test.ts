@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
 import type { AddressInfo } from 'node:net';
@@ -163,14 +164,14 @@ test(
       data: originalBytes,
     });
     assert.equal(upload.status(), 201);
-    let intake = (await upload.json()).data;
+    let intake = await stopFixtureImport(page, url, prefix, (await upload.json()).data.id);
     intake = await request(`${prefix}/intakes/${encodeURIComponent(intake.id)}/proposals`, 'POST', {
       version: intake.version,
       summary: 'Three independently fictional destination records for explicit acceptance.',
       jsonlText: entries.map((entry) => JSON.stringify(entry)).join('\n'),
     });
     const intakePath = `${prefix}/intakes/${encodeURIComponent(intake.id)}`;
-    const proposalId = intake.proposals.at(-1).id;
+    const proposalId = intake.proposals.at(-1)!.id;
     const reviewPath = intakePath + '/review?proposalId=' + encodeURIComponent(proposalId);
     let review = await request(reviewPath);
 

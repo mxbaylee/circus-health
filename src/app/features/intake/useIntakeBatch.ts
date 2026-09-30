@@ -186,7 +186,7 @@ export function useIntakeBatch(profileId: string) {
   );
 
   const control = useCallback(
-    async (action: 'stop' | 'resume') => {
+    async (action: 'stop' | 'resume' | 'retry-exceptions') => {
       if (!batch || busy) return null;
       if (
         activeProfile.current !== profileId ||
@@ -221,6 +221,12 @@ export function useIntakeBatch(profileId: string) {
   );
 
   return {
+    refresh: async () => {
+      const current = generation.current;
+      const result = await api<IntakeBatch[]>(prefix);
+      if (current === generation.current)
+        setBatch(result.data.find((item) => item.status === 'running') || result.data[0] || null);
+    },
     batch,
     loading,
     busy,
@@ -229,6 +235,7 @@ export function useIntakeBatch(profileId: string) {
     create,
     retryCreate: () => create(),
     stop: () => control('stop'),
+    retryExceptions: () => control('retry-exceptions'),
     resume: () => control('resume'),
   };
 }

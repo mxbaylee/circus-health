@@ -97,6 +97,11 @@ const requireProxy = (config: ProxyConfig): void => {
   if (config.backend !== 'litellm')
     throw new ModelError('Only LiteLLM Proxy is supported. Configure the Docker LiteLLM service.');
 };
+/** Opaque prerequisite revision: configuration or an explicit successful connection check. */
+export function modelRecoveryKey(profileId: string, config: ProxyConfig = modelConfig()): string {
+  const identity = key(config, profileId);
+  return identity + ':' + (receipts.get(identity)?.testedAt || '');
+}
 export function configuredModelIdentity(profileId?: string, config: ProxyConfig = modelConfig()) {
   const receipt = receipts.get(key(config, profileId));
   return { backend: config.backend, model: receipt?.model || config.model, reasoningEffort: null };

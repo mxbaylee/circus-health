@@ -211,10 +211,13 @@ test(
       return input instanceof HTMLInputElement && !input.disabled;
     });
     const created = page.waitForResponse(
-      (response) =>
-        response.request().method() === 'POST' &&
+      async (response) =>
+        response.request().method() === 'GET' &&
         response.url().endsWith('/intake-batches') &&
-        response.ok(),
+        response.ok() &&
+        (await response.json()).data.some(
+          (batch: { items: unknown[] }) => batch.items.length === 2,
+        ),
     );
     await page.locator('.import-dropzone input[type="file"]').setInputFiles([
       {
@@ -228,7 +231,9 @@ test(
         buffer: Buffer.from('Fictional second result 18 ng/mL; unread appendix retained.'),
       },
     ]);
-    const initialBatch = (await (await created).json()).data;
+    const initialBatch = (await (await created).json()).data.find(
+      (batch: { items: unknown[] }) => batch.items.length === 2,
+    );
     assert.equal(initialBatch.items.length, 2);
     assert.equal(conversionRequests.length, 0, 'the UI does not start per-file conversion routes');
     assert.equal(importRequests.length, 0, 'background reading never accepts a record');
@@ -242,11 +247,28 @@ test(
       arguments: { id: first.id },
       callId: 'fictional-first-source-text',
     })) as { revisionId: string };
+    const firstPlan = first.workflow.plans.find(
+      (plan: { status: string }) => plan.status === 'active',
+    );
     await bridges[0].callbacks.onTool!({
-      tool: 'health_intake_propose',
+      tool: 'health_intake_plan',
+      arguments: { id: first.id, action: 'read_unit', unitId: firstPlan.units[0].id },
+      callId: 'fictional-first-read',
+    });
+    await bridges[0].callbacks.onTool!({
+      tool: 'health_intake_batch',
       arguments: {
         id: first.id,
         version: first.version,
+        planId: firstPlan.id,
+        operationId: 'fictional-first-batch',
+        coverage: [
+          {
+            unitId: firstPlan.units[0].id,
+            kind: 'extracted',
+            notes: 'The supplied fictional section was fully read.',
+          },
+        ],
         sourceTextRevisionId: firstText.revisionId,
         jsonlText: proposal(first.id, 'first'),
         summary: 'One fictional bounded section; unread material remains.',
@@ -318,7 +340,7 @@ test(
     const stoppedResponse = page.waitForResponse(
       (response) => response.url().endsWith('/stop') && response.ok(),
     );
-    await page.getByRole('button', { name: 'Stop reading', exact: true }).click();
+    await page.getByRole('button', { name: 'Stop imports', exact: true }).click();
     const stopped = (await (await stoppedResponse).json()).data;
     assert.equal(stopped.status, 'stopped');
     assert.equal(stopped.items[0].status, 'review_ready');
@@ -328,7 +350,11 @@ test(
     const second = await get(
       `${prefix}/intakes/${encodeURIComponent(initialBatch.items[1].intakeId)}`,
     );
-    assert.equal(second.state, 'pending_conversion');
+    assert.equal(
+      second.state,
+      'needs_review',
+      'source capture remains available before clinical proposals',
+    );
     assert.equal(second.proposals.length, 0);
     const secondOriginal = await page.request.get(url + second.contentUrl);
     assert.equal(
@@ -337,12 +363,12 @@ test(
     );
 
     await page.reload();
-    await page.getByRole('button', { name: 'Resume reading', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Resume imports', exact: true }).waitFor();
     assert.equal(importRequests.length, 0, 'reload does not accept retained proposals');
     const resumedResponse = page.waitForResponse(
       (response) => response.url().endsWith('/resume') && response.ok(),
     );
-    await page.getByRole('button', { name: 'Resume reading', exact: true }).click();
+    await page.getByRole('button', { name: 'Resume imports', exact: true }).click();
     await resumedResponse;
     await waitFor(() => bridges.length === 3, 'explicit retry of stopped second pass');
     const resumedSecond = await get(
@@ -353,11 +379,28 @@ test(
       arguments: { id: resumedSecond.id },
       callId: 'fictional-second-source-text',
     })) as { revisionId: string };
+    const secondPlan = resumedSecond.workflow.plans.find(
+      (plan: { status: string }) => plan.status === 'active',
+    );
     await bridges[2].callbacks.onTool!({
-      tool: 'health_intake_propose',
+      tool: 'health_intake_plan',
+      arguments: { id: resumedSecond.id, action: 'read_unit', unitId: secondPlan.units[0].id },
+      callId: 'fictional-second-read',
+    });
+    await bridges[2].callbacks.onTool!({
+      tool: 'health_intake_batch',
       arguments: {
         id: resumedSecond.id,
         version: resumedSecond.version,
+        planId: secondPlan.id,
+        operationId: 'fictional-second-batch',
+        coverage: [
+          {
+            unitId: secondPlan.units[0].id,
+            kind: 'extracted',
+            notes: 'The supplied fictional section was fully read.',
+          },
+        ],
         sourceTextRevisionId: secondText.revisionId,
         jsonlText: proposal(resumedSecond.id, 'second'),
         summary: 'One fictional bounded section; unread material remains.',

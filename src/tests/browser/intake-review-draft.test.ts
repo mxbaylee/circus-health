@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
 import type { AddressInfo } from 'node:net';
@@ -153,7 +154,7 @@ test(
         data: Buffer.from('Fictional retained original ' + clinical),
       });
       assert.equal(uploaded.status(), 201);
-      let item = (await uploaded.json()).data;
+      let item = await stopFixtureImport(page, url, prefix, (await uploaded.json()).data.id);
       item = await api(`${prefix}/intakes/${encodeURIComponent(item.id)}/proposals`, {
         version: item.version,
         summary: 'Fictional draft regression',

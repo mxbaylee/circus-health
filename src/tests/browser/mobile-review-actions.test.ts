@@ -1,3 +1,4 @@
+import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
@@ -97,7 +98,7 @@ test('Import detail keeps a readable record and reachable explicit actions on mo
     ),
   });
   assert.equal(saved.status(), 201);
-  const savedIntake = (await saved.json()).data;
+  const savedIntake = await stopFixtureImport(page, url, prefix, (await saved.json()).data.id);
   const savedReviewResponse = await page.request.get(
     url + prefix + `/intakes/${encodeURIComponent(savedIntake.id)}/review`,
     { headers: { Origin: url } },
@@ -127,7 +128,7 @@ test('Import detail keeps a readable record and reachable explicit actions on mo
       data: Buffer.from(`${report}\nGlucose 87 mg/dL on 2026-08-10`),
     });
     assert.equal(uploaded.status(), 201);
-    const intake = (await uploaded.json()).data;
+    const intake = await stopFixtureImport(page, url, prefix, (await uploaded.json()).data.id);
     const proposed = await page.request.post(
       url + prefix + `/intakes/${encodeURIComponent(intake.id)}/proposals`,
       {

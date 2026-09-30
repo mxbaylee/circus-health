@@ -119,6 +119,7 @@ export function createVaultApp({
         if (!manager.opened.has(profile.id))
           throw new HttpError(423, 'PROFILE_LOCKED', 'Unlock this profile to continue');
         client.profiles.add(profile.id);
+        profileApp(profile.id);
         return profile;
       } catch (error) {
         // A failed activation must not leave a newly materialized profile or a
@@ -165,6 +166,9 @@ export function createVaultApp({
           },
         },
         intakeBatchOptions: {
+          authorized: (profileId) =>
+            manager.opened.has(profileId) &&
+            [...sessions.values()].some((session) => session.profiles.has(profileId)),
           journalWriter(root, profileId, batch, reason) {
             if (!manager.opened.has(profileId))
               throw new HttpError(423, 'PROFILE_LOCKED', 'Profile is locked');

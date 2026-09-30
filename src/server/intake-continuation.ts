@@ -1,9 +1,26 @@
 import { createHash } from 'node:crypto';
 import { HttpError } from './database.ts';
 import { accountedUnitKind } from './intake-unit-accounting.ts';
-import type { Intake, IntakeExtractionCoverage } from '../shared/intake.ts';
+import type { Intake, IntakeExtractionCoverage, IntakeExtractionUnit } from '../shared/intake.ts';
 import type { IntakeBatchReadingState } from '../shared/intake-batch.ts';
 import { ensureIntakeAttribution, type IntakeAttribution } from './intake-attribution.ts';
+
+export function intakeUnitSourcePages(unit: IntakeExtractionUnit): number[] {
+  return (
+    unit.pages ||
+    (unit.start !== undefined
+      ? Array.from(
+          {
+            length: Math.max(
+              1,
+              Math.ceil((unit.end || unit.start + 1) / 24000) - Math.floor(unit.start / 24000),
+            ),
+          },
+          (_, index) => Math.floor(unit.start! / 24000) + index + 1,
+        )
+      : [1])
+  );
+}
 
 export type IntakeWithWorkflow = Intake & { workflow: NonNullable<Intake['workflow']> };
 
@@ -29,6 +46,10 @@ interface ReadWindow {
 }
 
 export interface ConversionCheckpoint {
+  activeUnitId?: string;
+  contextTier?: number;
+  initialContextFailures?: number;
+  usableModelResponses?: number;
   attribution?: IntakeAttribution;
   pageTiming?: {
     turn: number;
@@ -148,7 +169,6 @@ interface CoverageInput {
 
 const hash = (value: unknown): string =>
   createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const MAX_WINDOWS = 10000;
 const descriptor = (tool: string, args: ReadArgs): ReadWindow => ({
   tool,
   args: Object.fromEntries(
@@ -287,12 +307,6 @@ export function deferConversionRead(
   if (checkpoint.seen.includes(key)) return null;
   if (structure && checkpoint.suppliedJSON?.some((item) => withinJSON(current, item))) return null;
   if (!checkpoint.pending.some((item) => keyOf(item) === key)) {
-    if (checkpoint.pending.length >= MAX_WINDOWS)
-      throw new HttpError(
-        413,
-        'CONVERSION_CHECKPOINT_LIMIT',
-        'Reading paused at the bounded checkpoint limit; retained proposals remain reviewable',
-      );
     checkpoint.pending.unshift(current);
   }
   const receipt: ReadResult = {
@@ -355,13 +369,6 @@ export function recordConversionRead(
   const markRead = (window: ReadWindow): void => {
     const windowKey = keyOf(window);
     if (checkpoint.seen.includes(windowKey)) return;
-
-    if (checkpoint.seen.length >= MAX_WINDOWS)
-      throw new HttpError(
-        413,
-        'CONVERSION_CHECKPOINT_LIMIT',
-        'Reading paused at the bounded checkpoint limit; retained proposals remain reviewable',
-      );
     checkpoint.seen.push(windowKey);
   };
   markRead(current);
@@ -375,12 +382,6 @@ export function recordConversionRead(
       checkpoint.pending.some((item) => keyOf(item) === nextKey)
     )
       return;
-    if (checkpoint.pending.length >= MAX_WINDOWS)
-      throw new HttpError(
-        413,
-        'CONVERSION_CHECKPOINT_LIMIT',
-        'Reading paused at the bounded checkpoint limit; retained proposals remain reviewable',
-      );
     checkpoint.pending.push(next);
   };
   const suppliedJSON = (window: ReadWindow): void => {
@@ -550,7 +551,8 @@ export function conversionResumeContext(
   intake: IntakeWithWorkflow,
 ) {
   const plan = intake.workflow.plans.find((item) => item.status === 'active');
-  const pendingUnits = plan?.units.filter((unit) => !accountedUnitKind(plan, unit)) || [];
+  const pendingUnits =
+    plan?.units.filter((unit) => !accountedUnitKind(plan, unit) && !unit.processingException) || [];
   const pending = checkpoint.pending.filter((window) => {
     const matching =
       plan?.units.filter((unit) => {
@@ -567,9 +569,9 @@ export function conversionResumeContext(
     // automatic traversal only in their exact scope; a later inspected batch reopens it.
     return (
       !matching.length ||
-      matching.some(
-        (unit) => !['context', 'unreadable'].includes(accountedUnitKind(plan!, unit) || ''),
-      )
+      matching
+        .filter((unit) => !unit.processingException)
+        .some((unit) => !['context', 'unreadable'].includes(accountedUnitKind(plan!, unit) || ''))
     );
   });
   return {
@@ -581,17 +583,24 @@ export function conversionResumeContext(
     pendingUnits: pendingUnits.length,
     pendingReadWindows: pending.length,
     currentWindow: checkpoint.lastWindow,
-    nextReadWindows: pending.slice(0, 12),
+    nextReadWindows: checkpoint.activeUnitId ? [] : pending.slice(0, 12),
     remainingUnits:
-      pendingUnits.slice(0, 8).map(({ id, kind, memberId, pages, locator }) => ({
-        id,
-        kind,
-        memberId,
-        pages,
-        locator,
+      (checkpoint.activeUnitId
+        ? pendingUnits.filter((unit) => unit.id === checkpoint.activeUnitId)
+        : pendingUnits.slice(0, 8)
+      ).map((unit) => ({
+        id: unit.id,
+        kind: unit.kind,
+        memberId: unit.memberId,
+        pages: unit.pages,
+        locator: unit.locator,
+        start: unit.start,
+        end: unit.end,
+        sourceFileId: unit.sourceFileId,
+        supportingSourcePages: intakeUnitSourcePages(unit),
       })) || [],
     retainedCandidates: intake.workflow.candidates
-      .slice(-50)
+      .slice(-(checkpoint.contextTier ? 5 : 50))
       .map(({ id, envelopeId, sourceRecordId }) => ({ id, envelopeId, sourceRecordId })),
     retainedCandidateCount: intake.workflow.candidates.length,
     ...(intake.workflow.plans.length === 0 && isFreshTopLevelImageConversion(checkpoint, intake)
@@ -604,8 +613,9 @@ export function conversionResumeContext(
         }
       : {}),
     proposalIds: intake.proposals.slice(-10).map((proposal) => proposal.id),
-    instructions:
-      'Resume this conversion without a greeting or introduction. Read cursors describe reading only, never extraction completion. When the latest user message explicitly prioritizes a different supplied section, inspect that section first and keep unfinished windows pending. Otherwise finish and publish all unproposed records from the current window before moving on; preserve stable source IDs and locators and do not repeat the first record. Inspect the remaining child pointers/pages, including every record in a large JSON array. Use one bounded proposal for multiple fully read records when practical, rather than one proposal per small record. Publish bounded batches and honest partial coverage; one proposal or a fully read window does not prove all entities were extracted. Do not accept/import. If progress is blocked, explain the blocker briefly.',
+    instructions: checkpoint.activeUnitId
+      ? 'This automatic slice owns only the listed remainingUnit. Use health_intake_plan read_unit for its literal text or page/member coordinates, then read its exact pages/member and current supportingSourcePages with health_intake_source_text passage. Publish through health_intake_batch with only this unit coverage and current source-text revision. Do not use health_intake_propose, create/replace plans, search/follow other source units or retarget a source. Other units remain queued for later contexts. Read_member may return a verified retained child sourceFileId for this member. Paginated plan reads may retrieve candidate/receipt metadata. Retain all distinct records and honest partial coverage; never accept/import.'
+      : 'Resume this conversion without a greeting or introduction. Read cursors describe reading only, never extraction completion. When the latest user message explicitly prioritizes a different supplied section, inspect that section first and keep unfinished windows pending. Otherwise finish and publish all unproposed records from the current window before moving on; preserve stable source IDs and locators and do not repeat the first record. Inspect the remaining child pointers/pages, including every record in a large JSON array. Use one bounded proposal for multiple fully read records when practical, rather than one proposal per small record. Publish bounded batches and honest partial coverage; one proposal or a fully read window does not prove all entities were extracted. Do not accept/import. If progress is blocked, explain the blocker briefly.',
   };
 }
 
@@ -642,13 +652,28 @@ export function conversionReadingState(
   const resume = conversionResumeContext(checkpoint, intake);
   const plan = intake.workflow.plans.find((item) => item.status === 'active');
   return {
+    workUnit: (() => {
+      const unit = plan?.units.find(
+        (unit) => !accountedUnitKind(plan, unit) && !unit.processingException,
+      );
+      return unit
+        ? { id: unit.id, locator: unit.locator || unit.pages?.join(', ') || unit.id }
+        : null;
+    })(),
     status: reason ? 'paused' : 'running',
     reason,
     turns: checkpoint.turns,
     modelRequests: checkpoint.modelRequests || 0,
+    usableModelResponses: checkpoint.usableModelResponses || 0,
     measuredModelTokens: checkpoint.measuredModelTokens || 0,
     modelUsageIncomplete: !!checkpoint.modelUsageIncomplete || !!checkpoint.unmeasuredRequests,
     readyRecords: resume.retainedCandidateCount,
+    substantiveVersions: intake.workflow.candidates.reduce(
+      (sum, candidate) =>
+        sum +
+        new Set(candidate.versions.map((version) => version.contentDigest || version.id)).size,
+      0,
+    ),
     remainingUnits: resume.pendingUnits,
     pendingReadWindows: resume.pendingReadWindows,
     // `readWindows` counts every window marked seen, including children satisfied by
@@ -656,7 +681,7 @@ export function conversionReadingState(
     // the model actually read. Equal for plain paginated sources, not in general.
     readWindows: checkpoint.seen.length,
     totalUnits: plan?.units.length || 0,
-    accountedUnits: (plan?.units.length || 0) - resume.pendingUnits,
+    accountedUnits: plan?.units.filter((unit) => !!accountedUnitKind(plan, unit)).length || 0,
     distinctReads: distinctReadsOf(checkpoint),
     // Derived from every plan's batches, so a replayed submitIntakeBatch — which
     // returns the existing intake without adding a batch entry — never double-counts,

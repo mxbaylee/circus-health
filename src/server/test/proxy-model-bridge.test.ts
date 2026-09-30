@@ -2911,3 +2911,37 @@ test('physical provider receipts distinguish known rejections from unknown outco
   assert.equal(proxyRetryAfterMs('Thu, 01 Jan 1970 00:02:00 GMT', 0), 120_000);
   assert.equal(proxyRetryAfterMs('invalid', 0), undefined);
 });
+
+test('provider context rejection distinguishes initial admission from a productive tool continuation', async () => {
+  for (const productive of [false, true]) {
+    let requests = 0;
+    let ended!: (error: Error) => void;
+    const terminal = new Promise<Error>((resolve) => {
+      ended = resolve;
+    });
+    const bridge = new ProxyModelBridge({
+      config: config(),
+      fetchImpl: async () => {
+        if (productive && requests++ === 0) return json(toolCall);
+        return new Response(
+          JSON.stringify({
+            error: { code: 'context_length_exceeded', message: 'Fictional request too large' },
+          }),
+          { status: 400 },
+        );
+      },
+      onTool: async () => ({ record: 'Fictional unique tool result' }),
+      onEvent() {},
+      onExit: ended,
+    });
+    try {
+      await bridge.start('Fictional scoped test', [tool]);
+      await bridge.turn('Read the fictional unit.');
+      const error = await terminal;
+      assert.ok(error instanceof ModelContextLimitError);
+      assert.equal(error.origin, productive ? 'slice' : 'initial');
+    } finally {
+      bridge.close();
+    }
+  }
+});

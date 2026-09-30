@@ -51,6 +51,7 @@ interface EvidenceContext {
   id: string;
   page?: unknown;
   offset?: unknown;
+  limit?: number;
   assertRunning?: () => void;
   modelContext?: boolean;
   /** Read-only scoped repair must not mutate its pinned source/version snapshot. */
@@ -132,6 +133,7 @@ export async function readIntakeEvidence({
   id,
   page = 1,
   offset = 0,
+  limit,
   assertRunning = () => {},
   modelContext = false,
   captureSourceText = true,
@@ -197,8 +199,8 @@ export async function readIntakeEvidence({
           note: 'Original retained. PDF text and visuals are read from bounded page ranges.',
         }
       : modelContext
-        ? literalWindow(readIntake(db, root, profileId, id, { offset: offset as number }))
-        : readIntake(db, root, profileId, id, { offset: offset as number }),
+        ? literalWindow(readIntake(db, root, profileId, id, { offset: offset as number, limit }))
+        : readIntake(db, root, profileId, id, { offset: offset as number, limit }),
   };
   if (file && ['image/png', 'image/jpeg', 'image/webp'].includes(file.mimeType)) {
     const { loadImage, createCanvas } = await import('@napi-rs/canvas');
