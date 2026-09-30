@@ -846,10 +846,17 @@ export function assessIdentityPolicy({
           group.report?.subject?.text || null,
         )
       : undefined;
+  const ownPersonReceipt =
+    latestPersonChoice?.outcome === 'this_is_person' &&
+    latestPersonChoice.scope.groupId === group?.id &&
+    latestPersonChoice.scope.groupVersionId === groupVersionId
+      ? latestPersonChoice
+      : undefined;
   if (
     latestPersonChoice?.outcome === 'this_is_person' &&
-    (matchedOwner?.personId !== latestPersonChoice.assignedPerson?.personId ||
-      hasUnstructuredIdentityQuestion)
+    !ownPersonReceipt &&
+    distinctOwners.length < 2 &&
+    matchedOwner?.personId !== latestPersonChoice.assignedPerson?.personId
   )
     return {
       ...common,
@@ -895,7 +902,12 @@ export function assessIdentityPolicy({
           group.report?.subject?.text || null,
         )
       : undefined;
-  if (challengedName && !explicitReceipt && !(receipt && receipt.scope.groupId === group?.id))
+  if (
+    challengedName &&
+    !explicitReceipt &&
+    !ownPersonReceipt &&
+    !(receipt && receipt.scope.groupId === group?.id)
+  )
     return {
       ...common,
       confidence: 'none',
@@ -973,6 +985,61 @@ export function assessIdentityPolicy({
         ...(Object.keys(evidencedIdentity).length ? { evidencedIdentity } : {}),
       },
     };
+  if (ownPersonReceipt) {
+    const assigned = people.find(
+      (person) =>
+        person.personId === ownPersonReceipt.assignedPerson?.personId &&
+        person.noteId === ownPersonReceipt.assignedPerson?.noteId,
+    );
+    const reviewedDate =
+      clean(ownPersonReceipt.identityAnswers?.birthDate) ||
+      birthDate ||
+      clean(ownPersonReceipt.scope.evidencedIdentity?.birthDate);
+    if (
+      !assigned ||
+      hasUnstructuredIdentityQuestion ||
+      conflicts.some((conflict) => conflict.reason === 'evidence_disagreement') ||
+      (!birthDate && !originalEvidenceChecked)
+    )
+      return {
+        ...common,
+        status: 'confirmation_required',
+        blocking: true,
+        message: 'Confirm who these current records belong to before saving.',
+      };
+    if (
+      reviewedDate &&
+      assigned.birthDate &&
+      !compatibleBirthDates(reviewedDate, assigned.birthDate)
+    )
+      return {
+        ...common,
+        status: 'conflict',
+        blocking: true,
+        message:
+          'The reviewed report birth date differs from the assigned person’s current birth date. Choose who this report belongs to before saving.',
+      };
+    return {
+      ...common,
+      status: 'prior_confirmation',
+      blocking: false,
+      message: `This report was assigned to ${assigned.fullName}.`,
+      attribution: {
+        status: 'prior_confirmation',
+        basis: 'explicit_person_confirmation',
+        groupId: group?.id || null,
+        groupVersionId,
+        confirmationOperationId: ownPersonReceipt.operationId,
+        assignedPerson: {
+          noteId: assigned.noteId,
+          personId: assigned.personId,
+          version: assigned.version,
+          fullName: assigned.fullName,
+        },
+        evidencedIdentity,
+      },
+    };
+  }
   if (distinctOwners.length > 1)
     return {
       ...common,

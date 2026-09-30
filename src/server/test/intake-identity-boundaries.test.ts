@@ -540,12 +540,14 @@ for (const banner of [false, true])
           ? { personSelection: { noteId: person.id, expectedVersion: person.version } }
           : {}),
       });
-      if (confirmedOwner === 'Person')
-        createNote(f.db, {
-          kind: 'person',
-          title: `Second ${patient}`,
-          person: { fullName: patient, birthDate: selfBirthDate },
-        });
+      const second =
+        confirmedOwner === 'Person'
+          ? createNote(f.db, {
+              kind: 'person',
+              title: `Second ${patient}`,
+              person: { fullName: patient, birthDate: selfBirthDate },
+            })
+          : null;
       const review = await getIntakeIdentityReview(
         f.db,
         f.root,
@@ -555,7 +557,106 @@ for (const banner of [false, true])
       );
       assert.equal(review.status, 'confirmation_required');
       assert.equal(review.blocking, true);
+      if (second) {
+        const borrowed = assessIdentityPolicy({
+          self: review.self,
+          people: [person, second].map((saved) => ({
+            noteId: saved.id,
+            personId: saved.personId!,
+            version: saved.version,
+            fullName: patient,
+            knownNames: [],
+            birthDate: selfBirthDate,
+          })),
+          evidence: review.evidencedIdentity,
+          group: b.group,
+          groupVersionId: review.scope!.groupVersionId,
+          originalFingerprint: review.scope!.evidenceOriginalFingerprint || '',
+          receipts: intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!
+            .identityConfirmations,
+        });
+        assert.equal(borrowed.blocking, true);
+        assert.match(borrowed.message, /more than one person/);
+      }
       blockedReportPaths(f, b.group.id, b.proposalId);
+      if (second) {
+        // B's own exact Person receipt answers B; A's receipt cannot choose
+        // between the same-named people, even when they share a birth date.
+        await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+          version: review.scope!.intakeVersion,
+          operationId: randomUUID(),
+          scope: review.scope!,
+          outcome: 'this_is_person',
+          attestation: review.scope!.questions?.length
+            ? 'confirmed_displayed_identity_questions'
+            : 'confirmed_displayed_report_subject',
+          personSelection: { noteId: second.id, expectedVersion: second.version },
+        });
+        const own = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, b.group.id);
+        assert.equal(own.blocking, false, own.message);
+        const ownReceipt = intake
+          .getIntake(f.db, f.root, f.profileId, f.item.id)
+          .workflow!.identityConfirmations!.at(-1)!;
+        const direct = assessIdentityPolicy({
+          self: own.self,
+          people: [person, second].map((saved) => ({
+            noteId: saved.id,
+            personId: saved.personId!,
+            version: saved.version,
+            fullName: patient,
+            knownNames: [],
+            birthDate: selfBirthDate,
+          })),
+          evidence: own.evidencedIdentity,
+          group: b.group,
+          groupVersionId: own.scope!.groupVersionId,
+          originalFingerprint: own.scope!.evidenceOriginalFingerprint || '',
+          receipts: [ownReceipt],
+          bannerBirthDates: banner ? [['1970-04-17']] : [],
+        });
+        assert.equal(direct.blocking, false, 'the shared policy must honor B’s own Person choice');
+        const staleVersion = assessIdentityPolicy({
+          self: own.self,
+          people: [person, second].map((saved) => ({
+            noteId: saved.id,
+            personId: saved.personId!,
+            version: saved.version,
+            fullName: patient,
+            knownNames: [],
+            birthDate: selfBirthDate,
+          })),
+          evidence: own.evidencedIdentity,
+          group: b.group,
+          groupVersionId: `${own.scope!.groupVersionId}-changed-members`,
+          originalFingerprint: own.scope!.evidenceOriginalFingerprint || '',
+          receipts: [ownReceipt],
+        });
+        assert.equal(staleVersion.blocking, true, 'a changed report version needs its own review');
+        const labelledConflict = assessIdentityPolicy({
+          self: own.self,
+          people: [person, second].map((saved) => ({
+            noteId: saved.id,
+            personId: saved.personId!,
+            version: saved.version,
+            fullName: patient,
+            knownNames: [],
+            birthDate: selfBirthDate,
+          })),
+          evidence: { ...own.evidencedIdentity, birthDate: '1970-04-17' },
+          group: b.group,
+          groupVersionId: own.scope!.groupVersionId,
+          originalFingerprint: own.scope!.evidenceOriginalFingerprint || '',
+          receipts: [ownReceipt],
+        });
+        assert.equal(
+          labelledConflict.blocking,
+          true,
+          'own Person choice cannot waive a verified DOB conflict',
+        );
+        const clinical = intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, b.proposalId);
+        assert.equal(clinical.records[0]!.identityReview?.blocking, false);
+        assert.equal(clinical.records[0]!.mapping.personId, second.personId);
+      }
     });
 
 test('confirmation cannot cross an original even when the printed subject is unchanged', async (t) => {
