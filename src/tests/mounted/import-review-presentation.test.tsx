@@ -569,7 +569,7 @@ it('keeps real progress and Stop beside Moxie without a redundant Reading detail
   expect(screen.queryByRole('progressbar')).toBeNull();
   expect(screen.queryByText(/source sections accounted/)).toBeNull();
   expect(screen.getByText('Discovered 30 records.')).toBeVisible();
-  expect(screen.getByText(/Rough estimate:/)).toBeVisible();
+  expect(screen.getByText(/Rough estimate, narrows as files are read:/)).toBeVisible();
   expect(screen.queryByRole('button', { name: /Reading details/ })).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: 'Stop imports' }));
   expect(onStopReading).toHaveBeenCalledOnce();
