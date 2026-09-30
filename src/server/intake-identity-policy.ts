@@ -858,6 +858,18 @@ export function assessIdentityPolicy({
       message:
         'This report was assigned to another person. Confirm who these current records belong to.',
     };
+  if (
+    latestPersonChoice?.outcome === 'this_is_me' &&
+    latestPersonChoice.scope.groupId !== group?.id &&
+    matchedOwner?.personId !== 'patient'
+  )
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'The person matched by this report has changed. Confirm who these current records belong to.',
+    };
   // A confirmation belongs to the reviewed report. A borrowed Self answer
   // cannot decide between same-named owners or override B's banner against
   // the owner it would actually assign, even when there is no unique match.
