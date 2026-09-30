@@ -239,3 +239,27 @@ it('keeps an unknown provider reset uncertain despite a local retry deadline', (
   expect(screen.getByText('Estimating…')).toBeVisible();
   expect(screen.queryByText(/Rough estimate/)).not.toBeInTheDocument();
 });
+
+it('explains the queued estimate gap after the first of fifteen files finishes', () => {
+  const backlog = activity();
+  backlog.activeFiles = 14;
+  backlog.progress!.files = Array.from({ length: 15 }, (_, index) => ({
+    accounted: index === 0 ? 10 : 0,
+    total: index === 0 ? 10 : 0,
+    readWindows: index === 0 ? 10 : 0,
+    activeMs: index === 0 ? 360000 : 0,
+    sliceStartedAt: null,
+    retryAt: null,
+    done: index === 0,
+    queued: index > 0,
+    exceptions: 0,
+  }));
+  render(<ImportReadingActivity activity={backlog} />);
+  expect(screen.getByText('1 of 15 files done · 14 queued')).toBeVisible();
+  expect(
+    screen.getByText(
+      /14 files are not yet estimated; 1 completed file took 6 minutes of active reading/,
+    ),
+  ).toBeVisible();
+  expect(screen.queryByText('Estimating…')).not.toBeInTheDocument();
+});

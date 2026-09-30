@@ -42,7 +42,20 @@ function remainingEstimate(
     const measured = estimates.filter(
       (value): value is { work: number; wait: number } => value !== null,
     );
-    if (!measured.length) return null;
+    if (!measured.length) {
+      const finished = progress.files.filter((file) => file.done && file.activeMs > 0);
+      if (!finished.length) return null;
+      const observed = finished.reduce((sum, file) => sum + file.activeMs, 0);
+      return (
+        pending.length +
+        (pending.length === 1 ? ' file is' : ' files are') +
+        ' not yet estimated; ' +
+        finished.length +
+        (finished.length === 1 ? ' completed file took ' : ' completed files took ') +
+        duration(observed) +
+        ' of active reading. The remaining estimate will narrow as files are read.'
+      );
+    }
     const work = measured.reduce((sum, value) => sum + value.work, 0);
     const wait = Math.max(...measured.map((value) => value.wait));
     const omitted = pending.length - measured.length;

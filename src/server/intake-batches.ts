@@ -306,6 +306,20 @@ export function createIntakeBatchManager({
       batch.automaticRun ??=
         batch.status === 'running' ||
         (batch.status !== 'stopped' && recoverable.has(batch.reason || ''));
+      // Old Stop cleared automaticRun but only changed the cursor item's status.
+      // Queued entries and an explicit stopped reason preserve automatic intent;
+      // a human-review pause or a completed proposal must stay untouched.
+      if (batch.status === 'stopped')
+        for (const item of batch.items)
+          if (
+            item.resumeAutomaticRun === undefined &&
+            (item.status === 'queued' || item.reason === 'stopped')
+          ) {
+            item.resumeAutomaticRun = true;
+            item.automaticRun = false;
+            item.status = 'paused';
+            item.reason = 'stopped';
+          }
       for (const item of batch.items) {
         item.automaticRun ??=
           batch.automaticRun &&

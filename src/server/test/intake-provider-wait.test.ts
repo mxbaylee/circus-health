@@ -447,3 +447,53 @@ test('shared model-tool prerequisite waits never consume the active source-stall
   }
   assert.ok(f.manager.get(f.profileId, f.batch.id).items[0].readingJob!.activeMs > 4 * 180000);
 });
+
+// Old Stop cleared every automatic flag but marked only the cursor item stopped.
+// Decode all remaining queued work without resuming human review or completed files.
+test('legacy stopped journals restore every automatic item after restart', async (t) => {
+  const f = fixture(t);
+  await waitFor(() => f.sends === 1);
+  f.manager.stop(f.profileId, f.batch.id);
+  const legacy = f.manager.get(f.profileId, f.batch.id);
+  const template = structuredClone(legacy.items[0]);
+  legacy.items = Array.from({ length: 5 }, (_, index) => {
+    const source = uploadIntake(f.db, f.root, f.profileId, {
+      filename: `fictional-legacy-${index}.txt`,
+      bytes: Buffer.from(`Fictional legacy source ${index}`),
+    });
+    const item = { ...structuredClone(template), intakeId: source.id };
+    delete item.resumeAutomaticRun;
+    item.automaticRun = false;
+    item.chatId = null;
+    item.status = index < 2 ? 'queued' : index === 3 ? 'review_ready' : 'paused';
+    item.reason =
+      index === 0
+        ? 'waiting_for_provider'
+        : index === 1
+          ? null
+          : index === 2
+            ? 'stopped'
+            : index === 3
+              ? 'bounded_pass_ready'
+              : 'source_review_required';
+    return item;
+  });
+  legacy.currentIndex = 2;
+  f.reopenWith(legacy);
+  const decoded = f.manager.get(f.profileId, f.batch.id);
+  assert.equal(decoded.status, 'stopped');
+  assert.deepEqual(
+    decoded.items.slice(0, 3).map((item) => item.reason),
+    ['stopped', 'stopped', 'stopped'],
+  );
+  const resumed = f.manager.resume(f.profileId, f.batch.id);
+  assert.equal(resumed.currentIndex, 0);
+  assert.deepEqual(
+    resumed.items.map((item) => item.automaticRun),
+    [true, true, true, false, false],
+  );
+  assert.deepEqual(
+    resumed.items.map((item) => item.status),
+    ['queued', 'queued', 'queued', 'review_ready', 'paused'],
+  );
+});

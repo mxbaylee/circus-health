@@ -758,7 +758,9 @@ function includedReadingGaps(
   const citations = new Set(
     records.flatMap((record) => record.citations.map((citation) => citation.id)),
   );
-  const sourceFiles = new Set<string>();
+  const sourceFiles = new Set(
+    records.filter((record) => record.type === 'source_file').map((record) => record.id),
+  );
   for (const id of citations) {
     const row = db.prepare('SELECT source_file_id FROM source_records WHERE id=?').get(id) as
       { source_file_id?: string } | undefined;

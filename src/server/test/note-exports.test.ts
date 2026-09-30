@@ -839,3 +839,45 @@ test('finished note exports resolve old clinical kinds while preserving link att
   assert.deepEqual(db.prepare('SELECT * FROM source_records').all(), oldSources);
   assert.deepEqual(db.prepare('SELECT * FROM source_files').all(), oldFiles);
 });
+
+// A directly linked original is included even without any accepted clinical citation.
+test('provider packets disclose unread pages of directly included originals', (t) => {
+  const { db, input, note } = fixture(t);
+  db.prepare(
+    "INSERT INTO source_files(id,provider_id,path,sha256,bytes,details_json) VALUES('direct-original','capture','fictional-direct.pdf','fictional-direct-hash',100,?)",
+  ).run(
+    JSON.stringify({
+      intake: {
+        originalName: 'fictional-direct.pdf',
+        workflow: {
+          plans: [
+            {
+              status: 'active',
+              batches: [],
+              units: [{ id: 'direct-page', locator: 'Page 7', status: 'pending' }],
+            },
+          ],
+        },
+      },
+    }),
+  );
+  const updated = saveNote(db, note.id, {
+    version: note.version,
+    links: [{ targetType: 'source', targetId: 'direct-original', relation: 'references' }],
+  });
+  const packet = exportSnapshot(db, { ...input, noteVersion: updated.version, mode: 'provider' });
+  assert.ok(
+    packet.records.some(
+      (record) =>
+        record.type === 'source_file' &&
+        record.id === 'direct-original' &&
+        record.citations.length === 0,
+    ),
+  );
+  assert.deepEqual(
+    packet.readingGaps.find((source) => source.sourceFileId === 'direct-original')?.gaps,
+    [{ locator: 'Page 7', reason: 'not yet read' }],
+  );
+  assert.match(exportHtml(packet), /fictional-direct.pdf[\s\S]*Page 7: not yet read/);
+  assert.deepEqual(exportEvidence(packet).readingGaps, packet.readingGaps);
+});
