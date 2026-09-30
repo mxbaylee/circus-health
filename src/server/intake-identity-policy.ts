@@ -35,6 +35,7 @@ import type {
 
 export interface IdentityPolicyPersonSnapshot extends IntakeIdentityPerson {
   knownNames: string[];
+  challengedNames?: string[];
   birthDate: string | null;
 }
 
@@ -406,6 +407,7 @@ export interface IdentityPolicyAssessment {
   status: IntakeIdentityReviewStatus;
   blocking: boolean;
   message: string;
+  challengedName?: string;
   evidencedIdentity: IntakeEvidencedIdentity;
   offeredSelfFields: Pick<IntakeEvidencedIdentity, 'fullName' | 'birthDate'>;
   conflicts: IntakeIdentityConflict[];
@@ -743,7 +745,25 @@ export function assessIdentityPolicy({
         owner.names.some((name) => canonicalIdentityName(name) === canonicalIdentityName(fullName)),
       )
     : [];
-  const distinctOwners = [...new Map(exactOwners.map((owner) => [owner.personId, owner])).values()];
+  const futureOwner = fullName
+    ? self.futureNameOwners?.find(
+        (decision) => canonicalIdentityName(decision.name) === canonicalIdentityName(fullName),
+      )?.personId
+    : undefined;
+  const distinctOwners = [
+    ...new Map(
+      exactOwners
+        .filter((owner) => !futureOwner || owner.personId === futureOwner)
+        .map((owner) => [owner.personId, owner]),
+    ).values(),
+  ];
+  const challengedName =
+    !!fullName &&
+    [self, ...people].some((owner) =>
+      owner.challengedNames?.some(
+        (name) => canonicalIdentityName(name) === canonicalIdentityName(fullName),
+      ),
+    );
   const matchedOwner = distinctOwners.length === 1 ? distinctOwners[0] : undefined;
   const incompatibleBanner =
     !!matchedOwner?.birthDate &&
@@ -800,6 +820,7 @@ export function assessIdentityPolicy({
     confidence,
     selfBirthDateConflict,
     defaultPerson,
+    ...(challengedName ? { challengedName: fullName! } : {}),
   };
   if (currentRefusal)
     return {
@@ -836,6 +857,18 @@ export function assessIdentityPolicy({
       message:
         'This report was assigned to another person. Confirm who these current records belong to.',
     };
+  if (
+    latestPersonChoice?.outcome === 'this_is_me' &&
+    latestPersonChoice.scope.groupId !== group?.id &&
+    matchedOwner?.personId !== 'patient'
+  )
+    return {
+      ...common,
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'The person matched by this report has changed. Confirm who these current records belong to.',
+    };
   // A confirmation belongs to the reviewed report: A cannot answer B's
   // unreadable DOB or incompatible banner merely because their names match.
   // B's own applicable confirmation can still resolve its ownership question.
@@ -857,6 +890,15 @@ export function assessIdentityPolicy({
           group.report?.subject?.text || null,
         )
       : undefined;
+  if (challengedName && !explicitReceipt && !(receipt && receipt.scope.groupId === group?.id))
+    return {
+      ...common,
+      confidence: 'none',
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'An accepted person correction challenged this printed name. Confirm this report’s person and choose whether future reports should use that name or ask each time.',
+    };
   const resolutionOperationId =
     explicitReceipt?.operationId ||
     (!hasUnstructuredIdentityQuestion ? receipt?.operationId : undefined);

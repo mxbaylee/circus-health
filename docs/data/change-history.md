@@ -162,10 +162,44 @@ report default, a small versioned hold references that exact default operation. 
 published with the affected group; a failed group cannot revoke unrelated authority.
 The hold survives replay and permits a new explicit valid confirmation after review.
 
+A selected-record correction also holds the remaining unaccepted members of a report
+assigned through ordinary identity confirmation. That hold applies even when the
+printed name has only one token or the learned name moves to the destination. A new
+explicit report confirmation releases the hold; neither an old receipt nor a newly
+unique spelling silently assigns the remaining records.
+
+Record details for observations, medications, procedures and provider documents show
+earlier person attribution, correction date and reason, with access to accepted version
+history. Moves retain that history even when the record ID stays the same. The actor is
+the profile user: the correction is a patient-side assertion, not a provider amendment.
+**Review undo** prepares another correction toward the former person using current
+versions. It still requires a reviewed preview and explicit confirmation; it does not
+erase the earlier correction. A moved prescription starts inactive and needs a separate
+personal current-use confirmation.
+
+Packets made after an ownership correction label the included record **Owner corrected
+on DATE**, including records in compact clinical tables. The automatic evidence
+companion carries the correction history. Earlier packet inclusion and delivery are
+not recorded: export previews exist only in a bounded, expiring memory cache, with no
+durable recipient or membership receipt. The correction preview and history explain
+that limitation and ask the person to review copies they shared when deciding who
+needs a corrected packet. See [packet previews and evidence](../../src/server/NOTE-EXPORTS.md).
+
+`GET /api/profiles/:profileId/record-history?kind=<kind>&recordId=<id>` returns
+accepted version entries, `ownershipCorrections`, and
+`earlierPacketInclusion: "not_recorded"`. `beforeSequence` and `limit` page accepted
+versions. History stays behind the profile's existing authorization boundary.
+
 Remembered-name support is recorded per confirmation before the legacy display list
 can deduplicate a spelling. Manual name edits, primary names, remaining confirmation
 support and unknown legacy provenance are assessed separately. Current matching filters
 superseded supporting receipts while preserving them for audit and exact operation replay.
+An unresolved learned association remains a challenged-name input that requires review
+before another report can use that spelling. It never becomes a positive match for
+another person by disappearing from the first person's effective names. Independently
+active manual assertions and primary names remain positive names; the correction does
+not silently remove them. Explicit future-report choices can settle a challenged
+spelling for Self or a named Person, or leave it asking each time.
 The earlier rule that historical linkage alone permanently protected a learned alias
 was superseded: keeping that mistaken authority active would repeat the original error.
 See the [correction workflow and current limitations](../import/identity-review.md#correcting-accepted-person-assignments).

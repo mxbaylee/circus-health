@@ -1,4 +1,9 @@
-import { effectiveKnownNames, activeIdentityReceipts } from './name-associations.ts';
+import {
+  effectiveKnownNames,
+  challengedKnownNames,
+  futureNameOwners,
+  activeIdentityReceipts,
+} from './name-associations.ts';
 import { selectionAuthority } from './intake-selection-authority.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { observeIntakeVersion, intakeVersionConflictFacts } from './import-version-diagnostics.ts';
@@ -1360,6 +1365,8 @@ export function reviewIntake(
       noteId: 'person-note:self',
       version: selfNote.version,
       knownNames: effectiveKnownNames(db, selfNote.id, selfNote.person),
+      challengedNames: challengedKnownNames(db, selfNote.id),
+      futureNameOwners: futureNameOwners(db),
       fullName:
         typeof selfNote.person.fullName === 'string' && selfNote.person.fullName.trim()
           ? selfNote.person.fullName.trim()

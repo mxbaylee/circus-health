@@ -19,7 +19,7 @@ export interface OwnershipRequest {
   destination: OwnershipDestination;
   decisions?: {
     recordId: string;
-    action: 'keep_both' | 'link';
+    action?: 'keep_both' | 'link';
     targetRecordId?: string;
     /** Exact reviewed contents for a contribution split, never a clone of the canonical record. */
     splitMapping?: IntakeClinicalMapping;

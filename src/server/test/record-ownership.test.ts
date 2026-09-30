@@ -195,6 +195,44 @@ test('stable replay, lost-response lookup and conflicting operation identity', (
   );
 });
 
+test('record history and a later patient packet disclose an accepted ownership correction', async (t) => {
+  const { clinicalRecordHistory } = await import('../clinical-history.ts');
+  const { exportSnapshot, exportHtml, exportEvidence } = await import('../note-exports.ts');
+  const { attachRecordDurability } = await import('../record-versions.ts');
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId: f.profileId, storage: memoryJournal().storage });
+  f.apply(f.preview({ ...f.request, reason: 'Fictional patient-side correction' }));
+  const self = getNote(f.db, 'person-note:self');
+  f.apply(
+    f.preview({
+      selection: { type: 'records', records: [{ kind: 'observation', recordId: f.recordId }] },
+      destination: { noteId: self.id, expectedVersion: self.version },
+      reason: 'Fictional return to Self',
+    }),
+  );
+  const history = clinicalRecordHistory(f.db, {
+    profileId: f.profileId,
+    kind: 'observation',
+    recordId: f.recordId,
+  });
+  assert.equal(history.ownershipCorrections.length, 2);
+  assert.equal(history.ownershipCorrections[1]!.fromPersonName, 'Robin Lane');
+  assert.equal(history.ownershipCorrections[1]!.reason, 'Fictional return to Self');
+  assert.equal(history.earlierPacketInclusion, 'not_recorded');
+  const snapshot = exportSnapshot(f.db, {
+    type: 'note',
+    id: self.id,
+    noteVersion: self.version,
+    mode: 'provider',
+  });
+  const html = exportHtml(snapshot);
+  assert.match(html, /Owner corrected on/);
+  assert.match(html, /Previously attributed to Robin Lane/);
+  const evidence = JSON.stringify(exportEvidence(snapshot));
+  assert.match(evidence, /ownershipCorrections/);
+  assert.match(evidence, /Fictional return to Self/);
+});
+
 test('stale records, edited destination and foreign profile fail before writes', (t) => {
   const f = fixture(t),
     p = f.preview(),
@@ -259,11 +297,9 @@ test('repeated full-name confirmations retain independent support instead of onl
     false,
     'mirroring a learned name is not an independent manual assertion',
   );
-  assert.equal(
-    getNote(f.db, 'person-note:self').person.sourceKnownNames!.length,
-    1,
-    'legacy evidence display stays compact',
-  );
+  const displayedNames = getNote(f.db, 'person-note:self').person.sourceKnownNames!;
+  assert.match(displayedNames[0]!.confirmedAt || '', /^\d{4}-\d{2}-\d{2}/);
+  assert.equal(displayedNames.length, 1, 'legacy evidence display stays compact');
 });
 
 test('a source whose ownership was corrected cannot reuse an old intake assignment', (t) => {
@@ -480,6 +516,11 @@ for (const kind of Object.keys(clinicalTables) as ClinicalKind[])
       destination = receipt.outcomes[0]!.destinationRecordId;
     assert.notEqual(destination, f.recordId);
     assert.equal(f.row().source_record_id, before.source_record_id);
+    // Splitting B cannot rewrite A's clinical values; its retained evidence
+    // remains authoritative (docs/data/change-history.md).
+    for (const [field, value] of Object.entries(before))
+      if (!['extra_json', 'person_id'].includes(field))
+        assert.deepEqual(f.row()[field], value, field);
     assert.equal(JSON.parse(String(f.row().extra_json)).import.personId, 'patient');
     assert.equal(f.db.prepare(`SELECT COUNT(*) n FROM ${clinicalTables[kind]}`).get()!.n, 2);
     assert.equal(
@@ -517,11 +558,17 @@ test('whole-record preview includes every attached source and moves both A and B
   }
 });
 
-async function confirmedReport(f: ReturnType<typeof fixture>, suffix: string, count = 2) {
+async function confirmedReport(
+  f: ReturnType<typeof fixture>,
+  suffix: string,
+  count = 2,
+  accepted = count,
+  printedName = 'Robin Lane',
+) {
   const { proposeConversion } = await import('../intake.ts');
   const { getIntakeIdentityScope, confirmIntakeIdentityScope } =
     await import('../intake-identity.ts');
-  const subject = 'Patient: Robin Lane',
+  const subject = 'Patient: ' + printedName,
     heading = 'Fictional report ' + suffix;
   const original = uploadIntake(f.db, f.root, f.profileId, {
     filename: 'fictional-' + suffix + '.txt',
@@ -555,7 +602,7 @@ async function confirmedReport(f: ReturnType<typeof fixture>, suffix: string, co
     scope,
     outcome: 'this_is_me',
     attestation: 'reviewed_original_and_membership',
-    printedName: 'Robin Lane',
+    printedName,
   });
   const review = reviewIntake(
     f.db,
@@ -568,7 +615,9 @@ async function confirmedReport(f: ReturnType<typeof fixture>, suffix: string, co
     version: review.version,
     reviewToken: review.reviewToken,
     proposalId: review.proposalId,
-    decisions: review.records.map((r) => ({ recordId: r.id, action: 'accept', mapping: {} })),
+    decisions: review.records
+      .slice(0, accepted)
+      .map((r) => ({ recordId: r.id, action: 'accept', mapping: {} })),
   });
   return {
     original,
@@ -599,6 +648,8 @@ test('whole report transfers sole learned-name authority and later members defau
   const oldReceipts = getIntake(f.db, f.root, f.profileId, r.original.id).workflow!
     .identityConfirmations;
   f.apply(p);
+  assert.equal(getNote(f.db, 'person-note:self').person.nameAssociations![0]!.origin, 'ownership');
+  assert.equal(getNote(f.db, f.person.id).person.nameAssociations![0]!.origin, 'ownership');
   assert.ok(
     !effectiveKnownNames(
       f.db,
@@ -655,6 +706,186 @@ test('two confirmation decisions of the same name retain separate support and re
     )!.length,
     0,
   );
+});
+
+async function laterPrintedNameReview(f: ReturnType<typeof fixture>, suffix: string) {
+  const { proposeConversion } = await import('../intake.ts');
+  const { getIntakeIdentityReview } = await import('../intake-identity.ts');
+  const heading = 'Fictional later report ' + suffix;
+  const original = uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-later-' + suffix + '.txt',
+    bytes: Buffer.from(heading + '\nPatient: Robin Lane\nFictional values 17.00'),
+    newProviderName: 'Fictional Clinic',
+  });
+  const value: HealthRecordEnvelope = {
+    ...f.envelope,
+    id: 'fictional-later-' + suffix,
+    provenance: {
+      ...f.envelope.provenance,
+      sourceRecordId: 'fictional-later-' + suffix,
+    },
+    clinical: { ...(f.envelope.clinical as object), subject: 'unknown' },
+    report: {
+      key: suffix,
+      title: heading,
+      anchor: { locator: 'heading', text: heading },
+      subject: { locator: 'patient', text: 'Patient: Robin Lane' },
+    },
+  };
+  const proposed = proposeConversion(f.db, f.root, f.profileId, original.id, {
+    version: getIntake(f.db, f.root, f.profileId, original.id).version,
+    summary: 'Fictional later identity review',
+    jsonlText: JSON.stringify(value),
+  });
+  const groupId = getIntake(f.db, f.root, f.profileId, original.id).workflow!.reportGroups![0]!.id;
+  await getIntakeIdentityReview(f.db, f.root, f.profileId, original.id, groupId);
+  return {
+    original,
+    review: reviewIntake(f.db, f.root, f.profileId, original.id, proposed.proposals.at(-1)!.id),
+  };
+}
+
+test('unresolved learned name blocks a distinct later report rather than making a Person unique', async (t) => {
+  const f = fixture(t);
+  await confirmedReport(f, 'challenged-a');
+  const b = await confirmedReport(f, 'challenged-b');
+  const p = f.preview({ ...f.request, selection: b.selection });
+  assert.equal(p.names[0]!.proposed, 'unresolved');
+  f.apply(p);
+  const later = await laterPrintedNameReview(f, 'challenged-c');
+  assert.equal(later.review.records[0]!.identityReview?.status, 'confirmation_required');
+  assert.equal(later.review.records[0]!.identityReview?.blocking, true);
+  assert.match(later.review.records[0]!.identityReview?.message || '', /corrected|challenged/i);
+});
+
+test('an independently asserted Self name remains a positive name after its learned association is challenged', async (t) => {
+  const f = fixture(t);
+  const self = getNote(f.db, 'person-note:self');
+  const { saveNote } = await import('../notes.ts');
+  saveNote(f.db, self.id, {
+    version: self.version,
+    person: { ...self.person, knownNames: ['Robin Lane'] },
+  });
+  const report = await confirmedReport(f, 'manual-name');
+  const p = f.preview({ ...f.request, selection: report.selection });
+  assert.equal(p.names[0]!.independentSupport, true);
+  assert.equal(p.names[0]!.proposed, 'unresolved');
+  f.apply(p);
+  const { effectiveKnownNames } = await import('../name-associations.ts');
+  assert.ok(
+    effectiveKnownNames(f.db, self.id, getNote(f.db, self.id).person).includes('Robin Lane'),
+  );
+  const later = await laterPrintedNameReview(f, 'manual-name-later');
+  assert.equal(later.review.records[0]!.identityReview?.blocking, true);
+  assert.match(later.review.records[0]!.identityReview?.message || '', /correction/i);
+});
+
+for (const future of ['person', 'self', 'ask'] as const)
+  test(`a challenged printed name offers an explicit ${future} future choice`, async (t) => {
+    const { getIntakeIdentityScope, getIntakeIdentityReview, confirmIntakeIdentityScope } =
+      await import('../intake-identity.ts');
+    const f = fixture(t);
+    await confirmedReport(f, 'future-choice-a-' + future);
+    const b = await confirmedReport(f, 'future-choice-b-' + future);
+    f.apply(f.preview({ ...f.request, selection: b.selection }));
+    const current = await laterPrintedNameReview(f, 'future-choice-current-' + future);
+    const groupId = getIntake(f.db, f.root, f.profileId, current.original.id).workflow!
+      .reportGroups![0]!.id;
+    const identity = await getIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      current.original.id,
+      groupId,
+    );
+    assert.equal(identity.challengedName, 'Robin Lane');
+    const scope = await getIntakeIdentityScope(
+      f.db,
+      f.root,
+      f.profileId,
+      current.original.id,
+      groupId,
+    );
+    const person = getNote(f.db, f.person.id);
+    await confirmIntakeIdentityScope(f.db, f.root, f.profileId, current.original.id, {
+      scope,
+      version: scope.intakeVersion,
+      operationId: randomUUID(),
+      outcome: 'this_is_person',
+      attestation: 'confirmed_displayed_report_subject',
+      personSelection: { noteId: person.id, expectedVersion: person.version },
+      printedName: 'Robin Lane',
+      futureNameOwner:
+        future === 'person'
+          ? { outcome: 'person', noteId: person.id, expectedVersion: person.version }
+          : { outcome: future },
+    });
+    const later = await laterPrintedNameReview(f, 'future-choice-later-' + future);
+    assert.equal(later.review.records[0]!.identityReview?.blocking, future === 'ask');
+    if (future !== 'ask')
+      assert.equal(
+        later.review.records[0]!.mapping.personId || 'patient',
+        future === 'self' ? 'patient' : f.person.personId,
+      );
+  });
+
+for (const outcome of ['old', 'destination', 'unresolved'] as const)
+  test(`partial confirmed report with ${outcome} name choice holds its remaining pending member`, async (t) => {
+    const f = fixture(t);
+    const report = await confirmedReport(f, 'held-' + outcome, 3, 2);
+    const selected = String(
+      f.db
+        .prepare('SELECT id FROM observations WHERE source_record_id=?')
+        .get(report.review.records[0]!.id)!.id,
+    );
+    const request: OwnershipRequest = {
+      selection: { type: 'records', records: [{ kind: 'observation', recordId: selected }] },
+      destination: { noteId: f.person.id, expectedVersion: f.person.version },
+    };
+    const preview = f.preview(request);
+    assert.equal(preview.reportHolds.length, 1);
+    f.apply(f.preview({ ...request, nameDecisions: [{ key: preview.names[0]!.key, outcome }] }));
+    const proposed = report.propose(
+      Array.from({ length: 3 }, (_, i) => report.value('held-' + outcome + '-' + i)),
+    );
+    const after = reviewIntake(
+      f.db,
+      f.root,
+      f.profileId,
+      report.original.id,
+      proposed.proposals.at(-1)!.id,
+    );
+    const remaining = after.records.find((r) => r.id === report.review.records[2]!.id)!;
+    assert.equal(remaining.identityReview?.status, 'confirmation_required');
+    assert.equal(remaining.identityReview?.blocking, true);
+  });
+
+test('partial correction holds a confirmed single-token report even with no name association', async (t) => {
+  const f = fixture(t);
+  const report = await confirmedReport(f, 'single-token-hold', 3, 2, 'R');
+  const selected = String(
+    f.db
+      .prepare('SELECT id FROM observations WHERE source_record_id=?')
+      .get(report.review.records[0]!.id)!.id,
+  );
+  const p = f.preview({
+    selection: { type: 'records', records: [{ kind: 'observation', recordId: selected }] },
+    destination: { noteId: f.person.id, expectedVersion: f.person.version },
+  });
+  assert.equal(p.names.length, 0);
+  assert.equal(p.reportHolds.length, 1);
+  f.apply(p);
+  const next = report.propose(
+    Array.from({ length: 3 }, (_, i) => report.value('single-token-hold-' + i)),
+  );
+  const review = reviewIntake(
+    f.db,
+    f.root,
+    f.profileId,
+    report.original.id,
+    next.proposals.at(-1)!.id,
+  );
+  assert.equal(review.records[2]!.identityReview?.status, 'confirmation_required');
 });
 for (const outcome of ['old', 'both', 'unresolved'] as const)
   test(`partial report correction with ${outcome} names challenges old receipt without moving the remaining record`, async (t) => {
@@ -736,6 +967,25 @@ function destinationMatch(f: ReturnType<typeof fixture>) {
   );
   return id;
 }
+test('split contents checkbox cannot silently choose keep both when a destination match exists', (t) => {
+  const f = fixture(t),
+    destination = destinationMatch(f),
+    b = attachedReport(f);
+  const first = f.preview({ ...f.request, selection: b.selection });
+  assert.ok(first.records[0]!.matches.some((m) => m.recordId === destination));
+  const reviewed = f.preview({
+    ...first.request,
+    decisions: [
+      {
+        recordId: f.recordId,
+        reviewedSplit: true,
+        splitMapping: first.records[0]!.mapping,
+        remainingMapping: first.records[0]!.remainingMapping,
+      },
+    ],
+  });
+  assert.ok(reviewed.records[0]!.blockers.some((b) => /link|keep both/i.test(b)));
+});
 for (const kind of Object.keys(clinicalTables) as ClinicalKind[])
   test(`${kind}: explicit link preserves destination contents and current activity with a durable redirect`, async (t) => {
     const f = fixture(t, kind),
@@ -1609,4 +1859,114 @@ test('name transfer uses its exact supporting report instead of every historical
     .all();
   assert.equal(scopes.length, b.review.records.length);
   assert.ok(scopes.every((s) => s.groupId === b.group.id));
+});
+
+// Reviewed correction scope is a snapshot, never permission to move evidence
+// discovered later. See docs/import/identity-review.md#correcting-accepted-person-assignments.
+test('a concurrent report member invalidates the pinned whole-report correction', async (t) => {
+  const f = fixture(t),
+    report = await confirmedReport(f, 'concurrent-member', 2);
+  const preview = f.preview({ ...f.request, selection: report.selection });
+  assert.deepEqual(preview.blockers, []);
+  const before = f.db.prepare('SELECT id,person_id FROM observations ORDER BY id').all();
+  report.propose([report.value('concurrent-member-2')]);
+  assert.throws(() => f.apply(preview), { code: 'OWNERSHIP_CHANGED' });
+  assert.deepEqual(f.db.prepare('SELECT id,person_id FROM observations ORDER BY id').all(), before);
+  assert.equal(
+    f.db
+      .prepare("SELECT count(*) n FROM manual_batches WHERE title='Record ownership event'")
+      .get()!.n,
+    0,
+  );
+});
+
+test('archiving the destination after preview rejects the correction without moving records', async (t) => {
+  const { setVisibility } = await import('../visibility.ts');
+  const f = fixture(t),
+    preview = f.preview(),
+    before = f.row();
+  setVisibility(f.db, 'person', f.person.personId!, { archived: true, version: 0 });
+  assert.throws(() => f.apply(preview), { code: 'OWNERSHIP_DESTINATION' });
+  assert.deepEqual(f.row(), before);
+});
+
+// An open acceptance editor cannot apply approval captured before a correction.
+test('ownership correction permanently invalidates an in-flight clinical review token', (t) => {
+  const f = fixture(t),
+    pinned = reviewIntake(f.db, f.root, f.profileId, f.original.id);
+  f.apply(f.preview());
+  assert.throws(
+    () =>
+      importIntake(f.db, f.root, f.profileId, f.original.id, {
+        version: pinned.version,
+        reviewToken: pinned.reviewToken,
+        decisions: [{ recordId: pinned.records[0]!.id, action: 'accept', mapping: {} }],
+      }),
+    { code: 'REVIEW_CHANGED' },
+  );
+  assert.equal(f.row().person_id, f.person.personId);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+});
+
+test('missing legacy name-support evidence stays unknown and cannot establish sole name authority', async (t) => {
+  const f = fixture(t),
+    report = await confirmedReport(f, 'unknown-legacy-support', 1);
+  // Simulate an actual older journal with no support entry. Do not synthesize
+  // an entry whose independent flags happen to be absent.
+  f.db.prepare("DELETE FROM manual_batches WHERE title='Remembered name support'").run();
+  assert.equal(
+    f.db
+      .prepare("SELECT count(*) n FROM manual_batches WHERE title='Remembered name support'")
+      .get()!.n,
+    0,
+  );
+  const preview = f.preview({ ...f.request, selection: report.selection });
+  assert.equal(preview.names.length, 1);
+  assert.equal(preview.names[0]!.unknownSupport, true);
+  assert.equal(preview.names[0]!.proposed, 'unresolved');
+  f.apply(preview);
+  const later = await laterPrintedNameReview(f, 'after-unknown-legacy-support');
+  assert.equal(later.review.records[0]!.identityReview?.blocking, true);
+});
+
+test('a mixed-owner report previews both prior owners and moves only its reviewed members', async (t) => {
+  const f = fixture(t),
+    report = await confirmedReport(f, 'mixed-owner-report', 2);
+  const reportRecordIds = report.review.records.map((record) =>
+    String(f.db.prepare('SELECT id FROM observations WHERE source_record_id=?').get(record.id)!.id),
+  );
+  const rowsBefore = f.db.prepare('SELECT * FROM observations ORDER BY id').all();
+  const one = f.preview({
+    ...f.request,
+    selection: {
+      type: 'records',
+      records: [{ kind: 'observation', recordId: reportRecordIds[0]! }],
+    },
+  });
+  f.apply(one);
+  const preview = f.preview({
+    ...f.request,
+    selection: report.selection,
+    destination: { noteId: f.another.id, expectedVersion: f.another.version },
+  });
+  assert.deepEqual(
+    new Set(preview.records.map((record) => record.owner.personId)),
+    new Set(['patient', f.person.personId]),
+  );
+  assert.equal(preview.records.length, 2);
+  assert.equal(preview.reportDefault, true);
+  const receipt = f.apply(preview);
+  assert.equal(receipt.moved, 2);
+  for (const id of reportRecordIds)
+    assert.equal(
+      f.db.prepare('SELECT person_id FROM observations WHERE id=?').get(id)!.person_id,
+      f.another.personId,
+    );
+  assert.equal(f.row().person_id, 'patient', 'the unrelated source stays with Self');
+  for (const before of rowsBefore) {
+    const after = f.db.prepare('SELECT * FROM observations WHERE id=?').get(before.id!)!;
+    for (const [field, value] of Object.entries(before))
+      if (!['extra_json', 'person_id'].includes(field))
+        assert.deepEqual(after[field], value, field);
+  }
 });

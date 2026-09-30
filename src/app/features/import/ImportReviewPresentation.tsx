@@ -1,5 +1,6 @@
 import { RecordOwnershipAction } from '../clinical-review/RecordOwnershipAction';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
+import { ImportFutureNameChoice, type FutureNameChoice } from './ImportFutureNameChoice';
 import type { IntakeIdentityReview } from '../../../shared/intake-identity';
 import {
   ImportPersonChoice,
@@ -117,6 +118,8 @@ export interface ImportReviewReport {
       | 'missing_warning'
       | 'conflict';
     identityMessage?: string;
+    challengedName?: string;
+    correctedPerson?: IntakeIdentityReview['correctedPerson'];
     warnings?: IntakeIdentityReview['warnings'];
     blocking?: boolean;
     offeredSelfFields?: { fullName?: string; birthDate?: string };
@@ -221,6 +224,7 @@ export interface ImportReviewActions {
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: FutureNameChoice,
   ) => void | Promise<void>;
   onEdit?: (recordId: string, value: string, unit: string) => void | Promise<void>;
   onResolveMatch?: (recordId: string) => void | Promise<void>;
@@ -605,24 +609,23 @@ export function ImportReviewPresentation({
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: FutureNameChoice,
   ) {
     const report = reports.find((item) => item.id === reportId);
     if (!report || actions.busy) return;
     if (!personSelectionReady(personSelection)) return;
     if (model && actions.onConfirmIdentity) {
       setSheet(null);
-      if (identityAnswers)
-        void actions.onConfirmIdentity(
-          reportId,
-          fields,
-          personSelection,
-          printedName,
-          identityAnswers,
-        );
-      else if (printedName)
-        void actions.onConfirmIdentity(reportId, fields, personSelection, printedName);
-      else if (personSelection) void actions.onConfirmIdentity(reportId, fields, personSelection);
-      else void actions.onConfirmIdentity(reportId, fields);
+      const confirmation: [
+        string,
+        typeof fields,
+        ImportPersonSelection?,
+        string?,
+        IntakeIdentityAnswers?,
+        FutureNameChoice?,
+      ] = [reportId, fields, personSelection, printedName, identityAnswers, futureNameOwner];
+      while (confirmation.at(-1) === undefined) confirmation.pop();
+      void actions.onConfirmIdentity(...confirmation);
       return;
     }
     setReports((current) =>
@@ -1047,19 +1050,25 @@ export function ImportReviewPresentation({
                           >
                             <UserRound size={14} aria-hidden="true" />
                             <span className="import-source">
-                              {report.subject.printedName || report.subject.label}
-                              {report.subject.confirmed &&
-                              (!report.subject.assignedPerson ||
-                                report.subject.assignedPerson.personId === 'patient')
-                                ? report.subject.nameOnlyMatch
-                                  ? ' (you?)'
-                                  : ' (you)'
-                                : report.subject.defaultPerson === 'new' &&
-                                    !report.subject.confirmed
-                                  ? ' (new)'
-                                  : report.subject.nameOnlyMatch
-                                    ? ' (?)'
-                                    : ''}
+                              {report.subject.correctedPerson
+                                ? `Corrected to ${report.subject.correctedPerson.fullName}`
+                                : report.subject.printedName || report.subject.label}
+                              {!report.subject.correctedPerson && (
+                                <>
+                                  {report.subject.confirmed &&
+                                  (!report.subject.assignedPerson ||
+                                    report.subject.assignedPerson.personId === 'patient')
+                                    ? report.subject.nameOnlyMatch
+                                      ? ' (you?)'
+                                      : ' (you)'
+                                    : report.subject.defaultPerson === 'new' &&
+                                        !report.subject.confirmed
+                                      ? ' (new)'
+                                      : report.subject.nameOnlyMatch
+                                        ? ' (?)'
+                                        : ''}
+                                </>
+                              )}
                             </span>
                             <span className="import-source-action">
                               {report.subject.confirmed && !report.subject.nameOnlyMatch
@@ -1334,8 +1343,22 @@ export function ImportReviewPresentation({
         busy={!!actions.busy}
         reviewSource={actions.onReviewSource}
         close={() => setSheet(null)}
-        confirmIdentity={(reportId, fields, personSelection, printedName, identityAnswers) => {
-          confirmReportIdentity(reportId, fields, personSelection, printedName, identityAnswers);
+        confirmIdentity={(
+          reportId,
+          fields,
+          personSelection,
+          printedName,
+          identityAnswers,
+          futureNameOwner,
+        ) => {
+          confirmReportIdentity(
+            reportId,
+            fields,
+            personSelection,
+            printedName,
+            identityAnswers,
+            futureNameOwner,
+          );
         }}
         changeSource={async (reportId, source, review) => {
           if (model && actions.onUseSource) {
@@ -1624,6 +1647,7 @@ function ImportSheet({
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: FutureNameChoice,
   ) => void;
   changeSource: (
     reportId: string,
@@ -1669,6 +1693,7 @@ function ImportSheet({
         : undefined,
   );
   const [selectedPrintedName, setSelectedPrintedName] = useState('');
+  const [futureNameOwner, setFutureNameOwner] = useState<FutureNameChoice>({ outcome: 'ask' });
   const [reviewedBirthDate, setReviewedBirthDate] = useState<string | null>(
     report?.subject.birthDateReview?.suggested || null,
   );
@@ -1943,6 +1968,15 @@ function ImportSheet({
                 onChange={setPersonSelection}
                 disabled={busy || report.subject.scopeReady === false}
               />
+              {report.subject.challengedName && (
+                <ImportFutureNameChoice
+                  name={report.subject.challengedName}
+                  people={report.subject.people}
+                  value={futureNameOwner}
+                  onChange={setFutureNameOwner}
+                  disabled={busy}
+                />
+              )}
               {report.subject.reviewUrl && (
                 <a className="text-link" href={`#${report.subject.reviewUrl}`}>
                   Review retained report evidence <ArrowRight size={15} aria-hidden="true" />
@@ -2004,6 +2038,7 @@ function ImportSheet({
                     if (
                       report.subject.confirmed &&
                       !report.subject.nameOnlyMatch &&
+                      !report.subject.challengedName &&
                       !needsPrintedName &&
                       (!personSelection
                         ? !report.subject.assignedPerson ||
@@ -2028,11 +2063,13 @@ function ImportSheet({
                       personSelection,
                       needsPrintedName ? selectedPrintedName.trim() : undefined,
                       report.subject.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
+                      report.subject.challengedName ? futureNameOwner : undefined,
                     );
                   }}
                 >
                   {report.subject.confirmed &&
                   !report.subject.nameOnlyMatch &&
+                  !report.subject.challengedName &&
                   !needsPrintedName &&
                   (!personSelection
                     ? !report.subject.assignedPerson ||

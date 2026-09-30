@@ -224,6 +224,7 @@ export interface PersonProfile {
     status: 'active' | 'superseded' | 'unresolved';
     operationId: string;
     at: string;
+    origin?: 'confirmation' | 'ownership' | 'future';
   }[];
   onboarding?: {
     completedSteps: string[];
@@ -248,6 +249,8 @@ export interface PersonProfile {
     sourceHash: string;
     groupId: string;
     subjectText: string;
+    /** Presentation timestamp for the explicit report confirmation, when retained. */
+    confirmedAt?: string;
   }[];
   pronouns?: string;
   birthDate?: string;

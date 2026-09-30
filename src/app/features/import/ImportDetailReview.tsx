@@ -1,5 +1,6 @@
 import { RecordOwnershipAction } from '../clinical-review/RecordOwnershipAction';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
+import { ImportFutureNameChoice, type FutureNameChoice } from './ImportFutureNameChoice';
 import { ImportIdentityWarnings } from './ImportIdentityWarnings';
 import {
   mappingFields,
@@ -691,6 +692,7 @@ export function ImportDetailReview({
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: FutureNameChoice,
   ) {
     const group = displayedDetail?.group;
     const review = currentIdentityReview;
@@ -709,7 +711,7 @@ export function ImportDetailReview({
     ) as { fullName?: string; birthDate?: string };
     // Retained uncertain requests are recoverable only inside the exact profile
     // and deep-link selection that created them.
-    const key = `${identityContext}:${review.scope.groupId}:${review.scope.groupVersionId}:${review.scope.intakeVersion}:${JSON.stringify([selected, personSelection, printedName, identityAnswers])}`;
+    const key = `${identityContext}:${review.scope.groupId}:${review.scope.groupVersionId}:${review.scope.intakeVersion}:${JSON.stringify([selected, personSelection, printedName, identityAnswers, futureNameOwner])}`;
     const request: IntakeIdentityConfirmation = identityOperations.current.get(key) || {
       version: review.scope.intakeVersion,
       operationId: crypto.randomUUID(),
@@ -718,6 +720,7 @@ export function ImportDetailReview({
       ...(personSelection ? { personSelection } : {}),
       ...(printedName ? { printedName } : {}),
       ...(identityAnswers ? { identityAnswers } : {}),
+      ...(review.challengedName ? { futureNameOwner: futureNameOwner || { outcome: 'ask' } } : {}),
       attestation: review.scope.questions?.length
         ? 'confirmed_displayed_identity_questions'
         : 'confirmed_displayed_report_subject',
@@ -826,8 +829,8 @@ export function ImportDetailReview({
         if (!selection.recordId) onBack();
       }}
       onRetry={identity.reload}
-      onConfirm={(fields, personSelection, printedName, identityAnswers) =>
-        void confirmIdentity(fields, personSelection, printedName, identityAnswers)
+      onConfirm={(fields, personSelection, printedName, identityAnswers, futureNameOwner) =>
+        void confirmIdentity(fields, personSelection, printedName, identityAnswers, futureNameOwner)
       }
     />
   );
@@ -982,8 +985,10 @@ export function ImportDetailReview({
           onClick={() => setContextSheet('identity')}
         >
           <span>
-            For {personLabel}
-            {personConfirmed
+            {currentIdentityReview?.correctedPerson
+              ? `Corrected to ${currentIdentityReview.correctedPerson.fullName}`
+              : `For ${personLabel}`}
+            {!currentIdentityReview?.correctedPerson && personConfirmed
               ? selfPerson
                 ? nameOnlyMatch
                   ? ' (you?)'
@@ -1259,9 +1264,11 @@ function ImportIdentityPanel({
     personSelection?: ImportPersonSelection,
     printedName?: string,
     identityAnswers?: IntakeIdentityAnswers,
+    futureNameOwner?: FutureNameChoice,
   ) => void;
 }) {
   const [personSelection, setPersonSelection] = useState<ImportPersonSelection>();
+  const [futureNameOwner, setFutureNameOwner] = useState<FutureNameChoice>({ outcome: 'ask' });
   const [selectedPrintedName, setSelectedPrintedName] = useState('');
   const [reviewedBirthDate, setReviewedBirthDate] = useState<string | null>(
     review?.scope?.birthDateReview?.suggested || null,
@@ -1291,6 +1298,7 @@ function ImportIdentityPanel({
     const previous = previousOffers.current;
     if (previous.scope !== selectionScope) {
       setSelectedPrintedName('');
+      setFutureNameOwner({ outcome: 'ask' });
       setReviewedBirthDate(review.scope?.birthDateReview?.suggested || null);
     }
     if (previous.scope !== selectionScope)
@@ -1372,6 +1380,7 @@ function ImportIdentityPanel({
   ).filter((entry): entry is ['fullName' | 'birthDate', string] => !!entry[1]);
   const unchanged =
     confirmed &&
+    !review.challengedName &&
     !(review.status === 'evidenced_match' && !review.evidencedIdentity.birthDate) &&
     (!personSelection
       ? !review.assignedPerson || review.assignedPerson.personId === 'patient'
@@ -1445,6 +1454,15 @@ function ImportIdentityPanel({
           onChange={setPersonSelection}
           disabled={busy || !review.scope}
         />
+        {review.challengedName && (
+          <ImportFutureNameChoice
+            name={review.challengedName}
+            people={review.people}
+            value={futureNameOwner}
+            onChange={setFutureNameOwner}
+            disabled={busy}
+          />
+        )}
         {!personSelection && offeredEntries.length > 0 && (
           <fieldset className="import-identity-self-fields">
             <legend>
@@ -1507,6 +1525,7 @@ function ImportIdentityPanel({
               personSelection,
               !review.evidencedIdentity.fullName ? selectedPrintedName.trim() : undefined,
               review.scope?.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
+              review.challengedName ? futureNameOwner : undefined,
             );
           }}
         >

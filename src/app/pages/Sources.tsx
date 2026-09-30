@@ -1,4 +1,6 @@
 import { OwnershipSelectionControl } from '../features/clinical-review/OwnershipSelectionControl';
+import { RecordOwnershipAction } from '../features/clinical-review/RecordOwnershipAction';
+import { OwnershipHistory } from '../components/OwnershipHistory';
 import { ImportSourceTextBrowser } from '../features/import/ImportSourceTextBrowser';
 import { ClinicalOwner } from '../components/ClinicalOwner';
 import {
@@ -408,6 +410,13 @@ export function Sources() {
                       metadata={<span>{formatDate(item.date)}</span>}
                       actions={
                         <EntryActions>
+                          <RecordOwnershipAction
+                            selection={{
+                              type: 'records',
+                              records: [{ kind: 'document', recordId: item.id }],
+                            }}
+                            onApplied={document.reload}
+                          />
                           <ArchiveControl
                             showHistory
                             targetType="document"
@@ -417,6 +426,7 @@ export function Sources() {
                         </EntryActions>
                       }
                     />
+                    <OwnershipHistory kind="document" recordId={item.id} />
                     <SourceDialog sourceRecordId={item.sourceRecordId} />
                     {item.text ? (
                       <pre className="raw-content document-text">{item.text}</pre>
