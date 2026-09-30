@@ -798,7 +798,7 @@ test('partial then bulk counted acceptance attributes all 190 fictional rows', a
 
 test(
   'one explicit current choice covers a sparse nine-version 190-row report and rebuilds exactly',
-  { timeout: 90000 },
+  { timeout: 30000 },
   async (t) => {
     const f = fixture(t),
       increments = [12, 30, 10, 30, 12, 24, 24, 24, 24],
@@ -855,7 +855,8 @@ test(
       },
       { total: 190, covered: 190, source: 'Fictional Body Studio' },
     );
-    for (const proposalId of proposalIds) item = await resolveProposalIdentity(f, item, proposalId);
+    // accept() confirms each report once across all proposals. Repeating that
+    // report-wide operation for every version duplicates the entire review.
     const accepted = await accept(
       f,
       proposalIds.map((proposalId) => block(f, item.id, proposalId)),

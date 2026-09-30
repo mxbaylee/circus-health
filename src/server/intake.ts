@@ -13,12 +13,7 @@ import {
   withDiagnosticValidation,
   withDiagnosticContext,
 } from './import-diagnostic-error.ts';
-import {
-  identityOriginalBirthDateEvidenceLookup,
-  identityGroundingLookup,
-  identitySubjectGroundingLookup,
-  identityNameQuestionGroundingLookup,
-} from './intake-identity-grounding.ts';
+import { identityReviewGroundingLookups } from './intake-identity-grounding.ts';
 import {
   intakeReportSourceCoverageCounts,
   intakeReportSourceForMember,
@@ -1378,25 +1373,7 @@ export function reviewIntake(
       profileId,
       people: identityPeopleSnapshots(db),
       activeReceipts: (receipts) => activeIdentityReceipts(db, receipts),
-      nameQuestionGrounded: identityNameQuestionGroundingLookup(db, {
-        profileId,
-        intakeId: id,
-        sourceHash: file.sha256,
-        workflow: intakeWorkflow(d),
-      }),
-      originalBirthDateEvidence: identityOriginalBirthDateEvidenceLookup(db, {
-        profileId,
-        intakeId: id,
-        sourceHash: file.sha256,
-        workflow: intakeWorkflow(d),
-      }),
-      subjectGrounded: identitySubjectGroundingLookup(db, {
-        profileId,
-        intakeId: id,
-        sourceHash: file.sha256,
-        workflow: intakeWorkflow(d),
-      }),
-      grounded: identityGroundingLookup(db, {
+      ...identityReviewGroundingLookups(db, {
         profileId,
         intakeId: id,
         sourceHash: file.sha256,
@@ -1404,7 +1381,9 @@ export function reviewIntake(
       }),
     },
   );
-  for (const record of review.records) refreshClinicalIdentityPolicy(db, reviewedFile, record);
+  // One immutable workflow snapshot per synchronous review, not a full JSON parse per row.
+  for (const record of review.records)
+    refreshClinicalIdentityPolicy(db, reviewedFile, record, intakeWorkflow(d));
   (
     finalizeClinicalPairScopes as unknown as (
       db: DatabaseSync,

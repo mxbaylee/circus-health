@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
 import type { AddressInfo } from 'node:net';
@@ -7,8 +8,6 @@ import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 
 test('encrypted runtime loads the PDF module worker and renders a fictional PDF', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'circus-pdf-worker-'));
@@ -23,7 +22,7 @@ test('encrypted runtime loads the PDF module worker and renders a fictional PDF'
     );
   }
   const runtimeDirectory = createTestRuntimeDirectory();
-  const runtime = await startRuntime({
+  const runtime = await startBrowserRuntime(t, {
     codeRoot: root,
     dataDirectory: join(root, 'data'),
     runtimeDirectory,
@@ -37,8 +36,8 @@ test('encrypted runtime loads the PDF module worker and renders a fictional PDF'
     rmSync(runtimeDirectory, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
   });
-  browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  browser = await launchBrowser(t);
+  const page = await newTestPage(browser);
   const workers: string[] = [];
   page.on('worker', (worker) => workers.push(worker.url()));
   await page.goto(`http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`);

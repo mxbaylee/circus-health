@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -5,26 +6,24 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 import { fictionalModel } from '../../server/test/fictional-model.ts';
 
 test(
   'encrypted browser corrects a saved result from comparison and returns to the unchanged incoming review',
-  { timeout: 90000 },
+  { timeout: 60000 },
   async (t) => {
     fictionalModel(t);
     const root = mkdtempSync(resolve(tmpdir(), 'circus-correction-browser-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
       host: '127.0.0.1',
       assistantOptions: { availability: () => ({ available: false, readiness: 'unavailable' }) },
     });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await launchBrowser(t);
     t.after(async () => {
       if (!completed && !page.isClosed()) {
         const path = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
@@ -37,8 +36,7 @@ test(
       rmSync(runtimeDirectory, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     });
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    page.setDefaultTimeout(10000);
+    const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
     let completed = false;
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));

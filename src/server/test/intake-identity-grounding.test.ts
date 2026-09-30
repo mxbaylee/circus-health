@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import {
   retainIdentityGrounding,
+  identityReviewGroundingLookups,
   identitySubjectGroundingLookup,
   identityNameQuestionGroundingLookup,
   identityOriginalBirthDateEvidenceLookup,
@@ -38,6 +39,40 @@ const boundary = {
   sourceHash: 'fictional-hash',
   workflow: { plans: [], reportGroups: [] },
 };
+
+test('new review snapshots recheck replaced proofs, membership, and database ownership', () => {
+  const db = new DatabaseSync(':memory:');
+  const other = new DatabaseSync(':memory:');
+  try {
+    const current = group('snapshot');
+    const question = { prompt: 'Fictional identity question', textAnchor: 'Patient: Iris Meadow' };
+    retainIdentityGrounding(db, boundary, current, [], true, [question], {
+      dates: ['1986-02-14'],
+      unreadable: false,
+    });
+    const review = identityReviewGroundingLookups(db, boundary);
+    assert.equal(review.subjectGrounded(current), true);
+    assert.equal(review.nameQuestionGrounded(current, question), true);
+    const returned = review.originalBirthDateEvidence(current)!;
+    returned.dates.push('1999-01-01');
+    assert.deepEqual(review.originalBirthDateEvidence(current)?.dates, ['1986-02-14']);
+    const grown = {
+      ...current,
+      versions: [...current.versions, { ...current.versions[0]!, id: 'v2' }],
+    };
+    assert.equal(review.subjectGrounded(grown), false);
+    assert.deepEqual(review.originalBirthDateEvidence(grown)?.dates, ['1986-02-14']);
+    assert.equal(identityReviewGroundingLookups(other, boundary).subjectGrounded(current), false);
+    retainIdentityGrounding(db, boundary, current, [], false, [], { dates: [], unreadable: true });
+    const next = identityReviewGroundingLookups(db, boundary);
+    assert.equal(next.subjectGrounded(current), false);
+    assert.equal(next.nameQuestionGrounded(current, question), false);
+    assert.equal(next.originalBirthDateEvidence(current)?.unreadable, true);
+  } finally {
+    db.close();
+    other.close();
+  }
+});
 
 test('grounding atomically replaces negative proofs and evicts date facts together with name proofs', () => {
   const db = new DatabaseSync(':memory:');

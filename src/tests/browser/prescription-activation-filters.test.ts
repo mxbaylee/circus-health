@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
 import type { AddressInfo } from 'node:net';
@@ -6,8 +7,6 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 
 test(
   'encrypted prescription activation restores prior filters on Done and Skip',
@@ -16,7 +15,7 @@ test(
     const root = mkdtempSync(resolve(tmpdir(), 'circus-prescription-filters-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
@@ -29,9 +28,8 @@ test(
       rmSync(runtimeDirectory, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     });
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    page.setDefaultTimeout(10000);
+    browser = await launchBrowser(t);
+    const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;

@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
@@ -6,8 +7,6 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 
 const envelope = (id: string, report: string) => ({
   format: 'health-record-v1',
@@ -43,22 +42,21 @@ test('Import detail keeps a readable record and reachable explicit actions on mo
   const root = mkdtempSync(resolve(tmpdir(), 'circus-mobile-review-actions-'));
   mkdirSync(resolve(root, 'data'));
   const runtimeDirectory = createTestRuntimeDirectory();
-  const runtime = await startRuntime({
+  const runtime = await startBrowserRuntime(t, {
     dataDirectory: resolve(root, 'data'),
     runtimeDirectory,
     port: 0,
     host: '127.0.0.1',
     assistantOptions: { availability: () => ({ available: false }) },
   });
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser(t);
   t.after(async () => {
     await browser.close();
     await runtime.close();
     rmSync(runtimeDirectory, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
   });
-  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
-  page.setDefaultTimeout(15_000);
+  const page = await newTestPage(browser, { viewport: { width: 1440, height: 1000 } });
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
   const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;

@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AppOptions } from '../../server/index.ts';
 import type { Browser } from 'playwright';
@@ -7,8 +8,6 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 import { fictionalModel } from '../../server/test/fictional-model.ts';
 
 const waitFor = async <T>(predicate: () => T, message: string, timeout = 12000) => {
@@ -58,7 +57,7 @@ function proposal(intakeId: string, label: string) {
 
 test(
   'encrypted browser reads two uploads sequentially and restores Stop, reload, Resume review',
-  { timeout: 90000 },
+  { timeout: 60000 },
   async (t) => {
     fictionalModel(t);
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-intake-batch-'));
@@ -78,7 +77,7 @@ test(
     const active = new Set();
     let maxActive = 0;
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
@@ -119,9 +118,8 @@ test(
       rmSync(root, { recursive: true, force: true });
     });
 
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
-    page.setDefaultTimeout(15000);
+    browser = await launchBrowser(t);
+    const page = await newTestPage(browser, { viewport: { width: 1440, height: 1000 } });
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
     await page.goto(url);
     const setup = await page.evaluate(async () => {

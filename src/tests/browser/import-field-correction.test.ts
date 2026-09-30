@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -5,9 +6,8 @@ import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium, type Browser } from 'playwright';
+import type { Browser } from 'playwright';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
-import { startRuntime } from '../../server/runtime.ts';
 
 for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'unclassified'])
   test(
@@ -16,7 +16,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       : scenario === 'date-and-value'
         ? 'an optional date warning cannot hide a missing result; partial edits retain correction reasons'
         : `record correction and approval while expanded: ${scenario}`,
-    { timeout: 120000 },
+    { timeout: 60000 },
     async (t) => {
       const partial = scenario === 'partial';
       const wrongKind = scenario === 'document' || scenario === 'unclassified';
@@ -24,7 +24,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       const root = mkdtempSync(resolve(tmpdir(), 'circus-focused-correction-'));
       mkdirSync(resolve(root, 'data'));
       const runtimeDirectory = createTestRuntimeDirectory();
-      const runtime = await startRuntime({
+      const runtime = await startBrowserRuntime(t, {
         dataDirectory: resolve(root, 'data'),
         runtimeDirectory,
         port: 0,
@@ -38,12 +38,12 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         rmSync(root, { recursive: true, force: true });
         rmSync(runtimeDirectory, { recursive: true, force: true });
       });
-      browser = await chromium.launch({ headless: true });
-      const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+      browser = await launchBrowser(t);
+      const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
       const errors: string[] = [];
       page.on('pageerror', (error) => errors.push(error.message));
       const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
-      const pdfPage = await browser.newPage();
+      const pdfPage = await newTestPage(browser);
       await pdfPage.setContent(
         `<style>@page{size:Letter;margin:50px}body{font-family:Arial;color:#183f50}.page{break-after:page}table{width:100%;border-collapse:collapse;margin-top:30px}td,th{padding:18px;text-align:left;border-bottom:1px solid #bbb}th{background:#eaf1f3}</style><section class="page"><h1>Cookie Doe laboratory report</h1><p>Meadowglass Laboratory</p><p>Patient: Cookie Doe</p><p>DOB: 1986-02-14</p><p>Collected: 2032-03-04</p><p>Supplemental results on page 2.</p><p>Synthetic test data</p></section><section><h1>Supplemental results</h1><p>Cookie Doe | 2032-03-04</p><table><tr><th>Test</th><th>Result</th><th>Unit</th></tr><tr><td>Potassium</td><td>4.1</td><td>mmol/L</td></tr></table><p>Synthetic test data</p></section>`,
       );

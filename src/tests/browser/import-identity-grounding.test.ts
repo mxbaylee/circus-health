@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
@@ -6,13 +7,12 @@ import type { AddressInfo } from 'node:net';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium, type Browser } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
+import type { Browser } from 'playwright';
 import type { Intake, IntakeImportFeed, IntakeReportQueueDetail } from '../../shared/intake.ts';
 
 test(
   'Import refreshes blocked records after the host checks a matching original',
-  { timeout: 90000 },
+  { timeout: 60000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-identity-grounding-browser-'));
     mkdirSync(resolve(root, 'data'));
@@ -24,7 +24,7 @@ test(
       host: '127.0.0.1',
       assistantOptions: { availability: () => ({ available: false }) },
     };
-    let runtime = await startRuntime(runtimeOptions);
+    let runtime = await startBrowserRuntime(t, runtimeOptions);
     let browser: Browser | undefined;
     t.after(async () => {
       await browser?.close();
@@ -33,9 +33,8 @@ test(
       rmSync(root, { recursive: true, force: true });
     });
 
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
-    page.setDefaultTimeout(15000);
+    browser = await launchBrowser(t);
+    const page = await newTestPage(browser);
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
     await page.goto(url);
     const setup = await page.evaluate(async () => {
@@ -276,7 +275,7 @@ test(
     assert.equal(seenDetails.length, 2, 'direct detail avoids refresh loops');
 
     await runtime.close();
-    runtime = await startRuntime({
+    runtime = await startBrowserRuntime(t, {
       ...runtimeOptions,
       port: new URL(url).port ? Number(new URL(url).port) : 0,
     });

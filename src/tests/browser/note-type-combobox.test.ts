@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Profile } from '../../shared/api.ts';
 import type { AddressInfo } from 'node:net';
@@ -7,17 +8,15 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 
 test(
   'Note types and People labels share explicit selection in an encrypted profile',
-  { timeout: 90000 },
+  { timeout: 60000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-note-type-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
@@ -37,10 +36,9 @@ test(
       rmSync(runtimeDirectory, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await launchBrowser(t);
     t.after(() => browser.close());
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    page.setDefaultTimeout(10000);
+    const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;

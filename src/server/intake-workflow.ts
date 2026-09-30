@@ -473,6 +473,15 @@ export function workflowReview<T extends IntakeReview>(
         if (!records.includes(record)) records.push(record);
         recordsByGroup.set(reference.groupId, records);
       }
+    // Self suggestions are fixed during this synchronous enrichment pass.
+    // Collect shared report facts once, rather than scanning every row per row.
+    const groupEvidence = new Map<
+      string,
+      {
+        collected: ReturnType<typeof collectEvidencedIdentity>;
+        structured: ReturnType<typeof collectEvidencedIdentity>['evidence'];
+      }
+    >();
     for (const record of review.records) {
       const reference = record.reportGroups?.[0] || null;
       const group = reference
@@ -485,9 +494,22 @@ export function workflowReview<T extends IntakeReview>(
       const originalBirthDates = group
         ? identityContext?.originalBirthDateEvidence?.(group)
         : undefined;
-      const { evidence, conflicts, unreadableBirthDate, bannerBirthDates } =
-        collectEvidencedIdentity(identityIssues, group?.report?.subject?.text, originalBirthDates);
-      const structuredEvidence = collectEvidencedIdentity(identityIssues).evidence;
+      let collected = group ? groupEvidence.get(group.id) : undefined;
+      if (!collected) {
+        collected = {
+          collected: collectEvidencedIdentity(
+            identityIssues,
+            group?.report?.subject?.text,
+            originalBirthDates,
+          ),
+          structured: collectEvidencedIdentity(identityIssues).evidence,
+        };
+        if (group) groupEvidence.set(group.id, collected);
+      }
+      const { evidence, conflicts, unreadableBirthDate, bannerBirthDates } = structuredClone(
+        collected.collected,
+      );
+      const structuredEvidence = structuredClone(collected.structured);
       const ownIdentityIssues = (record.issues || []).filter((issue) => issue.kind === 'identity');
       const genericIdentityIssueId =
         'issue:' +

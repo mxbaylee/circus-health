@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -5,8 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium, type Browser, type Request } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
+import { type Browser, type Request } from 'playwright';
 import type { Medication, Note, Observation, Procedure } from '../../shared/api.ts';
 import type {
   HealthRecordEnvelope,
@@ -166,12 +166,12 @@ async function until<T>(
 
 test(
   'encrypted Import holdout defers blocked work, saves exact destinations and recovers a lost acceptance acknowledgement',
-  { timeout: 120000 },
+  { timeout: 60000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-import-feed-holdout-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       codeRoot: process.env.CRS_TEST_CODE_ROOT,
@@ -186,9 +186,8 @@ test(
       rmSync(runtimeDirectory, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     });
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    page.setDefaultTimeout(15000);
+    browser = await launchBrowser(t);
+    const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
     async function captureControls(stage: string) {
       if (!process.env.CRS_TEST_SCREENSHOTS) return;
       mkdirSync(process.env.CRS_TEST_SCREENSHOTS, { recursive: true });

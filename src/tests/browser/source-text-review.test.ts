@@ -1,3 +1,4 @@
+import { launchBrowser, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -5,19 +6,18 @@ import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium, type Browser, type Page } from 'playwright';
+import { type Browser, type Page } from 'playwright';
 import { createCanvas } from '@napi-rs/canvas';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
-import { startRuntime } from '../../server/runtime.ts';
 
 test(
   'real source review retains corrections, history, stale-tab conflicts and original view without clinical acceptance',
-  { timeout: 120000 },
+  { timeout: 60000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-source-text-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
@@ -31,10 +31,11 @@ test(
       rmSync(runtimeDirectory, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     });
-    browser = await chromium.launch({ headless: true });
+    browser = await launchBrowser(t);
     const context = await browser.newContext();
+    context.setDefaultTimeout(5000);
+    context.setDefaultNavigationTimeout(10000);
     const page = await context.newPage();
-    page.setDefaultTimeout(15000);
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
@@ -106,7 +107,6 @@ test(
       .getByRole('button', { name: /Page 1 · native:.*Fictional administrative wording/ })
       .waitFor();
     const second = await context.newPage();
-    second.setDefaultTimeout(15000);
     await open(second);
     await second.getByRole('textbox', { name: /Passage 1/ }).waitFor();
     await passage.fill(original + '\nHuman verified missing administrative annotation.');

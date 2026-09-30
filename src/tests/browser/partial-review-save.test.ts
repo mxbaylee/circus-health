@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -5,8 +6,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { chromium, type Browser } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
+import type { Browser } from 'playwright';
 import type {
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceResult,
@@ -14,12 +14,12 @@ import type {
 
 test(
   'encrypted narrow browser retains an unsaved selection and reconciles a lost partial-save reply once',
-  { timeout: 90000 },
+  { timeout: 60000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'fictional-partial-review-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
@@ -33,9 +33,8 @@ test(
       rmSync(runtimeDirectory, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     });
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
-    page.setDefaultTimeout(15000);
+    browser = await launchBrowser(t);
+    const page = await newTestPage(browser, { viewport: { width: 390, height: 844 } });
     const origin = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
     await page.goto(origin);
     const profileId = await page.evaluate(async () => {

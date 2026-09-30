@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
 import type { Browser, Page } from 'playwright';
@@ -6,8 +7,6 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 
 const envelope = {
   format: 'health-record-v1',
@@ -82,12 +81,12 @@ async function api<T>(page: Page, url: string, path: string, method = 'GET', bod
 
 test(
   'encrypted browser explicitly updates, defers, and adds named People without clinical writes',
-  { timeout: 90000 },
+  { timeout: 60000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-import-people-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startRuntime({
+    const runtime = await startBrowserRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
@@ -102,9 +101,8 @@ test(
       rmSync(root, { recursive: true, force: true });
     });
 
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    page.setDefaultTimeout(15000);
+    browser = await launchBrowser(t);
+    const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
     await page.goto(url);
     const setup = await page.evaluate(async () => {

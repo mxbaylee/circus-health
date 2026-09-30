@@ -1,3 +1,4 @@
+import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
@@ -5,8 +6,6 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { chromium } from 'playwright';
-import { startRuntime } from '../../server/runtime.ts';
 
 const envelope = {
   format: 'health-record-v1',
@@ -69,13 +68,13 @@ test('People-only report stays separate, opens original evidence, and saves by e
   const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-intake-people-'));
   mkdirSync(resolve(root, 'data'));
   const runtimeDirectory = createTestRuntimeDirectory();
-  const runtime = await startRuntime({
+  const runtime = await startBrowserRuntime(t, {
     dataDirectory: resolve(root, 'data'),
     runtimeDirectory,
     port: 0,
     host: '127.0.0.1',
   });
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser(t);
   t.after(async () => {
     await browser.close();
     await runtime.close();
@@ -83,8 +82,7 @@ test('People-only report stays separate, opens original evidence, and saves by e
     rmSync(root, { recursive: true, force: true });
   });
 
-  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-  page.setDefaultTimeout(15000);
+  const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
   const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
   await page.goto(url);
   const setup = await page.evaluate(async () => {
