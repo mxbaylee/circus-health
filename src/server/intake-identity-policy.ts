@@ -861,6 +861,7 @@ export function assessIdentityPolicy({
   if (
     latestPersonChoice?.outcome === 'this_is_me' &&
     latestPersonChoice.scope.groupId !== group?.id &&
+    distinctOwners.length < 2 &&
     matchedOwner?.personId !== 'patient'
   )
     return {

@@ -505,6 +505,7 @@ test('a same-named Person keeps another report from borrowing the Self receipt w
     originalEvidenceChecked: true,
   });
   assert.equal(policy.status, 'confirmation_required');
+  assert.match(policy.message, /more than one person/);
   assert.equal(after.status, 'confirmation_required');
   assert.equal(after.blocking, true);
   blockedReportPaths(f, group.id, proposed.proposals.at(-1)!.id);
