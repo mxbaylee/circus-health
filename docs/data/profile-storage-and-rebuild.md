@@ -58,3 +58,5 @@ Synthetic backend and container tests cover cache loss, integrity failures, inte
 ## Repository boundary
 
 Profile originals, notes, chats, exports and receipts belong in external untracked data storage. Contributor documentation and tests use placeholders or invented examples. The user's designated backup is preserved. Old Git history and independently retained plaintext backups are not retroactively encrypted by the new runtime.
+
+Historical packet ownership is reconstructed from retained explicit subject evidence, never inferred from missing person fields or raw names. The [historical evidence inventory](../../src/server/NOTE-EXPORTS.md#historical-raw-assertion-ownership) documents current formats and unsupported restoration. Source-only rebuild preserves mixed-family subject evidence and unresolved omissions; it does not manufacture ownership or run an AI backfill.
