@@ -20,6 +20,8 @@ The companion has format `circus-health-provider-evidence-v1`, the frozen snapsh
 
 Included clinical records retain `ownershipCorrections` and field/reclassification `fieldCorrections` in the evidence companion. Preview and PDF display **Owner corrected on DATE**, the action (moved, split, or linked), former attribution and any recorded reason. Field corrections appear with their affected clinical value or narrative, date, changed fields, reason and actor; they are labeled as patient/caregiver assertions rather than provider amendments. A managed person's packet names the Self profile as caregiver. A fresh packet reflects the current owner and correction history, and a changed correction invalidates an earlier preview fingerprint.
 
+Correction actor context remains in the snapshot and fingerprint even when a brief omits optional patient information. Managed-person corrections still name Self as caregiver. Automatic unmatched clinical assertions require `report_subject` evidence for the selected person; a named person, clinician or other source mention cannot assign a report to them. Conflicting person evidence excludes that assertion.
+
 The app does not retain a durable packet-membership or delivery receipt. Its expiring in-memory preview cache cannot establish whether an earlier copy included a particular record or who received it. Ownership correction previews and record history state that limitation so the person can check copies they shared and send corrected packets where needed.
 
 ## API contract and immutable previews

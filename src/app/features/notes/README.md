@@ -42,7 +42,7 @@ Self's Display name field is editable and autosaved. Its canonical value comes f
 
 `person.icon` is a portable symbol identifier or a single emoji grapheme. It uses the same autosave, immutable generations, field restoration and rebuild as other person fields. Self's icon is included in versioned profile metadata so a successful save updates the sidebar without switching identities. No remote images or uploads are involved.
 
-Print / Export is near the top of each actual note and Self. Visit brief and New provider packet share the preview flow; see `server/NOTE-EXPORTS.md` for scope, privacy boundaries and attachment behavior. Other people's profiles do not start a patient-wide export.
+Print / Export is near the top of each actual note and person profile. Visit brief and New provider packet share the preview flow and always keep one person's scope; see `server/NOTE-EXPORTS.md` for scope, privacy boundaries and attachment behavior.
 
 The Person icon control opens a searchable Lucide-only grid. Names, upstream tags/categories and local synonyms (such as lotus for Flower 2) support prefix and typo-tolerant search. Exact full names receive the strongest boost. Within each match quality, name matches rank above upstream metadata, followed by supplemental synonyms; repeating a tag does not increase its weight. Categories filter results; icons load locally on demand, with 60 results shown initially. Existing emoji values remain readable and restorable, but the picker only offers installed Lucide icons. New values use `lucide:<name>` to distinguish them from legacy identifiers. Search changes do not save until selection; Escape cancels, and keyboard navigation and responsive placement are retained.
 

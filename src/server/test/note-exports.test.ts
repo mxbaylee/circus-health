@@ -481,6 +481,75 @@ test('Self packet excludes a relative’s unmatched clinical source assertion', 
   assert.ok(!snapshot.records.some((record) => record.id === 'relative-allergy'));
   assert.doesNotMatch(exportHtml(snapshot), /PRIVATE RELATIVE ALLERGY/);
 });
+test('a named-person source mention cannot assign an unmatched assertion to that person’s packet', (t) => {
+  const { db } = fixture(t);
+  const person = createNote(db, { kind: 'person', title: 'Fictional mentioned clinician' });
+  db.exec(`INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json)
+    VALUES('named-person-only','file','issuer','condition','{"display":"PRIVATE NAMED PERSON ASSERTION"}');`);
+  db.prepare(
+    "INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES('named-person-evidence','person',?,'named-person-only','source')",
+  ).run(person.personId!);
+  const options = exportOptions(db, { type: 'person', id: person.personId! });
+  const snapshot = exportSnapshot(db, {
+    type: 'person',
+    id: person.personId!,
+    noteVersion: options.noteVersion,
+    mode: 'provider',
+  });
+  assert.ok(!snapshot.records.some((record) => record.id === 'named-person-only'));
+  assert.doesNotMatch(exportHtml(snapshot), /PRIVATE NAMED PERSON ASSERTION/);
+});
+test('a managed-person brief labels the caregiver’s correction even with patient information omitted', (t) => {
+  const { db } = fixture(t);
+  db.prepare("UPDATE people SET display_name='Fictional caregiver Sam' WHERE id='patient'").run();
+  const person = createNote(db, { kind: 'person', title: 'Fictional daughter' });
+  const note = createNote(db, {
+    title: 'Fictional visit brief',
+    content: 'A fictional visit',
+    ownerPersonId: person.personId!,
+  });
+  db.prepare(
+    "INSERT INTO observations(id,test_type_id,person_id,source_record_id,label,value_text,extra_json) VALUES('managed-corrected','cbc',?,'raw','Managed corrected value','9',?)",
+  ).run(
+    person.personId!,
+    JSON.stringify({
+      recordCorrections: [
+        {
+          before: { kind: 'observation', valueText: '8' },
+          after: { kind: 'observation', valueText: '9' },
+          reason: 'Fictional source correction',
+          at: '2026-09-30T12:00:00Z',
+        },
+      ],
+    }),
+  );
+  db.prepare(
+    "INSERT INTO note_links(id,note_id,target_type,target_id,relation) VALUES('managed-corrected-link',?,'observation','managed-corrected','related')",
+  ).run(note.id);
+  const snapshot = exportSnapshot(db, {
+    type: 'note',
+    id: note.id,
+    noteVersion: note.version,
+    mode: 'brief',
+    selected: ['observation:managed-corrected'],
+    includeLinked: true,
+    includePatient: false,
+  });
+  assert.equal(snapshot.patient, null);
+  assert.deepEqual(snapshot.actor, { name: 'Fictional caregiver Sam', role: 'caregiver' });
+  assert.match(
+    exportHtml(snapshot),
+    /Corrected by Fictional caregiver Sam \(caregiver\) on 2026-09-30/,
+  );
+  assert.doesNotMatch(exportHtml(snapshot), /Corrected by the patient/);
+  const companion = exportEvidence(snapshot) as {
+    records: Array<{ fieldCorrections?: { actorDisplay: string }[] }>;
+  };
+  assert.equal(
+    companion.records[0].fieldCorrections![0].actorDisplay,
+    'Fictional caregiver Sam (caregiver)',
+  );
+});
 test('a managed Person packet starts from that profile and includes only explicitly assigned assertions and contacts', (t) => {
   const { db, input } = fixture(t);
   const person = createNote(db, { kind: 'person', title: 'Fictional daughter' });

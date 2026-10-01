@@ -204,6 +204,7 @@ export interface NoteExportSnapshot {
     gaps: { locator: string; reason: string }[];
   }[];
   patient: PatientInformation | null;
+  actor: { name: string; role: 'patient' | 'caregiver' };
   identity: { name: string; birthDate: unknown; pronouns: unknown; version: unknown };
   main: ExportRecord;
   records: ExportRecord[];
@@ -726,7 +727,7 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
       .prepare(
         `SELECT sr.id,sr.kind FROM source_records sr
           WHERE sr.provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))
-          AND EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id=? AND e.source_record_id=sr.id)
+          AND EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id=? AND e.source_record_id=sr.id AND e.role='report_subject')
           AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id<>? AND e.source_record_id=sr.id)
           ORDER BY sr.id`,
       )
@@ -1087,6 +1088,18 @@ export function exportSnapshot(
   };
   const patient =
     input.mode === 'provider' || input.includePatient ? patientInformation(db, personId) : null;
+  // Correction provenance is mandatory even when optional patient/contact
+  // details are hidden from a brief. The profile user is always the actor.
+  const actor =
+    personId === 'patient'
+      ? { name: 'the patient', role: 'patient' as const }
+      : {
+          name: String(
+            db.prepare("SELECT display_name FROM people WHERE id='patient'").get()?.display_name ||
+              'Name not recorded',
+          ),
+          role: 'caregiver' as const,
+        };
   if (input.type === 'person') {
     main.row = { ...main.row, content: '', topics: '', raw_thoughts: '', profile_json: '{}' };
     if (!main.note)
@@ -1119,6 +1132,7 @@ export function exportSnapshot(
   };
   const rank = (type: ExportRecordType): number => ranks[type] ?? 7;
   const payload = {
+    actor,
     reportReview: packetReportReview(
       db,
       [main, ...records.values()].flatMap((record) =>
@@ -1323,9 +1337,8 @@ export function exportEvidence(snapshot: NoteExportSnapshot): JsonRecord {
   );
   const project = (record: ExportRecord): JsonRecord => {
     const { note, ...clinical } = record;
-    const actorDisplay = snapshot.patient?.caregiver
-      ? `${snapshot.patient.caregiver.name} (caregiver)`
-      : 'the patient';
+    const actorDisplay =
+      snapshot.actor.role === 'caregiver' ? `${snapshot.actor.name} (caregiver)` : 'the patient';
     return {
       ...clinical,
       ...(clinical.fieldCorrections
@@ -1384,9 +1397,8 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
       }
       return citationIds.get(key)!;
     });
-  const correctedBy = snapshot.patient?.caregiver
-    ? `${snapshot.patient.caregiver.name} (caregiver)`
-    : 'the patient';
+  const correctedBy =
+    snapshot.actor.role === 'caregiver' ? `${snapshot.actor.name} (caregiver)` : 'the patient';
   const correctionLabels = (r: ExportRecord): string =>
     (r.fieldCorrections || [])
       .map(
