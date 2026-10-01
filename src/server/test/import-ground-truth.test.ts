@@ -432,9 +432,18 @@ test(
     assert.equal(db.prepare('SELECT count(*) n FROM medications').get()?.n, 1);
     assert.equal(db.prepare('SELECT count(*) n FROM documents').get()?.n, 1);
     assert.equal(
-      db.prepare('SELECT count(*) n FROM evidence').get()?.n,
+      db.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()?.n,
       7,
       'The unscoped package proposal does not attach a second clinical occurrence',
+    );
+    assert.equal(
+      db
+        .prepare(
+          "SELECT count(*) n FROM evidence WHERE entity_type='person' AND role='report_subject'",
+        )
+        .get()?.n,
+      7,
+      'Each accepted clinical occurrence keeps one report subject',
     );
 
     const acceptedTruth = {
