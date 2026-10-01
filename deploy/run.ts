@@ -39,6 +39,7 @@ Optional: CRS_LITELLM_ENV_FILE=/absolute/path/provider.env (secrets passed only 
           CRS_IMAGE=repository:tag (default: separate tag for each archive)
           CRS_IMPORT_DIAGNOSTICS=true (show metadata diagnostics; default: false)
 CRS_STATE_DIR=/absolute/path/state npm run login:chatgpt
+CRS_OAUTH_QUALIFICATION=1 CRS_OAUTH_OUTPUT_DIR=/absolute/path/receipts CRS_STATE_DIR=/absolute/path/state CRS_LITELLM_CONFIG=/absolute/path/litellm.yaml CRS_MODEL=health-primary npm run qualify:oauth
 npm run image:build
 CRS_DATA_DIR=/absolute/path/data npm run check:data
 npm run icons
