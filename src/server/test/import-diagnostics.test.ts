@@ -15,6 +15,7 @@ import { openDatabase } from '../database.ts';
 import { createApp } from '../index.ts';
 import { diagnosticRoute, isDiagnosticRoute } from '../../shared/import-diagnostic-route.ts';
 import { receiveIntakeUpload, type UploadRequest } from '../intake-upload.ts';
+import * as intake from '../intake.ts';
 
 function uploadRequest(
   chunks: Parameters<typeof Readable.from>[0],
@@ -537,6 +538,62 @@ test('a real upload receipt emits bounded upload_receive phase events with no fi
   assert.equal(typeof completed?.fields.durationMs, 'number');
   assert.equal(typeof completed?.fields.publishMs, 'number');
   assert.doesNotMatch(JSON.stringify(events), /Iris Meadow|fictional-chart|\.pdf/);
+});
+
+test('real fictional receive and curation publication link retained import to original-publish sibling', async (t) => {
+  const f = fixture(t);
+  const diagnostics = createImportDiagnostics({ enabled: true });
+  t.after(() => diagnostics.close());
+  const bytes = Buffer.from('Independently fictional upload for diagnostics topology');
+  const clientRequestId = '00000000-0000-4000-8000-000000000003';
+  const retained = await diagnostics.run(
+    { profileId: f.profileId, requestId: '00000000-0000-4000-8000-000000000004', clientRequestId },
+    () =>
+      receiveIntakeUpload(
+        uploadRequest([bytes], { 'content-length': String(bytes.length) }),
+        () =>
+          intake.uploadIntake(f.db, f.root, f.profileId, {
+            filename: 'fictional.txt',
+            newProviderName: 'Fictional Clinic',
+            mimeType: 'text/plain',
+            bytes,
+          }),
+        { tempRoot: f.root, diagnostics },
+      ),
+  );
+  const exported = diagnostics.exportSnapshot(f.profileId);
+  const events = exported.events;
+  const phase = (name: string) =>
+    events.find((event) => event.event === 'import.phase.completed' && event.fields.phase === name);
+  const receive = phase('upload_receive');
+  const curation = phase('upload_curation_publish');
+  const original = phase('upload_original_publish');
+  const progress = events.find(
+    (event) => event.event === 'import.progress' && event.fields.phase === 'upload_retained',
+  );
+  assert.ok(
+    receive && curation && original && progress,
+    JSON.stringify({
+      receive: !!receive,
+      curation: !!curation,
+      original: !!original,
+      progress: !!progress,
+    }),
+  );
+  assert.equal(receive.context.clientRequestId, clientRequestId);
+  assert.equal(curation.context.spanId, original.context.parentSpanId);
+  assert.equal(curation.context.spanId, progress.context.parentSpanId);
+  assert.equal(progress.context.importId === retained.id, false, 'source IDs are salted in export');
+  assert.ok(progress.context.importId);
+  assert.ok(
+    [curation, original, progress].every(
+      (event) => event.context.requestId === receive.context.requestId,
+    ),
+  );
+  assert.ok(original.sequence < progress.sequence);
+  assert.ok(progress.sequence < curation.sequence);
+  assert.ok(curation.sequence < receive.sequence);
+  assert.doesNotMatch(JSON.stringify(exported), /Independently fictional upload|fictional\.txt/);
 });
 
 test('upload_receive separates the publish half from the receive it is bundled with', async (t) => {
