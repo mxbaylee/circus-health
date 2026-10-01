@@ -7,6 +7,7 @@ import type { AddressInfo } from 'node:net';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import {
+  lockOwnedPasskeyProfile,
   physicalPasskeyJourney,
   physicalPasskeyPassed,
   type PhysicalPasskeyProgress,
@@ -57,6 +58,7 @@ for (const failFinalLock of [false, true])
         recoveryFallback: false,
       };
       let recoverySaved = false;
+      let ownedName = '';
       const journey = physicalPasskeyJourney(
         page,
         origin,
@@ -80,11 +82,24 @@ for (const failFinalLock of [false, true])
               enabled: false,
             });
         },
+        () => {},
+        (name) => {
+          ownedName = name;
+        },
       );
       if (failFinalLock) {
         await assert.rejects(journey);
         assert.equal(progress.recoveryFallback, true);
         assert.equal(physicalPasskeyPassed(progress, false), false);
+        assert.equal(
+          await lockOwnedPasskeyProfile(page.context().request, origin, undefined, ownedName),
+          true,
+        );
+        const cards = await page.evaluate(
+          async () =>
+            ((await (await fetch('/api/profiles')).json()) as { data: { locked: boolean }[] }).data,
+        );
+        assert.equal(cards[0]?.locked, true);
         return;
       }
       await journey;
