@@ -48,17 +48,16 @@ Each open item shows its score after its sizes. When a size or mark changes, rec
 
 | #   | Ticket                                     | Score | Tie-break            | Owner input                                                           |
 | --- | ------------------------------------------ | ----- | -------------------- | --------------------------------------------------------------------- |
-| 1   | 🔐 [CRS-153](#crs-153) passkeys            | 8     | 🔴, unblocks CRS-088 | Tap the passkey prompts on each device and browser                    |
-| 2   | 👨‍👦 [CRS-138](CRS-138.md) suffix-only names | 8     | 🔴, lower ID         | Decide whether a suffix-only difference should ask (recommended: yes) |
-| 3   | 💽 [CRS-152](#crs-152) deployment drive    | 8     | 🔴                   | Connect or choose the drive                                           |
-| 4   | 👥 [CRS-124](#crs-124) People display      | 8     | 🟡 🐭, lower ID      | Inspect non-Self people in intended layouts                           |
-| 5 | 🎯 [CRS-118](CRS-118.md) source dependencies | 7 | Unblocks another item, lower ID | None |
+| 1 | 🔐 [CRS-153](#crs-153) passkeys            | 8     | 🔴, unblocks CRS-088 | Tap the passkey prompts on each device and browser                    |
+| 2 | 💽 [CRS-152](#crs-152) deployment drive    | 8     | 🔴                   | Connect or choose the drive                                           |
+| 3 | 👥 [CRS-124](#crs-124) People display      | 8     | 🟡 🐭, lower ID      | Inspect non-Self people in intended layouts                           |
+| 4 | 🎯 [CRS-118](CRS-118.md) source dependencies | 7 | Unblocks another item, lower ID | None |
+| 5 | 🖨️ [CRS-147](CRS-147.md) safe packets | 7 | Unblocks another item | None |
 
-Next up: 🖨️ [CRS-147](CRS-147.md) (7, unblocks another item), then 🩺 [CRS-154](CRS-154.md) (7) when a real-provider complaint can be observed. ♻️ [CRS-155](CRS-155.md) scores 8 but waits for natural token expiry. 🧐 [CRS-073](#crs-073) also scores 8, but it waits for CRS-147.
+Next up: 🩺 [CRS-154](CRS-154.md) (7) when a real-provider complaint can be observed. ♻️ [CRS-155](CRS-155.md) scores 8 but waits for natural token expiry. 🧐 [CRS-073](#crs-073) also scores 8, but it waits for CRS-147.
 
 ## <a id="product-and-maintenance"></a>🛠️ Product and maintenance
 
-- [ ] <a id="crs-138"></a> 👨‍👦 [CRS-138](CRS-138.md) · 🐕 M · 🔴 L · 🚀 production · score 8 — Ask instead of reusing another report's confirmation when a saved name differs from the printed name only by a Jr./Sr./II/III suffix (remainder of CRS-137).
 - [ ] <a id="crs-139"></a><a id="crs-090"></a> 🏷️ [CRS-139](CRS-139.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Make remembered name owners visible, revocable and unable to outrank another person's own name; release holds on later whole-report corrections; finish ownership-correction tests, including ambiguous confirmed-name remembering (remainder of CRS-134; CRS-090's remainder, with its real-file part in [CRS-062](#crs-062)).
 - [ ] <a id="crs-140"></a> 🧊 [CRS-140](CRS-140.md) · 🐘 L · 🟡 M · 🚀 production · score 6 — Cool repeated timeouts on one unit with longer backoff, lower concurrency or a longer deadline behind a non-blocking status, never a stop or attempt cap (owner, 2026-09-30); detect provider sign-in without a click, stop journaling unchanged waits, and finish continuation tests (remainder of CRS-135).
 - [ ] <a id="crs-141"></a> 💾 [CRS-141](CRS-141.md) · 🐘 L · 🟡 M · score 3 — Keep partial saves linear on large intakes, keep coupled groups together above the cap, name the person on saved outcomes, and finish coverage (remainder of CRS-136).

@@ -2,12 +2,22 @@
 export function canonicalIdentityName(value: string): string {
   const normalized = value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US');
   const parts = normalized.split(',').map((part) => part.trim());
+  if (parts.length === 2 && /^(?:jr|sr|ii|iii|iv)\.?$/u.test(parts[1]!))
+    return `${parts[0]} ${parts[1]}`;
+  const surnameFirstWithSuffix =
+    parts.length === 2 ? parts[1]?.match(/^(.+?)\s+(jr\.?|sr\.?|ii|iii|iv)\.?$/u) : null;
+  if (
+    surnameFirstWithSuffix &&
+    /^[\p{L}\p{M} .’'-]+$/u.test(parts[0]!) &&
+    /^[\p{L}\p{M} .’'-]+$/u.test(surnameFirstWithSuffix[1]!)
+  )
+    return `${surnameFirstWithSuffix[1]} ${parts[0]} ${surnameFirstWithSuffix[2]}`;
   // Only the explicit surname, given-name convention is reordered. Multiple
-  // commas and suffixes remain literal, avoiding arbitrary token permutations.
+  // commas remain literal, avoiding arbitrary token permutations.
   if (
     parts.length === 2 &&
     parts.every((part) => /^[\p{L}\p{M} .’'-]+$/u.test(part)) &&
-    !parts.some((part) => /^(jr\.?|sr\.?|ii|iii|iv)$/i.test(part))
+    !parts.some((part) => /^(?:jr|sr|ii|iii|iv)\.?$/i.test(part))
   )
     return parts[1] + ' ' + parts[0];
   return normalized;
