@@ -198,6 +198,7 @@ export interface NoteExportInput extends JsonRecord {
 
 export interface NoteExportSnapshot {
   reportReview: PacketReportReview[];
+  unassignedRawAssertionsOmitted: boolean;
   readingGaps: {
     sourceFileId: string;
     filename: string;
@@ -215,6 +216,26 @@ export interface NoteExportSnapshot {
   selection: string[];
   generatedAt: string;
   fingerprint: string;
+}
+
+const unassignedAssertionDisclosure =
+  'Some retained clinical assertions have no verified single-person assignment and were left out of this packet. Review the original records before relying on this packet as complete.';
+
+function unassignedPacketAssertions(db: Database): boolean {
+  return !!db
+    .prepare(
+      `SELECT 1 FROM source_records sr
+       WHERE sr.provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))
+         AND lower(sr.kind) IN ('clinical_object','allergy','allergies','allergyintolerance','condition','conditions','diagnosis','diagnoses','encounter','encounters','visit','visits','immunization','immunizations','intake_record','intake_document')
+         AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type<>'person')
+         AND NOT EXISTS (SELECT 1 FROM observations WHERE source_record_id=sr.id)
+         AND NOT EXISTS (SELECT 1 FROM medications WHERE source_record_id=sr.id)
+         AND NOT EXISTS (SELECT 1 FROM procedures WHERE source_record_id=sr.id)
+         AND NOT EXISTS (SELECT 1 FROM documents WHERE source_record_id=sr.id)
+         AND (SELECT count(DISTINCT e.entity_id) FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject')<>1
+       LIMIT 1`,
+    )
+    .get();
 }
 
 interface SnapshotEntry {
@@ -728,7 +749,7 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
         `SELECT sr.id,sr.kind FROM source_records sr
           WHERE sr.provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))
           AND EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id=? AND e.source_record_id=sr.id AND e.role='report_subject')
-          AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id<>? AND e.source_record_id=sr.id)
+          AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id<>? AND e.source_record_id=sr.id AND e.role='report_subject')
           ORDER BY sr.id`,
       )
       .all(personId, personId) as unknown as Array<ExportRow & { id: string; kind: string }>) {
@@ -1133,6 +1154,7 @@ export function exportSnapshot(
   const rank = (type: ExportRecordType): number => ranks[type] ?? 7;
   const payload = {
     actor,
+    unassignedRawAssertionsOmitted: input.mode === 'provider' && unassignedPacketAssertions(db),
     reportReview: packetReportReview(
       db,
       [main, ...records.values()].flatMap((record) =>
@@ -1370,6 +1392,9 @@ export function exportEvidence(snapshot: NoteExportSnapshot): JsonRecord {
   return {
     format: 'circus-health-provider-evidence-v1',
     ...snapshot,
+    omissionDisclosure: snapshot.unassignedRawAssertionsOmitted
+      ? unassignedAssertionDisclosure
+      : null,
     main: project(snapshot.main),
     records: snapshot.records.map(project),
     citationIndex: citations,
@@ -1431,6 +1456,8 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
     : snapshot.mode === 'brief'
       ? `<p class="meta">Appointment brief · Generated ${esc(snapshot.generatedAt.slice(0, 10))} · ${snapshot.records.length} selected supplements. Date scope: ${esc(snapshot.scope.from || 'any')} to ${esc(snapshot.scope.to || 'any')}. This note and explicitly selected evidence.</p>`
       : `<div class="scope"><strong>${snapshot.mode === 'detailed' ? 'Detailed evidence packet' : 'New provider packet'}${provider ? ' · clinical archive and selected notes' : ' · selected evidence only'}</strong><p>Generated ${esc(snapshot.generatedAt)}. Date scope: ${esc(snapshot.scope.from || 'unbounded')} to ${esc(snapshot.scope.to || 'unbounded')}. Archived supplements: ${snapshot.scope.includeArchived ? 'allowed when selected' : 'excluded'}. ${snapshot.records.length} supplementary records and ${snapshot.assets.length} companion originals selected.</p><p>This is not a complete hospital chart. Missing, unreviewed and conflicting assertions are retained as recorded. No clinical recommendations or medication reconciliation are inferred. Original assets are companion downloads, not embedded pages.</p></div>`;
+  if (provider && snapshot.unassignedRawAssertionsOmitted)
+    body += `<section><h2>Records with unverified ownership</h2><p>${esc(unassignedAssertionDisclosure)}</p></section>`;
   const partialReports = snapshot.reportReview.filter(
     (report) => report.savedCount < report.totalCount,
   );

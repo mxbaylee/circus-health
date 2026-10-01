@@ -473,13 +473,38 @@ test('provider packet includes clinical history and unmatched assertions, exclud
   );
   assert.ok(!JSON.stringify(snapshot).includes(sensitive.content));
 });
-test('Self packet excludes a relative’s unmatched clinical source assertion', (t) => {
+test('Self packet excludes a relative’s unmatched clinical source assertion', async (t) => {
   const { db, input } = fixture(t);
   db.exec(`INSERT INTO people VALUES('relative','Fictional relative','family',0);
     INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json) VALUES('relative-allergy','file','issuer','allergy','{"person":"Fictional relative","display":"PRIVATE RELATIVE ALLERGY"}');`);
   const snapshot = exportSnapshot(db, { ...input, mode: 'provider' });
   assert.ok(!snapshot.records.some((record) => record.id === 'relative-allergy'));
-  assert.doesNotMatch(exportHtml(snapshot), /PRIVATE RELATIVE ALLERGY/);
+  assert.equal(snapshot.unassignedRawAssertionsOmitted, true);
+  assert.match(
+    exportHtml(snapshot),
+    /Some retained clinical assertions have no verified single-person assignment/,
+  );
+  assert.doesNotMatch(exportHtml(snapshot), /PRIVATE RELATIVE ALLERGY|relative-allergy/);
+  const companion = JSON.stringify(exportEvidence(snapshot));
+  assert.match(
+    companion,
+    /Some retained clinical assertions have no verified single-person assignment/,
+  );
+  assert.doesNotMatch(companion, /PRIVATE RELATIVE ALLERGY|relative-allergy/);
+  const pdf = await exportPdf(exportHtml(snapshot));
+  const loading = getDocument({ data: new Uint8Array(pdf), useSystemFonts: true });
+  const document = await loading.promise;
+  let rendered = '';
+  for (let page = 1; page <= document.numPages; page++) {
+    const content = await (await document.getPage(page)).getTextContent();
+    rendered += content.items.map((item) => ('str' in item ? item.str : '')).join(' ') + ' ';
+  }
+  assert.match(
+    rendered,
+    /Some retained clinical assertions have no verified single-person assignment/,
+  );
+  assert.doesNotMatch(rendered, /PRIVATE RELATIVE ALLERGY|relative-allergy/);
+  await loading.destroy();
 });
 test('a named-person source mention cannot assign an unmatched assertion to that person’s packet', (t) => {
   const { db } = fixture(t);
@@ -498,6 +523,39 @@ test('a named-person source mention cannot assign an unmatched assertion to that
   });
   assert.ok(!snapshot.records.some((record) => record.id === 'named-person-only'));
   assert.doesNotMatch(exportHtml(snapshot), /PRIVATE NAMED PERSON ASSERTION/);
+});
+test('an owner’s unmatched assertion survives a clinician mention, but competing ownership excludes it', (t) => {
+  const { db, input } = fixture(t);
+  const clinician = createNote(db, { kind: 'person', title: 'Fictional mentioned clinician' });
+  const managed = createNote(db, { kind: 'person', title: 'Fictional dependent' });
+  db.exec(`INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json)
+    VALUES('owned-allergy','file','issuer','allergy','{"display":"Fictional owned allergy"}'),
+          ('disputed-allergy','file','issuer','allergy','{"display":"Fictional disputed allergy"}'),
+          ('managed-allergy','file','issuer','allergy','{"display":"Fictional managed allergy"}');
+    INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role)
+    VALUES('owned-subject','person','patient','owned-allergy','report_subject'),
+          ('disputed-subject','person','patient','disputed-allergy','report_subject');`);
+  db.prepare(
+    "INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES('clinician-mention','person',?,'owned-allergy','source'),('competing-subject','person',?,'disputed-allergy','report_subject'),('managed-subject','person',?,'managed-allergy','report_subject'),('managed-clinician-mention','person',?,'managed-allergy','source')",
+  ).run(clinician.personId!, clinician.personId!, managed.personId!, clinician.personId!);
+  const snapshot = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.equal(snapshot.unassignedRawAssertionsOmitted, true);
+  assert.ok(snapshot.records.some((record) => record.id === 'owned-allergy'));
+  assert.ok(!snapshot.records.some((record) => record.id === 'disputed-allergy'));
+  assert.ok(!snapshot.records.some((record) => record.id === 'managed-allergy'));
+  const html = exportHtml(snapshot);
+  assert.match(html, /owned-allergy/);
+  assert.doesNotMatch(html, /disputed-allergy/);
+  assert.match(JSON.stringify(exportEvidence(snapshot)), /Fictional owned allergy/);
+  const managedOptions = exportOptions(db, { type: 'person', id: managed.personId! });
+  const managedPacket = exportSnapshot(db, {
+    type: 'person',
+    id: managed.personId!,
+    noteVersion: managedOptions.noteVersion,
+    mode: 'provider',
+  });
+  assert.ok(managedPacket.records.some((record) => record.id === 'managed-allergy'));
+  assert.ok(!managedPacket.records.some((record) => record.id === 'owned-allergy'));
 });
 test('a managed-person brief labels the caregiver’s correction even with patient information omitted', (t) => {
   const { db } = fixture(t);
