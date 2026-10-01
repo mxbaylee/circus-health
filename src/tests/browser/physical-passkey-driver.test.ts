@@ -4,10 +4,12 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
+import { createServer } from 'node:http';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import {
   lockOwnedPasskeyProfile,
+  physicalPasskeyConfiguration,
   physicalPasskeyJourney,
   physicalPasskeyPassed,
   type PhysicalPasskeyProgress,
@@ -38,6 +40,12 @@ for (const failFinalLock of [false, true])
       });
       const page = await newTestPage(browser);
       const origin = `http://localhost:${(runtime.server.address() as AddressInfo).port}`;
+      const config = physicalPasskeyConfiguration({
+        CRS_PHYSICAL_PASSKEY_QUALIFICATION: '1',
+        CRS_QUALIFICATION_ORIGIN: origin,
+        CRS_QUALIFICATION_OUTPUT_DIR: root,
+      });
+      assert.equal(config.https, false);
       const cdp = await page.context().newCDPSession(page);
       await cdp.send('WebAuthn.enable');
       const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', {
@@ -61,7 +69,7 @@ for (const failFinalLock of [false, true])
       let ownedName = '';
       const journey = physicalPasskeyJourney(
         page,
-        origin,
+        config.origin,
         (phrase) => {
           assert.equal(phrase.split(' ').length, 24);
           recoverySaved = true;
@@ -128,3 +136,66 @@ for (const failFinalLock of [false, true])
       assert.equal(physicalPasskeyPassed(existing), false);
     },
   );
+
+test(
+  'physical driver rejects insecure contexts and changed origins before profile access',
+  { timeout: 60000 },
+  async (t) => {
+    const browser = await launchBrowser(t);
+    t.after(() => browser.close());
+    const redirectServer = createServer((request, response) => {
+      if (request.headers.host?.startsWith('localhost:')) {
+        response.writeHead(302, {
+          Location: `http://127.0.0.1:${(redirectServer.address() as AddressInfo).port}`,
+        });
+        response.end();
+      } else {
+        response.writeHead(200, { 'Content-Type': 'text/html' });
+        response.end('<title>Fictional redirected origin</title>');
+      }
+    });
+    await new Promise<void>((resolve) => redirectServer.listen(0, '127.0.0.1', resolve));
+    t.after(
+      () =>
+        new Promise<void>((resolve, reject) =>
+          redirectServer.close((error) => (error ? reject(error) : resolve())),
+        ),
+    );
+    for (const redirected of [false, true]) {
+      const page = await newTestPage(browser);
+      const origin = redirected
+        ? `http://localhost:${(redirectServer.address() as AddressInfo).port}`
+        : 'http://fictional-insecure.example.test';
+      const requests: string[] = [];
+      page.on('request', (request) => requests.push(request.url()));
+      if (!redirected)
+        await page.route('**/*', async (route) => {
+          await route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: '<title>Fictional preflight</title>',
+          });
+        });
+      const progress: PhysicalPasskeyProgress = {
+        confirmedEnrollment: false,
+        successfulUnlocks: 0,
+        recoveryFallback: false,
+      };
+      await assert.rejects(
+        physicalPasskeyJourney(
+          page,
+          origin,
+          () => assert.fail('No recovery material before preflight'),
+          progress,
+        ),
+        redirected ? /origin changed/ : /secure context/,
+      );
+      assert.ok(
+        !requests.some((url) => url.includes('/api/')),
+        'No profile listing or writes before the origin/security guard',
+      );
+      assert.equal(physicalPasskeyPassed(progress, true), false);
+      await page.close();
+    }
+  },
+);
