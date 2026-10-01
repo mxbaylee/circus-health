@@ -189,7 +189,9 @@ export async function lockOwnedPasskeyProfile(
       timeout: 10_000,
     },
   );
-  if (!response.ok()) return false;
+  // The journey may fail after its final lock; the endpoint then reports 423.
+  // Confirm the same session sees the owned profile locked before accepting it.
+  if (!response.ok() && response.status() !== 423) return false;
   const profiles = await request.get(origin + '/api/profiles', {
     headers: { Origin: origin },
     timeout: 10_000,
