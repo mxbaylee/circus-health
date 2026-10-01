@@ -65,7 +65,7 @@ Keep working decrypted SQLite, WAL/SHM, extraction previews and other temporary 
 
 ## Verification limits
 
-Controlled fictional tests exercise recovery verification, invalid/wrong-profile kits, setup interruptions, independent keys, encryption authentication, locked-profile routes and cache-loss rebuild. These checks do not establish physical authenticator/PRF support or password-manager behavior on every browser. [Device acceptance](../todo/readme.md#crs-153) remains open.
+Controlled fictional tests exercise recovery verification, invalid/wrong-profile kits, setup interruptions, independent keys, encryption authentication, locked-profile routes and cache-loss rebuild. These checks do not establish physical authenticator/PRF support or password-manager behavior on every browser. [Device acceptance](../todo/readme.md#crs-163) remains open.
 
 ## Physical passkey qualification
 
@@ -80,7 +80,7 @@ CRS_QUALIFICATION_BROWSER=chrome npm run qualify:passkeys
 
 The hostname above is a placeholder, not provisioned TLS or a reachable phone origin. The external receipt directory must already exist outside Git and be separate from archive storage. Chrome is the default; `msedge` selects an installed Edge. The driver refuses any existing profile before creating a fictional one. It stores only that fictional recovery phrase in a mode-0600 external file, uses the application's UI and unmodified physical credential API, waits for confirmed PRF enrollment and three real unlocks, switches the final active passkey attempt to recovery, verifies private access and locks the profile. Human gestures have no elapsed-time pass/fail target. Ctrl-C cancels and closes the driver; failed progress cannot produce a passing receipt.
 
-Receipts cover only the observed desktop browser/authenticator/origin combination. No virtual authenticator or disabled certificate validation is used. Controlled browser tests exercise the same driver with virtual hardware solely to validate selectors and lifecycle; they do not establish physical compatibility. Safari, Firefox, physical phones and release-build recreation require their own actual observations under [CRS-153](../todo/CRS-153.md). Recovery material and all raw artifacts stay outside Git; never attach them to a PR.
+Receipts cover only the observed desktop browser/authenticator/origin combination. No virtual authenticator or disabled certificate validation is used. Controlled browser tests exercise the same driver with virtual hardware solely to validate selectors and lifecycle; they do not establish physical compatibility. Safari, Firefox, physical phones and release-build recreation require their own actual observations under [CRS-163](../todo/CRS-163.md). Recovery material and all raw artifacts stay outside Git; never attach them to a PR.
 
 Encryption does not retroactively protect earlier plaintext backups, exports, downloads or Git history. Recovery verification proves the submitted secret works; it cannot prove that an independent copy remains available.
 
