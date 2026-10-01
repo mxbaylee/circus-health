@@ -359,7 +359,7 @@ for (const modelQuestion of [false, true])
     assert.equal(
       aliasAbsent.status,
       'confirmation_required',
-      'the assigned Self banner still blocks if the alias is absent',
+      'a borrowed Self answer cannot apply after the matched owner changes, even without its alias',
     );
     const receipt = intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!
       .identityConfirmations![0]!;
@@ -514,6 +514,170 @@ test('a same-named Person keeps another report from borrowing the Self receipt w
   assert.equal(after.blocking, true);
   blockedReportPaths(f, group.id, proposed.proposals.at(-1)!.id);
 });
+
+test('a stale Self receipt cannot waive a new banner clue on a changed report version', async (t) => {
+  const f = fixture(
+    t,
+    `${heading}\nPatient: ${patient}\nFictional count 12.00`,
+    'fictional-changed-banner.txt',
+  );
+  const a = await f.identity();
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    version: a.scope!.intakeVersion,
+    operationId: randomUUID(),
+    scope: a.scope!,
+    outcome: 'this_is_me',
+    attestation: a.scope!.questions?.length
+      ? 'confirmed_displayed_identity_questions'
+      : 'confirmed_displayed_report_subject',
+  });
+  const own = await f.identity();
+  assert.equal(own.status, 'prior_confirmation');
+  const workflow = intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!;
+  const changed = assessIdentityPolicy({
+    self: own.self,
+    people: [],
+    evidence: own.evidencedIdentity,
+    group: workflow.reportGroups![0]!,
+    groupVersionId: `${own.scope!.groupVersionId}-changed-members`,
+    originalFingerprint: own.scope!.evidenceOriginalFingerprint || '',
+    receipts: workflow.identityConfirmations,
+    nameEvidenceGrounded: true,
+    originalEvidenceChecked: true,
+    bannerBirthDates: [['1970-04-17']],
+  });
+  assert.equal(changed.status, 'confirmation_required');
+  assert.equal(changed.blocking, true);
+});
+
+for (const banner of [false, true])
+  for (const confirmedOwner of ['Self', 'Person'] as const)
+    for (const suffix of ['Jr.', 'Jr', 'II', 'III.', 'IV'] as const)
+      test(`suffix-only family names ask again after A is confirmed as ${confirmedOwner} (${banner ? 'banner' : 'no banner'}, ${suffix})`, async (t) => {
+        const secondHeading = 'Fictional Willow report';
+        const printed = (date: string) =>
+          banner ? `${patient}   Female   ${date}` : `Patient: ${patient}`;
+        const f = fixture(
+          t,
+          `${heading}\n${printed('4/17/1982')}\nFictional count 12.00\n${secondHeading}\n${printed('4/17/1970')}\nFictional count 14.00`,
+          'fictional-family-suffixes.txt',
+          {
+            fullName: confirmedOwner === 'Self' ? `${patient} Sr.` : otherPatient,
+            birthDate: selfBirthDate,
+          },
+        );
+        const senior =
+          confirmedOwner === 'Person'
+            ? createNote(f.db, {
+                kind: 'person',
+                title: `${patient} Sr.`,
+                person: { fullName: `${patient} Sr.`, birthDate: selfBirthDate },
+              })
+            : null;
+        const junior = createNote(f.db, {
+          kind: 'person',
+          title: `${patient} ${suffix}`,
+          person: { fullName: `${patient} ${suffix}`, birthDate: '1970-04-17' },
+        });
+        const b = addReport(f, secondHeading, 'fictional-junior-count');
+        const a = await f.identity();
+        await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+          version: a.scope!.intakeVersion,
+          operationId: randomUUID(),
+          scope: a.scope!,
+          outcome: confirmedOwner === 'Self' ? 'this_is_me' : 'this_is_person',
+          attestation: a.scope!.questions?.length
+            ? 'confirmed_displayed_identity_questions'
+            : 'confirmed_displayed_report_subject',
+          ...(senior
+            ? { personSelection: { noteId: senior.id, expectedVersion: senior.version } }
+            : {}),
+        });
+        const aAfter = await f.identity();
+        assert.equal(aAfter.blocking, false, 'A keeps its own confirmation');
+        const aReceipt = intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!
+          .identityConfirmations![0]!;
+        const aGroup = intake
+          .getIntake(f.db, f.root, f.profileId, f.item.id)
+          .workflow!.reportGroups!.find((candidate) => candidate.id === a.scope!.groupId)!;
+        const changedA = assessIdentityPolicy({
+          self: aAfter.self,
+          people: [senior, junior]
+            .filter((saved) => saved !== null)
+            .map((saved) => ({
+              noteId: saved.id,
+              personId: saved.personId!,
+              version: saved.version,
+              fullName: saved.person.fullName!,
+              knownNames: saved.person.knownNames ?? [],
+              birthDate: saved.person.birthDate ?? null,
+            })),
+          evidence: aAfter.evidencedIdentity,
+          group: aGroup,
+          groupVersionId: `${aAfter.scope!.groupVersionId}-changed-members`,
+          originalFingerprint: aAfter.scope!.evidenceOriginalFingerprint || '',
+          receipts: [aReceipt],
+          nameEvidenceGrounded: true,
+          originalEvidenceChecked: true,
+        });
+        assert.equal(
+          changedA.blocking,
+          true,
+          'a stale Self or Person receipt cannot answer a changed report version',
+        );
+        const review = await getIntakeIdentityReview(
+          f.db,
+          f.root,
+          f.profileId,
+          f.item.id,
+          b.group.id,
+        );
+        assert.equal(review.status, 'confirmation_required');
+        assert.equal(review.blocking, true);
+        if (confirmedOwner === 'Self') {
+          const explicitlyBorrowed = assessIdentityPolicy({
+            self: review.self,
+            people: [junior].map((saved) => ({
+              noteId: saved.id,
+              personId: saved.personId!,
+              version: saved.version,
+              fullName: saved.person.fullName!,
+              knownNames: saved.person.knownNames ?? [],
+              birthDate: saved.person.birthDate ?? null,
+            })),
+            evidence: review.evidencedIdentity,
+            group: b.group,
+            groupVersionId: review.scope!.groupVersionId,
+            originalFingerprint: review.scope!.evidenceOriginalFingerprint || '',
+            receipts: [aReceipt],
+            explicitlyConfirmedOperationId: aReceipt.operationId,
+            nameEvidenceGrounded: true,
+            originalEvidenceChecked: true,
+          });
+          assert.equal(explicitlyBorrowed.blocking, true);
+        }
+        blockedReportPaths(f, b.group.id, b.proposalId);
+        await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+          version: review.scope!.intakeVersion,
+          operationId: randomUUID(),
+          scope: review.scope!,
+          outcome: 'this_is_person',
+          attestation: review.scope!.questions?.length
+            ? 'confirmed_displayed_identity_questions'
+            : 'confirmed_displayed_report_subject',
+          personSelection: { noteId: junior.id, expectedVersion: junior.version },
+        });
+        const resolved = await getIntakeIdentityReview(
+          f.db,
+          f.root,
+          f.profileId,
+          f.item.id,
+          b.group.id,
+        );
+        assert.equal(resolved.blocking, false, 'B keeps its own exact Person confirmation');
+        const clinical = intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, b.proposalId);
+        assert.equal(clinical.records[0]!.mapping.personId, junior.personId);
+      });
 
 for (const banner of [false, true])
   for (const confirmedOwner of ['Self', 'Person'] as const)

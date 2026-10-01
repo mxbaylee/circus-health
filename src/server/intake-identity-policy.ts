@@ -757,6 +757,22 @@ export function assessIdentityPolicy({
         .map((owner) => [owner.personId, owner]),
     ).values(),
   ];
+  const withoutGenerationalSuffix = (name: string): string =>
+    canonicalIdentityName(name)
+      .replace(/(?:[\s,]+)(?:jr\.?|sr\.?|ii|iii|iv)\.?$/u, '')
+      .trim();
+  const suffixAmbiguity =
+    !!fullName &&
+    distinctOwners.length === 1 &&
+    owners.some(
+      (owner) =>
+        owner.personId !== distinctOwners[0]!.personId &&
+        owner.names.some(
+          (name) =>
+            canonicalIdentityName(name) !== canonicalIdentityName(fullName) &&
+            withoutGenerationalSuffix(name) === withoutGenerationalSuffix(fullName),
+        ),
+    );
   const challengedName =
     !!fullName &&
     [self, ...people].some((owner) =>
@@ -882,12 +898,18 @@ export function assessIdentityPolicy({
   // cannot decide between same-named owners or override B's banner against
   // the owner it would actually assign, even when there is no unique match.
   // B's own applicable confirmation still resolves its ownership question.
-  const borrowedSelfReceipt =
-    latestPersonChoice?.outcome === 'this_is_me' && latestPersonChoice.scope.groupId !== group?.id;
+  const ownSelfReceipt =
+    latestPersonChoice?.outcome === 'this_is_me' &&
+    latestPersonChoice.scope.groupId === group?.id &&
+    latestPersonChoice.scope.groupVersionId === groupVersionId;
+  const borrowedSelfReceipt = latestPersonChoice?.outcome === 'this_is_me' && !ownSelfReceipt;
   const receipt =
     latestPersonChoice?.outcome === 'this_is_me' &&
     (!borrowedSelfReceipt ||
-      (!unreadableBirthDate && distinctOwners.length <= 1 && !bannerIncompatibleWith(owners[0])))
+      (!unreadableBirthDate &&
+        distinctOwners.length <= 1 &&
+        !suffixAmbiguity &&
+        !bannerIncompatibleWith(owners[0])))
       ? latestPersonChoice
       : undefined;
   const explicitReceipt =
@@ -974,6 +996,7 @@ export function assessIdentityPolicy({
   if (
     resolutionOperationId &&
     !ownPersonReceipt &&
+    (!suffixAmbiguity || ownSelfReceipt) &&
     !selfBirthDateConflict &&
     !conflicts.some((conflict) => conflict.reason === 'evidence_disagreement')
   )
@@ -1048,6 +1071,15 @@ export function assessIdentityPolicy({
       },
     };
   }
+  if (suffixAmbiguity && !ownSelfReceipt)
+    return {
+      ...common,
+      confidence: 'none',
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'This printed name could belong to people whose saved names differ only by a generational suffix. Choose who this report belongs to.',
+    };
   if (distinctOwners.length > 1)
     return {
       ...common,
