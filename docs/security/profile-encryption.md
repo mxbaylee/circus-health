@@ -69,18 +69,18 @@ Controlled fictional tests exercise recovery verification, invalid/wrong-profile
 
 ## Physical passkey qualification
 
-Run the headed journey only against a fresh, isolated fictional Compose installation on a reachable trusted HTTPS origin:
+Run the headed journey only against a fresh, isolated fictional Compose installation. For the supported local installation, use its exact HTTP localhost origin:
 
 ```sh
 CRS_PHYSICAL_PASSKEY_QUALIFICATION=1 \
-CRS_QUALIFICATION_ORIGIN=https://your-qualified-host.example \
+CRS_QUALIFICATION_ORIGIN=http://localhost:3001 \
 CRS_QUALIFICATION_OUTPUT_DIR=/absolute/path/private-receipts \
 CRS_QUALIFICATION_BROWSER=chrome npm run qualify:passkeys
 ```
 
-The hostname above is a placeholder, not provisioned TLS or a reachable phone origin. The external receipt directory must already exist outside Git and be separate from archive storage. Chrome is the default; `msedge` selects an installed Edge. The driver refuses any existing profile before creating a fictional one. It stores only that fictional recovery phrase in a mode-0600 external file, uses the application's UI and unmodified physical credential API, waits for confirmed PRF enrollment and three real unlocks, switches the final active passkey attempt to recovery, verifies private access and locks the profile. Human gestures have no elapsed-time pass/fail target. Ctrl-C cancels and closes the driver; failed progress cannot produce a passing receipt.
+Use the configured localhost port; the example does not launch a second installation or authorize using an existing household archive. A trusted HTTPS hostname is also accepted when that deployment is adopted; configuring an origin does not provision TLS. Numeric IP addresses (including loopback), insecure LAN/remote hosts, credentials, paths, queries, fragments and noncanonical origin spellings are refused. The navigated origin must remain exact and the browser must report a secure context before even listing profiles. Certificate validation and the native credential API remain unmodified. The external receipt directory must already exist outside Git and be separate from archive storage. Chrome is the default; `msedge` selects an installed Edge. The driver refuses any existing profile before creating a fictional one. It stores only that fictional recovery phrase in a mode-0600 external file, uses the application's UI and unmodified physical credential API, waits for confirmed PRF enrollment and three real unlocks, switches the final active passkey attempt to recovery, verifies private access and locks the profile. Human gestures have no elapsed-time pass/fail target. Ctrl-C cancels and closes the driver; failed progress cannot produce a passing receipt.
 
-Receipts cover only the observed desktop browser/authenticator/origin combination. No virtual authenticator or disabled certificate validation is used. Controlled browser tests exercise the same driver with virtual hardware solely to validate selectors and lifecycle; they do not establish physical compatibility. Safari, Firefox, physical phones and release-build recreation require their own actual observations under [CRS-163](../todo/CRS-163.md). Recovery material and all raw artifacts stay outside Git; never attach them to a PR.
+Receipts cover only the observed desktop browser/authenticator/origin combination. Their HTTPS flag reflects the configured transport (false for HTTP localhost), and scope distinguishes localhost from HTTPS; a failed preflight cannot produce a passing receipt. No virtual authenticator or disabled certificate validation is used. Controlled browser tests exercise the same driver with virtual hardware solely to validate selectors and lifecycle; they do not establish physical compatibility. Safari, Firefox, a second passkey and release-build recreation require their own actual observations; physical phone or remote-origin coverage applies only when that deployment is adopted, as tracked in [CRS-163](../todo/CRS-163.md). Recovery material and all raw artifacts stay outside Git; never attach them to a PR.
 
 Encryption does not retroactively protect earlier plaintext backups, exports, downloads or Git history. Recovery verification proves the submitted secret works; it cannot prove that an independent copy remains available.
 

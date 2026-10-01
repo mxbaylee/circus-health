@@ -50,11 +50,11 @@ Each open item shows its score after its sizes. When a size or mark changes, rec
 
 | #   | Ticket                                                         | Score | Tie-break                       | Owner input                                                                               |
 | --- | -------------------------------------------------------------- | ----- | ------------------------------- | ----------------------------------------------------------------------------------------- |
-| 1   | 🧭 [CRS-162](CRS-162.md) localhost passkey driver | 9 | 🔴, unblocks CRS-163 | None |
-| 2   | 🔐 [CRS-163](#crs-163) passkeys                                | 8     | 🔴, unblocks CRS-088            | Tap passkey prompts on the intended localhost desktop                                        |
-| 3   | 💽 [CRS-152](#crs-152) deployment drive                        | 8     | 🔴                              | Connect or choose the drive                                                               |
-| 4   | 👥 [CRS-124](#crs-124) People display                          | 8     | 🟡 🐭                           | Inspect non-Self people in intended layouts                                               |
-| 5   | 📈 [CRS-158](CRS-158.md) large-import diagnostics and baseline | 7     | 🔴, unblocks CRS-086 validation | None for scripted baseline; paid-run approval/route access later; optional owner feedback |
+| 1   | 🔐 [CRS-163](#crs-163) passkeys                                | 8     | 🔴, unblocks CRS-088            | Tap passkey prompts on the intended localhost desktop                                        |
+| 2   | 💽 [CRS-152](#crs-152) deployment drive                        | 8     | 🔴                              | Connect or choose the drive                                                               |
+| 3   | 👥 [CRS-124](#crs-124) People display                          | 8     | 🟡 🐭                           | Inspect non-Self people in intended layouts                                               |
+| 4   | 📈 [CRS-158](CRS-158.md) large-import diagnostics and baseline | 7     | 🔴, unblocks CRS-086 validation | None for scripted baseline; paid-run approval/route access later; optional owner feedback |
+| 5   | 🪡 [CRS-160](CRS-160.md) historical assertion restoration | 7 | 🔴, unblocks CRS-161 | None; split before implementation or owner grade before merge |
 
 Next up: 📦 [CRS-043](CRS-043.md), 🩻 [CRS-062](#crs-062), 🥡 [CRS-068](#crs-068), ⚙️ [CRS-086](CRS-086.md), and 🏷️ [CRS-139](CRS-139.md) (7, 🔴). CRS-086 independently implements async processing and bounded context; CRS-158 prepares complete downloadable diagnostics before the owner's common 800–900-page trial, supplies its instrumented comparison baseline, and produces prioritized production follow-ups (owner, 2026-10-01). Preparatory async design can start while diagnostics readiness proceeds; CRS-158's current scripted 900-page baseline precedes writing CRS-086's full implementation specification, and does not wait for parallel workers. 🩺 [CRS-154](CRS-154.md) (7, 🟡) shares complaint/download validation. ♻️ [CRS-155](CRS-155.md) scores 8 but waits for natural token expiry. 🗂️ [CRS-150](CRS-150.md) waits for 🩹 [CRS-085](CRS-085.md); 🧐 [CRS-073](#crs-073) waits for CRS-150.
 
@@ -97,7 +97,6 @@ Proposed focused-ticket divisions are recorded in [CRS-140](CRS-140.md#proposed-
 - [ ] <a id="crs-148"></a> 🧳 [CRS-148](CRS-148.md) · 🐘 L · 🟡 M · score 3 — Export everything in a portable form, Takeout-style: originals, records, notes, corrections and history, with a manifest, for moving storage or keeping a checkpoint elsewhere.
 - [ ] <a id="crs-149"></a> 🎣 [CRS-149](CRS-149.md) · 🐭 S · 🟡 M · score 5 — Confirm and show the destination of external links in assistant text (warn when a link carries data), and test that one session's unlock never grants another session access.
 
-- [ ] <a id="crs-162"></a> 🧭 [CRS-162](CRS-162.md) · 🐭 S · 🔴 L · 🚀 production · score 9 — Prepare the physical passkey driver for the intended localhost origin, preserving secure-context checks and truthful receipts; unblocks CRS-163.
 
 ## <a id="release-and-usability-checks"></a>✅ Release and usability checks
 

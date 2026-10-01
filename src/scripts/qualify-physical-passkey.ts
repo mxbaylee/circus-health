@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type APIRequestContext, type Page } from 'playwright';
@@ -14,10 +15,20 @@ export function physicalPasskeyConfiguration(env: NodeJS.ProcessEnv) {
   );
   assert.ok(env.CRS_QUALIFICATION_ORIGIN, 'Supply the isolated fictional installation origin.');
   const origin = publicOrigin({ CRS_PUBLIC_ORIGIN: env.CRS_QUALIFICATION_ORIGIN }, '443');
+  const address = new URL(origin);
   assert.equal(
-    new URL(origin).protocol,
-    'https:',
-    'Physical qualification requires a trusted HTTPS origin.',
+    address.origin,
+    origin,
+    'Supply the exact canonical origin; normalization is not qualification.',
+  );
+  assert.ok(
+    !isIP(address.hostname.replace(/^\[|\]$/g, '')),
+    'Passkeys require a hostname; use localhost for local qualification.',
+  );
+  assert.ok(
+    address.protocol === 'https:' ||
+      (address.protocol === 'http:' && address.hostname === 'localhost'),
+    'Physical qualification requires HTTP localhost or a trusted HTTPS hostname.',
   );
   const channel = env.CRS_QUALIFICATION_BROWSER ?? 'chrome';
   assert.ok(
@@ -27,7 +38,7 @@ export function physicalPasskeyConfiguration(env: NodeJS.ProcessEnv) {
   const output = external(env.CRS_QUALIFICATION_OUTPUT_DIR, 'CRS_QUALIFICATION_OUTPUT_DIR', {
     directory: true,
   });
-  return { origin, channel, output };
+  return { origin, channel, output, https: address.protocol === 'https:' };
 }
 
 export interface PhysicalPasskeyProgress {
@@ -77,6 +88,16 @@ export async function physicalPasskeyJourney(
     return result.data as T;
   };
   await page.goto(origin);
+  assert.equal(
+    new URL(page.url()).origin,
+    origin,
+    'Qualification origin changed during navigation.',
+  );
+  assert.equal(
+    await page.evaluate(() => (globalThis as { isSecureContext?: boolean }).isSecureContext),
+    true,
+    'The browser must report a secure context before creating a fictional profile.',
+  );
   assert.deepEqual(await api('/api/profiles'), [], 'Use a fresh isolated fictional installation.');
   const name = 'Fictional Passkey Person ' + randomUUID().slice(0, 8);
   creatingProfile(name);
@@ -280,19 +301,22 @@ async function main() {
         JSON.stringify(
           {
             schemaVersion: 1,
-            task: 'CRS-153',
+            task: 'CRS-163',
             independentlyFictional: true,
             browserChannel: config.channel,
             browserVersion: browser.version(),
-            https: true,
+            https: config.https,
             passed: physicalPasskeyPassed(progress, journeyCompleted),
             journeyCompleted,
             cleanupLock,
             progress,
-            scope: 'One actual desktop browser and authenticator on one trusted HTTPS origin.',
+            scope: config.https
+              ? 'One actual desktop browser and authenticator on one trusted HTTPS origin.'
+              : 'One actual desktop browser and authenticator on HTTP localhost; completion requires a browser-verified secure context.',
             remainingAcceptance: [
               'Other intended browsers and authenticators',
-              'Physical phone HTTPS-origin journey',
+              'Second passkey with independent unlock on an adopted device/authenticator',
+              'Physical phone or remote HTTPS-origin journey only if that deployment is adopted',
               'Release-build container recreation',
             ],
           },
