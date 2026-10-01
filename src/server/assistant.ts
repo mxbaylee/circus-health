@@ -2874,8 +2874,12 @@ export function createAssistant({
         // include context beyond one measured page or span.
         (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
       } else throw new Error('Unsupported extraction-plan operation');
-      if (args.action === 'read')
-        // Context sections can carry literal proposal evidence and source locators.
+      if (
+        params.tool === 'health_intake_question' ||
+        (params.tool === 'health_intake_plan' &&
+          (args.action === 'read' || args.action === 'create'))
+      )
+        // Plan and question responses can carry literal evidence and source locators.
         // Until each section has a measured contract, retain whole-source pinning.
         (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
     } else if (params.tool === 'health_intake_source_text') {
