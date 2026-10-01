@@ -6452,13 +6452,90 @@ test('external text correction remains terminal even if the model supplies its n
   assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
 });
 
-test('a late proposal preserves a consumed section when another section is captured', async (t) => {
+test('a deferred model proposal survives an unrelated append but rejects a later observed correction', async (t) => {
   fictionalModel(t);
-  const f = fixture(t, {}, encryptedRecordStorage(t));
+  const gates = [0, 1].map(() => {
+    let observed!: () => void;
+    let release!: () => void;
+    let settle!: () => void;
+    return {
+      observed: new Promise<void>((resolve) => (observed = resolve)),
+      released: new Promise<void>((resolve) => (release = resolve)),
+      settled: new Promise<void>((resolve) => (settle = resolve)),
+      signalObserved: () => observed(),
+      signalSettled: () => settle(),
+      release: () => release(),
+    };
+  });
+  t.after(() => gates.forEach((gate) => gate.release()));
+  let sourceId = '';
+  let turn = 0;
+  const outcomes: Array<{
+    result?: { proposalSourceText: ProposalSourceTextHandoff };
+    error?: unknown;
+  }> = [];
+  const f = fixture(
+    t,
+    {
+      bridgeFactory: (callbacks) => ({
+        async start() {
+          return { model: 'fictional-deferred-source-response' };
+        },
+        async turn() {
+          const currentTurn = turn++;
+          callbacks.beforeRequest?.();
+          callbacks.onEvent?.('turn/started', { turn: { id: `deferred-${currentTurn}` } });
+          const passage = (await callbacks.onTool?.({
+            tool: 'health_intake_source_text',
+            arguments: { id: sourceId, page: 1 },
+            callId: `fictional-deferred-read-${currentTurn}`,
+          })) as { revisionId: string };
+          const version = getIntake(f.db, f.root, 'cedar', sourceId).version;
+          gates[currentTurn]!.signalObserved();
+          await gates[currentTurn]!.released;
+          try {
+            const result = (await callbacks.onTool?.({
+              tool: 'health_intake_propose',
+              arguments: {
+                id: sourceId,
+                version,
+                sourceTextRevisionId: passage.revisionId,
+                summary: 'Fictional deferred bounded proposal',
+                jsonlText: JSON.stringify({
+                  format: 'health-record-v1',
+                  id: `fictional-deferred-context-${currentTurn}`,
+                  kind: 'context',
+                  payload: { text: 'Fictional first-page evidence' },
+                  provenance: {
+                    capturedVia: 'Fictional PDF',
+                    sourceSystem: null,
+                    sourceRecordId: null,
+                    evidenceClass: 'transcription',
+                    locator: 'page 1',
+                  },
+                  coverage: { status: 'partial', notes: ['Later source remains.'] },
+                }),
+              },
+              callId: `fictional-deferred-proposal-${currentTurn}`,
+            })) as { proposalSourceText: ProposalSourceTextHandoff };
+            outcomes[currentTurn] = { result };
+          } catch (error) {
+            outcomes[currentTurn] = { error };
+          }
+          callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+          gates[currentTurn]!.signalSettled();
+        },
+        async cancel() {},
+        close() {},
+      }),
+    },
+    encryptedRecordStorage(t),
+  );
   const item = uploadIntake(f.db, f.root, 'cedar', {
     filename: 'fictional-late-sections.txt',
     bytes: Buffer.from('Fictional first-page evidence. '.repeat(2500)),
   });
+  sourceId = item.id;
   const { extractIntakeSourceText } = await import('../intake-source-extraction.ts');
   const { getIntakeSourceText } = await import('../intake-source-text.ts');
   await extractIntakeSourceText({
@@ -6470,17 +6547,9 @@ test('a late proposal preserves a consumed section when another section is captu
   });
   const chat = f.assistant.create('cedar', { title: 'Fictional late page' });
   f.assistant.send('cedar', chat.id, { message: 'Review the fictional source page' });
-  await tick();
-  const bridge = f.bridges[0]!;
-  const before = getIntake(f.db, f.root, 'cedar', item.id);
-  const passage = await call<{ revisionId: string }>(bridge, 'intake_source_text', {
-    id: item.id,
-    page: 1,
-  });
-  assert.equal(
-    passage.revisionId,
-    getIntakeSourceText(f.db, f.root, 'cedar', item.id).revision?.id,
-  );
+  await gates[0]!.observed;
+  assert.equal(chat.status, 'running', 'the model response is held after seeing page one');
+  const beforeRevision = getIntakeSourceText(f.db, f.root, 'cedar', item.id).revision!.id;
   await extractIntakeSourceText({
     db: f.db,
     root: f.root,
@@ -6488,40 +6557,19 @@ test('a late proposal preserves a consumed section when another section is captu
     id: item.id,
     maxPages: 1,
   });
-  const result = await call<{ proposalSourceText: ProposalSourceTextHandoff }>(
-    bridge,
-    'intake_propose',
-    {
-      id: item.id,
-      version: before.version,
-      sourceTextRevisionId: passage.revisionId,
-      summary: 'Fictional bounded proposal',
-      jsonlText: JSON.stringify({
-        format: 'health-record-v1',
-        id: 'fictional-late-context',
-        kind: 'context',
-        payload: { text: 'Fictional first-page evidence' },
-        provenance: {
-          capturedVia: 'Fictional PDF',
-          sourceSystem: null,
-          sourceRecordId: null,
-          evidenceClass: 'transcription',
-          locator: 'page 1',
-        },
-        coverage: { status: 'partial', notes: ['Later source remains.'] },
-      }),
-    },
-  );
+  assert.equal(outcomes.length, 0, 'no proposal returned while the provider is held');
+  gates[0]!.release();
+  await gates[0]!.settled;
+  const result = outcomes[0]!.result!;
+  assert.equal(outcomes[0]!.error, undefined);
   assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
-  assert.notEqual(result.proposalSourceText.currentRevisionId, passage.revisionId);
-  await call(bridge, 'intake_source_text', {
-    id: item.id,
-    action: 'search',
-    query: 'Fictional',
-  });
+  assert.notEqual(result.proposalSourceText.currentRevisionId, beforeRevision);
+  assert.equal(chat.status, 'idle');
+  f.assistant.send('cedar', chat.id, { message: 'Review the same fictional page again' });
+  await gates[1]!.observed;
+  assert.equal(chat.status, 'running');
   const { reviewIntakeSourceText } = await import('../intake-source-text.ts');
   const current = getIntakeSourceText(f.db, f.root, 'cedar', item.id).revision!;
-  assert.ok(current.pages.some((page) => page.page === 2));
   reviewIntakeSourceText(
     f.db,
     f.root,
@@ -6532,41 +6580,22 @@ test('a late proposal preserves a consumed section when another section is captu
       expectedRevisionId: current.id,
       sourceHash: current.sourceHash,
       action: 'correct',
-      scope: { page: 2 },
+      scope: { page: 1 },
       spans: [
         {
           id: 'fictional-late-correction',
-          text: 'Corrected fictional second-page evidence.',
+          text: 'Corrected fictional first-page evidence.',
           provenance: 'human',
-          region: { page: 2 },
+          region: { page: 1 },
         },
       ],
     },
     'fictional-owner',
   );
-  await assert.rejects(
-    call(bridge, 'intake_propose', {
-      id: item.id,
-      version: before.version,
-      sourceTextRevisionId: passage.revisionId,
-      summary: 'Late response against corrected evidence',
-      jsonlText: JSON.stringify({
-        format: 'health-record-v1',
-        id: 'fictional-stale-context',
-        kind: 'context',
-        payload: { text: 'Fictional first-page evidence' },
-        provenance: {
-          capturedVia: 'Fictional PDF',
-          sourceSystem: null,
-          sourceRecordId: null,
-          evidenceClass: 'transcription',
-          locator: 'page 1',
-        },
-        coverage: { status: 'partial', notes: ['Later source remains.'] },
-      }),
-    }),
-    (error: unknown) => hasCode(error, 'SOURCE_TEXT_CHANGED'),
-  );
+  assert.equal(outcomes.length, 1, 'the corrected response is still held');
+  gates[1]!.release();
+  await gates[1]!.settled;
+  assert.ok(hasCode(outcomes[1]!.error, 'SOURCE_TEXT_CHANGED'));
   assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
 });
 
