@@ -155,6 +155,7 @@ export interface QualificationAcceptanceOptions {
     prefix: string,
   ) => Promise<{ blocks: IntakeImportFeedBlock[]; feed: IntakeImportFeed }>;
   originalHash: (prefix: string, originalId: string) => Promise<string>;
+  afterAcceptedBeforeRecovery?: () => Promise<void>;
 }
 
 export async function performQualificationAcceptance({
@@ -170,6 +171,7 @@ export async function performQualificationAcceptance({
   request,
   collectFeed,
   originalHash,
+  afterAcceptedBeforeRecovery,
 }: QualificationAcceptanceOptions) {
   check(
     /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(profileId) && prefix === `/api/profiles/${profileId}`,
@@ -397,6 +399,7 @@ export async function performQualificationAcceptance({
     (await originalHash(prefix, originalId)) === expectedSha256,
     'Acceptance changed the retained original.',
   );
+  await afterAcceptedBeforeRecovery?.();
   await request(prefix + '/lock', {});
   // Delete only this harness-owned disposable cache after lock. Originals,
   // manifests, accepted versions and the encrypted recovery authority survive.
