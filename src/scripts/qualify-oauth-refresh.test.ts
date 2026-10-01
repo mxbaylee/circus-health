@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { authMountOverlaps, containerPhase, parsePhaseResult } from './qualify-oauth-refresh.ts';
+import {
+  authMountOverlaps,
+  containerPhase,
+  parsePhaseResult,
+  safeOAuthFailureCode,
+} from './qualify-oauth-refresh.ts';
 import { Docker } from '../../deploy/run.ts';
 
 test('OAuth phase parser accepts only matching, internally consistent evidence', () => {
@@ -93,4 +98,21 @@ test('owned OAuth container cleanup runs after failure and cleanup failure canno
     assert.match(name, /^circus-oauth-qualification-/u);
     assert.deepEqual(docker.calls[1], ['rm', '--force', name]);
   }
+});
+
+test('failure codes disclose only known operational categories', () => {
+  assert.equal(
+    safeOAuthFailureCode(new Error('OWNED_CONTAINER_CLEANUP_FAILED')),
+    'owned_container_cleanup_failed',
+  );
+  assert.equal(
+    safeOAuthFailureCode(
+      new Error('Stop containers using this OAuth state before live refresh qualification.'),
+    ),
+    'active_auth_container',
+  );
+  assert.equal(
+    safeOAuthFailureCode(new Error('provider response contained fictional-secret')),
+    'phase_or_docker_error',
+  );
 });

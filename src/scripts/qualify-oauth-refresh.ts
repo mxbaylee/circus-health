@@ -21,6 +21,18 @@ type PhaseResult = {
   persistenceObserved: boolean;
 };
 
+export function safeOAuthFailureCode(error: unknown) {
+  if (!(error instanceof Error)) return 'phase_or_docker_error';
+  if (error.message === 'OWNED_CONTAINER_CLEANUP_FAILED') return 'owned_container_cleanup_failed';
+  if (error.message.includes('active launcher, login or qualification writer'))
+    return 'credential_writer_busy';
+  if (error.message === 'Stop containers using this OAuth state before live refresh qualification.')
+    return 'active_auth_container';
+  if (error.message === 'Could not inspect active credential writers.')
+    return 'credential_writer_inspection_failed';
+  return 'phase_or_docker_error';
+}
+
 export function parsePhaseResult(phase: Phase, output: string): PhaseResult {
   // Never echo untrusted provider/container output; accept exactly one small JSON line.
   const lines = output.trim().split(/\r?\n/u);
@@ -147,7 +159,11 @@ export async function containerPhase(
     try {
       // Remove only this owned container, including after Docker CLI cancellation.
       // Failure propagates and prevents a passing receipt.
-      await docker.run(['rm', '--force', name], { cleanup: true });
+      try {
+        await docker.run(['rm', '--force', name], { cleanup: true });
+      } catch {
+        throw new Error('OWNED_CONTAINER_CLEANUP_FAILED');
+      }
     } finally {
       docker.dispose();
     }
@@ -186,21 +202,27 @@ export async function qualifyOAuthRefresh(env: NodeJS.ProcessEnv = process.env) 
     sourceRevision: source.revision || 'unknown',
     sourceWorktree: source.worktree,
     outcome: 'failed',
+    failureStage: null as null | 'probe' | 'writer_check' | 'refresh' | 'reuse',
+    failureCode: null as null | ReturnType<typeof safeOAuthFailureCode>,
     phases: [] as Array<{ phase: Phase; result: PhaseResult }>,
   };
+  let stage: 'probe' | 'writer_check' | 'refresh' | 'reuse' = 'probe';
   try {
     const paths = { auth, config, providerEnv, model };
     const probe = await containerPhase('probe', paths);
     receipt.phases.push({ phase: 'probe', result: probe });
     if (probe.status === 'pending_natural_expiry') receipt.outcome = 'pending_natural_expiry';
     else {
+      stage = 'writer_check';
       const lock = acquireOAuthStateLock(auth);
       try {
         await refuseActiveAuthContainers(auth);
+        stage = 'refresh';
         const refresh = await containerPhase('refresh', paths);
         receipt.phases.push({ phase: 'refresh', result: refresh });
         if (refresh.status === 'pending_natural_expiry') receipt.outcome = 'pending_natural_expiry';
         else {
+          stage = 'reuse';
           const reuse = await containerPhase('reuse', paths);
           receipt.phases.push({ phase: 'reuse', result: reuse });
           receipt.outcome = 'passed';
@@ -209,9 +231,11 @@ export async function qualifyOAuthRefresh(env: NodeJS.ProcessEnv = process.env) 
         lock.release();
       }
     }
-  } catch {
+  } catch (error) {
     // Docker and provider error bodies never enter receipts or terminal output.
     receipt.outcome = 'failed';
+    receipt.failureStage = stage;
+    receipt.failureCode = safeOAuthFailureCode(error);
   }
   const name = `oauth-qualification-${new Date().toISOString().replace(/[:.]/gu, '-')}-${randomUUID()}.json`;
   const path = join(outputDir, name);
