@@ -82,6 +82,11 @@ not a new manual assertion; uncertain legacy provenance requires review.
 
 Use **Change person · saved and pending records** in report review, **Change person**
 on a saved clinical record, or **Select records to change person** in saved collections.
+Saved-result, prescription, procedure and provider-note action menus each compose one
+**Change person** control separately from **Correct saved record**. The correction control
+does not add ownership actions implicitly. Completing the person-change dialog refreshes
+the owning detail view. Source-document and vision views retain their own person-change
+controls; report-level controls name their broader saved-and-pending scope.
 Self, any active Person, and a Person created by the correction are available destinations.
 The preview pins the displayed membership, records, source contributions, destination,
 matching decisions, relationships and name support. Changed evidence or profile state

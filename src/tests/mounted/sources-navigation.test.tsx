@@ -314,3 +314,36 @@ it('keeps source review inside the selected original without a second inventory 
   await user.click(screen.getByRole('tab', { name: 'Documents' }));
   expect(screen.queryByRole('button', { name: 'Review source text' })).toBeNull();
 });
+
+it('source document detail keeps one person-change action', async () => {
+  selectProfile({ id: 'fictional-source-actions', name: 'Fictional profile', placebo: true });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(
+      async (input) =>
+        new Response(
+          JSON.stringify({
+            data: String(input).endsWith('/documents/fictional-document')
+              ? {
+                  id: 'fictional-document',
+                  personId: 'patient',
+                  title: 'Fictional document',
+                  date: null,
+                  sourceRecordId: 'fictional-source',
+                  text: 'Fictional retained words',
+                  extra: {},
+                }
+              : [],
+            meta: { revision: 1 },
+          }),
+        ),
+    ),
+  );
+  const router = createMemoryRouter([{ path: '/sources', element: <Sources /> }], {
+    initialEntries: ['/sources?document=fictional-document'],
+  });
+  render(<RouterProvider router={router} />);
+  await screen.findByRole('heading', { name: 'Fictional document' });
+  await userEvent.setup().click(screen.getByRole('button', { name: 'More entry actions' }));
+  expect(screen.getAllByRole('button', { name: 'Change person' })).toHaveLength(1);
+});
