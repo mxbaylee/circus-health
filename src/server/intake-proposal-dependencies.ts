@@ -272,8 +272,8 @@ export function writeProposalDependencies(
   const original = db
     .prepare("SELECT mime_type FROM source_files WHERE id=? AND kind='intake_original'")
     .get(originalIntakeId);
-  // Package membership and linked child/report relationships are not yet a
-  // measured closed scope. Their proposals retain the conservative broad pin.
+  // A package root needs an explicit measured child/member relationship; a
+  // non-package proposal cannot claim a different original's source text.
   if (!original) return;
   if (
     observed.some((source) =>
