@@ -221,19 +221,27 @@ export interface NoteExportSnapshot {
 const unassignedAssertionDisclosure =
   'Some retained clinical assertions have no verified single-person assignment and were left out of this packet. Review the original records before relying on this packet as complete.';
 
+// Keep raw-history selection and its privacy-preserving omission notice on the
+// same provider, kind and representation boundary. Intake rows are notice-only:
+// their retained extraction is not an accepted additional clinical assertion.
+const rawAssertionKinds =
+  "'clinical_object','allergy','allergies','allergyintolerance','condition','conditions','diagnosis','diagnoses','encounter','encounters','visit','visits','immunization','immunizations'";
+const unrepresentedProviderAssertion = `sr.provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))
+  AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type<>'person')
+  AND NOT EXISTS (SELECT 1 FROM observations WHERE source_record_id=sr.id)
+  AND NOT EXISTS (SELECT 1 FROM medications WHERE source_record_id=sr.id)
+  AND NOT EXISTS (SELECT 1 FROM procedures WHERE source_record_id=sr.id)
+  AND NOT EXISTS (SELECT 1 FROM documents WHERE source_record_id=sr.id)`;
+const singleAssertionOwner = `(SELECT count(DISTINCT e.entity_id) FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject')=1
+  AND EXISTS (SELECT 1 FROM evidence e JOIN people p ON p.id=e.entity_id WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject')`;
+
 function unassignedPacketAssertions(db: Database): boolean {
   return !!db
     .prepare(
       `SELECT 1 FROM source_records sr
-       WHERE sr.provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))
-         AND lower(sr.kind) IN ('clinical_object','allergy','allergies','allergyintolerance','condition','conditions','diagnosis','diagnoses','encounter','encounters','visit','visits','immunization','immunizations','intake_record','intake_document')
-         AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type<>'person')
-         AND NOT EXISTS (SELECT 1 FROM observations WHERE source_record_id=sr.id)
-         AND NOT EXISTS (SELECT 1 FROM medications WHERE source_record_id=sr.id)
-         AND NOT EXISTS (SELECT 1 FROM procedures WHERE source_record_id=sr.id)
-         AND NOT EXISTS (SELECT 1 FROM documents WHERE source_record_id=sr.id)
-         AND (SELECT count(DISTINCT e.entity_id) FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject')<>1
-       LIMIT 1`,
+    WHERE ${unrepresentedProviderAssertion}
+      AND lower(sr.kind) IN (${rawAssertionKinds},'intake_record','intake_document')
+      AND NOT (${singleAssertionOwner}) LIMIT 1`,
     )
     .get();
 }
@@ -736,32 +744,17 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
   // evidence identifies this one subject. A name in raw source JSON is not an
   // authority for packet membership.
   if (provider) {
-    const represented = new Set(
-      db
-        .prepare(
-          "SELECT source_record_id FROM evidence WHERE entity_type<>'person' UNION SELECT source_record_id FROM observations UNION SELECT source_record_id FROM medications UNION SELECT source_record_id FROM procedures UNION SELECT source_record_id FROM documents",
-        )
-        .all()
-        .map((r) => r.source_record_id),
-    );
     for (const row of db
       .prepare(
-        `SELECT sr.id,sr.kind FROM source_records sr
-          WHERE sr.provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))
-          AND EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id=? AND e.source_record_id=sr.id AND e.role='report_subject')
-          AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id<>? AND e.source_record_id=sr.id AND e.role='report_subject')
-          ORDER BY sr.id`,
+        `SELECT sr.id FROM source_records sr
+      WHERE ${unrepresentedProviderAssertion}
+        AND lower(sr.kind) IN (${rawAssertionKinds})
+        AND (${singleAssertionOwner})
+        AND EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id=? AND e.source_record_id=sr.id AND e.role='report_subject')
+      ORDER BY sr.id`,
       )
-      .all(personId, personId) as unknown as Array<ExportRow & { id: string; kind: string }>) {
-      if (
-        !represented.has(row.id) &&
-        (row.kind === 'clinical_object' ||
-          /^(allerg(y|ies|yintolerance)|conditions?|diagnos(is|es)|encounters?|visits?|immunizations?)$/i.test(
-            row.kind,
-          ))
-      )
-        add('source', row.id);
-    }
+      .all(personId))
+      add('source', String(row.id));
   }
   return {
     ...input,

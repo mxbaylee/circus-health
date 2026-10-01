@@ -161,3 +161,5 @@ earlier decision or automatically collapses a previous split. Accepted versions 
 available from the corrected record's history. A new export packet includes the person
 correction in PDF and evidence data; the app has no durable ledger of which earlier
 packets were generated or shared, so a person must check copies they already shared.
+
+Historical raw allergy, condition, visit and immunization assertions may predate explicit report-subject evidence. The [packet ownership evidence inventory](../../src/server/NOTE-EXPORTS.md#historical-raw-assertion-ownership) distinguishes accepted mappings and exact human receipts from raw names, shared files and source mentions. Packets omit unresolved assertions with a generic notice; current identity confirmation does not implement a historical backfill or raw-assertion review path.
