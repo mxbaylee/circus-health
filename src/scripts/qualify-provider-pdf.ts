@@ -23,6 +23,7 @@ import {
 } from './provider-qualification-batch.ts';
 import { gradeQualificationDelivery } from './provider-qualification-delivery.ts';
 import { performQualificationAcceptance } from './provider-qualification-acceptance.ts';
+import { gradeDiagnosticLifecycle } from './provider-diagnostics-qualification.ts';
 import {
   gradeProviderQualification,
   qualificationPerson,
@@ -92,6 +93,7 @@ interface QualificationRun {
   coordinator: ReturnType<typeof summarizeQualificationBatch>;
   reviewEvidenceFile: string;
   diagnostics: ReturnType<typeof summarizeQualificationDiagnostics>;
+  diagnosticQualification: ReturnType<typeof gradeDiagnosticLifecycle> | null;
   acceptance: null | {
     passed: boolean;
     selectedRecords: number;
@@ -260,8 +262,8 @@ async function main() {
   );
   const scenario = process.env.CRS_QUALIFICATION_SCENARIO ?? 'quick';
   check(
-    scenario === 'quick' || scenario === 'long',
-    'CRS_QUALIFICATION_SCENARIO must be quick or long.',
+    scenario === 'tiny' || scenario === 'quick' || scenario === 'long',
+    'CRS_QUALIFICATION_SCENARIO must be tiny, quick or long.',
   );
   const cacheMode = process.env.CRS_QUALIFICATION_CACHE ?? 'configured';
   check(
@@ -277,7 +279,21 @@ async function main() {
     'CRS_QUALIFICATION_ACCEPT must be 1 when enabled.',
   );
   const accept = process.env.CRS_QUALIFICATION_ACCEPT === '1';
+  const diagnosticRequested = process.env.CRS_QUALIFICATION_DIAGNOSTICS === '1';
+  check(
+    !process.env.CRS_QUALIFICATION_DIAGNOSTICS || diagnosticRequested,
+    'CRS_QUALIFICATION_DIAGNOSTICS must be 1 when enabled.',
+  );
   const format = process.env.CRS_QUALIFICATION_FORMAT ?? 'both';
+  if (diagnosticRequested)
+    check(
+      scenario === 'tiny' &&
+        accept &&
+        repetitions === 1 &&
+        format === 'auto' &&
+        cacheMode === 'configured',
+      'Diagnostics qualification requires tiny, accept=1, repeat=1, format=auto and configured cache.',
+    );
   check(
     format === 'both' || format === 'auto' || format === 'pdf' || format === 'png',
     'CRS_QUALIFICATION_FORMAT must be both, auto, pdf or png.',
@@ -325,6 +341,7 @@ async function main() {
     formatPolicy: format,
     repetitions,
     acceptanceRequested: accept,
+    diagnosticQualificationRequested: diagnosticRequested,
     // Status GETs also flush the encrypted workspace. Leave room in the bounded
     // event log for provider and extraction work throughout a long import.
     statusPollIntervalMs: 5_000,
@@ -344,7 +361,9 @@ async function main() {
     scope:
       scenario === 'long'
         ? 'One 100-page mixed laboratory, medication-order and performed-imaging fixture; 400 records, alternating text/scanned pages. Autonomous continuation only; not exhaustive chart or clinical quality qualification.'
-        : 'One 4-page, 64-row laboratory fixture; this is a quick gate, not representative long-chart qualification.',
+        : scenario === 'tiny'
+          ? 'One page and four independently fictional observations for bounded diagnostics qualification; not representative clinical extraction.'
+          : 'One 4-page, 64-row laboratory fixture; this is a quick gate, not representative long-chart qualification.',
   };
   const save = () => writeQualificationPrivateJson(reportPath, report);
   const controller = new AbortController();
@@ -845,6 +864,7 @@ async function main() {
           coordinator,
           reviewEvidenceFile,
           diagnostics: summarizeQualificationDiagnostics(diagnostics, sequence),
+          diagnosticQualification: null,
           acceptance: null,
         };
         runs.push(run);
@@ -877,6 +897,24 @@ async function main() {
             request,
             collectFeed,
             originalHash,
+            ...(diagnosticRequested
+              ? {
+                  afterAcceptedBeforeRecovery: async () => {
+                    const afterAcceptance = await request<ImportDiagnosticExport>(
+                      prefix + '/import-diagnostics',
+                    );
+                    const filename = `diagnostics-before-recovery-${mode}-${cache}-${configurationPosition}-${repetition}.json`;
+                    writeQualificationPrivateJson(join(root, filename), afterAcceptance);
+                    report.diagnosticFiles.push(filename);
+                    run.diagnosticQualification = gradeDiagnosticLifecycle(
+                      afterAcceptance,
+                      sequence,
+                      fixture.pages,
+                    );
+                    save();
+                  },
+                }
+              : {}),
           });
           if (!(await retainDiagnostics())) report.diagnosticCaptureFailures++;
           save();
@@ -904,6 +942,7 @@ async function main() {
           run.extractionComplete &&
           run.remainingUnits === 0 &&
           run.diagnostics.droppedEvents === 0 &&
+          (!diagnosticRequested || run.diagnosticQualification?.passed === true) &&
           (run.mode === 'pdf'
             ? (run.diagnostics.wirePdfParts ?? 0) > 0
             : run.diagnostics.wirePdfParts === 0 && (run.diagnostics.wireImageParts ?? 0) > 0),
