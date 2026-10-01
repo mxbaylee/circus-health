@@ -1,4 +1,3 @@
-import { RecordOwnershipAction } from './RecordOwnershipAction';
 import { useState } from 'react';
 import { api } from '../../data/api';
 import { useProfile } from '../../data/profile';
@@ -35,9 +34,6 @@ export function RecordCorrectionAction({
 
   return (
     <>
-      <RecordOwnershipAction
-        selection={{ type: 'records', records: [{ kind: target.kind, recordId: target.recordId }] }}
-      />
       <button
         type="button"
         className="button secondary"

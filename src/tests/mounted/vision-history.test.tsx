@@ -65,6 +65,8 @@ it('Vision tab compares every literal source entry with original links and unkno
   expect(screen.getByRole('tab', { name: 'Vision' })).toHaveAttribute('aria-selected', 'true');
   const first = await screen.findByRole('article', { name: 'Fictional prescription a' });
   expect(screen.getAllByRole('article')).toHaveLength(2);
+  for (const article of screen.getAllByRole('article'))
+    expect(within(article).getAllByRole('button', { name: 'Change person' })).toHaveLength(1);
   expect(within(first).getByText('+01.00')).toBeVisible();
   expect(within(first).getByText('005')).toBeVisible();
   expect(within(first).getByText('-0.50')).toBeVisible();

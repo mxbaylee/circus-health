@@ -11,6 +11,7 @@ import { AttachmentPanel } from './AttachmentPanel';
 import { RelatedNotes } from '../../components/RelatedNotes';
 import { NoteText } from './NoteText';
 import { RecordCorrectionAction } from '../clinical-review/RecordCorrectionAction';
+import { RecordOwnershipAction } from '../clinical-review/RecordOwnershipAction';
 import { documentCorrectionTarget } from '../clinical-review/recordCorrectionTargets';
 import { ClinicalRelationshipPanel } from '../clinical-review/ClinicalRelationshipPanel';
 
@@ -53,6 +54,10 @@ export function ProviderNoteDetail({
               </span>
             )}
             <EntryActions>
+              <RecordOwnershipAction
+                selection={{ type: 'records', records: [{ kind: 'document', recordId: note.id }] }}
+                onApplied={onChanged}
+              />
               <RecordCorrectionAction
                 target={documentCorrectionTarget(note)}
                 onApplied={() => onChanged?.()}

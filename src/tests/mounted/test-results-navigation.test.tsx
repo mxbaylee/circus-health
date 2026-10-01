@@ -178,6 +178,7 @@ describe('Test Results comparison navigation', () => {
       ),
     ).toBe(true);
     await user.click(screen.getByRole('button', { name: 'More entry actions' }));
+    expect(screen.getAllByRole('button', { name: 'Change person' })).toHaveLength(1);
     expect(screen.getByRole('button', { name: 'Correct saved record' })).toBeVisible();
   });
 
@@ -258,4 +259,12 @@ it('points an empty structured history toward optical prescriptions', async () =
     ),
   ).toBeVisible();
   expect(screen.getByRole('tab', { name: 'Vision' })).toBeVisible();
+});
+
+it('the by-test detail keeps its sole person-change action', async () => {
+  mount('/tests?view=by-test&type=total&detail=1');
+  await screen.findByRole('heading', { level: 2, name: 'Total Cholesterol' });
+  await userEvent.setup().click(screen.getByRole('button', { name: 'More entry actions' }));
+  expect(screen.getAllByRole('button', { name: 'Change person' })).toHaveLength(1);
+  expect(screen.queryByRole('button', { name: 'Correct saved record' })).not.toBeInTheDocument();
 });

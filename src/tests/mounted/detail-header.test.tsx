@@ -152,6 +152,7 @@ it('Rx keeps Active and retained history in the shared disclosure, with status b
     screen.getByRole('heading', { name: 'Synthetic prescription' }).closest('header'),
   ).toHaveTextContent('Inactive');
   await user.click(screen.getByRole('button', { name: 'More entry actions' }));
+  expect(screen.getAllByRole('button', { name: 'Change person' })).toHaveLength(1);
   expect(screen.getByRole('button', { name: 'Correct saved record' })).toBeVisible();
   expect(screen.getByRole('switch', { name: 'Active' })).not.toBeChecked();
   await user.click(screen.getByRole('button', { name: 'Current use history and details' }));
@@ -207,4 +208,94 @@ it('keeps source status separate from the reviewed procedure event kind', () => 
   expect(screen.getByText('Procedure status').closest('div')).toHaveTextContent(
     'scheduled by source',
   );
+});
+
+it('procedure actions expose one person change beside saved-record correction', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => response([])),
+  );
+  renderProcedure(procedure('performed'));
+  await userEvent.setup().click(screen.getByRole('button', { name: 'More entry actions' }));
+  expect(screen.getAllByRole('button', { name: 'Change person' })).toHaveLength(1);
+  expect(screen.getByRole('button', { name: 'Correct saved record' })).toBeVisible();
+});
+
+it('provider notes keep one explicit ownership action and refresh after its successful completion', async () => {
+  const { ProviderNoteDetail } = await import('../../app/features/notes/ProviderNoteDetail');
+  const note: import('../../shared/api').ProviderHistoricalNote = {
+    id: 'fictional-provider-note',
+    personId: 'patient',
+    origin: 'provider',
+    status: 'provider',
+    readOnly: true,
+    title: 'Fictional visit summary',
+    typeLabel: 'Visit summary',
+    date: null,
+    eventDate: null,
+    recordDate: null,
+    dateBasis: 'source',
+    sourceId: 'fictional-clinic',
+    sourceLabel: 'Fictional Clinic',
+    sourceStatus: 'final',
+    sourceType: 'Visit summary',
+    sourceRecordId: 'fictional-source',
+    content: 'Independently fictional note.',
+    authors: [],
+    classificationBasis: null,
+    presentationNote: null,
+    evidence: [],
+    attachments: [],
+    extra: {},
+  };
+  const person = {
+    noteId: 'fictional-person-note',
+    personId: 'fictional-person',
+    version: 1,
+    fullName: 'Robin Lane',
+    birthDate: null,
+  };
+  const selection = { type: 'records', records: [{ kind: 'document', recordId: note.id }] };
+  const preview = {
+    request: { selection, destination: { noteId: person.noteId, expectedVersion: 1 } },
+    scopeToken: 'fictional-scope',
+    version: 1,
+    records: [],
+    blockers: [],
+    names: [],
+    relationships: [],
+    reportHolds: [],
+    pending: [],
+    commitGroups: [],
+    destination: person,
+  };
+  const fetcher = vi.fn(async (input: string, options?: RequestInit) => {
+    const path = String(input);
+    if (path.endsWith('/record-ownership/people')) return response([person]);
+    if (path.endsWith('/record-ownership/preview')) {
+      expect(JSON.parse(String(options?.body)).selection).toEqual(selection);
+      return response(preview);
+    }
+    if (path.endsWith('/record-ownership') && options?.method === 'POST')
+      return response({ operationId: 'fictional-operation', moved: 1, pending: 0, outcomes: [] });
+    return response([]);
+  });
+  vi.stubGlobal('fetch', fetcher);
+  const changed = vi.fn();
+  const user = userEvent.setup();
+  render(
+    <MemoryRouter>
+      <ProviderNoteDetail note={note} onChanged={changed} />
+    </MemoryRouter>,
+  );
+  await user.click(screen.getByRole('button', { name: 'More entry actions' }));
+  expect(screen.getAllByRole('button', { name: 'Change person' })).toHaveLength(1);
+  expect(screen.getByRole('button', { name: 'Correct saved record' })).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Change person' }));
+  const next = await screen.findByRole('button', { name: 'Preview correction' });
+  await waitFor(() => expect(next).toBeEnabled());
+  await user.click(next);
+  await user.click(await screen.findByRole('button', { name: 'Confirm person correction' }));
+  await user.click(await screen.findByRole('button', { name: 'Done' }));
+  expect(changed).toHaveBeenCalledOnce();
 });
