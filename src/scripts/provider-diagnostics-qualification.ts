@@ -164,16 +164,29 @@ export function gradeDiagnosticLifecycle(
       event.context.clientRequestId === expected.uploadClientRequestId &&
       event.sequence < firstActive,
   );
+  // The retained import is announced by upload_retained inside the curation
+  // span. Original publication is a sibling under that span, not the parent
+  // of later import work. Match both siblings and the tagged receive request.
   const uploadJoined = uploads.some((upload) =>
-    phase('upload_original_publish').some(
-      (published) =>
-        published.context.requestId === upload.context.requestId &&
-        !!published.context.spanId &&
-        published.sequence <= upload.sequence &&
+    phase('upload_curation_publish').some(
+      (curation) =>
+        curation.context.requestId === upload.context.requestId &&
+        !!curation.context.spanId &&
+        curation.sequence < upload.sequence &&
         phase('upload_original_publish').some(
-          (retained) =>
-            retained.context.importId === importId &&
-            retained.context.parentSpanId === published.context.spanId,
+          (published) =>
+            published.context.requestId === upload.context.requestId &&
+            published.context.parentSpanId === curation.context.spanId &&
+            events.some(
+              (retained) =>
+                retained.event === 'import.progress' &&
+                retained.fields.phase === 'upload_retained' &&
+                retained.context.requestId === upload.context.requestId &&
+                retained.context.parentSpanId === curation.context.spanId &&
+                retained.context.importId === importId &&
+                published.sequence < retained.sequence &&
+                retained.sequence < curation.sequence,
+            ),
         ),
     ),
   );

@@ -44,13 +44,42 @@ function snapshot(): ImportDiagnosticExport {
     { phase: 'upload_receive' },
   );
   add(
+    'import.phase.started',
+    {
+      requestId: 'upload-request',
+      clientRequestId: uploadClientRequestId,
+      spanId: 'curation-span',
+    },
+    { phase: 'upload_curation_publish' },
+  );
+  add(
     'import.phase.completed',
     {
       requestId: 'upload-request',
       clientRequestId: uploadClientRequestId,
       spanId: 'original-publish-span',
+      parentSpanId: 'curation-span',
     },
     { phase: 'upload_original_publish' },
+  );
+  add(
+    'import.progress',
+    {
+      requestId: 'upload-request',
+      clientRequestId: uploadClientRequestId,
+      parentSpanId: 'curation-span',
+      importId,
+    },
+    { phase: 'upload_retained' },
+  );
+  add(
+    'import.phase.completed',
+    {
+      requestId: 'upload-request',
+      clientRequestId: uploadClientRequestId,
+      spanId: 'curation-span',
+    },
+    { phase: 'upload_curation_publish' },
   );
   add(
     'import.phase.completed',
@@ -69,11 +98,6 @@ function snapshot(): ImportDiagnosticExport {
     'model.tool.completed',
     { ...runContext, turnId },
     { toolName: 'health_intake_read', page: 1, firstRead: true, pdfBytes: 123 },
-  );
-  add(
-    'import.phase.completed',
-    { importId, parentSpanId: 'original-publish-span' },
-    { phase: 'upload_original_publish' },
   );
   add('import.active.completed', runContext);
   add(
@@ -133,53 +157,53 @@ test('realistic returned-tool ordering and correlated lifecycle pass the bounded
 
 test('missing, reversed, or unrelated provider responses and source reads fail closed', () => {
   const missing = snapshot();
-  missing.events.splice(6, 1);
+  missing.events.splice(9, 1);
   missing.retainedEvents--;
   assert.ok(grade(missing).reasons.includes('unpaired_model_requests'));
   const beforeResponse = snapshot();
-  const read = beforeResponse.events.splice(7, 1)[0]!;
-  beforeResponse.events.splice(6, 0, read);
+  const read = beforeResponse.events.splice(10, 1)[0]!;
+  beforeResponse.events.splice(9, 0, read);
   resequence(beforeResponse);
   assert.ok(grade(beforeResponse).reasons.includes('missing_completed_page_reads'));
   const otherRun = snapshot();
-  otherRun.events[7]!.context.runId = 'unrelated-run';
+  otherRun.events[10]!.context.runId = 'unrelated-run';
   assert.ok(grade(otherRun).reasons.includes('missing_completed_page_reads'));
   const otherImport = snapshot();
-  otherImport.events[6]!.context.importId = 'unrelated-import';
+  otherImport.events[9]!.context.importId = 'unrelated-import';
   assert.ok(grade(otherImport).reasons.includes('missing_import_correlation'));
 });
 
 test('active run must enclose the model requests and read with the same run and slice', () => {
   const swappedEnd = snapshot();
-  swappedEnd.events[9]!.context.runId = 'unrelated-run';
+  swappedEnd.events[11]!.context.runId = 'unrelated-run';
   assert.ok(grade(swappedEnd).reasons.includes('incomplete_active_lifecycle'));
   const earlyEnd = snapshot();
-  const end = earlyEnd.events.splice(9, 1)[0]!;
-  earlyEnd.events.splice(5, 0, end);
+  const end = earlyEnd.events.splice(11, 1)[0]!;
+  earlyEnd.events.splice(8, 0, end);
   resequence(earlyEnd);
   assert.ok(grade(earlyEnd).reasons.includes('unpaired_model_requests'));
   const otherModelRun = snapshot();
-  otherModelRun.events[5]!.context.runId = 'unrelated-run';
+  otherModelRun.events[8]!.context.runId = 'unrelated-run';
   assert.ok(grade(otherModelRun).reasons.includes('unpaired_model_requests'));
 });
 
 test('upload publication must be joined to this import; tagged review and acceptance must follow reading', () => {
   const otherUpload = snapshot();
-  otherUpload.events[2]!.context.clientRequestId = 'unrelated-upload';
+  otherUpload.events[5]!.context.clientRequestId = 'unrelated-upload';
   assert.ok(grade(otherUpload).reasons.includes('missing_upload_phase'));
   const brokenUploadLink = snapshot();
-  brokenUploadLink.events[8]!.context.parentSpanId = 'unrelated-span';
+  brokenUploadLink.events[3]!.context.parentSpanId = 'unrelated-span';
   assert.ok(grade(brokenUploadLink).reasons.includes('missing_upload_phase'));
   const otherReview = snapshot();
-  otherReview.events[10]!.context.clientRequestId = 'unrelated-review';
+  otherReview.events[12]!.context.clientRequestId = 'unrelated-review';
   assert.ok(grade(otherReview).reasons.includes('missing_review_acceptance_phases'));
   const earlyAcceptance = snapshot();
-  const phases = earlyAcceptance.events.splice(11, 2);
-  earlyAcceptance.events.splice(4, 0, ...phases);
+  const phases = earlyAcceptance.events.splice(13, 2);
+  earlyAcceptance.events.splice(7, 0, ...phases);
   resequence(earlyAcceptance);
   assert.ok(grade(earlyAcceptance).reasons.includes('missing_review_acceptance_phases'));
   const wrongAcceptance = snapshot();
-  wrongAcceptance.events[12]!.context.importId = 'unrelated-import';
+  wrongAcceptance.events[14]!.context.importId = 'unrelated-import';
   assert.ok(grade(wrongAcceptance).reasons.includes('missing_review_acceptance_phases'));
 });
 
@@ -197,9 +221,9 @@ test('recent operation evidence, retention and fixture privacy canaries are mand
   dropped.droppedEvents = 1;
   assert.ok(grade(dropped).reasons.includes('incomplete_event_retention'));
   const truncated = snapshot();
-  truncated.events[6]!.fields = { requestTruncated: true };
+  truncated.events[9]!.fields = { requestTruncated: true };
   assert.ok(grade(truncated).reasons.includes('truncated_event'));
   const leaked = snapshot();
-  leaked.events[7]!.fields = { toolName: 'health_intake_read', page: 1, note: 'FXP1R02' };
+  leaked.events[10]!.fields = { toolName: 'health_intake_read', page: 1, note: 'FXP1R02' };
   assert.ok(grade(leaked).reasons.includes('fictional_canary_in_export'));
 });
