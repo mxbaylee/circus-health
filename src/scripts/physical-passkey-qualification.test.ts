@@ -70,6 +70,7 @@ test('a receipt cannot pass with enrollment alone, missing unlocks or missing re
 test('failed journey locks only its exact generated profile, including before ID capture', async () => {
   const calls: string[] = [];
   let locked = false;
+  let alreadyLocked = false;
   const request = {
     async get(url: string) {
       calls.push(url);
@@ -85,8 +86,8 @@ test('failed journey locks only its exact generated profile, including before ID
     },
     async post(url: string) {
       calls.push(url);
-      locked = true;
-      return { ok: () => true };
+      if (!alreadyLocked) locked = true;
+      return { ok: () => !alreadyLocked, status: () => (alreadyLocked ? 423 : 200) };
     },
   } as unknown as APIRequestContext;
   assert.equal(
@@ -99,6 +100,26 @@ test('failed journey locks only its exact generated profile, including before ID
     true,
   );
   assert.ok(calls.includes('https://fictional.example.test/api/profiles/owned/lock'));
+  alreadyLocked = true;
+  assert.equal(
+    await lockOwnedPasskeyProfile(
+      request,
+      'https://fictional.example.test',
+      undefined,
+      'Fictional Passkey Person abcdef12',
+    ),
+    true,
+  );
+  locked = false;
+  assert.equal(
+    await lockOwnedPasskeyProfile(
+      request,
+      'https://fictional.example.test',
+      undefined,
+      'Fictional Passkey Person abcdef12',
+    ),
+    false,
+  );
   calls.length = 0;
   assert.equal(
     await lockOwnedPasskeyProfile(request, 'https://fictional.example.test', undefined, 'Unknown'),

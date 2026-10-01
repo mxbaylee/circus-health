@@ -105,6 +105,10 @@ for (const failFinalLock of [false, true])
       await journey;
       assert.equal(recoverySaved, true);
       assert.equal(physicalPasskeyPassed(progress, true), true);
+      assert.equal(
+        await lockOwnedPasskeyProfile(page.context().request, origin, undefined, ownedName),
+        true,
+      );
       // Controlled hardware validates the driver only; it is not physical acceptance.
       const existing = {
         ...progress,
