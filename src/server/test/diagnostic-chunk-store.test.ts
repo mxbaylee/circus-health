@@ -158,19 +158,22 @@ test('malformed, oversized and ambiguous storage fails without accepting arbitra
   const store = openDiagnosticChunkStore(f);
   assert.throws(() => store.append(0, payload), /sequence/);
   assert.throws(() => store.append(1.5, payload), /sequence/);
+  assert.throws(() => store.append('../invalid' as unknown as number, payload), /sequence/);
   assert.throws(() => store.append(1, Buffer.alloc(0)), /size/);
   assert.throws(
     () => store.append(1, Buffer.alloc(diagnosticChunkLimits.maxChunkBytes + 1)),
     /size/,
   );
   store.close();
-  for (const filename of ['../invalid', 'bad-name.enc']) {
-    assert.throws(() => openDiagnosticChunkStore({ ...f, limits: { maxChunks: 0 } }), /limits/);
-    if (filename === '../invalid') continue;
-    writeFileSync(join(f.directory, filename), 'fictional');
-    assert.throws(() => openDiagnosticChunkStore(f).inventory(), /identity/);
-    rmSync(join(f.directory, filename));
-  }
+  assert.throws(() => openDiagnosticChunkStore({ ...f, limits: { maxChunks: 0 } }), /limits/);
+  writeFileSync(join(f.directory, 'bad-name.enc'), 'fictional');
+  assert.throws(() => openDiagnosticChunkStore(f).inventory(), /identity/);
+  rmSync(join(f.directory, 'bad-name.enc'));
+  for (const sequence of [1, 2])
+    writeFileSync(join(f.directory, name(sequence) + '.pending-' + 'b'.repeat(24)), 'fictional');
+  assert.throws(() => openDiagnosticChunkStore(f).inventory(), /recovery allowance/);
+  assert.equal(readdirSync(f.directory).length, 2, 'an ambiguous inventory is not partly cleaned');
+  for (const file of readdirSync(f.directory)) rmSync(join(f.directory, file));
   writeFileSync(
     join(f.directory, name(1)),
     Buffer.alloc(diagnosticChunkLimits.maxChunkBytes + 4097),
@@ -179,4 +182,27 @@ test('malformed, oversized and ambiguous storage fails without accepting arbitra
   rmSync(join(f.directory, name(1)));
   mkdirSync(join(f.directory, name(1)));
   assert.throws(() => openDiagnosticChunkStore(f).inventory(), /Invalid diagnostic chunk file/);
+});
+
+test('failed retention stops further appends and an acknowledged chunk can be retried', (t) => {
+  const f = fixture(t);
+  const store = openDiagnosticChunkStore({ ...f, limits: { maxChunks: 2 } });
+  t.after(() => store.close());
+  store.append(1, payload);
+  store.append(2, payload);
+  const first = join(f.directory, name(1));
+  const cipher = readFileSync(first);
+  rmSync(first);
+  mkdirSync(first);
+  assert.throws(() => store.append(3, payload), /directory|EISDIR/i);
+  assert.throws(() => store.append(4, payload), /directory|EISDIR/i);
+  assert.equal(readdirSync(f.directory).length, 3);
+  assert.equal(store.work().chunkWrites, 3);
+  rmSync(first, { recursive: true });
+  writeFileSync(first, cipher);
+  assert.equal(store.append(3, payload), 'replayed');
+  assert.deepEqual(
+    store.inventory().chunks.map((c) => c.sequence),
+    [2, 3],
+  );
 });

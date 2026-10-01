@@ -113,6 +113,7 @@ export function openDiagnosticChunkStore(options: {
     }
     work.indexScans++;
     const found: DiagnosticChunkInventory['chunks'] = [];
+    const interrupted: string[] = [];
     if (existsSync(directory) && !lstatSync(directory).isDirectory())
       throw Error('Invalid diagnostic directory');
     const names = existsSync(directory) ? readdirSync(directory) : [];
@@ -124,8 +125,7 @@ export function openDiagnosticChunkStore(options: {
       const stat = lstatSync(file);
       if (!stat.isFile()) throw Error('Invalid diagnostic chunk file');
       if (pending.test(name)) {
-        rmSync(file);
-        syncDirectory();
+        interrupted.push(file);
         continue;
       }
       const match = pattern.exec(name);
@@ -135,6 +135,12 @@ export function openDiagnosticChunkStore(options: {
       if (stat.size > limits.maxChunkBytes + 4096)
         throw Error('Diagnostic chunk exceeds read bound');
       found.push({ sequence, encryptedBytes: stat.size });
+    }
+    if (found.length > limits.maxChunks + 1 || interrupted.length > 1)
+      throw Error('Diagnostic inventory exceeds recovery allowance');
+    for (const file of interrupted) {
+      rmSync(file);
+      syncDirectory();
     }
     found.sort((a, b) => a.sequence - b.sequence);
     chunks = found;
