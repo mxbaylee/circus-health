@@ -575,6 +575,7 @@ export function createEncryptedProfiles({
         read: () => vault.readPerformanceSummary(),
         write: (bytes) => vault.writePerformanceSummary(bytes),
       });
+      diagnostics.attachEventStore(id, vault.diagnosticChunks());
       return state;
     } catch (e) {
       disposeOriginalResolver();

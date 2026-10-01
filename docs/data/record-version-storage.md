@@ -73,7 +73,7 @@ Verify with fictional fixtures:
 
 ## Diagnostic chunk storage boundary
 
-`Vault.diagnosticChunks()` exposes a separate, lazy, single-writer encrypted store under `diagnostics/events/`. This storage primitive is not yet connected to the recorder or download; current detailed events remain memory-only. It is not clinical evidence, a medical-record journal, or recovery authority. Recorder integration and full-size qualification remain open work.
+`Vault.diagnosticChunks()` exposes a separate, lazy, single-writer encrypted store under `diagnostics/events/`. The opt-in detailed recorder attaches after profile unlock and the authorized download reads retained metadata across lock/restart and SQLite/cache loss. It is not clinical evidence, a medical-record journal, or recovery authority. Full-size retention and complaint reconstruction remain unqualified; see the [download contract](../import/import-performance.md#retained-event-archive).
 
 Each append carries a positive safe-integer sequence and at most 64 KiB of bytes. Authenticated encryption binds the profile and exact sequence; filenames are fixed 16-digit sequences. A still-retained identical retry returns replayed without rewriting ciphertext, a conflicting retry fails, and an evicted sequence cannot be re-appended. A new append writes only the new chunk, without changing the medical manifest, record head or earlier chunk payloads. The writer inventories filenames once and retains only bounded index metadata. It never rereads prior payloads during ordinary append; an explicit replay reads only its retained chunk to verify equality.
 

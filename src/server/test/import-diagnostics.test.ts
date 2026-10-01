@@ -105,6 +105,7 @@ test('bounded profile diagnostics correlate async work and export salted identif
   assert.equal(exported.events.length, 10);
   assert.equal(exported.droppedEvents, 2);
   assert.deepEqual(exported.eventWindow, {
+    windowId: exported.eventWindow.windowId,
     recording: 'enabled',
     storage: 'memory_only',
     capacity: 10,
@@ -114,6 +115,7 @@ test('bounded profile diagnostics correlate async work and export salted identif
     omittedBeforeWindow: null,
     completeness: 'not_established',
   });
+  assert.match(exported.eventWindow.windowId!, /^[0-9a-f-]{36}$/);
   // The first observation can predate every retained event after overflow.
   assert.ok(exported.eventWindow.observedSince! < exported.events[0]!.timestamp);
   assert.equal(diagnostics.exportSnapshot('another-profile').eventWindow.observedEvents, 0);

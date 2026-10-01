@@ -14,7 +14,13 @@ import {
 import { pdfEvidenceSessionDiagnostics } from './intake-pdf-session.ts';
 import { createRecentPerformance, type PerformanceSummaryStore } from './import-performance.ts';
 import { isDiagnosticRoute } from '../shared/import-diagnostic-route.ts';
-import type { ImportDiagnosticEventWindow } from '../shared/import-performance.ts';
+import type {
+  ImportDiagnosticEventWindow,
+  ImportDiagnosticArchive,
+} from '../shared/import-performance.ts';
+import { isRetainedDiagnosticField } from './import-diagnostic-fields.ts';
+import { createImportDiagnosticArchive } from './import-diagnostic-archive.ts';
+import type { DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
 import {
   createPrivateImportTrace,
   type PrivateImportTrace,
@@ -120,6 +126,11 @@ export interface ImportDiagnosticSink {
 export interface ImportDiagnostics extends ImportDiagnosticSink {
   snapshot(profileId: string): ImportDiagnosticEvent[];
   exportSnapshot(profileId: string, salt?: Buffer): ImportDiagnosticExport;
+  exportArchive(
+    profileId: string,
+    salt?: Buffer,
+  ): Promise<ImportDiagnosticArchive<ImportDiagnosticEvent>>;
+  attachEventStore(profileId: string, store: DiagnosticChunkStore): void;
   clear(profileId: string): void;
   close(): void;
   recordClientOperation(profileId: string, input: unknown): boolean;
@@ -509,6 +520,86 @@ function anonymizeEvent(event: ImportDiagnosticEvent, salt: Buffer): ImportDiagn
   return { ...event, context };
 }
 
+const archivedEventNames = new Set<ImportDiagnosticEventName>([
+  'http.request.started',
+  'http.request.completed',
+  'http.request.aborted',
+  'model.request.started',
+  'model.request.completed',
+  'model.request.failed',
+  'model.response.shape',
+  'model.tool.started',
+  'model.tool.completed',
+  'model.tool.failed',
+  'import.active.started',
+  'import.active.completed',
+  'import.phase.started',
+  'import.phase.completed',
+  'import.phase.failed',
+  'import.phase.cancelled',
+  'import.progress',
+  'process.resource.sample',
+]);
+function restoredArchiveEvent(value: unknown): ImportDiagnosticEvent | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const event = value as ImportDiagnosticEvent;
+  if (
+    Object.keys(value).some(
+      (key) =>
+        ![
+          'schemaVersion',
+          'sequence',
+          'timestamp',
+          'monotonicMs',
+          'event',
+          'context',
+          'fields',
+        ].includes(key),
+    ) ||
+    event.schemaVersion !== 1 ||
+    !archivedEventNames.has(event.event) ||
+    !Number.isSafeInteger(event.sequence) ||
+    event.sequence < 0 ||
+    typeof event.timestamp !== 'string' ||
+    !Number.isFinite(Date.parse(event.timestamp)) ||
+    new Date(event.timestamp).toISOString() !== event.timestamp ||
+    !Number.isFinite(event.monotonicMs) ||
+    event.monotonicMs < 0 ||
+    !event.context ||
+    typeof event.context !== 'object' ||
+    Array.isArray(event.context) ||
+    !event.fields ||
+    typeof event.fields !== 'object' ||
+    Array.isArray(event.fields) ||
+    Object.keys(event.fields).some((key) => !isRetainedDiagnosticField(key))
+  )
+    return null;
+  const context = publicContext(mergedContext(undefined, event.context));
+  const traceId = event.fields.traceEventId;
+  const fields = safeFields(
+    event.fields,
+    typeof traceId === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(traceId)
+      ? traceId
+      : null,
+  );
+  // Unknown old/corrupt fields cannot silently become trustworthy recovered observations.
+  if (
+    JSON.stringify(context) !== JSON.stringify(event.context) ||
+    JSON.stringify(fields) !== JSON.stringify(event.fields)
+  )
+    return null;
+  return {
+    schemaVersion: 1,
+    sequence: event.sequence,
+    timestamp: event.timestamp,
+    monotonicMs: event.monotonicMs,
+    event: event.event,
+    context,
+    fields,
+  };
+}
+
 export function createImportDiagnostics({
   enabled = false,
   capacity = 10_000,
@@ -524,6 +615,7 @@ export function createImportDiagnostics({
   onEvent,
   privateTrace,
 }: ImportDiagnosticsOptions = {}): ImportDiagnostics {
+  const archive = createImportDiagnosticArchive(enabled, restoredArchiveEvent);
   const recent = createRecentPerformance(now, (value) => {
     if (
       !value ||
@@ -555,7 +647,18 @@ export function createImportDiagnostics({
   const detachedProfiles = new Set<string>();
   let closed = false;
   const dropped = new Map<string, number>();
-  const windows = new Map<string, { observedSince: string; observedEvents: number }>();
+  const windows = new Map<
+    string,
+    { windowId: string; observedSince: string | null; observedEvents: number }
+  >();
+  const windowFor = (profileId: string) => {
+    let window = windows.get(profileId);
+    if (!window) {
+      window = { windowId: randomUUID(), observedSince: null, observedEvents: 0 };
+      windows.set(profileId, window);
+    }
+    return window;
+  };
   const pendingTraceIds = new Map<string, { profileId: string; traceEventId: string }>();
   const consoleSalt = randomBytes(32);
   const activeScopes = new Map<number, ImportDiagnosticContext>();
@@ -617,10 +720,8 @@ export function createImportDiagnostics({
       context: publicContext(context),
       fields: safeFields(fields, traceEventId),
     };
-    const window = windows.get(context.profileId) || {
-      observedSince: entry.timestamp,
-      observedEvents: 0,
-    };
+    const window = windowFor(context.profileId);
+    window.observedSince ??= entry.timestamp;
     window.observedEvents++;
     windows.set(context.profileId, window);
     try {
@@ -629,6 +730,7 @@ export function createImportDiagnostics({
       /* Optional diagnostics. */
     }
     if (!enabled) return;
+    archive.record(context.profileId, entry);
     buffer.push(entry);
     if (buffer.length > boundedCapacity) {
       dropped.set(
@@ -851,6 +953,7 @@ export function createImportDiagnostics({
       }));
     },
     exportSnapshot(profileId, salt = randomBytes(32)) {
+      archive.flush(profileId);
       return {
         schemaVersion: 1,
         generatedAt: now().toISOString(),
@@ -860,6 +963,7 @@ export function createImportDiagnostics({
         retainedEvents: buffers.get(profileId)?.length || 0,
         droppedEvents: dropped.get(profileId) || 0,
         eventWindow: {
+          windowId: windows.get(profileId)?.windowId ?? null,
           recording: enabled ? 'enabled' : 'disabled',
           storage: 'memory_only',
           capacity: boundedCapacity,
@@ -905,6 +1009,16 @@ export function createImportDiagnostics({
         ...(privateTrace ? { privateTrace: privateTrace.status(profileId) } : {}),
       };
     },
+    exportArchive(profileId, salt = randomBytes(32)) {
+      return archive.export(profileId, (event) => anonymizeEvent(event, salt));
+    },
+    attachEventStore(profileId, store) {
+      if (closed || detachedProfiles.has(profileId)) {
+        store.close();
+        return;
+      }
+      archive.attach(profileId, windowFor(profileId).windowId, store);
+    },
     recordClientOperation(profileId, input) {
       if (closed || detachedProfiles.has(profileId)) return false;
       try {
@@ -920,6 +1034,7 @@ export function createImportDiagnostics({
       } catch {}
     },
     detachSummaryStore(profileId) {
+      archive.detach(profileId);
       detachedProfiles.add(profileId);
       buffers.delete(profileId);
       dropped.delete(profileId);
@@ -934,11 +1049,13 @@ export function createImportDiagnostics({
       } catch {}
     },
     flushSummaries(profileId) {
+      archive.flush(profileId);
       try {
         recent.flush(profileId);
       } catch {}
     },
     clear(profileId) {
+      archive.detach(profileId);
       detachedProfiles.add(profileId);
       for (const [id, context] of activeScopes)
         if (context.profileId === profileId) activeScopes.delete(id);
@@ -954,6 +1071,7 @@ export function createImportDiagnostics({
     },
     close() {
       closed = true;
+      archive.close();
       try {
         recent.close();
       } catch {}
