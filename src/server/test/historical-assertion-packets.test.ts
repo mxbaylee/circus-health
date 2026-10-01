@@ -10,6 +10,9 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability, exportCuration, rebuildProfile } from '../portable.ts';
 import { createNote } from '../notes.ts';
 import { exportSnapshot, exportOptions, exportHtml, exportEvidence } from '../note-exports.ts';
+import { sourceAssertionOwnership } from '../source-assertion-ownership.ts';
+import { sourceRecords, getSourceRecord } from '../queries.ts';
+import { setVisibility } from '../visibility.ts';
 
 function fixture(t: TestContext) {
   const root = mkdtempSync(resolve(tmpdir(), 'fictional-historical-owners-'));
@@ -86,9 +89,13 @@ test('historical raw kinds use the same case-insensitive inclusion and omission 
     'immunizations',
   ].flatMap((kind) => [kind, kind.toUpperCase()])) {
     f.raw(kind, kind);
+    assert.equal(sourceAssertionOwnership(f.db, kind).state, 'unassigned');
+    assert.equal(sourceAssertionOwnership(f.db, kind).packetRole, 'additional_assertion');
     assert.equal(packet(f.db).unassignedRawAssertionsOmitted, true, kind);
     assert.deepEqual(ids(f.db), []);
     f.evidence(kind, 'patient', 'report_subject');
+    assert.equal(sourceAssertionOwnership(f.db, kind).state, 'single');
+    assert.equal(sourceAssertionOwnership(f.db, kind).ownerPersonId, 'patient');
     assert.ok(ids(f.db).includes(kind), kind);
     assert.equal(packet(f.db).unassignedRawAssertionsOmitted, false, kind);
     // Isolate each spelling; prior accepted assertions must not mask an omission.
@@ -302,4 +309,130 @@ test('the generic notice clears only after the final eligible ambiguity is resol
   check(false);
   assert.deepEqual(ids(f.db), ['first']);
   assert.deepEqual(ids(f.db, f.managed), ['last']);
+});
+
+test('ownership assessments preserve exact subjects, bound references and never write or approve', (t) => {
+  const f = fixture(t);
+  f.raw('missing-owner', 'allergy');
+  f.evidence('missing-owner', f.clinician, 'source');
+  f.raw('dangling-owner', 'condition', 'absent');
+  f.raw('mixed-owner', 'visit', 'patient');
+  f.evidence('mixed-owner', f.managed, 'report_subject');
+  f.raw('duplicate-owner', 'immunization', f.managed);
+  // Current storage rejects duplicate exact subjects; the assessment still counts distinct owners.
+  assert.throws(
+    () =>
+      f.db
+        .prepare(
+          'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES(?,?,?,?,?)',
+        )
+        .run(
+          'same-owner-second-evidence',
+          'person',
+          f.managed,
+          'duplicate-owner',
+          'report_subject',
+        ),
+    /UNIQUE constraint failed/,
+  );
+  f.raw('many-owners', 'condition');
+  for (let i = 0; i < 105; i++) f.evidence('many-owners', `missing-${i}`, 'report_subject');
+  const beforePacket = ids(f.db, f.managed);
+  const beforeChanges = f.db.prepare('SELECT total_changes() n').get()!.n;
+  const missing = sourceAssertionOwnership(f.db, 'missing-owner');
+  assert.equal(missing.state, 'unassigned');
+  assert.equal(missing.ownerPersonId, null);
+  assert.equal(missing.subjects.total, 0);
+  assert.equal(missing.originalIntegrity, 'not_checked');
+  assert.equal(missing.assignmentAuthority, 'read_only');
+  assert.equal(missing.sourceRecordUrl, '/source-records/missing-owner?fileView=reference');
+  assert.equal(
+    getSourceRecord(f.db, missing.sourceRecordId, { fileView: 'reference' }).file?.id,
+    'family-file',
+  );
+  assert.equal(sourceAssertionOwnership(f.db, 'dangling-owner').state, 'dangling');
+  assert.equal(sourceAssertionOwnership(f.db, 'dangling-owner').ownerPersonId, null);
+  assert.equal(sourceAssertionOwnership(f.db, 'mixed-owner').state, 'conflicting');
+  assert.equal(sourceAssertionOwnership(f.db, 'mixed-owner').ownerPersonId, null);
+  const duplicate = sourceAssertionOwnership(f.db, 'duplicate-owner');
+  assert.equal(duplicate.state, 'single');
+  assert.equal(duplicate.subjects.total, 1);
+  assert.equal(duplicate.ownerPersonId, f.managed);
+  const many = sourceAssertionOwnership(f.db, 'many-owners');
+  assert.equal(many.state, 'conflicting');
+  assert.equal(many.subjects.items.length, 100);
+  assert.equal(many.subjects.limit, 100);
+  assert.equal(many.subjects.total, 105);
+  assert.equal(many.subjects.truncated, true);
+  assert.ok(many.subjects.items.every((s) => !s.personExists));
+  assert.deepEqual(ids(f.db, f.managed), beforePacket);
+  assert.equal(f.db.prepare('SELECT total_changes() n').get()!.n, beforeChanges);
+  assert.throws(() => sourceAssertionOwnership(f.db, 'not-retained'), {
+    status: 404,
+    code: 'NOT_FOUND',
+  });
+});
+
+test('unresolved source filtering shares packet scope and composes with pagination and visibility', (t) => {
+  const f = fixture(t);
+  for (const [id, kind] of [
+    ['a-allergy', 'ALLERGY'],
+    ['b-dangling', 'condition'],
+    ['c-intake', 'INTAKE_RECORD'],
+    ['d-unsupported', 'person'],
+    ['e-represented', 'visit'],
+    ['f-private', 'condition'],
+    ['g-unknown-provider', 'condition'],
+    ['h-owned', 'allergy'],
+    ['i-archived', 'condition'],
+  ])
+    f.raw(id!, kind!);
+  f.evidence('b-dangling', 'not-a-person', 'report_subject');
+  f.evidence('h-owned', 'patient', 'report_subject');
+  f.db
+    .prepare(
+      'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES(?,?,?,?,?)',
+    )
+    .run('normalized', 'observation', 'normalized-observation', 'e-represented', 'source');
+  f.db.exec("INSERT INTO providers VALUES('personal','Personal notes')");
+  f.db.exec("UPDATE source_records SET provider_id='personal' WHERE id='f-private'");
+  f.db.exec("UPDATE source_records SET provider_id=NULL WHERE id='g-unknown-provider'");
+  setVisibility(f.db, 'source', 'i-archived', { archived: true, version: 0 });
+  const query = (extra = '') =>
+    sourceRecords(f.db, new URLSearchParams('ownership=unresolved' + extra));
+  assert.deepEqual(
+    query().data.map((r) => r.id),
+    ['a-allergy', 'b-dangling', 'c-intake'],
+  );
+  const first = query('&limit=2');
+  assert.equal(first.total, 3);
+  assert.equal(first.complete, false);
+  assert.deepEqual(
+    first.data.map((r) => r.id),
+    ['a-allergy', 'b-dangling'],
+  );
+  assert.deepEqual(
+    query('&limit=2&offset=2').data.map((r) => r.id),
+    ['c-intake'],
+  );
+  assert.deepEqual(query('&providerId=personal').data, []);
+  assert.deepEqual(query('&sourceFileId=missing').data, []);
+  assert.equal(query('&sourceFileId=family-file').total, 3);
+  assert.deepEqual(
+    query('&visibility=archived').data.map((r) => r.id),
+    ['i-archived'],
+  );
+  assert.equal(sourceAssertionOwnership(f.db, 'c-intake').packetRole, 'notice_only');
+  for (const id of ['d-unsupported', 'e-represented', 'f-private', 'g-unknown-provider'])
+    assert.equal(sourceAssertionOwnership(f.db, id).packetRole, 'outside_scope');
+  assert.equal(packet(f.db).unassignedRawAssertionsOmitted, true);
+  for (const invalid of [
+    'ownership=',
+    'ownership=single',
+    'ownership=unresolved&ownership=unresolved',
+  ])
+    assert.throws(() => sourceRecords(f.db, new URLSearchParams(invalid)), {
+      status: 400,
+      code: 'INVALID_OWNERSHIP_FILTER',
+    });
 });

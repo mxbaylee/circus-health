@@ -1,3 +1,4 @@
+import { sourceAssertionBoundary } from './source-assertion-ownership.ts';
 import { clinicalRedirect, resolveClinicalReference } from './clinical-references.ts';
 import { clinicalRelationshipProjections } from './clinical-relationships.ts';
 import { acceptedMeasurements } from './measurement-semantics.ts';
@@ -957,6 +958,13 @@ export function sourceRecords(db: Database, params: URLSearchParams): Page<Sourc
   const pg = pagination(params),
     args: string[] = [],
     w = [visibilityCondition(params, visibilitySQL("'source'", 'r.id'))];
+  const ownership = params.getAll('ownership');
+  if (ownership.length > 1 || (ownership.length === 1 && ownership[0] !== 'unresolved'))
+    throw new HttpError(400, 'INVALID_OWNERSHIP_FILTER', 'Use ownership=unresolved once');
+  if (ownership.length) {
+    const boundary = sourceAssertionBoundary('r');
+    w.push(boundary.disclosure, 'NOT ' + boundary.singleOwner);
+  }
   const originalSourceFileId = params.get('originalSourceFileId');
   if (originalSourceFileId) {
     w.push(`(

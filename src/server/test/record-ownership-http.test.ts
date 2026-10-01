@@ -110,6 +110,36 @@ test('ownership preview and commit require the owning unlocked HTTP session, inc
     decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
   });
   const recordId = String(state.db.prepare('SELECT id FROM observations').get()!.id);
+  const sourceRecordId = String(
+    state.db.prepare('SELECT source_record_id FROM observations WHERE id=?').get(recordId)!
+      .source_record_id,
+  );
+  const assessmentPath = (profileId: string) =>
+    `/api/profiles/${profileId}/source-records/${encodeURIComponent(sourceRecordId)}/ownership`;
+  const assessment = await send<{
+    sourceRecordId: string;
+    packetRole: string;
+    assignmentAuthority: string;
+  }>(assessmentPath(first.profileId));
+  assert.equal(assessment.status, 200);
+  assert.equal(assessment.data!.sourceRecordId, sourceRecordId);
+  assert.equal(assessment.data!.packetRole, 'outside_scope');
+  assert.equal(assessment.data!.assignmentAuthority, 'read_only');
+  assert.equal((await send(assessmentPath(first.profileId), undefined, false)).status, 423);
+  assert.equal(
+    (
+      await send(
+        `/api/profiles/${first.profileId}/source-records?ownership=unresolved`,
+        undefined,
+        false,
+      )
+    ).status,
+    423,
+  );
+  assert.equal(
+    (await send(`/api/profiles/${first.profileId}/source-records?ownership=invalid`)).status,
+    400,
+  );
   const request: OwnershipRequest = {
     selection: { type: 'records', records: [{ kind: 'observation', recordId }] },
     destination: { noteId: person.id, expectedVersion: person.version },
@@ -127,6 +157,8 @@ test('ownership preview and commit require the owning unlocked HTTP session, inc
   assert.equal(unsigned.status, 423);
   assert.equal(unsigned.error?.code, 'PROFILE_LOCKED');
   const second = await create('Fictional Willow');
+  assert.equal((await send(assessmentPath(first.profileId))).status, 423);
+  assert.equal((await send(assessmentPath(second.profileId))).status, 404);
   const secondState = app.manager.opened.get(second.profileId)!;
   const secondPerson = createNote(secondState.db, {
     kind: 'person',
@@ -158,6 +190,7 @@ test('ownership preview and commit require the owning unlocked HTTP session, inc
     0,
   );
   assert.equal((await send(`/api/profiles/${first.profileId}/lock`, {})).status, 200);
+  assert.equal((await send(assessmentPath(first.profileId))).status, 423);
   assert.equal((await send(path(first.profileId), commit)).status, 423);
   assert.equal(
     (await send(`/api/profiles/${first.profileId}/unlock`, { recovery: first.recoveryKit })).status,
