@@ -5,15 +5,17 @@ import type { ServerResponse, IncomingMessage } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { exportFixture } from './note-export-fixture.ts';
 import {
   exportOptions,
   exportSnapshot,
   exportHtml,
   exportEvidence,
+  exportPdf,
   createNoteExports,
 } from '../note-exports.ts';
-import { saveNote, getNote, finishNote } from '../notes.ts';
+import { createNote, saveNote, getNote, finishNote } from '../notes.ts';
 import type { ClinicalKind } from '../clinical-references.ts';
 type ExportRouteContext = Parameters<ReturnType<typeof createNoteExports>>[0];
 interface PreviewResult {
@@ -140,6 +142,9 @@ test('provider packet and evidence companion disclose unread cited source pages'
   ]);
   assert.match(exportHtml(packet), /Unread source sections[\s\S]*Page 3: processing_stalled/);
   assert.deepEqual(exportEvidence(packet).readingGaps, packet.readingGaps);
+  const brief = exportSnapshot(db, { ...input, includePrescriptions: true });
+  assert.deepEqual(brief.readingGaps, packet.readingGaps);
+  assert.match(exportHtml(brief), /Unread source sections[\s\S]*Page 3: processing_stalled/);
   // Converted clinical evidence cites the proposal file. Its root-level original
   // pointer must still disclose the retained PDF's unread sections.
   db.prepare(
@@ -438,6 +443,7 @@ test('provider packet includes clinical history and unmatched assertions, exclud
   const { db, input, sensitive } = fixture(t);
   db.exec(`INSERT INTO procedures(id,source_record_id,label) VALUES('procedure','raw','Recorded procedure');
     INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json) VALUES('allergy','file','issuer','clinical_object','{"data":{"display":"Recorded allergy"}}');
+    INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES('allergy-owner','person','patient','allergy','report_subject');
     INSERT INTO people VALUES('doctor','Dr Fiction','professional',0);
     INSERT INTO notes(id,kind,status,title,content,person_id,profile_json,created_at,updated_at) VALUES('doctor-note','person','editable','Doctor','PRIVATE DOCTOR THOUGHTS','doctor','{"tags":["Primary Care Provider"],"phone":"555-0100","medicalHistory":"PRIVATE DOCTOR HISTORY"}','2026-01-01','2026-01-01');`);
   db.exec(
@@ -466,6 +472,282 @@ test('provider packet includes clinical history and unmatched assertions, exclud
     /EXPLICIT SENSITIVE HISTORY|PRIVATE DOCTOR THOUGHTS|PRIVATE DOCTOR HISTORY|PRIVATE PERSONAL DOCUMENT|PRIVATE UNKNOWN DOCUMENT/,
   );
   assert.ok(!JSON.stringify(snapshot).includes(sensitive.content));
+});
+test('Self packet excludes a relative’s unmatched clinical source assertion', async (t) => {
+  const { db, input } = fixture(t);
+  db.exec(`INSERT INTO people VALUES('relative','Fictional relative','family',0);
+    INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json) VALUES('relative-allergy','file','issuer','allergy','{"person":"Fictional relative","display":"PRIVATE RELATIVE ALLERGY"}');`);
+  const snapshot = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.ok(!snapshot.records.some((record) => record.id === 'relative-allergy'));
+  assert.equal(snapshot.unassignedRawAssertionsOmitted, true);
+  assert.match(
+    exportHtml(snapshot),
+    /Some retained clinical assertions have no verified single-person assignment/,
+  );
+  assert.doesNotMatch(exportHtml(snapshot), /PRIVATE RELATIVE ALLERGY|relative-allergy/);
+  const companion = JSON.stringify(exportEvidence(snapshot));
+  assert.match(
+    companion,
+    /Some retained clinical assertions have no verified single-person assignment/,
+  );
+  assert.doesNotMatch(companion, /PRIVATE RELATIVE ALLERGY|relative-allergy/);
+  const pdf = await exportPdf(exportHtml(snapshot));
+  const loading = getDocument({ data: new Uint8Array(pdf), useSystemFonts: true });
+  const document = await loading.promise;
+  let rendered = '';
+  for (let page = 1; page <= document.numPages; page++) {
+    const content = await (await document.getPage(page)).getTextContent();
+    rendered += content.items.map((item) => ('str' in item ? item.str : '')).join(' ') + ' ';
+  }
+  assert.match(
+    rendered,
+    /Some retained clinical assertions have no verified single-person assignment/,
+  );
+  assert.doesNotMatch(rendered, /PRIVATE RELATIVE ALLERGY|relative-allergy/);
+  await loading.destroy();
+});
+test('a named-person source mention cannot assign an unmatched assertion to that person’s packet', (t) => {
+  const { db } = fixture(t);
+  const person = createNote(db, { kind: 'person', title: 'Fictional mentioned clinician' });
+  db.exec(`INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json)
+    VALUES('named-person-only','file','issuer','condition','{"display":"PRIVATE NAMED PERSON ASSERTION"}');`);
+  db.prepare(
+    "INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES('named-person-evidence','person',?,'named-person-only','source')",
+  ).run(person.personId!);
+  const options = exportOptions(db, { type: 'person', id: person.personId! });
+  const snapshot = exportSnapshot(db, {
+    type: 'person',
+    id: person.personId!,
+    noteVersion: options.noteVersion,
+    mode: 'provider',
+  });
+  assert.ok(!snapshot.records.some((record) => record.id === 'named-person-only'));
+  assert.doesNotMatch(exportHtml(snapshot), /PRIVATE NAMED PERSON ASSERTION/);
+});
+test('an owner’s unmatched assertion survives a clinician mention, but competing ownership excludes it', (t) => {
+  const { db, input } = fixture(t);
+  const clinician = createNote(db, { kind: 'person', title: 'Fictional mentioned clinician' });
+  const managed = createNote(db, { kind: 'person', title: 'Fictional dependent' });
+  db.exec(`INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json)
+    VALUES('owned-allergy','file','issuer','allergy','{"display":"Fictional owned allergy"}'),
+          ('disputed-allergy','file','issuer','allergy','{"display":"Fictional disputed allergy"}'),
+          ('managed-allergy','file','issuer','allergy','{"display":"Fictional managed allergy"}');
+    INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role)
+    VALUES('owned-subject','person','patient','owned-allergy','report_subject'),
+          ('disputed-subject','person','patient','disputed-allergy','report_subject');`);
+  db.prepare(
+    "INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES('clinician-mention','person',?,'owned-allergy','source'),('competing-subject','person',?,'disputed-allergy','report_subject'),('managed-subject','person',?,'managed-allergy','report_subject'),('managed-clinician-mention','person',?,'managed-allergy','source')",
+  ).run(clinician.personId!, clinician.personId!, managed.personId!, clinician.personId!);
+  const snapshot = exportSnapshot(db, { ...input, mode: 'provider' });
+  assert.equal(snapshot.unassignedRawAssertionsOmitted, true);
+  assert.ok(snapshot.records.some((record) => record.id === 'owned-allergy'));
+  assert.ok(!snapshot.records.some((record) => record.id === 'disputed-allergy'));
+  assert.ok(!snapshot.records.some((record) => record.id === 'managed-allergy'));
+  const html = exportHtml(snapshot);
+  assert.match(html, /owned-allergy/);
+  assert.doesNotMatch(html, /disputed-allergy/);
+  assert.match(JSON.stringify(exportEvidence(snapshot)), /Fictional owned allergy/);
+  const managedOptions = exportOptions(db, { type: 'person', id: managed.personId! });
+  const managedPacket = exportSnapshot(db, {
+    type: 'person',
+    id: managed.personId!,
+    noteVersion: managedOptions.noteVersion,
+    mode: 'provider',
+  });
+  assert.ok(managedPacket.records.some((record) => record.id === 'managed-allergy'));
+  assert.ok(!managedPacket.records.some((record) => record.id === 'owned-allergy'));
+});
+test('a managed-person brief labels the caregiver’s correction even with patient information omitted', (t) => {
+  const { db } = fixture(t);
+  db.prepare("UPDATE people SET display_name='Fictional caregiver Sam' WHERE id='patient'").run();
+  const person = createNote(db, { kind: 'person', title: 'Fictional daughter' });
+  const note = createNote(db, {
+    title: 'Fictional visit brief',
+    content: 'A fictional visit',
+    ownerPersonId: person.personId!,
+  });
+  db.prepare(
+    "INSERT INTO observations(id,test_type_id,person_id,source_record_id,label,value_text,extra_json) VALUES('managed-corrected','cbc',?,'raw','Managed corrected value','9',?)",
+  ).run(
+    person.personId!,
+    JSON.stringify({
+      recordCorrections: [
+        {
+          before: { kind: 'observation', valueText: '8' },
+          after: { kind: 'observation', valueText: '9' },
+          reason: 'Fictional source correction',
+          at: '2026-09-30T12:00:00Z',
+        },
+      ],
+    }),
+  );
+  db.prepare(
+    "INSERT INTO note_links(id,note_id,target_type,target_id,relation) VALUES('managed-corrected-link',?,'observation','managed-corrected','related')",
+  ).run(note.id);
+  const snapshot = exportSnapshot(db, {
+    type: 'note',
+    id: note.id,
+    noteVersion: note.version,
+    mode: 'brief',
+    selected: ['observation:managed-corrected'],
+    includeLinked: true,
+    includePatient: false,
+  });
+  assert.equal(snapshot.patient, null);
+  assert.deepEqual(snapshot.actor, { name: 'Fictional caregiver Sam', role: 'caregiver' });
+  assert.match(
+    exportHtml(snapshot),
+    /Corrected by Fictional caregiver Sam \(caregiver\) on 2026-09-30/,
+  );
+  assert.doesNotMatch(exportHtml(snapshot), /Corrected by the patient/);
+  const companion = exportEvidence(snapshot) as {
+    records: Array<{ fieldCorrections?: { actorDisplay: string }[] }>;
+  };
+  assert.equal(
+    companion.records[0].fieldCorrections![0].actorDisplay,
+    'Fictional caregiver Sam (caregiver)',
+  );
+});
+test('a managed Person packet starts from that profile and includes only explicitly assigned assertions and contacts', (t) => {
+  const { db, input } = fixture(t);
+  const person = createNote(db, { kind: 'person', title: 'Fictional daughter' });
+  const contact = createNote(db, {
+    kind: 'person',
+    title: 'Fictional contact',
+    person: { tags: ['Emergency Contact'], phone: '555-0102' },
+  });
+  const unrelated = createNote(db, {
+    kind: 'person',
+    title: 'Other contact',
+    person: { tags: ['Emergency Contact'], phone: '555-0103' },
+  });
+  db.prepare(
+    "INSERT INTO note_links(id,note_id,target_type,target_id,relation) VALUES('daughter-contact',?,'person',?,'related')",
+  ).run(person.id, contact.personId!);
+  db.prepare(
+    "INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json) VALUES('daughter-allergy','file','issuer','allergy','{\"data\":{\"display\":\"Daughter allergy\"}}')",
+  ).run();
+  db.prepare(
+    "INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES('daughter-allergy-owner','person',?,'daughter-allergy','report_subject')",
+  ).run(person.personId!);
+  db.prepare(
+    "INSERT INTO observations(id,test_type_id,person_id,source_record_id,label,value_text,extra_json) VALUES('daughter-result','cbc',?,'raw','Daughter result','9',?)",
+  ).run(
+    person.personId!,
+    JSON.stringify({
+      recordCorrections: [
+        {
+          before: { kind: 'observation', valueText: '8' },
+          after: { kind: 'observation', valueText: '9' },
+          reason: 'Reviewed source value',
+          at: '2026-09-30T12:00:00Z',
+        },
+      ],
+    }),
+  );
+  const options = exportOptions(db, { type: 'person', id: person.personId! });
+  const snapshot = exportSnapshot(db, {
+    type: 'person',
+    id: person.personId!,
+    noteVersion: options.noteVersion,
+    mode: 'provider',
+    noteIds: [],
+  });
+  const html = exportHtml(snapshot);
+  assert.equal(snapshot.identity.name, 'Fictional daughter');
+  assert.ok(snapshot.records.some((record) => record.id === 'daughter-allergy'));
+  assert.ok(!snapshot.records.some((record) => record.id === 'lab-1'));
+  assert.match(html, /Fictional contact/);
+  assert.match(html, /Corrected by .* \(caregiver\) on 2026-09-30 — not from a provider/);
+  assert.match(html, /Reviewed source value/);
+  const companion = exportEvidence(snapshot) as {
+    records: Array<{ id: string; fieldCorrections?: Array<{ actorDisplay: string }> }>;
+  };
+  assert.equal(
+    companion.records.find((record) => record.id === 'daughter-result')?.fieldCorrections?.[0]
+      ?.actorDisplay,
+    'Cookie Dough (caregiver)',
+  );
+  assert.doesNotMatch(html, /Other contact|555-0103/);
+  assert.deepEqual(snapshot.patient?.caregiver, { name: 'Cookie Dough', role: 'caregiver' });
+  assert.throws(
+    () => exportSnapshot(db, { ...input, selected: [`person:${unrelated.personId}`] }),
+    (error: unknown) => hasCode(error, 'EXPORT_SUBJECT'),
+  );
+  assert.ok(
+    !exportSnapshot(db, { ...input, mode: 'provider' }).records.some(
+      (record) => record.id === 'daughter-allergy',
+    ),
+  );
+});
+
+test('rendered brief, provider, and managed-person PDFs retain their subject and disclosures', async (t) => {
+  const { db, input } = fixture(t);
+  db.prepare("UPDATE source_files SET details_json=? WHERE id='file'").run(
+    JSON.stringify({
+      intake: {
+        originalName: 'fictional.pdf',
+        workflow: {
+          plans: [
+            {
+              status: 'active',
+              batches: [],
+              units: [
+                {
+                  id: 'page-3',
+                  locator: 'Page 3',
+                  status: 'pending',
+                  processingException: { reason: 'processing_stalled', at: '2026-09-30' },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+  );
+  const person = createNote(db, { kind: 'person', title: 'Fictional daughter' });
+  const options = exportOptions(db, { type: 'person', id: person.personId! });
+  const samples = [
+    {
+      input: { ...input, includePrescriptions: true },
+      expect: /Appointment brief/,
+      absent: /Fictional daughter/,
+      disclosure: /Unread source sections/,
+    },
+    {
+      input: { ...input, mode: 'provider' },
+      expect: /New provider packet/,
+      absent: /Fictional daughter/,
+      disclosure: /Unread source sections/,
+    },
+    {
+      input: {
+        type: 'person',
+        id: person.personId!,
+        noteVersion: options.noteVersion,
+        mode: 'provider',
+      },
+      expect: /Fictional daughter/,
+      absent: /Personally confirmed medication/,
+      disclosure: /Caregiver/,
+    },
+  ];
+  for (const sample of samples) {
+    const pdf = await exportPdf(exportHtml(exportSnapshot(db, sample.input)));
+    assert.equal(pdf.subarray(0, 5).toString(), '%PDF-');
+    const loading = getDocument({ data: new Uint8Array(pdf), useSystemFonts: true });
+    const document = await loading.promise;
+    let text = '';
+    for (let page = 1; page <= document.numPages; page++) {
+      const content = await (await document.getPage(page)).getTextContent();
+      text += content.items.map((item) => ('str' in item ? item.str : '')).join(' ') + ' ';
+    }
+    assert.match(text, sample.expect);
+    assert.match(text, sample.disclosure);
+    assert.doesNotMatch(text, sample.absent);
+    await loading.destroy();
+  }
 });
 test('simple visit toggles select current use and direct links, deduplicating assets without recursion', (t) => {
   const { db, input, note, sensitive } = fixture(t);
@@ -571,7 +853,8 @@ test('provider rendering compacts clinical rows and repeated narratives while ke
 test('evidence companion keeps literal source tokens and indexed citations, rejects stale or foreign previews', async (t) => {
   const { db, input } = fixture(t);
   db.exec(
-    `INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json) VALUES('unmapped','file','issuer','clinical_object','{"data":{"value":9007199254740993,"same":1,"same":2}}')`,
+    `INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json) VALUES('unmapped','file','issuer','clinical_object','{"data":{"value":9007199254740993,"same":1,"same":2}}');
+     INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES('unmapped-owner','person','patient','unmapped','report_subject')`,
   );
   const handler = createNoteExports();
   let response: PreviewResult | undefined,
@@ -772,6 +1055,14 @@ test('finished note exports resolve old clinical kinds while preserving link att
   const html = exportHtml(snapshot);
   assert.match(html, /Reviewed creatinine result/);
   assert.match(html, /1\.20/);
+  assert.match(html, /Reclassified from procedure to observation/);
+  assert.match(html, /Corrected by the patient on/);
+  assert.match(html, /Reviewed the retained fictional report/);
+  assert.ok(
+    snapshot.records[0].fieldCorrections?.some(
+      (correction) => correction.fromKind === 'procedure' && correction.toKind === 'observation',
+    ),
+  );
   assert.match(html, /Personal note; finished/);
   assert.match(html, /Fictional acquiring clinic/);
   assert.equal(snapshot.records[0].citations[0].id, accepted.source_record_id);

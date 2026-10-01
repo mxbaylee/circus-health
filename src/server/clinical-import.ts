@@ -1845,18 +1845,20 @@ export function projectClinicalReview(
         record.id,
       );
     }
-    if (mapping.personId)
-      db.prepare(
-        "INSERT OR IGNORE INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES(?,'person',?,?,'report_subject',?)",
-      ).run(
-        'identity-person:' + hash([mapping.personId, record.id]),
-        mapping.personId,
-        record.id,
-        JSON.stringify({
-          intakeId: file.id,
-          confirmationOperationId: record.identityAttribution?.confirmationOperationId,
-        }),
-      );
+    // The accepted mapping defaults to Self when personId is absent. Record
+    // that decision as evidence too, so packet ownership survives cache loss.
+    const assignedPersonId = mapping.personId || 'patient';
+    db.prepare(
+      "INSERT OR IGNORE INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES(?,'person',?,?,'report_subject',?)",
+    ).run(
+      'identity-person:' + hash([assignedPersonId, record.id]),
+      assignedPersonId,
+      record.id,
+      JSON.stringify({
+        intakeId: file.id,
+        confirmationOperationId: record.identityAttribution?.confirmationOperationId,
+      }),
+    );
     const identityKey = identity(entry, recordFile),
       versionKey = clinicalVersion(mapping),
       found =

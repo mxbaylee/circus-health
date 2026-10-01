@@ -173,6 +173,59 @@ it('Self editor hides legacy tags and scheduling but retains ordinary contact co
   expect(screen.getByLabelText('Phone')).toHaveValue(original.phone);
   expect(screen.getByLabelText('Email')).toHaveValue(original.email);
 });
+it('a saved managed Person opens Print for that person', async () => {
+  const person: Note = {
+    ...self,
+    id: 'person-note:fictional-dependent',
+    personId: 'fictional-dependent',
+    isSelf: false,
+    title: 'Fictional dependent',
+    person: { ...self.person, name: 'Fictional dependent', relationship: 'Family' },
+  };
+  const requests: Array<{ url: string; body: unknown }> = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      requests.push({
+        url: String(input),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      if (String(input).endsWith('/note-exports/options'))
+        return response({
+          noteTitle: person.title,
+          noteVersion: person.version,
+          choices: [],
+          assets: [],
+        });
+      return response([]);
+    }),
+  );
+  const router = createMemoryRouter([
+    {
+      path: '*',
+      element: (
+        <NoteEditor
+          initial={person}
+          initialKind="person"
+          types={[]}
+          onSaved={vi.fn()}
+          onRefresh={vi.fn()}
+          creationId="unused"
+          prelinkId={null}
+          prelinkType={null}
+        />
+      ),
+    },
+  ]);
+  render(<RouterProvider router={router} />);
+  await userEvent.click(screen.getByRole('button', { name: 'Print' }));
+  expect(await screen.findByText('New provider packet')).toBeVisible();
+  expect(requests.find(({ url }) => url.endsWith('/note-exports/options'))?.body).toEqual({
+    type: 'person',
+    id: 'fictional-dependent',
+  });
+  expect(screen.getByText(/Care contacts and additional clinical assertions/)).toBeVisible();
+});
 it('People requests canonical Self exclusion and does not render Self returned by a stale response', async () => {
   const fetch = vi.fn(async (input) => response(String(input).includes('/notes?') ? [self] : []));
   vi.stubGlobal('fetch', fetch);

@@ -93,6 +93,16 @@ test('provider PDF source and evidence count saved report items, then refresh af
     [{ title: 'Fictional panel', saved: 2, total: 3 }],
   );
   assert.match(exportHtml(partial), /2 of 3 current report items reviewed and saved/);
+  const first = db.prepare('SELECT id FROM observations ORDER BY id LIMIT 1').get();
+  assert.ok(first);
+  const brief = exportSnapshot(db, {
+    type: 'note',
+    id: self.id,
+    noteVersion: self.version,
+    mode: 'brief',
+    selected: [`observation:${first.id}`],
+  });
+  assert.match(exportHtml(brief), /2 of 3 current report items reviewed and saved/);
   save([2]);
   const complete = exportSnapshot(db, input);
   const completeEvidence = exportEvidence(complete);

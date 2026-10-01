@@ -517,7 +517,10 @@ test('exact unscoped retries preserve original JSON numeric spellings', async (t
   assert.equal(review.records[0]!.classification, 'duplicate');
   await accept(f, second.id);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
-  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 2);
+  assert.equal(
+    f.db.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+    2,
+  );
   for (const row of f.db.prepare('SELECT raw_json FROM source_records').all())
     assert.match(
       String(row.raw_json),

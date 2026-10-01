@@ -9,6 +9,7 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import { uploadIntake, reviewIntake, importIntake } from '../intake.ts';
 import { rebuildProfile } from '../portable.ts';
 import { getObservation } from '../queries.ts';
+import { exportOptions, exportSnapshot, exportHtml, exportEvidence } from '../note-exports.ts';
 import type { IntakeClinicalMapping, IntakeReviewDecision } from '../../shared/intake.ts';
 
 const envelope = (
@@ -148,7 +149,29 @@ test('empty profile imports clinical views with literal evidence and survives SQ
     'not_current',
     'old provider active flag does not replace the Inactive system default',
   );
-  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 4);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 8);
+  const acceptedSource = observation.source_record_id;
+  assert.deepEqual(
+    f.db
+      .prepare(
+        "SELECT entity_id,role FROM evidence WHERE source_record_id=? AND entity_type='person'",
+      )
+      .all(acceptedSource)
+      .map((row) => ({ ...row })),
+    [{ entity_id: 'patient', role: 'report_subject' }],
+  );
+  const packet = (database: typeof f.db) => {
+    const options = exportOptions(database, { type: 'person', id: 'patient' });
+    return exportSnapshot(database, {
+      type: 'person',
+      id: 'patient',
+      noteVersion: options.noteVersion,
+      mode: 'provider',
+    });
+  };
+  assert.ok(
+    packet(f.db).records.some((record) => record.citations.some((c) => c.id === acceptedSource)),
+  );
   assert.deepEqual(
     JSON.parse(
       f.db
@@ -161,8 +184,82 @@ test('empty profile imports clinical views with literal evidence and survives SQ
   const db = openDatabase(rebuilt.database, f.id);
   assert.equal(db.prepare('SELECT value_text FROM observations').get()!.value_text, '< 12.00');
   assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT entity_id,role FROM evidence WHERE source_record_id=? AND entity_type='person'",
+      )
+      .all(acceptedSource)
+      .map((row) => ({ ...row })),
+    [{ entity_id: 'patient', role: 'report_subject' }],
+  );
+  assert.ok(
+    packet(db).records.some((record) => record.citations.some((c) => c.id === acceptedSource)),
+  );
   assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
   db.close();
+});
+test('retained unassigned clinical history stays out of a packet with a visible notice after rebuild', (t) => {
+  const f = fixture(t);
+  const item = upload(f, [
+    envelope('accepted-self', lab),
+    envelope('unassigned-history', {
+      ...lab,
+      subject: 'unknown',
+      testLabel: 'PRIVATE UNASSIGNED HISTORY',
+    }),
+  ]);
+  const review = reviewIntake(f.db, f.root, f.id, item.id);
+  assert.equal(review.records.length, 2);
+  accept(f, item, (current) =>
+    current.records.map((record, index) => ({
+      recordId: record.id,
+      action: index === 0 ? 'accept' : 'skip',
+      mapping: {},
+    })),
+  );
+  const check = (database: typeof f.db) => {
+    const source = database
+      .prepare("SELECT id FROM source_records WHERE raw_json LIKE '%PRIVATE UNASSIGNED HISTORY%'")
+      .get();
+    assert.ok(source, 'the unmatched original remains retained');
+    assert.equal(
+      database
+        .prepare(
+          "SELECT count(*) n FROM evidence WHERE source_record_id=? AND role='report_subject'",
+        )
+        .get(source.id)!.n,
+      0,
+    );
+    const options = exportOptions(database, { type: 'person', id: 'patient' });
+    const snapshot = exportSnapshot(database, {
+      type: 'person',
+      id: 'patient',
+      noteVersion: options.noteVersion,
+      mode: 'provider',
+    });
+    assert.equal(snapshot.unassignedRawAssertionsOmitted, true);
+    assert.ok(!snapshot.records.some((record) => record.id === source.id));
+    assert.match(
+      exportHtml(snapshot),
+      /Some retained clinical assertions have no verified single-person assignment/,
+    );
+    assert.doesNotMatch(exportHtml(snapshot), /PRIVATE UNASSIGNED HISTORY/);
+    const companion = JSON.stringify(exportEvidence(snapshot));
+    assert.match(
+      companion,
+      /Some retained clinical assertions have no verified single-person assignment/,
+    );
+    assert.doesNotMatch(companion, /PRIVATE UNASSIGNED HISTORY/);
+  };
+  check(f.db);
+  const rebuilt = rebuildProfile(f.root, f.id, resolve(f.root, 'unassigned-rebuild'));
+  const db = openDatabase(rebuilt.database, f.id);
+  try {
+    check(db);
+  } finally {
+    db.close();
+  }
 });
 test('accepted grouped observation values keep their literal fields and rebuild the numeric query projection', (t) => {
   const f = fixture(t);
@@ -261,7 +358,7 @@ test('identical unscoped copies add attribution but changed unscoped deliveries 
   assert.equal(repeated.imported.clinical.duplicates, 1);
   assert.equal(repeated.imported.clinical.newMedications, 0);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
-  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 2);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 4);
   assert.equal(f.db.prepare('SELECT count(*) n FROM source_records').get()!.n, 2);
   const before = f.db.prepare('SELECT * FROM observations ORDER BY id').all();
   const changed = upload(f, [envelope('same', { ...lab, valueText: '14.2' })], 'changed.jsonl');
@@ -275,7 +372,7 @@ test('identical unscoped copies add attribution but changed unscoped deliveries 
     { code: 'CLINICAL_SOURCE_SCOPE_COLLISION' },
   );
   assert.deepEqual(f.db.prepare('SELECT * FROM observations ORDER BY id').all(), before);
-  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 2);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 4);
   assert.equal(f.db.prepare('SELECT count(*) n FROM source_records').get()!.n, 2);
   assert.equal(
     f.db
