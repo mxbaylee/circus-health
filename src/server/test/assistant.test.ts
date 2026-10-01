@@ -6514,6 +6514,60 @@ test('a late proposal preserves a consumed section when another section is captu
   );
   assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
   assert.notEqual(result.proposalSourceText.currentRevisionId, passage.revisionId);
+  await call(bridge, 'intake_source_text', {
+    id: item.id,
+    action: 'search',
+    query: 'Fictional',
+  });
+  const { reviewIntakeSourceText } = await import('../intake-source-text.ts');
+  const current = getIntakeSourceText(f.db, f.root, 'cedar', item.id).revision!;
+  assert.ok(current.pages.some((page) => page.page === 2));
+  reviewIntakeSourceText(
+    f.db,
+    f.root,
+    'cedar',
+    item.id,
+    {
+      operationId: randomUUID(),
+      expectedRevisionId: current.id,
+      sourceHash: current.sourceHash,
+      action: 'correct',
+      scope: { page: 2 },
+      spans: [
+        {
+          id: 'fictional-late-correction',
+          text: 'Corrected fictional second-page evidence.',
+          provenance: 'human',
+          region: { page: 2 },
+        },
+      ],
+    },
+    'fictional-owner',
+  );
+  await assert.rejects(
+    call(bridge, 'intake_propose', {
+      id: item.id,
+      version: before.version,
+      sourceTextRevisionId: passage.revisionId,
+      summary: 'Late response against corrected evidence',
+      jsonlText: JSON.stringify({
+        format: 'health-record-v1',
+        id: 'fictional-stale-context',
+        kind: 'context',
+        payload: { text: 'Fictional first-page evidence' },
+        provenance: {
+          capturedVia: 'Fictional PDF',
+          sourceSystem: null,
+          sourceRecordId: null,
+          evidenceClass: 'transcription',
+          locator: 'page 1',
+        },
+        coverage: { status: 'partial', notes: ['Later source remains.'] },
+      }),
+    }),
+    (error: unknown) => hasCode(error, 'SOURCE_TEXT_CHANGED'),
+  );
+  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
 });
 
 test('a passage read cannot erase a human correction that arrived during a provider response', async (t) => {

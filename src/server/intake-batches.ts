@@ -323,6 +323,8 @@ export function createIntakeBatchManager({
           }
       for (const item of batch.items) {
         restoreReadingJobBaseline(item);
+        if (item.status === 'review_ready' && item.sourceExtraction)
+          item.sourceExtraction.stepsAtModelPass ??= item.sourceExtraction.steps;
         item.automaticRun ??=
           batch.automaticRun &&
           (['queued', 'starting', 'running'].includes(item.status) ||
@@ -1095,8 +1097,18 @@ export function createIntakeBatchManager({
       schedule(profileId, batch.id);
       return;
     }
-    const capturedThisBatch = (item.sourceExtraction?.steps || 0) > 0;
-    if (!retry && !capturedThisBatch && current.proposalIds.length) {
+    const capturedThisBatch =
+      (item.sourceExtraction?.steps || 0) > (item.sourceExtraction?.stepsAtModelPass || 0);
+    const completedProposalPass =
+      linkedChat?.status === 'idle' &&
+      !linkedChat.reading?.remainingUnits &&
+      !linkedChat.reading?.pendingReadWindows;
+    if (
+      !item.forceModelResume &&
+      !capturedThisBatch &&
+      current.proposalIds.length &&
+      (!retry || completedProposalPass)
+    ) {
       finishItem(profileId, batch, item, 'review_ready', 'already_reviewable', intake, linkedChat);
       schedule(profileId, batch.id);
       return;
@@ -1256,6 +1268,7 @@ export function createIntakeBatchManager({
       return;
     }
     item.chatId = chat!.id;
+    delete item.forceModelResume;
     item.status = 'running';
     save(profileId, batch, 'conversion-running');
     schedule(profileId, batch.id, pollMs);
@@ -1405,6 +1418,10 @@ export function createIntakeBatchManager({
       return;
     }
     item.proposalIds = intake.proposals.map((proposal) => proposal.id);
+    // A retained cumulative step count is not evidence of new source capture on
+    // the next process run. Record that this completed pass covered those steps.
+    if (chat.status === 'idle' && item.sourceExtraction)
+      item.sourceExtraction.stepsAtModelPass = item.sourceExtraction.steps;
     if (chat.status === 'failed' && chat.reading?.providerWait) {
       // Provider unavailability is not local stuckness, even when a request timed out.
       // Do not forgive preceding unproductive model requests in this slice.
@@ -1661,6 +1678,12 @@ export function createIntakeBatchManager({
       } else {
         // Reprocess is a fresh intent for exactly the selected corrected file.
         // Every other stopped item keeps its Stop state.
+        if (owned.some((batch) => batch.id !== retained.id && batch.status === 'running'))
+          throw new HttpError(
+            409,
+            'INTAKE_BATCH_BUSY',
+            'Another reading batch is already running for this profile',
+          );
         for (const item of retained.items) {
           if (!intakeIds.includes(item.intakeId) || item.status !== 'review_ready') continue;
           const interpretation = currentIntakeInterpretations(
@@ -1888,6 +1911,7 @@ export function createIntakeBatchManager({
       if (!item.resumeAutomaticRun && item.reason !== 'stopped' && item !== batch.items[index])
         continue;
       if (!hasPausedIntakeReading(item) && item.status !== 'queued') continue;
+      item.forceModelResume = true;
       if (item.sourceExtraction?.draining) {
         item.sourceExtraction.allowanceId = randomUUID();
         item.sourceExtraction.stepsAtAllowance = item.sourceExtraction.steps;

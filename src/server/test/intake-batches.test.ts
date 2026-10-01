@@ -298,6 +298,56 @@ test('two uploaded originals run sequentially into one durable review queue', as
   assert.equal(f.checks(), 2);
 });
 
+test('restart does not treat cumulative capture steps as unread new work', async (t) => {
+  const f = setup(t);
+  const item = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-cumulative-steps.txt',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from('Fictional source for a completed model pass'),
+  });
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-cumulative-steps',
+    intakeIds: [item.id],
+  });
+  await waitFor(() => f.bridges.length === 1);
+  await propose(f.bridges[0], item);
+  complete(f.bridges[0]);
+  const completed = await waitFor(() => {
+    const value = f.manager.get(profileId, batch.id);
+    return value.status === 'complete' && value;
+  });
+  f.manager.close();
+  completed.items[0]!.sourceExtraction = {
+    steps: 3,
+    stepsAtModelPass: 3,
+    spentMs: 0,
+    allowanceId: 'fictional-allowance',
+    stepsAtAllowance: 0,
+    spentMsAtAllowance: 0,
+    operationId: null,
+    expectedRevisionId: null,
+    startedAt: null,
+    initialDone: true,
+    draining: false,
+  };
+  completed.status = 'running';
+  completed.automaticRun = true;
+  completed.items[0]!.status = 'queued';
+  completed.items[0]!.automaticRun = true;
+  completed.items[0]!.reason = 'continuing';
+  writeIntakeBatch(f.root, profileId, completed, 'fictional-restart-before-final-status');
+  const restarted = createIntakeBatchManager({
+    root: f.root,
+    databases: f.databases,
+    assistant: f.assistant,
+    pollMs: 5,
+  });
+  t.after(() => restarted.close());
+  restarted.wake(profileId);
+  await waitFor(() => restarted.get(profileId, batch.id).status === 'complete');
+  assert.equal(f.bridges.length, 1, 'the recorded pass already covered every capture step');
+});
+
 test('an active linked conversion is restarted under coordinator ownership after retaining its proposal', async (t) => {
   const f = setup(t);
   const first = uploadIntake(f.db, f.root, profileId, {
@@ -618,6 +668,56 @@ test('prepared JSONL and an existing partial proposal skip model work without co
       { status: 'review_ready', reason: 'already_reviewable', reading: null },
     ],
   );
+});
+
+test('a busy reprocess leaves stopped review-ready items unchanged', async (t) => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const f = setup(t, {
+    connectionCheck: async () => {
+      await blocked;
+      return { available: true, readiness: 'ready' };
+    },
+  });
+  const first = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-stopped-ready.jsonl',
+    bytes: Buffer.from(record('fictional-stopped-ready', 'complete_response')),
+  });
+  const second = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-competing.txt',
+    bytes: Buffer.from('Fictional competing source'),
+  });
+  const old = f.manager.create(profileId, {
+    operationId: 'fictional-stopped-ready-batch',
+    intakeIds: [first.id],
+  });
+  await waitFor(() => f.manager.get(profileId, old.id).status === 'complete');
+  f.manager.stop(profileId, old.id);
+  writeIntakeSourcePin(f.db, first.id, {
+    revisionId: 'fictional-new-source',
+    dependencyToken: 'fictional-new-source',
+    requiresInterpretation: true,
+    version: 1,
+  });
+  const competing = f.manager.create(profileId, {
+    operationId: 'fictional-competing-batch',
+    intakeIds: [second.id],
+  });
+  await waitFor(() => f.manager.get(profileId, competing.id).status === 'running');
+  const before = f.manager.get(profileId, old.id);
+  assert.throws(
+    () =>
+      f.manager.create(profileId, {
+        operationId: 'fictional-reopen-while-busy',
+        intakeIds: [first.id],
+      }),
+    { code: 'INTAKE_BATCH_BUSY' },
+  );
+  assert.deepEqual(f.manager.get(profileId, old.id), before);
+  release();
 });
 
 test('corrected completed work cannot displace a different running batch or claim cross-batch selection', async (t) => {

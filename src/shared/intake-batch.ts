@@ -116,6 +116,8 @@ export interface IntakeBatchItem {
   reason: string | null;
   chatId: string | null;
   proposalIds: string[];
+  /** Explicit Resume asks for another model pass despite already reviewable work. */
+  forceModelResume?: boolean;
   reading: IntakeBatchReadingState | null;
   /** Durable local extraction checkpoint; historical allowance fields remain decodable. */
   sourceExtraction?: {
@@ -124,6 +126,8 @@ export interface IntakeBatchItem {
     stalls?: number;
     unitPage?: number;
     steps: number;
+    /** Cumulative capture steps already followed by a completed model pass. */
+    stepsAtModelPass?: number;
     spentMs: number;
     allowanceId: string;
     stepsAtAllowance: number;

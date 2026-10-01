@@ -2612,6 +2612,9 @@ export function createAssistant({
           else (state.unknownSourceCoverage ||= new Set()).add(childId);
         } else (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
       }
+      if (args.action === 'inventory')
+        // Package inventory can expose member names and indexed source previews.
+        (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
     } else if (
       ['health_intake_plan', 'health_intake_question', 'health_intake_batch'].includes(params.tool)
     ) {
@@ -2867,7 +2870,14 @@ export function createAssistant({
           offset: optionalNumberArgument(args, 'offset'),
           assertRunning,
         });
+        // Search also exposes absence across the index; followed references can
+        // include context beyond one measured page or span.
+        (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
       } else throw new Error('Unsupported extraction-plan operation');
+      if (args.action === 'read')
+        // Context sections can carry literal proposal evidence and source locators.
+        // Until each section has a measured contract, retain whole-source pinning.
+        (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
     } else if (params.tool === 'health_intake_source_text') {
       const {
         getIntakeSourceTextPassage,
@@ -3059,7 +3069,7 @@ export function createAssistant({
             observeSourcePages(evidenceIntake.id, [
               evidenceIntake.mimeType === 'application/pdf' ? Number(args.page || 1) : 1,
             ]);
-        }
+        } else (state.unknownSourceCoverage ||= new Set()).add(evidenceIntake.id);
         assertRunning();
         if (state.checkpoint && args.id === state.checkpoint.intakeId) {
           const current = conversionIntake(profileId, chat);
