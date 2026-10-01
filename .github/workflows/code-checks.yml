@@ -92,6 +92,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes qpdf
+      - name: Install the PDF renderer used by real export tests
+        run: npx playwright install --with-deps chromium
       - name: Server tests with isolated fictional fixtures
         run: npm run test:server -- --test-shard=${{ matrix.shard }}/2
 
