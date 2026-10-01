@@ -14,6 +14,7 @@ import { resolve, relative } from 'node:path';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { recentPerformanceLimits } from './import-performance.ts';
 import { encryptObject, decryptObject, type VaultKey } from './vault-crypto.ts';
+import { openDiagnosticChunkStore, type DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
 
 interface VaultObjectMetadata {
   bytes: number;
@@ -67,6 +68,7 @@ export interface Vault {
   metadata(): VaultMetadata;
   readPerformanceSummary(): Uint8Array | null;
   writePerformanceSummary(bytes: Uint8Array): void;
+  diagnosticChunks(): DiagnosticChunkStore;
   close(): void;
 }
 
@@ -139,6 +141,7 @@ export function openVault({
   let closed = false,
     filesDirty = false,
     indexId: string | null = null;
+  let diagnosticChunks: DiagnosticChunkStore | undefined;
   const fingerprints = new Map<string, string>();
   const fingerprint = (path: string): string => {
     const s = statSync(path, { bigint: true });
@@ -490,6 +493,15 @@ export function openVault({
         throw Error('Invalid diagnostic summary size');
       return decryptObject(path, key, profileId, 'recent-performance-v1');
     },
+    diagnosticChunks() {
+      guard();
+      return (diagnosticChunks ??= openDiagnosticChunkStore({
+        directory: resolve(directory, 'diagnostics/events'),
+        profileId,
+        key,
+        guard,
+      }));
+    },
     writePerformanceSummary(bytes) {
       guard();
       if (bytes.byteLength > recentPerformanceLimits.maxBytes)
@@ -508,6 +520,8 @@ export function openVault({
     },
     close(): void {
       closed = true;
+      diagnosticChunks?.close();
+      diagnosticChunks = undefined;
       // Drop the only reference to decrypted metadata after the guard closes
       // every public operation.
       manifest = null!;
