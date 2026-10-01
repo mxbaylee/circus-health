@@ -15,6 +15,7 @@ function snapshot(overrides: Partial<IntakeBatch> = {}): IntakeBatch {
     id: 'fictional-batch',
     profileId: 'fictional-profile',
     operationId: 'fictional-operation',
+    automaticRun: true,
     status: 'running',
     reason: null,
     currentIndex: 0,
@@ -148,6 +149,21 @@ test('qualification waits through an idle time-limited slice for the batch coord
   assert.ok(execution.calls.every((call) => !/convert|resume|assistant\/chats/.test(call.path)));
 });
 
+test('upload-created automatic batch retains its own operation ID throughout polling', async () => {
+  const first = snapshot({ operationId: 'upload-operation' });
+  const last = complete();
+  last.operationId = 'upload-operation';
+  const execution = runner([first, last]);
+  assert.equal((await execution.run()).passed, true);
+  assert.equal(execution.calls.length, 2);
+  const drift = complete();
+  drift.operationId = 'another-operation';
+  await assert.rejects(
+    runner([snapshot({ operationId: 'upload-operation' }), drift]).run(),
+    /operation_id/,
+  );
+});
+
 test('paused, stopped and exhausted whole-job budgets cannot pass qualification', async () => {
   const exhausted = complete();
   exhausted.reason = 'items_paused';
@@ -183,9 +199,12 @@ test('a running batch reaches the harness deadline without another start or resu
 });
 
 test('the coordinator receipt must remain in the freshly created profile and original', async () => {
+  const wrongIntake = snapshot();
+  wrongIntake.items[0]!.intakeId = 'unrelated-original';
   for (const invalid of [
     snapshot({ profileId: 'unrelated-profile' }),
     snapshot({ items: [snapshot().items[0], snapshot().items[0]] }),
+    wrongIntake,
   ]) {
     await assert.rejects(runner([invalid]).run(), /scope/);
   }
