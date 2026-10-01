@@ -34,6 +34,7 @@
     "image:build": "node deploy/run.ts build",
     "check:data": "node deploy/run.ts check-data",
     "login:chatgpt": "node deploy/run.ts login-chatgpt",
+    "qualify:oauth": "node src/scripts/qualify-oauth-refresh.ts",
     "icons": "node deploy/icons.ts",
     "test:deploy": "node src/scripts/test-suite.ts deploy",
     "test:browser:run": "node src/scripts/test-suite.ts browser",
