@@ -2627,7 +2627,10 @@ test('confirmed native PDF headers authorize exact source reuse and preserve cha
       first.receipt.receipts[0]!.records[0]!.entityId,
     );
     assert.equal(recovered.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
-    assert.equal(recovered.prepare('SELECT count(*) n FROM evidence').get()!.n, 2);
+    assert.equal(
+      recovered.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+      2,
+    );
     const secondBackup = await createBackup(recovered, target, f.profileId);
     const nextRoot = join(f.root, 'rebuilt-pdf-source-reuse-again');
     const next = rebuildProfile(join(secondBackup.path, 'files'), f.profileId, nextRoot);
@@ -2660,7 +2663,10 @@ test('confirmed native PDF headers authorize exact source reuse and preserve cha
           .value_text,
         originalAccepted.value_text,
       );
-      assert.equal(cold.prepare('SELECT count(*) n FROM evidence').get()!.n, 3);
+      assert.equal(
+        cold.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+        3,
+      );
       assert.equal(
         intake.getIntake(cold, nextRoot, f.profileId, f.item.id).workflow!.identityConfirmations!
           .length,

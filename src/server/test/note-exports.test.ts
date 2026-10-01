@@ -602,14 +602,16 @@ test('a managed Person packet starts from that profile and includes only explici
   assert.match(html, /Fictional contact/);
   assert.match(html, /Corrected by .* \(caregiver\) on 2026-09-30 — not from a provider/);
   assert.match(html, /Reviewed source value/);
-  const companion = exportEvidence(snapshot);
-  assert.ok(
-    JSON.stringify(companion).includes('"actorDisplay":"Self (caregiver)"') ||
-      JSON.stringify(companion).includes('(caregiver)'),
+  const companion = exportEvidence(snapshot) as {
+    records: Array<{ id: string; fieldCorrections?: Array<{ actorDisplay: string }> }>;
+  };
+  assert.equal(
+    companion.records.find((record) => record.id === 'daughter-result')?.fieldCorrections?.[0]
+      ?.actorDisplay,
+    'Cookie Dough (caregiver)',
   );
   assert.doesNotMatch(html, /Other contact|555-0103/);
-  assert.ok(snapshot.patient?.caregiver);
-  assert.ok(unrelated.personId);
+  assert.deepEqual(snapshot.patient?.caregiver, { name: 'Cookie Dough', role: 'caregiver' });
   assert.throws(
     () => exportSnapshot(db, { ...input, selected: [`person:${unrelated.personId}`] }),
     (error: unknown) => hasCode(error, 'EXPORT_SUBJECT'),

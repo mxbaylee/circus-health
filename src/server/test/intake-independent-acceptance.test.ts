@@ -353,7 +353,10 @@ for (const boundary of ['before_head', 'after_head'] as const)
       getIntakeReportAcceptance(recovered, f.root, f.profileId, input.operationId).receipt,
       saved.receipt,
     );
-    assert.equal(recovered.prepare('SELECT count(*) AS n FROM evidence').get()!.n, 2);
+    assert.equal(
+      recovered.prepare("SELECT count(*) AS n FROM evidence WHERE entity_type<>'person'").get()!.n,
+      2,
+    );
   });
 
 for (const stale of [false, true])
@@ -400,5 +403,8 @@ for (const stale of [false, true])
       stale ? ['needs_review', 'needs_review', 'saved'] : ['saved', 'saved', 'saved'],
     );
     assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
-    assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, stale ? 2 : 4);
+    assert.equal(
+      f.db.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+      stale ? 2 : 4,
+    );
   });

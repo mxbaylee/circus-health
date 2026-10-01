@@ -319,8 +319,9 @@ export function NoteExportDialog({
               <>
                 <h3>New provider packet</h3>
                 <p>
-                  Patient information, care contacts, and clinical history are included
-                  automatically, with prescriptions, procedures, results, and source references.
+                  Patient information, recorded prescriptions, procedures, results, and source
+                  references are included automatically. Care contacts and additional clinical
+                  assertions appear when they are linked or assigned to this person.
                 </p>
                 <fieldset className="export-inclusions">
                   <legend>Notes to include</legend>
