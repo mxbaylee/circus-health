@@ -35,7 +35,17 @@ export function issueResolutionDependency(
   issue: IntakeReviewIssue,
   mapping: Partial<IntakeClinicalMapping>,
 ): NonNullable<IntakeIssueResolution['dependency']> {
-  const selected = [...new Set(resolutionFields(issue))].sort();
+  // Subject is projected from the printed identity and saved person after the
+  // workflow review. Pinning that derived value here would invalidate even an
+  // unchanged explicit Unknown answer on the next read. Exact identity receipt
+  // and report-boundary checks own the person assignment; kind remains stable.
+  const selected = [
+    ...new Set(
+      resolutionFields(issue).filter((field) =>
+        issue.kind === 'identity' ? field !== 'subject' : true,
+      ),
+    ),
+  ].sort();
   const fields = selected.length ? selected : ['*'];
   const pageHash = issue.page ? sourcePageCurrentHash(db, intakeId, issue.page) : null;
   return {

@@ -2653,6 +2653,16 @@ export function saveIntakeReviewDraft(
     }
     for (const resolution of submittedResolutions.values()) {
       const retained = resolutions.findLast((r) => r.issueId === resolution.issueId);
+      // A hydrated autosave carries the exact historical decision. Keep it in
+      // history even if a later field edit or identity projection removed the
+      // issue from the current review. Only a fresh choice can pin new evidence.
+      if (
+        retained &&
+        resolution.operationId === retained.operationId &&
+        resolution.at === retained.at &&
+        canonicalLiteral(resolution) === canonicalLiteral(retained)
+      )
+        continue;
       const issue = required(
         record.issues!.find((i) => i.id === resolution.issueId),
         'Issue does not belong to this candidate',

@@ -686,6 +686,62 @@ test('corrected completed work cannot displace a different running batch or clai
   await waitFor(() => f.bridges.length === 1);
 });
 
+test('a corrected earlier file cannot displace an in-flight sibling in its retained batch', async (t) => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const f = setup(t, {
+    connectionCheck: async () => {
+      await blocked;
+      return { available: true, readiness: 'ready' };
+    },
+  });
+  const first = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-ready-first.jsonl',
+    bytes: Buffer.from(record('fictional-ready-first', 'complete_response')),
+  });
+  const second = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-inflight-second.txt',
+    bytes: Buffer.from('Fictional second source waits for its model'),
+  });
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-same-batch-start',
+    intakeIds: [first.id, second.id],
+  });
+  await waitFor(() => {
+    const current = f.manager.get(profileId, batch.id);
+    return current.items[0]?.status === 'review_ready' && current.items[1]?.status === 'starting';
+  }, 'second source preflight');
+  writeIntakeSourcePin(f.db, first.id, {
+    revisionId: 'fictional-corrected-first',
+    dependencyToken: 'fictional-corrected-first',
+    requiresInterpretation: true,
+    version: 1,
+  });
+  const before = f.manager.get(profileId, batch.id);
+  assert.throws(
+    () =>
+      f.manager.create(profileId, {
+        operationId: 'fictional-same-batch-reprocess',
+        intakeIds: [first.id],
+      }),
+    { code: 'INTAKE_BATCH_BUSY' },
+  );
+  assert.deepEqual(f.manager.get(profileId, batch.id), before);
+  assert.equal(
+    f.manager.create(profileId, {
+      operationId: batch.operationId,
+      intakeIds: [first.id, second.id],
+    }).scheduled,
+    false,
+    'the original operation still replays exactly',
+  );
+  release();
+  await waitFor(() => f.bridges.length === 1, 'sibling model pass');
+});
+
 test('a retained partial proposal survives a failed pass and the next original still starts', async (t) => {
   const f = setup(t);
   const first = uploadIntake(f.db, f.root, profileId, {

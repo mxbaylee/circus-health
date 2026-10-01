@@ -17,6 +17,7 @@ import type {
   IntakeReview,
 } from '../../shared/intake.ts';
 import type { IntakePeopleQueue, IntakePersonApplyRequest } from '../../shared/intake-people.ts';
+import type { SourceAttentionQueue } from '../../shared/intake-source-text.ts';
 import type {
   IntakeIdentityConfirmation,
   IntakeIdentityReview,
@@ -437,7 +438,19 @@ test(
       'both reports retain their explicit printed-person confirmations',
     );
     await page.reload();
-    await page.getByRole('tab', { name: /^All\s*7$/ }).waitFor();
+    const sourceAttention = await request<SourceAttentionQueue>('/intakes/source-attention');
+    assert.equal(
+      sourceAttention.sections,
+      2,
+      'two retained originals have source sections to inspect',
+    );
+    assert.deepEqual(
+      sourceAttention.items.map((item) => item.intakeId).sort(),
+      [clinical.intake.id, people.intake.id].sort(),
+    );
+    // Source inspection remains separate from the five clinical and two People rows.
+    await page.getByRole('tab', { name: /^All\s*9$/ }).waitFor();
+    await page.getByRole('tab', { name: /^Needs attention\s*2$/ }).waitFor();
     await page.getByRole('tab', { name: /^People\s*2$/ }).waitFor();
     await captureControls('import-person-confirmed');
     await until(

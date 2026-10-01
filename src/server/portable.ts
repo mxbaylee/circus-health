@@ -24,6 +24,7 @@ import {
   openDatabase,
   databaseSchemaVersion,
   revision,
+  clinicalReviewRevision,
   registerTransactionDurability,
   LATEST_SCHEMA_VERSION,
   type Database,
@@ -66,6 +67,8 @@ export interface PortableSnapshot {
   revision: number;
   createdAt: string;
   semantics: string;
+  /** Scalar review authority at this personal generation, including later edits. */
+  clinicalReviewRevision?: number;
   tables: Record<string, PortableRow[]>;
   restoreOperations?: PortableRow[];
   assistantOperations?: PortableRow[];
@@ -279,6 +282,10 @@ function checkedGeneration(
     !Number.isInteger(value.schemaVersion) ||
     (value.schemaVersion as number) < 1 ||
     (value.schemaVersion as number) > LATEST_SCHEMA_VERSION ||
+    (value.clinicalReviewRevision !== undefined &&
+      (!Number.isSafeInteger(value.clinicalReviewRevision) ||
+        value.clinicalReviewRevision < 0 ||
+        value.clinicalReviewRevision > (value.revision as number))) ||
     !value.tables ||
     typeof value.tables !== 'object' ||
     Array.isArray(value.tables)
@@ -522,6 +529,7 @@ function personalSnapshot(db: Database, profileId: string): PortableSnapshot {
   );
   const snapshot: PortableSnapshot = {
     ...header(db, profileId, 'personal'),
+    clinicalReviewRevision: clinicalReviewRevision(db),
     tables: Object.fromEntries(
       tables.map((table) => [
         table,
@@ -1430,6 +1438,13 @@ export function projectPortableDatabase(
       }
       checkOwner(db, profileId);
       putMeta(db, 'revision', portable.personal.value.revision);
+      // Legacy generations had no separate counter. A conservative broad
+      // revision invalidates old review tokens without losing accepted data.
+      putMeta(
+        db,
+        'clinical_review_revision',
+        portable.personal.value.clinicalReviewRevision ?? portable.personal.value.revision,
+      );
       putMeta(db, 'personal_dirty', '0');
       putMeta(db, 'personal_persisted_revision', portable.personal.value.revision);
       putMeta(db, 'personal_last_error', '');

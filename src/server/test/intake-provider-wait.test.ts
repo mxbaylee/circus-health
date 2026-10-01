@@ -246,7 +246,7 @@ test('Stop keeps a waiting file resumable even when the cursor has passed it', a
   assert.equal(resumed.items[0].automaticRun, true);
   assert.equal(resumed.items[0].status, 'queued');
 });
-test('create reports whether a stopped or completed selection actually scheduled work', async (t) => {
+test('create reports a stopped restart and reopens a completed item with unfinished source capture', async (t) => {
   const f = fixture(t);
   await waitFor(() => f.sends === 1);
   f.manager.stop(f.profileId, f.batch.id);
@@ -265,11 +265,12 @@ test('create reports whether a stopped or completed selection actually scheduled
   completed.items[0].automaticRun = false;
   completed.automaticRun = false;
   f.reopenWith(completed);
-  const noWork = f.manager.create(f.profileId, {
+  const reopened = f.manager.create(f.profileId, {
     operationId: 'fictional-reprocess-complete',
     intakeIds: [f.batch.items[0].intakeId],
   });
-  assert.equal(noWork.scheduled, false);
+  assert.equal(reopened.scheduled, true);
+  assert.equal(reopened.status, 'running');
 });
 test('authentication waits for a changed prerequisite after the retry deadline', async (t) => {
   const f = fixture(t);

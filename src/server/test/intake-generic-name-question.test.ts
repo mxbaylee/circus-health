@@ -524,6 +524,36 @@ test('human unknown answers and changed report membership revoke a generic quest
   assert.equal(another.read().records[0]!.identityReview?.blocking, true);
 });
 
+for (const outcome of ['unknown', 'other_person'] as const)
+  test(`a generic ${outcome} refusal still blocks an automatic match after a clinical kind edit`, async (t) => {
+    const f = fixture(t);
+    const initial = f.read();
+    const record = initial.records[0]!;
+    saveIntakeReviewDraft(f.db, f.root, f.profile, f.item.id, {
+      version: initial.version,
+      operationId: `fictional-${outcome}-refusal`,
+      proposalId: f.proposal,
+      recordId: record.id,
+      candidateVersionId: record.candidateVersionId!,
+      resolutions: [
+        { issueId: record.issues!.find((issue) => issue.prompt === prompt)!.id, outcome },
+      ],
+    });
+    const beforeEdit = f.read();
+    saveIntakeReviewDraft(f.db, f.root, f.profile, f.item.id, {
+      version: beforeEdit.version,
+      operationId: `fictional-${outcome}-kind-edit`,
+      proposalId: f.proposal,
+      recordId: record.id,
+      candidateVersionId: record.candidateVersionId!,
+      mapping: { kind: 'document' },
+      resolutions: beforeEdit.records[0]!.draft!.resolutions,
+    });
+    const current = f.read();
+    assert.equal(current.records[0]!.identityReview?.blocking, true);
+    assert.equal((await f.preview()).blocking, true);
+  });
+
 test('header parsing does not invent a person from ambiguous names or arbitrary prose', () => {
   assert.equal(printedIdentityName(header), name);
   assert.equal(printedIdentityName(labelledHeader), name);

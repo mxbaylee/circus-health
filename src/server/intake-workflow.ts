@@ -450,10 +450,38 @@ export function workflowReview<T extends IntakeReview>(
           identityContext?.resolutionCurrent?.(resolution, {
             ...record.mapping,
             ...record.draft?.mapping,
-          }) === false
+          }) === false &&
+          !(
+            issue.kind === 'identity' &&
+            !resolution.dependency &&
+            ['this_is_me', 'other_person'].includes(resolution.outcome) &&
+            workflow.identityConfirmations?.some(
+              (receipt) =>
+                receipt.operationId === resolution.operationId &&
+                receipt.scope.intakeId === file.id &&
+                receipt.scope.sourceHash === file.sha256 &&
+                receipt.outcome ===
+                  (resolution.outcome === 'other_person' ? 'this_is_person' : 'this_is_me') &&
+                record.reportGroups?.some((group) => group.groupId === receipt.scope.groupId) &&
+                (receipt.scope.assignmentTargets || receipt.scope.targets).some(
+                  (target) =>
+                    target.candidateId === record.candidateId &&
+                    target.candidateVersionId === record.candidateVersionId &&
+                    target.proposalId === review.proposalId &&
+                    target.recordId === record.id &&
+                    (target.issueIds || [target.issueId]).includes(issue.id),
+                ),
+            )
+          )
         ) {
           issue.status = 'unresolved';
-          issue.resolution = undefined;
+          // An explicit refusal is negative intent, not authority to accept or
+          // assign a person. Keep it blocking even if its measured evidence is
+          // stale, so a later clinical edit cannot revive an automatic match.
+          issue.resolution =
+            issue.kind === 'identity' && ['unknown', 'other_person'].includes(resolution.outcome)
+              ? resolution
+              : undefined;
           record.questions = record.questions.map((question) =>
             question.id === issue.questionId
               ? { ...question, status: 'unanswered', answers: [] }
@@ -475,12 +503,15 @@ export function workflowReview<T extends IntakeReview>(
     record.suggestedMapping = Object.assign(
       {},
       ...record.questions
-        .filter(
-          (q) =>
+        .filter((q) => {
+          const issue = issues.find((i) => i.questionId === q.id);
+          return (
             q.status === 'answered' &&
-            issues.find((i) => i.questionId === q.id)?.kind !== 'information' &&
-            issues.find((i) => i.questionId === q.id)?.status === 'resolved',
-        )
+            issue?.kind !== 'information' &&
+            issue?.resolution?.outcome !== 'unknown' &&
+            (!issue?.resolution || issue.status === 'resolved')
+          );
+        })
         .map((q) => q.answers.at(-1)?.mapping || {}),
       record.draft?.mapping || {},
     );

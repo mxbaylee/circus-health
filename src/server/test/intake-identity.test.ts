@@ -2232,6 +2232,18 @@ for (const outcome of ['unknown', 'other_person'] as const)
         .identityReview?.blocking,
       true,
     );
+    const beforeEdit = intake.reviewIntake(f.db, f.root, f.profileId, f.item.id, review.proposalId);
+    intake.saveIntakeReviewDraft(f.db, f.root, f.profileId, f.item.id, {
+      version: beforeEdit.version,
+      operationId: `fictional-${outcome}-classification-edit`,
+      proposalId: beforeEdit.proposalId,
+      recordId: record.id,
+      candidateVersionId: record.candidateVersionId!,
+      mapping: { kind: 'document' },
+      resolutions: beforeEdit.records[0]!.draft!.resolutions,
+    });
+    const afterEdit = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, groupId);
+    assert.equal(afterEdit.blocking, true, 'classification edits never erase an explicit refusal');
   });
 
 test('a changed model DOB hint cannot change original evidence or revoke a matching confirmation', async (t) => {

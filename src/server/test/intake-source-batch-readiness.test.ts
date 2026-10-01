@@ -188,6 +188,11 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
           assert.equal((await waitForBatch(batch.id)).status, 'complete');
           assert.equal(manager.get(profileId, batch.id).items[0].status, 'review_ready');
           assert.equal(sends, 0, 'Current evidence must avoid unnecessary rereading');
+          assert.equal(
+            start(randomUUID()).scheduled,
+            false,
+            'a completed, fully captured interpretation has no work for a new operation',
+          );
           if (kind === 'existing-proposal' && outcome === 'current') {
             reviewIntakeSourceText(
               db,

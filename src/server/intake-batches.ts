@@ -1618,6 +1618,12 @@ export function createIntakeBatchManager({
           );
         });
         if (affected.length) {
+          if (retained.status === 'running')
+            throw new HttpError(
+              409,
+              'INTAKE_BATCH_BUSY',
+              'Finish or stop this reading batch before reprocessing a completed file',
+            );
           const competing = owned.find(
             (batch) => batch.id !== retained.id && batch.status === 'running',
           );
