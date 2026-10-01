@@ -335,6 +335,12 @@ export function acquireLauncherLock(data: string): { release(): void } {
     'This data directory already has an active Docker launcher.',
   );
 }
+export function acquireOAuthStateLock(auth: string): { release(): void } {
+  return kernelLock(
+    join(auth, '.oauth-writer.lock'),
+    'This OAuth state already has an active launcher, login or qualification writer.',
+  );
+}
 export function lease(
   data: string,
   platform: NodeJS.Platform = process.platform,
@@ -424,6 +430,7 @@ export async function main(
     return;
   }
   const docker = createDocker();
+  let oauthLock: { release(): void } | undefined;
   try {
     if (action === 'build') {
       const source = readBuildSource(ROOT);
@@ -455,6 +462,7 @@ export async function main(
       });
       chmodSync(state, 0o700);
       chmodSync(auth, 0o700);
+      oauthLock = acquireOAuthStateLock(auth);
       console.log(
         'ChatGPT login: follow the device instructions in this terminal. Never share the code or token file.',
       );
@@ -514,6 +522,7 @@ export async function main(
       create: true,
     });
     const key = join(state, 'proxy-key');
+    oauthLock = acquireOAuthStateLock(auth);
     durableCreate(key, 'sk-' + randomBytes(32).toString('hex') + '\n');
     external(key, 'Proxy key', { data });
     if (lstatSync(key).isSymbolicLink() || !/^sk-[0-9a-f]{64}\n?$/u.test(readFileSync(key, 'utf8')))
@@ -641,6 +650,7 @@ export async function main(
       launcherLock.release();
     }
   } finally {
+    oauthLock?.release();
     docker.dispose();
   }
 }

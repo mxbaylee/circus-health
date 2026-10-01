@@ -18,6 +18,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import {
   acquireLauncherLock,
+  acquireOAuthStateLock,
   applicationImage,
   Cancelled,
   dataDirectory,
@@ -66,6 +67,34 @@ class FakeDocker extends Docker {
     });
   }
 }
+
+test('OAuth state lease excludes launchers and login and is released after launcher failure', async (t) => {
+  const f = fixture(t);
+  const auth = join(f.state, 'chatgpt');
+  mkdirSync(auth, { recursive: true });
+  const lock = acquireOAuthStateLock(auth);
+  try {
+    assert.throws(() => acquireOAuthStateLock(auth), /active launcher/u);
+    await assert.rejects(
+      main('login-chatgpt', f.env, () => new FakeDocker()),
+      /active launcher/u,
+    );
+    await assert.rejects(
+      main('run', f.env, () => new FakeDocker()),
+      /active launcher/u,
+    );
+  } finally {
+    lock.release();
+  }
+  const docker = new FakeDocker();
+  docker.fail = (args) => args.includes('check');
+  await assert.rejects(
+    main('run', f.env, () => docker),
+    /Fictional Docker failure/u,
+  );
+  const after = acquireOAuthStateLock(auth);
+  after.release();
+});
 
 test('launcher preserves credentials, validates runtime, derives archive image and tears down its own stack', async (t) => {
   const f = fixture(t),

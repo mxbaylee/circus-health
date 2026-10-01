@@ -1,9 +1,16 @@
 /** Opt-in natural-expiry OAuth qualification on the supported pinned LiteLLM route. */
 import { randomUUID } from 'node:crypto';
 import { closeSync, fsyncSync, openSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { dataDirectory, Docker, external, PROXY_IMAGE, ROOT } from '../../deploy/run.ts';
+import {
+  acquireOAuthStateLock,
+  dataDirectory,
+  Docker,
+  external,
+  PROXY_IMAGE,
+  ROOT,
+} from '../../deploy/run.ts';
 import { readBuildSource } from './build-source.ts';
 
 type Phase = 'probe' | 'refresh' | 'reuse';
@@ -28,6 +35,8 @@ export function parsePhaseResult(phase: Phase, output: string): PhaseResult {
   if (!value || typeof value !== 'object')
     throw new Error('OAuth qualification response is invalid.');
   const result = value as Record<string, unknown>;
+  if (Object.keys(result).sort().join(',') !== 'persistenceObserved,refreshObserved,status')
+    throw new Error('OAuth qualification returned unexpected metadata fields.');
   const validStatus: PhaseStatus[] =
     phase === 'probe'
       ? ['ready_expired', 'pending_natural_expiry']
@@ -47,16 +56,55 @@ export function parsePhaseResult(phase: Phase, output: string): PhaseResult {
   return result as PhaseResult;
 }
 
-async function containerPhase(
+export function authMountOverlaps(auth: string, mounts: unknown): boolean {
+  if (!Array.isArray(mounts)) throw new Error('Could not inspect active credential writers.');
+  return mounts.some((mount: unknown) => {
+    if (!mount || typeof mount !== 'object') throw new Error('Invalid container mount metadata.');
+    const entry = mount as Record<string, unknown>;
+    if (typeof entry.Type !== 'string' || typeof entry.Source !== 'string')
+      throw new Error('Invalid container mount metadata.');
+    if (entry.Type !== 'bind') return false;
+    const source = resolve(entry.Source);
+    return source === auth || source.startsWith(auth + sep) || auth.startsWith(source + sep);
+  });
+}
+
+async function refuseActiveAuthContainers(auth: string) {
+  const docker = new Docker();
+  const timer = setTimeout(() => docker.stop('SIGTERM'), 45_000);
+  try {
+    const output = (await docker.run(['ps', '-q', '--no-trunc'], { capture: true })).trim();
+    const ids = output ? output.split(/\s+/u) : [];
+    if (ids.some((id) => !/^[a-f0-9]{64}$/u.test(id)))
+      throw new Error('Could not inspect active credential writers.');
+    for (const id of ids) {
+      const mounts: unknown = JSON.parse(
+        await docker.run(['inspect', '--format', '{{json .Mounts}}', id], { capture: true }),
+      );
+      if (authMountOverlaps(auth, mounts))
+        throw new Error(
+          'Stop containers using this OAuth state before live refresh qualification.',
+        );
+    }
+  } finally {
+    clearTimeout(timer);
+    docker.dispose();
+  }
+}
+
+export async function containerPhase(
   phase: Phase,
   paths: { auth: string; config: string; providerEnv?: string; model: string },
+  createDocker = () => new Docker(),
 ): Promise<PhaseResult> {
-  const docker = new Docker();
+  const docker = createDocker();
+  const name = 'circus-oauth-qualification-' + randomUUID();
   const timer = setTimeout(() => docker.stop('SIGTERM'), phase === 'refresh' ? 120_000 : 45_000);
   try {
     const args = [
       'run',
-      '--rm',
+      '--name',
+      name,
       '--read-only',
       '--security-opt',
       'no-new-privileges:true',
@@ -96,7 +144,13 @@ async function containerPhase(
     return parsePhaseResult(phase, await docker.run(args, { capture: true }));
   } finally {
     clearTimeout(timer);
-    docker.dispose();
+    try {
+      // Remove only this owned container, including after Docker CLI cancellation.
+      // Failure propagates and prevents a passing receipt.
+      await docker.run(['rm', '--force', name], { cleanup: true });
+    } finally {
+      docker.dispose();
+    }
   }
 }
 
@@ -140,13 +194,19 @@ export async function qualifyOAuthRefresh(env: NodeJS.ProcessEnv = process.env) 
     receipt.phases.push({ phase: 'probe', result: probe });
     if (probe.status === 'pending_natural_expiry') receipt.outcome = 'pending_natural_expiry';
     else {
-      const refresh = await containerPhase('refresh', paths);
-      receipt.phases.push({ phase: 'refresh', result: refresh });
-      if (refresh.status === 'pending_natural_expiry') receipt.outcome = 'pending_natural_expiry';
-      else {
-        const reuse = await containerPhase('reuse', paths);
-        receipt.phases.push({ phase: 'reuse', result: reuse });
-        receipt.outcome = 'passed';
+      const lock = acquireOAuthStateLock(auth);
+      try {
+        await refuseActiveAuthContainers(auth);
+        const refresh = await containerPhase('refresh', paths);
+        receipt.phases.push({ phase: 'refresh', result: refresh });
+        if (refresh.status === 'pending_natural_expiry') receipt.outcome = 'pending_natural_expiry';
+        else {
+          const reuse = await containerPhase('reuse', paths);
+          receipt.phases.push({ phase: 'reuse', result: reuse });
+          receipt.outcome = 'passed';
+        }
+      } finally {
+        lock.release();
       }
     }
   } catch {
