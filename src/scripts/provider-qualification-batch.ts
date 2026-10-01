@@ -67,18 +67,35 @@ export async function runQualificationBatch(options: {
     signal,
   );
   const batchId = batch.id;
+  // Upload publication now atomically enqueues the original. The POST above
+  // can therefore reconcile that already-owned automatic batch instead of
+  // creating one under our operation ID. Pin the returned receipt only after
+  // verifying it contains exactly this new profile's selected original.
+  check(
+    batch.profileId === options.profileId &&
+      batch.items.length === 1 &&
+      batch.items[0]?.intakeId === options.intakeId &&
+      batch.automaticRun === true &&
+      typeof batch.operationId === 'string' &&
+      batch.operationId.length > 0,
+    'Qualification batch scope changed at creation.',
+  );
+  const batchOperationId = batch.operationId;
   const sourceHash = batch.items[0]?.sourceHash;
   for (;;) {
     signal.throwIfAborted();
+    const invalidScope = [
+      !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(batch.id) && 'id_shape',
+      batch.id !== batchId && 'batch_id',
+      batch.profileId !== options.profileId && 'profile_id',
+      batch.operationId !== batchOperationId && 'operation_id',
+      batch.items.length !== 1 && 'item_count',
+      batch.items[0]?.intakeId !== options.intakeId && 'intake_id',
+      batch.items[0]?.sourceHash !== sourceHash && 'source_hash',
+    ].filter(Boolean);
     check(
-      /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(batch.id) &&
-        batch.id === batchId &&
-        batch.profileId === options.profileId &&
-        batch.operationId === operationId &&
-        batch.items.length === 1 &&
-        batch.items[0].intakeId === options.intakeId &&
-        batch.items[0].sourceHash === sourceHash,
-      'Qualification batch scope changed.',
+      invalidScope.length === 0,
+      `Qualification batch scope changed: ${invalidScope.join(',')}.`,
     );
     options.onSnapshot(batch);
     if (batch.status !== 'running') return summarizeQualificationBatch(batch);
