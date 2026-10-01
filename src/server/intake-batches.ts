@@ -1048,29 +1048,8 @@ export function createIntakeBatchManager({
       retryItems.delete(key(profileId, `${batch.id}/${item.intakeId}`)) ||
       (item.automaticRun === true && !!item.chatId) ||
       staleInterpretation;
-    if (intake.state === 'ready' && intake.validation?.valid && interpretations.original) {
-      finishItem(profileId, batch, item, 'review_ready', 'prepared_jsonl', intake, linkedChat);
-      schedule(profileId, batch.id);
-      return;
-    }
-    if (
-      !retry &&
-      (interpretations.proposalIds.length ||
-        (interpretations.original &&
-          intake.validation?.valid &&
-          ['conversion_proposed', 'needs_review'].includes(intake.state)))
-    ) {
-      finishItem(profileId, batch, item, 'review_ready', 'already_reviewable', intake, linkedChat);
-      schedule(profileId, batch.id);
-      return;
-    }
-    if (!retry && ['imported', 'kept_original'].includes(intake.state)) {
-      finishItem(profileId, batch, item, 'skipped', 'already_reviewed', intake, linkedChat);
-      schedule(profileId, batch.id);
-      return;
-    }
-    // Never mutate source-text pins after an existing reviewable proposal.
-    // Finish pending capture before a new clinical interpretation pins the source revision.
+    // Capture every remaining source section even when an early proposal is reviewable.
+    // Page-scoped dependencies keep unrelated later pages from staling it.
     if (item.sourceExtraction?.draining) {
       await drainRecordlessSource(profileId, batch, item, expected, linkedChat);
       return;
@@ -1103,7 +1082,31 @@ export function createIntakeBatchManager({
         return;
       }
     }
-    if (linkedChat && !retry) {
+    const current = currentIntakeInterpretations(db, profileId, item.intakeId);
+    if (
+      recordDurabilityStatus(db) &&
+      sourceTextExtractionPending(getIntakeSourceText(db, root, profileId, item.intakeId))
+    ) {
+      await drainRecordlessSource(profileId, batch, item, expected, linkedChat);
+      return;
+    }
+    if (intake.state === 'ready' && intake.validation?.valid && current.original) {
+      finishItem(profileId, batch, item, 'review_ready', 'prepared_jsonl', intake, linkedChat);
+      schedule(profileId, batch.id);
+      return;
+    }
+    const capturedThisBatch = (item.sourceExtraction?.steps || 0) > 0;
+    if (!retry && !capturedThisBatch && current.proposalIds.length) {
+      finishItem(profileId, batch, item, 'review_ready', 'already_reviewable', intake, linkedChat);
+      schedule(profileId, batch.id);
+      return;
+    }
+    if (!retry && ['imported', 'kept_original'].includes(intake.state)) {
+      finishItem(profileId, batch, item, 'skipped', 'already_reviewed', intake, linkedChat);
+      schedule(profileId, batch.id);
+      return;
+    }
+    if (linkedChat && !retry && !capturedThisBatch) {
       if (
         linkedChat.status !== 'cancelled' &&
         recordDurabilityStatus(db) &&
@@ -1528,7 +1531,8 @@ export function createIntakeBatchManager({
       (batch) =>
         batch.profileId === profileId &&
         (batch.operationId === operationId ||
-          batch.appendOperations?.some((operation) => operation.operationId === operationId)),
+          batch.appendOperations?.some((operation) => operation.operationId === operationId) ||
+          batch.reopenOperations?.some((operation) => operation.operationId === operationId)),
     );
     if (existing) {
       const appended = existing.appendOperations || [];
@@ -1540,10 +1544,16 @@ export function createIntakeBatchManager({
           ? existing.selectionIntakeIds ||
             existing.items.slice(0, originalCount).map((item) => item.intakeId)
           : (() => {
-              const operation = appended.find(
+              const appendedOperation = appended.find(
                 (operation) => operation.operationId === operationId,
-              )!;
-              return operation.selectionIntakeIds || operation.intakeIds;
+              );
+              if (appendedOperation)
+                return appendedOperation.selectionIntakeIds || appendedOperation.intakeIds;
+              return (
+                existing.reopenOperations?.find(
+                  (operation) => operation.operationId === operationId,
+                )?.intakeIds || []
+              );
             })();
       if (
         selection.length !== intakeIds.length ||
@@ -1564,6 +1574,66 @@ export function createIntakeBatchManager({
       const retained = owned.find((batch) =>
         batch.items.some((item) => intakeIds.includes(item.intakeId)),
       )!;
+      // A new operation may revisit completed work after source correction. The
+      // original operation above remains an exact replay, and explicit Stop is
+      // never overridden by a later enqueue.
+      if (retained.status !== 'stopped') {
+        const db = dbFor(profileId);
+        const affected = retained.items.filter((item) => {
+          if (!intakeIds.includes(item.intakeId) || item.status !== 'review_ready') return false;
+          const interpretation = currentIntakeInterpretations(db, profileId, item.intakeId);
+          const text = getIntakeSourceText(db, root, profileId, item.intakeId);
+          return (
+            (!interpretation.original && !interpretation.proposalIds.length) ||
+            sourceTextExtractionPending(text)
+          );
+        });
+        if (affected.length) {
+          if (!authorized(profileId, affected[0]!.intakeId, 'publish'))
+            throw new HttpError(403, 'PROFILE_SCOPE', 'Unlock this profile before reading');
+          for (const item of affected) {
+            item.status = 'queued';
+            item.reason = null;
+            item.endedAt = null;
+            item.automaticRun = true;
+            item.retryAt = null;
+            if (item.sourceExtraction) item.sourceExtraction.initialDone = false;
+            if (item.chatId) retryItems.add(key(profileId, `${retained.id}/${item.intakeId}`));
+          }
+          retained.currentIndex = retained.items.indexOf(affected[0]!);
+          retained.status = 'running';
+          retained.reason = null;
+          retained.automaticRun = true;
+          (retained.reopenOperations ||= []).push({
+            operationId,
+            intakeIds: [...intakeIds],
+            at: now(),
+          });
+          generations.set(profileId, generation(profileId) + 1);
+          save(profileId, retained, 'source-evidence-reopened');
+          schedule(profileId, retained.id);
+          return publicBatch(retained, true);
+        }
+      } else {
+        // Reprocess is a fresh intent for exactly the selected corrected file.
+        // Every other stopped item keeps its Stop state.
+        for (const item of retained.items) {
+          if (!intakeIds.includes(item.intakeId) || item.status !== 'review_ready') continue;
+          const interpretation = currentIntakeInterpretations(
+            dbFor(profileId),
+            profileId,
+            item.intakeId,
+          );
+          const pending = sourceTextExtractionPending(
+            getIntakeSourceText(dbFor(profileId), root, profileId, item.intakeId),
+          );
+          if ((interpretation.proposalIds.length || interpretation.original) && !pending) continue;
+          item.status = 'paused';
+          item.reason = 'stopped';
+          item.resumeAutomaticRun = true;
+          if (item.sourceExtraction) item.sourceExtraction.initialDone = false;
+        }
+      }
       if (
         retained.status === 'stopped' &&
         retained.items.some(
@@ -1572,7 +1642,7 @@ export function createIntakeBatchManager({
             (item.resumeAutomaticRun || item.reason === 'stopped'),
         )
       )
-        return publicBatch(resume(profileId, retained.id), true);
+        return publicBatch(resume(profileId, retained.id, new Set(intakeIds), operationId), true);
       return publicBatch(retained, false);
     }
     const running = [...batches.values()].find(
@@ -1727,7 +1797,12 @@ export function createIntakeBatchManager({
     return publicBatch(batch);
   }
 
-  function resume(profileId: string, batchId: string): IntakeBatch {
+  function resume(
+    profileId: string,
+    batchId: string,
+    selectedIntakeIds?: Set<string>,
+    reopenOperationId?: string,
+  ): IntakeBatch {
     const batch = get(profileId, batchId);
     const competing = [...batches.values()].find(
       (candidate) =>
@@ -1746,16 +1821,26 @@ export function createIntakeBatchManager({
       throw new HttpError(409, 'INTAKE_BATCH_RESUME', 'This reading batch cannot be resumed');
     let index = batch.items.findIndex(
       (item) =>
-        item.resumeAutomaticRun && (hasPausedIntakeReading(item) || item.status === 'queued'),
+        (!selectedIntakeIds || selectedIntakeIds.has(item.intakeId)) &&
+        item.resumeAutomaticRun &&
+        (hasPausedIntakeReading(item) || item.status === 'queued'),
     );
     if (index < 0 && batch.status === 'stopped')
       index = batch.items.findIndex(
-        (item) => item.reason === 'stopped' || item.status === 'queued',
+        (item) =>
+          (!selectedIntakeIds || selectedIntakeIds.has(item.intakeId)) &&
+          (item.reason === 'stopped' || item.status === 'queued'),
       );
-    if (index < 0) index = batch.items.findIndex(hasPausedIntakeReading);
+    if (index < 0)
+      index = batch.items.findIndex(
+        (item) =>
+          (!selectedIntakeIds || selectedIntakeIds.has(item.intakeId)) &&
+          hasPausedIntakeReading(item),
+      );
     if (index < 0)
       throw new HttpError(409, 'INTAKE_BATCH_RESUME', 'No paused delivery needs another pass');
     for (const item of batch.items) {
+      if (selectedIntakeIds && !selectedIntakeIds.has(item.intakeId)) continue;
       if (!item.resumeAutomaticRun && item.reason !== 'stopped' && item !== batch.items[index])
         continue;
       if (!hasPausedIntakeReading(item) && item.status !== 'queued') continue;
@@ -1778,6 +1863,12 @@ export function createIntakeBatchManager({
     batch.currentIndex = index;
     batch.status = 'running';
     batch.reason = null;
+    if (reopenOperationId && selectedIntakeIds)
+      (batch.reopenOperations ||= []).push({
+        operationId: reopenOperationId,
+        intakeIds: [...selectedIntakeIds],
+        at: now(),
+      });
     for (const queued of batch.items) if (queued.status === 'queued') queued.queuedAt = now();
     generations.set(profileId, generation(profileId) + 1);
     save(profileId, batch, 'resumed');

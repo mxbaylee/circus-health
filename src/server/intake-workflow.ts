@@ -38,6 +38,7 @@ import {
 } from './clinical-import.ts';
 import type {
   IntakeCandidateVersion,
+  IntakeClinicalMapping,
   IntakeIssueResolution,
   IntakeQuestion,
   IntakeQuestionAnswer,
@@ -304,6 +305,10 @@ export function workflowReview<T extends IntakeReview>(
       group: import('../shared/intake.ts').IntakeReportGroup,
       issue: Pick<import('../shared/intake.ts').IntakeReviewIssue, 'prompt' | 'textAnchor'>,
     ) => boolean;
+    resolutionCurrent?: (
+      resolution: import('../shared/intake.ts').IntakeIssueResolution,
+      mapping: Partial<IntakeClinicalMapping>,
+    ) => boolean;
   },
 ): T {
   const retainedWorkflow = intakeWorkflow(details);
@@ -441,9 +446,24 @@ export function workflowReview<T extends IntakeReview>(
     for (const issue of issues) {
       const resolution = record.draft?.resolutions.findLast((r) => r.issueId === issue.id);
       if (resolution) {
-        issue.resolution = resolution;
-        issue.status = resolution.outcome === 'unknown' ? 'unresolved' : 'resolved';
-        if (resolution.outcome === 'unknown' && issue.kind !== 'identity') issue.blocking = false;
+        if (
+          identityContext?.resolutionCurrent?.(resolution, {
+            ...record.mapping,
+            ...record.draft?.mapping,
+          }) === false
+        ) {
+          issue.status = 'unresolved';
+          issue.resolution = undefined;
+          record.questions = record.questions.map((question) =>
+            question.id === issue.questionId
+              ? { ...question, status: 'unanswered', answers: [] }
+              : question,
+          );
+        } else {
+          issue.resolution = resolution;
+          issue.status = resolution.outcome === 'unknown' ? 'unresolved' : 'resolved';
+          if (resolution.outcome === 'unknown' && issue.kind !== 'identity') issue.blocking = false;
+        }
       }
     }
     if (
@@ -459,7 +479,7 @@ export function workflowReview<T extends IntakeReview>(
           (q) =>
             q.status === 'answered' &&
             issues.find((i) => i.questionId === q.id)?.kind !== 'information' &&
-            issues.find((i) => i.questionId === q.id)?.resolution?.outcome !== 'unknown',
+            issues.find((i) => i.questionId === q.id)?.status === 'resolved',
         )
         .map((q) => q.answers.at(-1)?.mapping || {}),
       record.draft?.mapping || {},

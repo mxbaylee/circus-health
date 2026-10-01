@@ -455,6 +455,13 @@ interface ActiveState {
   /** Child originals obtained by reading this dispatch's exact package member. */
   workUnitSources?: Set<string>;
   sourceTextReads?: Map<string, string>;
+  observedSourcePages?: Map<string, Set<number>>;
+  observedSourceSpans?: Map<string, Set<string>>;
+  observedPackageMembers?: Map<
+    string,
+    { rootIntakeId: string; memberId: string; locator: string; sourceHash: string }
+  >;
+  unknownSourceCoverage?: Set<string>;
   sourceTextCapturePins?: Map<string, string>;
   diagnosticScope?: ImportDiagnosticActiveScope;
   chatId: string;
@@ -2057,8 +2064,46 @@ export function createAssistant({
         // current change-detection pin, but do not pretend its new text was read.
         (state.sourceTextCapturePins ||= new Map()).set(intakeId, revisionId);
         state.sourceTextReads?.delete(intakeId);
+        if (
+          state.observedSourcePages?.get(intakeId)?.size ||
+          state.observedSourceSpans?.get(intakeId)?.size
+        )
+          (state.unknownSourceCoverage ||= new Set()).add(intakeId);
       }
     };
+    const observeSourcePages = (intakeId: string, pages: number[]) => {
+      if (!pages.length || pages.some((page) => !Number.isSafeInteger(page) || page < 1)) {
+        (state.unknownSourceCoverage ||= new Set()).add(intakeId);
+        return;
+      }
+      const observed = state.observedSourcePages || (state.observedSourcePages = new Map());
+      const selected = observed.get(intakeId) || new Set<number>();
+      for (const page of pages) selected.add(page);
+      observed.set(intakeId, selected);
+    };
+    const observeSourceSpans = (intakeId: string, spanIds: string[]) => {
+      if (!spanIds.length) return;
+      const observed = state.observedSourceSpans || (state.observedSourceSpans = new Map());
+      const selected = observed.get(intakeId) || new Set<string>();
+      for (const spanId of spanIds) selected.add(spanId);
+      observed.set(intakeId, selected);
+    };
+    const measuredSources = () =>
+      state.unknownSourceCoverage?.size
+        ? undefined
+        : [
+            ...new Set([
+              ...(state.observedSourcePages?.keys() || []),
+              ...(state.observedSourceSpans?.keys() || []),
+            ]),
+          ].map((intakeId) => ({
+            intakeId,
+            pages: [...(state.observedSourcePages?.get(intakeId) || [])],
+            spanIds: [...(state.observedSourceSpans?.get(intakeId) || [])],
+            ...(state.observedPackageMembers?.get(intakeId)
+              ? { member: state.observedPackageMembers.get(intakeId)! }
+              : {}),
+          }));
     if (!args || typeof args !== 'object' || Array.isArray(args))
       throw new Error('Expected tool arguments');
     if (chat.context?.intakeRepair && !DRAFT_REPAIR_TOOLS.has(params.tool))
@@ -2146,6 +2191,13 @@ export function createAssistant({
         'This source is retained but excluded from model interpretation',
       );
     if (['health_intake_batch', 'health_intake_propose'].includes(params.tool)) {
+      for (const [sourceId, observedRevision] of state.sourceTextReads || [])
+        if (currentIntakeSourceTextRevisionId(db, profileId, sourceId) !== observedRevision)
+          throw new HttpError(
+            409,
+            'SOURCE_TEXT_CHANGED',
+            'A retained source page changed during this response. Start a fresh response and reread its current passages before proposing.',
+          );
       const revision = currentIntakeSourceTextRevisionId(db, profileId, stringArgument(args, 'id'));
       if (
         revision &&
@@ -2415,6 +2467,43 @@ export function createAssistant({
           modelMappingRuleContext(db, result.providerId),
         );
       } else throw new Error('Unsupported package discovery operation');
+      if (args.action === 'read_member' && object(result)) {
+        const memberResult = result as UnknownRecord;
+        const response = object(memberResult.metadata) ? memberResult.metadata : memberResult;
+        const member = object(response.member) ? response.member : null;
+        if (
+          typeof response.sourceFileId === 'string' &&
+          member &&
+          typeof member.memberId === 'string' &&
+          typeof member.locator === 'string' &&
+          typeof member.sourceHash === 'string'
+        ) {
+          const childId = response.sourceFileId;
+          (state.observedPackageMembers ||= new Map()).set(childId, {
+            rootIntakeId: stringArgument(args, 'id'),
+            memberId: member.memberId,
+            locator: member.locator,
+            sourceHash: member.sourceHash,
+          });
+          const child = (await import('./intake-source-text.ts')).getIntakeSourceText(
+            db,
+            root,
+            profileId,
+            childId,
+          );
+          const page = Number(args.page || 1);
+          const mimeType = db
+            .prepare('SELECT mime_type FROM source_files WHERE id=?')
+            .get(childId)?.mime_type;
+          if (
+            child.revision &&
+            child.revision.pages.some((candidate) => candidate.page === page) &&
+            (mimeType === 'application/pdf' || child.revision.pages.length === 1)
+          )
+            observeSourcePages(childId, [page]);
+          else (state.unknownSourceCoverage ||= new Set()).add(childId);
+        } else (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
+      }
     } else if (
       ['health_intake_plan', 'health_intake_question', 'health_intake_batch'].includes(params.tool)
     ) {
@@ -2450,7 +2539,14 @@ export function createAssistant({
           runId: chat.id,
         };
         try {
-          result = intake.submitIntakeBatch(db, root, profileId, intakeId, batchInput);
+          result = intake.submitIntakeBatch(
+            db,
+            root,
+            profileId,
+            intakeId,
+            batchInput,
+            measuredSources(),
+          );
         } catch (error) {
           if (
             !(error instanceof HttpError) ||
@@ -2560,10 +2656,17 @@ export function createAssistant({
             throw error;
           assertRunning();
           state.batchRevalidationBasis = undefined;
-          result = intake.submitIntakeBatch(db, root, profileId, intakeId, {
-            ...batchInput,
-            version: retryCurrent.version,
-          });
+          result = intake.submitIntakeBatch(
+            db,
+            root,
+            profileId,
+            intakeId,
+            {
+              ...batchInput,
+              version: retryCurrent.version,
+            },
+            measuredSources(),
+          );
         }
         // proposalsProduced is derived in conversionReadingState() from
         // plan.batches.length, not tracked here — see intake-continuation.ts.
@@ -2605,7 +2708,7 @@ export function createAssistant({
               },
             }
           : context;
-      } else if (args.action === 'read_unit')
+      } else if (args.action === 'read_unit') {
         result = intake.readIntakeUnit(
           db,
           root,
@@ -2616,7 +2719,15 @@ export function createAssistant({
             offset: optionalNumberArgument(args, 'offset'),
           },
         );
-      else if (args.action === 'create') {
+        const selected = intake.getIntake(db, root, profileId, stringArgument(args, 'id'));
+        const unit = selected.workflow?.plans
+          .flatMap((plan) => plan.units)
+          .find((candidate) => candidate.id === args.unitId);
+        const sourceId = unit?.sourceFileId || selected.id;
+        if (sourceId !== selected.id && !state.observedPackageMembers?.has(sourceId))
+          (state.unknownSourceCoverage ||= new Set()).add(sourceId);
+        else observeSourcePages(sourceId, unit?.pages || []);
+      } else if (args.action === 'create') {
         result = await measureImportPhase(
           'source_indexing',
           () =>
@@ -2704,6 +2815,22 @@ export function createAssistant({
                   maxCharacters: 12000,
                 });
       if ((!args.action || args.action === 'passage') && 'revisionId' in result) {
+        const passage = result as import('../shared/intake-source-text.ts').SourceTextPassage;
+        const id = stringArgument(args, 'id');
+        observeSourceSpans(
+          id,
+          passage.spans.map((span) => span.id),
+        );
+        if (passage.issues.length)
+          observeSourcePages(
+            id,
+            passage.issues.map((issue) => issue.region.page),
+          );
+        if (!passage.spans.length) {
+          if (typeof args.page === 'number') observeSourcePages(id, [args.page]);
+          else (state.unknownSourceCoverage ||= new Set()).add(id);
+        }
+        if (passage.reviewHistory.length) (state.unknownSourceCoverage ||= new Set()).add(id);
         (state.sourceTextReads ||= new Map()).set(
           stringArgument(args, 'id'),
           currentIntakeSourceTextRevisionId(
@@ -2715,6 +2842,12 @@ export function createAssistant({
         );
         state.sourceTextCapturePins?.delete(stringArgument(args, 'id'));
       }
+      if (args.action === 'search') {
+        // A literal search also exposes absence of hits across the entire source.
+        (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
+      }
+      if (args.action === 'annotation' || args.action === 'history')
+        (state.unknownSourceCoverage ||= new Set()).add(stringArgument(args, 'id'));
     } else if (params.tool === 'health_intake_read' || params.tool === 'health_intake_propose') {
       const intake = await import('./intake.ts');
       assertRunning();
@@ -2789,6 +2922,29 @@ export function createAssistant({
           assertRunning,
           onSourceTextCaptured,
         });
+        const evidenceIntake = intake.getIntake(db, root, profileId, stringArgument(args, 'id'));
+        if (evidenceIntake.mimeType !== 'application/zip') {
+          const text = (await import('./intake-source-text.ts')).getIntakeSourceText(
+            db,
+            root,
+            profileId,
+            evidenceIntake.id,
+          );
+          if (
+            evidenceIntake.parentSourceFileId &&
+            !state.observedPackageMembers?.has(evidenceIntake.id)
+          )
+            (state.unknownSourceCoverage ||= new Set()).add(evidenceIntake.id);
+          else if (
+            evidenceIntake.mimeType !== 'application/pdf' &&
+            (text.revision?.pages.length ?? 0) !== 1
+          )
+            (state.unknownSourceCoverage ||= new Set()).add(evidenceIntake.id);
+          else
+            observeSourcePages(evidenceIntake.id, [
+              evidenceIntake.mimeType === 'application/pdf' ? Number(args.page || 1) : 1,
+            ]);
+        }
         assertRunning();
         if (state.checkpoint && args.id === state.checkpoint.intakeId) {
           const current = conversionIntake(profileId, chat);
@@ -2876,7 +3032,7 @@ export function createAssistant({
               instructionVersion: INSTRUCTION_VERSION,
             },
           },
-          undefined,
+          { observedSourcePages: measuredSources() },
         );
         const { boundedPackagePlan } = await import('./intake-package.ts');
         result = boundedPackagePlan(result, modelMappingRuleContext(db, result.providerId));

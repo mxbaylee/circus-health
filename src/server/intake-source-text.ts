@@ -5,6 +5,7 @@ import { recordDurabilityStatus } from './record-versions.ts';
 import { profileOriginal } from './profile-storage.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { readIntakeSourcePin } from './intake-source-pin.ts';
+import { affectedSourcePages } from './intake-proposal-dependencies.ts';
 import { visibilityCondition, visibilitySQL } from './visibility.ts';
 import {
   invalidateIntakeSourceTextDependencies,
@@ -956,7 +957,12 @@ function mutate(
         ? loadStoredRevision(db, profileId, intakeId, row.sha256, head).pageRefs
         : null;
       const pageRefs = persist(db, revision);
-      invalidateIntakeSourceTextDependencies(db, prior, revision);
+      invalidateIntakeSourceTextDependencies(
+        db,
+        prior,
+        revision,
+        affectedSourcePages(prior, revision, priorRefs, pageRefs),
+      );
       put(db, key(intakeId, `operation:${request.operationId}`), {
         fingerprint: fp,
         revisionId: revision.id,

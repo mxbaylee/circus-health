@@ -492,6 +492,47 @@ test('Stop, reload, and explicit resume retry only the linked cancelled conversi
   );
 });
 
+test('reprocessing one stopped original leaves its sibling stopped and replays once', async (t) => {
+  const f = setup(t);
+  const first = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-stop-first.txt',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from('Fictional first source for Stop.'),
+  });
+  const second = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-stop-second.txt',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from('Fictional second source for Stop.'),
+  });
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-stop-both',
+    intakeIds: [first.id, second.id],
+  });
+  await waitFor(() => f.bridges.length > 0, 'first original starts');
+  f.manager.stop(profileId, batch.id);
+  const stopped = f.manager.get(profileId, batch.id);
+  assert.equal(stopped.items[0]!.reason, 'stopped');
+  assert.equal(stopped.items[1]!.reason, 'stopped');
+  const selected = f.manager.create(profileId, {
+    operationId: 'fictional-reprocess-second-only',
+    intakeIds: [second.id],
+  });
+  assert.equal(selected.scheduled, true);
+  assert.equal(
+    f.manager.create(profileId, {
+      operationId: 'fictional-reprocess-second-only',
+      intakeIds: [second.id],
+    }).scheduled,
+    false,
+  );
+  await waitFor(
+    () => f.manager.get(profileId, batch.id).items[1]!.status === 'running',
+    'selected original resumes',
+  );
+  assert.equal(f.manager.get(profileId, batch.id).items[0]!.reason, 'stopped');
+  f.manager.stop(profileId, batch.id);
+});
+
 test('Stop or resume on an old batch cannot invalidate the current batch runner', async (t) => {
   const f = setup(t);
   const oldIntake = uploadIntake(f.db, f.root, profileId, {

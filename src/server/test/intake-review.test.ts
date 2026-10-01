@@ -1017,6 +1017,60 @@ test('typed resolution preserves legacy answers and resolves only explicit revie
   assert.equal(item.workflow.questions[0]!.answers.length, 2);
 });
 
+test('editing one reviewed field reopens only its dependent issue', (t) => {
+  const f = fixture(t);
+  const value = document({
+    subject: 'self',
+    uncertainties: [],
+    clinical: {
+      kind: 'document',
+      subject: 'self',
+      documentTitle: 'Fictional report',
+      date: '2026-04',
+      documentDate: '2026-04',
+    },
+    reviewIssues: [
+      {
+        id: 'title-reading',
+        kind: 'uncertain_reading',
+        field: 'documentTitle',
+        prompt: 'Check the fictional title.',
+      },
+      { id: 'date-reading', kind: 'date', field: 'date', prompt: 'Check the fictional date.' },
+    ],
+  });
+  let item = call(f, 'uploadIntake', {
+    filename: 'fictional-field-issues.jsonl',
+    bytes: Buffer.from(JSON.stringify(value)),
+  });
+  let record = call(f, 'reviewIntake', item.id).records[0]!;
+  const title = record.issues.find((issue) => issue.field === 'documentTitle')!;
+  const date = record.issues.find((issue) => issue.field === 'date')!;
+  item = draft(f, item, record, {
+    resolutions: [
+      { issueId: title.id, outcome: 'confirmed' },
+      { issueId: date.id, outcome: 'confirmed' },
+    ],
+  });
+  record = call(f, 'reviewIntake', item.id).records[0]!;
+  assert.equal(record.issues.find((issue) => issue.id === title.id)!.status, 'resolved');
+  assert.equal(record.issues.find((issue) => issue.id === date.id)!.status, 'resolved');
+  item = draft(f, item, record, {
+    operationId: 'fictional-title-edit',
+    mapping: { documentTitle: 'Corrected fictional title' },
+  });
+  record = call(f, 'reviewIntake', item.id).records[0]!;
+  assert.equal(record.issues.find((issue) => issue.id === title.id)!.status, 'unresolved');
+  assert.equal(record.issues.find((issue) => issue.id === date.id)!.status, 'resolved');
+  item = draft(f, item, record, {
+    operationId: 'fictional-title-reconfirmation',
+    resolutions: [{ issueId: title.id, outcome: 'confirmed' }],
+  });
+  record = call(f, 'reviewIntake', item.id).records[0]!;
+  assert.equal(record.issues.find((issue) => issue.id === title.id)!.status, 'resolved');
+  assert.equal(record.issues.find((issue) => issue.id === date.id)!.status, 'resolved');
+});
+
 test('draft decision and answer text survive review reload without submitting answers or accepting', (t) => {
   const f = fixture(t),
     value = document({

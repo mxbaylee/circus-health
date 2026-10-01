@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
 import type { SourceTextRevision } from '../shared/intake-source-text.ts';
+import { updateSourcePageHashes } from './intake-proposal-dependencies.ts';
+import { proposalDependenciesCurrent } from './intake-proposal-dependencies.ts';
 import {
   readIntakeSourcePin,
   withIntakeSourcePin,
@@ -42,10 +44,12 @@ export function invalidateIntakeSourceTextDependencies(
   db: DatabaseSync,
   previous: SourceTextRevision | null,
   next: SourceTextRevision,
+  changedPages?: number[],
 ): void {
   // The review head and its receipt remain durable. Unchanged transcription does
   // not replace the material source pin, increment intake versions, or stale proposals.
   if (sourceTextConfirmationOnly(previous, next)) return;
+  updateSourcePageHashes(db, previous, next, changedPages);
   const owner = db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get();
   const file = db
     .prepare("SELECT sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'")
@@ -140,15 +144,20 @@ export function assertCurrentProposalSourceText(
     }[];
   },
   proposalId: string | null,
+  db?: DatabaseSync,
 ): void {
   if (!proposalId && !details.sourceTextRequiresInterpretation) return;
   const proposal = details.proposals.find((item) => item.id === proposalId);
+  const measured = db && proposal ? proposalDependenciesCurrent(db, proposal.id) : null;
   if (
     (!proposalId && details.sourceTextRequiresInterpretation) ||
     (proposal &&
-      ((proposal.sourceTextRevisionId || null) !== (details.sourceTextRevisionId || null) ||
-        (proposal.sourceTextDependencyToken || null) !==
-          (details.sourceTextDependencyToken || null)))
+      !(
+        measured ??
+        ((proposal.sourceTextRevisionId || null) === (details.sourceTextRevisionId || null) &&
+          (proposal.sourceTextDependencyToken || null) ===
+            (details.sourceTextDependencyToken || null))
+      ))
   )
     throw new HttpError(
       409,

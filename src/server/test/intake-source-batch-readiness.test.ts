@@ -136,8 +136,8 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
           db.close();
           rmSync(root, { recursive: true, force: true });
         });
-        const start = () =>
-          manager.create(profileId, { operationId: randomUUID(), intakeIds: [source.id] });
+        const start = (operationId: string = randomUUID()) =>
+          manager.create(profileId, { operationId, intakeIds: [source.id] });
         // Each case exercises its first enqueue. Re-enqueueing an already owned
         // original intentionally returns the retained batch, even after completion.
         if (outcome !== 'current') {
@@ -182,11 +182,57 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
             false,
           );
         }
-        const batch = start();
+        const firstOperationId = randomUUID();
+        const batch = start(firstOperationId);
         if (outcome === 'current' || outcome === 'fresh') {
           assert.equal((await waitForBatch(batch.id)).status, 'complete');
           assert.equal(manager.get(profileId, batch.id).items[0].status, 'review_ready');
           assert.equal(sends, 0, 'Current evidence must avoid unnecessary rereading');
+          if (kind === 'existing-proposal' && outcome === 'current') {
+            reviewIntakeSourceText(
+              db,
+              root,
+              profileId,
+              source.id,
+              {
+                operationId: randomUUID(),
+                expectedRevisionId: extracted.sourceText.revision!.id,
+                sourceHash: source.sha256,
+                action: 'correct',
+                scope: { page: 1 },
+                spans: [
+                  {
+                    id: 'fictional-later-correction',
+                    text: 'Fictional source value 31.00 mg.',
+                    region: { page: 1 },
+                    provenance: 'human',
+                  },
+                ],
+              },
+              'profile-owner',
+            );
+            assert.equal(manager.get(profileId, batch.id).status, 'complete', 'before replay');
+            assert.equal(start(batch.operationId).status, 'complete', 'original operation replays');
+            const reopenOperationId = randomUUID();
+            assert.equal(
+              start(reopenOperationId).scheduled,
+              true,
+              'new operation reopens affected evidence',
+            );
+            assert.equal(
+              start(reopenOperationId).scheduled,
+              false,
+              'reopen operation replays exactly',
+            );
+            assert.equal((await waitForBatch(batch.id, true)).items[0]!.status, 'running');
+            assert.equal(sends, 1);
+            const replacement = propose().proposals.at(-1)!;
+            assert.notEqual(replacement.id, oldProposal);
+            chat.status = 'idle';
+            assert.equal((await waitForBatch(batch.id)).status, 'complete');
+            assert.equal(manager.get(profileId, batch.id).items[0]!.status, 'review_ready');
+            assert.equal(start().scheduled, false, 'fresh replacement closes the reopened work');
+          }
           return;
         }
         assert.equal((await waitForBatch(batch.id, true)).items[0].status, 'running');

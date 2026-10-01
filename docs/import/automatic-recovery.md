@@ -20,7 +20,7 @@ Eligible items rotate while other files wait. Absolute retry deadlines survive r
 
 There is no document-wide page, step, elapsed-time, request or token allowance. Individual worker, request, slice and shared-capacity bounds remain. Cumulative usage and unique progress survive continuation; legacy cumulative budgets cannot restore the manual-pause dead end.
 
-Local capture processes one page or text section per checkpoint, rotating between files. Pending capture finishes before a new clinical conversion pins source text. Existing reviewable interpretations prevent background capture from changing their broad source-revision pins. Fine-grained page dependencies remain separate work.
+Local capture processes one page or text section per checkpoint, rotating between files. An early reviewable proposal does not stop remaining capture or reading. Measured page dependencies keep an unrelated later page from staling that proposal; unknown coverage still uses the broad source pin. A corrected source can reopen completed review work under a new operation while explicit Stop keeps unselected files stopped.
 
 The local watchdog is at least three minutes and twice the longest configured extraction-step timeout: currently six minutes because PDF inventory permits three minutes. Interrupted work retries with a new operation identity from the last durable page. Three failures without progress on the same page retain a located processing-stalled exception, then later pages continue. Missing local OCR is a shared prerequisite with a retry deadline, rather than another failing OCR invocation on every page. Failed initial inventory retains file scope and unknown page count; no page inventory is invented.
 

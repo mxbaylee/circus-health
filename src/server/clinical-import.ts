@@ -45,7 +45,7 @@ import type {
   IntakeWorkflow,
 } from '../shared/intake.ts';
 import { canonicalLiteral, type IntakeEntry } from './intake-format.ts';
-import { HttpError, json, revision, now } from './database.ts';
+import { HttpError, json, revision, clinicalReviewRevision, now } from './database.ts';
 import { intakeReportSourceForMember } from './intake-report-source.ts';
 import { projectObservationNumber } from './observation-number.ts';
 
@@ -230,6 +230,8 @@ interface BuildReviewInput {
   entries: IntakeEntry[];
   proposalId: string | null;
   version: number;
+  /** Stable intake row version for measured source dependencies; public version stays current. */
+  reviewTokenVersion?: number;
   drafts?: IntakeReviewDraft[];
   acceptedDecisions?: IntakeReviewDecision[];
 }
@@ -713,6 +715,7 @@ export function buildClinicalReview(
     entries,
     proposalId,
     version,
+    reviewTokenVersion,
     drafts = [],
     acceptedDecisions = [],
   }: BuildReviewInput,
@@ -987,10 +990,10 @@ export function buildClinicalReview(
     uncertain: records.filter((r) => r.uncertainties.length).length,
   };
   const reviewToken = hash([
-    revision(db),
+    clinicalReviewRevision(db),
     file.id,
     inputFile.sha256,
-    version,
+    reviewTokenVersion ?? version,
     proposalId,
     rules,
     records,

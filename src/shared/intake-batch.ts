@@ -192,6 +192,8 @@ export interface IntakeBatch {
     selectionIntakeIds?: string[];
     at: string;
   }[];
+  /** Exact new-operation selections that reopened already owned evidence. */
+  reopenOperations?: { operationId: string; intakeIds: string[]; at: string }[];
 }
 
 export interface CreateIntakeBatchInput {

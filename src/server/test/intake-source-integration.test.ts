@@ -174,11 +174,18 @@ test('source corrections stale original/proposal review; identical fresh payload
     );
   }
   original = intake.getIntake(db, root, profileId, original.id);
-  const fresh = intake.proposeConversion(db, root, profileId, original.id, {
-    version: original.version,
-    jsonlText,
-    summary: 'Fresh fictional review required',
-  });
+  const fresh = intake.proposeConversion(
+    db,
+    root,
+    profileId,
+    original.id,
+    {
+      version: original.version,
+      jsonlText,
+      summary: 'Fresh fictional review required',
+    },
+    { observedSourcePages: [{ intakeId: original.id, pages: [1] }] },
+  );
   const freshId = fresh.proposals.at(-1)!.id;
   assert.notEqual(freshId, proposalId);
   const after = intake.reviewIntake(db, root, profileId, original.id, freshId);
@@ -221,6 +228,9 @@ test('source corrections stale original/proposal review; identical fresh payload
   assert.notEqual(noOp.revision!.id, firstConfirm.revision!.id);
   assert.equal(firstConfirm.revision!.parentRevisionId, corrected.revision!.id);
   assert.equal(noOp.revision!.parentRevisionId, firstConfirm.revision!.id);
+  const afterConfirm = intake.reviewIntake(db, root, profileId, original.id, freshId);
+  assert.equal(afterConfirm.sourceTextStale, false);
+  assert.equal(afterConfirm.reviewToken, after.reviewToken);
   const latestOriginal = intake.getIntake(db, root, profileId, original.id);
   const pinned = intake.proposeConversion(db, root, profileId, original.id, {
     version: latestOriginal.version,
