@@ -7,7 +7,7 @@ export function canonicalIdentityName(value: string): string {
   if (
     parts.length === 2 &&
     parts.every((part) => /^[\p{L}\p{M} .’'-]+$/u.test(part)) &&
-    !parts.some((part) => /^(jr\.?|sr\.?|ii|iii|iv)$/i.test(part))
+    !parts.some((part) => /^(?:jr|sr|ii|iii|iv)\.?$/i.test(part))
   )
     return parts[1] + ' ' + parts[0];
   return normalized;

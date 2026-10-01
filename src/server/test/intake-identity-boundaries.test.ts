@@ -548,11 +548,89 @@ test('a stale Self receipt cannot waive a new banner clue on a changed report ve
   });
   assert.equal(changed.status, 'confirmation_required');
   assert.equal(changed.blocking, true);
+  const staleScope = {
+    self: own.self,
+    people: [],
+    evidence: own.evidencedIdentity,
+    group: workflow.reportGroups![0]!,
+    groupVersionId: `${own.scope!.groupVersionId}-changed-members`,
+    originalFingerprint: own.scope!.evidenceOriginalFingerprint || '',
+    receipts: workflow.identityConfirmations,
+    nameEvidenceGrounded: true,
+    originalEvidenceChecked: true,
+    explicitlyConfirmedOperationId: workflow.identityConfirmations![0]!.operationId,
+  };
+  for (const clue of [
+    { bannerBirthDates: [['1970-04-17']] },
+    { unreadableBirthDate: true },
+    {
+      people: [
+        {
+          noteId: 'fictional-peer',
+          personId: 'fictional-peer',
+          version: 1,
+          fullName: patient,
+          knownNames: [],
+          birthDate: selfBirthDate,
+        },
+      ],
+    },
+  ]) {
+    const explicit = assessIdentityPolicy({ ...staleScope, ...clue });
+    assert.equal(
+      explicit.blocking,
+      true,
+      'An old explicit operation cannot waive current competing identity evidence',
+    );
+    assert.notEqual(explicit.status, 'prior_confirmation');
+  }
+  const compatible = assessIdentityPolicy({ ...staleScope, bannerBirthDates: [[selfBirthDate]] });
+  assert.equal(
+    compatible.status,
+    'prior_confirmation',
+    'Compatible membership growth can reuse the report assignment',
+  );
+  assert.equal(compatible.blocking, false);
+  const changedOwner = {
+    ...staleScope,
+    self: { ...own.self, fullName: otherPatient, knownNames: [] },
+    people: [
+      {
+        noteId: 'fictional-peer',
+        personId: 'fictional-peer',
+        version: 1,
+        fullName: patient,
+        knownNames: [],
+        birthDate: selfBirthDate,
+      },
+    ],
+  };
+  for (const operationId of [undefined, staleScope.explicitlyConfirmedOperationId]) {
+    const staleOwner = assessIdentityPolicy({
+      ...changedOwner,
+      explicitlyConfirmedOperationId: operationId,
+    });
+    assert.equal(
+      staleOwner.blocking,
+      true,
+      'Changed-version assignment must recheck the currently matched owner',
+    );
+    const unchangedOwner = assessIdentityPolicy({
+      ...changedOwner,
+      groupVersionId: own.scope!.groupVersionId,
+      explicitlyConfirmedOperationId: operationId,
+    });
+    assert.equal(
+      unchangedOwner.blocking,
+      false,
+      'The unchanged report keeps its own explicit assignment',
+    );
+  }
 });
 
 for (const banner of [false, true])
   for (const confirmedOwner of ['Self', 'Person'] as const)
-    for (const suffix of ['Jr.', 'Jr', 'II', 'III.', 'IV'] as const)
+    for (const suffix of ['Jr.', 'Jr', 'II', 'III.', 'IV', ', II.', ', III.', ', IV.'] as const)
       test(`suffix-only family names ask again after A is confirmed as ${confirmedOwner} (${banner ? 'banner' : 'no banner'}, ${suffix})`, async (t) => {
         const secondHeading = 'Fictional Willow report';
         const printed = (date: string) =>

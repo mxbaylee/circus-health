@@ -868,6 +868,10 @@ export function assessIdentityPolicy({
     latestPersonChoice.scope.groupVersionId === groupVersionId
       ? latestPersonChoice
       : undefined;
+  const ownSelfReceipt =
+    latestPersonChoice?.outcome === 'this_is_me' &&
+    latestPersonChoice.scope.groupId === group?.id &&
+    latestPersonChoice.scope.groupVersionId === groupVersionId;
   if (
     latestPersonChoice?.outcome === 'this_is_person' &&
     !ownPersonReceipt &&
@@ -883,7 +887,7 @@ export function assessIdentityPolicy({
     };
   if (
     latestPersonChoice?.outcome === 'this_is_me' &&
-    latestPersonChoice.scope.groupId !== group?.id &&
+    !ownSelfReceipt &&
     distinctOwners.length < 2 &&
     matchedOwner?.personId !== 'patient'
   )
@@ -898,21 +902,20 @@ export function assessIdentityPolicy({
   // cannot decide between same-named owners or override B's banner against
   // the owner it would actually assign, even when there is no unique match.
   // B's own applicable confirmation still resolves its ownership question.
-  const ownSelfReceipt =
-    latestPersonChoice?.outcome === 'this_is_me' &&
-    latestPersonChoice.scope.groupId === group?.id &&
-    latestPersonChoice.scope.groupVersionId === groupVersionId;
   const borrowedSelfReceipt = latestPersonChoice?.outcome === 'this_is_me' && !ownSelfReceipt;
-  const receipt =
-    latestPersonChoice?.outcome === 'this_is_me' &&
-    (!borrowedSelfReceipt ||
+  const reusableSelfReceipt = (candidate: ReturnType<typeof receiptFor>) =>
+    candidate?.outcome === 'this_is_me' &&
+    ((candidate.scope.groupId === group?.id && candidate.scope.groupVersionId === groupVersionId) ||
       (!unreadableBirthDate &&
         distinctOwners.length <= 1 &&
         !suffixAmbiguity &&
-        !bannerIncompatibleWith(owners[0])))
+        !bannerIncompatibleWith(owners[0])));
+  const receipt =
+    latestPersonChoice?.outcome === 'this_is_me' &&
+    (!borrowedSelfReceipt || reusableSelfReceipt(latestPersonChoice))
       ? latestPersonChoice
       : undefined;
-  const explicitReceipt =
+  const explicitCandidate =
     explicitlyConfirmedOperationId && group && groupVersionId
       ? receiptFor(
           receipts?.filter((candidate) => candidate.operationId === explicitlyConfirmedOperationId),
@@ -924,6 +927,12 @@ export function assessIdentityPolicy({
           group.report?.subject?.text || null,
         )
       : undefined;
+  // An operation ID identifies the old decision; it is not a fresh review of
+  // changed membership or current identity clues. Apply the same reuse gate.
+  const explicitReceipt =
+    explicitCandidate?.outcome === 'this_is_me' && !reusableSelfReceipt(explicitCandidate)
+      ? undefined
+      : explicitCandidate;
   if (
     challengedName &&
     !explicitReceipt &&
