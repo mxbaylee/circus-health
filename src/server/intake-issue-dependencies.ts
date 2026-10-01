@@ -10,10 +10,20 @@ import { resolutionFields } from './intake-review.ts';
 import { sourcePageCurrentHash } from './intake-proposal-dependencies.ts';
 
 function fieldHash(mapping: Partial<IntakeClinicalMapping>, fields: string[]): string {
+  // Identity/source attribution is enriched after issue evaluation and has its
+  // own typed issues. A fieldless clinical issue follows every clinical field.
+  const {
+    subject: _subject,
+    personId: _personId,
+    sourceSystem: _sourceSystem,
+    ...clinical
+  } = mapping;
   return createHash('sha256')
     .update(
       canonicalLiteral(
-        fields.map((field) => [field, mapping[field as keyof IntakeClinicalMapping] ?? null]),
+        fields.includes('*')
+          ? clinical
+          : fields.map((field) => [field, mapping[field as keyof IntakeClinicalMapping] ?? null]),
       ),
     )
     .digest('hex');
@@ -25,7 +35,8 @@ export function issueResolutionDependency(
   issue: IntakeReviewIssue,
   mapping: Partial<IntakeClinicalMapping>,
 ): NonNullable<IntakeIssueResolution['dependency']> {
-  const fields = [...new Set(resolutionFields(issue))].sort();
+  const selected = [...new Set(resolutionFields(issue))].sort();
+  const fields = selected.length ? selected : ['*'];
   const pageHash = issue.page ? sourcePageCurrentHash(db, intakeId, issue.page) : null;
   return {
     fields,
@@ -40,7 +51,9 @@ export function issueResolutionCurrent(
   mapping: Partial<IntakeClinicalMapping>,
 ): boolean {
   const dependency = resolution.dependency;
-  if (!dependency) return true; // Historical answers remain visible until separately reviewed.
+  // Historical answers remain in the draft audit trail, but without a measured
+  // dependency they cannot prove that today's field/source still supports them.
+  if (!dependency) return false;
   if (!Array.isArray(dependency.fields) || typeof dependency.fieldHash !== 'string') return false;
   if (fieldHash(mapping, dependency.fields) !== dependency.fieldHash) return false;
   if (dependency.source) {

@@ -4755,7 +4755,7 @@ test('host source capture does not substitute for reading the new durable passag
       summary: 'Fictional current proposal',
       jsonlText: f.batch.jsonlText,
     }),
-    (error: unknown) => hasCode(error, 'SOURCE_TEXT_REQUIRED'),
+    (error: unknown) => hasCode(error, 'SOURCE_TEXT_CHANGED'),
   );
   assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
 });
@@ -6450,6 +6450,70 @@ test('external text correction remains terminal even if the model supplies its n
   );
   assert.equal(f.chat.status, 'idle');
   assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+});
+
+test('a late proposal preserves a consumed section when another section is captured', async (t) => {
+  fictionalModel(t);
+  const f = fixture(t, {}, encryptedRecordStorage(t));
+  const item = uploadIntake(f.db, f.root, 'cedar', {
+    filename: 'fictional-late-sections.txt',
+    bytes: Buffer.from('Fictional first-page evidence. '.repeat(2500)),
+  });
+  const { extractIntakeSourceText } = await import('../intake-source-extraction.ts');
+  const { getIntakeSourceText } = await import('../intake-source-text.ts');
+  await extractIntakeSourceText({
+    db: f.db,
+    root: f.root,
+    profileId: 'cedar',
+    id: item.id,
+    maxPages: 1,
+  });
+  const chat = f.assistant.create('cedar', { title: 'Fictional late page' });
+  f.assistant.send('cedar', chat.id, { message: 'Review the fictional source page' });
+  await tick();
+  const bridge = f.bridges[0]!;
+  const before = getIntake(f.db, f.root, 'cedar', item.id);
+  const passage = await call<{ revisionId: string }>(bridge, 'intake_source_text', {
+    id: item.id,
+    page: 1,
+  });
+  assert.equal(
+    passage.revisionId,
+    getIntakeSourceText(f.db, f.root, 'cedar', item.id).revision?.id,
+  );
+  await extractIntakeSourceText({
+    db: f.db,
+    root: f.root,
+    profileId: 'cedar',
+    id: item.id,
+    maxPages: 1,
+  });
+  const result = await call<{ proposalSourceText: ProposalSourceTextHandoff }>(
+    bridge,
+    'intake_propose',
+    {
+      id: item.id,
+      version: before.version,
+      sourceTextRevisionId: passage.revisionId,
+      summary: 'Fictional bounded proposal',
+      jsonlText: JSON.stringify({
+        format: 'health-record-v1',
+        id: 'fictional-late-context',
+        kind: 'context',
+        payload: { text: 'Fictional first-page evidence' },
+        provenance: {
+          capturedVia: 'Fictional PDF',
+          sourceSystem: null,
+          sourceRecordId: null,
+          evidenceClass: 'transcription',
+          locator: 'page 1',
+        },
+        coverage: { status: 'partial', notes: ['Later source remains.'] },
+      }),
+    },
+  );
+  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
+  assert.notEqual(result.proposalSourceText.currentRevisionId, passage.revisionId);
 });
 
 test('a passage read cannot erase a human correction that arrived during a provider response', async (t) => {

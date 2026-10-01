@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import { HttpError } from './database.ts';
 import type { SourceTextRevision } from '../shared/intake-source-text.ts';
 
 /** Pages actually exposed to a conversion response. Other paths retain the legacy broad pin. */
@@ -8,7 +9,16 @@ export interface ObservedSourcePages {
   pages: number[];
   /** Bounded passages/search hits expose these spans without necessarily exposing the whole page. */
   spanIds?: string[];
-  member?: { rootIntakeId: string; memberId: string; locator: string; sourceHash: string };
+  /** Host-only hashes recorded when the model received the evidence. */
+  pageHashes?: { page: number; hash: string }[];
+  spanHashes?: { spanId: string; hash: string }[];
+  member?: {
+    rootIntakeId: string;
+    memberId: string;
+    locator: string;
+    sourceHash: string;
+    roleHash?: string | null;
+  };
 }
 
 interface ProposalDependencies {
@@ -30,7 +40,7 @@ const amendmentKey = (intakeId: string, page: number) =>
   `intake_source_page_amendment:v1:${intakeId}:${page}`;
 const proposalKey = (proposalId: string) => `intake_proposal_dependencies:v1:${proposalId}`;
 
-function packageMemberRoleHash(
+export function packageMemberRoleHash(
   db: DatabaseSync,
   rootIntakeId: string,
   memberId: string,
@@ -65,7 +75,11 @@ export function sourcePageCurrentHash(
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : null;
 }
 
-function sourceSpanCurrentHash(db: DatabaseSync, intakeId: string, spanId: string): string | null {
+export function sourceSpanCurrentHash(
+  db: DatabaseSync,
+  intakeId: string,
+  spanId: string,
+): string | null {
   const value = db
     .prepare('SELECT value FROM app_meta WHERE key=?')
     .get(spanKey(intakeId, spanId))?.value;
@@ -91,16 +105,51 @@ export function sourcePageHash(revision: SourceTextRevision, page: number): stri
   });
 }
 
-function sourceSpanHashes(revision: SourceTextRevision, page: number): Map<string, string> {
+function amendment(db: DatabaseSync, intakeId: string, page: number): string | null {
+  const value = db
+    .prepare('SELECT value FROM app_meta WHERE key=?')
+    .get(amendmentKey(intakeId, page))?.value;
+  return typeof value === 'string' ? value : null;
+}
+
+function relatedAmendments(
+  db: DatabaseSync,
+  revision: SourceTextRevision,
+  spanIds: Set<string>,
+): [number, string | null][] {
+  const byId = new Map(revision.spans.map((span) => [span.id, span.region.page]));
+  const pages = new Set<number>();
+  for (const relation of revision.relations)
+    if (spanIds.has(relation.from) || spanIds.has(relation.to)) {
+      const from = byId.get(relation.from);
+      const to = byId.get(relation.to);
+      if (from) pages.add(from);
+      if (to) pages.add(to);
+    }
+  return [...pages]
+    .sort((a, b) => a - b)
+    .map((page) => [page, amendment(db, revision.intakeId, page)]);
+}
+
+function sourceSpanHashes(
+  db: DatabaseSync,
+  revision: SourceTextRevision,
+  page: number,
+): Map<string, string> {
   const spans = revision.spans.filter((span) => span.region.page === page);
   const byId = new Map(revision.spans.map((span) => [span.id, span]));
   const relationships = new Map<string, unknown[]>();
+  const relationPages = new Map<string, Set<number>>();
   for (const relation of revision.relations) {
     const edge = { relation, from: byId.get(relation.from), to: byId.get(relation.to) };
     for (const spanId of [relation.from, relation.to]) {
       const list = relationships.get(spanId) || [];
       list.push(edge);
       relationships.set(spanId, list);
+      const pages = relationPages.get(spanId) || new Set<number>();
+      if (edge.from) pages.add(edge.from.region.page);
+      if (edge.to) pages.add(edge.to.region.page);
+      relationPages.set(spanId, pages);
     }
   }
   const disposition = revision.pages.find((candidate) => candidate.page === page)?.disposition;
@@ -108,7 +157,15 @@ function sourceSpanHashes(revision: SourceTextRevision, page: number): Map<strin
   return new Map(
     spans.map((span) => [
       span.id,
-      digest({ span, disposition, issues, relations: relationships.get(span.id) || [] }),
+      digest({
+        span,
+        disposition,
+        issues,
+        relations: relationships.get(span.id) || [],
+        relatedAmendments: [...(relationPages.get(span.id) || [])]
+          .sort((a, b) => a - b)
+          .map((page) => [page, amendment(db, revision.intakeId, page)]),
+      }),
     ]),
   );
 }
@@ -120,32 +177,34 @@ export function updateSourcePageHashes(
   next: SourceTextRevision,
   changedPages?: number[],
 ): void {
-  for (const page of changedPages || next.pages.map((candidate) => candidate.page)) {
-    let amendment = db
-      .prepare('SELECT value FROM app_meta WHERE key=?')
-      .get(amendmentKey(next.intakeId, page))?.value;
+  const pages = changedPages || next.pages.map((candidate) => candidate.page);
+  for (const page of pages) {
     if (next.review?.scope.page === page) {
-      amendment = digest([amendment ?? null, next.review]);
+      const nextAmendment = digest([amendment(db, next.intakeId, page), next.review]);
       db.prepare(
         'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-      ).run(amendmentKey(next.intakeId, page), amendment);
+      ).run(amendmentKey(next.intakeId, page), nextAmendment);
     }
-    const hash = digest([sourcePageHash(next, page), amendment ?? null]);
-    if (
-      previous &&
-      sourcePageHash(previous, page) === sourcePageHash(next, page) &&
-      next.review?.scope.page !== page
-    )
-      continue;
+  }
+  for (const page of pages) {
+    const ids = new Set(
+      next.spans.filter((span) => span.region.page === page).map((span) => span.id),
+    );
+    const hash = digest([
+      sourcePageHash(next, page),
+      amendment(db, next.intakeId, page),
+      relatedAmendments(db, next, ids),
+    ]);
+    if (sourcePageCurrentHash(db, next.intakeId, page) === hash) continue;
     db.prepare(
       'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
     ).run(pageKey(next.intakeId, page), hash);
-    const currentHashes = sourceSpanHashes(next, page);
+    const currentHashes = sourceSpanHashes(db, next, page);
     for (const span of previous?.spans.filter((candidate) => candidate.region.page === page) || [])
       if (!currentHashes.has(span.id))
         db.prepare('DELETE FROM app_meta WHERE key=?').run(spanKey(next.intakeId, span.id));
     for (const [spanId, contentHash] of currentHashes) {
-      const spanHash = digest([contentHash, amendment ?? null]);
+      const spanHash = digest([contentHash, amendment(db, next.intakeId, page)]);
       if (sourceSpanCurrentHash(db, next.intakeId, spanId) === spanHash) continue;
       db.prepare(
         'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
@@ -226,6 +285,33 @@ export function writeProposalDependencies(
     return;
   const sources: ProposalDependencies['sources'] = [];
   for (const source of observed) {
+    if (source.member) {
+      const row = db
+        .prepare(
+          "SELECT sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+        )
+        .get(source.intakeId);
+      let relationship: { parentSourceFileId?: string; locator?: string } | undefined;
+      try {
+        relationship = (JSON.parse(String(row?.details_json)) as { intake?: typeof relationship })
+          .intake;
+      } catch {
+        return;
+      }
+      if (
+        row?.sha256 !== source.member.sourceHash ||
+        relationship?.parentSourceFileId !== source.member.rootIntakeId ||
+        relationship?.locator !== source.member.locator ||
+        (source.member.roleHash !== undefined &&
+          source.member.roleHash !==
+            packageMemberRoleHash(db, source.member.rootIntakeId, source.member.memberId))
+      )
+        throw new HttpError(
+          409,
+          'SOURCE_TEXT_CHANGED',
+          'Observed package relationship changed before proposal publication',
+        );
+    }
     const pages: ProposalDependencies['sources'][number]['pages'] = [];
     for (const page of [...new Set(source.pages)].sort((a, b) => a - b)) {
       if (!Number.isSafeInteger(page) || page < 1) return;
@@ -233,6 +319,13 @@ export function writeProposalDependencies(
         .prepare('SELECT value FROM app_meta WHERE key=?')
         .get(pageKey(source.intakeId, page))?.value;
       if (typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash)) return;
+      const observedHash = source.pageHashes?.find((entry) => entry.page === page)?.hash;
+      if (source.pageHashes && observedHash !== hash)
+        throw new HttpError(
+          409,
+          'SOURCE_TEXT_CHANGED',
+          'Observed source page changed before proposal publication',
+        );
       pages.push({ page, hash });
     }
     const spans: NonNullable<ProposalDependencies['sources'][number]['spans']> = [];
@@ -240,6 +333,13 @@ export function writeProposalDependencies(
       if (typeof spanId !== 'string' || !spanId || spanId.length > 128) return;
       const hash = sourceSpanCurrentHash(db, source.intakeId, spanId);
       if (!hash) return;
+      const observedHash = source.spanHashes?.find((entry) => entry.spanId === spanId)?.hash;
+      if (source.spanHashes && observedHash !== hash)
+        throw new HttpError(
+          409,
+          'SOURCE_TEXT_CHANGED',
+          'Observed source span changed before proposal publication',
+        );
       spans.push({ spanId, hash });
     }
     sources.push({

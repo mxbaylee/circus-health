@@ -20,6 +20,7 @@ import {
 } from '../intake.ts';
 import { createApp } from '../index.ts';
 import { createImportDiagnostics } from '../import-diagnostics.ts';
+import { writeIntakeSourcePin } from '../intake-source-pin.ts';
 
 const profileId = 'cedar';
 const waitFor = async <T>(
@@ -617,6 +618,72 @@ test('prepared JSONL and an existing partial proposal skip model work without co
       { status: 'review_ready', reason: 'already_reviewable', reading: null },
     ],
   );
+});
+
+test('corrected completed work cannot displace a different running batch or claim cross-batch selection', async (t) => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const f = setup(t, {
+    connectionCheck: async () => {
+      await blocked;
+      return { available: true, readiness: 'ready' };
+    },
+  });
+  const first = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-ready-first.jsonl',
+    bytes: Buffer.from(record('fictional-ready-first', 'complete_response')),
+  });
+  const second = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-ready-second.jsonl',
+    bytes: Buffer.from(record('fictional-ready-second', 'complete_response')),
+  });
+  const firstBatch = f.manager.create(profileId, {
+    operationId: 'fictional-ready-first-run',
+    intakeIds: [first.id],
+  });
+  await waitFor(() => f.manager.get(profileId, firstBatch.id).status === 'complete');
+  const secondBatch = f.manager.create(profileId, {
+    operationId: 'fictional-ready-second-run',
+    intakeIds: [second.id],
+  });
+  await waitFor(() => f.manager.get(profileId, secondBatch.id).status === 'complete');
+  for (const source of [first, second])
+    writeIntakeSourcePin(f.db, source.id, {
+      revisionId: 'fictional-material-change',
+      dependencyToken: 'fictional-material-change',
+      requiresInterpretation: true,
+      version: 1,
+    });
+  assert.throws(
+    () =>
+      f.manager.create(profileId, {
+        operationId: 'fictional-cross-batch-requeue',
+        intakeIds: [first.id, second.id],
+      }),
+    { code: 'INTAKE_BATCH_SELECTION' },
+  );
+  assert.equal(f.manager.get(profileId, firstBatch.id).status, 'complete');
+  assert.equal(f.manager.get(profileId, secondBatch.id).status, 'complete');
+  const competing = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-competing.txt',
+    bytes: Buffer.from('Fictional competing source'),
+  });
+  const competingBatch = f.manager.create(profileId, {
+    operationId: 'fictional-competing-run',
+    intakeIds: [competing.id],
+  });
+  await waitFor(() => f.manager.get(profileId, competingBatch.id).status === 'running');
+  assert.throws(
+    () =>
+      f.manager.create(profileId, { operationId: 'fictional-busy-requeue', intakeIds: [first.id] }),
+    { code: 'INTAKE_BATCH_BUSY' },
+  );
+  assert.equal(f.manager.get(profileId, competingBatch.id).status, 'running');
+  release();
+  await waitFor(() => f.bridges.length === 1);
 });
 
 test('a retained partial proposal survives a failed pass and the next original still starts', async (t) => {

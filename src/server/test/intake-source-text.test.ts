@@ -1171,6 +1171,32 @@ test('measured page dependencies survive unrelated correction and rebuild, but f
   });
   assert.equal(proposalDependenciesCurrent(related.db, 'fictional-header-proposal'), false);
 
+  const relatedClarification = fixture(t);
+  const clarificationSource = publish(relatedClarification);
+  transaction(relatedClarification.db, () =>
+    writeProposalDependencies(relatedClarification.db, intakeId, 'fictional-linked-clarification', [
+      { intakeId, pages: [1] },
+    ]),
+  );
+  transaction(relatedClarification.db, () =>
+    writeProposalDependencies(relatedClarification.db, intakeId, 'fictional-linked-span', [
+      { intakeId, pages: [], spanIds: ['b'] },
+    ]),
+  );
+  review(relatedClarification, clarificationSource, {
+    action: 'clarification',
+    scope: { page: 2 },
+    clarification: 'Fictional header clarification changes linked finding interpretation.',
+  });
+  assert.equal(
+    proposalDependenciesCurrent(relatedClarification.db, 'fictional-linked-clarification'),
+    false,
+  );
+  assert.equal(
+    proposalDependenciesCurrent(relatedClarification.db, 'fictional-linked-span'),
+    false,
+  );
+
   const clarified = fixture(t);
   const clarifiedFirst = publish(clarified, independent);
   transaction(clarified.db, () =>

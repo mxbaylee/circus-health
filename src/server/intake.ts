@@ -2764,6 +2764,18 @@ export function saveIntakeReviewDraft(
         question.status = 'answered';
       }
     }
+    // A save may resolve several questions and apply several corrections. Pin
+    // each newly made answer to the final reviewed mapping, independent of the
+    // order in which those answers appeared in the request.
+    for (const resolution of resolutions) {
+      if (resolution.operationId !== input.operationId) continue;
+      const issue = record.issues!.find((candidate) => candidate.id === resolution.issueId);
+      if (issue)
+        resolution.dependency = issueResolutionDependency(db, id, issue, {
+          ...record.mapping,
+          ...mapping,
+        });
+    }
     if (
       input.correctionReason !== undefined &&
       (typeof input.correctionReason !== 'string' ||

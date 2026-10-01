@@ -1570,7 +1570,36 @@ export function createIntakeBatchManager({
     const newIntakeIds = intakeIds.filter(
       (id) => !owned.some((batch) => batch.items.some((item) => item.intakeId === id)),
     );
+    if (newIntakeIds.length && newIntakeIds.length !== intakeIds.length) {
+      const db = dbFor(profileId);
+      const affectedOwned = owned.some((batch) =>
+        batch.items.some((item) => {
+          if (!intakeIds.includes(item.intakeId)) return false;
+          if (item.status !== 'review_ready') return batch.status === 'stopped';
+          const interpretation = currentIntakeInterpretations(db, profileId, item.intakeId);
+          return (
+            (!interpretation.original && !interpretation.proposalIds.length) ||
+            sourceTextExtractionPending(getIntakeSourceText(db, root, profileId, item.intakeId))
+          );
+        }),
+      );
+      if (affectedOwned)
+        throw new HttpError(
+          409,
+          'INTAKE_BATCH_SELECTION',
+          'Enqueue new originals and reprocess corrected originals in separate operations',
+        );
+    }
     if (!newIntakeIds.length) {
+      const selectedOwners = owned.filter((batch) =>
+        batch.items.some((item) => intakeIds.includes(item.intakeId)),
+      );
+      if (selectedOwners.length > 1)
+        throw new HttpError(
+          409,
+          'INTAKE_BATCH_SELECTION',
+          'Reprocess corrected originals from one retained batch at a time',
+        );
       const retained = owned.find((batch) =>
         batch.items.some((item) => intakeIds.includes(item.intakeId)),
       )!;
@@ -1589,6 +1618,15 @@ export function createIntakeBatchManager({
           );
         });
         if (affected.length) {
+          const competing = owned.find(
+            (batch) => batch.id !== retained.id && batch.status === 'running',
+          );
+          if (competing)
+            throw new HttpError(
+              409,
+              'INTAKE_BATCH_BUSY',
+              'Another reading batch is already running for this profile',
+            );
           if (!authorized(profileId, affected[0]!.intakeId, 'publish'))
             throw new HttpError(403, 'PROFILE_SCOPE', 'Unlock this profile before reading');
           for (const item of affected) {
