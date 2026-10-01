@@ -35,8 +35,9 @@ export interface PhysicalPasskeyProgress {
   successfulUnlocks: number;
   recoveryFallback: boolean;
 }
-export function physicalPasskeyPassed(progress: PhysicalPasskeyProgress) {
+export function physicalPasskeyPassed(progress: PhysicalPasskeyProgress, journeyCompleted = false) {
   return (
+    journeyCompleted === true &&
     progress.confirmedEnrollment === true &&
     progress.successfulUnlocks === 3 &&
     progress.recoveryFallback === true
@@ -51,6 +52,7 @@ export async function physicalPasskeyJourney(
   saveRecovery: (phrase: string) => void,
   progress: PhysicalPasskeyProgress,
   observe: (progress: PhysicalPasskeyProgress) => Promise<void> = async () => {},
+  ownProfile: (id: string) => void = () => {},
 ) {
   const api = async <T = unknown>(path: string, body?: unknown): Promise<T> => {
     assert.equal(new URL(page.url()).origin, origin);
@@ -90,6 +92,9 @@ export async function physicalPasskeyJourney(
   const verification = page.getByRole('dialog', { name: 'Open profile', exact: true });
   await verification.getByLabel('Recovery key', { exact: true }).fill(recovery);
   await verification.getByRole('button', { name: 'Open profile', exact: true }).click();
+  const created = await api<{ id: string }[]>('/api/profiles');
+  assert.equal(created.length, 1);
+  ownProfile(created[0].id);
   // Install response wait before the physical enrollment gesture can complete.
   const confirmation = page.waitForResponse(
     (response) =>
@@ -152,6 +157,7 @@ export async function physicalPasskeyJourney(
   progress.recoveryFallback = true;
   await observe(progress);
   await api(path + '/lock', {});
+  assert.equal((await api<Profiles>('/api/profiles'))[0].locked, true);
 }
 
 async function main() {
@@ -163,6 +169,10 @@ async function main() {
     recoveryFallback: false,
   };
   const browser = await chromium.launch({ channel: config.channel, headless: false });
+  let page: Page | undefined;
+  let profileId: string | undefined;
+  let journeyCompleted = false;
+  let cleanupLock = 'not_created';
   let cancel: (() => void) | undefined;
   const cancellation = new Promise<never>((_, reject) => {
     cancel = () => reject(new Error('Physical qualification cancelled.'));
@@ -170,7 +180,7 @@ async function main() {
   process.once('SIGINT', cancel!);
   process.once('SIGTERM', cancel!);
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
     // Human gestures have no elapsed-time acceptance target. Ctrl-C cancels the run.
     page.setDefaultTimeout(0);
     page.setDefaultNavigationTimeout(30_000);
@@ -188,37 +198,65 @@ async function main() {
           });
         },
         progress,
+        undefined,
+        (id) => {
+          profileId = id;
+        },
       ),
       cancellation,
     ]);
+    journeyCompleted = true;
+    cleanupLock = 'locked';
   } finally {
     process.removeListener('SIGINT', cancel!);
     process.removeListener('SIGTERM', cancel!);
-    writeFileSync(
-      join(config.output, attempt + '-passkey.json'),
-      JSON.stringify(
-        {
-          schemaVersion: 1,
-          task: 'CRS-072',
-          independentlyFictional: true,
-          browserChannel: config.channel,
-          browserVersion: browser.version(),
-          https: true,
-          passed: physicalPasskeyPassed(progress),
-          progress,
-          scope: 'One actual desktop browser and authenticator on one trusted HTTPS origin.',
-          remainingAcceptance: [
-            'Other intended browsers and authenticators',
-            'Physical phone HTTPS-origin journey',
-            'Release-build container recreation',
-          ],
-        },
-        null,
-        2,
-      ) + '\n',
-      { mode: 0o600, flag: 'wx' },
-    );
-    await browser.close();
+    try {
+      if (!journeyCompleted && profileId && page) {
+        // Close the page first to stop pending gestures and UI continuations.
+        // The context request client retains this isolated run's session cookie.
+        await page.close().catch(() => {});
+        cleanupLock = 'failed';
+        try {
+          const response = await page
+            .context()
+            .request.post(
+              config.origin + '/api/profiles/' + encodeURIComponent(profileId) + '/lock',
+              { data: {}, headers: { Origin: config.origin }, timeout: 10_000 },
+            );
+          if (response.ok()) cleanupLock = 'locked';
+        } catch {
+          // Failure remains visible in the failed metadata receipt.
+        }
+      }
+      writeFileSync(
+        join(config.output, attempt + '-passkey.json'),
+        JSON.stringify(
+          {
+            schemaVersion: 1,
+            task: 'CRS-072',
+            independentlyFictional: true,
+            browserChannel: config.channel,
+            browserVersion: browser.version(),
+            https: true,
+            passed: physicalPasskeyPassed(progress, journeyCompleted),
+            journeyCompleted,
+            cleanupLock,
+            progress,
+            scope: 'One actual desktop browser and authenticator on one trusted HTTPS origin.',
+            remainingAcceptance: [
+              'Other intended browsers and authenticators',
+              'Physical phone HTTPS-origin journey',
+              'Release-build container recreation',
+            ],
+          },
+          null,
+          2,
+        ) + '\n',
+        { mode: 0o600, flag: 'wx' },
+      );
+    } finally {
+      await browser.close();
+    }
   }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -37,17 +37,27 @@ test('physical qualification rejects insecure, normalized, unapproved and unsupp
 
 test('a receipt cannot pass with enrollment alone, missing unlocks or missing recovery', () => {
   assert.equal(
-    physicalPasskeyPassed({
-      confirmedEnrollment: true,
-      successfulUnlocks: 3,
-      recoveryFallback: true,
-    }),
+    physicalPasskeyPassed(
+      {
+        confirmedEnrollment: true,
+        successfulUnlocks: 3,
+        recoveryFallback: true,
+      },
+      true,
+    ),
     true,
+  );
+  assert.equal(
+    physicalPasskeyPassed(
+      { confirmedEnrollment: true, successfulUnlocks: 3, recoveryFallback: true },
+      false,
+    ),
+    false,
   );
   for (const progress of [
     { confirmedEnrollment: false, successfulUnlocks: 3, recoveryFallback: true },
     { confirmedEnrollment: true, successfulUnlocks: 2, recoveryFallback: true },
     { confirmedEnrollment: true, successfulUnlocks: 3, recoveryFallback: false },
   ])
-    assert.equal(physicalPasskeyPassed(progress), false);
+    assert.equal(physicalPasskeyPassed(progress, true), false);
 });
