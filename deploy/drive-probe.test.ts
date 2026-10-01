@@ -5,7 +5,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { probeDrive, verifyDrivePublication } from './drive-probe.ts';
-import { driveContainerArguments, qualifyDrive } from './qualify-drive.ts';
+import {
+  driveContainerArguments,
+  qualifyDrive,
+  requireSupportedDriveProbeHost,
+} from './qualify-drive.ts';
 
 test('fictional drive probe exercises real publication and separate-process writer leases', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-drive-'));
@@ -53,4 +57,9 @@ test('qualification refuses to run before explicit opt-in or without an external
     qualifyDrive({ CRS_DRIVE_QUALIFICATION: '1', CRS_DATA_DIR: '.' }),
     /absolute/u,
   );
+});
+
+test('unsupported host is rejected before UID 1000 container scratch is created', () => {
+  assert.doesNotThrow(() => requireSupportedDriveProbeHost('darwin'));
+  assert.throws(() => requireSupportedDriveProbeHost('linux'), /macOS Docker Desktop only/u);
 });

@@ -48,6 +48,14 @@ export function driveContainerArguments(
   ];
 }
 
+export function requireSupportedDriveProbeHost(platform: NodeJS.Platform = process.platform) {
+  assert.equal(
+    platform,
+    'darwin',
+    'Drive qualification currently supports macOS Docker Desktop only; UID 1000 scratch cleanup is not qualified on Linux.',
+  );
+}
+
 /** A mount-semantics receipt is deliberately narrower than full CRS-071 acceptance. */
 export async function qualifyDrive(env: NodeJS.ProcessEnv = process.env) {
   assert.equal(env.CRS_DRIVE_QUALIFICATION, '1', 'Explicit CRS_DRIVE_QUALIFICATION=1 required.');
@@ -57,6 +65,7 @@ export async function qualifyDrive(env: NodeJS.ProcessEnv = process.env) {
     data,
   });
   assert.ok(env.CRS_IMAGE, 'Supply CRS_IMAGE for an already built application image.');
+  requireSupportedDriveProbeHost();
   const scratch = mkdtempSync(join(data, '.fictional-drive-qualification-'));
   chmodSync(scratch, 0o700);
   const nonce = randomUUID();
