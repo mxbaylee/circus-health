@@ -1148,6 +1148,43 @@ test('canonical identity names retain Jr., Sr., II and III rather than merging g
     canonicalIdentityName('Robin Lane, Jr.'),
     canonicalIdentityName('Robin Lane, Sr.'),
   );
+  assert.equal(canonicalIdentityName('Lane, Robin Jr.'), canonicalIdentityName('Robin Lane Jr.'));
+  assert.equal(canonicalIdentityName('Lane, Robin Sr'), canonicalIdentityName('Robin Lane Sr'));
+});
+
+test('printed suffix distinguishes an owner, while an unsuffixed family alias still asks', async (t) => {
+  const f = fixture(t, `${heading}\nPatient: ${patient}\nFictional count 12.00`, 'family.txt', {
+    fullName: `${patient} Sr.`,
+  });
+  const review = await f.identity();
+  const group = intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!.reportGroups![0]!;
+  const self = { ...review.self, knownNames: [patient] };
+  const junior = {
+    noteId: 'fictional-junior-note',
+    personId: 'fictional-junior',
+    version: 1,
+    fullName: `${patient} Jr.`,
+    knownNames: [],
+    birthDate: '1970-04-17',
+  };
+  const assess = (printed: string, people = [junior]) =>
+    assessIdentityPolicy({
+      self,
+      people,
+      evidence: { ...review.evidencedIdentity, fullName: printed },
+      group,
+      groupVersionId: review.scope!.groupVersionId,
+      originalFingerprint: review.scope!.evidenceOriginalFingerprint || '',
+      receipts: [],
+      nameEvidenceGrounded: true,
+      originalEvidenceChecked: true,
+    });
+  assert.equal(assess(patient).blocking, true);
+  assert.equal(assess('Meadow, Iris').blocking, true);
+  assert.equal(assess(`${patient} Jr.`).blocking, false);
+  assert.equal(assess('Meadow, Iris Jr.').blocking, false);
+  assert.equal(assess(patient, []).blocking, false, 'a unique unsuffixed name needs no new prompt');
+  assert.equal(assess(`${patient} Sr.`, []).blocking, false);
 });
 
 // A caregiver can upload several people's reports together. Confirmation of A

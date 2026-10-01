@@ -757,21 +757,28 @@ export function assessIdentityPolicy({
         .map((owner) => [owner.personId, owner]),
     ).values(),
   ];
-  const withoutGenerationalSuffix = (name: string): string =>
-    canonicalIdentityName(name)
-      .replace(/(?:[\s,]+)(?:jr\.?|sr\.?|ii|iii|iv)\.?$/u, '')
-      .trim();
+  const generationalName = (name: string): { base: string; suffix: string | null } => {
+    const printed = name.normalize('NFKC').trim();
+    const surnameFirst = printed.match(/^([^,]+),\s*(.+?)\s+(jr\.?|sr\.?|ii|iii|iv)\.?$/iu);
+    const ordered = surnameFirst
+      ? `${surnameFirst[2]} ${surnameFirst[1]} ${surnameFirst[3]}`
+      : printed;
+    const canonical = canonicalIdentityName(ordered);
+    const match = canonical.match(/^(.*?)\s+(jr|sr|ii|iii|iv)\.?$/u);
+    return match ? { base: match[1]!, suffix: match[2]! } : { base: canonical, suffix: null };
+  };
+  const printedName = fullName ? generationalName(fullName) : null;
   const suffixAmbiguity =
-    !!fullName &&
+    !!printedName &&
+    !printedName.suffix &&
     distinctOwners.length === 1 &&
     owners.some(
       (owner) =>
         owner.personId !== distinctOwners[0]!.personId &&
-        owner.names.some(
-          (name) =>
-            canonicalIdentityName(name) !== canonicalIdentityName(fullName) &&
-            withoutGenerationalSuffix(name) === withoutGenerationalSuffix(fullName),
-        ),
+        owner.names.some((name) => {
+          const saved = generationalName(name);
+          return !!saved.suffix && saved.base === printedName.base;
+        }),
     );
   const challengedName =
     !!fullName &&
