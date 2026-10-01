@@ -40,6 +40,8 @@ Scores run from 2 to 9. For example, 🚀 🔴 🐭 scores 9, 🚀 🔴 🐘 sco
 
 Sizes and marks are estimates. When starting a ticket shows one is wrong, correct it here in the same change.
 
+Open scoring proposal (review feedback, 2026-10-01): an earlier draft reportedly proposed a 🫀 user-flow mark worth 4 points. Confirm whether it was intentionally dropped or should be reconsidered, including how it combines with production/impact/effort and changes tie-breaking. This mark is not adopted; keep the current scoring and ranking until the owner records a decision. Do not treat a reported unpublished proposal as current policy.
+
 Each open item shows its score after its sizes. When a size or mark changes, recompute its score in the same change.
 
 ### <a id="top-5"></a>🏆 Top 5
