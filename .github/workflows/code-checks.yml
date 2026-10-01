@@ -189,4 +189,4 @@ jobs:
           -e LITELLM_LOCAL_MODEL_COST_MAP=True
           --mount type=bind,source="${{ github.workspace }}/deploy",target=/workspace/deploy,readonly
           --workdir /workspace/deploy/litellm
-          circus-proxy-test -m unittest test_chatgpt_stream_semantics test_native_pdf test_response_diagnostics test_configure test_chatgpt_login
+          circus-proxy-test -m unittest test_chatgpt_stream_semantics test_native_pdf test_response_diagnostics test_configure test_chatgpt_login test_oauth_qualification

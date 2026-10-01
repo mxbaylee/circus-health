@@ -86,6 +86,38 @@ test('provider fixture has four independent pages and scan-only pages without hi
   }
 });
 
+test('tiny diagnostics fixture has one page and four literal fictional observations', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-tiny-diagnostics-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, 'tiny.pdf');
+  const receipt = writeProviderQualificationPdf(path, 'tiny');
+  assert.equal(receipt.pages, 1);
+  assert.equal(receipt.expectedRecords, 4);
+  const answers = answersForQualification('tiny');
+  assert.deepEqual(
+    answers.map((answer) => answer.marker),
+    ['FXP1R01', 'FXP1R02', 'FXP1R03', 'FXP1R04'],
+  );
+  assert.ok(answers.every((answer) => answer.kind === 'observation'));
+  const task = getDocument({
+    data: Uint8Array.from(readFileSync(path)),
+    standardFontDataUrl: fileURLToPath(
+      new URL('../../node_modules/pdfjs-dist/standard_fonts/', import.meta.url),
+    ),
+  });
+  try {
+    const document = await task.promise;
+    assert.equal(document.numPages, 1);
+    const page = await document.getPage(1);
+    const text = (await page.getTextContent()).items
+      .flatMap((item) => ('str' in item ? [item.str] : []))
+      .join(' ');
+    for (const answer of answers) assert.ok(text.includes(answer.marker));
+  } finally {
+    await task.destroy();
+  }
+});
+
 test('qualification oracle rejects omissions, duplicate rows, hallucinations and literal-field errors', () => {
   assert.equal(gradeProviderQualification(exactRecords(), originalId).passed, true);
   const incorrect = exactRecords();
