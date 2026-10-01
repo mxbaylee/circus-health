@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { physicalPasskeyConfiguration, physicalPasskeyPassed } from './qualify-physical-passkey.ts';
+import type { APIRequestContext } from 'playwright';
+import {
+  lockOwnedPasskeyProfile,
+  physicalPasskeyConfiguration,
+  physicalPasskeyPassed,
+} from './qualify-physical-passkey.ts';
 
 test('physical qualification rejects insecure, normalized, unapproved and unsupported-browser targets', (t) => {
   const output = mkdtempSync(join(tmpdir(), 'fictional-passkey-receipt-'));
@@ -60,4 +65,47 @@ test('a receipt cannot pass with enrollment alone, missing unlocks or missing re
     { confirmedEnrollment: true, successfulUnlocks: 3, recoveryFallback: false },
   ])
     assert.equal(physicalPasskeyPassed(progress, true), false);
+});
+
+test('failed journey locks only its exact generated profile, including before ID capture', async () => {
+  const calls: string[] = [];
+  let locked = false;
+  const request = {
+    async get(url: string) {
+      calls.push(url);
+      return {
+        ok: () => true,
+        json: async () => ({
+          data: [
+            { id: 'other', name: 'Other Person', locked: false },
+            { id: 'owned', name: 'Fictional Passkey Person abcdef12', locked },
+          ],
+        }),
+      };
+    },
+    async post(url: string) {
+      calls.push(url);
+      locked = true;
+      return { ok: () => true };
+    },
+  } as unknown as APIRequestContext;
+  assert.equal(
+    await lockOwnedPasskeyProfile(
+      request,
+      'https://fictional.example.test',
+      undefined,
+      'Fictional Passkey Person abcdef12',
+    ),
+    true,
+  );
+  assert.ok(calls.includes('https://fictional.example.test/api/profiles/owned/lock'));
+  calls.length = 0;
+  assert.equal(
+    await lockOwnedPasskeyProfile(request, 'https://fictional.example.test', undefined, 'Unknown'),
+    false,
+  );
+  assert.equal(
+    calls.some((url) => url.endsWith('/lock')),
+    false,
+  );
 });
