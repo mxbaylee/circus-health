@@ -621,7 +621,7 @@ export function NoteEditor({
   const changePending = busy || attachmentBusy || prelinkLoading || Boolean(prelinkError);
   const bloodType = text(form.person.bloodType);
   const lifeStatus = text(form.person.lifeStatus) || 'unknown';
-  const canPrint = kind !== 'person' || isSelf;
+  const canPrint = kind !== 'person' || isSelf || Boolean(note?.personId);
   const canOverflow = Boolean(note);
   return (
     <article className="panel note-detail">
@@ -664,8 +664,8 @@ export function NoteEditor({
           <>
             {canPrint && (
               <NoteExportDialog
-                type={isSelf ? 'person' : 'note'}
-                id={isSelf ? 'patient' : note?.id || creationId}
+                type={kind === 'person' ? 'person' : 'note'}
+                id={kind === 'person' ? note?.personId || 'patient' : note?.id || creationId}
                 prepare={finished ? undefined : prepareOwner}
                 disabled={changePending}
                 label="Print"

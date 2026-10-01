@@ -115,6 +115,41 @@ interface ExportRecord {
   note?: NoteDTO;
   currentUse?: MedicationPreference | null;
   ownershipCorrections?: OwnershipCorrectionHistory[];
+  fieldCorrections?: FieldCorrection[];
+}
+
+interface FieldCorrection {
+  at: string;
+  reason: string;
+  fields: string[];
+  actor: 'profile-user';
+  fromKind?: string;
+  toKind?: string;
+}
+
+function fieldCorrections(row: ExportRow): FieldCorrection[] {
+  const extra = parsedRecord(row.extra_json);
+  if (!Array.isArray(extra.recordCorrections)) return [];
+  return extra.recordCorrections.flatMap((item): FieldCorrection[] => {
+    if (!isRecord(item) || !isRecord(item.before) || !isRecord(item.after)) return [];
+    const before = item.before,
+      after = item.after;
+    const fields = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(
+      (key) => JSON.stringify(before[key]) !== JSON.stringify(after[key]),
+    );
+    if (!fields.length) return [];
+    return [
+      {
+        at: typeof item.at === 'string' ? item.at : '',
+        reason: typeof item.reason === 'string' ? item.reason : '',
+        fields,
+        actor: 'profile-user',
+        ...(before.kind !== after.kind
+          ? { fromKind: String(before.kind), toKind: String(after.kind) }
+          : {}),
+      },
+    ];
+  });
 }
 
 interface ExportOwner extends SqliteRow {
@@ -138,6 +173,7 @@ interface PatientInformation {
   name: string;
   details: JsonRecord;
   contacts: JsonRecord[];
+  caregiver?: { name: string; role: 'caregiver' };
 }
 
 export interface NoteExportInput extends JsonRecord {
@@ -382,7 +418,6 @@ function citations(db: Database, type: ExportRecordType, id: string, row: Export
 function exportPerson(db: Database, input: NoteExportInput): string {
   if (['note', 'person'].includes(input.type))
     return recordOwner(db, input.type, input.id) || 'patient';
-  // Preserve the existing requirement to start family exports from their owned note.
   return 'patient';
 }
 function record(
@@ -412,9 +447,11 @@ function record(
   if (
     (['observation', 'medication', 'procedure'].includes(type) && row.person_id !== personId) ||
     (type === 'document' && documentPersonId(row.extra_json) !== personId) ||
+    (type === 'person' && id !== personId) ||
     (type === 'note' &&
-      row.kind !== 'person' &&
-      (parsedRecord(row.profile_json).recordOwnerPersonId || 'patient') !== personId)
+      (row.kind === 'person'
+        ? row.person_id !== personId
+        : (parsedRecord(row.profile_json).recordOwnerPersonId || 'patient') !== personId))
   )
     throw new HttpError(
       400,
@@ -447,6 +484,7 @@ function record(
             type as 'observation' | 'medication' | 'procedure' | 'document',
             id,
           ),
+          fieldCorrections: fieldCorrections(row),
         }
       : {}),
   };
@@ -481,7 +519,7 @@ export function exportOptions(db: Database, value: unknown) {
   const main = record(db, input.type, input.id, personId);
   if (
     !['note', 'document'].includes(main.type) ||
-    (input.type === 'person' && input.id !== 'patient')
+    (input.type === 'person' && main.note?.kind !== 'person')
   )
     throw new HttpError(400, 'INVALID_EXPORT', 'Start an export from a note.');
   const links = new Set(
@@ -672,21 +710,27 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
     }
   }
   // Conditions, allergies, visits and immunizations have no normalized table yet.
-  // Include their retained clinical assertions, never all raw personal-source files.
-  if (provider && personId === 'patient') {
+  // An unrepresented assertion is safe to include only when its retained person
+  // evidence identifies this one subject. A name in raw source JSON is not an
+  // authority for packet membership.
+  if (provider) {
     const represented = new Set(
       db
         .prepare(
-          'SELECT source_record_id FROM evidence UNION SELECT source_record_id FROM observations UNION SELECT source_record_id FROM medications UNION SELECT source_record_id FROM procedures UNION SELECT source_record_id FROM documents',
+          "SELECT source_record_id FROM evidence WHERE entity_type<>'person' UNION SELECT source_record_id FROM observations UNION SELECT source_record_id FROM medications UNION SELECT source_record_id FROM procedures UNION SELECT source_record_id FROM documents",
         )
         .all()
         .map((r) => r.source_record_id),
     );
     for (const row of db
       .prepare(
-        "SELECT id,kind FROM source_records WHERE provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self')) ORDER BY id",
+        `SELECT sr.id,sr.kind FROM source_records sr
+          WHERE sr.provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))
+          AND EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id=? AND e.source_record_id=sr.id)
+          AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id<>? AND e.source_record_id=sr.id)
+          ORDER BY sr.id`,
       )
-      .all() as unknown as Array<ExportRow & { id: string; kind: string }>) {
+      .all(personId, personId) as unknown as Array<ExportRow & { id: string; kind: string }>) {
       if (
         !represented.has(row.id) &&
         (row.kind === 'clinical_object' ||
@@ -735,6 +779,17 @@ function patientInformation(db: Database, personId = 'patient'): PatientInformat
     fieldsToShare.filter((k) => profile[k] !== undefined).map((k) => [k, profile[k]]),
   );
   const contacts: JsonRecord[] = [];
+  const linkedContacts = new Set(
+    personId === 'patient'
+      ? []
+      : (
+          db
+            .prepare(
+              "SELECT target_id FROM note_links WHERE note_id=(SELECT id FROM notes WHERE person_id=?) AND target_type='person'",
+            )
+            .all(personId) as Array<{ target_id: string }>
+        ).map((row) => row.target_id),
+  );
   for (const row of db
     .prepare(
       "SELECT p.id,p.display_name,n.profile_json FROM people p JOIN notes n ON n.person_id=p.id WHERE p.id<>'patient' ORDER BY p.id",
@@ -747,7 +802,7 @@ function patientInformation(db: Database, personId = 'patient'): PatientInformat
           typeof t === 'string' &&
           ['Professional', 'Primary Care Provider', 'Emergency Contact'].includes(t),
       );
-    if (roles.length && personId === 'patient')
+    if (roles.length && (personId === 'patient' || linkedContacts.has(row.id)))
       contacts.push({
         name: row.display_name,
         roles,
@@ -762,6 +817,17 @@ function patientInformation(db: Database, personId = 'patient'): PatientInformat
     name: typeof self?.display_name === 'string' ? self.display_name : 'Not recorded',
     details,
     contacts,
+    ...(personId !== 'patient'
+      ? {
+          caregiver: {
+            name: String(
+              db.prepare("SELECT display_name FROM people WHERE id='patient'").get()
+                ?.display_name || 'Name not recorded',
+            ),
+            role: 'caregiver' as const,
+          },
+        }
+      : {}),
   };
 }
 function includedReadingGaps(
@@ -849,8 +915,8 @@ export function exportSnapshot(
   const main = record(db, input.type, input.id, personId);
   if ((main.note?.version ?? hash(main)) !== input.noteVersion)
     throw new HttpError(409, 'EXPORT_STALE', 'The note changed. Save and refresh the preview.');
-  if (input.type === 'person' && (input.id !== 'patient' || input.mode !== 'provider'))
-    throw new HttpError(400, 'INVALID_EXPORT', 'Start a patient packet from Self.');
+  if (input.type === 'person' && input.mode !== 'provider')
+    throw new HttpError(400, 'INVALID_EXPORT', 'Start a person packet in provider mode.');
   const selected: string[] = [];
   for (const key of [...new Set(input.selected || [])].sort()) {
     if (typeof key !== 'string')
@@ -1024,7 +1090,11 @@ export function exportSnapshot(
   if (input.type === 'person') {
     main.row = { ...main.row, content: '', topics: '', raw_thoughts: '', profile_json: '{}' };
     if (!main.note)
-      throw new HttpError(404, 'INVALID_EXPORT', 'The Self note is unavailable in this profile.');
+      throw new HttpError(
+        404,
+        'INVALID_EXPORT',
+        'The selected person note is unavailable in this profile.',
+      );
     main.note = {
       ...main.note,
       content: '',
@@ -1065,8 +1135,7 @@ export function exportSnapshot(
         a.key.localeCompare(b.key),
     ),
     assets,
-    readingGaps:
-      input.mode === 'provider' ? includedReadingGaps(db, [main, ...records.values()]) : [],
+    readingGaps: includedReadingGaps(db, [main, ...records.values()]),
     mode: input.mode ?? 'brief',
     trends: !!input.trends,
     scope: {
@@ -1106,7 +1175,7 @@ function fields(rows: Array<readonly [unknown, unknown]>): string {
     )
     .join('')}</dl>`;
 }
-function content(r: ExportRecord, mode: ExportMode): string {
+function content(r: ExportRecord, mode: ExportMode, confirmedBy: string): string {
   const row = r.row;
   if (
     r.type === 'note' &&
@@ -1135,7 +1204,14 @@ function content(r: ExportRecord, mode: ExportMode): string {
         : r.currentUse
           ? [
               ['Confirmation statement', assertion.statement],
-              ['Confirmed by', assertion.author || assertion.actor],
+              [
+                'Confirmed by',
+                r.currentUse?.status === 'current'
+                  ? confirmedBy.includes('(caregiver)')
+                    ? confirmedBy
+                    : assertion.author || confirmedBy
+                  : assertion.author || assertion.actor,
+              ],
               ['Confirmation basis', assertion.basis],
             ]
           : [];
@@ -1247,8 +1323,19 @@ export function exportEvidence(snapshot: NoteExportSnapshot): JsonRecord {
   );
   const project = (record: ExportRecord): JsonRecord => {
     const { note, ...clinical } = record;
+    const actorDisplay = snapshot.patient?.caregiver
+      ? `${snapshot.patient.caregiver.name} (caregiver)`
+      : 'the patient';
     return {
       ...clinical,
+      ...(clinical.fieldCorrections
+        ? {
+            fieldCorrections: clinical.fieldCorrections.map((correction) => ({
+              ...correction,
+              actorDisplay,
+            })),
+          }
+        : {}),
       ...(note
         ? {
             links: (note.links || [])
@@ -1297,20 +1384,34 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
       }
       return citationIds.get(key)!;
     });
-  const renderRecord = (r: ExportRecord, index: number, main = false): string => {
-    const numbers = citationNumbers(r);
-    return `<section id="record-${index}"><${main ? 'h1' : 'h3'}>${esc(r.title)}</${main ? 'h1' : 'h3'}><p class="meta">${esc(provenance(r))}${r.archived ? ' ARCHIVED.' : ''}<br>${snapshot.mode === 'detailed' ? 'Record ' + esc(r.key) + ' · ' : ''}${r.currentUse?.status === 'current' && !r.archived ? 'Personal confirmation date' : 'Date'}: ${esc(missing(r.date))}${numbers.length ? ' · Sources ' + numbers.map((n) => `[${n}]`).join(', ') : ' · Source citation not recorded.'}</p>${r.ownershipCorrections?.map((correction) => `<p class="meta">Owner corrected on ${esc(correction.at.slice(0, 10))}. Previously attributed to ${esc(correction.fromPersonName)}; corrected by the profile user as a patient-side assertion.${correction.reason ? ' Reason: ' + esc(correction.reason) : ''}</p>`).join('') || ''}${content(r, snapshot.mode)}</section>`;
-  };
-  const ownerCorrection = (r: ExportRecord) =>
+  const correctedBy = snapshot.patient?.caregiver
+    ? `${snapshot.patient.caregiver.name} (caregiver)`
+    : 'the patient';
+  const correctionLabels = (r: ExportRecord): string =>
+    (r.fieldCorrections || [])
+      .map(
+        (correction) =>
+          `Corrected by ${esc(correctedBy)} on ${esc(correction.at.slice(0, 10))} — not from a provider. ` +
+          `${correction.fromKind ? `Reclassified from ${esc(correction.fromKind)} to ${esc(correction.toKind)}. ` : ''}` +
+          `Fields: ${correction.fields.map((field) => esc(field.replace(/([a-z])([A-Z])/g, '$1 $2'))).join(', ')}.` +
+          `${correction.reason ? ` Reason: ${esc(correction.reason)}` : ''}`,
+      )
+      .join(' ');
+  const ownershipLabel = (r: ExportRecord): string =>
     r.ownershipCorrections
       ?.map(
         (correction) =>
-          `Owner corrected on ${esc(correction.at.slice(0, 10))}. Previously attributed to ${esc(correction.fromPersonName)}; corrected by the profile user as a patient-side assertion.${correction.reason ? ' Reason: ' + esc(correction.reason) : ''}`,
+          `Owner corrected on ${esc(correction.at.slice(0, 10))} (${esc(({ move: 'moved', split: 'split from a shared record', link: 'linked to an existing record', unchanged: 'confirmed unchanged' } as const)[correction.action])}). Previously attributed to ${esc(correction.fromPersonName)}; corrected by ${esc(correctedBy)} as a patient-side assertion.${correction.reason ? ' Reason: ' + esc(correction.reason) : ''}`,
       )
       .join(' ') || '';
+  const renderRecord = (r: ExportRecord, index: number, main = false): string => {
+    const numbers = citationNumbers(r);
+    return `<section id="record-${index}"><${main ? 'h1' : 'h3'}>${esc(r.title)}</${main ? 'h1' : 'h3'}><p class="meta">${esc(provenance(r))}${r.archived ? ' ARCHIVED.' : ''}<br>${snapshot.mode === 'detailed' ? 'Record ' + esc(r.key) + ' · ' : ''}${r.currentUse?.status === 'current' && !r.archived ? 'Personal confirmation date' : 'Date'}: ${esc(missing(r.date))}${numbers.length ? ' · Sources ' + numbers.map((n) => `[${n}]`).join(', ') : ' · Source citation not recorded.'}</p>${ownershipLabel(r) ? `<p class="meta">${ownershipLabel(r)}</p>` : ''}${correctionLabels(r) ? `<p class="meta">${correctionLabels(r)}</p>` : ''}${content(r, snapshot.mode, correctedBy)}</section>`;
+  };
+  const ownerCorrection = ownershipLabel;
   let body =
     `<p class="meta"><strong>${esc(snapshot.identity.name)}</strong>${snapshot.identity.birthDate ? ' · DOB ' + esc(snapshot.identity.birthDate) : ''}${snapshot.identity.pronouns ? ' · ' + esc(snapshot.identity.pronouns) : ''}</p>` +
-    (provider && snapshot.main.row.person_id === 'patient'
+    (provider && snapshot.main.note?.kind === 'person'
       ? `<h1>${esc(snapshot.identity.name)}</h1>`
       : renderRecord(snapshot.main, 0, true));
   body += provider
@@ -1321,19 +1422,19 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
   const partialReports = snapshot.reportReview.filter(
     (report) => report.savedCount < report.totalCount,
   );
-  if (provider && partialReports.length)
+  if (partialReports.length)
     body += `<section><h2>Partly reviewed reports</h2>${partialReports.map((report) => `<p><strong>${esc(report.title)}</strong>: ${report.savedCount} of ${report.totalCount} current report items reviewed and saved. Remaining items are not accepted clinical records. These counts describe review of the source report, not how many items are included in this packet.</p>`).join('')}</section>`;
-  if (provider && snapshot.readingGaps.length)
+  if (snapshot.readingGaps.length)
     body += `<section><h2>Unread source sections</h2><p>These source sections were not fully read. An absent finding in this packet does not establish absence in the original.</p>${snapshot.readingGaps.map((source) => `<h3>${esc(source.filename)}</h3><ul>${source.gaps.map((gap) => `<li>${esc(gap.locator)}: ${esc(gap.reason)}</li>`).join('')}</ul>`).join('')}</section>`;
   if (snapshot.mode === 'detailed')
     body += `<section class="section"><h2>Contents and overview</h2><ol><li>Main note: ${esc(snapshot.main.title)}</li>${snapshot.records.map((r, i) => `<li><a href="#record-${i + 1}">${esc(r.type)}: ${esc(r.title)}</a></li>`).join('')}<li><a href="#sources">Sources and companion originals</a></li></ol><h2>Selected chronology</h2>${fields([...all].sort((a, b) => (a.date || '').localeCompare(b.date || '')).map((r) => [missing(r.date), `${r.title} (${r.key})`]))}</section>`;
   if (snapshot.patient)
-    body += `<section><h2>Patient information</h2>${fields([['Name', snapshot.patient.name], ...Object.entries(snapshot.patient.details).filter(([key]) => key !== 'name')])}<h3>Care and emergency contacts</h3>${snapshot.patient.contacts.length ? snapshot.patient.contacts.map((c) => fields(Object.entries(c))).join('') : '<p>Not recorded.</p>'}</section>`;
+    body += `<section><h2>Patient information</h2>${fields([['Name', snapshot.patient.name], ...Object.entries(snapshot.patient.details).filter(([key]) => key !== 'name')])}${snapshot.patient.caregiver ? `<h3>Caregiver</h3>${fields(Object.entries(snapshot.patient.caregiver))}` : ''}<h3>Care and emergency contacts</h3>${snapshot.patient.contacts.length ? snapshot.patient.contacts.map((c) => fields(Object.entries(c))).join('') : '<p>Not recorded.</p>'}</section>`;
   if (provider) {
     const current = snapshot.records.filter(
       (r) => r.type === 'medication' && r.currentUse?.status === 'current' && !r.archived,
     );
-    body += `<section><h2>Current prescriptions</h2>${current.length ? fields(current.map((r) => [r.title, `${missing(r.row.dose_text)}; personally confirmed ${missing(r.currentUse?.updated_at)}`])) : '<p>No personally confirmed current prescriptions recorded. This does not establish that none are taken.</p>'}<p>Historical orders and source statuses follow below; they do not establish current use. Allergies, diagnoses and visits may appear in provider notes or additional retained clinical assertions; absence of a separate summary is not evidence of absence.</p></section>`;
+    body += `<section><h2>Current prescriptions</h2>${current.length ? fields(current.map((r) => [r.title, `${missing(r.row.dose_text)}; confirmed by ${correctedBy} on ${missing(r.currentUse?.updated_at)}`])) : '<p>No personally confirmed current prescriptions recorded. This does not establish that none are taken.</p>'}<p>Historical orders and source statuses follow below; they do not establish current use. Allergies, diagnoses and visits may appear in provider notes or additional retained clinical assertions; absence of a separate summary is not evidence of absence.</p></section>`;
   }
   if (provider)
     body += `<section><h2>Included clinical records</h2><p>Includes normalized patient clinical entries, known provider documents and additional retained clinical assertions. Personal-source and unknown-provider documents are included only when directly linked from a selected note. Other personal notes are not included.</p>${fields(Object.entries(snapshot.records.reduce<Record<string, number>>((counts, r) => ({ ...counts, [r.type]: (counts[r.type] || 0) + 1 }), {})))}</section>`;
@@ -1355,7 +1456,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
           return `<h3>${esc(group[0].title)}${group[0].row.unit ? ' · ' + esc(group[0].row.unit) : ''}</h3><table class="result-table"><thead><tr><th colspan="5">${esc(group[0].title)}${group[0].row.unit ? ' · ' + esc(group[0].row.unit) : ''}<br>Date precision: ${precisions.map((p, i) => `${precisions.length > 1 ? 'P' + (i + 1) + ': ' : ''}${esc(p)}`).join('; ')}</th></tr><tr><th>Date / precision</th><th>Result</th><th>Reference</th><th>Status</th><th>Sources</th></tr></thead><tbody>${group
             .map(
               (r) =>
-                `<tr id="record-${snapshot.records.indexOf(r) + 1}"><td>${esc(missing(r.date))}${precisions.length > 1 ? '<br>P' + (precisions.indexOf(missing(r.row.date_precision)) + 1) : ''}</td><td>${String(r.row.value_text).length > 160 ? 'Narrative below' : esc(r.row.value_text)}</td><td>${esc(missing(reference(r.row.reference_json)))}</td><td>${esc(missing(r.row.status))}${r.archived ? '; archived' : ''}${ownerCorrection(r) ? '<br>' + ownerCorrection(r) : ''}</td><td>${
+                `<tr id="record-${snapshot.records.indexOf(r) + 1}"><td>${esc(missing(r.date))}${precisions.length > 1 ? '<br>P' + (precisions.indexOf(missing(r.row.date_precision)) + 1) : ''}</td><td>${String(r.row.value_text).length > 160 ? 'Narrative below' : esc(r.row.value_text)}${correctionLabels(r) ? '<br>' + correctionLabels(r) : ''}</td><td>${esc(missing(reference(r.row.reference_json)))}</td><td>${esc(missing(r.row.status))}${r.archived ? '; archived' : ''}${ownerCorrection(r) ? '<br>' + ownerCorrection(r) : ''}</td><td>${
                   citationNumbers(r)
                     .map((n) => `[${n}]`)
                     .join(' ') || 'Not recorded'
@@ -1371,7 +1472,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
           numbers = citationNumbers(r);
         let details = '';
         if (type === 'medication')
-          details = `${esc(missing(row.dose_text))}<br>Route: ${esc(missing(row.route))}; frequency: ${esc(missing(row.frequency))}<br>Start: ${esc(missing(row.start_at))}; end: ${esc(missing(row.end_at))}${r.currentUse ? `<br>Confirmation: ${esc(missing(r.currentUse.updated_at))}; full assertion in evidence companion` : ''}`;
+          details = `${esc(missing(row.dose_text))}<br>Route: ${esc(missing(row.route))}; frequency: ${esc(missing(row.frequency))}<br>Start: ${esc(missing(row.start_at))}; end: ${esc(missing(row.end_at))}${r.currentUse?.status === 'current' ? `<br>Confirmed by ${esc(correctedBy)} on ${esc(missing(r.currentUse.updated_at))}; full assertion in evidence companion` : ''}`;
         if (type === 'procedure') {
           const extra = parsedRecord(row.extra_json),
             sourceFields = isRecord(extra.sourceFields) ? extra.sourceFields : {},
@@ -1400,7 +1501,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
           type === 'medication'
             ? `Personal state: ${r.archived ? 'Archived' : r.currentUse?.status === 'current' ? 'Current' : 'Inactive'}<br>Source status: ${esc(missing(row.status))}<br>Source kind: ${esc(missing(row.kind))}`
             : esc(missing(row.status));
-        return `<tr id="record-${snapshot.records.indexOf(r) + 1}"><td><strong>${esc(r.title)}</strong><br>${esc(missing(r.date))}</td><td>${details}</td><td>${status}${r.archived ? '<br>Archived' : ''}<br>${numbers.length ? 'Sources ' + numbers.map((n) => `[${n}]`).join(', ') : 'Source citation not recorded'}${ownerCorrection(r) ? '<br>' + ownerCorrection(r) : ''}</td></tr>`;
+        return `<tr id="record-${snapshot.records.indexOf(r) + 1}"><td><strong>${esc(r.title)}</strong><br>${esc(missing(r.date))}</td><td>${details}${correctionLabels(r) ? '<br>' + correctionLabels(r) : ''}</td><td>${status}${r.archived ? '<br>Archived' : ''}<br>${numbers.length ? 'Sources ' + numbers.map((n) => `[${n}]`).join(', ') : 'Source citation not recorded'}${ownerCorrection(r) ? '<br>' + ownerCorrection(r) : ''}</td></tr>`;
       })
       .join('')}</tbody></table>`;
   };
@@ -1457,7 +1558,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
           .map((n) => `[${n}]`)
           .join(
             ', ',
-          )}. Structured source document retained in full in the evidence JSON companion; normalized clinical entries are above. ${ownerCorrection(r)}</p>`;
+          )}. Structured source document retained in full in the evidence JSON companion; normalized clinical entries are above. ${ownerCorrection(r)} ${correctionLabels(r)}</p>`;
         return;
       }
       if (renderedNarratives.has(r.row.text_content)) return;
@@ -1467,7 +1568,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
         body += `<h2>${esc(r.title)}</h2><p>Identical narrative retained once below. Recorded in ${group.length} entries:</p><ul>${group
           .map(
             (item) =>
-              `<li>${esc(item.title)} · ${esc(missing(item.date))} · ${esc(provenance(item))} · ${ownerCorrection(item)} · Sources ${
+              `<li>${esc(item.title)} · ${esc(missing(item.date))} · ${esc(provenance(item))} · ${ownerCorrection(item)} ${correctionLabels(item)} · Sources ${
                 citationNumbers(item)
                   .map((n) => `[${n}]`)
                   .join(', ') || 'not recorded'

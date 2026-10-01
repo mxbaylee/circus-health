@@ -228,6 +228,7 @@ test('record history and a later patient packet disclose an accepted ownership c
   });
   const html = exportHtml(snapshot);
   assert.match(html, /Owner corrected on/);
+  assert.match(html, /Owner corrected on[^<]+\(moved\)/);
   assert.match(html, /Previously attributed to Robin Lane/);
   const evidence = JSON.stringify(exportEvidence(snapshot));
   assert.match(evidence, /ownershipCorrections/);
