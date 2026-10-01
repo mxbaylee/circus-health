@@ -73,6 +73,20 @@ Docker Desktop on macOS does not share advisory locks between the host and its L
 
 ## Verification boundaries
 
+### Deployment drive qualification
+
+For an existing external `/data` directory on the drive to be used, an already built application image and a separate existing external receipt directory, run:
+
+```sh
+CRS_DRIVE_QUALIFICATION=1 CRS_DATA_DIR=/absolute/path/data \
+CRS_IMAGE=circus-health:qualified-build \
+CRS_QUALIFICATION_OUTPUT_DIR=/absolute/path/receipts npm run qualify:drive
+```
+
+This opt-in command creates only a fresh fictional scratch directory under the selected data directory. It tests exclusive creation, hard links, publication rename, file and directory fsync, rejection of a concurrent writer, retained lock inodes, normal release and forced-kill reacquisition. It repeats the checks with UID 1000 in a read-only-root, network-disabled application container, then starts a new container to verify the first container's exact publication and reacquire its writer lease. The probe uses the current repository's storage-lock source. It never opens an existing profile, mounts provider credentials or changes the archive's writer-domain marker. Only its own scratch directory is removed; a metadata-only receipt is created with mode 0600 outside the archive and Git.
+
+A passing receipt establishes these filesystem/mount operations on that installation. It does not establish power-loss durability, actual provider credential persistence or a complete import lifecycle; those remaining gates are [CRS-152](../todo/CRS-152.md). An unavailable image, denied mount, unsupported filesystem operation, corrupted publication or unexpected container result fails explicitly. `npm run check:data` remains a location check, rather than a filesystem qualification.
+
 On 2026-09-23, the updated production image passed the dedicated hardened-consumer test: Chromium generated an actual note PDF, and legacy portable backup/restore preserved seven fictional originals totaling 140 MiB with only 128 MiB of container temporary space. Running-kernel assertions verified capability drop, no-new-privileges, zero core limits, CPU/process limits, and the configured runtime, temporary and shared-memory mount sizes and protections. The tested production module hashes matched the working source; later changes only wired contributor test commands and CI. A real device sign-in also completed in the hardened login helper. These checks establish consumer compatibility, not the earlier full forced-kill lifecycle, representative peak capacity or provider extraction quality.
 
 Configuration preflight reads PDF capability hints directly from the pinned LiteLLM package's bundled metadata, with an 8 MiB input bound. It locates the package without initializing LiteLLM, loading provider integrations or authenticating. Explicit boolean settings take precedence; metadata aliases retain canonical-key precedence and exact provider matching. Missing or malformed metadata supplies no trusted hint. This avoids loading the full library once for configuration and again for the proxy server. Actual tool/media capability is still proved with fictional content before model work; metadata alone never authorizes native PDF delivery.
