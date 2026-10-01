@@ -46,15 +46,15 @@ Each open item shows its score after its sizes. When a size or mark changes, rec
 
 **Refresh this list in the same change whenever a ticket is added, closed or removed, or whenever a size, mark or dependency changes.** Apply the rules above: skip items that are waiting on an unfinished ticket, and break ties as in step 2. The last column says what the owner must provide; everything else is agent work.
 
-| #   | Ticket                                     | Score | Tie-break            | Owner input                                                           |
-| --- | ------------------------------------------ | ----- | -------------------- | --------------------------------------------------------------------- |
-| 1 | 🔐 [CRS-153](#crs-153) passkeys            | 8     | 🔴, unblocks CRS-088 | Tap the passkey prompts on each device and browser                    |
-| 2 | 💽 [CRS-152](#crs-152) deployment drive    | 8     | 🔴                   | Connect or choose the drive                                           |
-| 3 | 🧾 [CRS-156](CRS-156.md) historical assertion owners | 8 | 🔴, lower ID | None |
-| 4 | 👥 [CRS-124](#crs-124) People display | 8 | 🟡 🐭 | Inspect non-Self people in intended layouts |
-| 5 | 📦 [CRS-043](CRS-043.md) stream large imports | 7 | 🔴, lower ID | None |
+| #   | Ticket                                               | Score | Tie-break            | Owner input                                         |
+| --- | ---------------------------------------------------- | ----- | -------------------- | --------------------------------------------------- |
+| 1   | 🔐 [CRS-153](#crs-153) passkeys                      | 8     | 🔴, unblocks CRS-088 | Tap the passkey prompts on each device and browser  |
+| 2   | 💽 [CRS-152](#crs-152) deployment drive              | 8     | 🔴                   | Connect or choose the drive                         |
+| 3   | 🧾 [CRS-156](CRS-156.md) historical assertion owners | 8     | 🔴, lower ID         | None                                                |
+| 4   | 👥 [CRS-124](#crs-124) People display                | 8     | 🟡 🐭                | Inspect non-Self people in intended layouts         |
+| 5   | 📦 [CRS-043](CRS-043.md) stream large imports        | 7     | 🔴, lower ID         | Choose storage-setting form and legacy cap behavior |
 
-Next up: 🩻 [CRS-062](#crs-062) and 🥡 [CRS-068](#crs-068) (7, 🔴), then 🩺 [CRS-154](CRS-154.md) (7) when a real-provider complaint can be observed. ♻️ [CRS-155](CRS-155.md) scores 8 but waits for natural token expiry. 🗂️ [CRS-150](CRS-150.md) waits for 🩹 [CRS-085](CRS-085.md); 🧐 [CRS-073](#crs-073) waits for CRS-150.
+Next up: 🩻 [CRS-062](#crs-062), 🥡 [CRS-068](#crs-068), and ⚙️ [CRS-086](CRS-086.md) (7, 🔴). CRS-086 is now a production requirement (owner, 2026-10-01); its first delivery is diagnostics readiness for the owner's common 800–900-page trial, followed by evidence-backed production fixes. Preparation and a serial baseline can start before the parallel-worker prerequisites finish. 🩺 [CRS-154](CRS-154.md) (7, 🟡) supplies the shared complaint/download qualification when a real-provider complaint can be observed. ♻️ [CRS-155](CRS-155.md) scores 8 but waits for natural token expiry. 🗂️ [CRS-150](CRS-150.md) waits for 🩹 [CRS-085](CRS-085.md); 🧐 [CRS-073](#crs-073) waits for CRS-150.
 
 ## <a id="product-and-maintenance"></a>🛠️ Product and maintenance
 
@@ -67,7 +67,7 @@ Next up: 🩻 [CRS-062](#crs-062) and 🥡 [CRS-068](#crs-068) (7, 🔴), then �
 - [ ] <a id="crs-080"></a> 📸 **CRS-080** · 🐭 S · 🟢 S · score 4 — Add test-only capture of a real fictional run's proposals as downstream fixtures, beside the hand-written `fictional-*-proposals.ts`; fresh quality and work-count measurements must bypass replay.
 - [ ] <a id="crs-081"></a> 🌙 [CRS-081](CRS-081.md) · 🐘 L · 🟡 M · score 3 — Extend the implemented automatic coordinator with scoped authority after lock/logout/profile switch to complete the decided background-import experience.
 - [ ] <a id="crs-084"></a> 🛡️ [CRS-084](CRS-084.md) · 🐕 M · 🟡 M · 🚀 production · score 7 — Prioritize unresolved security risks and mitigations without describing proposed controls as existing protection.
-- [ ] <a id="crs-086"></a> ⚙️ [CRS-086](CRS-086.md) · 🐘 L · 🔴 L · score 4 — Implement model-agnostic async artifact processing with bounded context, shared extraction, adaptive concurrency and reviewable aggregation.
+- [ ] <a id="crs-086"></a> ⚙️ [CRS-086](CRS-086.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Qualify common 800–900-page imports; first verify a complete downloadable AI/import/processing/UX diagnostics bundle for an owner trial, turn findings into prioritized production tickets, then deliver bounded context and safe adaptive processing.
 - [ ] <a id="crs-088"></a> 👆 [CRS-088](CRS-088.md) · 🐕 M · 🟡 M · score 4 — Quick passkey sign-in without choosing a profile first: a username-less request, one app-wide PRF salt migrated at the next unlock, while retaining origin checks, profile isolation and locked state after restart.
 - [ ] <a id="crs-089"></a> 🪶 [CRS-089](CRS-089.md) · 🐕 M · 🟡 M · score 4 — Make the model gateway lighter and less patched: measure LiteLLM's memory, tune it first, and weigh replacements such as Bifrost (blocked on subscription sign-in) only if tuning falls short.
 - [ ] <a id="crs-112"></a> 🧹 **CRS-112** · 🐭 S · 🟢 S · score 4 — Remove blank-Self-field filling from import confirmation; use normal profile editing/setup and keep old receipts readable.
