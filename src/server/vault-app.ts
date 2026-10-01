@@ -8,6 +8,7 @@ import {
   assertImportCapacity,
 } from './archive-storage.ts';
 import { createEncryptedProfiles } from './encrypted-profiles.ts';
+import { importDiagnostics, type ImportDiagnostics } from './import-diagnostics.ts';
 import { createProfilePasskeys } from './profile-passkeys.ts';
 import { writeChat } from './assistant-journal.ts';
 import { writeIntakeBatch } from './intake-batch-journal.ts';
@@ -44,6 +45,7 @@ interface VaultAppOptions {
   runtimeDirectory: string;
   allowedOrigins?: string[];
   assistantOptions?: AppOptions['assistantOptions'];
+  diagnostics?: ImportDiagnostics;
   port?: number;
 }
 interface Session {
@@ -56,9 +58,10 @@ export function createVaultApp({
   runtimeDirectory,
   allowedOrigins = ['http://127.0.0.1:5173', 'http://localhost:5173'],
   assistantOptions,
+  diagnostics = importDiagnostics,
   port = 3001,
 }: VaultAppOptions) {
-  const manager = createEncryptedProfiles({ dataDirectory, runtimeDirectory }),
+  const manager = createEncryptedProfiles({ dataDirectory, runtimeDirectory, diagnostics }),
     passkeys = createProfilePasskeys(manager),
     sessions = new Map<string, Session>();
   let closed = false,
@@ -156,6 +159,7 @@ export function createVaultApp({
         runtimeRoot: state.root,
         port,
         allowedOrigins: [...origins],
+        diagnostics,
         assistantOptions: {
           ...assistantOptions,
           journalWriter(root, profileId, chat, reason) {

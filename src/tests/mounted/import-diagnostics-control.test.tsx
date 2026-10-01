@@ -33,6 +33,7 @@ it.each([false, true])('downloads bounded JSON with detailed recording %s', asyn
       omittedBeforeWindow: null,
       completeness: 'not_established',
     },
+    eventArchive: { status: enabled ? 'partial' : 'unavailable' },
     recentPerformance: { operations: [] },
   };
   vi.stubGlobal(
@@ -50,7 +51,7 @@ it.each([false, true])('downloads bounded JSON with detailed recording %s', asyn
   const button = screen.getByRole('button', { name: 'Download performance diagnostics' });
   expect(button).toBeVisible();
   expect(button).toHaveAccessibleDescription(
-    enabled ? /Bounded recent diagnostics/ : /Detailed events are off/,
+    enabled ? /Bounded diagnostics/ : /Detailed events are off/,
   );
   await act(async () => {
     fireEvent.click(button);
@@ -70,6 +71,11 @@ it.each([false, true])('downloads bounded JSON with detailed recording %s', asyn
   expect(contents).not.toMatch(/fictional-diagnostics|Fictional Self/);
   expect(screen.getByRole('status')).toHaveTextContent(
     enabled ? /2 server events exceeded/ : /Detailed server events are off/,
+  );
+  expect(screen.getByRole('status')).toHaveTextContent(
+    enabled
+      ? /Some retained event history could not be included/
+      : /Retained event history is unavailable/,
   );
   expect(requests).toHaveLength(2);
   expect(requests[0]).toMatch(/import-diagnostics\/status$/);
@@ -102,4 +108,79 @@ it('hides the control when flag lookup fails rather than enabling a download', a
     render(<ImportDiagnosticsControl />);
   });
   expect(screen.queryByRole('button')).toBeNull();
+});
+
+it('downloads actual encrypted retained observations with recording off', async () => {
+  // Run the real Node recorder/store in its server runtime; jsdom rewrites import.meta.url.
+  const { execFileSync } = await import('node:child_process');
+  const server = JSON.parse(
+    execFileSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+    import { mkdtempSync, rmSync } from 'node:fs';
+    import { tmpdir } from 'node:os';
+    import { join } from 'node:path';
+    import { createImportDiagnostics } from './src/server/import-diagnostics.ts';
+    import { openDiagnosticChunkStore } from './src/server/diagnostic-chunk-store.ts';
+    import { freshKey } from './src/server/vault-crypto.ts';
+    const directory = mkdtempSync(join(tmpdir(), 'fictional-mounted-archive-'));
+    const key = freshKey(), profileId = 'fictional-diagnostics';
+    const open = () => openDiagnosticChunkStore({ directory, key, profileId });
+    const recorder = createImportDiagnostics({ enabled: true }), restored = createImportDiagnostics();
+    try {
+      recorder.attachEventStore(profileId, open());
+      recorder.record('import.progress', { accountedUnits: 42, narrative: 'Fictional medical canary' }, { profileId, importId: 'fictional-original.pdf' });
+      recorder.close();
+      restored.attachEventStore(profileId, open());
+      process.stdout.write(JSON.stringify({ ...restored.exportSnapshot(profileId), eventArchive: await restored.exportArchive(profileId) }));
+    } finally { recorder.close(); restored.close(); key.fill(0); rmSync(directory, { recursive: true, force: true }); }
+  `,
+      ],
+      { encoding: 'utf8' },
+    ),
+  );
+  let downloaded: Blob | undefined;
+  vi.stubGlobal(
+    'URL',
+    class extends URL {
+      static createObjectURL = vi.fn((blob: Blob) => {
+        downloaded = blob;
+        return 'blob:fictional';
+      });
+      static revokeObjectURL = vi.fn();
+    },
+  );
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(
+      async (path) =>
+        new Response(
+          JSON.stringify({ data: String(path).endsWith('/status') ? { enabled: false } : server }),
+        ),
+    ),
+  );
+  await act(async () => {
+    render(<ImportDiagnosticsControl />);
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Download performance diagnostics' }));
+  });
+  const contents = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = reject;
+    reader.readAsText(downloaded!);
+  });
+  const bundle = JSON.parse(contents);
+  expect(bundle.server.events).toHaveLength(0);
+  expect(bundle.server.eventArchive.events).toHaveLength(1);
+  expect(bundle.server.eventArchive.events[0].event.fields.accountedUnits).toBe(42);
+  expect(bundle.server.eventArchive.recording).toBe('disabled');
+  expect(bundle.server.eventArchive.crashTailEvents).toBeNull();
+  expect(contents).not.toMatch(/medical canary|fictional-original|fictional-diagnostics/);
+  expect(screen.getByRole('status')).toHaveTextContent(/Retained event history is bounded/);
 });

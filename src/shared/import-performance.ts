@@ -1,5 +1,7 @@
 /** Content-free, bounded browser timings. These are observations, never acceptance authority. */
 export interface ImportDiagnosticEventWindow {
+  /** Additive field; legacy downloads do not carry a window identity. */
+  windowId?: string | null;
   recording: 'enabled' | 'disabled';
   storage: 'memory_only';
   capacity: number;
@@ -9,6 +11,34 @@ export interface ImportDiagnosticEventWindow {
   /** Prior process/lock/clear history cannot be counted by the current memory window. */
   omittedBeforeWindow: null;
   completeness: 'not_established';
+}
+
+export interface ImportDiagnosticArchive<Event = unknown> {
+  storage: 'encrypted_chunks';
+  status: 'available' | 'partial' | 'unavailable' | 'not_attached';
+  recording: 'enabled' | 'disabled';
+  limits: { maxChunkBytes: number; maxChunks: number; maxBytes: number; maxExportBytes: number };
+  retainedChunks: number;
+  encryptedBytes: number;
+  missingChunksWithinInventory: number | null;
+  readFailures: number;
+  invalidChunks: number;
+  invalidEvents: number;
+  outputTruncated: boolean;
+  omittedBeforeInventory: null;
+  crashTailEvents: null;
+  completeness: 'not_established';
+  currentWindow: {
+    windowId: string | null;
+    observedEvents: number;
+    persistedEvents: number;
+    pendingEvents: number;
+    droppedEvents: number;
+    oversizedEvents: number;
+    writeFailures: number;
+  };
+  /** Deduplicate against the live window by windowId + event.sequence. */
+  events: Array<{ windowId: string; event: Event }>;
 }
 
 export const clientOperationKinds = [

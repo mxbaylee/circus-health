@@ -23,7 +23,7 @@ CRS_DATA_DIR=/absolute/path/to/archive/data CRS_PORT=3002 CRS_MODEL=health-prima
 
 The origin setting authorizes the configured host/origin; it does not provision TLS or a reverse proxy. The launcher keeps the published port bound to loopback. Writes require an allowed Origin, and each HTTP session must unlock a profile before reading its records or originals.
 
-Bounded, encrypted, profile-scoped performance summaries are captured by default. `CRS_IMPORT_DIAGNOSTICS=true` on `npm run start` additionally enables detailed in-memory metadata events; this detailed-tracing flag defaults to `false`. Console logging and private payload tracing are separate controls and are not forwarded or mounted by the supported Compose configuration. See [diagnostic retention and export](../import/import-performance.md).
+Bounded, encrypted, profile-scoped performance summaries are captured by default. `CRS_IMPORT_DIAGNOSTICS=true` on `npm run start` additionally enables detailed metadata events in a bounded memory window and encrypted chunk archive; this detailed-tracing flag defaults to `false`. Console logging and private payload tracing are separate controls and are not forwarded or mounted by the supported Compose configuration. See [diagnostic retention and export](../import/import-performance.md).
 
 ### Runtime capacity and containment
 

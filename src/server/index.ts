@@ -323,6 +323,7 @@ export function createApp({
       if (resource === 'import-diagnostics' && parts.length === 1 && method === 'GET') {
         const salt = randomBytes(32);
         const snapshot = diagnostics.exportSnapshot(profileId, salt);
+        const eventArchive = await diagnostics.exportArchive(profileId, salt);
         let attribution: unknown;
         try {
           const intakes = listIntakes(db, profileId, { visibility: 'all', limit: 100 }, root);
@@ -344,7 +345,9 @@ export function createApp({
           attribution = { unavailable: true };
         }
         // Diagnostics carry no normal envelope/profile identity or medical durability metadata.
-        send(res, 200, { data: { enabled: diagnostics.enabled, ...snapshot, attribution } });
+        send(res, 200, {
+          data: { enabled: diagnostics.enabled, ...snapshot, eventArchive, attribution },
+        });
         return;
       }
       if (resource === 'import-diagnostics' && parts.length === 1 && method === 'POST') {
