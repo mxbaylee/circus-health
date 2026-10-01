@@ -12,7 +12,7 @@ Restricted import authority after general session access ends remains [CRS-081](
 
 Accepted uploads retain an enqueue intent in the same durable transaction as their original metadata. The server reconciles that intent into one batch item, including after a crash between retention and queue creation. Older client enqueue calls reconcile with retained items. Upload and authorized runtime restoration wake the coordinator; browser GETs do not own scheduling.
 
-This reconciliation also returns a retained completed batch. The create response has `scheduled:false` when no new work starts, so Reprocess corrected source explains that the existing result remains available. A stopped item resumes and reports `scheduled:true`. Source corrections invalidate stale review output, but re-enqueueing an original does not itself reopen a completed `review_ready` item. The post-completion invalidation and rereading transition remains part of [precise source dependencies](../todo/CRS-118.md#terminal-batch-invalidation).
+This reconciliation also returns a retained completed batch. Replaying its original operation returns the original result. A new operation for corrected evidence reopens affected `review_ready` work and reports `scheduled:true`; if no evidence changed, it reports `scheduled:false`. A competing running batch must finish first. Reprocess one retained batch at a time; a selection spanning multiple retained batches, or mixing corrected retained originals with new originals, is rejected so no file is silently omitted from the receipt. Explicit Stop survives a new enqueue, and a selected reprocess resumes only the chosen stopped item.
 
 Eligible items rotate while other files wait. Absolute retry deadlines survive restart. The initial batch snapshot is followed by field deltas proportional to the changed state. Original bytes, proposals, candidate versions and provider receipts retain their separate authorities. Stop records every automatic item as stopped regardless of the batch cursor and cancels linked work. Resume restores each saved automatic item from the first eligible file, including older stopped journal entries whose queued files lost their automatic flags. Human-review pauses and completed files are not inferred to be automatic. A saved explicit Stop stays stopped; recognized historical machine interruptions migrate to automatic continuation, while unrecognized historical pauses stay visible for explicit review.
 
@@ -20,7 +20,7 @@ Eligible items rotate while other files wait. Absolute retry deadlines survive r
 
 There is no document-wide page, step, elapsed-time, request or token allowance. Individual worker, request, slice and shared-capacity bounds remain. Cumulative usage and unique progress survive continuation; legacy cumulative budgets cannot restore the manual-pause dead end.
 
-Local capture processes one page or text section per checkpoint, rotating between files. Pending capture finishes before a new clinical conversion pins source text. Existing reviewable interpretations prevent background capture from changing their broad source-revision pins. Fine-grained page dependencies remain separate work.
+Local capture processes one page or text section per checkpoint, rotating between files. An early reviewable proposal does not stop remaining capture or reading. Measured page dependencies keep an unrelated later page from staling that proposal; unknown coverage still uses the broad source pin. A corrected source can reopen completed review work under a new operation while explicit Stop keeps unselected files stopped.
 
 The local watchdog is at least three minutes and twice the longest configured extraction-step timeout: currently six minutes because PDF inventory permits three minutes. Interrupted work retries with a new operation identity from the last durable page. Three failures without progress on the same page retain a located processing-stalled exception, then later pages continue. Missing local OCR is a shared prerequisite with a retry deadline, rather than another failing OCR invocation on every page. Failed initial inventory retains file scope and unknown page count; no page inventory is invented.
 
@@ -29,6 +29,8 @@ Model reading binds a fresh context to an unresolved plan unit before dispatch. 
 **Retry exceptions** reopens retained machine failures without erasing protected human-reviewed text. Human transcription can resolve the matching OCR-unavailable issue only after original/text review validation; it never claims OCR succeeded or resolves unrelated issues.
 
 Source text uses partitioned immutable page/list storage instead of a total page/span/revision-byte ceiling. Decoder, raster and request limits remain. Full-revision editing still has memory costs proportional to document size. PDF inventory gets the page count separately and builds the index in 64-page worker chunks. Each chunk bounds both reference count and serialized reference bytes. Excess references are located as capacity exceptions while page text and later pages remain readable; long Unicode destinations cannot discard the whole inventory. Packets preserve those exact reference gaps. A source or capacity failure preserves its original and unresolved scope; it is not proof of complete clinical extraction. `SOURCE_TEXT_CHANGED` and active extraction races back off for the affected item; a true review conflict asks for source review. Locked durability waits for unlock, and a conflicted durable journal is reported as a durability problem.
+
+Legacy batch compatibility has one additional cost limit: older queued/running items with capture progress and no recorded model-pass baseline can run another billed model pass after upgrade. `review_ready` items can be hydrated safely; ambiguous active items cannot infer covered work from the count alone. Current-format completed passes persist the baseline. [CRS-157](../todo/CRS-157.md) retains provenance-based migration without skipping unread evidence.
 
 ## Provider outcomes
 
@@ -47,7 +49,6 @@ Current limitations, open in [CRS-140](../todo/CRS-140.md):
 - A unit whose request keeps timing out is retried as an unknown outcome at the normal pace, and each retry may be billed. There is deliberately no attempt cap (owner decision, 2026-09-30); the missing part is cooling: per-unit backoff, lower concurrency or a longer deadline, with a status that never needs the person to act.
 - Signing in again at the provider is not detected; a successful connection test is needed.
 - An authentication wait journals an entry on every check, even when nothing changed.
-- Reprocess on one stopped file resumes every stopped file in its batch.
 
 ## Validation boundaries
 

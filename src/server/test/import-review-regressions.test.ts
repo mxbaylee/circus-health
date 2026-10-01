@@ -209,6 +209,15 @@ test('reloaded unconfirmed dates remain saveable, and changed resolutions retain
   );
   assert.equal(record.draft.resolutions.length, 2);
   assert.equal(item.workflow?.questions[0]?.answers.length, 1);
+  assert.equal(
+    record.issues?.find((candidate) => candidate.id === issue.id)?.status,
+    'unresolved',
+    'the old answer cannot approve a newer corrected date',
+  );
+  assert.equal(
+    record.questions?.find((question) => question.id === issue.id)?.status,
+    'unanswered',
+  );
 });
 
 test('This is me retains a top-level document payload through reviewed acceptance', (t) => {

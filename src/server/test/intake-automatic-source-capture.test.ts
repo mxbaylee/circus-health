@@ -7,7 +7,14 @@ import { join } from 'node:path';
 import { openDatabase } from '../database.ts';
 import { profilePaths } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
-import { uploadIntake, getIntake, proposeConversion } from '../intake.ts';
+import {
+  uploadIntake,
+  getIntake,
+  proposeConversion,
+  reviewIntake,
+  currentIntakeInterpretations,
+  prepareIntakeImport,
+} from '../intake.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { readIntakeBatch } from '../intake-batch-journal.ts';
 import { getIntakeSourceText } from '../intake-source-text.ts';
@@ -164,7 +171,7 @@ test('productive local capture exceeds ten steps and 120 seconds without manual 
   assert.equal(f.manager.get(f.profileId, batch.id).status, 'complete');
 });
 
-test('an existing reviewable proposal prevents automatic text continuation from staling its pins', async (t) => {
+test('an early reviewable proposal does not stop later source capture and reading', async (t) => {
   const f = fixture(t);
   await extractIntakeSourceText({
     db: f.db,
@@ -176,34 +183,108 @@ test('an existing reviewable proposal prevents automatic text continuation from 
   const before = getIntakeSourceText(f.db, f.root, f.profileId, f.long.id);
   assert.equal(sourceTextExtractionPending(before), true);
   const intake = getIntake(f.db, f.root, f.profileId, f.long.id);
-  const proposed = proposeConversion(f.db, f.root, f.profileId, f.long.id, {
-    version: intake.version,
-    summary: 'Fictional context only',
-    jsonlText: JSON.stringify({
-      format: 'health-record-v1',
-      id: 'context-only',
-      kind: 'context',
-      payload: { text: 'Fictional source context retained.' },
-      provenance: {
-        capturedVia: 'Fictional',
-        sourceSystem: null,
-        sourceRecordId: null,
-        evidenceClass: 'transcription',
-        locator: 'section 1',
-      },
-      coverage: { status: 'partial', notes: ['Other sections remain.'] },
-    }),
-  });
+  const proposed = proposeConversion(
+    f.db,
+    f.root,
+    f.profileId,
+    f.long.id,
+    {
+      version: intake.version,
+      summary: 'Fictional context only',
+      jsonlText: JSON.stringify({
+        format: 'health-record-v1',
+        id: 'context-only',
+        kind: 'context',
+        payload: { text: 'Fictional source context retained.' },
+        provenance: {
+          capturedVia: 'Fictional',
+          sourceSystem: null,
+          sourceRecordId: null,
+          evidenceClass: 'transcription',
+          locator: 'section 1',
+        },
+        coverage: { status: 'partial', notes: ['Other sections remain.'] },
+      }),
+    },
+    { observedSourcePages: [{ intakeId: f.long.id, pages: [1] }] },
+  );
   const batch = f.manager.create(f.profileId, {
     operationId: 'fictional-preserve-proposal',
     intakeIds: [f.long.id],
   });
   await waitFor(() => f.manager.get(f.profileId, batch.id).status !== 'running');
-  assert.equal(f.dispatches.filter((dispatch) => dispatch.id === f.long.id).length, 0);
-  assert.equal(f.manager.get(f.profileId, batch.id).items[0].status, 'review_ready');
+  assert.ok(f.dispatches.some((dispatch) => dispatch.id === f.long.id));
+  const captured = getIntakeSourceText(f.db, f.root, f.profileId, f.long.id);
+  assert.notEqual(captured.revision!.id, before.revision!.id);
+  assert.equal(sourceTextExtractionPending(captured), false);
+  assert.ok(getIntake(f.db, f.root, f.profileId, f.long.id).version > proposed.version);
+  const proposalId = proposed.proposals.at(-1)!.id;
   assert.equal(
-    getIntakeSourceText(f.db, f.root, f.profileId, f.long.id).revision!.id,
-    before.revision!.id,
+    reviewIntake(f.db, f.root, f.profileId, f.long.id, proposalId).sourceTextStale,
+    false,
   );
-  assert.equal(getIntake(f.db, f.root, f.profileId, f.long.id).version, proposed.version);
+  assert.ok(
+    currentIntakeInterpretations(f.db, f.profileId, f.long.id).proposalIds.includes(proposalId),
+  );
+});
+
+test('an unrelated source append preserves a measured proposal review token', async (t) => {
+  const f = fixture(t);
+  await extractIntakeSourceText({
+    db: f.db,
+    root: f.root,
+    profileId: f.profileId,
+    id: f.long.id,
+    maxPages: 2,
+  });
+  const current = getIntake(f.db, f.root, f.profileId, f.long.id);
+  const proposed = proposeConversion(
+    f.db,
+    f.root,
+    f.profileId,
+    f.long.id,
+    {
+      version: current.version,
+      summary: 'Fictional first page context',
+      jsonlText: JSON.stringify({
+        format: 'health-record-v1',
+        id: 'fictional-first-page-context',
+        kind: 'context',
+        payload: { text: 'Fictional context.' },
+        provenance: {
+          capturedVia: 'Fictional',
+          sourceSystem: null,
+          sourceRecordId: null,
+          evidenceClass: 'transcription',
+          locator: 'section 1',
+        },
+        coverage: { status: 'partial', notes: ['Later sections remain.'] },
+      }),
+    },
+    { observedSourcePages: [{ intakeId: f.long.id, pages: [1] }] },
+  );
+  const proposalId = proposed.proposals.at(-1)!.id;
+  const before = reviewIntake(f.db, f.root, f.profileId, f.long.id, proposalId);
+  for (let count = 0; count < 100; count++) {
+    const source = getIntakeSourceText(f.db, f.root, f.profileId, f.long.id);
+    if (!sourceTextExtractionPending(source)) break;
+    await extractIntakeSourceText({
+      db: f.db,
+      root: f.root,
+      profileId: f.profileId,
+      id: f.long.id,
+      maxPages: 2,
+    });
+  }
+  const after = reviewIntake(f.db, f.root, f.profileId, f.long.id, proposalId);
+  assert.equal(after.sourceTextStale, false);
+  assert.equal(after.reviewToken, before.reviewToken);
+  assert.doesNotThrow(() =>
+    prepareIntakeImport(f.db, f.root, f.profileId, f.long.id, {
+      version: after.version,
+      proposalId,
+      reviewToken: before.reviewToken,
+      decisions: [],
+    }),
+  );
 });

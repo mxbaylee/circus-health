@@ -20,6 +20,7 @@ import {
 } from '../intake.ts';
 import { createApp } from '../index.ts';
 import { createImportDiagnostics } from '../import-diagnostics.ts';
+import { writeIntakeSourcePin } from '../intake-source-pin.ts';
 
 const profileId = 'cedar';
 const waitFor = async <T>(
@@ -297,6 +298,56 @@ test('two uploaded originals run sequentially into one durable review queue', as
   assert.equal(f.checks(), 2);
 });
 
+test('restart does not treat cumulative capture steps as unread new work', async (t) => {
+  const f = setup(t);
+  const item = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-cumulative-steps.txt',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from('Fictional source for a completed model pass'),
+  });
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-cumulative-steps',
+    intakeIds: [item.id],
+  });
+  await waitFor(() => f.bridges.length === 1);
+  await propose(f.bridges[0], item);
+  complete(f.bridges[0]);
+  const completed = await waitFor(() => {
+    const value = f.manager.get(profileId, batch.id);
+    return value.status === 'complete' && value;
+  });
+  f.manager.close();
+  completed.items[0]!.sourceExtraction = {
+    steps: 3,
+    stepsAtModelPass: 3,
+    spentMs: 0,
+    allowanceId: 'fictional-allowance',
+    stepsAtAllowance: 0,
+    spentMsAtAllowance: 0,
+    operationId: null,
+    expectedRevisionId: null,
+    startedAt: null,
+    initialDone: true,
+    draining: false,
+  };
+  completed.status = 'running';
+  completed.automaticRun = true;
+  completed.items[0]!.status = 'queued';
+  completed.items[0]!.automaticRun = true;
+  completed.items[0]!.reason = 'continuing';
+  writeIntakeBatch(f.root, profileId, completed, 'fictional-restart-before-final-status');
+  const restarted = createIntakeBatchManager({
+    root: f.root,
+    databases: f.databases,
+    assistant: f.assistant,
+    pollMs: 5,
+  });
+  t.after(() => restarted.close());
+  restarted.wake(profileId);
+  await waitFor(() => restarted.get(profileId, batch.id).status === 'complete');
+  assert.equal(f.bridges.length, 1, 'the recorded pass already covered every capture step');
+});
+
 test('an active linked conversion is restarted under coordinator ownership after retaining its proposal', async (t) => {
   const f = setup(t);
   const first = uploadIntake(f.db, f.root, profileId, {
@@ -492,6 +543,47 @@ test('Stop, reload, and explicit resume retry only the linked cancelled conversi
   );
 });
 
+test('reprocessing one stopped original leaves its sibling stopped and replays once', async (t) => {
+  const f = setup(t);
+  const first = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-stop-first.txt',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from('Fictional first source for Stop.'),
+  });
+  const second = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-stop-second.txt',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from('Fictional second source for Stop.'),
+  });
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-stop-both',
+    intakeIds: [first.id, second.id],
+  });
+  await waitFor(() => f.bridges.length > 0, 'first original starts');
+  f.manager.stop(profileId, batch.id);
+  const stopped = f.manager.get(profileId, batch.id);
+  assert.equal(stopped.items[0]!.reason, 'stopped');
+  assert.equal(stopped.items[1]!.reason, 'stopped');
+  const selected = f.manager.create(profileId, {
+    operationId: 'fictional-reprocess-second-only',
+    intakeIds: [second.id],
+  });
+  assert.equal(selected.scheduled, true);
+  assert.equal(
+    f.manager.create(profileId, {
+      operationId: 'fictional-reprocess-second-only',
+      intakeIds: [second.id],
+    }).scheduled,
+    false,
+  );
+  await waitFor(
+    () => f.manager.get(profileId, batch.id).items[1]!.status === 'running',
+    'selected original resumes',
+  );
+  assert.equal(f.manager.get(profileId, batch.id).items[0]!.reason, 'stopped');
+  f.manager.stop(profileId, batch.id);
+});
+
 test('Stop or resume on an old batch cannot invalidate the current batch runner', async (t) => {
   const f = setup(t);
   const oldIntake = uploadIntake(f.db, f.root, profileId, {
@@ -576,6 +668,178 @@ test('prepared JSONL and an existing partial proposal skip model work without co
       { status: 'review_ready', reason: 'already_reviewable', reading: null },
     ],
   );
+});
+
+test('a busy reprocess leaves stopped review-ready items unchanged', async (t) => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const f = setup(t, {
+    connectionCheck: async () => {
+      await blocked;
+      return { available: true, readiness: 'ready' };
+    },
+  });
+  const first = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-stopped-ready.jsonl',
+    bytes: Buffer.from(record('fictional-stopped-ready', 'complete_response')),
+  });
+  const second = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-competing.txt',
+    bytes: Buffer.from('Fictional competing source'),
+  });
+  const old = f.manager.create(profileId, {
+    operationId: 'fictional-stopped-ready-batch',
+    intakeIds: [first.id],
+  });
+  await waitFor(() => f.manager.get(profileId, old.id).status === 'complete');
+  f.manager.stop(profileId, old.id);
+  writeIntakeSourcePin(f.db, first.id, {
+    revisionId: 'fictional-new-source',
+    dependencyToken: 'fictional-new-source',
+    requiresInterpretation: true,
+    version: 1,
+  });
+  const competing = f.manager.create(profileId, {
+    operationId: 'fictional-competing-batch',
+    intakeIds: [second.id],
+  });
+  await waitFor(() => f.manager.get(profileId, competing.id).status === 'running');
+  const before = f.manager.get(profileId, old.id);
+  assert.throws(
+    () =>
+      f.manager.create(profileId, {
+        operationId: 'fictional-reopen-while-busy',
+        intakeIds: [first.id],
+      }),
+    { code: 'INTAKE_BATCH_BUSY' },
+  );
+  assert.deepEqual(f.manager.get(profileId, old.id), before);
+  release();
+});
+
+test('corrected completed work cannot displace a different running batch or claim cross-batch selection', async (t) => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const f = setup(t, {
+    connectionCheck: async () => {
+      await blocked;
+      return { available: true, readiness: 'ready' };
+    },
+  });
+  const first = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-ready-first.jsonl',
+    bytes: Buffer.from(record('fictional-ready-first', 'complete_response')),
+  });
+  const second = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-ready-second.jsonl',
+    bytes: Buffer.from(record('fictional-ready-second', 'complete_response')),
+  });
+  const firstBatch = f.manager.create(profileId, {
+    operationId: 'fictional-ready-first-run',
+    intakeIds: [first.id],
+  });
+  await waitFor(() => f.manager.get(profileId, firstBatch.id).status === 'complete');
+  const secondBatch = f.manager.create(profileId, {
+    operationId: 'fictional-ready-second-run',
+    intakeIds: [second.id],
+  });
+  await waitFor(() => f.manager.get(profileId, secondBatch.id).status === 'complete');
+  for (const source of [first, second])
+    writeIntakeSourcePin(f.db, source.id, {
+      revisionId: 'fictional-material-change',
+      dependencyToken: 'fictional-material-change',
+      requiresInterpretation: true,
+      version: 1,
+    });
+  assert.throws(
+    () =>
+      f.manager.create(profileId, {
+        operationId: 'fictional-cross-batch-requeue',
+        intakeIds: [first.id, second.id],
+      }),
+    { code: 'INTAKE_BATCH_SELECTION' },
+  );
+  assert.equal(f.manager.get(profileId, firstBatch.id).status, 'complete');
+  assert.equal(f.manager.get(profileId, secondBatch.id).status, 'complete');
+  const competing = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-competing.txt',
+    bytes: Buffer.from('Fictional competing source'),
+  });
+  const competingBatch = f.manager.create(profileId, {
+    operationId: 'fictional-competing-run',
+    intakeIds: [competing.id],
+  });
+  await waitFor(() => f.manager.get(profileId, competingBatch.id).status === 'running');
+  assert.throws(
+    () =>
+      f.manager.create(profileId, { operationId: 'fictional-busy-requeue', intakeIds: [first.id] }),
+    { code: 'INTAKE_BATCH_BUSY' },
+  );
+  assert.equal(f.manager.get(profileId, competingBatch.id).status, 'running');
+  release();
+  await waitFor(() => f.bridges.length === 1);
+});
+
+test('a corrected earlier file cannot displace an in-flight sibling in its retained batch', async (t) => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const f = setup(t, {
+    connectionCheck: async () => {
+      await blocked;
+      return { available: true, readiness: 'ready' };
+    },
+  });
+  const first = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-ready-first.jsonl',
+    bytes: Buffer.from(record('fictional-ready-first', 'complete_response')),
+  });
+  const second = uploadIntake(f.db, f.root, profileId, {
+    filename: 'fictional-inflight-second.txt',
+    bytes: Buffer.from('Fictional second source waits for its model'),
+  });
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-same-batch-start',
+    intakeIds: [first.id, second.id],
+  });
+  await waitFor(() => {
+    const current = f.manager.get(profileId, batch.id);
+    return current.items[0]?.status === 'review_ready' && current.items[1]?.status === 'starting';
+  }, 'second source preflight');
+  writeIntakeSourcePin(f.db, first.id, {
+    revisionId: 'fictional-corrected-first',
+    dependencyToken: 'fictional-corrected-first',
+    requiresInterpretation: true,
+    version: 1,
+  });
+  const before = f.manager.get(profileId, batch.id);
+  assert.throws(
+    () =>
+      f.manager.create(profileId, {
+        operationId: 'fictional-same-batch-reprocess',
+        intakeIds: [first.id],
+      }),
+    { code: 'INTAKE_BATCH_BUSY' },
+  );
+  assert.deepEqual(f.manager.get(profileId, batch.id), before);
+  assert.equal(
+    f.manager.create(profileId, {
+      operationId: batch.operationId,
+      intakeIds: [first.id, second.id],
+    }).scheduled,
+    false,
+    'the original operation still replays exactly',
+  );
+  release();
+  await waitFor(() => f.bridges.length === 1, 'sibling model pass');
 });
 
 test('a retained partial proposal survives a failed pass and the next original still starts', async (t) => {

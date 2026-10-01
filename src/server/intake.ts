@@ -32,6 +32,12 @@ import {
   sourceTextProposalId,
 } from './intake-source-text-dependencies.ts';
 import {
+  proposalDependenciesCurrent,
+  writeProposalDependencies,
+  type ObservedSourcePages,
+} from './intake-proposal-dependencies.ts';
+import { issueResolutionCurrent, issueResolutionDependency } from './intake-issue-dependencies.ts';
+import {
   inspectIntakeFile,
   intakeLimits,
   assertExtractionSize,
@@ -184,6 +190,7 @@ interface PersistenceOptions {
   /** Host-only receipt supplied by the authorized manual creation path. */
   manualSourceRecord?: import('../shared/intake-manual-source-record.ts').ManualSourceRecordReceipt;
   exportFn?: typeof exportCuration;
+  observedSourcePages?: ObservedSourcePages[];
   workflowBatch?: {
     planId: string;
     operationId: string;
@@ -1149,11 +1156,14 @@ export function currentIntakeInterpretations(db: DatabaseSync, profileId: string
   return {
     original: !d.sourceTextRequiresInterpretation,
     proposalIds: d.proposals
-      .filter(
-        (p) =>
-          (p.sourceTextRevisionId || null) === (d.sourceTextRevisionId || null) &&
-          (p.sourceTextDependencyToken || null) === (d.sourceTextDependencyToken || null),
-      )
+      .filter((p) => {
+        const measured = proposalDependenciesCurrent(db, p.id);
+        return (
+          measured ??
+          ((p.sourceTextRevisionId || null) === (d.sourceTextRevisionId || null) &&
+            (p.sourceTextDependencyToken || null) === (d.sourceTextDependencyToken || null))
+        );
+      })
       .map((p) => p.id),
   };
 }
@@ -1262,6 +1272,8 @@ export function proposeConversion(
         sourceTextRevisionId: d.sourceTextRevisionId || null,
         sourceTextDependencyToken: d.sourceTextDependencyToken || null,
       });
+    if (!existingProposal)
+      writeProposalDependencies(db, id, proposalId, options?.observedSourcePages);
     const existingGroupIds = new Set(
       workflowSummary(d).workflow.reportGroups.map((group) => group.id),
     );
@@ -1409,6 +1421,9 @@ function reviewIntakePrepared(
       entries: validation.entries!,
       proposalId,
       version: d.version,
+      ...(proposalId && proposalDependenciesCurrent(db, proposalId) !== null
+        ? { reviewTokenVersion: d.version - (parseIntakeSourcePin(file.source_pin)?.version ?? 0) }
+        : {}),
       acceptedDecisions: workflow.decisions,
       drafts: validation
         .entries!.map((entry) =>
@@ -1427,6 +1442,7 @@ function reviewIntakePrepared(
       profileId,
       people,
       activeReceipts: (receipts) => activeIdentityReceipts(db, receipts),
+      resolutionCurrent: (resolution, mapping) => issueResolutionCurrent(db, resolution, mapping),
       ...grounding,
     },
   );
@@ -1471,10 +1487,14 @@ function reviewIntakePrepared(
     }));
   if (proposalId || d.sourceTextRequiresInterpretation) {
     const proposal = d.proposals.find((item) => item.id === proposalId);
+    const measured = proposal ? proposalDependenciesCurrent(db, proposal.id) : null;
     review.sourceTextStale =
       (!proposalId && !!d.sourceTextRequiresInterpretation) ||
-      (proposal?.sourceTextRevisionId || null) !== (d.sourceTextRevisionId || null) ||
-      (proposal?.sourceTextDependencyToken || null) !== (d.sourceTextDependencyToken || null);
+      !(
+        measured ??
+        ((proposal?.sourceTextRevisionId || null) === (d.sourceTextRevisionId || null) &&
+          (proposal?.sourceTextDependencyToken || null) === (d.sourceTextDependencyToken || null))
+      );
     if (review.sourceTextStale)
       review.coverageGaps.push({
         id: 'source-text-changed',
@@ -1490,8 +1510,15 @@ function reviewIntakePrepared(
       proposalId,
       originalHash: file.sha256,
       proposalHash: inputFile.sha256,
-      sourceTextRevisionId: d.sourceTextRevisionId || null,
-      sourceTextDependencyToken: d.sourceTextDependencyToken || null,
+      sourceTextRevisionId:
+        proposalId && proposalDependenciesCurrent(db, proposalId) !== null
+          ? d.proposals.find((proposal) => proposal.id === proposalId)?.sourceTextRevisionId || null
+          : d.sourceTextRevisionId || null,
+      sourceTextDependencyToken:
+        proposalId && proposalDependenciesCurrent(db, proposalId) !== null
+          ? d.proposals.find((proposal) => proposal.id === proposalId)?.sourceTextDependencyToken ||
+            null
+          : d.sourceTextDependencyToken || null,
       sourceTextStale: review.sourceTextStale || false,
       // Discovery suggestions are not approvals. Exact chosen comparison scopes are
       // independently validated inside acceptance; duplicate classification remains pinned.
@@ -1626,7 +1653,7 @@ function prepareIntakeImportInternal(
   verifyIntakeOriginal(db, root, profileId, id);
   if (selected && !d.proposals.some((p) => p.id === selected))
     throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
-  assertCurrentProposalSourceText(d, selected);
+  assertCurrentProposalSourceText(d, selected, db);
   const inputFile: SourceFileRow = selected
     ? required(
         db.prepare('SELECT * FROM source_files WHERE id=?').get(selected) as
@@ -2626,17 +2653,28 @@ export function saveIntakeReviewDraft(
     }
     for (const resolution of submittedResolutions.values()) {
       const retained = resolutions.findLast((r) => r.issueId === resolution.issueId);
-      // Retain old decisions, including older unscoped date choices, without
-      // reapplying their edits when a hydrated draft is saved again.
+      // A hydrated autosave carries the exact historical decision. Keep it in
+      // history even if a later field edit or identity projection removed the
+      // issue from the current review. Only a fresh choice can pin new evidence.
       if (
-        retained?.outcome === resolution.outcome &&
-        canonicalLiteral(retained.mapping || {}) === canonicalLiteral(resolution.mapping || {})
+        retained &&
+        resolution.operationId === retained.operationId &&
+        resolution.at === retained.at &&
+        canonicalLiteral(resolution) === canonicalLiteral(retained)
       )
         continue;
       const issue = required(
         record.issues!.find((i) => i.id === resolution.issueId),
         'Issue does not belong to this candidate',
       );
+      // Retain old decisions, including older unscoped date choices, without
+      // reapplying their edits when a hydrated draft is saved again.
+      if (
+        retained?.outcome === resolution.outcome &&
+        canonicalLiteral(retained.mapping || {}) === canonicalLiteral(resolution.mapping || {}) &&
+        issueResolutionCurrent(db, retained, { ...record.mapping, ...mapping })
+      )
+        continue;
       if (
         ![
           'this_is_me',
@@ -2688,6 +2726,7 @@ export function saveIntakeReviewDraft(
       if (
         priorResolution?.outcome === resolution.outcome &&
         canonicalLiteral(priorResolution.mapping) === canonicalLiteral(effectiveCorrection) &&
+        issueResolutionCurrent(db, priorResolution, { ...record.mapping, ...mapping }) &&
         (resolution.outcome !== 'unknown' ||
           !Object.keys(correction).length ||
           canonicalLiteral(correction) === canonicalLiteral(priorResolution.mapping))
@@ -2720,6 +2759,7 @@ export function saveIntakeReviewDraft(
         mapping: correction,
         at,
         operationId: input.operationId,
+        dependency: issueResolutionDependency(db, id, issue, { ...record.mapping, ...mapping }),
       });
       const question = workflow.questions.find((q) => q.id === issue.questionId);
       if (question && resolution.outcome !== 'unknown') {
@@ -2733,6 +2773,18 @@ export function saveIntakeReviewDraft(
         });
         question.status = 'answered';
       }
+    }
+    // A save may resolve several questions and apply several corrections. Pin
+    // each newly made answer to the final reviewed mapping, independent of the
+    // order in which those answers appeared in the request.
+    for (const resolution of resolutions) {
+      if (resolution.operationId !== input.operationId) continue;
+      const issue = record.issues!.find((candidate) => candidate.id === resolution.issueId);
+      if (issue)
+        resolution.dependency = issueResolutionDependency(db, id, issue, {
+          ...record.mapping,
+          ...mapping,
+        });
     }
     if (
       input.correctionReason !== undefined &&
@@ -3141,6 +3193,7 @@ export function submitIntakeBatch(
   profileId: string,
   id: string,
   input: SubmitBatchInput,
+  observedSourcePages?: ObservedSourcePages[],
 ) {
   owner(db, profileId);
   const file = row(db, id),
@@ -3202,6 +3255,6 @@ export function submitIntakeBatch(
     profileId,
     id,
     { ...input, modelIdentity: plan.pins },
-    { workflowBatch: { planId: plan.id, operationId, coverage, fingerprint } },
+    { workflowBatch: { planId: plan.id, operationId, coverage, fingerprint }, observedSourcePages },
   );
 }

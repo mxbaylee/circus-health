@@ -122,7 +122,20 @@ test('ordinary app edit appends changed records and bounded metadata, no corpus 
   );
   const tx = commit(f),
     added = f.writes.slice(before).reduce((sum, row) => sum + row.bytes, 0);
-  assert.equal(tx.records, 2, 'one person and the profile revision');
+  assert.equal(tx.records, 3, 'one person and two bounded revision scalars');
+  const versions = Buffer.concat(tx.segments.map((segment) => stored(f, segment.name)))
+    .toString('utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as DurableRecordVersion);
+  assert.deepEqual(
+    versions.map((version) => [version.entity, version.contents.key || version.contents.id]).sort(),
+    [
+      ['people', 'fictional-1'],
+      ['app_meta', 'revision'],
+      ['app_meta', 'clinical_review_revision'],
+    ].sort(),
+  );
   assert.ok(added < 6000, `bounded append was ${added} bytes`);
   assert.equal(history(f.db, 'people', 'fictional-1').length, 2);
   const count = f.writes.length;

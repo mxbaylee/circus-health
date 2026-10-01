@@ -42,6 +42,12 @@ import {
   withIntakeSourcePin,
   withoutIntakeSourcePin,
 } from '../intake-source-pin.ts';
+import {
+  proposalDependenciesCurrent,
+  writeProposalDependencies,
+} from '../intake-proposal-dependencies.ts';
+import { issueResolutionCurrent, issueResolutionDependency } from '../intake-issue-dependencies.ts';
+import type { IntakeIssueResolution, IntakeReviewIssue } from '../../shared/intake.ts';
 
 const profileId = 'fictional-source-text';
 const intakeId = 'fictional-import';
@@ -672,6 +678,32 @@ test('member correction atomically invalidates ancestor proposals without impers
       );
   });
   const initial = publish(f);
+  transaction(f.db, () => {
+    const child = JSON.parse(
+      String(
+        f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!
+          .details_json,
+      ),
+    );
+    child.intake.locator = 'fictional/member-one';
+    f.db
+      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+      .run(JSON.stringify(child), intakeId);
+    f.db.prepare('UPDATE source_files SET mime_type=? WHERE id=?').run('application/zip', parent);
+    writeProposalDependencies(f.db, parent, 'fictional-measured-package-proposal', [
+      {
+        intakeId,
+        pages: [1],
+        member: {
+          rootIntakeId: parent,
+          memberId: 'fictional-member-one',
+          locator: 'fictional/member-one',
+          sourceHash: f.sourceHash,
+        },
+      },
+    ]);
+  });
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-measured-package-proposal'), true);
   const stored = (db = f.db) =>
     JSON.parse(
       db.prepare('SELECT details_json FROM source_files WHERE id=?').get(parent)!
@@ -696,6 +728,69 @@ test('member correction atomically invalidates ancestor proposals without impers
       .run(JSON.stringify({ intake: saved }), parent);
   });
   assert.doesNotThrow(() => assertCurrentProposalSourceText(metadata(), 'parent-proposal'));
+  const siblingId = 'fictional-sibling-member';
+  const siblingPath = `data/profiles/${profileId}/sources/fictional-sibling.txt`;
+  writeFileSync(resolve(f.root, siblingPath), readFileSync(f.path));
+  transaction(f.db, () =>
+    f.db
+      .prepare(
+        'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+      )
+      .run(
+        siblingId,
+        siblingPath,
+        f.sourceHash,
+        Buffer.byteLength(
+          'FICTIONAL ONLY\nPage 1: No finding. Decimal 1.00.\nPage 2: Administrative routing retained.',
+        ),
+        'intake_original',
+        JSON.stringify({
+          intake: {
+            version: 1,
+            proposals: [],
+            parentSourceFileId: parent,
+            locator: 'fictional/member-two',
+          },
+        }),
+      ),
+  );
+  publishIntakeSourceText(f.db, f.root, profileId, siblingId, {
+    operationId: randomUUID(),
+    sourceHash: f.sourceHash,
+    expectedRevisionId: null,
+    evidence: evidence(),
+  });
+  assert.equal(
+    proposalDependenciesCurrent(f.db, 'fictional-measured-package-proposal'),
+    true,
+    'an unrelated sibling member does not stale the measured package proposal',
+  );
+  transaction(f.db, () =>
+    writeProposalDependencies(f.db, parent, 'fictional-package-role-proposal', [
+      {
+        intakeId,
+        pages: [1],
+        member: {
+          rootIntakeId: parent,
+          memberId: 'fictional-member-one',
+          locator: 'fictional/member-one',
+          sourceHash: f.sourceHash,
+        },
+      },
+    ]),
+  );
+  transaction(f.db, () => {
+    const saved = stored();
+    saved.workflow = {
+      plans: [
+        { status: 'active', packageRoles: [{ memberId: 'fictional-member-one', role: 'report' }] },
+      ],
+    };
+    f.db
+      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+      .run(JSON.stringify({ intake: saved }), parent);
+  });
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-package-role-proposal'), false);
   const changed = review(f, initial, {
     action: 'correct',
     spans: [
@@ -704,6 +799,7 @@ test('member correction atomically invalidates ancestor proposals without impers
   });
   const after = metadata();
   assert.notEqual(after.sourceTextDependencyToken, before.sourceTextDependencyToken);
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-measured-package-proposal'), false);
   assert.equal(after.sourceTextRevisionId, null);
   assert.equal(after.sourceTextRequiresInterpretation, true);
   assert.throws(
@@ -1008,6 +1104,147 @@ test('unchanged text approval preserves clinical pins and receipts through rebui
     () => assertCurrentProposalSourceText({ ...metadata(), proposals: [proposal] }, proposal.id),
     code('SOURCE_TEXT_CHANGED'),
   );
+});
+
+test('measured page dependencies survive unrelated correction and rebuild, but follow cross-page headers', (t) => {
+  const f = fixture(t);
+  const independent = evidence();
+  independent.relations = independent.relations.filter((relation) => relation.id !== 'r2');
+  const first = publish(f, independent);
+  transaction(f.db, () =>
+    writeProposalDependencies(f.db, intakeId, 'fictional-page-one-proposal', [
+      { intakeId, pages: [1] },
+    ]),
+  );
+  const issue: IntakeReviewIssue = {
+    id: 'fictional-page-one-question',
+    kind: 'uncertain_reading',
+    field: 'documentTitle',
+    prompt: 'Check the fictional heading.',
+    blocking: true,
+    status: 'unresolved',
+    locator: 'page 1',
+    page: 1,
+    questionId: null,
+  };
+  const mapping = { documentTitle: 'Fictional heading' };
+  const answer: IntakeIssueResolution = {
+    issueId: issue.id,
+    outcome: 'confirmed',
+    dependency: issueResolutionDependency(f.db, intakeId, issue, mapping),
+  };
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-page-one-proposal'), true);
+  assert.equal(issueResolutionCurrent(f.db, answer, mapping), true);
+  const second = review(f, first, {
+    action: 'correct',
+    scope: { page: 2 },
+    spans: [
+      { id: 'c2', text: 'Corrected fictional routing.', region: { page: 2 }, provenance: 'human' },
+    ],
+  });
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-page-one-proposal'), true);
+  assert.equal(issueResolutionCurrent(f.db, answer, mapping), true);
+  assert.equal(proposalDependenciesCurrent(f.rebuild(), 'fictional-page-one-proposal'), true);
+  review(f, second, {
+    action: 'correct',
+    scope: { page: 1 },
+    spans: [
+      { id: 'a2', text: 'Corrected fictional finding.', region: { page: 1 }, provenance: 'human' },
+    ],
+  });
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-page-one-proposal'), false);
+  assert.equal(issueResolutionCurrent(f.db, answer, mapping), false);
+
+  const related = fixture(t);
+  const relatedFirst = publish(related);
+  transaction(related.db, () =>
+    writeProposalDependencies(related.db, intakeId, 'fictional-header-proposal', [
+      { intakeId, pages: [1] },
+    ]),
+  );
+  review(related, relatedFirst, {
+    action: 'correct',
+    scope: { page: 2 },
+    spans: [
+      { id: 'c', text: 'Changed fictional table value.', region: { page: 2 }, provenance: 'human' },
+    ],
+  });
+  assert.equal(proposalDependenciesCurrent(related.db, 'fictional-header-proposal'), false);
+
+  const relatedClarification = fixture(t);
+  const clarificationSource = publish(relatedClarification);
+  transaction(relatedClarification.db, () =>
+    writeProposalDependencies(relatedClarification.db, intakeId, 'fictional-linked-clarification', [
+      { intakeId, pages: [1] },
+    ]),
+  );
+  transaction(relatedClarification.db, () =>
+    writeProposalDependencies(relatedClarification.db, intakeId, 'fictional-linked-span', [
+      { intakeId, pages: [], spanIds: ['b'] },
+    ]),
+  );
+  review(relatedClarification, clarificationSource, {
+    action: 'clarification',
+    scope: { page: 2 },
+    clarification: 'Fictional header clarification changes linked finding interpretation.',
+  });
+  assert.equal(
+    proposalDependenciesCurrent(relatedClarification.db, 'fictional-linked-clarification'),
+    false,
+  );
+  assert.equal(
+    proposalDependenciesCurrent(relatedClarification.db, 'fictional-linked-span'),
+    false,
+  );
+
+  const clarified = fixture(t);
+  const clarifiedFirst = publish(clarified, independent);
+  transaction(clarified.db, () =>
+    writeProposalDependencies(clarified.db, intakeId, 'fictional-clarification-proposal', [
+      { intakeId, pages: [1] },
+    ]),
+  );
+  review(clarified, clarifiedFirst, {
+    action: 'clarification',
+    scope: { page: 1 },
+    clarification: 'Fictional external clarification changes how the first page is interpreted.',
+  });
+  assert.equal(
+    proposalDependenciesCurrent(clarified.db, 'fictional-clarification-proposal'),
+    false,
+  );
+});
+
+test('measured span dependencies survive unrelated same-page append and follow linked context', (t) => {
+  const f = fixture(t);
+  const firstEvidence = evidence();
+  firstEvidence.relations = [];
+  const first = publish(f, firstEvidence);
+  transaction(f.db, () =>
+    writeProposalDependencies(f.db, intakeId, 'fictional-span-proposal', [
+      { intakeId, pages: [], spanIds: ['a'] },
+    ]),
+  );
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-span-proposal'), true);
+  const appended = structuredClone(firstEvidence);
+  appended.spans.push({
+    id: 'unrelated-append',
+    text: 'Fictional unrelated margin note.',
+    region: { page: 1 },
+    provenance: 'native',
+  });
+  const second = publish(f, appended, first.id);
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-span-proposal'), true);
+  assert.equal(proposalDependenciesCurrent(f.rebuild(), 'fictional-span-proposal'), true);
+  appended.relations.push({
+    id: 'linked-note',
+    from: 'a',
+    to: 'unrelated-append',
+    kind: 'precedes',
+    provenance: 'adapter',
+  });
+  publish(f, appended, second.id);
+  assert.equal(proposalDependenciesCurrent(f.db, 'fictional-span-proposal'), false);
 });
 
 test('attention queue counts sections rather than flags and removes completed originals', async (t) => {

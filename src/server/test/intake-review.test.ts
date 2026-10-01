@@ -14,6 +14,7 @@ import { handleIntakeRoute } from '../intake-routes.ts';
 import { mappingFrom, clinicalSourceVersion } from '../clinical-import.ts';
 import { canonicalLiteral, INTAKE_SCHEMA_INSTRUCTIONS } from '../intake-format.ts';
 import { issueKind, resolutionFields, reviewIssues } from '../intake-review.ts';
+import { issueResolutionCurrent, issueResolutionDependency } from '../intake-issue-dependencies.ts';
 import { intakeCandidateId, workflowHash } from '../intake-workflow.ts';
 import type {
   HealthRecordEnvelope,
@@ -1015,6 +1016,140 @@ test('typed resolution preserves legacy answers and resolves only explicit revie
   item = accept(f, item);
   assert.equal(item.workflow.questions[0]!.status, 'resolved');
   assert.equal(item.workflow.questions[0]!.answers.length, 2);
+});
+
+test('editing one reviewed field reopens only its dependent issue', (t) => {
+  const f = fixture(t);
+  const value = document({
+    subject: 'self',
+    uncertainties: [],
+    clinical: {
+      kind: 'document',
+      subject: 'self',
+      documentTitle: 'Fictional report',
+      date: '2026-04',
+      documentDate: '2026-04',
+    },
+    reviewIssues: [
+      {
+        id: 'title-reading',
+        kind: 'uncertain_reading',
+        field: 'documentTitle',
+        prompt: 'Check the fictional title.',
+      },
+      { id: 'date-reading', kind: 'date', field: 'date', prompt: 'Check the fictional date.' },
+    ],
+  });
+  let item = call(f, 'uploadIntake', {
+    filename: 'fictional-field-issues.jsonl',
+    bytes: Buffer.from(JSON.stringify(value)),
+  });
+  let record = call(f, 'reviewIntake', item.id).records[0]!;
+  const title = record.issues.find((issue) => issue.field === 'documentTitle')!;
+  const date = record.issues.find((issue) => issue.field === 'date')!;
+  item = draft(f, item, record, {
+    resolutions: [
+      { issueId: title.id, outcome: 'confirmed' },
+      { issueId: date.id, outcome: 'confirmed' },
+    ],
+  });
+  record = call(f, 'reviewIntake', item.id).records[0]!;
+  assert.equal(record.issues.find((issue) => issue.id === title.id)!.status, 'resolved');
+  assert.equal(record.issues.find((issue) => issue.id === date.id)!.status, 'resolved');
+  item = draft(f, item, record, {
+    operationId: 'fictional-title-edit',
+    mapping: { documentTitle: 'Corrected fictional title' },
+  });
+  record = call(f, 'reviewIntake', item.id).records[0]!;
+  assert.equal(record.issues.find((issue) => issue.id === title.id)!.status, 'unresolved');
+  assert.equal(record.issues.find((issue) => issue.id === date.id)!.status, 'resolved');
+  item = draft(f, item, record, {
+    operationId: 'fictional-title-reconfirmation',
+    resolutions: [{ issueId: title.id, outcome: 'confirmed' }],
+  });
+  record = call(f, 'reviewIntake', item.id).records[0]!;
+  assert.equal(record.issues.find((issue) => issue.id === title.id)!.status, 'resolved');
+  assert.equal(record.issues.find((issue) => issue.id === date.id)!.status, 'resolved');
+});
+
+test('legacy unmeasured resolution remains in history but cannot approve a changed field', (t) => {
+  const f = fixture(t);
+  let item = call(f, 'uploadIntake', {
+    filename: 'fictional-legacy-resolution.jsonl',
+    bytes: Buffer.from(
+      JSON.stringify(
+        document({
+          subject: 'self',
+          uncertainties: [],
+          clinical: {
+            kind: 'document',
+            subject: 'self',
+            documentTitle: 'Original fictional title',
+          },
+          reviewIssues: [
+            {
+              id: 'legacy-title',
+              kind: 'uncertain_reading',
+              field: 'documentTitle',
+              prompt: 'Confirm the fictional title.',
+            },
+          ],
+        }),
+      ),
+    ),
+  });
+  let record = call(f, 'reviewIntake', item.id).records[0]!;
+  const title = record.issues.find((issue) => issue.field === 'documentTitle')!;
+  item = draft(f, item, record, {
+    resolutions: [{ issueId: title.id, outcome: 'confirmed' }],
+  });
+  const stored = JSON.parse(
+    String(
+      f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(item.id)!.details_json,
+    ),
+  );
+  const historical = stored.intake.workflow.reviewDrafts.at(-1).resolutions.at(-1);
+  delete historical.dependency;
+  f.db
+    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+    .run(JSON.stringify(stored), item.id);
+  item = call(f, 'getIntake', item.id);
+  record = call(f, 'reviewIntake', item.id).records[0]!;
+  item = draft(f, item, record, {
+    operationId: 'fictional-legacy-field-edit',
+    mapping: { documentTitle: 'Changed fictional title' },
+  });
+  const review = call(f, 'reviewIntake', item.id);
+  record = review.records[0]!;
+  assert.equal(record.issues.find((issue) => issue.id === title.id)!.status, 'unresolved');
+  assert.ok(record.draft.resolutions.some((resolution) => resolution.issueId === title.id));
+  assert.throws(() => accept(f, item), { code: 'REVIEW_ISSUES_PENDING' });
+});
+
+test('unlocated issue with no field target conservatively follows the whole reviewed mapping', (t) => {
+  const f = fixture(t);
+  const issue = {
+    id: 'fictional-unlocated-issue',
+    kind: 'uncertain_reading',
+    field: null,
+    prompt: 'Check the fictional source statement.',
+    blocking: true,
+    status: 'unresolved',
+    locator: '',
+    page: undefined,
+    questionId: null,
+  } as IntakeReviewIssue;
+  const original = { documentTitle: 'Original fictional title' };
+  const resolution = {
+    issueId: issue.id,
+    outcome: 'confirmed',
+    dependency: issueResolutionDependency(f.db, 'fictional-import', issue, original),
+  } as const;
+  assert.equal(issueResolutionCurrent(f.db, resolution, original), true);
+  assert.equal(
+    issueResolutionCurrent(f.db, resolution, { documentTitle: 'Changed fictional title' }),
+    false,
+  );
 });
 
 test('draft decision and answer text survive review reload without submitting answers or accepting', (t) => {

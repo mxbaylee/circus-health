@@ -57,7 +57,13 @@ import {
   intakePlanPinsCurrent,
   retainIntakeChildren,
   updateIntakeMetadata,
+  reviewIntake,
 } from '../intake.ts';
+import {
+  proposalDependenciesCurrent,
+  sourcePageCurrentHash,
+  sourceSpanCurrentHash,
+} from '../intake-proposal-dependencies.ts';
 import { uploadAsset } from '../assets.ts';
 import { vaultFixture, newProfile } from './helpers/vault-fixture.ts';
 import type { HealthTool } from '../proxy-model-bridge.ts';
@@ -4755,7 +4761,7 @@ test('host source capture does not substitute for reading the new durable passag
       summary: 'Fictional current proposal',
       jsonlText: f.batch.jsonlText,
     }),
-    (error: unknown) => hasCode(error, 'SOURCE_TEXT_REQUIRED'),
+    (error: unknown) => hasCode(error, 'SOURCE_TEXT_CHANGED'),
   );
   assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
 });
@@ -6450,6 +6456,261 @@ test('external text correction remains terminal even if the model supplies its n
   );
   assert.equal(f.chat.status, 'idle');
   assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+});
+
+for (const exposure of ['create', 'read', 'question'] as const)
+  test(`unmeasured ${exposure} context retains the broad proposal source pin`, async (t) => {
+    fictionalModel(t);
+    const f = fixture(t, {}, encryptedRecordStorage(t));
+    const item = uploadIntake(f.db, f.root, 'cedar', {
+      filename: 'fictional-unmeasured-context.txt',
+      bytes: Buffer.from('Fictional first-page evidence. '.repeat(2500)),
+    });
+    const { extractIntakeSourceText } = await import('../intake-source-extraction.ts');
+    const extract = () =>
+      extractIntakeSourceText({
+        db: f.db,
+        root: f.root,
+        profileId: 'cedar',
+        id: item.id,
+        maxPages: 1,
+      });
+    await extract();
+    // Prepare the plan outside the model response so the read case independently
+    // proves broad fallback without also exposing a create response to the model.
+    if (exposure === 'read')
+      await createIntakePlan(f.db, f.root, 'cedar', item.id, {
+        version: getIntake(f.db, f.root, 'cedar', item.id).version,
+      });
+    f.assistant.create('cedar', { message: 'Review fictional bounded source evidence' });
+    await tick();
+    const bridge = f.bridges[0];
+    const passage = await call<{ revisionId: string }>(bridge, 'intake_source_text', {
+      id: item.id,
+      page: 1,
+    });
+    const version = getIntake(f.db, f.root, 'cedar', item.id).version;
+    if (exposure === 'question')
+      await call(bridge, 'intake_question', {
+        id: item.id,
+        version,
+        key: 'fictional-source-question',
+        prompt: 'Which fictional statement is evidenced?',
+        locator: 'page 1',
+      });
+    else
+      await call(bridge, 'intake_plan', {
+        id: item.id,
+        action: exposure,
+        ...(exposure === 'read'
+          ? { freshStart: true, offset: 0, section: 'questions' }
+          : { version }),
+      });
+    await call(bridge, 'intake_propose', {
+      id: item.id,
+      version: getIntake(f.db, f.root, 'cedar', item.id).version,
+      summary: 'Fictional context after an unmeasured response',
+      sourceTextRevisionId: passage.revisionId,
+      jsonlText: JSON.stringify({
+        format: 'health-record-v1',
+        id: 'fictional-broad-context',
+        kind: 'context',
+        payload: { text: 'Fictional first-page evidence' },
+        provenance: {
+          capturedVia: 'Fictional text',
+          sourceSystem: null,
+          sourceRecordId: null,
+          evidenceClass: 'transcription',
+          locator: 'page 1',
+        },
+        coverage: { status: 'partial', notes: ['Later source remains.'] },
+      }),
+    });
+    const proposal = getIntake(f.db, f.root, 'cedar', item.id).proposals[0]!;
+    assert.equal(proposalDependenciesCurrent(f.db, proposal.id), null);
+    assert.equal(
+      f.db
+        .prepare('SELECT value FROM app_meta WHERE key=?')
+        .get(`intake_proposal_dependencies:v1:${proposal.id}`),
+      undefined,
+    );
+    assert.equal(reviewIntake(f.db, f.root, 'cedar', item.id, proposal.id).sourceTextStale, false);
+    await extract();
+    assert.equal(
+      reviewIntake(f.db, f.root, 'cedar', item.id, proposal.id).sourceTextStale,
+      true,
+      'an unobserved append still stales a broadly pinned proposal',
+    );
+  });
+
+test('a deferred model proposal survives an unrelated append but rejects a later observed correction', async (t) => {
+  fictionalModel(t);
+  const gates = [0, 1].map(() => {
+    let observed!: () => void;
+    let release!: () => void;
+    let settle!: () => void;
+    return {
+      observed: new Promise<void>((resolve) => (observed = resolve)),
+      released: new Promise<void>((resolve) => (release = resolve)),
+      settled: new Promise<void>((resolve) => (settle = resolve)),
+      signalObserved: () => observed(),
+      signalSettled: () => settle(),
+      release: () => release(),
+    };
+  });
+  t.after(() => gates.forEach((gate) => gate.release()));
+  let sourceId = '';
+  let turn = 0;
+  const outcomes: Array<{
+    result?: { proposalSourceText: ProposalSourceTextHandoff };
+    error?: unknown;
+  }> = [];
+  const f = fixture(
+    t,
+    {
+      bridgeFactory: (callbacks) => ({
+        async start() {
+          return { model: 'fictional-deferred-source-response' };
+        },
+        async turn() {
+          const currentTurn = turn++;
+          callbacks.beforeRequest?.();
+          callbacks.onEvent?.('turn/started', { turn: { id: `deferred-${currentTurn}` } });
+          const passage = (await callbacks.onTool?.({
+            tool: 'health_intake_source_text',
+            arguments: { id: sourceId, page: 1 },
+            callId: `fictional-deferred-read-${currentTurn}`,
+          })) as { revisionId: string };
+          const version = getIntake(f.db, f.root, 'cedar', sourceId).version;
+          gates[currentTurn]!.signalObserved();
+          await gates[currentTurn]!.released;
+          try {
+            const result = (await callbacks.onTool?.({
+              tool: 'health_intake_propose',
+              arguments: {
+                id: sourceId,
+                version,
+                sourceTextRevisionId: passage.revisionId,
+                summary: 'Fictional deferred bounded proposal',
+                jsonlText: JSON.stringify({
+                  format: 'health-record-v1',
+                  id: `fictional-deferred-context-${currentTurn}`,
+                  kind: 'context',
+                  payload: { text: 'Fictional first-page evidence' },
+                  provenance: {
+                    capturedVia: 'Fictional PDF',
+                    sourceSystem: null,
+                    sourceRecordId: null,
+                    evidenceClass: 'transcription',
+                    locator: 'page 1',
+                  },
+                  coverage: { status: 'partial', notes: ['Later source remains.'] },
+                }),
+              },
+              callId: `fictional-deferred-proposal-${currentTurn}`,
+            })) as { proposalSourceText: ProposalSourceTextHandoff };
+            outcomes[currentTurn] = { result };
+          } catch (error) {
+            outcomes[currentTurn] = { error };
+          }
+          callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+          gates[currentTurn]!.signalSettled();
+        },
+        async cancel() {},
+        close() {},
+      }),
+    },
+    encryptedRecordStorage(t),
+  );
+  const item = uploadIntake(f.db, f.root, 'cedar', {
+    filename: 'fictional-late-sections.txt',
+    bytes: Buffer.from('Fictional first-page evidence. '.repeat(2500)),
+  });
+  sourceId = item.id;
+  const { extractIntakeSourceText } = await import('../intake-source-extraction.ts');
+  const { getIntakeSourceText } = await import('../intake-source-text.ts');
+  await extractIntakeSourceText({
+    db: f.db,
+    root: f.root,
+    profileId: 'cedar',
+    id: item.id,
+    maxPages: 1,
+  });
+  const chat = f.assistant.create('cedar', { title: 'Fictional late page' });
+  f.assistant.send('cedar', chat.id, { message: 'Review the fictional source page' });
+  await gates[0]!.observed;
+  assert.equal(chat.status, 'running', 'the model response is held after seeing page one');
+  const beforeRevision = getIntakeSourceText(f.db, f.root, 'cedar', item.id).revision!.id;
+  await extractIntakeSourceText({
+    db: f.db,
+    root: f.root,
+    profileId: 'cedar',
+    id: item.id,
+    maxPages: 1,
+  });
+  assert.equal(outcomes.length, 0, 'no proposal returned while the provider is held');
+  gates[0]!.release();
+  await gates[0]!.settled;
+  const result = outcomes[0]!.result!;
+  assert.equal(outcomes[0]!.error, undefined);
+  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
+  assert.notEqual(result.proposalSourceText.currentRevisionId, beforeRevision);
+  const proposal = getIntake(f.db, f.root, 'cedar', item.id).proposals[0]!;
+  const dependency = JSON.parse(
+    sqlText(
+      f.db
+        .prepare('SELECT value FROM app_meta WHERE key=?')
+        .get(`intake_proposal_dependencies:v1:${proposal.id}`),
+      'value',
+    ),
+  );
+  assert.deepEqual(dependency, {
+    format: 'intake-proposal-dependencies-v1',
+    sources: [
+      {
+        intakeId: item.id,
+        pages: [{ page: 1, hash: sourcePageCurrentHash(f.db, item.id, 1) }],
+        spans: [{ spanId: 'p1-literal', hash: sourceSpanCurrentHash(f.db, item.id, 'p1-literal') }],
+      },
+    ],
+  });
+  assert.equal(proposalDependenciesCurrent(f.db, proposal.id), true);
+  assert.equal(reviewIntake(f.db, f.root, 'cedar', item.id, proposal.id).sourceTextStale, false);
+  assert.equal(chat.status, 'idle');
+  f.assistant.send('cedar', chat.id, { message: 'Review the same fictional page again' });
+  await gates[1]!.observed;
+  assert.equal(chat.status, 'running');
+  const { reviewIntakeSourceText } = await import('../intake-source-text.ts');
+  const current = getIntakeSourceText(f.db, f.root, 'cedar', item.id).revision!;
+  reviewIntakeSourceText(
+    f.db,
+    f.root,
+    'cedar',
+    item.id,
+    {
+      operationId: randomUUID(),
+      expectedRevisionId: current.id,
+      sourceHash: current.sourceHash,
+      action: 'correct',
+      scope: { page: 1 },
+      spans: [
+        {
+          id: 'fictional-late-correction',
+          text: 'Corrected fictional first-page evidence.',
+          provenance: 'human',
+          region: { page: 1 },
+        },
+      ],
+    },
+    'fictional-owner',
+  );
+  assert.equal(outcomes.length, 1, 'the corrected response is still held');
+  assert.equal(proposalDependenciesCurrent(f.db, proposal.id), false);
+  assert.equal(reviewIntake(f.db, f.root, 'cedar', item.id, proposal.id).sourceTextStale, true);
+  gates[1]!.release();
+  await gates[1]!.settled;
+  assert.ok(hasCode(outcomes[1]!.error, 'SOURCE_TEXT_CHANGED'));
+  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
 });
 
 test('a passage read cannot erase a human correction that arrived during a provider response', async (t) => {

@@ -114,6 +114,12 @@ export function managedTimestamp<T>(value: T): T | string {
 export const now = () => new Date().toISOString();
 export const revision = (db: DatabaseSync): number =>
   Number(db.prepare("SELECT value FROM app_meta WHERE key='revision'").get()?.value || 0);
+/** Clinical review authority excludes source-text-only journal revisions. */
+export const clinicalReviewRevision = (db: DatabaseSync): number =>
+  Number(
+    db.prepare("SELECT value FROM app_meta WHERE key='clinical_review_revision'").get()?.value ??
+      revision(db),
+  );
 
 export interface TransactionOperation {
   operationId?: unknown;
@@ -165,6 +171,13 @@ export function transaction<T>(
     }
     captured = hooks?.capture?.();
     const result = fn();
+    db.prepare(
+      "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
+    ).run();
+    if (operation.actor !== 'source-text')
+      db.exec(
+        "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='clinical_review_revision'",
+      );
     db.exec("UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'");
     hooks?.markDirty?.();
     // The recoverable intent must reach durable profile storage before an

@@ -2034,7 +2034,7 @@ export function ImportPage() {
         );
       if (result.scheduled === false)
         throw new Error(
-          'No new reading pass was scheduled. The existing result remains available for review. A corrected completed source can be read again when reopening completed work is supported.',
+          'No new reading pass was scheduled. The retained source has a current interpretation available for review.',
         );
     },
   };

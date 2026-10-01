@@ -512,6 +512,12 @@ export interface IntakeIssueResolution {
   mapping?: Partial<IntakeClinicalMapping>;
   at?: string;
   operationId?: string;
+  /** Measured field and located source dependencies at the time of this answer. */
+  dependency?: {
+    fields: string[];
+    fieldHash: string;
+    source?: { intakeId: string; page: number; hash: string };
+  };
 }
 export interface IntakeImportCorrection {
   operationId: string;
