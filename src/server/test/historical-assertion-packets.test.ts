@@ -71,15 +71,20 @@ test('historical raw kinds use the same case-insensitive inclusion and omission 
   const f = fixture(t);
   for (const kind of [
     'clinical_object',
-    'ALLERGY',
-    'AllergyIntolerance',
-    'CONDITIONS',
-    'Diagnosis',
-    'Encounters',
-    'VISIT',
-    'IMMUNIZATIONS',
-    'CLINICAL_OBJECT',
-  ]) {
+    'allergy',
+    'allergies',
+    'allergyintolerance',
+    'condition',
+    'conditions',
+    'diagnosis',
+    'diagnoses',
+    'encounter',
+    'encounters',
+    'visit',
+    'visits',
+    'immunization',
+    'immunizations',
+  ].flatMap((kind) => [kind, kind.toUpperCase()])) {
     f.raw(kind, kind);
     assert.equal(packet(f.db).unassignedRawAssertionsOmitted, true, kind);
     assert.deepEqual(ids(f.db), []);
@@ -154,8 +159,147 @@ test('unprojected intake rows remain notice-only and nonclinical source kinds do
   const f = fixture(t);
   f.raw('context', 'context');
   assert.equal(packet(f.db).unassignedRawAssertionsOmitted, false);
-  f.raw('intake', 'intake_record');
-  assert.equal(packet(f.db).unassignedRawAssertionsOmitted, true);
-  f.evidence('intake', 'patient', 'report_subject');
-  assert.deepEqual(ids(f.db), []);
+  for (const kind of ['intake_record', 'intake_document', 'INTAKE_RECORD', 'INTAKE_DOCUMENT']) {
+    f.raw(kind, kind);
+    assert.equal(packet(f.db).unassignedRawAssertionsOmitted, true);
+    f.evidence(kind, 'patient', 'report_subject');
+    assert.deepEqual(ids(f.db), []);
+    assert.equal(packet(f.db).unassignedRawAssertionsOmitted, false);
+  }
+});
+
+test('real persisted identity receipts and accepted mappings do not assign a neighboring historical assertion', async (t) => {
+  const f = fixture(t);
+  const { getNote, saveNote } = await import('../notes.ts');
+  const intake = await import('../intake.ts');
+  const { getIntakeIdentityReview, confirmIntakeIdentityScope } =
+    await import('../intake-identity.ts');
+  const self = getNote(f.db, 'person-note:self');
+  saveNote(f.db, self.id, {
+    version: self.version,
+    person: { ...self.person, fullName: 'Fictional Iris Meadow', birthDate: '1982-04-17' },
+  });
+  const item = intake.uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-mixed-history.txt',
+    newProviderName: 'Fictional History Clinic',
+    bytes: Buffer.from(
+      'Fictional history report\nPatient: Fictional Iris Meadow\nFictional count 12.00\nSeparate unresolved historical assertion',
+    ),
+  });
+  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, item.id, {
+    version: item.version,
+    summary: 'One fictional observation',
+    jsonlText: JSON.stringify({
+      format: 'health-record-v1',
+      id: 'fictional-count',
+      kind: 'record',
+      payload: { literal: '12.00' },
+      provenance: {
+        capturedVia: null,
+        sourceSystem: 'Fictional History Clinic',
+        sourceRecordId: 'fictional-count',
+        evidenceClass: 'provider_export',
+        locator: 'page 1 count',
+      },
+      coverage: { status: 'complete_response', notes: [] },
+      clinical: {
+        kind: 'observation',
+        subject: 'unknown',
+        testLabel: 'Fictional count',
+        valueText: '12.00',
+        unit: 'mg',
+        date: '2026-03-02',
+      },
+      report: {
+        key: 'history',
+        title: 'Fictional history report',
+        anchor: { locator: 'page 1 heading', text: 'Fictional history report' },
+        subject: { locator: 'page 1 patient', text: 'Fictional Iris Meadow' },
+      },
+    }),
+  });
+  const identity = await getIntakeIdentityReview(
+    f.db,
+    f.root,
+    f.profileId,
+    item.id,
+    proposed.workflow!.reportGroups![0]!.id,
+  );
+  assert.ok(identity.scope);
+  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, item.id, {
+    version: identity.scope.intakeVersion,
+    operationId: 'fictional-exact-identity',
+    scope: identity.scope,
+    outcome: 'this_is_me',
+    attestation: 'confirmed_displayed_report_subject',
+  });
+  const proposalId = proposed.proposals[0]!.id;
+  const review = intake.reviewIntake(f.db, f.root, f.profileId, item.id, proposalId);
+  intake.importIntake(f.db, f.root, f.profileId, item.id, {
+    version: review.version,
+    proposalId,
+    reviewToken: review.reviewToken,
+    decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+  });
+  f.raw('neighbor', 'condition');
+  f.db.prepare('UPDATE source_records SET source_file_id=? WHERE id=?').run(item.id, 'neighbor');
+  const check = (db: Database) => {
+    const receipt = intake.getIntake(db, f.root, f.profileId, item.id).workflow!
+      .identityConfirmations![0]!;
+    assert.equal(receipt.operationId, 'fictional-exact-identity');
+    assert.ok(
+      (receipt.scope.assignmentTargets || receipt.scope.targets).some(
+        (target) => target.recordId === review.records[0]!.id,
+      ),
+    );
+    const accepted = db
+      .prepare(
+        "SELECT coverage_json FROM manual_batches WHERE title='Accepted clinical contribution'",
+      )
+      .get();
+    assert.ok(accepted, 'use an actual accepted contribution, not receipt-shaped raw data');
+    assert.equal(JSON.parse(String(accepted.coverage_json)).sourceRecordId, review.records[0]!.id);
+    const snapshot = packet(db);
+    assert.ok(snapshot.records.some((record) => record.type === 'observation'));
+    assert.equal(snapshot.unassignedRawAssertionsOmitted, true);
+    assert.ok(!snapshot.records.some((record) => record.id === 'neighbor'));
+    assert.doesNotMatch(exportHtml(snapshot), /PRIVATE neighbor/);
+    assert.doesNotMatch(JSON.stringify(exportEvidence(snapshot)), /PRIVATE neighbor/);
+  };
+  check(f.db);
+  exportCuration(f.db, f.root, f.profileId);
+  const rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'receipt-rebuild'));
+  const db = openDatabase(rebuilt.database, f.profileId);
+  try {
+    check(db);
+  } finally {
+    db.close();
+  }
+});
+
+test('the generic notice clears only after the final eligible ambiguity is resolved', (t) => {
+  const f = fixture(t);
+  f.raw('first', 'allergy');
+  f.raw('last', 'condition');
+  const check = (omitted: boolean) => {
+    for (const person of ['patient', f.managed]) {
+      const snapshot = packet(f.db, person);
+      assert.equal(snapshot.unassignedRawAssertionsOmitted, omitted);
+      if (omitted) {
+        assert.doesNotMatch(exportHtml(snapshot), /PRIVATE last/);
+        assert.doesNotMatch(JSON.stringify(exportEvidence(snapshot)), /PRIVATE last/);
+      }
+    }
+  };
+  check(true);
+  // Fixture transitions model the packet after authority exists; they are not
+  // an implementation of the deferred reviewed-assignment write path.
+  f.evidence('first', 'patient', 'report_subject');
+  check(true);
+  assert.deepEqual(ids(f.db), ['first']);
+  assert.deepEqual(ids(f.db, f.managed), []);
+  f.evidence('last', f.managed, 'report_subject');
+  check(false);
+  assert.deepEqual(ids(f.db), ['first']);
+  assert.deepEqual(ids(f.db, f.managed), ['last']);
 });
