@@ -14,6 +14,7 @@ import {
 import { pdfEvidenceSessionDiagnostics } from './intake-pdf-session.ts';
 import { createRecentPerformance, type PerformanceSummaryStore } from './import-performance.ts';
 import { isDiagnosticRoute } from '../shared/import-diagnostic-route.ts';
+import type { ImportDiagnosticEventWindow } from '../shared/import-performance.ts';
 import {
   createPrivateImportTrace,
   type PrivateImportTrace,
@@ -78,6 +79,7 @@ export interface ImportDiagnosticExport {
   events: ImportDiagnosticEvent[];
   retainedEvents: number;
   droppedEvents: number;
+  eventWindow: ImportDiagnosticEventWindow;
   coverage: 'bounded_metadata_only';
   privateTrace?: PrivateTraceStatus;
   recentPerformance?: ReturnType<ReturnType<typeof createRecentPerformance>['snapshot']>;
@@ -553,6 +555,7 @@ export function createImportDiagnostics({
   const detachedProfiles = new Set<string>();
   let closed = false;
   const dropped = new Map<string, number>();
+  const windows = new Map<string, { observedSince: string; observedEvents: number }>();
   const pendingTraceIds = new Map<string, { profileId: string; traceEventId: string }>();
   const consoleSalt = randomBytes(32);
   const activeScopes = new Map<number, ImportDiagnosticContext>();
@@ -614,6 +617,12 @@ export function createImportDiagnostics({
       context: publicContext(context),
       fields: safeFields(fields, traceEventId),
     };
+    const window = windows.get(context.profileId) || {
+      observedSince: entry.timestamp,
+      observedEvents: 0,
+    };
+    window.observedEvents++;
+    windows.set(context.profileId, window);
     try {
       recent.record(context.profileId, entry);
     } catch {
@@ -850,6 +859,16 @@ export function createImportDiagnostics({
         events: (buffers.get(profileId) || []).map((event) => anonymizeEvent(event, salt)),
         retainedEvents: buffers.get(profileId)?.length || 0,
         droppedEvents: dropped.get(profileId) || 0,
+        eventWindow: {
+          recording: enabled ? 'enabled' : 'disabled',
+          storage: 'memory_only',
+          capacity: boundedCapacity,
+          observedEvents: windows.get(profileId)?.observedEvents || 0,
+          observedSince: windows.get(profileId)?.observedSince || null,
+          notRetainedWhileDisabled: enabled ? 0 : windows.get(profileId)?.observedEvents || 0,
+          omittedBeforeWindow: null,
+          completeness: 'not_established',
+        },
         coverage: 'bounded_metadata_only',
         recentPerformance: (() => {
           const summary = recent.snapshot(profileId);
@@ -904,6 +923,7 @@ export function createImportDiagnostics({
       detachedProfiles.add(profileId);
       buffers.delete(profileId);
       dropped.delete(profileId);
+      windows.delete(profileId);
       for (const [id, pending] of pendingTraceIds)
         if (pending.profileId === profileId) pendingTraceIds.delete(id);
       for (const [id, context] of activeScopes)
@@ -928,6 +948,7 @@ export function createImportDiagnostics({
       } catch {}
       buffers.delete(profileId);
       dropped.delete(profileId);
+      windows.delete(profileId);
       for (const [key, pending] of pendingTraceIds)
         if (pending.profileId === profileId) pendingTraceIds.delete(key);
     },
@@ -942,6 +963,7 @@ export function createImportDiagnostics({
       eventLoop.disable();
       buffers.clear();
       dropped.clear();
+      windows.clear();
       pendingTraceIds.clear();
     },
   };

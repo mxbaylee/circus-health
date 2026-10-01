@@ -115,6 +115,16 @@ function snapshot(): ImportDiagnosticExport {
     events,
     retainedEvents: events.length,
     droppedEvents: 0,
+    eventWindow: {
+      recording: 'enabled',
+      storage: 'memory_only',
+      capacity: 10000,
+      observedEvents: events.length,
+      observedSince: events[0]?.timestamp ?? null,
+      notRetainedWhileDisabled: 0,
+      omittedBeforeWindow: null,
+      completeness: 'not_established',
+    },
     coverage: 'bounded_metadata_only',
     recentPerformance: {
       droppedOperations: 0,

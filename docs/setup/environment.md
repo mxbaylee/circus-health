@@ -43,7 +43,7 @@ The LiteLLM YAML must already exist (see [installation](installation.md)). Reusi
 - `CRS_PDF`: `auto` (default), `true`, or `false`. Native PDF requires a fictional runtime capability check even when true.
 - `CRS_PROMPT_CACHE`: `true`/`false` override of provider prompt-cache support. Default comes from proxy metadata, otherwise false. This does not enable a response cache.
 - `CRS_AI_PROXY_TIMEOUT_SECONDS`: integer 30–2,147,483; default 300 seconds per inference request. The upper bound follows the host timer range. Increase for slow local routes. The overall reading run yields after each slice and continues automatically.
-- `CRS_IMPORT_DIAGNOSTICS`: `true` enables detailed bounded metadata events and the sidebar download control; otherwise off. Basic authorized performance summaries remain available. This is not private payload tracing. Read the [privacy boundary](../import/import-performance.md) before sharing exports.
+- `CRS_IMPORT_DIAGNOSTICS`: `true` enables detailed bounded metadata events; otherwise detailed recording is off. The sidebar download and basic authorized performance summaries remain available in either mode. This is not private payload tracing. Read the [privacy boundary](../import/import-performance.md) before sharing exports.
 - `CRS_INTAKE_UPLOAD_MIB`: maximum upload size, default 128 MiB.
 - `CRS_INTAKE_EXTRACTION_MIB`: maximum in-memory text extraction size, default 64 MiB.
 - `CRS_CPUS`, `CRS_LITELLM_CPUS`: Compose CPU limits, defaults 2 and 1 respectively.

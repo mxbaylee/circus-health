@@ -1,4 +1,16 @@
 /** Content-free, bounded browser timings. These are observations, never acceptance authority. */
+export interface ImportDiagnosticEventWindow {
+  recording: 'enabled' | 'disabled';
+  storage: 'memory_only';
+  capacity: number;
+  observedEvents: number;
+  observedSince: string | null;
+  notRetainedWhileDisabled: number;
+  /** Prior process/lock/clear history cannot be counted by the current memory window. */
+  omittedBeforeWindow: null;
+  completeness: 'not_established';
+}
+
 export const clientOperationKinds = [
   'upload',
   'review_open',

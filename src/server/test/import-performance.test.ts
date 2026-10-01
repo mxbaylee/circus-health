@@ -144,6 +144,7 @@ test('failed and cancelled phases retain reason and unfinished work survives loc
   d.detachSummaryStore(profileId);
   assert.ok(bytes);
   assert.equal(summary(d).operations.length, 0);
+  assert.equal(d.exportSnapshot(profileId).eventWindow.observedEvents, 0);
   const next = createImportDiagnostics();
   next.attachSummaryStore(profileId, {
     read: () => bytes,
@@ -152,6 +153,10 @@ test('failed and cancelled phases retain reason and unfinished work survives loc
     },
   });
   const restored = summary(next);
+  assert.deepEqual(next.exportSnapshot(profileId).events, []);
+  assert.equal(next.exportSnapshot(profileId).eventWindow.observedSince, null);
+  assert.equal(next.exportSnapshot(profileId).eventWindow.omittedBeforeWindow, null);
+  assert.equal(next.exportSnapshot(profileId).eventWindow.completeness, 'not_established');
   assert.equal(restored.operations.length, 3);
   assert.ok(
     restored.operations.some(

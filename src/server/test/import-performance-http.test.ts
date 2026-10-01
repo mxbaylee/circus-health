@@ -60,6 +60,12 @@ test('profile API ingests strict browser summaries without diagnostic feedback a
   };
   const result = await snapshot();
   assert.equal(result.enabled, false);
+  assert.equal(result.eventWindow.recording, 'disabled');
+  assert.equal(result.eventWindow.storage, 'memory_only');
+  assert.equal(result.eventWindow.omittedBeforeWindow, null);
+  assert.ok(result.eventWindow.observedEvents > 0);
+  assert.equal(result.eventWindow.notRetainedWhileDisabled, result.eventWindow.observedEvents);
+  assert.deepEqual(result.events, []);
   const op = result.recentPerformance.operations.find(
     (entry: { operationId: string }) => entry.operationId === operationId,
   );
