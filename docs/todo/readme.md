@@ -50,11 +50,11 @@ Each open item shows its score after its sizes. When a size or mark changes, rec
 | --- | ------------------------------------------ | ----- | -------------------- | --------------------------------------------------------------------- |
 | 1 | 🔐 [CRS-153](#crs-153) passkeys            | 8     | 🔴, unblocks CRS-088 | Tap the passkey prompts on each device and browser                    |
 | 2 | 💽 [CRS-152](#crs-152) deployment drive    | 8     | 🔴                   | Connect or choose the drive                                           |
-| 3 | 👥 [CRS-124](#crs-124) People display      | 8     | 🟡 🐭, lower ID      | Inspect non-Self people in intended layouts                           |
-| 4 | 🎯 [CRS-118](CRS-118.md) source dependencies | 7 | Unblocks another item, lower ID | None |
-| 5 | 📦 [CRS-043](CRS-043.md) stream large imports | 7 | 🔴, lower ID | None |
+| 3 | 🧾 [CRS-156](CRS-156.md) historical assertion owners | 8 | 🔴, lower ID | None |
+| 4 | 👥 [CRS-124](#crs-124) People display | 8 | 🟡 🐭 | Inspect non-Self people in intended layouts |
+| 5 | 🎯 [CRS-118](CRS-118.md) source dependencies | 7 | Unblocks another item, lower ID | None |
 
-Next up: 🩺 [CRS-154](CRS-154.md) (7) when a real-provider complaint can be observed. ♻️ [CRS-155](CRS-155.md) scores 8 but waits for natural token expiry. 🗂️ [CRS-150](CRS-150.md) waits for 🩹 [CRS-085](CRS-085.md); 🧐 [CRS-073](#crs-073) waits for CRS-150.
+Next up: 📦 [CRS-043](CRS-043.md) (7, 🔴 lower ID), then 🩺 [CRS-154](CRS-154.md) (7) when a real-provider complaint can be observed. ♻️ [CRS-155](CRS-155.md) scores 8 but waits for natural token expiry. 🗂️ [CRS-150](CRS-150.md) waits for 🩹 [CRS-085](CRS-085.md); 🧐 [CRS-073](#crs-073) waits for CRS-150.
 
 ## <a id="product-and-maintenance"></a>🛠️ Product and maintenance
 
@@ -87,7 +87,7 @@ Next up: 🩺 [CRS-154](CRS-154.md) (7) when a real-provider complaint can be ob
 - [ ] <a id="crs-143"></a> 🕰️ [CRS-143](CRS-143.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Decide and show which record is current when corrections and new versions arrive; today the importer does not infer it and the chart has no outdated display (CRS-126 scenario 5).
 - [ ] <a id="crs-146"></a> 👣 [CRS-146](CRS-146.md) · 🐕 M · 🟡 M · score 4 — Log every sign-in (unlock) and failed attempt and show them clearly to the patient on their next sign-in; failed attempts happen before unlock, so they need a small separate log with no health data.
 - [ ] <a id="crs-150"></a> 🗂️ [CRS-150](CRS-150.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Offer job-based packet presets, per-category and per-record exclusions, a generic withheld-record disclosure and a one-page emergency summary; annual and emergency current-condition lists depend on [CRS-085](CRS-085.md). Remainder of CRS-147.
-- [ ] <a id="crs-156"></a> 🧾 [CRS-156](CRS-156.md) · 🐕 M · 🔴 L · 🚀 production · score 7 — Restore historical raw assertions to the correct person's packet only from durable proof or reviewed assignment; packets currently disclose unassigned assertions generically without printing them. Remainder of CRS-147.
+- [ ] <a id="crs-156"></a> 🧾 [CRS-156](CRS-156.md) · 🐕 M · 🔴 L · 🚀 production · score 8 — Restore historical raw assertions to the correct person's packet only from durable proof or reviewed assignment; packets currently disclose unassigned assertions generically without printing them. Remainder of CRS-147.
 - [ ] <a id="crs-148"></a> 🧳 [CRS-148](CRS-148.md) · 🐘 L · 🟡 M · score 3 — Export everything in a portable form, Takeout-style: originals, records, notes, corrections and history, with a manifest, for moving storage or keeping a checkpoint elsewhere.
 - [ ] <a id="crs-149"></a> 🎣 [CRS-149](CRS-149.md) · 🐭 S · 🟡 M · score 5 — Confirm and show the destination of external links in assistant text (warn when a link carries data), and test that one session's unlock never grants another session access.
 
