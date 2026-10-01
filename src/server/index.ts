@@ -1,3 +1,4 @@
+import { sourceAssertionOwnership } from './source-assertion-ownership.ts';
 import { handleRecordOwnershipRoute } from './record-ownership-routes.ts';
 import { recordOwner } from './record-owner.ts';
 import { readProfileRegistry, recoverProfileDeletions } from './profile-registry.ts';
@@ -657,6 +658,10 @@ export function createApp({
           return;
         }
         if (resource === 'source-records') {
+          if (id && action === 'ownership') {
+            respond(sourceAssertionOwnership(db, id));
+            return;
+          }
           if (id && action === 'evidence') {
             list(q.sourceRecordClinicalEvidence(db, id, params));
             return;

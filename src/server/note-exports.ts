@@ -1,3 +1,4 @@
+import { sourceAssertionBoundary } from './source-assertion-ownership.ts';
 import { recordOwner } from './record-owner.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 import { ownershipCorrections, type OwnershipCorrectionHistory } from './ownership-history.ts';
@@ -221,27 +222,14 @@ export interface NoteExportSnapshot {
 const unassignedAssertionDisclosure =
   'Some retained clinical assertions have no verified single-person assignment and were left out of this packet. Review the original records before relying on this packet as complete.';
 
-// Keep raw-history selection and its privacy-preserving omission notice on the
-// same provider, kind and representation boundary. Intake rows are notice-only:
-// their retained extraction is not an accepted additional clinical assertion.
-const rawAssertionKinds =
-  "'clinical_object','allergy','allergies','allergyintolerance','condition','conditions','diagnosis','diagnoses','encounter','encounters','visit','visits','immunization','immunizations'";
-const unrepresentedProviderAssertion = `sr.provider_id IN (SELECT id FROM providers WHERE lower(name) NOT LIKE '%personal%' AND lower(id) NOT IN ('personal','self'))
-  AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type<>'person')
-  AND NOT EXISTS (SELECT 1 FROM observations WHERE source_record_id=sr.id)
-  AND NOT EXISTS (SELECT 1 FROM medications WHERE source_record_id=sr.id)
-  AND NOT EXISTS (SELECT 1 FROM procedures WHERE source_record_id=sr.id)
-  AND NOT EXISTS (SELECT 1 FROM documents WHERE source_record_id=sr.id)`;
-const singleAssertionOwner = `(SELECT count(DISTINCT e.entity_id) FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject')=1
-  AND EXISTS (SELECT 1 FROM evidence e JOIN people p ON p.id=e.entity_id WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject')`;
+const assertionBoundary = sourceAssertionBoundary('sr');
 
 function unassignedPacketAssertions(db: Database): boolean {
   return !!db
     .prepare(
       `SELECT 1 FROM source_records sr
-    WHERE ${unrepresentedProviderAssertion}
-      AND lower(sr.kind) IN (${rawAssertionKinds},'intake_record','intake_document')
-      AND NOT (${singleAssertionOwner}) LIMIT 1`,
+    WHERE ${assertionBoundary.disclosure}
+      AND NOT ${assertionBoundary.singleOwner} LIMIT 1`,
     )
     .get();
 }
@@ -747,9 +735,8 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
     for (const row of db
       .prepare(
         `SELECT sr.id FROM source_records sr
-      WHERE ${unrepresentedProviderAssertion}
-        AND lower(sr.kind) IN (${rawAssertionKinds})
-        AND (${singleAssertionOwner})
+      WHERE ${assertionBoundary.additional}
+        AND ${assertionBoundary.singleOwner}
         AND EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id=? AND e.source_record_id=sr.id AND e.role='report_subject')
       ORDER BY sr.id`,
       )

@@ -181,6 +181,23 @@ export interface SourceRecordReference extends Omit<
   ancestorFiles?: SourceFileReference[];
 }
 export type SourceRecordFileView = 'full' | 'reference';
+/** Current exact report-subject evidence; never a commit token or original-integrity proof. */
+export interface SourceAssertionOwnership {
+  sourceRecordId: string;
+  /** Profile-relative API URL; includes retained original references in the existing source view. */
+  sourceRecordUrl: string;
+  packetRole: 'additional_assertion' | 'notice_only' | 'outside_scope';
+  state: 'unassigned' | 'single' | 'conflicting' | 'dangling';
+  ownerPersonId: string | null;
+  subjects: {
+    items: { personId: string; personExists: boolean }[];
+    total: number;
+    limit: number;
+    truncated: boolean;
+  };
+  originalIntegrity: 'not_checked';
+  assignmentAuthority: 'read_only';
+}
 export interface Evidence {
   id: string;
   sourceRecordId: string;
