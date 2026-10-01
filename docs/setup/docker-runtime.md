@@ -85,6 +85,20 @@ Startup and health under load remain variable on the validation host: an 8 GiB M
 
 That earlier cold run exceeded its original 15-minute harness timeout while building browser dependencies and running alongside host tests on an 8 GiB machine. The complete warm run passed with a 30-minute harness bound; this is validation elapsed time, not import throughput. Run `CRS_LAUNCH_TEST=1 node --test src/server/test/launch.integration.test.ts` with supported contributor dependencies to repeat the fictional test. It removes only its own containers and network.
 
+### Deployment drive qualification
+
+For an existing external `/data` directory on the drive to be used, an already built application image and a separate existing external receipt directory, run:
+
+```sh
+CRS_DRIVE_QUALIFICATION=1 CRS_DATA_DIR=/absolute/path/data \
+CRS_IMAGE=circus-health:qualified-build \
+CRS_QUALIFICATION_OUTPUT_DIR=/absolute/path/receipts npm run qualify:drive
+```
+
+This opt-in command creates only a fresh fictional scratch directory under the selected data directory. It tests exclusive creation, hard links, publication rename, file and directory fsync, rejection of a concurrent writer, retained lock inodes, normal release and forced-kill reacquisition. It repeats the checks with UID 1000 in a read-only-root, network-disabled application container, then starts a new container to verify the first container's exact publication and reacquire its writer lease. The probe uses the current repository's storage-lock source. It never opens an existing profile, mounts provider credentials or changes the archive's writer-domain marker. Only its own scratch directory is removed; a metadata-only receipt is created with mode 0600 outside the archive and Git.
+
+A passing receipt establishes these filesystem/mount operations on that installation. It does not establish power-loss durability, actual provider credential persistence or a complete import lifecycle; those remaining gates are [CRS-152](../todo/CRS-152.md). An unavailable image, denied mount, unsupported filesystem operation, corrupted publication or unexpected container result fails explicitly. The UID 1000 container probe currently runs only on macOS Docker Desktop. It refuses Linux before creating scratch data because a different host UID can prevent container access or cleanup. Linux support needs an explicit mount identity and cleanup design. `npm run check:data` remains a location check, rather than a filesystem qualification.
+
 For a smaller startup-only check, this smoke recipe starts an isolated archive/state with a fictional model route pointed at a closed container-local port. It uses no provider credentials or real records. Choose a free browser port before running it:
 
 ```sh

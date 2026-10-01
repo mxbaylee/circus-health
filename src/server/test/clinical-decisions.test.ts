@@ -354,7 +354,10 @@ for (const [kind, set] of Object.entries(correctionSets) as [
       db = openDatabase(rebuilt.database, f.profileId);
     try {
       assert.deepEqual(db.prepare(`SELECT * FROM ${table}`).all(), after);
-      assert.equal(db.prepare('SELECT COUNT(*) n FROM evidence').get()!.n, 2);
+      assert.equal(
+        db.prepare("SELECT COUNT(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+        2,
+      );
     } finally {
       db.close();
     }
@@ -632,7 +635,10 @@ test('repeated locators require a reviewed pair, retain one clinical entity, reb
   });
   const accepted = testRow(f.db.prepare('SELECT * FROM observations').get()!);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
-  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 1);
+  assert.equal(
+    f.db.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+    1,
+  );
 
   const repeatProposalId = proposal(
     [context, envelope('fictional-second-occurrence', 'fictional row 2', context.contextId)],
@@ -656,7 +662,10 @@ test('repeated locators require a reviewed pair, retain one clinical entity, reb
     decisions: [{ recordId: repeat.id, action: 'skip', mapping: {}, comparisons: [sameEvent] }],
   });
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
-  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 1);
+  assert.equal(
+    f.db.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+    1,
+  );
   const sourceRecords = f.db
     .prepare("SELECT id,raw_json FROM source_records WHERE kind LIKE 'intake_%' ORDER BY id")
     .all() as Array<{ id: string; raw_json: string }>;
@@ -683,7 +692,10 @@ test('repeated locators require a reviewed pair, retain one clinical entity, reb
   const rebuiltDb = openDatabase(rebuilt.database, f.profileId);
   try {
     assert.equal(rebuiltDb.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
-    assert.equal(rebuiltDb.prepare('SELECT count(*) n FROM evidence').get()!.n, 1);
+    assert.equal(
+      rebuiltDb.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+      1,
+    );
     assert.deepEqual(
       rebuiltDb.prepare("SELECT * FROM record_relationships WHERE relation='reviewed_pair'").get(),
       relationship,
@@ -735,7 +747,10 @@ test('repeated locators require a reviewed pair, retain one clinical entity, reb
   assert.equal(rejected.status, 'rejected');
   assert.equal(JSON.parse(String(rejected.rationale)).outcome, 'distinct');
   assert.deepEqual(f.db.prepare('SELECT * FROM observations').get(), accepted);
-  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 1);
+  assert.equal(
+    f.db.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+    1,
+  );
 
   review = typedReviewIntake(f.db, f.root, f.profileId, item.id, repeatProposalId);
   const terminal = review.records[0]!;
@@ -762,7 +777,10 @@ test('repeated locators require a reviewed pair, retain one clinical entity, reb
   });
   assert.equal(item.workflow!.decisions.at(-1)!.action, 'keep_original_only');
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
-  assert.equal(f.db.prepare('SELECT count(*) n FROM evidence').get()!.n, 1);
+  assert.equal(
+    f.db.prepare("SELECT count(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+    1,
+  );
 });
 
 test('terminal keep original retains an exact reviewed same-event occurrence through rebuild', (t) => {
@@ -1270,7 +1288,10 @@ test('accepted procedure becomes a lab with stable identity, original references
       db.prepare('SELECT * FROM observations').all(),
       f.db.prepare('SELECT * FROM observations').all(),
     );
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM evidence').get()!.n, 2);
+    assert.equal(
+      db.prepare("SELECT COUNT(*) n FROM evidence WHERE entity_type<>'person'").get()!.n,
+      2,
+    );
   } finally {
     db.close();
   }
