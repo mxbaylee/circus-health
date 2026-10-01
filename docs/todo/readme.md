@@ -49,8 +49,8 @@ Each open item shows its score after its sizes. When a size or mark changes, rec
 | #   | Ticket                                     | Score | Tie-break            | Owner input                                                           |
 | --- | ------------------------------------------ | ----- | -------------------- | --------------------------------------------------------------------- |
 | 1   | 🔐 [CRS-072](#crs-072) passkeys            | 8     | 🔴, unblocks CRS-088 | Tap the passkey prompts on each device and browser                    |
-| 2   | 💽 [CRS-152](#crs-152) deployment drive    | 8     | 🔴, lower ID         | Connect or choose the drive                                           |
-| 3   | 👨‍👦 [CRS-138](CRS-138.md) suffix-only names | 8     | 🔴                   | Decide whether a suffix-only difference should ask (recommended: yes) |
+| 2   | 👨‍👦 [CRS-138](CRS-138.md) suffix-only names | 8     | 🔴, lower ID         | Decide whether a suffix-only difference should ask (recommended: yes) |
+| 3   | 💽 [CRS-152](#crs-152) deployment drive    | 8     | 🔴                   | Connect or choose the drive                                           |
 | 4   | 🩺 [CRS-038](#crs-038) diagnostics export  | 8     | 🟡 🐭, lower ID      | A provider sign-in, plus approval for one real import run             |
 | 5   | ♻️ [CRS-063](#crs-063) OAuth refresh       | 8     | 🟡 🐭, lower ID      | A provider sign-in                                                    |
 

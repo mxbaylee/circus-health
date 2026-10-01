@@ -81,7 +81,7 @@ export async function qualifyDrive(env: NodeJS.ProcessEnv = process.env) {
     assert.deepEqual(recreated, { publicationRetained: true, writerReacquired: true });
     const receipt = {
       schemaVersion: 1,
-      task: 'CRS-071',
+      task: 'CRS-152',
       independentlyFictional: true,
       scope: 'Host and container mount semantics, publication retained after container recreation.',
       passed: true,
