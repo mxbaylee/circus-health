@@ -757,6 +757,29 @@ export function assessIdentityPolicy({
         .map((owner) => [owner.personId, owner]),
     ).values(),
   ];
+  const generationalName = (name: string): { base: string; suffix: string | null } => {
+    const printed = name.normalize('NFKC').trim();
+    const surnameFirst = printed.match(/^([^,]+),\s*(.+?)\s+(jr\.?|sr\.?|ii|iii|iv)\.?$/iu);
+    const ordered = surnameFirst
+      ? `${surnameFirst[2]} ${surnameFirst[1]} ${surnameFirst[3]}`
+      : printed;
+    const canonical = canonicalIdentityName(ordered);
+    const match = canonical.match(/^(.*?)\s+(jr|sr|ii|iii|iv)\.?$/u);
+    return match ? { base: match[1]!, suffix: match[2]! } : { base: canonical, suffix: null };
+  };
+  const printedName = fullName ? generationalName(fullName) : null;
+  const suffixAmbiguity =
+    !!printedName &&
+    !printedName.suffix &&
+    distinctOwners.length === 1 &&
+    owners.some(
+      (owner) =>
+        owner.personId !== distinctOwners[0]!.personId &&
+        owner.names.some((name) => {
+          const saved = generationalName(name);
+          return !!saved.suffix && saved.base === printedName.base;
+        }),
+    );
   const challengedName =
     !!fullName &&
     [self, ...people].some((owner) =>
@@ -852,6 +875,10 @@ export function assessIdentityPolicy({
     latestPersonChoice.scope.groupVersionId === groupVersionId
       ? latestPersonChoice
       : undefined;
+  const ownSelfReceipt =
+    latestPersonChoice?.outcome === 'this_is_me' &&
+    latestPersonChoice.scope.groupId === group?.id &&
+    latestPersonChoice.scope.groupVersionId === groupVersionId;
   if (
     latestPersonChoice?.outcome === 'this_is_person' &&
     !ownPersonReceipt &&
@@ -867,7 +894,7 @@ export function assessIdentityPolicy({
     };
   if (
     latestPersonChoice?.outcome === 'this_is_me' &&
-    latestPersonChoice.scope.groupId !== group?.id &&
+    !ownSelfReceipt &&
     distinctOwners.length < 2 &&
     matchedOwner?.personId !== 'patient'
   )
@@ -882,15 +909,20 @@ export function assessIdentityPolicy({
   // cannot decide between same-named owners or override B's banner against
   // the owner it would actually assign, even when there is no unique match.
   // B's own applicable confirmation still resolves its ownership question.
-  const borrowedSelfReceipt =
-    latestPersonChoice?.outcome === 'this_is_me' && latestPersonChoice.scope.groupId !== group?.id;
+  const borrowedSelfReceipt = latestPersonChoice?.outcome === 'this_is_me' && !ownSelfReceipt;
+  const reusableSelfReceipt = (candidate: ReturnType<typeof receiptFor>) =>
+    candidate?.outcome === 'this_is_me' &&
+    ((candidate.scope.groupId === group?.id && candidate.scope.groupVersionId === groupVersionId) ||
+      (!unreadableBirthDate &&
+        distinctOwners.length <= 1 &&
+        !suffixAmbiguity &&
+        !bannerIncompatibleWith(owners[0])));
   const receipt =
     latestPersonChoice?.outcome === 'this_is_me' &&
-    (!borrowedSelfReceipt ||
-      (!unreadableBirthDate && distinctOwners.length <= 1 && !bannerIncompatibleWith(owners[0])))
+    (!borrowedSelfReceipt || reusableSelfReceipt(latestPersonChoice))
       ? latestPersonChoice
       : undefined;
-  const explicitReceipt =
+  const explicitCandidate =
     explicitlyConfirmedOperationId && group && groupVersionId
       ? receiptFor(
           receipts?.filter((candidate) => candidate.operationId === explicitlyConfirmedOperationId),
@@ -902,6 +934,12 @@ export function assessIdentityPolicy({
           group.report?.subject?.text || null,
         )
       : undefined;
+  // An operation ID identifies the old decision; it is not a fresh review of
+  // changed membership or current identity clues. Apply the same reuse gate.
+  const explicitReceipt =
+    explicitCandidate?.outcome === 'this_is_me' && !reusableSelfReceipt(explicitCandidate)
+      ? undefined
+      : explicitCandidate;
   if (
     challengedName &&
     !explicitReceipt &&
@@ -974,6 +1012,7 @@ export function assessIdentityPolicy({
   if (
     resolutionOperationId &&
     !ownPersonReceipt &&
+    (!suffixAmbiguity || ownSelfReceipt) &&
     !selfBirthDateConflict &&
     !conflicts.some((conflict) => conflict.reason === 'evidence_disagreement')
   )
@@ -1048,6 +1087,15 @@ export function assessIdentityPolicy({
       },
     };
   }
+  if (suffixAmbiguity && !ownSelfReceipt)
+    return {
+      ...common,
+      confidence: 'none',
+      status: 'confirmation_required',
+      blocking: true,
+      message:
+        'This printed name could belong to people whose saved names differ only by a generational suffix. Choose who this report belongs to.',
+    };
   if (distinctOwners.length > 1)
     return {
       ...common,

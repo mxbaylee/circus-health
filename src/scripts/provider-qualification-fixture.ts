@@ -9,7 +9,7 @@ export const qualificationPerson = 'Fictional Qualification Person';
 export const qualificationBirthDate = '1982-04-17';
 export const qualificationSourceSystem = 'Fictional Qualification System';
 export type QualificationStage = 'extracted' | 'accepted';
-export type QualificationScenario = 'quick' | 'long';
+export type QualificationScenario = 'tiny' | 'quick' | 'long';
 export interface QualificationAnswer {
   page: number;
   format: 'dense' | 'scan';
@@ -20,57 +20,60 @@ export interface QualificationAnswer {
 export function answersForQualification(
   scenario: QualificationScenario,
 ): readonly QualificationAnswer[] {
-  return Array.from({ length: scenario === 'quick' ? 64 : 400 }, (_, index) => {
-    const rows = scenario === 'quick' ? 16 : 4;
-    const page = Math.floor(index / rows) + 1;
-    const row = index % rows;
-    const marker = `FXP${page}R${String(row + 1).padStart(2, '0')}`;
-    const date = `2026-${String(Math.floor((page - 1) / 28) + 1).padStart(2, '0')}-${String(((page - 1) % 28) + 1).padStart(2, '0')}`;
-    const kind =
-      scenario === 'quick' || row < 2 ? 'observation' : row === 2 ? 'medication' : 'procedure';
-    const fields: Partial<IntakeClinicalMapping> =
-      kind === 'observation'
-        ? {
-            testLabel: marker,
-            eventKind: 'performed',
-            status: 'final',
-            observationCategory: 'laboratory',
-            specimen: '',
-            method: '',
-            date,
-            valueText:
-              row % 7 === 0 ? `<${(0.01 * page).toFixed(2)}` : (page + row * 0.17).toFixed(2),
-            unit: row % 3 === 0 ? 'mg/dL' : row % 3 === 1 ? 'U/L' : 'mmol/L',
-            referenceText: '0.01 - 9.99',
-          }
-        : kind === 'medication'
+  return Array.from(
+    { length: scenario === 'tiny' ? 4 : scenario === 'quick' ? 64 : 400 },
+    (_, index) => {
+      const rows = scenario === 'quick' ? 16 : 4;
+      const page = Math.floor(index / rows) + 1;
+      const row = index % rows;
+      const marker = `FXP${page}R${String(row + 1).padStart(2, '0')}`;
+      const date = `2026-${String(Math.floor((page - 1) / 28) + 1).padStart(2, '0')}-${String(((page - 1) % 28) + 1).padStart(2, '0')}`;
+      const kind =
+        scenario !== 'long' || row < 2 ? 'observation' : row === 2 ? 'medication' : 'procedure';
+      const fields: Partial<IntakeClinicalMapping> =
+        kind === 'observation'
           ? {
-              medicationName: marker,
-              medicationKind: 'order',
-              eventKind: 'order',
-              dateRole: 'recorded',
-              date,
-              doseText: `${page + 1} mg`,
-              route: 'oral',
-              frequency: 'once daily',
-              startDate: '',
-              endDate: '',
-            }
-          : {
-              procedureLabel: marker,
-              procedureCategory: 'imaging',
-              date,
+              testLabel: marker,
               eventKind: 'performed',
-              status: 'completed',
-            };
-    return {
-      page,
-      format: page % 2 ? 'dense' : 'scan',
-      marker,
-      kind,
-      fields: { ...fields, subject: 'self', sourceSystem: qualificationSourceSystem },
-    };
-  });
+              status: 'final',
+              observationCategory: 'laboratory',
+              specimen: '',
+              method: '',
+              date,
+              valueText:
+                row % 7 === 0 ? `<${(0.01 * page).toFixed(2)}` : (page + row * 0.17).toFixed(2),
+              unit: row % 3 === 0 ? 'mg/dL' : row % 3 === 1 ? 'U/L' : 'mmol/L',
+              referenceText: '0.01 - 9.99',
+            }
+          : kind === 'medication'
+            ? {
+                medicationName: marker,
+                medicationKind: 'order',
+                eventKind: 'order',
+                dateRole: 'recorded',
+                date,
+                doseText: `${page + 1} mg`,
+                route: 'oral',
+                frequency: 'once daily',
+                startDate: '',
+                endDate: '',
+              }
+            : {
+                procedureLabel: marker,
+                procedureCategory: 'imaging',
+                date,
+                eventKind: 'performed',
+                status: 'completed',
+              };
+      return {
+        page,
+        format: page % 2 ? 'dense' : 'scan',
+        marker,
+        kind,
+        fields: { ...fields, subject: 'self', sourceSystem: qualificationSourceSystem },
+      };
+    },
+  );
 }
 export const qualificationAnswers = answersForQualification('quick');
 const escaped = (value: string) => value.replace(/[\\()]/g, '\\$&');
@@ -138,7 +141,7 @@ export function writeProviderQualificationPdf(
         9,
       ],
     ];
-    if (scenario === 'quick') {
+    if (scenario !== 'long') {
       lines.push(
         [
           'No external patient/record IDs or terminology codes supplied. FX markers are labels only.',
