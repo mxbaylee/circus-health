@@ -49,7 +49,6 @@ Current limitations, open in [CRS-140](../todo/CRS-140.md):
 - A unit whose request keeps timing out is retried as an unknown outcome at the normal pace, and each retry may be billed. There is deliberately no attempt cap (owner decision, 2026-09-30); the missing part is cooling: per-unit backoff, lower concurrency or a longer deadline, with a status that never needs the person to act.
 - Signing in again at the provider is not detected; a successful connection test is needed.
 - An authentication wait journals an entry on every check, even when nothing changed.
-- Reprocess on one stopped file resumes every stopped file in its batch.
 
 ## Validation boundaries
 
