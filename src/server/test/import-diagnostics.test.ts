@@ -71,7 +71,12 @@ function fixture(t: TestContext) {
 }
 
 test('bounded profile diagnostics correlate async work and export salted identifiers', async () => {
-  const diagnostics = createImportDiagnostics({ enabled: true, capacity: 10 });
+  let tick = Date.parse('2026-01-01T00:00:00Z');
+  const diagnostics = createImportDiagnostics({
+    enabled: true,
+    capacity: 10,
+    now: () => new Date(tick++),
+  });
   await diagnostics.run(
     {
       profileId: 'fictional-profile',
@@ -99,6 +104,19 @@ test('bounded profile diagnostics correlate async work and export salted identif
   const exported = diagnostics.exportSnapshot('fictional-profile');
   assert.equal(exported.events.length, 10);
   assert.equal(exported.droppedEvents, 2);
+  assert.deepEqual(exported.eventWindow, {
+    recording: 'enabled',
+    storage: 'memory_only',
+    capacity: 10,
+    observedEvents: 12,
+    observedSince: '2026-01-01T00:00:00.000Z',
+    notRetainedWhileDisabled: 0,
+    omittedBeforeWindow: null,
+    completeness: 'not_established',
+  });
+  // The first observation can predate every retained event after overflow.
+  assert.ok(exported.eventWindow.observedSince! < exported.events[0]!.timestamp);
+  assert.equal(diagnostics.exportSnapshot('another-profile').eventWindow.observedEvents, 0);
   assert.notEqual(exported.events[0]?.context.requestId, 'request-stable-id');
   assert.equal(
     exported.events[0]?.context.requestId,
@@ -107,6 +125,30 @@ test('bounded profile diagnostics correlate async work and export salted identif
   );
   assert.doesNotMatch(JSON.stringify(exported), /stable-id|patient narrative/);
   diagnostics.close();
+});
+
+test('disabled detailed windows count only current profile observations and reset with lifecycle', () => {
+  const diagnostics = createImportDiagnostics({ enabled: false });
+  for (const profileId of ['fictional-alpha', 'fictional-alpha', 'fictional-beta'])
+    diagnostics.record('import.progress', {}, { profileId });
+  const exported = diagnostics.exportSnapshot('fictional-alpha');
+  assert.equal(exported.eventWindow.recording, 'disabled');
+  assert.equal(exported.eventWindow.observedEvents, 2);
+  assert.equal(exported.eventWindow.notRetainedWhileDisabled, 2);
+  assert.equal(exported.eventWindow.omittedBeforeWindow, null);
+  assert.deepEqual(exported.events, []);
+  assert.equal(exported.droppedEvents, 0);
+  diagnostics.clear('fictional-alpha');
+  diagnostics.record('import.progress', {}, { profileId: 'fictional-alpha' });
+  assert.equal(diagnostics.exportSnapshot('fictional-alpha').eventWindow.observedSince, null);
+  assert.equal(diagnostics.exportSnapshot('fictional-beta').eventWindow.observedEvents, 1);
+  diagnostics.detachSummaryStore('fictional-beta');
+  assert.equal(diagnostics.exportSnapshot('fictional-beta').eventWindow.observedEvents, 0);
+  diagnostics.attachSummaryStore('fictional-alpha', { read: () => null, write: () => {} });
+  diagnostics.record('import.progress', {}, { profileId: 'fictional-alpha' });
+  assert.equal(diagnostics.exportSnapshot('fictional-alpha').eventWindow.observedEvents, 1);
+  diagnostics.close();
+  assert.equal(diagnostics.exportSnapshot('fictional-alpha').eventWindow.observedEvents, 0);
 });
 
 test('exports preserve random browser HTTP correlation but salt source and arbitrary identifiers', () => {

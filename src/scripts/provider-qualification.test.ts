@@ -151,6 +151,16 @@ test('qualification usage totals preserve unreported cache values and recorder l
     consoleScopeId: '',
     retainedEvents: 4,
     droppedEvents: 0,
+    eventWindow: {
+      recording: 'enabled',
+      storage: 'memory_only',
+      capacity: 10000,
+      observedEvents: 4,
+      observedSince: '2026-01-01T00:00:00Z',
+      notRetainedWhileDisabled: 0,
+      omittedBeforeWindow: null,
+      completeness: 'not_established',
+    },
     coverage: 'bounded_metadata_only',
     events: [1, 2, 3, 4].map((sequence) => ({
       schemaVersion: 1,
