@@ -2830,7 +2830,10 @@ export function createAssistant({
           if (typeof args.page === 'number') observeSourcePages(id, [args.page]);
           else (state.unknownSourceCoverage ||= new Set()).add(id);
         }
-        if (passage.reviewHistory.length) (state.unknownSourceCoverage ||= new Set()).add(id);
+        const reviewedPages = passage.reviewHistory.flatMap((entry) =>
+          entry.event ? [entry.event.scope.page] : [],
+        );
+        if (reviewedPages.length) observeSourcePages(id, reviewedPages);
         (state.sourceTextReads ||= new Map()).set(
           stringArgument(args, 'id'),
           currentIntakeSourceTextRevisionId(
