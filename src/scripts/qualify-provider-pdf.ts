@@ -1,5 +1,5 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import {
   chmodSync,
@@ -413,6 +413,7 @@ async function main() {
     input?: unknown,
     bytes?: Buffer,
     signal: AbortSignal = controller.signal,
+    clientRequestId?: string,
   ): Promise<T> {
     const response = await fetch(base + path, {
       method: input !== undefined || bytes ? 'POST' : 'GET',
@@ -420,6 +421,7 @@ async function main() {
         Origin: base,
         Cookie: cookie,
         'Content-Type': bytes ? 'application/pdf' : 'application/json',
+        ...(clientRequestId ? { 'X-Client-Request-ID': clientRequestId } : {}),
         ...(bytes
           ? {
               'X-Filename': fixtureFilename,
@@ -440,6 +442,7 @@ async function main() {
     check(response.ok, `Qualification HTTP request failed with status ${response.status}.`);
     return ((await response.json()) as { data: T }).data;
   }
+  const reviewFeedClientRequestIds = new Set<string>();
   async function collectFeed(
     prefix: string,
     signal = controller.signal,
@@ -451,6 +454,8 @@ async function main() {
     let cursor: string | null = null;
     const seen = new Set<string>();
     do {
+      const clientRequestId = diagnosticRequested ? randomUUID() : undefined;
+      if (clientRequestId) reviewFeedClientRequestIds.add(clientRequestId);
       feed = await request<IntakeImportFeed>(
         prefix +
           '/intakes/import-feed?view=all&limit=100' +
@@ -458,6 +463,7 @@ async function main() {
         undefined,
         undefined,
         signal,
+        clientRequestId,
       );
       blocks.push(...feed.blocks);
       pages.push(feed);
@@ -786,12 +792,16 @@ async function main() {
         stage('reading_initial_diagnostics');
         const before = await request<ImportDiagnosticExport>(prefix + '/import-diagnostics');
         const sequence = Math.max(0, ...before.events.map((event) => event.sequence));
+        reviewFeedClientRequestIds.clear();
+        const uploadClientRequestId = diagnosticRequested ? randomUUID() : undefined;
         const started = performance.now();
         stage('uploading');
         const uploaded = await request<Intake>(
           prefix + '/intakes',
           undefined,
           readFileSync(fixturePath),
+          controller.signal,
+          uploadClientRequestId,
         );
         activeReview.originalId = uploaded.id;
         stage('starting_batch');
@@ -910,6 +920,10 @@ async function main() {
                       afterAcceptance,
                       sequence,
                       fixture.pages,
+                      {
+                        uploadClientRequestId: uploadClientRequestId!,
+                        reviewFeedClientRequestIds: [...reviewFeedClientRequestIds],
+                      },
                     );
                     save();
                   },

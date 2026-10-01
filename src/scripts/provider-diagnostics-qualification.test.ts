@@ -6,45 +6,83 @@ import type {
 } from '../server/import-diagnostics.ts';
 import { gradeDiagnosticLifecycle } from './provider-diagnostics-qualification.ts';
 
+const importId = 'fictional-import';
+const runId = 'fictional-run';
+const sliceId = 'fictional-slice';
+const turnId = 'fictional-turn';
+const providerRequestId = 'fictional-provider-request';
+const uploadClientRequestId = '00000000-0000-4000-8000-000000000001';
+const reviewClientRequestId = '00000000-0000-4000-8000-000000000002';
+const expected = {
+  uploadClientRequestId,
+  reviewFeedClientRequestIds: [reviewClientRequestId],
+};
+const runContext = { importId, runId, sliceId };
+const modelContext = { ...runContext, turnId, providerRequestId };
+
 function snapshot(): ImportDiagnosticExport {
-  const names: ImportDiagnosticEvent['event'][] = [
+  const events: ImportDiagnosticEvent[] = [];
+  const add = (
+    event: ImportDiagnosticEvent['event'],
+    context: ImportDiagnosticEvent['context'],
+    fields: ImportDiagnosticEvent['fields'] = {},
+  ) => {
+    const sequence = events.length + 1;
+    events.push({
+      schemaVersion: 1,
+      sequence,
+      timestamp: '2026-09-30T00:00:00.000Z',
+      monotonicMs: sequence,
+      event,
+      context: { ...context },
+      fields: { ...fields },
+    });
+  };
+  add(
+    'import.phase.started',
+    { requestId: 'upload-request', clientRequestId: uploadClientRequestId },
+    { phase: 'upload_receive' },
+  );
+  add(
     'import.phase.completed',
-    'import.active.started',
-    'model.request.started',
-    'model.tool.completed',
-    'model.request.completed',
-    'import.active.completed',
-    'import.phase.completed',
-    'import.phase.completed',
-    'import.phase.completed',
-  ];
-  const events: ImportDiagnosticEvent[] = names.map((event, index) => ({
-    schemaVersion: 1,
-    sequence: index + 1,
-    timestamp: '2026-09-30T00:00:00.000Z',
-    monotonicMs: index + 1,
-    event,
-    context: {
-      importId: 'fictional-import',
-      providerRequestId: 'fictional-request',
-      runId: 'fictional-run',
-      sliceId: 'fictional-slice',
+    {
+      requestId: 'upload-request',
+      clientRequestId: uploadClientRequestId,
+      spanId: 'original-publish-span',
     },
-    fields: (event === 'import.phase.completed'
-      ? {
-          phase:
-            index === 0
-              ? 'upload_receive'
-              : index === 6
-                ? 'review_feed_query'
-                : index === 7
-                  ? 'review_acceptance_validation'
-                  : 'review_acceptance_apply',
-        }
-      : event === 'model.tool.completed'
-        ? { toolName: 'health_intake_read', page: 1, firstRead: true, pdfBytes: 123 }
-        : {}) as ImportDiagnosticEvent['fields'],
-  }));
+    { phase: 'upload_original_publish' },
+  );
+  add(
+    'import.phase.completed',
+    { requestId: 'upload-request', clientRequestId: uploadClientRequestId },
+    { phase: 'upload_receive' },
+  );
+  add(
+    'import.phase.completed',
+    { importId, batchId: 'fictional-batch' },
+    { phase: 'processing_queue' },
+  );
+  add('import.active.started', runContext);
+  add('model.request.started', modelContext);
+  add('model.request.completed', modelContext);
+  add(
+    'model.tool.completed',
+    { ...runContext, turnId },
+    { toolName: 'health_intake_read', page: 1, firstRead: true, pdfBytes: 123 },
+  );
+  add(
+    'import.phase.completed',
+    { importId, parentSpanId: 'original-publish-span' },
+    { phase: 'upload_original_publish' },
+  );
+  add('import.active.completed', runContext);
+  add(
+    'import.phase.completed',
+    { requestId: 'review-request', clientRequestId: reviewClientRequestId },
+    { phase: 'review_feed_query' },
+  );
+  add('import.phase.completed', { importId }, { phase: 'review_acceptance_validation' });
+  add('import.phase.completed', { importId }, { phase: 'review_acceptance_apply' });
   return {
     schemaVersion: 1,
     generatedAt: '2026-09-30T00:00:00.000Z',
@@ -58,94 +96,110 @@ function snapshot(): ImportDiagnosticExport {
       droppedOperations: 0,
       readFailures: 0,
       writeFailures: 0,
-      operations: [],
+      operations: [
+        {
+          relatedImportIds: [importId],
+          context: runContext,
+          status: 'completed',
+          spans: ['processing_active', 'provider_request', 'tool_execution'].map((phase) => ({
+            phase,
+            durationMs: 1,
+          })),
+          droppedEvents: 0,
+          relatedImportIdsTruncated: false,
+          lifecycleIncomplete: false,
+          phaseTotalsTruncated: false,
+          recoverySequenceDropped: 0,
+        },
+      ],
     } as unknown as NonNullable<ImportDiagnosticExport['recentPerformance']>,
   };
 }
 
-test('diagnostics reconstruct one correlated completed import without fixture content', () => {
-  const grade = gradeDiagnosticLifecycle(snapshot(), 0, 1);
-  assert.equal(grade.passed, true);
-  assert.equal(grade.completedModelRequests, 1);
-  assert.deepEqual(grade.pagesRead, [1]);
+const grade = (value: ImportDiagnosticExport) => gradeDiagnosticLifecycle(value, 0, 1, expected);
+const resequence = (value: ImportDiagnosticExport) => {
+  value.events.forEach((event, index) => {
+    event.sequence = index + 1;
+    event.monotonicMs = index + 1;
+  });
+};
+
+test('realistic returned-tool ordering and correlated lifecycle pass the bounded oracle', () => {
+  const result = grade(snapshot());
+  assert.equal(result.passed, true, result.reasons.join(','));
+  assert.deepEqual(result.pagesRead, [1]);
+  assert.equal(result.completedModelRequests, 1);
 });
 
-test('diagnostics reject missing requests, retention loss, truncation and clinical canaries', () => {
+test('missing, reversed, or unrelated provider responses and source reads fail closed', () => {
   const missing = snapshot();
-  missing.events.splice(4, 1);
+  missing.events.splice(6, 1);
   missing.retainedEvents--;
-  assert.ok(gradeDiagnosticLifecycle(missing, 0, 1).reasons.includes('unpaired_model_requests'));
-  const reversed = snapshot();
-  reversed.events[2]!.event = 'model.request.completed';
-  reversed.events[4]!.event = 'model.request.started';
-  assert.ok(gradeDiagnosticLifecycle(reversed, 0, 1).reasons.includes('unpaired_model_requests'));
+  assert.ok(grade(missing).reasons.includes('unpaired_model_requests'));
+  const beforeResponse = snapshot();
+  const read = beforeResponse.events.splice(7, 1)[0]!;
+  beforeResponse.events.splice(6, 0, read);
+  resequence(beforeResponse);
+  assert.ok(grade(beforeResponse).reasons.includes('missing_completed_page_reads'));
+  const otherRun = snapshot();
+  otherRun.events[7]!.context.runId = 'unrelated-run';
+  assert.ok(grade(otherRun).reasons.includes('missing_completed_page_reads'));
+  const otherImport = snapshot();
+  otherImport.events[6]!.context.importId = 'unrelated-import';
+  assert.ok(grade(otherImport).reasons.includes('missing_import_correlation'));
+});
+
+test('active run must enclose the model requests and read with the same run and slice', () => {
+  const swappedEnd = snapshot();
+  swappedEnd.events[9]!.context.runId = 'unrelated-run';
+  assert.ok(grade(swappedEnd).reasons.includes('incomplete_active_lifecycle'));
+  const earlyEnd = snapshot();
+  const end = earlyEnd.events.splice(9, 1)[0]!;
+  earlyEnd.events.splice(5, 0, end);
+  resequence(earlyEnd);
+  assert.ok(grade(earlyEnd).reasons.includes('unpaired_model_requests'));
+  const otherModelRun = snapshot();
+  otherModelRun.events[5]!.context.runId = 'unrelated-run';
+  assert.ok(grade(otherModelRun).reasons.includes('unpaired_model_requests'));
+});
+
+test('upload publication must be joined to this import; tagged review and acceptance must follow reading', () => {
+  const otherUpload = snapshot();
+  otherUpload.events[2]!.context.clientRequestId = 'unrelated-upload';
+  assert.ok(grade(otherUpload).reasons.includes('missing_upload_phase'));
+  const brokenUploadLink = snapshot();
+  brokenUploadLink.events[8]!.context.parentSpanId = 'unrelated-span';
+  assert.ok(grade(brokenUploadLink).reasons.includes('missing_upload_phase'));
+  const otherReview = snapshot();
+  otherReview.events[10]!.context.clientRequestId = 'unrelated-review';
+  assert.ok(grade(otherReview).reasons.includes('missing_review_acceptance_phases'));
+  const earlyAcceptance = snapshot();
+  const phases = earlyAcceptance.events.splice(11, 2);
+  earlyAcceptance.events.splice(4, 0, ...phases);
+  resequence(earlyAcceptance);
+  assert.ok(grade(earlyAcceptance).reasons.includes('missing_review_acceptance_phases'));
+  const wrongAcceptance = snapshot();
+  wrongAcceptance.events[12]!.context.importId = 'unrelated-import';
+  assert.ok(grade(wrongAcceptance).reasons.includes('missing_review_acceptance_phases'));
+});
+
+test('recent operation evidence, retention and fixture privacy canaries are mandatory', () => {
+  const emptyOperations = snapshot();
+  emptyOperations.recentPerformance!.operations = [];
+  assert.ok(grade(emptyOperations).reasons.includes('missing_correlated_recent_operation'));
+  const incomplete = snapshot();
+  incomplete.recentPerformance!.operations[0]!.lifecycleIncomplete = true;
+  assert.ok(grade(incomplete).reasons.includes('incomplete_recent_timeline'));
+  const absent = snapshot();
+  delete absent.recentPerformance;
+  assert.ok(grade(absent).reasons.includes('missing_recent_timeline'));
   const dropped = snapshot();
   dropped.droppedEvents = 1;
-  assert.ok(gradeDiagnosticLifecycle(dropped, 0, 1).reasons.includes('incomplete_event_retention'));
+  assert.ok(grade(dropped).reasons.includes('incomplete_event_retention'));
   const truncated = snapshot();
-  truncated.events[2]!.fields = { requestTruncated: true };
-  assert.ok(gradeDiagnosticLifecycle(truncated, 0, 1).reasons.includes('truncated_event'));
+  truncated.events[6]!.fields = { requestTruncated: true };
+  assert.ok(grade(truncated).reasons.includes('truncated_event'));
   const leaked = snapshot();
-  leaked.events[3]!.fields = {
-    toolName: 'health_intake_read',
-    page: 1,
-    firstRead: true,
-    note: 'FXP1R02',
-  };
-  assert.ok(gradeDiagnosticLifecycle(leaked, 0, 1).reasons.includes('fictional_canary_in_export'));
-});
-
-test('diagnostics require source reads, upload and active lifecycle on one import correlation', () => {
-  const noRead = snapshot();
-  noRead.events.splice(3, 1);
-  noRead.retainedEvents--;
-  assert.ok(
-    gradeDiagnosticLifecycle(noRead, 0, 1).reasons.includes('missing_completed_page_reads'),
-  );
-  const noUpload = snapshot();
-  noUpload.events[0]!.fields = { phase: 'other' };
-  assert.ok(gradeDiagnosticLifecycle(noUpload, 0, 1).reasons.includes('missing_upload_phase'));
-  const noAcceptance = snapshot();
-  noAcceptance.events[8]!.fields = { phase: 'other' };
-  assert.ok(
-    gradeDiagnosticLifecycle(noAcceptance, 0, 1).reasons.includes(
-      'missing_review_acceptance_phases',
-    ),
-  );
-  const unrelatedAcceptance = snapshot();
-  unrelatedAcceptance.events[8]!.context.importId = 'other-import';
-  assert.ok(
-    gradeDiagnosticLifecycle(unrelatedAcceptance, 0, 1).reasons.includes(
-      'missing_review_acceptance_phases',
-    ),
-  );
-  const noActiveEnd = snapshot();
-  noActiveEnd.events.splice(5, 1);
-  noActiveEnd.retainedEvents--;
-  assert.ok(
-    gradeDiagnosticLifecycle(noActiveEnd, 0, 1).reasons.includes('incomplete_active_lifecycle'),
-  );
-  const mixed = snapshot();
-  mixed.events[4]!.context = { importId: 'different', providerRequestId: 'fictional-request' };
-  assert.ok(gradeDiagnosticLifecycle(mixed, 0, 1).reasons.includes('missing_import_correlation'));
-  const unrelatedRead = snapshot();
-  unrelatedRead.events[3]!.context.importId = 'different';
-  assert.ok(
-    gradeDiagnosticLifecycle(unrelatedRead, 0, 1).reasons.includes('missing_completed_page_reads'),
-  );
-  const swappedActive = snapshot();
-  swappedActive.events[5]!.context.runId = 'another-run';
-  assert.ok(
-    gradeDiagnosticLifecycle(swappedActive, 0, 1).reasons.includes('incomplete_active_lifecycle'),
-  );
-  const truncatedSummary = snapshot();
-  truncatedSummary.recentPerformance!.droppedOperations = 1;
-  assert.ok(
-    gradeDiagnosticLifecycle(truncatedSummary, 0, 1).reasons.includes('incomplete_recent_timeline'),
-  );
-  const missingSummary = snapshot();
-  delete missingSummary.recentPerformance;
-  assert.ok(
-    gradeDiagnosticLifecycle(missingSummary, 0, 1).reasons.includes('missing_recent_timeline'),
-  );
+  leaked.events[7]!.fields = { toolName: 'health_intake_read', page: 1, note: 'FXP1R02' };
+  assert.ok(grade(leaked).reasons.includes('fictional_canary_in_export'));
 });
