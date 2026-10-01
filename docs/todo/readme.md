@@ -2,7 +2,7 @@
 
 This is the single work list. Keep ordinary items to an ID and a short description here. Add a separate CRS file when an item needs more room: its specification, proposal, owner decisions, open questions and review findings belong there. Fold review feedback into the items it concerns.
 
-Numbers are stable identifiers, not priority. Never renumber or reuse an ID. After skipping active and retired tickets, CRS-150 is next. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
+Numbers are stable identifiers, not priority. Never renumber or reuse an ID. After skipping active and retired tickets, CRS-154 is next. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
 
 Each open item carries an effort and an impact size (S, M or L; owner request, 2026-09-30). The sizes live only in this index, so there is one place to update. They inform prioritization but are not priority.
 
@@ -48,7 +48,7 @@ Each open item shows its score after its sizes. When a size or mark changes, rec
 
 | #   | Ticket                                     | Score | Tie-break            | Owner input                                                           |
 | --- | ------------------------------------------ | ----- | -------------------- | --------------------------------------------------------------------- |
-| 1   | 🔐 [CRS-072](#crs-072) passkeys            | 8     | 🔴, unblocks CRS-088 | Tap the passkey prompts on each device and browser                    |
+| 1   | 🔐 [CRS-153](#crs-153) passkeys            | 8     | 🔴, unblocks CRS-088 | Tap the passkey prompts on each device and browser                    |
 | 2   | 💽 [CRS-071](#crs-071) deployment drive    | 8     | 🔴, lower ID         | Connect or choose the drive                                           |
 | 3   | 👨‍👦 [CRS-138](CRS-138.md) suffix-only names | 8     | 🔴                   | Decide whether a suffix-only difference should ask (recommended: yes) |
 | 4   | 🩺 [CRS-038](#crs-038) diagnostics export  | 8     | 🟡 🐭, lower ID      | A provider sign-in, plus approval for one real import run             |
@@ -97,7 +97,7 @@ Next up: 👥 [CRS-124](#crs-124) (8), then 🎯 [CRS-118](CRS-118.md) and 🖨�
 
 - [ ] <a id="crs-061"></a> 🏁 **CRS-061** · 🚦 gate · 🚀 production — Release gate: every check below passes on the release build; a mock, viewport simulation or partial extraction closes none.
 - [ ] <a id="crs-055"></a><a id="crs-014"></a><a id="crs-056"></a> 📱 **CRS-055**, with CRS-014 and CRS-056 · 🐕 M · 🟡 M · 🚀 production · score 7 — Phones and browsers: on physical devices, Files/Photos, virtual keyboard, screen reader, zoom, rotation, upload interruption, background return and lock recovery; in the release browsers, real tab and home-screen icons at small size and a live OS Light/Dark flip. Icon generation and theme logic are already tested.
-- [ ] <a id="crs-072"></a> 🔐 **CRS-072**, with CRS-056's HTTPS part · 🐕 M · 🔴 L · 🚀 production · score 8 — Passkeys: physical passkey/PRF enrollment, repeated unlock and recovery fallback on intended browsers, authenticators and HTTPS origins, including the phone origin.
+- [ ] <a id="crs-153"></a> 🔐 [CRS-153](CRS-153.md) · 🐕 M · 🔴 L · 🚀 production · score 8 — Complete physical passkey qualification across intended desktop and phone HTTPS origins, authenticators, repeated unlock, recovery and recreation. A headed Chrome/Edge journey driver is implemented (remainder of CRS-072).
 - [ ] <a id="crs-071"></a> 💽 **CRS-071** · 🐕 M · 🔴 L · 🚀 production · score 8 — Deployment drive: the intended drive, filesystem semantics, mounts, provider persistence, including real auth persistence across recreation, and actual import workflows.
 - [ ] <a id="crs-063"></a> ♻️ **CRS-063** · 🐭 S · 🟡 M · 🚀 production · score 8 — Live OAuth refresh: expiry/refresh and credential persistence for every adopted route; narrow sign-in/recreation checks are already recorded.
 - [ ] <a id="crs-065"></a><a id="crs-064"></a><a id="crs-076"></a> 🛣️ **CRS-065**, with CRS-064 and CRS-076 · 🐕 M · 🟡 M · 🚀 production · score 7 — Route capabilities: per adopted hosted and Ollama route, with fictional content, alias and model identity, tools, images, native PDF, same-page PNG fallback and text-only coverage gaps, credential isolation, and proxy retention and logging. Never silently change providers or weaken local-only settings; the proxy configuration's rejections are already tested.
