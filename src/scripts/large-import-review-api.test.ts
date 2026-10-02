@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createVaultApp } from '../server/vault-app.ts';
 import type { Note } from '../shared/api.ts';
 import type {
@@ -11,7 +12,11 @@ import type {
   IntakeReportQueue,
   HealthRecordEnvelope,
 } from '../shared/intake.ts';
-import type { IntakeIdentityPerson, IntakeIdentityReview } from '../shared/intake-identity.ts';
+import type {
+  IntakeIdentityPerson,
+  IntakeIdentityReview,
+  IntakeIdentityConfirmation,
+} from '../shared/intake-identity.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
 import { writeFictionalPdf } from './fictional-pdf-writer.ts';
 import { createLargeImportOracle } from './large-import-fixture.ts';
@@ -37,7 +42,12 @@ test('independent small real upload/proposal/review snapshots remain a partial o
   assert.ok(address && typeof address === 'object');
   const base = `http://127.0.0.1:${address.port}`;
   let cookie = '';
-  async function request<T>(path: string, input?: unknown, bytes?: Buffer): Promise<T> {
+  async function request<T>(
+    path: string,
+    input?: unknown,
+    bytes?: Buffer,
+    rejection?: string,
+  ): Promise<T> {
     const response = await fetch(base + path, {
       method: input !== undefined || bytes ? 'POST' : 'GET',
       headers: {
@@ -55,7 +65,12 @@ test('independent small real upload/proposal/review snapshots remain a partial o
     });
     const set = response.headers.get('set-cookie');
     if (set) cookie = set.split(';')[0]!;
-    const result = (await response.json()) as { data: T; error?: unknown };
+    const result = (await response.json()) as { data: T; error?: { code?: string } };
+    if (rejection) {
+      assert.equal(response.ok, false);
+      assert.equal(result.error?.code, rejection);
+      return result.data;
+    }
     assert.equal(response.ok, true, `${path}: ${JSON.stringify(result.error)}`);
     return result.data;
   }
@@ -134,7 +149,10 @@ test('independent small real upload/proposal/review snapshots remain a partial o
       };
     },
   });
-  const uploaded = await request<Intake>(prefix + '/intakes', undefined, readFileSync(path));
+  const originalBytes = readFileSync(path);
+  const originalHash = createHash('sha256').update(originalBytes).digest('hex');
+  const uploaded = await request<Intake>(prefix + '/intakes', undefined, originalBytes);
+  assert.equal(uploaded.sha256, originalHash);
   const batches = await request<IntakeBatch[]>(prefix + '/intake-batches');
   for (const batch of batches.filter((batch) =>
     batch.items.some((item) => item.intakeId === uploaded.id),
@@ -264,20 +282,206 @@ test('independent small real upload/proposal/review snapshots remain a partial o
   });
   assert.equal(result.observedRecords, 5);
   assert.equal(result.exactRecords, 5, JSON.stringify(result));
-  // Keep the real identity finding: the host retains the sentence-ending period
-  // in each evidenced name and initially compares Willow's DOB with Self.
-  // Clinical/source correctness must not erase those ownership disagreements.
-  assert.equal(result.mismatches.length, 5);
-  for (const mismatch of result.mismatches) {
-    assert.deepEqual(mismatch.fields, []);
-    assert.deepEqual(mismatch.provenance, []);
-    assert.deepEqual(mismatch.ownership, ['identityConflict']);
-  }
-  assert.equal(result.unresolved.length, 5);
   assert.equal(result.ownershipResolved, false);
   assert.equal(result.missing.length, 896);
   assert.equal(result.unexpectedRecords, 0);
   assert.deepEqual(result.authorityIssues, []);
   assert.equal(result.passed, false);
   assert.equal(result.reviewReady, false);
+
+  const peopleBefore = await request<IntakeIdentityPerson[]>(prefix + '/record-ownership/people');
+  const notesBefore = await Promise.all(
+    peopleBefore.map((person) => request<Note>(prefix + `/notes/${person.noteId}`)),
+  );
+  const workflowBefore = (await request<Intake>(prefix + `/intakes/${uploaded.id}`)).workflow;
+  const identityPath = prefix + `/intakes/${uploaded.id}/identity-scope`;
+  async function identity(groupId: string) {
+    const reading = await request<IntakeIdentityReview>(
+      prefix + `/intakes/${uploaded.id}/identity-review?groupId=${encodeURIComponent(groupId)}`,
+    );
+    assert.ok(reading.scope);
+    return reading;
+  }
+  function confirmation(
+    reading: IntakeIdentityReview,
+    operationId: string,
+    person?: IntakeIdentityPerson,
+  ): IntakeIdentityConfirmation {
+    assert.ok(reading.scope);
+    return {
+      version: reading.scope.intakeVersion,
+      scope: reading.scope,
+      operationId,
+      outcome: person ? 'this_is_person' : 'this_is_me',
+      printedName: person ? 'Fictional Willow Brook' : 'Fictional Cedar Vale',
+      attestation: 'confirmed_displayed_identity_questions',
+      ...(person
+        ? { personSelection: { noteId: person.noteId, expectedVersion: person.version } }
+        : {}),
+    };
+  }
+  const cedarGroup = authorities.find(
+    (authority) => authority.retained.report?.key === 'fictional-report-1',
+  )!;
+  const willowGroup = authorities.find(
+    (authority) => authority.retained.report?.key === 'fictional-report-2',
+  )!;
+  assert.ok(cedarGroup);
+  assert.ok(willowGroup);
+  const cedarReading = await identity(cedarGroup.retained.id);
+  const willowReading = await identity(willowGroup.retained.id);
+  assert.equal(cedarReading.evidencedIdentity.fullName, 'Fictional Cedar Vale');
+  assert.equal(willowReading.evidencedIdentity.fullName, 'Fictional Willow Brook');
+  await request(
+    identityPath,
+    confirmation(willowReading, 'wrong-self'),
+    undefined,
+    'IDENTITY_CONFLICT',
+  );
+  await request(
+    identityPath,
+    {
+      ...confirmation(cedarReading, 'wrong-person', savedWillow),
+      printedName: 'Fictional Cedar Vale',
+    },
+    undefined,
+    'IDENTITY_CONFLICT',
+  );
+  const stalePerson = confirmation(willowReading, 'stale-person', {
+    ...savedWillow,
+    version: savedWillow.version + 1,
+  });
+  await request(identityPath, stalePerson, undefined, 'PERSON_VERSION_CONFLICT');
+  const alteredScope = confirmation(cedarReading, 'altered-scope');
+  alteredScope.scope = {
+    ...alteredScope.scope,
+    subject: { ...alteredScope.scope.subject, text: subject2 },
+  };
+  await request(identityPath, alteredScope, undefined, 'IDENTITY_SCOPE');
+  assert.deepEqual(
+    (await request<Intake>(prefix + `/intakes/${uploaded.id}`)).workflow,
+    workflowBefore,
+  );
+  assert.deepEqual(
+    await Promise.all(
+      peopleBefore.map((person) => request<Note>(prefix + `/notes/${person.noteId}`)),
+    ),
+    notesBefore,
+  );
+
+  const cedarInput = confirmation(await identity(cedarGroup.retained.id), 'confirm-cedar');
+  const cedarConfirmed = await request<Intake>(identityPath, cedarInput);
+  assert.deepEqual(
+    (await request<Intake>(identityPath, cedarInput)).workflow,
+    cedarConfirmed.workflow,
+  );
+  // The first successful write invalidates the other displayed intake snapshot.
+  await request(
+    identityPath,
+    confirmation(willowReading, 'stale-scope', savedWillow),
+    undefined,
+    'VERSION_CONFLICT',
+  );
+  const stillWillow = await identity(willowGroup.retained.id);
+  // A different DOB from an earlier confirmed report on this same original
+  // requires Willow's own explicit choice; Cedar's receipt cannot assign her.
+  assert.equal(stillWillow.assignedPerson, undefined);
+  assert.equal(stillWillow.blocking, true);
+  assert.equal(stillWillow.status, 'confirmation_required');
+  assert.equal(cedarConfirmed.workflow!.identityConfirmations!.length, 1);
+  assert.equal(
+    cedarConfirmed.workflow!.identityConfirmations![0]!.scope.groupId,
+    cedarGroup.retained.id,
+  );
+  const currentPeople = await request<IntakeIdentityPerson[]>(prefix + '/record-ownership/people');
+  const currentWillow = currentPeople.find((person) => person.personId === willow.personId)!;
+  const willowInput = confirmation(stillWillow, 'confirm-willow', currentWillow);
+  const willowConfirmed = await request<Intake>(identityPath, willowInput);
+  assert.deepEqual(
+    (await request<Intake>(identityPath, willowInput)).workflow,
+    willowConfirmed.workflow,
+  );
+  assert.deepEqual(
+    await request<IntakeIdentityPerson[]>(prefix + '/record-ownership/people'),
+    peopleBefore,
+  );
+  assert.deepEqual(
+    await Promise.all(
+      peopleBefore.map((person) => request<Note>(prefix + `/notes/${person.noteId}`)),
+    ),
+    notesBefore,
+  );
+  const finalIntake = await request<Intake>(prefix + `/intakes/${uploaded.id}`);
+  assert.equal(finalIntake.sha256, originalHash);
+  assert.deepEqual(finalIntake.workflow!.reportGroups, retained.workflow!.reportGroups);
+  for (const receipt of finalIntake.workflow!.identityConfirmations!) {
+    assert.equal(receipt.knownNameAdded, undefined);
+    assert.equal(receipt.scope.sourceHash, originalHash);
+    assert.equal(
+      receipt.scope.subject.text,
+      receipt.outcome === 'this_is_me' ? subject1 : subject2,
+    );
+    assert.equal(
+      receipt.confirmedPrintedName,
+      receipt.outcome === 'this_is_me' ? 'Fictional Cedar Vale' : 'Fictional Willow Brook',
+    );
+  }
+  const finalReview = await request<IntakeReview>(
+    prefix + `/intakes/${uploaded.id}/review?proposalId=${encodeURIComponent(proposalId)}`,
+  );
+  for (const record of finalReview.records) {
+    const initial = review.records.find((item) => item.id === record.id)!;
+    const {
+      subject: _initialSubject,
+      personId: _initialPerson,
+      ...initialClinical
+    } = initial.mapping;
+    const { subject: _finalSubject, personId: _finalPerson, ...finalClinical } = record.mapping;
+    assert.deepEqual(finalClinical, initialClinical);
+    assert.deepEqual(record.evidence, initial.evidence);
+    assert.equal(record.identityReview?.blocking, false);
+    assert.equal(record.mapping.subject, record.mapping.testLabel === 'FXP151' ? 'other' : 'self');
+    assert.equal(
+      record.mapping.personId,
+      record.mapping.testLabel === 'FXP151' ? willow.personId : undefined,
+    );
+  }
+  const finalQueue = await request<IntakeReportQueue>(
+    prefix + '/intakes/report-queue?view=all&limit=100',
+  );
+  const finalAuthorities: LargeImportReviewAuthority[] = [];
+  for (const group of finalQueue.groups)
+    finalAuthorities.push({
+      queue: group,
+      retained: finalIntake.workflow!.reportGroups!.find((item) => item.id === group.groupId)!,
+      identity: await identity(group.groupId),
+    });
+  const finalGrade = gradeLargeImportReview({
+    oracle: createLargeImportOracle(),
+    stage: 'review',
+    originalId: uploaded.id,
+    people: { 'fictional-cedar': cedar, 'fictional-willow': savedWillow },
+    reviews: [finalReview],
+    authorities: finalAuthorities,
+  });
+  assert.equal(finalGrade.exactRecords, 5, JSON.stringify(finalGrade));
+  assert.deepEqual(finalGrade.mismatches, []);
+  assert.deepEqual(finalGrade.unresolved, []);
+  assert.deepEqual(finalGrade.authorityIssues, []);
+  assert.equal(finalGrade.missing.length, 896);
+  assert.equal(finalGrade.ownershipResolved, false);
+  assert.equal(finalGrade.clinicalProvenancePassed, false);
+  assert.equal(finalGrade.reviewReady, false);
+  assert.equal(finalGrade.passed, false);
+  const originalResponse = await fetch(
+    base + finalAuthorities[0]!.identity.scope!.original.contentUrl,
+    { headers: { Cookie: cookie }, signal: t.signal },
+  );
+  assert.equal(originalResponse.ok, true);
+  assert.equal(
+    createHash('sha256')
+      .update(Buffer.from(await originalResponse.arrayBuffer()))
+      .digest('hex'),
+    originalHash,
+  );
 });

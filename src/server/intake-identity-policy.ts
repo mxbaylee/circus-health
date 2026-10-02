@@ -224,6 +224,10 @@ export function identityPersonFingerprint(
 export function printedIdentityName(subject: string | null | undefined): string | undefined {
   if (!subject) return;
   const text = subject.trim();
+  // A later labelled subject must not disappear when the first DOB is split off.
+  // Keep multi-person headers for explicit scoped human review.
+  if ((text.match(/\b(?:(?:patient|client)(?:\s+name)?|name|subject)\s*:/gi) || []).length > 1)
+    return;
   const labeled =
     /^(?:(?:patient|client)(?:\s+name)?|name|subject)\s*:\s*([^\n;|]+)(?:[\n;|]|$)/i.exec(text);
   let name = (labeled?.[1] || text).trim();
@@ -232,8 +236,23 @@ export function printedIdentityName(subject: string | null | undefined): string 
   const columns = /^(.*?)\s{2,}(?:Female|Male)\s{2,}\d{1,4}[/-]\d{1,2}[/-]\d{1,4}(.*)$/i.exec(name);
   if (columns && /^(?:\s+(?:\d+(?:[./:-]\d+)*|in\.?|lbs\.?|cm|kg|ft\.?))*\s*$/i.test(columns[2]!))
     name = columns[1]!.trim();
-  if (labeled)
-    name = name.split(/\s+(?:DOB|date of birth|birth\s*date|MRN|patient\s*ID)\s*:/i)[0]!.trim();
+  if (labeled) {
+    const dateSentence =
+      /^(.*?)\.\s+(?:DOB|date of birth|birth\s*date)\s*:\s*(\d{4}-\d{2}-\d{2})\.?$/i.exec(name);
+    // A complete labelled date can delimit a sentence. Keep initials and suffixes
+    // literal: their terminal period is meaningful and is not a safe delimiter.
+    const terminal = dateSentence?.[1]?.match(/(?:^|\s)([\p{L}\p{M}’'-]+)$/u)?.[1];
+    if (
+      terminal &&
+      validOnboardingBirthDate(dateSentence![2]) &&
+      [...terminal].length >= 3 &&
+      !/^(?:jr|sr|ii|iii|iv|esq|phd)$/i.test(terminal) &&
+      !/[\p{Lu}]/u.test([...terminal].slice(1).join(''))
+    )
+      name = dateSentence![1]!.trim();
+    else
+      name = name.split(/\s+(?:DOB|date of birth|birth\s*date|MRN|patient\s*ID)\s*:/i)[0]!.trim();
+  }
   if (
     !name ||
     name.length > 200 ||

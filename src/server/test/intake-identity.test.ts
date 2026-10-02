@@ -18,6 +18,7 @@ import {
   exactCurrentIdentityResolutionOperationId,
   identityReceiptAppliesToCurrentBoundary,
   modelBirthDateWarnings,
+  printedIdentityName,
 } from '../intake-identity-policy.ts';
 import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
 import { listIntakeImportFeed } from '../intake-report-queue.ts';
@@ -32,6 +33,49 @@ import type {
 } from '../../shared/intake-identity.ts';
 
 const heading = 'Fictional report IVY-61';
+test('labelled ISO DOB sentence separates a full name while preserving terminal initials and suffixes', () => {
+  for (const name of ['Fictional Cedar Vale', 'Fictional O’Neil Meadow', 'Fictional J. Meadow'])
+    assert.equal(printedIdentityName(`Patient: ${name}. DOB: 1982-04-17.`), name);
+  for (const name of [
+    'Fictional John Q.',
+    'Fictional John AJ.',
+    'Fictional John Aj.',
+    'Fictional John MD.',
+    'Fictional John M.D.',
+    'Fictional John Ph.D.',
+    'Fictional John PhD.',
+    'Fictional John Phd.',
+    'Fictional John Jr.',
+    'Fictional John Jr..',
+    'Fictional John Sr.',
+    'Fictional John Esq.',
+  ])
+    assert.equal(printedIdentityName(`Patient: ${name} DOB: 1982-04-17.`), name);
+  assert.equal(
+    printedIdentityName('Patient: Fictional Cedar Vale. DOB: unclear'),
+    'Fictional Cedar Vale.',
+  );
+  assert.equal(
+    printedIdentityName('Patient: Fictional Cedar Vale. DOB: 1982-99-17.'),
+    'Fictional Cedar Vale.',
+  );
+  assert.equal(
+    printedIdentityName(
+      'Patient: Fictional Cedar Vale. DOB: 1982-04-17. Patient: Fictional Willow Brook',
+    ),
+    undefined,
+  );
+  assert.equal(
+    printedIdentityName(
+      'Patient: Fictional Cedar Vale and Fictional Willow Brook. DOB: 1982-04-17.',
+    ),
+    undefined,
+  );
+  assert.equal(
+    printedIdentityName('Patient: Fictional Different Meadow. DOB: 1982-04-17.'),
+    'Fictional Different Meadow',
+  );
+});
 const subject = 'Patient: Fictional Iris Meadow';
 const fictionalBirthDate = '1990-03-08';
 const identityLine = `${subject}\nDOB: ${fictionalBirthDate}`;
@@ -1667,7 +1711,9 @@ test('an evidenced match auto-allows records and one optional action atomically 
   assert.deepEqual(committed.workflow!.identityConfirmations![0]!.selfUpdate, {
     noteId: 'person-note:self',
     versionBefore: review.self.version,
-    versionAfter: review.self.version + 2,
+    // Only the selected birth-date update writes Self; its unchanged primary
+    // name needs no redundant alias/support write or second version increment.
+    versionAfter: review.self.version + 1,
     fields: { birthDate: fictionalBirthDate },
   });
   attachPersonalDurability(f.db, {
