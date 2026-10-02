@@ -22,7 +22,13 @@ import {
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
 import type { Server, ServerResponse } from 'node:http';
-import { openDatabase, HttpError, LATEST_SCHEMA_VERSION, type Database } from './database.ts';
+import {
+  openDatabase,
+  HttpError,
+  LATEST_SCHEMA_VERSION,
+  transaction,
+  type Database,
+} from './database.ts';
 import { durableWrite, attachPersonalDurability } from './portable.ts';
 import {
   registerProfileDisplayGuard,
@@ -52,6 +58,7 @@ import { validPersonIcon } from '../shared/person-icon.ts';
 import { rebuildRecordDatabase, type DurableRecordVersion } from './record-versions.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
 import { clearChatJournalCache } from './assistant-journal.ts';
+import { prepareIntakeStateCopy, stageIntakeStateCopy } from './intake-state-bootstrap.ts';
 export interface EncryptedLabel {
   algorithm: 'xchacha20poly1305-ietf';
   nonce: string;
@@ -132,6 +139,7 @@ interface OpenOptions {
   icon?: string;
   placebo?: boolean;
   copyState?: OpenedProfile;
+  pendingActivation?: boolean;
 }
 
 type RecordVersion = DurableRecordVersion;
@@ -148,6 +156,11 @@ interface BeginInput {
 interface VerifyInput {
   acknowledged?: unknown;
   recovery?: unknown;
+}
+
+interface VerifyOptions {
+  /** The HTTP caller enforces its current source-session authorization here. */
+  authorizeCopySource?: (profileId: string) => void;
 }
 
 interface RemoveInput {
@@ -339,6 +352,7 @@ export function createEncryptedProfiles({
       icon,
       placebo = false,
       copyState,
+      pendingActivation = false,
     }: OpenOptions = {},
   ): OpenedProfile {
     if (opened.has(id)) {
@@ -365,6 +379,12 @@ export function createEncryptedProfiles({
     let db: Database | null | undefined;
     let disposeOriginalResolver = () => {};
     try {
+      // A selected accepted head always wins, including publication followed by
+      // an exception before verification/activation acknowledged its success.
+      if (vault.recordStorage().read('head') !== null) {
+        initial = false;
+        copyState = undefined;
+      }
       const workspacePlan = vault.workspaceEstimate(deferredOriginal);
       const uploadPlanningBytes = importStorageEstimate(
         intakeLimits().uploadBytes,
@@ -434,33 +454,39 @@ export function createEncryptedProfiles({
       let cacheHit = false;
       if (initial) {
         if (copyState) {
+          const intakePlan = prepareIntakeStateCopy(copyState.db, copyState.id, id);
           copyState.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
           mkdirSync(resolve(root, 'db'), { recursive: true, mode: 0o700 });
           cpSync(copyState.db.location()!, dbPath);
           // Rebind projection ownership before opening under the new profile.
           const copied = new DatabaseSync(dbPath);
           try {
-            copied.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
-            for (const [table, column] of [
-              ['source_files', 'path'],
-              ['assets', 'stored_path'],
-            ])
-              copied
-                .prepare(`UPDATE ${table} SET ${column}=replace(${column},?,?)`)
-                .run(`data/profiles/${copyState.id}/`, `data/profiles/${id}/`);
-            rebindCopiedIntakeSourceText(copied, copyState.id, id);
-            for (const t of copied
-              .prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '__record_%'",
-              )
-              .all())
-              copied.exec(`DROP TABLE IF EXISTS "${(t.name as string).replaceAll('"', '""')}"`);
+            transaction(copied, () => {
+              copied.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
+              for (const [table, column] of [
+                ['source_files', 'path'],
+                ['assets', 'stored_path'],
+              ])
+                copied
+                  .prepare(`UPDATE ${table} SET ${column}=replace(${column},?,?)`)
+                  .run(`data/profiles/${copyState!.id}/`, `data/profiles/${id}/`);
+              rebindCopiedIntakeSourceText(copied, copyState!.id, id);
+              for (const t of copied
+                .prepare(
+                  "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
+                )
+                .all())
+                copied.exec(`DROP TABLE IF EXISTS "${(t.name as string).replaceAll('"', '""')}"`);
+              stageIntakeStateCopy(copied, intakePlan, {
+                profileId: id,
+                readSelectedHead: () => recordStorage.read('head'),
+              });
+            });
           } finally {
             copied.close();
           }
-          copyState.vault.syncWorkspace(copyState.workspace, {
-            exclude: (name) => !privateFile(name),
-          });
+          // Copy selected durable evidence only. Plaintext workspace changes
+          // cannot silently publish new source authority while making a copy.
           const copyManifest = copyState.vault.metadata();
           const scratch = resolve(root, 'copy-original');
           for (const [name, objectId] of Object.entries(copyManifest.files)) {
@@ -609,30 +635,63 @@ export function createEncryptedProfiles({
         closing: false,
         disposeOriginalResolver,
       };
-      registerProfileDisplayGuard(state.db, (name, icon) =>
-        requireDistinctProfile(name, icon, state.id),
-      );
-      refreshCard(state);
-      opened.set(id, state);
-      diagnostics.attachSummaryStore(id, {
-        read: () => vault.readPerformanceSummary(),
-        write: (bytes) => vault.writePerformanceSummary(bytes),
-      });
-      diagnostics.attachEventStore(id, vault.diagnosticChunks());
+      if (!pendingActivation) installOpened(state);
       return state;
     } catch (e) {
-      clearChatJournalCache(root, id);
-      disposeOriginalResolver();
-      if (db) {
-        clearIntakeStateCache(db);
-        clearIntakeLookupCache(db);
-      }
-      db?.close();
-      vault.close();
-      key.fill(0);
-      rmSync(root, { recursive: true, force: true });
-      throw e;
+      discardFailedOpen({ id, root, key, vault, db, disposeOriginalResolver }, e);
     }
+  }
+  function installOpened(state: OpenedProfile): void {
+    registerProfileDisplayGuard(state.db, (name, icon) =>
+      requireDistinctProfile(name, icon, state.id),
+    );
+    refreshCard(state);
+    opened.set(state.id, state);
+    diagnostics.attachSummaryStore(state.id, {
+      read: () => state.vault.readPerformanceSummary(),
+      write: (bytes) => state.vault.writePerformanceSummary(bytes),
+    });
+    diagnostics.attachEventStore(state.id, state.vault.diagnosticChunks());
+  }
+  function discardFailedOpen(
+    state: Pick<OpenedProfile, 'id' | 'root' | 'key' | 'vault' | 'disposeOriginalResolver'> & {
+      db: Database | null | undefined;
+    },
+    failure: unknown,
+  ): never {
+    const errors = [failure];
+    const cleanup = (operation: () => void): void => {
+      try {
+        operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+    const installed = opened.get(state.id);
+    if (installed) installed.closing = true;
+    opened.delete(state.id);
+    cleanup(() => clearChatJournalCache(state.root, state.id));
+    if (state.db) {
+      const db = state.db;
+      cleanup(() => clearIntakeStateCache(db));
+      cleanup(() => clearIntakeLookupCache(db));
+      cleanup(() => {
+        if (db.isOpen) db.close();
+      });
+    }
+    cleanup(() => state.disposeOriginalResolver());
+    cleanup(() => state.vault.close());
+    state.key.fill(0);
+    // Stores can have attached before installation failed. Close their vault
+    // first so detaching diagnostics cannot flush into the retained authority.
+    cleanup(() => diagnostics.detachSummaryStore(state.id));
+    cleanup(() => rmSync(state.root, { recursive: true, force: true }));
+    if (errors.length > 1)
+      throw new AggregateError(
+        errors,
+        'Profile opening failed and runtime cleanup reported errors',
+      );
+    throw failure;
   }
   function requireDistinctProfile(name: string, icon: string | undefined, exceptId?: string) {
     const pair = personDisplayKey(name, icon);
@@ -717,7 +776,11 @@ export function createEncryptedProfiles({
       secret?.fill(0);
     }
   }
-  async function verify(setupId: string, input: VerifyInput) {
+  async function verify(
+    setupId: string,
+    input: VerifyInput,
+    { authorizeCopySource }: VerifyOptions = {},
+  ) {
     const setup = setups.get(setupId);
     if (!setup || setup.expires < Date.now())
       throw new HttpError(410, 'SETUP_EXPIRED', 'Restart profile setup.');
@@ -728,65 +791,75 @@ export function createEncryptedProfiles({
         'Download and acknowledge your recovery key first',
       );
     const key = secretKey(setup.id, input.recovery);
-    if (registry.profiles.some((p) => p.id === setup.id)) {
-      open(setup.id, key);
-      return card(setup.id);
-    }
-    const vault = openVault({ directory: pathFor(setup.id), profileId: setup.id, key });
-    const details = JSON.parse(vault.readFile('setup.json') as unknown as string) as SetupDetails;
-    vault.close();
+    let pending: OpenedProfile | undefined;
     try {
-      requireDistinctProfile(details.name, details.icon || 'person', setup.id);
-    } catch (error) {
-      key.fill(0);
-      throw error;
-    }
-    let copyState;
-    if (details.copyFrom) {
-      copyState = opened.get(details.copyFrom);
-      if (!copyState || copyState.closing) {
-        key.fill(0);
-        throw new HttpError(
-          423,
-          'PROFILE_LOCKED',
-          'Unlock the original profile before completing its copy',
-        );
+      if (registry.profiles.some((p) => p.id === setup.id)) {
+        open(setup.id, key);
+        return card(setup.id);
       }
-    }
-    if (!registryPublished) {
+      const vault = openVault({ directory: pathFor(setup.id), profileId: setup.id, key });
+      let details: SetupDetails;
+      let published: boolean;
       try {
+        details = JSON.parse(vault.readFile('setup.json') as unknown as string) as SetupDetails;
+        published = vault.recordStorage().read('head') !== null;
+      } finally {
+        vault.close();
+      }
+      if (details.profileId !== setup.id)
+        throw new HttpError(400, 'SETUP_INVALID', 'This recovery file could not resume setup');
+      requireDistinctProfile(details.name, details.icon || 'person', setup.id);
+      let copyState;
+      if (details.copyFrom && !published) {
+        authorizeCopySource?.(details.copyFrom);
+        copyState = opened.get(details.copyFrom);
+        if (!copyState || copyState.closing)
+          throw new HttpError(
+            423,
+            'PROFILE_LOCKED',
+            'Unlock the original profile before completing its copy',
+          );
+      }
+      if (!registryPublished) {
         // A crash after the active keyring is published must still leave the
         // registry needed to resume first-time activation with the saved kit.
         writeRegistry();
-      } catch (error) {
-        key.fill(0);
-        throw error;
       }
+      pending = open(setup.id, key, {
+        ...details,
+        initial: !published,
+        copyState,
+        pendingActivation: true,
+      });
+      const identity = selfIdentity(pending.db) as {
+        name: string;
+        icon: string;
+        nameVersion: number;
+      };
+      const ring = keyring(setup.id);
+      ring.active = true;
+      writeKeyring(setup.id, ring);
+      writeRegistry({
+        ...registry,
+        profiles: [
+          ...registry.profiles,
+          {
+            id: setup.id,
+            name: identity.name,
+            icon: identity.icon,
+            placebo: details.placebo,
+            nameVersion: identity.nameVersion,
+            version: identity.nameVersion,
+          },
+        ],
+      });
+      installOpened(pending);
+      return card(setup.id);
+    } catch (error) {
+      if (pending) discardFailedOpen(pending, error);
+      else key.fill(0);
+      throw error;
     }
-    const state = open(setup.id, key, { initial: true, ...details, copyState });
-    const identity = selfIdentity(state.db) as {
-      name: string;
-      icon: string;
-      nameVersion: number;
-    };
-    const ring = keyring(setup.id);
-    ring.active = true;
-    writeKeyring(setup.id, ring);
-    writeRegistry({
-      ...registry,
-      profiles: [
-        ...registry.profiles,
-        {
-          id: setup.id,
-          name: identity.name,
-          icon: identity.icon,
-          placebo: details.placebo,
-          nameVersion: identity.nameVersion,
-          version: identity.nameVersion,
-        },
-      ],
-    });
-    return card(setup.id);
   }
   function unlock(id: string, recovery: unknown) {
     card(id);

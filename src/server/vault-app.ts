@@ -250,7 +250,13 @@ export function createVaultApp({
       const setup = path.match(/^\/api\/profile-setups\/([A-Za-z0-9_-]+)\/verify$/);
       if (setup && method === 'POST') {
         const input = await body(req),
-          p = await activate(() => manager.verify(setup[1], input), client);
+          p = await activate(
+            () =>
+              manager.verify(setup[1], input, {
+                authorizeCopySource: (sourceId) => requireAccess(sourceId, client),
+              }),
+            client,
+          );
         send(res, 201, { data: publicCard(p, client, hostname) });
         return;
       }

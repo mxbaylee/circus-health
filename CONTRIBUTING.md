@@ -88,7 +88,7 @@ Update documentation with contract changes. Cite current implementation and test
 
 ## Working across computers
 
-Keep short open items in the [single CRS work list](docs/todo/readme.md); give an item its own file only when necessary context justifies it. Maintain documentation of current behavior and limitations alongside code. Keep implementation plans and feedback in chats or issues, not repository specifications. Use repository-relative paths and reproducible commands when handing off changes. Keep health records, credentials, local paths, raw diagnostics and runtime state out of contributions. Follow [repository scope and handoffs](docs/architecture/workspace-and-handoffs.md) when transferring changes or interpreting another computer’s test receipts.
+Every new or edited ticket needs a user story using the canonical [personas and jobs](docs/design/personas.md), with the user benefit and technical ambiguity explained for a product manager. Follow the [ticket template and workflow](docs/todo/readme.md#ticket-writing-and-review). Split at useful complexity boundaries; coherent high-effort work can proceed with independent review, and effort alone does not require owner grading. Keep short open items in the [single CRS work list](docs/todo/readme.md); give an item its own file only when necessary context justifies it. Maintain documentation of current behavior and limitations alongside code. Keep implementation plans and feedback in chats or issues, not repository specifications. Use repository-relative paths and reproducible commands when handing off changes. Keep health records, credentials, local paths, raw diagnostics and runtime state out of contributions. Follow [repository scope and handoffs](docs/architecture/workspace-and-handoffs.md) when transferring changes or interpreting another computer’s test receipts.
 
 ## Commit messages and pull requests
 
@@ -107,7 +107,7 @@ Use the contributor Node version on Git's PATH, including in graphical Git clien
 
 Exceptions are fine: use `git commit --no-verify` or `HUSKY=0 git commit ...` to skip local hooks, including when amending a merge. Branch commits are not scanned by CI.
 
-Push changes on a feature branch and open a pull request with an emoji-prefixed title. Request independent review and wait for the required GitHub Actions checks to pass, then squash merge the pull request. Do not push directly to `main`. Leave other worktrees, including the main demo checkout, unchanged. Use the full local lane and shard commands above when persistent CI failures need reproduction; do not weaken checks solely to make a failing change pass. Preserve the Git protections on `main`.
+Push changes on a feature branch and open a pull request with an emoji-prefixed title. Request independent review against requirements and current evidence without supplying a desired score or expected conclusion; resolve blocking findings and request concrete improvement feedback. Wait for the required GitHub Actions checks to pass, then squash merge the pull request. Do not push directly to `main`. Leave other worktrees, including the main demo checkout, unchanged. Use the full local lane and shard commands above when persistent CI failures need reproduction; do not weaken checks solely to make a failing change pass. Preserve the Git protections on `main`.
 
 ## Submit a change
 

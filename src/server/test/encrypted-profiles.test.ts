@@ -281,17 +281,8 @@ test('first activation retains a resumable registry before publishing its active
   }
   assert.equal(manager.keyring(setup.profileId).active, true);
   assert.deepEqual(JSON.parse(readFileSync(registryPath, 'utf8')).profiles, []);
-  // Discard the open fixture runtime. An unpublished profile has no public card
-  // for lock() to return, even though it has closed and removed its workspace.
-  assert.throws(
-    () => manager.close(),
-    (error: unknown) => {
-      assert.ok(error instanceof AggregateError);
-      assert.equal(error.errors.length, 1);
-      assert.equal(error.errors[0].code, 'PROFILE_NOT_FOUND');
-      return true;
-    },
-  );
+  assert.equal(manager.opened.has(setup.profileId), false);
+  assert.doesNotThrow(() => manager.close());
   assert.equal(manager.opened.size, 0);
   const restarted = createEncryptedProfiles({ dataDirectory, runtimeDirectory });
   t.after(() => restarted.close());
