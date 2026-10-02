@@ -14,6 +14,7 @@ import { resolve, relative } from 'node:path';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { recentPerformanceLimits } from './import-performance.ts';
 import { encryptObject, decryptObject, type VaultKey } from './vault-crypto.ts';
+import { openVaultIndex, safeVaultName, type VaultIndexLimits } from './vault-index.ts';
 import { openDiagnosticChunkStore, type DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
 
 interface VaultObjectMetadata {
@@ -27,14 +28,6 @@ export interface VaultMetadata {
   revision: number;
   files: Record<string, string>;
   objects: Record<string, VaultObjectMetadata>;
-  recordsHead: string | null;
-}
-
-interface VaultHead {
-  format: 'circus-health-vault-head-v1';
-  profileId: string;
-  indexId: string;
-  revision: number;
   recordsHead: string | null;
 }
 
@@ -77,6 +70,8 @@ export interface OpenVaultOptions {
   profileId: string;
   key: VaultKey;
   initialize?: boolean;
+  /** Optional stricter contributor/test bounds; defaults cannot be raised. */
+  indexLimits?: Partial<VaultIndexLimits>;
 }
 
 type CurrentPositionRead = (
@@ -102,17 +97,7 @@ export function hashFile(path: string): string {
     closeSync(fd);
   }
 }
-function safeName(value: unknown): string {
-  if (
-    typeof value !== 'string' ||
-    !value ||
-    value.includes('\\') ||
-    value.includes('\0') ||
-    value.split('/').some((x) => !x || x === '.' || x === '..')
-  )
-    throw Error('Invalid vault path');
-  return value;
-}
+const safeName = safeVaultName;
 function checkPlainTree(root: string): string[] {
   if (!existsSync(root)) return [];
   const result: string[] = [];
@@ -135,12 +120,14 @@ export function openVault({
   profileId,
   key,
   initialize = false,
+  indexLimits,
 }: OpenVaultOptions): Vault {
   checkPlainTree(directory);
   const manifestPath = resolve(directory, 'vault', 'manifest.enc');
-  let closed = false,
-    filesDirty = false,
-    indexId: string | null = null;
+  let closed = false;
+  const pendingFiles = new Map<string, string>();
+  const pendingObjects = new Map<string, VaultObjectMetadata>();
+  const digests = new Map<string, string[]>();
   let diagnosticChunks: DiagnosticChunkStore | undefined;
   const fingerprints = new Map<string, string>();
   const fingerprint = (path: string): string => {
@@ -150,56 +137,47 @@ export function openVault({
   const guard = (): void => {
     if (closed) throw Error('Profile is locked');
   };
-  let manifest: VaultMetadata;
-  if (existsSync(manifestPath)) {
-    const head = JSON.parse(
-      decryptObject(manifestPath, key, profileId, 'manifest') as unknown as string,
-    ) as Partial<VaultHead>;
-    if (
-      head.format !== 'circus-health-vault-head-v1' ||
-      head.profileId !== profileId ||
-      !/^[-0-9a-f]{36}$/.test(head.indexId as string)
-    )
-      throw Error('Invalid vault head');
-    indexId = head.indexId as string;
-    manifest = {
-      // The encrypted index is application-owned JSON. Keep its dynamic shape
-      // localized until the existing format/profile/member checks below pass.
-      ...(JSON.parse(
-        decryptObject(
-          resolve(directory, 'vault/indices', indexId + '.enc'),
-          key,
-          profileId,
-          `index:${indexId}`,
-        ) as unknown as string,
-      ) as Partial<VaultMetadata>),
-      recordsHead: head.recordsHead,
-      revision: head.revision,
-    } as VaultMetadata;
-  } else if (initialize)
-    manifest = {
-      format: 'circus-health-vault-index-v1',
-      profileId,
-      revision: 0,
-      files: {},
-      objects: {},
-      recordsHead: null,
-    };
-  else throw Error('Missing authoritative vault manifest');
-  if (
-    manifest.format !== 'circus-health-vault-index-v1' ||
-    manifest.profileId !== profileId ||
-    !manifest.files ||
-    !manifest.objects
-  )
-    throw Error('Invalid vault manifest');
+  const index = openVaultIndex(directory, profileId, key, initialize, indexLimits);
+  let manifest: VaultMetadata = {
+    format: 'circus-health-vault-index-v1',
+    profileId,
+    revision: index.revision,
+    files: index.files,
+    objects: index.objects,
+    recordsHead: index.recordsHead,
+  };
+  const rememberDigest = (id: string, meta: VaultObjectMetadata) => {
+    const hash = meta.bytes + ':' + meta.sha256;
+    const ids = digests.get(hash) ?? [];
+    ids.push(id);
+    digests.set(hash, ids);
+  };
+  for (const [id, meta] of Object.entries(manifest.objects)) rememberDigest(id, meta);
+  function discard(): void {
+    if (closed) return;
+    closed = true;
+    diagnosticChunks?.close();
+    diagnosticChunks = undefined;
+    fingerprints.clear();
+    pendingFiles.clear();
+    pendingObjects.clear();
+    digests.clear();
+    index.close();
+    for (const name of Object.keys(manifest.files)) delete manifest.files[name];
+    for (const id of Object.keys(manifest.objects)) delete manifest.objects[id];
+    manifest = null!;
+  }
   const objectPath = (id: string): string => {
     if (!/^[0-9a-f-]{36}$/.test(id)) throw Error('Invalid vault object ID');
     return resolve(directory, 'vault', 'objects', id + '.enc');
   };
   const readObject = (id: string): Buffer => {
     guard();
-    return decryptObject(objectPath(id), key, profileId, `object:${id}`);
+    const bytes = decryptObject(objectPath(id), key, profileId, `object:${id}`);
+    const meta = manifest.objects[id];
+    if (!meta || bytes.length !== meta.bytes || digest(bytes) !== meta.sha256)
+      throw Error('Original evidence is missing or changed');
+    return bytes;
   };
   function put(input: Uint8Array | string): string {
     guard();
@@ -211,40 +189,39 @@ export function openVault({
         { bytes: size },
         { profileId },
       );
-    for (const [id, meta] of Object.entries(manifest.objects))
-      if (meta.bytes === size && meta.sha256 === hash) {
-        // Establish byte identity, not just equal digests, before reusing ciphertext.
-        let fd: number | undefined,
-          offset = 0,
-          equal = true;
-        if (!isBytes) fd = openSync(input, 'r');
-        try {
-          decryptObject(objectPath(id), key, profileId, `object:${id}`, (chunk) => {
-            let actual: Buffer;
-            if (isBytes) actual = Buffer.from(input.subarray(offset, offset + chunk.length));
-            else {
-              actual = Buffer.alloc(chunk.length);
-              let pos = 0;
-              while (pos < actual.length) {
-                const n = (readSync as unknown as CurrentPositionRead)(
-                  fd!,
-                  actual,
-                  pos,
-                  actual.length - pos,
-                );
-                if (!n) break;
-                pos += n;
-              }
-              if (pos !== chunk.length) equal = false;
+    for (const id of digests.get(size + ':' + hash) ?? []) {
+      // Establish byte identity, not just equal digests, before reusing ciphertext.
+      let fd: number | undefined,
+        offset = 0,
+        equal = true;
+      if (!isBytes) fd = openSync(input, 'r');
+      try {
+        decryptObject(objectPath(id), key, profileId, `object:${id}`, (chunk) => {
+          let actual: Buffer;
+          if (isBytes) actual = Buffer.from(input.subarray(offset, offset + chunk.length));
+          else {
+            actual = Buffer.alloc(chunk.length);
+            let pos = 0;
+            while (pos < actual.length) {
+              const n = (readSync as unknown as CurrentPositionRead)(
+                fd!,
+                actual,
+                pos,
+                actual.length - pos,
+              );
+              if (!n) break;
+              pos += n;
             }
-            if (!chunk.equals(actual)) equal = false;
-            offset += chunk.length;
-          });
-        } finally {
-          if (fd !== undefined) closeSync(fd);
-        }
-        if (equal && offset === size) return id;
+            if (pos !== chunk.length) equal = false;
+          }
+          if (!chunk.equals(actual)) equal = false;
+          offset += chunk.length;
+        });
+      } finally {
+        if (fd !== undefined) closeSync(fd);
       }
+      if (equal && offset === size) return id;
+    }
     const id = randomUUID();
     measureImportPhase(
       'vault_encrypt_object',
@@ -253,7 +230,8 @@ export function openVault({
       { profileId },
     );
     manifest.objects[id] = { bytes: size, sha256: hash };
-    filesDirty = true;
+    pendingObjects.set(id, manifest.objects[id]);
+    rememberDigest(id, manifest.objects[id]);
     return id;
   }
   function publish(): void {
@@ -262,44 +240,31 @@ export function openVault({
   function publishInternal(): void {
     guard();
     try {
-      if (filesDirty || !indexId) {
-        indexId = randomUUID();
-        const { recordsHead, revision, ...index } = manifest;
-        encryptObject(
-          resolve(directory, 'vault/indices', indexId + '.enc'),
-          Buffer.from(JSON.stringify(index)),
-          key,
-          profileId,
-          `index:${indexId}`,
-        );
+      // Verify only newly staged objects and changed binding targets, never old index history.
+      const ids = new Set([...pendingObjects.keys(), ...pendingFiles.values()]);
+      for (const id of ids) {
+        const meta = manifest.objects[id];
+        const hash = createHash('sha256');
+        let bytes = 0;
+        decryptObject(objectPath(id), key, profileId, `object:${id}`, (chunk) => {
+          bytes += chunk.length;
+          hash.update(chunk);
+        });
+        if (!meta || bytes !== meta.bytes || hash.digest('hex') !== meta.sha256)
+          throw Error('Original evidence is missing or changed');
       }
-      const revision = manifest.revision + 1;
-      encryptObject(
-        manifestPath,
-        Buffer.from(
-          JSON.stringify({
-            format: 'circus-health-vault-head-v1',
-            profileId,
-            indexId,
-            revision,
-            recordsHead: manifest.recordsHead,
-          }),
-        ),
-        key,
-        profileId,
-        'manifest',
-      );
-      manifest.revision = revision;
-      filesDirty = false;
+      manifest.revision = index.publish(pendingFiles, pendingObjects, manifest.recordsHead);
+      pendingFiles.clear();
+      pendingObjects.clear();
     } catch (error) {
-      closed = true;
+      discard();
       throw error;
     }
   }
   function storeFile(name: string, input: Uint8Array | string): string {
     safeName(name);
     const id = put(input);
-    if (manifest.files[name] !== id) filesDirty = true;
+    if (manifest.files[name] !== id) pendingFiles.set(name, id);
     manifest.files[name] = id;
     return id;
   }
@@ -394,9 +359,14 @@ export function openVault({
       },
       publishHead(bytes: Uint8Array): void {
         guard();
-        beforeHead?.();
-        manifest.recordsHead = Buffer.from(bytes).toString('base64');
-        publish();
+        try {
+          beforeHead?.();
+          manifest.recordsHead = Buffer.from(bytes).toString('base64');
+          publish();
+        } catch (error) {
+          discard();
+          throw error;
+        }
       },
     };
   }
@@ -519,12 +489,7 @@ export function openVault({
       return structuredClone(manifest);
     },
     close(): void {
-      closed = true;
-      diagnosticChunks?.close();
-      diagnosticChunks = undefined;
-      // Drop the only reference to decrypted metadata after the guard closes
-      // every public operation.
-      manifest = null!;
+      if (!closed) discard();
     },
   };
 }
