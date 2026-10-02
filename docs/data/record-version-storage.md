@@ -32,7 +32,7 @@ The index is built atomically from committed versions and belongs to the authent
 
 A fictional regression makes 300 actual source-file edits to a growing structured value. At 100, 200 and 300 edits, indexed contents occupy 566,950, 2,198,800 and 4,900,650 bytes; version metadata occupies 43,308, 86,308 and 129,308 bytes; changed-field reference metadata occupies 51,572, 102,072 and 152,572 bytes. SQLite allocation is 1,601,536, 3,944,448 and 7,417,856 bytes on that test setup. These counts distinguish the remaining complete-version contents from metadata that follows changed paths and edit counts. A seven-entry filtered page selects eight identifiers and reads only its seven versions and seven predecessors, without archive reads. They are scoped fixture measurements, not installation capacity targets.
 
-The remaining contents copy still grows with the size of each retained record version. This projection change does not resolve the growing durable intake workflow ([CRS-201](../todo/CRS-201.md)) or broader storage qualification in pending [PR #35](https://github.com/mxbaylee/circus-health/pull/35). The separate [incremental encrypted vault index](../security/vault-index.md) now publishes changed bindings and new object metadata rather than whole file/object maps. No historical versions are pruned, and no runtime-capacity increase is part of these changes.
+The remaining contents copy still grows with the size of each retained record version. This projection change does not resolve the growing durable intake workflow ([CRS-205](../todo/CRS-205.md)) or broader storage qualification in pending [PR #35](https://github.com/mxbaylee/circus-health/pull/35). The separate [incremental encrypted vault index](../security/vault-index.md) now publishes changed bindings and new object metadata rather than whole file/object maps. No historical versions are pruned, and no runtime-capacity increase is part of these changes.
 
 ## Durability and encryption
 
@@ -102,3 +102,7 @@ Schema 7 adds the condition-occurrence table. Current-schema occurrences use the
 ## Conversation writes
 
 Conversation recovery uses its own [linked changed-content journal](conversation-journal.md). Each save adds changed values and small generation metadata, including incremental array items and text splices. It preserves history without copying the growing chat, operations or request-attempt arrays into every event. The encrypted wrapper retains this journal; originals and accepted-record authority remain separate. Older conversation snapshot envelopes are explicitly unsupported.
+
+## Incremental intake state primitive
+
+The [incremental intake state primitive](intake-state-storage.md) frames changed operational JSON into immutable source-scoped `app_meta` contributions with a bounded head and operation receipts. It uses the existing accepted-record transaction and compact history projection. Production intake has not cut over to this primitive; its current full workflow versions remain an open storage limitation.
