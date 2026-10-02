@@ -26,13 +26,22 @@ The complete placement rules and known duplication are in [docs/architecture/cod
 
 ## Develop and verify
 
-Install dependencies and run checks from the repository root. Use focused tests while iterating, then complete the full local validation before merging:
+Install dependencies and run focused checks from the repository root. For each change, run formatting, type checking, and the relevant tests locally. GitHub Actions runs the full validation suite on pull requests; its required checks, together with independent review, must pass before squash merging. Run the full local suite when persistent CI failures justify reproducing them on your machine.
+
+The focused baseline is:
 
 ```sh
 npm ci
 npm run format:check
-node scripts/repository-file-inventory.ts --check
 npm run typecheck
+```
+
+Then run the test command relevant to the behavior you changed.
+
+The complete local suite is useful when persistent CI failures need reproduction. Its lane commands are listed below for that purpose; routine changes do not require running every lane locally.
+
+```sh
+node scripts/repository-file-inventory.ts --check
 npm test
 npm run build:assets
 npm run test:browser:run
@@ -67,7 +76,7 @@ Coordinator tests should observe published journal checkpoints before asserting 
 
 Node suites run at most two files concurrently, and browser suites run one. These fixtures perform real PDF extraction, encryption and archive rebuilds; allowing concurrency to grow with the host CPU count can starve their bounded waits. HTTP upload tests should observe the automatically queued conversion rather than start a competing conversion immediately after upload. Large report fixtures establish each report-wide identity once; they retain representative row/version counts and full acceptance/rebuild assertions.
 
-The workflow definitions in `.github/workflows/` document the validation lanes and remain useful for reproducing individual jobs or shards locally. GitHub Actions checks and PR-title validation are disabled; local validation is the merge gate. Server and browser lanes each use two deterministic file shards in the workflow, with fail-fast disabled so one failure does not hide another lane's results. Each browser runner builds assets once; the unit lane owns type checking. The ordinary `build` command still includes type checking. To reproduce a workflow shard locally, append `-- --test-shard=1/2` (or `2/2`) to the corresponding Node suite command. Console logs retain assertions and the slow-test summary. Reruns are explicit validation runs, not a mechanism to turn a flaky test green.
+The workflows in `.github/workflows/` run the full validation lanes on pull requests and remain useful for reproducing individual jobs or shards locally when CI failures persist. Server and browser lanes each use two deterministic file shards in the workflow, with fail-fast disabled so one failure does not hide another lane's results. Each browser runner builds assets once; the unit lane owns type checking. The ordinary `build` command still includes type checking. To reproduce a workflow shard locally, append `-- --test-shard=1/2` (or `2/2`) to the corresponding Node suite command. Console logs retain assertions and the slow-test summary. Reruns are explicit validation runs, not a mechanism to turn a flaky test green.
 
 Static-render fixtures using Vite middleware mode disable both `hmr` and `ws`. Disabling hot reload alone leaves the WebSocket server enabled in the pinned Vite version, causing concurrent fixtures to compete for its default port.
 
@@ -81,7 +90,7 @@ Update documentation with contract changes. Cite current implementation and test
 
 Keep short open items in the [single CRS work list](docs/todo/readme.md); give an item its own file only when necessary context justifies it. Maintain documentation of current behavior and limitations alongside code. Keep implementation plans and feedback in chats or issues, not repository specifications. Use repository-relative paths and reproducible commands when handing off changes. Keep health records, credentials, local paths, raw diagnostics and runtime state out of contributions. Follow [repository scope and handoffs](docs/architecture/workspace-and-handoffs.md) when transferring changes or interpreting another computer’s test receipts.
 
-## Commit messages and local squash integration
+## Commit messages and pull requests
 
 Start ordinary commit subjects with any Unicode emoji, followed by a space and description, for example `📚 Update docs`, `✨ Add import review`, `🐛 Fix upload retry` or `📝 Clarify provider setup`. Existing [Gitmoji shortcodes](https://gitmoji.dev/) such as `:sparkles:` are also accepted for compatibility; literal emojis are not restricted to that catalog. This default applies to human and agent commits; merge operations are exempt.
 
@@ -98,9 +107,7 @@ Use the contributor Node version on Git's PATH, including in graphical Git clien
 
 Exceptions are fine: use `git commit --no-verify` or `HUSKY=0 git commit ...` to skip local hooks, including when amending a merge. Branch commits are not scanned by CI.
 
-Integrate changes locally on an isolated integration branch created from fetched `origin/main`. Bring reviewed work onto that branch by squash merge, using an emoji-prefixed commit subject, then inspect the final merge tree and run full local validation against it. Passing results can carry forward only when the final tree is verified identical to the validated tree. Push the resulting commit to `main` with a normal non-force `git push origin HEAD:main` after each squash merge. Do not push directly from a feature checkout or update `main` in a checkout where it is checked out elsewhere. Keep the integration branch and its review separate from the main demo checkout.
-
-The existing Actions workflow files remain reference material for the validation they describe. Hosted Code checks and Lint PR Title have been disabled; do not add a hosted runner as part of the local workflow. Do not weaken existing checks solely to make a failing change pass. Preserve the existing Git protections on `main`.
+Push changes on a feature branch and open a pull request with an emoji-prefixed title. Request independent review and wait for the required GitHub Actions checks to pass, then squash merge the pull request. Do not push directly to `main`. Leave other worktrees, including the main demo checkout, unchanged. Use the full local lane and shard commands above when persistent CI failures need reproduction; do not weaken checks solely to make a failing change pass. Preserve the Git protections on `main`.
 
 ## Submit a change
 
