@@ -50,8 +50,14 @@ function writeChunk(
     sequence,
     Buffer.from(
       JSON.stringify({
-        format: 'circus-import-events-v2',
+        format: 'circus-import-events-v3',
         windowId,
+        origin: {
+          windowId,
+          attachedAt: '2026-01-01T00:00:00.000Z',
+          recordingAtAttachment: 'enabled',
+          observedBeforeAttachment: 0,
+        },
         events,
         checkpoint: {
           observedEvents: events.length,
@@ -97,7 +103,7 @@ test('retained metadata survives lock/reopen with capture off, joins the live wi
   assert.equal(archive.events[0]!.event.context.importId, live.events[0]!.context.importId);
   assert.equal(archive.events[0]!.event.context.requestId, requestId);
   assert.equal(archive.events.at(-1)!.event.sequence, live.events.at(-1)!.sequence);
-  assert.equal(store.work().chunkWrites, 3);
+  assert.equal(store.work().chunkWrites, 4);
   assert.doesNotMatch(
     JSON.stringify(archive),
     /fictional-source|secret narrative|fictional-profile/,
@@ -151,13 +157,14 @@ test('default-off capture creates no chunks and record work scales only with new
       d = createImportDiagnostics({ enabled: true, now: () => new Date('2026-01-01T00:00:00Z') }),
       store = f.open();
     d.attachEventStore(f.profileId, store);
+    const attachmentBytes = store.work().plaintextBytesWritten;
     for (let i = 0; i < size; i++)
       d.record('import.progress', { accountedUnits: 1 }, { profileId: f.profileId });
     const measured = store.work();
-    assert.equal(measured.chunkWrites, size / 128);
+    assert.equal(measured.chunkWrites, size / 128 + 1);
     assert.equal(measured.chunkReads, 0);
     assert.equal(measured.indexScans, 1);
-    work.push(measured.plaintextBytesWritten);
+    work.push(measured.plaintextBytesWritten - attachmentBytes);
     d.close();
   }
   assert.ok(work[1]! > work[0]! * 1.9 && work[1]! < work[0]! * 2.1);
@@ -175,19 +182,23 @@ test('ambiguous publication retries identical bytes and bounds dropped work whil
       attempts++;
       attemptedBytes.push(Buffer.from(bytes));
       const result = store.append(sequence, bytes);
-      if (attempts === 1) throw Error('Fictional lost acknowledgement');
+      if (attempts === 2) throw Error('Fictional lost acknowledgement');
       return result;
     },
   };
   d.attachEventStore(f.profileId, flaky);
   for (let i = 0; i < 132; i++)
     assert.doesNotThrow(() => d.record('import.progress', {}, { profileId: f.profileId }));
-  assert.equal(attempts, 1, 'no append retry per event while a frozen chunk is pending');
+  assert.equal(
+    attempts,
+    2,
+    'origin plus no append retry per event while a frozen chunk is pending',
+  );
   const exported = await d.exportArchive(f.profileId);
-  assert.equal(attempts, 3, 'retry plus one coalesced loss checkpoint');
-  assert.deepEqual(attemptedBytes[0], attemptedBytes[1]);
+  assert.equal(attempts, 4, 'origin, retry plus one coalesced loss checkpoint');
+  assert.deepEqual(attemptedBytes[1], attemptedBytes[2]);
   assert.equal(exported.events.length, 128);
-  assert.equal(store.work().chunkWrites, 2);
+  assert.equal(store.work().chunkWrites, 3);
   assert.equal(exported.currentWindow.droppedEvents, 4);
   assert.equal(exported.currentWindow.writeFailures, 1);
   assert.equal(exported.currentWindow.pendingEvents, 0);
@@ -219,8 +230,9 @@ test('persistent failure and oversized observations remain bounded and explicit'
   let attempts = 0;
   const broken: DiagnosticChunkStore = {
     ...store,
-    append() {
+    append(sequence, bytes) {
       attempts++;
+      if (attempts === 1) return store.append(sequence, bytes);
       throw Error('Fictional disk failure');
     },
   };
@@ -228,7 +240,7 @@ test('persistent failure and oversized observations remain bounded and explicit'
   d.attachEventStore(f.profileId, broken);
   for (let i = 0; i < 300; i++) d.record('import.progress', {}, { profileId: f.profileId });
   const result = await d.exportArchive(f.profileId);
-  assert.equal(attempts, 2);
+  assert.equal(attempts, 3);
   assert.equal(result.currentWindow.pendingEvents, 128);
   assert.equal(result.currentWindow.droppedEvents, 172);
   assert.equal(result.status, 'partial');
@@ -237,7 +249,7 @@ test('persistent failure and oversized observations remain bounded and explicit'
   t.after(() => failedRecovery.close());
   failedRecovery.attachEventStore(f.profileId, f.open());
   const unknownTail = await failedRecovery.exportArchive(f.profileId);
-  assert.deepEqual(unknownTail.windowCheckpoints, []);
+  assert.equal(unknownTail.windowCheckpoints[0]!.persistedEvents, 0);
   assert.equal(unknownTail.crashTailEvents, null);
   assert.equal(unknownTail.completeness, 'not_established');
   const other = fixture(t),
@@ -331,6 +343,8 @@ test('export yields to foreground work and discards plaintext if the profile loc
   assert.equal(result.currentWindow.windowId, null);
   assert.deepEqual(result.windowCheckpoints, []);
   assert.deepEqual(result.windowCoverage, []);
+  assert.deepEqual(result.windowOrigins, []);
+  assert.equal(result.currentAttachment, null);
   assert.equal((await d.exportArchive('another-profile')).status, 'not_attached');
   d.close();
 });
@@ -361,7 +375,7 @@ test('retention remains explicit without claiming a loss-free current inventory 
       knownPersistedNotExportedEvents: 128,
     },
   ]);
-  assert.equal(store.work().chunkWrites, 3);
+  assert.equal(store.work().chunkWrites, 4);
   d.close();
 });
 
@@ -404,7 +418,7 @@ test('unreadable and invalid earlier chunks retain exact omission counts from a 
     d.attachEventStore(f.profileId, {
       ...store,
       read(sequence) {
-        if (sequence === 1) {
+        if (sequence === 2) {
           if (failure === 'unreadable') throw Error('Fictional read failure');
           return Buffer.from('{}');
         }
@@ -425,7 +439,7 @@ test('unreadable and invalid earlier chunks retain exact omission counts from a 
         knownPersistedNotExportedEvents: 128,
       },
     ]);
-    assert.equal(store.work().chunkWrites, 2);
+    assert.equal(store.work().chunkWrites, 3);
     d.close();
   }
 });
@@ -450,6 +464,9 @@ test('interleaved profile sequences do not imply omissions or mix window evidenc
     assert.equal(result.windowCoverage[0]!.checkpointedPersistedEvents, 256);
     assert.equal(result.windowCoverage[0]!.readableEvents, 256);
     assert.equal(result.windowCoverage[0]!.knownPersistedNotExportedEvents, 0);
+    assert.equal(result.windowOrigins.length, 1);
+    assert.equal(result.windowOrigins[0]!.windowId, result.currentWindow.windowId);
+    assert.equal(result.windowOrigins[0]!.observedBeforeAttachment, 0);
     assert.equal(result.events[1]!.event.sequence - result.events[0]!.event.sequence, 2);
     assert.ok(result.events.every((row) => row.event.fields.accountedUnits === expected));
   }
@@ -466,23 +483,23 @@ test('scheduled flush retries a frozen publication without new observations', as
     ...store,
     append(sequence, bytes) {
       attempts++;
-      if (attempts === 1) throw Error('Fictional temporary failure');
+      if (attempts === 2) throw Error('Fictional temporary failure');
       return store.append(sequence, bytes);
     },
   });
   archive.record(f.profileId, event());
-  assert.equal(store.work().chunkWrites, 0);
+  assert.equal(store.work().chunkWrites, 1);
   t.mock.timers.tick(diagnosticArchiveLimits.flushIntervalMs);
-  assert.equal(attempts, 1);
+  assert.equal(attempts, 2);
   t.mock.timers.tick(diagnosticArchiveLimits.flushIntervalMs);
-  assert.equal(attempts, 3);
-  assert.equal(store.work().chunkWrites, 2);
+  assert.equal(attempts, 4);
+  assert.equal(store.work().chunkWrites, 3);
   const result = await archive.export(f.profileId, (value) => value);
   assert.equal(result.events.length, 1);
   assert.equal(result.currentWindow.writeFailures, 1);
   archive.close();
   t.mock.timers.tick(diagnosticArchiveLimits.flushIntervalMs);
-  assert.equal(attempts, 3);
+  assert.equal(attempts, 4);
 });
 
 test('loss-only counters coalesce on the timer and unchanged export/flush/close writes nothing', async (t) => {
@@ -493,15 +510,15 @@ test('loss-only counters coalesce on the timer and unchanged export/flush/close 
   archive.attach(f.profileId, randomUUID(), store);
   archive.flush(f.profileId);
   await archive.export(f.profileId, (value) => value);
-  assert.equal(store.work().chunkWrites, 0);
+  assert.equal(store.work().chunkWrites, 1);
   for (let i = 0; i < 100; i++)
     archive.record(f.profileId, {
       ...event(i),
       context: { importId: 'x'.repeat(diagnosticArchiveLimits.maxChunkBytes) },
     });
-  assert.equal(store.work().chunkWrites, 0, 'not one chunk per oversized observation');
+  assert.equal(store.work().chunkWrites, 1, 'not one chunk per oversized observation');
   t.mock.timers.tick(diagnosticArchiveLimits.flushIntervalMs);
-  assert.equal(store.work().chunkWrites, 1);
+  assert.equal(store.work().chunkWrites, 2);
   const result = await archive.export(f.profileId, (value) => value);
   assert.equal(result.windowCheckpoints[0]!.droppedEvents, 100);
   archive.flush(f.profileId);
@@ -567,6 +584,8 @@ test('evicting an entire lost window leaves previous history unknown', async (t)
   assert.equal(result.windowCheckpoints.length, 1);
   assert.equal(result.windowCoverage.length, 1);
   assert.equal(result.windowCoverage[0]!.knownPersistedNotExportedEvents, 0);
+  assert.equal(result.windowOrigins.length, 1);
+  assert.equal(result.windowOrigins[0]!.windowId, result.windowCheckpoints[0]!.windowId);
   assert.equal(result.windowCheckpoints[0]!.droppedEvents, 0);
   assert.equal(result.omittedBeforeInventory, null);
   assert.equal(result.crashTailEvents, null);
@@ -578,8 +597,14 @@ test('strict checkpoint envelopes reject unsupported schemas, private keys and u
     store = f.open(),
     windowId = randomUUID();
   const base = {
-    format: 'circus-import-events-v2',
+    format: 'circus-import-events-v3',
     windowId,
+    origin: {
+      windowId,
+      attachedAt: '2026-01-01T00:00:00.000Z',
+      recordingAtAttachment: 'enabled',
+      observedBeforeAttachment: 0,
+    },
     events: [],
     checkpoint: {
       observedEvents: 4,
@@ -663,4 +688,189 @@ test('checkpoint reserve keeps nearly full event payloads inside the plaintext c
   assert.ok(largestChunk > diagnosticArchiveLimits.maxChunkBytes - 1000);
   assert.equal(result.windowCheckpoints[0]!.persistedEvents, 3);
   archive.close();
+});
+
+test('attachment origin precedes first archived observation and preserves pre-attachment count', async (t) => {
+  const f = fixture(t),
+    store = f.open();
+  let at = '2026-01-01T00:00:00.000Z';
+  const d = createImportDiagnostics({ enabled: true, now: () => new Date(at) });
+  d.record('import.progress', {}, { profileId: f.profileId });
+  const before = d.exportSnapshot(f.profileId);
+  at = '2026-01-01T01:00:00.000Z';
+  d.attachEventStore(f.profileId, store);
+  assert.equal(store.work().chunkWrites, 1);
+  const zero = await d.exportArchive(f.profileId);
+  assert.equal(zero.events.length, 0);
+  assert.deepEqual(zero.windowOrigins, [
+    {
+      windowId: before.eventWindow.windowId,
+      attachedAt: at,
+      recordingAtAttachment: 'enabled',
+      observedBeforeAttachment: 1,
+    },
+  ]);
+  assert.equal(zero.windowCheckpoints[0]!.observedEvents, 0);
+  at = '2026-01-01T02:00:00.000Z';
+  d.record('import.progress', {}, { profileId: f.profileId });
+  const after = await d.exportArchive(f.profileId);
+  assert.deepEqual(after.windowOrigins, zero.windowOrigins);
+  assert.equal(after.events[0]!.event.timestamp, at);
+  assert.equal(after.currentWindow.persistedEvents, 1);
+  d.close();
+  const recovered = createImportDiagnostics({ now: () => new Date('2026-02-01T00:00:00.000Z') });
+  recovered.attachEventStore(f.profileId, f.open());
+  const restored = await recovered.exportArchive(f.profileId);
+  assert.deepEqual(restored.windowOrigins, zero.windowOrigins);
+  assert.equal(restored.currentAttachment!.origin.recordingAtAttachment, 'disabled');
+  assert.equal(restored.currentAttachment!.publication, 'disabled');
+  recovered.close();
+});
+
+test('enabled zero-event origins recover without a first event and prefix eviction retains repeated origin', async (t) => {
+  for (const records of [0, 256]) {
+    const f = fixture(t, 1),
+      store = f.open(),
+      d = createImportDiagnostics({ enabled: true });
+    d.attachEventStore(f.profileId, store);
+    const origin = (await d.exportArchive(f.profileId)).windowOrigins[0]!;
+    for (let i = 0; i < records; i++) d.record('import.progress', {}, { profileId: f.profileId });
+    d.close();
+    const recovered = createImportDiagnostics();
+    recovered.attachEventStore(f.profileId, f.open());
+    const restored = await recovered.exportArchive(f.profileId);
+    assert.deepEqual(restored.windowOrigins, [origin]);
+    assert.equal(restored.events.length, Math.min(records, 128));
+    assert.equal(restored.currentAttachment!.publication, 'disabled');
+    recovered.close();
+  }
+});
+
+test('reattachment creates a fresh live window while flushing and preserving earlier archive evidence', async (t) => {
+  const f = fixture(t),
+    d = createImportDiagnostics({ enabled: true });
+  d.attachEventStore(f.profileId, f.open());
+  d.record('import.progress', { accountedUnits: 1 }, { profileId: f.profileId });
+  const first = d.exportSnapshot(f.profileId);
+  d.attachEventStore(f.profileId, f.open());
+  const second = d.exportSnapshot(f.profileId);
+  assert.notEqual(second.eventWindow.windowId, first.eventWindow.windowId);
+  assert.equal(second.events.length, 0);
+  assert.equal(second.eventWindow.observedEvents, 0);
+  d.record('import.progress', { accountedUnits: 2 }, { profileId: f.profileId });
+  const result = await d.exportArchive(f.profileId);
+  assert.equal(result.status, 'available');
+  assert.equal(result.windowOrigins.length, 2);
+  assert.deepEqual(
+    result.windowCheckpoints.map((row) => row.persistedEvents),
+    [1, 1],
+  );
+  assert.equal(result.events[0]!.windowId, first.eventWindow.windowId);
+  assert.equal(result.events[1]!.windowId, second.eventWindow.windowId);
+  d.close();
+});
+
+test('origin publication acknowledgement stays separate from readable evidence and retries identical bytes', async (t) => {
+  for (const mode of ['failed', 'lost-ack', 'unreadable'] as const) {
+    const f = fixture(t),
+      store = f.open(),
+      bytes: Buffer[] = [];
+    let fail = true;
+    const d = createImportDiagnostics({ enabled: true });
+    d.attachEventStore(f.profileId, {
+      ...store,
+      append(sequence, value) {
+        bytes.push(Buffer.from(value));
+        if (mode === 'failed' && fail) throw Error('Fictional unavailable storage');
+        const result = store.append(sequence, value);
+        if (mode === 'lost-ack' && fail) throw Error('Fictional missing acknowledgement');
+        return result;
+      },
+      read(sequence) {
+        if (mode === 'unreadable') throw Error('Fictional unavailable read');
+        return store.read(sequence);
+      },
+    });
+    d.record('import.progress', {}, { profileId: f.profileId });
+    const initial = await d.exportArchive(f.profileId);
+    assert.equal(
+      initial.currentAttachment!.publication,
+      mode === 'unreadable' ? 'confirmed' : 'unconfirmed',
+    );
+    assert.equal(initial.windowOrigins.length, mode === 'lost-ack' ? 1 : 0);
+    if (mode !== 'unreadable') {
+      assert.deepEqual(bytes[0], bytes[1]);
+      fail = false;
+      const retried = await d.exportArchive(f.profileId);
+      assert.deepEqual(bytes[0], bytes[2]);
+      assert.equal(retried.currentAttachment!.publication, 'confirmed');
+      assert.equal(retried.windowOrigins.length, 1);
+      assert.equal(retried.currentWindow.droppedEvents, 1);
+      assert.equal(retried.currentWindow.persistedEvents, 0);
+    }
+    d.close();
+  }
+});
+
+test('strict origin validation rejects conflicting and malformed origin envelopes', async (t) => {
+  const f = fixture(t),
+    store = f.open(),
+    windowId = randomUUID();
+  const origin = {
+    windowId,
+    attachedAt: '2026-01-01T00:00:00.000Z',
+    recordingAtAttachment: 'enabled',
+    observedBeforeAttachment: 0,
+  };
+  const checkpoint = {
+    observedEvents: 0,
+    persistedEvents: 0,
+    droppedEvents: 0,
+    oversizedEvents: 0,
+    writeFailures: 0,
+  };
+  const base = { format: 'circus-import-events-v3', windowId, origin, events: [], checkpoint };
+  store.append(1, Buffer.from(JSON.stringify(base)));
+  const invalid = [
+    { ...base, format: 'circus-import-events-v2' },
+    { ...base, origin: { ...origin, extra: 'Fictional private origin canary' } },
+    { ...base, origin: { ...origin, windowId: randomUUID() } },
+    { ...base, origin: { ...origin, attachedAt: '2026-02-30T00:00:00.000Z' } },
+    { ...base, origin: { ...origin, attachedAt: '2026-01-02T00:00:00.000Z' } },
+    { ...base, origin: { ...origin, recordingAtAttachment: 'disabled' } },
+    ...[-1, 0.5, Number.MAX_SAFE_INTEGER + 1, 'unknown'].map((observedBeforeAttachment) => ({
+      ...base,
+      origin: { ...origin, observedBeforeAttachment },
+    })),
+    { ...base, origin: { ...origin, observedBeforeAttachment: 1 } },
+  ];
+  for (const [index, chunk] of invalid.entries())
+    store.append(index + 2, Buffer.from(JSON.stringify(chunk)));
+  const d = createImportDiagnostics();
+  d.attachEventStore(f.profileId, store);
+  const result = await d.exportArchive(f.profileId);
+  assert.equal(result.invalidChunks, invalid.length);
+  assert.deepEqual(result.windowOrigins, [origin]);
+  assert.equal(result.status, 'partial');
+  assert.doesNotMatch(JSON.stringify(result), /private origin canary/);
+  d.close();
+});
+
+test('many zero-event attachments retain bounded origins with one write each and one-pass export', async (t) => {
+  const f = fixture(t),
+    d = createImportDiagnostics({ enabled: true });
+  let current: DiagnosticChunkStore;
+  for (let i = 0; i < 40; i++) {
+    current = f.open();
+    d.attachEventStore(f.profileId, current);
+    assert.equal(current.work().chunkWrites, 1);
+    assert.equal(current.work().chunkReads, 0);
+  }
+  const result = await d.exportArchive(f.profileId);
+  assert.equal(result.windowOrigins.length, 40);
+  assert.equal(new Set(result.windowOrigins.map((origin) => origin.windowId)).size, 40);
+  assert.equal(current!.work().chunkWrites, 1);
+  assert.equal(current!.work().chunkReads, 40);
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= diagnosticArchiveLimits.maxExportBytes);
+  d.close();
 });

@@ -34,7 +34,7 @@ export function ImportDiagnosticsControl() {
         format: 'circus-import-diagnostics-v1',
         exportedAt: new Date().toISOString(),
         coverage:
-          'Bounded metadata only, not an established full-run history. The live event window resets after profile lock, clear or process restart. A separate encrypted archive may retain earlier events; its coverage, failures and limits are explicit. Earlier omissions and an abrupt-shutdown tail remain unknown. Deduplicate live and archived observations by windowId and sequence. No medical text, filenames, profile identity, credentials or raw model payloads. Source reading is not clinical completeness.',
+          'Bounded metadata only, not an established full-run history. The live event window resets after profile lock, clear, process restart or archive reattachment. A separate encrypted archive may retain earlier events; its coverage, failures and limits are explicit. Recording attachment dates describe archive attachment, not a complete import history. Pre-attachment observations are separate from saved archive evidence. Earlier omissions and an abrupt-shutdown tail remain unknown. Deduplicate live and archived observations by windowId and sequence. No medical text, filenames, profile identity, credentials or raw model payloads. Source reading is not clinical completeness.',
         clientBuild: CLIENT_BUILD_IDENTITY,
         browser,
         reviewEditors,
@@ -99,7 +99,7 @@ export function ImportDiagnosticsControl() {
       </button>
       <p id={coverageId} className="helper-text">
         {enabled.data.enabled
-          ? 'Bounded diagnostics include retained events when available. Earlier history and an abrupt-shutdown tail may be missing.'
+          ? 'Bounded diagnostics include retained events and recording attachment details when available. Attachment dates do not prove that a whole import was recorded. Earlier history and an abrupt-shutdown tail may be missing.'
           : 'Detailed events are off. Download summaries and any previously retained events, or enable detailed diagnostics before reproducing a problem.'}
       </p>
       {message && <p role="status">{message}</p>}

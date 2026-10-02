@@ -21,6 +21,14 @@ export interface ImportDiagnosticCheckpoint {
   writeFailures: number;
 }
 
+export interface ImportDiagnosticOrigin {
+  windowId: string;
+  attachedAt: string;
+  recordingAtAttachment: 'enabled' | 'disabled';
+  /** Live observations in this profile window before archive attachment; never archived counts. */
+  observedBeforeAttachment: number;
+}
+
 export interface ImportDiagnosticArchive<Event = unknown> {
   storage: 'encrypted_chunks';
   status: 'available' | 'partial' | 'unavailable' | 'not_attached';
@@ -36,6 +44,13 @@ export interface ImportDiagnosticArchive<Event = unknown> {
   omittedBeforeInventory: null;
   crashTailEvents: null;
   completeness: 'not_established';
+  /** Evidence only from readable, strictly validated current-format chunks. */
+  windowOrigins: ImportDiagnosticOrigin[];
+  currentAttachment: {
+    origin: ImportDiagnosticOrigin;
+    /** Append acknowledgement only; readable retained evidence is separate in windowOrigins. */
+    publication: 'confirmed' | 'unconfirmed' | 'disabled';
+  } | null;
   /** Latest retained cumulative checkpoint per window; never sum checkpoints for one window. */
   windowCheckpoints: Array<ImportDiagnosticCheckpoint & { windowId: string }>;
   windowCoverageScope: 'retained_readable_checkpoints';
