@@ -15,6 +15,7 @@ import {
 } from '../proxy-model-bridge.ts';
 import type { HealthTool, ProxyConfig, ProxyModelBridgeOptions } from '../proxy-model-bridge.ts';
 import { createImportDiagnostics, measureImportPhase } from '../import-diagnostics.ts';
+import { requestInputComposition } from '../request-input-composition.ts';
 import {
   compactConsumedProxyHistory,
   compactIntakeReadResult,
@@ -787,6 +788,20 @@ test('HTTP 503 retries the exact provider request with bounded physical-attempt 
     ],
   );
   const events = importDiagnostics.snapshot('fictional-retry-profile');
+  const physicalStarts = events.filter(({ event }) => event === 'model.request.started');
+  assert.equal(new Set(physicalStarts.map(({ context }) => context.providerRequestId)).size, 3);
+  for (const [index, start] of physicalStarts.entries()) {
+    const composition = requestInputComposition(JSON.parse(String(f.requests[index]!.init.body)));
+    for (const [name, value] of Object.entries(composition))
+      assert.equal(start.fields[name], value);
+    assert.ok(
+      events.some(
+        (event) =>
+          event.event !== 'model.request.started' &&
+          event.context.providerRequestId === start.context.providerRequestId,
+      ),
+    );
+  }
   assert.equal(events.filter(({ event }) => event === 'model.request.started').length, 3);
   assert.equal(events.filter(({ event }) => event === 'model.request.failed').length, 2);
   assert.equal(events.filter(({ event }) => event === 'model.request.completed').length, 1);
@@ -1121,7 +1136,9 @@ test('cached input usage accumulates across tool rounds and remains unknown afte
   );
 });
 
-test('consumed durable intake batches use bounded history after the model sees each true result', async () => {
+test('consumed durable intake batches use bounded history after the model sees each true result', async (t) => {
+  const diagnostics = createImportDiagnostics({ enabled: true });
+  t.after(() => diagnostics.close());
   const batchCount = 21;
   const argumentsByCall = new Map<string, string>();
   const replies: Reply[] = Array.from({ length: batchCount }, (_, index) => {
@@ -1168,6 +1185,8 @@ test('consumed durable intake batches use bounded history after the model sees e
   });
   replies.push(answer);
   const f = harness(replies, {
+    diagnostics,
+    diagnosticContext: { profileId: 'fictional-compacted-profile' },
     onTool: async ({ callId, arguments: args }) => ({
       intakeId: args.id,
       version: Number(args.version) + 1,
@@ -1218,6 +1237,25 @@ test('consumed durable intake batches use bounded history after the model sees e
     assert.equal(finalCalls[index]?.function.arguments, argumentsByCall.get(callId));
   }
   const finalCharacters = finalRequest.init.body.length;
+  const physicalStarts = diagnostics
+    .snapshot('fictional-compacted-profile')
+    .filter(({ event }) => event === 'model.request.started');
+  assert.equal(physicalStarts.length, f.requests.length);
+  const finalComposition = requestInputComposition(finalRequest.body);
+  for (const [name, value] of Object.entries(finalComposition))
+    assert.equal(physicalStarts.at(-1)!.fields[name], value, name);
+  assert.equal(
+    finalComposition.inputArgumentCharacters,
+    finalCalls.reduce((count, call) => count + call.function.arguments.length, 0),
+  );
+  assert.ok(
+    Number(finalComposition.inputArgumentCharacters) <
+      [...argumentsByCall.values()].reduce(
+        (count, argumentsText) => count + argumentsText.length,
+        0,
+      ),
+    'measurement reflects compacted outbound arguments rather than retained full arguments',
+  );
   const totalCharacters = f.requests.reduce((sum, request) => sum + request.init.body.length, 0);
   assert.ok(finalCharacters < 100000, `final request stayed bounded at ${finalCharacters} chars`);
   assert.ok(totalCharacters < 1500000, `aggregate requests stayed bounded at ${totalCharacters}`);

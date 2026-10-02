@@ -3,6 +3,13 @@
  * Values still pass the recorder's existing metadata value validators.
  */
 const names = new Set([
+  ...`inputMessageCount inputArgumentCharacters inputArgumentBytes inputToolDefinitionCharacters
+  inputToolDefinitionBytes inputMediaTransportBytes inputUnsupportedShapes inputCompositionComplete`.split(
+    /\s+/,
+  ),
+  ...['System', 'Developer', 'User', 'Assistant', 'Tool', 'Other'].flatMap((role) =>
+    ['Messages', 'Characters', 'Bytes'].map((count) => `input${role}${count}`),
+  ),
   // HTTP, model, import progress and host phases.
   ...`accountedUnits activeMs attempt bytes cachedInputTokens candidates choiceCount chunkCount
   classification currentIndex currentVersion dispatched durationMs errorCategory errorCode

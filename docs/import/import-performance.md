@@ -22,6 +22,18 @@ The compact serialized archive section is capped at 24 MiB after identifier anon
 
 Focused fictional tests verify encrypted session isolation, lock flushing, fresh-runtime/cache-loss recovery, default-off capture, replay/failure bounds, unsafe/corrupt metadata rejection, export bounds and a mounted download of actual retained data. Work-count checks at 256 and 512 events produce two and four chunk writes without prior payload rereads. These checks do not establish actual release-browser complaint reconstruction, full-run retention, provider speed or clinical completeness.
 
+## Request input composition
+
+With detailed recording enabled, each physical `model.request.started` observation measures the outgoing body after transcript compaction. Its `providerRequestId` distinguishes physical requests, including retries and replacement requests. These measurements do not change the request, fit limits or retry behavior. Detailed recording off skips composition measurement.
+
+`inputMessageCount` counts message array entries. Fixed `inputSystem`, `inputDeveloper`, `inputUser`, `inputAssistant`, `inputTool` and `inputOther` prefixes expose `Messages`, `Characters` and `Bytes`: message counts, content-text UTF-16 code units (JavaScript string length) and UTF-8 bytes. Text content arrays contribute their text parts; tool-result text belongs to the Tool bucket. Unknown roles and non-object entries belong to Other and mark the measurement incomplete. The bucket never retains an arbitrary role name.
+
+`inputArgumentCharacters` and `inputArgumentBytes` count assistant function-call argument strings separately from assistant content. `inputToolDefinitionCharacters` and `inputToolDefinitionBytes` measure the serialized tools array, including its JSON framing and schemas. `inputMediaTransportBytes` counts file-data and image-URL strings, including data-URL/base64 overhead and remote URL bytes. It does not measure decoded media, remotely fetched bytes, image/PDF content or provider tokenization. Existing `requestBytes`, `pdfParts`, `imageParts` and transcript-fit measurements keep their existing meanings. Message/argument text excludes JSON framing; category bytes need not add up to the total serialized request bytes.
+
+`inputUnsupportedShapes` counts unsupported message, role, content-part, function-call or tools shapes. `inputCompositionComplete: false` means recognized subsets were counted but unsupported content remains unmeasured; zero subset counts must not be read as zero total content. If measurement throws, all composition counters are null and completeness is false. No content, arguments, schemas, names, URLs, credentials or content fingerprints appear in these new fields. The fixed counters fit the normal observation field bound alongside private-trace linkage and survive the encrypted archive's schema validation.
+
+These are per-request metadata counters, not full-run qualification. Archive budgets, earlier omissions and shutdown-tail limits above still apply. [CRS-177](../todo/CRS-177.md) retains diagnostics readiness, early/late complaint reconstruction, the current scripted 900-page baseline and adopted-route qualification.
+
 ## Reading a complaint
 
 1. Find the operation by time, kind and outcome. Inspect its total browser duration and request IDs. Server timelines expose current stage, last progress, elapsed time, interruption/error state and dropped observations.
