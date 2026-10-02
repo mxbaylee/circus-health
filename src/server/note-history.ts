@@ -7,6 +7,7 @@ import { profileFile } from './assets.ts';
 import {
   recordDurabilityStatus,
   queryRecordHistory,
+  readIndexedRecordVersion,
   type DurableRecordVersion,
   type RecordFieldChange,
 } from './record-versions.ts';
@@ -578,19 +579,14 @@ function indexedVersion(
       'INVALID_GENERATION',
       'Choose a version from this entry’s saved history',
     );
-  const row = db
-    .prepare(
-      'SELECT version_json FROM __record_versions WHERE profile_id=? AND entity=? AND record_id=? AND version_id=? AND deleted=0',
-    )
-    .get(profileId, entity, JSON.stringify([id]), versionId) as
-    (SqliteRow & { version_json: string }) | undefined;
+  const row = readIndexedRecordVersion(db, profileId, entity, JSON.stringify([id]), versionId);
   if (!row)
     throw new HttpError(
       404,
       'HISTORY_NOT_FOUND',
       'This version is not in the selected entry’s history',
     );
-  return JSON.parse(row.version_json) as DurableRecordVersion;
+  return row;
 }
 function rowAt(
   db: Database,
