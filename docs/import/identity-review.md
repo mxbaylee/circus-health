@@ -1,5 +1,7 @@
 # Report identity review
 
+Serves the [Caregiver, Self-tracker and Records assembler](../design/personas.md#file-family-records); [correct a record](../design/personas.md#correct-a-record) distinguishes provider evidence from a person's attribution.
+
 Identity assignment applies to each report. A name or birth-date mismatch never rejects the upload or stops reading. Pending records can be assigned to Self, an existing person or a newly created person. Records assigned to someone else remain outside Self's clinical lists and trends. Assignment leaves clinical records in review; acceptance is a separate action.
 
 ## Automatic matches and human confirmation
