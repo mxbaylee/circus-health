@@ -2,7 +2,7 @@
 
 This is the single work list. Keep ordinary items to an ID and a short description here. Add a separate CRS file when an item needs more room: its specification, proposal, owner decisions, open questions and review findings belong there. Fold review feedback into the items it concerns.
 
-Numbers are stable identifiers, not priority. Never renumber or reuse an ID. After skipping active and retired tickets, CRS-193 is next. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
+Numbers are stable identifiers, not priority. Never renumber or reuse an ID. After skipping active and retired tickets, CRS-194 is next. When a ticket's work lands, delete its entry and CRS file in the same change and describe the result in the maintained documentation. If only part landed, delete it anyway and open a new ticket for the rest, with context scoped to that remainder. Entries under Closed identifiers predate this practice; they preserve prior status and do not certify today's code. Research items retain their status pending a separate discussion; listing them does not authorize runs, paid inference or deployment.
 
 Each open item carries an effort and an impact size (S, M or L; owner request, 2026-09-30). The sizes live only in this index, so there is one place to update. They inform prioritization but are not priority.
 
@@ -48,13 +48,13 @@ Each open item shows its score after its sizes. When a size or mark changes, rec
 
 **Refresh this list in the same change whenever a ticket is added, closed or removed, or whenever a size, mark or dependency changes.** Apply the rules above: skip items that are waiting on an unfinished ticket, and break ties as in step 2. The last column says what the owner must provide; everything else is agent work.
 
-| #   | Ticket                                                         | Score | Tie-break                       | Owner input                                                                               |
-| --- | -------------------------------------------------------------- | ----- | ------------------------------- | ----------------------------------------------------------------------------------------- |
-| 1   | 🔐 [CRS-163](#crs-163) passkeys | 8 | 🔴, unblocks CRS-088, lower ID | Tap passkey prompts on the intended localhost desktop |
-| 2   | 💽 [CRS-152](#crs-152) deployment drive | 8 | 🔴 | Connect or choose the drive and adopted provider |
-| 3   | 👥 [CRS-124](#crs-124) People display | 8 | 🟡 🐭 | Inspect non-Self people in intended layouts |
-| 4   | 📈 [CRS-192](CRS-192.md) large-import diagnostics qualification | 7 | 🔴, unblocks CRS-086 | Split before implementation; adopted route and approval for paid full-size inference |
-| 5   | 📦 [CRS-043](CRS-043.md) supported-size import | 7 | 🔴, lower ID | None; split before implementation or owner grade before merge |
+| #   | Ticket                                              | Score | Tie-break                      | Owner input                                                   |
+| --- | --------------------------------------------------- | ----- | ------------------------------ | ------------------------------------------------------------- |
+| 1   | 🔐 [CRS-163](#crs-163) passkeys                     | 8     | 🔴, unblocks CRS-088, lower ID | Tap passkey prompts on the intended localhost desktop         |
+| 2   | 💽 [CRS-152](#crs-152) deployment drive             | 8     | 🔴                             | Connect or choose the drive and adopted provider              |
+| 3   | 🔎 [CRS-193](CRS-193.md) diagnostic recording check | 8     | 🔴, unblocks CRS-192           | None                                                          |
+| 4   | 👥 [CRS-124](#crs-124) People display               | 8     | 🟡 🐭                          | Inspect non-Self people in intended layouts                   |
+| 5   | 📦 [CRS-043](CRS-043.md) supported-size import      | 7     | 🔴, lower ID                   | None; split before implementation or owner grade before merge |
 
 Next up: 🩻 [CRS-062](#crs-062), 🥡 [CRS-068](#crs-068), ⚙️ [CRS-086](CRS-086.md), 🏷️ [CRS-139](CRS-139.md), and 🎨 [CRS-190](CRS-190.md) (7, 🔴). CRS-086 independently implements async processing and bounded context; CRS-192 prepares complete downloadable diagnostics before the owner's common 800–900-page trial, supplies its instrumented comparison baseline, and produces prioritized production follow-ups (owner, 2026-10-01). Preparatory async design can start while diagnostics readiness proceeds; CRS-192's current scripted 900-page baseline precedes writing CRS-086's full implementation specification, and does not wait for parallel workers. 🩺 [CRS-154](CRS-154.md) (7, 🟡) shares complaint/download validation. ♻️ [CRS-155](CRS-155.md) scores 8 but waits for natural token expiry. 🗂️ [CRS-150](CRS-150.md) waits for 🗂️ [CRS-175](CRS-175.md); 🧐 [CRS-073](#crs-073) waits for CRS-150.
 
@@ -95,10 +95,10 @@ Proposed focused-ticket divisions are recorded in [CRS-140](CRS-140.md#proposed-
 - [ ] <a id="crs-146"></a> 👣 [CRS-146](CRS-146.md) · 🐕 M · 🟡 M · score 4 — Log every sign-in (unlock) and failed attempt and show them clearly to the patient on their next sign-in; failed attempts happen before unlock, so they need a small separate log with no health data.
 - [ ] <a id="crs-150"></a> 🗂️ [CRS-150](CRS-150.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Offer job-based packet presets, per-category and per-record exclusions, a generic withheld-record disclosure and a one-page emergency summary; annual and emergency current-condition lists depend on [CRS-175](CRS-175.md). Remainder of CRS-147.
 - [ ] <a id="crs-157"></a> 🧮 [CRS-157](CRS-157.md) · 🐕 M · 🟡 M · 🚀 production · score 7 — Establish model-pass baselines for legacy queued/running batch journals from durable provenance, avoiding redundant billed replay without skipping new capture. Current-format and legacy review-ready baselines are implemented (remainder of CRS-118).
-- [ ] <a id="crs-192"></a> 📈 [CRS-192](CRS-192.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Before an owner's common 800–900-page trial, verify complete downloadable AI/import/processing/UX diagnostics, establish an instrumented baseline and turn findings into prioritized production tickets; unblocks CRS-086's measured comparison and supports CRS-154 complaint reconstruction.
+- [ ] <a id="crs-193"></a> 🔎 [CRS-193](CRS-193.md) · 🐕 M · 🔴 L · 🚀 production · score 8 — Add an explicit pre-upload check of the current encrypted diagnostic attachment, with dated evidence and separate history limits; unblocks CRS-192.
+- [ ] <a id="crs-192"></a> 📈 [CRS-192](CRS-192.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — After CRS-193, before an owner's common 800–900-page trial, verify complete downloadable AI/import/processing/UX diagnostics, establish an instrumented baseline and turn findings into prioritized production tickets; unblocks CRS-086's measured comparison and supports CRS-154 complaint reconstruction.
 - [ ] <a id="crs-148"></a> 🧳 [CRS-148](CRS-148.md) · 🐘 L · 🟡 M · score 3 — Export everything in a portable form, Takeout-style: originals, records, notes, corrections and history, with a manifest, for moving storage or keeping a checkpoint elsewhere.
 - [ ] <a id="crs-149"></a> 🎣 [CRS-149](CRS-149.md) · 🐭 S · 🟡 M · score 5 — Confirm and show the destination of external links in assistant text (warn when a link carries data), and test that one session's unlock never grants another session access.
-
 
 ## <a id="release-and-usability-checks"></a>✅ Release and usability checks
 
