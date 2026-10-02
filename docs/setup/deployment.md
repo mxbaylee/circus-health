@@ -22,9 +22,14 @@ Stop the stack cleanly, make a consistent archive backup, update the repository,
 
 ## Backup and recovery
 
-The durable authority is the complete encrypted `CRS_DATA_DIR`, not SQLite. Stop the writer or use a filesystem snapshot with suitable consistency, then copy the whole directory, including the registry, keyrings, indexes, objects, originals, and record-version history. Copying individual files while the app runs is not an application backup.
+The durable authority is the complete encrypted `CRS_DATA_DIR`, not SQLite. The supported backup is a consistent copy of that whole directory. The npm `backup` and `restore` aliases are removed. Direct invocation of `src/server/recovery-cli.ts` refuses all operations with guidance before opening an archive or touching a destination; its retired plaintext portable commands are not a vault backup, restore or Takeout export.
 
-Store recovery kits separately from the archive. Back up `CRS_STATE_DIR` and provider credentials separately; they contain proxy keys and authentication state, not health history. Practice restore with a fictional profile and verify unlock, an original download, history, and rebuild after cache loss.
+1. Stop the installation cleanly with Ctrl-C and wait for its Compose cleanup. Ensure no other writer uses this archive. Preserve the complete encrypted directory, including its registry, keyrings, indexes, objects, originals and record-version history, in a separate protected location outside Git. A filesystem snapshot requires its own consistency guarantee; copying selected files while the app runs is not an application backup.
+2. Store usable recovery kits separately from the archive and its backup. A recovery kit restores access to retained data; it contains no copy of the records. Back up `CRS_STATE_DIR` and provider credentials separately because proxy authentication is not health history.
+3. Restore the complete backup into a distinct empty external directory whose resolved name is `data`. Preserve the original and backup; do not overlay an existing archive or run two versions against one directory. Use this restored path as `CRS_DATA_DIR` with the normal npm → Compose launcher and the intended separate proxy configuration/state. Unlock using the separately retained recovery kit.
+4. Practice with independently fictional records and check original hashes, accepted records, corrections/history and pending work. A cache rebuild only reconstructs SQLite from the same authority; it does not prove an independent backup is complete. The release-build independent restore drill remains [CRS-214](../todo/CRS-214.md). Stop on an integrity/refusal error and preserve the evidence rather than initializing an empty archive or bypassing a writer guard.
+
+Backups retain the clinical and key state at the time of the copy. Removing a passkey or deleting a profile from the active archive does not revoke independently retained copies. Portable export for other applications remains separate work in [CRS-148](../todo/CRS-148.md). `npm run help` points to this procedure without opening an archive or invoking Docker.
 
 ## Filesystem and process requirements
 

@@ -48,6 +48,9 @@ Prerequisites: Node 24, npm, Docker with Compose v2.30 or newer.
 Source your external shell env file before launch; .env files are not loaded automatically.
 Model/provider settings belong in your LiteLLM configuration. See docs/setup/installation.md and docs/setup/environment.md.
 Ctrl-C stops both containers. Health data and proxy authentication survive recreation.
+Backup/restore: stop the writer, then copy the complete encrypted CRS_DATA_DIR consistently.
+Keep recovery kits separately; SQLite and recovery kits are not archive backups.
+Offline backup/restore/rebuild/export commands are retired. See docs/setup/deployment.md.
 `;
 type Environment = NodeJS.ProcessEnv;
 const errno = (error: unknown, code: string) =>

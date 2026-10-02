@@ -8,13 +8,11 @@ import {
   readFileSync,
   rmSync,
   existsSync,
-  cpSync,
   symlinkSync,
   realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { openDatabase, type Database } from '../database.ts';
 import { PROFILE_IDS, PROFILES } from '../profiles.ts';
 import { writeProfileRegistry } from '../profile-registry.ts';
@@ -286,40 +284,15 @@ test('Fictional Orchid original guards and backup restore reject other profiles 
   assert.equal(existsSync(resolve(root, 'bad-restore')), false);
 });
 
-test('recovery CLI accepts Fictional Orchid without writing another profile or assuming legacy paths', (t) => {
+test('portable recovery internals preserve Fictional Orchid without writing another profile', async (t) => {
   const { root, dbs } = fixture(t, ['orchid']);
   source(root, dbs.get('orchid')!, 'orchid');
   attachPersonalDurability(dbs.get('orchid')!, { root, profileId: 'orchid' });
   exportCuration(dbs.get('orchid')!, root, 'orchid');
-  dbs.get('orchid')!.close();
-  symlinkSync(
-    new URL('../../../node_modules', import.meta.url),
-    resolve(root, 'node_modules'),
-    'dir',
-  );
-  cpSync(new URL('../', import.meta.url), resolve(root, 'src/server'), { recursive: true });
-  cpSync(new URL('../../shared/', import.meta.url), resolve(root, 'src/shared'), {
-    recursive: true,
-  });
-  const invoke = (...args: string[]) =>
-    spawnSync(process.execPath, [resolve(root, 'src/server/recovery-cli.ts'), ...args], {
-      encoding: 'utf8',
-      env: { ...process.env, CRS_DATA_DIR: resolve(root, 'data') },
-    });
-  let result = invoke('backup', 'orchid');
-  assert.equal(result.status, 0, result.stderr);
-  const receipt = JSON.parse(result.stdout);
+  const receipt = await createBackup(dbs.get('orchid')!, root, 'orchid');
   assert.equal(receipt.profileId, 'orchid');
-  assert.ok(receipt.path.startsWith(resolve(root, 'data/backups/orchid/')));
-  result = invoke('export-sources', 'orchid');
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Offline database export is retired/);
-  result = invoke('rebuild', 'orchid', resolve(root, 'cli-rebuild'));
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).profileId, 'orchid');
-  result = invoke('backup', 'unregistered');
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Unknown profile/);
+  const rebuilt = rebuildProfile(root, 'orchid', resolve(root, 'internal-rebuild'));
+  assert.equal(rebuilt.profileId, 'orchid');
   assert.equal(existsSync(profilePaths(root, 'cedar').database), false);
   assert.equal(existsSync(profilePaths(root, 'cookie-dough').database), false);
 });

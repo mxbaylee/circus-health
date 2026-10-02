@@ -21,8 +21,6 @@
     "test:tools": "node src/scripts/test-suite.ts tools",
     "test:continuation": "node src/scripts/test-suite.ts continuation",
     "test:ui": "vitest run --config vitest.config.ts",
-    "backup": "node src/server/recovery-cli.ts backup",
-    "restore": "node src/server/recovery-cli.ts restore",
     "test:state": "node src/scripts/test-suite.ts state",
     "test": "npm run test:server && npm run test:tools && npm run test:deploy && npm run test:continuation && npm run test:ui && npm run test:state",
     "test:browser": "npm run build && npm run test:browser:run",
