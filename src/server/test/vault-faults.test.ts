@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, truncateSync }
 import { resolve } from 'node:path';
 import { revision } from '../database.ts';
 import { getNote, saveNote } from '../notes.ts';
+import { queryRecordHistory } from '../record-versions.ts';
 import type { TransactionOperation } from '../database.ts';
 import type { OpenedProfile } from '../encrypted-profiles.ts';
 import { vaultFixture, newProfile } from './helpers/vault-fixture.ts';
@@ -49,12 +50,15 @@ test('a partial orphan object cannot replace acknowledged current records or his
   assert.ok(rebuiltState);
   const rebuilt = rebuiltState.db;
   assert.equal(getNote(rebuilt, 'patient').person.pronouns, 'B');
-  const values = rebuilt
-    .prepare(
-      "SELECT after_json FROM __record_fields WHERE entity='notes' AND field='profile_json.pronouns' ORDER BY sequence",
-    )
-    .all()
-    .map((row) => JSON.parse(String(row.after_json)) as unknown);
+  const values = queryRecordHistory(rebuilt, {
+    profileId: profile.id,
+    entity: 'notes',
+    recordId: getNote(rebuilt, 'patient').id,
+    field: 'profile_json.pronouns',
+  })
+    .entries.toReversed()
+    .map((entry) => entry.changes.find((change) => change.field === 'profile_json.pronouns')?.after)
+    .flatMap((value) => (value?.present ? [value.value] : []));
   assert.deepEqual(values.slice(-2), ['A', 'B']);
   assert.equal(values.includes('UNACCEPTED'), false);
   assert.ok(orphan);

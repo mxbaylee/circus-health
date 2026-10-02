@@ -144,7 +144,7 @@ export interface RecordHistoryResult {
 }
 
 const FORMAT = 'health-record-versions-v1';
-const PROJECTION = 1;
+const PROJECTION = 2;
 const LIMIT = 256 * 1024;
 const q = (s: string): string => '"' + s.replaceAll('"', '""') + '"';
 const literal = (s: string): string => "'" + s.replaceAll("'", "''") + "'";
@@ -180,16 +180,55 @@ function tables(db: Database): TableSchema[] {
   });
 }
 function setup(db: Database): void {
+  const saved = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='__record_state'")
+    .get();
+  if (saved) {
+    const row = db.prepare('SELECT projection FROM __record_state WHERE singleton=1').get();
+    if (row && row.projection !== PROJECTION)
+      fail('unsupported or incomplete history projection; rebuild cache');
+    for (const [table, columns] of [
+      [
+        '__record_versions',
+        'version_id,profile_id,entity,record_id,sequence,recorded_at,previous_version,operation_id,deleted,contents_json,metadata_json',
+      ],
+      [
+        '__record_fields',
+        'version_id,profile_id,entity,record_id,field,sequence,before_version,before_present,after_present',
+      ],
+    ]) {
+      if (
+        db
+          .prepare(`PRAGMA table_info(${q(table)})`)
+          .all()
+          .map((column) => column.name)
+          .join(',') !== columns
+      )
+        fail('invalid history projection schema; rebuild cache');
+    }
+    if (!row) {
+      for (const table of [
+        '__record_state',
+        '__record_versions',
+        '__record_fields',
+        '__record_transactions',
+        '__record_current',
+      ]) {
+        if (db.prepare(`SELECT count(*) AS count FROM ${q(table)}`).get()?.count !== 0)
+          fail('incomplete populated history projection; rebuild cache');
+      }
+    }
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS __record_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile_id TEXT NOT NULL, projection INTEGER NOT NULL, schema_version INTEGER NOT NULL, sequence INTEGER NOT NULL, head_json TEXT);
     CREATE TABLE IF NOT EXISTS __record_transactions (operation_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, fingerprint TEXT, result_json TEXT NOT NULL, commit_json TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS __record_versions (version_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, entity TEXT NOT NULL, record_id TEXT NOT NULL, sequence INTEGER NOT NULL, recorded_at TEXT NOT NULL, previous_version TEXT, operation_id TEXT NOT NULL, deleted INTEGER NOT NULL, contents_json TEXT NOT NULL, version_json TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS __record_versions (version_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, entity TEXT NOT NULL, record_id TEXT NOT NULL, sequence INTEGER NOT NULL, recorded_at TEXT NOT NULL, previous_version TEXT, operation_id TEXT NOT NULL, deleted INTEGER NOT NULL, contents_json TEXT NOT NULL, metadata_json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS __record_history ON __record_versions(profile_id,entity,record_id,sequence DESC);
     CREATE INDEX IF NOT EXISTS __record_time ON __record_versions(profile_id,recorded_at,sequence);
     CREATE INDEX IF NOT EXISTS __record_link_owner ON __record_versions(profile_id,entity,json_extract(contents_json,'$.note_id'),sequence DESC);
     CREATE INDEX IF NOT EXISTS __record_attachment_owner ON __record_versions(profile_id,entity,json_extract(contents_json,'$.owner_type'),json_extract(contents_json,'$.owner_id'),sequence DESC);
     CREATE TABLE IF NOT EXISTS __record_current (entity TEXT NOT NULL, record_id TEXT NOT NULL, version_id TEXT NOT NULL, PRIMARY KEY(entity,record_id));
-    CREATE TABLE IF NOT EXISTS __record_fields (version_id TEXT NOT NULL, profile_id TEXT NOT NULL, entity TEXT NOT NULL, record_id TEXT NOT NULL, field TEXT NOT NULL, sequence INTEGER NOT NULL, before_json TEXT, after_json TEXT, PRIMARY KEY(version_id,field));
+    CREATE TABLE IF NOT EXISTS __record_fields (version_id TEXT NOT NULL, profile_id TEXT NOT NULL, entity TEXT NOT NULL, record_id TEXT NOT NULL, field TEXT NOT NULL, sequence INTEGER NOT NULL, before_version TEXT, before_present INTEGER NOT NULL, after_present INTEGER NOT NULL, PRIMARY KEY(version_id,field));
     CREATE INDEX IF NOT EXISTS __record_field_history ON __record_fields(profile_id,entity,record_id,field,sequence DESC);
     CREATE TEMP TABLE IF NOT EXISTS __record_changed (entity TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY(entity,record_id));
   `);
@@ -422,6 +461,7 @@ function indexTransaction(
         previous && !previous.deleted ? JSON.parse(previous.contents_json) : null,
       ),
       after = values(version.deleted ? null : version.contents);
+    const { contents, ...metadata } = version;
     db.prepare('INSERT INTO __record_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(
       version.versionId,
       config.profileId,
@@ -432,23 +472,24 @@ function indexTransaction(
       version.previousVersion,
       version.operationId,
       Number(version.deleted),
-      JSON.stringify(version.contents),
-      JSON.stringify(version),
+      JSON.stringify(contents),
+      JSON.stringify(metadata),
     );
     db.prepare(
       'INSERT INTO __record_current VALUES(?,?,?) ON CONFLICT(entity,record_id) DO UPDATE SET version_id=excluded.version_id',
     ).run(version.entity, version.recordId, version.versionId);
     for (const field of new Set([...before.keys(), ...after.keys()]))
       if (before.get(field) !== after.get(field))
-        db.prepare('INSERT INTO __record_fields VALUES(?,?,?,?,?,?,?,?)').run(
+        db.prepare('INSERT INTO __record_fields VALUES(?,?,?,?,?,?,?,?,?)').run(
           version.versionId,
           config.profileId,
           version.entity,
           version.recordId,
           field,
           version.sequence,
-          before.get(field) ?? null,
-          after.get(field) ?? null,
+          previous?.version_id ?? null,
+          Number(before.has(field)),
+          Number(after.has(field)),
         );
   }
   db.prepare('INSERT INTO __record_transactions VALUES(?,?,?,?,?)').run(
@@ -890,6 +931,56 @@ export function rebuildRecordDatabase(
     } catch {}
   }
 }
+function indexedVersion(config: RecordConfig, row: SqliteRow): DurableRecordVersion {
+  const metadata = JSON.parse(String(row.metadata_json)) as Omit<DurableRecordVersion, 'contents'>;
+  const contents = JSON.parse(String(row.contents_json)) as Record<string, unknown>;
+  const table = config.schema.find((table) => table.name === row.entity);
+  if (
+    !metadata ||
+    typeof metadata !== 'object' ||
+    Array.isArray(metadata) ||
+    Object.keys(metadata).sort().join(',') !==
+      'actor,deleted,entity,format,operationId,origin,previousVersion,profileId,recordId,recordedAt,references,schemaVersion,sequence,versionId' ||
+    metadata.format !== FORMAT ||
+    metadata.profileId !== config.profileId ||
+    metadata.schemaVersion !== config.schemaVersion ||
+    metadata.versionId !== row.version_id ||
+    metadata.profileId !== row.profile_id ||
+    metadata.entity !== row.entity ||
+    metadata.recordId !== row.record_id ||
+    metadata.sequence !== row.sequence ||
+    metadata.operationId !== row.operation_id ||
+    metadata.previousVersion !== row.previous_version ||
+    metadata.recordedAt !== row.recorded_at ||
+    typeof metadata.deleted !== 'boolean' ||
+    Number(metadata.deleted) !== row.deleted ||
+    !table ||
+    !contents ||
+    Array.isArray(contents) ||
+    !eq(Object.keys(contents).sort(), [...table.columns].sort()) ||
+    identity(table, contents) !== row.record_id
+  )
+    fail('invalid indexed version');
+  return { ...metadata, contents };
+}
+/** Selected-version lookup for history consumers; never reads the immutable archive. */
+export function readIndexedRecordVersion(
+  db: Database,
+  profileId: string,
+  entity: string,
+  recordId: string,
+  versionId: string,
+): DurableRecordVersion | undefined {
+  const config = state.get(db);
+  if (!config || config.profileId !== profileId || meta(db, 'owner_profile_id') !== profileId)
+    fail('history requires the unlocked owning profile');
+  const row = db
+    .prepare(
+      'SELECT * FROM __record_versions WHERE profile_id=? AND entity=? AND record_id=? AND version_id=? AND deleted=0',
+    )
+    .get(profileId, entity, recordId, versionId);
+  return row ? indexedVersion(config!, row) : undefined;
+}
 /** Indexed history; recordId is the literal single PK or array for compound PK.
  * A field such as profile_json.birthDate queries nested JSON with absence and
  * null preserved. No storage reads or full-archive replay are performed here.
@@ -926,7 +1017,7 @@ export function queryRecordHistory(
     beforeSequence,
   ];
   let sql =
-    'SELECT v.version_json FROM __record_versions v WHERE v.profile_id=? AND v.entity=? AND v.record_id=? AND v.sequence<?';
+    'SELECT v.version_id FROM __record_versions v WHERE v.profile_id=? AND v.entity=? AND v.record_id=? AND v.sequence<?';
   if (field !== undefined) {
     sql +=
       ' AND EXISTS(SELECT 1 FROM __record_fields f WHERE f.version_id=v.version_id AND f.field=?)';
@@ -934,26 +1025,62 @@ export function queryRecordHistory(
   }
   sql += ' ORDER BY v.sequence DESC LIMIT ?';
   params.push(limit + 1);
-  const rows = db.prepare(sql).all(...params) as Array<SqliteRow & { version_json: string }>,
+  const rows = db.prepare(sql).all(...params),
     more = rows.length > limit;
-  const entries: RecordHistoryEntry[] = rows.slice(0, limit).map((row) => {
-    const version = JSON.parse(row.version_json) as DurableRecordVersion;
+  const config = state.get(db)!;
+  const entries: RecordHistoryEntry[] = rows.slice(0, limit).map((selected) => {
+    const row = db
+      .prepare('SELECT * FROM __record_versions WHERE version_id=?')
+      .get(selected.version_id);
+    if (!row) fail('missing indexed version');
+    const version = indexedVersion(config, row!);
+    const priorRow = version.previousVersion
+      ? db
+          .prepare('SELECT * FROM __record_versions WHERE version_id=?')
+          .get(version.previousVersion)
+      : undefined;
+    if (version.previousVersion && !priorRow) fail('missing indexed previous version');
+    const prior = priorRow ? indexedVersion(config, priorRow) : undefined;
+    if (
+      prior &&
+      (prior.entity !== version.entity ||
+        prior.recordId !== version.recordId ||
+        prior.sequence >= version.sequence)
+    )
+      fail('invalid indexed previous version');
+    const before = values(prior && !prior.deleted ? prior.contents : null);
+    const after = values(version.deleted ? null : version.contents);
     const changes: RecordFieldChange[] = db
-      .prepare(
-        'SELECT field,before_json,after_json FROM __record_fields WHERE version_id=? ORDER BY field',
-      )
+      .prepare('SELECT * FROM __record_fields WHERE version_id=? ORDER BY field')
       .all(version.versionId)
-      .map((change) => ({
-        field: change.field as string,
-        before:
-          change.before_json === null
-            ? { present: false }
-            : { present: true, value: JSON.parse(change.before_json as string) },
-        after:
-          change.after_json === null
-            ? { present: false }
-            : { present: true, value: JSON.parse(change.after_json as string) },
-      }));
+      .map((change) => {
+        const name = String(change.field);
+        if (
+          change.profile_id !== version.profileId ||
+          change.entity !== version.entity ||
+          change.record_id !== version.recordId ||
+          change.sequence !== version.sequence ||
+          change.before_version !== version.previousVersion ||
+          change.before_present !== Number(before.has(name)) ||
+          change.after_present !== Number(after.has(name)) ||
+          before.get(name) === after.get(name)
+        )
+          fail('invalid indexed field reference');
+        return {
+          field: name,
+          before: before.has(name)
+            ? { present: true as const, value: JSON.parse(before.get(name)!) }
+            : { present: false as const },
+          after: after.has(name)
+            ? { present: true as const, value: JSON.parse(after.get(name)!) }
+            : { present: false as const },
+        };
+      });
+    const expected = [...new Set([...before.keys(), ...after.keys()])]
+      .filter((name) => before.get(name) !== after.get(name))
+      .sort();
+    if (!eq(changes.map((change) => change.field).sort(), expected))
+      fail('missing indexed field reference');
     return { ...version, changes };
   });
   return { entries, nextSequence: more ? entries.at(-1)!.sequence : null };
