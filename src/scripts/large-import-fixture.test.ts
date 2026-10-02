@@ -18,6 +18,7 @@ import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { getDocument, OPS } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import {
   createLargeImportOracle,
+  fitLargeImportTableCell,
   largeImportPage,
   renderLargeImportPage,
   writeLargeImportFixture,
@@ -37,6 +38,41 @@ const pdf = (path: string) =>
       new URL('../../node_modules/pdfjs-dist/standard_fonts/', import.meta.url),
     ),
   });
+
+test('raster fitting bounds ink overhang and separator clearance without excessive compression', () => {
+  const measured = { width: 204.7, actualBoundingBoxLeft: 0, actualBoundingBoxRight: 204.7 };
+  const fitted = fitLargeImportTableCell(measured, 203);
+  assert.ok(fitted.scaleX < 1 && fitted.scaleX >= 0.9);
+  assert.equal(fitted.offsetX, 0);
+  assert.ok(fitted.inkRight <= 203);
+  const overhang = fitLargeImportTableCell(
+    { width: 200, actualBoundingBoxLeft: 4, actualBoundingBoxRight: 205 },
+    203,
+  );
+  assert.equal(overhang.inkLeft, 0);
+  assert.ok(overhang.inkRight <= 203);
+  for (const metrics of [
+    { width: 230, actualBoundingBoxLeft: 0, actualBoundingBoxRight: 230 },
+    { width: 200, actualBoundingBoxLeft: 40, actualBoundingBoxRight: 200 },
+    { width: NaN, actualBoundingBoxLeft: 0, actualBoundingBoxRight: 0 },
+  ])
+    assert.throws(() => fitLargeImportTableCell(metrics, 203), /visible column bounds/);
+});
+
+test('all 450 native page content bytes retain their pre-portable-renderer digest', () => {
+  const oracle = createLargeImportOracle(),
+    hash = createHash('sha256');
+  for (let page = 1; page <= 900; page += 2)
+    hash.update(
+      renderLargeImportPage(largeImportPage(oracle, page), false, {
+        rasterFontFamily: 'deliberately-unavailable-fictional-font',
+      }).content,
+    );
+  assert.equal(
+    hash.digest('hex'),
+    '79fe1e7f90cf35f9fe1e2af5fdf574421c3e458e196fbb6bd43ca672cb26a4a2',
+  );
+});
 
 test('scanned columns remain aligned across narrow and wide glyphs', async () => {
   const oracle = createLargeImportOracle();
