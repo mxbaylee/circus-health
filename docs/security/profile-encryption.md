@@ -21,6 +21,14 @@ Handle passkey cancellation or unsupported PRF without losing setup: leave the r
 
 Use plain setup copy: **Keep this file somewhere safe. It can unlock your profile without a passkey.** Do not generate real keys in documentation or checked-in fixtures. A placebo's invented medical fixtures may be deterministic; its live encryption keys must be fresh.
 
+## Encrypted private-copy setup
+
+A private copy receives independent profile/recovery keys and target-bound intake evidence. The [copy publication contract](../data/intake-state-storage.md#encrypted-private-copy-publication-and-retry) validates selected source state before rebinding, copies authenticated retained originals and publishes the target only after checking its evidence. It does not sync incidental plaintext workspace changes into the source archive.
+
+Before the target's first accepted head, recovery verification requires current source access in the requesting browser session; another session's globally unlocked source cannot authorize the copy. After a target head has been published, retry/restart recovers that target with its own kit, without recopying later source changes or requiring the source unlocked. Failed activation clears pending runtime access and private caches while preserving published target evidence. Pre-activation failures remain unlisted. A diagnostics/final-response error after successful keyring and registry activation may leave a visible locked target, which recovers normally; cleanup preserves its activated registry entry and published authority.
+
+Contributor copy integration and production intake-authority activation remain separate open work; this encrypted path does not establish their readiness or a large-archive capacity claim.
+
 ## Keys and passkeys
 
 Use a fresh independent 256-bit profile data key and 256-bit recovery secret from Node's operating-system-backed cryptographic generator at runtime. Abort setup on randomness failure; never fall back to timestamps, Math.random, identifiers, AI-generated words or a seeded placebo generator. Encode the recovery secret as a standard 24-word mnemonic with checksum using a maintained implementation and test vectors. Mnemonic encoding is not Bitcoin wallet seed derivation or an additional mnemonic passphrase feature. [Node randomBytes](https://nodejs.org/docs/latest-v24.x/api/crypto.html#cryptorandombytessize-callback), [BIP-39 encoding](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki).
