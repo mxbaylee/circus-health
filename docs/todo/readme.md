@@ -51,7 +51,7 @@ Each open item shows its score after its sizes. When a size or mark changes, rec
 | # | Ticket | Score | Tie-break | Owner input |
 | --- | --- | --- | --- | --- |
 | 1 | 🔐 [CRS-163](#crs-163) passkeys | 8 | 🔴, unblocks CRS-088, lower ID | Tap passkey prompts on the intended localhost desktop |
-| 2 | 🧬 [CRS-205](CRS-205.md) incremental intake cutover | 8 | 🔴, unblocks CRS-194 | None |
+| 2 | 🧬 [CRS-205](CRS-205.md) incremental intake cutover | 8 | 🔴, unblocks CRS-198 | None |
 | 3 | 💽 [CRS-152](#crs-152) deployment drive | 8 | 🔴 | Connect or choose the drive and adopted provider |
 | 4 | 👥 [CRS-124](#crs-124) People display | 8 | 🟡 🐭 | Inspect non-Self people in intended layouts |
 | 5 | 📦 [CRS-043](CRS-043.md) package import | 7 | 🔴, lower ID | Split before implementation or owner grade before merge |
