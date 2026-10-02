@@ -1,3 +1,4 @@
+import { maximumReportDiscoveryOrder } from './intake-state-access.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { IntakeWorkflow } from '../shared/intake.ts';
 
@@ -11,13 +12,7 @@ export function stampNewReportGroups(
     (group) => group.discoveryOrder === undefined && !previous.has(group.id),
   );
   if (!additions.length) return;
-  let maximum = Number(
-    db
-      .prepare(
-        "SELECT MAX(CAST(json_extract(g.value,'$.discoveryOrder') AS INTEGER)) n FROM source_files f, json_each(f.details_json,'$.intake.workflow.reportGroups') g WHERE f.kind='intake_original'",
-      )
-      .get()!.n || 0,
-  );
+  let maximum = maximumReportDiscoveryOrder(db);
   maximum = Math.max(
     maximum,
     ...(workflow.reportGroups || []).map((group) => group.discoveryOrder || 0),

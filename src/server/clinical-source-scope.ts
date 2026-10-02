@@ -1,3 +1,4 @@
+import { storedIntakeDetails } from './intake-state-access.ts';
 import { latestOwnershipDecision } from './ownership-journal.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { HealthRecordEnvelope, IntakeWorkflow } from '../shared/intake.ts';
@@ -349,7 +350,7 @@ export function clinicalSourceScopeCheck(
   const scopeFor = (original: Original): OriginalScope => {
     const cached = scopeCache.get(original);
     if (cached) return cached;
-    const intake = object(parse(original.details_json).intake);
+    const intake = object(storedIntakeDetails(db, original));
     const workflow = object(intake.workflow) as unknown as IntakeWorkflow;
     workflow.plans ||= [];
     const memberIds = new Set(

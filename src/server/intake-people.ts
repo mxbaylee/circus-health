@@ -1,3 +1,8 @@
+import {
+  requireStoredIntakeDetails,
+  type IntakeDetails,
+  type IntakePersonDraft,
+} from './intake-state-access.ts';
 import { effectiveKnownNames } from './name-associations.ts';
 import { matchesSelfIdentityName } from '../shared/self-identity.ts';
 import { createHash } from 'node:crypto';
@@ -15,7 +20,7 @@ import type {
   IntakePersonProposal,
   IntakePersonProposalState,
 } from '../shared/intake-people.ts';
-import type { IntakeReportGroup, IntakeWorkflow } from '../shared/intake.ts';
+import type { IntakeReportGroup } from '../shared/intake.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { canonicalLiteral, validateJSONL } from './intake-format.ts';
 import type { IntakeEntry } from './intake-format.ts';
@@ -43,21 +48,6 @@ interface SourceFileRow {
   mime_type: string;
   batch_id: string | null;
   details_json: string;
-}
-interface IntakeDetails {
-  originalName: string;
-  version: number;
-  validation?: { valid?: boolean };
-  proposals: { id: string; fileId: string }[];
-  workflow?: IntakeWorkflow & {
-    peopleDrafts?: IntakePersonDraft[];
-  };
-}
-interface IntakePersonDraft {
-  proposalId: string;
-  proposalVersion: string;
-  state: Exclude<IntakePersonProposalState, 'saved'>;
-  at: string;
 }
 interface PersonalImportReceipt {
   profileId: string;
@@ -98,11 +88,8 @@ const personMatchName = (note: Note): string =>
   typeof note.person.fullName === 'string' && note.person.fullName.trim()
     ? note.person.fullName
     : note.title;
-const details = (row: SourceFileRow): IntakeDetails => {
-  const value = json(row.details_json, {}) as UnknownRecord;
-  if (!object(value.intake)) throw new Error('Intake source metadata is incomplete');
-  return value.intake as unknown as IntakeDetails;
-};
+const details = (db: DatabaseSync, row: SourceFileRow): IntakeDetails =>
+  requireStoredIntakeDetails(db, row);
 const uuidFromHash = (value: string): string => {
   const h = hash(value);
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
@@ -130,7 +117,7 @@ function inputFile(
   proposalId: string | null,
 ): SourceFileRow {
   if (!proposalId) return original;
-  const intake = details(original);
+  const intake = details(db, original);
   if (
     !intake.proposals.some(
       (proposal) => proposal.id === proposalId && proposal.fileId === proposalId,
@@ -296,7 +283,7 @@ function collectForOriginal(
   profileId: string,
   original: SourceFileRow,
 ): ResolvedProposal[] {
-  const intake = details(original);
+  const intake = details(db, original);
   const sources: (string | null)[] = [
     ...(intake.validation?.valid ? [null] : []),
     ...intake.proposals.map((item) => item.id),
@@ -424,7 +411,7 @@ export function getIntakePeopleQueue(
   const cursor =
     input.cursor == null || input.cursor === '' ? null : safeText(input.cursor, 'cursor', 500);
   const proposals = originalRows(db)
-    .filter((row) => details(row).workflow?.reportGroups?.some((group) => group.id === groupId))
+    .filter((row) => details(db, row).workflow?.reportGroups?.some((group) => group.id === groupId))
     .flatMap((row) => collectForOriginal(db, root, profileId, row))
     .map((item) => item.dto)
     .filter((item) => item.groupId === groupId)

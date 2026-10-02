@@ -1,3 +1,4 @@
+import { requireStoredIntakeDetails, writeIntakeDetails } from './intake-state-access.ts';
 import { latestOwnershipDecision } from './ownership-journal.ts';
 import {
   intakeWorkflow,
@@ -1191,8 +1192,7 @@ export function syncDuplicateQuestions(db: DatabaseSync, decision: DuplicateDeci
       .prepare("SELECT * FROM source_files WHERE id=? AND kind='intake_original'")
       .get(sourceFileId) as WorkflowFileRow | undefined;
     if (!file) continue;
-    const details = parsedObject(file.details_json),
-      intake = parsedObject(details.intake),
+    const intake = requireStoredIntakeDetails(db, file),
       workflow = intakeWorkflow(intake);
     const envelope = json(source.raw_json) as HealthRecordEnvelope,
       candidateId = intakeCandidateId(file, { value: envelope });
@@ -1231,9 +1231,6 @@ export function syncDuplicateQuestions(db: DatabaseSync, decision: DuplicateDeci
     }
     intake.version = Number(intake.version || 0) + 1;
     intake.state = workflowSummary(intake).needsReview ? 'needs_review' : 'imported';
-    db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-      JSON.stringify(details),
-      stringValue(file.id),
-    );
+    writeIntakeDetails(db, file, intake, { effective: false });
   }
 }

@@ -1,3 +1,4 @@
+import { sourceFileDetails, sourceDetailsSearch } from './intake-state-access.ts';
 import { sourceAssertionBoundary } from './source-assertion-ownership.ts';
 import { clinicalRedirect, resolveClinicalReference } from './clinical-references.ts';
 import { clinicalRelationshipProjections } from './clinical-relationships.ts';
@@ -691,8 +692,8 @@ export function setMedicationCurrentStatus(db: Database, id: string, value: unkn
   return clinicalList(db, 'medications', new URLSearchParams(), id);
 }
 export type SourceFileDTO = SourceFile & Record<string, unknown>;
-export function sourceFile(r: SourceFileRow): SourceFileDTO {
-  const details = json(r.details_json);
+export function sourceFile(db: Database, r: SourceFileRow): SourceFileDTO {
+  const details = sourceFileDetails(db, r);
   const intakeMetadata = nested(nested(details, 'intake'), 'metadata');
   return {
     id: r.id,
@@ -715,6 +716,7 @@ export function getSourceFile(db: Database, id: string): SourceFileDTO {
   return {
     archived: visibilityState(db, 'source_file', id).archived,
     ...sourceFile(
+      db,
       required(
         db
           .prepare(
@@ -791,12 +793,14 @@ export function sourceFiles(db: Database, params: URLSearchParams): Page<SourceF
     args.push(value);
   }
   const search = params.get('q');
-  if (search) {
-    where.push('(f.path LIKE ? OR f.details_json LIKE ?)');
-    args.push(...Array(2).fill('%' + search + '%'));
+  const searchPlan = search ? sourceDetailsSearch(db, search) : null;
+  if (searchPlan) {
+    where.push(searchPlan.predicate);
+    args.push(...searchPlan.parameters);
   }
   const from =
     ' FROM source_files f LEFT JOIN providers p ON p.id=f.provider_id' +
+    (searchPlan?.joins || '') +
     (where.length ? ' WHERE ' + where.join(' AND ') : '');
   const total = count(db, 'SELECT COUNT(*) AS n' + from, args);
   const data = db
@@ -805,7 +809,7 @@ export function sourceFiles(db: Database, params: URLSearchParams): Page<SourceF
     .map((valueRow) => {
       const row = valueRow as SourceFileRow;
       return {
-        ...sourceFile(row),
+        ...sourceFile(db, row),
         archived: visibilityState(db, 'source_file', row.id).archived,
       };
     });
