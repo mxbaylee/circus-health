@@ -666,3 +666,133 @@ test('condition acceptance writes scale with changed occurrences at two corpus s
     assert.equal(history(rebuild(f), 'conditions', 'condition-0').length, 2);
   }
 });
+
+test('compact history preserves JSON ancestors, dotted collisions, arrays and Unicode fields', (t) => {
+  const initial = {
+    'a.b': 'literal',
+    a: { b: 'nested', gone: null },
+    list: [1, null],
+    '\uE000': 'first',
+    '😀': 'first',
+  };
+  const f = fixture(t, (db) =>
+    db
+      .prepare('INSERT INTO source_files(id,path,sha256,bytes,details_json) VALUES(?,?,?,?,?)')
+      .run('fictional-history', 'fictional.json', 'fictional', 1, JSON.stringify(initial)),
+  );
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  const update = (value: string) =>
+    transaction(f.db, () =>
+      f.db
+        .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+        .run(value, 'fictional-history'),
+    );
+  const changed = {
+    'a.b': 'changed literal',
+    a: { b: 'changed nested' },
+    list: [2],
+    '\uE000': 'next',
+    '😀': 'next',
+  };
+  update(JSON.stringify(changed));
+  const latest = history(f.db, 'source_files', 'fictional-history')[0];
+  const field = (name: string) => latest.changes.find((change) => change.field === name);
+  assert.deepEqual(field('details_json.a.b')?.before, { present: true, value: 'nested' });
+  assert.deepEqual(field('details_json.a.b')?.after, { present: true, value: 'changed nested' });
+  assert.deepEqual(field('details_json.a.gone')?.before, { present: true, value: null });
+  assert.deepEqual(field('details_json.a.gone')?.after, { present: false });
+  assert.deepEqual(field('details_json.list')?.after, { present: true, value: [2] });
+  assert.equal(field('details_json.list.0'), undefined, 'arrays remain whole field values');
+  assert.deepEqual(field('details_json.a')?.after, { present: true, value: changed.a });
+  assert.deepEqual(field('details_json.😀')?.after, { present: true, value: 'next' });
+  assert.deepEqual(
+    history(rebuild(f), 'source_files', 'fictional-history'),
+    history(f.db, 'source_files', 'fictional-history'),
+  );
+  // Exercise the history decoder's literal fallback with an independently fictional
+  // historical value; current source writes retain their JSON constraint.
+  f.db.exec('PRAGMA ignore_check_constraints=ON');
+  update('literal invalid JSON');
+  f.db.exec('PRAGMA ignore_check_constraints=OFF');
+  assert.deepEqual(
+    history(f.db, 'source_files', 'fictional-history', 'details_json.a')[0].changes.find(
+      (change) => change.field === 'details_json.a',
+    )?.after,
+    { present: false },
+  );
+  transaction(f.db, () =>
+    f.db.prepare('DELETE FROM source_files WHERE id=?').run('fictional-history'),
+  );
+  const tombstone = history(f.db, 'source_files', 'fictional-history')[0];
+  assert.equal(tombstone.deleted, true);
+  assert.deepEqual(tombstone.changes.find((change) => change.field === 'details_json')?.before, {
+    present: true,
+    value: 'literal invalid JSON',
+  });
+  assert.deepEqual(tombstone.changes.find((change) => change.field === 'details_json')?.after, {
+    present: false,
+  });
+});
+
+test('selected history fails on missing or corrupt compact references and rejects obsolete caches before writes', (t) => {
+  for (const fault of ['missing', 'wrong-reference', 'presence', 'metadata', 'previous'] as const) {
+    const f = fixture(t);
+    attachRecordDurability(f.db, { profileId, storage: f.storage });
+    transaction(f.db, () =>
+      f.db.prepare("UPDATE people SET display_name='Fictional revised' WHERE id='patient'").run(),
+    );
+    const entry = history(f.db, 'people', 'patient')[0];
+    if (fault === 'missing')
+      f.db
+        .prepare('DELETE FROM __record_fields WHERE version_id=? AND field=?')
+        .run(entry.versionId, 'display_name');
+    if (fault === 'wrong-reference')
+      f.db
+        .prepare('UPDATE __record_fields SET before_version=? WHERE version_id=?')
+        .run(entry.versionId, entry.versionId);
+    if (fault === 'presence')
+      f.db
+        .prepare('UPDATE __record_fields SET before_present=9 WHERE version_id=?')
+        .run(entry.versionId);
+    if (fault === 'metadata')
+      f.db
+        .prepare(
+          "UPDATE __record_versions SET metadata_json=json_set(metadata_json,'$.entity','other') WHERE version_id=?",
+        )
+        .run(entry.versionId);
+    if (fault === 'previous')
+      f.db.prepare('DELETE FROM __record_versions WHERE version_id=?').run(entry.previousVersion);
+    assert.throws(() => history(f.db, 'people', 'patient'), /indexed/);
+  }
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  f.db.prepare('UPDATE __record_state SET projection=1').run();
+  const writes = f.writes.length;
+  assert.throws(
+    () => attachRecordDurability(f.db, { profileId, storage: f.storage }),
+    /unsupported/,
+  );
+  assert.equal(f.writes.length, writes);
+  assert.ok(history(rebuild(f), 'people', 'patient').length);
+});
+
+test('initial accepted head survives a failed cache commit and an exact empty index can recover', (t) => {
+  const f = fixture(t);
+  const publish = f.storage.publishHead;
+  f.storage.publishHead = (bytes) => {
+    publish(bytes);
+    throw Error('Fictional interruption after initial acceptance');
+  };
+  assert.throws(
+    () => attachRecordDurability(f.db, { profileId, storage: f.storage }),
+    /Fictional interruption/,
+  );
+  const accepted = stored(f, 'head');
+  const writes = f.writes.length;
+  assert.equal(f.db.prepare('SELECT count(*) AS count FROM __record_versions').get()?.count, 0);
+  f.storage.publishHead = publish;
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  assert.deepEqual(stored(f, 'head'), accepted);
+  assert.equal(f.writes.length, writes, 'recovery only indexes accepted bytes');
+  assert.deepEqual(history(rebuild(f), 'people', 'patient'), history(f.db, 'people', 'patient'));
+});
