@@ -1,3 +1,4 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -175,15 +176,9 @@ export function htmlNavigationIndex({
         })
     : [];
   const parentDetails = intakeDetails?.parentSourceFileId
-    ? (JSON.parse(
-        (
-          db
-            .prepare('SELECT details_json FROM source_files WHERE id=?')
-            .get(intakeDetails.parentSourceFileId) as { details_json?: string } | undefined
-        )?.details_json || '{}',
-      ) as { intake?: { workflow?: { plans?: IntakeExtractionPlan[] } } })
-    : null;
-  const inventory = parentDetails?.intake?.workflow?.plans?.find(
+    ? readStoredIntakeDetails(db, intakeDetails.parentSourceFileId)
+    : undefined;
+  const inventory = parentDetails?.workflow?.plans?.find(
     (plan) => plan.status === 'active' && plan.index?.inventoryVersion === 1,
   )?.index;
   const anchors: NavigationAnchor[] = [],

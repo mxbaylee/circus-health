@@ -1,4 +1,10 @@
 import {
+  intakeDetails as details,
+  registerIntakeFile as registerFile,
+  writeIntakeDetails,
+  type IntakeDetails,
+} from './intake-state-access.ts';
+import {
   effectiveKnownNames,
   challengedKnownNames,
   futureNameOwners,
@@ -114,7 +120,6 @@ import type {
   IntakeExtractionUnit,
   IntakeMetadata,
   IntakePackageRole,
-  IntakeProposal,
   IntakeReview,
   IntakeReviewDecision,
   IntakeReviewDraft,
@@ -127,15 +132,10 @@ import type {
   IntakeReportSourceResult,
   IntakeReportSourceReview,
   IntakeReportQueueView,
-  IntakeState,
   IntakeValidation,
 } from '../shared/intake.ts';
 import type { IntakeEntry } from './intake-format.ts';
-import {
-  parseIntakeSourcePin,
-  withIntakeSourcePin,
-  withoutIntakeSourcePin,
-} from './intake-source-pin.ts';
+import { parseIntakeSourcePin } from './intake-source-pin.ts';
 
 type Workflow = ReturnType<typeof intakeWorkflow>;
 
@@ -151,39 +151,6 @@ interface SourceFileRow {
   details_json: string;
   /** The intake's source pin record, joined by `row()` and the intake list. */
   source_pin: string | null;
-}
-
-interface InternalProposal extends IntakeProposal {
-  modelIdentity?: Record<string, string | null> | null;
-}
-
-interface IntakeDetails {
-  sourceTextRevisionId?: string | null;
-  sourceTextDependencyToken?: string | null;
-  sourceTextRequiresInterpretation?: boolean;
-  originalName: string;
-  acquisition?: { providerId: string; provider: string };
-  metadata?: IntakeMetadata;
-  metadataHistory?: NonNullable<Intake['metadataHistory']>;
-  receivedMimeType?: string | null;
-  createdAt: string;
-  version: number;
-  state: IntakeState;
-  validation: IntakeValidation;
-  proposals: InternalProposal[];
-  acceptedProposalId: string | null;
-  imported: Intake['imported'];
-  conversionChatId?: string | null;
-  importHistory?: (NonNullable<Intake['imported']> & {
-    acceptedProposalId: string | null;
-    reviewToken: string | null;
-  })[];
-  workflow?: Workflow;
-  lastDecisionFingerprint?: string;
-  lastReviewToken?: string | null;
-  parentSourceFileId?: string | null;
-  locator?: string;
-  derivative?: boolean;
 }
 
 interface PersistenceOptions {
@@ -223,20 +190,6 @@ interface ProviderRow {
   id: string;
   name: string;
   create: boolean;
-}
-
-interface RegisterFileInput {
-  id: string;
-  providerId: string;
-  path: string;
-  sha256?: string;
-  bytes?: Buffer;
-  size?: number;
-  mimeType: string;
-  kind: string;
-  coverage: string;
-  batchId: string;
-  details: Record<string, unknown>;
 }
 
 interface IntakeListOptions {
@@ -474,17 +427,17 @@ function row(db: DatabaseSync, id: string): SourceFileRow {
     'Source intake not found',
   );
 }
-function details(file: SourceFileRow): IntakeDetails {
-  return withIntakeSourcePin(
-    (json(file.details_json) as { intake: IntakeDetails }).intake,
-    parseIntakeSourcePin(file.source_pin),
-  );
-}
 function checkVersion(db: DatabaseSync, file: SourceFileRow, version: unknown): void {
-  if (!Number.isSafeInteger(version) || version !== details(file).version)
+  if (!Number.isSafeInteger(version) || version !== details(db, file).version)
     throw withDiagnosticContext(
       new HttpError(409, 'VERSION_CONFLICT', 'This intake changed. Reload it before continuing.'),
-      intakeVersionConflictFacts(db, file.id, version, details(file).version, file.details_json),
+      intakeVersionConflictFacts(
+        db,
+        file.id,
+        version,
+        details(db, file).version,
+        file.details_json,
+      ),
     );
 }
 const sourceContextVersionCache = new Map<string, Set<string>>();
@@ -558,7 +511,7 @@ function dto(
   profileId: string,
   file: SourceFileRow,
 ): Intake {
-  const d = details(file);
+  const d = details(db, file);
   const visibility = visibilityState(db, 'source_file', file.id);
   const workflow = workflowSummary(d, {
     sourceContextVersionIds: cachedSourceContextVersions(db, root, profileId, file, d),
@@ -676,7 +629,7 @@ export function getRetainedIntakeOriginalReference(
     size: file.bytes,
     sourceHash: file.sha256,
     mimeType: file.mime_type,
-    filename: details(file).originalName,
+    filename: details(db, file).originalName,
   };
 }
 export function getIntakeOriginal(db: DatabaseSync, root: string, profileId: string, id: string) {
@@ -910,22 +863,6 @@ function provider(db: DatabaseSync, input: ProviderInput): ProviderRow {
     ? { ...existing, create: false }
     : { id: 'source-' + hash(name.toLowerCase()).slice(0, 24), name, create: true };
 }
-function registerFile(db: DatabaseSync, file: RegisterFileInput): void {
-  db.prepare(
-    'INSERT INTO source_files(id,provider_id,path,sha256,bytes,mime_type,kind,coverage_status,batch_id,details_json) VALUES(?,?,?,?,?,?,?,?,?,?)',
-  ).run(
-    file.id,
-    file.providerId,
-    file.path,
-    file.sha256 || hash(file.bytes!),
-    file.size ?? file.bytes!.length,
-    file.mimeType,
-    file.kind,
-    file.coverage,
-    file.batchId,
-    JSON.stringify(file.details),
-  );
-}
 export function validateIntakeUpload(
   db: DatabaseSync,
   profileId: string,
@@ -1138,11 +1075,8 @@ function publishIntakeInternal(
   };
 }
 function update(db: DatabaseSync, file: SourceFileRow, d: IntakeDetails): void {
-  const all = json(file.details_json) as { intake: IntakeDetails };
-  const before = details(file);
-  all.intake = withoutIntakeSourcePin(d, all.intake, parseIntakeSourcePin(file.source_pin));
-  const raw = JSON.stringify(all);
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(raw, file.id);
+  const before = details(db, file);
+  const raw = writeIntakeDetails(db, file, d);
   try {
     observeIntakeVersion(db, file.id, before, d, raw, file.details_json);
   } catch {
@@ -1152,7 +1086,7 @@ function update(db: DatabaseSync, file: SourceFileRow, d: IntakeDetails): void {
 /** Readiness uses dependency pins, not merely the presence of an old proposal. */
 export function currentIntakeInterpretations(db: DatabaseSync, profileId: string, id: string) {
   owner(db, profileId);
-  const d = details(row(db, id));
+  const d = details(db, row(db, id));
   return {
     original: !d.sourceTextRequiresInterpretation,
     proposalIds: d.proposals
@@ -1177,7 +1111,7 @@ export function proposeConversion(
 ) {
   owner(db, profileId);
   const file = row(db, id),
-    d = details(file);
+    d = details(db, file);
   safeText(input.jsonlText, 'JSONL proposal', MAX_INTAKE_BYTES);
   const bytes = Buffer.from(input.jsonlText),
     proposalId = sourceTextProposalId(
@@ -1305,7 +1239,7 @@ export function linkIntakeConversion(
 ): void {
   owner(db, profileId);
   const file = row(db, id),
-    d = details(file);
+    d = details(db, file);
   if (d.conversionChatId === chatId) return;
   mutate(db, () => {
     d.conversionChatId = chatId;
@@ -1349,7 +1283,7 @@ function prepareIntakeReviewContext(db: DatabaseSync, root: string, profileId: s
   reviewCallObserver?.();
   owner(db, profileId);
   const file = row(db, id),
-    d = details(file);
+    d = details(db, file);
   verifyIntakeOriginal(db, root, profileId, id);
   const workflow = intakeWorkflow(d);
   const selfNote = getNote(db, 'person-note:self');
@@ -1537,7 +1471,7 @@ export function intakeDraftRepairSourceSections(
 ) {
   owner(db, profileId);
   const file = row(db, id);
-  const d = details(file);
+  const d = details(db, file);
   if (proposalId && !d.proposals.some((proposal) => proposal.id === proposalId))
     throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
   verifyIntakeOriginal(db, root, profileId, id);
@@ -1586,7 +1520,7 @@ export function importIntake(
 ) {
   owner(db, profileId);
   const file = row(db, id),
-    d = details(file);
+    d = details(db, file);
   const selected = input.proposalId || null;
   const decisionFingerprint = hash(
     canonicalLiteral({ proposalId: selected, decisions: input.decisions || [] }),
@@ -1644,7 +1578,7 @@ function prepareIntakeImportInternal(
 ) {
   owner(db, profileId);
   const file = row(db, id),
-    d = details(file),
+    d = details(db, file),
     selected = input.proposalId || null;
   const decisionFingerprint = hash(
     canonicalLiteral({ proposalId: selected, decisions: input.decisions || [] }),
@@ -1790,7 +1724,7 @@ function prepareIntakeImportInternal(
     decisions,
     apply(expectedVersion: number, occurrenceAuthorityFinalizers?: OccurrenceAuthorityFinalizer[]) {
       const file = row(db, id),
-        d = details(file);
+        d = details(db, file);
       checkVersion(db, file, expectedVersion);
       const insert = db.prepare(
         'INSERT OR IGNORE INTO source_records(id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
@@ -1978,7 +1912,7 @@ export function workflowMutation<T extends WorkflowMutationInput>(
 ) {
   owner(db, profileId);
   const file = row(db, id),
-    d = details(file),
+    d = details(db, file),
     workflow = intakeWorkflow(d);
   const operationId = input.operationId ? safeText(input.operationId, 'operation ID', 200) : null;
   const { version, ...request } = input,
@@ -2022,7 +1956,7 @@ export function askIntakeQuestion(
 ) {
   owner(db, profileId);
   const file = row(db, id),
-    workflow = intakeWorkflow(details(file));
+    workflow = intakeWorkflow(details(db, file));
   if (workflow.questions.some((q) => q.id === 'question:' + workflowHash([file.id, input.key]))) {
     addWorkflowQuestion(file, workflow, input);
     return getIntake(db, root, profileId, id);
@@ -3121,7 +3055,7 @@ export function intakePlanPinsCurrent(
 ): boolean {
   owner(db, profileId);
   const file = row(db, id);
-  const workflow = intakeWorkflow(details(file));
+  const workflow = intakeWorkflow(details(db, file));
   const plan = workflow.plans.find(
     (candidate) => candidate.id === planId && candidate.status === 'active',
   );
@@ -3197,7 +3131,7 @@ export function submitIntakeBatch(
 ) {
   owner(db, profileId);
   const file = row(db, id),
-    workflow = intakeWorkflow(details(file));
+    workflow = intakeWorkflow(details(db, file));
   const operationId = safeText(input.operationId, 'batch operation ID', 200);
   if (!operationId)
     throw new HttpError(400, 'OPERATION_ID', 'A stable batch operation ID is required');

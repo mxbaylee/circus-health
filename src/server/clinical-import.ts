@@ -1,3 +1,4 @@
+import { storedIntakeDetails } from './intake-state-access.ts';
 import { retainAcceptedContribution } from './ownership-contributions.ts';
 import {
   requireCorrectedOwnershipReview,
@@ -755,8 +756,7 @@ export function buildClinicalReview(
     .filter((item) => !item.contextOnly)
     .map((item) => item.entry);
   const retainedGroups = (() => {
-    const intake = parsedObject(parsedObject(file.details_json).intake);
-    const workflow = parsedObject(intake.workflow);
+    const workflow = parsedObject(storedIntakeDetails(db, file)?.workflow);
     return Array.isArray(workflow.reportGroups)
       ? (workflow.reportGroups as IntakeReportGroup[])
       : [];

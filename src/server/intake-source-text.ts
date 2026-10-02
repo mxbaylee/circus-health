@@ -1,3 +1,4 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { sourceIssueCategory, sourceIssueNeedsReview } from '../shared/intake-source-issues.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { HttpError, transaction, type Database } from './database.ts';
@@ -534,13 +535,9 @@ export function intakeSourceTextInterpretationRevisionId(
   const row = owner(db, profileId, intakeId);
   // The durable intake projection keeps the last material revision. The common
   // current-head path must not walk hundreds of whole-document approval receipts.
-  const metadata = db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId);
+  const metadata = readStoredIntakeDetails(db, intakeId);
   const pin = readIntakeSourcePin(db, intakeId);
-  const material = pin
-    ? pin.revisionId
-    : metadata
-      ? JSON.parse(String(metadata.details_json)).intake?.sourceTextRevisionId
-      : null;
+  const material = pin ? pin.revisionId : metadata ? metadata.sourceTextRevisionId : null;
   if (id === head && typeof material === 'string') return material;
   let revision = loadRevision(db, profileId, intakeId, row.sha256, id);
   for (

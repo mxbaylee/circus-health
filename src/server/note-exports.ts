@@ -1,3 +1,4 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { sourceAssertionBoundary } from './source-assertion-ownership.ts';
 import { recordOwner } from './record-owner.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
@@ -861,7 +862,7 @@ function includedReadingGaps(
     // point at a parent original. Follow retained pointers without guessing paths.
     if (typeof metadata.originalSourceFileId === 'string')
       pending.push(metadata.originalSourceFileId);
-    const details = isRecord(metadata.intake) ? metadata.intake : null;
+    const details = readStoredIntakeDetails(db, sourceId);
     if (!details) continue;
     if (typeof details.parentSourceFileId === 'string') pending.push(details.parentSourceFileId);
     const workflow = details.workflow as { plans?: IntakeExtractionPlan[] } | undefined;

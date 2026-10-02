@@ -1,5 +1,5 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import type { Database } from './database.ts';
-import type { IntakeWorkflow } from '../shared/intake.ts';
 
 export interface PacketReportReview {
   intakeId: string;
@@ -25,10 +25,8 @@ export function packetReportReview(db: Database, sourceIds: string[]): PacketRep
     byIntake.set(intakeId, ids);
   }
   const reports: PacketReportReview[] = [];
-  const file = db.prepare('SELECT details_json FROM source_files WHERE id=?');
   for (const [intakeId, included] of byIntake) {
-    const details = JSON.parse(String(file.get(intakeId)?.details_json || '{}'));
-    const workflow = details?.intake?.workflow as IntakeWorkflow | undefined;
+    const workflow = readStoredIntakeDetails(db, intakeId)?.workflow;
     if (!workflow) continue;
     // Older retained workflows and source-only reading plans may not have
     // clinical candidates. They cannot establish report completion counts.

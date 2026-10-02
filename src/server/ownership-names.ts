@@ -1,11 +1,10 @@
+import { readStoredIntakeDetails, intakeIdentityConfirmations } from './intake-state-access.ts';
 import { json, type Database } from './database.ts';
 import { canonicalIdentityName, safeSourceIdentityName } from '../shared/self-identity.ts';
-import type { IntakeIdentityReceipt } from '../shared/intake-identity.ts';
 import type { OwnershipNameEffect, OwnershipRequest } from '../shared/record-ownership.ts';
 import { ownershipHash, appendOwnershipDecision } from './ownership-journal.ts';
 import { activeIdentityReceipts, type NameSupport } from './name-associations.ts';
 import { getNote, rememberSourceNameInTransaction } from './notes.ts';
-import type { IntakeWorkflow } from '../shared/intake.ts';
 
 interface CorrectionNameSupport {
   operationId: string;
@@ -28,9 +27,8 @@ function sourceNameScopes(
   if (!source) return [];
   const locator = json(source.locator_json) as { originalSourceFileId?: string };
   const intakeId = locator.originalSourceFileId || String(source.source_file_id);
-  const file = db.prepare('SELECT sha256,details_json FROM source_files WHERE id=?').get(intakeId);
-  const workflow = (json(file?.details_json) as { intake?: { workflow?: IntakeWorkflow } }).intake
-    ?.workflow;
+  const file = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(intakeId);
+  const workflow = readStoredIntakeDetails(db, intakeId)?.workflow;
   const exact = support.filter((s) => s.sourceRecordIds.includes(sourceRecordId));
   return (workflow?.reportGroups || [])
     .filter((group) =>
@@ -63,12 +61,7 @@ export function previewOwnershipNames(
     if (!source) continue;
     const locator = json(source.locator_json) as { originalSourceFileId?: string };
     const intakeId = locator.originalSourceFileId || String(source.source_file_id);
-    const file = db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId);
-    const workflow = (
-      json(file?.details_json) as {
-        intake?: { workflow?: import('../shared/intake.ts').IntakeWorkflow };
-      }
-    ).intake?.workflow;
+    const workflow = readStoredIntakeDetails(db, intakeId)?.workflow;
     for (const group of workflow?.reportGroups || [])
       if (
         group.versions.some((v) =>
@@ -82,13 +75,7 @@ export function previewOwnershipNames(
         sourceScopes.set(key, ids);
       }
   }
-  const receipts: IntakeIdentityReceipt[] = [];
-  for (const row of db
-    .prepare(
-      "SELECT j.value receipt FROM source_files s,json_each(s.details_json,'$.intake.workflow.identityConfirmations') j WHERE json_valid(s.details_json)",
-    )
-    .iterate())
-    receipts.push(json(row.receipt) as IntakeIdentityReceipt);
+  const receipts = intakeIdentityConfirmations(db);
   const active = activeIdentityReceipts(db, receipts) || [];
   // A correction establishes new support, independent of the original receipt's
   // former owner. Follow those exact contributions on later corrections/undo.

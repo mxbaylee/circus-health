@@ -1,6 +1,6 @@
 # Incremental intake state primitive
 
-The internal `createIntakeStateStorage` API stores an operational JSON state using changed-content contributions in ordinary durable `app_meta` records. It is a storage primitive: production intake still stores its workflow in `source_files.details_json`. Consumer adapters and the production cutover remain open work. This primitive does not establish large-import qualification.
+The internal `createIntakeStateStorage` API stores an operational JSON state using changed-content contributions in ordinary durable `app_meta` records. It is a storage primitive: production intake still stores its workflow in `source_files.details_json`. The [operational access boundary](../import/intake-state-access.md) is implemented; the production cutover remains open work. This primitive does not establish large-import qualification.
 
 ## Authority and identity
 
