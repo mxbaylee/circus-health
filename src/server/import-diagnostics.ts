@@ -22,6 +22,10 @@ import { isRetainedDiagnosticField } from './import-diagnostic-fields.ts';
 import { createImportDiagnosticArchive } from './import-diagnostic-archive.ts';
 import type { DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
 import {
+  recordingCheckFromArchive,
+  type ImportRecordingCheck,
+} from '../shared/import-recording-check.ts';
+import {
   createPrivateImportTrace,
   type PrivateImportTrace,
   type PrivateTraceEvent,
@@ -124,6 +128,7 @@ export interface ImportDiagnosticSink {
 }
 
 export interface ImportDiagnostics extends ImportDiagnosticSink {
+  checkRecording(profileId: string): Promise<ImportRecordingCheck>;
   snapshot(profileId: string): ImportDiagnosticEvent[];
   exportSnapshot(profileId: string, salt?: Buffer): ImportDiagnosticExport;
   exportArchive(
@@ -1011,6 +1016,10 @@ export function createImportDiagnostics({
     },
     exportArchive(profileId, salt = randomBytes(32)) {
       return archive.export(profileId, (event) => anonymizeEvent(event, salt));
+    },
+    async checkRecording(profileId) {
+      const inspected = await this.exportArchive(profileId);
+      return recordingCheckFromArchive(inspected, now().toISOString());
     },
     attachEventStore(profileId, store) {
       if (closed || detachedProfiles.has(profileId)) {

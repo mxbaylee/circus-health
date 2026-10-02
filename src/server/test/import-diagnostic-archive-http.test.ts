@@ -7,6 +7,10 @@ import type { AddressInfo } from 'node:net';
 import { createVaultApp } from '../vault-app.ts';
 import { createImportDiagnostics, type ImportDiagnosticEvent } from '../import-diagnostics.ts';
 import type { ImportDiagnosticArchive } from '../../shared/import-performance.ts';
+import {
+  isImportRecordingCheck,
+  type ImportRecordingCheck,
+} from '../../shared/import-recording-check.ts';
 
 interface Download {
   enabled: boolean;
@@ -25,6 +29,12 @@ test('retained HTTP export requires the owning session and survives fresh runtim
     runtime = join(root, 'runtime');
   mkdirSync(data);
   let diagnostics = createImportDiagnostics({ enabled: true });
+  let archiveInspections = 0;
+  const exportArchive = diagnostics.exportArchive.bind(diagnostics);
+  diagnostics.exportArchive = (...args) => {
+    archiveInspections++;
+    return exportArchive(...args);
+  };
   let failAfterPublication = false;
   const attach = diagnostics.attachEventStore.bind(diagnostics);
   diagnostics.attachEventStore = (profileId, store) =>
@@ -90,6 +100,19 @@ test('retained HTTP export requires the owning session and survives fresh runtim
   }
   const first = await create('Fictional Cedar');
   const path = `/api/profiles/${first.profileId}/import-diagnostics`;
+  assert.equal((await send(`${path}/status`)).status, 200);
+  assert.equal(archiveInspections, 0);
+  assert.equal((await send(`${path}/check`, {}, false)).status, 423);
+  assert.equal(archiveInspections, 0);
+  const checked = await send<ImportRecordingCheck>(`${path}/check`, {});
+  assert.equal(archiveInspections, 1);
+  assert.equal(checked.status, 200);
+  assert.ok(isImportRecordingCheck(checked.payload.data));
+  assert.equal(checked.payload.data.status, 'current_origin_readable');
+  assert.doesNotMatch(
+    JSON.stringify(checked.payload),
+    /Fictional Cedar|recoveryKit|events|attribution/,
+  );
   diagnostics.record(
     'import.progress',
     { accountedUnits: 42, unsafeText: 'Fictional medical canary' },
@@ -115,6 +138,7 @@ test('retained HTTP export requires the owning session and survives fresh runtim
   );
   const second = await create('Fictional Willow');
   assert.equal((await send(path)).status, 423);
+  assert.equal((await send(`${path}/check`, {})).status, 423);
   const other = await send(`/api/profiles/${second.profileId}/import-diagnostics`);
   assert.ok(
     !other.payload.data.eventArchive.events.some((row) => row.event.fields.accountedUnits === 42),

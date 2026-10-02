@@ -320,6 +320,17 @@ export function createApp({
         send(res, 200, { data: { enabled: diagnostics.enabled } });
         return;
       }
+      // Explicit POST avoids replay by the browser's automatic safe-read recovery.
+      // This inspects optional diagnostics only; it creates no check receipt or clinical write.
+      if (
+        resource === 'import-diagnostics' &&
+        id === 'check' &&
+        parts.length === 2 &&
+        method === 'POST'
+      ) {
+        send(res, 200, { data: await diagnostics.checkRecording(profileId) });
+        return;
+      }
       if (resource === 'import-diagnostics' && parts.length === 1 && method === 'GET') {
         const salt = randomBytes(32);
         const snapshot = diagnostics.exportSnapshot(profileId, salt);

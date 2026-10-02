@@ -1,6 +1,12 @@
 import { CLIENT_BUILD_IDENTITY } from '../../data/build';
 import { browserImportPerformance } from '../../data/import-performance';
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { currentProfile, subscribeProfileIdentity } from '../../data/profile';
+import {
+  isImportRecordingCheck,
+  sameDiagnosticOrigin,
+  type ImportRecordingCheck,
+} from '../../../shared/import-recording-check';
 import type {
   ImportDiagnosticEventWindow,
   ImportDiagnosticArchive,
@@ -14,12 +20,73 @@ import {
 
 export function ImportDiagnosticsControl() {
   const enabled = useResource<{ enabled: boolean }>('/import-diagnostics/status');
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<'download' | 'check' | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [check, setCheck] = useState<ImportRecordingCheck | null>(null);
+  const latestCheck = useRef<ImportRecordingCheck | null>(null);
+  const epoch = useRef(0);
+  const controller = useRef<AbortController | null>(null);
   const coverageId = useId();
-  async function download() {
-    setBusy(true);
+  useEffect(() => {
+    const clear = () => {
+      epoch.current++;
+      controller.current?.abort();
+      latestCheck.current = null;
+      setCheck(null);
+      setMessage(null);
+      setBusy(null);
+    };
+    const unsubscribe = subscribeProfileIdentity(clear);
+    return () => {
+      unsubscribe();
+      epoch.current++;
+      controller.current?.abort();
+      latestCheck.current = null;
+    };
+  }, []);
+  function start(action: 'check' | 'download') {
+    const generation = ++epoch.current;
+    const profileId = currentProfile()?.id;
+    controller.current?.abort();
+    const request = new AbortController();
+    controller.current = request;
+    setBusy(action);
     setMessage(null);
+    return {
+      request,
+      current: () =>
+        epoch.current === generation &&
+        currentProfile()?.id === profileId &&
+        !request.signal.aborted,
+    };
+  }
+  async function checkRecording() {
+    const { request, current } = start('check');
+    latestCheck.current = null;
+    setCheck(null);
+    try {
+      const response = await api<unknown>('/import-diagnostics/check', {
+        method: 'POST',
+        signal: request.signal,
+      });
+      if (!current()) return;
+      if (!isImportRecordingCheck(response.data))
+        throw new Error('Diagnostic recording could not be verified. Try checking again.');
+      latestCheck.current = response.data;
+      setCheck(response.data);
+    } catch (error) {
+      if (current())
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : 'Could not check diagnostic recording. Try again.',
+        );
+    } finally {
+      if (current()) setBusy(null);
+    }
+  }
+  async function download() {
+    const { request, current } = start('download');
     try {
       const browser = browserImportDiagnostics();
       const reviewEditors = reviewEditorDiagnostics();
@@ -29,13 +96,33 @@ export function ImportDiagnosticsControl() {
         events: unknown[];
         eventWindow?: ImportDiagnosticEventWindow;
         eventArchive?: ImportDiagnosticArchive;
-      }>('/import-diagnostics');
+      }>('/import-diagnostics', { signal: request.signal });
+      if (!current()) return;
+      const savedCheck = latestCheck.current;
+      const currentOrigin = response.data.eventArchive?.currentAttachment?.origin;
       const data = {
         format: 'circus-import-diagnostics-v1',
         exportedAt: new Date().toISOString(),
         coverage:
           'Bounded metadata only, not an established full-run history. The live event window resets after profile lock, clear, process restart or archive reattachment. A separate encrypted archive may retain earlier events; its coverage, failures and limits are explicit. Recording attachment dates describe archive attachment, not a complete import history. Pre-attachment observations are separate from saved archive evidence. Earlier omissions and an abrupt-shutdown tail remain unknown. Deduplicate live and archived observations by windowId and sequence. No medical text, filenames, profile identity, credentials or raw model payloads. Source reading is not clinical completeness.',
         clientBuild: CLIENT_BUILD_IDENTITY,
+        recordingCheck: savedCheck
+          ? {
+              observation: savedCheck,
+              attachmentComparison:
+                !response.data.eventArchive ||
+                (!currentOrigin && response.data.eventArchive.status !== 'not_attached')
+                  ? 'unavailable'
+                  : savedCheck.currentAttachment &&
+                      currentOrigin &&
+                      sameDiagnosticOrigin(savedCheck.currentAttachment.origin, currentOrigin)
+                    ? 'same_attachment'
+                    : !savedCheck.currentAttachment &&
+                        response.data.eventArchive.status === 'not_attached'
+                      ? 'same_attachment'
+                      : 'superseded',
+            }
+          : null,
         browser,
         reviewEditors,
         identityReviews: identityReviewDiagnostics(),
@@ -72,11 +159,12 @@ export function ImportDiagnosticsControl() {
         }`,
       );
     } catch (error) {
-      setMessage(
-        error instanceof Error ? error.message : 'Could not download diagnostics. Try again.',
-      );
+      if (current())
+        setMessage(
+          error instanceof Error ? error.message : 'Could not download diagnostics. Try again.',
+        );
     } finally {
-      setBusy(false);
+      if (current()) setBusy(null);
     }
   }
   if (
@@ -91,17 +179,56 @@ export function ImportDiagnosticsControl() {
       <button
         className="button subtle"
         type="button"
-        disabled={busy}
+        disabled={busy !== null}
         aria-describedby={coverageId}
         onClick={() => void download()}
       >
-        {busy ? 'Preparing diagnostics…' : 'Download performance diagnostics'}
+        {busy === 'download' ? 'Preparing diagnostics…' : 'Download performance diagnostics'}
+      </button>
+      <button
+        className="button subtle"
+        type="button"
+        disabled={busy !== null}
+        aria-describedby={coverageId}
+        onClick={() => void checkRecording()}
+      >
+        {busy === 'check' ? 'Checking diagnostic recording…' : 'Check diagnostic recording'}
       </button>
       <p id={coverageId} className="helper-text">
         {enabled.data.enabled
           ? 'Bounded diagnostics include retained events and recording attachment details when available. Attachment dates do not prove that a whole import was recorded. Earlier history and an abrupt-shutdown tail may be missing.'
-          : 'Detailed events are off. Download summaries and any previously retained events, or enable detailed diagnostics before reproducing a problem.'}
+          : 'Detailed events are off. Download summaries and any previously retained events. To record a future reproduction, set CRS_IMPORT_DIAGNOSTICS=true in the Compose environment and restart with npm start before uploading.'}
       </p>
+      {busy === 'check' && <p role="status">Checking saved diagnostic attachment evidence…</p>}
+      {check && (
+        <p role="status">
+          Checked at{' '}
+          <time dateTime={check.checkedAt}>{new Date(check.checkedAt).toLocaleString()}</time>.{' '}
+          {check.status === 'recording_disabled'
+            ? 'Detailed recording is off. Older saved events do not show that new events are being recorded. To record a future reproduction, set CRS_IMPORT_DIAGNOSTICS=true in the Compose environment and restart with npm start before uploading.'
+            : check.status === 'not_attached'
+              ? 'No encrypted diagnostic attachment is available for this profile.'
+              : check.status === 'inspection_unavailable'
+                ? 'Saved diagnostic evidence could not be inspected. Check again before reproducing the problem.'
+                : check.status === 'current_origin_readable'
+                  ? 'Detailed recording is on, and the current saved attachment record was readable.'
+                  : 'Detailed recording is on, but the current saved attachment record could not be verified.'}
+          {check.currentAttachment?.publication === 'unconfirmed' && check.currentOriginReadable
+            ? ' The save was not acknowledged, but its attachment record was readable.'
+            : ''}
+          {check.currentAttachment?.publication === 'confirmed' && !check.currentOriginReadable
+            ? ' A save acknowledgement alone does not show that the attachment record can be read.'
+            : ''}
+          {check.currentAttachment?.origin.observedBeforeAttachment
+            ? ` ${check.currentAttachment.origin.observedBeforeAttachment} observations occurred before encrypted attachment; this is not proof they were saved.`
+            : ''}
+          {check.archive.coverageWarnings
+            ? ' Some retained history is missing or could not be inspected; current attachment evidence is separate.'
+            : ''}{' '}
+          This checks the attachment at that time. It does not guarantee that a whole import was
+          recorded or that future events will be retained.
+        </p>
+      )}
       {message && <p role="status">{message}</p>}
     </div>
   );
