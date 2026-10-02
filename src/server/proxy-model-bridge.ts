@@ -7,6 +7,7 @@ import { ModelContextLimitError, ModelError, privateAddress } from './model-conf
 import { isModelToolTerminalError, ModelToolValidationError } from './model-tool-validation.ts';
 import { validateToolArguments } from './tool-arguments.ts';
 import { diagnosticValidationPath } from './import-diagnostic-error.ts';
+import { requestInputComposition } from './request-input-composition.ts';
 import {
   compactConsumedProxyHistory,
   compactIntakeMutationArguments,
@@ -788,6 +789,7 @@ export async function proxyRequest(
       requestBytes,
       ...requestMediaCounts(body),
       ...(diagnostics.enabled ? structuralFields('request', body) : {}),
+      ...(diagnostics.enabled ? requestInputComposition(body) : {}),
     },
     requestContext,
   );
