@@ -76,7 +76,7 @@ function history(db: Database, entity: string, id: string, field?: string) {
 function logical(db: Database) {
   return db
     .prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_intake_lookup_*' ORDER BY name",
     )
     .all()
     .map((row) => [
@@ -511,6 +511,19 @@ test('in-app source intake appends literal source records and occurrences and re
   const rebuilt = rebuild(f);
   assert.equal(intakeDurability(rebuilt).pending, false);
   assert.deepEqual(logical(rebuilt), logical(f.db));
+  const lookup = await import('../intake-state-access.ts');
+  assert.equal(
+    lookup.maximumReportDiscoveryOrder(rebuilt),
+    lookup.maximumReportDiscoveryOrder(f.db),
+  );
+  assert.deepEqual(
+    lookup.intakeIdentityConfirmations(rebuilt),
+    lookup.intakeIdentityConfirmations(f.db),
+  );
+  assert.equal(
+    lookup.retainedReportAcceptance(rebuilt, 'fictional-missing-operation'),
+    lookup.retainedReportAcceptance(f.db, 'fictional-missing-operation'),
+  );
   assert.equal(
     existsSync(resolve(f.root, 'data/profiles', profileId, 'curation/current.json')),
     false,
