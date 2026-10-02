@@ -615,7 +615,7 @@ export function createImportDiagnostics({
   onEvent,
   privateTrace,
 }: ImportDiagnosticsOptions = {}): ImportDiagnostics {
-  const archive = createImportDiagnosticArchive(enabled, restoredArchiveEvent);
+  const archive = createImportDiagnosticArchive(enabled, restoredArchiveEvent, now);
   const recent = createRecentPerformance(now, (value) => {
     if (
       !value ||
@@ -1017,7 +1017,15 @@ export function createImportDiagnostics({
         store.close();
         return;
       }
-      archive.attach(profileId, windowFor(profileId).windowId, store);
+      if (archive.attached(profileId)) {
+        // Reattachment is a new collection boundary, never reset counters under
+        // the previous UUID or relabel its live observations as the new window.
+        buffers.delete(profileId);
+        dropped.delete(profileId);
+        windows.delete(profileId);
+      }
+      const window = windowFor(profileId);
+      archive.attach(profileId, window.windowId, store, window.observedEvents);
     },
     recordClientOperation(profileId, input) {
       if (closed || detachedProfiles.has(profileId)) return false;

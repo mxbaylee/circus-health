@@ -196,6 +196,15 @@ it('downloads actual encrypted retained observations with recording off', async 
   expect(bundle.server.eventArchive.events).toHaveLength(1);
   expect(bundle.server.eventArchive.events[0].event.fields.accountedUnits).toBe(42);
   expect(bundle.server.eventArchive.recording).toBe('disabled');
+  expect(bundle.server.eventArchive.windowOrigins).toHaveLength(1);
+  expect(bundle.server.eventArchive.windowOrigins[0].recordingAtAttachment).toBe('enabled');
+  expect(bundle.server.eventArchive.currentAttachment.origin.recordingAtAttachment).toBe(
+    'disabled',
+  );
+  expect(bundle.server.eventArchive.currentAttachment.publication).toBe('disabled');
+  expect(bundle.coverage).toMatch(
+    /Recording attachment dates describe archive attachment, not a complete import history/,
+  );
   expect(bundle.server.eventArchive.crashTailEvents).toBeNull();
   expect(bundle.server.eventArchive.status).toBe('partial');
   expect(bundle.server.eventArchive.windowCoverageScope).toBe('retained_readable_checkpoints');

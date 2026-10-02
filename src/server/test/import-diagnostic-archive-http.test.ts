@@ -101,6 +101,9 @@ test('retained HTTP export requires the owning session and survives fresh runtim
   assert.equal(initial.status, 200);
   const archive = initial.payload.data.eventArchive;
   assert.ok(archive.events.length > 0);
+  assert.equal(archive.windowOrigins.length, 1);
+  assert.equal(archive.windowOrigins[0]!.recordingAtAttachment, 'enabled');
+  assert.equal(archive.currentAttachment!.origin.windowId, archive.currentWindow.windowId);
   assert.equal(archive.windowCoverageScope, 'retained_readable_checkpoints');
   assert.equal(archive.windowCoverage[0]!.exportedEvents, archive.events.length);
   assert.equal(archive.windowCoverage[0]!.knownPersistedNotExportedEvents, 0);
@@ -147,6 +150,15 @@ test('retained HTTP export requires the owning session and survives fresh runtim
   assert.equal(restored.enabled, false);
   assert.equal(restored.events.length, 0);
   assert.equal(restored.eventArchive.recording, 'disabled');
+  assert.ok(
+    restored.eventArchive.windowOrigins.some(
+      (origin) =>
+        origin.windowId === archive.currentWindow.windowId &&
+        origin.attachedAt === archive.windowOrigins[0]!.attachedAt,
+    ),
+  );
+  assert.equal(restored.eventArchive.currentAttachment!.origin.recordingAtAttachment, 'disabled');
+  assert.equal(restored.eventArchive.currentAttachment!.publication, 'disabled');
   assert.ok(restored.eventArchive.events.some((row) => row.event.fields.accountedUnits === 42));
   assert.ok(restored.eventArchive.events.some((row) => row.event.fields.accountedUnits === 43));
   assert.equal(restored.eventArchive.completeness, 'not_established');
