@@ -1,0 +1,442 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createLargeImportOracle } from './large-import-fixture.ts';
+import {
+  exactLargeImportPages,
+  gradeLargeImportReview,
+  type LargeImportReviewInput,
+} from './large-import-review-grader.ts';
+import type { IntakeReportGroupMember, IntakeReviewRecord } from '../shared/intake.ts';
+
+function snapshots(): LargeImportReviewInput {
+  const oracle = createLargeImportOracle();
+  const people = Object.fromEntries(
+    oracle.people.map((person, index) => [
+      person.key,
+      {
+        personId: `runtime-person-${index}`,
+        noteId: index ? 'note:fictional-willow' : 'person-note:self',
+        version: 1,
+        fullName: person.name,
+        birthDate: person.birthDate,
+      },
+    ]),
+  );
+  const records: IntakeReviewRecord[] = oracle.assertions.map((assertion) => ({
+    id: `record-${assertion.key}`,
+    candidateId: `candidate-${assertion.key}`,
+    candidateVersionId: `version-${assertion.key}`,
+    classification: 'addition',
+    kind: assertion.mapping.kind,
+    title: assertion.key,
+    date: assertion.mapping.date!,
+    provider: null,
+    confidence: null,
+    uncertainties: [],
+    supportedFields: [],
+    mapping: {
+      ...assertion.mapping,
+      personId: people[assertion.personKey]!.personId,
+      subject: assertion.personKey === oracle.people[0]!.key ? 'self' : 'other',
+    },
+    evidence: assertion.pages.map((page) => ({
+      label: 'Original source',
+      locator: `page ${page}`,
+      contentUrl: '/api/sources/original/content',
+    })),
+    reportGroups: [
+      { groupId: assertion.reportKey, groupVersionId: `group-version-${assertion.reportKey}` },
+    ],
+    identityReview: {
+      status: 'evidenced_match',
+      blocking: false,
+      message: '',
+      conflicts: [],
+      assignedPerson: people[assertion.personKey]!,
+      evidencedIdentity: {
+        fullName: people[assertion.personKey]!.fullName,
+        birthDate: people[assertion.personKey]!.birthDate!,
+      },
+    },
+  }));
+  const authorities = oracle.reports.map((report) => {
+    const bound = people[report.personKey]!;
+    const members: IntakeReportGroupMember[] = records
+      .filter((record) => record.reportGroups![0]!.groupId === report.key)
+      .map((record) => ({
+        candidateId: record.candidateId!,
+        candidateVersionId: record.candidateVersionId!,
+        occurrences: [
+          {
+            proposalId: 'proposal',
+            recordId: record.id,
+            batchId: null,
+            locator: record.evidence[0]!.locator,
+          },
+        ],
+      }));
+    const anchor = { locator: `page ${report.firstPage}`, text: `Report: ${report.key}.` };
+    const subject = {
+      locator: `page ${report.firstPage}`,
+      text: `Patient: ${bound.fullName}. DOB: ${bound.birthDate}.`,
+    };
+    return {
+      retained: {
+        id: report.key,
+        basis: 'report_anchor' as const,
+        sourceFileId: 'original',
+        sourceHash: 'fixture-hash',
+        sourceSystem: null,
+        memberId: null,
+        report: { key: report.key, title: 'Fictional report', anchor, subject },
+        versions: [
+          {
+            id: `group-version-${report.key}`,
+            createdAt: '2026-01-01',
+            title: 'Fictional report',
+            members,
+            contributionId: 'contribution',
+          },
+        ],
+      },
+      queue: {
+        groupId: report.key,
+        groupVersionId: `group-version-${report.key}`,
+        intakeId: 'original',
+        intakeVersion: 1,
+        discoveryOrder: null,
+        title: 'Fictional report',
+        source: null,
+        date: report.date,
+        basis: 'report_anchor' as const,
+        original: {
+          filename: 'fictional.pdf',
+          contentUrl: '/api/sources/original/content',
+          parentSourceFileId: null,
+        },
+        member: null,
+        anchor,
+        counts: {
+          pending: members.length,
+          deferred: 0,
+          blocked: 0,
+          accepted: 0,
+          keptOriginal: 0,
+          superseded: 0,
+          questions: 0,
+        },
+      },
+      identity: {
+        status: 'evidenced_match' as const,
+        blocking: false,
+        message: '',
+        conflicts: [],
+        assignedPerson: bound,
+        evidencedIdentity: { fullName: bound.fullName, birthDate: bound.birthDate! },
+        self: {
+          noteId: 'person-note:self' as const,
+          version: 1,
+          fullName: oracle.people[0]!.name,
+          birthDate: oracle.people[0]!.birthDate,
+        },
+        offeredSelfFields: {},
+        scope: {
+          profileId: 'fictional-profile',
+          intakeId: 'original',
+          intakeVersion: 1,
+          groupId: report.key,
+          groupVersionId: `group-version-${report.key}`,
+          sourceHash: 'fixture-hash',
+          memberId: null,
+          original: {
+            filename: 'fictional.pdf',
+            contentUrl: '/api/sources/original/content',
+            page: report.firstPage,
+          },
+          report: anchor,
+          subject,
+          verificationMode: 'literal_text_match' as const,
+          membership: members,
+          targets: [],
+          scopeToken: 'opaque-scope',
+        },
+      },
+    };
+  });
+  return {
+    oracle,
+    stage: 'review',
+    originalId: 'original',
+    people,
+    reviews: [
+      {
+        intakeId: 'original',
+        proposalId: 'proposal',
+        version: 1,
+        reviewToken: 'opaque',
+        summary: { additions: 901, duplicates: 0, unsupported: 0, uncertain: 0 },
+        records,
+        coverageGaps: [],
+      },
+    ],
+    authorities,
+  };
+}
+const grade = (input: LargeImportReviewInput) => gradeLargeImportReview(input);
+const first = (input: LargeImportReviewInput) => input.reviews[0]!.records[0]!;
+
+test('full oracle reconciliation is pure and distinguishes proposal/review outcomes', () => {
+  const input = snapshots(),
+    before = JSON.stringify(input);
+  assert.equal(grade(input).reviewReady, true);
+  assert.equal(grade(input).exactRecords, 901);
+  assert.equal(JSON.stringify(input), before);
+  first(input).mapping.personId = undefined;
+  first(input).mapping.subject = 'unknown';
+  first(input).identityReview!.assignedPerson = undefined;
+  first(input).identityReview!.status = 'confirmation_required';
+  first(input).identityReview!.blocking = true;
+  input.stage = 'proposal';
+  const pending = grade(input);
+  assert.equal(pending.passed, true);
+  assert.equal(pending.clinicalProvenancePassed, true);
+  assert.equal(pending.ownershipResolved, false);
+  assert.equal(pending.reviewReady, false);
+  input.stage = 'review';
+  assert.equal(grade(input).passed, false);
+});
+
+test('missing, extra, duplicates and exact occurrence duplicates remain separate', () => {
+  const input = snapshots();
+  input.reviews[0]!.records.pop();
+  const extra = structuredClone(first(input));
+  extra.id = 'extra';
+  extra.mapping.testLabel = 'invented-label';
+  input.reviews[0]!.records.push(extra, structuredClone(first(input)));
+  const result = grade(input);
+  assert.equal(result.missing.length, 1);
+  assert.equal(result.unexpectedRecords, 1);
+  assert.equal(result.duplicate.length, 1);
+  assert.equal(result.duplicateOccurrences, 1);
+  assert.equal(result.passed, false);
+  const output = JSON.stringify(result);
+  assert.equal(output.includes('invented-label'), false);
+  assert.equal(output.includes('runtime-person'), false);
+});
+
+test('literal precision and canonical classifications are exact and host defaults narrowly allowed', () => {
+  const input = snapshots(),
+    record = first(input);
+  Object.assign(record.mapping, {
+    label: record.mapping.testLabel,
+    dateRole: 'recorded',
+    medicationKind: 'unknown',
+    procedureCategory: 'unspecified',
+    documentDate: record.mapping.date,
+    documentTitle: 'Private host envelope title',
+    text: 'Private retained payload',
+    assets: ['original'],
+    uncertainties: [],
+    mappingOrigins: { kind: 'clinical', documentTitle: 'envelope', text: 'payload' },
+  });
+  assert.equal(grade(input).passed, true);
+  record.mapping.label = 'altered canonical label';
+  assert.equal(grade(input).passed, false);
+  record.mapping.label = record.mapping.testLabel;
+  record.mapping.valueText = '<0.07';
+  record.mapping.observationCategory = 'Laboratory';
+  record.mapping.specimen = 'invented';
+  const result = grade(input);
+  assert.deepEqual(
+    [...result.mismatches[0]!.fields].sort(),
+    ['observationCategory', 'valueText', 'unexpectedField'].sort(),
+  );
+  assert.equal(JSON.stringify(result).includes('Private'), false);
+  assert.equal(JSON.stringify(result).includes('invented'), false);
+  (record.mapping as Record<string, unknown>).mappingOrigins = {
+    kind: 'clinical',
+    documentTitle: 'clinical',
+    text: 'clinical',
+  };
+  assert.ok(grade(input).mismatches[0]!.fields.includes('unexpectedField'));
+});
+
+test('wrong original, broad pages, missing split half and wrong report fail attribution', () => {
+  for (const mutate of [
+    (input: LargeImportReviewInput) => {
+      first(input).evidence[0]!.contentUrl = '/api/sources/wrong/content';
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).evidence[0]!.locator = 'pages 1-2';
+    },
+    (input: LargeImportReviewInput) => {
+      input.reviews[0]!.records.at(-1)!.evidence.pop();
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).reportGroups![0]!.groupId = input.authorities[1]!.retained.id;
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.retained.report!.anchor.text = 'An unrelated heading';
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.subject.locator = 'page 151';
+    },
+  ]) {
+    const input = snapshots();
+    mutate(input);
+    assert.equal(grade(input).clinicalProvenancePassed, false);
+  }
+});
+
+test('single API locator accepts precise clauses without hiding uncertainty or ranges', () => {
+  const evidence = {
+    label: 'Original source',
+    contentUrl: '/api/sources/original/content',
+    locator: 'page 149 label; page 150 result unit reference',
+  };
+  assert.deepEqual(exactLargeImportPages(evidence, 'original'), [149, 150]);
+  for (const locator of [
+    'pages 149-150',
+    '149;150',
+    'page 149;150',
+    'page 149;',
+    'page 149; possibly page 150',
+    'maybe page 149; page 150',
+    'page 149; page 150 uncertain',
+    'page 149; page 150?',
+    'page 149; pages 150-151',
+  ])
+    assert.equal(exactLargeImportPages({ ...evidence, locator }, 'original'), null, locator);
+  const input = snapshots();
+  input.reviews[0]!.records.at(-1)!.evidence = [evidence];
+  assert.equal(grade(input).passed, true);
+});
+
+test('wrong ownership, unresolved issues and conflicting/missing bindings cannot become review ready', () => {
+  for (const mutate of [
+    (input: LargeImportReviewInput) => {
+      first(input).mapping.personId = input.people['fictional-willow']!.personId;
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).identityReview!.evidencedIdentity.birthDate = '1999-01-01';
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).identityReview!.status = 'conflict';
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope = null;
+    },
+    (input: LargeImportReviewInput) => {
+      input.people = { ...input.people, 'fictional-willow': input.people['fictional-cedar']! };
+    },
+    (input: LargeImportReviewInput) => {
+      input.people = {};
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities = [...input.authorities, input.authorities[0]!];
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.queue.groupVersionId = 'not-retained';
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.queue.basis = 'candidate_fallback';
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).issues = [
+        {
+          id: 'issue',
+          kind: 'identity',
+          prompt: 'Private question',
+          field: 'subject',
+          blocking: true,
+          status: 'unresolved',
+          locator: 'page 1',
+          questionId: null,
+        },
+      ];
+    },
+  ]) {
+    const input = snapshots();
+    mutate(input);
+    assert.equal(grade(input).reviewReady, false);
+  }
+});
+
+test('missing report authority cannot hide wrong or unresolved ownership', () => {
+  for (const personId of [undefined, 'wrong-person']) {
+    const input = snapshots();
+    first(input).reportGroups![0]!.groupId = 'missing-group';
+    first(input).mapping.personId = personId;
+    const result = grade(input);
+    assert.equal(result.ownershipResolved, false);
+    assert.ok(result.unresolved.includes(input.oracle.assertions[0]!.key));
+    if (personId) assert.ok(result.mismatches[0]!.ownership.includes('mappingPerson'));
+  }
+});
+
+test('record-level identity scope cannot contradict the actual group scope', () => {
+  for (const change of [
+    (scope: NonNullable<LargeImportReviewInput['authorities'][number]['identity']['scope']>) => {
+      scope.sourceHash = 'wrong';
+    },
+    (scope: NonNullable<LargeImportReviewInput['authorities'][number]['identity']['scope']>) => {
+      scope.groupId = 'wrong';
+    },
+    (scope: NonNullable<LargeImportReviewInput['authorities'][number]['identity']['scope']>) => {
+      scope.intakeId = 'wrong';
+    },
+    (scope: NonNullable<LargeImportReviewInput['authorities'][number]['identity']['scope']>) => {
+      scope.membership = [];
+    },
+  ]) {
+    const input = snapshots(),
+      scope = structuredClone(input.authorities[0]!.identity.scope!);
+    change(scope);
+    Object.assign(first(input).identityReview!, { scope });
+    assert.equal(grade(input).clinicalProvenancePassed, false);
+  }
+});
+
+test('optional pinned identity facts and original member authority must agree', () => {
+  for (const mutate of [
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.evidencedIdentity = { birthDate: '1900-01-01' };
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.evidencedIdentity = { fullName: 'Wrong Person' };
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.memberId = 'different-member';
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.queue.member = {
+        memberId: 'different-member',
+        filename: null,
+        locator: null,
+      };
+    },
+  ]) {
+    const input = snapshots();
+    mutate(input);
+    assert.equal(grade(input).ownershipResolved, false);
+    assert.equal(grade(input).reviewReady, false);
+  }
+});
+
+test('valid older introducing versions pass but invented versions and membership do not', () => {
+  const input = snapshots(),
+    authority = input.authorities[0]!;
+  authority.retained.versions.push({
+    ...structuredClone(authority.retained.versions[0]!),
+    id: 'latest-version',
+    contributionId: 'later',
+  });
+  authority.queue.groupVersionId = 'latest-version';
+  authority.identity.scope!.groupVersionId = 'latest-version';
+  assert.equal(grade(input).passed, true);
+  first(input).reportGroups![0]!.groupVersionId = 'unretained-version';
+  assert.equal(grade(input).passed, false);
+  first(input).reportGroups![0]!.groupVersionId = authority.retained.versions[0]!.id;
+  authority.retained.versions[0]!.members = [];
+  assert.equal(grade(input).passed, false);
+});
