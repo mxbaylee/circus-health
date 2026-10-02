@@ -102,3 +102,7 @@ Schema 7 adds the condition-occurrence table. Current-schema occurrences use the
 ## Conversation writes
 
 Conversation recovery uses its own [linked changed-content journal](conversation-journal.md). Each save adds changed values and small generation metadata, including incremental array items and text splices. It preserves history without copying the growing chat, operations or request-attempt arrays into every event. The encrypted wrapper retains this journal; originals and accepted-record authority remain separate. Older conversation snapshot envelopes are explicitly unsupported.
+
+## Incremental intake state primitive
+
+The [incremental intake state primitive](intake-state-storage.md) frames changed operational JSON into immutable source-scoped `app_meta` contributions with a bounded head and operation receipts. It uses the existing accepted-record transaction and compact history projection. Production intake has not cut over to this primitive; its current full workflow versions remain an open storage limitation.
