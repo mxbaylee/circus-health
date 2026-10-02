@@ -160,6 +160,10 @@ export function registerTransactionDurability<Capture, Result>(
   if (hooks) durabilityHooks.set(db, hooks as TransactionDurabilityHooks);
   else durabilityHooks.delete(db);
 }
+/** Whether a real transaction durability participant is already attached. */
+export function hasTransactionDurability(db: DatabaseSync): boolean {
+  return durabilityHooks.has(db);
+}
 /** Memory-only observers; accepted-record durability hooks retain their ordering. */
 export type TransactionOutcome = { token: object; committed: boolean; succeeded: boolean };
 const transactionTokens = new WeakMap<DatabaseSync, object>();
