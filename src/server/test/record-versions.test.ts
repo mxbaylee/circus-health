@@ -516,3 +516,153 @@ test('in-app source intake appends literal source records and occurrences and re
     false,
   );
 });
+
+test('literal condition occurrences require person and source, remain distinct and replay complete versions', (t) => {
+  const f = fixture(t);
+  f.db.exec(
+    "INSERT INTO people(id,display_name) VALUES('relative','Fictional relative'); INSERT INTO source_files(id,path,sha256,bytes) VALUES('file','providers/fictional.json','fictional',0)",
+  );
+  const fixtures = [
+    {
+      id: 'problem',
+      person: 'patient',
+      raw: {
+        kind: 'problem-list',
+        label: 'Example diagnosis',
+        status: 'ACTIVE',
+        code: 'F00.001',
+        nullable: null,
+      },
+    },
+    {
+      id: 'fhir',
+      person: 'patient',
+      raw: {
+        resourceType: 'Condition',
+        code: { text: 'Example diagnosis' },
+        clinicalStatus: { text: 'provider wording' },
+      },
+    },
+    {
+      id: 'visit',
+      person: 'patient',
+      raw: { kind: 'visit-summary', diagnosis: 'Example diagnosis', date: '2020-04' },
+    },
+    {
+      id: 'relative',
+      person: 'relative',
+      raw: { diagnosis: 'Example diagnosis', status: 'resolved?' },
+    },
+  ];
+  for (const row of fixtures)
+    f.db
+      .prepare('INSERT INTO source_records(id,source_file_id,kind,raw_json) VALUES(?,?,?,?)')
+      .run(row.id, 'file', 'clinical_object', JSON.stringify(row.raw));
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  const originals = f.db.prepare('SELECT * FROM source_records ORDER BY id').all();
+  const insert = f.db.prepare(
+    'INSERT INTO conditions(id,source_record_id,person_id,label,status,effective_at,extra_json) VALUES(?,?,?,?,?,?,?)',
+  );
+  for (const row of fixtures) {
+    const before = f.writes.length;
+    transaction(
+      f.db,
+      () =>
+        insert.run(
+          row.id,
+          row.id,
+          row.person,
+          'Example diagnosis',
+          'Printed status',
+          row.id === 'visit' ? '2020-04' : null,
+          JSON.stringify(row.raw),
+        ),
+      { actor: 'fictional-reviewer', origin: 'fixture-review' },
+    );
+    assert.equal(commit(f).records, 3);
+    assert.ok(f.writes.slice(before).reduce((n, w) => n + w.bytes, 0) < 7000);
+  }
+  assert.throws(
+    () => transaction(f.db, () => insert.run('bad', 'problem', null, 'x', null, null, '{}')),
+    /NOT NULL/,
+  );
+  assert.throws(
+    () => transaction(f.db, () => insert.run('bad', 'missing', 'patient', 'x', null, null, '{}')),
+    /FOREIGN KEY/,
+  );
+  assert.throws(
+    () => transaction(f.db, () => insert.run('bad', 'problem', 'missing', 'x', null, null, '{}')),
+    /FOREIGN KEY/,
+  );
+  assert.throws(
+    () =>
+      transaction(f.db, () => insert.run('bad', 'problem', 'patient', 'x', null, null, 'broken')),
+    /CHECK/,
+  );
+  // SQLite rowid tables otherwise permit NULL text primary keys, which ID-based journals cannot recover.
+  assert.throws(
+    () => transaction(f.db, () => insert.run(null, 'problem', 'patient', 'x', null, null, '{}')),
+    /NOT NULL/,
+  );
+  const originalVersion = history(f.db, 'conditions', 'problem');
+  transaction(
+    f.db,
+    () =>
+      f.db.prepare("UPDATE conditions SET status='reviewed correction' WHERE id='problem'").run(),
+    { actor: 'fictional-caregiver', origin: 'fixture-correction' },
+  );
+  const recovered = rebuild(f);
+  assert.deepEqual(
+    recovered.prepare('SELECT * FROM conditions ORDER BY id').all(),
+    f.db.prepare('SELECT * FROM conditions ORDER BY id').all(),
+  );
+  assert.deepEqual(recovered.prepare('SELECT * FROM source_records ORDER BY id').all(), originals);
+  assert.equal(
+    recovered.prepare("SELECT count(*) n FROM conditions WHERE person_id='patient'").get()?.n,
+    3,
+  );
+  assert.equal(
+    recovered.prepare("SELECT count(*) n FROM conditions WHERE person_id='relative'").get()?.n,
+    1,
+  );
+  assert.deepEqual(history(recovered, 'conditions', 'problem').slice(1), originalVersion);
+  assert.equal(history(recovered, 'conditions', 'problem')[0]?.actor, 'fictional-caregiver');
+});
+
+test('condition acceptance writes scale with changed occurrences at two corpus sizes', (t) => {
+  for (const size of [4, 400]) {
+    const f = fixture(t, (db) => {
+      db.exec(
+        "INSERT INTO source_files(id,path,sha256,bytes) VALUES('file','providers/fictional.json','fictional',0)",
+      );
+      const source = db.prepare(
+        "INSERT INTO source_records(id,source_file_id,raw_json) VALUES(?,'file',?)",
+      );
+      const occurrence = db.prepare(
+        "INSERT INTO conditions(id,source_record_id,person_id,label) VALUES(?,?,'patient',?)",
+      );
+      for (let i = 0; i < size; i++) {
+        source.run('source-' + i, JSON.stringify({ diagnosis: 'Fictional condition ' + i }));
+        occurrence.run('condition-' + i, 'source-' + i, 'Fictional condition ' + i);
+      }
+    });
+    attachRecordDurability(f.db, { profileId, storage: f.storage });
+    const old = new Map(f.objects),
+      before = f.writes.length;
+    transaction(
+      f.db,
+      () =>
+        f.db
+          .prepare(
+            "UPDATE conditions SET status='literal source correction' WHERE id='condition-0'",
+          )
+          .run(),
+      { actor: 'fictional-reviewer' },
+    );
+    assert.equal(commit(f).records, 3, 'one occurrence and two revision scalars');
+    assert.equal(f.writes.length - before, 3, 'one bounded segment, commit and head');
+    assert.ok(f.writes.slice(before).reduce((sum, row) => sum + row.bytes, 0) < 6500);
+    for (const [name, bytes] of old) if (name !== 'head') assert.deepEqual(stored(f, name), bytes);
+    assert.equal(history(rebuild(f), 'conditions', 'condition-0').length, 2);
+  }
+});
