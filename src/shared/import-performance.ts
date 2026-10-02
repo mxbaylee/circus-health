@@ -13,6 +13,14 @@ export interface ImportDiagnosticEventWindow {
   completeness: 'not_established';
 }
 
+export interface ImportDiagnosticCheckpoint {
+  observedEvents: number;
+  persistedEvents: number;
+  droppedEvents: number;
+  oversizedEvents: number;
+  writeFailures: number;
+}
+
 export interface ImportDiagnosticArchive<Event = unknown> {
   storage: 'encrypted_chunks';
   status: 'available' | 'partial' | 'unavailable' | 'not_attached';
@@ -28,6 +36,8 @@ export interface ImportDiagnosticArchive<Event = unknown> {
   omittedBeforeInventory: null;
   crashTailEvents: null;
   completeness: 'not_established';
+  /** Latest retained cumulative checkpoint per window; never sum checkpoints for one window. */
+  windowCheckpoints: Array<ImportDiagnosticCheckpoint & { windowId: string }>;
   currentWindow: {
     windowId: string | null;
     observedEvents: number;
