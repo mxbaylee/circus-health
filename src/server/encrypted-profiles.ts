@@ -1,3 +1,4 @@
+import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
 import { personDisplayKey } from '../shared/person-display.ts';
 import { randomUUID, randomBytes } from 'node:crypto';
@@ -505,7 +506,10 @@ export function createEncryptedProfiles({
               throw Error('Invalid cache');
             cacheHit = true;
           } catch {
-            if (db) clearIntakeStateCache(db);
+            if (db) {
+              clearIntakeStateCache(db);
+              clearIntakeLookupCache(db);
+            }
             db?.close();
             db = null;
           }
@@ -541,6 +545,7 @@ export function createEncryptedProfiles({
       } catch (error) {
         if (!cacheHit) throw error;
         clearIntakeStateCache(db);
+        clearIntakeLookupCache(db);
         db.close();
         for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true });
         rebuildRecordDatabase(dbPath, { profileId: id, storage: recordStorage, verifyReferences });
@@ -584,7 +589,10 @@ export function createEncryptedProfiles({
     } catch (e) {
       clearChatJournalCache(root, id);
       disposeOriginalResolver();
-      if (db) clearIntakeStateCache(db);
+      if (db) {
+        clearIntakeStateCache(db);
+        clearIntakeLookupCache(db);
+      }
       db?.close();
       vault.close();
       key.fill(0);
@@ -771,6 +779,7 @@ export function createEncryptedProfiles({
       });
     } finally {
       clearIntakeStateCache(state.db);
+      clearIntakeLookupCache(state.db);
       clearChatJournalCache(state.root, id);
       state.disposeOriginalResolver();
       diagnostics.detachSummaryStore(id);

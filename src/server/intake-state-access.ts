@@ -1,3 +1,8 @@
+import {
+  maximumIntakeDiscoveryOrder,
+  retainedIntakeAcceptance,
+  indexedIntakeIdentityConfirmations,
+} from './intake-lookup-projection.ts';
 import type { IntakePersonProposalState } from '../shared/intake-people.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
@@ -152,34 +157,19 @@ export function updateStoredIntakeDetails(
     effective: false,
   });
 }
-/** Preserve current scoped SQL; later persistence can replace this lookup without hydrating all intakes. */
+/** Disposable current-source indexes preserve the scoped lookup contracts. */
 export function maximumReportDiscoveryOrder(db: DatabaseSync): number {
-  return Number(
-    db
-      .prepare(
-        "SELECT MAX(CAST(json_extract(g.value,'$.discoveryOrder') AS INTEGER)) n FROM source_files f, json_each(f.details_json,'$.intake.workflow.reportGroups') g WHERE f.kind='intake_original'",
-      )
-      .get()!.n || 0,
-  );
+  return maximumIntakeDiscoveryOrder(db);
 }
 export function retainedReportAcceptance(
   db: DatabaseSync,
   operationId: string,
 ): NonNullable<IntakeWorkflow['reportAcceptances']>[number] | null {
-  const row = db
-    .prepare(
-      "SELECT operation.value AS operation FROM source_files f, json_each(f.details_json,'$.intake.workflow.reportAcceptances') operation WHERE f.kind='intake_original' AND json_extract(operation.value,'$.receipt.operationId')=? LIMIT 1",
-    )
-    .get(operationId);
-  return row ? JSON.parse(String(row.operation)) : null;
+  return retainedIntakeAcceptance(db, operationId) as
+    NonNullable<IntakeWorkflow['reportAcceptances']>[number] | null;
 }
 export function intakeIdentityConfirmations(db: DatabaseSync): IntakeIdentityReceipt[] {
-  return db
-    .prepare(
-      "SELECT j.value receipt FROM source_files s,json_each(s.details_json,'$.intake.workflow.identityConfirmations') j WHERE json_valid(s.details_json)",
-    )
-    .all()
-    .map((row) => json(row.receipt) as IntakeIdentityReceipt);
+  return indexedIntakeIdentityConfirmations(db) as IntakeIdentityReceipt[];
 }
 /** Source-file DTOs currently expose the complete envelope, including operational intake state. */
 export function sourceFileDetails(_db: DatabaseSync, file: DetailsRow & { id: string }): unknown {
