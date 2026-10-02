@@ -8,14 +8,15 @@ import {
 } from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
-  applyChatChanges,
-  chatChanges,
-  cloneChatJson,
-  type ChatDecodeBudget,
-  type ChatJson,
-} from './chat-journal-codec.ts';
+  applyIntakeChanges,
+  intakeChanges,
+  normalizeIntakeJson,
+  serializeIntakeJson,
+  type IntakeJson,
+} from './intake-state-codec.ts';
+import type { ChatDecodeBudget } from './chat-journal-codec.ts';
 
-const FORMAT = 'health-intake-state-v1';
+const FORMAT = 'health-intake-state-v2';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const FRAME_BYTES = 64 * 1024;
@@ -68,7 +69,7 @@ interface Frame extends IntakeStateIdentity {
 }
 interface Basis {
   head: Head;
-  value: ChatJson;
+  value: IntakeJson;
   semanticBytes: number;
 }
 interface Cache {
@@ -109,15 +110,6 @@ function reference(value: unknown): asserts value is Reference {
 function same(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
-function stable(value: ChatJson): string {
-  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
-  if (value && typeof value === 'object')
-    return `{${Object.keys(value)
-      .sort()
-      .map((k) => `${JSON.stringify(k)}:${stable(value[k]!)}`)
-      .join(',')}}`;
-  return JSON.stringify(value);
-}
 function decode(value: unknown, max: number): unknown {
   if (typeof value !== 'string' || Buffer.byteLength(value) > max) invalid('encoded bytes');
   const bytes = Buffer.from(value);
@@ -129,13 +121,13 @@ function decode(value: unknown, max: number): unknown {
   }
 }
 function scope(value: Record<string, unknown>, identity: IntakeStateIdentity) {
+  if (value.format !== FORMAT) invalid('unsupported authority format');
   if (
-    value.format !== FORMAT ||
     value.profileId !== identity.profileId ||
     value.intakeId !== identity.intakeId ||
     value.sourceHash !== identity.sourceHash
   )
-    invalid('scope/format');
+    invalid('scope');
 }
 function limits(options: Partial<Limits> = {}): Limits {
   if (Object.keys(options).some((k) => !Object.hasOwn(DEFAULT_LIMITS, k))) invalid('limit key');
@@ -219,6 +211,8 @@ export function createIntakeStateStorage(
     sourceHash: identity.sourceHash,
   };
   const caps = limits(options.limits);
+  // The allocation namespace stays fixed so older payload formats are refused
+  // at their existing head, never mistaken for an uninitialized new namespace.
   const prefix = `intake_state_v1:${digest(JSON.stringify(identity))}:`;
   const headKey = `${prefix}head`;
   let closed = false;
@@ -231,6 +225,9 @@ export function createIntakeStateStorage(
     candidateCopyBytes: 0,
     framesWritten: 0,
     frameBytesWritten: 0,
+    readCopies: 0,
+    readCopyBytes: 0,
+    serializedReadBytes: 0,
   };
   const get = (key: string) => db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
   function ready() {
@@ -343,7 +340,7 @@ export function createIntakeStateStorage(
       ref = frame.previous as Reference | null;
     }
     frames.reverse();
-    let value: ChatJson | undefined;
+    let value: IntakeJson | undefined;
     let version = 0;
     let semanticBytes = 0;
     let used: Usage = {
@@ -380,9 +377,9 @@ export function createIntakeStateStorage(
         invalid('payload hash/UTF-8');
       const remaining = budget(caps, used);
       const changes = decode(payload.toString('utf8'), caps.bytes);
-      value = applyChatChanges(value, changes, remaining);
+      value = applyIntakeChanges(value, changes, remaining);
       used = addDecoded(used, caps, remaining);
-      const serializedValue = stable(value);
+      const serializedValue = serializeIntakeJson(value);
       semanticBytes = Buffer.byteLength(serializedValue);
       if (digest(serializedValue) !== first.fingerprint) invalid('result fingerprint');
       const receiptRaw = get(`${prefix}operation:${first.operationId}`);
@@ -398,11 +395,10 @@ export function createIntakeStateStorage(
       usage(used, caps);
       offset += first.chunks;
     }
-    if (!value && value !== null && value !== false && value !== 0 && value !== '')
-      invalid('missing value');
+    if (!value) invalid('missing value');
     if (version !== head.version || !same(used, head.usage)) invalid('usage agreement');
     usage(used, caps);
-    const result = { head, value: value as ChatJson, semanticBytes };
+    const result = { head, value, semanticBytes };
     if (token) {
       cache.token = token;
       cache.candidates.set(prefix, result);
@@ -425,14 +421,14 @@ export function createIntakeStateStorage(
     integer(raw.version, 1);
     if (version !== undefined && raw.version !== version) invalid('receipt version');
   }
-  function normalized(next: unknown): { value: ChatJson; fingerprint: string } {
-    const value = cloneChatJson(next);
-    const serialized = stable(value);
+  function normalized(next: unknown): { value: IntakeJson; fingerprint: string } {
+    const value = normalizeIntakeJson(next);
+    const serialized = serializeIntakeJson(value);
     counters.normalizedStateBytes += Buffer.byteLength(serialized);
     return { value, fingerprint: digest(serialized) };
   }
   function stageNormalized(
-    value: ChatJson,
+    value: IntakeJson,
     fingerprint: string,
     operationId: string,
   ): IntakeStateResult {
@@ -451,9 +447,9 @@ export function createIntakeStateStorage(
       return { ...receipt.result };
     }
     const before = load();
-    const changes = before ? chatChanges(before.value, value) : [{ op: 'set', path: [], value }];
+    const changes = before ? intakeChanges(before.value, value) : [{ op: 'set', path: [], value }];
     counters.patchOperations += changes.length;
-    const candidate = before ? cloneChatJson(before.value) : undefined;
+    const candidate = before ? normalizeIntakeJson(before.value) : undefined;
     if (before) {
       counters.candidateCopies++;
       counters.candidateCopyBytes += before.semanticBytes;
@@ -466,8 +462,8 @@ export function createIntakeStateStorage(
       stringWork: 0,
     };
     const remaining = budget(caps, oldUsage);
-    const applied = applyChatChanges(candidate, changes, remaining);
-    const serializedValue = stable(applied);
+    const applied = applyIntakeChanges(candidate, changes, remaining);
+    const serializedValue = serializeIntakeJson(applied);
     const semanticBytes = Buffer.byteLength(serializedValue);
     if (digest(serializedValue) !== fingerprint) invalid('candidate mismatch');
     const payload = Buffer.from(JSON.stringify(changes));
@@ -535,9 +531,18 @@ export function createIntakeStateStorage(
   }
   return {
     counters,
-    read(): ChatJson | undefined {
+    read(): IntakeJson | undefined {
       const basis = load();
-      return basis ? cloneChatJson(basis.value) : undefined;
+      if (!basis) return undefined;
+      counters.readCopies++;
+      counters.readCopyBytes += basis.semanticBytes;
+      return normalizeIntakeJson(basis.value);
+    },
+    readSerialized(): string | undefined {
+      const basis = load();
+      if (!basis) return undefined;
+      counters.serializedReadBytes += basis.semanticBytes;
+      return serializeIntakeJson(basis.value);
     },
     stage(next: unknown, operationId: string): IntakeStateResult {
       try {
@@ -553,8 +558,10 @@ export function createIntakeStateStorage(
       if (currentTransactionToken(db) || db.isTransaction) invalid('mutate owns outer transaction');
       const { value, fingerprint } = normalized(next);
       uuid(operationId);
-      ready();
       try {
+        // The transaction layer can return a retained result without invoking
+        // its callback. Validate selected authority before that replay shortcut.
+        load();
         return transaction(db, () => stageNormalized(value, fingerprint, operationId), {
           operationId,
           fingerprint: `${prefix}${fingerprint}`,
