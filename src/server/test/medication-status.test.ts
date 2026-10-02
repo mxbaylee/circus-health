@@ -5,7 +5,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { openDatabase, revision, databaseSchemaVersion, type Database } from '../database.ts';
+import {
+  openDatabase,
+  revision,
+  databaseSchemaVersion,
+  LATEST_SCHEMA_VERSION,
+  type Database,
+} from '../database.ts';
 import { clinicalList, setMedicationCurrentStatus, type MedicationDTO } from '../queries.ts';
 import { createApp } from '../index.ts';
 import { ensureProfileDirectories, profilePaths } from '../profile-storage.ts';
@@ -355,7 +361,7 @@ test('schema 3 upgrades without inferring any medication current use', (t) => {
   const raw = db.prepare('SELECT * FROM medications').get();
   db.close();
   db = openDatabase(path, 'cedar');
-  assert.equal(databaseSchemaVersion(db), 6);
+  assert.equal(databaseSchemaVersion(db), LATEST_SCHEMA_VERSION);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM medication_preferences').get()?.n, 0);
   assert.deepEqual(db.prepare('SELECT * FROM medications').get(), raw);
   assert.equal(list(db).total, 0);
@@ -382,57 +388,31 @@ test('personal medication assertions survive autosave, rebuild and backup withou
   restored.close();
 });
 
-test('older schema 3 portable snapshots rebuild with an empty preference table; schema 4 omissions fail', (t) => {
+test('current-schema portable snapshots reject a missing medication preference table', (t) => {
   const { db, root, paths } = fixture(t);
   add(db, 'med', 'active');
   exportCuration(db, root, 'cedar');
-  for (const kind of ['personal', 'curation'] as const) {
-    const currentPath = resolve(paths[kind], 'current.json');
-    const manifest = JSON.parse(readFileSync(currentPath, 'utf8'));
-    const generationPath = resolve(paths[kind], manifest.file);
-    const value = JSON.parse(readFileSync(generationPath, 'utf8'));
-    value.schemaVersion = 3;
-    delete value.tables.medication_preferences;
-    if (value.tables.schema_migrations)
-      value.tables.schema_migrations = value.tables.schema_migrations.filter(
-        (r: { version: number }) => r.version < 4,
-      );
-    const bytes = Buffer.from(JSON.stringify(value));
-    writeFileSync(generationPath, bytes);
-    writeFileSync(
-      currentPath,
-      JSON.stringify({ ...manifest, sha256: hash(bytes), bytes: bytes.length }),
-    );
-  }
-  const rebuilt = rebuildProfile(root, 'cedar', resolve(root, 'old-snapshot-rebuild'));
-  const restored = openDatabase(rebuilt.database, 'cedar');
-  assert.equal(databaseSchemaVersion(restored), 6);
-  assert.equal(list(restored).total, 0);
-  assert.equal(list(restored, { status: 'unknown' }).total, 1);
-  restored.close();
-  const pointer = resolve(paths.personal, 'current.json'),
-    manifest = JSON.parse(readFileSync(pointer, 'utf8'));
-  const path = resolve(paths.personal, manifest.file),
-    value = JSON.parse(readFileSync(path, 'utf8'));
-  value.schemaVersion = 4;
+  const pointer = resolve(paths.personal, 'current.json');
+  const manifest = JSON.parse(readFileSync(pointer, 'utf8'));
+  const path = resolve(paths.personal, manifest.file);
+  const value = JSON.parse(readFileSync(path, 'utf8'));
+  delete value.tables.medication_preferences;
   const bytes = Buffer.from(JSON.stringify(value));
   writeFileSync(path, bytes);
   writeFileSync(pointer, JSON.stringify({ ...manifest, sha256: hash(bytes), bytes: bytes.length }));
   assert.throws(
-    () => rebuildProfile(root, 'cedar', resolve(root, 'bad-schema4')),
+    () => rebuildProfile(root, 'cedar', resolve(root, 'missing-preferences')),
     /portable table ownership/,
   );
 });
 
-test('a read-only schema 3 database can create a modern backup that restores and rebuilds under the current schema', async (t) => {
+test('a read-only current-schema database can create a backup that restores and rebuilds without inferring medication use', async (t) => {
   const { db, root, paths } = fixture(t);
   add(db, 'old-active-order', 'active', {
     startAt: '2021-03-08',
     extra: { unknown: { preserved: true } },
   });
-  db.exec(
-    'DROP TABLE visibility_events; DROP TABLE medication_preferences; ALTER TABLE notes DROP COLUMN text_formats_json; DELETE FROM schema_migrations WHERE version>=4; PRAGMA wal_checkpoint(TRUNCATE)',
-  );
+  db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   const expected = Object.fromEntries(
     db
       .prepare(
@@ -456,12 +436,8 @@ test('a read-only schema 3 database can create a modern backup that restores and
   let receipt;
   try {
     receipt = await createBackup(old, root, 'cedar');
-    assert.equal(databaseSchemaVersion(old), 3);
-    assert.equal(
-      old.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name='medication_preferences'").get()
-        ?.n,
-      0,
-    );
+    assert.equal(databaseSchemaVersion(old), LATEST_SCHEMA_VERSION);
+    assert.equal(old.prepare('SELECT COUNT(*) n FROM medication_preferences').get()?.n, 0);
   } finally {
     old.close();
   }
@@ -478,7 +454,7 @@ test('a read-only schema 3 database can create a modern backup that restores and
         .sort(),
       rows,
     );
-  assert.equal(databaseSchemaVersion(restored), 6);
+  assert.equal(databaseSchemaVersion(restored), LATEST_SCHEMA_VERSION);
   assert.equal(list(restored).total, 0);
   assert.equal(list(restored, { status: 'unknown' }).total, 1);
   restored.close();
@@ -494,12 +470,12 @@ test('a read-only schema 3 database can create a modern backup that restores and
         .sort(),
       rows,
     );
-  assert.equal(databaseSchemaVersion(restored), 6);
+  assert.equal(databaseSchemaVersion(restored), LATEST_SCHEMA_VERSION);
   assert.equal(restored.prepare('SELECT COUNT(*) n FROM medication_preferences').get()?.n, 0);
   restored.close();
 });
 
-test('schema 4 backups refuse a missing personal medication table instead of silently losing it', async (t) => {
+test('current-schema backups refuse a missing personal medication table instead of silently losing it', async (t) => {
   const { db, root } = fixture(t);
   add(db, 'med', 'active');
   db.exec('DROP TABLE medication_preferences');
