@@ -33,7 +33,18 @@ it.each([false, true])('downloads bounded JSON with detailed recording %s', asyn
       omittedBeforeWindow: null,
       completeness: 'not_established',
     },
-    eventArchive: { status: enabled ? 'partial' : 'unavailable' },
+    eventArchive: {
+      status: enabled ? 'partial' : 'unavailable',
+      windowCoverage: enabled
+        ? [0, 1].map((index) => ({
+            windowId: `fictional-window-${index}`,
+            checkpointedPersistedEvents: Number.MAX_SAFE_INTEGER,
+            readableEvents: 0,
+            exportedEvents: 0,
+            knownPersistedNotExportedEvents: Number.MAX_SAFE_INTEGER,
+          }))
+        : [],
+    },
     recentPerformance: { operations: [] },
   };
   vi.stubGlobal(
@@ -72,6 +83,10 @@ it.each([false, true])('downloads bounded JSON with detailed recording %s', asyn
   expect(screen.getByRole('status')).toHaveTextContent(
     enabled ? /2 server events exceeded/ : /Detailed server events are off/,
   );
+  if (enabled)
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'At least 18014398509481982 previously saved diagnostic events are missing',
+    );
   expect(screen.getByRole('status')).toHaveTextContent(
     enabled
       ? /Some retained event history could not be included/
@@ -128,10 +143,11 @@ it('downloads actual encrypted retained observations with recording off', async 
     import { freshKey } from './src/server/vault-crypto.ts';
     const directory = mkdtempSync(join(tmpdir(), 'fictional-mounted-archive-'));
     const key = freshKey(), profileId = 'fictional-diagnostics';
-    const open = () => openDiagnosticChunkStore({ directory, key, profileId });
+    const open = () => openDiagnosticChunkStore({ directory, key, profileId, limits: { maxChunks: 1 } });
     const recorder = createImportDiagnostics({ enabled: true }), restored = createImportDiagnostics();
     try {
       recorder.attachEventStore(profileId, open());
+      for (let i = 0; i < 128; i++) recorder.record('import.progress', { accountedUnits: i }, { profileId });
       recorder.record('import.progress', { accountedUnits: 42, narrative: 'Fictional medical canary' }, { profileId, importId: 'fictional-original.pdf' });
       recorder.close();
       restored.attachEventStore(profileId, open());
@@ -181,6 +197,22 @@ it('downloads actual encrypted retained observations with recording off', async 
   expect(bundle.server.eventArchive.events[0].event.fields.accountedUnits).toBe(42);
   expect(bundle.server.eventArchive.recording).toBe('disabled');
   expect(bundle.server.eventArchive.crashTailEvents).toBeNull();
+  expect(bundle.server.eventArchive.status).toBe('partial');
+  expect(bundle.server.eventArchive.windowCoverageScope).toBe('retained_readable_checkpoints');
+  expect(bundle.server.eventArchive.windowCoverage).toEqual([
+    {
+      windowId: bundle.server.eventArchive.events[0].windowId,
+      checkpointedPersistedEvents: 129,
+      readableEvents: 1,
+      exportedEvents: 1,
+      knownPersistedNotExportedEvents: 128,
+    },
+  ]);
   expect(contents).not.toMatch(/medical canary|fictional-original|fictional-diagnostics/);
-  expect(screen.getByRole('status')).toHaveTextContent(/Retained event history is bounded/);
+  expect(screen.getByRole('status')).toHaveTextContent(
+    /Some retained event history could not be included/,
+  );
+  expect(screen.getByRole('status')).toHaveTextContent(
+    /At least 128 previously saved diagnostic events are missing from this download. The cause is unknown/,
+  );
 });

@@ -84,6 +84,15 @@ test('retained metadata survives lock/reopen with capture off, joins the live wi
   assert.equal(archive.events.length, 300);
   assert.equal(archive.status, 'available');
   assert.equal(archive.currentWindow.persistedEvents, 300);
+  assert.deepEqual(archive.windowCoverage, [
+    {
+      windowId: archive.currentWindow.windowId,
+      checkpointedPersistedEvents: 300,
+      readableEvents: 300,
+      exportedEvents: 300,
+      knownPersistedNotExportedEvents: 0,
+    },
+  ]);
   assert.equal(archive.events[0]!.windowId, live.eventWindow.windowId);
   assert.equal(archive.events[0]!.event.context.importId, live.events[0]!.context.importId);
   assert.equal(archive.events[0]!.event.context.requestId, requestId);
@@ -114,6 +123,7 @@ test('retained metadata survives lock/reopen with capture off, joins the live wi
   assert.equal(recovered.omittedBeforeInventory, null);
   assert.equal(recovered.completeness, 'not_established');
   assert.deepEqual(recovered.windowCheckpoints, archive.windowCheckpoints);
+  assert.deepEqual(recovered.windowCoverage, archive.windowCoverage);
   assert.equal(recovered.windowCheckpoints.length, 1);
   assert.equal(recovered.windowCheckpoints[0]!.persistedEvents, 300);
   assert.notEqual(
@@ -280,6 +290,15 @@ test('recovered schema corruption, private strings and duplicate sequences are r
   );
   assert.equal(result.invalidEvents, 8);
   assert.equal(result.invalidChunks, 1);
+  assert.deepEqual(result.windowCoverage, [
+    {
+      windowId,
+      checkpointedPersistedEvents: 10,
+      readableEvents: 2,
+      exportedEvents: 2,
+      knownPersistedNotExportedEvents: 8,
+    },
+  ]);
   assert.equal(result.status, 'partial');
   assert.doesNotMatch(
     JSON.stringify(result),
@@ -311,6 +330,7 @@ test('export yields to foreground work and discards plaintext if the profile loc
   assert.deepEqual(result.events, []);
   assert.equal(result.currentWindow.windowId, null);
   assert.deepEqual(result.windowCheckpoints, []);
+  assert.deepEqual(result.windowCoverage, []);
   assert.equal((await d.exportArchive('another-profile')).status, 'not_attached');
   d.close();
 });
@@ -330,6 +350,18 @@ test('retention remains explicit without claiming a loss-free current inventory 
   assert.equal(result.completeness, 'not_established');
   assert.equal(result.windowCheckpoints.length, 1);
   assert.equal(result.windowCheckpoints[0]!.persistedEvents, 384);
+  assert.equal(result.missingChunksWithinInventory, 0);
+  assert.equal(result.status, 'partial');
+  assert.deepEqual(result.windowCoverage, [
+    {
+      windowId: result.currentWindow.windowId,
+      checkpointedPersistedEvents: 384,
+      readableEvents: 256,
+      exportedEvents: 256,
+      knownPersistedNotExportedEvents: 128,
+    },
+  ]);
+  assert.equal(store.work().chunkWrites, 3);
   d.close();
 });
 
@@ -352,7 +384,76 @@ test('serialized export output stays bounded even when anonymization expands sto
     'later checkpoints remain visible after event truncation',
   );
   assert.ok(Buffer.byteLength(JSON.stringify(result)) <= diagnosticArchiveLimits.maxExportBytes);
+  assert.deepEqual(result.windowCoverage, [
+    {
+      windowId: result.currentWindow.windowId,
+      checkpointedPersistedEvents: 4096,
+      readableEvents: 4096,
+      exportedEvents: result.events.length,
+      knownPersistedNotExportedEvents: 4096 - result.events.length,
+    },
+  ]);
   archive.close();
+});
+
+test('unreadable and invalid earlier chunks retain exact omission counts from a later checkpoint', async (t) => {
+  for (const failure of ['unreadable', 'invalid'] as const) {
+    const f = fixture(t),
+      store = f.open(),
+      d = createImportDiagnostics({ enabled: true });
+    d.attachEventStore(f.profileId, {
+      ...store,
+      read(sequence) {
+        if (sequence === 1) {
+          if (failure === 'unreadable') throw Error('Fictional read failure');
+          return Buffer.from('{}');
+        }
+        return store.read(sequence);
+      },
+    });
+    for (let i = 0; i < 256; i++) d.record('import.progress', {}, { profileId: f.profileId });
+    const result = await d.exportArchive(f.profileId);
+    assert.equal(result.status, 'partial');
+    assert.equal(result.readFailures, failure === 'unreadable' ? 1 : 0);
+    assert.equal(result.invalidChunks, failure === 'invalid' ? 1 : 0);
+    assert.deepEqual(result.windowCoverage, [
+      {
+        windowId: result.currentWindow.windowId,
+        checkpointedPersistedEvents: 256,
+        readableEvents: 128,
+        exportedEvents: 128,
+        knownPersistedNotExportedEvents: 128,
+      },
+    ]);
+    assert.equal(store.work().chunkWrites, 2);
+    d.close();
+  }
+});
+
+test('interleaved profile sequences do not imply omissions or mix window evidence', async (t) => {
+  const first = fixture(t),
+    second = fixture(t);
+  const d = createImportDiagnostics({ enabled: true });
+  const otherProfile = 'fictional-other-profile';
+  d.attachEventStore(first.profileId, first.open());
+  d.attachEventStore(otherProfile, second.open());
+  for (let i = 0; i < 256; i++) {
+    d.record('import.progress', { accountedUnits: 1 }, { profileId: first.profileId });
+    d.record('import.progress', { accountedUnits: 2 }, { profileId: otherProfile });
+  }
+  for (const [profileId, expected] of [
+    [first.profileId, 1],
+    [otherProfile, 2],
+  ] as const) {
+    const result = await d.exportArchive(profileId);
+    assert.equal(result.status, 'available');
+    assert.equal(result.windowCoverage[0]!.checkpointedPersistedEvents, 256);
+    assert.equal(result.windowCoverage[0]!.readableEvents, 256);
+    assert.equal(result.windowCoverage[0]!.knownPersistedNotExportedEvents, 0);
+    assert.equal(result.events[1]!.event.sequence - result.events[0]!.event.sequence, 2);
+    assert.ok(result.events.every((row) => row.event.fields.accountedUnits === expected));
+  }
+  d.close();
 });
 
 test('scheduled flush retries a frozen publication without new observations', async (t) => {
@@ -464,6 +565,8 @@ test('evicting an entire lost window leaves previous history unknown', async (t)
   recovered.attachEventStore(f.profileId, f.open());
   const result = await recovered.exportArchive(f.profileId);
   assert.equal(result.windowCheckpoints.length, 1);
+  assert.equal(result.windowCoverage.length, 1);
+  assert.equal(result.windowCoverage[0]!.knownPersistedNotExportedEvents, 0);
   assert.equal(result.windowCheckpoints[0]!.droppedEvents, 0);
   assert.equal(result.omittedBeforeInventory, null);
   assert.equal(result.crashTailEvents, null);

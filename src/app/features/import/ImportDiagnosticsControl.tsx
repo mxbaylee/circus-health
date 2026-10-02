@@ -51,14 +51,19 @@ export function ImportDiagnosticsControl() {
       link.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       const archive = response.data.eventArchive;
+      const knownOmissions =
+        archive?.windowCoverage?.reduce(
+          (total, window) => total + BigInt(window.knownPersistedNotExportedEvents),
+          0n,
+        ) || 0n;
       const coverage =
         !archive || archive.status === 'not_attached' || archive.status === 'unavailable'
           ? 'Retained event history is unavailable.'
           : archive.status === 'partial'
             ? 'Some retained event history could not be included; inspect the coverage and failure counts.'
-            : 'Retained event history is bounded; earlier events and an abrupt-shutdown tail may be missing.';
+            : 'The retained portion shows no known missing events; earlier history and an abrupt-shutdown tail may still be missing.';
       setMessage(
-        `Diagnostics downloaded. ${coverage} ${
+        `Diagnostics downloaded. ${coverage} ${knownOmissions ? `At least ${knownOmissions} previously saved diagnostic events are missing from this download. The cause is unknown. ` : ''}${
           !response.data.enabled
             ? 'Detailed server events are off; enable CRS_IMPORT_DIAGNOSTICS=true before a future reproduction.'
             : response.data.droppedEvents

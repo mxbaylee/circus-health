@@ -15,6 +15,8 @@ export const diagnosticArchiveLimits = Object.freeze({
 const format = 'circus-import-events-v2';
 // Five safe integer counters and their fixed keys fit this reserve, including JSON framing.
 const checkpointReserveBytes = 512;
+// Fixed coverage keys, UUID and four safe integer counters fit this export-only reserve.
+const coverageReserveBytes = 512;
 const counterKeys = [
   'observedEvents',
   'persistedEvents',
@@ -211,6 +213,8 @@ export function createImportDiagnosticArchive(
         completeness: 'not_established',
         currentWindow: emptyCounts(null),
         windowCheckpoints: [],
+        windowCoverageScope: 'retained_readable_checkpoints',
+        windowCoverage: [],
         events: [],
       };
       if (!state) return result;
@@ -225,6 +229,7 @@ export function createImportDiagnosticArchive(
         missingChunksWithinInventory: null,
         currentWindow: emptyCounts(null),
         windowCheckpoints: [],
+        windowCoverage: [],
         events: [],
       });
       try {
@@ -234,9 +239,18 @@ export function createImportDiagnosticArchive(
         result.missingChunksWithinInventory = inventory.missingChunksWithinInventory;
         let outputBytes = Buffer.byteLength(JSON.stringify(result)) + 4096;
         // Reserve fixed metadata space before events, so an event cap cannot hide later checkpoints.
-        let checkpointReserve = inventory.chunks.length * checkpointReserveBytes;
+        let checkpointReserve =
+          inventory.chunks.length * (checkpointReserveBytes + coverageReserveBytes);
         let eventsTruncated = false;
         const lastSequence = new Map<string, number>();
+        const checkpointByWindow = new Map<
+          string,
+          ImportDiagnosticCheckpoint & { windowId: string }
+        >();
+        const coverageByWindow = new Map<
+          string,
+          ImportDiagnosticArchive['windowCoverage'][number]
+        >();
         for (const chunk of inventory.chunks) {
           // Decrypt/validate only one bounded chunk before yielding to foreground requests.
           await yieldToRequests();
@@ -264,7 +278,7 @@ export function createImportDiagnosticArchive(
             result.invalidChunks++;
             continue;
           }
-          const prior = result.windowCheckpoints.find((item) => item.windowId === record.windowId);
+          const prior = checkpointByWindow.get(record.windowId);
           const boundary = record.checkpoint;
           if (
             prior &&
@@ -286,8 +300,27 @@ export function createImportDiagnosticArchive(
           }
           outputBytes += checkpointBytes - previousBytes;
           checkpointReserve -= checkpointBytes - previousBytes;
-          if (prior) result.windowCheckpoints[result.windowCheckpoints.indexOf(prior)] = next;
-          else result.windowCheckpoints.push(next);
+          if (prior) Object.assign(prior, next);
+          else {
+            result.windowCheckpoints.push(next);
+            checkpointByWindow.set(record.windowId, next);
+          }
+          let coverage = coverageByWindow.get(record.windowId);
+          if (!coverage) {
+            coverage = {
+              windowId: record.windowId,
+              checkpointedPersistedEvents: 0,
+              readableEvents: 0,
+              exportedEvents: 0,
+              knownPersistedNotExportedEvents: 0,
+            };
+            coverageByWindow.set(record.windowId, coverage);
+            result.windowCoverage.push(coverage);
+            // Reserve its maximum final representation before including event detail.
+            outputBytes += coverageReserveBytes;
+            checkpointReserve -= coverageReserveBytes;
+          }
+          coverage.checkpointedPersistedEvents = boundary.persistedEvents;
           for (const value of record.events) {
             const event = sanitize(value);
             if (!event || event.sequence <= (lastSequence.get(record.windowId) ?? -1)) {
@@ -295,6 +328,7 @@ export function createImportDiagnosticArchive(
               continue;
             }
             lastSequence.set(record.windowId, event.sequence);
+            coverage.readableEvents++;
             if (eventsTruncated) continue;
             const exported = { windowId: record.windowId, event: anonymize(event) };
             const bytes = Buffer.byteLength(JSON.stringify(exported));
@@ -308,6 +342,7 @@ export function createImportDiagnosticArchive(
             }
             outputBytes += bytes + 1;
             result.events.push(exported);
+            coverage.exportedEvents++;
           }
         }
       } catch {
@@ -315,6 +350,11 @@ export function createImportDiagnosticArchive(
         result.readFailures++;
       }
       if (detached()) return discard();
+      for (const coverage of result.windowCoverage)
+        coverage.knownPersistedNotExportedEvents = Math.max(
+          0,
+          coverage.checkpointedPersistedEvents - coverage.exportedEvents,
+        );
       if (
         result.status === 'available' &&
         (result.readFailures ||
@@ -325,6 +365,7 @@ export function createImportDiagnosticArchive(
           result.currentWindow.writeFailures ||
           result.currentWindow.droppedEvents ||
           result.currentWindow.pendingEvents ||
+          result.windowCoverage.some((item) => item.knownPersistedNotExportedEvents > 0) ||
           result.windowCheckpoints.some(
             (item) => item.droppedEvents || item.oversizedEvents || item.writeFailures,
           ))
