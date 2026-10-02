@@ -241,8 +241,41 @@ export function largeImportPage(oracle: LargeImportOracle, page: number): LargeI
   };
 }
 
+/** Fit ink and advance into an explicit raster cell without clipping or changing glyph height.
+ * A 10% maximum horizontal adjustment accommodates small platform metric differences;
+ * larger changes indicate an unsuitable font/content layout and remain an error.
+ */
+export function fitLargeImportTableCell(
+  metrics: { width: number; actualBoundingBoxLeft: number; actualBoundingBoxRight: number },
+  availableWidth: number,
+) {
+  if (
+    !Number.isFinite(availableWidth) ||
+    availableWidth <= 0 ||
+    ![metrics.width, metrics.actualBoundingBoxLeft, metrics.actualBoundingBoxRight].every(
+      Number.isFinite,
+    ) ||
+    metrics.width < 0
+  )
+    throw Error('Fictional clinical table cell exceeds its visible column bounds');
+  const left = Math.max(0, metrics.actualBoundingBoxLeft);
+  const extent = left + Math.max(0, metrics.width, metrics.actualBoundingBoxRight);
+  const scaleX = extent > availableWidth ? availableWidth / extent : 1;
+  if (scaleX < 0.9) throw Error('Fictional clinical table cell exceeds its visible column bounds');
+  const offsetX = left * scaleX;
+  const inkLeft = offsetX - metrics.actualBoundingBoxLeft * scaleX;
+  const inkRight = offsetX + metrics.actualBoundingBoxRight * scaleX;
+  if (inkLeft < 0 || inkRight > availableWidth + 1e-9)
+    throw Error('Fictional clinical table cell exceeds its visible column bounds');
+  return { scaleX, offsetX, inkLeft, inkRight };
+}
+
 /** Fixed Courier layout and explicit raster table columns; no hidden OCR. */
-export function renderLargeImportPage(page: LargeImportPage, nativeOnly = false): FictionalPdfPage {
+export function renderLargeImportPage(
+  page: LargeImportPage,
+  nativeOnly = false,
+  options: { rasterFontFamily?: string } = {},
+): FictionalPdfPage {
   const fontSize = 10,
     x = 30,
     top = 752,
@@ -251,7 +284,10 @@ export function renderLargeImportPage(page: LargeImportPage, nativeOnly = false)
   const canvas = createCanvas(1224, 1584),
     context = canvas.getContext('2d');
   try {
-    context.font = `${fontSize * 2}px monospace`;
+    const family = options.rasterFontFamily ?? 'monospace';
+    if (!family || family.length > 128 || /[\r\n]/.test(family))
+      throw Error('Invalid fictional raster font');
+    context.font = `${fontSize * 2}px ${nativeOnly || page.kind === 'native' ? 'monospace' : family}`;
     for (const [index, line] of page.lines.entries()) {
       if (
         !/^[\x20-\x7e]*$/.test(line) ||
@@ -291,17 +327,38 @@ export function renderLargeImportPage(page: LargeImportPage, nativeOnly = false)
         const text = cell.trim();
         const width =
           (start + cell.length < line.length ? cell.length : 92 - start) * characterWidth;
-        if (context.measureText(text).width > width * 2)
-          throw Error('Fictional clinical table cell exceeds its visible column bounds');
+        const separator = start + cell.length < line.length;
         if (/^-+$/.test(text)) {
+          // This segment is drawn as geometry, not as hyphen glyphs.
+          if (cell.length * characterWidth > width)
+            throw Error('Fictional clinical table rule exceeds its visible column bounds');
           context.beginPath();
           context.moveTo((x + start * characterWidth) * 2, baseline - fontSize);
           context.lineTo((x + (start + cell.length) * characterWidth) * 2, baseline - fontSize);
           context.strokeStyle = '#161616';
           context.stroke();
-        } else context.fillText(text, (x + start * characterWidth) * 2, baseline);
-        if (start + cell.length < line.length)
-          context.fillText('|', (x + (start + cell.length) * characterWidth) * 2, baseline);
+        } else {
+          // Reserve one raster pixel before the separator and account for glyph
+          // overhang on both sides. No clipping, character loss or height scaling.
+          const fitted = fitLargeImportTableCell(
+            context.measureText(text),
+            width * 2 - (separator ? 1 : 0),
+          );
+          context.save();
+          context.translate((x + start * characterWidth) * 2 + fitted.offsetX, 0);
+          context.scale(fitted.scaleX, 1);
+          context.fillText(text, 0, baseline);
+          context.restore();
+        }
+        if (separator) {
+          // Keep separator ink within its own nominal Courier character slot.
+          const fitted = fitLargeImportTableCell(context.measureText('|'), characterWidth * 2);
+          context.save();
+          context.translate((x + (start + cell.length) * characterWidth) * 2 + fitted.offsetX, 0);
+          context.scale(fitted.scaleX, 1);
+          context.fillText('|', 0, baseline);
+          context.restore();
+        }
         start += cell.length + 1;
       }
     }
