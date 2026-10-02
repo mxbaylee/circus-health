@@ -6,7 +6,7 @@ import { profilePaths } from './profile-storage.ts';
 import { profileDefinition, validProfileId } from './profiles.ts';
 import { readDatabaseOwner } from './profile-ownership.ts';
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-export const LATEST_SCHEMA_VERSION = 6;
+export const LATEST_SCHEMA_VERSION = 7;
 export type Database = DatabaseSync;
 export type SqliteRow = Record<string, SQLOutputValue>;
 
@@ -84,6 +84,13 @@ export function openDatabase(path?: string | null, profileId?: string): Database
     if (databaseSchemaVersion(db) < 6)
       db.exec(
         readFileSync(new URL('./migrations/006-visibility-events.sql', import.meta.url), 'utf8'),
+      );
+    if (databaseSchemaVersion(db) < 7)
+      db.exec(
+        readFileSync(
+          new URL('./migrations/007-condition-occurrences.sql', import.meta.url),
+          'utf8',
+        ),
       );
     db.exec('COMMIT');
     inTransaction = false;

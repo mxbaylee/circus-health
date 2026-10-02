@@ -1103,15 +1103,21 @@ it('retains one identical in-flight identity read across ordinary feed search ch
   );
 
   await waitFor(() => expect(identityReleases).toHaveLength(1));
-  fireEvent.change(screen.getByRole('searchbox', { name: 'Search records' }), {
-    target: { value: 'fictional churn' },
+  // Flush the refreshed feed's effects before resolving the retained identity request.
+  // Visible activity text can precede those effects; a completed request may legitimately refresh.
+  await act(async () => {
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search records' }), {
+      target: { value: 'fictional churn' },
+    });
   });
   await waitFor(() => expect(searchFeedReads).toBe(1));
   expect(feedReads).toBeGreaterThanOrEqual(2);
   expect(await screen.findByText('Moxie is reading 1 file')).toBeVisible();
   expect(identityReleases).toHaveLength(1);
 
-  identityReleases[0](response(identity));
+  await act(async () => {
+    identityReleases[0](response(identity));
+  });
   expect(await screen.findByText('Stable Fictional Person')).toBeVisible();
   expect(identityReleases).toHaveLength(1);
 });

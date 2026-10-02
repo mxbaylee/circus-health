@@ -74,3 +74,9 @@ Portable exports include stable IDs, relationships, mappings, personal state, cu
 - Unicode, decimals, arrays, empty values, unknown fields, long text, and artifacts round-trip through portable rebuild.
 - A profile cannot read, link, mutate, back up, or restore another profile's records.
 - Repository fixtures and browser checks use generated fictional data.
+
+## Condition occurrence storage
+
+Schema 7 adds `conditions`: one literal provider mention per source occurrence, with a required `source_record_id` and explicit `person_id`, optional provider, provider status and effective date, plus retained JSON fields. Labels and printed codes are not identities; equal mentions remain separate. Partial dates and null/absent source fields remain literal. The migration creates no condition rows and never reinterprets retained raw assertions. Existing record-version durability captures changed occurrences and their full history. This is storage groundwork: accepted import kinds, corrections, personal status, UI and packet summaries are still unfinished ([reviewed ingestion](../todo/CRS-173.md), [personal status/UI](../todo/CRS-174.md), [packets](../todo/CRS-175.md)). No public write API exposes the new table yet.
+
+The owner chose first-class Conditions to support longitudinal tracking and useful provider problem lists. Provider status does not establish whether a condition is current for the person; that separate personal confirmation remains unfinished. A Visit remains a note, not a new entity or date book. The new storage schema does not add visit or allergy entities.

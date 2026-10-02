@@ -5,7 +5,18 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { openDatabase, databaseSchemaVersion, type Database } from '../database.ts';
+import {
+  openDatabase,
+  databaseSchemaVersion,
+  transaction,
+  LATEST_SCHEMA_VERSION,
+  type Database,
+} from '../database.ts';
+import {
+  attachRecordDurability,
+  queryRecordHistory,
+  type RecordStorage,
+} from '../record-versions.ts';
 import { clinicalList } from '../queries.ts';
 import { createApp } from '../index.ts';
 import { hash } from '../assets.ts';
@@ -50,13 +61,13 @@ test('schema 1 upgrades both owners atomically without classifying records or ch
       beforeNote = db.prepare('SELECT * FROM notes').get();
     db.close();
     db = openDatabase(path, owner);
-    assert.equal(databaseSchemaVersion(db), 6);
+    assert.equal(databaseSchemaVersion(db), LATEST_SCHEMA_VERSION);
     assert.deepEqual(
       db
         .prepare('SELECT version FROM schema_migrations ORDER BY version')
         .all()
         .map((r) => r.version),
-      [1, 2, 3, 4, 5, 6],
+      [1, 2, 3, 4, 5, 6, 7],
     );
     const { category, ...afterProcedure } = requiredRow<
       Record<string, unknown> & { category: string }
@@ -82,7 +93,10 @@ test('schema 1 upgrades both owners atomically without classifying records or ch
     db.close();
     db = openDatabase(path, owner);
     assert.equal(db.prepare('SELECT category FROM procedures').get()?.category, 'surgery');
-    assert.equal(db.prepare('SELECT count(*) n FROM schema_migrations').get()?.n, 6);
+    assert.equal(
+      db.prepare('SELECT count(*) n FROM schema_migrations').get()?.n,
+      LATEST_SCHEMA_VERSION,
+    );
     db.close();
   }
 });
@@ -215,11 +229,11 @@ test('procedure categories separate clinical and tests with correct filtering, p
   assert.equal(overviewPayload.data.counts.procedures, 4);
 });
 
-test('new profiles and portable backups record the current schema, and restored classifications survive reopening', async (t) => {
+test('new profiles and portable backups record the current schema, and restored procedure classifications and conditions survive reopening', async (t) => {
   const root = temporary(t),
     db = openDatabase(resolve(root, 'data/profiles/cookie-dough.sqlite'), 'cookie-dough');
   t.after(() => db.close());
-  assert.equal(databaseSchemaVersion(db), 6);
+  assert.equal(databaseSchemaVersion(db), LATEST_SCHEMA_VERSION);
   assert.equal(
     db.prepare("SELECT display_name FROM people WHERE id='patient'").get()?.display_name,
     'Cookie Dough',
@@ -245,18 +259,47 @@ test('new profiles and portable backups record the current schema, and restored 
     'Fictional procedure',
     'surgery',
   );
+  const objects = new Map<string, Buffer>();
+  const storage: RecordStorage = {
+    read: (name) => objects.get(name) ?? null,
+    writeImmutable: (name, bytes) => {
+      assert.equal(objects.has(name), false);
+      objects.set(name, Buffer.from(bytes));
+    },
+    publishHead: (bytes) => {
+      objects.set('head', Buffer.from(bytes));
+    },
+  };
+  attachRecordDurability(db, { profileId: 'cookie-dough', storage });
+  transaction(
+    db,
+    () =>
+      db.exec(
+        "INSERT INTO conditions(id,source_record_id,person_id,label,status,extra_json) VALUES('condition','placebo-record','patient','Fictional condition','source wording','{\"printedCode\":\"F00.001\",\"nullable\":null}')",
+      ),
+    { actor: 'fictional-reviewer', origin: 'condition-storage-fixture' },
+  );
+  transaction(
+    db,
+    () => db.exec("UPDATE conditions SET effective_at='2021-04' WHERE id='condition'"),
+    { actor: 'fictional-caregiver' },
+  );
+  const expectedConditions = db.prepare('SELECT * FROM conditions').all();
+  const historyQuery = { profileId: 'cookie-dough', entity: 'conditions', recordId: 'condition' };
+  const expectedHistory = queryRecordHistory(db, historyQuery);
+  assert.equal(expectedHistory.entries.length, 2);
   const receipt = await createBackup(db, root, 'cookie-dough');
   const manifest = JSON.parse(readFileSync(resolve(receipt.path, 'manifest.json'), 'utf8')),
     portable = JSON.parse(readFileSync(resolve(receipt.path, 'portable.json'), 'utf8'));
-  assert.equal(manifest.schemaVersion, 6);
-  assert.equal(portable.schemaVersion, 6);
+  assert.equal(manifest.schemaVersion, LATEST_SCHEMA_VERSION);
+  assert.equal(portable.schemaVersion, LATEST_SCHEMA_VERSION);
   const target = resolve(root, 'restored');
   restoreBackup(receipt.path, target);
   const restored = openDatabase(
     resolve(target, 'data/profiles/cookie-dough.sqlite'),
     'cookie-dough',
   );
-  assert.equal(databaseSchemaVersion(restored), 6);
+  assert.equal(databaseSchemaVersion(restored), LATEST_SCHEMA_VERSION);
   assert.equal(
     restored.prepare('SELECT category FROM procedures WHERE id=?').get('placebo-procedure')
       ?.category,
@@ -267,5 +310,22 @@ test('new profiles and portable backups record the current schema, and restored 
       ?.name,
     'category',
   );
+  assert.deepEqual(restored.prepare('SELECT * FROM conditions').all(), expectedConditions);
+  // This exercises snapshot history restoration, not rebuilding it from the test's journal.
+  // Archive-only recovery is covered separately by condition-storage.test.ts.
+  const head = objects.get('head')!;
+  objects.clear();
+  attachRecordDurability(restored, {
+    profileId: 'cookie-dough',
+    storage: {
+      read: (name) => {
+        assert.equal(name, 'head', 'restore must not replay missing snapshot history');
+        return head;
+      },
+      writeImmutable: () => assert.fail('restore must not invent historical versions'),
+      publishHead: () => assert.fail('restore must not replace the accepted head'),
+    },
+  });
+  assert.deepEqual(queryRecordHistory(restored, historyQuery), expectedHistory);
   restored.close();
 });
