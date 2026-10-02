@@ -8,9 +8,15 @@ import { resolve } from 'node:path';
 import {
   openDatabase,
   databaseSchemaVersion,
+  transaction,
   LATEST_SCHEMA_VERSION,
   type Database,
 } from '../database.ts';
+import {
+  attachRecordDurability,
+  queryRecordHistory,
+  type RecordStorage,
+} from '../record-versions.ts';
 import { clinicalList } from '../queries.ts';
 import { createApp } from '../index.ts';
 import { hash } from '../assets.ts';
@@ -253,10 +259,35 @@ test('new profiles and portable backups record the current schema, and restored 
     'Fictional procedure',
     'surgery',
   );
-  db.exec(
-    "INSERT INTO conditions(id,source_record_id,person_id,label,status,extra_json) VALUES('condition','placebo-record','patient','Fictional condition','source wording','{\"printedCode\":\"F00.001\",\"nullable\":null}')",
+  const objects = new Map<string, Buffer>();
+  const storage: RecordStorage = {
+    read: (name) => objects.get(name) ?? null,
+    writeImmutable: (name, bytes) => {
+      assert.equal(objects.has(name), false);
+      objects.set(name, Buffer.from(bytes));
+    },
+    publishHead: (bytes) => {
+      objects.set('head', Buffer.from(bytes));
+    },
+  };
+  attachRecordDurability(db, { profileId: 'cookie-dough', storage });
+  transaction(
+    db,
+    () =>
+      db.exec(
+        "INSERT INTO conditions(id,source_record_id,person_id,label,status,extra_json) VALUES('condition','placebo-record','patient','Fictional condition','source wording','{\"printedCode\":\"F00.001\",\"nullable\":null}')",
+      ),
+    { actor: 'fictional-reviewer', origin: 'condition-storage-fixture' },
+  );
+  transaction(
+    db,
+    () => db.exec("UPDATE conditions SET effective_at='2021-04' WHERE id='condition'"),
+    { actor: 'fictional-caregiver' },
   );
   const expectedConditions = db.prepare('SELECT * FROM conditions').all();
+  const historyQuery = { profileId: 'cookie-dough', entity: 'conditions', recordId: 'condition' };
+  const expectedHistory = queryRecordHistory(db, historyQuery);
+  assert.equal(expectedHistory.entries.length, 2);
   const receipt = await createBackup(db, root, 'cookie-dough');
   const manifest = JSON.parse(readFileSync(resolve(receipt.path, 'manifest.json'), 'utf8')),
     portable = JSON.parse(readFileSync(resolve(receipt.path, 'portable.json'), 'utf8'));
@@ -280,5 +311,21 @@ test('new profiles and portable backups record the current schema, and restored 
     'category',
   );
   assert.deepEqual(restored.prepare('SELECT * FROM conditions').all(), expectedConditions);
+  // This exercises snapshot history restoration, not rebuilding it from the test's journal.
+  // Archive-only recovery is covered separately by condition-storage.test.ts.
+  const head = objects.get('head')!;
+  objects.clear();
+  attachRecordDurability(restored, {
+    profileId: 'cookie-dough',
+    storage: {
+      read: (name) => {
+        assert.equal(name, 'head', 'restore must not replay missing snapshot history');
+        return head;
+      },
+      writeImmutable: () => assert.fail('restore must not invent historical versions'),
+      publishHead: () => assert.fail('restore must not replace the accepted head'),
+    },
+  });
+  assert.deepEqual(queryRecordHistory(restored, historyQuery), expectedHistory);
   restored.close();
 });
