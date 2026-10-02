@@ -87,3 +87,7 @@ Encryption does not retroactively protect earlier plaintext backups, exports, do
 ## Import recovery authority
 
 Durable automatic-run intent never unlocks an archive. The coordinator checks the exact profile/import dispatch and publication permissions. Lock/logout/profile switch revoke the ordinary runtime; authorized unlock recovers eligible work automatically, while explicit Stop survives. See [automatic recovery rationale and the CRS-081 boundary](../import/automatic-recovery.md#rationale-and-authorization). Restricted post-logout processing remains separate work; clinical acceptance, identity confirmation and browsing require a live session.
+
+## Conversation recovery state
+
+The [conversation journal](../data/conversation-journal.md) verifies profile/chat identity, immutable generation hashes and exact predecessor links. Its small commit marker and changed generations are encrypted through the existing workspace flush. In-memory diff bases use weak caller-owned keys and are explicitly cleared on app closure, profile lock and failed activation; failed encrypted flushes invalidate the affected basis. Diagnostic reads always enforce aggregate history budgets rather than bypassing them through that cache. Missing commit markers with retained history fail explicitly; the server never treats them as permission to create an empty replacement conversation.
