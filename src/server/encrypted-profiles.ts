@@ -49,6 +49,7 @@ import { onboardingIdentity } from './profile-onboarding.ts';
 import { validPersonIcon } from '../shared/person-icon.ts';
 import { rebuildRecordDatabase, type DurableRecordVersion } from './record-versions.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
+import { clearChatJournalCache } from './assistant-journal.ts';
 export interface EncryptedLabel {
   algorithm: 'xchacha20poly1305-ietf';
   nonce: string;
@@ -578,6 +579,7 @@ export function createEncryptedProfiles({
       diagnostics.attachEventStore(id, vault.diagnosticChunks());
       return state;
     } catch (e) {
+      clearChatJournalCache(root, id);
       disposeOriginalResolver();
       db?.close();
       vault.close();
@@ -764,6 +766,7 @@ export function createEncryptedProfiles({
         schemaVersion: LATEST_SCHEMA_VERSION,
       });
     } finally {
+      clearChatJournalCache(state.root, id);
       state.disposeOriginalResolver();
       diagnostics.detachSummaryStore(id);
       state.vault.close();
