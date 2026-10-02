@@ -160,6 +160,28 @@ export function registerTransactionDurability<Capture, Result>(
   if (hooks) durabilityHooks.set(db, hooks as TransactionDurabilityHooks);
   else durabilityHooks.delete(db);
 }
+/** Memory-only observers; accepted-record durability hooks retain their ordering. */
+export type TransactionOutcome = { token: object; committed: boolean; succeeded: boolean };
+const transactionTokens = new WeakMap<DatabaseSync, object>();
+const transactionFailures = new WeakMap<DatabaseSync, unknown>();
+/** A failed staged storage write must abort its outer transaction even if caught. */
+export function rejectCurrentTransaction(db: DatabaseSync, error: unknown): void {
+  if (!transactionTokens.has(db)) throw Error('No application transaction');
+  transactionFailures.set(db, error);
+}
+const outcomeObservers = new WeakMap<DatabaseSync, Set<(outcome: TransactionOutcome) => void>>();
+export function currentTransactionToken(db: DatabaseSync): object | undefined {
+  return transactionTokens.get(db);
+}
+export function observeTransactionOutcome(
+  db: DatabaseSync,
+  observer: (outcome: TransactionOutcome) => void,
+): () => void {
+  let observers = outcomeObservers.get(db);
+  if (!observers) outcomeObservers.set(db, (observers = new Set()));
+  observers.add(observer);
+  return () => observers.delete(observer);
+}
 export function transaction<T>(
   db: DatabaseSync,
   fn: () => T,
@@ -167,6 +189,9 @@ export function transaction<T>(
 ): T {
   db.exec('BEGIN IMMEDIATE');
   let committed = false;
+  let succeeded = false;
+  const token = {};
+  transactionTokens.set(db, token);
   const hooks = durabilityHooks.get(db);
   let captured;
   try {
@@ -174,10 +199,12 @@ export function transaction<T>(
     if (retry?.replayed) {
       db.exec('COMMIT');
       committed = true;
+      succeeded = true;
       return retry.result as T;
     }
     captured = hooks?.capture?.();
     const result = fn();
+    if (transactionFailures.has(db)) throw transactionFailures.get(db);
     db.prepare(
       "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
     ).run();
@@ -195,12 +222,31 @@ export function transaction<T>(
     // Publication may be retried from the durable intent, even after losing
     // this database and its WAL entirely.
     hooks?.flush?.();
+    succeeded = true;
     return result;
   } catch (error) {
     if (!committed) db.exec('ROLLBACK');
     throw error;
   } finally {
-    hooks?.release?.(captured);
+    transactionTokens.delete(db);
+    transactionFailures.delete(db);
+    // Read at completion: observers can register while fn stages its first value.
+    try {
+      hooks?.release?.(captured);
+    } catch (error) {
+      succeeded = false;
+      throw error;
+    } finally {
+      for (const observer of outcomeObservers.get(db) ?? []) {
+        // A disposable-cache observer cannot change a durable acknowledgement
+        // or suppress cleanup by another observer.
+        try {
+          observer({ token, committed, succeeded });
+        } catch {
+          /* memory only */
+        }
+      }
+    }
   }
 }
 export class HttpError extends Error {
