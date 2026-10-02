@@ -158,6 +158,34 @@ export interface QualificationAcceptanceOptions {
   afterAcceptedBeforeRecovery?: () => Promise<void>;
 }
 
+/** Caller must first lock its freshly created qualification profile. Never remove
+ * originals, versions or any path outside the owned, regular cache directory. */
+export function removeQualificationCache(
+  dataDirectory: string,
+  profileId: string,
+  ownedProfiles: ReadonlySet<string>,
+) {
+  check(
+    /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(profileId) && ownedProfiles.has(profileId),
+    'Cache removal requires a freshly created qualification profile.',
+  );
+  const profileDirectory = join(dataDirectory, 'profiles', profileId);
+  const cacheDirectory = join(profileDirectory, 'cache');
+  check(
+    realpathSync(profileDirectory) === profileDirectory &&
+      !lstatSync(profileDirectory).isSymbolicLink(),
+    'Qualification cache directory escaped its owned archive.',
+  );
+  check(
+    existsSync(cacheDirectory) &&
+      realpathSync(cacheDirectory) === cacheDirectory &&
+      lstatSync(cacheDirectory).isDirectory(),
+    'Qualification expected a regular cache directory.',
+  );
+  rmSync(cacheDirectory, { recursive: true });
+  check(!existsSync(cacheDirectory), 'Qualification cache deletion failed.');
+}
+
 export async function performQualificationAcceptance({
   prefix,
   profileId,
@@ -403,22 +431,7 @@ export async function performQualificationAcceptance({
   await request(prefix + '/lock', {});
   // Delete only this harness-owned disposable cache after lock. Originals,
   // manifests, accepted versions and the encrypted recovery authority survive.
-  const profileDirectory = join(dataDirectory, 'profiles', profileId);
-  const cacheDirectory = join(profileDirectory, 'cache');
-  check(
-    ownedProfiles.has(profileId) &&
-      realpathSync(profileDirectory) === profileDirectory &&
-      !lstatSync(profileDirectory).isSymbolicLink(),
-    'Qualification cache directory escaped its owned archive.',
-  );
-  check(
-    existsSync(cacheDirectory) &&
-      realpathSync(cacheDirectory) === cacheDirectory &&
-      lstatSync(cacheDirectory).isDirectory(),
-    'Qualification expected a regular cache directory.',
-  );
-  rmSync(cacheDirectory, { recursive: true });
-  check(!existsSync(cacheDirectory), 'Qualification cache deletion failed.');
+  removeQualificationCache(dataDirectory, profileId, ownedProfiles);
   await request(prefix + '/unlock', { recovery });
   const after = await acceptedSnapshot();
   await checkClinicalCounts();

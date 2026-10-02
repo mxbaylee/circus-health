@@ -69,8 +69,8 @@ export function exactLargeImportPages(
   );
   return pages.every((page) => page !== null) ? [...new Set(pages as number[])] : null;
 }
-function fieldMismatches(
-  record: IntakeReviewRecord,
+export function largeImportFieldMismatches(
+  record: Pick<IntakeReviewRecord, 'kind' | 'mapping'>,
   expected: LargeImportAssertion,
   original: string,
 ) {
@@ -236,7 +236,7 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
         continue;
       }
       matches.set(expected.key, (matches.get(expected.key) ?? 0) + 1);
-      const fields = fieldMismatches(record, expected, originalId);
+      const fields = largeImportFieldMismatches(record, expected, originalId);
       const provenance = new Set<string>(),
         ownership = new Set<string>();
       const report = reports.get(expected.reportKey),
