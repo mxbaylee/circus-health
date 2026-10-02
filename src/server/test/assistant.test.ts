@@ -4387,6 +4387,9 @@ test('cancelled and failed responses retain completed items and isolate reused i
       t.after(() => recoveredService.close());
       assert.deepEqual(recoveredService.get(profileId, chat.id).messages, chat.messages);
       assistant.retry(profileId, chat.id);
+      const retriedChat = assistant.get(profileId, chat.id);
+      if (terminal === 'close')
+        assert.notEqual(retriedChat, chat, 'close discards the prior conversation cache');
       await tick();
       bridges[0].callbacks.onEvent('item/agentMessage/delta', {
         itemId: 'shared-item',
@@ -4400,12 +4403,12 @@ test('cancelled and failed responses retain completed items and isolate reused i
         },
       });
       complete(bridges[1]);
-      assert.equal(chat.messages.length, 4);
-      assert.notEqual(chat.messages[1].id, chat.messages[3].id);
-      assert.notEqual(chat.messages[1].runId, chat.messages[3].runId);
-      assert.equal(chat.messages[1].content, 'The first note is retained.');
-      assert.equal(chat.messages[1].status, 'interrupted');
-      assert.equal(chat.messages[3].status, 'complete');
+      assert.equal(retriedChat.messages.length, 4);
+      assert.notEqual(retriedChat.messages[1].id, retriedChat.messages[3].id);
+      assert.notEqual(retriedChat.messages[1].runId, retriedChat.messages[3].runId);
+      assert.equal(retriedChat.messages[1].content, 'The first note is retained.');
+      assert.equal(retriedChat.messages[1].status, 'interrupted');
+      assert.equal(retriedChat.messages[3].status, 'complete');
     });
 });
 

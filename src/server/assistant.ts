@@ -63,7 +63,7 @@ import {
   testModelConnection,
   ensureModelConnection,
 } from './model-bridge.ts';
-import { listChats, readChat, writeChat } from './assistant-journal.ts';
+import { listChats, readChat, writeChat, clearChatJournalCache } from './assistant-journal.ts';
 import { ModelContextLimitError, ModelError } from './model-config.ts';
 import { ModelToolValidationError, markModelToolTerminalError } from './model-tool-validation.ts';
 import { HttpError, required, transaction, json, revision } from './database.ts';
@@ -4461,7 +4461,7 @@ export function createAssistant({
         readBytes = 0;
       for (const id of ids.slice(0, 100)) {
         try {
-          // Read at most the selected imports' latest journal. Never enumerate
+          // Read only the selected imports' bounded linked journal histories. Never enumerate
           // unrelated chat histories, and never retain/export message content.
           const cached = cache.get(key(profileId, id));
           if (!cached && readBytes >= 32 * 1024 * 1024) {
@@ -4805,6 +4805,8 @@ export function createAssistant({
     close() {
       for (const state of [...active.values()])
         state.finish?.('cancelled', 'The app closed during this response.');
+      clearChatJournalCache(root);
+      cache.clear();
     },
   };
   return service;

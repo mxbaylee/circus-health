@@ -10,7 +10,7 @@ import {
 import { createEncryptedProfiles } from './encrypted-profiles.ts';
 import { importDiagnostics, type ImportDiagnostics } from './import-diagnostics.ts';
 import { createProfilePasskeys } from './profile-passkeys.ts';
-import { writeChat } from './assistant-journal.ts';
+import { writeChat, forgetChatJournal } from './assistant-journal.ts';
 import { writeIntakeBatch } from './intake-batch-journal.ts';
 import { HttpError } from './database.ts';
 import { modelAvailability, testModelConnection } from './model-bridge.ts';
@@ -165,8 +165,13 @@ export function createVaultApp({
           journalWriter(root, profileId, chat, reason) {
             if (!manager.opened.has(profileId))
               throw new HttpError(423, 'PROFILE_LOCKED', 'Profile is locked');
-            writeChat(root, profileId, chat, reason);
-            manager.flush(profileId, { duringLock: true });
+            try {
+              writeChat(root, profileId, chat, reason);
+              manager.flush(profileId, { duringLock: true });
+            } catch (error) {
+              forgetChatJournal(chat);
+              throw error;
+            }
           },
         },
         intakeBatchOptions: {

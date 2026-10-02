@@ -86,3 +86,7 @@ The recorder's `circus-import-events-v3` envelope includes a fixed cumulative ob
 ## Condition storage schema boundary
 
 Schema 7 adds the condition-occurrence table. Current-schema occurrences use the existing changed-record journal and preserve earlier versions, original evidence and attribution on replay. The journal still requires an exact schema match; this change does not decode older journal schemas. No legacy journal, encrypted-cache or portable snapshot compatibility is provided for this addition (owner scope decision, 2026-10-01, before production use). Unsupported archives fail explicitly; the app does not discard or silently reset them. Current-schema encrypted restart/cache-loss and portable recovery are covered by fictional fixtures.
+
+## Conversation writes
+
+Conversation recovery uses its own [linked changed-content journal](conversation-journal.md). Each save adds changed values and small generation metadata, including incremental array items and text splices. It preserves history without copying the growing chat, operations or request-attempt arrays into every event. The encrypted wrapper retains this journal; originals and accepted-record authority remain separate. Older conversation snapshot envelopes are explicitly unsupported.
