@@ -49,6 +49,7 @@ const implementationHashes = () =>
     [
       './benchmark-intake-pdf.ts',
       './fictional-pdf-benchmark-fixture.ts',
+      './fictional-pdf-writer.ts',
       '../server/intake-pdf-native.ts',
       '../server/intake-pdf-worker.ts',
       '../server/intake-pdf-session.ts',
