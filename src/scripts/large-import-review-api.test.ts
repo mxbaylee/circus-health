@@ -1,16 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createVaultApp } from '../server/vault-app.ts';
-import type { Note } from '../shared/api.ts';
+import type { Note, Observation, Medication, Procedure } from '../shared/api.ts';
 import type {
   Intake,
   IntakeReview,
   IntakeReportQueue,
   HealthRecordEnvelope,
+  IntakeReportAcceptanceRequest,
+  IntakeReportAcceptanceResult,
 } from '../shared/intake.ts';
 import type {
   IntakeIdentityPerson,
@@ -24,9 +26,14 @@ import {
   gradeLargeImportReview,
   type LargeImportReviewAuthority,
 } from './large-import-review-grader.ts';
+import {
+  gradeLargeImportAccepted,
+  type LargeImportAcceptedEntity,
+} from './large-import-accepted-grader.ts';
+import { removeQualificationCache } from './provider-qualification-acceptance.ts';
 
 test('independent small real upload/proposal/review snapshots remain a partial oracle result', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-review-grader-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'fictional-review-grader-')));
   mkdirSync(join(root, 'data'));
   const app = createVaultApp({
     dataDirectory: join(root, 'data'),
@@ -484,4 +491,135 @@ test('independent small real upload/proposal/review snapshots remain a partial o
       .digest('hex'),
     originalHash,
   );
+  // Acceptance is explicit and limited to this fresh fictional profile. Capture
+  // exact current versions; the whole 901-assertion oracle still remains incomplete.
+  const acceptance: IntakeReportAcceptanceRequest = {
+    operationId: 'cf28d806-8e1d-4d69-9b61-38f460bc9768',
+    blocks: [
+      {
+        intakeId: uploaded.id,
+        proposalId,
+        intakeVersion: finalReview.version,
+        reviewToken: finalReview.reviewToken,
+        selections: finalReview.records.map((record) => {
+          assert.ok(record.candidateId && record.candidateVersionId);
+          return {
+            recordId: record.id,
+            candidateId: record.candidateId,
+            candidateVersionId: record.candidateVersionId,
+            mapping: {},
+          };
+        }),
+      },
+    ],
+  };
+  const accepted = await request<IntakeReportAcceptanceResult>(
+    prefix + '/intakes/report-acceptance',
+    acceptance,
+  );
+  assert.equal(accepted.replayed, false);
+  assert.equal(accepted.receipt.acceptedCount, 5);
+  async function checkReceipt() {
+    const fetched = await request<IntakeReportAcceptanceResult>(
+      prefix + '/intakes/report-acceptance/' + acceptance.operationId,
+    );
+    assert.deepEqual(fetched.receipt, accepted.receipt);
+    const replay = await request<IntakeReportAcceptanceResult>(
+      prefix + '/intakes/report-acceptance',
+      acceptance,
+    );
+    assert.equal(replay.replayed, true);
+    assert.deepEqual(replay.receipt, accepted.receipt);
+  }
+  const collections = {
+    observation: 'tests',
+    medication: 'medications',
+    procedure: 'procedures',
+  } as const;
+  async function acceptedSnapshot() {
+    const entities: LargeImportAcceptedEntity[] = [];
+    for (const part of accepted.receipt.receipts)
+      for (const entry of part.records) {
+        assert.notEqual(entry.kind, 'document');
+        if (entry.kind === 'observation')
+          entities.push({
+            kind: entry.kind,
+            record: await request<Observation>(
+              prefix + `/tests/${encodeURIComponent(entry.entityId)}`,
+            ),
+          });
+        else if (entry.kind === 'medication')
+          entities.push({
+            kind: entry.kind,
+            record: await request<Medication>(
+              prefix + `/medications/${encodeURIComponent(entry.entityId)}`,
+            ),
+          });
+        else if (entry.kind === 'procedure')
+          entities.push({
+            kind: entry.kind,
+            record: await request<Procedure>(
+              prefix + `/procedures/${encodeURIComponent(entry.entityId)}`,
+            ),
+          });
+      }
+    const people = await request<IntakeIdentityPerson[]>(prefix + '/record-ownership/people');
+    assert.deepEqual(people, peopleBefore);
+    assert.deepEqual(
+      await Promise.all(people.map((person) => request<Note>(prefix + `/notes/${person.noteId}`))),
+      notesBefore,
+    );
+    // Lists and details must agree for both owners; default-Self list filtering
+    // cannot hide the family record or masquerade as a whole-profile count.
+    for (const person of people)
+      for (const kind of ['observation', 'medication', 'procedure'] as const) {
+        const listed = await request<Array<Observation | Medication | Procedure>>(
+          prefix +
+            `/${collections[kind]}?personId=${encodeURIComponent(person.personId)}&limit=100${kind === 'medication' ? '&status=all' : ''}`,
+        );
+        const expected = entities.filter(
+          (entity) => entity.kind === kind && entity.record.personId === person.personId,
+        );
+        assert.deepEqual(
+          listed.map((record) => record.id).sort(),
+          expected.map((entity) => entity.record.id).sort(),
+        );
+        assert.ok(listed.every((record) => record.personId === person.personId));
+      }
+    const grade = gradeLargeImportAccepted({
+      oracle: createLargeImportOracle(),
+      originalId: uploaded.id,
+      people: {
+        'fictional-cedar': people.find((person) => person.personId === 'patient')!,
+        'fictional-willow': people.find((person) => person.personId === willow.personId)!,
+      },
+      records: entities,
+      transactions: [{ request: acceptance, reviews: [finalReview], receipt: accepted.receipt }],
+    });
+    assert.equal(grade.exactRecords, 5, JSON.stringify(grade));
+    assert.equal(grade.observedRecordsPassed, true, JSON.stringify(grade));
+    assert.equal(grade.receiptsPassed, true, JSON.stringify(grade));
+    assert.equal(grade.missing.length, 896);
+    assert.equal(grade.passed, false);
+    const source = await fetch(
+      base + prefix + `/sources/${encodeURIComponent(uploaded.id)}/content`,
+      { headers: { Cookie: cookie }, signal: t.signal },
+    );
+    assert.equal(source.ok, true);
+    const bytes = Buffer.from(await source.arrayBuffer());
+    assert.deepEqual(bytes, originalBytes);
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), originalHash);
+    return entities;
+  }
+  await checkReceipt();
+  const before = await acceptedSnapshot();
+  await request(prefix + '/lock', {});
+  assert.equal(app.manager.opened.has(profile.id), false);
+  removeQualificationCache(join(root, 'data'), profile.id, new Set([profile.id]));
+  await request(prefix + '/unlock', { recovery: setup.recoveryKit });
+  assert.equal(app.manager.opened.get(profile.id)!.metrics.cacheHit, false);
+  const after = await acceptedSnapshot();
+  assert.deepEqual(after, before);
+  await checkReceipt();
+  assert.deepEqual(await acceptedSnapshot(), before);
 });
