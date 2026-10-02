@@ -139,9 +139,14 @@ export function createIntakeStateStorage(
     }
     if (remembered && same(remembered.head, head)) return remembered;
     counters.coldReconstructions++;
-    const result = reconstructIntakeEvidence(identity, caps, head, get, () => {
+    const reconstructed = reconstructIntakeEvidence(identity, caps, head, get, () => {
       counters.ancestorReads++;
     });
+    const result: Basis = {
+      head: reconstructed.head,
+      value: reconstructed.value,
+      semanticBytes: reconstructed.semanticBytes,
+    };
     if (token) {
       cache.token = token;
       cache.candidates.set(prefix, result);

@@ -5,7 +5,12 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SQLInputValue } from 'node:sqlite';
-import { openDatabase, transaction, type Database } from '../database.ts';
+import {
+  openDatabase,
+  transaction,
+  registerTransactionDurability,
+  type Database,
+} from '../database.ts';
 import {
   attachRecordDurability,
   rebuildRecordDatabase,
@@ -728,6 +733,76 @@ test('staging requires the caller transaction, poisons caught failure and rolls 
       ),
     /owner|profile|target/i,
   );
+});
+
+test('fabricated or deserialized plans fail capability validation and poison a caught outer transaction', (t) => {
+  const f = fixture(t);
+  const prepared = prepareIntakeStateCopy(f.source, sourceId, targetId);
+  const before = snapshot(f.target);
+  const sourceBefore = snapshot(f.source);
+  for (const forged of [{ ...prepared }, JSON.parse(JSON.stringify(prepared)) as typeof prepared]) {
+    assert.throws(
+      () => stageIntakeStateCopy(f.target, forged, f.options),
+      /unrecognized copy plan/i,
+    );
+    assert.throws(
+      () =>
+        transaction(f.target, () => {
+          f.target
+            .prepare('INSERT INTO app_meta(key,value) VALUES(?,?)')
+            .run('fictional-forged-plan-staged', 'must roll back');
+          try {
+            stageIntakeStateCopy(f.target, forged, f.options);
+          } catch {}
+          return { bounded: true };
+        }),
+      /unrecognized copy plan/i,
+      'catching a forged plan cannot commit unrelated staged writes',
+    );
+    assert.deepEqual(snapshot(f.target), before);
+    assert.deepEqual(snapshot(f.source), sourceBefore);
+    assert.equal(f.targetAuthority.objects.size, 0);
+  }
+});
+
+test('non-record transaction durability hooks also disqualify an unpublished bootstrap target', (t) => {
+  const f = fixture(t);
+  const plan = prepareIntakeStateCopy(f.source, sourceId, targetId);
+  const before = snapshot(f.target);
+  let prepares = 0;
+  registerTransactionDurability(f.target, {
+    capture: () => true,
+    prepare: () => {
+      prepares++;
+    },
+  });
+  assert.equal(
+    recordDurabilityStatus(f.target),
+    null,
+    'these hooks do not certify accepted record durability',
+  );
+  assert.equal(
+    f.target
+      .prepare("SELECT count(*) n FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'")
+      .get()!.n,
+    0,
+  );
+  assert.throws(
+    () =>
+      transaction(f.target, () => {
+        f.target
+          .prepare('INSERT INTO app_meta(key,value) VALUES(?,?)')
+          .run('fictional-hook-target-staged', 'must roll back');
+        try {
+          stageIntakeStateCopy(f.target, plan, f.options);
+        } catch {}
+        return { bounded: true };
+      }),
+    /durability|unpublished/i,
+  );
+  assert.equal(prepares, 0, 'rejected bootstrap cannot prepare an outer durable commit');
+  assert.deepEqual(snapshot(f.target), before);
+  assert.equal(f.targetAuthority.objects.size, 0);
 });
 
 test('postwrite original/pin/inventory corruption rolls back the complete installation', async (t) => {
