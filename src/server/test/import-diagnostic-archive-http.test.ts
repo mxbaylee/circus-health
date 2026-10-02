@@ -25,6 +25,20 @@ test('retained HTTP export requires the owning session and survives fresh runtim
     runtime = join(root, 'runtime');
   mkdirSync(data);
   let diagnostics = createImportDiagnostics({ enabled: true });
+  let failAfterPublication = false;
+  const attach = diagnostics.attachEventStore.bind(diagnostics);
+  diagnostics.attachEventStore = (profileId, store) =>
+    attach(profileId, {
+      ...store,
+      append(sequence, bytes) {
+        const result = store.append(sequence, bytes);
+        if (failAfterPublication) {
+          failAfterPublication = false;
+          throw Error('Fictional lost publication acknowledgement');
+        }
+        return result;
+      },
+    });
   const options = {
     dataDirectory: data,
     runtimeDirectory: runtime,
@@ -82,10 +96,13 @@ test('retained HTTP export requires the owning session and survives fresh runtim
     { profileId: first.profileId, importId: 'fictional-private-source.pdf' },
   );
   assert.equal((await send(path, undefined, false)).status, 423);
+  failAfterPublication = true;
   const initial = await send(path);
   assert.equal(initial.status, 200);
   const archive = initial.payload.data.eventArchive;
   assert.ok(archive.events.length > 0);
+  assert.equal(archive.currentWindow.writeFailures, 1);
+  assert.equal(archive.status, 'partial');
   assert.doesNotMatch(
     JSON.stringify(initial.payload),
     /Fictional medical canary|fictional-private-source|Fictional Cedar/,
@@ -130,5 +147,13 @@ test('retained HTTP export requires the owning session and survives fresh runtim
   assert.ok(restored.eventArchive.events.some((row) => row.event.fields.accountedUnits === 42));
   assert.ok(restored.eventArchive.events.some((row) => row.event.fields.accountedUnits === 43));
   assert.equal(restored.eventArchive.completeness, 'not_established');
+  assert.equal(restored.eventArchive.currentWindow.writeFailures, 0);
+  assert.ok(restored.eventArchive.windowCheckpoints.some((item) => item.writeFailures === 1));
+  assert.equal(restored.eventArchive.status, 'partial');
+  assert.equal(restored.eventArchive.crashTailEvents, null);
+  assert.doesNotMatch(
+    JSON.stringify(restored),
+    /Fictional medical canary|fictional-private-source|Fictional Cedar|lost publication acknowledgement/,
+  );
   assert.notEqual(restored.eventArchive.currentWindow.windowId, archive.currentWindow.windowId);
 });
