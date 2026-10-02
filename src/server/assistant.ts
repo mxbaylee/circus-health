@@ -1,3 +1,4 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import {
   assistantPersonScope,
   scopeAssistantQuery,
@@ -1757,11 +1758,7 @@ export function createAssistant({
   const conversionIntake = (profileId: string, chat: AssistantChat): IntakeWithWorkflow | null => {
     if (!chat.context?.intakeId) return null;
     const db = dbFor(profileId);
-    const details = json(
-      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(chat.context.intakeId)
-        ?.details_json,
-    );
-    const intakeDetails = object(details) && object(details.intake) ? details.intake : null;
+    const intakeDetails = readStoredIntakeDetails(db, chat.context.intakeId);
     if (intakeDetails?.conversionChatId !== chat.id) return null;
     const intake = getIntake(db, root, profileId, chat.context.intakeId);
     return intake.workflow ? intakeWithWorkflow(intake) : null;
@@ -2246,16 +2243,7 @@ export function createAssistant({
       const seen = new Set<string>();
       while (sourceId && sourceId !== state.checkpoint.intakeId && !seen.has(sourceId)) {
         seen.add(sourceId);
-        const sourceDetails = json(
-          db.prepare('SELECT details_json FROM source_files WHERE id=?').get(sourceId)
-            ?.details_json,
-        );
-        sourceId =
-          object(sourceDetails) &&
-          object(sourceDetails.intake) &&
-          typeof sourceDetails.intake.parentSourceFileId === 'string'
-            ? sourceDetails.intake.parentSourceFileId
-            : undefined;
+        sourceId = readStoredIntakeDetails(db, sourceId)?.parentSourceFileId || undefined;
       }
       if (sourceId !== state.checkpoint.intakeId)
         throw new HttpError(
@@ -2668,13 +2656,7 @@ export function createAssistant({
           const basis = state.batchRevalidationBasis;
           const current = conversionIntake(profileId, chat);
           const currentRawIntake = current
-            ? ((
-                json(
-                  db.prepare('SELECT details_json FROM source_files WHERE id=?').get(current.id)
-                    ?.details_json,
-                  {},
-                ) as UnknownRecord
-              ).intake as UnknownRecord | undefined)
+            ? (readStoredIntakeDetails(db, current.id) as unknown as UnknownRecord | undefined)
             : undefined;
           const mappingVersion = current
             ? modelMappingRuleContext(db, current.providerId).mappingRulesVersion
@@ -2718,14 +2700,7 @@ export function createAssistant({
           });
           const retryCurrent = conversionIntake(profileId, chat);
           const retryRawIntake = retryCurrent
-            ? ((
-                json(
-                  db
-                    .prepare('SELECT details_json FROM source_files WHERE id=?')
-                    .get(retryCurrent.id)?.details_json,
-                  {},
-                ) as UnknownRecord
-              ).intake as UnknownRecord | undefined)
+            ? (readStoredIntakeDetails(db, retryCurrent.id) as unknown as UnknownRecord | undefined)
             : undefined;
           const retryDurability = personalDurabilityStatus(db);
           if (
@@ -4011,14 +3986,10 @@ export function createAssistant({
                 const durability = personalDurabilityStatus(dbFor(profileId)) as ReturnType<
                   typeof personalDurabilityStatus
                 > & { sequence?: number };
-                const rawDetails = basisIntake
-                  ? (json(
-                      dbFor(profileId)
-                        .prepare('SELECT details_json FROM source_files WHERE id=?')
-                        .get(basisIntake.id)?.details_json,
-                      {},
-                    ) as UnknownRecord)
-                  : null;
+                const rawIntake = basisIntake
+                  ? (readStoredIntakeDetails(dbFor(profileId), basisIntake.id) as unknown as
+                      UnknownRecord | undefined)
+                  : undefined;
                 const unitSources = basisIntake
                   ? batchUnitSourceBasis(dbFor(profileId), root, profileId, basisIntake)
                   : null;
@@ -4027,7 +3998,7 @@ export function createAssistant({
                   basisIntake &&
                   unitSources &&
                   !basisIntake.durability.pending &&
-                  rawDetails?.intake &&
+                  rawIntake &&
                   !durability.dirty &&
                   !durability.conflicted &&
                   !durability.lastError
@@ -4048,7 +4019,7 @@ export function createAssistant({
                         ).mappingRulesVersion,
                         checkpoint: batchCheckpointBasis(checkpoint),
                         intake: structuredClone(basisIntake),
-                        rawIntake: structuredClone(rawDetails.intake as UnknownRecord),
+                        rawIntake: structuredClone(rawIntake),
                         revision: revision(dbFor(profileId)),
                         persistedRevision: durability.persistedRevision,
                         sequence: durability.sequence ?? null,

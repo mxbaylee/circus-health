@@ -89,3 +89,7 @@ The assistant has current profile/page context, warm first greetings, Markdown r
 Synthetic server tests cover PDF text/render and ZIP bounds, original preservation, profile boundaries, duplicate/version behavior, stale review rejection, rule replacement, receipt conflicts, publication retry and deterministic rebuild. A full HTTP test runs an empty profile through upload, injected-model conversion, review, acceptance, clinical lookup, mapping correction and database-loss recovery. Mounted React tests exercise the intake flow and profile controls. These tests verify the host workflow; they do not certify the accuracy of every future model extraction.
 
 Component, backend, browser, and encrypted Docker checks cover fictional import and cache-loss reconstruction paths. Real-provider and OAuth workflows, representative image/PDF extraction, large-ZIP end-to-end behavior, physical passkeys, and printing remain unverified release checks. Controlled fixtures do not close those gates.
+
+## Intake state access
+
+The [operational intake access boundary](intake-state-access.md) centralizes current views, publication, discovery and receipt lookup while preserving the existing source-row representation. The incremental primitive is not yet the production intake authority.

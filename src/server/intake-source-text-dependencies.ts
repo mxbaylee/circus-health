@@ -1,3 +1,4 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
@@ -52,11 +53,11 @@ export function invalidateIntakeSourceTextDependencies(
   updateSourcePageHashes(db, previous, next, changedPages);
   const owner = db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get();
   const file = db
-    .prepare("SELECT sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'")
-    .get(next.intakeId) as { sha256: string; details_json: string } | undefined;
+    .prepare("SELECT sha256 FROM source_files WHERE id=? AND kind='intake_original'")
+    .get(next.intakeId) as { sha256: string } | undefined;
   if (owner?.value !== next.profileId || !file || file.sha256 !== next.sourceHash)
     throw new HttpError(409, 'SOURCE_CHANGED', 'The source text no longer matches this intake');
-  const details = JSON.parse(file.details_json).intake;
+  const details = readStoredIntakeDetails(db, next.intakeId);
   if (!details || typeof details !== 'object')
     throw new HttpError(409, 'SOURCE_CHANGED', 'The intake metadata is unavailable');
   // Proposals keep their old source pin and cannot be accepted after a material edit;
@@ -79,10 +80,10 @@ export function invalidateIntakeSourceTextDependencies(
       throw new HttpError(409, 'SOURCE_CHANGED', 'Invalid retained source ancestry');
     seen.add(parent);
     const ancestor = db
-      .prepare("SELECT details_json FROM source_files WHERE id=? AND kind='intake_original'")
+      .prepare("SELECT id FROM source_files WHERE id=? AND kind='intake_original'")
       .get(parent);
     if (!ancestor) throw new HttpError(409, 'SOURCE_CHANGED', 'Retained parent source is missing');
-    const metadata = JSON.parse(String(ancestor.details_json)).intake;
+    const metadata = readStoredIntakeDetails(db, parent);
     if (!metadata)
       throw new HttpError(409, 'SOURCE_CHANGED', 'Retained parent metadata is missing');
     const saved = withIntakeSourcePin(metadata, readIntakeSourcePin(db, parent));

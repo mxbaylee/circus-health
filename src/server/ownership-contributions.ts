@@ -1,3 +1,4 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import type { Database, SqliteRow } from './database.ts';
 import { HttpError, json } from './database.ts';
 import { clinicalTables, type ClinicalKind } from './clinical-references.ts';
@@ -67,9 +68,7 @@ export function ownershipContributions(
     const envelope = json(source.raw_json) as HealthRecordEnvelope;
     const locator = json(source.locator_json, {}) as Record<string, unknown>;
     const originalId = String(locator.originalSourceFileId || source.source_file_id);
-    const original = db
-      .prepare('SELECT sha256,details_json FROM source_files WHERE id=?')
-      .get(originalId);
+    const original = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(originalId);
     if (!original)
       throw new HttpError(
         409,
@@ -98,13 +97,7 @@ export function ownershipContributions(
     return {
       sourceRecordId: id,
       sourceFileId: originalId,
-      reportScopes: (
-        (
-          json(original.details_json) as {
-            intake?: { workflow?: import('../shared/intake.ts').IntakeWorkflow };
-          }
-        ).intake?.workflow?.reportGroups || []
-      )
+      reportScopes: (readStoredIntakeDetails(db, originalId)?.workflow?.reportGroups || [])
         .filter((g) =>
           g.versions.at(-1)?.members.some((m) => m.occurrences.some((o) => o.recordId === id)),
         )

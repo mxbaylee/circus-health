@@ -1,3 +1,4 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
@@ -45,23 +46,11 @@ export function packageMemberRoleHash(
   rootIntakeId: string,
   memberId: string,
 ): string | null {
-  const row = db
-    .prepare("SELECT details_json FROM source_files WHERE id=? AND kind='intake_original'")
-    .get(rootIntakeId);
-  if (!row) return null;
-  try {
-    const details = JSON.parse(String(row.details_json)) as {
-      intake?: {
-        workflow?: { plans?: { status: string; packageRoles?: { memberId: string }[] }[] };
-      };
-    };
-    const role = details.intake?.workflow?.plans
-      ?.find((plan) => plan.status === 'active')
-      ?.packageRoles?.find((candidate) => candidate.memberId === memberId);
-    return role ? digest(role) : null;
-  } catch {
-    return null;
-  }
+  const details = readStoredIntakeDetails(db, rootIntakeId, { originalOnly: true });
+  const role = details?.workflow?.plans
+    ?.find((plan) => plan.status === 'active')
+    ?.packageRoles?.find((candidate) => candidate.memberId === memberId);
+  return role ? digest(role) : null;
 }
 
 export function sourcePageCurrentHash(

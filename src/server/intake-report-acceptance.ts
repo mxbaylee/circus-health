@@ -1,3 +1,4 @@
+import { retainedReportAcceptance, updateStoredIntakeDetails } from './intake-state-access.ts';
 import {
   acceptPartialSelection,
   acceptPartialSelectionAsync,
@@ -25,7 +26,6 @@ import type {
   IntakeAtomicAcceptanceReceipt,
   IntakeReportAcceptanceResult,
   IntakeReview,
-  IntakeWorkflow,
 } from '../shared/intake.ts';
 import {
   duplicateRecord,
@@ -135,14 +135,7 @@ function retained(
   db: DatabaseSync,
   operationId: string,
 ): { fingerprint: string; receipt: IntakeReportAcceptanceReceipt } | null {
-  const row = db
-    .prepare(
-      "SELECT operation.value AS operation FROM source_files f, json_each(f.details_json,'$.intake.workflow.reportAcceptances') operation WHERE f.kind='intake_original' AND json_extract(operation.value,'$.receipt.operationId')=? LIMIT 1",
-    )
-    .get(operationId) as { operation: string } | undefined;
-  return row
-    ? (JSON.parse(row.operation) as { fingerprint: string; receipt: IntakeReportAcceptanceReceipt })
-    : null;
+  return retainedReportAcceptance(db, operationId);
 }
 export function getIntakeReportAcceptance(
   db: DatabaseSync,
@@ -438,15 +431,9 @@ export function applyAcceptanceGroup(
             return result;
           }
           const coordinator = selected.blocks[0]!.intakeId;
-          const row = db
-            .prepare('SELECT details_json FROM source_files WHERE id=?')
-            .get(coordinator) as { details_json: string };
-          const details = JSON.parse(row.details_json) as { intake: { workflow: IntakeWorkflow } };
-          (details.intake.workflow.reportAcceptances ||= []).push({ fingerprint, receipt: result });
-          db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-            JSON.stringify(details),
-            coordinator,
-          );
+          updateStoredIntakeDetails(db, coordinator, (details) => {
+            (details.workflow!.reportAcceptances ||= []).push({ fingerprint, receipt: result });
+          });
           return result;
         },
         { operationId: selected.operationId, fingerprint },

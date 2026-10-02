@@ -1,3 +1,4 @@
+import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { json, type Database } from './database.ts';
 import type {
   IntakeReviewRecord,
@@ -129,10 +130,9 @@ export function ownershipIdentityBlockers(
   record: IntakeReviewRecord,
   destinationBirthDate: string | null | undefined,
 ): string[] {
-  const file = db.prepare('SELECT sha256,details_json FROM source_files WHERE id=?').get(intakeId);
+  const file = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(intakeId);
   if (!file) return ['The retained original is unavailable.'];
-  const details = json(file.details_json) as { intake?: { workflow?: IntakeWorkflow } };
-  const workflow = details.intake?.workflow;
+  const workflow = readStoredIntakeDetails(db, intakeId)?.workflow;
   const groups = record.reportGroups || [];
   const blockers: string[] = [];
   const current = identityBeforeOwnershipHold(record);
@@ -210,7 +210,7 @@ export function requireCorrectedOwnershipReview(
   identity: string,
   file?: { id: string; sha256: string; details_json?: string },
   workflow: IntakeWorkflow | undefined = file
-    ? (json(file.details_json) as { intake?: { workflow?: IntakeWorkflow } }).intake?.workflow
+    ? readStoredIntakeDetails(db, file.id)?.workflow
     : undefined,
 ) {
   const source = ownershipSourceAuthority(db, identity);
@@ -372,16 +372,7 @@ export function ownershipReportHolds(
           'groupId',
           groupId,
         );
-        const file = db
-          .prepare('SELECT details_json FROM source_files WHERE id=?')
-          .get(c.sourceFileId);
-        const intake = file
-          ? (
-              json(file.details_json) as {
-                intake?: { version?: number; workflow?: IntakeWorkflow };
-              }
-            ).intake
-          : undefined;
+        const intake = readStoredIntakeDetails(db, c.sourceFileId);
         const group = intake?.workflow?.reportGroups?.find((g) => g.id === groupId);
         const selectedSources = new Set(
           records.flatMap((r) =>
