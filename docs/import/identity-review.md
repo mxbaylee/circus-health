@@ -20,7 +20,9 @@ An unlabelled date such as `4/12/88` uses the same compatibility readings whethe
 
 This resolvable banner question is distinct from interpretation of a labelled ambiguous or two-digit DOB, which still needs review, and from an exception for a verified but incorrectly printed DOB. The latter requires the separately approved explicit human attribution action tracked in [CRS-133](../todo/CRS-133.md); banner confirmation does not introduce that exception. Model-only DOB discrepancies remain advisory for the reasons below. Permanent regressions in `src/server/test/intake-generic-name-question.test.ts` and `src/server/test/intake-identity-boundaries.test.ts` exercise these distinctions.
 
-Shared names require an explicit choice. Existing-person choices include birth dates; duplicate names also show relationships and identifiers for disambiguation. The server checks the selected person's current version and birth date. Pending acceptance rechecks the selected person’s current birth date against the original or human-confirmed reading. A new conflict blocks acceptance; unrelated profile edits leave the report assignment usable. A conflicting birth date requires another destination. Confirmed printed names with at least two name tokens can be retained as aliases without replacing primary name or birth date. A single printed name stays in the report confirmation and is not added as a reusable alias.
+Shared names require an explicit choice. Existing-person choices include birth dates; duplicate names also show relationships and identifiers for disambiguation. The server checks the selected person's current version and birth date. Pending acceptance rechecks the selected person’s current birth date against the original or human-confirmed reading. A new conflict blocks acceptance; unrelated profile edits leave the report assignment usable. A conflicting birth date requires another destination. Confirmed printed names with at least two name tokens can be retained as aliases without replacing primary name or birth date. An exact primary-name confirmation retains the report receipt without adding an alias or changing the Person version. A single printed name stays in the report confirmation and is not added as a reusable alias.
+
+For a labelled subject such as `Patient: Fictional Cedar Vale. DOB: 1982-04-17.`, a sentence separator before a complete valid ISO birth date is excluded from the name reading. Terminal initials, uppercase abbreviations and recognized suffixes retain their punctuation; ambiguous subjects and unrecognized date grammar still require review. This bounded reading leaves the original and retained report/subject anchors unchanged and does not alter identity-name comparison rules.
 
 ## Birth-date evidence
 
@@ -56,8 +58,9 @@ forever: doing so would turn one mistaken confirmation into repeated wrong-perso
 assignments. Any correction of the second answer must preserve the first answer as
 evidence. Primary names and saved birth dates remain separate assertions.
 
-New full-name confirmations retain a separate support entry for each decision and
-report boundary, including repeated confirmations of the same spelling. The compact
+New alias confirmations retain a separate support entry for each decision and
+report boundary, including repeated confirmations of the same spelling. Exact
+primary-name confirmations need no alias support entry. The compact
 `sourceKnownNames` display list still keeps its original evidence link; it is not a
 complete ledger of support. The first support entry records whether the name already
 had a manual or primary-name assertion before it was mirrored into `knownNames`.

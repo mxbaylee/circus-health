@@ -263,8 +263,69 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
         unresolved.add(expected.key);
       }
       const bound = input.people[person.key];
-      if (!record.mapping.personId) unresolved.add(expected.key);
-      else if (record.mapping.personId !== bound?.personId) ownership.add('mappingPerson');
+      const selfAuthority =
+        record.reportGroups?.length === 1
+          ? byGroup.get(record.reportGroups[0]!.groupId)
+          : undefined;
+      const selfIdentity = selfAuthority?.identity;
+      const selfScope = selfIdentity?.scope;
+      // Normal Self confirmation stores subject:self without a personId or
+      // assignedPerson. Its current, explicitly bound Self snapshot and exact
+      // scoped original evidence supply that authority; absence alone never does.
+      const scopedSelfProof = !!(
+        bound?.noteId === 'person-note:self' &&
+        bound.personId === 'patient' &&
+        record.mapping.subject === 'self' &&
+        (!record.mapping.personId || record.mapping.personId === 'patient') &&
+        selfIdentity &&
+        selfScope &&
+        selfAuthority &&
+        selfIdentity.self?.noteId === bound.noteId &&
+        selfIdentity.self.version === bound.version &&
+        selfScope.selfVersion === bound.version &&
+        selfIdentity.self.fullName === bound.fullName &&
+        selfIdentity.self.birthDate === bound.birthDate &&
+        selfIdentity.evidencedIdentity.fullName === person.name &&
+        selfIdentity.evidencedIdentity.birthDate === person.birthDate &&
+        selfScope.evidencedIdentity?.fullName === person.name &&
+        selfScope.evidencedIdentity.birthDate === person.birthDate &&
+        !selfIdentity.blocking &&
+        !selfIdentity.conflicts.length &&
+        ['evidenced_match', 'prior_confirmation'].includes(selfIdentity.status) &&
+        selfScope.groupId === selfAuthority.retained.id &&
+        selfScope.groupVersionId === selfAuthority.queue.groupVersionId &&
+        selfScope.intakeId === review.intakeId &&
+        selfScope.intakeVersion === review.version &&
+        selfScope.sourceHash === selfAuthority.retained.sourceHash &&
+        selfScope.memberId === selfAuthority.retained.memberId &&
+        selfScope.report.text === selfAuthority.retained.report?.anchor.text &&
+        selfScope.report.locator === selfAuthority.retained.report?.anchor.locator &&
+        selfScope.subject.text === selfAuthority.retained.report?.subject?.text &&
+        selfScope.subject.locator === selfAuthority.retained.report?.subject?.locator &&
+        scopeMemberships
+          .get(selfAuthority.retained.id)
+          ?.has(
+            occurrenceKey(
+              review.proposalId,
+              record.id,
+              record.candidateId ?? '',
+              record.candidateVersionId ?? '',
+            ),
+          ) &&
+        memberships
+          .get(JSON.stringify([selfAuthority.retained.id, record.reportGroups![0]!.groupVersionId]))
+          ?.has(
+            occurrenceKey(
+              review.proposalId,
+              record.id,
+              record.candidateId ?? '',
+              record.candidateVersionId ?? '',
+            ),
+          )
+      );
+      if (!record.mapping.personId) {
+        if (!scopedSelfProof) unresolved.add(expected.key);
+      } else if (record.mapping.personId !== bound?.personId) ownership.add('mappingPerson');
       if (record.mapping.subject && !['self', 'other', 'unknown'].includes(record.mapping.subject))
         ownership.add('subject');
       if (!record.mapping.subject || record.mapping.subject === 'unknown')
@@ -422,11 +483,11 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
               assigned.noteId !== bound.noteId ||
               assigned.version !== bound.version ||
               assigned.fullName !== bound.fullName ||
-              assigned.birthDate !== bound.birthDate)
+              (assigned.birthDate !== undefined && assigned.birthDate !== bound.birthDate))
           )
             ownership.add('assignedPerson');
           if (
-            !assigned ||
+            (!assigned && !scopedSelfProof) ||
             reading.blocking ||
             !['evidenced_match', 'prior_confirmation'].includes(reading.status) ||
             reading.evidencedIdentity.fullName !== person.name ||
@@ -441,6 +502,16 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
         (record.questions ?? []).some((question) => question.status === 'unanswered')
       )
         unresolvedIssues.add(expected.key);
+      // Omitted Self fields depend on this exact source/report proof. A later
+      // attribution failure cannot leave the ownership-only result resolved.
+      if (
+        scopedSelfProof &&
+        provenance.size &&
+        (!record.mapping.personId ||
+          !selfIdentity?.assignedPerson ||
+          !record.identityReview?.assignedPerson)
+      )
+        unresolved.add(expected.key);
       if (fields.length || provenance.size || ownership.size)
         mismatches.push({
           key: expected.key,

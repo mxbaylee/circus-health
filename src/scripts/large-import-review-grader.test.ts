@@ -14,7 +14,7 @@ function snapshots(): LargeImportReviewInput {
     oracle.people.map((person, index) => [
       person.key,
       {
-        personId: `runtime-person-${index}`,
+        personId: index ? `runtime-person-${index}` : 'patient',
         noteId: index ? 'note:fictional-willow' : 'person-note:self',
         version: 1,
         fullName: person.name,
@@ -144,6 +144,7 @@ function snapshots(): LargeImportReviewInput {
           profileId: 'fictional-profile',
           intakeId: 'original',
           intakeVersion: 1,
+          selfVersion: 1,
           groupId: report.key,
           groupVersionId: `group-version-${report.key}`,
           sourceHash: 'fixture-hash',
@@ -156,6 +157,7 @@ function snapshots(): LargeImportReviewInput {
           report: anchor,
           subject,
           verificationMode: 'literal_text_match' as const,
+          evidencedIdentity: { fullName: bound.fullName, birthDate: bound.birthDate! },
           membership: members,
           targets: [],
           scopeToken: 'opaque-scope',
@@ -184,6 +186,165 @@ function snapshots(): LargeImportReviewInput {
 }
 const grade = (input: LargeImportReviewInput) => gradeLargeImportReview(input);
 const first = (input: LargeImportReviewInput) => input.reviews[0]!.records[0]!;
+
+function scopedSelfSnapshots() {
+  const input = snapshots();
+  first(input).mapping.personId = undefined;
+  first(input).identityReview!.assignedPerson = undefined;
+  first(input).identityReview!.status = 'prior_confirmation';
+  input.authorities[0]!.identity.assignedPerson = undefined;
+  input.authorities[0]!.identity.status = 'prior_confirmation';
+  return input;
+}
+
+test('normal Self projection requires exact current bound and scoped Self evidence', () => {
+  assert.equal(grade(scopedSelfSnapshots()).passed, true);
+  const linkedPages = scopedSelfSnapshots();
+  for (const authority of linkedPages.authorities) {
+    const original = authority.identity.scope!.original;
+    original.contentUrl += `#page=${original.page}`;
+  }
+  // The normal scope URL points at its page; the queue URL points at the file.
+  // Both must pass exact original/page validation, not raw URL string equality.
+  assert.equal(grade(linkedPages).passed, true);
+  for (const mutate of [
+    (input: LargeImportReviewInput) => {
+      Object.assign(input.authorities[0]!.identity, { self: undefined });
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.selfVersion = undefined;
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.selfVersion = 2;
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.self.version = 2;
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.self.fullName = 'Fictional Wrong Person';
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.self.birthDate = '1900-01-01';
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.evidencedIdentity = undefined;
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.evidencedIdentity = {
+        fullName: input.people['fictional-cedar']!.fullName,
+      };
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.evidencedIdentity!.fullName = 'Fictional Wrong Person';
+    },
+    (input: LargeImportReviewInput) => {
+      input.people['fictional-cedar']!.personId = 'wrong-self';
+    },
+    (input: LargeImportReviewInput) => {
+      input.people['fictional-cedar']!.noteId = 'wrong-self-note';
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).mapping.personId = input.people['fictional-willow']!.personId;
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).mapping.subject = 'unknown';
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).identityReview!.status = 'confirmation_required';
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).identityReview!.blocking = true;
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).identityReview!.evidencedIdentity.fullName = 'Fictional Wrong Person';
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).identityReview!.evidencedIdentity.birthDate = '1900-01-01';
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).identityReview!.assignedPerson = input.people['fictional-willow']!;
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.assignedPerson = input.people['fictional-willow']!;
+    },
+    (input: LargeImportReviewInput) => {
+      first(input).identityReview!.conflicts = [
+        {
+          field: 'birthDate',
+          selfValue: input.people['fictional-cedar']!.birthDate!,
+          evidencedValue: '1900-01-01',
+          reason: 'evidence_disagreement',
+        },
+      ];
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.sourceHash = 'wrong-original';
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.subject.text = 'Patient: Fictional Wrong Person';
+    },
+    (input: LargeImportReviewInput) => {
+      input.authorities[0]!.identity.scope!.membership = [];
+    },
+    (input: LargeImportReviewInput) => {
+      const authority = input.authorities[0]!;
+      authority.retained.versions[0]!.members = [];
+    },
+    (input: LargeImportReviewInput) => {
+      const authority = input.authorities[0]!;
+      authority.identity.scope!.original.contentUrl = '/api/sources/wrong/content';
+      authority.queue.original.contentUrl = '/api/sources/wrong/content';
+    },
+    (input: LargeImportReviewInput) => {
+      const authority = input.authorities[0]!;
+      authority.identity.scope!.report.text = 'Wrong report';
+      authority.retained.report!.anchor.text = 'Wrong report';
+      authority.queue.anchor!.text = 'Wrong report';
+    },
+  ]) {
+    const input = scopedSelfSnapshots();
+    mutate(input);
+    assert.equal(grade(input).ownershipResolved, false);
+    assert.equal(grade(input).passed, false);
+  }
+});
+
+test('assignment snapshots may omit DOB but cannot contradict the required binding or evidence', () => {
+  const input = snapshots();
+  for (const authority of input.authorities) {
+    const { birthDate: _dob, ...assigned } = authority.identity.assignedPerson!;
+    authority.identity.assignedPerson = assigned;
+  }
+  for (const record of input.reviews[0]!.records) {
+    const { birthDate: _dob, ...assigned } = record.identityReview!.assignedPerson!;
+    record.identityReview!.assignedPerson = assigned;
+  }
+  assert.equal(grade(input).passed, true);
+  const other = input.reviews[0]!.records.find((record) => record.mapping.subject === 'other')!;
+  for (const birthDate of [null, '', '1900-01-01']) {
+    other.identityReview!.assignedPerson!.birthDate = birthDate;
+    assert.equal(grade(input).ownershipResolved, false);
+  }
+  delete other.identityReview!.assignedPerson!.birthDate;
+  delete input.people['fictional-willow']!.birthDate;
+  assert.ok(grade(input).authorityIssues.includes('peopleBinding'));
+});
+
+test('another person cannot borrow the Self projection fallback', () => {
+  const input = scopedSelfSnapshots();
+  const record = input.reviews[0]!.records.find(
+    (item) => item.mapping.personId === input.people['fictional-willow']!.personId,
+  )!;
+  record.mapping.personId = undefined;
+  record.identityReview!.assignedPerson = undefined;
+  const authority = input.authorities.find(
+    (item) => item.retained.id === record.reportGroups![0]!.groupId,
+  )!;
+  authority.identity.assignedPerson = undefined;
+  assert.equal(grade(input).ownershipResolved, false);
+  record.mapping.subject = 'self';
+  assert.equal(grade(input).ownershipResolved, false);
+});
 
 test('full oracle reconciliation is pure and distinguishes proposal/review outcomes', () => {
   const input = snapshots(),

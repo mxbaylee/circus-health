@@ -324,17 +324,21 @@ test('a guarantor substring cannot automatically own the patient report or becom
     outcome: 'this_is_me' as const,
     attestation: 'confirmed_displayed_identity_questions' as const,
   };
+  const savedSelfNote = structuredClone(getNote(f.db, 'person-note:self'));
   await assert.rejects(confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input), {
     code: 'IDENTITY_PRINTED_NAME',
   });
-  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+  const confirmed = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
     ...input,
     printedName: 'Iris Meadow',
   });
-  const names = getNote(f.db, 'person-note:self').person.sourceKnownNames?.map(
-    (entry) => entry.name,
-  );
-  assert.deepEqual(names, ['Iris Meadow']);
+  // Keep the report decision without a redundant primary-name alias or Person write.
+  assert.deepEqual(getNote(f.db, 'person-note:self'), savedSelfNote);
+  const receipt = confirmed.workflow!.identityConfirmations!.find(
+    (entry) => entry.operationId === input.operationId,
+  )!;
+  assert.equal(receipt.confirmedPrintedName, 'Iris Meadow');
+  assert.equal(receipt.knownNameAdded, undefined);
 });
 
 test('report person defaults follow Cookie Doe name and birth-date combinations', () => {

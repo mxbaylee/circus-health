@@ -1070,9 +1070,10 @@ export async function confirmIntakeIdentityScope(
       ['prior_confirmation', 'evidenced_match'].includes(assessment.status) &&
       input.selfUpdate === undefined &&
       input.outcome === 'this_is_me' &&
-      getNote(db, 'person-note:self').person.sourceKnownNames?.some(
-        (entry) => entry.name === confirmedPrintedName,
-      ) &&
+      (getNote(db, 'person-note:self').person.fullName === confirmedPrintedName ||
+        getNote(db, 'person-note:self').person.sourceKnownNames?.some(
+          (entry) => entry.name === confirmedPrintedName,
+        )) &&
       activeIdentityReceipts(db, workflow.identityConfirmations)?.some(
         (receipt) =>
           receipt.outcome === 'this_is_me' &&
@@ -1253,16 +1254,19 @@ export async function confirmIntakeIdentityScope(
         fields: structuredClone(selected.fields),
       };
     }
-    const knownNameAdded = safeSourceIdentityName(confirmedPrintedName)
-      ? rememberSourceNameInTransaction(db, assignedPerson?.noteId || 'person-note:self', {
-          name: confirmedPrintedName,
-          operationId: input.operationId,
-          intakeId: id,
-          sourceHash: current.sourceHash,
-          groupId: current.groupId,
-          subjectText: current.subject.text,
-        })
-      : undefined;
+    const selectedNote = getNote(db, assignedPerson?.noteId || 'person-note:self');
+    const knownNameAdded =
+      safeSourceIdentityName(confirmedPrintedName) &&
+      confirmedPrintedName !== selectedNote.person.fullName
+        ? rememberSourceNameInTransaction(db, assignedPerson?.noteId || 'person-note:self', {
+            name: confirmedPrintedName,
+            operationId: input.operationId,
+            intakeId: id,
+            sourceHash: current.sourceHash,
+            groupId: current.groupId,
+            subjectText: current.subject.text,
+          })
+        : undefined;
     if (assessment.challengedName && safeSourceIdentityName(confirmedPrintedName))
       rememberFutureNameOwner(
         db,
