@@ -51,7 +51,7 @@ Import source text uses the same encrypted record journal transaction authority 
 
 Source text uses partitioned immutable page/list storage rather than a document-wide page/span/revision-byte allowance. Individual decoder, raster and request limits remain; unresolved scopes retain exceptions and their originals. Full-revision editing still has memory costs proportional to document size. Source-review events are inspection/correction history, not accepted clinical versions.
 
-Keep a consistent copy of the encrypted durable directory and the recovery kit separately. Default encrypted HTTP routes reject the legacy plaintext backup/copy routes. The legacy recovery CLI's portable snapshot format must not be mistaken for a current encrypted-vault backup command.
+Keep a consistent copy of the encrypted durable directory and the recovery kit separately. Default encrypted HTTP routes reject the legacy plaintext backup/copy routes. The npm backup/restore aliases have been removed, and the retired recovery CLI refuses operations before reading archive inputs or changing a destination. Use the [complete encrypted-directory procedure](../setup/deployment.md#backup-and-recovery); access recovery, archive restore, cache reconstruction and portable export are distinct operations.
 
 Synthetic backend and container tests cover cache loss, integrity failures, interrupted publication, profile/session isolation, selective history restoration, and recovery. Real-device WebAuthn PRF and real configured model-provider checks remain release gates; these tests do not establish them.
 

@@ -1,6 +1,5 @@
 // Invoked only by the opt-in hardened-container check with a disposable archive.
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statfsSync } from 'node:fs';
 import { join } from 'node:path';
 import { exportPdf } from '../note-exports.ts';
@@ -10,7 +9,7 @@ import { writeProfileRegistry } from '../profile-registry.ts';
 import { attachPersonalDurability, exportCuration } from '../portable.ts';
 import { createNote } from '../notes.ts';
 import { uploadAsset } from '../assets.ts';
-import { restoreBackup } from '../recovery.ts';
+import { createBackup, restoreBackup } from '../recovery.ts';
 
 const root = '/archive';
 const profileId = 'cedar';
@@ -62,15 +61,14 @@ attachPersonalDurability(db, { root, profileId });
 createNote(db, { title: 'Fictional backup consumer', content: 'Seven retained fictional PDFs.' });
 exportCuration(db, root, profileId);
 writeProfileRegistry(root, [{ id: profileId, placebo: true }]);
-db.close();
-
 const beforeTemporary = readdirSync('/tmp').sort();
-const output = execFileSync(process.execPath, ['server/recovery-cli.ts', 'backup', profileId], {
-  env: { ...process.env, CRS_DATA_DIR: join(root, 'data'), TMPDIR: '/tmp' },
-  encoding: 'utf8',
-  timeout: 120000,
-});
-const receipt = JSON.parse(output) as { path: string; files: number };
+let receipt;
+try {
+  // Exercise the retained contributor API; the operator CLI is intentionally retired.
+  receipt = await createBackup(db, root, profileId);
+} finally {
+  db.close();
+}
 assert.equal(receipt.files, 7);
 const manifest = JSON.parse(readFileSync(join(receipt.path, 'manifest.json'), 'utf8')) as {
   files: { bytes: number }[];
