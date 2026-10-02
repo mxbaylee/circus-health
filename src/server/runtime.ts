@@ -17,6 +17,7 @@ import {
   recordStartupMetrics,
 } from './startup-rebuild.ts';
 import { createVaultApp } from './vault-app.ts';
+import type { ImportDiagnostics } from './import-diagnostics.ts';
 import { readBuildIdentity } from './build-identity.ts';
 import { writeChat } from './assistant-journal.ts';
 
@@ -28,6 +29,7 @@ interface RuntimeOptions {
   host?: string;
   profileIds?: string[];
   assistantOptions?: AppOptions['assistantOptions'];
+  diagnostics?: ImportDiagnostics;
   lockFactory?: typeof acquireStorageLock;
 }
 interface RuntimeStatus {
@@ -257,6 +259,7 @@ export async function startRuntime({
   port = Number(process.env.CRS_PORT) || 3001,
   host = '0.0.0.0',
   assistantOptions,
+  diagnostics,
   lockFactory = acquireStorageLock,
 }: RuntimeOptions = {}) {
   const buildIdentity = readBuildIdentity(codeRoot);
@@ -349,6 +352,7 @@ export async function startRuntime({
       port: actualPort,
       allowedOrigins: origins,
       assistantOptions,
+      diagnostics,
     });
     status = {
       ready: true,
