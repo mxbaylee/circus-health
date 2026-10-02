@@ -1,6 +1,19 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { createEncryptedProfiles } from '../encrypted-profiles.ts';
@@ -22,6 +35,117 @@ function opened(manager: ReturnType<typeof createEncryptedProfiles>, profileId: 
   assert.ok(state);
   return state;
 }
+function archiveSnapshot(directory: string): unknown[] {
+  return readdirSync(directory, { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((entry) => {
+      const path = resolve(directory, entry.name);
+      return [
+        entry.name,
+        entry.isSymbolicLink()
+          ? { link: readlinkSync(path) }
+          : entry.isDirectory()
+            ? archiveSnapshot(path)
+            : createHash('sha256').update(readFileSync(path)).digest('hex'),
+      ];
+    });
+}
+
+test('missing registry refuses retained active profiles without changing archive or runtime', async (t) => {
+  const { manager, base, dataDirectory } = fixture(t);
+  const setup = manager.begin({
+    fullName: 'Fictional retained person',
+    birthDate: '1982-04-17',
+    name: 'Fictional retained person',
+  });
+  const profile = await manager.verify(setup.setupId, {
+    acknowledged: true,
+    recovery: setup.recoveryKit,
+  });
+  const note = createNote(opened(manager, profile.id).db, {
+    kind: 'note',
+    title: 'Fictional retained note',
+    content: 'Retained independently fictional authority',
+  });
+  manager.close();
+  const registryPath = resolve(dataDirectory, 'profiles.json'),
+    registry = readFileSync(registryPath);
+  rmSync(registryPath);
+  const before = archiveSnapshot(dataDirectory),
+    runtimeDirectory = resolve(base, 'refused-runtime');
+  assert.throws(
+    () => createEncryptedProfiles({ dataDirectory, runtimeDirectory }),
+    /Archive registry is missing.*private records and history are unavailable/,
+  );
+  assert.deepEqual(archiveSnapshot(dataDirectory), before);
+  assert.equal(existsSync(runtimeDirectory), false);
+  assert.equal(existsSync(registryPath), false);
+
+  writeFileSync(registryPath, registry);
+  const restored = createEncryptedProfiles({ dataDirectory, runtimeDirectory });
+  t.after(() => restored.close());
+  restored.unlock(profile.id, setup.recoveryKit);
+  assert.equal(getNote(opened(restored, profile.id).db, note.id).content, note.content);
+  restored.close();
+});
+
+test('missing registry rejects unrecognized retained entries and symbolic links without initialization', (t) => {
+  const base = mkdtempSync(resolve(tmpdir(), 'circus-registry-refusal-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  for (const fault of [
+    'missing-keyring',
+    'corrupt-keyring',
+    'linked-keyring',
+    'linked-profile',
+    'linked-profiles',
+    'linked-registry',
+  ]) {
+    const root = resolve(base, fault),
+      dataDirectory = resolve(root, 'data'),
+      runtimeDirectory = resolve(root, 'runtime'),
+      profiles = resolve(dataDirectory, 'profiles'),
+      profile = resolve(profiles, 'p-00000000-0000-4000-8000-000000000214'),
+      target = resolve(root, 'missing-target');
+    mkdirSync(dataDirectory, { recursive: true });
+    if (fault === 'linked-profiles') symlinkSync(target, profiles);
+    else if (fault === 'linked-registry')
+      symlinkSync(target, resolve(dataDirectory, 'profiles.json'));
+    else {
+      mkdirSync(profiles);
+      if (fault === 'linked-profile') symlinkSync(target, profile);
+      else {
+        mkdirSync(profile);
+        if (fault === 'corrupt-keyring') writeFileSync(resolve(profile, 'keyring.json'), '{');
+        if (fault === 'linked-keyring') symlinkSync(target, resolve(profile, 'keyring.json'));
+      }
+    }
+    const before = archiveSnapshot(dataDirectory);
+    assert.throws(
+      () => createEncryptedProfiles({ dataDirectory, runtimeDirectory }),
+      /registry|directory/i,
+      fault,
+    );
+    assert.deepEqual(archiveSnapshot(dataDirectory), before, fault);
+    assert.equal(existsSync(runtimeDirectory), false, fault);
+  }
+});
+
+test('fresh archives with absent or empty profile directories still initialize without inventing profiles', (t) => {
+  const base = mkdtempSync(resolve(tmpdir(), 'circus-fresh-registry-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  for (const existingProfiles of [false, true]) {
+    const dataDirectory = resolve(base, String(existingProfiles), 'data'),
+      runtimeDirectory = resolve(base, String(existingProfiles), 'runtime');
+    mkdirSync(dataDirectory, { recursive: true });
+    if (existingProfiles) mkdirSync(resolve(dataDirectory, 'profiles'));
+    const manager = createEncryptedProfiles({ dataDirectory, runtimeDirectory });
+    assert.deepEqual(manager.list(), []);
+    manager.close();
+    assert.equal(existsSync(resolve(dataDirectory, 'profiles.json')), false);
+    assert.deepEqual(readdirSync(resolve(dataDirectory, 'profiles')), []);
+  }
+});
+
 test('new profile requires actual recovery verification; edits survive lock and cache loss', async (t) => {
   const { manager, dataDirectory } = fixture(t);
   const setup = manager.begin({
@@ -125,6 +249,89 @@ test('recovery file resumes interrupted setup after restart without reissuing se
   assert.equal(active.name, 'Restart Person');
   restarted.lock(profile.id);
   assert.equal(restarted.unlock(profile.id, setup.recoveryKit).locked, false);
+  restarted.close();
+});
+
+test('first activation retains a resumable registry before publishing its active keyring', async (t) => {
+  const { manager, dataDirectory, runtimeDirectory } = fixture(t);
+  const setup = manager.begin({
+    fullName: 'Fictional interrupted activation',
+    birthDate: '1982-04-17',
+    name: 'Fictional interrupted activation',
+  });
+  const registryPath = resolve(dataDirectory, 'profiles.json');
+  const rename = fs.renameSync;
+  const injected = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof rename>) => {
+    if (
+      String(args[1]) === registryPath &&
+      JSON.parse(readFileSync(args[0], 'utf8')).profiles.length > 0
+    )
+      throw Error('Fictional activation registry publication failure');
+    return rename(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      manager.verify(setup.setupId, { acknowledged: true, recovery: setup.recoveryKit }),
+      /Fictional activation registry publication failure/,
+    );
+  } finally {
+    injected.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(manager.keyring(setup.profileId).active, true);
+  assert.deepEqual(JSON.parse(readFileSync(registryPath, 'utf8')).profiles, []);
+  // Discard the open fixture runtime. An unpublished profile has no public card
+  // for lock() to return, even though it has closed and removed its workspace.
+  assert.throws(
+    () => manager.close(),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 1);
+      assert.equal(error.errors[0].code, 'PROFILE_NOT_FOUND');
+      return true;
+    },
+  );
+  assert.equal(manager.opened.size, 0);
+  const restarted = createEncryptedProfiles({ dataDirectory, runtimeDirectory });
+  t.after(() => restarted.close());
+  const resumed = restarted.resume(setup.recoveryKit);
+  assert.equal(resumed.active, false);
+  assert.ok(resumed.setupId);
+  const profile = await restarted.verify(resumed.setupId, {
+    acknowledged: true,
+    recovery: setup.recoveryKit,
+  });
+  assert.equal(profile.id, setup.profileId);
+  assert.equal(getNote(opened(restarted, profile.id).db, 'patient').person.fullName, profile.name);
+  restarted.close();
+});
+
+test('failed initial registry publication leaves first setup inactive and resumable', async (t) => {
+  const { manager, dataDirectory, runtimeDirectory } = fixture(t);
+  const setup = manager.begin({
+    fullName: 'Fictional registry initialization',
+    birthDate: '1982-04-17',
+    name: 'Fictional registry initialization',
+  });
+  const registryPath = resolve(dataDirectory, 'profiles.json');
+  mkdirSync(registryPath);
+  await assert.rejects(
+    manager.verify(setup.setupId, { acknowledged: true, recovery: setup.recoveryKit }),
+  );
+  assert.equal(manager.keyring(setup.profileId).active, false);
+  assert.equal(manager.opened.size, 0);
+  rmSync(registryPath, { recursive: true });
+  manager.close();
+  const restarted = createEncryptedProfiles({ dataDirectory, runtimeDirectory });
+  t.after(() => restarted.close());
+  const resumed = restarted.resume(setup.recoveryKit);
+  assert.ok(resumed.setupId);
+  assert.equal(
+    (await restarted.verify(resumed.setupId, { acknowledged: true, recovery: setup.recoveryKit }))
+      .id,
+    setup.profileId,
+  );
   restarted.close();
 });
 

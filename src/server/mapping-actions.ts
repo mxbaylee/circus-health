@@ -235,29 +235,35 @@ export function applyClinicalDecision(
         'CLINICAL_REVIEW_CHANGED',
         'Records or evidence changed; review the proposal again',
       );
-    transaction(db, () => {
-      result =
-        kind === 'clinical_correction'
-          ? correctClinicalRecord(db, input, operationId, { root, profileId })
-          : saveDuplicateDecision(
-              db,
-              (preview as DuplicatePreview).left,
-              (preview as DuplicatePreview).right,
-              input as DuplicatePreviewInput,
-              operationId,
-            );
-      if (kind === 'duplicate_decision')
-        syncDuplicateQuestions(db, result as unknown as DuplicateDecision);
-      db.prepare(
-        "INSERT INTO manual_batches(id,title,status,created_at,verified_at,notes,coverage_json) VALUES(?,'Applied clinical review','verified',?,?,?,?)",
-      ).run(
-        receiptId,
-        now(),
-        now(),
-        'Explicitly accepted clinical review; original evidence retained.',
-        JSON.stringify({ requestFingerprint, appliedRevision: revision(db) + 1, result }),
-      );
-    });
+    transaction(
+      db,
+      () => {
+        result =
+          kind === 'clinical_correction'
+            ? correctClinicalRecord(db, input, operationId, { root, profileId })
+            : saveDuplicateDecision(
+                db,
+                (preview as DuplicatePreview).left,
+                (preview as DuplicatePreview).right,
+                input as DuplicatePreviewInput,
+                operationId,
+              );
+        if (kind === 'duplicate_decision')
+          syncDuplicateQuestions(db, result as unknown as DuplicateDecision);
+        db.prepare(
+          "INSERT INTO manual_batches(id,title,status,created_at,verified_at,notes,coverage_json) VALUES(?,'Applied clinical review','verified',?,?,?,?)",
+        ).run(
+          receiptId,
+          now(),
+          now(),
+          'Explicitly accepted clinical review; original evidence retained.',
+          JSON.stringify({ requestFingerprint, appliedRevision: revision(db) + 1, result }),
+        );
+      },
+      kind === 'clinical_correction'
+        ? { actor: 'profile-user', origin: 'clinical-correction' }
+        : {},
+    );
   }
   try {
     exportFn(db, root, profileId);

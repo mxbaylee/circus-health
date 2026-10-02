@@ -205,16 +205,59 @@ export function createEncryptedProfiles({
   diagnostics = importDiagnostics,
   availableRuntimeBytes = () => runtimeCapacity(runtimeDirectory).reportedAvailableBytes,
 }: CreateEncryptedProfilesOptions) {
-  mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
   const data = realpathSync(dataDirectory),
-    runtime = realpathSync(runtimeDirectory),
+    registryPath = resolve(data, 'profiles.json'),
+    profilesDir = resolve(data, 'profiles'),
+    registryStat = lstatSync(registryPath, { throwIfNoEntry: false }),
+    profilesStat = lstatSync(profilesDir, { throwIfNoEntry: false });
+  if (registryStat && !registryStat.isFile())
+    throw Error('Profile registry must be a regular file');
+  if (profilesStat && !profilesStat.isDirectory())
+    throw Error('Profile directory must be a directory without symbolic links');
+  if (!registryStat && profilesStat) {
+    // First-time setup is resumable before the first registry publication. An
+    // active profile, or an entry we cannot establish as a pending setup, must
+    // never turn a damaged archive into an apparently empty installation.
+    for (const entry of readdirSync(profilesDir, { withFileTypes: true })) {
+      let pending = false;
+      if (entry.isDirectory() && idValid(entry.name)) {
+        const ringPath = resolve(profilesDir, entry.name, 'keyring.json');
+        if (lstatSync(ringPath, { throwIfNoEntry: false })?.isFile()) {
+          try {
+            const ring = JSON.parse(readFileSync(ringPath, 'utf8')) as ProfileKeyring | null;
+            pending =
+              ring?.format === 'circus-health-keyring-v1' &&
+              ring.profileId === entry.name &&
+              ring.active === false;
+          } catch {
+            // Corrupt setup metadata cannot authorize an empty registry.
+          }
+        }
+      }
+      if (!pending)
+        throw Error(
+          'Archive registry is missing while retained profile data exists. Preserve the archive and restore a complete backup; private records and history are unavailable.',
+        );
+    }
+  }
+  let registry: ProfileRegistry = registryStat
+    ? (JSON.parse(readFileSync(registryPath) as unknown as string) as ProfileRegistry)
+    : { format: 'circus-health-profiles-v1', revision: 0, profiles: [] };
+  if (
+    !registry ||
+    registry.format !== 'circus-health-profiles-v1' ||
+    !Array.isArray(registry.profiles) ||
+    registry.profiles.some((p) => !idValid(p.id) || typeof p.placebo !== 'boolean')
+  )
+    throw Error('Unsupported archive: use a new empty data directory for encrypted profiles');
+  if (new Set(registry.profiles.map((p) => p.id)).size !== registry.profiles.length)
+    throw Error('Duplicate profile IDs');
+  mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
+  const runtime = realpathSync(runtimeDirectory),
     rel = relative(data, runtime),
     back = relative(runtime, data);
   if ((!rel.startsWith('..') && !isAbsolute(rel)) || (!back.startsWith('..') && !isAbsolute(back)))
     throw Error('Runtime plaintext must be separate from durable data');
-  const registryPath = resolve(data, 'profiles.json'),
-    profilesDir = resolve(data, 'profiles');
-  safeDir(profilesDir);
   mkdirSync(profilesDir, { recursive: true, mode: 0o700 });
   const requireRuntime = (bytes: number, code: string, purpose: string): void => {
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw Error('Invalid runtime planning size');
@@ -226,19 +269,9 @@ export function createEncryptedProfiles({
         `Not enough runtime capacity ${purpose}: the planning allowance needs ${Math.ceil(bytes / 1024 / 1024)} MiB and ${Math.floor(available / 1024 / 1024)} MiB is reported available. Lock another profile or increase the runtime mount and host memory together, then retry. Retained originals remain in the encrypted archive.`,
       );
   };
-  let registry: ProfileRegistry = existsSync(registryPath)
-    ? (JSON.parse(readFileSync(registryPath) as unknown as string) as ProfileRegistry)
-    : { format: 'circus-health-profiles-v1', revision: 0, profiles: [] };
-  if (
-    registry.format !== 'circus-health-profiles-v1' ||
-    !Array.isArray(registry.profiles) ||
-    registry.profiles.some((p) => !idValid(p.id) || typeof p.placebo !== 'boolean')
-  )
-    throw Error('Unsupported archive: use a new empty data directory for encrypted profiles');
-  if (new Set(registry.profiles.map((p) => p.id)).size !== registry.profiles.length)
-    throw Error('Duplicate profile IDs');
   const opened = new Map<string, OpenedProfile>(),
     setups = new Map<string, SetupState>();
+  let registryPublished = !!registryStat;
   const pathFor = (id: unknown): string => {
     if (!idValid(id)) throw new HttpError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
     const p = resolve(profilesDir, id);
@@ -249,6 +282,7 @@ export function createEncryptedProfiles({
     const published = { ...(next || registry), revision: registry.revision + 1 };
     durableWrite(registryPath, jsonBytes(published));
     registry = published;
+    registryPublished = true;
   };
   const keyring = (id: string): ProfileKeyring =>
     JSON.parse(
@@ -717,6 +751,16 @@ export function createEncryptedProfiles({
           'PROFILE_LOCKED',
           'Unlock the original profile before completing its copy',
         );
+      }
+    }
+    if (!registryPublished) {
+      try {
+        // A crash after the active keyring is published must still leave the
+        // registry needed to resume first-time activation with the saved kit.
+        writeRegistry();
+      } catch (error) {
+        key.fill(0);
+        throw error;
       }
     }
     const state = open(setup.id, key, { initial: true, ...details, copyState });

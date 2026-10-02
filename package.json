@@ -38,7 +38,8 @@
     "test:browser:run": "node src/scripts/test-suite.ts browser",
     "build:assets": "npm run brand:check && vite build",
     "qualify:passkeys": "node src/scripts/qualify-physical-passkey.ts",
-    "qualify:drive": "node deploy/qualify-drive.ts"
+    "qualify:drive": "node deploy/qualify-drive.ts",
+    "qualify:archive-restore": "node src/scripts/qualify-archive-restore.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "1.0.9",

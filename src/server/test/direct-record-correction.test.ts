@@ -291,6 +291,19 @@ test('wrong profile, invalid fields, missing reason and medication reclassificat
   assert.throws(() => f.preview({ ...f.request, profileId: 'injected' }), {
     code: 'CORRECTION_INPUT',
   });
+  const preview = f.preview();
+  for (const field of ['actor', 'origin'])
+    assert.throws(
+      () =>
+        applyDirectRecordCorrection(f.db, f.root, f.profileId, {
+          ...preview.request,
+          version: preview.version,
+          previewToken: preview.previewToken,
+          operationId: 'fictional-forged-correction-attribution',
+          [field]: 'fictional-forged-actor',
+        }),
+      { code: 'CORRECTION_INPUT' },
+    );
   assert.equal((getObservation(f.db, f.recordId) as { valueText: string }).valueText, '12.00');
 });
 
@@ -436,12 +449,49 @@ test('encrypted correction support, exact operation receipt and clinical history
   const f = fixture(t, { root: state.root, db: state.db, profileId: profile.id });
   const incoming = f.incoming();
   const preview = f.preview({ ...f.request, supportingEvidence: [incoming.ref] });
+  const priorHistory = clinicalRecordHistory(f.db, {
+    profileId: profile.id,
+    kind: 'observation',
+    recordId: f.recordId,
+  });
+  const original = intake.getIntakeOriginal(f.db, f.root, profile.id, f.original.id).bytes;
+  const sourceRows = f.db.prepare('SELECT * FROM source_records ORDER BY id').all();
+  const beforeCorrection = Date.now();
   const result = f.apply(preview);
+  const afterCorrection = Date.now();
   const history = clinicalRecordHistory(f.db, {
     profileId: profile.id,
     kind: 'observation',
     recordId: f.recordId,
   });
+  assert.equal(history.entries.length, priorHistory.entries.length + 1);
+  const correction = history.entries[0]!;
+  assert.equal(correction.actor, 'profile-user');
+  assert.equal(correction.origin, 'clinical-correction');
+  assert.ok(Date.parse(correction.recordedAt) >= beforeCorrection);
+  assert.ok(Date.parse(correction.recordedAt) <= afterCorrection);
+  assert.equal(correction.previousVersion, priorHistory.entries[0]!.versionId);
+  assert.deepEqual(history.entries.slice(1), priorHistory.entries);
+  assert.deepEqual(
+    correction.changes.find((change) => change.field === 'value_text'),
+    {
+      field: 'value_text',
+      before: { present: true, value: '12.00' },
+      after: { present: true, value: '14.00' },
+    },
+  );
+  const retained = JSON.parse(String(correction.contents.extra_json));
+  assert.equal(retained.import.recordException.sourceFileId, f.original.id);
+  assert.equal(retained.recordCorrections[0].operationId, result.operationId);
+  assert.equal(
+    retained.recordCorrections[0].supportingEvidence[0].originalSourceFileId,
+    incoming.ref.originalSourceFileId,
+  );
+  assert.deepEqual(f.db.prepare('SELECT * FROM source_records ORDER BY id').all(), sourceRows);
+  assert.deepEqual(
+    intake.getIntakeOriginal(f.db, f.root, profile.id, f.original.id).bytes,
+    original,
+  );
   assert.ok(JSON.stringify(history).includes(incoming.ref.originalSourceFileId));
   const dto = getObservation(f.db, f.recordId);
   manager.lock(profile.id);
@@ -466,6 +516,22 @@ test('encrypted correction support, exact operation receipt and clinical history
   });
   assert.equal(replay.replayed, true);
   assert.deepEqual(replay.receipt, result.receipt);
+  assert.deepEqual(
+    clinicalRecordHistory(rebuilt.db, {
+      profileId: profile.id,
+      kind: 'observation',
+      recordId: f.recordId,
+    }),
+    history,
+  );
+  assert.deepEqual(
+    rebuilt.db.prepare('SELECT * FROM source_records ORDER BY id').all(),
+    sourceRows,
+  );
+  assert.deepEqual(
+    intake.getIntakeOriginal(rebuilt.db, rebuilt.root, profile.id, f.original.id).bytes,
+    original,
+  );
   assert.equal(rebuilt.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
   assert.equal(
     intake.getIntake(rebuilt.db, rebuilt.root, profile.id, incoming.item.id).workflow!.decisions

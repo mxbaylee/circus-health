@@ -4,7 +4,7 @@ Start with [installation](setup/installation.md). The supported runtime is npm â
 
 ## Current application references
 
-- **Setup and operation:** [environment](setup/environment.md), [Docker runtime](setup/docker-runtime.md), [LiteLLM boundary](setup/docker-ai.md), [model providers](setup/model-providers.md), [connection behavior](setup/connection-awareness.md).
+- **Setup and operation:** [independent archive restore](setup/archive-restore.md), [environment](setup/environment.md), [Docker runtime](setup/docker-runtime.md), [LiteLLM boundary](setup/docker-ai.md), [model providers](setup/model-providers.md), [connection behavior](setup/connection-awareness.md).
 - **Security:** [security model and limitations](security/model.md), [profile encryption](security/profile-encryption.md), [vault format](security/vault-format.md), [vulnerability reporting](../SECURITY.md).
 - **Import:** [import and rebuild](import/import-and-rebuild.md), [processing and evidence review](import/processing.md), [automatic recovery](import/automatic-recovery.md), [report identity](import/identity-review.md), [reconciliation](import/import-reconciliation.md), [reliable review and partial saves](import/review-reliability.md), [performance diagnostics](import/import-performance.md).
 - **Data:** [data contracts](data/data-model-contracts.md), [profile storage/rebuild](data/profile-storage-and-rebuild.md), [record versions](data/record-version-storage.md), [change history](data/change-history.md), [storage accounting](data/storage-accounting.md), [clinical relationships](data/clinical-relationships.md), [public-profile compatibility](data/public-profile-compatibility.md).
