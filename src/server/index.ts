@@ -1,3 +1,4 @@
+import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
 import { sourceAssertionOwnership } from './source-assertion-ownership.ts';
 import { handleRecordOwnershipRoute } from './record-ownership-routes.ts';
@@ -993,6 +994,7 @@ export function createApp({
         void disposePdfEvidenceSessions(profileId);
         diagnostics.clear(profileId);
         clearIntakeStateCache(db);
+        clearIntakeLookupCache(db);
         db.close();
       }
     },
