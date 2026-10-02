@@ -38,6 +38,17 @@ export interface ImportDiagnosticArchive<Event = unknown> {
   completeness: 'not_established';
   /** Latest retained cumulative checkpoint per window; never sum checkpoints for one window. */
   windowCheckpoints: Array<ImportDiagnosticCheckpoint & { windowId: string }>;
+  windowCoverageScope: 'retained_readable_checkpoints';
+  /** Latest checkpoint once per window; entirely missing windows/history stay unknown. */
+  windowCoverage: Array<{
+    windowId: string;
+    checkpointedPersistedEvents: number;
+    /** Distinct valid observations in readable chunks, including output omissions. */
+    readableEvents: number;
+    exportedEvents: number;
+    /** Checkpointed persisted events absent from this download, without guessing why. */
+    knownPersistedNotExportedEvents: number;
+  }>;
   currentWindow: {
     windowId: string | null;
     observedEvents: number;

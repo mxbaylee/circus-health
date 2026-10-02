@@ -101,6 +101,9 @@ test('retained HTTP export requires the owning session and survives fresh runtim
   assert.equal(initial.status, 200);
   const archive = initial.payload.data.eventArchive;
   assert.ok(archive.events.length > 0);
+  assert.equal(archive.windowCoverageScope, 'retained_readable_checkpoints');
+  assert.equal(archive.windowCoverage[0]!.exportedEvents, archive.events.length);
+  assert.equal(archive.windowCoverage[0]!.knownPersistedNotExportedEvents, 0);
   assert.equal(archive.currentWindow.writeFailures, 1);
   assert.equal(archive.status, 'partial');
   assert.doesNotMatch(
@@ -149,6 +152,14 @@ test('retained HTTP export requires the owning session and survives fresh runtim
   assert.equal(restored.eventArchive.completeness, 'not_established');
   assert.equal(restored.eventArchive.currentWindow.writeFailures, 0);
   assert.ok(restored.eventArchive.windowCheckpoints.some((item) => item.writeFailures === 1));
+  assert.ok(
+    restored.eventArchive.windowCoverage.some(
+      (item) =>
+        item.windowId === archive.currentWindow.windowId &&
+        item.exportedEvents >= archive.events.length &&
+        item.knownPersistedNotExportedEvents === 0,
+    ),
+  );
   assert.equal(restored.eventArchive.status, 'partial');
   assert.equal(restored.eventArchive.crashTailEvents, null);
   assert.doesNotMatch(
