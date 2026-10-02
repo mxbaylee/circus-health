@@ -24,6 +24,12 @@ The current full server type is inventoried as follows; none of these fields is 
 
 Proposal objects include their existing source pins, model identity, review/version history and manual-source receipts. Workflow includes its format, questions and answers, candidates and candidate versions, plans/inventory/units/attempts/batches, decisions, review drafts, report groups and versions, identity confirmations, source confirmations and atomic acceptance receipts. Server extensions include operation fingerprints, decision evidence and People drafts/dispositions. These arrays and histories belong to operational state, not compact source attribution. Unknown surrounding envelope fields and exact absent/null/empty values remain intact.
 
+## Exact serialization obligations for activation and copy
+
+The [intake serialization contract](../data/intake-state-storage.md#exact-serialization-domain) defines order-preserving normalized JSON authority and `readSerialized()`. Production still reads and searches retained `source_files.details_json`; this contract does not activate incremental persistence. Future activation and target-bound private-copy bootstrap must preserve the complete outer envelope's member order, the operational intake slot's position and nested object order, including JavaScript integer-index enumeration. Semantic object equality alone is insufficient for exact source search or operation replay identity.
+
+The guarantee is exactly `JSON.stringify` over the supported normalized plain-data domain, including finite primitives, omitted undefined object members, null undefined array positions and standard Unicode/lone-surrogate escaping. It does not preserve arbitrary original JSON text. Already-retained whitespace, duplicate-property spelling and alternative escape spelling remain unchanged durable/search bytes until an actual authorized rewrite or a separately specified raw-text solution. A cutover may not silently normalize these bytes or replace their authority with a disposable search row. Copy preparation must identify and retain this distinction rather than serializing every envelope afresh.
+
 ## Operational consumer inventory
 
 The shared boundary serves intake details, version checks, DTO/review construction, proposal publication and workflow mutations. Additional writers are duplicate-review questions and atomic acceptance receipts. Additional readers are:
