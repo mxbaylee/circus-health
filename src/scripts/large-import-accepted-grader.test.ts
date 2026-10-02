@@ -31,11 +31,11 @@ function snapshots(): LargeImportAcceptedInput {
       id: `runtime-entity-${index}`,
       personId: people[assertion.personKey]!.personId,
       label: mapping.testLabel ?? mapping.medicationName ?? mapping.procedureLabel!,
-      sourceRecordId: `runtime-source-${index}`,
+      sourceRecordId: `runtime-record-${index}`,
       extra: { import: { acceptedMapping: { ...mapping } } },
       evidence: assertion.pages.map((page) => ({
         id: `runtime-evidence-${index}-${page}`,
-        sourceRecordId: `runtime-source-${index}`,
+        sourceRecordId: `runtime-record-${index}`,
         role: 'primary',
         locator: { originalSourceFileId: 'runtime-original', locator: `page ${page}` },
       })),
@@ -337,6 +337,16 @@ for (const [name, mutate, category] of mutations)
     );
   });
 const receiptMutations: Array<[string, (input: LargeImportAcceptedInput) => void, string]> = [
+  [
+    'unrelated source occurrence with internally consistent evidence',
+    (input) => {
+      const record = input.records[0]!.record;
+      record.sourceRecordId = 'unrelated-source-occurrence';
+      for (const evidence of record.evidence!)
+        evidence.sourceRecordId = 'unrelated-source-occurrence';
+    },
+    'entityBinding',
+  ],
   [
     'candidate version',
     (input) => {

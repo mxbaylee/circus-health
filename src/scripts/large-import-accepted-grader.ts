@@ -309,6 +309,7 @@ export function gradeLargeImportAccepted(input: LargeImportAcceptedInput) {
         else if (
           entity.kind !== accepted.kind ||
           selection?.kind !== accepted.kind ||
+          entity.record.sourceRecordId !== accepted.recordId ||
           entity.record.label !== selection?.label
         )
           receiptIssues.add('entityBinding');
