@@ -171,3 +171,25 @@ test('ZIP worker rejects invalid descriptor selection pairs before launch', asyn
     /empty private regular file/,
   );
 });
+
+test('ZIP worker reports actual unwritable output as unavailable storage with its retained occurrence', async (t) => {
+  const setup = fixture(t, zipFixture([{ name: 'safe/report.txt', data: 'fictional' }]));
+  const readonlyOutput = openSync(setup.output, 'r');
+  t.after(() => closeSync(readonlyOutput));
+  await assert.rejects(
+    inspectPackageFile({ sourceFd: setup.sourceFd, outputFd: readonlyOutput, selectedOrdinal: 0 }),
+    (error) => {
+      assert.ok(error instanceof PackageInspectionError);
+      assert.equal(error.reasonCode, 'PACKAGE_STORAGE');
+      assert.equal(error.filename, 'safe/report.txt');
+      assert.equal(error.ordinal, 0);
+      assert.equal(error.work?.writtenBytes, 0);
+      assert.equal(error.work?.memberReadBytes, 9);
+      assert.equal(error.work?.hashBytes, 9);
+      assert.match(error.message, /restore writable storage/);
+      assert.ok(!error.message.includes(setup.path));
+      return true;
+    },
+  );
+  assert.equal(fstatSync(setup.outputFd).size, 0);
+});

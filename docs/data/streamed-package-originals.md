@@ -14,6 +14,8 @@ Child identity remains bound to parent, exact locator and digest. Repeated acces
 
 Package inspection, member extraction and bounded structure failures retain a source-bound pending exception with the original filename/download, the exact member location when known, a sanitized reason and retry action. Unknown scope stays unknown. Repeating the same failure does not add another mutation; successful work resolves only its matching operation and source. A failed inventory cannot claim that every member was read, that the package was empty, or that an invented page was unreadable. Import exposes these failures even when inventory itself fails; model context pages them separately from other workflow sections.
 
+Worker staging exhaustion (`ENOSPC`/`EDQUOT`) returns HTTP 507 with `PACKAGE_STORAGE_FULL` and guidance to free storage. Unavailable writes return HTTP 503 with `PACKAGE_STORAGE`, preserving the distinction from format/processing refusals. Both keep the exact unfinished location and counted partial work. Host-stage failures retain their existing storage/integrity response codes. Cancellation, closed ownership, a changed parent and uncertain durable publication cannot authorize a new failure mutation; recover the existing authority before retrying uncertain writes.
+
 ## Current limits
 
 There is no 25 MiB ZIP member-byte cap or 100 MiB aggregate expanded-byte cap on the streamed path. Selection processes one member per operation, so the legacy buffered child API's 300-member/100 MiB-per-call safeguard is not used by ZIP selection. That buffered API still protects other callers, including PDF embedded attachments.

@@ -25,11 +25,13 @@ import { rebuildProfile } from '../portable.ts';
 import { fictionalModel } from './fictional-model.ts';
 import {
   indexIntakePackage,
+  packageInspectionHttpError,
   inventoryIntakePackage,
   readIntakePackageMember,
   validatePackageRolePlan,
 } from '../intake-package.ts';
 import { readJSONStructure } from '../intake-json.ts';
+import { PackageInspectionError } from '../intake-package-worker.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
 import type { IntakeWithWorkflow } from '../intake-continuation.ts';
 
@@ -268,6 +270,63 @@ test('382-member ZIP inventories without extraction, persists every occurrence a
   await assert.rejects(
     inventoryIntakePackage({ ...f, limit: 51 }),
     (error: unknown) => error instanceof HttpError && error.code === 'PACKAGE_WINDOW',
+  );
+});
+
+test('package worker storage reasons map to capacity and availability responses', () => {
+  for (const [reason, status, code] of [
+    ['PACKAGE_STORAGE_FULL', 507, 'PACKAGE_STORAGE_FULL'],
+    ['PACKAGE_STORAGE', 503, 'PACKAGE_STORAGE'],
+    ['PACKAGE_CRC', 413, 'PACKAGE_LIMIT'],
+  ] as const) {
+    const error = packageInspectionHttpError(
+      new PackageInspectionError('Fictional inspector refusal', reason),
+    );
+    assert.equal(error.status, status);
+    assert.equal(error.code, code);
+  }
+});
+
+test('an actual inspector output write failure preserves its storage code and located member', async (t) => {
+  const f = fixture(t);
+  const index = await indexIntakePackage(f);
+  const member = index.members[0]!;
+  const open = fs.openSync;
+  const injectedOpen = t.mock.method(fs, 'openSync', (...args: Parameters<typeof open>) => {
+    const fd = open(...args);
+    if (
+      String(args[0]).includes('.intake-child-staging/') &&
+      String(args[0]).endsWith('/original')
+    ) {
+      // The subprocess receives a real, empty regular file descriptor. Its
+      // attempted payload write fails through the actual inspector/protocol.
+      fs.closeSync(fd);
+      return open(args[0], fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    }
+    return fd;
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(readIntakePackageMember({ ...f, memberId: member.memberId }), {
+      status: 503,
+      code: 'PACKAGE_STORAGE',
+    });
+    assert.equal(f.db.prepare('SELECT count(*) n FROM source_files').get()!.n, 1);
+    const failures = Object.values(
+      getIntake(f.db, f.root, f.profileId, f.id).packageFailures || {},
+    );
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].operationKey, 'extract:' + member.memberId);
+    assert.equal(failures[0].filename, member.filename);
+    assert.equal(failures[0].reasonCode, 'PACKAGE_STORAGE');
+  } finally {
+    injectedOpen.mock.restore();
+    syncBuiltinESMExports();
+  }
+  await readIntakePackageMember({ ...f, memberId: member.memberId });
+  assert.equal(
+    Object.values(getIntake(f.db, f.root, f.profileId, f.id).packageFailures || {}).length,
+    0,
   );
 });
 

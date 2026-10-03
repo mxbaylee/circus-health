@@ -236,8 +236,16 @@ export async function inspectPackageDescriptor(
   } catch (error) {
     if (error instanceof PackageInspectionError) throw error;
     const code = (error as NodeJS.ErrnoException).code;
-    if (['ENOSPC', 'EDQUOT', 'EIO', 'EROFS', 'EACCES', 'EBADF'].includes(code || ''))
-      fail('ZIP staging storage is unavailable; original retained', 'PACKAGE_STORAGE');
+    if (['ENOSPC', 'EDQUOT'].includes(code || ''))
+      fail(
+        'Not enough storage to extract this ZIP member; original retained. Free runtime or archive space, or ask the operator to increase storage capacity, then retry.',
+        'PACKAGE_STORAGE_FULL',
+      );
+    if (['EIO', 'EROFS', 'EACCES', 'EBADF'].includes(code || ''))
+      fail(
+        'ZIP staging storage is unavailable; original retained. Ask the operator to restore writable storage, then retry.',
+        'PACKAGE_STORAGE',
+      );
     return fail('ZIP member could not be safely decoded; original retained', 'PACKAGE_FORMAT');
   } finally {
     archive.close();

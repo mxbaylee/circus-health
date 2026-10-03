@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, writeFileSync, rmSync, openSync, closeSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspectPackage } from '../intake-package-inspector.ts';
+import { PackageInspectionError } from '../intake-package-worker.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 
 const malformed = [
@@ -21,6 +24,47 @@ const malformed = [
   { name: 'corrupt.txt', data: 'fictional', checksum: 0 },
   { name: 'encrypted.txt', data: 'fictional', encrypted: true },
 ];
+
+for (const code of ['ENOSPC', 'EDQUOT']) {
+  test(`ZIP inspector classifies ${code} after a real partial staging write as capacity failure`, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-zip-storage-'));
+    const path = join(root, 'fixture.zip'),
+      output = join(root, 'member');
+    writeFileSync(path, zipFixture([{ name: 'safe/report.txt', data: 'fictional' }]));
+    const outputFd = openSync(output, 'wx', 0o600);
+    t.after(() => {
+      closeSync(outputFd);
+      rmSync(root, { recursive: true, force: true });
+    });
+    const write = fs.writeSync;
+    let writes = 0;
+    const mocked = t.mock.method(fs, 'writeSync', (...args: unknown[]) => {
+      if (args[0] !== outputFd) return Reflect.apply(write, fs, args);
+      if (++writes === 1) return write(outputFd, args[1] as Buffer, args[2] as number, 1);
+      throw Object.assign(Error('private path /fictional/private/storage'), { code });
+    });
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(inspectPackage(path, 0, outputFd), (error) => {
+        assert.ok(error instanceof PackageInspectionError);
+        assert.equal(error.reasonCode, 'PACKAGE_STORAGE_FULL');
+        assert.equal(error.filename, 'safe/report.txt');
+        assert.equal(error.ordinal, 0);
+        assert.equal(error.work?.writtenBytes, 1);
+        assert.equal(error.work?.memberReadBytes, 9);
+        assert.equal(error.work?.hashBytes, 9);
+        assert.match(error.message, /Free runtime or archive space/);
+        assert.ok(!error.message.includes('/fictional/private'));
+        return true;
+      });
+    } finally {
+      mocked.mock.restore();
+      syncBuiltinESMExports();
+    }
+    assert.equal(writes, 2);
+    assert.equal(readFileSync(output, 'utf8'), 'f');
+  });
+}
 for (const [index, entry] of malformed.entries()) {
   test(`ZIP inspector rejects malformed fixture ${index + 1}`, async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'fictional-zip-invalid-'));

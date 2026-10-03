@@ -129,6 +129,27 @@ function packageOriginal({ db, root, profileId, id }: PackageContext) {
   }
   return file;
 }
+/** Keep storage refusal distinct from unsafe or unsupported archive contents. */
+export function packageInspectionHttpError(error: PackageInspectionError): HttpError {
+  if (error.reasonCode === 'PACKAGE_STORAGE_FULL')
+    return new HttpError(
+      507,
+      error.reasonCode,
+      'Original retained. Free extraction storage or ask the operator to increase available storage, then retry this member.',
+    );
+  if (error.reasonCode === 'PACKAGE_STORAGE')
+    return new HttpError(
+      503,
+      error.reasonCode,
+      'Original retained. Extraction storage is unavailable; restore writable storage access, then retry this member.',
+    );
+  return new HttpError(
+    413,
+    'PACKAGE_LIMIT',
+    'ZIP inspection failed; original retained. ' + error.message,
+  );
+}
+
 export async function indexIntakePackage(context: PackageContext): Promise<PackageIndex> {
   packageOriginal(context);
   const intake = getIntake(context.db, context.root, context.profileId, context.id);
@@ -153,11 +174,7 @@ export async function indexIntakePackage(context: PackageContext): Promise<Packa
       reasonCode: error.reasonCode,
       detail: error.message,
     });
-    throw new HttpError(
-      413,
-      'PACKAGE_LIMIT',
-      'ZIP inspection failed; original retained. ' + error.message,
-    );
+    throw packageInspectionHttpError(error);
   }
   resolveIntakePackageFailure(context.db, context.root, context.profileId, context.id, {
     operationKey: 'inventory',
@@ -392,11 +409,7 @@ export async function readIntakePackageMember(context: PackageContext) {
         detail: error.message,
       });
       if (!(error instanceof PackageInspectionError)) throw error;
-      throw new HttpError(
-        413,
-        'PACKAGE_LIMIT',
-        'ZIP member extraction failed; original retained. ' + error.message,
-      );
+      throw packageInspectionHttpError(error);
     }
     throw error;
   }
