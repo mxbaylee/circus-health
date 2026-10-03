@@ -64,7 +64,16 @@ test('production handles aggregate without sharing counters; full DTO and recons
   const warm = intakeWorkCounters(db);
   assert.equal(warm.primitive.readCopies - baseline.primitive.readCopies, 2);
   assert.equal(warm.primitive.coldReconstructions, baseline.primitive.coldReconstructions);
-  assert.ok(warm.warm.normalizeValidationNodes > baseline.warm.normalizeValidationNodes);
+  // Verified immutable state needs detached result copies, not another input
+  // validation. Keep that real copying visible under its own accounting scope.
+  assert.equal(warm.warm.normalizeValidationNodes, baseline.warm.normalizeValidationNodes);
+  assert.equal(warm.warm.normalizeCalls, baseline.warm.normalizeCalls);
+  assert.equal(warm.warm.trustedCloneCalls - baseline.warm.trustedCloneCalls, 2);
+  assert.ok(warm.warm.trustedCloneNodes > baseline.warm.trustedCloneNodes);
+  assert.equal(
+    warm.primitive.readCopyBytes - baseline.primitive.readCopyBytes,
+    2 * Buffer.byteLength(JSON.stringify(value)),
+  );
   assert.deepEqual(sourceFileDetails(db, { id, kind: 'intake_original' }), value);
   const dto = intakeWorkCounters(db);
   assert.equal(dto.warm.sourceDTOHydrations - warm.warm.sourceDTOHydrations, 1);
