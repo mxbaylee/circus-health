@@ -1,8 +1,11 @@
 import { createSourceDetailsSearch } from '../source-details-search.ts';
 import { sourceTextProjectionCounters } from '../source-text-projection.ts';
 import { intakeLookupCounters } from '../intake-lookup-projection.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
+
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,7 +22,20 @@ import {
   registerRawIntakeFixture,
 } from './helpers/intake-authority-fixture.ts';
 
-test('real selected-authority writers retain operational arrays and distant string middles with bounded accepted writes', (t) => {
+function counterDelta<T extends { [K in keyof T]: Record<string, number> }>(after: T, before: T) {
+  return Object.fromEntries(
+    (Object.keys(after) as (keyof T)[]).map((scope) => [
+      scope,
+      Object.fromEntries(
+        Object.entries(after[scope]).map(([key, value]) => [key, value - before[scope][key]!]),
+      ),
+    ]),
+  );
+}
+function qualifyLocality(
+  t: TestContext,
+  recordVersionWork: ReturnType<typeof createRecordVersionWorkCounters>,
+) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-intake-locality-'));
   const profileId = 'fictional-mutation-locality';
   const db = openDatabase(join(root, 'source.sqlite'), profileId);
@@ -183,10 +199,16 @@ test('real selected-authority writers retain operational arrays and distant stri
       acceptedBytes = 0;
       immutableObjects = 0;
       publications = 0;
-      const priorText = { ...sourceTextProjectionCounters(db) };
+      const priorHost = intakeWorkCounters(db);
+      const priorRecord = structuredClone(recordVersionWork);
+      const priorText = structuredClone(sourceTextProjectionCounters(db));
       const priorLookup = { ...intakeLookupCounters(db) };
       write(value, stage);
+      const afterMutationHost = intakeWorkCounters(db);
+      const afterMutationRecord = structuredClone(recordVersionWork);
       warm();
+      const afterConsumerHost = intakeWorkCounters(db);
+      const afterConsumerRecord = structuredClone(recordVersionWork);
       const text = sourceTextProjectionCounters(db),
         lookup = intakeLookupCounters(db);
       const derived = {
@@ -200,6 +222,32 @@ test('real selected-authority writers retain operational arrays and distant stri
         textLinkBytes: text.linkBytesWritten - priorText.linkBytesWritten,
         textTotalBytes: text.projectionBytes - priorText.projectionBytes,
       };
+      assert.equal(
+        derived.lookupRows,
+        label === 'insert' || label === 'delete' ? 2 : 1,
+        'group order changes only rewrite the source binding and a changed maximum',
+      );
+      assert.equal(
+        afterMutationHost.warm.normalizeCalls - priorHost.warm.normalizeCalls,
+        1,
+        'one preparation of the changed intent',
+      );
+      assert.equal(
+        afterMutationHost.primitive.readCopies - priorHost.primitive.readCopies,
+        0,
+        'internal selected-authority adapters reuse immutable materializations',
+      );
+      assert.equal(
+        afterMutationHost.primitive.candidateCopies - priorHost.primitive.candidateCopies,
+        0,
+        'checked replay copies mutation paths instead of the complete old basis',
+      );
+      assert.equal(
+        afterMutationHost.warm.envelopeSerializationCalls -
+          priorHost.warm.envelopeSerializationCalls,
+        0,
+        'selected-envelope consumers reuse the validated serialization',
+      );
       assert.ok(derived.textContentBytes < 3000, JSON.stringify(derived));
       assert.ok(derived.textTotalBytes < 20_000, JSON.stringify(derived));
       const writes = db.prepare('SELECT kind,value FROM locality_writes').all() as {
@@ -235,6 +283,14 @@ test('real selected-authority writers retain operational arrays and distant stri
         JSON.stringify({
           size,
           ...derived,
+          hostWork: {
+            mutation: counterDelta(afterMutationHost, priorHost),
+            consumer: counterDelta(afterConsumerHost, afterMutationHost),
+          },
+          recordVersionWork: {
+            mutation: counterDelta(afterMutationRecord, priorRecord),
+            consumer: counterDelta(afterConsumerRecord, afterMutationRecord),
+          },
           operation: label,
           initialNormalizationBytes: normalizationBytes,
           frameBytes,
@@ -252,4 +308,9 @@ test('real selected-authority writers retain operational arrays and distant stri
   authority.attach(rebuilt);
   opened.push(rebuilt);
   for (const [id, exact] of expected) assert.equal(readIntakeEnvelopeText(rebuilt, { id }), exact);
+}
+
+test('real selected-authority writers retain operational arrays and distant string middles with bounded accepted writes', (t) => {
+  const recordVersionWork = createRecordVersionWorkCounters();
+  return withRecordVersionWork(recordVersionWork, () => qualifyLocality(t, recordVersionWork));
 });

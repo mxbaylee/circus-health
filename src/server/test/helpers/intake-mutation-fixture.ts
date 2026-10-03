@@ -22,6 +22,7 @@ import {
 import { fictionalModel } from '../fictional-model.ts';
 import type { HealthRecordEnvelope } from '../../../shared/intake.ts';
 import { intakeWorkCounters } from '../../intake-work-accounting.ts';
+import type { createRecordVersionWorkCounters } from '../../record-version-work.ts';
 
 export const CLINICAL_LITERALS = ['< 0.030', '+004.500', '7.20', '−0.125'] as const;
 const literalFor = (index: number) =>
@@ -63,6 +64,7 @@ export async function createMutationFixture(
       profileId: string,
     ) => AttachRecordDurabilityOptions['verifyReferences'];
     fileWorkSnapshot?: () => Record<string, number>;
+    recordVersionWorkSnapshot?: () => ReturnType<typeof createRecordVersionWorkCounters>;
   } = {},
 ) {
   fictionalModel(t);
@@ -129,6 +131,7 @@ export async function createMutationFixture(
       io: { ...io },
       host: intakeWorkCounters(db),
       fileWork: options.fileWorkSnapshot?.(),
+      recordVersionWork: options.recordVersionWorkSnapshot?.(),
     },
   };
   const bytes = Buffer.from(
@@ -153,6 +156,7 @@ export async function createMutationFixture(
     io: { ...io },
     host: intakeWorkCounters(db),
     fileWork: options.fileWorkSnapshot?.(),
+    recordVersionWork: options.recordVersionWorkSnapshot?.(),
   };
   await intakeSourceRoute({
     db,
@@ -169,6 +173,7 @@ export async function createMutationFixture(
     io: { ...io },
     host: intakeWorkCounters(db),
     fileWork: options.fileWorkSnapshot?.(),
+    recordVersionWork: options.recordVersionWorkSnapshot?.(),
   };
   const planned = await intake.createIntakePlan(db, root, profileId, original.id, {
     version: intake.getIntake(db, root, profileId, original.id).version,
@@ -181,6 +186,7 @@ export async function createMutationFixture(
     io: { ...io },
     host: intakeWorkCounters(db),
     fileWork: options.fileWorkSnapshot?.(),
+    recordVersionWork: options.recordVersionWorkSnapshot?.(),
   };
   const proposals = new Map<number, string>();
   const proposalBytes = new Map<string, Buffer>();

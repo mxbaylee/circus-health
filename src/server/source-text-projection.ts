@@ -8,7 +8,7 @@ import {
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
   intakeEnvelopeAuthorityBinding,
-  readIntakeEnvelopeText,
+  readIntakeEnvelopeMaterialized,
   type IntakeEnvelopeSource,
 } from './intake-authority.ts';
 import {
@@ -30,6 +30,7 @@ import {
 
 const PREFIX = '__record_source_text_';
 const DIRTY = '__source_text_dirty';
+const INVALIDATED = '__source_text_invalidated';
 const OBSOLETE = '__source_text_obsolete';
 const WORK = '__source_text_reference_work';
 const AUTHORITIES = '__source_text_authorities';
@@ -56,6 +57,8 @@ export interface SourceTextProjectionCounters {
   authorityReads: number;
   authorityBytes: number;
   authorityHashBytes: number;
+  snapshotLoads: number;
+  snapshotReuses: number;
   projectionRowsRead: number;
   projectionReadBytes: number;
   projectionWrites: number;
@@ -79,6 +82,8 @@ export interface SourceTextProjectionCounters {
 }
 interface Connection {
   schema: number;
+  dataVersion: number;
+  snapshots: Map<string, Retained>;
   active: boolean;
   dispose: () => void;
   counters: SourceTextProjectionCounters;
@@ -104,6 +109,8 @@ function connectionFor(db: DatabaseSync): Connection {
   if (existing) return existing;
   const connection: Connection = {
     schema: -1,
+    dataVersion: -1,
+    snapshots: new Map(),
     active: false,
     dispose: () => {},
     counters: {
@@ -113,6 +120,8 @@ function connectionFor(db: DatabaseSync): Connection {
       authorityReads: 0,
       authorityBytes: 0,
       authorityHashBytes: 0,
+      snapshotLoads: 0,
+      snapshotReuses: 0,
       projectionRowsRead: 0,
       projectionReadBytes: 0,
       projectionWrites: 0,
@@ -136,7 +145,10 @@ function connectionFor(db: DatabaseSync): Connection {
     },
   };
   connection.dispose = observeTransactionOutcome(db, ({ succeeded }) => {
-    if (!succeeded) connection.schema = -1;
+    if (!succeeded) {
+      connection.schema = -1;
+      connection.snapshots.clear();
+    }
   });
   connections.set(db, connection);
   return connection;
@@ -148,8 +160,9 @@ function connectionFor(db: DatabaseSync): Connection {
 export function sourceTextProjectionCounters(db: DatabaseSync): SourceTextProjectionCounters {
   return connectionFor(db).counters;
 }
-/** Forget private readiness on lock/close. No source text is retained in JS connection state. */
+/** Forget private readiness and retained exact snapshots on lock/close. */
 export function clearSourceTextProjectionCache(db: DatabaseSync): void {
+  connections.get(db)?.snapshots.clear();
   connections.get(db)?.dispose();
   connections.delete(db);
 }
@@ -180,10 +193,11 @@ function write(connection: Connection, name: Table, row: unknown, deleted = fals
     c[`${prefix}BytesWritten`] += size;
   }
 }
-const mark = (id: string) =>
-  `INSERT INTO ${DIRTY} SELECT ${id} WHERE NOT EXISTS(SELECT 1 FROM ${DIRTY} WHERE source_id=${id});`;
+const mark = (id: string, target = DIRTY) =>
+  `INSERT INTO ${target} SELECT ${id} WHERE NOT EXISTS(SELECT 1 FROM ${target} WHERE source_id=${id});`;
 function sourceTracking(db: DatabaseSync): void {
   db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${DIRTY}(source_id TEXT PRIMARY KEY);
+    CREATE TEMP TABLE IF NOT EXISTS ${INVALIDATED}(source_id TEXT PRIMARY KEY);
     CREATE TEMP TABLE IF NOT EXISTS ${AUTHORITIES}(authority_key TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE);
     CREATE TEMP TABLE IF NOT EXISTS ${OBSOLETE}(id TEXT PRIMARY KEY);
     CREATE TEMP TABLE IF NOT EXISTS ${WORK}(singleton INTEGER PRIMARY KEY,rows_read INTEGER NOT NULL);
@@ -207,13 +221,13 @@ function cacheTracking(db: DatabaseSync): void {
           ? `INSERT INTO ${OBSOLETE} SELECT OLD.content_id WHERE NOT EXISTS(SELECT 1 FROM ${OBSOLETE} WHERE id=OLD.content_id);`
           : '';
       db.exec(
-        `CREATE TEMP TRIGGER IF NOT EXISTS __source_text_${name}_${op} AFTER ${op} ON main.${table(name)} BEGIN ${refs.map((ref) => mark(ref + '.source_id')).join(' ')} ${orphan} END`,
+        `CREATE TEMP TRIGGER IF NOT EXISTS __source_text_${name}_${op} AFTER ${op} ON main.${table(name)} BEGIN ${refs.map((ref) => mark(ref + '.source_id') + mark(ref + '.source_id', INVALIDATED)).join(' ')} ${orphan} END`,
       );
     }
   for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
     const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
     db.exec(
-      `CREATE TEMP TRIGGER IF NOT EXISTS __source_text_contents_${op} AFTER ${op} ON main.${table('contents')} BEGIN ${refs.map((ref) => `UPDATE ${WORK} SET rows_read=rows_read+2*(SELECT COUNT(*) FROM ${table('occurrences')} WHERE content_id=${ref}.id) WHERE singleton=1; INSERT INTO ${DIRTY} SELECT DISTINCT source_id FROM ${table('occurrences')} o WHERE content_id=${ref}.id AND NOT EXISTS(SELECT 1 FROM ${DIRTY} d WHERE d.source_id=o.source_id); INSERT INTO ${OBSOLETE} SELECT ${ref}.id WHERE NOT EXISTS(SELECT 1 FROM ${OBSOLETE} WHERE id=${ref}.id);`).join(' ')} END`,
+      `CREATE TEMP TRIGGER IF NOT EXISTS __source_text_contents_${op} AFTER ${op} ON main.${table('contents')} BEGIN ${refs.map((ref) => `UPDATE ${WORK} SET rows_read=rows_read+3*(SELECT COUNT(*) FROM ${table('occurrences')} WHERE content_id=${ref}.id) WHERE singleton=1; INSERT INTO ${DIRTY} SELECT DISTINCT source_id FROM ${table('occurrences')} o WHERE content_id=${ref}.id AND NOT EXISTS(SELECT 1 FROM ${DIRTY} d WHERE d.source_id=o.source_id); INSERT INTO ${INVALIDATED} SELECT DISTINCT source_id FROM ${table('occurrences')} o WHERE content_id=${ref}.id AND NOT EXISTS(SELECT 1 FROM ${INVALIDATED} d WHERE d.source_id=o.source_id); INSERT INTO ${OBSOLETE} SELECT ${ref}.id WHERE NOT EXISTS(SELECT 1 FROM ${OBSOLETE} WHERE id=${ref}.id);`).join(' ')} END`,
     );
   }
 }
@@ -228,6 +242,7 @@ function bindingMatches(db: DatabaseSync, profile: string): boolean {
   return rows.length === 1 && rows[0]!.valid === 1;
 }
 function initialize(db: DatabaseSync, connection: Connection, profile: string): void {
+  connection.snapshots.clear();
   const cold = connection.schema === -1;
   let valid = true;
   for (const [name, definition] of Object.entries(schemas)) {
@@ -307,6 +322,22 @@ function retained(
   profile: string,
   validateSelection = false,
 ): Retained | null {
+  if (db.prepare(`DELETE FROM temp.${INVALIDATED} WHERE source_id=?`).run(id).changes)
+    connection.snapshots.delete(id);
+  const cached = connection.snapshots.get(id);
+  if (cached) {
+    if (cached.row.profile_id !== profile) return corrupt('head binding');
+    if (
+      validateSelection &&
+      cached.row.authority_key !== null &&
+      db.prepare('SELECT value FROM app_meta WHERE key=?').get(cached.row.authority_key!)?.value !==
+        cached.row.authority_head
+    )
+      return corrupt('selected intake head binding');
+    connection.counters.snapshotReuses++;
+    return cached;
+  }
+  connection.counters.snapshotLoads++;
   const row = readRows(
     connection,
     db
@@ -392,7 +423,9 @@ function retained(
   try {
     const result = reconstructTextPieces(snapshot);
     addMetrics(connection.counters.engine, result.metrics);
-    return { row, snapshot, text: result.text };
+    const selected = { row, snapshot, text: result.text };
+    connection.snapshots.set(id, selected);
+    return selected;
   } catch (error) {
     // Only validation with the engine's DEFAULT limits is cache repair evidence.
     // Caller-lowered budgets and automatic matching run outside this catch.
@@ -420,11 +453,17 @@ function authority(db: DatabaseSync, connection: Connection, id: string): Row | 
   const binding = intakeEnvelopeAuthorityBinding(db, selected);
   source.authority_key = binding.key;
   source.authority_head = binding.head;
-  if (source.kind === 'intake_original') source.details_json = readIntakeEnvelopeText(db, selected);
+  if (source.kind === 'intake_original') {
+    const materialized = readIntakeEnvelopeMaterialized(db, selected);
+    source.details_json = materialized.text;
+    source.selected_digest = materialized.fingerprint;
+  }
   const raw = source.details_json as string;
   if (Buffer.byteLength(raw) > TEXT_PIECE_LIMITS.maxTextBytes)
     fail('selected authority exceeds the text bound');
   connection.counters.authorityBytes += Buffer.byteLength(raw);
+  // Original authority already checked shape, supported workflow and exact compact agreement.
+  if (source.kind === 'intake_original') return source;
   let value: unknown;
   try {
     value = JSON.parse(raw);
@@ -433,8 +472,6 @@ function authority(db: DatabaseSync, connection: Connection, id: string): Row | 
   }
   const object = (v: unknown): v is Record<string, unknown> =>
     !!v && typeof v === 'object' && !Array.isArray(v);
-  if (source.kind === 'intake_original' && (!object(value) || !object(value.intake)))
-    fail('selected original intake authority is incomplete');
   if (object(value) && Object.hasOwn(value, 'intake')) {
     if (!object(value.intake)) fail('selected intake authority is incomplete');
     const workflow = (value.intake as Record<string, unknown>).workflow;
@@ -455,6 +492,7 @@ function removeSource(
   id: string,
   obsolete: Set<string>,
 ): void {
+  connection.snapshots.delete(id);
   db.prepare(`DELETE FROM temp.${AUTHORITIES} WHERE source_id=?`).run(id);
   for (const row of db
     .prepare(
@@ -482,6 +520,7 @@ function removeSource(
     connection.counters.projectionBytes += Number(aggregate.bytes);
     connection.counters.deletedBytes += Number(aggregate.bytes);
   }
+  db.prepare(`DELETE FROM temp.${INVALIDATED} WHERE source_id=?`).run(id);
 }
 function apply(
   db: DatabaseSync,
@@ -584,8 +623,11 @@ function reconcile(
     return;
   }
   const raw = source.details_json as string;
-  connection.counters.authorityHashBytes += Buffer.byteLength(raw);
-  const digest = createHash('sha256').update(raw).digest('hex');
+  let digest = source.selected_digest;
+  if (typeof digest !== 'string') {
+    connection.counters.authorityHashBytes += Buffer.byteLength(raw);
+    digest = createHash('sha256').update(raw).digest('hex');
+  }
   let before: Retained | null;
   try {
     before = retained(db, connection, id, profile);
@@ -659,6 +701,7 @@ function removeMalformedIdentity(
     connection.counters.rowsDeleted += Number(count.n);
     connection.counters.deletedBytes += Number(count.bytes);
   }
+  db.prepare(`DELETE FROM temp.${INVALIDATED} WHERE source_id IS ${selected}`).run(dirtyRow);
   db.prepare(`DELETE FROM temp.${DIRTY} WHERE rowid=?`).run(dirtyRow);
 }
 function current<T>(
@@ -682,6 +725,12 @@ function current<T>(
     db.exec('SAVEPOINT __source_text_reconcile');
     try {
       sourceTracking(db);
+      const dataVersion = Number(db.prepare('PRAGMA data_version').get()!.data_version);
+      if (connection.dataVersion !== dataVersion) {
+        connection.schema = -1;
+        connection.snapshots.clear();
+        connection.dataVersion = dataVersion;
+      }
       if (connection.schema !== schemaVersion(db)) initialize(db, connection, profile as string);
       if (!bindingMatches(db, profile as string)) initialize(db, connection, profile as string);
       const obsolete = new Set<string>();
@@ -754,6 +803,7 @@ function current<T>(
     }
   } catch (error) {
     connection.schema = -1;
+    connection.snapshots.clear();
     if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
     throw error;
   }
@@ -771,7 +821,7 @@ export function reconcileSourceTextProjection(
 export function reconcileActiveSourceTextProjection(db: DatabaseSync): void {
   if (connections.get(db)?.active && currentTransactionToken(db)) reconcileSourceTextProjection(db);
 }
-/** Bounded exact reconstruction. Warm calls read no source details/operational intake.
+/** Bounded exact reconstruction. Warm calls reuse verified unchanged snapshots.
  * Limits apply per pure-engine call, not cumulatively across a multi-source batch.
  * Default-budget validation always precedes optional lowered-budget reconstruction.
  */

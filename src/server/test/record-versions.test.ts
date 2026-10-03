@@ -19,6 +19,7 @@ import {
 } from '../record-versions.ts';
 import { attachPersonalDurability, exportCuration, personalDurabilityStatus } from '../portable.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
+import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 
 const profileId = 'cookie-dough';
 function fixture(t: TestContext, seed: (db: Database) => void = () => {}) {
@@ -102,6 +103,126 @@ function durability(db: Database) {
   assert.ok(status);
   return status;
 }
+
+test('record work accounts for actual encoded payloads and independent replay on a temporary connection', (t) => {
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  const work = createRecordVersionWorkCounters();
+  const firstWrite = f.writes.length;
+  withRecordVersionWork(work, () =>
+    transaction(f.db, () => {
+      f.db
+        .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+        .run('fictional-metric', 'Fictional Ω');
+    }),
+  );
+  const selected = commit(f);
+  assert.equal(
+    work.operation.encodedBytes,
+    f.writes.slice(firstWrite).reduce((sum, item) => sum + item.bytes, 0),
+  );
+  assert.equal(
+    work.operation.encodeCalls,
+    selected.records + 2,
+    'each complete version, commit and head is encoded once',
+  );
+  assert.equal(work.operation.indexedVersionAttempts, selected.records);
+  assert.equal(work.operation.versionValidations, selected.records);
+  assert.equal(work.operation.decodedVersions, selected.records);
+  assert.ok(work.operation.hashedBytes > 0);
+  assert.ok(work.operation.parsedBytes > 0);
+  assert.ok(work.operation.fieldVisits > 0);
+  assert.ok(work.operation.headReadBytes > 0);
+  assert.equal(work.reconstruction.replayDeleteAttempts, 0);
+
+  const inspected = createRecordVersionWorkCounters();
+  const entries = withRecordVersionWork(inspected, () =>
+    history(f.db, 'people', 'fictional-metric'),
+  );
+  assert.equal(entries.length, 1);
+  assert.ok(inspected.operation.indexedVersionValidations >= entries.length);
+  assert.ok(inspected.operation.validatedColumns > 0);
+  assert.equal(
+    inspected.operation.versionValidations,
+    0,
+    'indexed history has its own validation counter',
+  );
+  assert.equal(
+    inspected.operation.objectReadBytes,
+    0,
+    'indexed history does not reread retained objects',
+  );
+
+  // Rebuild owns and closes another connection; a final-connection-only counter
+  // would silently omit this verification and all replayed rows.
+  const rebuilt = createRecordVersionWorkCounters();
+  withRecordVersionWork(rebuilt, () =>
+    rebuildRecordDatabase(resolve(f.root, 'work-rebuilt.sqlite'), {
+      profileId,
+      storage: f.storage,
+    }),
+  );
+  assert.equal(rebuilt.operation.parseCalls, 0);
+  assert.ok(rebuilt.reconstruction.replayDeleteAttempts >= selected.records);
+  assert.ok(rebuilt.reconstruction.replayInsertAttempts >= selected.records);
+  assert.ok(rebuilt.reconstruction.decodedVersions > selected.records);
+  assert.ok(rebuilt.reconstruction.validatedColumns > 0);
+  assert.equal(
+    rebuilt.reconstruction.encodedBytes,
+    0,
+    'recovery reads retained authority without republishing it',
+  );
+  const db = f.open('work-rebuilt.sqlite');
+  assert.equal(
+    db.prepare('SELECT display_name FROM people WHERE id=?').get('fictional-metric')!.display_name,
+    'Fictional Ω',
+  );
+});
+
+test('failed publication retains observed work and async scopes do not charge another operation', async (t) => {
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  const earlierHead = Buffer.from(f.objects.get('head')!);
+  const work = createRecordVersionWorkCounters();
+  const other = createRecordVersionWorkCounters();
+  const original = f.storage.publishHead;
+  f.storage.publishHead = () => {
+    throw Error('fictional accounting publication failure');
+  };
+  try {
+    await withRecordVersionWork(work, async () => {
+      await Promise.resolve();
+      assert.throws(
+        () =>
+          transaction(f.db, () => {
+            f.db
+              .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+              .run('fictional-failed-metric', 'Fictional failure');
+          }),
+        /fictional accounting publication failure/,
+      );
+      const before = structuredClone(work);
+      await withRecordVersionWork(other, async () => {
+        await Promise.resolve();
+        assert.equal(recordDurabilityStatus(f.db)!.dirty, false);
+      });
+      assert.deepEqual(work, before, 'nested instrumentation scope owns its own work');
+    });
+  } finally {
+    f.storage.publishHead = original;
+  }
+  assert.ok(work.operation.encodedBytes > 0);
+  assert.ok(work.operation.hashedBytes > 0);
+  assert.ok(other.operation.parsedBytes > 0);
+  assert.deepEqual(f.objects.get('head'), earlierHead);
+  assert.equal(
+    f.db.prepare('SELECT count(*) n FROM people WHERE id=?').get('fictional-failed-metric')!.n,
+    0,
+  );
+  const observed = structuredClone(work);
+  recordDurabilityStatus(f.db);
+  assert.deepEqual(work, observed, 'work outside the async scope is not attributed');
+});
 
 test('ordinary app edit appends changed records and bounded metadata, no corpus snapshots', (t) => {
   const f = fixture(t, (db) => {

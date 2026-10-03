@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { HttpError, now, safeText } from './database.ts';
 import { accountedUnitKind } from './intake-unit-accounting.ts';
 import { canonicalLiteral } from './intake-format.ts';
+import { recordIntakeCandidateVersionHash } from './intake-file-work.ts';
 import { validatedIntakePeople } from './intake-people-format.ts';
 import { recordReportGroups, reportGroupsWithLegacyFallback } from './intake-report-groups.ts';
 import { intakeReportSourceForMember } from './intake-report-source.ts';
@@ -93,6 +94,7 @@ export function intakeCandidateVersionId(
     'candidate-version:' +
     workflowHash(
       revision ? [canonicalLiteral(entry.value), revision] : canonicalLiteral(entry.value),
+      recordIntakeCandidateVersionHash,
     )
   );
 }
@@ -127,10 +129,11 @@ const typedActionableIssueKind = actionableIssueKind as unknown as (
   field?: string | null,
 ) => IntakeReviewIssue['kind'];
 
-export const workflowHash = (value: unknown): string =>
-  createHash('sha256')
-    .update(typeof value === 'string' ? value : JSON.stringify(value))
-    .digest('hex');
+export const workflowHash = (value: unknown, observeInput?: (input: string) => void): string => {
+  const input = typeof value === 'string' ? value : JSON.stringify(value);
+  observeInput?.(input);
+  return createHash('sha256').update(input).digest('hex');
+};
 export function intakeWorkflow(details: IntakeWorkflowDetails): DurableWorkflow {
   const workflow = (details.workflow ||= {
     format: 'health-intake-workflow-v1',

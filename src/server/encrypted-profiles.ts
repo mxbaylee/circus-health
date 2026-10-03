@@ -1,3 +1,4 @@
+import { clearSourceContextClassificationCache } from './intake-source-context-classification.ts';
 import { archiveRefusal } from './archive-refusal.ts';
 import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
@@ -659,6 +660,7 @@ export function createEncryptedProfiles({
             if (db) {
               clearIntakeStateCache(db);
               clearIntakeLookupCache(db);
+              clearSourceContextClassificationCache(db);
               clearSourceTextProjectionCache(db);
               clearSourceDetailsSearchCache(db);
             }
@@ -701,6 +703,7 @@ export function createEncryptedProfiles({
         }
         clearIntakeStateCache(db);
         clearIntakeLookupCache(db);
+        clearSourceContextClassificationCache(db);
         clearSourceTextProjectionCache(db);
         clearSourceDetailsSearchCache(db);
         db.close();
@@ -781,6 +784,7 @@ export function createEncryptedProfiles({
       const db = state.db;
       cleanup(() => clearIntakeStateCache(db));
       cleanup(() => clearIntakeLookupCache(db));
+      cleanup(() => clearSourceContextClassificationCache(db));
       cleanup(() => clearSourceTextProjectionCache(db));
       cleanup(() => clearSourceDetailsSearchCache(db));
       cleanup(() => {
@@ -1006,6 +1010,7 @@ export function createEncryptedProfiles({
     } finally {
       clearIntakeStateCache(state.db);
       clearIntakeLookupCache(state.db);
+      clearSourceContextClassificationCache(state.db);
       clearSourceTextProjectionCache(state.db);
       clearSourceDetailsSearchCache(state.db);
       clearChatJournalCache(state.root, id);

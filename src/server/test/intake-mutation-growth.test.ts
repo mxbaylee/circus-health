@@ -16,6 +16,32 @@ import { readIntakeSourcePin } from '../intake-source-pin.ts';
 import { createMutationFixture } from './helpers/intake-mutation-fixture.ts';
 import { installIntakeSqlAudit, SQL_AUDIT_VERSION } from './helpers/intake-sql-audit.ts';
 import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
+import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
+
+function withQualificationWork<T>(
+  records: ReturnType<typeof createRecordVersionWorkCounters>,
+  files: ReturnType<typeof createIntakeFileWorkCounters>,
+  run: () => T,
+): T {
+  return withRecordVersionWork(records, () => withIntakeFileWork(files, run));
+}
+
+function recordWorkDelta(
+  after: ReturnType<typeof createRecordVersionWorkCounters>,
+  before: ReturnType<typeof createRecordVersionWorkCounters>,
+) {
+  return Object.fromEntries(
+    (['operation', 'reconstruction'] as const).map((phase) => [
+      phase,
+      Object.fromEntries(
+        Object.entries(after[phase]).map(([key, value]) => [
+          key,
+          value - before[phase][key as keyof (typeof before)[typeof phase]],
+        ]),
+      ),
+    ]),
+  );
+}
 
 // The dedicated qualification retains 301 clinical evidence carriers and measures
 // the expensive warm projection, complete DTO, history and cache-loss path. Its
@@ -34,9 +60,13 @@ for (const fullQualification of [false, true]) {
     },
     async (t) => {
       const fileWork = createIntakeFileWorkCounters();
+      const recordVersionWork = createRecordVersionWorkCounters();
       const artifactRoot = mkdtempSync(join(tmpdir(), 'fictional-intake-growth-artifacts-'));
-      return withIntakeFileWork(fileWork, async () => {
-        const f = await createMutationFixture(t, { fileWorkSnapshot: () => ({ ...fileWork }) });
+      return withQualificationWork(recordVersionWork, fileWork, async () => {
+        const f = await createMutationFixture(t, {
+          fileWorkSnapshot: () => ({ ...fileWork }),
+          recordVersionWorkSnapshot: () => structuredClone(recordVersionWork),
+        });
         let phase = 'initial preparation';
         let activeCycle = 0;
         let lastPassedCheckpoint: number | null = null;
@@ -95,6 +125,7 @@ for (const fullQualification of [false, true]) {
             },
             io: { ...f.io },
             fileWork: { ...fileWork },
+            recordVersionWork: structuredClone(recordVersionWork),
             physicalSourceEvidence: {
               inventory: f.physicalEvidenceInventory(),
               originalFiles: 1,
@@ -475,7 +506,7 @@ for (const fullQualification of [false, true]) {
               ),
             );
             const frozen = measurement.checkpoint === 0 ? persisted.initial : persisted;
-            for (const group of ['lookup', 'search', 'text'] as const)
+            for (const group of ['host', 'lookup', 'search', 'text', 'recordVersionWork'] as const)
               assert.deepEqual(
                 measurement[group],
                 frozen[group],
@@ -491,6 +522,7 @@ for (const fullQualification of [false, true]) {
           );
           const beforeOpenIO = { ...f.io };
           const beforeOpenFileWork = { ...fileWork };
+          const beforeOpenRecordWork = structuredClone(recordVersionWork);
           phase = 'reopen';
           f.reopen();
           phase = 'reopen parity';
@@ -498,6 +530,7 @@ for (const fullQualification of [false, true]) {
           const openWork = intakeWorkCounters(f.db);
           const afterOpenIO = { ...f.io };
           const afterOpenFileWork = { ...fileWork };
+          const afterOpenRecordWork = structuredClone(recordVersionWork);
           phase = 'complete cache-loss rebuild';
           f.rebuild();
           phase = 'cache-loss parity';
@@ -505,6 +538,7 @@ for (const fullQualification of [false, true]) {
           const reconstruction = intakeWorkCounters(f.db);
           const afterReconstructionIO = { ...f.io };
           const afterReconstructionFileWork = { ...fileWork };
+          const afterReconstructionRecordWork = structuredClone(recordVersionWork);
           const ioDelta = (after: typeof f.io, before: typeof f.io) =>
             Object.fromEntries(
               Object.keys(after).map((key) => [
@@ -546,6 +580,37 @@ for (const fullQualification of [false, true]) {
             smallAPI.after.text.projectionWrites > beforeSmall.text.projectionWrites,
             'the real review draft must write its source-text projection',
           );
+          assert.equal(
+            smallAPI.after.host.warm.normalizeCalls - beforeSmall.host.warm.normalizeCalls,
+            1,
+            'one normalization of the review draft intent, independent of retained history',
+          );
+          assert.equal(
+            smallAPI.after.host.warm.envelopeSerializationCalls -
+              beforeSmall.host.warm.envelopeSerializationCalls,
+            0,
+            'internal envelope reads reuse the selected serialized materialization',
+          );
+          assert.equal(
+            smallAPI.after.host.primitive.candidateCopies -
+              beforeSmall.host.primitive.candidateCopies,
+            0,
+            'review draft candidate replay does not copy the full old envelope',
+          );
+          assert.equal(
+            smallAPI.after.recordVersionWork.operation.encodedBytes -
+              beforeSmall.recordVersionWork.operation.encodedBytes,
+            smallAPI.after.io.immutableWriteBytes -
+              beforeSmall.io.immutableWriteBytes +
+              smallAPI.after.io.headWriteBytes -
+              beforeSmall.io.headWriteBytes,
+            'accepted-record encoding observes every segment, commit and head written by the draft',
+          );
+          assert.ok(
+            afterReconstructionRecordWork.reconstruction.decodedVersions >
+              afterOpenRecordWork.reconstruction.decodedVersions,
+            'cache-loss accounting includes accepted-record replay on the temporary rebuild connection',
+          );
           writeFileSync(join(artifactRoot, 'small-api.json'), JSON.stringify(smallAPI, null, 2));
           phase = 'small draft consumer parity';
           parity();
@@ -577,6 +642,16 @@ for (const fullQualification of [false, true]) {
             checkpoints: measurements.slice(1),
             openWork,
             reconstruction,
+            recordVersionAccounting: {
+              baseline: 'Not instrumented before CRS-228; these measurements are post-change only.',
+              scope:
+                'Async-scoped accepted-record work across all connections, including temporary rebuild connections.',
+            },
+            openRecordVersionWork: recordWorkDelta(afterOpenRecordWork, beforeOpenRecordWork),
+            cacheLossRecordVersionWork: recordWorkDelta(
+              afterReconstructionRecordWork,
+              afterOpenRecordWork,
+            ),
             openIO: ioDelta(afterOpenIO, beforeOpenIO),
             cacheLossIO: ioDelta(afterReconstructionIO, afterOpenIO),
             openFileWork: Object.fromEntries(
@@ -613,6 +688,9 @@ for (const fullQualification of [false, true]) {
               schedulerJournal: report.schedulerJournal,
               openWork,
               reconstruction,
+              recordVersionAccounting: report.recordVersionAccounting,
+              openRecordVersionWork: report.openRecordVersionWork,
+              cacheLossRecordVersionWork: report.cacheLossRecordVersionWork,
               openIO: report.openIO,
               cacheLossIO: report.cacheLossIO,
               openFileWork: report.openFileWork,
@@ -637,6 +715,7 @@ for (const fullQualification of [false, true]) {
                 : String(error),
             host,
             fileWork: { ...fileWork },
+            recordVersionWork: structuredClone(recordVersionWork),
             io: { ...f.io },
           };
           writeFileSync(join(artifactRoot, 'failure.json'), JSON.stringify(failure, null, 2));

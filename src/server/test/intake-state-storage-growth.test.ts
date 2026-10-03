@@ -109,9 +109,7 @@ test('large Unicode state and 300 tiny mutations retain bounded contributions an
   const samples: Array<ReturnType<typeof measure> & { edits: number }> = [];
   let latest = initial;
   let normalizedBytes = Buffer.byteLength(JSON.stringify(initial));
-  let copiedBytes = 0;
   for (let step = 1; step <= 300; step++) {
-    copiedBytes += Buffer.byteLength(JSON.stringify(latest));
     latest = { workflow: { ...initial.workflow, step } };
     normalizedBytes += Buffer.byteLength(JSON.stringify(latest));
     const beforeFrames = state.counters.framesWritten;
@@ -126,7 +124,7 @@ test('large Unicode state and 300 tiny mutations retain bounded contributions an
     );
     assert.equal(state.counters.ancestorReads, afterInitialCounters.ancestorReads);
     assert.equal(state.counters.normalizedStateBytes, normalizedBytes);
-    assert.equal(state.counters.candidateCopyBytes, copiedBytes);
+    assert.equal(state.counters.candidateCopyBytes, 0, 'warm replay uses private changed branches');
     assert.equal(state.counters.patchOperations, step + 1);
     if (step % 100 === 0) samples.push({ edits: step, ...measure() });
   }
@@ -329,12 +327,10 @@ test('small key moves stay bounded independently of unchanged payload and siblin
     let maxPayloadBytes = 0;
     let maxMutationFrameBytes = 0;
     let normalizedBytes = f.store.counters.normalizedStateBytes;
-    let copiedBytes = f.store.counters.candidateCopyBytes;
     for (let edits = 1; edits <= 300; edits++) {
       const before = mutationWork(f.store);
       const fixed = keys.slice(0, -1);
       const ordered = edits % 2 === 1 ? [keys.at(-1)!, ...fixed] : [...fixed, keys.at(-1)!];
-      copiedBytes += Buffer.byteLength(JSON.stringify(latest));
       latest = { literal, ...Object.fromEntries(ordered.map((key) => [key, 'equal'])) };
       normalizedBytes += Buffer.byteLength(JSON.stringify(latest));
       const result = f.store.mutate(latest, randomUUID());
@@ -343,11 +339,11 @@ test('small key moves stay bounded independently of unchanged payload and siblin
       assert.equal(after.reads, before.reads, 'warm moves must not reread ancestors');
       assert.equal(
         after.copies - before.copies,
-        1,
-        'one complete host candidate copy is disclosed',
+        0,
+        'warm replay no longer clones the complete candidate',
       );
       assert.equal(after.normalizedBytes, normalizedBytes);
-      assert.equal(after.copiedBytes, copiedBytes);
+      assert.equal(after.copiedBytes, 0);
       assert.ok(after.frames - before.frames <= 2);
       const changedBytes = after.frameBytes - before.frameBytes;
       maxMutationFrameBytes = Math.max(maxMutationFrameBytes, changedBytes);
@@ -419,7 +415,7 @@ test('small key moves stay bounded independently of unchanged payload and siblin
     JSON.stringify({
       scenarios: results,
       scope:
-        'Intake primitive only. Single object key moves, including both directions; full normalization and candidate copying remain host costs. No array/string move or production activation claim.',
+        'Intake primitive only. Single object key moves, including both directions; full input normalization and serialization remain host costs, while candidate replay copies changed containers. No array/string move or production activation claim.',
     }),
   );
 });
@@ -449,16 +445,8 @@ test('middle-key insertions have bounded contributions despite growing order man
     assert.ok(changedBytes < 4096, 'new middle key cannot rewrite the growing key manifest');
     assert.ok(after.frames - before.frames <= 2);
     assert.equal(after.reads, before.reads);
-    assert.equal(after.copies - before.copies, 1);
-    assert.equal(
-      after.copiedBytes - before.copiedBytes,
-      Buffer.byteLength(
-        JSON.stringify(
-          Object.fromEntries(Object.entries(latest).filter(([key]) => key !== inserted[0])),
-        ),
-      ),
-      'host copy size is the complete prior object',
-    );
+    assert.equal(after.copies - before.copies, 0);
+    assert.equal(after.copiedBytes - before.copiedBytes, 0, 'no complete prior-object clone');
     const contributions = f.db
       .prepare(
         "SELECT value FROM app_meta WHERE key GLOB 'intake_state_v1:*:frame:*' AND json_extract(value,'$.version')=?",
@@ -505,7 +493,7 @@ test('middle-key insertions have bounded contributions despite growing order man
       maxPayloadBytes,
       blockBytes,
       scope:
-        '300 individual object-key insertions only. Complete normalization/hash/candidate-copy work remains disclosed separately; source details and production persistence unchanged.',
+        '300 individual object-key insertions only. Complete normalization/hash and shallow changed-container copying remain disclosed separately; source details and production persistence unchanged.',
     }),
   );
 });

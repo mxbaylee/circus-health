@@ -57,6 +57,8 @@ export interface Basis {
   head: Head;
   value: IntakeJson;
   semanticBytes: number;
+  serialized: string;
+  fingerprint: string;
 }
 export function invalid(message: string): never {
   throw Error(`Invalid intake state: ${message}`);
@@ -281,6 +283,8 @@ export function reconstructIntakeEvidence(
   let value: IntakeJson | undefined;
   let version = 0;
   let semanticBytes = 0;
+  let serialized = '';
+  let fingerprint = '';
   let used: Usage = {
     bytes: physicalBytes,
     frames: frames.length,
@@ -320,6 +324,8 @@ export function reconstructIntakeEvidence(
     value = applyIntakeChanges(value, changes, remaining);
     used = addDecoded(used, caps, remaining);
     const serializedValue = serializeIntakeJson(value);
+    serialized = serializedValue;
+    fingerprint = first.fingerprint;
     semanticBytes = Buffer.byteLength(serializedValue);
     if (digest(serializedValue) !== first.fingerprint) invalid('result fingerprint');
     const receiptRaw = get(`${prefix}operation:${first.operationId}`);
@@ -342,7 +348,7 @@ export function reconstructIntakeEvidence(
   if (!value) invalid('missing value');
   if (version !== head.version || !same(used, head.usage)) invalid('usage agreement');
   usage(used, caps);
-  return { head, value, semanticBytes, consumed };
+  return { head, value, semanticBytes, serialized, fingerprint, consumed };
 }
 export function frameIntakeChanges(
   identity: IntakeStateIdentity,
@@ -367,6 +373,7 @@ export function frameIntakeChanges(
   const payload = copied(Buffer.from(recordIntakeSerialization(JSON.stringify(changes))));
   if (payload.length > caps.bytes) invalid('operation bytes');
   const chunks = Math.max(1, Math.ceil(payload.length / CHUNK_BYTES));
+  const payloadHash = digest(payload);
   const version = (previous?.version ?? 0) + 1;
   const result: IntakeStateResult = {
     format: 'health-intake-state-result-v1',
@@ -393,7 +400,7 @@ export function frameIntakeChanges(
       fingerprint,
       chunk,
       chunks,
-      payloadHash: digest(payload),
+      payloadHash,
       data: payload.subarray(chunk * CHUNK_BYTES, (chunk + 1) * CHUNK_BYTES).toString('base64'),
     };
     const serialized = recordIntakeSerialization(JSON.stringify(frame));

@@ -8,15 +8,18 @@ import {
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
   createIntakePrimitiveCounters,
-  recordIntakeSerialization,
+  recordIntakeWork,
   withIntakeWork,
 } from './intake-work-accounting.ts';
 import {
-  applyIntakeChanges,
+  applyIntakeChangesIsolated,
+  cloneValidatedIntakeJson,
+  freezeValidatedIntakeJson,
   intakeChanges,
   normalizeIntakeJson,
   serializeIntakeJson,
   type IntakeJson,
+  type IntakeChange,
 } from './intake-state-codec.ts';
 
 import {
@@ -40,11 +43,34 @@ import {
   type IntakeStateResult,
 } from './intake-state-evidence.ts';
 export type { IntakeStateIdentity, IntakeStateResult } from './intake-state-evidence.ts';
-const same = (a: unknown, b: unknown) =>
-  recordIntakeSerialization(JSON.stringify(a)) === recordIntakeSerialization(JSON.stringify(b));
+export interface IntakePreparedMaterialization {
+  /** Recursively immutable at runtime. Use read() when a mutable view is needed. */
+  readonly value: IntakeJson;
+  readonly serialized: string;
+  readonly fingerprint: string;
+  readonly semanticBytes: number;
+}
+export interface IntakeStateMaterialization extends IntakePreparedMaterialization {
+  readonly selectedHead: string;
+}
+declare const preparedBrand: unique symbol;
+export interface PreparedIntakeState {
+  readonly [preparedBrand]: true;
+}
+interface CachedBasis extends Basis {
+  materialization: IntakeStateMaterialization;
+}
+interface Preparation {
+  db: Database;
+  prefix: string;
+  caps: string;
+  cache: Cache;
+  materialization: IntakePreparedMaterialization;
+}
+const preparations = new WeakMap<PreparedIntakeState, Preparation>();
 interface Cache {
-  committed: Map<string, Basis>;
-  candidates: Map<string, Basis>;
+  committed: Map<string, CachedBasis>;
+  candidates: Map<string, CachedBasis>;
   token?: object;
   dispose: () => void;
 }
@@ -64,6 +90,10 @@ function cacheFor(db: Database): Cache {
     const owned = cache;
     owned.dispose = observeTransactionOutcome(db, (outcome) => {
       try {
+        if (!outcome.succeeded) {
+          clearIntakeStateCache(db);
+          return;
+        }
         if (outcome.token !== owned.token) return;
         if (outcome.succeeded) {
           for (const [key, candidate] of owned.candidates) owned.committed.set(key, candidate);
@@ -87,6 +117,7 @@ export function createIntakeStateStorage(
 ) {
   identity = validateIntakeIdentity(identity);
   const caps = limits(options.limits);
+  const capsBinding = JSON.stringify(caps);
   // The allocation namespace stays fixed so older payload formats are refused
   // at their existing head, never mistaken for an uninitialized new namespace.
   const prefix = intakeNamespace(identity);
@@ -124,9 +155,24 @@ export function createIntakeStateStorage(
     }
     db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(key, serialized);
   }
-  function load(): Basis | undefined {
+  function cachedBasis(basis: Basis, selectedHead: string): CachedBasis {
+    freezeValidatedIntakeJson(basis.value);
+    recordIntakeWork('materializationsCreated');
+    return {
+      ...basis,
+      materialization: Object.freeze({
+        value: basis.value,
+        serialized: basis.serialized,
+        fingerprint: basis.fingerprint,
+        semanticBytes: basis.semanticBytes,
+        selectedHead,
+      }),
+    };
+  }
+  function load(): CachedBasis | undefined {
     ready();
-    const head = parseIntakeHead(get(headKey), identity, caps);
+    const selectedHead = get(headKey);
+    const head = parseIntakeHead(selectedHead, identity, caps);
     const cache = cacheFor(db);
     const token = currentTransactionToken(db);
     const candidate = token === cache.token ? cache.candidates.get(prefix) : undefined;
@@ -136,7 +182,7 @@ export function createIntakeStateStorage(
         invalid('missing head with retained evidence');
       return undefined;
     }
-    if (remembered && same(remembered.head, head)) {
+    if (remembered && remembered.materialization.selectedHead === selectedHead) {
       count('warmLoads');
       return remembered;
     }
@@ -146,28 +192,49 @@ export function createIntakeStateStorage(
         count('ancestorReads');
       }),
     );
-    const result: Basis = {
-      head: reconstructed.head,
-      value: reconstructed.value,
-      semanticBytes: reconstructed.semanticBytes,
-    };
+    const result = cachedBasis(
+      {
+        head: reconstructed.head,
+        value: reconstructed.value,
+        semanticBytes: reconstructed.semanticBytes,
+        serialized: reconstructed.serialized,
+        fingerprint: reconstructed.fingerprint,
+      },
+      selectedHead as string,
+    );
     if (token) {
       cache.token = token;
       cache.candidates.set(prefix, result);
     } else cache.committed.set(prefix, result);
     return result;
   }
-  function normalized(next: unknown): { value: IntakeJson; fingerprint: string } {
-    const value = normalizeIntakeJson(next);
+  function normalized(next: unknown): IntakePreparedMaterialization {
+    const value = normalizeIntakeJson(next, undefined, true);
     const serialized = serializeIntakeJson(value);
-    count('normalizedStateBytes', Buffer.byteLength(serialized));
-    return { value, fingerprint: digest(serialized) };
+    const semanticBytes = Buffer.byteLength(serialized);
+    count('normalizedStateBytes', semanticBytes);
+    freezeValidatedIntakeJson(value);
+    return Object.freeze({ value, serialized, fingerprint: digest(serialized), semanticBytes });
+  }
+  function inspected(prepared: PreparedIntakeState): IntakePreparedMaterialization {
+    ready();
+    const entry = preparations.get(prepared);
+    if (
+      !entry ||
+      entry.db !== db ||
+      entry.prefix !== prefix ||
+      entry.caps !== capsBinding ||
+      entry.cache !== caches.get(db)
+    )
+      invalid('foreign or expired prepared state');
+    recordIntakeWork('preparedStateReuses');
+    return entry.materialization;
   }
   function stageNormalized(
-    value: IntakeJson,
-    fingerprint: string,
+    intended: IntakePreparedMaterialization,
     operationId: string,
   ): IntakeStateResult {
+    const { value, fingerprint } = intended;
     ready();
     uuid(operationId);
     const token = currentTransactionToken(db);
@@ -183,13 +250,10 @@ export function createIntakeStateStorage(
       return { ...receipt.result };
     }
     const before = load();
-    const changes = before ? intakeChanges(before.value, value) : [{ op: 'set', path: [], value }];
+    const changes: IntakeChange[] = before
+      ? intakeChanges(before.value, value)
+      : [{ op: 'set', path: [], value }];
     count('patchOperations', changes.length);
-    const candidate = before ? normalizeIntakeJson(before.value) : undefined;
-    if (before) {
-      count('candidateCopies');
-      count('candidateCopyBytes', before.semanticBytes);
-    }
     const oldUsage = before?.head.usage ?? {
       bytes: 0,
       frames: 0,
@@ -198,10 +262,13 @@ export function createIntakeStateStorage(
       stringWork: 0,
     };
     const remaining = budget(caps, oldUsage);
-    const applied = applyIntakeChanges(candidate, changes, remaining);
-    const serializedValue = serializeIntakeJson(applied);
+    const applied = applyIntakeChangesIsolated(before?.value, changes, remaining);
+    const serializedValue =
+      before?.value === applied ? before.serialized : serializeIntakeJson(applied);
     const semanticBytes = Buffer.byteLength(serializedValue);
-    if (digest(serializedValue) !== fingerprint) invalid('candidate mismatch');
+    recordIntakeWork('candidateVerificationCalls');
+    recordIntakeWork('candidateVerificationBytes', semanticBytes);
+    if (serializedValue !== intended.serialized) invalid('candidate mismatch');
     const evidence = frameIntakeChanges(
       identity,
       changes,
@@ -225,18 +292,73 @@ export function createIntakeStateStorage(
     ).run(headKey, serializedHead);
     const cache = cacheFor(db);
     cache.token = token;
-    cache.candidates.set(prefix, { head, value: applied, semanticBytes });
+    cache.candidates.set(
+      prefix,
+      cachedBasis(
+        {
+          head,
+          value: applied,
+          semanticBytes,
+          serialized: serializedValue,
+          fingerprint,
+        },
+        serializedHead,
+      ),
+    );
     return result;
   }
   return {
     counters,
+    prepare(next: unknown): PreparedIntakeState {
+      return withIntakeWork(db, 'warm', () => {
+        try {
+          ready();
+          const materialization = normalized(next);
+          const prepared = Object.freeze({}) as PreparedIntakeState;
+          preparations.set(prepared, {
+            db,
+            prefix,
+            caps: capsBinding,
+            cache: cacheFor(db),
+            materialization,
+          });
+          return prepared;
+        } catch (error) {
+          if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
+          clearIntakeStateCache(db);
+          throw error;
+        }
+      });
+    },
+    inspectPrepared(prepared: PreparedIntakeState): IntakePreparedMaterialization {
+      return withIntakeWork(db, 'warm', () => inspected(prepared));
+    },
+    readMaterialization(): IntakeStateMaterialization | undefined {
+      return withIntakeWork(db, 'warm', () => {
+        const basis = load();
+        if (!basis) return undefined;
+        recordIntakeWork('materializationReads');
+        return basis.materialization;
+      });
+    },
+    stagePrepared(prepared: PreparedIntakeState, operationId: string): IntakeStateResult {
+      return withIntakeWork(db, 'warm', () => {
+        try {
+          return stageNormalized(inspected(prepared), operationId);
+        } catch (error) {
+          if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
+          clearIntakeStateCache(db);
+          throw error;
+        }
+      });
+    },
     read(): IntakeJson | undefined {
       return withIntakeWork(db, 'warm', () => {
         const basis = load();
         if (!basis) return undefined;
         count('readCopies');
         count('readCopyBytes', basis.semanticBytes);
-        return normalizeIntakeJson(basis.value);
+        return cloneValidatedIntakeJson(basis.value);
       });
     },
     readSerialized(): string | undefined {
@@ -244,14 +366,13 @@ export function createIntakeStateStorage(
         const basis = load();
         if (!basis) return undefined;
         count('serializedReadBytes', basis.semanticBytes);
-        return serializeIntakeJson(basis.value);
+        return basis.serialized;
       });
     },
     stage(next: unknown, operationId: string): IntakeStateResult {
       return withIntakeWork(db, 'warm', () => {
         try {
-          const { value, fingerprint } = normalized(next);
-          return stageNormalized(value, fingerprint, operationId);
+          return stageNormalized(normalized(next), operationId);
         } catch (error) {
           if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
           clearIntakeStateCache(db);
@@ -263,13 +384,14 @@ export function createIntakeStateStorage(
       return withIntakeWork(db, 'warm', () => {
         if (currentTransactionToken(db) || db.isTransaction)
           invalid('mutate owns outer transaction');
-        const { value, fingerprint } = normalized(next);
+        const intended = normalized(next);
+        const { fingerprint } = intended;
         uuid(operationId);
         try {
           // The transaction layer can return a retained result without invoking
           // its callback. Validate selected authority before that replay shortcut.
           load();
-          return transaction(db, () => stageNormalized(value, fingerprint, operationId), {
+          return transaction(db, () => stageNormalized(intended, operationId), {
             operationId,
             fingerprint: `${prefix}${fingerprint}`,
             actor: 'intake-state',

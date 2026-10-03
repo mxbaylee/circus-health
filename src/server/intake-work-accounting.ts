@@ -24,7 +24,20 @@ const hostTemplate = {
   normalizeCalls: 0,
   normalizeValidationNodes: 0,
   normalizeCloneNodes: 0,
+  normalizeReusedNodes: 0,
+  normalizeValidationReusedNodes: 0,
   normalizeValidatedStringUnits: 0,
+  trustedCloneCalls: 0,
+  trustedCloneNodes: 0,
+  immutableNodesFrozen: 0,
+  immutableNodesReused: 0,
+  candidatePathCopies: 0,
+  candidateCopiedMembers: 0,
+  candidateVerificationCalls: 0,
+  candidateVerificationBytes: 0,
+  materializationReads: 0,
+  materializationsCreated: 0,
+  preparedStateReuses: 0,
   serializationCalls: 0,
   serializedBytes: 0,
   diffCalls: 0,
@@ -77,7 +90,8 @@ function countersFor(db: DatabaseSync): IntakeWorkCounters {
 /** Snapshots cannot alter the measured counters. Initial/conversion/open intervals
  * should be sampled separately. Counts overlap by activity, are logical work, and
  * are not physical allocation or total CPU instructions. JSON runtime internals,
- * SQLite VM/index work and accepted-record internal codecs/hashes are unmeasured. */
+ * SQLite VM/index work is unmeasured here. Accepted-record codecs/hashes and
+ * temporary rebuild work have their separate record-version-work observer. */
 export function intakeWorkCounters(db: DatabaseSync): IntakeWorkCounters {
   const counters = countersFor(db);
   return {

@@ -1,0 +1,45 @@
+# Reusing verified intake work
+
+The [High-precision tracker's history-building job](../design/personas.md#build-a-history) includes reviewing one more record without repeatedly rebuilding everything already filed. The intake storage and derived readers reuse verified state while preserving exact values, ordering, review decisions and recovery evidence. This reduces repeated host work; it does not make every operation proportional only to changed bytes.
+
+## Selected materializations and isolated changes
+
+The [intake primitive](intake-state-storage.md) retains a privately owned immutable value, its exact serialized text, byte count and fingerprint with each verified selected basis. Ordinary `read()` and the public envelope reader still return detached mutable values. An internal reader can use the immutable materialization without copying it. A caller cannot promote an arbitrary frozen object or a fabricated preparation token into trusted state.
+
+Reuse requires a current accepted-record projection and matching database owner, original source identity/hash and selected intake head. The envelope adapter additionally binds the exact compact `details_json` text. A matching head cannot hide conflicting compact metadata. Tentative values belong to the active application transaction; failed staging, rollback, uncertain publication and closure invalidate disposable state. Neither a cached value nor its serialized text becomes recovery authority.
+
+Preparation normalizes the intended value once, reusing privately owned unchanged subtrees while charging their same logical node and depth budgets. Checked replay isolates changed ancestors and mutation targets while reusing immutable untouched children. It independently produces and compares exact candidate text with the intended text. The existing `health-intake-state-v3` fingerprint still hashes complete ordered JSON; this change does not replace that fingerprint or alter frame, receipt or cumulative decoder budgets. Array shifts and object-key reordering retain their existing logical work charges even when the warm implementation avoids cloning untouched descendants.
+
+The access adapter obtains the selected envelope and stored intake from one materialization. Replacing the intake value preserves its existing outer member position. Stored state and effective source-pin overlays remain distinct, including their version arithmetic and interpretation requirements. Raw mode still retains exact input spelling and duplicate members until an authorized write normalizes it; the raw envelope text and the primitive's serialized `{raw: ...}` wrapper are different representations.
+
+## Derived lookup and text reuse
+
+The lookup projection stores what its consumers need: a maximum discovery value per source, the first acceptance payload for each operation within each source, and a linked sequence of identity occurrences. Equal identity payloads retain separate occurrences and observable order. Front insertion or movement changes affected references instead of renumbering every later item. Across sources, first-acceptance and identity ordering continue to follow source insertion order. Raw SQL extraction and scalar conversion semantics remain unchanged.
+
+This is disposable lookup format 2. An earlier or damaged cache is rebuilt from supported selected authority; originals and accepted records are unchanged. Missing, cyclic or extra identity references cannot silently supply a shortened result. Dirty-source tracking reconciles changed authority while reusing verified unchanged payloads. Transaction failure, reconstruction, schema initialization, unmanaged transactions and profile closure discard disposable payload memos so failed work cannot certify a later retry.
+
+The [source-text projection](source-text-projection.md) consumes already validated envelope text. In normalized mode it reuses the primitive fingerprint for those exact bytes; raw mode hashes the raw envelope rather than reusing the wrapper's fingerprint. Verified text-piece snapshots can serve subsequent unchanged reads without reloading and reconstructing the same rows.
+
+Snapshot reuse follows authority bindings and derived-row invalidation. Content, occurrence, link and head changes invalidate affected snapshots, including changes from another connection detected through SQLite's data version. Schema changes and failed transactions clear readiness. Lowered caller limits still require their prescribed validation; a cached default-limit success cannot authorize a stricter operation. The pure text engine retains its conservative validation, reconstruction and matching checks for actual reconciliation. Those passes remain measured work, not a claim that every retained pass is intrinsically unavoidable.
+
+## Proposal classification beyond a small cache
+
+Source-context classification keeps positive and negative results within the open database, profile, root and original collection. Results cover currently referenced proposal sources and are pruned when no longer referenced. Separate collections do not compete for a process-wide 128-entry FIFO. No fixed cache allowance is raised, and no source literals are retained in the classification cache.
+
+A reusable result binds the source ID, kind, path, original hash, byte count, resolved file identity and effective proposal source-text dependency/revision. Every hit checks physical metadata. Changed or replaced files and changed revision bindings require verification again; missing or corrupt evidence does not inherit an earlier classification. An explicitly unsuccessful transaction, failed activation, lock or close clears the relevant state. The DTO's best-effort classification fallback remains separate from review and acceptance verification, which still refuses changed evidence.
+
+The dedicated fictional regression uses 160 mixed positive/negative proposals: the initial scan reads and hashes all 160 files, an unchanged repeated scan reads and hashes none, and adding one source reads and hashes one. Complete-view iteration and physical metadata checks remain. Candidate-version hash inputs have separate counters taken at the actual hashing boundary; these newly instrumented counts are not retroactively present in earlier receipts.
+
+## Accounting and qualification limits
+
+The [application qualification](intake-mutation-qualification.md) preserves its independently expected clinical literals, pending decisions, accepted history, source pins, exact search text, private-copy and recovery checks. Initial preparation, first raw normalization, warm mutations, complete consumer responses and cold reconstruction are separate phases. Generic mutable input still needs validation and ownership; public detached views still cost copying. Changed-array lookup scans and text matching remain visible even where writes are bounded.
+
+Intake counters distinguish validation, trusted copying, immutable reuse, candidate ancestor copies, serialization, hashing, diffing and returned-view work. Logical decoder charges remain separate from physical copies avoided by reuse. Lookup counters include visited contributions, payload serialization/hashing, previous rows and changed ordering references. Text counters distinguish snapshot loads/reuses and retain completed engine work. Their overlapping units must not be added as total CPU instructions or physical disk traffic.
+
+The optional `withRecordVersionWork` observation scope also counts work inside the accepted-record journal across every connection used by an operation. It includes actual JSON serialization/parsing, encoding, hashing, object and head reads, attempted indexing, structural version/column validation, field visits and replay attempts. Rebuild and catch-up have a separate reconstruction phase, including the temporary connection that a rebuild opens and closes before the final connection is inspected. Failed work remains counted. These counters retain numbers only, without record values, identities or paths.
+
+Encoding includes serialization, and verification may reread the same object more than once. Relationship checks, SQL VM/index work, encryption, other consumers' codecs and total allocator work are outside these counters. The record observer adds evidence about previously uninstrumented work; an earlier receipt without these fields is not a zero-cost baseline.
+
+The current focused before-baseline was captured from commit `3458b404a1d42b7cf01512f76ecf77c2b041675a`: seven real proposal/draft cycles including the initial cycle, plus 20/80/160-group locality cases. Its opt-in 300-cycle case was skipped. Earlier completed 300-cycle results in the application qualification are separately dated historical evidence and must not be relabeled as a new before-run.
+
+Neither a small fixture nor storage-local work counts qualify a whole clinical import, provider performance, foreground responsiveness or an installation capacity. The [large-import qualification](../todo/CRS-194.md), its held runner/storage prerequisites and the physical release gates retain their separate requirements.

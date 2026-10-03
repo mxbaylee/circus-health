@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { currentTransactionToken, json, rejectCurrentTransaction } from './database.ts';
-import { normalizeIntakeJson, type IntakeJson } from './intake-state-codec.ts';
+import {
+  cloneValidatedIntakeJson,
+  normalizeIntakeJson,
+  type IntakeJson,
+} from './intake-state-codec.ts';
 import { createIntakeStateStorage } from './intake-state-storage.ts';
 import {
   intakeNamespace,
@@ -12,6 +16,7 @@ import {
 } from './intake-state-evidence.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
+  recordIntakePrimitiveWork,
   recordIntakeSerialization,
   recordIntakeWork,
   withIntakeWork,
@@ -159,6 +164,13 @@ export function validateIntakeEnvelopeRepresentation(
   detailsJson: string,
   state: unknown,
 ): { value: Record<string, unknown>; text: string } {
+  return validateRepresentation(detailsJson, state);
+}
+function validateRepresentation(
+  detailsJson: string,
+  state: unknown,
+  serialized?: string,
+): { value: Record<string, unknown>; text: string } {
   const mode = intakeEnvelopeMode(detailsJson);
   let value: unknown, text: string;
   if (mode === 'raw') {
@@ -168,11 +180,13 @@ export function validateIntakeEnvelopeRepresentation(
     value = parse(text);
   } else {
     value = state;
-    text = JSON.stringify(state);
+    text = serialized ?? JSON.stringify(state);
     if (typeof text !== 'string') return fail('missing selected envelope');
-    recordIntakeSerialization(text);
-    recordIntakeWork('envelopeSerializationCalls');
-    recordIntakeWork('envelopeSerializedBytes', Buffer.byteLength(text));
+    if (serialized === undefined) {
+      recordIntakeSerialization(text);
+      recordIntakeWork('envelopeSerializationCalls');
+      recordIntakeWork('envelopeSerializedBytes', Buffer.byteLength(text));
+    }
   }
   envelope(value);
   if (compact(value, mode, text) !== detailsJson)
@@ -224,6 +238,63 @@ export function intakeEnvelopeAuthorityBinding(
   return { key, head: head as string };
 }
 
+type StateMaterialization = NonNullable<
+  ReturnType<ReturnType<typeof createIntakeStateStorage>['readMaterialization']>
+>;
+export interface IntakeEnvelopeMaterialization {
+  readonly mode: Mode;
+  /** Internal immutable view. Public readers receive a detached mutable copy. */
+  readonly value: Record<string, unknown>;
+  readonly text: string;
+  /** Exact text digest only when primitive serialization is the envelope text. */
+  readonly fingerprint: string | null;
+}
+const materializedEnvelopes = new WeakMap<
+  StateMaterialization,
+  { detailsJson: string; envelope: IntakeEnvelopeMaterialization }
+>();
+function freezeEnvelope(value: unknown): void {
+  const pending = [value];
+  while (pending.length) {
+    const child = pending.pop();
+    if (!child || typeof child !== 'object') continue;
+    for (const nested of Object.values(child)) pending.push(nested);
+    Object.freeze(child);
+    recordIntakeWork('immutableNodesFrozen');
+  }
+}
+function selectedEnvelope(
+  db: DatabaseSync,
+  source: IntakeEnvelopeSource,
+): { state: StateMaterialization; envelope: IntakeEnvelopeMaterialization } {
+  const state = createIntakeStateStorage(db, identity(db, source)).readMaterialization();
+  if (!state) return fail('missing selected envelope');
+  const prior = materializedEnvelopes.get(state);
+  if (prior && prior.detailsJson === source.details_json)
+    return { state, envelope: prior.envelope };
+  const selected = validateRepresentation(source.details_json!, state.value, state.serialized);
+  const mode = intakeEnvelopeMode(source.details_json);
+  if (mode === 'raw') freezeEnvelope(selected.value);
+  const result = Object.freeze({
+    mode,
+    value: selected.value,
+    text: selected.text,
+    fingerprint: mode === 'normalized' ? state.fingerprint : null,
+  });
+  materializedEnvelopes.set(state, { detailsJson: source.details_json!, envelope: result });
+  return { state, envelope: result };
+}
+/** Internal selected original view; reuse never substitutes for current authority checks. */
+export function readIntakeEnvelopeMaterialized(
+  db: DatabaseSync,
+  input: IntakeEnvelopeSource,
+): IntakeEnvelopeMaterialization {
+  return withIntakeWork(db, 'warm', () => {
+    const source = selectedSource(db, input);
+    if (source.kind !== 'intake_original') return fail('materialization requires an original');
+    return selectedEnvelope(db, source).envelope;
+  });
+}
 export function readIntakeEnvelope(
   db: DatabaseSync,
   input: IntakeEnvelopeSource,
@@ -232,15 +303,15 @@ export function readIntakeEnvelope(
   return withIntakeWork(db, 'warm', () => {
     const source = selectedSource(db, input);
     if (source.kind !== 'intake_original') return readNonIntakeEnvelope(source.details_json);
-    intakeEnvelopeAuthorityBinding(db, source);
-    const state = createIntakeStateStorage(db, identity(db, source)).read();
-    const selected = validateIntakeEnvelopeRepresentation(source.details_json!, state);
+    const { state, envelope: selected } = selectedEnvelope(db, source);
     recordIntakeWork('envelopeHydrations');
+    recordIntakePrimitiveWork(db, 'readCopies');
+    recordIntakePrimitiveWork(db, 'readCopyBytes', Buffer.byteLength(selected.text));
     if (sourceDTO) {
       recordIntakeWork('sourceDTOHydrations');
       recordIntakeWork('sourceDTOEnvelopeBytes', Buffer.byteLength(selected.text));
     }
-    return selected.value;
+    return selected.mode === 'raw' ? parse(selected.text) : cloneValidatedIntakeJson(state.value);
   });
 }
 export function readIntakeEnvelopeText(db: DatabaseSync, input: IntakeEnvelopeSource): string {
@@ -251,12 +322,9 @@ export function readIntakeEnvelopeText(db: DatabaseSync, input: IntakeEnvelopeSo
       if (typeof source.details_json !== 'string') return fail('missing source details');
       return source.details_json;
     }
-    intakeEnvelopeAuthorityBinding(db, source);
-    const serialized = createIntakeStateStorage(db, identity(db, source)).readSerialized();
-    if (serialized === undefined) return fail('missing selected envelope');
-    const text = validateIntakeEnvelopeRepresentation(source.details_json!, parse(serialized)).text;
+    const selected = selectedEnvelope(db, source).envelope;
     recordIntakeWork('envelopeTextReads');
-    return text;
+    return selected.text;
   });
 }
 
@@ -315,22 +383,21 @@ export function stageIntakeEnvelope(
     try {
       const source = selectedSource(db, input);
       if (source.kind !== 'intake_original') fail('operational write requires an original');
-      readIntakeEnvelope(db, source);
-      if (intakeEnvelopeMode(source.details_json) === 'raw') {
+      const selected = selectedEnvelope(db, source).envelope;
+      if (selected.mode === 'raw') {
         recordIntakeWork('rawNormalizations');
         // The selected raw text was already validated above; conversion volume is
         // accounted by the existing primitive normalization/serialization hooks.
       }
-      const state = normalizeIntakeJson(next);
-      envelope(state);
-      const detailsJson = compact(state, 'normalized');
-      createIntakeStateStorage(db, identity(db, source)).stage(state, randomUUID());
+      const storage = createIntakeStateStorage(db, identity(db, source));
+      const prepared = storage.prepare(next);
+      const state = storage.inspectPrepared(prepared);
+      envelope(state.value);
+      const detailsJson = compact(state.value, 'normalized');
+      storage.stagePrepared(prepared, randomUUID());
       if (detailsJson !== source.details_json)
         db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(detailsJson, source.id);
-      const serialized = recordIntakeSerialization(JSON.stringify(state));
-      recordIntakeWork('envelopeSerializationCalls');
-      recordIntakeWork('envelopeSerializedBytes', Buffer.byteLength(serialized));
-      return serialized;
+      return state.serialized;
     } catch (error) {
       rejectCurrentTransaction(db, error);
       throw error;
