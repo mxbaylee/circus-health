@@ -356,7 +356,8 @@ export default function App({ controller }: { controller: CheckerController }) {
                         <p>
                           Once B is created and A is confirmed, select A again to check that it
                           still decrypts its retained fictional value. A's earlier three uses do not
-                          pass this check.
+                          pass this check. Before opening the prompt, review the provider labels
+                          above for A; they may still describe B's provider.
                         </p>
                       )}
                       <p>
@@ -391,7 +392,12 @@ export default function App({ controller }: { controller: CheckerController }) {
                           <ul>
                             {history.map((attempt) => (
                               <li key={attempt.id}>
-                                {attempt.startedAt}: {attempt.status}
+                                {attempt.startedAt}:{' '}
+                                {attempt.step === 'use-after-b' &&
+                                attempt.status === 'verified' &&
+                                !isVerifiedReturnToA(state, attempt)
+                                  ? 'Unfinished evidence — saved evidence does not establish a return to A after B creation.'
+                                  : attempt.status}
                                 {attempt.error ? ` — ${ERROR_MESSAGES[attempt.error]}` : ''}
                               </li>
                             ))}

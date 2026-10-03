@@ -163,13 +163,16 @@ describe('standalone checker guidance (controlled tests)', () => {
     ).toBeVisible();
     expect(within(card).getByText(/A retained after B creation: Not yet verified/)).toBeVisible();
     expect(within(card).getByText(/even if B confirmation failed or is unfinished/)).toBeVisible();
+    expect(
+      within(card).getByText(/Before opening the prompt, review the provider labels/),
+    ).toHaveTextContent("above for A; they may still describe B's provider.");
     await userEvent.click(
       within(card).getByRole('button', { name: 'Start use a after b is created for A' }),
     );
     expect(f.controller.runStep).toHaveBeenCalledWith('A', 'use-after-b');
   });
 
-  it('shows verified, failed and inconsistent retained-A evidence separately from initial uses', () => {
+  it('shows verified, failed and inconsistent retained-A evidence separately from initial uses', async () => {
     const returned = {
       ...attempt('use-after-b', 'verified', 'a-return'),
       startedAt: '2026-10-03T00:00:02.000Z',
@@ -188,7 +191,10 @@ describe('standalone checker guidance (controlled tests)', () => {
     expect(screen.getByText(/A retained after B creation: Failed/)).toBeVisible();
     act(() =>
       f.publish({
-        state: { ...f.controller.getSnapshot().state, attempts: [returned] },
+        state: {
+          ...f.controller.getSnapshot().state,
+          attempts: [{ ...bCreation(), finishedAt: '2026-10-03T00:00:03.000Z' }, returned],
+        },
       }),
     );
     expect(
@@ -197,6 +203,14 @@ describe('standalone checker guidance (controlled tests)', () => {
     expect(
       screen.queryByText(/Automatic evidence: Fresh PRF decrypted and matched/),
     ).not.toBeInTheDocument();
+    const card = screen.getByRole('article', { name: 'Passkey A' });
+    await userEvent.click(within(card).getByText('Attempt history (1)'));
+    const history = within(within(card).getByText('Attempt history (1)').parentElement!);
+    expect(
+      history.getByText(/Unfinished evidence — saved evidence does not establish/),
+    ).toBeVisible();
+    expect(history.queryByText(/: verified$/)).not.toBeInTheDocument();
+    expect(f.controller.getSnapshot().state.attempts[1]).toEqual(returned);
   });
 
   it.each(['invalid-state', 'unknown-error'] as const)(
