@@ -18,6 +18,7 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import {
   createIntakeBatchJournalWorkCounters,
   readIntakeBatch,
+  trackIntakeBatch,
   withIntakeBatchJournalWork,
   writeIntakeBatch,
 } from '../intake-batch-journal.ts';
@@ -118,12 +119,12 @@ test('nested accounting restores database and phase attribution after exceptions
   }
 });
 
-test('journal counts actual reread, replay, diff and writes across awaited API work', async (t) => {
+test('journal attributes asynchronous warm writes, detached snapshots and cold recovery separately', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'batch-work-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const profileId = 'fictional-journal';
   const paths = ensureProfileDirectories(root, profileId);
-  const batch: IntakeBatch = {
+  const initial: IntakeBatch = {
     id: randomUUID(),
     profileId,
     operationId: randomUUID(),
@@ -134,34 +135,62 @@ test('journal counts actual reread, replay, diff and writes across awaited API w
     updatedAt: '2026-01-01T00:00:00Z',
     items: [],
   };
+  const batch = trackIntakeBatch(initial);
+  const creation = createIntakeBatchJournalWorkCounters();
+  withIntakeBatchJournalWork(creation, () => writeIntakeBatch(root, profileId, batch, 'initial'));
   const counters = createIntakeBatchJournalWorkCounters();
+  let detached: typeof counters | undefined;
   await withIntakeBatchJournalWork(counters, async () => {
-    writeIntakeBatch(root, profileId, batch, 'initial');
-    await Promise.resolve();
     batch.currentIndex = 1;
     writeIntakeBatch(root, profileId, batch, 'first');
+    detached = { ...counters };
+    await Promise.resolve();
     batch.currentIndex = 2;
     writeIntakeBatch(root, profileId, batch, 'second');
   });
+  assert.equal(detached!.eventWrites, 1, 'numeric snapshot cannot change after subsequent writes');
+  detached!.eventWrites = -100;
+  assert.equal(counters.eventWrites, 2, 'mutating a snapshot cannot alter accumulated work');
   const directory = join(paths.intakeBatches, batch.id, 'events');
   const events = readdirSync(directory)
+    .filter((name) => name.endsWith('.json'))
     .sort()
     .map((name) => readFileSync(join(directory, name)));
-  assert.equal(counters.eventWrites, 3);
-  assert.equal(counters.publishedEvents, 3);
+  assert.equal(events.length, 3);
+  assert.equal(counters.publishedEvents, 2);
+  assert.equal(creation.eventWriteBytes, events[0]!.length);
+  assert.equal(counters.eventWriteBytes, events[1]!.length + events[2]!.length);
+  assert.equal(counters.eventSerializedBytes, counters.eventWriteBytes);
+  assert.equal(counters.headWrites, 2);
+  assert.ok(counters.headWriteBytes > 0);
+  assert.equal(counters.eventReads, 0);
+  assert.equal(counters.eventReadBytes, 0);
+  assert.equal(counters.replayedEvents, 0);
+  assert.equal(counters.replayedChanges, 0);
+  assert.equal(counters.directoryEntries, 0);
+  assert.equal(counters.diffCalls, 0);
+  assert.equal(counters.diffSerializedBytes, 0);
+  assert.equal(counters.emittedChanges, 2);
+  assert.ok(counters.hashedBytes >= counters.eventWriteBytes);
+  const before = { ...counters };
+  const cold = createIntakeBatchJournalWorkCounters();
+  assert.deepEqual(
+    withIntakeBatchJournalWork(cold, () => readIntakeBatch(root, profileId, batch.id)),
+    { ...initial, currentIndex: 2 },
+  );
+  assert.deepEqual(
+    counters,
+    before,
+    'a later cold read cannot retroactively change a warm interval',
+  );
+  assert.equal(cold.eventReads, 3);
+  assert.equal(cold.replayedEvents, 3);
   assert.equal(
-    counters.eventWriteBytes,
+    cold.eventReadBytes,
     events.reduce((sum, bytes) => sum + bytes.length, 0),
   );
-  assert.equal(counters.eventReads, 3);
-  assert.equal(counters.eventReadBytes, 2 * events[0]!.length + events[1]!.length);
-  assert.equal(counters.replayedEvents, 3);
-  assert.equal(counters.replayedChanges, 1);
-  assert.equal(counters.emittedChanges, 2);
-  assert.ok(counters.diffSerializedBytes > counters.eventWriteBytes);
-  const before = { ...counters };
-  assert.deepEqual(readIntakeBatch(root, profileId, batch.id), batch);
-  assert.deepEqual(counters, before);
+  assert.equal(cold.eventWrites, 0);
+  assert.ok(cold.hashedBytes >= cold.eventReadBytes);
   assert.ok(Object.values(counters).every((value) => typeof value === 'number'));
 });
 

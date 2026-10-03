@@ -227,3 +227,52 @@ test('encrypted HTTP batch route survives profile lock and complete SQLite cache
   assert.equal(restored.data.items[0].sourceHash, intake.sha256);
   assert.equal(restored.data.items[0].filename, filename);
 });
+
+test('failed encrypted Stop publication requires a successful flush before idempotent success and survives cache loss', async (t) => {
+  const f = vaultFixture(t);
+  const created = await newProfile(f.manager, 'Fictional encrypted Stop retry person');
+  const profileId = created.profile.id;
+  const state = f.manager.opened.get(profileId)!;
+  const firstRuntime = runtime(f.manager, state);
+  const intake = uploadIntake(state.db, state.root, profileId, {
+    filename: 'fictional-stop-flush.txt',
+    bytes: Buffer.from('Fictional stop flush evidence'),
+  });
+  const request = { operationId: 'fictional-encrypted-stop-retry', intakeIds: [intake.id] };
+  const batch = firstRuntime.batches.create(profileId, request);
+  const originalFlush = f.manager.flush;
+  let rejectFlush = true;
+  let attemptedFlushes = 0;
+  f.manager.flush = (id, options) => {
+    attemptedFlushes++;
+    if (rejectFlush) throw Error('Fictional vault flush interrupted');
+    originalFlush(id, options);
+  };
+  t.after(() => {
+    f.manager.flush = originalFlush;
+    firstRuntime.batches.close();
+    firstRuntime.assistant.close();
+  });
+  assert.throws(() => firstRuntime.batches.stop(profileId, batch.id), /vault flush interrupted/);
+  assert.throws(() => firstRuntime.batches.stop(profileId, batch.id), /vault flush interrupted/);
+  assert.throws(() => firstRuntime.batches.create(profileId, request), /vault flush interrupted/);
+  assert.equal(attemptedFlushes, 3);
+  rejectFlush = false;
+  const stopped = firstRuntime.batches.stop(profileId, batch.id);
+  assert.equal(attemptedFlushes, 4);
+  assert.equal(stopped.status, 'stopped');
+  assert.equal(stopped.items[0]!.queuedAt, null);
+  firstRuntime.batches.close();
+  firstRuntime.assistant.close();
+  f.manager.lock(profileId);
+  const cache = resolve(f.manager.pathFor(profileId), 'cache');
+  rmSync(cache, { recursive: true, force: true });
+  mkdirSync(cache, { recursive: true, mode: 0o700 });
+  f.manager.unlock(profileId, created.recoveryKit);
+  const secondRuntime = runtime(f.manager, f.manager.opened.get(profileId)!);
+  t.after(() => {
+    secondRuntime.batches.close();
+    secondRuntime.assistant.close();
+  });
+  assert.deepEqual(secondRuntime.batches.get(profileId, batch.id), stopped);
+});

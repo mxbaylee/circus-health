@@ -253,7 +253,7 @@ The twelve consumer files pass 248 tests. The filtered assistant cases pass 38 t
 
 ## Separate processing queue journal
 
-The [queue-journal fixture](../../src/server/test/intake-batch-journal-growth.test.ts) exercises actual manager create/stop/resume operations synchronously without starting inference. It preserves every event and original byte, compares independent durable and public-response state, and reopens the manager.
+The earlier [queue-journal fixture](../../src/server/test/intake-batch-journal-growth.test.ts) exercised actual manager create/stop/resume operations synchronously without starting inference. The following dated results describe the previous journal, before the implemented [selected queue authority](intake-batch-journal.md). The fixture now qualifies that replacement while preserving the independent state and byte-retention oracles.
 
 | Subsequent transitions | Retained events | Retained journal bytes | Prior bytes read by the checkpoint write |
 | ---------------------: | --------------: | ---------------------: | ---------------------------------------: |
@@ -262,10 +262,10 @@ The [queue-journal fixture](../../src/server/test/intake-batch-journal-growth.te
 |                    200 |             202 |                110,611 |                                  110,071 |
 |                    300 |             302 |                165,211 |                                  164,671 |
 
-The checkpoint writes each append 540 bytes. One final item reason changes 24 value bytes and appends a 290-byte event but rereads all 302 earlier events/165,211 bytes and replays 2,860 changes. This is a separate journal measurement, not a whole clinical-processing run. The stopped public response clears diagnostic `queuedAt` after publication, while durable/reopened state retains the timestamp; the oracle explicitly checks both boundaries.
+In that earlier implementation, checkpoint writes each appended 540 bytes. One final item reason changed 24 value bytes and appended a 290-byte event but reread all 302 earlier events/165,211 bytes and replayed 2,860 changes. This was a separate journal measurement, not a whole clinical-processing run. The stopped public response cleared diagnostic `queuedAt` after publication, while durable/reopened state retained the timestamp; the earlier oracle explicitly checked both boundaries.
 
-The journal still scans/replays its history on each write. [CRS-227](../todo/CRS-227.md) is its scoped production prerequisite. The intake-envelope fixes do not replace this journal or establish bounded processing cost.
+These earlier complete-history scans and the diagnostic timestamp mismatch are addressed by the [processing queue journal](intake-batch-journal.md). Its current measurements separate warm queue work, encrypted publication, cold reconstruction, complete response copies and unrelated workspace inventory. Neither the earlier intake-envelope qualification nor this queue-specific work establishes bounded whole-import processing cost.
 
 ## Release boundary
 
-The tests use fictional evidence and unchanged runtime limits. No known-failing dense/full import, paid route, owner original, physical passkey or deployment is exercised. The scheduler journal and repeated full-view processing remain explicit prerequisites in [CRS-194](../todo/CRS-194.md). [PR #35](https://github.com/mxbaylee/circus-health/pull/35) stays held for its own runner, capacity, clinical completeness and diagnostics requirements. Current focused storage evidence cannot close those requirements or the localhost release gate.
+The tests use fictional evidence and unchanged runtime limits. No known-failing dense/full import, paid route, owner original, physical passkey or deployment is exercised. The implemented [scheduler journal](intake-batch-journal.md) has separate queue-specific evidence; [full-view processing](../todo/CRS-228.md) remains a prerequisite in [CRS-194](../todo/CRS-194.md). [PR #35](https://github.com/mxbaylee/circus-health/pull/35) stays held for its own runner, capacity, clinical completeness and diagnostics requirements. Current focused storage evidence cannot close those requirements or the localhost release gate.

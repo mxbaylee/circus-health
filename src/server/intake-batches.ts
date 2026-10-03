@@ -27,7 +27,18 @@ import {
   retainSourceStall,
   retrySourceExceptions,
 } from './intake-source-extraction.ts';
-import { listIntakeBatches, readIntakeBatch, writeIntakeBatch } from './intake-batch-journal.ts';
+import {
+  listIntakeBatches,
+  readIntakeBatch,
+  writeIntakeBatch,
+  trackIntakeBatch,
+  cloneIntakeBatch,
+  pendingIntakeBatchChanges,
+  refreshIntakeBatch,
+  forgetIntakeBatchJournal,
+  clearIntakeBatchJournalCache,
+  assertCurrentIntakeBatch,
+} from './intake-batch-journal.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { Intake } from '../shared/intake.ts';
 import { hasPausedIntakeReading } from '../shared/intake-batch.ts';
@@ -145,8 +156,19 @@ function modelFailure(error: unknown): boolean {
   return value.code === 'MODEL_UNAVAILABLE';
 }
 
+// Read back newly assigned containers: tracked assignments take ownership by
+// copying input, so a caller must mutate the retained proxy, not its input array.
+function itemExceptions(item: IntakeBatchItem) {
+  item.exceptions ||= [];
+  return item.exceptions;
+}
+function reopenOperations(batch: IntakeBatch) {
+  batch.reopenOperations ||= [];
+  return batch.reopenOperations;
+}
+
 function publicBatch(batch: IntakeBatch, scheduled?: boolean): IntakeBatch {
-  return { ...structuredClone(batch), ...(scheduled === undefined ? {} : { scheduled }) };
+  return { ...cloneIntakeBatch(batch, 'dto'), ...(scheduled === undefined ? {} : { scheduled }) };
 }
 
 export function createIntakeBatchManager({
@@ -178,8 +200,16 @@ export function createIntakeBatchManager({
   const retryItems = new Set<string>();
   const progressSavedAt = new Map<string, number>();
   const dirtyProgress = new Set<string>();
+  const queueState = new WeakMap<
+    IntakeBatch,
+    { queued: Set<number>; status: IntakeBatch['status'] }
+  >();
+  // A local journal publication is not an encrypted-vault acknowledgement. Keep
+  // this barrier until the entire injected writer succeeds, including its flush.
+  const failedPublications = new Map<string, { batch: IntakeBatch; reason: string }>();
   const queueSpans = new Map<string, ReturnType<typeof beginImportPhase>>();
   let closed = false;
+  let closeIncomplete = false;
   const key = (profileId: string, batchId: string): string => `${profileId}/${batchId}`;
   const now = (): string => clock().toISOString();
   const dbFor = (profileId: string): DatabaseSync =>
@@ -197,7 +227,10 @@ export function createIntakeBatchManager({
     ).toISOString();
   };
   const live = (profileId: string, value: number): boolean =>
-    !closed && databases.has(profileId) && generation(profileId) === value;
+    !closed &&
+    databases.has(profileId) &&
+    !hasFailedPublication(profileId) &&
+    generation(profileId) === value;
 
   const backgroundContext = (profileId: string, batch: IntakeBatch, item: IntakeBatchItem) => ({
     profileId,
@@ -229,22 +262,76 @@ export function createIntakeBatchManager({
     }
     item.queuedAt = null;
   }
-  function observeQueues(profileId: string, batch: IntakeBatch) {
-    for (const item of batch.items) {
-      const id = key(profileId, `${batch.id}/${item.intakeId}`);
-      if (batch.status !== 'running' || item.status !== 'queued') {
-        if (queueSpans.has(id)) finishQueue(profileId, batch, item, batch.status !== 'running');
-        continue;
+  function hasFailedPublication(profileId: string): boolean {
+    return [...failedPublications.values()].some(
+      (pending) => pending.batch.profileId === profileId,
+    );
+  }
+
+  function retryPublication(profileId: string): void {
+    for (const [id, pending] of failedPublications) {
+      if (pending.batch.profileId !== profileId) continue;
+      // Refresh again: a failed retry may itself have published before throwing.
+      refreshIntakeBatch(root, profileId, pending.batch);
+      journalWriter(root, profileId, pending.batch, pending.reason);
+      failedPublications.delete(id);
+      queueState.delete(pending.batch);
+      if (!closed && pending.batch.status === 'running') schedule(profileId, pending.batch.id);
+    }
+  }
+
+  function changedQueueItems(batch: IntakeBatch): { indexes: Set<number>; queued: Set<number> } {
+    let state = queueState.get(batch);
+    const indexes = new Set<number>();
+    if (!state) {
+      state = { queued: new Set(), status: batch.status };
+      for (let index = 0; index < batch.items.length; index++) {
+        indexes.add(index);
+        if (batch.items[index]!.status === 'queued') state.queued.add(index);
       }
+      queueState.set(batch, state);
+    } else {
+      for (const change of pendingIntakeBatchChanges(batch)) {
+        if (!change.path.length || (change.path[0] === 'items' && change.path.length === 1)) {
+          for (let index = 0; index < batch.items.length; index++) indexes.add(index);
+        } else if (change.path[0] === 'items' && /^\d+$/.test(change.path[1] || '')) {
+          indexes.add(Number(change.path[1]));
+        }
+      }
+      if (state.status !== batch.status) for (const index of state.queued) indexes.add(index);
+    }
+    for (const index of indexes) {
+      const item = batch.items[index];
+      if (item?.status === 'queued') state.queued.add(index);
+      else state.queued.delete(index);
+      if (!item) continue;
+      if (batch.status === 'running' && item.status === 'queued') item.queuedAt ||= now();
+      else if (
+        item.queuedAt ||
+        queueSpans.has(key(batch.profileId, `${batch.id}/${item.intakeId}`))
+      )
+        finishQueue(batch.profileId, batch, item, batch.status !== 'running');
+    }
+    state.status = batch.status;
+    return { indexes, queued: state.queued };
+  }
+
+  function observeQueues(
+    profileId: string,
+    batch: IntakeBatch,
+    indexes: Set<number>,
+    queued: Set<number>,
+  ) {
+    for (const index of indexes) {
+      const item = batch.items[index];
+      if (!item || batch.status !== 'running' || item.status !== 'queued') continue;
+      const id = key(profileId, `${batch.id}/${item.intakeId}`);
       if (!queueSpans.has(id))
         queueSpans.set(
           id,
           beginImportPhase(
             item.reason === 'continuing' ? 'continuation_wait' : 'processing_queue',
-            {
-              queueDepth: batch.items.filter((candidate) => candidate.status === 'queued').length,
-              queueWaitKnown: !!item.queuedAt,
-            },
+            { queueDepth: queued.size, queueWaitKnown: !!item.queuedAt },
             backgroundContext(profileId, batch, item),
             diagnostics,
           ),
@@ -252,14 +339,59 @@ export function createIntakeBatchManager({
     }
   }
 
+  function publicationFailed(
+    profileId: string,
+    batch: IntakeBatch,
+    reason: string,
+    error: unknown,
+  ): never {
+    clear(profileId);
+    if (error instanceof HttpError && error.code === 'INTAKE_BATCH_STALE')
+      generations.set(profileId, generation(profileId) + 1);
+    failedPublications.set(key(profileId, batch.id), { batch, reason });
+    forgetIntakeBatchJournal(batch);
+    queueState.delete(batch);
+    try {
+      refreshIntakeBatch(root, profileId, batch);
+      batches.set(key(profileId, batch.id), batch);
+    } catch (refreshError) {
+      // A never-published creation has no authority to recover. Other recovery
+      // failures retain the barrier so corrupt/unreadable authority fails closed.
+      if (refreshError instanceof HttpError && refreshError.code === 'INTAKE_BATCH_NOT_FOUND') {
+        failedPublications.delete(key(profileId, batch.id));
+        batches.delete(key(profileId, batch.id));
+      }
+    }
+    throw error;
+  }
+
+  function assertCurrent(profileId: string, batch: IntakeBatch): IntakeBatch {
+    try {
+      assertCurrentIntakeBatch(root, profileId, batch);
+    } catch (error) {
+      // Validation failures have no uncertain local publication to preserve.
+      // Fence old continuations even if a later repair makes authority readable.
+      if (!(error instanceof HttpError && error.code === 'INTAKE_BATCH_STALE'))
+        generations.set(profileId, generation(profileId) + 1);
+      publicationFailed(profileId, batch, 'head-reconciled', error);
+    }
+    return batch;
+  }
+
+  function assertProfileCurrent(profileId: string): void {
+    for (const batch of batches.values())
+      if (batch.profileId === profileId) assertCurrent(profileId, batch);
+  }
+
   function save(profileId: string, batch: IntakeBatch, reason: string): void {
     batch.updatedAt = now();
-    if (batch.status === 'running')
-      for (const item of batch.items) {
-        if (item.status === 'queued' && !item.queuedAt) item.queuedAt = now();
-      }
-    journalWriter(root, profileId, batch, reason);
-    observeQueues(profileId, batch);
+    const { indexes, queued } = changedQueueItems(batch);
+    try {
+      journalWriter(root, profileId, batch, reason);
+    } catch (error) {
+      publicationFailed(profileId, batch, reason, error);
+    }
+    observeQueues(profileId, batch, indexes, queued);
     const item = batch.items[batch.currentIndex];
     diagnostics.record(
       'import.progress',
@@ -291,7 +423,7 @@ export function createIntakeBatchManager({
     const prefix = profileId + '/';
     if ([...batches.keys()].some((item) => item.startsWith(prefix))) return;
     for (const saved of listIntakeBatches(root, profileId)) {
-      const batch = structuredClone(saved);
+      const batch = saved;
       const recoverable = new Set([
         'interrupted',
         'profile_locked',
@@ -356,9 +488,10 @@ export function createIntakeBatchManager({
 
   function get(profileId: string, batchId: string): IntakeBatch {
     dbFor(profileId);
+    retryPublication(profileId);
     loadProfile(profileId);
     const stored = batches.get(key(profileId, batchId));
-    return stored || readIntakeBatch(root, profileId, batchId);
+    return stored ? assertCurrent(profileId, stored) : readIntakeBatch(root, profileId, batchId);
   }
 
   function clear(profileId: string, batchId: string | null = null): boolean {
@@ -430,7 +563,7 @@ export function createIntakeBatchManager({
                     progress.page,
                   );
                 else
-                  (current.exceptions ||= []).push({
+                  itemExceptions(current).push({
                     unitId: unit,
                     locator: 'Retained file (source inventory unavailable)',
                     reason: 'processing_stalled',
@@ -481,7 +614,7 @@ export function createIntakeBatchManager({
                 /* The exact page is unavailable; the original remains located. */
               }
               if (!review)
-                (current.exceptions ||= []).push({
+                itemExceptions(current).push({
                   unitId: `source:${current.intakeId}`,
                   locator,
                   reason: 'technical_error',
@@ -575,7 +708,7 @@ export function createIntakeBatchManager({
             /-(failed|processing-stalled|ocr-unavailable)$/.test(i.id),
         )) {
           if (!(item.exceptions || []).some((e) => e.unitId === issue.id))
-            (item.exceptions ||= []).push({
+            itemExceptions(item).push({
               unitId: issue.id,
               locator: 'Page ' + issue.region.page,
               reason: 'processing_stalled',
@@ -586,7 +719,7 @@ export function createIntakeBatchManager({
     item.reason = reason;
     item.endedAt = now();
     item.proposalIds = intake?.proposals?.map((proposal) => proposal.id) || item.proposalIds;
-    item.reading = chat?.reading ? structuredClone(chat.reading) : item.reading;
+    item.reading = chat?.reading ? cloneIntakeBatch(chat.reading) : item.reading;
     batch.currentIndex = Math.min(batch.items.length, batch.currentIndex + 1);
     save(profileId, batch, `item-${status}`);
   }
@@ -634,7 +767,7 @@ export function createIntakeBatchManager({
       lastWaitAt: now(),
       responsesAtWait: chat.reading?.usableModelResponses || 0,
     };
-    item.reading = chat.reading ? structuredClone(chat.reading) : item.reading;
+    item.reading = chat.reading ? cloneIntakeBatch(chat.reading) : item.reading;
     if (safeRetry) {
       item.status = 'queued';
       item.reason = 'waiting_for_provider';
@@ -781,7 +914,7 @@ export function createIntakeBatchManager({
     if (!recordDurabilityStatus(db)) return 'complete';
     const before = getIntakeSourceText(db, root, profileId, item.intakeId);
     if (!sourceTextExtractionPending(before)) return 'complete';
-    const state = (item.sourceExtraction ||= {
+    item.sourceExtraction ||= {
       steps: 0,
       spentMs: 0,
       allowanceId: randomUUID(),
@@ -792,7 +925,8 @@ export function createIntakeBatchManager({
       startedAt: null,
       initialDone: false,
       draining: false,
-    });
+    };
+    const state = item.sourceExtraction;
     item.reason = 'extracting_source_text';
     item.startedAt ||= now();
     if (!state.operationId) {
@@ -873,7 +1007,7 @@ export function createIntakeBatchManager({
       if (item.sourceRetryAttempts >= 3) {
         if (next.page) retainSourceStall(db, root, profileId, item.intakeId, next.page);
         else {
-          (item.exceptions ||= []).push({
+          itemExceptions(item).push({
             unitId: unit,
             locator: 'Retained file (source inventory unavailable)',
             reason: 'processing_stalled',
@@ -913,7 +1047,7 @@ export function createIntakeBatchManager({
     if (after.status === 'unavailable') {
       state.stalls = (state.stalls || 0) + 1;
       if (state.stalls >= 3) {
-        (item.exceptions ||= []).push({
+        itemExceptions(item).push({
           unitId: 'source:' + item.intakeId,
           locator: 'Retained file (page inventory unavailable)',
           reason: 'processing_stalled',
@@ -1012,7 +1146,7 @@ export function createIntakeBatchManager({
       return;
     }
     item.chatId = linkedChat?.id || item.chatId;
-    item.reading = linkedChat?.reading ? structuredClone(linkedChat.reading) : item.reading;
+    item.reading = linkedChat?.reading ? cloneIntakeBatch(linkedChat.reading) : item.reading;
     if (
       linkedChat?.status === 'failed' &&
       linkedChat.reading?.providerWait &&
@@ -1186,6 +1320,13 @@ export function createIntakeBatchManager({
           throw Error('Import processing authorization ended');
       },
       beforeModelRequest: (reading) => {
+        if (
+          !live(profileId, expected) ||
+          batch.status !== 'running' ||
+          !item.automaticRun ||
+          !authorized(profileId, item.intakeId, 'dispatch')
+        )
+          throw Error('Import processing authorization ended');
         if (reading.workUnit && item.stalls?.unitId !== reading.workUnit.id)
           item.stalls = {
             unitId: reading.workUnit.id,
@@ -1290,7 +1431,7 @@ export function createIntakeBatchManager({
       return;
     }
     if (chat.status === 'running') {
-      item.reading = chat.reading ? structuredClone(chat.reading) : item.reading;
+      item.reading = chat.reading ? cloneIntakeBatch(chat.reading) : item.reading;
       const progressKey = key(profileId, `${batch.id}/${item.intakeId}`);
       if (observeReadingProgress(item, now())) dirtyProgress.add(progressKey);
       if (
@@ -1310,7 +1451,7 @@ export function createIntakeBatchManager({
     const intake = getIntake(dbFor(profileId), root, profileId, item.intakeId) as Intake;
     const responsesBefore = item.reading?.usableModelResponses || 0;
     const madeProgress = finishReadingSlice(item, chat.reading || item.reading, now());
-    item.reading = chat.reading ? structuredClone(chat.reading) : item.reading;
+    item.reading = chat.reading ? cloneIntakeBatch(chat.reading) : item.reading;
     if ((item.reading?.usableModelResponses || 0) > responsesBefore) item.modelRetryAttempts = 0;
     if (intake.sha256 !== item.sourceHash) {
       finishItem(profileId, batch, item, 'paused', 'source_changed', intake, chat);
@@ -1379,7 +1520,7 @@ export function createIntakeBatchManager({
             locator: scope.locator,
             reason: 'processing_stalled' as const,
           };
-          (item.exceptions ||= []).push(exception);
+          itemExceptions(item).push(exception);
           workflowMutation(
             dbFor(profileId),
             root,
@@ -1530,7 +1671,9 @@ export function createIntakeBatchManager({
 
   function create(profileId: string, input: Partial<CreateIntakeBatchInput> | null): IntakeBatch {
     dbFor(profileId);
+    retryPublication(profileId);
     loadProfile(profileId);
+    assertProfileCurrent(profileId);
     const operationId = op(input?.operationId);
     if (
       !Array.isArray(input?.intakeIds) ||
@@ -1665,7 +1808,7 @@ export function createIntakeBatchManager({
           retained.status = 'running';
           retained.reason = null;
           retained.automaticRun = true;
-          (retained.reopenOperations ||= []).push({
+          reopenOperations(retained).push({
             operationId,
             intakeIds: [...intakeIds],
             at: now(),
@@ -1744,50 +1887,21 @@ export function createIntakeBatchManager({
     });
     const at = now();
     if (running) {
-      const snapshot: IntakeBatch = {
-        ...structuredClone(running),
-        updatedAt: at,
-        items: [...structuredClone(running.items), ...items],
-        appendOperations: [
-          ...(running.appendOperations || []),
-          { operationId, intakeIds: [...newIntakeIds], selectionIntakeIds: [...intakeIds], at },
-        ],
-      };
-      const applyAppend = () => {
-        // The asynchronous runner may hold this batch and its current item across
-        // await. Preserve those object identities so its next save includes the append.
-        running.items.push(...items);
-        running.appendOperations = snapshot.appendOperations;
-        running.updatedAt = at;
-        observeQueues(profileId, running);
-      };
-      try {
-        journalWriter(root, profileId, snapshot, 'originals-appended');
-      } catch (error) {
-        // A publication may have completed before acknowledgement failed. Keep the
-        // receipt in the live batch so its active runner cannot overwrite durable additions.
-        // The caller still receives the failure and must retry the same operation.
-        try {
-          const retained = readIntakeBatch(root, profileId, running.id);
-          const receipt = retained.appendOperations?.find(
-            (entry) => entry.operationId === operationId,
-          );
-          if (
-            receipt &&
-            JSON.stringify(receipt.selectionIntakeIds || receipt.intakeIds) ===
-              JSON.stringify(intakeIds)
-          )
-            applyAppend();
-        } catch {
-          // No confirmed journal head: new work remains unqueued in memory.
-        }
-        throw error;
-      }
-      applyAppend();
+      // Append through the tracked containers. Retained runner/item references
+      // remain valid across awaits and failure recovery.
+      running.items.push(...items);
+      running.appendOperations ||= [];
+      running.appendOperations.push({
+        operationId,
+        intakeIds: [...newIntakeIds],
+        selectionIntakeIds: [...intakeIds],
+        at,
+      });
+      save(profileId, running, 'originals-appended');
       schedule(profileId, running.id);
       return publicBatch(running, true);
     }
-    const batch: IntakeBatch = {
+    const batch = trackIntakeBatch({
       id: randomUUID(),
       profileId,
       operationId,
@@ -1799,7 +1913,7 @@ export function createIntakeBatchManager({
       createdAt: at,
       updatedAt: at,
       items,
-    };
+    } as IntakeBatch);
     save(profileId, batch, 'created');
     schedule(profileId, batch.id);
     return publicBatch(batch, true);
@@ -1807,7 +1921,9 @@ export function createIntakeBatchManager({
 
   function list(profileId: string): IntakeBatch[] {
     dbFor(profileId);
+    retryPublication(profileId);
     loadProfile(profileId);
+    assertProfileCurrent(profileId);
     return [...batches.values()]
       .filter((batch) => batch.profileId === profileId)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
@@ -1932,7 +2048,7 @@ export function createIntakeBatchManager({
     batch.status = 'running';
     batch.reason = null;
     if (reopenOperationId && selectedIntakeIds)
-      (batch.reopenOperations ||= []).push({
+      reopenOperations(batch).push({
         operationId: reopenOperationId,
         intakeIds: [...selectedIntakeIds],
         at: now(),
@@ -1985,31 +2101,49 @@ export function createIntakeBatchManager({
   }
 
   function close(reason = 'interrupted'): void {
-    if (closed) return;
+    if (closed && !closeIncomplete) return;
+    const retrying = closed;
     closed = true;
+    closeIncomplete = true;
+    const failures: unknown[] = [];
     for (const profileId of databases.keys()) {
       clear(profileId);
       generations.set(profileId, generation(profileId) + 1);
-      loadProfile(profileId);
-      for (const batch of batches.values()) {
-        if (batch.profileId !== profileId || batch.status !== 'running') continue;
-        const item = batch.items[batch.currentIndex];
-        if (item?.chatId && item.status === 'running') assistant.cancel(profileId, item.chatId);
-        if (item && ['queued', 'starting', 'running'].includes(item.status)) {
-          finishReadingSlice(item, item.reading, now());
-          item.status = 'paused';
-          item.reason = reason;
-          item.endedAt = now();
+      try {
+        retryPublication(profileId);
+        loadProfile(profileId);
+        for (const batch of batches.values()) {
+          if (batch.profileId !== profileId) continue;
+          // A prior failed close revoked every handle, including batches whose
+          // publication had not yet been attempted. Reconstruct before retrying.
+          if (retrying) refreshIntakeBatch(root, profileId, batch);
+          if (batch.status !== 'running') continue;
+          const item = batch.items[batch.currentIndex];
+          if (item?.chatId && item.status === 'running') assistant.cancel(profileId, item.chatId);
+          if (item && ['queued', 'starting', 'running'].includes(item.status)) {
+            finishReadingSlice(item, item.reading, now());
+            item.status = 'paused';
+            item.reason = reason;
+            item.endedAt = now();
+          }
+          batch.status = 'paused';
+          batch.reason = reason;
+          save(profileId, batch, 'runner-closed');
         }
-        batch.status = 'paused';
-        batch.reason = reason;
-        save(profileId, batch, 'runner-closed');
+      } catch (error) {
+        failures.push(error);
+      } finally {
+        clearIntakeBatchJournalCache(root, profileId);
       }
     }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length) throw new AggregateError(failures, 'Reading batch close failed');
+    closeIncomplete = false;
   }
 
   function wake(profileId: string) {
     if (closed || !databases.has(profileId)) return;
+    retryPublication(profileId);
     loadProfile(profileId);
     const owned = new Set(
       [...batches.values()]
@@ -2046,7 +2180,9 @@ export function createIntakeBatchManager({
     retryExceptions,
     close,
     isBusy(profileId: string): boolean {
+      retryPublication(profileId);
       loadProfile(profileId);
+      assertProfileCurrent(profileId);
       return [...batches.values()].some(
         (batch) => batch.profileId === profileId && batch.status === 'running',
       );

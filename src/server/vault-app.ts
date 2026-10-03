@@ -11,7 +11,7 @@ import { createEncryptedProfiles } from './encrypted-profiles.ts';
 import { importDiagnostics, type ImportDiagnostics } from './import-diagnostics.ts';
 import { createProfilePasskeys } from './profile-passkeys.ts';
 import { writeChat, forgetChatJournal } from './assistant-journal.ts';
-import { writeIntakeBatch } from './intake-batch-journal.ts';
+import { writeIntakeBatch, forgetIntakeBatchJournal } from './intake-batch-journal.ts';
 import { HttpError } from './database.ts';
 import { modelAvailability, testModelConnection } from './model-bridge.ts';
 const send = (res: ServerResponse, status: number, data: unknown) => {
@@ -181,8 +181,13 @@ export function createVaultApp({
           journalWriter(root, profileId, batch, reason) {
             if (!manager.opened.has(profileId))
               throw new HttpError(423, 'PROFILE_LOCKED', 'Profile is locked');
-            writeIntakeBatch(root, profileId, batch, reason);
-            manager.flush(profileId, { duringLock: true });
+            try {
+              writeIntakeBatch(root, profileId, batch, reason);
+              manager.flush(profileId, { duringLock: true });
+            } catch (error) {
+              forgetIntakeBatchJournal(batch);
+              throw error;
+            }
           },
         },
       });

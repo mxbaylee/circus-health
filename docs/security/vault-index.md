@@ -14,6 +14,12 @@ Cold open reads the committed chain once, recomputes cumulative usage, validates
 
 Publication failures close the affected writer and discard reconstructed maps, pending bindings/metadata, digest lookups and workspace fingerprints. A failure after manifest replacement can have committed successfully despite the exception; reopen follows the actual authenticated manifest. A failure before replacement leaves the previous commit authoritative. Unreferenced staged artifacts are not adopted or deleted as evidence. Missing manifests with retained artifacts fail explicitly rather than initializing over them. Profile locking/closure clears the same disposable state.
 
+## Selected processing-queue files
+
+Every ordinary workspace inventory prunes `intake-batches/` before enumerating it. The [queue journal](../data/intake-batch-journal.md) supplies validated selected event/head paths through a vault-owned pending set; cold opening materializes existing files from the authenticated manifest, and queue reads verify the selected chain. Selected paths receive ancestor/file safety checks without walking retained siblings. Pending selections are cleared only after successful encrypted manifest publication. Locks, staging files and unselected events are excluded.
+
+The same path applies to ordinary flush, accepted-record publication, successful HTTP acknowledgment and profile lock. Pending non-queue source/chat dependencies retain their existing inventory/publication behavior. Queue measurements attribute this unrelated inventory separately; the change does not make all workspace discovery incremental. Actual manifest failure retains the existing closed-writer/reopen boundary described above.
+
 ## Bounds and schema boundary
 
 Each generation permits at most 64 KiB of plaintext; the manifest permits 16 KiB, including at most 8,192 characters of canonical base64 record-head data. Committed-chain reconstruction and publication share limits of 256 MiB of index plaintext, one million generations and one million object/binding entries. Logical paths permit at most 4,096 UTF-8 bytes. These host-resource bounds count committed index work; they do not limit model execution time or automatically prune uncommitted artifacts. Contributor/test options can impose stricter valid limits, never raise the defaults. A writer refuses a candidate before publishing a chain that exceeds its cold-read budgets.

@@ -67,6 +67,10 @@ import {
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
 import { clearChatJournalCache } from './assistant-journal.ts';
 import {
+  clearIntakeBatchJournalCache,
+  registerIntakeBatchPublication,
+} from './intake-batch-journal.ts';
+import {
   prepareProductionIntakeStateCopy,
   stageIntakeStateCopy,
   validateProductionIntakeAuthority,
@@ -126,6 +130,7 @@ export interface OpenedProfile {
   requests: Set<ServerResponse>;
   closing: boolean;
   disposeOriginalResolver(): void;
+  disposeBatchPublication(): void;
 }
 
 interface SetupState {
@@ -221,7 +226,14 @@ const privateFile = (name: string): boolean =>
   !name.startsWith('db/') &&
   !name.startsWith('personal/') &&
   !name.startsWith('curation/') &&
-  !name.endsWith('.pending');
+  !name.endsWith('.pending') &&
+  !name.endsWith('/writer.lock');
+const workspaceSyncOptions = {
+  exclude: (name: string) => !privateFile(name),
+  // The queue writer supplies exact selected event/head names. Walking this
+  // directory would both scale with history and adopt unselected crash tails.
+  excludeDirectory: (name: string) => name === 'intake-batches',
+};
 const deferredOriginal = (name: string): boolean =>
   name.startsWith('sources/') || name.startsWith('attachments/');
 export function createEncryptedProfiles({
@@ -419,6 +431,7 @@ export function createEncryptedProfiles({
     }
     let db: Database | null | undefined;
     let disposeOriginalResolver = () => {};
+    let disposeBatchPublication = () => {};
     try {
       // A selected accepted head always wins, including publication followed by
       // an exception before verification/activation acknowledged its success.
@@ -442,6 +455,9 @@ export function createEncryptedProfiles({
         'to unlock this profile with its required workspace and one configured upload',
       );
       vault.materialize(workspace, { exclude: deferredOriginal });
+      disposeBatchPublication = registerIntakeBatchPublication(root, id, (names) =>
+        vault.trackWorkspaceFiles(workspace, names),
+      );
       disposeOriginalResolver = registerProfileOriginalResolver(root, id, (path) => {
         const name = path.slice(`data/profiles/${id}/`.length);
         const object = vault.fileMetadata(name);
@@ -460,7 +476,7 @@ export function createEncryptedProfiles({
           );
       });
       const recordStorage = vault.recordStorage(() =>
-        vault.syncWorkspace(workspace, { exclude: (n) => !privateFile(n), publishNow: false }),
+        vault.syncWorkspace(workspace, { ...workspaceSyncOptions, publishNow: false }),
       );
       const verifyReferences = (versions: RecordVersion[]): void => {
         for (const v of versions) {
@@ -716,11 +732,15 @@ export function createEncryptedProfiles({
         requests: new Set(),
         closing: false,
         disposeOriginalResolver,
+        disposeBatchPublication,
       };
       if (!pendingActivation) installOpened(state);
       return state;
     } catch (e) {
-      discardFailedOpen({ id, root, key, vault, db, disposeOriginalResolver }, e);
+      discardFailedOpen(
+        { id, root, key, vault, db, disposeOriginalResolver, disposeBatchPublication },
+        e,
+      );
     }
   }
   function installOpened(state: OpenedProfile): void {
@@ -736,7 +756,10 @@ export function createEncryptedProfiles({
     diagnostics.attachEventStore(state.id, state.vault.diagnosticChunks());
   }
   function discardFailedOpen(
-    state: Pick<OpenedProfile, 'id' | 'root' | 'key' | 'vault' | 'disposeOriginalResolver'> & {
+    state: Pick<
+      OpenedProfile,
+      'id' | 'root' | 'key' | 'vault' | 'disposeOriginalResolver' | 'disposeBatchPublication'
+    > & {
       db: Database | null | undefined;
     },
     failure: unknown,
@@ -753,6 +776,7 @@ export function createEncryptedProfiles({
     if (installed) installed.closing = true;
     opened.delete(state.id);
     cleanup(() => clearChatJournalCache(state.root, state.id));
+    cleanup(() => clearIntakeBatchJournalCache(state.root, state.id));
     if (state.db) {
       const db = state.db;
       cleanup(() => clearIntakeStateCache(db));
@@ -764,6 +788,7 @@ export function createEncryptedProfiles({
       });
     }
     cleanup(() => state.disposeOriginalResolver());
+    cleanup(() => state.disposeBatchPublication());
     cleanup(() => state.vault.close());
     state.key.fill(0);
     // Stores can have attached before installation failed. Close their vault
@@ -958,7 +983,7 @@ export function createEncryptedProfiles({
     measureImportPhase(
       'encrypted_workspace_flush',
       () => {
-        state.vault.syncWorkspace(state.workspace, { exclude: (n) => !privateFile(n) });
+        state.vault.syncWorkspace(state.workspace, workspaceSyncOptions);
         refreshCard(state);
       },
       {},
@@ -974,7 +999,7 @@ export function createEncryptedProfiles({
     try {
       state.app?.close('profile_locked');
       if (!state.app) state.db.close();
-      state.vault.syncWorkspace(state.workspace, { exclude: (n) => !privateFile(n) });
+      state.vault.syncWorkspace(state.workspace, workspaceSyncOptions);
       state.vault.writeCache(resolve(state.root, 'db/database.sqlite'), {
         schemaVersion: LATEST_SCHEMA_VERSION,
       });
@@ -984,7 +1009,9 @@ export function createEncryptedProfiles({
       clearSourceTextProjectionCache(state.db);
       clearSourceDetailsSearchCache(state.db);
       clearChatJournalCache(state.root, id);
+      clearIntakeBatchJournalCache(state.root, id);
       state.disposeOriginalResolver();
+      state.disposeBatchPublication();
       diagnostics.detachSummaryStore(id);
       state.vault.close();
       state.key.fill(0);
