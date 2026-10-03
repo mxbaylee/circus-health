@@ -99,6 +99,14 @@ The recorder's `circus-import-events-v3` envelope includes a fixed cumulative ob
 
 Schema 7 adds the condition-occurrence table. Current-schema occurrences use the existing changed-record journal and preserve earlier versions, original evidence and attribution on replay. The journal still requires an exact schema match; this change does not decode older journal schemas. No legacy journal, encrypted-cache or portable snapshot compatibility is provided for this addition (owner scope decision, 2026-10-01, before production use). Unsupported archives fail explicitly; the app does not discard or silently reset them. Current-schema encrypted restart/cache-loss and portable recovery are covered by fictional fixtures.
 
+## Personal packet choices
+
+Packet withholding and manually applied record tags are personal metadata in `app_meta`, under `packet_preference:v1:`. The payload records the selected person, stable record reference, withholding flag, bounded tags, version and profile-user timestamp. They do not alter clinical rows, accepted clinical versions or original files. The [packet procedure](../features/selective-packets.md) explains the sharing boundary and its limits.
+
+Ordinary accepted-journal mutations append only changed preference records plus the existing revision scalars. An unchanged save opens no transaction. Optimistic versions prevent stale edits, and an operation ID cannot be reused with different choices. Clinical reclassification resolves the original stable identity; accepted ownership redirects retain the restrictive choice rather than silently making the record shareable. Joined preferences combine withholding conservatively. An explicit save reconciles the affected preference rows while accepted history retains their earlier values; former-owner tags are not disclosed to the newly selected person.
+
+Whole-profile export and recovery retain these preferences. Explicit portable personal generations carry a separate `packetPreferences` field so a later personal choice can supersede an older curation snapshot; a generation lacking the field retains the earlier curation values. This is separate from the normal changed-record journal. Earlier application builds do not enforce packet preferences even if their archive reader retains the metadata.
+
 ## Conversation writes
 
 Conversation recovery uses its own [linked changed-content journal](conversation-journal.md). Each save adds changed values and small generation metadata, including incremental array items and text splices. It preserves history without copying the growing chat, operations or request-attempt arrays into every event. The encrypted wrapper retains this journal; originals and accepted-record authority remain separate. Older conversation snapshot envelopes are explicitly unsupported.

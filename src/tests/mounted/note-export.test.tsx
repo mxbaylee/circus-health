@@ -164,7 +164,7 @@ it('supporting categories are explicit, and changed profile cannot export an old
   await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('profile changed'));
 });
 
-it('Self offers an automatic provider packet with optional notes, not clinical inclusion switches', async () => {
+it('Self starts a provider packet with optional notes and no brief-only switches', async () => {
   const requests: Record<string, unknown>[] = [];
   vi.stubGlobal(
     'fetch',
@@ -234,7 +234,7 @@ it('a note becomes the introduction when switching to provider packet', async ()
   await userEvent.click(screen.getByRole('button', { name: 'Print / Export' }));
   await screen.findByRole('combobox', { name: 'Format' });
   await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Format' }), 'provider');
-  expect(screen.getByText(/included as your introduction/)).toHaveTextContent('Fictional note');
+  expect(screen.getByText(/starts as your introduction/)).toHaveTextContent('Fictional note');
   await userEvent.click(screen.getByRole('button', { name: 'Preview provider packet' }));
   await screen.findByTitle('Exact export preview');
   expect(requests[0]).toMatchObject({ mode: 'provider', noteIds: ['fictional'] });
@@ -294,7 +294,7 @@ it('provider evidence downloads save and validate the current packet before retr
   expect(events).toEqual(['save', 'validate', 'evidence']);
   expect(createObjectURL).toHaveBeenCalledOnce();
   expect((click.mock.instances[0] as HTMLAnchorElement).download).toBe(
-    'Fictional note-provider-evidence.json',
+    'health-packet-provider-evidence.json',
   );
 });
 it('an outdated provider packet cannot download evidence and briefs have no evidence action', async () => {
@@ -358,4 +358,34 @@ it('preview Back retains export selections and does not close the dialog', async
   expect(screen.getByRole('dialog', { name: 'Print / Export' })).toBeInTheDocument();
   expect(screen.getByRole('checkbox', { name: /Linked entries/ })).toBeChecked();
   expect(screen.queryByTitle('Exact export preview')).not.toBeInTheDocument();
+});
+
+it('export options cannot change while a saved preview is being prepared', async () => {
+  let finishPreview: (value: Response) => void = () => {};
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      if (String(input).endsWith('/options')) return response(options);
+      if (String(input).endsWith('/preview'))
+        return new Promise<Response>((resolve) => {
+          finishPreview = resolve;
+        });
+      throw new Error(`Unexpected request ${input}`);
+    }),
+  );
+  render(<NoteExportDialog type="note" id="fictional" />);
+  await userEvent.click(screen.getByRole('button', { name: 'Print / Export' }));
+  await userEvent.click(await screen.findByRole('button', { name: 'Preview note only' }));
+  expect(screen.getByRole('combobox', { name: 'Format' })).toBeDisabled();
+  expect(screen.getByRole('checkbox', { name: /Linked entries/ })).toBeDisabled();
+  expect(screen.getByRole('checkbox', { name: /Attachments/ })).toBeDisabled();
+  finishPreview(
+    response({
+      token: 'frozen',
+      html: '<h1>Saved note</h1>',
+      generatedAt: '2026-09-11',
+      assets: [],
+    }),
+  );
+  await screen.findByTitle('Exact export preview');
 });

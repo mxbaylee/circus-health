@@ -1,3 +1,7 @@
+import {
+  PACKET_PREFERENCE_PREFIX,
+  validatePacketPreferenceRows,
+} from './packet-preference-codec.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { validatePortableIntakeState } from './intake-state-portable.ts';
@@ -80,6 +84,7 @@ export interface PortableSnapshot {
   tables: Record<string, PortableRow[]>;
   restoreOperations?: PortableRow[];
   assistantOperations?: PortableRow[];
+  packetPreferences?: Array<{ key: string; value: string }>;
   history?: {
     format: 'circus-health-personal-lineage-v1';
     previous: PortableManifest | null;
@@ -551,6 +556,13 @@ function personalSnapshot(db: Database, profileId: string): PortableSnapshot {
       ]),
     ),
   };
+  snapshot.packetPreferences = db
+    .prepare('SELECT key,value FROM app_meta WHERE substr(key,1,?)=? ORDER BY key')
+    .all(PACKET_PREFERENCE_PREFIX.length, PACKET_PREFERENCE_PREFIX) as Array<{
+    key: string;
+    value: string;
+  }>;
+  validatePacketPreferenceRows(snapshot.packetPreferences);
   snapshot.restoreOperations = db
     .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'personal_restore_*' ORDER BY key")
     .all();
@@ -687,7 +699,8 @@ function writePersonalLocked(db: Database, state: PersonalDurabilityState): void
     JSON.stringify(existing.value.restoreOperations || []) ===
       JSON.stringify(snapshot.restoreOperations) &&
     JSON.stringify(existing.value.assistantOperations || []) ===
-      JSON.stringify(snapshot.assistantOperations)
+      JSON.stringify(snapshot.assistantOperations) &&
+    JSON.stringify(existing.value.packetPreferences) === JSON.stringify(snapshot.packetPreferences)
   ) {
     putMeta(db, 'personal_persisted_revision', snapshot.revision);
     putMeta(db, 'personal_dirty', '0');
@@ -1295,7 +1308,17 @@ export function loadPortable(
       ...(personal.value.tables.evidence || []),
     ],
   };
-  rows.app_meta = [...(rows.app_meta || []), ...operations, ...assistantOperations];
+  const packetPreferences = personal.value.packetPreferences;
+  if (packetPreferences !== undefined) validatePacketPreferenceRows(packetPreferences);
+  rows.app_meta = [
+    ...(rows.app_meta || []).filter(
+      (row) =>
+        packetPreferences === undefined || !String(row.key).startsWith(PACKET_PREFERENCE_PREFIX),
+    ),
+    ...operations,
+    ...assistantOperations,
+    ...(packetPreferences || []),
+  ];
   if (!Array.isArray(rows.source_files) || !Array.isArray(rows.source_records))
     throw new Error('Incomplete portable source tables');
   const files = new Map<string, { file: PortableRow; bytes: Buffer }>();

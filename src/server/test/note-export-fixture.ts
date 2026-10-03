@@ -5,6 +5,7 @@ export function exportFixture(path: string, profile = 'cookie-dough') {
   db.exec(`INSERT INTO providers VALUES('issuer','Fictional Clinic'),('capture','Fictional Import Service');
     INSERT INTO source_files(id,provider_id,path,sha256,bytes) VALUES('file','capture','providers/fictional/report.pdf','synthetic-sha256',100);
     INSERT INTO source_records(id,source_file_id,provider_id,source_key,raw_json,locator_json) VALUES('raw','file','capture','source-42','{}','{"pages":[2,3]}');
+    INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES('fictional-raw-subject','person','patient','raw','report_subject');
     INSERT INTO test_types(id,label,unit) VALUES('cbc','Hemoglobin','g/dL');
     INSERT INTO observations(id,test_type_id,source_record_id,provider_id,label,effective_at,date_precision,value_text,value_numeric,unit,reference_json,status) VALUES
     ('lab-1','cbc','raw','issuer','Hemoglobin','2026-07-01','day','12.4',12.4,'g/dL','{"low":12,"high":16}','final'),

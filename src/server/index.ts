@@ -475,6 +475,7 @@ export function createApp({
           req,
           res,
           db,
+          root,
           profileId,
           respond,
           jsonBody,
