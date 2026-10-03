@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -22,6 +23,7 @@ for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] 
     const root = mkdtempSync(join(tmpdir(), 'fictional-own-draft-pair-'));
     const profileId = 'cookie-dough';
     const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+    attachPersonalDurability(db, { root, profileId });
     const app = createApp({ root, databases: new Map([[profileId, db]]) });
     await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
     t.after(async () => {

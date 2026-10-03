@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { HttpError, openDatabase } from '../database.ts';
+import { HttpError, openDatabase, transaction } from '../database.ts';
 import { profilePaths } from '../profile-storage.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
@@ -21,6 +21,9 @@ import {
 import { createApp } from '../index.ts';
 import { createImportDiagnostics } from '../import-diagnostics.ts';
 import { writeIntakeSourcePin } from '../intake-source-pin.ts';
+import { fictionalModel } from './fictional-model.ts';
+import { extractIntakeSourceText } from '../intake-source-extraction.ts';
+import { DEFAULT_INTAKE_READING_LIMITS } from '../intake-reading-budget.ts';
 
 const profileId = 'cedar';
 const waitFor = async <T>(
@@ -42,6 +45,7 @@ type BridgeFactory = NonNullable<AssistantOptions['bridgeFactory']>;
 type TestBridge = ReturnType<BridgeFactory> & {
   callbacks: Parameters<BridgeFactory>[0];
   closed: boolean;
+  started: boolean;
 };
 
 function uploadIntake(...args: Parameters<typeof uploadIntakeRaw>) {
@@ -53,6 +57,7 @@ function setup(
   overrides: Partial<AssistantOptions> = {},
   batchOverrides: Partial<BatchOptions> = {},
 ) {
+  fictionalModel(t);
   const root = mkdtempSync(resolve(tmpdir(), 'health-intake-batches-'));
   const db = openDatabase(profilePaths(root, profileId).database, profileId);
   attachPersonalDurability(db, { root, profileId });
@@ -72,10 +77,12 @@ function setup(
         const bridge: TestBridge = {
           callbacks,
           closed: false,
+          started: false,
           async start() {
             return { model: 'fictional-batch-model', backend: 'synthetic' };
           },
           async turn() {
+            bridge.started = true;
             callbacks.onEvent?.('turn/started', { turn: { id: 'turn-1' } });
           },
           async cancel() {},
@@ -136,19 +143,54 @@ const record = (id: string, coverage = 'partial') =>
   });
 
 type TestIntake = ReturnType<typeof uploadIntake>;
-const propose = (bridge: TestBridge, intake: TestIntake, jsonlText = record(intake.id)) =>
-  bridge.callbacks.onTool?.({
-    tool: 'health_intake_propose',
-    arguments: {
+const propose = async (
+  bridge: TestBridge,
+  intake: TestIntake,
+  jsonlText = record(intake.id),
+  coverageKind: 'extracted' | 'inspected' = 'extracted',
+) => {
+  const dispatch = (tool: string, args: Record<string, unknown>) =>
+    bridge.callbacks.onTool?.({
+      tool,
+      arguments: args,
+      callId: `call-${tool}-${intake.id}`,
+      threadId: 'thread-fixture',
+      turnId: 'turn-1',
+    } as unknown as Parameters<NonNullable<TestBridge['callbacks']['onTool']>>[0]);
+  await dispatch('health_intake_read', { id: intake.id });
+  const text = (await dispatch('health_intake_source_text', { id: intake.id })) as {
+    revisionId?: string;
+  };
+  const current = getIntake(intake.db, intake.root, profileId, intake.id);
+  const plan = current.workflow?.plans.find((plan) => plan.status === 'active');
+  if (plan) {
+    const unit = plan.units.find((unit) => unit.status === 'pending') ?? plan.units[0]!;
+    await dispatch('health_intake_plan', { id: intake.id, action: 'read_unit', unitId: unit.id });
+    return dispatch('health_intake_batch', {
       id: intake.id,
       version: getIntake(intake.db, intake.root, profileId, intake.id).version,
+      planId: plan.id,
+      operationId: `fictional-proposal-${intake.id}-${current.proposals.length}`,
+      coverage: [
+        {
+          unitId: unit.id,
+          kind: coverageKind,
+          notes: 'The independently fictional dispatched source unit was read.',
+        },
+      ],
+      sourceTextRevisionId: text?.revisionId,
       jsonlText,
       summary: 'Fictional bounded conversion pass',
-    },
-    callId: `call-${intake.id}`,
-    threadId: 'thread-fixture',
-    turnId: 'turn-1',
-  } as unknown as Parameters<NonNullable<TestBridge['callbacks']['onTool']>>[0]);
+    });
+  }
+  return dispatch('health_intake_propose', {
+    id: intake.id,
+    version: getIntake(intake.db, intake.root, profileId, intake.id).version,
+    sourceTextRevisionId: text?.revisionId,
+    jsonlText,
+    summary: 'Fictional bounded conversion pass',
+  });
+};
 
 const complete = (bridge: TestBridge) =>
   bridge.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
@@ -388,6 +430,7 @@ test('an active linked conversion is restarted under coordinator ownership after
   assert.equal(f.bridges[0].closed, true);
   assert.equal(f.manager.get(profileId, batch.id).items[1].status, 'queued');
 
+  await propose(f.bridges[1], first);
   complete(f.bridges[1]);
   await waitFor(() => f.bridges.length === 3, 'next file after linked terminal pass');
   assert.equal(f.manager.get(profileId, batch.id).items[0].status, 'review_ready');
@@ -641,13 +684,19 @@ test('prepared JSONL and an existing partial proposal skip model work without co
     newProviderName: 'Fictional clinic',
     bytes: Buffer.from('Fictional original with unread remainder'),
   });
+  await extractIntakeSourceText({
+    db: f.db,
+    root: f.root,
+    profileId,
+    id: partial.id,
+  });
   const proposedPartial = (await import('../intake.ts')).proposeConversion(
     f.db,
     f.root,
     profileId,
     partial.id,
     {
-      version: partial.version,
+      version: getIntake(f.db, f.root, profileId, partial.id).version,
       jsonlText: record('partial-fixture'),
       summary: 'One bounded section only; unread remainder retained',
     },
@@ -696,11 +745,13 @@ test('a busy reprocess leaves stopped review-ready items unchanged', async (t) =
   });
   await waitFor(() => f.manager.get(profileId, old.id).status === 'complete');
   f.manager.stop(profileId, old.id);
-  writeIntakeSourcePin(f.db, first.id, {
-    revisionId: 'fictional-new-source',
-    dependencyToken: 'fictional-new-source',
-    requiresInterpretation: true,
-    version: 1,
+  transaction(f.db, () => {
+    writeIntakeSourcePin(f.db, first.id, {
+      revisionId: 'fictional-new-source',
+      dependencyToken: 'fictional-new-source',
+      requiresInterpretation: true,
+      version: 1,
+    });
   });
   const competing = f.manager.create(profileId, {
     operationId: 'fictional-competing-batch',
@@ -751,11 +802,13 @@ test('corrected completed work cannot displace a different running batch or clai
   });
   await waitFor(() => f.manager.get(profileId, secondBatch.id).status === 'complete');
   for (const source of [first, second])
-    writeIntakeSourcePin(f.db, source.id, {
-      revisionId: 'fictional-material-change',
-      dependencyToken: 'fictional-material-change',
-      requiresInterpretation: true,
-      version: 1,
+    transaction(f.db, () => {
+      writeIntakeSourcePin(f.db, source.id, {
+        revisionId: 'fictional-material-change',
+        dependencyToken: 'fictional-material-change',
+        requiresInterpretation: true,
+        version: 1,
+      });
     });
   assert.throws(
     () =>
@@ -814,11 +867,13 @@ test('a corrected earlier file cannot displace an in-flight sibling in its retai
     const current = f.manager.get(profileId, batch.id);
     return current.items[0]?.status === 'review_ready' && current.items[1]?.status === 'starting';
   }, 'second source preflight');
-  writeIntakeSourcePin(f.db, first.id, {
-    revisionId: 'fictional-corrected-first',
-    dependencyToken: 'fictional-corrected-first',
-    requiresInterpretation: true,
-    version: 1,
+  transaction(f.db, () => {
+    writeIntakeSourcePin(f.db, first.id, {
+      revisionId: 'fictional-corrected-first',
+      dependencyToken: 'fictional-corrected-first',
+      requiresInterpretation: true,
+      version: 1,
+    });
   });
   const before = f.manager.get(profileId, batch.id);
   assert.throws(
@@ -929,11 +984,51 @@ test('explicit resume continues a partial review-ready source after recreating t
     intakeIds: [original.id],
   });
   await waitFor(() => f.bridges.length === 1);
-  await propose(f.bridges[0], original, record('fictional-first-section'));
+  await propose(f.bridges[0], original, record('fictional-first-section'), 'inspected');
   complete(f.bridges[0]);
+  await waitFor(() => f.bridges.length === 2, 'partial proposal continues reading');
+  complete(f.bridges[1]);
+  await waitFor(() => f.bridges.length === 3, 'one bounded coverage reconciliation');
+  complete(f.bridges[2]);
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    await waitFor(
+      () => f.bridges.length === attempt + 3 && f.bridges[attempt + 2].started,
+      'unfinished unit continues reading',
+    );
+    const bridge = f.bridges[attempt + 2];
+    for (let request = 0; request < DEFAULT_INTAKE_READING_LIMITS.requests!; request++) {
+      const requestId = `fictional-no-progress-${attempt}-${request}`;
+      bridge.callbacks.onEvent?.('model/requestStarted', {
+        requestId,
+        model: 'fictional',
+        attempt: 1,
+        requestDigest: 'b'.repeat(64),
+        requestBytes: 1,
+      });
+      bridge.callbacks.onEvent?.('model/requestFinished', {
+        requestId,
+        failed: false,
+        outcome: 'response',
+      });
+    }
+    await waitFor(
+      () =>
+        f.manager.get(profileId, batch.id).items[0].reading?.usableModelResponses ===
+        attempt * DEFAULT_INTAKE_READING_LIMITS.requests!,
+      'all completed no-progress responses are accounted',
+    );
+    complete(bridge);
+  }
   await waitFor(() => f.manager.get(profileId, batch.id).status === 'complete');
   assert.equal(f.manager.get(profileId, batch.id).items[0].status, 'review_ready');
-  assert.equal(f.manager.get(profileId, batch.id).items[0].reading?.reason, 'no_progress');
+  assert.equal(f.manager.get(profileId, batch.id).items[0].reason, 'processing_stalled');
+  assert.equal(f.manager.get(profileId, batch.id).items[0].stalls?.attempts, 3);
+  assert.equal(
+    f.manager.get(profileId, batch.id).items[0].reading?.usableModelResponses,
+    6 * DEFAULT_INTAKE_READING_LIMITS.requests!,
+    'three source-unit stall attempts retain all six completed request windows',
+  );
+  assert.equal(f.manager.get(profileId, batch.id).items[0].readingJob?.extensions, 3);
   const retainedProposal = getIntake(f.db, f.root, profileId, original.id).proposals[0].id;
   f.manager.close();
   const restarted = createIntakeBatchManager({
@@ -943,11 +1038,11 @@ test('explicit resume continues a partial review-ready source after recreating t
     pollMs: 5,
   });
   t.after(() => restarted.close());
-  assert.equal(f.bridges.length, 1, 'recreation alone does not restart model work');
+  assert.equal(f.bridges.length, 9, 'recreation alone does not restart model work');
   restarted.resume(profileId, batch.id);
-  await waitFor(() => f.bridges.length === 2, 'explicit resume starts another linked pass');
-  await propose(f.bridges[1], original, record('fictional-second-section'));
-  complete(f.bridges[1]);
+  await waitFor(() => f.bridges.length === 10, 'explicit resume starts another linked pass');
+  await propose(f.bridges[9], original, record('fictional-second-section'));
+  complete(f.bridges[9]);
   await waitFor(() => restarted.get(profileId, batch.id).status === 'complete');
   const after = getIntake(f.db, f.root, profileId, original.id);
   assert.equal(after.proposals.length, 2);
@@ -1331,6 +1426,7 @@ test('appended selections survive restart and operation replay while automatic w
   const restoredRoot = resolve(f.root, 'fictional-rebuilt');
   const rebuilt = rebuildProfile(resolve(backup.path, 'files'), profileId, restoredRoot);
   const restoredDb = openDatabase(rebuilt.database, profileId);
+  attachPersonalDurability(restoredDb, { root: restoredRoot, profileId });
   const restored = createIntakeBatchManager({
     root: restoredRoot,
     databases: new Map([[profileId, restoredDb]]),

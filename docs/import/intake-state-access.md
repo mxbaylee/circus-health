@@ -30,6 +30,12 @@ The [intake serialization contract](../data/intake-state-storage.md#exact-serial
 
 The guarantee is exactly `JSON.stringify` over the supported normalized plain-data domain, including finite primitives, omitted undefined object members, null undefined array positions and standard Unicode/lone-surrogate escaping. Arbitrary original JSON text instead uses the mutually exclusive [raw initial representation](../data/intake-envelope-authority.md#one-selected-representation). Whitespace, duplicates and escape spelling remain exact through reads/search/copy until an actual authorized write converts it once to normalized mode. Raw compact metadata preserves SQLite first-duplicate and JavaScript last-duplicate behavior. Neither a disposable search row nor an unmarked legacy inline source can replace selected authority.
 
+## Fixture authority
+
+Intake test fixtures must attach genuine accepted-record durability before uploading or registering originals. The [in-memory authority fixture](../../src/server/test/helpers/intake-authority-fixture.ts) uses the real record coordinator for bounded adapter tests; runtime, copy and recovery cases use the filesystem or encrypted backend. Do not bypass readiness, seed operational JSON directly into compact source rows, or switch a populated fixture to fresh unrelated storage. Fixture mutations use the application transaction boundary.
+
+Model-script fixtures use the [fictional model helper](../../src/server/test/fictional-model.ts) to configure the coordinator's selected model; a supplied bridge factory alone does not establish model availability. They must read current durable source text and pass its revision when the runtime requires it. Use actual plan and coverage APIs to account for work; an original preview, invented batch label or successful proposal alone does not establish source-text consumption or completion. Tests specifically about portable snapshot formats opt into `portableSnapshots: true`; ordinary runtime fixtures keep journal authority.
+
 ## Operational consumer inventory
 
 The shared boundary serves intake details, version checks, DTO/review construction, proposal publication and workflow mutations. Additional writers are duplicate-review questions and atomic acceptance receipts. Additional readers are:

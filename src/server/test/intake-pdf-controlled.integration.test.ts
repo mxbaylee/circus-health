@@ -1,16 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { writeFictionalBenchmarkPdf } from '../../scripts/fictional-pdf-benchmark-fixture.ts';
+import {
+  fictionalPageMarker,
+  writeFictionalBenchmarkPdf,
+} from '../../scripts/fictional-pdf-benchmark-fixture.ts';
 import { createAssistant } from '../assistant.ts';
 import { openDatabase } from '../database.ts';
 import { writeIntakeBatch } from '../intake-batch-journal.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { disposePdfEvidenceSessions } from '../intake-pdf-session.ts';
-import { getIntake, getIntakeOriginal, uploadIntake } from '../intake.ts';
+import { createIntakePlan, getIntake, getIntakeOriginal, uploadIntake } from '../intake.ts';
+import { publishIntakeSourceText } from '../intake-source-text.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { profilePaths } from '../profile-storage.ts';
 import { PROXY_MAX_TOOL_ROUNDS, ProxyModelBridge } from '../proxy-model-bridge.ts';
@@ -63,12 +67,34 @@ test(
     let planId = '';
     let nextPage = 1;
     let unitId = '';
-    let phase: 'context' | 'plan' | 'read' | 'batch' | 'complete' = 'context';
+    let phase: 'context' | 'read' | 'source_text' | 'batch' | 'complete' = 'context';
+    let sourceTextPage = 1;
+    let lastTextPage = 1;
+    let afterText: 'read' | 'batch' = 'read';
+    let sourceTextRevisionId = '';
+    let selectedRevisionId = '';
+    let passageCursor = { offset: 0, character: 0, issueOffset: 0, relationOffset: 0 };
+    const durablePagesRead = new Set<number>();
+    const passageReads: Array<{ slice: number; page: number; revisionId: string }> = [];
+    const beginText = (first: number, last: number, next: 'read' | 'batch') => {
+      sourceTextPage = first;
+      lastTextPage = last;
+      afterText = next;
+      passageCursor = { offset: 0, character: 0, issueOffset: 0, relationOffset: 0 };
+      phase = 'source_text';
+    };
     const pagesRead: number[] = [];
     const pagesDelivered = new Set<number>();
     const mediaPages = new Map<string, number>();
-    const unitReceipts: Array<{ unitId: string; pages: number[] }> = [];
+    const unitReceipts: Array<{
+      unitId: string;
+      operationId: string;
+      pages: number[];
+      coverage: string;
+      sourceTextRevisionId: string;
+    }> = [];
     const errors: string[] = [];
+    const acknowledgedTools: Array<{ slice: number; tool: string }> = [];
     const requests: Array<{
       slice: number;
       textCharacters: number;
@@ -85,6 +111,9 @@ test(
       connectionCheck: async () => ({ available: true, readiness: 'ready' }),
       bridgeFactory: (options) => {
         const currentSlice = ++slice;
+        // A batch requested at the round cap may not have executed. Its new
+        // context rereads the ten relevant passages before attempting it again.
+        if (phase === 'batch') beginText(nextPage - 10, nextPage - 1, 'batch');
         return new ProxyModelBridge({
           ...options,
           config: {
@@ -106,6 +135,7 @@ test(
             try {
               assert.ok(options.onTool);
               const result = object(await options.onTool(params));
+              acknowledgedTools.push({ slice: currentSlice, tool: params.tool });
               if (params.tool === 'health_intake_read') {
                 const args = object(params.arguments);
                 const metadata = object(result.metadata);
@@ -126,25 +156,96 @@ test(
                 assert.ok(Array.isArray(units) && units.length === 1);
                 unitId = String(object(units[0]).id);
                 nextPage = page + 1;
-                phase = page % 10 === 0 ? 'batch' : 'read';
+                // Keep each real original read beside its durable passage;
+                // transcript retrieval must not consume a long no-progress run.
+                beginText(page, page, page % 10 === 0 ? 'batch' : 'read');
+              } else if (params.tool === 'health_intake_source_text') {
+                assert.equal(result.sourceHash, fixture.sourceHash);
+                assert.equal(typeof result.revisionId, 'string');
+                assert.ok(result.revisionId);
+                assert.equal(result.revisionId, selectedRevisionId);
+                sourceTextRevisionId = String(result.revisionId);
+                const spans = result.spans;
+                const issues = result.issues;
+                const relations = result.relations;
+                assert.ok(
+                  Array.isArray(spans) && Array.isArray(issues) && Array.isArray(relations),
+                );
+                for (const span of spans)
+                  assert.equal(object(object(span).region).page, sourceTextPage);
+                assert.equal(spans.length, 1);
+                assert.equal(object(spans[0]).text, fictionalPageMarker(sourceTextPage, 100));
+                passageReads.push({
+                  slice: currentSlice,
+                  page: sourceTextPage,
+                  revisionId: sourceTextRevisionId,
+                });
+                if (
+                  result.nextOffset !== null ||
+                  result.nextIssueOffset !== null ||
+                  result.nextRelationOffset !== null
+                ) {
+                  passageCursor = {
+                    offset:
+                      result.nextOffset === null
+                        ? passageCursor.offset + spans.length
+                        : integer(result.nextOffset),
+                    character: integer(result.nextCharacter),
+                    issueOffset:
+                      result.nextIssueOffset === null
+                        ? passageCursor.issueOffset + issues.length
+                        : integer(result.nextIssueOffset),
+                    relationOffset:
+                      result.nextRelationOffset === null
+                        ? passageCursor.relationOffset + relations.length
+                        : integer(result.nextRelationOffset),
+                  };
+                } else {
+                  durablePagesRead.add(sourceTextPage);
+                  sourceTextPage++;
+                  passageCursor = { offset: 0, character: 0, issueOffset: 0, relationOffset: 0 };
+                  if (sourceTextPage > lastTextPage) phase = afterText;
+                }
               } else if (params.tool === 'health_intake_plan') {
                 version = integer(result.version);
-                if (phase === 'context') phase = 'plan';
-                else {
-                  planId = String(object(result.plan).id);
-                  phase = 'read';
-                }
+                assert.equal(phase, 'context');
+                phase = 'read';
               } else if (params.tool === 'health_intake_batch') {
+                const args = object(params.arguments);
+                assert.equal(args.sourceTextRevisionId, selectedRevisionId);
+                assert.ok(Array.isArray(args.coverage) && args.coverage.length === 1);
+                const coverage = object(args.coverage[0]);
+                const completedUnit = (nextPage - 1) % 50 === 0;
+                assert.equal(coverage.kind, completedUnit ? 'extracted' : 'inspected');
+                const batchPages = Array.from({ length: 10 }, (_, index) => nextPage - 10 + index);
+                const claimedPages = completedUnit
+                  ? Array.from({ length: 50 }, (_, index) => nextPage - 50 + index)
+                  : batchPages;
+                for (const page of claimedPages) {
+                  assert.ok(
+                    pagesDelivered.has(page),
+                    `Original page ${page} must reach the scripted upstream before coverage`,
+                  );
+                  assert.ok(
+                    durablePagesRead.has(page),
+                    `Durable page ${page} must be read before coverage`,
+                  );
+                }
                 version = integer(result.version);
                 unitReceipts.push({
                   unitId,
-                  pages: Array.from({ length: 10 }, (_, index) => nextPage - 10 + index),
+                  operationId: String(args.operationId),
+                  pages: batchPages,
+                  coverage: String(coverage.kind),
+                  sourceTextRevisionId,
                 });
                 phase = nextPage > 100 ? 'complete' : 'read';
               }
               return result;
             } catch (error) {
-              errors.push(String(error));
+              errors.push(
+                `${params.tool} (${phase}, next original page ${nextPage}): ${String(error)}`,
+              );
               throw error;
             }
           },
@@ -181,16 +282,18 @@ test(
                 section: 'units',
                 offset: 0,
               };
-            else if (phase === 'plan')
-              args = { id: intakeId, action: 'create', version, unitSize: 10, overlap: 0 };
             else if (phase === 'read') {
               name = 'health_intake_read';
               args = { id: intakeId, page: nextPage };
+            } else if (phase === 'source_text') {
+              name = 'health_intake_source_text';
+              args = { id: intakeId, page: sourceTextPage, ...passageCursor };
             } else if (phase === 'batch') {
               name = 'health_intake_batch';
               args = {
                 id: intakeId,
                 version,
+                sourceTextRevisionId,
                 planId,
                 operationId: `fictional-controlled-unit-${nextPage - 1}`,
                 jsonlText: Array.from({ length: 10 }, (_, index) =>
@@ -200,9 +303,11 @@ test(
                 coverage: [
                   {
                     unitId,
-                    kind: 'extracted',
+                    kind: (nextPage - 1) % 50 === 0 ? 'extracted' : 'inspected',
                     notes:
-                      'All ten original page windows delivered to the scripted transport; no extraction fidelity inference.',
+                      (nextPage - 1) % 50 === 0
+                        ? 'All fifty original pages and durable passages in this unit delivered; no extraction fidelity inference.'
+                        : 'Ten additional original pages and durable passages delivered; the rest of the unit remains pending.',
                   },
                 ],
               };
@@ -273,17 +378,65 @@ test(
       bytes: readFileSync(fixturePath),
     });
     intakeId = source.id;
+    // This check qualifies continuation and original-page transport, not OCR.
+    // Publish the generator's known visible markers through the real accepted
+    // source-text API. Partial, uninspected evidence makes no completeness claim.
+    const pageNumbers = Array.from({ length: 100 }, (_, index) => index + 1);
+    const seeded = publishIntakeSourceText(db, root, profileId, intakeId, {
+      operationId: randomUUID(),
+      expectedRevisionId: null,
+      sourceHash: fixture.sourceHash,
+      evidence: {
+        adapter: { name: 'fictional-controlled-page-markers', version: '1' },
+        pages: pageNumbers.map((page) => ({ page, disposition: 'partial', inspected: false })),
+        spans: pageNumbers.map((page) => ({
+          id: `fictional-marker-${page}`,
+          text: fictionalPageMarker(page, 100),
+          region: { page },
+          provenance: 'structured',
+        })),
+        relations: [],
+        issues: [],
+      },
+    });
+    assert.ok(seeded.revision);
+    selectedRevisionId = seeded.revision.id;
+    // Genuine automatic dispatch scopes a context to its pending unit. Fifty
+    // pages leave enough productive work to cross the real 64-request boundary;
+    // each ten-page partial batch remains a separate durable review receipt.
+    const planned = await createIntakePlan(db, root, profileId, intakeId, {
+      version: getIntake(db, root, profileId, intakeId).version,
+      unitSize: 50,
+      overlap: 0,
+    });
+    const initialPlan = planned.workflow?.plans.find((plan) => plan.status === 'active');
+    assert.ok(initialPlan);
+    planId = initialPlan.id;
     const batch = manager.create(profileId, {
       operationId: 'fictional-controlled-start',
       intakeIds: [intakeId],
     });
     const deadline = Date.now() + 150_000;
-    while (Date.now() < deadline && manager.get(profileId, batch.id).status !== 'complete')
+    while (
+      Date.now() < deadline &&
+      !errors.length &&
+      manager.get(profileId, batch.id).status !== 'complete'
+    )
       await new Promise((resolve) => setTimeout(resolve, 20));
     const finalBatch = manager.get(profileId, batch.id);
     const final = getIntake(db, root, profileId, intakeId);
     const item = finalBatch.items[0]!;
     const plan = final.workflow?.plans.find((value) => value.id === planId);
+    t.diagnostic(
+      JSON.stringify({
+        boundaries,
+        requestsPerSlice: Array.from(
+          { length: slice },
+          (_, index) => requests.filter((value) => value.slice === index + 1).length,
+        ),
+        sourceTextPassages: passageReads.length,
+      }),
+    );
     assert.deepEqual(errors, []);
     assert.equal(
       finalBatch.status,
@@ -299,6 +452,18 @@ test(
       [...pagesDelivered].sort((a, b) => a - b),
       pagesRead,
     );
+    assert.deepEqual(
+      [...durablePagesRead].sort((a, b) => a - b),
+      pagesRead,
+    );
+    assert.ok(
+      passageReads.length >= 100,
+      'Every proposed page needs an actual durable passage read',
+    );
+    assert.ok(
+      passageReads.length <= 100 + boundaries.length * 10,
+      'A fresh context rereads at most its current ten-page batch',
+    );
     assert.ok(boundaries.length > 0, 'The run must cross a productive reading boundary');
     for (const [index, boundary] of boundaries.entries()) {
       assert.equal(boundary.reason, 'time_limit');
@@ -306,6 +471,19 @@ test(
       assert.ok(boundary.proposals > (boundaries[index - 1]?.proposals || 0));
     }
     assert.equal(requests.filter((value) => value.slice === 1).length, PROXY_MAX_TOOL_ROUNDS);
+    assert.equal(
+      acknowledgedTools.filter((value) => value.slice === 1).length,
+      PROXY_MAX_TOOL_ROUNDS - 1,
+      'The final requested tool at the round cap is not acknowledged or treated as completed',
+    );
+    assert.equal(
+      acknowledgedTools.filter((value) => value.tool === 'health_intake_read').length,
+      100,
+    );
+    assert.equal(
+      acknowledgedTools.filter((value) => value.tool === 'health_intake_batch').length,
+      10,
+    );
     // After the round boundary, fresh contexts bind to pending units and can
     // finish at those unit boundaries before reaching the round cap again.
     for (let current = 1; current <= slice; current++) {
@@ -316,14 +494,18 @@ test(
     assert.equal(item.readingJob?.slices, slice);
     assert.equal(item.reading?.pendingReadWindows, 0);
     assert.equal(item.reading?.readWindows, 100);
-    assert.equal(item.reading?.accountedUnits, 10);
+    assert.equal(item.reading?.accountedUnits, 2);
     assert.equal(item.reading?.remainingUnits, 0);
     assert.equal(item.reading?.reason, 'reading_exhausted');
     assert.equal(item.reading?.readyRecords, 100);
     assert.equal(item.reading?.modelRequests, requests.length);
     assert.equal(item.reading?.modelUsageIncomplete, true);
     assert.equal(plan?.batches.length, 10);
-    assert.equal(plan?.units.length, 10);
+    assert.equal(plan?.units.length, 2);
+    assert.ok(plan?.units.every((unit) => unit.pages?.length === 50));
+    assert.equal(new Set(unitReceipts.map((receipt) => receipt.operationId)).size, 10);
+    assert.equal(unitReceipts.filter((receipt) => receipt.coverage === 'inspected').length, 8);
+    assert.equal(unitReceipts.filter((receipt) => receipt.coverage === 'extracted').length, 2);
     assert.ok(plan?.units.every((unit) => unit.coverage?.kind === 'extracted'));
     assert.equal(final.proposals.length, 10);
     assert.equal(final.imported, null);
@@ -350,8 +532,11 @@ test(
         advancesAfterHostAcknowledgement: true,
         tokenUsage: 'unmeasured',
         cachedInputTokens: null,
+        durableSourceText:
+          'Known visible fixture markers published through the accepted source-text API; OCR and transcription quality are not measured.',
       },
       physicalRequests: requests.length,
+      acknowledgedTools,
       requestsPerSlice: Array.from(
         { length: slice },
         (_, index) => requests.filter((value) => value.slice === index + 1).length,
@@ -365,6 +550,7 @@ test(
       boundaries,
       pagesRead,
       pagesDelivered: [...pagesDelivered].sort((a, b) => a - b),
+      passageReads,
       unitReceipts,
       finalReading: item.reading,
       finalReadingJob: item.readingJob,
@@ -381,6 +567,7 @@ test(
       JSON.stringify({
         physicalRequests: requests.length,
         slices: slice,
+        sourceTextPassages: passageReads.length,
         durationMs: report.durationMs,
         requestMaxima: report.requestMaxima,
       }),
