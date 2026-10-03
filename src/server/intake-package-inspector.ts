@@ -3,7 +3,7 @@ import { crc32 } from 'node:zlib';
 import { openSync, closeSync, fstatSync, writeSync } from 'node:fs';
 import { fromFd, type Entry, type LocalFileHeader, type ZipFile } from 'yauzl';
 import { pathToFileURL } from 'node:url';
-import type { Readable } from 'node:stream';
+import type { Readable, Writable } from 'node:stream';
 import {
   PackageInspectionError,
   emptyPackageInspectionWork,
@@ -58,7 +58,7 @@ export async function inspectPackageDescriptor(
   sourceFd: number,
   selected: number | null = null,
   outputFd?: number,
-  progress: (work: PackageInspectionWork) => void = () => {},
+  progress: (work: PackageInspectionWork) => void | Promise<void> = () => {},
 ) {
   const work = emptyPackageInspectionWork();
   let current: { filename: string; ordinal: number } | undefined;
@@ -117,7 +117,7 @@ export async function inspectPackageDescriptor(
           ),
         ),
       );
-      archive.on('entry', (entry: Entry) => {
+      archive.on('entry', async (entry: Entry) => {
         if (ended) return;
         try {
           current = undefined;
@@ -178,11 +178,11 @@ export async function inspectPackageDescriptor(
               );
           }
           work.entries++;
-          if (work.entries % 100 === 0) progress({ ...work });
+          if (work.entries % 100 === 0) await progress({ ...work });
           // Yauzl can reject the next name before emitting its entry. Do not
           // misattribute that failure to the preceding valid member.
           current = undefined;
-          archive.readEntry();
+          if (!ended) archive.readEntry();
         } catch (error) {
           rejectOnce(error);
         }
@@ -257,7 +257,7 @@ export async function inspectPackageDescriptor(
           }
         }
         if (work.memberReadBytes - lastReported >= MIB) {
-          progress({ ...work });
+          await progress({ ...work });
           lastReported = work.memberReadBytes;
         }
       }
@@ -273,7 +273,7 @@ export async function inspectPackageDescriptor(
         sourceHash: digest.digest('hex'),
       });
       work.membersVerified++;
-      progress({ ...work });
+      await progress({ ...work });
     }
     if (failure) fail('ZIP source could not be read', 'PACKAGE_FORMAT');
     return { members, work };
@@ -305,32 +305,78 @@ export async function inspectPackage(
 ) {
   return (await inspectPackageDescriptor(openSync(path, 'r'), selected, outputFd)).members;
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const send = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\n');
-  try {
-    const result = await inspectPackageDescriptor(
-      3,
-      process.argv[2] === undefined ? null : Number(process.argv[2]),
-      process.argv[2] === undefined ? undefined : 4,
-      (work) => {
-        send({ type: 'progress', work });
-      },
-    );
-    for (const member of result.members) send({ type: 'member', member });
-    send({ type: 'complete', work: result.work });
-  } catch (error) {
-    const failure =
-      error instanceof PackageInspectionError
-        ? error
-        : new PackageInspectionError('ZIP inspection failed', 'PACKAGE_FORMAT');
-    send({
-      type: 'error',
-      message: failure.message,
-      reasonCode: failure.reasonCode,
-      filename: failure.filename,
-      ordinal: failure.ordinal,
-      work: failure.work,
+/** One outstanding protocol frame at a time, including progress. Awaiting the
+ * write completion propagates a slow receiver back to lazy entries and payload
+ * iteration instead of retaining an archive-sized queue of progress frames. */
+export async function inspectPackageToProtocol(
+  sourceFd: number,
+  selected: number | null,
+  outputFd: number | undefined,
+  output: Writable,
+): Promise<boolean> {
+  let transportError: Error | undefined;
+  const onError = (error: Error) => {
+    transportError = error;
+  };
+  output.on('error', onError);
+  const send = async (value: unknown) => {
+    if (transportError) throw transportError;
+    await new Promise<void>((resolve, reject) => {
+      output.write(JSON.stringify(value) + '\n', (error) => {
+        if (error) {
+          transportError = error;
+          reject(error);
+        } else resolve();
+      });
     });
+  };
+  try {
+    let result;
+    try {
+      result = await inspectPackageDescriptor(sourceFd, selected, outputFd, (work) =>
+        send({ type: 'progress', work }),
+      );
+    } catch (error) {
+      if (transportError) throw transportError;
+      const failure =
+        error instanceof PackageInspectionError
+          ? error
+          : new PackageInspectionError('ZIP inspection failed', 'PACKAGE_FORMAT');
+      await send({
+        type: 'error',
+        message: failure.message,
+        reasonCode: failure.reasonCode,
+        filename: failure.filename,
+        ordinal: failure.ordinal,
+        work: failure.work,
+      });
+      return false;
+    }
+    for (const member of result.members) await send({ type: 'member', member });
+    await send({ type: 'complete', work: result.work });
+    return true;
+  } finally {
+    // Writable reports a failed write callback before emitting its error event.
+    // Keep the small handler on the failed stream, including when inspection
+    // has already rejected, so a lost receiver cannot become an uncaught
+    // exception. `closed` may already be true before its error event is emitted.
+    if (!transportError) output.off('error', onError);
+  }
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    if (
+      !(await inspectPackageToProtocol(
+        3,
+        process.argv[2] === undefined ? null : Number(process.argv[2]),
+        process.argv[2] === undefined ? undefined : 4,
+        process.stdout,
+      ))
+    )
+      process.exitCode = 1;
+  } catch {
+    // A broken receiver cannot accept a diagnostic frame. Exit without leaking
+    // raw transport errors/paths; the parent observes the missing completion.
     process.exitCode = 1;
   }
 }
