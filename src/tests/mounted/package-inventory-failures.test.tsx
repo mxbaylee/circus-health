@@ -145,7 +145,7 @@ it('reloads durable failures after inventory fails, retains the exact original l
   expect(screen.getByRole('button', { name: 'Retry structure' })).toBeVisible();
   expect(screen.getByText('This member could not be indexed as structured data.')).toBeVisible();
   expect(detailReads).toContainEqual(['structure']);
-  expect(fetcher.mock.calls.every(([, options]) => options.method !== 'POST')).toBe(true);
+  expect(fetcher.mock.calls.every(([, options]) => options?.method !== 'POST')).toBe(true);
   expect(
     screen.queryByText(/^(Import complete|Extraction complete|Accepted)$/i),
   ).not.toBeInTheDocument();
