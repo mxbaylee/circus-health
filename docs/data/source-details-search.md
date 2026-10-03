@@ -26,7 +26,7 @@ Reopen, private copy and total cache loss rebuild from the selected profile's ve
 
 ## Work accounting and measured growth
 
-`sourceDetailsSearchCounters(db)` separates requests/outcomes, callback evaluations and binding reads, reconstructed text units/bytes, projection reads inside callbacks, callback authority reads, and selected DTO rows/raw-details bytes. Upfront dirty-source maintenance is counted in `sourceTextProjectionCounters`, separately from callback deltas. The projection totals also include callback work, so adding them to callback counters would double-count it. Engine reconstruction, validation, hashing, encoding and logical-copy counts overlap by activity and are not physical disk bytes. Counters describe completed reconstruction payloads and counted host attempts; a failed pure-engine call does not return partial engine metrics.
+`sourceDetailsSearchCounters(db)` separates requests/outcomes, callback evaluations and binding reads, reconstructed text units/bytes, projection reads inside callbacks, callback source-row authority reads, and selected DTO rows/raw-details bytes. Upfront dirty-source maintenance is counted in `sourceTextProjectionCounters`, separately from callback deltas. The projection totals also include callback work, so adding them to callback counters would double-count it. Engine reconstruction, validation, hashing, encoding and logical-copy counts overlap by activity and are not physical disk bytes. Counters describe completed reconstruction payloads and counted host attempts; a failed pure-engine call does not return partial engine metrics.
 
 The [growth regression](../../src/server/test/source-details-search-growth.test.ts) starts with 10,097 UTF-8 bytes / 10,094 UTF-16 units of fictional JSON, including periodic text, Unicode and a literal escaped surrogate. It performs 300 actual one-character insertions in application transactions. Each change runs one source-list request before commit and two warm requests afterward; every request compares count and selected details with an independent old-SQL oracle. The details-only search term forces reconstruction in both count and page statements.
 
@@ -46,12 +46,12 @@ Independent SQL audit triggers count actual inserted/updated payloads. Maximum c
 |     200 |                600 / 1,200 |             256,800 / 43,801,302 |                12,237,000 |          600 / 6,118,500 |
 |     300 |                900 / 1,800 |             565,200 / 87,801,702 |                18,445,500 |          900 / 9,222,750 |
 
-Callback authority reads remain zero; upfront maintenance reads and hashes each changed source once: 100/200/300 reads and 1,014,750/2,039,500/3,074,250 bytes. Selected DTO reads are additional full-envelope reads, as shown above. Binding reads equal reconstruction counts. Peak individual reconstructed strings grow to 10,197/10,297/10,397 bytes; retained text entries stay zero. Cumulative reconstructed UTF-16 units are 6,086,700/12,233,400/18,440,100.
+Callback source-row authority reads remain zero; durable readiness-head reads are separate below. Upfront maintenance reads and hashes each changed source once: 100/200/300 reads and 1,014,750/2,039,500/3,074,250 bytes. Selected DTO reads are additional full-envelope reads, as shown above. Binding reads equal reconstruction counts. Peak individual reconstructed strings grow to 10,197/10,297/10,397 bytes; retained text entries stay zero. Cumulative reconstructed UTF-16 units are 6,086,700/12,233,400/18,440,100.
 
 | Changes | All projection rows / bytes read | Total SQLite allocation | Accepted writes / bytes written | Total retained accepted bytes |
 | ------: | -------------------------------: | ----------------------: | ------------------------------: | ----------------------------: |
 |     100 |              79,601 / 16,963,287 |               2,199,552 |                 300 / 1,252,168 |                     1,254,727 |
-|     200 |             299,201 / 51,052,487 |               3,956,736 |                 600 / 2,515,118 |                     2,503,277 |
+|     200 |             299,201 / 51,052,487 |               3,948,544 |                 600 / 2,515,118 |                     2,503,277 |
 |     300 |            658,801 / 102,361,687 |               5,763,072 |                 900 / 3,788,068 |                     3,761,827 |
 
 SQLite totals include source rows, accepted indexes and projection/index pages, not just changed text rows or filesystem usage. These allocation samples are dated 2026-10-03 and can vary with generated identities and SQLite. They are evidence about this fixture, not capacity thresholds.
@@ -63,6 +63,16 @@ SQLite totals include source rows, accepted indexes and projection/index pages, 
 |     300 |                         27,264,597 |       148,495,224 |                   436,700,520 |                        30,732,600 |
 
 Engine validation processes 10,100,247/20,210,497/30,330,747 UTF-16 units, exact comparisons process 1,014,450/2,038,900/3,073,350 units, and UTF-8 encoding processes 31,788,924/83,306,324/154,643,724 bytes. Automatic matching scans 5,086,241/10,202,291/15,368,341 units, compares 5,068,502/10,181,652/15,339,802 units, hashes 9,169,915/18,389,465/27,699,015 units and logically copies 1,014,750/2,039,500/3,074,250 bytes. It derives one operation per change, with no Myers trace or residual reuse in this fixture. Growing read/hash/reconstruction costs remain visible despite small changed rows; this does not prove computation proportional only to changed bytes.
+
+The fixture also counts actual calls to its accepted-record `RecordStorage.read`, separating durable heads from immutable objects and isolating the reads made inside `sourceFiles` from oracle/mutation/publication work. Initialization makes 7 head reads / 720 returned bytes and 3 immutable-object reads / 33,197 bytes; two initial head reads return missing. Its first source-list request accounts for 3 head reads / 432 bytes and no immutable reads. The following table excludes initialization:
+
+| Changes | All head reads / bytes | All immutable-object reads / bytes | Request-only head reads / bytes |
+| ------: | ---------------------: | ---------------------------------: | ------------------------------: |
+|     100 |        1,200 / 172,800 |                    300 / 2,418,250 |                   900 / 129,600 |
+|     200 |        2,400 / 345,600 |                    600 / 4,857,850 |                 1,800 / 259,200 |
+|     300 |        3,600 / 518,400 |                    900 / 7,317,450 |                 2,700 / 388,800 |
+
+Each request in this fixture reads three readiness heads and no immutable history objects. No additional missing returns occur. Returned bytes equal bytes copied by the fixture's `Buffer.from`; these counts do not measure filesystem I/O, encryption or copies internal to the durability implementation. They must not be interpreted as zero durable reads merely because callback source-row authority reads are zero.
 
 ## Validation and remaining activation
 
