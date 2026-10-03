@@ -1,6 +1,9 @@
 import * as operations from './core.ts';
 import { createRun, inspectEnvironment } from './environment.ts';
-import { ENVIRONMENT_FIELDS } from './types.ts';
+import { projectPrfDiagnostics } from './diagnostics.ts';
+import type { DiagnosticObserver } from './diagnostics.ts';
+import { isVerifiedReturnToA } from './progress.ts';
+import { ENVIRONMENT_FIELDS, stepsForAlias } from './types.ts';
 import type {
   Attempt,
   BuildInfo,
@@ -174,8 +177,16 @@ export async function createCheckerController(
   function canRunStep(alias: CredentialAlias, step: Step): boolean {
     if (!available() || !['A', 'B'].includes(alias)) return false;
     const credential = state.credentials.find((item) => item.alias === alias);
-    if (step === 'create') return !credential;
+    if (step === 'create')
+      return !credential && (alias === 'A' || state.credentials.some((item) => item.alias === 'A'));
     if (step === 'confirm') return !!credential && !credential.cipher;
+    if (step === 'use-after-b')
+      return (
+        alias === 'A' &&
+        !!credential?.cipher &&
+        state.credentials.some((item) => item.alias === 'B') &&
+        !state.attempts.some((item) => isVerifiedReturnToA(state, item))
+      );
     if (!credential?.cipher || !['use-1', 'use-2', 'use-3'].includes(step)) return false;
     if (
       state.attempts.some(
@@ -234,12 +245,16 @@ export async function createCheckerController(
       // Safari requires the original button gesture for credential operations.
       try {
         const credential = state.credentials.find((item) => item.alias === alias);
+        const observe: DiagnosticObserver = (diagnostics) => {
+          const safe = projectPrfDiagnostics(diagnostics);
+          if (safe) attempt.diagnostics = safe;
+        };
         const result =
           step === 'create'
-            ? await core.createCredential(state.run, alias, state.credentials)
+            ? await core.createCredential(state.run, alias, state.credentials, undefined, observe)
             : step === 'confirm'
-              ? await core.confirmCredential(state.run, credential!)
-              : await core.verifyCredential(state.run, credential!);
+              ? await core.confirmCredential(state.run, credential!, undefined, observe)
+              : await core.verifyCredential(state.run, credential!, undefined, observe);
         if (result) {
           const publicCredential = {
             alias: result.alias,
@@ -276,7 +291,7 @@ export async function createCheckerController(
       if (!available()) return;
       if (
         !['A', 'B'].includes(input.alias) ||
-        !['create', 'confirm', 'use-1', 'use-2', 'use-3', 'general'].includes(input.step) ||
+        ![...stepsForAlias(input.alias), 'general'].includes(input.step) ||
         !['worked', 'failed', 'could-not-test'].includes(input.outcome)
       )
         return;

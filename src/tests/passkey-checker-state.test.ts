@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createCheckerController } from '../app/passkey-checker/controller.ts';
 import type { ControllerOptions } from '../app/passkey-checker/controller.ts';
 import { CheckerStorageError } from '../app/passkey-checker/store.ts';
+import { CheckerError } from '../app/passkey-checker/core.ts';
 import type {
   Change,
   CheckerStore,
@@ -197,6 +198,107 @@ test('only public credential fields are persisted from the operation result', as
     salt: 'salt',
   });
   assert.equal(JSON.stringify(f.changes).includes('must-not-persist'), false);
+});
+
+test('return to A requires B creation, uses retained ciphertext despite B failure and preserves retries', async () => {
+  const f = fixture();
+  const controller = await createCheckerController(f.options);
+  assert.equal(controller.canRunStep('B', 'create'), false);
+  assert.equal(controller.canRunStep('A', 'use-after-b'), false);
+  await controller.runStep('A', 'create');
+  await controller.runStep('A', 'confirm');
+  for (const step of ['use-1', 'use-2', 'use-3'] as const) await controller.runStep('A', step);
+  const originalA = structuredClone(controller.exportModel().credentials[0]);
+  assert.equal(controller.canRunStep('A', 'use-after-b'), false);
+  await controller.runStep('B', 'create');
+  f.options.core!.confirmCredential = async () => {
+    throw new CheckerError('prf-absent');
+  };
+  await controller.runStep('B', 'confirm');
+  assert.equal(controller.canRunStep('A', 'use-after-b'), true);
+  assert.equal(controller.canRunStep('B', 'use-after-b'), false);
+  let calls = 0;
+  f.options.core!.verifyCredential = async (_run, credential) => {
+    assert.deepEqual(credential, originalA);
+    if (++calls === 1) throw new CheckerError('wrong-credential');
+  };
+  await controller.runStep('A', 'use-after-b');
+  assert.equal(controller.canRunStep('A', 'use-after-b'), true);
+  controller.close();
+  const resumed = await createCheckerController({
+    ...f.options,
+    build: { ...build, revision: 'return-check-build' },
+  });
+  await resumed.runStep('A', 'use-after-b');
+  assert.equal(calls, 2);
+  assert.equal(resumed.canRunStep('A', 'use-after-b'), false);
+  const state = resumed.exportModel();
+  assert.deepEqual(
+    state.credentials.find((v) => v.alias === 'A'),
+    originalA,
+  );
+  assert.equal(state.credentials.find((v) => v.alias === 'B')?.cipher, undefined);
+  assert.deepEqual(
+    state.attempts.filter((v) => v.step === 'use-after-b').map((v) => [v.status, v.error]),
+    [
+      ['failed', 'wrong-credential'],
+      ['verified', undefined],
+    ],
+  );
+  assert.equal(state.attempts.at(-1)?.build.revision, 'return-check-build');
+  assert.equal(state.attempts.filter((v) => v.alias === 'A' && v.status === 'verified').length, 5);
+  const count = state.observations.length;
+  await resumed.addObservation({ alias: 'B', step: 'use-after-b', outcome: 'worked', note: '' });
+  assert.equal(resumed.exportModel().observations.length, count);
+  resumed.close();
+  // A clock change or damaged chronology must not leave the report unfinished
+  // while preventing the operator from obtaining a fresh, ordered observation.
+  f.retained!.state.attempts.at(-1)!.startedAt = '1970-01-01T00:00:00.000Z';
+  const unordered = await createCheckerController(f.options);
+  assert.equal(unordered.canRunStep('A', 'use-after-b'), true);
+  await unordered.runStep('A', 'use-after-b');
+  assert.equal(calls, 3);
+  assert.equal(unordered.canRunStep('A', 'use-after-b'), false);
+});
+
+test('safe diagnostics persist on failed attempts without relabeling legacy errors or retaining native material', async () => {
+  const f = fixture();
+  const controller = await createCheckerController(f.options);
+  await controller.runStep('A', 'create');
+  f.options.core!.confirmCredential = async () => {
+    throw new CheckerError('missing-prf');
+  };
+  await controller.runStep('A', 'confirm');
+  const legacy = structuredClone(controller.exportModel().attempts.at(-1)!);
+  const raw = {
+    requestMode: 'eval' as const,
+    inputShape: 'array-buffer' as const,
+    inputLength: 32,
+    extensionPresent: true,
+    resultsPresent: true,
+    outputShape: 'string' as const,
+    outputLength: 7,
+    credentialMatched: true,
+    rawPrf: 'must-not-persist',
+    rawId: 'must-not-persist',
+  };
+  f.options.core!.confirmCredential = async (_run, _credential, _port, observe) => {
+    observe?.(raw);
+    // A retained callback input must not alias durable evidence.
+    raw.outputLength = 99;
+    throw new CheckerError('prf-invalid');
+  };
+  await controller.runStep('A', 'confirm');
+  const latest = controller.exportModel().attempts.at(-1)!;
+  assert.equal(latest.error, 'prf-invalid');
+  assert.equal(latest.diagnostics?.outputLength, 7);
+  assert.equal('rawPrf' in latest.diagnostics!, false);
+  assert.equal(JSON.stringify(f.changes).includes('must-not-persist'), false);
+  controller.close();
+  const resumed = await createCheckerController(f.options);
+  assert.deepEqual(resumed.exportModel().attempts[1], legacy);
+  assert.equal(resumed.exportModel().attempts[1].diagnostics, undefined);
+  assert.deepEqual(resumed.exportModel().attempts.at(-1), latest);
 });
 
 test('reload interrupts pending evidence and stale tab conflicts preserve its export', async () => {

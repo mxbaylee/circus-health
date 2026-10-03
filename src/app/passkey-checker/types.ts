@@ -1,3 +1,5 @@
+import type { PrfDiagnostics } from './diagnostics.ts';
+
 /** Public, browser-local fictional checker data. Never add PRF output or keys. */
 export interface BuildInfo {
   version: string;
@@ -22,14 +24,19 @@ export type EnvironmentField = (typeof ENVIRONMENT_FIELDS)[number];
 export type Environment = Record<EnvironmentField, MetadataField>;
 export type CredentialAlias = 'A' | 'B';
 export const KNOWN_TRANSPORTS = ['ble', 'hybrid', 'internal', 'nfc', 'usb'] as const;
-export type Step = 'create' | 'confirm' | 'use-1' | 'use-2' | 'use-3';
+export type Step = 'create' | 'confirm' | 'use-1' | 'use-2' | 'use-3' | 'use-after-b';
 export const STEP_LABELS: Record<Step, string> = {
   create: 'Create credential',
   confirm: 'Confirm PRF and fictional encryption',
   'use-1': 'Fresh use 1',
   'use-2': 'Fresh use 2',
   'use-3': 'Fresh use 3',
+  'use-after-b': 'Use A after B is created',
 };
+export function stepsForAlias(alias: CredentialAlias): Step[] {
+  const steps: Step[] = ['create', 'confirm', 'use-1', 'use-2', 'use-3'];
+  return alias === 'A' ? [...steps, 'use-after-b'] : steps;
+}
 export const ERROR_MESSAGES = {
   'insecure-context': 'A valid HTTPS secure context is required.',
   unsupported: 'The native credential API or required operation is unavailable.',
@@ -43,6 +50,8 @@ export const ERROR_MESSAGES = {
   'duplicate-credential': 'A distinct second credential was not returned.',
   'invalid-credential': 'The browser did not return a usable public credential.',
   'missing-prf': 'No valid 32-byte PRF result was returned.',
+  'prf-absent': 'The browser returned no PRF result for this request.',
+  'prf-invalid': 'The returned PRF result was not a supported 32-byte representation.',
   'decrypt-failed': 'The fresh PRF result could not decrypt and match the fictional value.',
   unconfirmed: 'Confirm this credential before testing further uses.',
   'scope-mismatch': 'This saved run belongs to a different origin or relying-party scope.',
@@ -74,6 +83,7 @@ export interface Attempt {
   step: Step;
   status: 'pending' | 'created' | 'verified' | 'failed' | 'interrupted';
   error?: ErrorCode;
+  diagnostics?: PrfDiagnostics;
   startedAt: string;
   finishedAt?: string;
   build: BuildInfo;

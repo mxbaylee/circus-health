@@ -1,6 +1,8 @@
 import { encodePrf, prfFrom, withBinaryPrf } from '../components/passkey-prf.ts';
 import { ERROR_MESSAGES, KNOWN_TRANSPORTS } from './types.ts';
 import type { CredentialAlias, CredentialRecord, ErrorCode, RunHeader } from './types.ts';
+import { describePrfRequest, describePrfResponse, emitPrfDiagnostics } from './diagnostics.ts';
+import type { PrfDiagnostics, PrfDiagnosticsObserver } from './diagnostics.ts';
 
 export class CheckerError extends Error {
   readonly code: ErrorCode;
@@ -126,11 +128,19 @@ function request(
     }) as unknown as PublicKeyCredentialRequestOptions,
   };
 }
-function extractPrf(value: Credential | null, credential: CredentialRecord): string {
+function extractPrf(
+  value: Credential | null,
+  credential: CredentialRecord,
+  diagnostics: PrfDiagnostics,
+): string {
   const result = publicCredential(value);
-  if (encodePrf(result.rawId) !== credential.id) throw new CheckerError('wrong-credential');
-  const prf = prfFrom({ clientExtensionResults: result.getClientExtensionResults() });
-  if (!prf) throw new CheckerError('missing-prf');
+  diagnostics.credentialMatched = encodePrf(result.rawId) === credential.id;
+  if (!diagnostics.credentialMatched) throw new CheckerError('wrong-credential');
+  const extensions = result.getClientExtensionResults();
+  const captured = describePrfResponse(diagnostics, extensions);
+  const prf = prfFrom({ clientExtensionResults: captured });
+  if (!prf)
+    throw new CheckerError(diagnostics.outputShape === 'absent' ? 'prf-absent' : 'prf-invalid');
   return prf;
 }
 /** Public browser routing hints, never used as proof of authenticator/provider identity. */
@@ -150,63 +160,84 @@ export async function createCredential(
   alias: CredentialAlias,
   existing: CredentialRecord[],
   port?: CredentialPort,
+  observer?: PrfDiagnosticsObserver,
 ): Promise<CredentialRecord> {
-  if (existing.some((entry) => entry.alias === alias)) throw new CheckerError('invalid-state');
   const salt = encodePrf(random(32).buffer);
-  // Calling the port precedes the first await, preserving the button's user activation.
-  const result = publicCredential(
-    await (port ?? nativePort(run)).create({
-      publicKey: withBinaryPrf({
-        challenge: random(32),
-        timeout: 60_000,
-        rp: { name: 'Circus Health fictional compatibility checker', id: run.rpId },
-        user: {
-          id: bytes(run.userId),
-          name: `fictional-${run.id}`,
-          displayName: 'Fictional compatibility test',
-        },
-        pubKeyCredParams: [
-          { type: 'public-key', alg: -8 },
-          { type: 'public-key', alg: -7 },
-          { type: 'public-key', alg: -257 },
-        ],
-        authenticatorSelection: {
-          residentKey: 'required',
-          requireResidentKey: true,
-          userVerification: 'required',
-        },
-        attestation: 'none',
-        excludeCredentials: existing.map((entry) => ({
-          type: 'public-key',
-          id: bytes(entry.id),
-          ...(entry.transports ? { transports: entry.transports } : {}),
-        })),
-        extensions: { credProps: true, prf: { eval: { first: salt } } },
-      }) as unknown as PublicKeyCredentialCreationOptions,
-    }),
-  );
-  const id = encodePrf(result.rawId);
-  if (existing.some((entry) => entry.id === id)) throw new CheckerError('duplicate-credential');
-  const transports = transportHints(result);
-  return { alias, id, salt, ...(transports.length ? { transports } : {}) };
+  const options: CredentialCreationOptions = {
+    publicKey: withBinaryPrf({
+      challenge: random(32),
+      timeout: 60_000,
+      rp: { name: 'Circus Health fictional compatibility checker', id: run.rpId },
+      user: {
+        id: bytes(run.userId),
+        name: `fictional-${run.id}-passkey-${alias}`,
+        displayName: `Fictional compatibility test — passkey ${alias}`,
+      },
+      pubKeyCredParams: [
+        { type: 'public-key', alg: -8 },
+        { type: 'public-key', alg: -7 },
+        { type: 'public-key', alg: -257 },
+      ],
+      authenticatorSelection: {
+        residentKey: 'required',
+        requireResidentKey: true,
+        userVerification: 'required',
+      },
+      attestation: 'none',
+      excludeCredentials: existing.map((entry) => ({
+        type: 'public-key',
+        id: bytes(entry.id),
+        ...(entry.transports ? { transports: entry.transports } : {}),
+      })),
+      extensions: { credProps: true, prf: { eval: { first: salt } } },
+    }) as unknown as PublicKeyCredentialCreationOptions,
+  };
+  const diagnostics = describePrfRequest('eval', options.publicKey?.extensions?.prf?.eval?.first);
+  try {
+    if (existing.some((entry) => entry.alias === alias)) throw new CheckerError('invalid-state');
+    // Calling the port precedes the first await, preserving the button's user activation.
+    const result = publicCredential(await (port ?? nativePort(run)).create(options));
+    try {
+      const extensions = result.getClientExtensionResults();
+      describePrfResponse(diagnostics, extensions);
+    } catch {
+      // Creation alone is not PRF confirmation; optional evidence cannot lose an enrolled credential.
+    }
+    const id = encodePrf(result.rawId);
+    if (existing.some((entry) => entry.id === id)) throw new CheckerError('duplicate-credential');
+    const transports = transportHints(result);
+    return { alias, id, salt, ...(transports.length ? { transports } : {}) };
+  } finally {
+    emitPrfDiagnostics(diagnostics, observer);
+  }
 }
 export async function confirmCredential(
   run: RunHeader,
   credential: CredentialRecord,
   port?: CredentialPort,
+  observer?: PrfDiagnosticsObserver,
 ): Promise<CredentialRecord> {
-  if (credential.cipher) throw new CheckerError('invalid-state');
-  const assertion = await (port ?? nativePort(run)).get(request(run, credential, true));
-  const key = await keyFor(extractPrf(assertion, credential), run, credential);
-  const iv = random(12);
-  const data = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: context(run, credential) },
-    key,
-    fictionalValue(run, credential),
-  );
-  const confirmed = { ...credential, cipher: { iv: encodePrf(iv.buffer), data: encodePrf(data) } };
-  await decryptAndCompare(key, run, confirmed);
-  return confirmed;
+  const options = request(run, credential, true);
+  const diagnostics = describePrfRequest('eval', options.publicKey?.extensions?.prf?.eval?.first);
+  try {
+    if (credential.cipher) throw new CheckerError('invalid-state');
+    const assertion = await (port ?? nativePort(run)).get(options);
+    const key = await keyFor(extractPrf(assertion, credential, diagnostics), run, credential);
+    const iv = random(12);
+    const data = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: context(run, credential) },
+      key,
+      fictionalValue(run, credential),
+    );
+    const confirmed = {
+      ...credential,
+      cipher: { iv: encodePrf(iv.buffer), data: encodePrf(data) },
+    };
+    await decryptAndCompare(key, run, confirmed);
+    return confirmed;
+  } finally {
+    emitPrfDiagnostics(diagnostics, observer);
+  }
 }
 async function decryptAndCompare(key: CryptoKey, run: RunHeader, credential: CredentialRecord) {
   if (!credential.cipher) throw new CheckerError('unconfirmed');
@@ -236,9 +267,19 @@ export async function verifyCredential(
   run: RunHeader,
   credential: CredentialRecord,
   port?: CredentialPort,
+  observer?: PrfDiagnosticsObserver,
 ): Promise<void> {
-  if (!credential.cipher) throw new CheckerError('unconfirmed');
-  const assertion = await (port ?? nativePort(run)).get(request(run, credential, false));
-  const key = await keyFor(extractPrf(assertion, credential), run, credential);
-  await decryptAndCompare(key, run, credential);
+  const options = request(run, credential, false);
+  const diagnostics = describePrfRequest(
+    'evalByCredential',
+    options.publicKey?.extensions?.prf?.evalByCredential?.[credential.id]?.first,
+  );
+  try {
+    if (!credential.cipher) throw new CheckerError('unconfirmed');
+    const assertion = await (port ?? nativePort(run)).get(options);
+    const key = await keyFor(extractPrf(assertion, credential, diagnostics), run, credential);
+    await decryptAndCompare(key, run, credential);
+  } finally {
+    emitPrfDiagnostics(diagnostics, observer);
+  }
 }

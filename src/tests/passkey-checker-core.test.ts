@@ -10,6 +10,7 @@ import type { CredentialPort } from '../app/passkey-checker/core.ts';
 import type { RunHeader } from '../app/passkey-checker/types.ts';
 import { inspectEnvironment } from '../app/passkey-checker/environment.ts';
 import { encodePrf } from '../app/components/passkey-prf.ts';
+import type { PrfDiagnostics } from '../app/passkey-checker/diagnostics.ts';
 const encode = (bytes: number[]) => encodePrf(Uint8Array.from(bytes).buffer);
 const run: RunHeader = {
   schemaVersion: 1,
@@ -79,11 +80,19 @@ test('controlled port: native-shaped requests start synchronously and preserve p
   id = [4, 5, 6];
   const b = await createCredential(run, 'B', [confirmed], port);
   assert.deepEqual(creates[1].user.id, creates[0].user.id, 'same fictional profile user ID');
+  assert.match(creates[0].user.name, /passkey-A$/);
+  assert.match(creates[1].user.name, /passkey-B$/);
+  assert.match(creates[0].user.displayName, /passkey A$/);
+  assert.match(creates[1].user.displayName, /passkey B$/);
   assert.equal(creates[1].excludeCredentials?.length, 1);
   assert.deepEqual(creates[1].excludeCredentials![0].transports, a.transports);
+  assert.deepEqual(creates[1].excludeCredentials![0].id, new Uint8Array([1, 2, 3]));
   assert.notEqual(b.id, a.id);
   const confirmedB = await confirmCredential(run, b, port);
   await verifyCredential(run, confirmedB, port);
+  id = [1, 2, 3];
+  await verifyCredential(run, confirmed, port);
+  assert.deepEqual(gets.at(-1)!.allowCredentials![0].id, new Uint8Array([1, 2, 3]));
   assert.deepEqual(Object.keys(confirmed).sort(), ['alias', 'cipher', 'id', 'salt', 'transports']);
   assert.deepEqual(Object.keys(confirmed.cipher!).sort(), ['data', 'iv']);
 });
@@ -98,7 +107,9 @@ test('controlled crypto: rejects missing/malformed PRF, wrong credential, duplic
       rawId: new Uint8Array([1]).buffer,
       getClientExtensionResults: () => ({ prf: { results: { first: prf } } }),
     } as unknown as Credential;
-    await assert.rejects(confirmCredential(run, a, port), { code: 'missing-prf' });
+    await assert.rejects(confirmCredential(run, a, port), {
+      code: prf === undefined ? 'prf-absent' : 'prf-invalid',
+    });
   }
   returned = result([2]);
   await assert.rejects(confirmCredential(run, a, port), { code: 'wrong-credential' });
@@ -133,4 +144,154 @@ test('native adapter refuses insecure contexts and error classification never in
   assert.equal(environment.browser.source, 'browser-reported');
   assert.equal(environment.osVersion.source, 'unknown');
   assert.equal(environment.provider.source, 'unknown');
+});
+test('controlled diagnostics: capture once and distinguish absence, rejected shapes, mismatch and native refusal', async () => {
+  let calls = 0;
+  let extensions: unknown = { prf: { results: { first: new Uint8Array(32).fill(7) } } };
+  let returnedId = [1];
+  let refusal: unknown;
+  const port: CredentialPort = {
+    create: async () => result([1]),
+    get: async () => {
+      if (refusal) throw refusal;
+      return {
+        type: 'public-key',
+        rawId: Uint8Array.from(returnedId).buffer,
+        getClientExtensionResults() {
+          calls++;
+          return extensions;
+        },
+      } as unknown as Credential;
+    },
+  };
+  const observed: PrfDiagnostics[] = [];
+  const observe = (diagnostics: PrfDiagnostics) => observed.push(diagnostics);
+  const a = await createCredential(run, 'A', [], port, observe);
+  assert.deepEqual(observed.pop(), {
+    requestMode: 'eval',
+    inputShape: 'array-buffer',
+    inputLength: 32,
+    extensionPresent: true,
+    resultsPresent: true,
+    outputShape: 'array-buffer-view',
+    outputLength: 32,
+  });
+  const confirmed = await confirmCredential(run, a, port, observe);
+  assert.equal(calls, 1, 'the extension API is shared by diagnostics and production decoder');
+  assert.deepEqual(observed.pop(), {
+    requestMode: 'eval',
+    inputShape: 'array-buffer',
+    inputLength: 32,
+    credentialMatched: true,
+    extensionPresent: true,
+    resultsPresent: true,
+    outputShape: 'array-buffer-view',
+    outputLength: 32,
+  });
+  let firstReads = 0;
+  extensions = {
+    prf: {
+      results: {
+        get first() {
+          firstReads++;
+          return new Uint8Array(32).fill(firstReads === 1 ? 7 : 8);
+        },
+      },
+    },
+  };
+  const capturedConfirmation = await confirmCredential(run, a, port, observe);
+  assert.equal(firstReads, 1, 'diagnostics and decoder use one captured output value');
+  assert.equal(observed.pop()!.outputLength, 32);
+  extensions = { prf: { results: { first: new Uint8Array(32).fill(7) } } };
+  await verifyCredential(run, capturedConfirmation, port, observe);
+  observed.pop();
+  await verifyCredential(run, confirmed, port, observe);
+  assert.equal(calls, 4);
+  assert.equal(observed.pop()!.requestMode, 'evalByCredential');
+  for (const [first, expectedShape] of [
+    [Array(32).fill(7), 'array'],
+    [encode(Array(32).fill(7)), 'string'],
+    [new Uint8Array(32).fill(7).buffer, 'array-buffer'],
+  ] as const) {
+    extensions = { prf: { results: { first } } };
+    await verifyCredential(run, confirmed, port, observe);
+    assert.equal(observed.pop()!.outputShape, expectedShape);
+  }
+  extensions = { prf: { results: { first: new Uint8Array(32).fill(8) } } };
+  await assert.rejects(verifyCredential(run, confirmed, port, observe), { code: 'decrypt-failed' });
+  assert.deepEqual(observed.pop(), {
+    requestMode: 'evalByCredential',
+    inputShape: 'array-buffer',
+    inputLength: 32,
+    credentialMatched: true,
+    extensionPresent: true,
+    resultsPresent: true,
+    outputShape: 'array-buffer-view',
+    outputLength: 32,
+  });
+  for (const missing of [{}, { prf: {} }, { prf: { results: {} } }]) {
+    extensions = missing;
+    await assert.rejects(confirmCredential(run, a, port, observe), { code: 'prf-absent' });
+    assert.equal(observed.pop()!.outputShape, 'absent');
+  }
+  for (const [first, outputShape, outputLength] of [
+    [null, 'null', undefined],
+    [Array(31).fill(7), 'array', 31],
+    [Array(32).fill('7'), 'array', 32],
+    [new Uint8Array(33), 'array-buffer-view', 33],
+    ['fictional-untrusted', 'string', 19],
+    [{ private: 'fictional-secret' }, 'object', undefined],
+  ] as const) {
+    extensions = { prf: { results: { first } }, untrusted: 'fictional-secret' };
+    await assert.rejects(confirmCredential(run, a, port, observe), { code: 'prf-invalid' });
+    const evidence = observed.pop()!;
+    assert.equal(evidence.outputShape, outputShape);
+    assert.equal(evidence.outputLength, outputLength);
+    assert.equal(JSON.stringify(evidence).includes('fictional-secret'), false);
+  }
+  const beforeMismatch = calls;
+  returnedId = [2];
+  await assert.rejects(confirmCredential(run, a, port, observe), { code: 'wrong-credential' });
+  assert.equal(calls, beforeMismatch, "never inspect another credential's extensions");
+  assert.deepEqual(observed.pop(), {
+    requestMode: 'eval',
+    inputShape: 'array-buffer',
+    inputLength: 32,
+    credentialMatched: false,
+  });
+  refusal = new DOMException('fictional-secret native response', 'NotAllowedError');
+  await assert.rejects(confirmCredential(run, a, port, observe), { name: 'NotAllowedError' });
+  assert.deepEqual(observed.pop(), {
+    requestMode: 'eval',
+    inputShape: 'array-buffer',
+    inputLength: 32,
+  });
+  refusal = undefined;
+  returnedId = [1];
+  extensions = { prf: { results: { first: new Uint8Array(32).fill(7) } } };
+  await confirmCredential(run, a, port, () => {
+    throw new Error('observer failure');
+  });
+});
+test('creation retains the credential when optional extension diagnostics fail', async () => {
+  let calls = 0;
+  const port: CredentialPort = {
+    create: async () =>
+      ({
+        type: 'public-key',
+        rawId: new Uint8Array([1]).buffer,
+        getClientExtensionResults() {
+          calls++;
+          throw new Error('fictional native extension failure');
+        },
+      }) as unknown as Credential,
+    get: async () => null,
+  };
+  const observed: PrfDiagnostics[] = [];
+  const a = await createCredential(run, 'A', [], port, (diagnostics) => observed.push(diagnostics));
+  assert.equal(a.id, encode([1]));
+  assert.equal(calls, 1);
+  assert.deepEqual(observed, [
+    { requestMode: 'eval', inputShape: 'array-buffer', inputLength: 32 },
+  ]);
 });

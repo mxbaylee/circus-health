@@ -1,4 +1,5 @@
-import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, KNOWN_TRANSPORTS } from './types.ts';
+import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, KNOWN_TRANSPORTS, stepsForAlias } from './types.ts';
+import { isPrfDiagnostics } from './diagnostics.ts';
 import { fictionalValue } from './core.ts';
 import type { Attempt, CheckerState, CredentialRecord, Observation, RunHeader } from './types.ts';
 
@@ -88,8 +89,7 @@ function environment(value: unknown): boolean {
     )
   );
 }
-const steps = ['create', 'confirm', 'use-1', 'use-2', 'use-3'];
-function alias(value: unknown): boolean {
+function alias(value: unknown): value is 'A' | 'B' {
   return value === 'A' || value === 'B';
 }
 function encoded(value: unknown, minBytes: number, maxBytes = minBytes): boolean {
@@ -151,16 +151,17 @@ function validAttempt(value: unknown): value is Attempt {
     keys(
       value,
       ['id', 'alias', 'step', 'status', 'startedAt', 'build', 'environment'],
-      ['error', 'finishedAt'],
+      ['error', 'finishedAt', 'diagnostics'],
     ) &&
     text(value.id) &&
     alias(value.alias) &&
-    steps.includes(String(value.step)) &&
+    stepsForAlias(value.alias).some((step) => step === value.step) &&
     ['pending', 'created', 'verified', 'failed', 'interrupted'].includes(String(value.status)) &&
     (value.error === undefined ||
       (typeof value.error === 'string' && Object.hasOwn(ERROR_MESSAGES, value.error))) &&
     date(value.startedAt) &&
     (value.finishedAt === undefined || date(value.finishedAt)) &&
+    (value.diagnostics === undefined || isPrfDiagnostics(value.diagnostics)) &&
     build(value.build) &&
     environment(value.environment) &&
     (value.status !== 'created' || value.step === 'create') &&
@@ -172,7 +173,7 @@ function validObservation(value: unknown): value is Observation {
     keys(value, ['id', 'alias', 'step', 'outcome', 'note', 'createdAt', 'build', 'environment']) &&
     text(value.id) &&
     alias(value.alias) &&
-    [...steps, 'general'].includes(String(value.step)) &&
+    (value.step === 'general' || stepsForAlias(value.alias).some((step) => step === value.step)) &&
     ['worked', 'failed', 'could-not-test'].includes(String(value.outcome)) &&
     typeof value.note === 'string' &&
     value.note.length <= 2000 &&
