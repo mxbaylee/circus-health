@@ -170,8 +170,25 @@ export function prepareIntakeStateCopySnapshot(
   targetProfileId: string,
   options: Options = {},
 ): IntakeStateCopyPlan {
+  return inspectSnapshot(snapshot, targetProfileId, options)!;
+}
+
+/** Validate retained portable evidence without generating a new copy or requiring a backend. */
+export function validateIntakeStateCopySnapshot(
+  snapshot: IntakeStateCopySnapshot,
+  options: Options = {},
+): void {
+  inspectSnapshot(snapshot, undefined, options);
+}
+
+function inspectSnapshot(
+  snapshot: IntakeStateCopySnapshot,
+  targetProfileId: string | undefined,
+  options: Options,
+): IntakeStateCopyPlan | undefined {
   exact(snapshot, ['sourceProfileId', 'originals', 'rows']);
-  profiles(snapshot.sourceProfileId, targetProfileId);
+  if (targetProfileId !== undefined) profiles(snapshot.sourceProfileId, targetProfileId);
+  else if (!validProfileId(snapshot.sourceProfileId)) invalid('copy profile identity');
   if (!Array.isArray(snapshot.originals) || !Array.isArray(snapshot.rows)) invalid('copy snapshot');
   const caps = preparationLimits(options);
   if (snapshot.originals.length + snapshot.rows.length > caps.rows)
@@ -282,6 +299,7 @@ export function prepareIntakeStateCopySnapshot(
     const serialized = serializeIntakeJson(basis.value);
     counters.reconstructedStateBytes += Buffer.byteLength(serialized);
     if (counters.reconstructedStateBytes > caps.bytes) invalid('aggregate reconstructed bytes');
+    if (targetProfileId === undefined) continue;
     const targetIdentity = { ...identity, profileId: targetProfileId };
     const changes = [{ op: 'set', path: [], value: basis.value }];
     const remaining = budget(chainCaps, {
@@ -327,6 +345,7 @@ export function prepareIntakeStateCopySnapshot(
     counters.preparedHeadBytes += Buffer.byteLength(evidence.serializedHead);
     counters.preparedReceiptBytes += Buffer.byteLength(evidence.receipt);
   }
+  if (targetProfileId === undefined) return;
   const plan: IntakeStateCopyPlan = Object.freeze({
     format: 'health-intake-state-copy-v1',
     sourceProfileId,
@@ -380,6 +399,15 @@ function capture(
     snapshot.rows.push(contribution);
   }
   return snapshot;
+}
+
+/** Read-only bounded capture; the caller must independently certify selected publication. */
+export function captureIntakeStateCopySnapshot(
+  db: Database,
+  sourceProfileId: string,
+  options: Options = {},
+): IntakeStateCopySnapshot {
+  return capture(db, sourceProfileId, preparationLimits(options));
 }
 
 /** Capture only a real, current selected source projection, before owner/path rewrites. */
