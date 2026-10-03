@@ -115,7 +115,7 @@ Proposed focused-ticket divisions are recorded in [CRS-140](CRS-140.md#proposed-
 
 ## <a id="product-and-maintenance"></a>🛠️ Product and maintenance
 
-- [ ] <a id="crs-212"></a> 🧪 [CRS-212](CRS-212.md) · 🐕 M · 🔴 L · 🚀 production · score 8 — Run and retain a new unchanged full scripted-fixture attempt; builds on the implemented renderer; waits for the runner/storage qualifications CRS-195/198 in pending PR #35. Unblocks CRS-194’s baseline.
+- [ ] <a id="crs-212"></a> 🧪 [CRS-212](CRS-212.md) · 🐕 M · 🔴 L · 🚀 production · score 8 — Run and retain a new unchanged full scripted-fixture attempt; builds on the implemented renderer; waits for CRS-227/228 and the runner/storage qualifications CRS-195/198 in pending PR #35. Unblocks CRS-194’s baseline.
 
 - [ ] <a id="crs-227"></a> 🧵 [CRS-227](CRS-227.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Remove complete-history rereads/replay from ordinary processing-queue journal changes while retaining exact recovery and every event; separately measured prerequisite for CRS-194 before another heavy attempt.
 - [ ] <a id="crs-228"></a> 🪶 [CRS-228](CRS-228.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Reduce measured full-view validation, cloning, serialization, repeated proposal reads and projection work for small intake changes, with complete DTO/cold-rebuild costs separated; prerequisite for CRS-194 before another heavy attempt.
@@ -124,13 +124,13 @@ Proposed focused-ticket divisions are recorded in [CRS-140](CRS-140.md#proposed-
 - [ ] <a id="crs-174"></a> 🗒️ [CRS-174](CRS-174.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Separate personal condition confirmations and Conditions UI; follows CRS-173. Visits remain notes.
 - [ ] <a id="crs-175"></a> 🗂️ [CRS-175](CRS-175.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Qualify personally confirmed conditions in packets, exclusions and recovery; follows CRS-173/174 and CRS-216's packet foundation, and unblocks CRS-150. Allergy scope remains open.
 
-- [ ] <a id="crs-139"></a><a id="crs-090"></a> 🏷️ [CRS-139](CRS-139.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Make remembered name owners visible, revocable and unable to outrank another person's own name; release holds on later whole-report corrections; finish ownership-correction tests, including ambiguous confirmed-name remembering (remainder of CRS-134; CRS-090's remainder, with its real-file part in [CRS-062](#crs-062)).
+- [ ] <a id="crs-139"></a><a id="crs-090"></a> 🏷️ [CRS-139](CRS-139.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Resolve remembered-owner precedence and make choices visible and revocable; release holds on later whole-report corrections; finish ownership-correction tests, including ambiguous confirmed-name remembering (remainder of CRS-134; CRS-090's remainder, with its real-file part in [CRS-062](#crs-062)).
 - [ ] <a id="crs-140"></a> 🧊 [CRS-140](CRS-140.md) · 🐘 L · 🟡 M · 🚀 production · score 6 — Cool repeated timeouts on one unit with longer backoff, lower concurrency or a longer deadline behind a non-blocking status, never a stop or attempt cap (owner, 2026-09-30); detect provider sign-in without a click, stop journaling unchanged waits, and finish continuation tests (remainder of CRS-135).
 - [ ] <a id="crs-141"></a> 💾 [CRS-141](CRS-141.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Keep partial saves linear on large intakes, keep coupled groups together above the cap, name the person on saved outcomes, and finish coverage (remainder of CRS-136).
 - [ ] <a id="crs-133"></a> 🎂 [CRS-133](CRS-133.md) · 🐕 M · 🟡 M · score 4 — Allow an explicit report-scoped assignment despite an incorrect printed DOB, preserving originals, demographics and the reason for the human exception.
 - [ ] <a id="crs-043"></a> 📦 [CRS-043](CRS-043.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — If the app can store a file, it can import it: stream ZIP members and extraction to disk, replace the upload cap with a free-disk or operator-set storage check, and keep rather than reject a file that cannot be processed yet.
 - [ ] <a id="crs-144"></a> 🪪 [CRS-144](CRS-144.md) · 🐘 L · 🟡 M · score 3 — Define coordinated clinical/candidate/report identity scope for the supported format; prevent running-header splits and explain refusals without crossing people. Preserve current accepted history and decisions; cross-member consolidation remains a decision. No old-archive migration (merges CRS-042 and CRS-046).
-- [ ] <a id="crs-080"></a> 📸 **CRS-080** · 🐭 S · 🟢 S · score 4 — Add test-only capture of a real fictional run's proposals as downstream fixtures, beside the hand-written `fictional-*-proposals.ts`; fresh quality and work-count measurements must bypass replay.
+- [ ] <a id="crs-080"></a> 📸 **CRS-080** · 🐭 S · 🟢 S · score 4 — Turn the existing private fictional proposal captures in `qualify-provider-pdf.ts` into reusable downstream test fixtures beside the hand-written `fictional-*-proposals.ts`; preserve capture completeness/provenance, and bypass replay for fresh quality and work-count measurements.
 
   **User Story:** As an [Operator](../design/personas.md#operate-and-recover), I want to trust that app updates keep record review working, so that I can update without repeatedly paying to reread the same test documents.
 
@@ -142,14 +142,14 @@ Proposed focused-ticket divisions are recorded in [CRS-140](CRS-140.md#proposed-
   Scenario: Reuse fictional review inputs honestly
     Given a completed fictional reading has retained proposals
     When downstream review tests replay those proposals
-    Then test-only fixtures reproduce review inputs, while fresh quality and work-count runs bypass replay
+    Then test-only fixtures reproduce the complete captured review inputs with their provenance, partial captures stay explicit, and fresh quality and work-count runs bypass replay
   ```
 
 - [ ] <a id="crs-081"></a> 🌙 [CRS-081](CRS-081.md) · 🐘 L · 🟡 M · 🚀 production · score 6 — Extend the implemented automatic coordinator with scoped authority after lock/logout/profile switch to complete the decided background-import experience and its joint release journeys; dependent recovery checks need CRS-140.
 - [ ] <a id="crs-084"></a> 🛡️ [CRS-084](CRS-084.md) · 🐕 M · 🟡 M · 🚀 production · score 7 — Prioritize unresolved security risks and mitigations without describing proposed controls as existing protection.
 - [ ] <a id="crs-086"></a> ⚙️ [CRS-086](CRS-086.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Independently implement async artifact processing with bounded context, shared extraction, safe adaptive concurrency and usable foreground chat/browsing/review; CRS-194 supplies diagnostics and the large-document baseline. Progressive review is a separate proposal pending its publication policy.
 - [ ] <a id="crs-088"></a> 👆 [CRS-088](CRS-088.md) · 🐕 M · 🟡 M · score 4 — Quick passkey sign-in without choosing a profile first: a username-less request, one app-wide PRF salt migrated at the next unlock, while retaining origin checks, profile isolation and locked state after restart. Waits for CRS-163’s physical baseline.
-- [ ] <a id="crs-089"></a> 🪶 [CRS-089](CRS-089.md) · 🐕 M · 🟡 M · score 4 — Make the model gateway lighter and less patched: measure LiteLLM's memory, tune it first, and weigh replacements such as Bifrost (blocked on subscription sign-in) only if tuning falls short.
+- [ ] <a id="crs-089"></a> 🪶 [CRS-089](CRS-089.md) · 🐕 M · 🟡 M · score 4 — Make the model gateway lighter and less patched: measure LiteLLM's memory, tune it first, and weigh replacements such as Bifrost only if tuning falls short, rechecking the candidate release's adopted-route sign-in support.
 - [ ] <a id="crs-112"></a> 🧹 **CRS-112** · 🐭 S · 🟢 S · score 4 — Remove blank-Self-field filling from import confirmation; use normal profile editing/setup. Preserve historical human decisions within the supported current format; no old-schema decoder or deletion of accepted history. The selfUpdate mutation in intake-identity.ts is still live.
 
   **User Story:** As a [Low-effort self-tracker](../design/personas.md#file-and-review), I want to keep my personal details under my control when I file a report, so that a document does not unexpectedly change my profile.
@@ -185,8 +185,8 @@ Proposed focused-ticket divisions are recorded in [CRS-140](CRS-140.md#proposed-
     Then the medication is not deactivated; an explicit stopped statement becomes a reviewable suggestion under the recorded vocabulary and date rules
   ```
 
-- [ ] <a id="crs-142"></a> 🐛 [CRS-142](CRS-142.md) · 🐘 L · 🟡 M · score 3 — Add error matchers to bare throw assertions, fail loudly on old `HEALTH_*` test opt-ins, decide whether CI installs Tesseract or OCR is qualified only in the image, resolve the `PDF_NATIVE_PAGE_LIMIT` flake, add the missing R40 route denial cases, and cover Import deep links and the historical Sources redirect in an encrypted browser journey (remainder of CRS-122 and CRS-041).
-- [ ] <a id="crs-123"></a> 🧽 **CRS-123** · 🐭 S · 🟢 S · score 4 — Narrow or justify the broad legacy-variable rejection (`deploy/run.ts` `oldLauncherKeys` and the `HEALTH_`/`CIRCUS_` loop); make proxy-diagnostics flags consistent across `configure.py`, `compose.yaml` and `environment.md`; review noisy diagnostics routes; recheck `import/import-performance.md:3` (R48). Correct stale docs: `environment.md:84` still describes `CRS_CODEX_INTEGRATION_TEST`, removed from CI in `3a8b076`; `import/import-reconciliation.md:9-11` pauses on "a time/context limit" and "exhausted windows", contradicting CRS-126 D2/D3 and [automatic recovery](../import/automatic-recovery.md), and `:17` limits upload review to Self-confirmed records, contradicting D1; the tracked root `prompt.txt` points at missing `docs/application-todo.md` and `docs/workspace-and-handoffs.md`. Coordinate with CRS-142's `HEALTH_*` opt-ins.
+- [ ] <a id="crs-142"></a> 🐛 [CRS-142](CRS-142.md) · 🐘 L · 🟡 M · score 3 — Add error matchers to bare throw assertions, fail loudly on old `HEALTH_*` test opt-ins, select and run the explicit packaged OCR qualification lane, resolve the `PDF_NATIVE_PAGE_LIMIT` flake, add the missing R40 route denial cases, and complete encrypted parity between existing direct Import links and the historical Sources redirect (remainder of CRS-122 and CRS-041).
+- [ ] <a id="crs-123"></a> 🧽 **CRS-123** · 🐕 M · 🟢 S · score 3 — Narrow or justify the broad legacy-variable rejection (`deploy/run.ts` `oldLauncherKeys` and the `HEALTH_`/`CIRCUS_` loop); make proxy-diagnostics flags consistent across `configure.py`, `compose.yaml` and `environment.md`; review noisy diagnostics routes while preserving the implemented recording controls and documented metadata-correlation limits. Correct stale docs: `environment.md:84` still describes `CRS_CODEX_INTEGRATION_TEST`, removed from CI in `3a8b076`; `import/import-reconciliation.md:9-11` pauses on "a time/context limit" and "exhausted windows", contradicting CRS-126 D2/D3 and [automatic recovery](../import/automatic-recovery.md), and `:17` limits upload review to Self-confirmed records, contradicting D1; the tracked root `prompt.txt` points at missing `docs/application-todo.md` and `docs/workspace-and-handoffs.md`. Coordinate with CRS-142's `HEALTH_*` opt-ins.
 
   **User Story:** As an [Operator](../design/personas.md#operate-and-recover), I want to follow setup and recovery instructions that match the app, so that I can resolve problems without following obsolete advice.
 
@@ -480,7 +480,7 @@ The [experiment material](../experiments/README.md) is retained separately. No b
   Scenario: Publish counts only after separate authorization
     Given the owner separately authorizes and runs the private-library counts reducer
     When its output is prepared for sharing
-    Then only aggregate counts are published, excluding names, medical values, dates, filenames and paths
+    Then only aggregate counts are published, excluding names, medical values, dates, filenames and paths, with retained selected scopes distinguished from unknown original-page and whole-library coverage
   ```
 
 - [ ] <a id="crs-104"></a> 🪙 **CRS-104** · 🐭 S · 🟢 S · score 4 — Measure achieved provider cache share as cached input tokens over input tokens per request, per route, rather than assuming cached-token savings.
@@ -495,7 +495,7 @@ The [experiment material](../experiments/README.md) is retained separately. No b
   Scenario: Measure observed cache share
     Given an authorized route reports input and cached-input token usage
     When request-level cache share is calculated
-    Then the result uses cached input tokens divided by input tokens for that request and route, with unavailable evidence left explicit
+    Then the result uses reported cached input tokens divided by input tokens for that request and route, with missing usage or a zero denominator left unavailable; implemented usage capture alone does not qualify an adopted route
   ```
 
 - [ ] <a id="crs-106"></a> 🗜️ **CRS-106** · 🐭 S · 🟢 S · score 4 — Only if CRS-086 adopts a stage-one or compaction design, measure page-reading output size and whether compaction preserves useful evidence.
