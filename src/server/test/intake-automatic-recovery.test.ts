@@ -14,7 +14,13 @@ import { uploadIntake, getIntake } from '../intake.ts';
 import { createAssistant } from '../assistant.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { DEFAULT_INTAKE_READING_LIMITS } from '../intake-reading-budget.ts';
-import { readIntakeBatch, writeIntakeBatch } from '../intake-batch-journal.ts';
+import {
+  readIntakeBatch,
+  listIntakeBatches,
+  writeIntakeBatch,
+  trackIntakeBatch,
+  cloneIntakeBatch,
+} from '../intake-batch-journal.ts';
 import {
   extractIntakeSourceText,
   locateSourceExtractionProgress,
@@ -416,10 +422,10 @@ test('unknown replacement retains its predecessor, and superseded tools cannot p
   );
 });
 
-test('batch journal changes are proportional to the edited state and replay legacy initial snapshots', (t) => {
+test('batch journal changes are proportional to the edited state and replay the retained initial snapshot', (t) => {
   const f = fixture(t, 'model');
   f.manager.close();
-  const batch: IntakeBatch = {
+  const batch = trackIntakeBatch({
     id: randomUUID(),
     profileId: f.profileId,
     operationId: 'fictional-bounded-journal',
@@ -429,7 +435,7 @@ test('batch journal changes are proportional to the edited state and replay lega
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     items: [],
-  };
+  } as IntakeBatch);
   for (let i = 0; i < 200; i++)
     batch.items.push({
       intakeId: 'fictional-' + i,
@@ -451,6 +457,7 @@ test('batch journal changes are proportional to the edited state and replay lega
   }
   const dir = join(profilePaths(f.root, f.profileId).root, 'intake-batches', batch.id, 'events');
   const sizes = readdirSync(dir)
+    .filter((file) => /^\d{12}-.*\.json$/.test(file))
     .sort()
     .map((file) => statSync(join(dir, file)).size);
   assert.ok(sizes[0] > 50000);
@@ -480,18 +487,18 @@ test("finishing one batch preserves another batch's future wake without browser 
   const f = fixture(t, 'unknown');
   f.manager.close();
   f.assistant.close();
-  const first = f.manager.list(f.profileId)[0]!;
+  const first = listIntakeBatches(f.root, f.profileId)[0]!;
   const otherSource = uploadIntake(f.db, f.root, f.profileId, {
     filename: 'fictional-other.txt',
     bytes: Buffer.from('Another independent fictional source.'),
   });
   let schedulerNow = Date.now();
-  const second = structuredClone(first);
+  const second = cloneIntakeBatch(first);
   second.id = randomUUID();
   second.operationId = 'fictional-other-operation';
   second.items = [
     {
-      ...structuredClone(first.items[0]),
+      ...cloneIntakeBatch(first.items[0]),
       intakeId: otherSource.id,
       sourceHash: otherSource.sha256,
       filename: otherSource.filename,
@@ -708,7 +715,7 @@ test('one explicit Resume restores every previously automatic prerequisite wait'
   const f = fixture(t, 'unknown');
   f.manager.close();
   f.assistant.close();
-  const saved = f.manager.list(f.profileId)[0]!;
+  const saved = listIntakeBatches(f.root, f.profileId)[0]!;
   saved.status = 'running';
   saved.automaticRun = true;
   saved.items[0].status = 'paused';
@@ -716,13 +723,13 @@ test('one explicit Resume restores every previously automatic prerequisite wait'
   saved.items[0].reason = 'provider_authentication';
   saved.items[0].retryAt = new Date(Date.now() + 60000).toISOString();
   saved.items.push({
-    ...structuredClone(saved.items[0]),
+    ...cloneIntakeBatch(saved.items[0]),
     intakeId: 'fictional-second-prerequisite',
     reason: 'provider_rejected',
     prerequisiteKey: 'unchanged',
   });
   saved.items.push({
-    ...structuredClone(saved.items[0]),
+    ...cloneIntakeBatch(saved.items[0]),
     intakeId: 'fictional-historical-review',
     automaticRun: false,
     retryAt: null,

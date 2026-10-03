@@ -153,7 +153,9 @@ function fixture(
     },
     reopenWith(batch: Parameters<typeof writeIntakeBatch>[2]) {
       manager.close('profile_locked');
-      writeIntakeBatch(root, profileId, batch, 'fictional-completed');
+      const saved = readIntakeBatch(root, profileId, batch.id);
+      Object.assign(saved, batch);
+      writeIntakeBatch(root, profileId, saved, 'fictional-completed');
       manager = createIntakeBatchManager(options);
     },
   };
@@ -240,7 +242,7 @@ test('Stop keeps a waiting file resumable even when the cursor has passed it', a
   live.items[1].status = 'review_ready';
   live.items[1].automaticRun = false;
   live.currentIndex = live.items.length;
-  writeIntakeBatch(f.root, f.profileId, live, 'fictional-second-complete');
+  f.reopenWith(live);
   const stopped = f.manager.stop(f.profileId, f.batch.id);
   assert.equal(stopped.items[0].status, 'paused');
   assert.equal(stopped.items[0].reason, 'stopped');
@@ -426,23 +428,24 @@ test('an extraction failure while queued leaves an actionable paused item, never
   assert.equal(f.sends, 0);
 });
 
-test('a failed capacity-wait journal stops work without an unhandled rejection or retry', async (t) => {
+test('a failed coordinator journal blocks acknowledgement and dispatch until publication is repaired', async (t) => {
   const reasons: string[] = [];
+  let unavailable = true;
   const f = fixture(t, true, (reason) => {
     reasons.push(reason);
-    // Inject the same named local-admission failure at the pump boundary.
-    if (reason === 'source-extraction-started')
+    if (unavailable && reason === 'source-extraction-started')
       throw new HttpError(429, 'SOURCE_EXTRACTION_BUSY', 'Fictional occupied workers');
-    if (reason === 'source-extraction-capacity-wait') throw Error('Fictional journal unavailable');
   });
-  await waitFor(() => f.manager.get(f.profileId, f.batch.id).status === 'paused');
-  assert.ok(reasons.includes('source-extraction-capacity-wait'));
-  assert.ok(reasons.includes('runner-paused'));
-  assert.equal(f.manager.get(f.profileId, f.batch.id).items[0].status, 'paused');
-  assert.equal(f.manager.get(f.profileId, f.batch.id).reason, 'runner_error');
+  await waitFor(() => reasons.includes('source-extraction-started'));
+  assert.throws(() => f.manager.get(f.profileId, f.batch.id), /Fictional occupied workers/);
+  assert.equal(readIntakeBatch(f.root, f.profileId, f.batch.id).status, 'running');
+  const attempted = reasons.length;
   await new Promise((r) => setTimeout(r, 1050));
-  assert.equal(reasons.filter((r) => r === 'source-extraction-started').length, 1);
+  assert.equal(reasons.length, attempted, 'failed publication does not schedule another runner');
   assert.equal(f.sends, 0);
+  unavailable = false;
+  assert.equal(f.manager.stop(f.profileId, f.batch.id).status, 'stopped');
+  assert.equal(readIntakeBatch(f.root, f.profileId, f.batch.id).status, 'stopped');
 });
 
 test('retain-only batch sources retain an explicit limitation and never dispatch a model', async (t) => {

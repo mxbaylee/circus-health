@@ -41,9 +41,15 @@ export interface Vault {
   put(input: Uint8Array | string): string;
   storeFile(name: string, input: Uint8Array | string): string;
   publish(): void;
+  /** Exact selected files supplied by an authority writer, retained until publication. */
+  trackWorkspaceFiles(workspace: string, names: readonly string[]): void;
   syncWorkspace(
     workspace: string,
-    options?: { exclude?: (name: string) => boolean; publishNow?: boolean },
+    options?: {
+      exclude?: (name: string) => boolean;
+      excludeDirectory?: (name: string) => boolean;
+      publishNow?: boolean;
+    },
   ): boolean;
   materialize(workspace: string, options?: { exclude?: (name: string) => boolean }): void;
   materializeFile(name: string, workspace: string): boolean;
@@ -98,13 +104,16 @@ export function hashFile(path: string): string {
   }
 }
 const safeName = safeVaultName;
-function checkPlainTree(root: string): string[] {
+function checkPlainTree(root: string, excludeDirectory = (_name: string) => false): string[] {
   if (!existsSync(root)) return [];
   const result: string[] = [];
   function visit(path: string): void {
     for (const name of readdirSync(path)) {
-      const p = resolve(path, name),
-        s = lstatSync(p);
+      const p = resolve(path, name);
+      // A selected authority supplies its changed names separately. Do not even
+      // inventory its retained history during an unrelated workspace flush.
+      if (excludeDirectory(relative(root, p))) continue;
+      const s = lstatSync(p);
       if (s.isSymbolicLink()) throw Error('Vault workspace cannot contain symbolic links');
       if (s.isDirectory()) visit(p);
       else if (s.isFile()) result.push(relative(root, p));
@@ -127,6 +136,8 @@ export function openVault({
   let closed = false;
   const pendingFiles = new Map<string, string>();
   const pendingObjects = new Map<string, VaultObjectMetadata>();
+  const selectedWorkspaceFiles = new Map<string, Set<string>>();
+  const stagedWorkspaceFiles = new Map<string, Set<string>>();
   const digests = new Map<string, string[]>();
   let diagnosticChunks: DiagnosticChunkStore | undefined;
   const fingerprints = new Map<string, string>();
@@ -161,6 +172,8 @@ export function openVault({
     fingerprints.clear();
     pendingFiles.clear();
     pendingObjects.clear();
+    selectedWorkspaceFiles.clear();
+    stagedWorkspaceFiles.clear();
     digests.clear();
     index.close();
     for (const name of Object.keys(manifest.files)) delete manifest.files[name];
@@ -256,6 +269,12 @@ export function openVault({
       manifest.revision = index.publish(pendingFiles, pendingObjects, manifest.recordsHead);
       pendingFiles.clear();
       pendingObjects.clear();
+      for (const [workspace, names] of stagedWorkspaceFiles) {
+        const selected = selectedWorkspaceFiles.get(workspace);
+        for (const name of names) selected?.delete(name);
+        if (!selected?.size) selectedWorkspaceFiles.delete(workspace);
+      }
+      stagedWorkspaceFiles.clear();
     } catch (error) {
       discard();
       throw error;
@@ -272,12 +291,38 @@ export function openVault({
     workspace: string,
     {
       exclude = () => false,
+      excludeDirectory = () => false,
       publishNow = true,
-    }: { exclude?: (name: string) => boolean; publishNow?: boolean } = {},
+    }: {
+      exclude?: (name: string) => boolean;
+      excludeDirectory?: (name: string) => boolean;
+      publishNow?: boolean;
+    } = {},
   ): boolean {
     guard();
     let changed = false;
-    for (const name of checkPlainTree(workspace)) {
+    workspace = resolve(workspace);
+    const selected = selectedWorkspaceFiles.get(workspace);
+    for (const name of selected ?? []) {
+      // Bypassing inventory must not bypass path safety. Check every ancestor
+      // and the selected leaf without touching any retained sibling.
+      let path = workspace;
+      const root = lstatSync(path);
+      if (!root.isDirectory() || root.isSymbolicLink())
+        throw Error('Vault workspace cannot contain symbolic links');
+      const segments = name.split('/');
+      for (let i = 0; i < segments.length; i++) {
+        path = resolve(path, segments[i]);
+        const stat = lstatSync(path);
+        if (
+          stat.isSymbolicLink() ||
+          (i < segments.length - 1 ? !stat.isDirectory() : !stat.isFile())
+        )
+          throw Error('Unsupported selected workspace object');
+      }
+    }
+    const names = new Set([...checkPlainTree(workspace, excludeDirectory), ...(selected ?? [])]);
+    for (const name of names) {
       if (exclude(name)) continue;
       const source = resolve(workspace, name),
         previous = manifest.files[name],
@@ -292,8 +337,23 @@ export function openVault({
       fingerprints.set(source, stamp);
       changed = true;
     }
+    if (selected?.size) {
+      const staged = stagedWorkspaceFiles.get(workspace) ?? new Set<string>();
+      for (const name of selected) if (!exclude(name)) staged.add(name);
+      stagedWorkspaceFiles.set(workspace, staged);
+    }
     // Removal is explicit in records; retained artifacts are never physically deleted here.
-    if (changed && publishNow) publish();
+    // A previous accepted-record stage can already own every fingerprint while
+    // its bindings are still pending. They must reach the manifest on flush.
+    if (publishNow && (pendingFiles.size || pendingObjects.size)) publish();
+    else if (publishNow && stagedWorkspaceFiles.size) {
+      for (const [path, staged] of stagedWorkspaceFiles) {
+        const files = selectedWorkspaceFiles.get(path);
+        for (const name of staged) files?.delete(name);
+        if (!files?.size) selectedWorkspaceFiles.delete(path);
+      }
+      stagedWorkspaceFiles.clear();
+    }
     return changed;
   }
   function materializeFile(name: string, workspace: string): boolean {
@@ -375,6 +435,16 @@ export function openVault({
     put,
     storeFile,
     publish,
+    trackWorkspaceFiles(workspace, names) {
+      guard();
+      workspace = resolve(workspace);
+      const selected = selectedWorkspaceFiles.get(workspace) ?? new Set<string>();
+      for (const name of names) {
+        selected.add(safeName(name));
+        stagedWorkspaceFiles.get(workspace)?.delete(name);
+      }
+      selectedWorkspaceFiles.set(workspace, selected);
+    },
     syncWorkspace,
     materialize,
     materializeFile,
