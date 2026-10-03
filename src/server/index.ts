@@ -994,19 +994,30 @@ export function createApp({
     databases: dbs,
     diagnostics,
     close(reason = 'interrupted') {
-      lifecycle.close();
-      intakeBatches.close(reason);
-      assistant.close();
-      server.close();
+      const failures: unknown[] = [];
+      const cleanup = (operation: () => void): void => {
+        try {
+          operation();
+        } catch (error) {
+          failures.push(error);
+        }
+      };
+      cleanup(() => lifecycle.close());
+      cleanup(() => intakeBatches.close(reason));
+      cleanup(() => assistant.close());
+      cleanup(() => server.close());
       for (const [profileId, db] of dbs) {
         void disposePdfEvidenceSessions(profileId);
-        diagnostics.clear(profileId);
-        clearIntakeStateCache(db);
-        clearIntakeLookupCache(db);
-        clearSourceTextProjectionCache(db);
-        clearSourceDetailsSearchCache(db);
-        db.close();
+        cleanup(() => diagnostics.clear(profileId));
+        cleanup(() => clearIntakeStateCache(db));
+        cleanup(() => clearIntakeLookupCache(db));
+        cleanup(() => clearSourceTextProjectionCache(db));
+        cleanup(() => clearSourceDetailsSearchCache(db));
+        cleanup(() => db.close());
       }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length)
+        throw new AggregateError(failures, 'Application close failed', { cause: failures[0] });
     },
   };
 }

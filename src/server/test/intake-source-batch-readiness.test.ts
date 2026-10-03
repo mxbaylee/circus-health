@@ -9,7 +9,7 @@ import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
-import { writeIntakeBatch } from '../intake-batch-journal.ts';
+import { writeIntakeBatch, cloneIntakeBatch } from '../intake-batch-journal.ts';
 import type { IntakeBatch } from '../../shared/intake-batch.ts';
 import {
   currentIntakeInterpretations,
@@ -114,7 +114,7 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
           pollMs: 2,
           journalWriter: (...args) => {
             writeIntakeBatch(...args);
-            const snapshot = structuredClone(args[2]);
+            const snapshot = cloneIntakeBatch(args[2]);
             snapshots.set(snapshot.id, snapshot);
             published.emit('batch', snapshot);
           },

@@ -21,7 +21,7 @@ import {
 } from '../intake-continuation.ts';
 import { accountedUnitKind } from '../intake-unit-accounting.ts';
 import { writeChat } from '../assistant-journal.ts';
-import { writeIntakeBatch } from '../intake-batch-journal.ts';
+import { readIntakeBatch, writeIntakeBatch } from '../intake-batch-journal.ts';
 import { createBackup } from '../recovery.ts';
 import { rebuildProfile } from '../portable.ts';
 import type { Intake, IntakeExtractionCoverage } from '../../shared/intake.ts';
@@ -359,8 +359,9 @@ test('latest source-pinned pauses distinguish time, no-progress and exhaustion w
     { reason: 'no_progress', files: 1 },
   ]);
   assert.equal(f.activity().readingAccounting!.hostReading.exhaustedSources, 0);
-  batch.items[0]!.sourceHash = 'wrong-original';
-  writeIntakeBatch(f.root, f.profileId, batch, 'fictional-stale-scope');
+  const retained = readIntakeBatch(f.root, f.profileId, batch.id);
+  retained.items[0]!.sourceHash = 'wrong-original';
+  writeIntakeBatch(f.root, f.profileId, retained, 'fictional-stale-scope');
   assert.deepEqual(f.activity().readingAccounting!.pauseReasons, []);
 });
 

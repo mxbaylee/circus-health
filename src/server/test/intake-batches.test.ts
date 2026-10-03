@@ -354,11 +354,12 @@ test('restart does not treat cumulative capture steps as unread new work', async
   await waitFor(() => f.bridges.length === 1);
   await propose(f.bridges[0], item);
   complete(f.bridges[0]);
-  const completed = await waitFor(() => {
+  await waitFor(() => {
     const value = f.manager.get(profileId, batch.id);
     return value.status === 'complete' && value;
   });
   f.manager.close();
+  const completed = readIntakeBatch(f.root, profileId, batch.id);
   completed.items[0]!.sourceExtraction = {
     steps: 3,
     stepsAtModelPass: 3,
@@ -503,6 +504,9 @@ test('restart resumes a batch linked immediately before a simulated process cras
   await waitFor(() => linkedJournalWritten, 'durable conversion-linked crash boundary');
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(f.bridges.length, 0, 'the model was not started before the simulated exit');
+  assert.throws(() => f.manager.close(), /Synthetic process exited/);
+  // This fixture represents a dead process: further cleanup cannot call its writer.
+  f.manager.close = () => {};
   assert.deepEqual(getIntakeOriginal(f.db, f.root, profileId, intake.id).bytes, original);
 
   f.assistant.close();
@@ -1322,6 +1326,12 @@ test('append journal acknowledgement loss retains one append and retry never dup
       },
     },
   );
+  let requestGuard: NonNullable<Parameters<typeof f.assistant.send>[3]>['beforeModelRequest'];
+  const send = f.assistant.send.bind(f.assistant);
+  f.assistant.send = (...args) => {
+    requestGuard = args[3]?.beforeModelRequest;
+    return send(...args);
+  };
   const first = fictionalAppendOriginal(f, 'uncertain-first'),
     second = fictionalAppendOriginal(f, 'uncertain-second');
   const batch = f.manager.create(profileId, {
@@ -1336,6 +1346,20 @@ test('append journal acknowledgement loss retains one append and retry never dup
   };
   assert.throws(() => f.manager.create(profileId, request), /acknowledgement loss/);
   assert.equal(readIntakeBatch(f.root, profileId, batch.id).items.length, 2);
+  assert.ok(requestGuard);
+  assert.throws(
+    () =>
+      requestGuard!({
+        status: 'running',
+        reason: null,
+        turns: 0,
+        readyRecords: 0,
+        remainingUnits: 1,
+        pendingReadWindows: 1,
+        coverage: 'reading_progress_only',
+      }),
+    /authorization ended/,
+  );
   assert.equal(
     f.manager.get(profileId, batch.id).items.length,
     2,
@@ -1449,4 +1473,173 @@ test('appended selections survive restart and operation replay while automatic w
     restored.close();
     restoredDb.close();
   }
+});
+
+test('a failed Stop restores the durable running state and retries the stop with matching queue timestamps', (t) => {
+  let rejectStop = true;
+  const f = setup(
+    t,
+    {},
+    {
+      journalWriter(root, id, batch, reason) {
+        if (reason === 'stopped' && rejectStop) {
+          rejectStop = false;
+          throw new Error('Fictional stop publication failure');
+        }
+        writeIntakeBatch(root, id, batch, reason);
+      },
+    },
+  );
+  const first = fictionalAppendOriginal(f, 'stop-failure-first');
+  const second = fictionalAppendOriginal(f, 'stop-failure-second');
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-stop-failure',
+    intakeIds: [first.id, second.id],
+  });
+  assert.ok(batch.items.every((item) => item.queuedAt));
+  assert.throws(() => f.manager.stop(profileId, batch.id), /stop publication failure/);
+  const retained = readIntakeBatch(f.root, profileId, batch.id);
+  assert.equal(retained.status, 'running');
+  assert.ok(retained.items.every((item) => item.queuedAt));
+  const stopped = f.manager.stop(profileId, batch.id);
+  assert.equal(stopped.status, 'stopped');
+  assert.ok(stopped.items.every((item) => item.queuedAt === null));
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(readIntakeBatch(f.root, profileId, batch.id))),
+    stopped,
+  );
+  f.manager.close();
+  const reopened = createIntakeBatchManager({
+    root: f.root,
+    databases: f.databases,
+    assistant: f.assistant,
+  });
+  t.after(() => reopened.close());
+  assert.deepEqual(reopened.get(profileId, batch.id), stopped);
+});
+
+test('a published Stop with failed acknowledgement cannot return success until its writer retries', (t) => {
+  let rejectAcknowledgement = false;
+  let attempts = 0;
+  const f = setup(
+    t,
+    {},
+    {
+      journalWriter(root, id, batch, reason) {
+        writeIntakeBatch(root, id, batch, reason);
+        if (reason === 'stopped') {
+          attempts++;
+          if (rejectAcknowledgement) throw new Error('Fictional encrypted publication failure');
+        }
+      },
+    },
+  );
+  const intake = fictionalAppendOriginal(f, 'stop-acknowledgement');
+  const request = { operationId: 'fictional-stop-acknowledgement', intakeIds: [intake.id] };
+  const batch = f.manager.create(profileId, request);
+  rejectAcknowledgement = true;
+  assert.throws(() => f.manager.stop(profileId, batch.id), /encrypted publication failure/);
+  assert.equal(readIntakeBatch(f.root, profileId, batch.id).status, 'stopped');
+  assert.throws(() => f.manager.stop(profileId, batch.id), /encrypted publication failure/);
+  assert.throws(() => f.manager.create(profileId, request), /encrypted publication failure/);
+  assert.throws(() => f.manager.get(profileId, batch.id), /encrypted publication failure/);
+  assert.equal(attempts, 4);
+  rejectAcknowledgement = false;
+  assert.equal(f.manager.stop(profileId, batch.id).status, 'stopped');
+  assert.equal(attempts, 5, 'idempotent Stop retries acknowledgement before returning');
+  assert.equal(f.manager.create(profileId, request).scheduled, false);
+});
+
+test('application close reports a queue publication failure after closing assistant, server, and every database', async (t) => {
+  const root = mkdtempSync(resolve(tmpdir(), 'health-batch-close-failure-'));
+  const db = openDatabase(profilePaths(root, profileId).database, profileId);
+  const otherDb = openDatabase(profilePaths(root, 'other-person').database, 'other-person');
+  attachPersonalDurability(db, { root, profileId });
+  const failure = Error('Fictional close publication failure');
+  const app = createApp({
+    root,
+    databases: new Map([
+      [profileId, db],
+      ['other-person', otherDb],
+    ]),
+    intakeBatchOptions: {
+      journalWriter(root, id, batch, reason) {
+        if (reason === 'runner-closed') throw failure;
+        writeIntakeBatch(root, id, batch, reason);
+      },
+    },
+  });
+  t.after(() => {
+    if (db.isOpen || otherDb.isOpen) {
+      try {
+        app.close();
+      } catch {}
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
+  await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  const intake = uploadIntake(db, root, profileId, {
+    filename: 'fictional-close-failure.txt',
+    bytes: Buffer.from('Fictional close failure evidence'),
+  });
+  const batch = app.intakeBatches.create(profileId, {
+    operationId: 'fictional-close-failure',
+    intakeIds: [intake.id],
+  });
+  const retainedHandle = readIntakeBatch(root, profileId, batch.id);
+  let assistantClosed = false;
+  const closeAssistant = app.assistant.close.bind(app.assistant);
+  app.assistant.close = () => {
+    assistantClosed = true;
+    closeAssistant();
+  };
+  assert.throws(
+    () => app.close(),
+    (error) => error === failure,
+  );
+  assert.equal(assistantClosed, true);
+  assert.equal(app.server.listening, false);
+  assert.equal(db.isOpen, false);
+  assert.equal(otherDb.isOpen, false);
+  assert.throws(() => {
+    retainedHandle.reason = 'stale callback';
+  }, /tracked intake batch/);
+  assert.equal(
+    readIntakeBatch(root, profileId, batch.id).status,
+    'running',
+    'failed close never acknowledges its unpublished pause',
+  );
+});
+
+test('idempotent Stop and Resume reject a stale cached head before reporting success', (t) => {
+  const f = setup(t);
+  const intake = fictionalAppendOriginal(f, 'stale-idempotent');
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-stale-idempotent',
+    intakeIds: [intake.id],
+  });
+  f.manager.stop(profileId, batch.id);
+  const external = readIntakeBatch(f.root, profileId, batch.id);
+  external.status = 'running';
+  external.automaticRun = true;
+  external.reason = null;
+  external.items[0]!.status = 'queued';
+  external.items[0]!.automaticRun = true;
+  writeIntakeBatch(f.root, profileId, external, 'fictional-external-resume');
+  assert.throws(() => f.manager.stop(profileId, batch.id), { code: 'INTAKE_BATCH_STALE' });
+  assert.equal(readIntakeBatch(f.root, profileId, batch.id).status, 'running');
+  assert.equal(f.manager.stop(profileId, batch.id).status, 'stopped');
+  f.manager.resume(profileId, batch.id);
+  const stopped = readIntakeBatch(f.root, profileId, batch.id);
+  stopped.status = 'stopped';
+  stopped.automaticRun = false;
+  stopped.reason = 'stopped';
+  stopped.items[0]!.status = 'paused';
+  stopped.items[0]!.reason = 'stopped';
+  stopped.items[0]!.resumeAutomaticRun = true;
+  stopped.items[0]!.automaticRun = false;
+  writeIntakeBatch(f.root, profileId, stopped, 'fictional-external-stop');
+  assert.throws(() => f.manager.resume(profileId, batch.id), { code: 'INTAKE_BATCH_STALE' });
+  assert.equal(readIntakeBatch(f.root, profileId, batch.id).status, 'stopped');
+  assert.equal(f.manager.resume(profileId, batch.id).status, 'running');
 });
