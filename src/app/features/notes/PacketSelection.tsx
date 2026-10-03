@@ -28,6 +28,112 @@ const categoryLabel = (kind: string) =>
 const pageSize = 50;
 const boundedPage = (page: number, total: number) =>
   Math.min(page, Math.max(0, Math.ceil(total / pageSize) - 1));
+const recordDateLabel = (candidate: PacketCandidate) => {
+  if (!candidate.date) return 'No date recorded';
+  const basis =
+    candidate.dateBasis === 'note-last-modified'
+      ? 'Last modified'
+      : candidate.dateBasis === 'event'
+        ? 'Event date'
+        : 'Date';
+  return `${basis}: ${candidate.date}`;
+};
+const objectValue = (value: unknown): Record<string, unknown> | null =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+const inspectionValue = (value: unknown) =>
+  typeof value === 'string' ? value || 'Not recorded' : JSON.stringify(value, null, 2);
+
+function PrivateTextInspection({ text, truncated }: { text: string; truncated?: boolean }) {
+  let record: Record<string, unknown> | null = null;
+  if (!truncated) {
+    try {
+      record = objectValue(JSON.parse(text));
+    } catch {
+      /* Keep the literal material available. */
+    }
+  }
+  const row = objectValue(record?.row);
+  const sections = [
+    ['Note body', row?.content],
+    ['Document text', row?.text_content],
+    ['Topics and questions', row?.topics],
+    ['Raw thoughts', row?.raw_thoughts],
+  ] as const;
+  const corrections = [
+    ['Record corrections', record?.fieldCorrections],
+    ['Ownership corrections', record?.ownershipCorrections],
+  ] as const;
+  return (
+    <details className="packet-inspection">
+      <summary>Review private text</summary>
+      <p>This material is private inspection only. Approval shares it unredacted.</p>
+      {truncated ? (
+        <p className="note-warning">
+          Only the beginning of this material is shown. Download the complete private inspection
+          before approving; the shortened text below is not the full record.
+        </p>
+      ) : (
+        <>
+          {sections
+            .filter(([, value]) => value !== undefined && value !== null)
+            .map(([label, value]) => (
+              <section key={label} aria-label={label}>
+                <h4>{label}</h4>
+                <pre className="packet-private-text">{inspectionValue(value)}</pre>
+              </section>
+            ))}
+          {corrections.some(([, value]) => Array.isArray(value) && value.length) && (
+            <section aria-label="Correction details">
+              <h4>Correction details</h4>
+              {corrections
+                .filter(([, value]) => Array.isArray(value) && value.length)
+                .map(([label, value]) => (
+                  <div key={label}>
+                    <h5>{label}</h5>
+                    {(value as unknown[]).map((correction, index) => {
+                      const fields = objectValue(correction);
+                      return fields ? (
+                        <dl key={index} className="packet-correction-fields">
+                          {Object.entries(fields).map(([field, detail]) => (
+                            <div key={field}>
+                              <dt>
+                                {field.replace(/_/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2')}
+                              </dt>
+                              <dd>
+                                <pre className="packet-private-text">{inspectionValue(detail)}</pre>
+                              </dd>
+                            </div>
+                          ))}
+                        </dl>
+                      ) : (
+                        <pre key={index} className="packet-private-text">
+                          {inspectionValue(correction)}
+                        </pre>
+                      );
+                    })}
+                  </div>
+                ))}
+            </section>
+          )}
+          {record?.currentUse !== undefined && record.currentUse !== null && (
+            <section aria-label="Current medication use">
+              <h4>Current medication use</h4>
+              <pre className="packet-private-text">{inspectionValue(record.currentUse)}</pre>
+            </section>
+          )}
+        </>
+      )}
+      <details>
+        <summary>
+          {truncated ? 'Raw text excerpt (incomplete)' : 'All raw inspection fields'}
+        </summary>
+        <pre className="packet-private-text">{text}</pre>
+      </details>
+    </details>
+  );
+}
 
 function PageControls({
   label,
@@ -188,6 +294,10 @@ export function PacketSelection({
         clear that preference separately to make a record eligible again.
       </p>
       <p className="text-muted">
+        The date window uses event dates. For notes without an event date, it uses the last modified
+        date shown below.
+      </p>
+      <p className="text-muted">
         Saved tags and always leave out preferences apply to future packets for this person. Tags
         are your own categories, not an assessment of sensitivity.
       </p>
@@ -230,7 +340,7 @@ export function PacketSelection({
               <div>
                 <strong>{candidate.title}</strong>
                 <small>
-                  {[categoryLabel(candidate.kind), candidate.date, ...candidate.tags]
+                  {[categoryLabel(candidate.kind), recordDateLabel(candidate), ...candidate.tags]
                     .filter(Boolean)
                     .join(' · ')}
                 </small>
@@ -404,24 +514,20 @@ export function PacketPrivateReview({
                         ? 'Included unredacted in this frozen preview.'
                         : 'Left out of this frozen preview.'}
                   </small>
-                  {item.contentUrl &&
+                  {item.contentUrl?.startsWith('/api/') &&
                     (busy ? (
                       <span>
-                        Private original review unavailable while preparing or changing profiles.
+                        Private inspection unavailable while preparing or changing profiles.
                       </span>
                     ) : (
                       <a href={item.contentUrl} target="_blank" rel="noreferrer">
-                        Review private original (not a packet download)
+                        {item.key.startsWith('original:')
+                          ? 'Review private original (not a packet download)'
+                          : 'Download complete private inspection (not a packet download)'}
                       </a>
                     ))}
                   {item.text && (
-                    <details>
-                      <summary>Review private text</summary>
-                      <pre className="packet-private-text">{item.text}</pre>
-                      {item.truncated && (
-                        <small>Text is shortened here. Review the full record in the app.</small>
-                      )}
-                    </details>
+                    <PrivateTextInspection text={item.text} truncated={item.truncated} />
                   )}
                 </span>
               </div>

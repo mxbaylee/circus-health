@@ -1,3 +1,18 @@
+import {
+  PACKET_PREFERENCE_PREFIX,
+  packetPreferenceKey,
+  packetPreferenceIdentity,
+  packetPreferenceRef,
+  normalizePacketTags,
+  decodePacketPreference,
+  validatePacketPreferenceRows as validateStoredPacketPreferenceRows,
+  type PacketPreference,
+} from './packet-preference-codec.ts';
+export {
+  PACKET_PREFERENCE_PREFIX,
+  packetPreferenceKey,
+  type PacketPreference,
+} from './packet-preference-codec.ts';
 import { createHash } from 'node:crypto';
 import {
   clinicalReferenceAliases,
@@ -10,16 +25,6 @@ import { sourceAssertionOwnership } from './source-assertion-ownership.ts';
 
 import type { PacketRecordRef } from '../shared/packet-selection.ts';
 export type { PacketRecordRef } from '../shared/packet-selection.ts';
-export interface PacketPreference {
-  personId: string;
-  record: PacketRecordRef;
-  alwaysWithhold: boolean;
-  /** Explicitly assigned by the profile user; never a sensitivity inference. */
-  tags: string[];
-  version: number;
-  actor: 'profile-user';
-  updatedAt: string | null;
-}
 export interface PacketPreferenceInput {
   record: PacketRecordRef;
   alwaysWithhold: boolean;
@@ -36,43 +41,20 @@ export type PacketMembershipValidator = (
 export interface PacketPreferenceOptions {
   validateMembership?: PacketMembershipValidator;
 }
-export const PACKET_PREFERENCE_PREFIX = 'packet_preference:v1:';
 function invalid(message: string): never {
   throw new HttpError(400, 'INVALID_PACKET_PREFERENCE', message);
 }
-function identity(value: unknown): asserts value is string {
-  if (typeof value !== 'string' || !value || value.length > 256 || /[\x00-\x1f\x7f]/u.test(value))
-    invalid('Invalid packet record identity');
+export function validatePacketPreferenceRows(
+  rows: unknown,
+): asserts rows is Array<{ key: string; value: string }> {
+  validateStoredPacketPreferenceRows(rows, invalid);
 }
-function checkedRef(ref: PacketRecordRef): PacketRecordRef {
-  // Portable recovery can reach this module while clinical references are
-  // initializing. Consult their supported kinds only when validating a request.
-  if (
-    !ref ||
-    (!['note', 'source', 'source_file'].includes(ref.kind) &&
-      !Object.hasOwn(clinicalTables, ref.kind))
-  )
-    invalid('Unsupported packet record kind');
-  identity(ref.recordId);
-  return { kind: ref.kind, recordId: ref.recordId };
-}
-function normalizedTags(tags: unknown): string[] {
-  if (!Array.isArray(tags) || tags.length > 32) invalid('Use at most 32 person-applied tags');
-  return [
-    ...new Set(
-      tags.map((tag: unknown) => {
-        if (
-          typeof tag !== 'string' ||
-          !tag.trim() ||
-          tag.trim().length > 80 ||
-          /[\x00-\x1f\x7f]/u.test(tag)
-        )
-          invalid('Each tag must contain 1 to 80 printable characters');
-        return tag.trim();
-      }),
-    ),
-  ].sort();
-}
+const identity = (value: unknown) => packetPreferenceIdentity(value, invalid);
+const checkedRef = (ref: PacketRecordRef) => packetPreferenceRef(ref, invalid);
+const normalizedTags = (tags: unknown) => normalizePacketTags(tags, invalid);
+const decode = (text: string) => decodePacketPreference(text, invalid);
+const sharedSource = (record: PacketRecordRef) =>
+  record.kind === 'source' || record.kind === 'source_file';
 function requirePerson(db: Database, personId: string) {
   identity(personId);
   if (!db.prepare('SELECT 1 FROM people WHERE id=?').get(personId))
@@ -113,51 +95,6 @@ export function resolvePacketRecord(
     if (recordOwner(db, current.kind, current.recordId) !== personId) scopeError();
   }
   return current;
-}
-const sharedSource = (record: PacketRecordRef) =>
-  record.kind === 'source' || record.kind === 'source_file';
-export function packetPreferenceKey(personId: string, record: PacketRecordRef): string {
-  const family = Object.hasOwn(clinicalTables, record.kind) ? 'clinical' : record.kind;
-  // Clinical/note identity has one current owner. Originals may serve several
-  // people concurrently, so their choices retain an explicit subject suffix.
-  return `${PACKET_PREFERENCE_PREFIX}${family}:${encodeURIComponent(record.recordId)}${sharedSource(record) ? `:${encodeURIComponent(personId)}` : ''}`;
-}
-/** Portable readers validate the new field before overlaying it on older curation. */
-export function validatePacketPreferenceRows(
-  rows: unknown,
-): asserts rows is Array<{ key: string; value: string }> {
-  if (!Array.isArray(rows)) invalid('Invalid stored packet preferences');
-  const seen = new Set<string>();
-  for (const row of rows) {
-    if (!row || typeof row.key !== 'string' || typeof row.value !== 'string' || seen.has(row.key))
-      invalid('Invalid stored packet preference');
-    seen.add(row.key);
-    const stored = decode(row.value);
-    if (row.key !== packetPreferenceKey(stored.personId, stored.record))
-      invalid('Invalid stored packet preference identity');
-  }
-}
-function decode(text: string): PacketPreference {
-  let value: PacketPreference;
-  try {
-    value = JSON.parse(text) as PacketPreference;
-  } catch {
-    return invalid('Invalid stored packet preference');
-  }
-  if (!value || typeof value !== 'object') invalid('Invalid stored packet preference');
-  identity(value.personId);
-  checkedRef(value.record);
-  if (
-    typeof value.alwaysWithhold !== 'boolean' ||
-    !Number.isSafeInteger(value.version) ||
-    value.version < 1 ||
-    value.actor !== 'profile-user' ||
-    typeof value.updatedAt !== 'string' ||
-    !Number.isFinite(Date.parse(value.updatedAt)) ||
-    JSON.stringify(normalizedTags(value.tags)) !== JSON.stringify(value.tags)
-  )
-    invalid('Invalid stored packet preference');
-  return value;
 }
 function lookup(
   db: Database,

@@ -328,23 +328,30 @@ export function packetCandidates(db: Database, personId: string, items: PacketSe
   const byKey = new Map(preferences.map((p) => [packetKey(p.record), p]));
   const candidates: PacketCandidate[] = items.map((item) => {
     const preference = byKey.get(item.key);
+    // Personal current-use confirmation is not a clinical event date. Authored
+    // notes deliberately fall back to last modification, disclosed separately.
+    const date =
+      String(
+        item.type === 'medication'
+          ? item.row.start_at || ''
+          : ['observation', 'procedure', 'document'].includes(item.type)
+            ? item.row.effective_at || item.row.event_date || ''
+            : item.type === 'source'
+              ? item.row.date_text || ''
+              : item.type === 'note'
+                ? item.row.event_date || item.row.updated_at || ''
+                : '',
+      ) || null;
     return {
       record: { kind: item.type, recordId: item.id },
       key: item.key,
       title: item.title,
-      // Personal current-use confirmation is not a clinical event date.
-      date:
-        String(
-          item.type === 'medication'
-            ? item.row.start_at || ''
-            : ['observation', 'procedure', 'document'].includes(item.type)
-              ? item.row.effective_at || item.row.event_date || ''
-              : item.type === 'source'
-                ? item.row.date_text || ''
-                : item.type === 'note'
-                  ? item.row.event_date || item.row.updated_at || ''
-                  : '',
-        ) || null,
+      date,
+      dateBasis: !date
+        ? 'undated'
+        : item.type === 'note' && !item.row.event_date
+          ? 'note-last-modified'
+          : 'event',
       kind: item.type,
       tags: preference?.tags || [],
       alwaysWithhold: preference?.alwaysWithhold || false,

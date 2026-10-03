@@ -169,6 +169,25 @@
 .packet-pages span {
   margin-right: auto;
 }
+.packet-inspection h4,
+.packet-inspection h5 {
+  margin: 12px 0 6px;
+}
+.packet-correction-fields > div {
+  display: grid;
+  grid-template-columns: minmax(90px, 1fr) minmax(0, 3fr);
+  gap: 12px;
+}
+.packet-correction-fields dt {
+  color: var(--muted);
+  text-transform: capitalize;
+}
+.packet-correction-fields dd {
+  margin: 0;
+}
+.packet-correction-fields pre {
+  margin: 0 0 6px;
+}
 .packet-private-review {
   padding: 16px;
   margin: 16px 0;

@@ -1,4 +1,7 @@
-import { PACKET_PREFERENCE_PREFIX, validatePacketPreferenceRows } from './packet-preferences.ts';
+import {
+  PACKET_PREFERENCE_PREFIX,
+  validatePacketPreferenceRows,
+} from './packet-preference-codec.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { validatePortableIntakeState } from './intake-state-portable.ts';

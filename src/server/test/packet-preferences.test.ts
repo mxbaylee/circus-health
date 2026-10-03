@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { openDatabase, revision, transaction, type Database } from '../database.ts';
 import { hash } from '../assets.ts';
 import { createNote } from '../notes.ts';
@@ -41,8 +42,17 @@ const request = (overrides: Partial<PacketPreferenceInput> = {}): PacketPreferen
   ...overrides,
 });
 
-test('clinical and recovery modules initialize independently in fresh processes', () => {
-  for (const entry of ['clinical-references', 'record-owner', 'portable', 'packet-preferences']) {
+test('clinical, recovery and model modules initialize independently in fresh processes', () => {
+  for (const entry of [
+    'clinical-references',
+    'record-owner',
+    'portable',
+    'packet-preferences',
+    'packet-preference-codec',
+    'model-config',
+    'model-bridge',
+    'proxy-model-bridge',
+  ]) {
     const url = new URL(`../${entry}.ts`, import.meta.url).href;
     const result = spawnSync(
       process.execPath,
@@ -52,6 +62,24 @@ test('clinical and recovery modules initialize independently in fresh processes'
     assert.equal(result.error, undefined, `${entry}: ${result.error?.message}`);
     assert.equal(result.status, 0, `${entry} cold import failed:\n${result.stderr}`);
   }
+});
+
+test('the model-adapters test entry executes independently of preference import order', () => {
+  const entry = new URL('./model-adapters.test.ts', import.meta.url);
+  // A nested runner otherwise inherits Node's child-test context and may exit
+  // successfully without executing its entry. Require real TAP test evidence.
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const result = spawnSync(
+    process.execPath,
+    ['--test', '--test-reporter=tap', fileURLToPath(entry)],
+    { encoding: 'utf8', env },
+  );
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.status, 0, `Model adapter entry failed:\n${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /configuration defaults to LiteLLM/);
+  assert.match(result.stdout, /# tests [1-9]\d*\b/);
+  assert.doesNotMatch(result.stdout, /(?:tests|pass) 0\b/);
 });
 
 function seed(db: Database, root: string, count = 3) {

@@ -12,6 +12,8 @@ Print / Export prepares a packet for one person. It keeps the person's complete 
 
 An empty selected category does not mean the person has no such history. Job presets, reviewed Conditions/status summaries and a one-page emergency layout remain separate [open work](../todo/CRS-150.md).
 
+Date filtering uses each clinical record's recorded date. An authored note uses its event date when present, otherwise its last modification date; the list labels that distinction. A personal medication confirmation does not supply a missing clinical date. Undated or imprecisely dated records need an individual inclusion choice to enter a dated packet.
+
 ## Shared disclosure and unredacted material
 
 When the person withholds records, the shared packet says “Some records were left out at the patient's request.” It does not list or count the withheld records. Records with unresolved ownership and unread or partly reviewed sources have separate disclosures; those limitations are not presented as the person's choice.
@@ -22,7 +24,7 @@ Known conflicts are derived from retained source/evidence relationships, attachm
 
 The user can explicitly approve an offered unredacted item for a packet. That approval is tied to the exact reviewed material and selection. The shared packet then explains that unredacted material may contain information absent from the selected record summary. The exception cannot bypass an active persistent withholding preference connected to that material. Change the saved preference first if sharing it is intended.
 
-The private inspection covers every section and metadata field that the approval shares. Long inspections offer a complete private download alongside their shortened on-screen preview. Original inspection opens the complete retained bytes; nonessential attachment captions are excluded from shared companion metadata. These private inspection controls are separate from the packet's approved download list.
+The private inspection covers every section and metadata field that the approval shares. Note text, questions, raw thoughts and correction details have separate readable sections, with all raw fields still available. Long inspections offer a complete private download alongside their clearly shortened on-screen preview. Original inspection opens the complete retained bytes; nonessential attachment captions are excluded from shared companion metadata. These private inspection controls are separate from the packet's approved download list.
 
 An original is never edited in place. An offered original retains its complete bytes; the packet does not claim those bytes were redacted. Unknown textual relationships cannot be proven absent by a record-ID filter. Review included material and the final shared outputs before sending them.
 

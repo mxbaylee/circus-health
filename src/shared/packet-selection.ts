@@ -22,6 +22,8 @@ export interface PacketCandidate {
   key: string;
   title: string;
   date: string | null;
+  /** Notes without an event date use their last modification date for date-window filtering. */
+  dateBasis?: 'event' | 'note-last-modified' | 'undated';
   kind: string;
   tags: string[];
   alwaysWithhold: boolean;

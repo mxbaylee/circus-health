@@ -1,7 +1,8 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { NoteExportDialog } from '../../app/features/notes/NoteExportDialog';
+import { PacketSelection, PacketPrivateReview } from '../../app/features/notes/PacketSelection';
 import { selectProfile } from '../../app/data/profile';
 
 const response = (data: unknown, status = 200) =>
@@ -448,4 +449,172 @@ it('withheld starting-note titles never appear in PDF or evidence download filen
     'health-packet-provider.pdf',
     'health-packet-provider-evidence.json',
   ]);
+});
+
+it('labels note event dates and last-modified fallbacks used by the date window', () => {
+  render(
+    <PacketSelection
+      packet={{
+        ...options.packet,
+        candidates: [
+          {
+            ...routineRecord,
+            key: 'note:event',
+            title: 'Fictional event note',
+            kind: 'note',
+            date: '2025-04-03',
+            dateBasis: 'event',
+          },
+          {
+            ...routineRecord,
+            key: 'note:modified',
+            title: 'Fictional undated note',
+            kind: 'note',
+            date: '2026-10-03',
+            dateBasis: 'note-last-modified',
+          },
+          {
+            ...routineRecord,
+            key: 'procedure:undated',
+            title: 'Fictional undated procedure',
+            date: null,
+            dateBasis: 'undated',
+          },
+        ],
+      }}
+      selection={{}}
+      onChange={vi.fn()}
+      onPreference={vi.fn()}
+      busy={false}
+    />,
+  );
+  expect(screen.getByText(/Event date: 2025-04-03/)).toBeInTheDocument();
+  expect(screen.getByText(/Last modified: 2026-10-03/)).toBeInTheDocument();
+  expect(screen.getByText(/No date recorded/)).toBeInTheDocument();
+  expect(
+    screen.getByText(/For notes without an event date, it uses the last modified date/),
+  ).toBeInTheDocument();
+});
+
+it('private inspection separates complete note fields and corrections while preserving every raw field', async () => {
+  const text = JSON.stringify(
+    {
+      row: {
+        content: '<img src=x onerror=alert(1)> Fictional note body',
+        topics: 'Fictional topics',
+        raw_thoughts: '[Untrusted](javascript:alert(1)) Fictional raw thoughts',
+      },
+      fieldCorrections: [
+        {
+          at: '2026-10-03',
+          reason: 'Fictional correction reason',
+          fields: ['content'],
+          actor: 'profile-user',
+        },
+      ],
+      ownershipCorrections: [
+        {
+          reason: 'Fictional owner correction',
+          futureDetail: { preserved: 'Unknown correction field' },
+        },
+      ],
+      unknownExtension: { exact: 'Retained additional field' },
+    },
+    null,
+    2,
+  );
+  render(
+    <PacketPrivateReview
+      review={{
+        ...review,
+        opaqueItems: [
+          {
+            ...review.opaqueItems[0],
+            key: 'record:note',
+            title: 'Fictional private note',
+            text,
+            contentUrl: '/api/note-exports/frozen/inspection?key=record%3Anote',
+          },
+          {
+            ...review.opaqueItems[0],
+            key: 'original:bytes',
+            title: 'Fictional original bytes',
+            contentUrl: '/api/originals/fictional',
+          },
+          {
+            ...review.opaqueItems[0],
+            key: 'original:untrusted',
+            title: 'Untrusted external location',
+            contentUrl: 'javascript:alert(1)',
+          },
+        ],
+      }}
+      selection={{}}
+      onChange={vi.fn()}
+      busy={false}
+    />,
+  );
+  await userEvent.click(screen.getByText('Review private text'));
+  expect(
+    within(screen.getByRole('region', { name: 'Note body' })).getByText(/Fictional note body/),
+  ).toHaveTextContent('<img src=x onerror=alert(1)>');
+  expect(screen.queryByRole('img')).not.toBeInTheDocument();
+  expect(screen.getByRole('region', { name: 'Topics and questions' })).toHaveTextContent(
+    'Fictional topics',
+  );
+  expect(screen.getByRole('region', { name: 'Raw thoughts' })).toHaveTextContent(
+    '[Untrusted](javascript:alert(1))',
+  );
+  expect(screen.getByRole('region', { name: 'Correction details' })).toHaveTextContent(
+    'Fictional correction reason',
+  );
+  expect(screen.getByRole('region', { name: 'Correction details' })).toHaveTextContent(
+    'Unknown correction field',
+  );
+  expect(
+    screen.getByRole('link', {
+      name: 'Download complete private inspection (not a packet download)',
+    }),
+  ).toHaveAttribute('href', '/api/note-exports/frozen/inspection?key=record%3Anote');
+  expect(
+    screen.getByRole('link', { name: 'Review private original (not a packet download)' }),
+  ).toHaveAttribute('href', '/api/originals/fictional');
+  expect(screen.getAllByRole('link')).toHaveLength(2);
+  await userEvent.click(screen.getByText('All raw inspection fields'));
+  expect(screen.getByText(text, { exact: true, normalizer: (value) => value })).toHaveTextContent(
+    'Retained additional field',
+  );
+});
+
+it('truncated inspection stays visibly incomplete and cannot be mistaken for parsed complete fields', async () => {
+  const excerpt = JSON.stringify({ row: { content: 'Fictional incomplete beginning' } });
+  render(
+    <PacketPrivateReview
+      review={{
+        ...review,
+        opaqueItems: [
+          {
+            ...review.opaqueItems[0],
+            key: 'record:truncated',
+            text: excerpt,
+            truncated: true,
+            contentUrl: '/api/note-exports/frozen/inspection?key=record%3Atruncated',
+          },
+        ],
+      }}
+      selection={{}}
+      onChange={vi.fn()}
+      busy={false}
+    />,
+  );
+  await userEvent.click(screen.getByText('Review private text'));
+  expect(screen.getByText(/Only the beginning of this material is shown/)).toBeInTheDocument();
+  expect(screen.queryByRole('region', { name: 'Note body' })).not.toBeInTheDocument();
+  expect(
+    screen.getByRole('link', {
+      name: 'Download complete private inspection (not a packet download)',
+    }),
+  ).toBeInTheDocument();
+  await userEvent.click(screen.getByText('Raw text excerpt (incomplete)'));
+  expect(screen.getByText(excerpt)).toBeInTheDocument();
 });

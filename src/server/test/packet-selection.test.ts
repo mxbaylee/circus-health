@@ -793,6 +793,12 @@ test('Person origins and note aliases use an identity wrapper without private pr
 test('a personal medication confirmation cannot replace a missing clinical date in a date filter', (t) => {
   const f = packetFixture(t);
   f.db.prepare("UPDATE medications SET start_at=NULL,end_at=NULL WHERE id='current-med'").run();
+  const medication = exportOptions(f.db, {
+    type: 'person',
+    id: f.personId,
+  }).packet!.candidates.find((item) => item.key === 'medication:current-med');
+  assert.equal(medication?.date, null);
+  assert.equal(medication?.dateBasis, 'undated');
   const dateWindow = { kinds: ['medication'], from: '2026-09-01', to: '2026-09-01' };
   const filtered = exportSnapshot(f.db, { ...f.input, packetSelection: dateWindow });
   assert.ok(!filtered.records.some((record) => record.id === 'current-med'));
@@ -1360,4 +1366,72 @@ test('an original reachable only through an owned attachment is offered and supp
     r.preview({ approvals: [{ key: original.key, fingerprint: original.fingerprint }] }),
     hasCode('EXPORT_DISCLOSURE_STALE'),
   );
+});
+
+test('authored note date metadata distinguishes last modification from event date while preserving filtering and explicit inclusion', async (t) => {
+  const f = packetFixture(t);
+  const undated = createNote(f.db, {
+    title: 'Fictional undated agenda',
+    content: 'Fictional undated agenda content',
+  });
+  const dated = createNote(f.db, {
+    title: 'Fictional dated visit',
+    content: 'Fictional dated visit content',
+  });
+  f.db
+    .prepare('UPDATE notes SET event_date=?,updated_at=? WHERE id=?')
+    .run(null, '2026-09-15T12:00:00Z', undated.id);
+  f.db
+    .prepare('UPDATE notes SET event_date=?,updated_at=? WHERE id=?')
+    .run('2026-08-01', '2026-09-15T12:00:00Z', dated.id);
+  const candidates = exportOptions(f.db, { type: 'person', id: f.personId }).packet!.candidates;
+  const undatedCandidate = candidates.find((item) => item.record.recordId === undated.id)!;
+  const datedCandidate = candidates.find((item) => item.record.recordId === dated.id)!;
+  assert.equal(undatedCandidate.date, '2026-09-15T12:00:00Z');
+  assert.equal(undatedCandidate.dateBasis, 'note-last-modified');
+  assert.equal(datedCandidate.date, '2026-08-01');
+  assert.equal(datedCandidate.dateBasis, 'event');
+  const r = routes(f);
+  const selection = { kinds: ['note'], from: '2026-09-01', to: '2026-09-30' };
+  const extra = { noteIds: [undated.id, dated.id] };
+  const first = await r.preview(selection, extra);
+  const undatedReview = first.packetReview.opaqueItems.find(
+    (item) => item.key === `record:note:${undated.id}`,
+  );
+  assert.ok(undatedReview, 'the last-modified date admits an undated note to private text review');
+  assert.ok(
+    first.packetReview.withheld.some(
+      (item) => item.key === `note:${dated.id}` && /Date window/.test(item.reason),
+    ),
+  );
+  assert.ok(!first.packetReview.opaqueItems.some((item) => item.key === `record:note:${dated.id}`));
+  const approved = await r.preview(
+    {
+      ...selection,
+      approvals: [{ key: undatedReview.key, fingerprint: undatedReview.fingerprint }],
+    },
+    extra,
+  );
+  const shared = JSON.parse((await r.call(approved.token, 'evidence')).body.toString()) as {
+    records: Array<{ id: string }>;
+  };
+  assert.ok(shared.records.some((item) => item.id === undated.id));
+  assert.ok(!shared.records.some((item) => item.id === dated.id));
+  const explicitSelection = { ...selection, include: [{ kind: 'note', recordId: dated.id }] };
+  const explicit = await r.preview(explicitSelection, extra);
+  const datedReview = explicit.packetReview.opaqueItems.find(
+    (item) => item.key === `record:note:${dated.id}`,
+  );
+  assert.ok(datedReview, 'individual inclusion overrides the event-date category filter');
+  const approvedExplicit = await r.preview(
+    {
+      ...explicitSelection,
+      approvals: [{ key: datedReview.key, fingerprint: datedReview.fingerprint }],
+    },
+    extra,
+  );
+  const explicitShared = JSON.parse(
+    (await r.call(approvedExplicit.token, 'evidence')).body.toString(),
+  ) as { records: Array<{ id: string; date: string }> };
+  assert.equal(explicitShared.records.find((item) => item.id === dated.id)?.date, '2026-08-01');
 });
