@@ -2,11 +2,19 @@ import {
   maximumIntakeDiscoveryOrder,
   retainedIntakeAcceptance,
   indexedIntakeIdentityConfirmations,
+  reconcileActiveIntakeLookup,
 } from './intake-lookup-projection.ts';
 import type { IntakePersonProposalState } from '../shared/intake-people.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { json } from './database.ts';
+import { currentTransactionToken } from './database.ts';
+import {
+  initializeIntakeEnvelope,
+  prepareInitialIntakeEnvelope,
+  readIntakeEnvelope,
+  readNonIntakeEnvelope,
+  stageIntakeEnvelope,
+} from './intake-authority.ts';
 import { createSourceDetailsSearch } from './source-details-search.ts';
 import { reconcileActiveSourceTextProjection } from './source-text-projection.ts';
 import type {
@@ -73,17 +81,17 @@ interface DetailsRow {
 }
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
-function envelope(file: DetailsRow): Record<string, unknown> {
-  const value = json(file.details_json);
+function envelope(db: DatabaseSync, file: DetailsRow): Record<string, unknown> {
+  const value = readIntakeEnvelope(db, file);
   if (!object(value)) throw Error('Intake source metadata is incomplete');
   return value;
 }
 /** Current persisted view, deliberately without merging the separate source pin. */
-export function storedIntakeDetails(
-  _db: DatabaseSync,
-  file: DetailsRow,
-): IntakeDetails | undefined {
-  const all = json(file.details_json);
+export function storedIntakeDetails(db: DatabaseSync, file: DetailsRow): IntakeDetails | undefined {
+  const all =
+    file.kind === 'intake_original' || file.kind === undefined
+      ? readIntakeEnvelope(db, file)
+      : readNonIntakeEnvelope(file.details_json);
   if (!object(all)) {
     if (file.kind === 'intake_original') throw Error('Intake source metadata is incomplete');
     return undefined;
@@ -134,13 +142,13 @@ export function writeIntakeDetails(
   next: IntakeDetails,
   { effective = true }: { effective?: boolean } = {},
 ): string {
-  const all = envelope(file);
+  const all = envelope(db, file);
   const stored = requireStoredIntakeDetails(db, file);
   all.intake = effective
     ? withoutIntakeSourcePin(next, stored, parseIntakeSourcePin(file.source_pin))
     : next;
-  const raw = JSON.stringify(all);
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(raw, file.id);
+  const raw = stageIntakeEnvelope(db, file, all);
+  reconcileActiveIntakeLookup(db);
   reconcileActiveSourceTextProjection(db);
   return raw;
 }
@@ -175,8 +183,10 @@ export function intakeIdentityConfirmations(db: DatabaseSync): IntakeIdentityRec
   return indexedIntakeIdentityConfirmations(db) as IntakeIdentityReceipt[];
 }
 /** Source-file DTOs currently expose the complete envelope, including operational intake state. */
-export function sourceFileDetails(_db: DatabaseSync, file: DetailsRow & { id: string }): unknown {
-  return json(file.details_json);
+export function sourceFileDetails(db: DatabaseSync, file: DetailsRow & { id: string }): unknown {
+  return file.kind === 'intake_original'
+    ? readIntakeEnvelope(db, file)
+    : readNonIntakeEnvelope(file.details_json);
 }
 /** Source list search includes operational JSON. Both count/page queries use this scoped adapter. */
 export function sourceDetailsSearch(db: DatabaseSync, query: string) {
@@ -186,7 +196,7 @@ export function sourceDetailsSearch(db: DatabaseSync, query: string) {
 /** Registration of roots, extracted children and proposals remains in the caller's publication transaction. */
 export interface IntakeFileRegistration {
   id: string;
-  providerId: string;
+  providerId?: string | null;
   path: string;
   sha256?: string;
   bytes?: Buffer;
@@ -194,24 +204,31 @@ export interface IntakeFileRegistration {
   mimeType: string;
   kind: string;
   coverage: string;
-  batchId: string;
-  details: Record<string, unknown>;
+  batchId?: string | null;
+  details: Record<string, unknown> | string;
 }
 
 export function registerIntakeFile(db: DatabaseSync, file: IntakeFileRegistration): void {
+  if (file.kind === 'intake_original' && (!currentTransactionToken(db) || !db.isTransaction))
+    throw Error('Intake registration requires the existing application transaction');
+  const prepared =
+    file.kind === 'intake_original' ? prepareInitialIntakeEnvelope(file.details) : null;
   db.prepare(
     'INSERT INTO source_files(id,provider_id,path,sha256,bytes,mime_type,kind,coverage_status,batch_id,details_json) VALUES(?,?,?,?,?,?,?,?,?,?)',
   ).run(
     file.id,
-    file.providerId,
+    file.providerId ?? null,
     file.path,
     file.sha256 || createHash('sha256').update(file.bytes!).digest('hex'),
     file.size ?? file.bytes!.length,
     file.mimeType,
     file.kind,
     file.coverage,
-    file.batchId,
-    JSON.stringify(file.details),
+    file.batchId ?? null,
+    prepared?.detailsJson ??
+      (typeof file.details === 'string' ? file.details : JSON.stringify(file.details)),
   );
+  if (prepared) initializeIntakeEnvelope(db, { id: file.id }, file.details);
+  reconcileActiveIntakeLookup(db);
   reconcileActiveSourceTextProjection(db);
 }

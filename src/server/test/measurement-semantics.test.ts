@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -45,6 +46,7 @@ function fixture(
     profileId = state?.profileId || 'cookie-dough';
   const db =
     state?.db || openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  if (!state) attachPersonalDurability(db, { root, profileId });
   if (!state)
     t.after(() => {
       db.close();
@@ -307,6 +309,7 @@ test('durable semantic precision, historical receipt and rebuildable conversion 
     target = join(f.root, 'recovered');
   const recovered = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(recovered.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     assert.deepEqual(
       deriveMeasurement(
@@ -340,6 +343,7 @@ test('exact inline accepted unit supports semantic preview, apply and portable r
     target = join(f.root, 'recovered-inline-unit'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const recovered = acceptedMeasurement(db, target, f.profileId, 'observation', inline.recordId);
     assert.deepEqual(recovered, before);

@@ -659,6 +659,23 @@ export function verifyDuplicateOriginals(
   record: DuplicateRecord,
   verified: Set<string>,
 ): void {
+  const sourceIds = new Set<string>();
+  // The evidence link can point to an uploaded original while the accepted
+  // assertion itself came from a retained transcription/proposal. Both are
+  // dependencies of this comparison; verify the carrier without rescanning
+  // unrelated originals as the former whole-profile snapshot did.
+  for (const sourceRecordId of new Set([
+    record.sourceRecordId,
+    ...record.evidence.map((evidence) => evidence.sourceRecordId),
+  ])) {
+    if (!sourceRecordId) continue;
+    const source = db
+      .prepare('SELECT source_file_id FROM source_records WHERE id=?')
+      .get(sourceRecordId);
+    if (!source)
+      throw new HttpError(409, 'DUPLICATE_EVIDENCE', 'The saved assertion source is unavailable');
+    sourceIds.add(String(source.source_file_id));
+  }
   for (const evidence of record.evidence) {
     const match = /^\/api\/sources\/([^/?#]+)\/content(?:[?#]|$)/.exec(evidence.contentUrl);
     if (!match)
@@ -667,7 +684,9 @@ export function verifyDuplicateOriginals(
         'DUPLICATE_EVIDENCE',
         'Both records need their exact retained originals',
       );
-    const id = decodeURIComponent(match[1]!);
+    sourceIds.add(decodeURIComponent(match[1]!));
+  }
+  for (const id of sourceIds) {
     if (verified.has(id)) continue;
     const source = db.prepare('SELECT path,bytes,sha256 FROM source_files WHERE id=?').get(id) as
       { path: string; bytes: number; sha256: string } | undefined;

@@ -39,7 +39,7 @@ function fixture(t: TestContext) {
   db.prepare("INSERT INTO source_records(id,source_file_id,raw_json) VALUES('raw','file',?)").run(
     oldRaw,
   );
-  attachPersonalDurability(db, { root, profileId: 'cedar' });
+  attachPersonalDurability(db, { portableSnapshots: true, root, profileId: 'cedar' });
   exportCuration(db, root, 'cedar');
   const oldPointer = readFileSync(resolve(paths.curation, 'current.json')),
     oldManifest = JSON.parse(oldPointer.toString('utf8')) as { file: string },

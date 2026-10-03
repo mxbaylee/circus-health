@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -51,6 +52,7 @@ function fixture(t: TestContext) {
   const profileId = 'cookie-dough',
     paths = ensureProfileDirectories(root, profileId),
     db = openDatabase(paths.database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     try {
       db.close();

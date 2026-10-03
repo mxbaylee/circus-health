@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -16,6 +17,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-report-field-holdout-'));
   const profileId = 'fictional-orchard-field-holdout';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -173,6 +175,7 @@ test('counted report acceptance preserves scoped clinical fields, literal glyphs
   }
   const rebuilt = rebuildProfile(f.root, f.profileId, join(f.root, 'rebuilt'));
   const rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(rebuiltDb, { root: join(f.root, 'rebuilt'), profileId: f.profileId });
   try {
     assert.deepEqual(savedFields(rebuiltDb), saved);
   } finally {
@@ -203,6 +206,7 @@ test('missing clinical fields remain unknown instead of borrowing unrelated payl
   assert.deepEqual(saved[0].raw, source);
   const rebuilt = rebuildProfile(f.root, f.profileId, join(f.root, 'rebuilt'));
   const rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(rebuiltDb, { root: join(f.root, 'rebuilt'), profileId: f.profileId });
   try {
     assert.deepEqual(savedFields(rebuiltDb), saved);
   } finally {

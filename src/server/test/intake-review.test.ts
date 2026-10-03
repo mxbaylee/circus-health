@@ -1,3 +1,6 @@
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -61,6 +64,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'circus-import-review-'));
   const profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -450,7 +454,7 @@ test('context-only envelopes remain inspectable evidence without becoming clinic
     { value: context as unknown as HealthRecordEnvelope },
   );
   const contextVersionId = 'candidate-version:' + workflowHash(canonicalLiteral(context));
-  const stored = JSON.parse(String(sourceFile.details_json));
+  const stored = JSON.parse(readIntakeEnvelopeText(f.db, { id: item.id })!);
   stored.intake.workflow.candidates.push({
     id: contextCandidateId,
     envelopeId: context.id,
@@ -491,9 +495,7 @@ test('context-only envelopes remain inspectable evidence without becoming clinic
       answers: [],
     },
   );
-  f.db
-    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-    .run(JSON.stringify(stored), item.id);
+  writeIntakeFixtureEnvelope(f.db, item.id, stored);
   assert.equal(
     call(f, 'getIntake', item.id).pendingCount,
     2,
@@ -548,10 +550,7 @@ test('context-only envelopes remain inspectable evidence without becoming clinic
   );
   assert.deepEqual(call(f, 'getIntakeOriginal', item.id).bytes, originalBytes);
 
-  const afterImport = f.db
-    .prepare('SELECT details_json FROM source_files WHERE id=?')
-    .get(item.id)!;
-  const retainedDetails = JSON.parse(String(afterImport.details_json));
+  const retainedDetails = JSON.parse(readIntakeEnvelopeText(f.db, { id: item.id })!);
   retainedDetails.intake.workflow.reviewDrafts.push({
     id: 'legacy-reviewed-context-draft',
     proposalId,
@@ -569,9 +568,7 @@ test('context-only envelopes remain inspectable evidence without becoming clinic
     disposition: 'pending',
     at: '2026-01-01T00:00:00.000Z',
   });
-  f.db
-    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-    .run(JSON.stringify(retainedDetails), item.id);
+  writeIntakeFixtureEnvelope(f.db, item.id, retainedDetails);
   const mappedContext = call(f, 'reviewIntake', item.id, proposalId);
   assert.equal(mappedContext.sourceContext.length, 0);
   assert.equal(mappedContext.records.length, 4);
@@ -781,7 +778,7 @@ test('legacy context candidates are projected out of pending counts without rewr
   );
   const versionId = 'candidate-version:' + workflowHash(canonicalLiteral(context));
   const recordId = `${item.id}:line:1`;
-  const stored = JSON.parse(String(sourceFile.details_json));
+  const stored = JSON.parse(readIntakeEnvelopeText(f.db, { id: item.id })!);
   stored.intake.workflow.candidates.push({
     id: candidateId,
     envelopeId: context.id,
@@ -804,7 +801,7 @@ test('legacy context candidates are projected out of pending counts without rewr
     ],
   });
   const retained = JSON.stringify(stored);
-  f.db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(retained, item.id);
+  writeIntakeFixtureEnvelope(f.db, item.id, JSON.parse(retained));
 
   let projected = call(f, 'getIntake', item.id);
   let review = call(f, 'reviewIntake', item.id);
@@ -815,7 +812,7 @@ test('legacy context candidates are projected out of pending counts without rewr
   assert.equal(review.records.length, 0);
   assert.equal(review.sourceContext.length, 1);
   assert.equal(
-    f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(item.id)!.details_json,
+    readIntakeEnvelopeText(f.db, { id: item.id }),
     retained,
     'read projection does not rewrite the retained workflow',
   );
@@ -835,9 +832,7 @@ test('legacy context candidates are projected out of pending counts without rewr
     disposition: 'review_later',
     at: '2026-01-02T00:00:00.000Z',
   });
-  f.db
-    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-    .run(JSON.stringify(stored), item.id);
+  writeIntakeFixtureEnvelope(f.db, item.id, stored);
   projected = call(f, 'getIntake', item.id);
   review = call(f, 'reviewIntake', item.id);
   assert.equal(projected.pendingCount, 1);
@@ -862,9 +857,7 @@ test('legacy context candidates are projected out of pending counts without rewr
     evidence: [],
     at: '2026-01-03T00:00:00.000Z',
   });
-  f.db
-    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-    .run(JSON.stringify(stored), item.id);
+  writeIntakeFixtureEnvelope(f.db, item.id, stored);
   projected = call(f, 'getIntake', item.id);
   review = call(f, 'reviewIntake', item.id);
   assert.equal(projected.pendingCount, 0);
@@ -1103,16 +1096,10 @@ test('legacy unmeasured resolution remains in history but cannot approve a chang
   item = draft(f, item, record, {
     resolutions: [{ issueId: title.id, outcome: 'confirmed' }],
   });
-  const stored = JSON.parse(
-    String(
-      f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(item.id)!.details_json,
-    ),
-  );
+  const stored = JSON.parse(String(readIntakeEnvelopeText(f.db, { id: item.id })));
   const historical = stored.intake.workflow.reviewDrafts.at(-1).resolutions.at(-1);
   delete historical.dependency;
-  f.db
-    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-    .run(JSON.stringify(stored), item.id);
+  writeIntakeFixtureEnvelope(f.db, item.id, stored);
   item = call(f, 'getIntake', item.id);
   record = call(f, 'reviewIntake', item.id).records[0]!;
   item = draft(f, item, record, {

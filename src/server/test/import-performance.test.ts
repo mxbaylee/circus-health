@@ -1,3 +1,5 @@
+import { recordPublicationFixture } from './helpers/accepted-record-fixture.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
@@ -16,7 +18,7 @@ import { createEncryptedProfiles } from '../encrypted-profiles.ts';
 import { receiveIntakeUpload } from '../intake-upload.ts';
 import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
-import { uploadIntake, flushIntake } from '../intake.ts';
+import { uploadIntake } from '../intake.ts';
 
 const profileId = 'fictional-performance';
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -305,43 +307,42 @@ test('upload streaming delay is attributed separately from local hash/write and 
   assert.equal(stream.fields.chunkCount, 2);
   d.close();
 });
-test('curation delay and failed durability are measured without changing upload or flush outcome', (t) => {
+test('refused accepted publication has no upload acknowledgement and the same input can retry', (t) => {
   const root = directory(t);
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  const backend = recordPublicationFixture();
+  attachPersonalDurability(db, { root, profileId, recordStorage: backend.storage });
   const d = createImportDiagnostics();
   t.after(() => {
     db.close();
     d.close();
   });
-  const intake = d.run({ profileId, operationId: randomUUID() }, () =>
-    uploadIntake(
-      db,
-      root,
-      profileId,
-      { filename: 'fictional.txt', bytes: Buffer.from('fictional report') },
-      {
-        exportFn: () => {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 12);
-          throw Error('fictional storage failure');
-        },
-      },
-    ),
+  const input = { filename: 'fictional.txt', bytes: Buffer.from('fictional report') };
+  backend.refusePublication(new Error('fictional storage failure'));
+  assert.throws(
+    () =>
+      d.run({ profileId, operationId: randomUUID() }, () =>
+        uploadIntake(db, root, profileId, input),
+      ),
+    /fictional storage failure/,
   );
-  assert.equal(intake.durability.pending, true);
+  assert.equal(
+    db.prepare("SELECT count(*) n FROM source_files WHERE kind='intake_original'").get()!.n,
+    0,
+  );
   const spans = summary(d).operations[0]!.spans;
-  const flush = spans.find((s) => s.phase === 'curation_flush')!;
-  assert.equal(flush.outcome, 'failed');
-  assert.ok(flush.durationMs! >= 10);
-  assert.ok(spans.some((s) => s.phase === 'upload_original_copy'));
-  assert.ok(spans.some((s) => s.phase === 'upload_original_fsync'));
-  const failure = d.run({ profileId, operationId: randomUUID() }, () =>
-    flushIntake(db, root, profileId, {
-      exportFn: () => {
-        throw Error('retry failure');
-      },
-    }),
+  assert.ok(spans.some((span) => span.outcome === 'failed'));
+  assert.ok(spans.some((span) => span.phase === 'upload_original_copy'));
+  assert.ok(spans.some((span) => span.phase === 'upload_original_fsync'));
+  backend.refusePublication(null);
+  const retained = d.run({ profileId, operationId: randomUUID() }, () =>
+    uploadIntake(db, root, profileId, input),
   );
-  assert.equal(failure.pending, true);
+  assert.equal(retained.durability.pending, false);
+  assert.equal(
+    db.prepare("SELECT count(*) n FROM source_files WHERE kind='intake_original'").get()!.n,
+    1,
+  );
 });
 
 test('one export salt joins import IDs across summaries and attribution without making exports linkable by default', () => {
@@ -630,6 +631,7 @@ test('scoped progress keeps same-profile turn enrichment without borrowing anoth
 test('default upload and processing share a salted source reference after detail eviction and restart', (t) => {
   const root = directory(t),
     db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   const d = createImportDiagnostics(),
     operationId = randomUUID(),
     salt = Buffer.alloc(32, 9);

@@ -83,6 +83,7 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
       connectionCheck: async () => ({ available: true, readiness: 'ready' }),
       bridgeFactory: (options) => {
         let round = 0;
+        let sourceTextRevisionId: string | undefined;
         return new ProxyModelBridge({
           ...options,
           config: {
@@ -101,6 +102,8 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
           onTool: async (params) => {
             assert.ok(options.onTool);
             const result = await options.onTool(params);
+            if (params.tool === 'health_intake_source_text')
+              sourceTextRevisionId = (result as { revisionId: string }).revisionId;
             if (params.tool === 'health_intake_read') {
               hostReads++;
               if (!recovery && boundary === 'time') now = 900_001;
@@ -136,12 +139,14 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
                 });
               assert.fail('time/transcript boundary must prevent the next physical request');
             }
-            if (round === 2)
+            if (round === 2) return response('health_intake_source_text', { id: source.id });
+            if (round === 3)
               return response('health_intake_batch', {
                 id: source.id,
                 version: getIntake(db, root, profileId, source.id).version,
                 planId: plan.id,
                 operationId: 'fictional-recovered-batch',
+                sourceTextRevisionId,
                 coverage,
                 summary: 'Fictional source receipt for review',
                 jsonlText: JSON.stringify({
@@ -229,10 +234,10 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
     assert.equal(attribution.totals.attempts, requests);
     assert.equal(
       scope.inputTokens,
-      20,
-      'the two recent requests still contain the actual source payload',
+      30,
+      'the three recent requests retain the original and revision-pinned source payload',
     );
-    assert.equal(attribution.totals.inputTokens, 40);
+    assert.equal(attribution.totals.inputTokens, 50);
     assert.equal(
       attribution.totals.unknownUsageAttempts,
       ['time', 'transcript'].includes(boundary) ? 0 : 1,

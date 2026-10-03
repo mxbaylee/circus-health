@@ -1,3 +1,7 @@
+import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -32,6 +36,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(resolve(tmpdir(), 'fictional-clinical-scope-'));
   const profile = 'orchid';
   const db = openDatabase(ensureProfileDirectories(root, profile).database, profile);
+  attachPersonalDurability(db, { root, profileId: profile });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -203,6 +208,7 @@ test('evidenced same-subject/member copies and changed versions survive locator 
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
   const rebuilt = rebuildProfile(f.root, f.profile, resolve(f.root, 'rebuilt'));
   const db = openDatabase(rebuilt.database, f.profile);
+  attachPersonalDurability(db, { root: resolve(f.root, 'rebuilt'), profileId: f.profile });
   try {
     const restored = { ...f, db, root: resolve(f.root, 'rebuilt') };
     await refuses(
@@ -309,9 +315,9 @@ for (const clinical of [
 test('missing retained authority and orphan corrections fail closed without hiding the review', async (t) => {
   const f = fixture(t);
   await accept(f, upload(f, [envelope()]).id, { testLabel: 'Fictional reviewed label' });
-  f.db.prepare("UPDATE source_records SET raw_json='{}'").run();
+  fixtureTransaction(f.db, () => f.db.prepare("UPDATE source_records SET raw_json='{}'").run());
   await refuses(f, upload(f, [envelope()], 'copy.jsonl').id);
-  f.db.prepare('DELETE FROM observations').run();
+  fixtureTransaction(f.db, () => f.db.prepare('DELETE FROM observations').run());
   await refuses(f, upload(f, [envelope()], 'orphan-copy.jsonl').id);
 });
 
@@ -324,11 +330,13 @@ test('all attached source occurrences are checked, including an older contaminat
   };
   await accept(f, upload(f, [different], 'separate.jsonl').id);
   const rows = f.db.prepare('SELECT id,source_record_id FROM observations ORDER BY id').all();
-  f.db
-    .prepare(
-      "INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES('fictional-legacy-contamination','observation',?,?,'source','{}')",
-    )
-    .run(String(rows[0]!.id), String(rows[1]!.source_record_id));
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare(
+        "INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES('fictional-legacy-contamination','observation',?,?,'source','{}')",
+      )
+      .run(String(rows[0]!.id), String(rows[1]!.source_record_id)),
+  );
   const primary = JSON.parse(
     String(
       f.db
@@ -377,7 +385,10 @@ test('the scope snapshot rejects a colliding context-only correction before it c
       }),
     ),
   ).entries![0]!;
-  const check = clinicalSourceScopeCheck(f.db, { sha256: 'fictional-new-original' }, [entry]);
+  const incoming = upload(f, [entry.value], 'fictional-context-source.jsonl');
+  const check = clinicalSourceScopeCheck(f.db, { id: incoming.id, sha256: incoming.sha256 }, [
+    entry,
+  ]);
   assert.match(check(entry)!, /different or unverified report subject or member/);
 });
 
@@ -395,20 +406,22 @@ test('context-only classification does not inherit a colliding correction that w
   const file = f.db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(first.id) as {
     sha256: string;
   };
-  f.db
-    .prepare(
-      "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES('fictional-context-exception','Import record exception','verified','2026-09-23',?)",
-    )
-    .run(
-      JSON.stringify({
-        recordException: {
-          identityKey: clinicalSourceIdentityV1(entry, file),
-          sourceVersion: clinicalSourceVersion(mappingFrom(entry)),
-          recordId: `${first.id}:line:1`,
-          set: { ...envelope().clinical },
-        },
-      }),
-    );
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare(
+        "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES('fictional-context-exception','Import record exception','verified','2026-09-23',?)",
+      )
+      .run(
+        JSON.stringify({
+          recordException: {
+            identityKey: clinicalSourceIdentityV1(entry, file),
+            sourceVersion: clinicalSourceVersion(mappingFrom(entry)),
+            recordId: `${first.id}:line:1`,
+            set: { ...envelope().clinical },
+          },
+        }),
+      ),
+  );
   const second = upload(
     f,
     [{ ...value, report: envelope('Fictional Morgan Fern').report }],
@@ -483,10 +496,13 @@ test('identical retained child bytes do not erase distinct host package occurren
     { filename: 'b.jsonl', locator: 'member:b', bytes },
   ]);
   const rows = f.db
-    .prepare(
-      "SELECT id FROM source_files WHERE json_extract(details_json,'$.intake.parentSourceFileId')=? ORDER BY id",
-    )
-    .all(parent.id);
+    .prepare("SELECT id FROM source_files WHERE kind='intake_original' ORDER BY id")
+    .all()
+    .filter(
+      (row) =>
+        JSON.parse(readIntakeEnvelopeText(f.db, { id: String(row.id) })!).intake
+          .parentSourceFileId === parent.id,
+    );
   assert.equal(rows.length, 2);
   await accept(f, String(rows[0]!.id));
   const firstReview = reviewIntake(f.db, f.root, f.profile, String(rows[0]!.id));
@@ -539,7 +555,15 @@ test('raw numeric token wrappers cannot supply literal report or patient text', 
     );
   });
   const entries = validateJSONL(Buffer.from(values.join('\n'))).entries!;
-  const check = clinicalSourceScopeCheck(f.db, { sha256: 'fictional-numeric-source' }, entries);
+  const incoming = uploadIntake(f.db, f.root, f.profile, {
+    filename: 'fictional-numeric-source.txt',
+    bytes: Buffer.from('Fictional source without printed report or patient text.'),
+  });
+  const check = clinicalSourceScopeCheck(
+    f.db,
+    { id: incoming.id, sha256: incoming.sha256 },
+    entries,
+  );
   assert.ok(
     entries.every((entry) => check(entry)),
     'Numeric wrappers are preserved tokens, never printed text grounding',
@@ -608,6 +632,7 @@ for (const family of [false, true])
     const destination = resolve(f.root, 'cold-auto-owner');
     const rebuilt = rebuildProfile(f.root, f.profile, destination);
     const db = openDatabase(rebuilt.database, f.profile);
+    attachPersonalDurability(db, { root: destination, profileId: f.profile });
     try {
       const restored = { ...f, db, root: destination };
       const laterValue = {
@@ -651,25 +676,20 @@ for (const family of [false, true])
         null,
         'accepted historical proof and current original proof work after cache loss',
       );
-      const prior = String(
-        db.prepare('SELECT details_json FROM source_files WHERE id=?').get(first.id)!.details_json,
-      );
+      const prior = String(readIntakeEnvelopeText(db, { id: first.id }));
       for (const marker of [undefined, 'different-original-fingerprint']) {
         const altered = JSON.parse(prior);
         for (const batch of [altered.intake.imported, ...(altered.intake.importHistory || [])])
           for (const record of batch?.clinical?.records || [])
             if (record.identityAttribution)
               record.identityAttribution.originalSubjectFingerprint = marker;
-        db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-          JSON.stringify(altered),
-          first.id,
-        );
+        writeIntakeFixtureEnvelope(db, first.id, altered);
         assert.ok(
           clinicalSourceScopeCheck(db, row(), [entry], secondProposal)(entry),
           'legacy or different-original marker is not accepted authority',
         );
       }
-      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(prior, first.id);
+      writeIntakeFixtureEnvelope(db, first.id, JSON.parse(prior));
       const ready = reviewIntake(db, destination, f.profile, second.id, secondProposal);
       importIntake(db, destination, f.profile, second.id, {
         version: ready.version,

@@ -1,3 +1,6 @@
+import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
+import { registerIntakeFile } from '../intake-state-access.ts';
+import { transaction } from '../database.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -18,99 +21,105 @@ const sentinel = 'fictional-workflow-sentinel-'.repeat(800);
 function fixture(t: TestContext) {
   const root = mkdtempSync(resolve(tmpdir(), 'health-source-record-reference-'));
   const db = openDatabase(resolve(root, 'cookie-dough.sqlite'), 'cookie-dough');
+  memoryRecordAuthority(db);
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
-  db.exec(
-    "INSERT INTO providers VALUES('acquisition','Fictional Acquisition'),('reviewed','Fictional Reviewed Source')",
-  );
-  const insertFile = db.prepare(
-    `INSERT INTO source_files
+  transaction(db, () => {
+    db.exec(
+      "INSERT INTO providers VALUES('acquisition','Fictional Acquisition'),('reviewed','Fictional Reviewed Source')",
+    );
+    const insertFile = db.prepare(
+      `INSERT INTO source_files
       (id,provider_id,path,sha256,bytes,mime_type,kind,coverage_status,details_json)
      VALUES(?,?,?,?,?,?,?,?,?)`,
-  );
-  const details = (source: string, parentSourceFileId?: string) =>
-    JSON.stringify({
-      intake: {
-        metadata: { sourceProviderId: 'reviewed', source },
-        ...(parentSourceFileId ? { parentSourceFileId } : {}),
-      },
-      workflow: sentinel,
-    });
-  insertFile.run(
-    'extraction',
-    'acquisition',
-    'fictional/proposal.jsonl',
-    'e'.repeat(64),
-    111,
-    'application/x-ndjson',
-    'intake_proposal',
-    'derived_proposal; mapped',
-    details('Fictional Extraction Label'),
-  );
-  insertFile.run(
-    'original',
-    'acquisition',
-    'fictional/original.txt',
-    'o'.repeat(64),
-    222,
-    'text/plain',
-    'intake_original',
-    'original_retained; clinical_coverage_unknown',
-    details('Fictional Original Label', 'ancestor-1'),
-  );
-  for (let index = 1; index <= 9; index += 1)
-    insertFile.run(
-      `ancestor-${index}`,
-      'acquisition',
-      `fictional/ancestor-${index}.zip`,
-      String(index).repeat(64),
-      300 + index,
-      'application/zip',
-      'archive',
-      'retained',
-      details(`Fictional Ancestor ${index}`, index === 9 ? 'ancestor-1' : `ancestor-${index + 1}`),
     );
-  const insertRecord = db.prepare(
-    `INSERT INTO source_records
+    const details = (source: string, parentSourceFileId?: string) =>
+      JSON.stringify({
+        intake: {
+          metadata: { sourceProviderId: 'reviewed', source },
+          ...(parentSourceFileId ? { parentSourceFileId } : {}),
+        },
+        workflow: sentinel,
+      });
+    insertFile.run(
+      'extraction',
+      'acquisition',
+      'fictional/proposal.jsonl',
+      'e'.repeat(64),
+      111,
+      'application/x-ndjson',
+      'intake_proposal',
+      'derived_proposal; mapped',
+      details('Fictional Extraction Label'),
+    );
+    registerIntakeFile(db, {
+      id: 'original',
+      providerId: 'acquisition',
+      path: 'fictional/original.txt',
+      sha256: 'a'.repeat(64),
+      size: 222,
+      mimeType: 'text/plain',
+      kind: 'intake_original',
+      coverage: 'original_retained; clinical_coverage_unknown',
+      details: details('Fictional Original Label', 'ancestor-1'),
+    });
+    for (let index = 1; index <= 9; index += 1)
+      insertFile.run(
+        `ancestor-${index}`,
+        'acquisition',
+        `fictional/ancestor-${index}.zip`,
+        String(index).repeat(64),
+        300 + index,
+        'application/zip',
+        'archive',
+        'retained',
+        details(
+          `Fictional Ancestor ${index}`,
+          index === 9 ? 'ancestor-1' : `ancestor-${index + 1}`,
+        ),
+      );
+    const insertRecord = db.prepare(
+      `INSERT INTO source_records
       (id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status)
      VALUES(?,?,?,?,?,?,?,?,?)`,
-  );
-  insertRecord.run(
-    'source:fictional',
-    'extraction',
-    'reviewed',
-    'fictional-key',
-    'source_capture',
-    'Fictional retained source',
-    '{"content":{"literal":"01.00"}}',
-    JSON.stringify({ originalSourceFileId: 'original', page: 2 }),
-    'projected_reviewed',
-  );
-  insertRecord.run(
-    'source:related',
-    'extraction',
-    'reviewed',
-    'related-key',
-    'context',
-    'Fictional related source',
-    '{"data":{}}',
-    '{}',
-    'retained',
-  );
-  db.prepare(
-    `INSERT INTO record_relationships
+    );
+    insertRecord.run(
+      'source:fictional',
+      'extraction',
+      'reviewed',
+      'fictional-key',
+      'source_capture',
+      'Fictional retained source',
+      '{"content":{"literal":"01.00"}}',
+      JSON.stringify({ originalSourceFileId: 'original', page: 2 }),
+      'projected_reviewed',
+    );
+    insertRecord.run(
+      'source:related',
+      'extraction',
+      'reviewed',
+      'related-key',
+      'context',
+      'Fictional related source',
+      '{"data":{}}',
+      '{}',
+      'retained',
+    );
+    db.prepare(
+      `INSERT INTO record_relationships
       (id,from_record_id,to_record_id,relation,status,rationale)
      VALUES(?,?,?,?,?,?)`,
-  ).run(
-    'relationship-1',
-    'source:fictional',
-    'source:related',
-    'fictional-context',
-    'accepted',
-    'Fictional reviewed relationship',
-  );
+    ).run(
+      'relationship-1',
+      'source:fictional',
+      'source:related',
+      'fictional-context',
+      'accepted',
+      'Fictional reviewed relationship',
+    );
+  });
   setVisibility(db, 'source_file', 'ancestor-2', { archived: true, version: 0 });
   return { root, db };
 }

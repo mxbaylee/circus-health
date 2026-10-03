@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDatabase } from '../database.ts';
+import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
 import {
@@ -15,12 +15,13 @@ import {
   getIntakeReportAcceptance,
 } from '../intake-report-acceptance.ts';
 import { createBackup } from '../recovery.ts';
-import { rebuildProfile } from '../portable.ts';
+import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { attachRecordDurability, rebuildRecordDatabase } from '../record-versions.ts';
 import type { RecordStorage } from '../record-versions.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
 import { createNote, getNote, saveNote } from '../notes.ts';
 import { vaultFixture, newProfile } from './helpers/vault-fixture.ts';
+import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import type {
   HealthRecordEnvelope,
   Intake,
@@ -30,10 +31,13 @@ import type {
 } from '../../shared/intake.ts';
 import type { IncomingMessage } from 'node:http';
 
-function fixture(t: TestContext) {
+function fixture(t: TestContext, storage?: RecordStorage | 'memory') {
   const root = mkdtempSync(join(tmpdir(), 'fictional-counted-acceptance-')),
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  if (storage === 'memory') memoryRecordAuthority(db);
+  else if (storage) attachRecordDurability(db, { profileId, storage });
+  else attachPersonalDurability(db, { root, profileId });
   t.after(() => {
     try {
       db.close();
@@ -304,6 +308,7 @@ test('receipt and original selections survive source updates, backup/rebuild and
     target = join(f.root, 'rebuilt');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId, initialize: false });
   try {
     assert.deepEqual(
       getIntakeReportAcceptance(db, target, f.profileId, input.operationId).receipt,
@@ -317,9 +322,6 @@ test('receipt and original selections survive source updates, backup/rebuild and
 });
 
 test('a durable-head publication followed by lost commit acknowledgement never manufactures success or duplicates on recovery', (t) => {
-  const f = fixture(t),
-    first = upload(f, [envelope('head-one')], 'head-one.jsonl'),
-    second = upload(f, [envelope('head-two')], 'head-two.jsonl');
   const objects = new Map<string, Buffer>();
   const storage: RecordStorage = {
     read: (name) => objects.get(name) || null,
@@ -332,7 +334,9 @@ test('a durable-head publication followed by lost commit acknowledgement never m
       objects.set('head', Buffer.from(bytes));
     },
   };
-  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  const f = fixture(t, storage),
+    first = upload(f, [envelope('head-one')], 'head-one.jsonl'),
+    second = upload(f, [envelope('head-two')], 'head-two.jsonl');
   const input = request(block(f, first.id), block(f, second.id));
   const publish = storage.publishHead;
   storage.publishHead = (bytes) => {
@@ -416,13 +420,17 @@ test('acceptance routes return exact receipts and reject duplicate candidates an
 });
 
 test('kept and repeated candidate selections are rejected and aggregate review bytes are bounded before parsing', (t) => {
-  const f = fixture(t);
+  // Synthetic oversized metadata tests the pre-parse limit without allocating
+  // a large original; publish it through the same transaction boundary.
+  const f = fixture(t, 'memory');
   let item = upload(f, [envelope('kept')]);
   item = disposition(f, item, 0, 'keep_original_only');
   assert.throws(() => accept(f, request(block(f, item.id))), { code: 'REPORT_ACCEPTANCE_STALE' });
   const other = upload(f, [envelope('bounded')], 'bounded.jsonl');
   const input = request(block(f, other.id));
-  f.db.prepare('UPDATE source_files SET bytes=? WHERE id=?').run(65 * 1024 * 1024, other.id);
+  transaction(f.db, () =>
+    f.db.prepare('UPDATE source_files SET bytes=? WHERE id=?').run(65 * 1024 * 1024, other.id),
+  );
   assert.throws(() => accept(f, input), { code: 'REPORT_ACCEPTANCE_LIMIT' });
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
 });
@@ -485,12 +493,6 @@ test('partial approval reviews each intake once and journals proportional work',
   }> = [];
   for (const n of [10, 50, 200]) {
     await t.test(`N=${n}`, (scope) => {
-      const f = fixture(scope);
-      const item = upload(
-        f,
-        Array.from({ length: n }, (_, index) => envelope(`fictional-scale-${index}`)),
-      );
-      const input = partial(f, block(f, item.id));
       const objects = new Map<string, Buffer>();
       let writes = 0,
         bytes = 0,
@@ -506,7 +508,12 @@ test('partial approval reviews each intake once and journals proportional work',
           objects.set('head', Buffer.from(value));
         },
       };
-      attachRecordDurability(f.db, { profileId: f.profileId, storage });
+      const f = fixture(scope, storage);
+      const item = upload(
+        f,
+        Array.from({ length: n }, (_, index) => envelope(`fictional-scale-${index}`)),
+      );
+      const input = partial(f, block(f, item.id));
       writes = 0;
       bytes = 0;
       const before = Number(f.db.prepare('SELECT count(*) n FROM __record_versions').get()!.n);
@@ -691,12 +698,6 @@ test('one stale approval in a bounded batch leaves every independent sibling sav
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 199);
 });
 test('a lost acknowledgement for 200 batched approvals rebuilds once under the original operation', async (t) => {
-  const f = fixture(t);
-  const item = upload(
-    f,
-    Array.from({ length: 200 }, (_, index) => envelope(`fictional-rebuild-${index}`)),
-  );
-  const input = partial(f, block(f, item.id));
   const objects = new Map<string, Buffer>();
   let publications = 0;
   let failAt = Infinity;
@@ -710,7 +711,12 @@ test('a lost acknowledgement for 200 batched approvals rebuilds once under the o
       if (++publications === failAt) throw Error('Fictional lost batch acknowledgement');
     },
   };
-  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  const f = fixture(t, storage);
+  const item = upload(
+    f,
+    Array.from({ length: 200 }, (_, index) => envelope(`fictional-rebuild-${index}`)),
+  );
+  const input = partial(f, block(f, item.id));
   failAt = publications + 2; // manifest, then one bounded clinical transaction
   assert.throws(() => accept(f, input), { code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED' });
   failAt = Infinity;
@@ -760,6 +766,7 @@ test('partial v1 manifest and bounded item receipts survive backup and rebuild w
     target = join(f.root, 'partial-rebuilt');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId, initialize: false });
   try {
     assert.deepEqual(
       getIntakeReportAcceptance(db, target, f.profileId, input.operationId).receipt,
@@ -773,8 +780,6 @@ test('partial v1 manifest and bounded item receipts survive backup and rebuild w
 });
 
 test('partial children reconcile lost publication acknowledgement after earlier saves and reopen', (t) => {
-  const f = fixture(t),
-    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma')]);
   const objects = new Map<string, Buffer>();
   let publishes = 0,
     failAt = Infinity;
@@ -788,7 +793,8 @@ test('partial children reconcile lost publication acknowledgement after earlier 
       if (++publishes === failAt) throw Error('Lost acknowledgement after publication');
     },
   };
-  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  const f = fixture(t, storage),
+    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma')]);
   const input = partial(f, block(f, item.id));
   failAt = publishes + 3;
   assert.throws(() => accept(f, input), { code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED' });
@@ -807,8 +813,6 @@ test('partial children reconcile lost publication acknowledgement after earlier 
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
 });
 test('partial shared storage failure stops later children with explicit terminal outcomes', (t) => {
-  const f = fixture(t),
-    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma')]);
   const objects = new Map<string, Buffer>();
   let publishes = 0,
     stopAfter = Infinity,
@@ -827,7 +831,8 @@ test('partial shared storage failure stops later children with explicit terminal
       publishes++;
     },
   };
-  attachRecordDurability(f.db, { profileId: f.profileId, storage });
+  const f = fixture(t, storage),
+    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma')]);
   const input = partial(f, block(f, item.id));
   stopAfter = publishes + 2;
   const result = accept(f, input);

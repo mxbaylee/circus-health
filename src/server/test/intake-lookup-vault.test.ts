@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { transaction } from '../database.ts';
+import { readIntakeEnvelopeText, stageIntakeEnvelope } from '../intake-authority.ts';
 import { uploadIntake, getIntakeOriginal } from '../intake.ts';
 import {
   maximumReportDiscoveryOrder,
@@ -22,10 +23,7 @@ test('warmed lookup cache private copy and both cache-loss rebuilds preserve sco
     newProviderName: 'Fictional clinic',
   });
   transaction(state.db, () => {
-    const row = state.db
-      .prepare('SELECT details_json FROM source_files WHERE id=?')
-      .get(intake.id)!;
-    const details = JSON.parse(String(row.details_json));
+    const details = JSON.parse(readIntakeEnvelopeText(state.db, { id: intake.id }));
     details.intake.workflow = {
       reportGroups: [{ discoveryOrder: 71 }],
       reportAcceptances: [
@@ -33,18 +31,14 @@ test('warmed lookup cache private copy and both cache-loss rebuilds preserve sco
       ],
       identityConfirmations: [{ marker: 'fictional-name-support' }],
     };
-    state.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify(details), intake.id);
+    stageIntakeEnvelope(state.db, { id: intake.id }, details);
   });
   const expected = () => {
     assert.equal(maximumReportDiscoveryOrder(state.db), 71);
   };
   expected();
   const sourceHead = state.recordStorage.read('head'),
-    sourceDetails = state.db
-      .prepare('SELECT details_json FROM source_files WHERE id=?')
-      .get(intake.id)!.details_json;
+    sourceDetails = readIntakeEnvelopeText(state.db, { id: intake.id });
   const setup = manager.begin({ name: 'Fictional copied lookup owner', copyFrom: id });
   await manager.verify(setup.setupId, { acknowledged: true, recovery: setup.recoveryKit });
   const check = (profileId: string) => {
@@ -77,11 +71,7 @@ test('warmed lookup cache private copy and both cache-loss rebuilds preserve sco
   };
   check(setup.profileId);
   assert.deepEqual(state.recordStorage.read('head'), sourceHead);
-  assert.equal(
-    state.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intake.id)!
-      .details_json,
-    sourceDetails,
-  );
+  assert.equal(readIntakeEnvelopeText(state.db, { id: intake.id }), sourceDetails);
   for (const [profileId, recovery] of [
     [id, created.recoveryKit],
     [setup.profileId, setup.recoveryKit],

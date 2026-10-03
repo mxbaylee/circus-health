@@ -1,3 +1,7 @@
+import { recordPublicationFixture, fixtureTransaction } from './helpers/accepted-record-fixture.ts';
+import type { RecordStorage } from '../record-versions.ts';
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import type { AddressInfo } from 'node:net';
@@ -21,7 +25,6 @@ import {
   uploadIntake,
   getIntake,
   getIntakeOriginal,
-  listIntakes,
   readIntake,
   proposeConversion,
   importIntake,
@@ -38,11 +41,12 @@ const line = (
   status = 'unknown',
 ) =>
   `{"format":"health-record-v1","id":${JSON.stringify(id)},"kind":"record","payload":${payload},"provenance":{"capturedVia":"Kaiser via Health","sourceSystem":null,"sourceRecordId":null,"evidenceClass":"health_response","locator":"response/items/0"},"coverage":{"status":"${status}","notes":["Source coverage remains unknown"]},"extra":{"unmapped":true}}`;
-function fixture(t: TestContext, profileId = 'orchid') {
+function fixture(t: TestContext, profileId = 'orchid', recordStorage?: RecordStorage) {
   const root = mkdtempSync(resolve(tmpdir(), 'health-intake-'));
   const paths = ensureProfileDirectories(root, profileId),
     db = openDatabase(paths.database, profileId);
   db.prepare('INSERT INTO providers(id,name) VALUES(?,?)').run('issuer', 'Example source');
+  attachPersonalDurability(db, { root, profileId, ...(recordStorage ? { recordStorage } : {}) });
   t.after(() => {
     try {
       db.close();
@@ -130,6 +134,7 @@ test('uploads preserve exact originals; repeated uploads/imports are idempotent 
     resolve(f.root, 'rebuilt'),
   );
   const db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: resolve(f.root, 'rebuilt'), profileId: f.profileId });
   const rebuiltIntake = getIntake(db, resolve(f.root, 'rebuilt'), f.profileId, importedResult.id);
   assert.ok(rebuiltIntake.imported);
   assert.equal(rebuiltIntake.imported.records, 2);
@@ -203,17 +208,22 @@ test('binary originals stay pending; bounded conversion proposals require review
   );
 });
 
-test('pending curation publication is recoverable and source changes or profile escapes are rejected', (t) => {
-  const f = fixture(t),
-    fail = {
-      exportFn() {
-        throw new Error('Disk unavailable');
-      },
-    };
-  const result = upload(f, undefined, {}, fail);
-  assert.equal(result.durability.pending, true);
-  assert.match(result.durability.error ?? '', /Disk unavailable/);
-  assert.equal(listIntakes(f.db, f.profileId).intakeDurability.pending, true);
+test('accepted publication refusal cannot acknowledge an original and retry preserves source boundaries', (t) => {
+  const backend = recordPublicationFixture();
+  const f = fixture(t, 'orchid', backend.storage);
+  backend.refusePublication(new Error('Disk unavailable'));
+  assert.throws(() => upload(f), /Disk unavailable/);
+  assert.equal(
+    f.db.prepare("SELECT count(*) n FROM source_files WHERE kind='intake_original'").get()!.n,
+    0,
+  );
+  backend.refusePublication(null);
+  const result = upload(f);
+  assert.equal(result.durability.pending, false);
+  assert.deepEqual(
+    getIntakeOriginal(f.db, f.root, f.profileId, result.id).bytes,
+    Buffer.from(line()),
+  );
   assert.equal(flushIntake(f.db, f.root, f.profileId).pending, false);
   assert.throws(
     () => getIntake(f.db, f.root, 'cedar', result.id),
@@ -228,7 +238,9 @@ test('pending curation publication is recoverable and source changes or profile 
   const elsewhere = ensureProfileDirectories(f.root, 'cedar');
   const sourcePath = resolve(f.paths.sources, 'linked');
   symlinkSync(elsewhere.sources, sourcePath);
-  f.db.prepare("INSERT INTO providers(id,name) VALUES('linked','Linked')").run();
+  fixtureTransaction(f.db, () =>
+    f.db.prepare("INSERT INTO providers(id,name) VALUES('linked','Linked')").run(),
+  );
   const before = readdirSync(elsewhere.sources);
   assert.throws(
     () => upload(f, Buffer.from(line()), { providerId: 'linked' }),
@@ -292,13 +304,15 @@ test('HTTP intake upload, preview and import honor origin and profile scope', as
       .complete,
     false,
   );
+  const current = (await (await fetch(`${base}/${encodeURIComponent(intake.id)}`)).json()).data;
   response = await fetch(`${base}/${encodeURIComponent(intake.id)}/import`, {
     method: 'POST',
     headers: { Origin: origin, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ version: intake.version }),
+    body: JSON.stringify({ version: current.version }),
   });
-  assert.equal(response.status, 200);
-  assert.equal((await response.json()).data.imported.records, 1);
+  const importedBody = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(importedBody));
+  assert.equal(importedBody.data.imported.records, 1);
   assert.equal((await (await fetch(base)).json()).meta.total, 1);
 });
 
@@ -355,18 +369,16 @@ test('conversion model identity and instruction version survive rebuild without 
     modelIdentity: typeof modelIdentity;
   };
   assert.deepEqual(selected.modelIdentity, modelIdentity);
-  const details = JSON.parse(
-    String(
-      f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(selected.id)!
-        .details_json,
-    ),
-  ) as { modelIdentity: typeof modelIdentity };
+  const details = JSON.parse(String(readIntakeEnvelopeText(f.db, { id: selected.id }))) as {
+    modelIdentity: typeof modelIdentity;
+  };
   assert.deepEqual(details.modelIdentity, modelIdentity);
   assert.ok(!JSON.stringify(details).includes('must-not-persist'));
   const backup = await createBackup(f.db, f.root, f.profileId);
   const target = resolve(f.root, 'model-rebuilt'),
     receipt = rebuildProfile(resolve(backup.path, 'files'), f.profileId, target);
   const rebuilt = openDatabase(receipt.database, f.profileId);
+  attachPersonalDurability(rebuilt, { root: target, profileId: f.profileId });
   try {
     assert.deepEqual(
       (

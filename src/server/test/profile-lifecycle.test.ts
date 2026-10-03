@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { createApp } from '../index.ts';
 import { rebuildProfile, exportCuration } from '../portable.ts';
-import { openDatabase, type Database } from '../database.ts';
+import { openDatabase, transaction, type Database } from '../database.ts';
 import { getNote, createNote } from '../notes.ts';
 import { readProfileRegistry, recoverProfileDeletions } from '../profile-registry.ts';
 import { createProfileLifecycle } from '../profile-lifecycle.ts';
@@ -59,16 +59,18 @@ test('private copy retains current notes and original source owner unchanged', a
   mkdirSync(resolve(root, `data/profiles/${a.id}/sources/provider`), { recursive: true });
   const raw = Buffer.from('{"label":"original evidence"}');
   writeFileSync(resolve(root, file), raw);
-  databases
-    .get(a.id)!
-    .prepare("INSERT INTO source_files(id,path,sha256,bytes) VALUES('original',?,?,?)")
-    .run(file, hash(raw), raw.length);
-  databases
-    .get(a.id)!
-    .prepare(
-      "INSERT INTO source_records(id,source_file_id,raw_json) VALUES('original-record','original',?)",
-    )
-    .run(raw.toString());
+  transaction(databases.get(a.id)!, () => {
+    databases
+      .get(a.id)!
+      .prepare("INSERT INTO source_files(id,path,sha256,bytes) VALUES('original',?,?,?)")
+      .run(file, hash(raw), raw.length);
+    databases
+      .get(a.id)!
+      .prepare(
+        "INSERT INTO source_records(id,source_file_id,raw_json) VALUES('original-record','original',?)",
+      )
+      .run(raw.toString());
+  });
   exportCuration(databases.get(a.id)!, root, a.id);
   const b = await actions.create(
     {

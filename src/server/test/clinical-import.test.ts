@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -45,6 +46,7 @@ function fixture(t: TestContext) {
   const id = 'orchid';
   const paths = ensureProfileDirectories(root, id);
   const db = openDatabase(paths.database, id);
+  attachPersonalDurability(db, { root, profileId: id });
   t.after(() => {
     try {
       db.close();
@@ -182,6 +184,7 @@ test('empty profile imports clinical views with literal evidence and survives SQ
   );
   const rebuilt = rebuildProfile(f.root, f.id, resolve(f.root, 'rebuilt'));
   const db = openDatabase(rebuilt.database, f.id);
+  attachPersonalDurability(db, { root: resolve(f.root, 'rebuilt'), profileId: f.id });
   assert.equal(db.prepare('SELECT value_text FROM observations').get()!.value_text, '< 12.00');
   assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 1);
   assert.deepEqual(
@@ -255,6 +258,7 @@ test('retained unassigned clinical history stays out of a packet with a visible 
   check(f.db);
   const rebuilt = rebuildProfile(f.root, f.id, resolve(f.root, 'unassigned-rebuild'));
   const db = openDatabase(rebuilt.database, f.id);
+  attachPersonalDurability(db, { root: resolve(f.root, 'unassigned-rebuild'), profileId: f.id });
   try {
     check(db);
   } finally {
@@ -319,6 +323,7 @@ test('accepted grouped observation values keep their literal fields and rebuild 
   });
   const rebuilt = rebuildProfile(f.root, f.id, resolve(f.root, 'grouped-rebuilt'));
   const db = openDatabase(rebuilt.database, f.id);
+  attachPersonalDurability(db, { root: resolve(f.root, 'grouped-rebuilt'), profileId: f.id });
   try {
     assert.deepEqual(
       expected.map(([label]) => getObservation(db, entity(label).entityId)),

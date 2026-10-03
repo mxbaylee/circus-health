@@ -2,6 +2,8 @@ import { existsSync, readFileSync, readdirSync, lstatSync, mkdirSync, rmSync } f
 import { resolve } from 'node:path';
 import { validProfileId, profileDefinition } from './profiles.ts';
 import { durableWrite, syncDirectory, publishedPersonalLineage } from './portable.ts';
+import { hasContributorAuthority } from './contributor-record-storage.ts';
+import { verifyContributorProfileAuthority } from './contributor-durability.ts';
 import {
   readDatabaseOwner,
   legacyDatabaseFile,
@@ -71,7 +73,12 @@ export function readProfileRegistry(root: string) {
       const database = legacyDatabaseFile(root, `data/profiles/${id}/db/database.sqlite`);
       if (existsSync(database)) {
         if (readDatabaseOwner(database) !== id) throw Error('Profile directory owner mismatch');
-      } else if (!profiles.some((profile) => profile.id === id)) {
+      }
+      if (hasContributorAuthority(root, id)) {
+        if (profiles.some((profile) => profile.id === id))
+          throw Error('Multiple durable archives claim the same profile');
+        verifyContributorProfileAuthority(root, id);
+      } else if (!existsSync(database) && !profiles.some((profile) => profile.id === id)) {
         const current = publishedPersonalLineage(root, id).next();
         if (current.done)
           throw Error('Profile has no verified owner metadata; recover its registry explicitly');

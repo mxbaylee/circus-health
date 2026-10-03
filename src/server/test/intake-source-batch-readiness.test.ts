@@ -8,7 +8,6 @@ import { EventEmitter, on } from 'node:events';
 import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
-import { attachRecordDurability } from '../record-versions.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { writeIntakeBatch } from '../intake-batch-journal.ts';
 import type { IntakeBatch } from '../../shared/intake-batch.ts';
@@ -33,11 +32,11 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
         const root = mkdtempSync(join(tmpdir(), 'fictional-source-batch-'));
         const profileId = 'fictional-source-batch';
         const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-        attachPersonalDurability(db, { root, profileId });
         const objects = new Map<string, Buffer>();
-        attachRecordDurability(db, {
+        attachPersonalDurability(db, {
+          root,
           profileId,
-          storage: {
+          recordStorage: {
             read: (name) => objects.get(name) || null,
             writeImmutable: (name, bytes) => {
               assert.ok(!objects.has(name));

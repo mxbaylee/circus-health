@@ -5,14 +5,9 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { openDatabase } from '../database.ts';
 import { getNote, saveNote, createNote, selfIdentity } from '../notes.ts';
-import {
-  attachPersonalDurability,
-  exportCuration,
-  rebuildProfile,
-  publishedPersonalLineage,
-} from '../portable.ts';
+import { attachPersonalDurability, exportCuration, rebuildProfile } from '../portable.ts';
 import { ensureProfileDirectories, profilePaths } from '../profile-storage.ts';
-import { restoreNoteFields } from '../note-history.ts';
+import { restoreNoteFields, previewNoteRestoration } from '../note-history.ts';
 import { validPersonIcon } from '../../shared/person-icon.ts';
 import { randomUUID } from 'node:crypto';
 import { resolveAssistantPage } from '../assistant-context.ts';
@@ -36,13 +31,23 @@ test('Self icon publishes versioned identity, restores append-only and survives 
   attachPersonalDurability(db, { root, profileId });
   let self: Note = getNote(db, 'patient');
   self = saveNote(db, self.id, { ...self, person: { ...self.person, icon: 'moon' } });
-  const baseline = [...publishedPersonalLineage(root, profileId)][0].manifest.file.slice(
-    'snapshots/'.length,
+  const baseline = String(
+    db
+      .prepare(
+        "SELECT version_id FROM __record_versions WHERE entity='notes' AND record_id=? ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(JSON.stringify([self.id]))!.version_id,
   );
   self = saveNote(db, self.id, { ...self, person: { ...self.person, icon: '🃏' } });
   assert.equal(selfIdentity(db).icon, '🃏');
   assert.equal(selfIdentity(db).nameVersion, self.version);
   const restored = restoreNoteFields(db, root, profileId, self.id, {
+    ...previewNoteRestoration(db, root, profileId, self.id, {
+      generationId: baseline,
+      fields: ['person.icon'],
+      version: self.version,
+      operationId: randomUUID(),
+    }),
     generationId: baseline,
     fields: ['person.icon'],
     version: self.version,

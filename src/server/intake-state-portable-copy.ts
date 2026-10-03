@@ -3,11 +3,13 @@ import { resolve } from 'node:path';
 import { currentTransactionToken, type Database } from './database.ts';
 import {
   captureIntakeStateCopySnapshot,
-  prepareIntakeStateCopySnapshot,
+  prepareProductionIntakeStateCopySnapshot,
   type IntakeStateCopyPlan,
 } from './intake-state-bootstrap.ts';
 import { invalid } from './intake-state-evidence.ts';
 import { profilePaths } from './profile-storage.ts';
+import { hasContributorAuthority } from './contributor-record-storage.ts';
+import { assertContributorCopyCoherence } from './contributor-durability.ts';
 import {
   loadPortable,
   personalDurabilityStatus,
@@ -76,7 +78,11 @@ export function assertPortableCopyCoherence(
   db: Database,
   root: string,
   profileId: string,
-): CompleteLoadedPortable {
+): CompleteLoadedPortable | null {
+  if (hasContributorAuthority(root, profileId)) {
+    assertContributorCopyCoherence(db, root, profileId);
+    return null;
+  }
   if (!db.isOpen || db.isTransaction || currentTransactionToken(db))
     invalid('portable copy source transaction/closed');
   const status = personalDurabilityStatus(db);
@@ -97,11 +103,18 @@ export function preparePortableIntakeCopy(
   sourceProfileId: string,
   targetProfileId: string,
 ): IntakeStateCopyPlan {
+  if (hasContributorAuthority(root, sourceProfileId)) {
+    assertContributorCopyCoherence(sourceDb, root, sourceProfileId, backupDb);
+    return prepareProductionIntakeStateCopySnapshot(
+      captureIntakeStateCopySnapshot(backupDb, sourceProfileId),
+      targetProfileId,
+    );
+  }
   const portable = assertPortableCopyCoherence(sourceDb, root, sourceProfileId);
   if (!backupDb.isOpen || backupDb.isTransaction || currentTransactionToken(backupDb))
     invalid('portable copy backup transaction/closed');
-  assertSelectedRows(backupDb, portable);
-  return prepareIntakeStateCopySnapshot(
+  assertSelectedRows(backupDb, portable!);
+  return prepareProductionIntakeStateCopySnapshot(
     captureIntakeStateCopySnapshot(backupDb, sourceProfileId),
     targetProfileId,
   );

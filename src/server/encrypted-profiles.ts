@@ -60,7 +60,11 @@ import { validPersonIcon } from '../shared/person-icon.ts';
 import { rebuildRecordDatabase, type DurableRecordVersion } from './record-versions.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
 import { clearChatJournalCache } from './assistant-journal.ts';
-import { prepareIntakeStateCopy, stageIntakeStateCopy } from './intake-state-bootstrap.ts';
+import {
+  prepareProductionIntakeStateCopy,
+  stageIntakeStateCopy,
+  validateProductionIntakeAuthority,
+} from './intake-state-bootstrap.ts';
 export interface EncryptedLabel {
   algorithm: 'xchacha20poly1305-ietf';
   nonce: string;
@@ -456,7 +460,7 @@ export function createEncryptedProfiles({
       let cacheHit = false;
       if (initial) {
         if (copyState) {
-          const intakePlan = prepareIntakeStateCopy(copyState.db, copyState.id, id);
+          const intakePlan = prepareProductionIntakeStateCopy(copyState.db, copyState.id, id);
           copyState.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
           mkdirSync(resolve(root, 'db'), { recursive: true, mode: 0o700 });
           cpSync(copyState.db.location()!, dbPath);
@@ -483,6 +487,7 @@ export function createEncryptedProfiles({
                 profileId: id,
                 readSelectedHead: () => recordStorage.read('head'),
               });
+              validateProductionIntakeAuthority(copied, id);
             });
           } finally {
             copied.close();
@@ -600,6 +605,7 @@ export function createEncryptedProfiles({
         }
       }
       try {
+        validateProductionIntakeAuthority(db, id);
         (attachPersonalDurability as unknown as AttachVaultDurability)(db, {
           root,
           profileId: id,
@@ -616,6 +622,7 @@ export function createEncryptedProfiles({
         for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true });
         rebuildRecordDatabase(dbPath, { profileId: id, storage: recordStorage, verifyReferences });
         db = openDatabase(dbPath, id);
+        validateProductionIntakeAuthority(db, id);
         (attachPersonalDurability as unknown as AttachVaultDurability)(db, {
           root,
           profileId: id,

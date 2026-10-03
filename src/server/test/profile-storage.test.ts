@@ -144,7 +144,7 @@ test('portable rebuild uses originals plus explicit curation and latest personal
     db.prepare(
       "INSERT INTO evidence(id,entity_type,entity_id,source_record_id) VALUES('personal-evidence','note',?,'record2')",
     ).run(draft.id);
-    const attached = attachPersonalDurability(db, { root, profileId });
+    const attached = attachPersonalDurability(db, { portableSnapshots: true, root, profileId });
     assert.equal(attached.dirty, false);
     const receipt = exportCuration(db, root, profileId);
     assert.deepEqual(receipt.rawJson, { referenced: 2, verbatim: 1 });
@@ -236,8 +236,9 @@ test('startup retries the committed dirty revision after a failed write and conn
   const f = fixture(t),
     { root, paths } = f;
   let db = f.db;
-  attachPersonalDurability(db, { root, profileId: 'cedar' });
+  attachPersonalDurability(db, { portableSnapshots: true, root, profileId: 'cedar' });
   attachPersonalDurability(db, {
+    portableSnapshots: true,
     root,
     profileId: 'cedar',
     writer() {
@@ -255,7 +256,11 @@ test('startup retries the committed dirty revision after a failed write and conn
   assert.equal(personalDurabilityStatus(db).configured, false);
   assert.equal(personalDurabilityStatus(db).dirty, true);
   assert.equal(revision(db), savedRevision);
-  const status = attachPersonalDurability(db, { root, profileId: 'cedar' });
+  const status = attachPersonalDurability(db, {
+    portableSnapshots: true,
+    root,
+    profileId: 'cedar',
+  });
   assert.equal(status.dirty, false);
   assert.equal(status.persistedRevision, savedRevision);
   assert.equal(
@@ -268,6 +273,7 @@ test('staging rejects semantically incomplete or broken portable rows even with 
   const f = fixture(t),
     { db, root, paths } = f;
   seed(f);
+  attachPersonalDurability(db, { root, profileId: 'cedar', portableSnapshots: true });
   exportCuration(db, root, 'cedar');
   const original = latest(paths.curation);
   function replace(value: PortableValue) {
@@ -321,6 +327,7 @@ test('portable publication holds a SQLite write lock across capture and file pub
   let phase = 'attach',
     witnessed = new Set();
   attachPersonalDurability(db, {
+    portableSnapshots: true,
     root,
     profileId: 'cedar',
     writer(path, bytes) {
@@ -346,11 +353,12 @@ test('portable publication holds a SQLite write lock across capture and file pub
 test('a post-commit file failure leaves a recoverable dirty marker and retries without claiming SQLite rolled back', (t) => {
   const { root, paths, db } = fixture(t);
   seed({ root, paths, db });
-  attachPersonalDurability(db, { root, profileId: 'cedar' });
+  attachPersonalDurability(db, { portableSnapshots: true, root, profileId: 'cedar' });
   const note = createNote(db, { title: 'Before failure' });
   const previous = readFileSync(resolve(paths.personal, 'current.json'), 'utf8');
   let writes = 0;
   attachPersonalDurability(db, {
+    portableSnapshots: true,
     root,
     profileId: 'cedar',
     writer() {
@@ -370,7 +378,11 @@ test('a post-commit file failure leaves a recoverable dirty marker and retries w
   assert.equal(readFileSync(resolve(paths.personal, 'current.json'), 'utf8'), previous);
   assert.ok(writes >= 2);
   assert.throws(() => exportCuration(db, root, 'cedar'), /must be durable/);
-  const retried = attachPersonalDurability(db, { root, profileId: 'cedar' });
+  const retried = attachPersonalDurability(db, {
+    portableSnapshots: true,
+    root,
+    profileId: 'cedar',
+  });
   assert.equal(retried.dirty, false);
   assert.equal(retried.lastError, null);
   assert.equal(retried.persistedRevision, revision(db));
@@ -395,11 +407,16 @@ test('an older restored database cannot overwrite newer portable personal histor
   const f = fixture(t),
     { db, root, paths } = f;
   seed(f);
+  attachPersonalDurability(db, { root, profileId: 'cedar', portableSnapshots: true });
   exportCuration(db, root, 'cedar');
   const note = createNote(db, { title: 'Latest personal history' });
   const pointer = readFileSync(resolve(paths.personal, 'current.json'), 'utf8');
   db.prepare("UPDATE app_meta SET value='0' WHERE key='revision'").run();
-  const status = attachPersonalDurability(db, { root, profileId: 'cedar' });
+  const status = attachPersonalDurability(db, {
+    portableSnapshots: true,
+    root,
+    profileId: 'cedar',
+  });
   assert.equal(status.dirty, true);
   assert.equal(status.conflicted, true);
   assert.ok(status.lastError);
@@ -428,6 +445,7 @@ test('an older restored database cannot overwrite newer portable personal histor
 test('staged rebuild rejects damaged sources, damaged generations, cross-profile files and live destinations', (t) => {
   const { root, paths, db } = fixture(t);
   const original = seed({ root, paths, db });
+  attachPersonalDurability(db, { root, profileId: 'cedar', portableSnapshots: true });
   exportCuration(db, root, 'cedar');
   assert.throws(() => rebuildProfile(root, 'cedar', root), /never overwritten/);
   const bytes = readFileSync(resolve(root, original.path));
@@ -451,7 +469,7 @@ test('staged rebuild rejects damaged sources, damaged generations, cross-profile
 test('modern backup restores the symmetric layout and can rebuild again after deleting its restored database', async (t) => {
   const { root, paths, db } = fixture(t, 'cookie-dough');
   seed({ root, paths, db });
-  attachPersonalDurability(db, { root, profileId: 'cookie-dough' });
+  attachPersonalDurability(db, { portableSnapshots: true, root, profileId: 'cookie-dough' });
   createNote(db, { title: 'Fictional note', content: 'Saved personal text' });
   const expected = allRows(db);
   const receipt = await createBackup(db, root, 'cookie-dough');
@@ -525,7 +543,7 @@ test('source relationship API order survives a fresh database rebuild', (t) => {
     expected,
   );
 
-  attachPersonalDurability(f.db, { root: f.root, profileId: f.profileId });
+  attachPersonalDurability(f.db, { portableSnapshots: true, root: f.root, profileId: f.profileId });
   exportCuration(f.db, f.root, f.profileId);
   const target = resolve(f.root, 'relationship-order-rebuilt');
   const rebuilt = rebuildProfile(f.root, f.profileId, target);

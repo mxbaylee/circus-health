@@ -25,7 +25,9 @@ import {
   reviewIntakeSourceText,
 } from '../intake-source-text.ts';
 import { intakeSourcePinKey, readIntakeSourcePin } from '../intake-source-pin.ts';
-import { storedIntakeDetails } from '../intake-state-access.ts';
+import { storedIntakeDetails, registerIntakeFile } from '../intake-state-access.ts';
+import { readIntakeEnvelope, readIntakeEnvelopeText } from '../intake-authority.ts';
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
 import { decryptObject, recoveryEntropy, unwrapKey } from '../vault-crypto.ts';
 import { newProfile, vaultFixture } from './helpers/vault-fixture.ts';
 import { fictionalModel } from './fictional-model.ts';
@@ -192,39 +194,47 @@ async function fixture(t: TestContext) {
     locator: 'fictional row proposal-pending',
     field: 'valueText',
   });
-  // Deliberately preserve durable raw spelling separately from normalized authority.
+  // The full selected envelope is the sole operational authority.
   const current = source.db.prepare('SELECT * FROM source_files WHERE id=?').get(item.id)!;
-  const details = JSON.parse(String(current.details_json));
+  const details = readIntakeEnvelope(source.db, { id: item.id }) as { intake: Intake };
   assert.ok(details.intake.proposals.length > 0);
+  assert.ok(details.intake.workflow);
   assert.ok(details.intake.workflow.questions.length > 0);
   assert.ok(
     details.intake.workflow.plans.some((plan: { units: unknown[] }) => plan.units.length > 0),
   );
   assert.ok(details.intake.workflow.decisions.length > 0);
-  assert.ok(details.intake.workflow.reviewDrafts.length > 0);
-  assert.ok(details.intake.workflow.reportAcceptances.length > 0);
+  assert.ok(
+    details.intake.workflow.reviewDrafts && details.intake.workflow.reviewDrafts.length > 0,
+  );
+  assert.ok(
+    details.intake.workflow.reportAcceptances &&
+      details.intake.workflow.reportAcceptances.length > 0,
+  );
   const raw = ` { "before" : {"escaped":"\\u03A9","duplicate":1,"duplicate":2}, "intake" : ${JSON.stringify(details.intake)}, "after" : {"second":"fictional","first":null} }\n`;
   transaction(source.db, () => {
-    source.db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(raw, item.id);
     source.db
       .prepare('INSERT INTO app_meta(key,value) VALUES(?,?)')
       .run('fictional-copy-unrelated', '{"second":2,"first":1}');
   });
   const scope = { profileId: sourceId, intakeId: item.id, sourceHash: item.sha256 };
   const store = createIntakeStateStorage(source.db, scope);
-  store.mutate(JSON.parse(raw), randomUUID());
+  writeIntakeFixtureEnvelope(source.db, item.id, JSON.parse(raw));
   const baseline = JSON.parse(raw);
-  // Outer order and nested order differ from the raw source row; both must survive.
+  // Intentional normalized outer and nested member order must survive copying.
   const selected = {
     after: baseline.after,
     before: baseline.before,
     intake: baseline.intake,
     future: { z: 'fictional-' + 'x'.repeat(8192), a: ['Ω', '🪴', '\ud800'] },
   };
-  store.mutate(selected, randomUUID());
+  writeIntakeFixtureEnvelope(source.db, item.id, selected);
   assert.equal(store.readSerialized(), JSON.stringify(selected));
   const expected = {
-    raw,
+    compact: String(
+      source.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(item.id)!
+        .details_json,
+    ),
     serialized: JSON.stringify(selected),
     bytes,
     receipt,
@@ -264,7 +274,8 @@ function check(
   serialized = f.expected.serialized,
 ) {
   const row = state.db.prepare('SELECT * FROM source_files WHERE id=?').get(f.item.id)!;
-  assert.equal(row.details_json, f.expected.raw);
+  assert.equal(row.details_json, f.expected.compact);
+  assert.equal(readIntakeEnvelopeText(state.db, { id: f.item.id }), serialized);
   assert.equal(row.sha256, sha(f.expected.bytes));
   assert.equal(
     row.path,
@@ -445,16 +456,20 @@ test('actual encrypted copy retains exact intake evidence, originals and indepen
   }
   const sourceBefore = archive(f.manager.pathFor(f.sourceId));
   const reopened = f.manager.opened.get(f.setup.profileId)!;
-  const store = createIntakeStateStorage(reopened.db, {
-    profileId: reopened.id,
-    intakeId: f.item.id,
-    sourceHash: f.item.sha256,
-  });
+  const frameBytes = () =>
+    Number(
+      reopened.db
+        .prepare(
+          "SELECT coalesce(sum(length(CAST(value AS BLOB))),0) AS bytes FROM app_meta WHERE key GLOB 'intake_state_v1:*:frame:*'",
+        )
+        .get()!.bytes,
+    );
+  const beforeFrameBytes = frameBytes();
   const next = JSON.parse(f.expected.serialized);
   next.future.a.push('fictional destination only');
-  store.mutate(next, randomUUID());
+  writeIntakeFixtureEnvelope(reopened.db, f.item.id, next);
   assert.ok(
-    store.counters.frameBytesWritten < 4096,
+    frameBytes() > beforeFrameBytes && frameBytes() - beforeFrameBytes < 4096,
     'subsequent intake frame scales with the changed suffix',
   );
   assert.deepEqual(archive(f.manager.pathFor(f.sourceId)), sourceBefore);
@@ -481,7 +496,7 @@ for (const kind of ['immutable', 'head-before', 'head-after', 'activation'] as c
       assert.equal(head !== null, published);
       const advanced = JSON.parse(f.expected.serialized);
       advanced.future.a.push('fictional source advanced');
-      f.store.mutate(advanced, randomUUID());
+      writeIntakeFixtureEnvelope(f.source.db, f.item.id, advanced);
       if (!published) {
         f.manager.lock(f.sourceId);
         await assert.rejects(
@@ -592,6 +607,9 @@ for (const kind of [
   'wrong-hash',
   'orphan-namespace',
   'corrupt-pin',
+  'missing-namespace',
+  'duplicated-inline-authority',
+  'conflicting-compact-metadata',
 ] as const) {
   test(
     'actual encrypted copy refuses ' + kind + ' source evidence before target publication',
@@ -604,6 +622,19 @@ for (const kind of [
           f.source.db.prepare('SELECT value FROM app_meta WHERE key=?').get(headKey)!.value,
         );
         const head = JSON.parse(raw);
+        if (kind === 'missing-namespace')
+          f.source.db.prepare('DELETE FROM app_meta WHERE key LIKE ?').run(prefix + '%');
+        if (kind === 'duplicated-inline-authority')
+          f.source.db
+            .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+            .run(f.expected.serialized, f.item.id);
+        if (kind === 'conflicting-compact-metadata') {
+          const compact = JSON.parse(f.expected.compact);
+          compact.intake.originalName = 'Fictional conflicting original';
+          f.source.db
+            .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+            .run(JSON.stringify(compact), f.item.id);
+        }
         if (kind === 'missing-head')
           f.source.db.prepare('DELETE FROM app_meta WHERE key=?').run(headKey);
         if (kind === 'unsupported') {
@@ -696,3 +727,76 @@ for (const kind of ['missing', 'corrupt'] as const) {
     },
   );
 }
+
+test('encrypted raw initial envelope remains exact through copy and rebuild until its first authorized rewrite', async (t) => {
+  const f = vaultFixture(t);
+  const created = await newProfile(f.manager, 'Fictional raw envelope source');
+  const source = f.manager.opened.get(created.profile.id)!;
+  const id = 'fictional-raw-envelope';
+  const bytes = Buffer.from('Independently fictional raw original.');
+  const relativePath = `data/profiles/${source.id}/sources/raw-envelope.txt`;
+  const raw =
+    ' { "before":{"escaped":"\\u03A9","duplicate":1,"duplicate":2}, "intake" : {"originalName":"raw-envelope.txt","version":1,"state":"pending","proposals":[],"workflow":{"format":"health-intake-workflow-v1","questions":[]}}, "after":true }\n';
+  writeFileSync(resolve(source.root, relativePath), bytes);
+  source.vault.storeFile('sources/raw-envelope.txt', bytes);
+  transaction(source.db, () => {
+    source.db
+      .prepare('INSERT INTO providers(id,name) VALUES(?,?)')
+      .run('fictional-raw-provider', 'Fictional raw provider');
+    registerIntakeFile(source.db, {
+      id,
+      providerId: 'fictional-raw-provider',
+      batchId: null,
+      path: relativePath,
+      bytes,
+      mimeType: 'text/plain',
+      kind: 'intake_original',
+      coverage: 'unknown',
+      details: raw,
+    });
+  });
+  const setup = f.manager.begin({ name: 'Fictional raw envelope copy', copyFrom: source.id });
+  await f.manager.verify(setup.setupId, { acknowledged: true, recovery: setup.recoveryKit });
+  for (const [profileId, kit] of [
+    [source.id, created.recoveryKit],
+    [setup.profileId, setup.recoveryKit],
+  ] as const) {
+    f.manager.lock(profileId);
+    rmSync(resolve(f.manager.pathFor(profileId), 'cache'), { recursive: true, force: true });
+    f.manager.unlock(profileId, kit);
+    const state = f.manager.opened.get(profileId)!;
+    assert.equal(readIntakeEnvelopeText(state.db, { id }), raw);
+    assert.deepEqual(
+      createIntakeStateStorage(state.db, {
+        profileId,
+        intakeId: id,
+        sourceHash: sha(bytes),
+      }).read(),
+      { raw },
+    );
+    assert.deepEqual(intake.getIntakeOriginal(state.db, state.root, profileId, id).bytes, bytes);
+    const compact = JSON.parse(
+      String(
+        state.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
+      ),
+    );
+    assert.equal(compact.intakeAuthority.mode, 'raw');
+    assert.equal(compact.intake.workflow, undefined);
+  }
+  const target = f.manager.opened.get(setup.profileId)!;
+  const normalized = JSON.parse(raw);
+  normalized.intake.workflow.questions.push({
+    id: 'fictional-target-question',
+    prompt: 'Fictional review?',
+  });
+  writeIntakeFixtureEnvelope(target.db, id, normalized);
+  assert.equal(readIntakeEnvelopeText(target.db, { id }), JSON.stringify(normalized));
+  assert.equal(readIntakeEnvelopeText(f.manager.opened.get(source.id)!.db, { id }), raw);
+  f.manager.lock(target.id);
+  rmSync(resolve(f.manager.pathFor(target.id), 'cache'), { recursive: true, force: true });
+  f.manager.unlock(target.id, setup.recoveryKit);
+  assert.equal(
+    readIntakeEnvelopeText(f.manager.opened.get(target.id)!.db, { id }),
+    JSON.stringify(normalized),
+  );
+});

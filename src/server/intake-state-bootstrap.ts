@@ -9,6 +9,7 @@ import { flushRecordDurability, recordDurabilityStatus } from './record-versions
 import { safeRelative } from './profile-storage.ts';
 import { validProfileId } from './profiles.ts';
 import { intakeSourcePinKey, parseIntakeSourcePin } from './intake-source-pin.ts';
+import { intakeEnvelopeMode, validateIntakeEnvelopeRepresentation } from './intake-authority.ts';
 import { applyIntakeChanges, serializeIntakeJson } from './intake-state-codec.ts';
 import {
   DEFAULT_LIMITS,
@@ -89,7 +90,7 @@ export interface IntakeCopyPublicationReader {
   readonly profileId: string;
   readSelectedHead(): unknown | null;
 }
-type Options = { limits?: Partial<IntakePreparationLimits> };
+type Options = { limits?: Partial<IntakePreparationLimits>; production?: boolean };
 interface PlanData {
   snapshot: IntakeStateCopySnapshot;
   prepared: Array<{ key: string; value: string }>;
@@ -218,6 +219,7 @@ function inspectSnapshot(
     counters.sourceBytes += sourceSize(original);
     assertTotals(counters.sourceRows, counters.sourceBytes, caps);
     const validated = validateOriginal(original, sourceProfileId);
+    if (options.production) intakeEnvelopeMode(validated.detailsJson);
     if (originals.has(validated.id)) invalid('duplicate copy original');
     originals.set(validated.id, validated);
     captured.originals.push(validated);
@@ -297,6 +299,7 @@ function inspectSnapshot(
     )
       invalid('aggregate preparation decoded work');
     const serialized = serializeIntakeJson(basis.value);
+    if (options.production) validateIntakeEnvelopeRepresentation(original.detailsJson, basis.value);
     counters.reconstructedStateBytes += Buffer.byteLength(serialized);
     if (counters.reconstructedStateBytes > caps.bytes) invalid('aggregate reconstructed bytes');
     if (targetProfileId === undefined) continue;
@@ -345,6 +348,18 @@ function inspectSnapshot(
     counters.preparedHeadBytes += Buffer.byteLength(evidence.serializedHead);
     counters.preparedReceiptBytes += Buffer.byteLength(evidence.receipt);
   }
+  if (options.production)
+    for (const original of originals.values())
+      if (
+        !buckets.has(
+          intakeNamespace({
+            profileId: sourceProfileId,
+            intakeId: original.id,
+            sourceHash: original.sha256,
+          }),
+        )
+      )
+        invalid('missing production intake authority');
   if (targetProfileId === undefined) return;
   const plan: IntakeStateCopyPlan = Object.freeze({
     format: 'health-intake-state-copy-v1',
@@ -408,6 +423,31 @@ export function captureIntakeStateCopySnapshot(
   options: Options = {},
 ): IntakeStateCopySnapshot {
   return capture(db, sourceProfileId, preparationLimits(options));
+}
+
+/** Validate selected SQL evidence before runtime attachment/first publication.
+ * The caller independently certifies its genuine selected durability backend. */
+export function validateProductionIntakeAuthority(db: Database, profileId?: string): void {
+  const owner = db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value;
+  if (typeof owner !== 'string' || (profileId !== undefined && owner !== profileId))
+    invalid('production intake owner');
+  validateProductionIntakeStateCopySnapshot(captureIntakeStateCopySnapshot(db, owner));
+}
+export function validateProductionIntakeStateCopySnapshot(snapshot: IntakeStateCopySnapshot): void {
+  inspectSnapshot(snapshot, undefined, { production: true });
+}
+export function prepareProductionIntakeStateCopySnapshot(
+  snapshot: IntakeStateCopySnapshot,
+  targetProfileId: string,
+): IntakeStateCopyPlan {
+  return inspectSnapshot(snapshot, targetProfileId, { production: true })!;
+}
+export function prepareProductionIntakeStateCopy(
+  db: Database,
+  sourceProfileId: string,
+  targetProfileId: string,
+): IntakeStateCopyPlan {
+  return prepareIntakeStateCopy(db, sourceProfileId, targetProfileId, { production: true });
 }
 
 /** Capture only a real, current selected source projection, before owner/path rewrites. */

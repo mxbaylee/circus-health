@@ -1,3 +1,5 @@
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -270,6 +272,7 @@ test(
     const profileId = 'cookie-dough';
     const paths = ensureProfileDirectories(root, profileId);
     let db = openDatabase(paths.database, profileId);
+    attachPersonalDurability(db, { root, profileId: profileId });
     t.after(() => {
       try {
         db.close();
@@ -440,18 +443,13 @@ test(
     await assert.rejects(
       () =>
         acceptDexaAndSkipOtherSubject(db, root, profileId, mixedZip, zipEnvelopes, () => {
-          pendingBefore = db
-            .prepare('SELECT details_json FROM source_files WHERE id=?')
-            .get(mixedZip.id);
+          pendingBefore = readIntakeEnvelopeText(db, { id: mixedZip.id });
         }),
       { code: 'CLINICAL_SOURCE_SCOPE_COLLISION' },
     );
     assert.deepEqual(db.prepare('SELECT * FROM observations ORDER BY id').all(), acceptedRows);
     assert.deepEqual(db.prepare('SELECT * FROM evidence ORDER BY id').all(), acceptedEvidence);
-    assert.deepEqual(
-      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(mixedZip.id),
-      pendingBefore,
-    );
+    assert.deepEqual(readIntakeEnvelopeText(db, { id: mixedZip.id }), pendingBefore);
     const accepted = getIntake(db, root, profileId, mixedZip.id);
     const pendingProposalId = accepted.proposals.at(-1)!.id;
     const pendingReview = reviewIntake(db, root, profileId, mixedZip.id, pendingProposalId);
@@ -602,6 +600,7 @@ test(
     assert.equal(existsSync(paths.database), false);
     const rebuilt = rebuildProfile(root, profileId, resolve(root, 'rebuilt'));
     db = openDatabase(rebuilt.database, profileId);
+    attachPersonalDurability(db, { root: resolve(root, 'rebuilt'), profileId: profileId });
     const after = acceptedDexaQueries(db);
     assert.deepEqual(after, before);
     const rebuiltStandalone = getIntake(db, resolve(root, 'rebuilt'), profileId, standalone.id);

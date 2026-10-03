@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -85,6 +86,18 @@ async function fixture(t: TestContext, scoped = false) {
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId),
     opened = [db];
+  const objects = new Map<string, Buffer>();
+  const storage: RecordStorage = {
+    read: (name) => (objects.has(name) ? Buffer.from(objects.get(name)!) : null),
+    writeImmutable(name, bytes) {
+      assert.equal(objects.has(name), false, 'accepted immutable object was overwritten');
+      objects.set(name, Buffer.from(bytes));
+    },
+    publishHead(bytes) {
+      objects.set('head', Buffer.from(bytes));
+    },
+  };
+  attachPersonalDurability(db, { root, profileId, recordStorage: storage });
   if (scoped) {
     const self = getNote(db, 'person-note:self');
     saveNote(db, self.id, {
@@ -210,17 +223,6 @@ async function fixture(t: TestContext, scoped = false) {
       version: current.version,
       previewToken: current.previewToken,
     });
-  };
-  const objects = new Map<string, Buffer>();
-  const storage: RecordStorage = {
-    read: (name) => (objects.has(name) ? Buffer.from(objects.get(name)!) : null),
-    writeImmutable(name, bytes) {
-      assert.equal(objects.has(name), false, 'accepted immutable object was overwritten');
-      objects.set(name, Buffer.from(bytes));
-    },
-    publishHead(bytes) {
-      objects.set('head', Buffer.from(bytes));
-    },
   };
   const rebuild = () => {
     const path = join(root, randomUUID() + '.sqlite');

@@ -35,6 +35,12 @@ import {
   type ProfileCopyOperation,
 } from './profile-copy-operation.ts';
 import { ensureProfileDirectories, profilePaths } from './profile-storage.ts';
+import { contributorAuthorityPath, hasContributorAuthority } from './contributor-record-storage.ts';
+import {
+  rebuildContributorDatabase,
+  assertContributorCopyCoherence,
+  selectedContributorHead,
+} from './contributor-durability.ts';
 import {
   readProfileRegistry,
   writeProfileRegistry,
@@ -42,11 +48,11 @@ import {
 } from './profile-registry.ts';
 import {
   attachPersonalDurability,
-  exportCuration,
+  flushPersonal,
+  writePortableSources,
   loadPortable,
   durableWrite,
   syncDirectory,
-  projectPortableDatabase,
   type CompleteLoadedPortable,
 } from './portable.ts';
 import { registerProfileDisplayGuard, selfIdentity, getNote, saveNote } from './notes.ts';
@@ -267,7 +273,6 @@ export function createProfileLifecycle({
     const id = operation.targetProfileId,
       final = profilePaths(root, id);
     safeTree(final.root);
-    const portable = loadPortable(root, id) as CompleteLoadedPortable;
     const registry = readProfileRegistry(root) as ProfileRegistry;
     const entry = registry.profiles.find((p) => p.id === id);
     const active = databases.get(id);
@@ -299,9 +304,10 @@ export function createProfileLifecycle({
           'PROFILE_COPY_OPERATION',
           'Private copy registry binding conflicts',
         );
+      flushPersonal(active);
       return { ...profileInfo(active, entry), operationId: operation.operationId };
     }
-    if (!entry) verifyCopyHeads(operation, portable);
+    if (!entry) verifyCopyHeads(operation, loadPortable(root, id) as CompleteLoadedPortable, root);
     else if (!operation.published || entry.placebo)
       throw new HttpError(409, 'PROFILE_COPY_OPERATION', 'Private copy registry binding conflicts');
     operation = { ...operation, published: true };
@@ -311,8 +317,9 @@ export function createProfileLifecycle({
       : final.database;
     let recovered: Database | undefined;
     try {
-      if (!existsSync(location)) projectPortableDatabase(location, id, portable);
+      if (!existsSync(location)) rebuildContributorDatabase(location, root, id);
       recovered = openDatabase(location, id);
+      attachPersonalDurability(recovered, { root, profileId: id, initialize: false });
       assertPortableCopyCoherence(recovered, root, id);
       const identity = selfIdentity(recovered);
       if (!entry && identity.name !== operation.name)
@@ -322,7 +329,6 @@ export function createProfileLifecycle({
           'Published private copy display name conflicts',
         );
       requireDistinctProfile(identity.name, identity.icon, id);
-      attachPersonalDurability(recovered, { root, profileId: id, initialize: false });
       assertOpen();
       if (!entry) writeProfileRegistry(root, [...registry.profiles, { id, placebo: false }]);
       else if (entry.placebo)
@@ -450,11 +456,17 @@ export function createProfileLifecycle({
             stageIntakeStateCopy(copy, plan, {
               profileId: id,
               readSelectedHead: () => {
-                for (const base of [stage, root])
+                for (const base of [stage, root]) {
+                  if (hasContributorAuthority(base, id))
+                    throw Error(
+                      'Copy target already has selected record authority: ' +
+                        contributorAuthorityPath(base, id),
+                    );
                   for (const kind of ['personal', 'curation'] as const) {
                     const head = resolve(profilePaths(base, id)[kind], 'current.json');
                     if (existsSync(head)) return readFileSync(head);
                   }
+                }
                 return null;
               },
             });
@@ -490,8 +502,10 @@ export function createProfileLifecycle({
           seed: SYNTHETIC_PLACEBO_SEED,
         });
       checkpoint(operation, stage, 'before-export');
-      attachPersonalDurability(db, { root: stage, profileId: id });
-      exportCuration(db, stage, id);
+      attachPersonalDurability(db, { root: stage, profileId: id, initialize: true });
+      // One-time portable copy/export artifact. Subsequent runtime writes select
+      // only the record journal and never refresh these complete snapshots.
+      writePortableSources(db, stage, id, stage);
       if (operation) {
         mkdirSync(resolve(paths.root, 'mappings'), { recursive: true });
         durableWrite(
@@ -514,9 +528,11 @@ export function createProfileLifecycle({
         );
       }
       checkpoint(operation, stage, 'exported');
+      assertContributorCopyCoherence(db, stage, id);
+      const acceptedHead = selectedContributorHead(stage, id);
       const portable = loadPortable(stage, id) as CompleteLoadedPortable;
       if (operation) {
-        operation = selectCopyHeads(operation, portable);
+        operation = selectCopyHeads(operation, portable, stage);
         writeCopyOperation(root, operation);
       }
       const createdIdentity = selfIdentity(db);
@@ -554,6 +570,8 @@ export function createProfileLifecycle({
       assertOpen();
       requireDistinctProfile(createdIdentity.name, createdIdentity.icon);
       checkpoint(operation, stage, 'before-publication');
+      if (selectedContributorHead(stage, id) !== acceptedHead)
+        throw Error('Prepared contributor authority changed before target publication');
       if (existsSync(final.root))
         throw new HttpError(
           409,
@@ -574,7 +592,7 @@ export function createProfileLifecycle({
         return activatePublishedCopy(operation);
       }
       db = openDatabase(finalDb, id);
-      attachPersonalDurability(db, { root, profileId: id });
+      attachPersonalDurability(db, { root, profileId: id, initialize: false });
       const registry = readProfileRegistry(root) as ProfileRegistry;
       writeProfileRegistry(root, [...registry.profiles, { id, placebo }]);
       guard(id, db);

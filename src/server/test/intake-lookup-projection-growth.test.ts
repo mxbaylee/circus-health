@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, transaction } from '../database.ts';
 import { attachRecordDurability, type RecordStorage } from '../record-versions.ts';
+import { registerRawIntakeFixture } from './helpers/intake-authority-fixture.ts';
+import { stageIntakeEnvelope } from '../intake-authority.ts';
 import { intakeLookupCounters, clearIntakeLookupCache } from '../intake-lookup-projection.ts';
 import {
   maximumReportDiscoveryOrder,
@@ -32,12 +34,9 @@ test('300 contributions keep warm lookups indexed and changed projection writes 
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
+  attachRecordDurability(db, { profileId, storage });
   const insert = (id: string, details: unknown) =>
-    db
-      .prepare(
-        'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-      )
-      .run(id, `${id}.txt`, 'a'.repeat(64), 0, 'intake_original', JSON.stringify(details));
+    registerRawIntakeFixture(db, id, JSON.stringify(details));
   insert('untouched', {
     intake: {
       workflow: {
@@ -49,7 +48,6 @@ test('300 contributions keep warm lookups indexed and changed projection writes 
     },
   });
   insert('changing', { intake: { workflow: {} } });
-  attachRecordDurability(db, { profileId, storage });
   const originalObjects = new Map([...objects].filter(([name]) => name !== 'head'));
   assert.equal(maximumReportDiscoveryOrder(db), 7);
   assert.deepEqual(retainedReportAcceptance(db, 'duplicate-operation'), {
@@ -131,9 +129,11 @@ test('300 contributions keep warm lookups indexed and changed projection writes 
     });
     confirmations.push({ marker: `confirmation-${step}` });
     const before = { ...intakeLookupCounters(db) };
-    transaction(db, () =>
-      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-        JSON.stringify({
+    transaction(db, () => {
+      stageIntakeEnvelope(
+        db,
+        { id: 'changing' },
+        {
           intake: {
             workflow: {
               reportGroups: groups,
@@ -141,10 +141,9 @@ test('300 contributions keep warm lookups indexed and changed projection writes 
               identityConfirmations: confirmations,
             },
           },
-        }),
-        'changing',
-      ),
-    );
+        },
+      );
+    });
     assert.equal(maximumReportDiscoveryOrder(db), step + 7);
     assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 'first' }, ...confirmations]);
     assert.deepEqual(retainedReportAcceptance(db, 'duplicate-operation'), {
@@ -187,7 +186,7 @@ test('300 contributions keep warm lookups indexed and changed projection writes 
       baseline,
       samples,
       limitation:
-        'Source details and accepted source versions still grow; reconciliation reads the changed full view.',
+        'Lookup projection mutation fixture only; reconciliation reads the changed full view. Real batch/review/acceptance growth qualification remains CRS-210.',
     }),
   );
 });

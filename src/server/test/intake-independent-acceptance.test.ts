@@ -11,11 +11,8 @@ import {
   acceptIntakeReportSelection,
   getIntakeReportAcceptance,
 } from '../intake-report-acceptance.ts';
-import {
-  attachRecordDurability,
-  rebuildRecordDatabase,
-  type RecordStorage,
-} from '../record-versions.ts';
+import { attachRecordDurability, rebuildRecordDatabase } from '../record-versions.ts';
+import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import type { HealthRecordEnvelope, IntakeReportAcceptanceBlock } from '../../shared/intake.ts';
 
 // Independently fictional facts: two separate measurements from the same issuer.
@@ -47,6 +44,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'independent-intake-review-'));
   const profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  const authority = memoryRecordAuthority(db);
   const opened = [db];
   t.after(() => {
     for (const connection of opened) connection.close();
@@ -83,7 +81,7 @@ function fixture(t: TestContext) {
       })),
     };
   };
-  return { db, root, profileId, opened, upload, block };
+  return { db, root, opened, upload, block, ...authority };
 }
 
 for (const mode of ['ordinary', 'counted', 'mismatched', 'unsupported'] as const)
@@ -267,18 +265,7 @@ for (const boundary of ['before_head', 'after_head'] as const)
         operationId: randomUUID(),
         metadata: { source: 'Invented reviewed issuer' },
       });
-    const objects = new Map<string, Buffer>();
-    const storage: RecordStorage = {
-      read: (name) => (objects.has(name) ? Buffer.from(objects.get(name)!) : null),
-      writeImmutable(name, bytes) {
-        assert.equal(objects.has(name), false, 'accepted history objects are append-only');
-        objects.set(name, Buffer.from(bytes));
-      },
-      publishHead(bytes) {
-        objects.set('head', Buffer.from(bytes));
-      },
-    };
-    attachRecordDurability(f.db, { profileId: f.profileId, storage });
+    const { objects, storage } = f;
     const retained = new Map(
       [...objects]
         .filter(([name]) => name !== 'head')

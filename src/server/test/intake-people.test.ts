@@ -91,6 +91,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'health-intake-people-')),
     profileId = 'cookie-dough',
     db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId });
   let rebuilt: Database | null = null;
   const rebuiltRoot = root + '-rebuilt';
   t.after(() => {
@@ -109,6 +110,7 @@ function fixture(t: TestContext) {
     profileId,
     db,
     setRebuilt(value: Database) {
+      attachPersonalDurability(value, { root: rebuiltRoot, profileId, initialize: false });
       rebuilt = value;
     },
   };

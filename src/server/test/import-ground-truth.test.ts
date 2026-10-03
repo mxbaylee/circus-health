@@ -1,3 +1,5 @@
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
@@ -334,6 +336,7 @@ test(
     const profileId = 'cookie-dough';
     const paths = ensureProfileDirectories(root, profileId);
     let db = openDatabase(paths.database, profileId);
+    attachPersonalDurability(db, { root, profileId: profileId });
     t.after(() => {
       try {
         db.close();
@@ -405,19 +408,14 @@ test(
           {
             forceAccept: true,
             beforeImport: () => {
-              pendingBefore = db
-                .prepare('SELECT details_json FROM source_files WHERE id=?')
-                .get(zipIntake.id);
+              pendingBefore = readIntakeEnvelopeText(db, { id: zipIntake.id });
             },
           },
         ),
       { code: 'CLINICAL_SOURCE_SCOPE_COLLISION' },
     );
     assert.deepEqual(acceptedQueries(db), firstAccepted);
-    assert.deepEqual(
-      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(zipIntake.id),
-      pendingBefore,
-    );
+    assert.deepEqual(readIntakeEnvelopeText(db, { id: zipIntake.id }), pendingBefore);
     const pending = getIntake(db, root, profileId, zipIntake.id);
     const pendingProposalId = pending.proposals.at(-1)!.id;
     const pendingReview = reviewIntake(db, root, profileId, zipIntake.id, pendingProposalId);
@@ -485,6 +483,7 @@ test(
     assert.equal(existsSync(paths.database), false);
     const rebuilt = rebuildProfile(root, profileId, resolve(root, 'rebuilt'));
     db = openDatabase(rebuilt.database, profileId);
+    attachPersonalDurability(db, { root: resolve(root, 'rebuilt'), profileId: profileId });
     const after = acceptedQueries(db);
     assert.deepEqual(after, before);
     const rebuiltReport = evaluateImportGroundTruth(

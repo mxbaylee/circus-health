@@ -10,9 +10,15 @@ import {
   intakeIdentityConfirmations,
 } from '../intake-state-access.ts';
 import { clearIntakeLookupCache, intakeLookupCounters } from '../intake-lookup-projection.ts';
+import {
+  memoryRecordAuthority,
+  registerRawIntakeFixture,
+  writeIntakeFixtureEnvelope,
+} from './helpers/intake-authority-fixture.ts';
 function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-lookup-'));
   const db = openDatabase(join(root, 'cache.sqlite'), 'fictional-profile');
+  const authority = memoryRecordAuthority(db);
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -27,16 +33,21 @@ function fixture(t: TestContext) {
         },
       },
     });
-  const insert = (id: string, n: number, kind = 'intake_original') =>
-    db
-      .prepare(
-        'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-      )
-      .run(id, id + '.txt', 'a'.repeat(64), 0, kind, body(n));
-  return { db, body, insert };
+  const write = (id: string, raw: string) => writeIntakeFixtureEnvelope(db, id, JSON.parse(raw));
+  const insert = (id: string, n: number, kind = 'intake_original') => {
+    if (kind === 'intake_original') return registerRawIntakeFixture(db, id, body(n));
+    transaction(db, () =>
+      db
+        .prepare(
+          'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+        )
+        .run(id, id + '.txt', 'a'.repeat(64), 0, kind, body(n)),
+    );
+  };
+  return { db, body, insert, write, authority };
 }
 test('raw writes, reordered contributions, kind and ID changes preserve scoped lookup ordering', (t) => {
-  const { db, body, insert } = fixture(t);
+  const { db, body, insert, write } = fixture(t);
   insert('first', 3);
   insert('second', 9);
   insert('other', 100, 'derived');
@@ -48,24 +59,27 @@ test('raw writes, reordered contributions, kind and ID changes preserve scoped l
     { marker: 100 },
   ]);
   transaction(db, () => {
-    db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(body(12), 'first');
+    write('first', body(12));
     assert.equal(maximumReportDiscoveryOrder(db), 12);
-    db.prepare('UPDATE source_files SET id=?,kind=? WHERE id=?').run('renamed', 'derived', 'first');
-    assert.equal(maximumReportDiscoveryOrder(db), 9);
-    assert.equal((retainedReportAcceptance(db, 'same') as unknown as { marker: number }).marker, 9);
+    db.prepare('UPDATE source_files SET id=? WHERE id=?').run('renamed', 'other');
+    assert.equal(maximumReportDiscoveryOrder(db), 12);
+    assert.equal(
+      (retainedReportAcceptance(db, 'same') as unknown as { marker: number }).marker,
+      12,
+    );
   });
-  db.prepare('DELETE FROM source_files WHERE id=?').run('second');
-  assert.equal(maximumReportDiscoveryOrder(db), 0);
+  transaction(db, () => db.prepare('DELETE FROM source_files WHERE id=?').run('second'));
+  assert.equal(maximumReportDiscoveryOrder(db), 12);
   assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 12 }, { marker: 100 }]);
 });
 test('rollback restores allocation and freshness even when first build occurs inside transaction', (t) => {
-  const { db, body, insert } = fixture(t);
+  const { db, body, insert, write } = fixture(t);
   insert('first', 2);
   assert.throws(
     () =>
       transaction(db, () => {
         assert.equal(maximumReportDiscoveryOrder(db), 2);
-        db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(body(77), 'first');
+        write('first', body(77));
         assert.equal(maximumReportDiscoveryOrder(db), 77);
         throw Error('fictional rollback');
       }),
@@ -97,10 +111,12 @@ test('schema/index loss and cold payload corruption rebuild without persistent t
   clearIntakeLookupCache(db);
   assert.equal((retainedReportAcceptance(db, 'same') as unknown as { marker: number }).marker, 5);
   const names = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'")
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_intake_lookup_*'",
+    )
     .all();
   for (const row of names) db.exec(`DROP TABLE "${String(row.name)}"`);
-  db.prepare('UPDATE source_files SET path=?').run('fictional-rebound.txt');
+  transaction(db, () => db.prepare('UPDATE source_files SET path=?').run('fictional-rebound.txt'));
   assert.equal(maximumReportDiscoveryOrder(db), 5);
   assert.equal(db.prepare('SELECT details_json FROM source_files').get()!.details_json, original);
   assert.equal(
@@ -117,28 +133,32 @@ test('invalid non-original JSON is skipped while malformed original contribution
   insert('first', 4);
   insert('invalid', 90, 'derived');
   db.exec('PRAGMA ignore_check_constraints=ON');
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run('{', 'invalid');
+  transaction(db, () =>
+    db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run('{', 'invalid'),
+  );
   db.exec('PRAGMA ignore_check_constraints=OFF');
   assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 4 }]);
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-    JSON.stringify({ intake: { workflow: { reportGroups: { bad: true } } } }),
-    'first',
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
+          JSON.stringify({ intake: { workflow: { reportGroups: { bad: true } } } }),
+          'first',
+        );
+        maximumReportDiscoveryOrder(db);
+      }),
+    /authority|unsupported|missing/i,
   );
-  assert.throws(() => maximumReportDiscoveryOrder(db), /malformed contribution array/);
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-    JSON.stringify({ intake: {} }),
-    'first',
-  );
-  assert.equal(maximumReportDiscoveryOrder(db), 0);
+  assert.equal(maximumReportDiscoveryOrder(db), 4);
 });
 
 test('cold stale projection reconciled inside rollback remains cold afterward', (t) => {
-  const { db, body, insert } = fixture(t);
+  const { db, body, insert, write } = fixture(t);
   insert('first', 2);
   maximumReportDiscoveryOrder(db);
   // Simulate a later connection writing while lookup tracking is absent.
   db.exec('DROP TRIGGER temp.__intake_lookup_update');
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(body(44), 'first');
+  write('first', body(44));
   clearIntakeLookupCache(db);
   assert.throws(
     () =>
@@ -163,11 +183,9 @@ test('early insert, reorder, duplicate and removal update references without rew
   const a = { receipt: { operationId: 'same' }, marker: 1 },
     b = { receipt: { operationId: 'same' }, marker: 2 };
   const write = (values: unknown[]) =>
-    db.prepare('UPDATE source_files SET details_json=?').run(
-      JSON.stringify({
-        intake: { workflow: { reportAcceptances: values, identityConfirmations: values } },
-      }),
-    );
+    writeIntakeFixtureEnvelope(db, 'first', {
+      intake: { workflow: { reportAcceptances: values, identityConfirmations: values } },
+    });
   write([b, a, a]);
   assert.deepEqual(retainedReportAcceptance(db, 'same'), b);
   write([a, b, a]);
@@ -186,100 +204,86 @@ test('early insert, reorder, duplicate and removal update references without rew
   assert.equal(retainedReportAcceptance(db, 'wrong'), null);
 });
 
-test('actual connection close and reopen reconciles changes made without lookup tracking', (t) => {
+test('actual connection close and reopen reads selected intake head rather than stale lookup contribution', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-lookup-reopen-')),
     path = join(root, 'cache.sqlite');
   let db = openDatabase(path, 'fictional-profile');
+  const authority = memoryRecordAuthority(db);
   t.after(() => {
     if (db.isOpen) db.close();
     rmSync(root, { recursive: true, force: true });
   });
-  db.prepare(
-    'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-  ).run(
+  registerRawIntakeFixture(
+    db,
     'one',
-    'one.txt',
-    'a'.repeat(64),
-    0,
-    'intake_original',
     JSON.stringify({ intake: { workflow: { reportGroups: [{ discoveryOrder: 5 }] } } }),
   );
   assert.equal(maximumReportDiscoveryOrder(db), 5);
   db.close();
   db = openDatabase(path, 'fictional-profile');
-  db.prepare('UPDATE source_files SET details_json=?').run(
-    JSON.stringify({ intake: { workflow: { reportGroups: [{ discoveryOrder: 88 }] } } }),
-  );
+  authority.attach(db);
+  writeIntakeFixtureEnvelope(db, 'one', {
+    intake: { workflow: { reportGroups: [{ discoveryOrder: 88 }] } },
+  });
   assert.equal(maximumReportDiscoveryOrder(db), 88);
   assert.equal(intakeLookupCounters(db).builds, 1);
 });
 
-test('source rename preserves shared payload bytes through whole-dirty-set reconciliation', (t) => {
+test('source ID rebinding refuses cross-source authority and rollback retains shared payload bytes', (t) => {
   const { db, insert } = fixture(t);
   insert('a', 3);
   maximumReportDiscoveryOrder(db);
-  db.exec(
-    "CREATE TEMP TABLE payload_changes(kind); CREATE TEMP TRIGGER count_payload_insert AFTER INSERT ON main.__record_intake_lookup_payloads BEGIN INSERT INTO payload_changes VALUES('insert'); END; CREATE TEMP TRIGGER count_payload_delete AFTER DELETE ON main.__record_intake_lookup_payloads BEGIN INSERT INTO payload_changes VALUES('delete'); END;",
+  const original = db.prepare('SELECT * FROM __record_intake_lookup_payloads ORDER BY hash').all();
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        db.prepare('UPDATE source_files SET id=? WHERE id=?').run('z', 'a');
+        maximumReportDiscoveryOrder(db);
+      }),
+    /authority|missing|source|intake/i,
   );
-  transaction(db, () => {
-    db.prepare('UPDATE source_files SET id=? WHERE id=?').run('z', 'a');
-    assert.equal(maximumReportDiscoveryOrder(db), 3);
-  });
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM payload_changes').get()!.n, 0);
-  assert.equal((retainedReportAcceptance(db, 'same') as unknown as { marker: number }).marker, 3);
+  assert.equal(maximumReportDiscoveryOrder(db), 3);
+  assert.deepEqual(
+    db.prepare('SELECT * FROM __record_intake_lookup_payloads ORDER BY hash').all(),
+    original,
+  );
 });
 
-test('partial dirty batch failure stays coherent across close/reopen without orphan payloads', (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-lookup-partial-')),
-    path = join(root, 'cache.sqlite');
-  let db = openDatabase(path, 'fictional-profile');
-  t.after(() => {
-    if (db.isOpen) db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  const insert = (id: string, n: number) =>
-    db
-      .prepare(
-        'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-      )
-      .run(
-        id,
-        id + '.txt',
-        'a'.repeat(64),
-        0,
-        'intake_original',
-        JSON.stringify({
-          intake: {
-            workflow: { reportAcceptances: [{ receipt: { operationId: id }, marker: n }] },
-          },
-        }),
-      );
+test('selected head corruption refuses warm and cold lookups without erasing retained receipts', (t) => {
+  const { db, insert, authority } = fixture(t);
   insert('a', 1);
   insert('z', 2);
   maximumReportDiscoveryOrder(db);
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-    JSON.stringify({ intake: { workflow: {} } }),
-    'a',
-  );
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-    JSON.stringify({ intake: { workflow: null } }),
-    'z',
-  );
-  assert.throws(() => maximumReportDiscoveryOrder(db), /malformed workflow/);
-  assert.equal(
-    db.prepare('SELECT COUNT(*) n FROM __record_intake_lookup_acceptances').get()!.n,
-    2,
-    'failed derived batch rolls back earlier contribution changes',
-  );
-  db.close();
-  db = openDatabase(path, 'fictional-profile');
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-    JSON.stringify({ intake: { workflow: {} } }),
-    'z',
-  );
-  maximumReportDiscoveryOrder(db);
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM __record_intake_lookup_payloads').get()!.n, 0);
+  const keys = db
+    .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_state_v1:*:head' ORDER BY key")
+    .all();
+  assert.equal(keys.length, 2);
+  const selected = keys[1]!;
+  for (const clear of [false, true]) {
+    assert.throws(
+      () =>
+        transaction(db, () => {
+          db.prepare('UPDATE app_meta SET value=? WHERE key=?').run(
+            '{"format":"fictional-unsupported"}',
+            selected.key!,
+          );
+          if (clear) clearIntakeLookupCache(db);
+          maximumReportDiscoveryOrder(db);
+        }),
+      /intake|authority|schema|format/i,
+    );
+    assert.deepEqual(retainedReportAcceptance(db, 'same'), {
+      receipt: { operationId: 'same' },
+      marker: 1,
+    });
+    assert.equal(
+      db.prepare('SELECT COUNT(*) n FROM __record_intake_lookup_acceptances').get()!.n,
+      2,
+    );
+  }
+  assert.ok(authority.objects.has('head'));
 });
+
 test('wrong projection affinity or singleton binding rebuilds from unchanged source evidence', (t) => {
   const { db, insert } = fixture(t);
   insert('one', 19);

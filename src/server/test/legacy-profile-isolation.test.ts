@@ -98,7 +98,10 @@ test('Fictional Orchid is an explicit private profile with its own Self and no l
   );
   const cedarBefore = readFileSync(profilePaths(root, 'cedar').database);
   assert.throws(() => existingProfileDatabase(root, 'orchid'), /database is missing/);
-  assert.throws(() => createApp({ root }), /Missing orchid database/);
+  assert.throws(
+    () => createApp({ root }),
+    /Missing orchid database|selected record authority is missing/,
+  );
   assert.equal(existsSync(profilePaths(root, 'orchid').database), false);
   assert.equal(existsSync(resolve(profilePaths(root, 'cedar').personal, 'current.json')), false);
   assert.deepEqual(readFileSync(profilePaths(root, 'cedar').database), cedarBefore);

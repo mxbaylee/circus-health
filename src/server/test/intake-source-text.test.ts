@@ -14,6 +14,8 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { openDatabase, transaction, type Database } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
+import { registerIntakeFile } from '../intake-state-access.ts';
+import { readIntakeEnvelopeText, stageIntakeEnvelope } from '../intake-authority.ts';
 import {
   attachRecordDurability,
   rebuildRecordDatabase,
@@ -61,16 +63,6 @@ function fixture(t: TestContext, { attach = true } = {}) {
   );
   const path = resolve(paths.sources, 'fictional.txt');
   writeFileSync(path, bytes);
-  db.prepare(
-    'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-  ).run(
-    intakeId,
-    `${paths.relativeRoot}/sources/fictional.txt`,
-    digest(bytes),
-    bytes.length,
-    'intake_original',
-    JSON.stringify({ intake: { version: 1, proposals: [] } }),
-  );
   const objects = new Map<string, Buffer>();
   const storage: RecordStorage = {
     read: (name) => (objects.has(name) ? Buffer.from(objects.get(name)!) : null),
@@ -81,6 +73,30 @@ function fixture(t: TestContext, { attach = true } = {}) {
     publishHead: (value) => objects.set('head', Buffer.from(value)),
   };
   if (attach) attachRecordDurability(db, { profileId, storage });
+  if (attach)
+    transaction(db, () =>
+      registerIntakeFile(db, {
+        id: intakeId,
+        path: `${paths.relativeRoot}/sources/fictional.txt`,
+        sha256: digest(bytes),
+        size: bytes.length,
+        mimeType: 'text/plain',
+        kind: 'intake_original',
+        coverage: 'unknown',
+        details: { intake: { version: 1, proposals: [] } },
+      }),
+    );
+  else
+    db.prepare(
+      'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+    ).run(
+      intakeId,
+      `${paths.relativeRoot}/sources/fictional.txt`,
+      digest(bytes),
+      bytes.length,
+      'intake_original',
+      JSON.stringify({ intake: { version: 1, proposals: [] } }),
+    );
   const opened: Database[] = [db];
   t.after(() => {
     for (const connection of opened)
@@ -658,37 +674,27 @@ test('member correction atomically invalidates ancestor proposals without impers
   const parentPath = `data/profiles/${profileId}/sources/parent.fixture`;
   writeFileSync(resolve(f.root, parentPath), bytes);
   transaction(f.db, () => {
-    f.db
-      .prepare(
-        'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-      )
-      .run(
-        parent,
-        parentPath,
-        digest(bytes),
-        bytes.length,
-        'intake_original',
-        JSON.stringify({ intake: { version: 1, proposals: [] } }),
-      );
-    f.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(
-        JSON.stringify({ intake: { version: 1, proposals: [], parentSourceFileId: parent } }),
-        intakeId,
-      );
+    registerIntakeFile(f.db, {
+      id: parent,
+      path: parentPath,
+      sha256: digest(bytes),
+      size: bytes.length,
+      mimeType: 'text/plain',
+      kind: 'intake_original',
+      coverage: 'unknown',
+      details: { intake: { version: 1, proposals: [] } },
+    });
+    stageIntakeEnvelope(
+      f.db,
+      { id: intakeId },
+      { intake: { version: 1, proposals: [], parentSourceFileId: parent } },
+    );
   });
   const initial = publish(f);
   transaction(f.db, () => {
-    const child = JSON.parse(
-      String(
-        f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!
-          .details_json,
-      ),
-    );
+    const child = JSON.parse(String(readIntakeEnvelopeText(f.db, { id: intakeId })));
     child.intake.locator = 'fictional/member-one';
-    f.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify(child), intakeId);
+    stageIntakeEnvelope(f.db, { id: intakeId }, child);
     f.db.prepare('UPDATE source_files SET mime_type=? WHERE id=?').run('application/zip', parent);
     writeProposalDependencies(f.db, parent, 'fictional-measured-package-proposal', [
       {
@@ -704,11 +710,7 @@ test('member correction atomically invalidates ancestor proposals without impers
     ]);
   });
   assert.equal(proposalDependenciesCurrent(f.db, 'fictional-measured-package-proposal'), true);
-  const stored = (db = f.db) =>
-    JSON.parse(
-      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(parent)!
-        .details_json as string,
-    ).intake;
+  const stored = (db = f.db) => JSON.parse(readIntakeEnvelopeText(db, { id: parent })).intake;
   const metadata = (db = f.db) => withIntakeSourcePin(stored(db), readIntakeSourcePin(db, parent));
   const before = metadata();
   assert.equal(before.sourceTextRevisionId, null);
@@ -723,36 +725,30 @@ test('member correction atomically invalidates ancestor proposals without impers
         sourceTextDependencyToken: metadata().sourceTextDependencyToken,
       },
     ];
-    f.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify({ intake: saved }), parent);
+    stageIntakeEnvelope(f.db, { id: parent }, { intake: saved });
   });
   assert.doesNotThrow(() => assertCurrentProposalSourceText(metadata(), 'parent-proposal'));
   const siblingId = 'fictional-sibling-member';
   const siblingPath = `data/profiles/${profileId}/sources/fictional-sibling.txt`;
   writeFileSync(resolve(f.root, siblingPath), readFileSync(f.path));
   transaction(f.db, () =>
-    f.db
-      .prepare(
-        'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-      )
-      .run(
-        siblingId,
-        siblingPath,
-        f.sourceHash,
-        Buffer.byteLength(
-          'FICTIONAL ONLY\nPage 1: No finding. Decimal 1.00.\nPage 2: Administrative routing retained.',
-        ),
-        'intake_original',
-        JSON.stringify({
-          intake: {
-            version: 1,
-            proposals: [],
-            parentSourceFileId: parent,
-            locator: 'fictional/member-two',
-          },
-        }),
-      ),
+    registerIntakeFile(f.db, {
+      id: siblingId,
+      path: siblingPath,
+      sha256: f.sourceHash,
+      size: readFileSync(f.path).length,
+      mimeType: 'text/plain',
+      kind: 'intake_original',
+      coverage: 'unknown',
+      details: {
+        intake: {
+          version: 1,
+          proposals: [],
+          parentSourceFileId: parent,
+          locator: 'fictional/member-two',
+        },
+      },
+    }),
   );
   publishIntakeSourceText(f.db, f.root, profileId, siblingId, {
     operationId: randomUUID(),
@@ -786,9 +782,7 @@ test('member correction atomically invalidates ancestor proposals without impers
         { status: 'active', packageRoles: [{ memberId: 'fictional-member-one', role: 'report' }] },
       ],
     };
-    f.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify({ intake: saved }), parent);
+    stageIntakeEnvelope(f.db, { id: parent }, { intake: saved });
   });
   assert.equal(proposalDependenciesCurrent(f.db, 'fictional-package-role-proposal'), false);
   const changed = review(f, initial, {
@@ -1056,12 +1050,7 @@ test('unchanged text approval preserves clinical pins and receipts through rebui
     initial = publish(f);
   const metadata = () =>
     withIntakeSourcePin(
-      JSON.parse(
-        String(
-          f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!
-            .details_json,
-        ),
-      ).intake,
+      JSON.parse(String(readIntakeEnvelopeText(f.db, { id: intakeId }))).intake,
       readIntakeSourcePin(f.db, intakeId),
     );
   const before = metadata();
@@ -1311,11 +1300,16 @@ test('attention totals include later files while pages omit completed files', (t
       readFileSync(f.path),
     );
     transaction(f.db, () =>
-      f.db
-        .prepare(
-          "INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) SELECT ?,replace(path,'fictional.txt',?),sha256,bytes,kind,? FROM source_files WHERE id=?",
-        )
-        .run(id, id + '.txt', JSON.stringify({ intake: { version: 1, proposals: [] } }), intakeId),
+      registerIntakeFile(f.db, {
+        id,
+        path: `data/profiles/${profileId}/sources/${id}.txt`,
+        sha256: f.sourceHash,
+        size: readFileSync(f.path).length,
+        mimeType: 'text/plain',
+        kind: 'intake_original',
+        coverage: 'unknown',
+        details: { intake: { version: 1, proposals: [] } },
+      }),
     );
     publishIntakeSourceText(f.db, f.root, profileId, id, {
       operationId: randomUUID(),
@@ -1375,9 +1369,11 @@ function captureBytes(t: TestContext, pages: number, proposals = 0) {
     writeImmutable = f.storage.writeImmutable,
     steps = 5;
   if (proposals)
-    transaction(f.db, () =>
-      f.db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-        JSON.stringify({
+    transaction(f.db, () => {
+      stageIntakeEnvelope(
+        f.db,
+        { id: intakeId },
+        {
           intake: {
             version: 1,
             proposals: Array.from({ length: proposals }, (_, i) => ({
@@ -1385,10 +1381,9 @@ function captureBytes(t: TestContext, pages: number, proposals = 0) {
               note: 'Fictional proposal wording. '.repeat(20),
             })),
           },
-        }),
-        intakeId,
-      ),
-    );
+        },
+      );
+    });
   let written = 0;
   f.storage.writeImmutable = (name, value) => {
     written += value.length;
@@ -1532,8 +1527,10 @@ test('the first pinned revision continues the dependency chain kept in older int
   // Recreate an intake written before source pins: its pin fields live in the row.
   transaction(f.db, () => {
     f.db.prepare('DELETE FROM app_meta WHERE key=?').run(`intake_source_pin:v1:${intakeId}`);
-    f.db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-      JSON.stringify({
+    stageIntakeEnvelope(
+      f.db,
+      { id: intakeId },
+      {
         intake: {
           version: 7,
           proposals: [],
@@ -1541,14 +1538,10 @@ test('the first pinned revision continues the dependency chain kept in older int
           sourceTextDependencyToken: legacyToken,
           sourceTextRequiresInterpretation: true,
         },
-      }),
-      intakeId,
+      },
     );
   });
-  const row = () =>
-    String(
-      f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!.details_json,
-    );
+  const row = () => String(readIntakeEnvelopeText(f.db, { id: intakeId }));
   const legacy = row();
   const legacyView = JSON.parse(legacy).intake;
   const ev = evidence();

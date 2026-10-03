@@ -23,23 +23,23 @@ import {
   writePortableSources,
 } from '../portable.ts';
 import { createNote, getNote, saveNote, finishNote } from '../notes.ts';
-import { noteHistory, restoreNoteFields } from '../note-history.ts';
+import { noteHistory, restoreNoteFields, previewNoteRestoration } from '../note-history.ts';
 import { createBackup, restoreBackup } from '../recovery.ts';
 import { writeChat, readChat } from '../assistant-journal.ts';
 
-function fixture(t: TestContext) {
+function fixture(t: TestContext, portableSnapshots = false) {
   const root = mkdtempSync(resolve(tmpdir(), 'health-note-history-'));
   const profileId = 'cookie-dough',
     paths = ensureProfileDirectories(root, profileId),
     db = openDatabase(paths.database, profileId);
-  attachPersonalDurability(db, { root, profileId });
+  attachPersonalDurability(db, { root, profileId, portableSnapshots });
   t.after(() => {
     try {
       db.close();
     } catch {}
     rmSync(root, { recursive: true, force: true });
   });
-  return { root, profileId, paths, db };
+  return { root, profileId, paths, db, portableSnapshots };
 }
 type Fixture = ReturnType<typeof fixture>;
 interface HistoryFieldView {
@@ -60,7 +60,17 @@ const viewHistory = (...args: Parameters<typeof noteHistory>): HistoryView =>
 const errorCode = (error: unknown, code: string): boolean =>
   error instanceof Error && (error as Error & { code?: string }).code === code;
 const currentId = (f: Fixture): string =>
-  [...publishedPersonalLineage(f.root, f.profileId)][0]!.manifest.file.slice('snapshots/'.length);
+  f.portableSnapshots
+    ? [...publishedPersonalLineage(f.root, f.profileId)][0]!.manifest.file.slice(
+        'snapshots/'.length,
+      )
+    : String(
+        f.db
+          .prepare(
+            "SELECT version_id FROM __record_versions WHERE entity='notes' ORDER BY sequence DESC LIMIT 1",
+          )
+          .get()!.version_id,
+      );
 const restore = (
   f: Fixture,
   id: string,
@@ -69,7 +79,20 @@ const restore = (
   version: number,
   operationId = randomUUID(),
 ) =>
-  restoreNoteFields(f.db, f.root, f.profileId, id, { generationId, fields, version, operationId });
+  restoreNoteFields(f.db, f.root, f.profileId, id, {
+    generationId,
+    fields,
+    version,
+    operationId,
+    ...(f.portableSnapshots
+      ? {}
+      : previewNoteRestoration(f.db, f.root, f.profileId, id, {
+          generationId,
+          fields,
+          version,
+          operationId,
+        })),
+  });
 
 test('field restoration preserves unrelated edits, absent values, links, unknown profile facts and identity', (t) => {
   const f = fixture(t),
@@ -137,7 +160,7 @@ test('field restoration preserves unrelated edits, absent values, links, unknown
 });
 
 test('CAS conflict, immutable finished notes, profile isolation, unsafe fields and unpublished candidates are rejected', (t) => {
-  const f = fixture(t),
+  const f = fixture(t, true),
     { db, paths } = f;
   let note = createNote(db, { kind: 'historical', title: 'Visit', content: 'Before' }),
     baseline = currentId(f);
@@ -190,13 +213,14 @@ test('CAS conflict, immutable finished notes, profile isolation, unsafe fields a
 });
 
 test('idempotent restores survive uncertain response, pending publication, and a later retry', (t) => {
-  const f = fixture(t),
+  const f = fixture(t, true),
     { db, root, profileId } = f;
   let note = createNote(db, { title: 'Entry', content: 'Old' }),
     baseline = currentId(f);
   note = saveNote(db, note.id, { ...note, content: 'New' });
   const operationId = randomUUID();
   attachPersonalDurability(db, {
+    portableSnapshots: true,
     root,
     profileId,
     writer() {
@@ -217,7 +241,7 @@ test('idempotent restores survive uncertain response, pending publication, and a
     () => restore(f, note.id, baseline, ['title'], note.version, operationId),
     (e) => errorCode(e, 'OPERATION_CONFLICT'),
   );
-  attachPersonalDurability(db, { root, profileId });
+  attachPersonalDurability(db, { root, profileId, portableSnapshots: true });
   const durable = restore(f, note.id, baseline, ['content'], note.version, operationId);
   assert.equal(durable.recovery.published, true);
   assert.equal(durable.durability.dirty, false);
@@ -225,11 +249,12 @@ test('idempotent restores survive uncertain response, pending publication, and a
 });
 
 test('only the published lineage is shown after interrupted pointer writes; checksum failures do not invent history', (t) => {
-  const f = fixture(t),
+  const f = fixture(t, true),
     { db, root, profileId, paths } = f;
   let note = createNote(db, { title: 'Entry', content: 'First' });
   const published = currentId(f);
   attachPersonalDurability(db, {
+    portableSnapshots: true,
     root,
     profileId,
     writer(path, bytes) {
@@ -248,7 +273,7 @@ test('only the published lineage is shown after interrupted pointer writes; chec
         'Unpublished candidate',
     ),
   );
-  attachPersonalDurability(db, { root, profileId });
+  attachPersonalDurability(db, { root, profileId, portableSnapshots: true });
   assert.equal(
     viewHistory(db, root, profileId, note.id).entries[0]!.fields.find(
       (field) => field.path === 'content',
@@ -265,7 +290,7 @@ test('only the published lineage is shown after interrupted pointer writes; chec
 });
 
 test('portable backup output, actual backup/restore and rebuild retain lineage, receipts and restored values', async (t) => {
-  const f = fixture(t),
+  const f = fixture(t, true),
     { db, root, profileId } = f;
   let note = createNote(db, { title: 'Entry', content: 'Before' });
   const baseline = currentId(f);
@@ -309,7 +334,7 @@ test('portable backup output, actual backup/restore and rebuild retain lineage, 
 });
 
 test('legacy published current is one known baseline and never adopts loose earlier snapshots', (t) => {
-  const f = fixture(t),
+  const f = fixture(t, true),
     { db, root, profileId, paths } = f;
   let note = createNote(db, { title: 'Entry', content: 'Old loose state' });
   const loose = currentId(f);
@@ -346,7 +371,7 @@ test('legacy published current is one known baseline and never adopts loose earl
 });
 
 test('paged history stays profile scoped and an exact captured lineage can be copied after newer saves', (t) => {
-  const f = fixture(t),
+  const f = fixture(t, true),
     { db, root, profileId } = f;
   let note = createNote(db, { title: 'Entry', content: 'One' });
   const chosen = [...publishedPersonalLineage(root, profileId)][0].manifest;
@@ -438,7 +463,7 @@ test('rebuild preserves the selected profile assistant journal alongside the sam
 });
 
 test('symlinked history cannot escape the personal directory even with matching checksums', (t) => {
-  const f = fixture(t),
+  const f = fixture(t, true),
     { db, root, profileId, paths } = f;
   const note = createNote(db, { title: 'Entry', content: 'Local only' });
   const manifest = JSON.parse(readFileSync(resolve(paths.personal, 'current.json'), 'utf8'));

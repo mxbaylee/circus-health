@@ -29,6 +29,7 @@ export interface ProfilePaths {
   sources: string;
   personal: string;
   curation: string;
+  records: string;
   attachments: string;
   intakeBatches: string;
 }
@@ -45,6 +46,7 @@ export function profilePaths(root: string, profileId: unknown): ProfilePaths {
     sources: resolve(base, 'sources'),
     personal: resolve(base, 'personal'),
     curation: resolve(base, 'curation'),
+    records: resolve(base, 'records'),
     attachments: resolve(base, 'attachments'),
     intakeBatches: resolve(base, 'intake-batches'),
   };

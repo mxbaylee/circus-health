@@ -1,3 +1,7 @@
+import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -59,6 +63,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-related-review-')),
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -307,22 +312,40 @@ test('counted acceptance attaches two prevalidated occurrences to one target ato
   const conflictingFile = f.db
     .prepare('SELECT provider_id,batch_id FROM source_files WHERE id=?')
     .get(intakeB.id)!;
-  f.db
-    .prepare(
-      'INSERT INTO source_records(id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
-    )
-    .run(
-      reviewB.records[0]!.id,
-      intakeB.id,
-      conflictingFile.provider_id,
-      'line:1',
-      'intake_record',
-      'counted-occurrence-b',
-      JSON.stringify({ independentlyChanged: true }),
-      JSON.stringify({ independentlyChanged: true }),
-      'retained_unprojected',
-      conflictingFile.batch_id,
-    );
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare(
+        'INSERT INTO source_records(id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      )
+      .run(
+        reviewB.records[0]!.id,
+        intakeB.id,
+        conflictingFile.provider_id,
+        'line:1',
+        'intake_record',
+        'counted-occurrence-b',
+        JSON.stringify({ independentlyChanged: true }),
+        JSON.stringify({ independentlyChanged: true }),
+        'retained_unprojected',
+        conflictingFile.batch_id,
+      ),
+  );
+  const refreshRequest = () => {
+    for (const block of request.blocks) {
+      const refreshed = f.review(block.intakeId);
+      block.reviewToken = refreshed.reviewToken;
+      block.intakeVersion = refreshed.version;
+      for (const chosen of block.selections) {
+        if ('comparisons' in chosen) {
+          const current = refreshed.records.find((record) => record.id === chosen.recordId)!;
+          chosen.comparisons = [
+            attach(current.comparisons!.find((candidate) => candidate.id === targetId)!),
+          ];
+        }
+      }
+    }
+  };
+  refreshRequest();
   assert.throws(() => acceptIntakeReportSelection(f.db, f.root, f.profileId, request), {
     code: 'SOURCE_CHANGED',
   });
@@ -341,8 +364,11 @@ test('counted acceptance attaches two prevalidated occurrences to one target ato
       .get()!.n,
     0,
   );
-  f.db.prepare('DELETE FROM source_records WHERE id=?').run(reviewB.records[0]!.id);
+  fixtureTransaction(f.db, () =>
+    f.db.prepare('DELETE FROM source_records WHERE id=?').run(reviewB.records[0]!.id),
+  );
 
+  refreshRequest();
   const result = acceptIntakeReportSelection(f.db, f.root, f.profileId, request);
   assert.equal(result.receipt.selectedCount, 3);
   assert.equal(result.receipt.acceptedCount, 3);
@@ -500,18 +526,21 @@ test('finalization never reanchors a pre-existing receipt that happens to share 
       "SELECT id,coverage_json FROM manual_batches WHERE title='Duplicate evidence decision' ORDER BY id LIMIT 1",
     )
     .get() as { id: string; coverage_json: string };
-  const second = f.review(f.upload([sample('receipt-occurrence-two')]).id);
+  let second = f.review(f.upload([sample('receipt-occurrence-two')]).id);
   const forgedCollision = JSON.parse(prior.coverage_json);
   forgedCollision.duplicateDecision.occurrenceAttachment.appliedRevision =
-    Number(f.db.prepare("SELECT value FROM app_meta WHERE key='revision'").get()!.value) + 1;
-  f.db
-    .prepare('UPDATE manual_batches SET coverage_json=? WHERE id=?')
-    .run(JSON.stringify(forgedCollision), prior.id);
+    Number(f.db.prepare("SELECT value FROM app_meta WHERE key='revision'").get()!.value) + 2;
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare('UPDATE manual_batches SET coverage_json=? WHERE id=?')
+      .run(JSON.stringify(forgedCollision), prior.id),
+  );
   const immutablePrior = String(
     f.db.prepare('SELECT coverage_json FROM manual_batches WHERE id=?').get(prior.id)!
       .coverage_json,
   );
 
+  second = f.review(second.intakeId);
   f.accept(second, [
     attach(second.records[0]!.comparisons!.find((candidate) => candidate.id === targetId)!),
   ]);
@@ -600,6 +629,7 @@ test('a relationship from a later search page retains undecided and resolved his
     rebuiltRoot = join(f.root, 'rebuilt-page');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, rebuiltRoot),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: rebuiltRoot, profileId: f.profileId });
   try {
     const restored = intake
       .reviewIntake(db, rebuiltRoot, f.profileId, pending.intakeId)
@@ -757,9 +787,8 @@ test('ordinary attachment verifies every deterministic incoming source field bef
   const alternateIntake = f.upload([sample('incoming-authority-alternate-file')]);
   const envelope = sample('incoming-authority-occurrence');
   const pendingIntake = f.upload([envelope]);
-  const pending = f.review(pendingIntake.id);
+  let pending = f.review(pendingIntake.id);
   const record = pending.records[0]!;
-  const comparison = record.comparisons!.find((candidate) => candidate.id === targetId)!;
   const acquisition = f.db
     .prepare(
       'SELECT f.provider_id,f.batch_id,p.name FROM source_files f JOIN providers p ON p.id=f.provider_id WHERE f.id=?',
@@ -769,7 +798,11 @@ test('ordinary attachment verifies every deterministic incoming source field bef
     .prepare('SELECT id,batch_id FROM source_files WHERE id=?')
     .get(alternateIntake.id)!;
   const otherProviderId = 'provider:fictional-same-name-drift';
-  f.db.prepare('INSERT INTO providers(id,name) VALUES(?,?)').run(otherProviderId, acquisition.name);
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare('INSERT INTO providers(id,name) VALUES(?,?)')
+      .run(otherProviderId, acquisition.name),
+  );
   const exact = {
     id: record.id,
     source_file_id: pendingIntake.id,
@@ -804,8 +837,12 @@ test('ordinary attachment verifies every deterministic incoming source field bef
   );
   for (const [field, changed] of mismatches) {
     const conflicting = { ...exact, [field]: changed };
-    insert.run(...Object.values(conflicting));
-    assert.throws(() => f.accept(pending, [attach(comparison)]), { code: 'SOURCE_CHANGED' });
+    fixtureTransaction(f.db, () => insert.run(...Object.values(conflicting)));
+    pending = f.review(pendingIntake.id);
+    const currentComparison = pending.records[0]!.comparisons!.find(
+      (candidate) => candidate.id === targetId,
+    )!;
+    assert.throws(() => f.accept(pending, [attach(currentComparison)]), { code: 'SOURCE_CHANGED' });
     assert.deepEqual(
       {
         ...f.db
@@ -827,10 +864,15 @@ test('ordinary attachment verifies every deterministic incoming source field bef
         .get()!.n,
       0,
     );
-    f.db.prepare('DELETE FROM source_records WHERE id=?').run(record.id);
+    fixtureTransaction(f.db, () =>
+      f.db.prepare('DELETE FROM source_records WHERE id=?').run(record.id),
+    );
   }
 
-  const accepted = f.accept(pending, [attach(comparison)]);
+  pending = f.review(pendingIntake.id);
+  const accepted = f.accept(pending, [
+    attach(pending.records[0]!.comparisons!.find((candidate) => candidate.id === targetId)!),
+  ]);
   assert.equal(accepted.imported!.clinical!.records![0]!.outcome, 'matched');
   const staleEnvelope = sample('incoming-authority-stale-revision');
   const stale = f.review(f.upload([staleEnvelope]).id);
@@ -957,10 +999,8 @@ test('legacy pending choices remain visible but unpinned; historical accepted pa
   );
   // Construct only the fictional legacy storage shape that older application versions wrote.
   transaction(f.db, () => {
-    const row = f.db
-      .prepare('SELECT details_json FROM source_files WHERE id=?')
-      .get(pending.intakeId)!;
-    const details = JSON.parse(String(row.details_json));
+    const row = f.db.prepare('SELECT id FROM source_files WHERE id=?').get(pending.intakeId)!;
+    const details = JSON.parse(readIntakeEnvelopeText(f.db, { id: String(row.id) })!);
     details.intake.workflow.reviewDrafts.push({
       id: 'fictional-old-draft',
       proposalId: null,
@@ -980,9 +1020,7 @@ test('legacy pending choices remain visible but unpinned; historical accepted pa
         ],
       },
     });
-    f.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify(details), pending.intakeId);
+    writeIntakeFixtureEnvelope(f.db, pending.intakeId, details);
   });
   let refreshed = f.review(pending.intakeId);
   assert.equal(refreshed.records[0]!.comparisonDrafts![0]!.status, 'missing');
@@ -1038,6 +1076,7 @@ test('legacy pending choices remain visible but unpinned; historical accepted pa
     rebuiltRoot = join(f.root, 'rebuilt');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, rebuiltRoot),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: rebuiltRoot, profileId: f.profileId });
   try {
     const restored = intake.reviewIntake(db, rebuiltRoot, f.profileId, pending.intakeId);
     assert.equal(restored.records[0]!.comparisonDrafts![0]!.status, 'missing');

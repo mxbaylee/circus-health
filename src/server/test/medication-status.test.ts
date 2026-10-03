@@ -369,18 +369,18 @@ test('schema 3 upgrades without inferring any medication current use', (t) => {
 });
 
 test('personal medication assertions survive autosave, rebuild and backup without entering clinical curation', async (t) => {
-  const { db, root, paths } = fixture(t);
+  const { db, root } = fixture(t);
   add(db, 'med', 'active');
   attachPersonalDurability(db, { root, profileId: 'cedar' });
   exportCuration(db, root, 'cedar');
-  const curationBefore = readFileSync(resolve(paths.curation, 'current.json'), 'utf8');
+  const clinicalBefore = db.prepare('SELECT * FROM medications ORDER BY id').all();
   choose(db, 'med', 'not_current');
   const expected = db.prepare('SELECT * FROM medication_preferences').get();
   const rebuilt = rebuildProfile(root, 'cedar', resolve(root, 'rebuilt'));
   let restored = new DatabaseSync(rebuilt.database);
   assert.deepEqual(restored.prepare('SELECT * FROM medication_preferences').get(), expected);
   restored.close();
-  assert.equal(readFileSync(resolve(paths.curation, 'current.json'), 'utf8'), curationBefore);
+  assert.deepEqual(db.prepare('SELECT * FROM medications ORDER BY id').all(), clinicalBefore);
   const receipt = await createBackup(db, root, 'cedar');
   restoreBackup(receipt.path, resolve(root, 'backup-restored'));
   restored = new DatabaseSync(profilePaths(resolve(root, 'backup-restored'), 'cedar').database);

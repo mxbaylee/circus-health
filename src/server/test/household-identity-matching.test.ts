@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -112,6 +113,7 @@ function fixture(
   const root = mkdtempSync(join(tmpdir(), 'fictional-household-matching-'));
   const profileId = 'fictional-household';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });

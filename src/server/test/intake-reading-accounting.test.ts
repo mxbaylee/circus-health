@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -31,6 +32,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-reading-accounting-'));
   const profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -160,6 +162,7 @@ test('all supported image formats use one durable unit and preserve accounted di
   const target = join(f.root, 'image-rebuilt'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const restored = listIntakeReportQueue(db, target, f.profileId).activity.readingAccounting!;
     assert.deepEqual(restored, accounting);
@@ -401,6 +404,7 @@ test('exact ZIP occurrence accounting preserves duplicate copies and survives ba
   const target = join(f.root, 'recovered'),
     restored = rebuildProfile(join(backup.path, 'files'), f.profileId, target);
   const db = openDatabase(restored.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     assert.deepEqual(
       listIntakeReportQueue(db, target, f.profileId).activity.readingAccounting,

@@ -15,18 +15,13 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, relative } from 'node:path';
-import { openDatabase, type Database } from '../database.ts';
+import { openDatabase, transaction, type Database } from '../database.ts';
 import {
   createProfileLifecycle,
   type CreateProfileLifecycleOptions,
 } from '../profile-lifecycle.ts';
 import { profilePaths } from '../profile-storage.ts';
-import {
-  exportCuration,
-  loadPortable,
-  rebuildProfile,
-  attachPersonalDurability,
-} from '../portable.ts';
+import { exportCuration, rebuildProfile, attachPersonalDurability } from '../portable.ts';
 import { uploadIntake } from '../intake.ts';
 import { getIntakePeopleQueue, applyIntakePerson } from '../intake-people.ts';
 import { createNote, getNote, saveNote } from '../notes.ts';
@@ -34,24 +29,12 @@ import { readProfileRegistry } from '../profile-registry.ts';
 import { createIntakeStateStorage } from '../intake-state-storage.ts';
 import { getIntakeSourceText } from '../intake-source-text.ts';
 import { readIntakeSourcePin, writeIntakeSourcePin } from '../intake-source-pin.ts';
-import { storedIntakeDetails, intakeDetails } from '../intake-state-access.ts';
-import {
-  normalizeIntakeJson,
-  intakeChanges,
-  applyIntakeChanges,
-  serializeIntakeJson,
-  type IntakeJson,
-} from '../intake-state-codec.ts';
-import {
-  frameIntakeChanges,
-  digest,
-  limits,
-  budget,
-  intakeNamespace,
-  parseIntakeHead,
-  reconstructIntakeEvidence,
-  type Head,
-} from '../intake-state-evidence.ts';
+import { storedIntakeDetails, intakeDetails, registerIntakeFile } from '../intake-state-access.ts';
+import { readIntakeEnvelopeText, stageIntakeEnvelope } from '../intake-authority.ts';
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
+import { contributorAuthorityPath } from '../contributor-record-storage.ts';
+import { normalizeIntakeJson, serializeIntakeJson } from '../intake-state-codec.ts';
+import { digest } from '../intake-state-evidence.ts';
 
 const intakeId = 'fictional-contributor-intake';
 const publicOperation = 'fictional-public-acceptance-operation';
@@ -74,48 +57,7 @@ function retainedFiles(root: string, id: string) {
   return found;
 }
 function selected(db: Database, id: string, sourceHash: string) {
-  const identity = { profileId: id, intakeId, sourceHash };
-  const get = (key: string) => db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
-  const caps = limits();
-  const head = parseIntakeHead(get(intakeNamespace(identity) + 'head'), identity, caps);
-  return serializeIntakeJson(reconstructIntakeEvidence(identity, caps, head!, get).value);
-}
-// Seed fictional retained evidence through the pure framing contract. The contributor
-// runtime primitive intentionally has no accepted-record backend and remains refused.
-function appendEvidence(db: Database, id: string, sourceHash: string, values: IntakeJson[]) {
-  const identity = { profileId: id, intakeId, sourceHash };
-  const caps = limits();
-  let previous: Head | undefined;
-  let before: IntakeJson | undefined;
-  for (const next of values) {
-    const changes = before ? intakeChanges(before, next) : [{ op: 'set', path: [], value: next }];
-    const remaining = budget(
-      caps,
-      previous?.usage ?? { bytes: 0, frames: 0, nodes: 0, operations: 0, stringWork: 0 },
-    );
-    const applied = applyIntakeChanges(before, changes, remaining);
-    const operationId = randomUUID();
-    const evidence = frameIntakeChanges(
-      identity,
-      changes,
-      digest(serializeIntakeJson(applied)),
-      operationId,
-      caps,
-      previous,
-      remaining,
-    );
-    for (const frame of evidence.frames)
-      db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(frame.key, frame.serialized);
-    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
-      intakeNamespace(identity) + 'operation:' + operationId,
-      evidence.receipt,
-    );
-    db.prepare(
-      'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-    ).run(intakeNamespace(identity) + 'head', evidence.serializedHead);
-    previous = evidence.head;
-    before = applied;
-  }
+  return createIntakeStateStorage(db, { profileId: id, intakeId, sourceHash }).readSerialized();
 }
 async function fixture(t: TestContext) {
   const root = mkdtempSync(resolve(tmpdir(), 'contributor-intake-copy-'));
@@ -136,191 +78,203 @@ async function fixture(t: TestContext) {
   const sourceHash = digest(bytes);
   const unrelatedBytes = Buffer.from('Independently fictional unrelated provider payload.');
   writeFileSync(resolve(profilePaths(root, source.id).sources, 'unrelated.txt'), unrelatedBytes);
-  db.prepare(
-    'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-  ).run(
-    'fictional-unrelated-source',
-    `data/profiles/${source.id}/sources/unrelated.txt`,
-    digest(unrelatedBytes),
-    unrelatedBytes.length,
-    'source',
-    ' {"providerOriginal" : "fictional"} ',
-  );
-  const path = `data/profiles/${source.id}/sources/fictional.txt`;
-  writeFileSync(resolve(root, path), bytes);
-  const intake = {
-    originalName: 'fictional.txt',
-    createdAt: '2026-01-12T00:00:00.000Z',
-    version: 7,
-    state: 'pending',
-    validation: {},
-    proposals: [
-      { id: 'proposal-pending', fileId: intakeId, summary: 'Fictional pending proposal' },
-    ],
-    acceptedProposalId: null,
-    imported: null,
-    workflow: {
-      format: 'health-intake-workflow-v1',
-      questions: [
-        { id: 'question-pending', question: 'Fictional unresolved question?', answer: null },
-      ],
-      candidates: [
-        { id: 'candidate-pending', versionId: 'candidate-version', recordId: 'record-pending' },
-      ],
-      plans: [
-        {
-          id: 'plan-pending',
-          units: [{ id: 'unit-pending', locator: 'Fictional page 1', status: 'pending' }],
-        },
-      ],
-      decisions: [
-        {
-          id: 'decision-prior',
-          candidateId: 'candidate-prior',
-          candidateVersionId: 'version-prior',
-          recordId: 'record-prior',
-          action: 'accept',
-          mapping: { valueText: '10.00' },
-          scope: 'record',
-          at: '2026-01-11T00:00:00.000Z',
-        },
-      ],
-      reviewDrafts: [
-        {
-          id: 'draft-pending',
-          proposalId: 'proposal-pending',
-          recordId: 'record-pending',
-          candidateId: 'candidate-pending',
-          candidateVersionId: 'candidate-version',
-          disposition: 'review_later',
-          mapping: { valueText: '12.00' },
-          at: '2026-01-12T00:00:00.000Z',
-        },
-      ],
-      reportAcceptances: [
-        {
-          fingerprint: 'fictional-public-fingerprint',
-          receipt: {
-            version: 1,
-            operationId: publicOperation,
-            status: 'completed',
-            at: '2026-01-11T00:00:00.000Z',
-            receipts: [{ id: 'public-receipt', recordId: 'record-prior' }],
-          },
-        },
-      ],
-    },
-    unknownFuture: { second: 'Fictional nested text Ω', first: null },
-  };
-  const raw = ` { "before" : {"escaped":"\\u03A9","duplicate":1,"duplicate":2}, "intake" : ${JSON.stringify(intake)}, "after" : "fictional" }\n`;
-  db.prepare(
-    'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-  ).run(intakeId, path, sourceHash, bytes.length, 'intake_original', raw);
-  const revisionId = randomUUID();
-  const priorId = randomUUID();
-  const blob = (value: unknown) => {
-    const raw = JSON.stringify(value);
-    const hash = digest(raw);
-    db.prepare('INSERT OR IGNORE INTO app_meta(key,value) VALUES(?,?)').run(
-      `intake_source_text:v1:${intakeId}:blob:${hash}`,
-      raw,
+  const { raw, current, corrected } = transaction(db, () => {
+    db.prepare(
+      'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+    ).run(
+      'fictional-unrelated-source',
+      `data/profiles/${source.id}/sources/unrelated.txt`,
+      digest(unrelatedBytes),
+      unrelatedBytes.length,
+      'source',
+      ' {"providerOriginal" : "fictional"} ',
     );
-    return hash;
-  };
-  const relationRef = blob([]);
-  for (const [id, parentRevisionId, human] of [
-    [priorId, null, false],
-    [revisionId, priorId, true],
-  ] as const) {
-    const header = {
-      format: 'intake-source-text-v1',
-      id,
-      parentRevisionId,
-      profileId: source.id,
-      intakeId,
-      sourceHash,
+    const path = `data/profiles/${source.id}/sources/fictional.txt`;
+    writeFileSync(resolve(root, path), bytes);
+    const intake = {
+      originalName: 'fictional.txt',
       createdAt: '2026-01-12T00:00:00.000Z',
-      adapter: { name: 'fictional-contributor-text', version: '1' },
-      review: human
-        ? {
-            operationId: randomUUID(),
-            expectedRevisionId: priorId,
-            action: 'correct',
-            scope: { page: 1 },
-            actor: 'fictional-authenticated-owner',
-            at: '2026-01-12T00:00:00.000Z',
-          }
-        : null,
-      protectedPages: human ? [1] : [],
-    };
-    const pageRef = blob({
-      page: { page: 1, disposition: 'extracted', inspected: human },
-      spans: [
-        {
-          id: 'fictional-span',
-          text: human
-            ? 'Fictional human corrected value 10.00.'
-            : 'Fictional extracted value 10.00.',
-          region: { page: 1 },
-          provenance: human ? 'human' : 'native',
-        },
+      version: 7,
+      state: 'pending',
+      validation: {},
+      proposals: [
+        { id: 'proposal-pending', fileId: intakeId, summary: 'Fictional pending proposal' },
       ],
-      issues: [],
+      acceptedProposalId: null,
+      imported: null,
+      workflow: {
+        format: 'health-intake-workflow-v1',
+        questions: [
+          { id: 'question-pending', question: 'Fictional unresolved question?', answer: null },
+        ],
+        candidates: [
+          { id: 'candidate-pending', versionId: 'candidate-version', recordId: 'record-pending' },
+        ],
+        plans: [
+          {
+            id: 'plan-pending',
+            units: [{ id: 'unit-pending', locator: 'Fictional page 1', status: 'pending' }],
+          },
+        ],
+        decisions: [
+          {
+            id: 'decision-prior',
+            candidateId: 'candidate-prior',
+            candidateVersionId: 'version-prior',
+            recordId: 'record-prior',
+            action: 'accept',
+            mapping: { valueText: '10.00' },
+            scope: 'record',
+            at: '2026-01-11T00:00:00.000Z',
+          },
+        ],
+        reviewDrafts: [
+          {
+            id: 'draft-pending',
+            proposalId: 'proposal-pending',
+            recordId: 'record-pending',
+            candidateId: 'candidate-pending',
+            candidateVersionId: 'candidate-version',
+            disposition: 'review_later',
+            mapping: { valueText: '12.00' },
+            at: '2026-01-12T00:00:00.000Z',
+          },
+        ],
+        reportAcceptances: [
+          {
+            fingerprint: 'fictional-public-fingerprint',
+            receipt: {
+              version: 1,
+              operationId: publicOperation,
+              status: 'completed',
+              at: '2026-01-11T00:00:00.000Z',
+              receipts: [{ id: 'public-receipt', recordId: 'record-prior' }],
+            },
+          },
+        ],
+      },
+      unknownFuture: { second: 'Fictional nested text Ω', first: null },
+    };
+    const raw = ` { "before" : {"escaped":"\\u03A9","duplicate":1,"duplicate":2}, "intake" : ${JSON.stringify(intake)}, "after" : "fictional" }\n`;
+    registerIntakeFile(db, {
+      id: intakeId,
+      providerId: null,
+      batchId: null,
+      path,
+      bytes,
+      mimeType: 'text/plain',
+      kind: 'intake_original',
+      coverage: 'unknown',
+      details: raw,
     });
-    const value = { header, pageRefs: [pageRef], relationRef };
+    const revisionId = randomUUID();
+    const priorId = randomUUID();
+    const blob = (value: unknown) => {
+      const raw = JSON.stringify(value);
+      const hash = digest(raw);
+      db.prepare('INSERT OR IGNORE INTO app_meta(key,value) VALUES(?,?)').run(
+        `intake_source_text:v1:${intakeId}:blob:${hash}`,
+        raw,
+      );
+      return hash;
+    };
+    const relationRef = blob([]);
+    for (const [id, parentRevisionId, human] of [
+      [priorId, null, false],
+      [revisionId, priorId, true],
+    ] as const) {
+      const header = {
+        format: 'intake-source-text-v1',
+        id,
+        parentRevisionId,
+        profileId: source.id,
+        intakeId,
+        sourceHash,
+        createdAt: '2026-01-12T00:00:00.000Z',
+        adapter: { name: 'fictional-contributor-text', version: '1' },
+        review: human
+          ? {
+              operationId: randomUUID(),
+              expectedRevisionId: priorId,
+              action: 'correct',
+              scope: { page: 1 },
+              actor: 'fictional-authenticated-owner',
+              at: '2026-01-12T00:00:00.000Z',
+            }
+          : null,
+        protectedPages: human ? [1] : [],
+      };
+      const pageRef = blob({
+        page: { page: 1, disposition: 'extracted', inspected: human },
+        spans: [
+          {
+            id: 'fictional-span',
+            text: human
+              ? 'Fictional human corrected value 10.00.'
+              : 'Fictional extracted value 10.00.',
+            region: { page: 1 },
+            provenance: human ? 'human' : 'native',
+          },
+        ],
+        issues: [],
+      });
+      const value = { header, pageRefs: [pageRef], relationRef };
+      db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
+        `intake_source_text:v1:${intakeId}:revision:${id}`,
+        JSON.stringify({ value, sha256: digest(JSON.stringify(value)) }),
+      );
+    }
     db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
-      `intake_source_text:v1:${intakeId}:revision:${id}`,
-      JSON.stringify({ value, sha256: digest(JSON.stringify(value)) }),
+      `intake_source_text:v1:${intakeId}:head`,
+      JSON.stringify({ revisionId, sourceHash }),
     );
-  }
-  db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
-    `intake_source_text:v1:${intakeId}:head`,
-    JSON.stringify({ revisionId, sourceHash }),
-  );
-  writeIntakeSourcePin(db, intakeId, {
-    revisionId,
-    dependencyToken: 'fictional-material-token',
-    requiresInterpretation: true,
-    version: 3,
+    writeIntakeSourcePin(db, intakeId, {
+      revisionId,
+      dependencyToken: 'fictional-material-token',
+      requiresInterpretation: true,
+      version: 3,
+    });
+    const corrected = getIntakeSourceText(db, root, source.id, intakeId);
+    const initial = normalizeIntakeJson(JSON.parse(raw));
+    const reordered = normalizeIntakeJson({
+      after: initial.after,
+      intake: initial.intake,
+      before: initial.before,
+    });
+    const current = normalizeIntakeJson({
+      ...reordered,
+      intake: {
+        ...(reordered.intake as Record<string, unknown>),
+        unknownFuture: { first: null, second: 'Fictional exact nested changed text Ω 😀' },
+      },
+    });
+    for (const value of [initial, reordered, current])
+      stageIntakeEnvelope(db, { id: intakeId }, value);
+    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
+      'unrelated-fictional-metadata',
+      '{"b":2,"a":1}',
+    );
+    db.exec(
+      "INSERT INTO providers(id,name) VALUES('fictional-clinic','Fictional Clinic'); INSERT INTO test_types(id,label) VALUES('fictional-type','Fictional accepted reach')",
+    );
+    db.prepare('INSERT INTO source_records(id,source_file_id,raw_json) VALUES(?,?,?)').run(
+      'fictional-accepted-source',
+      intakeId,
+      '{"literal":"10.00"}',
+    );
+    db.prepare(
+      'INSERT INTO observations(id,test_type_id,source_record_id,label,value_text,value_numeric,unit) VALUES(?,?,?,?,?,?,?)',
+    ).run(
+      'fictional-observation',
+      'fictional-type',
+      'fictional-accepted-source',
+      'Fictional accepted reach',
+      '10.00',
+      10,
+      'cm',
+    );
+    return { raw, current, corrected };
   });
-  const corrected = getIntakeSourceText(db, root, source.id, intakeId);
-  const initial = normalizeIntakeJson(JSON.parse(raw));
-  const reordered = normalizeIntakeJson({
-    after: initial.after,
-    intake: initial.intake,
-    before: initial.before,
-  });
-  const current = normalizeIntakeJson({
-    ...reordered,
-    intake: {
-      ...(reordered.intake as IntakeJson),
-      unknownFuture: { first: null, second: 'Fictional exact nested changed text Ω 😀' },
-    },
-  });
-  appendEvidence(db, source.id, sourceHash, [initial, reordered, current]);
-  db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
-    'unrelated-fictional-metadata',
-    '{"b":2,"a":1}',
-  );
-  db.exec(
-    "INSERT INTO providers(id,name) VALUES('fictional-clinic','Fictional Clinic'); INSERT INTO test_types(id,label) VALUES('fictional-type','Fictional accepted reach')",
-  );
-  db.prepare('INSERT INTO source_records(id,source_file_id,raw_json) VALUES(?,?,?)').run(
-    'fictional-accepted-source',
-    intakeId,
-    '{"literal":"10.00"}',
-  );
-  db.prepare(
-    'INSERT INTO observations(id,test_type_id,source_record_id,label,value_text,value_numeric,unit) VALUES(?,?,?,?,?,?,?)',
-  ).run(
-    'fictional-observation',
-    'fictional-type',
-    'fictional-accepted-source',
-    'Fictional accepted reach',
-    '10.00',
-    10,
-    'cm',
-  );
   exportCuration(db, root, source.id);
   const sourceFiles = retainedFiles(root, source.id);
   const sourceRows = Object.fromEntries(
@@ -362,13 +316,12 @@ async function fixture(t: TestContext) {
 }
 function verify(f: Awaited<ReturnType<typeof fixture>>, id: string) {
   const db = f.databases.get(id)!;
-  loadPortable(f.root, id);
   assert.equal(selected(db, id, f.sourceHash), serializeIntakeJson(f.current));
   const file = db.prepare('SELECT * FROM source_files WHERE id=?').get(intakeId)!;
   assert.equal(
-    file.details_json,
-    f.raw,
-    'raw envelope whitespace, duplicate property and escape spelling are exact',
+    readIntakeEnvelopeText(db, { id: intakeId }),
+    serializeIntakeJson(f.current),
+    'the selected full envelope retains outer member order and exact normalized content',
   );
   const unrelated = db
     .prepare('SELECT * FROM source_files WHERE id=?')
@@ -398,18 +351,20 @@ function verify(f: Awaited<ReturnType<typeof fixture>>, id: string) {
     db.prepare('SELECT value FROM app_meta WHERE key=?').get('unrelated-fictional-metadata')!.value,
     '{"b":2,"a":1}',
   );
-  assert.throws(
-    () =>
-      createIntakeStateStorage(db, {
-        profileId: id,
-        intakeId,
-        sourceHash: f.sourceHash,
-      }).readSerialized(),
-    /configured|authority|durability/i,
+  assert.equal(
+    createIntakeStateStorage(db, {
+      profileId: id,
+      intakeId,
+      sourceHash: f.sourceHash,
+    }).readSerialized(),
+    serializeIntakeJson(f.current),
   );
+  const compact = JSON.parse(String(file.details_json));
+  assert.equal(compact.intakeAuthority.mode, 'normalized');
+  assert.equal(compact.intake.workflow, undefined);
 }
 
-test('real contributor copy retains exact staged review, raw originals and human text through independent reopen and complete cache loss', async (t) => {
+test('real contributor copy retains exact active review, originals and human text through independent reopen and complete cache loss', async (t) => {
   const f = await fixture(t);
   const copy = await f.actions.create({ name: copiedName, operationId: randomUUID() }, f.source.id);
   verify(f, copy.id);
@@ -517,31 +472,40 @@ test('real immutable-write and staged selected-head failures refuse publication 
       const f = await fixture(child);
       const operationId = randomUUID();
       let targetId = '';
+      const link = fs.linkSync;
+      let hits = 0;
+      const injected = child.mock.method(fs, 'linkSync', (...args: Parameters<typeof link>) => {
+        if (
+          kind === 'immutable-write' &&
+          String(args[1]).includes('/profile-staging/') &&
+          String(args[1]).includes('/records/objects/')
+        ) {
+          hits++;
+          throw Error('Fictional immutable authority write failure');
+        }
+        return link(...args);
+      });
+      syncBuiltinESMExports();
       const interrupted = createProfileLifecycle({
         root: f.root,
         databases: f.databases,
         copyCheckpoint(point, context) {
           targetId = context.targetProfileId;
           const paths = profilePaths(context.stageRoot, targetId);
-          if (kind === 'immutable-write' && point === 'before-export') {
-            mkdirSync(resolve(paths.personal, 'snapshots'), { recursive: true });
-            rmSync(resolve(paths.personal, 'snapshots'), { recursive: true });
-            writeFileSync(
-              resolve(paths.personal, 'snapshots'),
-              'fictional immutable-directory blocker',
-            );
-          }
           if (kind === 'staged-head' && point === 'exported')
             writeFileSync(
-              resolve(paths.curation, 'current.json'),
+              resolve(paths.root, 'records/head'),
               '{"fictional":"invalid selected head"}',
             );
         },
       });
       await assert.rejects(
         interrupted.create({ name: copiedName, operationId }, f.source.id),
-        /snapshot|directory|manifest|ENOTDIR/i,
+        /snapshot|directory|manifest|ENOTDIR|authority|head/i,
       );
+      injected.mock.restore();
+      syncBuiltinESMExports();
+      if (kind === 'immutable-write') assert.ok(hits > 0);
       assert.equal(existsSync(profilePaths(f.root, targetId).root), false);
       assert.equal(f.databases.has(targetId), false);
       assert.deepEqual(readdirSync(resolve(f.root, 'data/operations/profile-staging')), []);
@@ -623,7 +587,6 @@ test('invalid selected source evidence fails explicitly without resetting scope 
         f.db
           .prepare('UPDATE app_meta SET value=? WHERE key=?')
           .run(String(row.value) + ' ', row.key!);
-        exportCuration(f.db, f.root, f.source.id);
       },
     ],
     [
@@ -635,7 +598,6 @@ test('invalid selected source evidence fails explicitly without resetting scope 
         const head = JSON.parse(String(row.value));
         head.format = 'unsupported-fictional-intake-format';
         f.db.prepare('UPDATE app_meta SET value=? WHERE key=?').run(JSON.stringify(head), row.key!);
-        exportCuration(f.db, f.root, f.source.id);
       },
     ],
     [
@@ -647,7 +609,6 @@ test('invalid selected source evidence fails explicitly without resetting scope 
         const head = JSON.parse(String(row.value));
         head.profileId = 'foreign-fictional-owner';
         f.db.prepare('UPDATE app_meta SET value=? WHERE key=?').run(JSON.stringify(head), row.key!);
-        exportCuration(f.db, f.root, f.source.id);
       },
     ],
     [
@@ -659,7 +620,25 @@ test('invalid selected source evidence fails explicitly without resetting scope 
         const head = JSON.parse(String(row.value));
         head.intakeId = 'foreign-fictional-source';
         f.db.prepare('UPDATE app_meta SET value=? WHERE key=?').run(JSON.stringify(head), row.key!);
-        exportCuration(f.db, f.root, f.source.id);
+      },
+    ],
+    [
+      'missing-namespace',
+      (f) => f.db.prepare("DELETE FROM app_meta WHERE key GLOB 'intake_state_*'").run(),
+    ],
+    [
+      'duplicated-inline-authority',
+      (f) => f.db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(f.raw, intakeId),
+    ],
+    [
+      'conflicting-compact-metadata',
+      (f) => {
+        const row = f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intakeId)!;
+        const compact = JSON.parse(String(row.details_json));
+        compact.intake.originalName = 'Fictional conflicting name';
+        f.db
+          .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+          .run(JSON.stringify(compact), intakeId);
       },
     ],
     [
@@ -702,14 +681,14 @@ test('invalid selected source evidence fails explicitly without resetting scope 
           )
           .get()!;
         f.db.prepare('UPDATE app_meta SET value=? WHERE key=?').run('{}', row.key!);
-        exportCuration(f.db, f.root, f.source.id);
       },
     ],
   ];
   for (const [name, corrupt] of cases)
     await t.test(name, async (child) => {
       const f = await fixture(child);
-      corrupt(f);
+      if (name === 'unpublished-sql-state') corrupt(f);
+      else transaction(f.db, () => corrupt(f));
       const evidence = rows(f.db, 'app_meta');
       await assert.rejects(
         f.actions.create({ name: copiedName, operationId: randomUUID() }, f.source.id),
@@ -875,14 +854,14 @@ test('actual final rename errors before and after side effect preserve the corre
     });
 });
 
-test('published corrupt portable authority or stale cache refuses retry and is retained for explicit recovery', async (t) => {
-  for (const kind of ['portable-head', 'stale-cache'] as const)
+test('published corrupt record authority or stale cache refuses retry and is retained for explicit recovery', async (t) => {
+  for (const kind of ['record-head', 'stale-cache'] as const)
     await t.test(kind, async (child) => {
       const f = await fixture(child);
       const operationId = randomUUID();
       const target = await f.actions.create({ name: copiedName, operationId }, f.source.id);
-      if (kind === 'portable-head')
-        writeFileSync(resolve(profilePaths(f.root, target.id).curation, 'current.json'), '{}');
+      if (kind === 'record-head')
+        writeFileSync(resolve(contributorAuthorityPath(f.root, target.id), 'head'), '{}');
       else
         f.databases
           .get(target.id)!
@@ -900,37 +879,75 @@ test('published corrupt portable authority or stale cache refuses retry and is r
     });
 });
 
-test('copy deliberately discards copied source record projections without configuring a contributor record backend', async (t) => {
+test('active completed-copy retry requires the actual selected head and acknowledged target state', async (t) => {
+  for (const kind of ['missing-head', 'corrupt-head', 'unacknowledged-sql'] as const)
+    await t.test(kind, async (child) => {
+      const f = await fixture(child);
+      const operationId = randomUUID();
+      const target = await f.actions.create({ name: copiedName, operationId }, f.source.id);
+      const db = f.databases.get(target.id)!;
+      assert.equal(db.isOpen, true);
+      assert.equal(
+        (await f.actions.create({ name: copiedName, operationId }, f.source.id)).id,
+        target.id,
+      );
+      createNote(db, {
+        title: 'Fictional acknowledged target advance',
+        content: 'Retained by valid active retry',
+      });
+      const acceptedArchive = retainedFiles(f.root, target.id);
+      assert.equal(
+        (await f.actions.create({ name: copiedName, operationId }, f.source.id)).id,
+        target.id,
+      );
+      assert.deepEqual(retainedFiles(f.root, target.id), acceptedArchive);
+      const head = resolve(contributorAuthorityPath(f.root, target.id), 'head');
+      if (kind === 'missing-head') rmSync(head);
+      else if (kind === 'corrupt-head')
+        writeFileSync(head, '{"fictional":"invalid selected record head"}');
+      else
+        db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
+          'fictional-unacknowledged-target-write',
+          'must not become accepted through retry',
+        );
+      const before = retainedFiles(f.root, target.id);
+      const selectedRows = rows(db, 'app_meta');
+      await assert.rejects(
+        f.actions.create({ name: copiedName, operationId }, f.source.id),
+        /head|authority|durability|projection|uncommitted|transaction/i,
+      );
+      assert.equal(f.databases.get(target.id), db, 'exercise the still-active target branch');
+      assert.equal(db.isOpen, true);
+      assert.deepEqual(
+        retainedFiles(f.root, target.id),
+        before,
+        'refusal preserves retained target authority without recopy',
+      );
+      assert.deepEqual(
+        rows(db, 'app_meta'),
+        selectedRows,
+        'retry does not publish or discard unacknowledged SQL',
+      );
+      assert.deepEqual(retainedFiles(f.root, f.source.id), f.sourceFiles);
+      assert.equal(
+        readProfileRegistry(f.root).profiles.filter((profile) => profile.id === target.id).length,
+        1,
+      );
+    });
+});
+
+test('copy seeds target accepted record authority without retaining source version identities', async (t) => {
   const f = await fixture(t);
-  f.db.exec(
-    'CREATE TABLE __record_current(entity TEXT NOT NULL,record_id TEXT NOT NULL,version_id TEXT NOT NULL,PRIMARY KEY(entity,record_id))',
-  );
-  f.db
-    .prepare('INSERT INTO __record_current VALUES(?,?,?)')
-    .run('observation', 'fictional-observation', 'fictional-source-only-version');
-  exportCuration(f.db, f.root, f.source.id);
   const sourceArchive = retainedFiles(f.root, f.source.id);
+  const sourceVersions = new Set(rows(f.db, '__record_current').map((row) => row.version_id));
+  assert.ok(sourceVersions.size > 0);
   const target = await f.actions.create(
     { name: copiedName, operationId: randomUUID() },
     f.source.id,
   );
-  assert.equal(
-    f.databases
-      .get(target.id)!
-      .prepare("SELECT count(*) n FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'")
-      .get()!.n,
-    0,
-  );
-  assert.deepEqual(
-    rows(f.db, '__record_current'),
-    [
-      {
-        entity: 'observation',
-        record_id: 'fictional-observation',
-        version_id: 'fictional-source-only-version',
-      },
-    ].map((row) => Object.assign(Object.create(null), row)),
-  );
+  const targetVersions = rows(f.databases.get(target.id)!, '__record_current');
+  assert.ok(targetVersions.length > 0);
+  for (const row of targetVersions) assert.equal(sourceVersions.has(row.version_id), false);
   assert.deepEqual(retainedFiles(f.root, f.source.id), sourceArchive);
   verify(f, target.id);
 });
@@ -1101,8 +1118,10 @@ test('copied saved People state retains public receipt and archives exact source
   const restoreKey = 'personal_restore_' + randomUUID();
   const genericRaw = ` { "profileId" : "${source.id}", "proposalId":"${genericKey.slice('personal_assistant_'.length)}", "noteId":"${accepted.noteId}", "kind":"person", "version":${accepted.version}, "fictional" : "\\u03A9", "duplicate":1,"duplicate":2 }\n`;
   const restoreRaw = ` { "profileId" : "${source.id}", "operationId":"${restoreKey.slice('personal_restore_'.length)}", "fingerprint":"fictional-restore-fingerprint", "noteId":"${accepted.noteId}", "previousVersion":1,"currentVersion":2, "fictionalRestore" : true }\n`;
-  db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(genericKey, genericRaw);
-  db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(restoreKey, restoreRaw);
+  transaction(db, () => {
+    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(genericKey, genericRaw);
+    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(restoreKey, restoreRaw);
+  });
   exportCuration(db, root, source.id);
   const sourceArchive = retainedFiles(root, source.id);
   const target = await actions.create(
@@ -1193,4 +1212,87 @@ test('published target with wrong owner, intake identity or original bytes never
       assert.deepEqual(retainedFiles(f.root, f.source.id), f.sourceFiles);
       assert.equal(f.databases.has(target.id), false);
     });
+});
+
+test('contributor raw initial authority survives private copy and cache loss, then normalizes only the edited target', async (t) => {
+  const root = mkdtempSync(resolve(tmpdir(), 'contributor-raw-intake-copy-'));
+  const databases = new Map<string, Database>();
+  const actions = createProfileLifecycle({ root, databases });
+  t.after(() => {
+    for (const db of databases.values()) if (db.isOpen) db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const source = await actions.create({
+    name: 'Fictional raw source',
+    fullName: 'Fictional raw source',
+    birthDate: '1982-04-17',
+  });
+  const db = databases.get(source.id)!;
+  const bytes = Buffer.from('Fictional source original, untouched by review.');
+  const path = `data/profiles/${source.id}/sources/raw-original.txt`;
+  writeFileSync(resolve(root, path), bytes);
+  const raw =
+    ' {"before":{"escaped":"\\u03A9","duplicate":1,"duplicate":2}, "intake":{"originalName":"raw-original.txt","version":1,"state":"pending","proposals":[],"workflow":{"format":"health-intake-workflow-v1","questions":[]}}, "after":true}\n';
+  transaction(db, () =>
+    registerIntakeFile(db, {
+      id: intakeId,
+      providerId: null,
+      batchId: null,
+      path,
+      bytes,
+      mimeType: 'text/plain',
+      kind: 'intake_original',
+      coverage: 'unknown',
+      details: raw,
+    }),
+  );
+  const sourceArchive = retainedFiles(root, source.id);
+  const copy = await actions.create(
+    { name: 'Fictional raw copy', operationId: randomUUID() },
+    source.id,
+  );
+  const rebuild = (id: string) => {
+    databases.get(id)!.close();
+    databases.delete(id);
+    const paths = profilePaths(root, id);
+    for (const suffix of ['', '-wal', '-shm']) rmSync(paths.database + suffix, { force: true });
+    const recovered = rebuildProfile(
+      root,
+      id,
+      resolve(root, 'fictional-raw-rebuild-' + randomUUID()),
+    );
+    cpSync(recovered.database, paths.database);
+    const next = openDatabase(paths.database, id);
+    attachPersonalDurability(next, { root, profileId: id });
+    databases.set(id, next);
+    return next;
+  };
+  for (const id of [source.id, copy.id]) {
+    const current = rebuild(id);
+    assert.equal(readIntakeEnvelopeText(current, { id: intakeId }), raw);
+    assert.deepEqual(
+      createIntakeStateStorage(current, {
+        profileId: id,
+        intakeId,
+        sourceHash: digest(bytes),
+      }).read(),
+      { raw },
+    );
+    assert.deepEqual(
+      readFileSync(resolve(profilePaths(root, id).sources, 'raw-original.txt')),
+      bytes,
+    );
+  }
+  const normalized = JSON.parse(raw);
+  normalized.intake.workflow.questions.push({
+    id: 'fictional-target-only',
+    prompt: 'Fictional pending question?',
+  });
+  writeIntakeFixtureEnvelope(databases.get(copy.id)!, intakeId, normalized);
+  assert.equal(
+    readIntakeEnvelopeText(rebuild(copy.id), { id: intakeId }),
+    JSON.stringify(normalized),
+  );
+  assert.equal(readIntakeEnvelopeText(databases.get(source.id)!, { id: intakeId }), raw);
+  assert.deepEqual(retainedFiles(root, source.id), sourceArchive);
 });

@@ -10,6 +10,7 @@ import {
   rmSync,
   rmdirSync,
   realpathSync,
+  lstatSync,
 } from 'node:fs';
 import { resolve, dirname, isAbsolute, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -20,6 +21,12 @@ import { validProfileId, profileDefinition } from './profiles.ts';
 import { safeLegacyDatabasePath, legacyDatabaseFile } from './profile-ownership.ts';
 import { writeProfileRegistry } from './profile-registry.ts';
 import { writePortableSources } from './portable.ts';
+import { hasContributorAuthority } from './contributor-record-storage.ts';
+import {
+  assertContributorCopyCoherence,
+  copyContributorAuthority,
+  rebuildContributorDatabase,
+} from './contributor-durability.ts';
 import { copyAssistantJournals } from './assistant-journal.ts';
 import { copyIntakeBatchJournals } from './intake-batch-journal.ts';
 import type { Database, SqliteRow } from './database.ts';
@@ -85,6 +92,8 @@ export async function createBackup(
       .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
       .get()?.value;
     if (owner !== profileId) throw new Error('Backup profile mismatch');
+    const contributor = hasContributorAuthority(root, profileId);
+    if (contributor) assertContributorCopyCoherence(db, root, profileId, snapshot);
     if (snapshot.prepare("SELECT value FROM app_meta WHERE key='personal_conflict'").get()?.value)
       throw new Error(
         'Resolve the newer portable personal history before creating a database-based backup',
@@ -106,9 +115,31 @@ export async function createBackup(
       mkdirSync(dirname(target), { recursive: true });
       copyFileSync(source, target);
     }
+    if (contributor) {
+      // Selected history can reference originals no longer in current rows.
+      // Keep their physical evidence for historical verification during rebuild.
+      const retain = (path: string): void => {
+        const full = resolve(root, path),
+          stat = lstatSync(full);
+        if (stat.isDirectory()) {
+          for (const name of readdirSync(full)) retain(path + '/' + name);
+        } else if (stat.isFile()) {
+          if (files.has(path)) return;
+          const bytes = readFileSync(profileFile(root, path, profileId));
+          files.set(path, { path, bytes: bytes.length, sha256: hash(bytes) });
+          const target = resolve(pending, 'files', path);
+          mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+          copyFileSync(full, target);
+        } else throw Error('Backup original tree contains nonregular files');
+      };
+      for (const kind of ['sources', 'attachments']) {
+        const path = `${profilePaths(root, profileId).relativeRoot}/${kind}`;
+        if (existsSync(resolve(root, path))) retain(path);
+      }
+    }
     const tables = snapshot
       .prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_*' ORDER BY name",
       )
       .all()
       .map((r) => r.name as string);
@@ -126,6 +157,7 @@ export async function createBackup(
     const paths = profilePaths(root, profileId),
       currentPath = paths.database;
     const modern =
+      contributor ||
       (existsSync(currentPath) &&
         realpathSync(db.location() as string) === realpathSync(currentPath)) ||
       (existsSync(resolve(paths.personal, 'current.json')) &&
@@ -134,6 +166,9 @@ export async function createBackup(
     const profileSources: BackupFileReceipt[] = [];
     if (modern) {
       const retainedPaths = [
+        ...(contributor
+          ? copyContributorAuthority(root, profileId, resolve(pending, 'files'))
+          : []),
         ...writePortableSources(snapshot, root, profileId, resolve(pending, 'files')),
         ...copyAssistantJournals(root, profileId, resolve(pending, 'files')),
         ...copyIntakeBatchJournals(root, profileId, resolve(pending, 'files')),
@@ -142,7 +177,8 @@ export async function createBackup(
         const bytes = readFileSync(resolve(pending, 'files', path));
         const file = { path, bytes: bytes.length, sha256: hash(bytes) };
         if (
-          ['personal', 'curation', 'chats', 'intake-batches', 'mappings'].some((kind) =>
+          path === `${profilePaths(root, profileId).relativeRoot}/record-authority.json` ||
+          ['personal', 'curation', 'chats', 'intake-batches', 'mappings', 'records'].some((kind) =>
             path.startsWith(`${profilePaths(root, profileId).relativeRoot}/${kind}/`),
           )
         )
@@ -222,7 +258,9 @@ export function restoreBackup(backupDir: string, targetDir: string): RestoreResu
     throw new Error('Invalid backup file manifest');
   for (const f of profileSources)
     if (
-      !['personal', 'curation', 'chats', 'intake-batches', 'mappings'].some((kind) =>
+      f.path !==
+        `${profilePaths(backupDir, manifest.profileId).relativeRoot}/record-authority.json` &&
+      !['personal', 'curation', 'chats', 'intake-batches', 'mappings', 'records'].some((kind) =>
         f.path.startsWith(`${profilePaths(backupDir, manifest.profileId).relativeRoot}/${kind}/`),
       )
     )
@@ -274,7 +312,9 @@ export function restoreBackup(backupDir: string, targetDir: string): RestoreResu
         ? profilePaths(temp, manifest.profileId).database
         : legacyDatabaseFile(temp, legacyPath);
     mkdirSync(dirname(restoredDb), { recursive: true });
-    copyFileSync(dbPath, restoredDb);
+    if (hasContributorAuthority(temp, manifest.profileId))
+      rebuildContributorDatabase(restoredDb, temp, manifest.profileId);
+    else copyFileSync(dbPath, restoredDb);
     writeProfileRegistry(temp, [
       {
         id: manifest.profileId,

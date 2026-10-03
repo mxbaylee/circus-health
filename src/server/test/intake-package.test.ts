@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import { zipFixture, type ZipFixtureEntry } from '../../tests/fixtures/zip.ts';
 import { createImportDiagnostics } from '../import-diagnostics.ts';
 import test from 'node:test';
@@ -153,6 +154,7 @@ function fixture(
   const root = mkdtempSync(join(tmpdir(), 'fictional-package-')),
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -456,6 +458,7 @@ test('versioned role plans retain revisions and missing references across restar
     target = join(f.root, 'rebuilt');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const recovered = getIntake(db, target, f.profileId, f.id);
     assert.deepEqual(recovered.workflow, item.workflow);
