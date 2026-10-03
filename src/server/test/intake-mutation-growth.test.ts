@@ -159,9 +159,9 @@ for (const fullQualification of [false, true]) {
               freePages: f.db.prepare('PRAGMA freelist_count').get()!.freelist_count,
             },
             host: intakeWorkCounters(f.db),
-            lookup: intakeLookupCounters(f.db),
-            search: sourceDetailsSearchCounters(f.db),
-            text: sourceTextProjectionCounters(f.db),
+            lookup: structuredClone(intakeLookupCounters(f.db)),
+            search: structuredClone(sourceDetailsSearchCounters(f.db)),
+            text: structuredClone(sourceTextProjectionCounters(f.db)),
           });
           const parity = () => {
             const expected = f.db
@@ -461,6 +461,27 @@ for (const fullQualification of [false, true]) {
               );
             }
           }
+          phase = 'verify retained checkpoint counter snapshots';
+          for (const measurement of measurements) {
+            const persisted = JSON.parse(
+              readFileSync(
+                join(
+                  artifactRoot,
+                  measurement.checkpoint === 0
+                    ? 'initial.json'
+                    : `checkpoint-${measurement.checkpoint}.json`,
+                ),
+                'utf8',
+              ),
+            );
+            const frozen = measurement.checkpoint === 0 ? persisted.initial : persisted;
+            for (const group of ['lookup', 'search', 'text'] as const)
+              assert.deepEqual(
+                measurement[group],
+                frozen[group],
+                `${group} checkpoint counters must retain their measured values after later mutations`,
+              );
+          }
           phase = 'final workflow parity';
           const before = parity();
           const immutable = new Map(
@@ -497,6 +518,10 @@ for (const fullQualification of [false, true]) {
           const review = intake.reviewIntake(f.db, f.root, f.profileId, f.original.id, proposalId),
             record = review.records[0]!;
           const beforeSmall = measure(lastCycle);
+          writeFileSync(
+            join(artifactRoot, 'before-small.json'),
+            JSON.stringify(beforeSmall, null, 2),
+          );
           installSqlAudit();
           phase = 'small review draft after history';
           intake.saveIntakeReviewDraft(f.db, f.root, f.profileId, f.original.id, {
@@ -512,9 +537,22 @@ for (const fullQualification of [false, true]) {
             after: measure(lastCycle),
             sqlWrites: f.db.prepare('SELECT * FROM mutation_sql_writes ORDER BY table_name').all(),
           };
+          assert.ok(
+            smallAPI.after.lookup.projectionWrites > beforeSmall.lookup.projectionWrites,
+            'the real review draft must write its lookup projection',
+          );
+          assert.ok(
+            smallAPI.after.text.projectionWrites > beforeSmall.text.projectionWrites,
+            'the real review draft must write its source-text projection',
+          );
           writeFileSync(join(artifactRoot, 'small-api.json'), JSON.stringify(smallAPI, null, 2));
           phase = 'small draft consumer parity';
           parity();
+          const afterSmall = measure(lastCycle);
+          assert.ok(
+            afterSmall.search.requests > smallAPI.after.search.requests,
+            'consumer parity must issue real search requests after the draft API interval',
+          );
           const report = {
             qualification: {
               mode: fullQualification ? 'full-300' : 'ci-pipeline',
@@ -556,7 +594,7 @@ for (const fullQualification of [false, true]) {
             small: {
               before: beforeSmall,
               api: smallAPI,
-              after: measure(lastCycle),
+              after: afterSmall,
               sqlWrites: f.db
                 .prepare('SELECT * FROM mutation_sql_writes ORDER BY table_name')
                 .all(),
