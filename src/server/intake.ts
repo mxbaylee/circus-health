@@ -1,3 +1,4 @@
+import { cachedSourceContextVersions } from './intake-source-context-classification.ts';
 import {
   intakeDetails as details,
   registerIntakeFile as registerFile,
@@ -78,7 +79,6 @@ import {
   projectClinicalReview,
   refreshClinicalIdentityPolicy,
   retainedClinicalSourceRecord,
-  sourceContextEnvelope,
   validateClinicalPairScopes,
   datePrecision,
 } from './clinical-import.ts';
@@ -104,7 +104,7 @@ import {
   recordIntakeFileWork,
 } from './intake-file-work.ts';
 import { resolve, dirname, basename } from 'node:path';
-import { HttpError, required, safeText, transaction, revision, now, json } from './database.ts';
+import { HttpError, required, safeText, transaction, revision, now } from './database.ts';
 import { profilePaths, profileOriginal, safeRelative } from './profile-storage.ts';
 import { visibilityState, visibilitySQL, visibilityCondition } from './visibility.ts';
 import { exportCuration } from './portable.ts';
@@ -138,7 +138,6 @@ import type {
   IntakeReportSourceResult,
   IntakeReportSourceReview,
   IntakeReportQueueView,
-  IntakeValidation,
 } from '../shared/intake.ts';
 import type { IntakeEntry } from './intake-format.ts';
 import { parseIntakeSourcePin } from './intake-source-pin.ts';
@@ -450,71 +449,7 @@ function checkVersion(db: DatabaseSync, file: SourceFileRow, version: unknown): 
       ),
     );
 }
-const sourceContextVersionCache = new Map<string, Set<string>>();
-function cachedSourceContextVersions(
-  db: DatabaseSync,
-  root: string | null,
-  profileId: string,
-  file: SourceFileRow,
-  d: IntakeDetails,
-): Set<string> {
-  if (!root || !d.workflow?.candidates?.some((candidate) => candidate.versions?.length))
-    return new Set();
-  const unresolved = new Set<string>(
-    d.workflow.candidates.flatMap((candidate) =>
-      candidate.versions.filter((version) => !version.sourceContext).map((version) => version.id),
-    ),
-  );
-  if (!unresolved.size) return new Set();
-  const allowed = new Set<string>([file.id, ...(d.proposals || []).map((proposal) => proposal.id)]);
-  const referenced = new Set<string>(
-    d.workflow.candidates
-      .flatMap((candidate) => candidate.versions)
-      .filter((version) => unresolved.has(version.id))
-      .flatMap((version) => version.occurrences || [])
-      .map((occurrence) => occurrence.proposalId || file.id)
-      .filter((id) => allowed.has(id)),
-  );
-  const sourceIds = referenced.size ? referenced : allowed;
-  const contextVersions = new Set<string>();
-  for (const sourceId of sourceIds) {
-    const source =
-      sourceId === file.id
-        ? file
-        : (db.prepare('SELECT * FROM source_files WHERE id=?').get(sourceId) as
-            SourceFileRow | undefined);
-    if (!source) continue;
-    const validation =
-      sourceId === file.id
-        ? d.validation
-        : (json(source.details_json) as { validation?: IntakeValidation } | null)?.validation;
-    if (!validation?.valid || source.bytes > MAX_INTAKE_BYTES) continue;
-    const key = `${profileId}:${source.id}:${source.sha256}`;
-    let retained = sourceContextVersionCache.get(key);
-    if (!retained) {
-      retained = new Set<string>();
-      try {
-        const bytes = readFileSync(profileOriginal(root, source.path, profileId));
-        if (bytes.length !== source.bytes || hash(bytes) !== source.sha256) continue;
-        const parsed = validateJSONL(bytes);
-        if (parsed.valid)
-          for (const entry of parsed.entries)
-            if (sourceContextEnvelope(entry.value))
-              retained.add(
-                intakeCandidateVersionId(d, sourceId === file.id ? null : sourceId, entry),
-              );
-      } catch {
-        // DTO reads do not replace explicit source verification or review errors.
-        continue;
-      }
-      sourceContextVersionCache.set(key, retained);
-      if (sourceContextVersionCache.size > 128)
-        sourceContextVersionCache.delete(sourceContextVersionCache.keys().next().value!);
-    }
-    for (const versionId of retained) if (unresolved.has(versionId)) contextVersions.add(versionId);
-  }
-  return contextVersions;
-}
+
 function dto(
   db: DatabaseSync,
   root: string | null,

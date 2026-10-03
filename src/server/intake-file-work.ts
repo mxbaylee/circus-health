@@ -11,8 +11,9 @@ import {
 
 /** Filesystem API payload work for the calling intake APIs, not physical disk
  * traffic. Fixed numeric totals only; no paths, identities or file contents.
- * Stream reads/hashes are separate from whole-buffer reads/hashes. A failed
- * writeFileSync may have partially written bytes: attempts and failures expose
+ * Stream reads/hashes are separate from whole-buffer reads/hashes. Candidate
+ * version hashes have separate counters for actual serialized semantic input.
+ * A failed writeFileSync may have partially written bytes: attempts and failures expose
  * that uncertainty; successful payload bytes are not a total for failed writes.
  * Metadata syscalls, allocator/string copies, encrypted-vault/worker/HTTP upload
  * receiver I/O and unrelated consumers are outside these hooks. */
@@ -35,6 +36,8 @@ export function createIntakeFileWorkCounters() {
     bufferHashBytes: 0,
     textHashCalls: 0,
     textHashBytes: 0,
+    candidateVersionHashCalls: 0,
+    candidateVersionHashBytes: 0,
     verificationCacheHits: 0,
     fsyncAttempts: 0,
     fsyncCalls: 0,
@@ -65,6 +68,14 @@ export function recordIntakeFileHash(value: string | Uint8Array): void {
     counters.bufferHashCalls++;
     counters.bufferHashBytes += value.byteLength;
   }
+}
+/** Newly instrumented semantic version hashes; separate from existing file/text
+ * digest counters so their before/after meaning remains unchanged. */
+export function recordIntakeCandidateVersionHash(input: string): void {
+  const counters = scope.getStore();
+  if (!counters) return;
+  counters.candidateVersionHashCalls++;
+  counters.candidateVersionHashBytes += Buffer.byteLength(input);
 }
 export function readIntakeFileSync(path: PathOrFileDescriptor): Buffer {
   recordIntakeFileWork('readAttempts');

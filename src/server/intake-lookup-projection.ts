@@ -9,18 +9,18 @@ import {
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
   intakeEnvelopeAuthorityBinding,
-  readIntakeEnvelopeText,
+  readIntakeEnvelopeMaterialized,
   type IntakeEnvelopeSource,
 } from './intake-authority.ts';
 
 const PREFIX = '__record_intake_lookup_';
-const VERSION = 1;
+const VERSION = 2;
 const tables = {
   state: 'singleton,format,profile_id',
-  sources: 'source_id,source_order,kind,authority_key,authority_head',
+  sources: 'source_id,source_order,kind,authority_key,authority_head,identity_first',
   groups: 'source_id,ordinal,discovery_order',
-  acceptances: 'source_id,ordinal,operation_id,hash',
-  identities: 'source_id,ordinal,hash',
+  acceptances: 'source_id,operation_id,hash',
+  identities: 'source_id,id,next,hash',
   payloads: 'hash,payload',
 };
 export interface IntakeLookupCounters {
@@ -31,6 +31,9 @@ export interface IntakeLookupCounters {
   projectionRowsRead: number;
   projectionReadBytes: number;
   hashedPayloadBytes: number;
+  contributionItemsVisited: number;
+  serializedPayloadBytes: number;
+  identityLinksWritten: number;
   cleanupQueries: number;
   projectionWrites: number;
   projectionBytes: number;
@@ -40,6 +43,8 @@ interface Connection {
   rebuild: boolean;
   schema: number;
   counters: IntakeLookupCounters;
+  hashes: Map<string, string>;
+  entries: WeakMap<object, Map<string, ProjectionRow>>;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -49,11 +54,17 @@ const fail = (reason: string): never => {
 };
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
+function clearPayloadMemo(connection: Connection): void {
+  connection.hashes.clear();
+  connection.entries = new WeakMap();
+}
 function create(db: DatabaseSync): Connection {
   const connection: Connection = {
     dispose: () => {},
     rebuild: false,
     schema: -1,
+    hashes: new Map(),
+    entries: new WeakMap(),
     counters: {
       builds: 0,
       reconciledSources: 0,
@@ -62,13 +73,19 @@ function create(db: DatabaseSync): Connection {
       projectionRowsRead: 0,
       projectionReadBytes: 0,
       hashedPayloadBytes: 0,
+      contributionItemsVisited: 0,
+      serializedPayloadBytes: 0,
+      identityLinksWritten: 0,
       cleanupQueries: 0,
       projectionWrites: 0,
       projectionBytes: 0,
     },
   };
   connection.dispose = observeTransactionOutcome(db, (outcome) => {
-    if (!outcome.succeeded) connection.schema = -1;
+    if (!outcome.succeeded) {
+      clearPayloadMemo(connection);
+      connection.schema = -1;
+    }
   });
   connections.set(db, connection);
   return connection;
@@ -97,6 +114,9 @@ function tracking(db: DatabaseSync): void {
       INSERT OR IGNORE INTO __intake_lookup_dirty VALUES(OLD.id); END;`);
 }
 function initialize(db: DatabaseSync, connection: Connection, profile: string): void {
+  // Reconstruction cannot inherit text retained by an aborted attempt or an
+  // earlier schema/profile binding. Keep work counters across invalidation.
+  clearPayloadMemo(connection);
   const cold = connection.schema === -1;
   const names = db
     .prepare(
@@ -123,19 +143,26 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
       name === 'state'
         ? [1, 0, 0]
         : name === 'sources'
-          ? [1, 0, 0, 0, 0]
+          ? [1, 0, 0, 0, 0, 0]
           : name === 'payloads'
             ? [1, 0]
-            : name === 'groups' || name === 'identities'
-              ? [1, 2, 0]
-              : [1, 2, 0, 0];
+            : name === 'identities'
+              ? [1, 2, 0, 0]
+              : [1, 2, 0];
     valid &&= info.every(
       (column, index) =>
         Number(column.pk) === expectedPk[index] &&
         column.type ===
-          (['singleton', 'format', 'source_order', 'ordinal', 'discovery_order'].includes(
-            String(column.name),
-          )
+          ([
+            'singleton',
+            'format',
+            'source_order',
+            'ordinal',
+            'discovery_order',
+            'identity_first',
+            'id',
+            'next',
+          ].includes(String(column.name))
             ? 'INTEGER'
             : 'TEXT'),
     );
@@ -147,8 +174,8 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
           : name === 'groups'
             ? [0, 1]
             : name === 'identities'
-              ? [0, 1, 2]
-              : [0, 1, 3];
+              ? [0, 1, 3]
+              : [0, 1, 2];
     valid &&= required.every((index) => info[index]?.notnull === 1);
   }
   if (valid) {
@@ -164,12 +191,12 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
     for (const name of Object.keys(tables) as Array<keyof typeof tables>)
       db.exec(`DROP TABLE IF EXISTS ${table(name)}`);
     db.exec(`CREATE TABLE ${table('state')}(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format INTEGER NOT NULL,profile_id TEXT NOT NULL);
-      CREATE TABLE ${table('sources')}(source_id TEXT PRIMARY KEY,source_order INTEGER NOT NULL,kind TEXT NOT NULL,authority_key TEXT,authority_head TEXT);
+      CREATE TABLE ${table('sources')}(source_id TEXT PRIMARY KEY,source_order INTEGER NOT NULL,kind TEXT NOT NULL,authority_key TEXT,authority_head TEXT,identity_first INTEGER);
       CREATE TABLE ${table('groups')}(source_id TEXT NOT NULL,ordinal INTEGER NOT NULL,discovery_order INTEGER,PRIMARY KEY(source_id,ordinal));
       CREATE INDEX ${PREFIX}discovery ON ${table('groups')}(discovery_order DESC);
-      CREATE TABLE ${table('acceptances')}(source_id TEXT NOT NULL,ordinal INTEGER NOT NULL,operation_id TEXT,hash TEXT NOT NULL,PRIMARY KEY(source_id,ordinal));
+      CREATE TABLE ${table('acceptances')}(source_id TEXT NOT NULL,operation_id TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(source_id,operation_id));
       CREATE INDEX ${PREFIX}operation ON ${table('acceptances')}(operation_id);
-      CREATE TABLE ${table('identities')}(source_id TEXT NOT NULL,ordinal INTEGER NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(source_id,ordinal));
+      CREATE TABLE ${table('identities')}(source_id TEXT NOT NULL,id INTEGER NOT NULL,next INTEGER,hash TEXT NOT NULL,PRIMARY KEY(source_id,id));
       CREATE TABLE ${table('payloads')}(hash TEXT PRIMARY KEY,payload TEXT NOT NULL);`);
     db.prepare(`INSERT INTO ${table('state')} VALUES(1,?,?)`).run(VERSION, profile);
     db.exec('INSERT OR IGNORE INTO temp.__intake_lookup_dirty SELECT id FROM source_files');
@@ -233,10 +260,35 @@ function prune(db: DatabaseSync, connection: Connection, obsolete: Set<string>):
       ? Buffer.byteLength(JSON.stringify(retained))
       : 0;
     if (!retained) {
-      const result = db.prepare(`DELETE FROM ${table('payloads')} WHERE hash=?`).run(hash);
-      if (result.changes) countWrite(connection, { hash, deleted: true });
+      const removed = db
+        .prepare(`DELETE FROM ${table('payloads')} WHERE hash=? RETURNING payload`)
+        .get(hash);
+      if (removed) {
+        connection.hashes.delete(String(removed.payload));
+        countWrite(connection, { hash, deleted: true });
+      }
     }
   }
+}
+type ProjectionRow = Record<string, import('node:sqlite').SQLOutputValue>;
+function readRows(connection: Connection, rows: ProjectionRow[]): void {
+  connection.counters.projectionRowsRead += rows.length;
+  connection.counters.projectionReadBytes += Buffer.byteLength(JSON.stringify(rows));
+}
+function identityOrder(rows: ProjectionRow[], first: unknown): ProjectionRow[] | undefined {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const ordered: ProjectionRow[] = [];
+  const seen = new Set<unknown>();
+  let next = first;
+  while (next !== null) {
+    if (!Number.isSafeInteger(next) || seen.has(next)) return;
+    const row = byId.get(next as number);
+    if (!row) return;
+    ordered.push(row);
+    seen.add(next);
+    next = row.next;
+  }
+  return ordered.length === rows.length ? ordered : undefined;
 }
 function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<string> {
   const source = db
@@ -258,21 +310,25 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
   if (!source) {
     db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
     for (const name of ['groups', 'acceptances', 'identities', 'sources'] as const) {
-      const result = db.prepare(`DELETE FROM ${table(name)} WHERE source_id=?`).run(id);
-      connection.counters.projectionWrites += Number(result.changes);
+      const rows = db.prepare(`DELETE FROM ${table(name)} WHERE source_id=? RETURNING *`).all(id);
+      for (const row of rows) countWrite(connection, { ...row, deleted: true });
+      if (name === 'identities') connection.counters.identityLinksWritten += rows.length;
+      if (name === 'sources' && rows[0]?.identity_first !== null)
+        connection.counters.identityLinksWritten += rows.length;
     }
     db.prepare('DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?').run(id);
     return obsolete;
   }
   const selected = source as unknown as IntakeEnvelopeSource;
   const binding = intakeEnvelopeAuthorityBinding(db, selected);
-  const raw =
-    source.kind === 'intake_original'
-      ? readIntakeEnvelopeText(db, selected)
-      : String(source.details_json);
+  const material =
+    source.kind === 'intake_original' ? readIntakeEnvelopeMaterialized(db, selected) : undefined;
+  const raw = material?.text ?? String(source.details_json);
   connection.counters.authorityBytes += Buffer.byteLength(raw);
-  const validJson = Number(db.prepare('SELECT json_valid(?) valid').get(raw)!.valid) === 1;
-  const all = json(raw);
+  const validJson =
+    material?.mode === 'normalized' ||
+    Number(db.prepare('SELECT json_valid(?) valid').get(raw)!.valid) === 1;
+  const all = material?.value ?? json(raw);
   if (!object(all)) {
     if (source.kind === 'intake_original') fail('original metadata is unavailable');
   } else if (source.kind === 'intake_original' && !object(all.intake))
@@ -300,7 +356,7 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     prior.authority_head !== binding.head
   ) {
     db.prepare(
-      `INSERT INTO ${table('sources')} VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind,authority_key=excluded.authority_key,authority_head=excluded.authority_head`,
+      `INSERT INTO ${table('sources')}(source_id,source_order,kind,authority_key,authority_head) VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind,authority_key=excluded.authority_key,authority_head=excluded.authority_head`,
     ).run(id, source.source_order!, source.kind!, binding.key, binding.head);
     countWrite(connection, {
       id,
@@ -313,93 +369,188 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     if (binding.key !== null)
       db.prepare('INSERT INTO temp.__intake_lookup_authorities VALUES(?,?)').run(binding.key, id);
   }
-  const fields = {
-    groups: 'reportGroups',
-    acceptances: 'reportAcceptances',
-    identities: 'identityConfirmations',
-  } as const;
-  for (const name of Object.keys(fields) as Array<keyof typeof fields>) {
-    const originalOnly = name !== 'identities';
-    const path = '$.intake.workflow.' + fields[name];
-    const entries =
-      !validJson || (originalOnly && source.kind !== 'intake_original')
-        ? []
-        : db
-            .prepare(
-              `SELECT j.key AS ordinal,j.value AS payload,${name === 'groups' ? "CAST(json_extract(j.value,'$.discoveryOrder') AS INTEGER)" : 'NULL'} AS discovery_order,${name === 'acceptances' ? "json_extract(j.value,'$.receipt.operationId')" : 'NULL'} AS operation_id FROM json_each(?,?) j`,
-            )
-            .all(raw, path);
-    const oldRows = db
-      .prepare(
-        `SELECT ordinal,${name === 'groups' ? 'discovery_order' : name === 'acceptances' ? 'hash,operation_id' : 'hash'} FROM ${table(name)} WHERE source_id=?`,
-      )
-      .all(id);
-    connection.counters.projectionRowsRead += oldRows.length;
-    connection.counters.projectionReadBytes += Buffer.byteLength(JSON.stringify(oldRows));
-    if (name !== 'groups') for (const row of oldRows) obsolete.add(String(row.hash));
-    const old = new Map(oldRows.map((r) => [Number(r.ordinal), r]));
-    for (const entry of entries) {
-      const ordinal = Number(entry.ordinal);
-      if (!Number.isSafeInteger(ordinal) || ordinal < 0) fail('invalid contribution ordinal');
-      const before = old.get(ordinal);
-      old.delete(ordinal);
-      if (name === 'groups') {
-        if (!before || before.discovery_order !== entry.discovery_order) {
-          db.prepare(
-            `INSERT INTO ${table(name)} VALUES(?,?,?) ON CONFLICT(source_id,ordinal) DO UPDATE SET discovery_order=excluded.discovery_order`,
-          ).run(id, ordinal, entry.discovery_order!);
-          countWrite(connection, { id, ordinal, discovery_order: entry.discovery_order });
+  const entries = (name: string, originalOnly: boolean): ProjectionRow[] => {
+    if (!validJson || (originalOnly && source.kind !== 'intake_original')) return [];
+    const columns = `j.value AS payload,${name === 'reportGroups' ? "CAST(json_extract(j.value,'$.discoveryOrder') AS INTEGER)" : 'NULL'} discovery_order,${name === 'reportAcceptances' ? "json_extract(j.value,'$.receipt.operationId')" : 'NULL'} operation_id`;
+    let rows: ProjectionRow[];
+    if (material?.mode === 'normalized') {
+      const values = object(workflow) && Array.isArray(workflow[name]) ? workflow[name] : [];
+      rows = values.map((value: unknown) => {
+        const cached =
+          value && typeof value === 'object' ? connection.entries.get(value)?.get(name) : undefined;
+        if (cached) return cached;
+        const serialized = JSON.stringify([value]);
+        connection.counters.serializedPayloadBytes += Buffer.byteLength(serialized);
+        const row = db.prepare(`SELECT ${columns} FROM json_each(?) j`).get(serialized)!;
+        if (value && typeof value === 'object') {
+          const cached = connection.entries.get(value) ?? new Map<string, ProjectionRow>();
+          cached.set(name, row);
+          connection.entries.set(value, cached);
         }
-      } else {
-        // SQLite json_each returns primitive scalars directly; encode them as JSON
-        // so the public json() result matches the former lookup exactly.
-        const payload =
-          typeof entry.payload === 'string' ? entry.payload : JSON.stringify(entry.payload);
-        connection.counters.hashedPayloadBytes += Buffer.byteLength(payload);
-        const hash = digest(payload);
-        retainedHere.add(hash);
-        const stored = db
-          .prepare(`SELECT payload FROM ${table('payloads')} WHERE hash=?`)
-          .get(hash);
-        connection.counters.projectionRowsRead += stored ? 1 : 0;
-        connection.counters.projectionReadBytes += stored
-          ? Buffer.byteLength(String(stored.payload))
-          : 0;
-        if (!stored || stored.payload !== payload) {
-          db.prepare(
-            `INSERT INTO ${table('payloads')} VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET payload=excluded.payload`,
-          ).run(hash, payload);
-          countWrite(connection, { hash, payload });
-        }
-        const operation = entry.operation_id;
-        if (name === 'acceptances' && operation !== null && typeof operation !== 'string')
-          fail('invalid acceptance operation identity');
-        if (
-          !before ||
-          before.hash !== hash ||
-          (name === 'acceptances' && before.operation_id !== operation)
-        ) {
-          if (name === 'acceptances')
-            db.prepare(
-              `INSERT INTO ${table(name)} VALUES(?,?,?,?) ON CONFLICT(source_id,ordinal) DO UPDATE SET operation_id=excluded.operation_id,hash=excluded.hash`,
-            ).run(id, ordinal, operation ?? null, hash);
-          else
-            db.prepare(
-              `INSERT INTO ${table(name)} VALUES(?,?,?) ON CONFLICT(source_id,ordinal) DO UPDATE SET hash=excluded.hash`,
-            ).run(id, ordinal, hash);
-          countWrite(connection, {
-            id,
-            ordinal,
-            operation: name === 'acceptances' ? operation : undefined,
-            hash,
-          });
-        }
-      }
+        return row;
+      });
+    } else {
+      // Exact SQL-first member selection is required for retained raw JSON with
+      // duplicate keys, and json_each's scalar conversions remain observable.
+      rows = db
+        .prepare(`SELECT ${columns} FROM json_each(?,?) j`)
+        .all(raw, '$.intake.workflow.' + name);
     }
-    for (const ordinal of old.keys()) {
-      db.prepare(`DELETE FROM ${table(name)} WHERE source_id=? AND ordinal=?`).run(id, ordinal);
-      countWrite(connection, { id, ordinal, deleted: true });
+    connection.counters.contributionItemsVisited += rows.length;
+    return rows;
+  };
+  // Discovery exposes only a maximum. No consumer observes group ordinals or
+  // multiplicity; retaining one scalar avoids shifting every later group.
+  const groups = entries('reportGroups', true);
+  let maximum: number | null = null;
+  for (const entry of groups) {
+    const value = entry.discovery_order;
+    if (value !== null && (maximum === null || Number(value) > maximum)) maximum = Number(value);
+  }
+  const oldGroup = db
+    .prepare(`SELECT ordinal,discovery_order FROM ${table('groups')} WHERE source_id=?`)
+    .all(id);
+  readRows(connection, oldGroup);
+  for (const row of oldGroup)
+    if (row.ordinal !== 0) {
+      db.prepare(`DELETE FROM ${table('groups')} WHERE source_id=? AND ordinal=?`).run(
+        id,
+        row.ordinal!,
+      );
+      countWrite(connection, { id, ordinal: row.ordinal, deleted: true });
     }
+  if (!oldGroup.some((row) => row.ordinal === 0 && row.discovery_order === maximum)) {
+    db.prepare(
+      `INSERT INTO ${table('groups')} VALUES(?,0,?) ON CONFLICT(source_id,ordinal) DO UPDATE SET discovery_order=excluded.discovery_order`,
+    ).run(id, maximum);
+    countWrite(connection, { id, ordinal: 0, discovery_order: maximum });
+  }
+  const payload = (value: unknown): string => {
+    // Preserve json_each scalar behavior, including its boolean conversion.
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    if (typeof value !== 'string')
+      connection.counters.serializedPayloadBytes += Buffer.byteLength(text);
+    let hash = connection.hashes.get(text);
+    if (!hash) {
+      connection.counters.hashedPayloadBytes += Buffer.byteLength(text);
+      hash = digest(text);
+      connection.hashes.set(text, hash);
+    }
+    retainedHere.add(hash);
+    const stored = db.prepare(`SELECT payload FROM ${table('payloads')} WHERE hash=?`).get(hash);
+    readRows(connection, stored ? [stored] : []);
+    if (!stored || stored.payload !== text) {
+      db.prepare(
+        `INSERT INTO ${table('payloads')} VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET payload=excluded.payload`,
+      ).run(hash, text);
+      countWrite(connection, { hash, payload: text });
+    }
+    return hash;
+  };
+  const oldAcceptances = db
+    .prepare(`SELECT operation_id,hash FROM ${table('acceptances')} WHERE source_id=?`)
+    .all(id);
+  readRows(connection, oldAcceptances);
+  const acceptanceMap = new Map(
+    oldAcceptances.map((row) => [String(row.operation_id), String(row.hash)]),
+  );
+  for (const row of oldAcceptances) obsolete.add(String(row.hash));
+  const seenOperations = new Set<string>();
+  for (const entry of entries('reportAcceptances', true)) {
+    const operation = entry.operation_id;
+    if (operation !== null && typeof operation !== 'string')
+      return fail('invalid acceptance operation identity');
+    if (operation === null || seenOperations.has(operation)) continue;
+    seenOperations.add(operation);
+    const hash = payload(entry.payload);
+    if (acceptanceMap.get(operation) !== hash) {
+      db.prepare(
+        `INSERT INTO ${table('acceptances')} VALUES(?,?,?) ON CONFLICT(source_id,operation_id) DO UPDATE SET hash=excluded.hash`,
+      ).run(id, operation, hash);
+      countWrite(connection, { id, operation, hash });
+    }
+    acceptanceMap.delete(operation);
+  }
+  for (const operation of acceptanceMap.keys()) {
+    db.prepare(`DELETE FROM ${table('acceptances')} WHERE source_id=? AND operation_id=?`).run(
+      id,
+      operation,
+    );
+    countWrite(connection, { id, operation, deleted: true });
+  }
+  const oldIdentities = db
+    .prepare(`SELECT id,next,hash FROM ${table('identities')} WHERE source_id=? ORDER BY id`)
+    .all(id);
+  readRows(connection, oldIdentities);
+  for (const row of oldIdentities) obsolete.add(String(row.hash));
+  const first = db
+    .prepare(`SELECT identity_first FROM ${table('sources')} WHERE source_id=?`)
+    .get(id)!.identity_first;
+  const oldOrder = identityOrder(oldIdentities, first) ?? oldIdentities;
+  const desired = entries('identityConfirmations', false).map((entry) => payload(entry.payload));
+  const matched: Array<(typeof oldIdentities)[number] | undefined> = new Array(desired.length);
+  const used = new Set<number>();
+  let prefix = 0;
+  while (
+    prefix < Math.min(oldOrder.length, desired.length) &&
+    oldOrder[prefix]!.hash === desired[prefix]
+  ) {
+    matched[prefix] = oldOrder[prefix];
+    used.add(Number(oldOrder[prefix]!.id));
+    prefix++;
+  }
+  let oldEnd = oldOrder.length - 1,
+    nextEnd = desired.length - 1;
+  while (oldEnd >= prefix && nextEnd >= prefix && oldOrder[oldEnd]!.hash === desired[nextEnd]) {
+    matched[nextEnd] = oldOrder[oldEnd];
+    used.add(Number(oldOrder[oldEnd]!.id));
+    oldEnd--;
+    nextEnd--;
+  }
+  const queues = new Map<string, { rows: typeof oldIdentities; cursor: number }>();
+  for (const row of oldOrder) {
+    if (used.has(Number(row.id))) continue;
+    let queue = queues.get(String(row.hash));
+    if (!queue) {
+      queue = { rows: [], cursor: 0 };
+      queues.set(String(row.hash), queue);
+    }
+    queue.rows.push(row);
+  }
+  let nextId = oldIdentities.reduce((maximum, row) => Math.max(maximum, Number(row.id)), -1) + 1;
+  const nextRows = desired.map((hash, index) => {
+    const queue = queues.get(hash);
+    const before = matched[index] ?? queue?.rows[queue.cursor++];
+    if (before) used.add(Number(before.id));
+    const occurrence = before ? Number(before.id) : nextId++;
+    if (!Number.isSafeInteger(occurrence)) fail('identity occurrence limit');
+    return { id: occurrence, hash, before };
+  });
+  for (let index = 0; index < nextRows.length; index++) {
+    const row = nextRows[index]!,
+      next = nextRows[index + 1]?.id ?? null;
+    if (!row.before || row.before.next !== next) {
+      db.prepare(
+        `INSERT INTO ${table('identities')} VALUES(?,?,?,?) ON CONFLICT(source_id,id) DO UPDATE SET next=excluded.next,hash=excluded.hash`,
+      ).run(id, row.id, next, row.hash);
+      countWrite(connection, { id, occurrence: row.id, next, hash: row.hash });
+      connection.counters.identityLinksWritten++;
+    }
+  }
+  for (const row of oldIdentities)
+    if (!used.has(Number(row.id))) {
+      db.prepare(`DELETE FROM ${table('identities')} WHERE source_id=? AND id=?`).run(id, row.id!);
+      countWrite(connection, { id, occurrence: row.id, deleted: true });
+      connection.counters.identityLinksWritten++;
+    }
+  const nextFirst = nextRows[0]?.id ?? null;
+  if (first !== nextFirst) {
+    db.prepare(`UPDATE ${table('sources')} SET identity_first=? WHERE source_id=?`).run(
+      nextFirst,
+      id,
+    );
+    countWrite(connection, { id, identity_first: nextFirst });
+    connection.counters.identityLinksWritten++;
   }
   for (const hash of retainedHere) obsolete.delete(hash);
   db.prepare('DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?').run(id);
@@ -441,12 +592,16 @@ function current(db: DatabaseSync): Connection {
     } catch {
       /* An aborted outer transaction is recovered by its owner. */
     }
+    clearPayloadMemo(connection);
     connection.rebuild = true;
     connection.schema = -1;
     if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
     throw error;
   }
-  if (db.isTransaction && !currentTransactionToken(db)) connection.schema = -1;
+  if (db.isTransaction && !currentTransactionToken(db)) {
+    clearPayloadMemo(connection);
+    connection.schema = -1;
+  }
   return connection;
 }
 export function reconcileActiveIntakeLookup(db: DatabaseSync): void {
@@ -461,17 +616,27 @@ export function retainedIntakeAcceptance(db: DatabaseSync, operationId: string):
   current(db);
   const row = db
     .prepare(
-      `SELECT p.payload FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id WHERE a.operation_id=? ORDER BY s.source_order,a.ordinal LIMIT 1`,
+      `SELECT p.payload FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id WHERE a.operation_id=? ORDER BY s.source_order LIMIT 1`,
     )
     .get(operationId);
   return row ? JSON.parse(String(row.payload)) : null;
 }
 export function indexedIntakeIdentityConfirmations(db: DatabaseSync): unknown[] {
   current(db);
-  return db
-    .prepare(
-      `SELECT p.payload FROM ${table('identities')} i JOIN ${table('payloads')} p ON p.hash=i.hash JOIN ${table('sources')} s ON s.source_id=i.source_id ORDER BY s.source_order,i.ordinal`,
-    )
-    .all()
-    .map((r) => json(r.payload));
+  const sources = db
+    .prepare(`SELECT source_id,identity_first FROM ${table('sources')} ORDER BY source_order`)
+    .all();
+  const values: unknown[] = [];
+  for (const source of sources) {
+    const rows = db
+      .prepare(
+        `SELECT i.id,i.next,i.hash,p.payload FROM ${table('identities')} i LEFT JOIN ${table('payloads')} p ON p.hash=i.hash WHERE i.source_id=?`,
+      )
+      .all(source.source_id!);
+    const ordered = identityOrder(rows, source.identity_first);
+    if (!ordered || ordered.some((row) => typeof row.payload !== 'string'))
+      return fail('invalid identity occurrence chain');
+    for (const row of ordered) values.push(json(row.payload));
+  }
+  return values;
 }

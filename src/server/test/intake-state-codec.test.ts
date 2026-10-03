@@ -3,11 +3,150 @@ import test from 'node:test';
 import { chatDecodeBudget, ChatDecodeLimitError } from '../chat-journal-codec.ts';
 import {
   applyIntakeChanges,
+  applyIntakeChangesIsolated,
+  freezeValidatedIntakeJson,
+  cloneValidatedIntakeJson,
   intakeChanges,
   normalizeIntakeJson,
   serializeIntakeJson,
   type IntakeChange,
+  type IntakeJson,
 } from '../intake-state-codec.ts';
+
+test('owned subtree preparation preserves logical node/depth limits and refuses forged frozen data', () => {
+  const owned = freezeValidatedIntakeJson(normalizeIntakeJson({ values: [1, 2, 3] }));
+  const input = { left: owned, right: owned, undefined, array: [undefined, null, -0] };
+  const normalBudget = chatDecodeBudget();
+  const reusedBudget = chatDecodeBudget();
+  const detached = normalizeIntakeJson(input, normalBudget);
+  const reused = normalizeIntakeJson(input, reusedBudget, true);
+  assert.deepEqual(
+    reusedBudget,
+    normalBudget,
+    'both repeated references consume their complete logical node count',
+  );
+  assert.equal(JSON.stringify(reused), JSON.stringify(detached));
+  assert.equal(reused.left, owned);
+  assert.equal(reused.right, owned);
+  assert.notEqual(
+    detached.left,
+    owned,
+    'default normalization still returns detached mutable data',
+  );
+  const neededNodes = chatDecodeBudget().nodes - normalBudget.nodes;
+  const exact = { ...chatDecodeBudget(), nodes: neededNodes };
+  normalizeIntakeJson(input, exact, true);
+  assert.equal(exact.nodes, 0);
+  assert.throws(
+    () => normalizeIntakeJson(input, { ...chatDecodeBudget(), nodes: neededNodes - 1 }, true),
+    ChatDecodeLimitError,
+  );
+
+  let deepest: IntakeJson = { leaf: 0 };
+  for (let depth = 1; depth < 64; depth++) deepest = { child: deepest };
+  const deepOwned = freezeValidatedIntakeJson(normalizeIntakeJson(deepest));
+  assert.equal(normalizeIntakeJson(deepOwned, undefined, true), deepOwned);
+  assert.throws(
+    () => normalizeIntakeJson({ deeper: deepOwned }, undefined, true),
+    /Invalid intake delta/,
+  );
+  let getterCalls = 0;
+  const accessor = Object.freeze(
+    Object.defineProperty({}, 'value', {
+      enumerable: true,
+      get() {
+        getterCalls++;
+        return 1;
+      },
+    }),
+  );
+  assert.throws(() => normalizeIntakeJson(accessor, undefined, true), /Invalid intake delta/);
+  assert.equal(getterCalls, 0);
+  class Foreign {
+    value = 1;
+  }
+  assert.throws(
+    () =>
+      normalizeIntakeJson(Object.freeze({ nested: Object.freeze(new Foreign()) }), undefined, true),
+    /Invalid intake delta/,
+  );
+  assert.throws(
+    () => normalizeIntakeJson(Object.freeze({ nested: Infinity }), undefined, true),
+    /Invalid conversation delta/,
+  );
+  const different = normalizeIntakeJson({ right: owned, left: owned }, undefined, true);
+  assert.deepEqual(
+    intakeChanges(normalizeIntakeJson({ left: owned, right: owned }, undefined, true), different),
+    [{ op: 'move-key', path: [], key: 'right', before: 'left' }],
+  );
+});
+
+test('isolated replay preserves overlapping mutation order, shared children and exact decoder charges', () => {
+  const initial = freezeValidatedIntakeJson(
+    normalizeIntakeJson({
+      retained: { evidence: 'Fictional immutable Ω evidence' },
+      items: [
+        { name: 'first', text: 'A😀Z' },
+        { name: 'second', text: 'BCD' },
+      ],
+      order: { alpha: { value: 1 }, beta: 2, gamma: 3 },
+    }),
+  );
+  const original = JSON.stringify(initial);
+  const changes: IntakeChange[] = [
+    { op: 'array-move', path: ['items'], from: 0, to: 1 },
+    { op: 'set', path: ['items', '1', 'name'], value: 'changed first' },
+    { op: 'splice', path: ['items', '1', 'text'], offset: 1, remove: 2, text: '𝄞' },
+    {
+      op: 'array-splice',
+      path: ['items'],
+      offset: 0,
+      remove: 1,
+      values: [{ name: 'new', text: 'XYZ' }],
+    },
+    { op: 'set', path: ['items', '0', 'name'], value: 'changed new' },
+    { op: 'move-key', path: ['order'], key: 'gamma', before: 'alpha' },
+    { op: 'set', path: ['order', 'alpha', 'value'], value: 2 },
+    { op: 'remove', path: ['order', 'beta'] },
+    { op: 'truncate', path: ['items'], length: 1 },
+  ];
+  const ordinaryBudget = chatDecodeBudget();
+  const isolatedBudget = chatDecodeBudget();
+  const expected = applyIntakeChanges(cloneValidatedIntakeJson(initial), changes, ordinaryBudget);
+  const actual = applyIntakeChangesIsolated(initial, changes, isolatedBudget);
+  assert.equal(JSON.stringify(actual), JSON.stringify(expected));
+  assert.equal(
+    JSON.stringify(actual),
+    '{"retained":{"evidence":"Fictional immutable Ω evidence"},"items":[{"name":"changed new","text":"XYZ"}],"order":{"gamma":3,"alpha":{"value":2}}}',
+  );
+  assert.deepEqual(isolatedBudget, ordinaryBudget);
+  assert.equal(actual.retained, initial.retained);
+  assert.equal(JSON.stringify(initial), original);
+  const consumed = {
+    nodes: chatDecodeBudget().nodes - ordinaryBudget.nodes,
+    operations: chatDecodeBudget().operations - ordinaryBudget.operations,
+    stringWork: chatDecodeBudget().stringWork - ordinaryBudget.stringWork,
+  };
+  assert.equal(
+    JSON.stringify(applyIntakeChangesIsolated(initial, changes, { ...consumed })),
+    JSON.stringify(expected),
+  );
+  for (const metric of ['nodes', 'operations', 'stringWork'] as const) {
+    assert.throws(
+      () =>
+        applyIntakeChangesIsolated(initial, changes, {
+          ...consumed,
+          [metric]: consumed[metric] - 1,
+        }),
+      ChatDecodeLimitError,
+    );
+    assert.equal(JSON.stringify(initial), original, `${metric} refusal preserves the frozen basis`);
+  }
+  assert.throws(
+    () => cloneValidatedIntakeJson(Object.freeze({ invented: true })),
+    /Invalid intake delta/,
+  );
+});
 
 function roundTrip(before: unknown, after: unknown) {
   const initial = normalizeIntakeJson(before);

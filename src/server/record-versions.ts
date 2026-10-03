@@ -1,3 +1,10 @@
+import {
+  parseRecordJson,
+  stringifyRecordJson,
+  recordVersionWork,
+  recordVersionColumns,
+  withRecordVersionWorkPhase,
+} from './record-version-work.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 // Logical record journal. All storage callbacks operate on plaintext bytes in
 // memory; the profile vault must authenticate/encrypt durable objects and own
@@ -148,13 +155,22 @@ const PROJECTION = 2;
 const LIMIT = 256 * 1024;
 const q = (s: string): string => '"' + s.replaceAll('"', '""') + '"';
 const literal = (s: string): string => "'" + s.replaceAll("'", "''") + "'";
-const digest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
-const encode = (value: unknown): Buffer => Buffer.from(JSON.stringify(value) + '\n');
+const digest = (bytes: Uint8Array): string => {
+  recordVersionWork('hashCalls');
+  recordVersionWork('hashedBytes', bytes.byteLength);
+  return createHash('sha256').update(bytes).digest('hex');
+};
+const encode = (value: unknown): Buffer => {
+  recordVersionWork('encodeCalls');
+  const bytes = Buffer.from(stringifyRecordJson(value) + '\n');
+  recordVersionWork('encodedBytes', bytes.length);
+  return bytes;
+};
 const state = new WeakMap<Database, RecordConfig>();
 const fail = (message: string): never => {
   throw new Error('Record journal: ' + message);
 };
-const eq = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+const eq = (a: unknown, b: unknown): boolean => stringifyRecordJson(a) === stringifyRecordJson(b);
 const internalKey = (key: string): boolean =>
   (key.startsWith('personal_') && !/^personal_(restore|assistant)_/.test(key)) ||
   key === 'curation_revision';
@@ -268,7 +284,9 @@ function refValid(ref: unknown): ref is RecordObjectReference {
 }
 function readObject(storage: RecordStorage, ref: unknown): Buffer {
   if (!refValid(ref)) fail('invalid object reference');
+  recordVersionWork('objectReadCalls');
   const bytes = storage.read((ref as RecordObjectReference).name);
+  if (Buffer.isBuffer(bytes)) recordVersionWork('objectReadBytes', bytes.length);
   if (
     !Buffer.isBuffer(bytes) ||
     bytes.length !== (ref as RecordObjectReference).bytes ||
@@ -278,9 +296,11 @@ function readObject(storage: RecordStorage, ref: unknown): Buffer {
   return bytes as Buffer;
 }
 function readHead(storage: RecordStorage): RecordObjectReference | null {
+  recordVersionWork('headReadCalls');
   const bytes = storage.read('head');
+  if (Buffer.isBuffer(bytes)) recordVersionWork('headReadBytes', bytes.length);
   if (bytes === null || bytes === undefined) return null;
-  const ref = JSON.parse(bytes as unknown as string) as unknown;
+  const ref = parseRecordJson(bytes as unknown as string) as unknown;
   if (!refValid(ref)) fail('invalid head');
   return ref as RecordObjectReference;
 }
@@ -297,7 +317,8 @@ function readCommit(
   profileId: string,
   schemaVersion: number,
 ): RecordCommit {
-  const commit = JSON.parse(readObject(storage, ref) as unknown as string) as RecordCommit;
+  const commit = parseRecordJson(readObject(storage, ref) as unknown as string) as RecordCommit;
+  recordVersionWork('commitValidations');
   if (
     commit.format !== FORMAT ||
     commit.profileId !== profileId ||
@@ -366,7 +387,9 @@ function readSegmentVersions(
             : bytes.subarray(offset, end);
           const text = line.toString('utf8');
           if (!Buffer.from(text).equals(line)) fail('invalid UTF-8');
-          yield JSON.parse(text) as DurableRecordVersion;
+          const version = parseRecordJson(text) as DurableRecordVersion;
+          recordVersionWork('decodedVersions');
+          yield version;
           count++;
           pending = Buffer.alloc(0);
           offset = end + 1;
@@ -384,7 +407,8 @@ function readSegmentVersions(
 function values(contents: unknown): Map<string, string | undefined> {
   const found = new Map<string, string | undefined>();
   const visit = (path: string, value: unknown): void => {
-    found.set(path, JSON.stringify(value));
+    recordVersionWork('fieldVisits');
+    found.set(path, stringifyRecordJson(value));
     if (value && typeof value === 'object' && !Array.isArray(value))
       for (const key of Object.keys(value))
         visit(path + '.' + key, (value as Record<string, unknown>)[key]);
@@ -394,7 +418,7 @@ function values(contents: unknown): Map<string, string | undefined> {
       visit(key, value);
       if (key.endsWith('_json') && typeof value === 'string') {
         try {
-          const parsed = JSON.parse(value);
+          const parsed = parseRecordJson(value);
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
             for (const child of Object.keys(parsed))
               visit(key + '.' + child, (parsed as Record<string, unknown>)[child]);
@@ -413,7 +437,7 @@ function current(db: Database, entity: string, id: string): CurrentVersionRow | 
     .get(entity, id) as CurrentVersionRow | undefined;
 }
 function identity(table: TableSchema, row: Record<string, unknown>): string {
-  return JSON.stringify(table.pk.map((key) => row[key]));
+  return stringifyRecordJson(table.pk.map((key) => row[key]));
 }
 function validateVersion(
   db: Database,
@@ -422,6 +446,7 @@ function validateVersion(
   version: DurableRecordVersion,
   identities: Set<string>,
 ): CurrentVersionRow | undefined {
+  recordVersionWork('versionValidations');
   const table = config.schema.find((table) => table.name === version.entity);
   if (
     !table ||
@@ -435,18 +460,18 @@ function validateVersion(
     typeof version.deleted !== 'boolean' ||
     !version.contents ||
     Array.isArray(version.contents) ||
-    !eq(Object.keys(version.contents).sort(), [...table.columns].sort()) ||
+    !eq(recordVersionColumns(Object.keys(version.contents)).sort(), [...table.columns].sort()) ||
     identity(table, version.contents) !== version.recordId
   )
     fail('invalid complete record version');
-  const key = JSON.stringify([version.entity, version.recordId]);
+  const key = stringifyRecordJson([version.entity, version.recordId]);
   if (identities.has(key)) fail('duplicate record in transaction');
   identities.add(key);
   const previous = current(db, version.entity, version.recordId);
   if (version.previousVersion !== (previous?.version_id ?? null))
     fail('invalid previous-version reference');
   if (version.deleted && (!previous || previous.deleted)) fail('deletion without current record');
-  if (version.deleted && !eq(version.contents, JSON.parse(previous!.contents_json)))
+  if (version.deleted && !eq(version.contents, parseRecordJson(previous!.contents_json)))
     fail('tombstone changed the removed record');
   if (table!.name === 'app_meta' && internalKey(version.contents.key as string))
     fail('operational metadata is not a durable record');
@@ -461,23 +486,27 @@ function indexTransaction(
     RecordStateRow | undefined;
   if (
     commit.sequence !== (indexed?.sequence ?? 0) + 1 ||
-    !eq(commit.previous, indexed ? JSON.parse(indexed.head_json) : null)
+    !eq(commit.previous, indexed ? parseRecordJson<RecordObjectReference>(indexed.head_json) : null)
   )
     fail('commit sequence gap or cache ancestry mismatch');
   if (indexed) {
     const previous = db
       .prepare('SELECT commit_json FROM __record_transactions WHERE sequence=?')
       .get(indexed.sequence) as (SqliteRow & { commit_json: string }) | undefined;
-    if (!previous || commit.revision !== JSON.parse(previous.commit_json).revision + 1)
+    if (
+      !previous ||
+      commit.revision !== parseRecordJson<RecordCommit>(previous.commit_json).revision + 1
+    )
       fail('profile revision gap');
   }
   if (indexed && commit.revision !== revision(db))
     fail('projection revision differs from committed transaction');
   const identities = new Set<string>();
   for (const version of versions) {
+    recordVersionWork('indexedVersionAttempts');
     const previous = validateVersion(db, config, commit, version, identities);
     const before = values(
-        previous && !previous.deleted ? JSON.parse(previous.contents_json) : null,
+        previous && !previous.deleted ? parseRecordJson(previous.contents_json) : null,
       ),
       after = values(version.deleted ? null : version.contents);
     const { contents, ...metadata } = version;
@@ -491,8 +520,8 @@ function indexTransaction(
       version.previousVersion,
       version.operationId,
       Number(version.deleted),
-      JSON.stringify(contents),
-      JSON.stringify(metadata),
+      stringifyRecordJson(contents),
+      stringifyRecordJson(metadata),
     );
     db.prepare(
       'INSERT INTO __record_current VALUES(?,?,?) ON CONFLICT(entity,record_id) DO UPDATE SET version_id=excluded.version_id',
@@ -515,15 +544,15 @@ function indexTransaction(
     commit.operationId,
     commit.sequence,
     commit.fingerprint as SQLInputValue,
-    JSON.stringify(commit.result),
-    JSON.stringify(commit),
+    stringifyRecordJson(commit.result),
+    stringifyRecordJson(commit),
   );
   db.prepare('INSERT OR REPLACE INTO __record_state VALUES(1,?,?,?,?,?)').run(
     config.profileId,
     PROJECTION,
     config.schemaVersion,
     commit.sequence,
-    JSON.stringify(ref),
+    stringifyRecordJson(ref),
   );
 }
 function* collect(
@@ -547,7 +576,7 @@ function* collect(
       >);
   for (const { entity, record_id: recordId } of keys) {
     const table = config.schema.find((table) => table.name === entity),
-      id = JSON.parse(recordId) as SQLInputValue[];
+      id = parseRecordJson(recordId) as SQLInputValue[];
     if (entity === 'app_meta' && internalKey(id[0] as string)) continue;
     const contents = db
       .prepare(
@@ -561,7 +590,7 @@ function* collect(
       recordId,
       contents:
         (contents as Record<string, unknown> | undefined) ??
-        (JSON.parse(previous!.contents_json) as Record<string, unknown>),
+        (parseRecordJson(previous!.contents_json) as Record<string, unknown>),
       deleted: !contents,
       previousVersion: previous?.version_id ?? null,
     };
@@ -589,7 +618,7 @@ function publish(
     fail('database ownership or schema changed');
   const indexed = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as
     RecordStateRow | undefined;
-  const previous = indexed ? JSON.parse(indexed.head_json) : null;
+  const previous = indexed ? parseRecordJson<RecordObjectReference>(indexed.head_json) : null;
   if (!eq(readHead(config.storage), previous))
     fail('durable head changed; reopen or rebuild before saving');
   const sequence = (indexed?.sequence ?? 0) + 1,
@@ -664,14 +693,17 @@ function applyVersions(
   // Values are complete records, never patches or rerun application operations.
   // Delete changed rows first to allow accepted changes to unique associations.
   for (const version of versions) {
+    recordVersionWork('replayDeleteAttempts');
     const table = config.schema.find((table) => table.name === version.entity);
-    if (!table || !Array.isArray(JSON.parse(version.recordId))) fail('unknown record identity');
+    if (!table || !Array.isArray(parseRecordJson(version.recordId)))
+      fail('unknown record identity');
     db.prepare(
       `DELETE FROM ${q(table!.name)} WHERE ${table!.pk.map((key) => q(key) + '=?').join(' AND ')}`,
-    ).run(...(JSON.parse(version.recordId) as SQLInputValue[]));
+    ).run(...(parseRecordJson(version.recordId) as SQLInputValue[]));
   }
   for (const version of versions)
     if (!version.deleted) {
+      recordVersionWork('replayInsertAttempts');
       const table = config.schema.find((table) => table.name === version.entity)!;
       db.prepare(
         `INSERT INTO ${q(table.name)} (${table.columns.map(q).join(',')}) VALUES(${table.columns.map(() => '?').join(',')})`,
@@ -724,6 +756,13 @@ function verifyTargets(db: Database): void {
 function catchUp(
   db: Database,
   config: RecordConfig,
+  options: { empty?: boolean } = {},
+): RecordObjectReference | null {
+  return withRecordVersionWorkPhase('reconstruction', () => catchUpRecords(db, config, options));
+}
+function catchUpRecords(
+  db: Database,
+  config: RecordConfig,
   { empty = false }: { empty?: boolean } = {},
 ): RecordObjectReference | null {
   const indexed = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as
@@ -744,7 +783,7 @@ function catchUp(
     if (
       !latest ||
       latest.sequence !== indexed.sequence ||
-      JSON.parse(latest.commit_json).revision !== revision(db)
+      parseRecordJson<RecordCommit>(latest.commit_json).revision !== revision(db)
     )
       fail('cached projection sequence or revision is inconsistent');
   }
@@ -752,7 +791,7 @@ function catchUp(
     config.storage,
     config.profileId,
     config.schemaVersion,
-    indexed ? JSON.parse(indexed.head_json) : null,
+    indexed ? parseRecordJson<RecordObjectReference>(indexed.head_json) : null,
   );
   if (!transactions.length) return head;
   const triggers = db
@@ -850,7 +889,7 @@ export function attachRecordDurability(
     begin(operation) {
       const indexed = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as
         RecordStateRow | undefined;
-      if (!eq(readHead(storage), JSON.parse(indexed!.head_json)))
+      if (!eq(readHead(storage), parseRecordJson(indexed!.head_json)))
         fail('cache is behind accepted history; reopen before writing');
       if (hasChanges(db, config))
         fail('uncommitted direct writes bypassed the transaction boundary');
@@ -877,7 +916,7 @@ export function attachRecordDurability(
               'OPERATION_CONFLICT',
               'Operation ID was already used for a different request',
             );
-          return { replayed: true, result: JSON.parse(prior.result_json) };
+          return { replayed: true, result: parseRecordJson(prior.result_json) };
         }
       }
       if (operation.expectedRevision !== undefined && operation.expectedRevision !== revision(db))
@@ -904,7 +943,7 @@ export function attachRecordDurability(
 export function recordDurabilityStatus(db: Database): RecordDurabilityStatus | null {
   if (!state.has(db)) return null;
   const row = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as RecordStateRow;
-  const behind = !eq(readHead(state.get(db)!.storage), JSON.parse(row.head_json));
+  const behind = !eq(readHead(state.get(db)!.storage), parseRecordJson(row.head_json));
   return {
     configured: true,
     format: FORMAT,
@@ -922,12 +961,17 @@ export function flushRecordDurability(db: Database): RecordDurabilityStatus | nu
   // App mutations must use transaction(). Refuse a snapshot-like backfill of
   // direct writes: it cannot supply the intended transaction or attribution.
   const row = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as RecordStateRow;
-  if (!eq(readHead(config!.storage), JSON.parse(row.head_json)))
+  if (!eq(readHead(config!.storage), parseRecordJson(row.head_json)))
     fail('projection requires recovery');
   if (hasChanges(db, config!)) fail('uncommitted direct writes bypassed the transaction boundary');
   return recordDurabilityStatus(db);
 }
-export function rebuildRecordDatabase(
+export function rebuildRecordDatabase(path: string, options: AttachRecordDurabilityOptions = {}) {
+  return withRecordVersionWorkPhase('reconstruction', () =>
+    rebuildRecordDatabaseInside(path, options),
+  );
+}
+function rebuildRecordDatabaseInside(
   path: string,
   { profileId, storage, verifyReferences }: AttachRecordDurabilityOptions = {},
 ) {
@@ -951,8 +995,12 @@ export function rebuildRecordDatabase(
   }
 }
 function indexedVersion(config: RecordConfig, row: SqliteRow): DurableRecordVersion {
-  const metadata = JSON.parse(String(row.metadata_json)) as Omit<DurableRecordVersion, 'contents'>;
-  const contents = JSON.parse(String(row.contents_json)) as Record<string, unknown>;
+  recordVersionWork('indexedVersionValidations');
+  const metadata = parseRecordJson(String(row.metadata_json)) as Omit<
+    DurableRecordVersion,
+    'contents'
+  >;
+  const contents = parseRecordJson(String(row.contents_json)) as Record<string, unknown>;
   const table = config.schema.find((table) => table.name === row.entity);
   if (
     !metadata ||
@@ -976,7 +1024,7 @@ function indexedVersion(config: RecordConfig, row: SqliteRow): DurableRecordVers
     !table ||
     !contents ||
     Array.isArray(contents) ||
-    !eq(Object.keys(contents).sort(), [...table.columns].sort()) ||
+    !eq(recordVersionColumns(Object.keys(contents)).sort(), [...table.columns].sort()) ||
     identity(table, contents) !== row.record_id
   )
     fail('invalid indexed version');
@@ -1032,7 +1080,7 @@ export function queryRecordHistory(
   const params: SQLInputValue[] = [
     profileId as string,
     entity as string,
-    JSON.stringify(Array.isArray(recordId) ? recordId : [recordId]),
+    stringifyRecordJson(Array.isArray(recordId) ? recordId : [recordId]),
     beforeSequence,
   ];
   let sql =
@@ -1088,10 +1136,10 @@ export function queryRecordHistory(
         return {
           field: name,
           before: before.has(name)
-            ? { present: true as const, value: JSON.parse(before.get(name)!) }
+            ? { present: true as const, value: parseRecordJson(before.get(name)!) }
             : { present: false as const },
           after: after.has(name)
-            ? { present: true as const, value: JSON.parse(after.get(name)!) }
+            ? { present: true as const, value: parseRecordJson(after.get(name)!) }
             : { present: false as const },
         };
       });

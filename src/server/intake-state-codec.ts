@@ -21,6 +21,47 @@ export type IntakeChange =
 const MAX_ITEMS = 1_000_000;
 const MAX_DEPTH = 64;
 const BAD = new Set(['__proto__', 'prototype', 'constructor']);
+const immutableValues = new WeakMap<object, { nodes: number; depth: number }>();
+
+/** Internal ownership boundary: only pass normalized input or checked decoder output.
+ * Newly owned branches freeze once; retained immutable branches are not traversed. */
+export function freezeValidatedIntakeJson(value: IntakeJson): IntakeJson {
+  const freeze = (child: ChatJson): { nodes: number; depth: number } => {
+    if (!child || typeof child !== 'object') return { nodes: 1, depth: 0 };
+    const retained = immutableValues.get(child);
+    if (retained) {
+      recordIntakeWork('immutableNodesReused');
+      return retained;
+    }
+    const size = { nodes: 1, depth: 0 };
+    for (const nested of Object.values(child)) {
+      const descendant = freeze(nested);
+      size.nodes += descendant.nodes;
+      size.depth = Math.max(size.depth, descendant.depth + 1);
+    }
+    Object.freeze(child);
+    immutableValues.set(child, size);
+    recordIntakeWork('immutableNodesFrozen');
+    return size;
+  };
+  freeze(value);
+  return value;
+}
+
+/** Detached mutable view of a privately validated immutable root. */
+export function cloneValidatedIntakeJson(value: IntakeJson): IntakeJson {
+  if (!immutableValues.has(value)) fail();
+  recordIntakeWork('trustedCloneCalls');
+  const copy = (child: ChatJson): ChatJson => {
+    recordIntakeWork('trustedCloneNodes');
+    if (!child || typeof child !== 'object') return child;
+    if (Array.isArray(child)) return child.map(copy);
+    const result: IntakeJson = {};
+    for (const name of Object.keys(child)) result[name] = copy(child[name]!);
+    return result;
+  };
+  return copy(value) as IntakeJson;
+}
 function fail(): never {
   throw new Error('Invalid intake delta');
 }
@@ -41,7 +82,11 @@ function indexKey(value: string): boolean {
 }
 
 /** Plain JSON object domain; object undefined is absent, array undefined/holes are null. */
-export function normalizeIntakeJson(value: unknown, budget = chatDecodeBudget()): IntakeJson {
+export function normalizeIntakeJson(
+  value: unknown,
+  budget = chatDecodeBudget(),
+  reuseOwned = false,
+): IntakeJson {
   recordIntakeWork('normalizeCalls');
   if (!object(value)) fail();
   // Check data descriptors before the shared cloner reads values. Accessors and
@@ -54,6 +99,14 @@ export function normalizeIntakeJson(value: unknown, budget = chatDecodeBudget())
     if (--nodes < 0) throw new ChatDecodeLimitError('Intake decoded work limit exceeded');
     if (depth > MAX_DEPTH) fail();
     if (!input || typeof input !== 'object') return;
+    const retained = reuseOwned ? immutableValues.get(input) : undefined;
+    if (retained) {
+      recordIntakeWork('normalizeValidationReusedNodes', retained.nodes);
+      nodes -= retained.nodes - 1;
+      if (nodes < 0) throw new ChatDecodeLimitError('Intake decoded work limit exceeded');
+      if (depth + retained.depth > MAX_DEPTH) fail();
+      return;
+    }
     if (!Array.isArray(input) && !object(input)) fail();
     if (ancestors.has(input)) fail();
     ancestors.add(input);
@@ -77,6 +130,39 @@ export function normalizeIntakeJson(value: unknown, budget = chatDecodeBudget())
     ancestors.delete(input);
   };
   validate(value, 0);
+  if (reuseOwned) {
+    let clonedNodes = 0;
+    const copy = (input: unknown, depth: number): ChatJson => {
+      if (!input || typeof input !== 'object') {
+        clonedNodes++;
+        return cloneChatJson(input, depth, budget);
+      }
+      const retained = immutableValues.get(input);
+      if (retained) {
+        budget.nodes -= retained.nodes;
+        if (budget.nodes < 0) throw new ChatDecodeLimitError('Intake decoded work limit exceeded');
+        recordIntakeWork('normalizeReusedNodes', retained.nodes);
+        return input as ChatJson;
+      }
+      if (--budget.nodes < 0) throw new ChatDecodeLimitError('Intake decoded work limit exceeded');
+      clonedNodes++;
+      if (Array.isArray(input))
+        return Array.from({ length: input.length }, (_, index) =>
+          copy(input[index] === undefined ? null : input[index], depth + 1),
+        );
+      const result: IntakeJson = {};
+      for (const name of Object.keys(input)) {
+        const child = (input as Record<string, unknown>)[name];
+        if (child !== undefined) result[name] = copy(child, depth + 1);
+      }
+      return result;
+    };
+    try {
+      return copy(value, 0) as IntakeJson;
+    } finally {
+      recordIntakeWork('normalizeCloneNodes', clonedNodes);
+    }
+  }
   const priorNodes = budget.nodes;
   const cloned = cloneChatJson(value, 0, budget) as IntakeJson;
   recordIntakeWork('normalizeCloneNodes', priorNodes - budget.nodes);
@@ -225,6 +311,47 @@ export function applyIntakeChanges(
       if (!object(next)) fail();
       state = next;
     }
+  }
+  if (!state) fail();
+  return state;
+}
+
+/** Replay into private changed branches using exactly the ordinary decoder budget.
+ * Host shallow copies are counted separately; they do not change v3 usage charges. */
+export function applyIntakeChangesIsolated(
+  initial: IntakeJson | undefined,
+  changes: IntakeChange[],
+  budget = chatDecodeBudget(),
+): IntakeJson {
+  let state = initial;
+  const owned = new WeakSet<object>();
+  const copy = (value: ChatJson): ChatJson => {
+    if (!value || typeof value !== 'object') fail();
+    if (owned.has(value)) return value;
+    const result = Array.isArray(value) ? [...value] : { ...value };
+    owned.add(result);
+    recordIntakeWork('candidatePathCopies');
+    recordIntakeWork('candidateCopiedMembers', Object.keys(value).length);
+    return result;
+  };
+  for (const change of changes) {
+    if (state !== undefined) {
+      state = copy(state) as IntakeJson;
+      // Container operations mutate the target itself. Other operations only
+      // replace/delete a property on its parent; strings are immutable values.
+      const targetPath = ['move-key', 'array-splice', 'array-move', 'truncate'].includes(change.op)
+        ? change.path
+        : change.path.slice(0, -1);
+      let parent: ChatJson = state;
+      for (const name of targetPath) {
+        key(name);
+        if (!parent || typeof parent !== 'object' || !Object.hasOwn(parent, name)) fail();
+        const container = parent as Record<string, ChatJson>;
+        container[name] = copy(container[name]!);
+        parent = container[name]!;
+      }
+    }
+    state = applyIntakeChanges(state, [change], budget);
   }
   if (!state) fail();
   return state;

@@ -1,3 +1,4 @@
+import { clearSourceContextClassificationCache } from './intake-source-context-classification.ts';
 import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
@@ -1011,6 +1012,7 @@ export function createApp({
         cleanup(() => diagnostics.clear(profileId));
         cleanup(() => clearIntakeStateCache(db));
         cleanup(() => clearIntakeLookupCache(db));
+        cleanup(() => clearSourceContextClassificationCache(db));
         cleanup(() => clearSourceTextProjectionCache(db));
         cleanup(() => clearSourceDetailsSearchCache(db));
         cleanup(() => db.close());

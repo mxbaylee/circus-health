@@ -16,7 +16,12 @@ import {
   rebuildRecordDatabase,
   type RecordStorage,
 } from '../record-versions.ts';
-import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
+import {
+  createIntakeStateStorage,
+  clearIntakeStateCache,
+  type PreparedIntakeState,
+} from '../intake-state-storage.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'intake-state-'));
   const dbs: Database[] = [];
@@ -131,6 +136,137 @@ test('exact JSON changes, operation replay, private snapshots, outer staged writ
   assert.deepEqual(store.read(), { final: [null, ''] });
   clearIntakeStateCache(db);
   assert.deepEqual(store.read(), { final: [null, ''] });
+});
+
+test('prepared capabilities and immutable materializations reuse exact text while isolating callers', (t) => {
+  const { db, identity } = fixture(t);
+  const store = createIntakeStateStorage(db, identity);
+  const input = {
+    retained: { text: 'Fictional retained evidence'.repeat(500) },
+    changing: { value: 1 },
+  };
+  const prepared = store.prepare(input);
+  input.changing.value = 999;
+  const intended = store.inspectPrepared(prepared);
+  assert.equal(
+    intended.serialized,
+    JSON.stringify({ retained: input.retained, changing: { value: 1 } }),
+  );
+  assert.throws(() => {
+    (intended.value.changing as { value: number }).value = 999;
+  }, TypeError);
+  transaction(db, () => {
+    createIntakeStateStorage(db, identity).stagePrepared(prepared, randomUUID());
+  });
+  const first = store.readMaterialization()!;
+  const beforeReads = intakeWorkCounters(db);
+  assert.equal(store.readMaterialization(), first);
+  assert.equal(store.readSerialized(), first.serialized);
+  assert.equal(intakeWorkCounters(db).warm.serializedBytes, beforeReads.warm.serializedBytes);
+  assert.equal(intakeWorkCounters(db).warm.normalizeCalls, beforeReads.warm.normalizeCalls);
+  const detached = store.read()!;
+  (detached.retained as { text: string }).text = 'only local';
+  assert.equal(store.readMaterialization(), first);
+  const unchanged = store.prepare(first.value);
+  const beforeNoop = intakeWorkCounters(db);
+  const noop = transaction(db, () => store.stagePrepared(unchanged, randomUUID()));
+  assert.equal(noop.changed, false);
+  assert.equal(store.readMaterialization()!.value, first.value);
+  assert.ok(
+    intakeWorkCounters(db).warm.serializedBytes - beforeNoop.warm.serializedBytes <
+      first.semanticBytes,
+    'no-op verification compares retained exact text rather than serializing the whole view',
+  );
+  const next = store.prepare({ retained: input.retained, changing: { value: 2 } });
+  const beforeStage = intakeWorkCounters(db);
+  transaction(db, () => store.stagePrepared(next, randomUUID()));
+  const second = store.readMaterialization()!;
+  assert.notEqual(second, first);
+  assert.equal(
+    second.value.retained,
+    first.value.retained,
+    'unchanged validated subtree retains ownership',
+  );
+  assert.equal((first.value.changing as { value: number }).value, 1);
+  assert.equal((second.value.changing as { value: number }).value, 2);
+  const afterStage = intakeWorkCounters(db);
+  assert.equal(afterStage.warm.normalizeCalls, beforeStage.warm.normalizeCalls);
+  assert.equal(afterStage.primitive.candidateCopies, 0);
+  assert.equal(afterStage.primitive.candidateCopyBytes, 0);
+  assert.equal(afterStage.warm.candidatePathCopies - beforeStage.warm.candidatePathCopies, 2);
+  assert.equal(
+    afterStage.warm.candidateVerificationBytes - beforeStage.warm.candidateVerificationBytes,
+    second.semanticBytes,
+  );
+  clearIntakeStateCache(db);
+  assert.throws(() => store.inspectPrepared(next), /expired prepared state/);
+  const cold = store.readMaterialization()!;
+  assert.equal(cold.serialized, second.serialized);
+  assert.equal(cold.fingerprint, second.fingerprint);
+  assert.notEqual(cold, second);
+});
+
+test('prepared capabilities reject foreign scopes, changed limits, rollback and fabrication', (t) => {
+  const { db, identity } = fixture(t);
+  const other = fixture(t);
+  const store = createIntakeStateStorage(db, identity);
+  store.mutate({ value: 'committed' }, randomUUID());
+  const prepared = store.prepare({ value: 'candidate' });
+  const otherIdentity = { ...identity, intakeId: 'other-fictional-source' };
+  transaction(db, () => {
+    db.prepare(
+      'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+    ).run(
+      otherIdentity.intakeId,
+      'other-fictional.txt',
+      otherIdentity.sourceHash,
+      0,
+      'intake_original',
+      '{}',
+    );
+  });
+  assert.throws(
+    () => createIntakeStateStorage(db, otherIdentity).inspectPrepared(prepared),
+    /foreign or expired/,
+  );
+  assert.throws(
+    () => createIntakeStateStorage(other.db, other.identity).inspectPrepared(prepared),
+    /foreign or expired/,
+  );
+  assert.throws(
+    () =>
+      createIntakeStateStorage(db, identity, { limits: { nodes: 100 } }).inspectPrepared(prepared),
+    /foreign or expired/,
+  );
+  assert.throws(() => store.inspectPrepared({} as PreparedIntakeState), /foreign or expired/);
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        store.stagePrepared(prepared, randomUUID());
+        throw Error('rollback candidate');
+      }),
+    /rollback candidate/,
+  );
+  assert.equal(store.readSerialized(), '{"value":"committed"}');
+  assert.throws(() => store.inspectPrepared(prepared), /foreign or expired/);
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        try {
+          store.stagePrepared(prepared, randomUUID());
+        } catch {
+          /* cannot hide rejected staging */
+        }
+      }),
+    /foreign or expired/,
+  );
+  assert.equal(store.readSerialized(), '{"value":"committed"}');
+  const fresh = store.prepare({ value: 'candidate' });
+  transaction(db, () => {
+    store.stagePrepared(fresh, randomUUID());
+    store.stage({ value: 'later' }, randomUUID());
+  });
+  assert.equal(store.readSerialized(), '{"value":"later"}');
 });
 test('failed staged SQL poisons caught outer transaction and retains the committed basis', (t) => {
   const { db, identity } = fixture(t);

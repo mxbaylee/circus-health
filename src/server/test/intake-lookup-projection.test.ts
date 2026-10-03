@@ -308,3 +308,102 @@ test('wrong projection affinity or singleton binding rebuilds from unchanged sou
   );
   assert.equal(db.prepare('SELECT details_json FROM source_files').get()!.details_json, original);
 });
+
+test('raw SQL-first duplicate members, scalar identities and integer discovery conversion remain exact', (t) => {
+  const { db } = fixture(t);
+  registerRawIntakeFixture(
+    db,
+    'raw',
+    `{"intake":{"workflow":{
+    "reportGroups":[{"discoveryOrder":"009fictional","discoveryOrder":700},null,{}],
+    "reportAcceptances":[{"receipt":{"operationId":"raw-first","operationId":"raw-last"},"marker":"first"},{"receipt":{"operationId":null}}],
+    "identityConfirmations":[null,1,true,false,"fictional scalar","17",{"marker":"kept"}]
+  }},"intake":{"workflow":{"reportGroups":[{"discoveryOrder":999}]}}}`,
+  );
+  assert.equal(maximumReportDiscoveryOrder(db), 9);
+  assert.deepEqual(retainedReportAcceptance(db, 'raw-first'), {
+    receipt: { operationId: 'raw-last' },
+    marker: 'first',
+  });
+  assert.equal(retainedReportAcceptance(db, 'raw-last'), null);
+  assert.deepEqual(intakeIdentityConfirmations(db), [null, 1, 1, 0, null, 17, { marker: 'kept' }]);
+});
+
+test('identity cycles, missing links, extra rows and missing payloads refuse warm and repair cold', (t) => {
+  const { db, insert, write } = fixture(t);
+  insert('first', 1);
+  const identities = [{ marker: 1 }, { marker: 2 }, { marker: 1 }];
+  write('first', JSON.stringify({ intake: { workflow: { identityConfirmations: identities } } }));
+  assert.deepEqual(intakeIdentityConfirmations(db), identities);
+  for (const corrupt of [
+    'UPDATE __record_intake_lookup_identities SET next=id',
+    'UPDATE __record_intake_lookup_identities SET next=999 WHERE next IS NOT NULL',
+    'INSERT INTO __record_intake_lookup_identities SELECT source_id,999,NULL,hash FROM __record_intake_lookup_identities LIMIT 1',
+    'DELETE FROM __record_intake_lookup_payloads',
+  ]) {
+    db.exec(corrupt);
+    assert.throws(() => intakeIdentityConfirmations(db), /identity occurrence chain/);
+    clearIntakeLookupCache(db);
+    assert.deepEqual(intakeIdentityConfirmations(db), identities);
+  }
+});
+
+test('deleting and reinserting a source updates cross-source acceptance and identity order', (t) => {
+  const { db, insert } = fixture(t);
+  insert('a', 1);
+  insert('b', 2);
+  assert.deepEqual(retainedReportAcceptance(db, 'same'), {
+    receipt: { operationId: 'same' },
+    marker: 1,
+  });
+  transaction(db, () => db.prepare('DELETE FROM source_files WHERE id=?').run('a'));
+  insert('c', 3);
+  assert.deepEqual(retainedReportAcceptance(db, 'same'), {
+    receipt: { operationId: 'same' },
+    marker: 2,
+  });
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 2 }, { marker: 3 }]);
+});
+
+test('rolled-back payload memo is discarded before reconstruction and retry', (t) => {
+  const { db, body, insert, write } = fixture(t);
+  insert('first', 1);
+  maximumReportDiscoveryOrder(db);
+  const retainedRows = db
+    .prepare('SELECT * FROM __record_intake_lookup_payloads ORDER BY hash')
+    .all();
+  const payloadBytes = (marker: number) =>
+    Buffer.byteLength(JSON.stringify({ receipt: { operationId: 'same' }, marker })) +
+    Buffer.byteLength(JSON.stringify({ marker }));
+  const before = { ...intakeLookupCounters(db) };
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        write('first', body(77));
+        assert.equal(maximumReportDiscoveryOrder(db), 77);
+        throw Error('fictional payload rollback');
+      }),
+    /fictional payload rollback/,
+  );
+  const failed = { ...intakeLookupCounters(db) };
+  assert.equal(failed.hashedPayloadBytes - before.hashedPayloadBytes, payloadBytes(77));
+  assert.deepEqual(
+    db.prepare('SELECT * FROM __record_intake_lookup_payloads ORDER BY hash').all(),
+    retainedRows,
+  );
+  assert.equal(maximumReportDiscoveryOrder(db), 1);
+  const restored = { ...intakeLookupCounters(db) };
+  assert.equal(
+    restored.hashedPayloadBytes - failed.hashedPayloadBytes,
+    payloadBytes(1),
+    'cold restoration revalidates committed payloads',
+  );
+  write('first', body(77));
+  assert.equal(maximumReportDiscoveryOrder(db), 77);
+  const retried = { ...intakeLookupCounters(db) };
+  assert.equal(
+    retried.hashedPayloadBytes - restored.hashedPayloadBytes,
+    payloadBytes(77),
+    'an aborted new payload must be hashed again on retry',
+  );
+});

@@ -12,6 +12,7 @@ import {
   initializeIntakeEnvelope,
   prepareInitialIntakeEnvelope,
   readIntakeEnvelope,
+  readIntakeEnvelopeMaterialized,
   readNonIntakeEnvelope,
   stageIntakeEnvelope,
 } from './intake-authority.ts';
@@ -83,11 +84,6 @@ interface DetailsRow {
 }
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
-function envelope(db: DatabaseSync, file: DetailsRow): Record<string, unknown> {
-  const value = readIntakeEnvelope(db, file);
-  if (!object(value)) throw Error('Intake source metadata is incomplete');
-  return value;
-}
 /** Current persisted view, deliberately without merging the separate source pin. */
 export function storedIntakeDetails(db: DatabaseSync, file: DetailsRow): IntakeDetails | undefined {
   const all =
@@ -144,8 +140,11 @@ export function writeIntakeDetails(
   next: IntakeDetails,
   { effective = true }: { effective?: boolean } = {},
 ): string {
-  const all = envelope(db, file);
-  const stored = requireStoredIntakeDetails(db, file);
+  // Replace the existing intake slot on a shallow envelope copy. The selected
+  // stored view stays immutable, and unknown surrounding members retain order.
+  const all = { ...readIntakeEnvelopeMaterialized(db, file).value };
+  if (!object(all.intake)) throw Error('Intake source metadata is incomplete');
+  const stored = all.intake as unknown as IntakeDetails;
   all.intake = effective
     ? withoutIntakeSourcePin(next, stored, parseIntakeSourcePin(file.source_pin))
     : next;
