@@ -1,9 +1,15 @@
 import { useState, useRef } from 'react';
 import { Printer } from 'lucide-react';
 import { api, apiUrl } from '../../data/api';
-import { currentProfile } from '../../data/profile';
+import { currentProfile, useProfile } from '../../data/profile';
 import { NoteDialog } from './NoteDialog';
 import { LoadingIndicator } from '../../components/LoadingIndicator';
+import { PacketSelection, PacketPrivateReview, type PacketOptions } from './PacketSelection';
+import type {
+  PacketCandidate,
+  PacketSelection as Selection,
+  PacketReview,
+} from '../../../shared/packet-selection';
 import './note-export.css';
 
 type Choice = {
@@ -36,6 +42,7 @@ type Options = {
   noteTitle: string;
   choices: Choice[];
   assets: Asset[];
+  packet?: PacketOptions;
 };
 type Preview = {
   token: string;
@@ -43,6 +50,7 @@ type Preview = {
   fingerprint: string;
   generatedAt: string;
   assets: Asset[];
+  packetReview?: PacketReview;
 };
 export function NoteExportDialog({
   type,
@@ -57,6 +65,7 @@ export function NoteExportDialog({
   disabled?: boolean;
   label?: string;
 }) {
+  const activeProfile = useProfile();
   const [open, setOpen] = useState(false),
     [options, setOptions] = useState<Options | null>(null),
     [preview, setPreview] = useState<Preview | null>(null);
@@ -70,8 +79,16 @@ export function NoteExportDialog({
     [includePrescriptions, setIncludePrescriptions] = useState(false),
     [includePatient, setIncludePatient] = useState(false);
   const [search, setSearch] = useState('');
+  const [packetSelection, setPacketSelection] = useState<Selection>({});
+  const [previewChoicesChanged, setPreviewChoicesChanged] = useState(false);
   const frame = useRef<HTMLIFrameElement>(null),
     profile = useRef(currentProfile()?.id);
+  const profileChanged = profile.current !== activeProfile?.id;
+  function changeScope(change: () => void) {
+    change();
+    setPacketSelection((selection) => ({ ...selection, approvals: [] }));
+    setPreviewChoicesChanged(true);
+  }
   function checkProfile() {
     if (profile.current !== currentProfile()?.id)
       throw new Error('The profile changed. Reopen Print / Export in the selected profile.');
@@ -89,6 +106,8 @@ export function NoteExportDialog({
     setIncludePrescriptions(false);
     setIncludePatient(false);
     setSearch('');
+    setPacketSelection({});
+    setPreviewChoicesChanged(false);
     setMode(type === 'person' ? 'provider' : 'brief');
     profile.current = currentProfile()?.id;
     try {
@@ -138,10 +157,12 @@ export function NoteExportDialog({
           includePatient,
           selected: [],
           assets: [],
+          ...(latest.packet ? { packetSelection } : {}),
         }),
       });
       checkProfile();
       setPreview(response.data);
+      setPreviewChoicesChanged(false);
     } catch (e) {
       setPreview(null);
       setError(e instanceof Error ? e.message : 'Could not create a preview.');
@@ -150,7 +171,7 @@ export function NoteExportDialog({
     }
   }
   async function output(format: 'print' | 'pdf' | 'evidence') {
-    if (!preview) return;
+    if (!preview || previewChoicesChanged) return;
     setBusy(true);
     setError('');
     try {
@@ -183,12 +204,49 @@ export function NoteExportDialog({
         const url = URL.createObjectURL(blob),
           link = document.createElement('a');
         link.href = url;
-        link.download = `${(options?.noteTitle || 'note').replace(/[^a-z0-9 _-]/gi, '').slice(0, 80) || 'note'}-${mode}${format === 'evidence' ? '-evidence.json' : '.pdf'}`;
+        link.download = `health-packet-${mode}${format === 'evidence' ? '-evidence.json' : '.pdf'}`;
         link.click();
         setTimeout(() => URL.revokeObjectURL(url), 10000);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Export failed.');
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function savePreference(
+    candidate: PacketCandidate,
+    alwaysWithhold: boolean,
+    tags = candidate.tags,
+  ) {
+    if (!options?.packet) return;
+    setBusy(true);
+    setError('');
+    try {
+      checkProfile();
+      await api(endpoint('preferences'), {
+        method: 'POST',
+        body: JSON.stringify({
+          type,
+          id,
+          personId: options.packet.personId,
+          record: candidate.record,
+          alwaysWithhold,
+          tags,
+          expectedVersion: candidate.preferenceVersion,
+        }),
+      });
+      checkProfile();
+      const latest = await api<Options>(endpoint('options'), {
+        method: 'POST',
+        body: JSON.stringify({ type, id }),
+      });
+      checkProfile();
+      setOptions(latest.data);
+      setPacketSelection((selection) => ({ ...selection, approvals: [] }));
+      setPreview(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not save the withholding preference.');
     } finally {
       setBusy(false);
     }
@@ -207,7 +265,13 @@ export function NoteExportDialog({
     includeAttachments ||
     includeProcedures ||
     includePrescriptions ||
-    includePatient;
+    includePatient ||
+    !!packetSelection.include?.length ||
+    !!packetSelection.exclude?.length ||
+    packetSelection.kinds !== undefined ||
+    !!packetSelection.tags?.length ||
+    !!packetSelection.from ||
+    !!packetSelection.to;
   return (
     <>
       <button
@@ -235,7 +299,7 @@ export function NoteExportDialog({
         backLabel="Back to export options"
         backDisabled={busy}
         title="Print / Export"
-        description="Prepare a focused visit brief or a complete introduction for a new provider."
+        description="Prepare a visit brief or selected history to share with a provider."
         className="note-export-dialog"
       >
         {error && (
@@ -254,7 +318,11 @@ export function NoteExportDialog({
             {type !== 'person' && (
               <label className="note-field">
                 Format
-                <select value={mode} onChange={(e) => setMode(e.target.value)}>
+                <select
+                  disabled={busy}
+                  value={mode}
+                  onChange={(e) => changeScope(() => setMode(e.target.value))}
+                >
                   <option value="brief">Visit brief</option>
                   <option value="provider">New provider packet</option>
                 </select>
@@ -263,16 +331,17 @@ export function NoteExportDialog({
             {mode === 'brief' ? (
               <>
                 <p>
-                  <strong>{options.noteTitle}</strong> is always included. Choose any supporting
-                  information for this visit.
+                  <strong>{options.noteTitle}</strong> is your starting note. Choose any supporting
+                  information and review what to leave out.
                 </p>
                 <fieldset className="export-inclusions">
                   <legend>Include</legend>
                   <label className="export-check">
                     <input
                       type="checkbox"
+                      disabled={busy}
                       checked={includeLinked}
-                      onChange={(e) => setIncludeLinked(e.target.checked)}
+                      onChange={(e) => changeScope(() => setIncludeLinked(e.target.checked))}
                     />
                     <span>
                       Linked entries<small>Direct links only.</small>
@@ -281,8 +350,9 @@ export function NoteExportDialog({
                   <label className="export-check">
                     <input
                       type="checkbox"
+                      disabled={busy}
                       checked={includeAttachments}
-                      onChange={(e) => setIncludeAttachments(e.target.checked)}
+                      onChange={(e) => changeScope(() => setIncludeAttachments(e.target.checked))}
                     />
                     <span>
                       Attachments
@@ -292,24 +362,27 @@ export function NoteExportDialog({
                   <label className="export-check">
                     <input
                       type="checkbox"
+                      disabled={busy}
                       checked={includeProcedures}
-                      onChange={(e) => setIncludeProcedures(e.target.checked)}
+                      onChange={(e) => changeScope(() => setIncludeProcedures(e.target.checked))}
                     />
                     Procedure history
                   </label>
                   <label className="export-check">
                     <input
                       type="checkbox"
+                      disabled={busy}
                       checked={includePrescriptions}
-                      onChange={(e) => setIncludePrescriptions(e.target.checked)}
+                      onChange={(e) => changeScope(() => setIncludePrescriptions(e.target.checked))}
                     />
                     Current prescriptions
                   </label>
                   <label className="export-check">
                     <input
                       type="checkbox"
+                      disabled={busy}
                       checked={includePatient}
-                      onChange={(e) => setIncludePatient(e.target.checked)}
+                      onChange={(e) => changeScope(() => setIncludePatient(e.target.checked))}
                     />
                     Patient information
                   </label>
@@ -319,26 +392,28 @@ export function NoteExportDialog({
               <>
                 <h3>New provider packet</h3>
                 <p>
-                  Patient information, recorded prescriptions, procedures, results, and source
-                  references are included automatically. Care contacts and additional clinical
-                  assertions appear when they are linked or assigned to this person.
+                  Start with this person's recorded history, then choose which records to share.
+                  Care contacts and additional clinical assertions appear when they are linked or
+                  assigned to this person.
                 </p>
                 <fieldset className="export-inclusions">
                   <legend>Notes to include</legend>
                   {type !== 'person' && (
                     <p>
-                      <strong>{options.noteTitle}</strong> is included as your introduction.
+                      <strong>{options.noteTitle}</strong> starts as your introduction, subject to
+                      your packet choices.
                     </p>
                   )}
                   <p className="text-muted">
-                    Selected notes include their direct links and attachments. Other personal notes
-                    stay out.
+                    Selected notes start with their direct links and attachments, subject to your
+                    withholding choices and original review. Other personal notes stay out.
                   </p>
                   {!!notes.length && (
                     <label className="note-field">
                       Find a note
                       <input
                         type="search"
+                        disabled={busy}
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
                         placeholder="Search notes"
@@ -350,8 +425,9 @@ export function NoteExportDialog({
                       <label className="export-check" key={note.key}>
                         <input
                           type="checkbox"
+                          disabled={busy}
                           checked={noteIds.includes(note.id)}
-                          onChange={() => toggle(note.id, noteIds, setNoteIds)}
+                          onChange={() => changeScope(() => toggle(note.id, noteIds, setNoteIds))}
                         />
                         <span>
                           {note.title}
@@ -372,6 +448,17 @@ export function NoteExportDialog({
                   )}
                 </fieldset>
               </>
+            )}
+            {options.packet && (
+              <PacketSelection
+                packet={options.packet}
+                selection={packetSelection}
+                onChange={setPacketSelection}
+                onPreference={(candidate, alwaysWithhold, tags) =>
+                  void savePreference(candidate, alwaysWithhold, tags)
+                }
+                busy={busy || profileChanged}
+              />
             )}
             <p className="text-muted">
               Repeated entries are included once. The preview lists accompanying attachment
@@ -397,6 +484,22 @@ export function NoteExportDialog({
               Preview generated {new Date(preview.generatedAt).toLocaleString()}. Refresh the
               preview if content changes.
             </p>
+            {preview.packetReview && (
+              <PacketPrivateReview
+                review={preview.packetReview}
+                selection={packetSelection}
+                onChange={(selection) => {
+                  setPacketSelection(selection);
+                  setPreviewChoicesChanged(true);
+                }}
+                busy={busy || profileChanged}
+              />
+            )}
+            {previewChoicesChanged && (
+              <p className="note-warning" role="status">
+                Disclosure choices changed. Refresh the preview before sharing.
+              </p>
+            )}
             <div className="note-dialog-actions">
               <button className="button secondary" disabled={busy} onClick={() => setPreview(null)}>
                 Edit options
@@ -410,18 +513,22 @@ export function NoteExportDialog({
               </button>
               <button
                 className="button secondary"
-                disabled={busy}
+                disabled={busy || previewChoicesChanged}
                 onClick={() => void output('print')}
               >
                 Print
               </button>
-              <button className="button primary" disabled={busy} onClick={() => void output('pdf')}>
+              <button
+                className="button primary"
+                disabled={busy || previewChoicesChanged}
+                onClick={() => void output('pdf')}
+              >
                 Download PDF
               </button>
               {mode === 'provider' && (
                 <button
                   className="button secondary"
-                  disabled={busy}
+                  disabled={busy || previewChoicesChanged}
                   onClick={() => void output('evidence')}
                 >
                   Download evidence JSON
@@ -431,7 +538,8 @@ export function NoteExportDialog({
             {mode === 'provider' && (
               <p className="text-muted">
                 The PDF presents the readable clinical records. The accompanying evidence JSON
-                contains exact retained source assertions and full attribution for this packet.
+                contains the selected evidence and attribution for this packet. Any explicitly
+                approved narrative or original is included unredacted.
               </p>
             )}
             <iframe
@@ -446,9 +554,24 @@ export function NoteExportDialog({
                 <h3>Accompanying attachments</h3>
                 {preview.assets.map((a) => (
                   <p key={a.id}>
-                    <a href={a.contentUrl} download>
-                      {a.originalName}
-                    </a>
+                    {busy || previewChoicesChanged || profileChanged ? (
+                      <span>{a.originalName} — refresh the preview to download</span>
+                    ) : (
+                      <a
+                        href={a.contentUrl}
+                        download
+                        onClick={(event) => {
+                          try {
+                            checkProfile();
+                          } catch (e) {
+                            event.preventDefault();
+                            setError(e instanceof Error ? e.message : 'The profile changed.');
+                          }
+                        }}
+                      >
+                        {a.originalName}
+                      </a>
+                    )}
                   </p>
                 ))}
               </div>

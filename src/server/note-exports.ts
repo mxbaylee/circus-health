@@ -1,5 +1,5 @@
 import { readStoredIntakeDetails } from './intake-state-access.ts';
-import { sourceAssertionBoundary } from './source-assertion-ownership.ts';
+import { sourceAssertionBoundary, sourceAssertionOwnership } from './source-assertion-ownership.ts';
 import { recordOwner } from './record-owner.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 import { ownershipCorrections, type OwnershipCorrectionHistory } from './ownership-history.ts';
@@ -21,6 +21,23 @@ import type { NoteDTO } from './notes.ts';
 import { packetReportReview, type PacketReportReview } from './packet-report-review.ts';
 import type { IntakeExtractionPlan } from '../shared/intake.ts';
 import { accountedUnitKind } from './intake-unit-accounting.ts';
+import { readFile } from 'node:fs/promises';
+import { profileFile } from './assets.ts';
+import { writePacketPreference, type PacketPreferenceInput } from './packet-preferences.ts';
+import {
+  checkedPacketSelection,
+  packetCandidates,
+  packetOpaqueRecord,
+  packetDependencies,
+  packetDependencyCache,
+  planPacketSelection,
+  packetWithholdingNotice,
+  packetOpaqueNotice,
+  packetUnredactedNotice,
+  type PacketDependencies,
+  type PacketDependencyCache,
+} from './packet-selection.ts';
+import type { PacketReview, PacketSelection } from '../shared/packet-selection.ts';
 
 const tables = {
   note: 'notes',
@@ -196,9 +213,20 @@ export interface NoteExportInput extends JsonRecord {
   includePrescriptions?: boolean;
   normalizedSelection?: boolean;
   trends?: boolean;
+  packetSelection?: PacketSelection;
+  /** Captured by the authenticated preview route, never accepted from its JSON body. */
+  packetApproval?: { actor: 'profile-user'; approvedAt: string };
 }
 
 export interface NoteExportSnapshot {
+  packetReview?: PacketReview;
+  packetPrivate?: unknown;
+  packetInspection?: Record<string, string>;
+  selective?: boolean;
+  patientRequestedWithholding?: boolean;
+  unredactedMaterialsIncluded?: boolean;
+  sourceReviewIncomplete?: boolean;
+  sourceReadingIncomplete?: boolean;
   reportReview: PacketReportReview[];
   unassignedRawAssertionsOmitted: boolean;
   readingGaps: {
@@ -251,6 +279,7 @@ interface NoteExportRouteContext {
   res: ServerResponse;
   db: Database;
   profileId: string;
+  root?: string;
   respond(data: unknown): void;
   jsonBody(req: IncomingMessage): Promise<unknown>;
 }
@@ -279,6 +308,9 @@ const inputRecord = (value: unknown): NoteExportInput => {
     ...(Array.isArray(value.selected) ? { selected: value.selected } : {}),
     ...(Array.isArray(value.assets) ? { assets: value.assets } : {}),
     ...(Array.isArray(value.noteIds) ? { noteIds: value.noteIds } : {}),
+    ...(value.packetSelection === undefined
+      ? {}
+      : { packetSelection: checkedPacketSelection(value.packetSelection) }),
   };
 };
 const parse = (s: unknown, fallback: unknown = {}): unknown => {
@@ -463,6 +495,12 @@ function record(
   )
     type = 'source_file';
   let row = rowFor(db, type, id);
+  if (type === 'source' && sourceAssertionOwnership(db, id).ownerPersonId !== personId)
+    throw new HttpError(
+      400,
+      'EXPORT_SUBJECT',
+      'A retained assertion needs a verified assignment to the selected person before sharing.',
+    );
   if (
     (['observation', 'medication', 'procedure'].includes(type) && row.person_id !== personId) ||
     (type === 'document' && documentPersonId(row.extra_json) !== personId) ||
@@ -532,6 +570,175 @@ function record(
   }
   return result;
 }
+/** Subject-scoped choices, including optional notes and originals represented by their evidence. */
+function packetOriginalMember(db: Database, personId: string, id: string): boolean {
+  // This targeted read is used by a single preference write. Do not build or
+  // materialize the person's complete packet merely to change one flag.
+  const pending = [id],
+    seen = new Set<string>();
+  while (pending.length) {
+    const file = pending.pop()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    if (seen.size > 100000)
+      throw new HttpError(400, 'EXPORT_TOO_LARGE', 'Source ancestry exceeds the packet limit.');
+    const linked = db
+      .prepare(
+        "SELECT 1 FROM note_links l JOIN notes n ON n.id=l.note_id WHERE l.target_type='source' AND l.target_id=? AND n.kind<>'person' AND COALESCE(json_extract(n.profile_json,'$.recordOwnerPersonId'),'patient')=? LIMIT 1",
+      )
+      .get(file, personId);
+    if (linked) return true;
+    for (const attached of db
+      .prepare(
+        'SELECT at.owner_type,at.owner_id FROM attachments at JOIN assets a ON a.id=at.asset_id WHERE a.source_file_id=?',
+      )
+      .iterate(file)) {
+      if (recordOwner(db, String(attached.owner_type), String(attached.owner_id)) === personId)
+        return true;
+    }
+    const sources = db
+      .prepare(
+        "SELECT id FROM source_records WHERE source_file_id=? OR json_extract(locator_json,'$.originalSourceFileId')=?",
+      )
+      .iterate(file, file);
+    for (const source of sources) {
+      const sourceId = String(source.id);
+      if (sourceAssertionOwnership(db, sourceId).ownerPersonId === personId) return true;
+      for (const [kind, table] of [
+        ['observation', 'observations'],
+        ['medication', 'medications'],
+        ['procedure', 'procedures'],
+        ['document', 'documents'],
+        ['note', 'notes'],
+      ] as const) {
+        const owner =
+          kind === 'document'
+            ? "COALESCE(json_extract(r.extra_json,'$.import.personId'),'patient')"
+            : kind === 'note'
+              ? "COALESCE(json_extract(r.profile_json,'$.recordOwnerPersonId'),'patient')"
+              : 'r.person_id';
+        if (
+          db
+            .prepare(
+              `SELECT 1 FROM ${table} r WHERE ${owner}=? ${kind === 'note' ? "AND r.kind<>'person'" : ''} AND (r.source_record_id=? OR EXISTS(SELECT 1 FROM evidence e WHERE e.entity_type=? AND e.entity_id=r.id AND e.source_record_id=?)) LIMIT 1`,
+            )
+            .get(personId, sourceId, kind, sourceId)
+        )
+          return true;
+      }
+    }
+    for (const child of db
+      .prepare(
+        "SELECT id FROM source_files WHERE json_extract(details_json,'$.originalSourceFileId')=? OR json_extract(details_json,'$.intake.parentSourceFileId')=?",
+      )
+      .iterate(file, file))
+      pending.push(String(child.id));
+  }
+  // A factored context may be reachable only through a retained reference. Use
+  // scoped identities for that uncommon proof; do not load clinical/note bodies.
+  const sources = new Set<string>(),
+    assets = new Set<string>();
+  for (const [kind, table] of [
+    ['observation', 'observations'],
+    ['medication', 'medications'],
+    ['procedure', 'procedures'],
+    ['document', 'documents'],
+    ['note', 'notes'],
+  ] as const) {
+    const owner =
+      kind === 'document'
+        ? "COALESCE(json_extract(r.extra_json,'$.import.personId'),'patient')"
+        : kind === 'note'
+          ? "COALESCE(json_extract(r.profile_json,'$.recordOwnerPersonId'),'patient')"
+          : 'r.person_id';
+    const where = `${owner}=? ${kind === 'note' ? "AND r.kind<>'person'" : ''}`;
+    for (const row of db
+      .prepare(
+        `SELECT r.source_record_id source FROM ${table} r WHERE ${where} UNION SELECT e.source_record_id source FROM evidence e JOIN ${table} r ON r.id=e.entity_id AND e.entity_type=? WHERE ${where}`,
+      )
+      .iterate(personId, kind, personId))
+      if (row.source) sources.add(String(row.source));
+    for (const row of db
+      .prepare(
+        `SELECT at.asset_id FROM attachments at JOIN ${table} r ON r.id=at.owner_id AND at.owner_type=? WHERE ${where}`,
+      )
+      .iterate(kind, personId))
+      assets.add(String(row.asset_id));
+  }
+  for (const row of db
+    .prepare(
+      `SELECT sr.id FROM source_records sr WHERE ${assertionBoundary.singleOwner} AND EXISTS(SELECT 1 FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject' AND e.entity_id=?)`,
+    )
+    .iterate(personId))
+    sources.add(String(row.id));
+  return packetDependencies(db, {
+    key: 'membership',
+    type: 'membership',
+    id: 'membership',
+    title: '',
+    date: null,
+    row: {},
+    citations: [...sources].map((id) => ({ id })),
+    attachments: [...assets].map((assetId) => ({ assetId })),
+  }).files.has(id);
+}
+
+function packetItems(
+  db: Database,
+  personId: string,
+  cache = packetDependencyCache(),
+): ExportRecord[] {
+  const items = new Map<string, ExportRecord>();
+  for (const [type, table] of [
+    ['note', 'notes'],
+    ['observation', 'observations'],
+    ['medication', 'medications'],
+    ['procedure', 'procedures'],
+    ['document', 'documents'],
+  ] as const) {
+    const where =
+      type === 'note'
+        ? "kind<>'person' AND COALESCE(json_extract(profile_json,'$.recordOwnerPersonId'),'patient')=?"
+        : type === 'document'
+          ? "COALESCE(json_extract(extra_json,'$.import.personId'),'patient')=?"
+          : 'person_id=?';
+    for (const row of db
+      .prepare(`SELECT id FROM ${table} WHERE ${where} ORDER BY id`)
+      .all(personId)) {
+      const item = record(db, type, String(row.id), personId);
+      items.set(item.key, item);
+    }
+  }
+  for (const row of db
+    .prepare(
+      `SELECT sr.id FROM source_records sr WHERE ${assertionBoundary.singleOwner} AND EXISTS (SELECT 1 FROM evidence e WHERE e.entity_type='person' AND e.entity_id=? AND e.source_record_id=sr.id AND e.role='report_subject') ORDER BY sr.id`,
+    )
+    .all(personId)) {
+    const item = record(db, 'source', String(row.id), personId);
+    items.set(item.key, item);
+  }
+  const sourceFiles = new Set<string>();
+  for (const item of items.values()) {
+    for (const file of packetDependencies(db, item, cache).files) sourceFiles.add(file);
+    for (const link of item.note?.links || []) {
+      if (
+        link.targetType === 'source' &&
+        db.prepare('SELECT 1 FROM source_files WHERE id=?').get(link.targetId)
+      )
+        sourceFiles.add(link.targetId);
+    }
+  }
+  for (const id of sourceFiles)
+    for (const ancestor of packetDependencies(db, record(db, 'source_file', id, personId), cache)
+      .files)
+      sourceFiles.add(ancestor);
+  for (const id of [...sourceFiles].sort()) {
+    const item = record(db, 'source_file', id, personId);
+    items.set(item.key, item);
+  }
+  return [...items.values()].sort((a, b) => a.key.localeCompare(b.key));
+}
+
 export function exportOptions(db: Database, value: unknown) {
   const input = inputRecord(value);
   const personId = exportPerson(db, input);
@@ -639,7 +846,14 @@ export function exportOptions(db: Database, value: unknown) {
       `SELECT a.id,a.original_name AS title,a.mime_type AS mimeType,a.sha256,a.bytes,at.owner_type AS ownerType,at.owner_id AS ownerId,at.event_date AS date,at.caption FROM attachments at JOIN assets a ON a.id=at.asset_id ORDER BY a.id,at.id`,
     )
     .all();
+  const { candidates } = packetCandidates(db, personId, packetItems(db, personId));
   return {
+    packet: {
+      personId,
+      candidates,
+      kinds: [...new Set(candidates.map((candidate) => candidate.kind))].sort(),
+      tags: [...new Set(candidates.flatMap((candidate) => candidate.tags))].sort(),
+    },
     noteVersion: main.note?.version ?? hash(main),
     choices,
     assets: assetChoices.filter((asset) => {
@@ -684,6 +898,10 @@ function packetSelection(db: Database, input: NoteExportInput): NoteExportInput 
     if (r.note?.kind === 'person')
       throw new HttpError(400, 'INVALID_EXPORT', 'Choose notes rather than people.');
     seeds.push(add('note', id));
+  }
+  for (const ref of input.packetSelection?.include || []) {
+    const included = add(ref.kind, ref.recordId);
+    if (included.note && included.note.kind !== 'person') seeds.push(included);
   }
   const attached = (r: ExportRecord): void => {
     for (const a of r.attachments) assetIds.add(a.assetId);
@@ -905,6 +1123,205 @@ function includedReadingGaps(
   return result;
 }
 
+/** Only these normalized fields are shared while a packet withholds records. */
+function selectedRecordProjection(
+  item: ExportRecord,
+  unredacted: boolean,
+  included: Set<string>,
+): ExportRecord {
+  const fields = [
+    'id',
+    'kind',
+    'person_id',
+    'title',
+    'label',
+    'display_name',
+    'event_date',
+    'effective_at',
+    'start_at',
+    'end_at',
+    'date_text',
+    'date_precision',
+    'status',
+    'value_text',
+    'unit',
+    'dose_text',
+    'route',
+    'frequency',
+    'test_type_id',
+    'updated_at',
+    'value_numeric',
+    'comparator',
+  ];
+  const row: ExportRow = unredacted
+    ? { ...item.row }
+    : Object.fromEntries(
+        fields
+          .filter((field) => item.row[field] !== undefined)
+          .map((field) => [field, item.row[field]]),
+      );
+  if (!unredacted) {
+    row.extra_json = '{}';
+    if (item.row.reference_json) {
+      const referenceValue = parse(item.row.reference_json, null);
+      const numeric = (value: unknown) =>
+        (typeof value === 'number' && Number.isFinite(value)) ||
+        (typeof value === 'string' && /^\s*[<>≤≥]?\s*-?\d+(?:\.\d+)?\s*$/.test(value));
+      const safeReference = isRecord(referenceValue)
+        ? Object.fromEntries(
+            Object.entries(referenceValue).filter(
+              ([key, value]) =>
+                [
+                  'low',
+                  'high',
+                  'min',
+                  'max',
+                  'lower',
+                  'upper',
+                  'lowerBound',
+                  'upperBound',
+                ].includes(key) && numeric(value),
+            ),
+          )
+        : {};
+      row.reference_json = JSON.stringify(
+        Object.keys(safeReference).length
+          ? safeReference
+          : referenceValue === null || (isRecord(referenceValue) && referenceValue.raw === null)
+            ? { raw: null }
+            : { detail: 'Unstructured reference detail left out of this packet' },
+      );
+    }
+  }
+  // Author/profile/link metadata is not part of consent to a note's literal body.
+  if (item.type === 'note') {
+    row.profile_json = '{}';
+    row.extra_json = '{}';
+  }
+  const note = item.note
+    ? {
+        ...item.note,
+        links: item.note.links.filter((link) =>
+          included.has(`${link.resolvedTargetType || link.targetType}:${link.targetId}`),
+        ),
+        backlinks: [],
+        attachments: [],
+        person: {},
+        profile: {},
+      }
+    : undefined;
+  const safeLocator = (value: unknown): JsonRecord => {
+    if (!isRecord(value)) return {};
+    const projected = Object.fromEntries(
+      ['page', 'startPage', 'endPage', 'pageStart', 'pageEnd']
+        .filter(
+          (key) =>
+            typeof value[key] === 'number' &&
+            Number.isSafeInteger(value[key]) &&
+            Number(value[key]) > 0,
+        )
+        .map((key) => [key, value[key]]),
+    );
+    if (
+      Array.isArray(value.pages) &&
+      value.pages.every((page) => Number.isSafeInteger(page) && Number(page) > 0)
+    )
+      projected.pages = value.pages;
+    return projected;
+  };
+  const correctionFields = new Set([
+    ...fields,
+    'valueText',
+    'valueNumeric',
+    'date',
+    'datePrecision',
+    'doseText',
+    'startAt',
+    'endAt',
+    'text',
+    'textContent',
+    'reference',
+    'testTypeId',
+    'personId',
+  ]);
+  const correctionDate = (date: string) =>
+    /^\d{4}-\d{2}-\d{2}(?:T[0-9:.]+Z)?$/.test(date) && Number.isFinite(Date.parse(date))
+      ? date
+      : '';
+  return {
+    key: item.key,
+    type: item.type,
+    id: item.id,
+    title: item.title,
+    date: item.date,
+    archived: item.archived,
+    row,
+    citations: item.citations.map((citation) => ({
+      id: citation.id,
+      role: 'source',
+      issuer: citation.sourceRecordProvider || citation.acquisition || null,
+      authors: null,
+      sourceRecordProvider: citation.sourceRecordProvider,
+      acquisition: citation.acquisition,
+      sha256: citation.sha256,
+      locator: safeLocator(citation.locator),
+      sourceLocator: safeLocator(citation.sourceLocator),
+    })),
+    attachments: [],
+    ...(note ? { note } : {}),
+    ...(item.currentUse
+      ? {
+          currentUse: {
+            status: item.currentUse.status,
+            updated_at: item.currentUse.updated_at,
+            ...(unredacted ? { assertion_json: item.currentUse.assertion_json } : {}),
+          },
+        }
+      : {}),
+    ...(item.ownershipCorrections
+      ? {
+          ownershipCorrections: unredacted
+            ? item.ownershipCorrections
+            : item.ownershipCorrections.map((correction) => ({
+                operationId: correction.operationId,
+                action: correction.action,
+                at: correctionDate(correction.at),
+                actor: correction.actor,
+                fromPersonId: '',
+                fromNoteId: '',
+                fromPersonName: 'a prior person',
+                toPersonId: '',
+                reason: null,
+              })),
+        }
+      : {}),
+    ...(item.fieldCorrections
+      ? {
+          fieldCorrections: unredacted
+            ? item.fieldCorrections
+            : item.fieldCorrections.map((correction) => ({
+                at: correctionDate(correction.at),
+                actor: correction.actor,
+                fields: correction.fields
+                  .map((field) => (correctionFields.has(field) ? field : 'record details'))
+                  .filter((field, index, all) => all.indexOf(field) === index),
+                reason: '',
+                ...(correction.fromKind &&
+                ['observation', 'medication', 'procedure', 'document', 'condition'].includes(
+                  correction.fromKind,
+                ) &&
+                correction.toKind &&
+                ['observation', 'medication', 'procedure', 'document', 'condition'].includes(
+                  correction.toKind,
+                )
+                  ? { fromKind: correction.fromKind, toKind: correction.toKind }
+                  : {}),
+              })),
+        }
+      : {}),
+  };
+}
+
 export function exportSnapshot(
   db: Database,
   value: unknown,
@@ -915,7 +1332,7 @@ export function exportSnapshot(
     throw new HttpError(400, 'INVALID_EXPORT', 'Invalid export options.');
   input = { ...input, mode: input.mode || 'brief' };
   const personId = exportPerson(db, input);
-  const main = record(db, input.type, input.id, personId);
+  let main = record(db, input.type, input.id, personId);
   if ((main.note?.version ?? hash(main)) !== input.noteVersion)
     throw new HttpError(409, 'EXPORT_STALE', 'The note changed. Save and refresh the preview.');
   if (input.type === 'person' && input.mode !== 'provider')
@@ -979,10 +1396,45 @@ export function exportSnapshot(
       'EXPORT_TOO_LARGE',
       'This selection expands beyond 2,000 records. Narrow the dates or choose fewer histories.',
     );
+  const dependencyCache: PacketDependencyCache = packetDependencyCache();
+  const allItems = packetItems(db, personId, dependencyCache);
+  const candidatesByKey = new Map(allItems.map((item) => [item.key, item]));
+  for (const item of [main, ...records.values()]) {
+    if (item.type === 'source_file' && !candidatesByKey.has(item.key))
+      throw new HttpError(
+        400,
+        'EXPORT_SUBJECT',
+        'This original is not associated with the selected person’s records.',
+      );
+    if (!(item.type === 'note' && item.note?.kind === 'person'))
+      candidatesByKey.set(item.key, item);
+  }
+  const plan = planPacketSelection(
+    db,
+    personId,
+    [...candidatesByKey.values()],
+    new Set([main.key, ...records.keys()]),
+    input.packetSelection,
+    dependencyCache,
+  );
+  for (const key of [...records.keys()]) if (!plan.selected.has(key)) records.delete(key);
+  for (const key of plan.selected)
+    if (key !== main.key && !records.has(key)) records.set(key, candidatesByKey.get(key)!);
+  const mainSelected = main.note?.kind === 'person' || plan.selected.has(main.key);
+  // Originals are selected from the same scoped evidence, then independently disclosed.
+  if (plan.active) {
+    const assetIds = new Set(
+      (input.assets || []).filter((id): id is string => typeof id === 'string'),
+    );
+    for (const item of [...records.values(), ...(mainSelected ? [main] : [])]) {
+      for (const attached of item.attachments) assetIds.add(attached.assetId);
+    }
+    input = { ...input, assets: [...assetIds] };
+  }
   if ((input.assets?.length || 0) > 100)
     throw new HttpError(400, 'EXPORT_TOO_LARGE', 'Select at most 100 companion originals.');
   const allowedOwners = new Set(
-    [main, ...records.values()].flatMap((r) => [
+    [...(mainSelected ? [main] : []), ...records.values()].flatMap((r) => [
       r.key,
       ...(r.note?.personId ? [`person:${r.note.personId}`] : []),
     ]),
@@ -1025,7 +1477,10 @@ export function exportSnapshot(
         'EXPORT_DATE_SCOPE',
         'A selected original has no attachment date within the selected range.',
       );
-    if (!allowed.length) throw new HttpError(400, 'INVALID_EXPORT', 'Select an attached original.');
+    if (!allowed.length) {
+      if (plan.active) continue;
+      throw new HttpError(400, 'INVALID_EXPORT', 'Select an attached original.');
+    }
     if (
       !input.includeArchived &&
       allowed.every((o) =>
@@ -1055,11 +1510,64 @@ export function exportSnapshot(
         contentUrl: `/api/sources/${encodeURIComponent(r.id)}/content`,
         owners: [],
       });
+  if (plan.active) {
+    const files = new Set<string>();
+    for (const item of [...records.values(), ...(mainSelected ? [main] : [])])
+      for (const file of plan.dependencies.get(item.key)?.files || []) files.add(file);
+    for (const file of [...files].sort()) {
+      if (assets.some((asset) => asset.id === `source-file:${file}`)) continue;
+      const source = rowFor(db, 'source_file', file);
+      assets.push({
+        id: `source-file:${file}`,
+        originalName: String(source.path || file)
+          .split('/')
+          .at(-1)!,
+        mimeType: typeof source.mime_type === 'string' ? source.mime_type : null,
+        bytes: typeof source.bytes === 'number' ? source.bytes : null,
+        sha256: typeof source.sha256 === 'string' ? source.sha256 : null,
+        contentUrl: `/api/sources/${encodeURIComponent(file)}/content`,
+        owners: [],
+      });
+    }
+  }
+  const originalDependencies = new Map<string, PacketDependencies>();
+  if (plan.active)
+    for (const asset of assets) {
+      const dependency = asset.id.startsWith('source-file:')
+        ? packetDependencies(
+            db,
+            record(db, 'source_file', asset.id.slice(12), personId),
+            plan.dependencyCache,
+          )
+        : packetDependencies(
+            db,
+            {
+              key: asset.id,
+              type: 'asset',
+              id: asset.id,
+              title: asset.originalName,
+              date: null,
+              row: {},
+              citations: [],
+              attachments: [{ assetId: asset.id }],
+            },
+            plan.dependencyCache,
+          );
+      for (const owner of asset.owners)
+        dependency.links.add(`${owner.owner_type}:${owner.owner_id}`);
+      originalDependencies.set(asset.id, dependency);
+    }
   for (let i = assets.length - 1; i >= 0; i--) {
     const first = assets.findIndex(
       (a) => a.sha256 && a.sha256 === assets[i].sha256 && a.bytes === assets[i].bytes,
     );
     if (first !== -1 && first !== i) {
+      if (plan.active) {
+        const retained = originalDependencies.get(assets[first].id)!,
+          removed = originalDependencies.get(assets[i].id)!;
+        for (const key of ['files', 'hashes', 'assets', 'links'] as const)
+          for (const value of removed[key]) retained[key].add(value);
+      }
       assets[first].owners.push(...assets[i].owners);
       assets[first].originalNames = [
         ...new Set([
@@ -1102,8 +1610,103 @@ export function exportSnapshot(
           ),
           role: 'caregiver' as const,
         };
-  if (input.type === 'person') {
-    main.row = { ...main.row, content: '', topics: '', raw_thoughts: '', profile_json: '{}' };
+  let unredactedMaterialsIncluded = false;
+  const packetInspection: Record<string, string> = {};
+  const requestedWithholding = plan.withheld.size > 0;
+  if (plan.active) {
+    const disclose = (item: ExportRecord): boolean => {
+      const opaque = packetOpaqueRecord(item);
+      const key = `${opaque ? 'record' : 'context'}:${item.key}`;
+      const approved = plan.approve(
+        key,
+        `${item.title}${opaque ? '' : ' — full source and correction detail'}`,
+        item,
+        plan.dependencies.get(item.key)!,
+      );
+      const inspection = plan.review.opaqueItems.at(-1)!;
+      const text = JSON.stringify(selectedRecordProjection(item, true, plan.selected), null, 2);
+      packetInspection[key] = text;
+      inspection.text = text.slice(0, 20000);
+      inspection.truncated = text.length > 20000;
+      if (approved) unredactedMaterialsIncluded = true;
+      if (opaque && !approved) {
+        plan.selected.delete(item.key);
+        plan.withheld.set(item.key, 'Unchecked narrative or original context');
+        return false;
+      }
+      records.set(item.key, selectedRecordProjection(item, approved, plan.selected));
+      return true;
+    };
+    for (const item of [...records.values()]) disclose(item);
+    for (const key of [...records.keys()]) if (!plan.selected.has(key)) records.delete(key);
+    if (mainSelected && main.note?.kind !== 'person') {
+      if (disclose(main)) main = records.get(main.key)!;
+      records.delete(main.key);
+    }
+    for (let i = assets.length - 1; i >= 0; i--) {
+      const asset = assets[i];
+      const dependency = originalDependencies.get(asset.id)!;
+      const approved = plan.approve(`original:${asset.id}`, asset.originalName, asset, dependency);
+      plan.review.opaqueItems.at(-1)!.contentUrl = asset.contentUrl;
+      if (!approved) assets.splice(i, 1);
+      else {
+        unredactedMaterialsIncluded = true;
+        asset.owners = asset.owners
+          .filter((owner) => plan.selected.has(`${owner.owner_type}:${owner.owner_id}`))
+          .map((owner) => ({
+            owner_type: owner.owner_type,
+            owner_id: owner.owner_id,
+            event_date: null,
+          }));
+        delete asset.originalNames;
+      }
+    }
+    if (patient) {
+      patient.details = Object.fromEntries(
+        Object.entries(patient.details).filter(([key]) =>
+          [
+            'fullName',
+            'name',
+            'pronouns',
+            'birthDate',
+            'deathDate',
+            'lifeStatus',
+            'phone',
+            'email',
+            'address',
+            'bloodType',
+          ].includes(key),
+        ),
+      );
+    }
+  }
+  // A withheld initiating note supplies no shared title, text or attachments.
+  if (plan.active && main.note?.kind !== 'person' && !plan.selected.has(main.key)) {
+    main = {
+      key: `packet:${personId}`,
+      type: 'note',
+      id: `packet:${personId}`,
+      title: 'Selected health records',
+      date: null,
+      archived: false,
+      row: { kind: 'person', person_id: personId, content: '' },
+      citations: [],
+      attachments: [],
+    };
+  }
+  if (main.note?.kind === 'person') {
+    main.title = identity.name;
+    main.row = {
+      id: main.id,
+      kind: 'person',
+      person_id: personId,
+      title: identity.name,
+      content: '',
+      topics: '',
+      raw_thoughts: '',
+      profile_json: '{}',
+    };
+    main.citations = [];
     if (!main.note)
       throw new HttpError(
         404,
@@ -1112,6 +1715,7 @@ export function exportSnapshot(
       );
     main.note = {
       ...main.note,
+      title: identity.name,
       content: '',
       topics: '',
       rawThoughts: '',
@@ -1133,15 +1737,29 @@ export function exportSnapshot(
     source_file: 6,
   };
   const rank = (type: ExportRecordType): number => ranks[type] ?? 7;
+  const reportReview = packetReportReview(
+    db,
+    [main, ...records.values()].flatMap((item) => item.citations.map((citation) => citation.id)),
+  );
+  const readingGaps = includedReadingGaps(db, [main, ...records.values()]);
   const payload = {
+    ...(plan.active || input.packetSelection !== undefined || plan.preferences.length
+      ? {
+          selective: plan.active,
+          patientRequestedWithholding: requestedWithholding,
+          unredactedMaterialsIncluded,
+          sourceReviewIncomplete: reportReview.some(
+            (report) => report.savedCount < report.totalCount,
+          ),
+          sourceReadingIncomplete: readingGaps.length > 0,
+          packetReview: plan.review,
+          packetInspection,
+          packetPrivate: { ...plan.finish(), approval: input.packetApproval || null },
+        }
+      : {}),
     actor,
     unassignedRawAssertionsOmitted: input.mode === 'provider' && unassignedPacketAssertions(db),
-    reportReview: packetReportReview(
-      db,
-      [main, ...records.values()].flatMap((record) =>
-        record.citations.map((citation) => citation.id),
-      ),
-    ),
+    reportReview: plan.active ? [] : reportReview,
     patient,
     identity,
     main,
@@ -1152,7 +1770,7 @@ export function exportSnapshot(
         a.key.localeCompare(b.key),
     ),
     assets,
-    readingGaps: includedReadingGaps(db, [main, ...records.values()]),
+    readingGaps: plan.active ? [] : readingGaps,
     mode: input.mode ?? 'brief',
     trends: !!input.trends,
     scope: {
@@ -1160,7 +1778,7 @@ export function exportSnapshot(
       to: input.to || null,
       includeArchived: !!input.includeArchived,
     },
-    selection: selected,
+    selection: plan.active ? [...plan.selected].sort() : selected,
   };
   if (JSON.stringify(payload).length > (input.mode === 'provider' ? 64_000_000 : 8_000_000))
     throw new HttpError(
@@ -1372,7 +1990,34 @@ export function exportEvidence(snapshot: NoteExportSnapshot): JsonRecord {
   };
   return {
     format: 'circus-health-provider-evidence-v1',
-    ...snapshot,
+    // Deliberately enumerate the shared contract: private choices, review titles,
+    // preference versions and disclosure receipts never belong in evidence JSON.
+    actor: snapshot.actor,
+    identity: snapshot.identity,
+    patient: snapshot.patient,
+    mode: snapshot.mode,
+    trends: snapshot.trends,
+    scope: snapshot.scope,
+    selection: snapshot.selection,
+    generatedAt: snapshot.generatedAt,
+    fingerprint: snapshot.fingerprint,
+    reportReview: snapshot.reportReview,
+    readingGaps: snapshot.readingGaps,
+    unassignedRawAssertionsOmitted: snapshot.unassignedRawAssertionsOmitted,
+    assets: snapshot.assets.map(({ contentUrl: _contentUrl, ...asset }) => asset),
+    ...(snapshot.selective
+      ? {
+          selectionDisclosure: packetOpaqueNotice,
+          withholdingDisclosure: snapshot.patientRequestedWithholding
+            ? packetWithholdingNotice
+            : null,
+          unredactedDisclosure: snapshot.unredactedMaterialsIncluded
+            ? packetUnredactedNotice
+            : null,
+          sourceReviewIncomplete: !!snapshot.sourceReviewIncomplete,
+          sourceReadingIncomplete: !!snapshot.sourceReadingIncomplete,
+        }
+      : {}),
     omissionDisclosure: snapshot.unassignedRawAssertionsOmitted
       ? unassignedAssertionDisclosure
       : null,
@@ -1429,9 +2074,17 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
   const ownerCorrection = ownershipLabel;
   let body =
     `<p class="meta"><strong>${esc(snapshot.identity.name)}</strong>${snapshot.identity.birthDate ? ' · DOB ' + esc(snapshot.identity.birthDate) : ''}${snapshot.identity.pronouns ? ' · ' + esc(snapshot.identity.pronouns) : ''}</p>` +
-    (provider && snapshot.main.note?.kind === 'person'
+    (snapshot.main.key.startsWith('packet:') || (provider && snapshot.main.note?.kind === 'person')
       ? `<h1>${esc(snapshot.identity.name)}</h1>`
       : renderRecord(snapshot.main, 0, true));
+  if (snapshot.selective)
+    body += `<section class="scope"><h2>Sharing choices</h2>${snapshot.patientRequestedWithholding ? `<p>${esc(packetWithholdingNotice)}</p>` : ''}<p>${esc(packetOpaqueNotice)}</p>${snapshot.unredactedMaterialsIncluded ? `<p><strong>${esc(packetUnredactedNotice)}</strong></p>` : ''}</section>`;
+  if (snapshot.selective && snapshot.sourceReviewIncomplete)
+    body +=
+      '<section><h2>Partly reviewed reports</h2><p>Some represented source reports still contain items awaiting review. This is separate from records left out at the patient’s request.</p></section>';
+  if (snapshot.selective && snapshot.sourceReadingIncomplete)
+    body +=
+      '<section><h2>Unread source sections</h2><p>Some represented source sections were not fully read. This is separate from records left out at the patient’s request.</p></section>';
   body += provider
     ? `<div class="scope"><strong>New provider packet</strong><p>Prepared ${esc(snapshot.generatedAt.slice(0, 10))}. ${snapshot.records.length} clinical and selected-note entries, with ${snapshot.assets.length} accompanying originals.</p><p>Includes recorded history and selected notes. Missing, unreviewed and conflicting assertions remain labeled as recorded. This is not a complete hospital chart. Originals are separate accompanying downloads. Full indexed provenance, raw assertions and structured source documents are preserved in the automatic evidence JSON companion.</p></div>`
     : snapshot.mode === 'brief'
@@ -1614,6 +2267,29 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
   const providerSources = () =>
     `<p>The accompanying <strong>provider-evidence.json</strong> contains all ${refs.length} indexed citations. Match each [number] above to its citationIndex entry for issuer, acquisition provider, original file path/hash, exact locator and coverage. It also contains every included record with original assertions, full source JSON and structured document text. Download and share it with this PDF when full supporting detail is needed.</p><p>Sources represented: ${[...new Set(refs.map((c) => c.issuer || c.sourceRecordProvider || c.acquisition).filter(Boolean))].map(esc).join('; ') || 'Not recorded'}.</p>`;
   body += `<section id="sources" class="${snapshot.mode === 'detailed' ? 'section' : ''}"><h2>Sources and companion originals</h2>${provider && refs.length ? providerSources() : refs.length ? refs.map((c, i) => `<p class="citation">[${i + 1}] ${snapshot.mode === 'detailed' ? `Source record ${esc(c.id)}; source key ${esc(missing(c.sourceKey))}. ` : ''}Issuer: ${esc(missing(c.issuer))}; acquisition source: ${esc(missing(c.acquisition))}.${snapshot.mode === 'detailed' ? ' Source-record provider: ' + esc(missing(c.sourceRecordProvider)) + '.' : ''} File: ${esc(missing(c.file))}${snapshot.mode === 'detailed' ? '; SHA-256: ' + esc(missing(c.sha256)) : ''}. Evidence locator / PDF pages: ${esc(snapshot.mode === 'detailed' ? missing(c.locator) : pageReference(c.locator))}; original locator: ${esc(snapshot.mode === 'detailed' ? missing(c.sourceLocator) : pageReference(c.sourceLocator))}. Coverage: ${esc(missing(c.coverage))}; source date: ${esc(missing(c.date))}.</p>`).join('') : '<p>No external source citations recorded for the selected content.</p>'}${snapshot.assets.map((a) => `<p class="citation">Companion original: ${esc(a.originalName)} (${esc(a.mimeType)}, ${a.bytes} bytes).${snapshot.mode === 'detailed' ? ' Asset ' + esc(a.id) + '; SHA-256 ' + esc(a.sha256) + '.' : ''} Download separately from the preview; not embedded in this PDF.</p>`).join('')}<p class="citation">${snapshot.mode === 'detailed' ? 'Snapshot SHA-256: ' + esc(snapshot.fingerprint) + '. ' : ''}Note revision: ${esc(snapshot.main.note?.version || snapshot.fingerprint)}. ${snapshot.mode === 'detailed' ? 'Supplement versions and original assertions preserved by the snapshot fingerprint; source locators reproduced as recorded.' : 'Selected saved content; missing source information is labeled above.'}</p></section>`;
+  if (snapshot.selective) {
+    body = body
+      .replaceAll(
+        'Full indexed provenance, raw assertions and structured source documents are preserved in the automatic evidence JSON companion.',
+        'The evidence JSON contains the same selected fields and explicitly approved materials as this packet; unchecked source context is left out.',
+      )
+      .replaceAll(
+        'It also contains every included record with original assertions, full source JSON and structured document text.',
+        'It contains the selected record fields. Raw context and structured document text are included only when explicitly approved.',
+      )
+      .replaceAll(
+        'No personally confirmed current prescriptions recorded.',
+        'No personally confirmed current prescriptions included in this packet.',
+      )
+      .replaceAll(
+        'No additional clinical fields recorded. Full source and mapping metadata in evidence companion.',
+        'Additional source details are left out unless explicitly approved.',
+      )
+      .replaceAll(
+        'full assertion in evidence companion',
+        'personal confirmation retained; unchecked assertion detail may be left out',
+      );
+  }
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:"><title>Circus Health · ${esc(snapshot.main.title)}</title><style>${exportCss}</style></head><body>${body}</body></html>`;
 }
 export async function exportPdf(html: string): Promise<Buffer> {
@@ -1656,6 +2332,7 @@ export function createNoteExports() {
     res,
     db,
     profileId,
+    root,
     respond,
     jsonBody,
   }: NoteExportRouteContext): Promise<boolean> => {
@@ -1666,9 +2343,32 @@ export function createNoteExports() {
       respond(exportOptions(db, await jsonBody(req)));
       return true;
     }
+    if (method === 'POST' && id === 'preferences') {
+      const body = inputRecord(await jsonBody(req));
+      if (!['note', 'document', 'person'].includes(body.type))
+        throw new HttpError(
+          400,
+          'INVALID_EXPORT',
+          'Start packet choices from a saved note or person.',
+        );
+      const personId = exportPerson(db, body);
+      record(db, body.type, body.id, personId);
+      if (body.personId !== personId)
+        throw new HttpError(400, 'EXPORT_SUBJECT', 'Packet choices belong to the selected person.');
+      respond(
+        writePacketPreference(db, personId, body as unknown as PacketPreferenceInput, {
+          validateMembership: (_db, _personId, ref) =>
+            ref.kind === 'source_file' && packetOriginalMember(db, personId, ref.recordId),
+        }),
+      );
+      return true;
+    }
     if (method === 'POST' && id === 'preview') {
-      const input = inputRecord(await jsonBody(req)),
-        snapshot = exportSnapshot(db, input),
+      const input = inputRecord(await jsonBody(req));
+      delete input.packetApproval;
+      if (input.packetSelection?.approvals?.length)
+        input.packetApproval = { actor: 'profile-user', approvedAt: new Date().toISOString() };
+      const snapshot = exportSnapshot(db, input),
         token = randomUUID();
       if (snapshots.size >= 30) {
         const oldest = snapshots.keys().next().value;
@@ -1680,12 +2380,35 @@ export function createNoteExports() {
         html: exportHtml(snapshot),
         fingerprint: snapshot.fingerprint,
         generatedAt: snapshot.generatedAt,
-        assets: snapshot.assets,
+        assets: snapshot.assets.map((asset) => ({
+          ...asset,
+          contentUrl: `/api/note-exports/${encodeURIComponent(token)}/companion?asset=${encodeURIComponent(asset.id)}`,
+        })),
+        ...(snapshot.packetReview
+          ? {
+              packetReview: {
+                ...snapshot.packetReview,
+                opaqueItems: snapshot.packetReview.opaqueItems.map((item) => ({
+                  ...item,
+                  ...(snapshot.packetInspection?.[item.key]
+                    ? {
+                        contentUrl: `/api/note-exports/${encodeURIComponent(token)}/inspection?key=${encodeURIComponent(item.key)}`,
+                      }
+                    : {}),
+                })),
+              },
+            }
+          : {}),
         evidenceAvailable: snapshot.mode === 'provider',
       });
       return true;
     }
-    if (method === 'POST' && id && action && ['validate', 'pdf', 'evidence'].includes(action)) {
+    if (
+      ((method === 'POST' && ['validate', 'pdf', 'evidence'].includes(action || '')) ||
+        (method === 'GET' && ['companion', 'inspection'].includes(action || ''))) &&
+      id &&
+      action
+    ) {
       const entry = snapshots.get(id);
       if (!entry || entry.profileId !== profileId)
         throw new HttpError(
@@ -1693,14 +2416,84 @@ export function createNoteExports() {
           'EXPORT_EXPIRED',
           'Preview expired or is unavailable in this profile. Refresh the preview.',
         );
-      if (exportSnapshot(db, entry.input).fingerprint !== entry.snapshot.fingerprint)
-        throw new HttpError(
-          409,
-          'EXPORT_STALE',
-          'Selected content changed after preview. Refresh the preview.',
-        );
+      const validate = () => {
+        let current: NoteExportSnapshot;
+        try {
+          current = exportSnapshot(db, entry.input);
+        } catch (error) {
+          if (
+            error instanceof HttpError &&
+            [
+              'EXPORT_DISCLOSURE_STALE',
+              'INVALID_PACKET_SELECTION',
+              'PACKET_RECORD_NOT_FOUND',
+            ].includes(error.code)
+          )
+            throw new HttpError(
+              409,
+              'EXPORT_STALE',
+              'Packet choices changed after preview. Refresh the preview.',
+            );
+          throw error;
+        }
+        if (current.fingerprint !== entry.snapshot.fingerprint)
+          throw new HttpError(
+            409,
+            'EXPORT_STALE',
+            'Selected content changed after preview. Refresh the preview.',
+          );
+      };
+      validate();
       if (action === 'validate') respond({ valid: true });
-      else if (action === 'evidence') {
+      else if (action === 'inspection') {
+        const key = new URL(req.url || '/', 'http://localhost').searchParams.get('key');
+        const text = key && entry.snapshot.packetInspection?.[key];
+        if (!text)
+          throw new HttpError(
+            404,
+            'NOT_FOUND',
+            'This material is not available in the private packet review.',
+          );
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Content-Disposition': 'attachment; filename="private-packet-review.json"',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          'Content-Security-Policy': "default-src 'none'; sandbox",
+        });
+        res.end(text);
+      } else if (action === 'companion') {
+        const assetId = new URL(req.url || '/', 'http://localhost').searchParams.get('asset');
+        const asset = entry.snapshot.assets.find((asset) => asset.id === assetId);
+        if (!asset || !root)
+          throw new HttpError(404, 'NOT_FOUND', 'This original is not included in the packet.');
+        const original = asset.id.startsWith('source-file:')
+          ? db
+              .prepare('SELECT path AS stored_path FROM source_files WHERE id=?')
+              .get(asset.id.slice(12))
+          : db.prepare('SELECT stored_path FROM assets WHERE id=?').get(asset.id);
+        if (!original || !asset.sha256)
+          throw new HttpError(
+            409,
+            'EXPORT_STALE',
+            'The original is unavailable. Refresh the preview.',
+          );
+        const bytes = await readFile(profileFile(root, original.stored_path, profileId));
+        if (
+          createHash('sha256').update(bytes).digest('hex') !== asset.sha256 ||
+          (asset.bytes !== null && bytes.length !== asset.bytes)
+        )
+          throw new HttpError(409, 'EXPORT_STALE', 'The original no longer matches the preview.');
+        validate();
+        res.writeHead(200, {
+          'Content-Type': 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="packet-original"; filename*=UTF-8''${encodeURIComponent(asset.originalName)}`,
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          'Content-Security-Policy': "default-src 'none'; sandbox",
+        });
+        res.end(bytes);
+      } else if (action === 'evidence') {
         if (entry.snapshot.mode !== 'provider')
           throw new HttpError(
             400,
@@ -1716,12 +2509,7 @@ export function createNoteExports() {
         res.end(content);
       } else {
         const pdf = await exportPdf(exportHtml(entry.snapshot));
-        if (exportSnapshot(db, entry.input).fingerprint !== entry.snapshot.fingerprint)
-          throw new HttpError(
-            409,
-            'EXPORT_STALE',
-            'Selected content changed while preparing the PDF. Refresh the preview.',
-          );
+        validate();
         res.writeHead(200, {
           'Content-Type': 'application/pdf',
           'Content-Disposition': 'attachment; filename="note-export.pdf"',
