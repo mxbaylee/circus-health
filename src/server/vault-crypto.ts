@@ -1,5 +1,6 @@
 import sodium from 'libsodium-wrappers-sumo';
 import { randomBytes, hkdfSync } from 'node:crypto';
+import { archiveRefusal } from './archive-refusal.ts';
 import {
   openSync,
   closeSync,
@@ -250,7 +251,11 @@ export function decryptObject(
     chunks: Buffer[] = [];
   let size = 0;
   function decode(fd?: number | ((chunk: Buffer) => void)): void {
-    if (!readExact(source, MAGIC.length).equals(MAGIC)) throw Error('Unsupported encrypted object');
+    if (!readExact(source, MAGIC.length).equals(MAGIC))
+      throw archiveRefusal(
+        'Profile encrypted object format',
+        'This profile’s records and history are unavailable.',
+      );
     const state = sodium.crypto_secretstream_xchacha20poly1305_init_pull(
       readExact(source, HEADER),
       key,
@@ -274,7 +279,10 @@ export function decryptObject(
         break;
       }
       if (result.tag !== sodium.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE)
-        throw Error('Unsupported encrypted frame tag');
+        throw archiveRefusal(
+          'Profile encrypted frame tag',
+          'This profile’s records and history are unavailable.',
+        );
     }
   }
   try {

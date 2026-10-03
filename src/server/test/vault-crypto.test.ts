@@ -1,5 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import sodium from 'libsodium-wrappers-sumo';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -82,4 +83,32 @@ test('vault stores identical originals once with separate references and hides n
   again.materialize(restored);
   assert.equal(readFileSync(resolve(restored, 'private-name.pdf'), 'utf8'), 'private evidence');
   assert.throws(() => again.storeFile('../escape', Buffer.from('x')));
+});
+
+test('an authenticated unsupported stream tag refuses with scope and recovery action', (t) => {
+  const path = resolve(dir(t), 'future-tag.enc');
+  const key = freshKey();
+  const { state, header } = sodium.crypto_secretstream_xchacha20poly1305_init_push(key);
+  const frame = sodium.crypto_secretstream_xchacha20poly1305_push(
+    state,
+    Buffer.from('Independently fictional future stream'),
+    Buffer.from(JSON.stringify(['circus-health-vault-v1', 'p-fictional', 'source'])),
+    sodium.crypto_secretstream_xchacha20poly1305_TAG_PUSH,
+  );
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(frame.length);
+  const bytes = Buffer.concat([
+    Buffer.from('CIRCUS01'),
+    Buffer.from(header),
+    length,
+    Buffer.from(frame),
+  ]);
+  writeFileSync(path, bytes, { mode: 0o600 });
+  assert.throws(() => decryptObject(path, key, 'p-fictional', 'source'), {
+    code: 'ARCHIVE_UNSUPPORTED',
+    status: 409,
+    message: /Profile encrypted frame tag.*Preserve this archive and use a compatible app release/,
+  });
+  assert.deepEqual(readFileSync(path), bytes);
+  key.fill(0);
 });

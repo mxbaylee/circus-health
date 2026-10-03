@@ -1,3 +1,4 @@
+import { archiveRefusal } from './archive-refusal.ts';
 import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
@@ -58,7 +59,11 @@ import {
 import { openVault, hashFile, type Vault, type VaultRecordStorage } from './vault-store.ts';
 import { onboardingIdentity } from './profile-onboarding.ts';
 import { validPersonIcon } from '../shared/person-icon.ts';
-import { rebuildRecordDatabase, type DurableRecordVersion } from './record-versions.ts';
+import {
+  rebuildRecordDatabase,
+  verifyRecordAuthorityHead,
+  type DurableRecordVersion,
+} from './record-versions.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
 import { clearChatJournalCache } from './assistant-journal.ts';
 import {
@@ -260,18 +265,26 @@ export function createEncryptedProfiles({
         );
     }
   }
-  let registry: ProfileRegistry = registryStat
-    ? (JSON.parse(readFileSync(registryPath) as unknown as string) as ProfileRegistry)
-    : { format: 'circus-health-profiles-v1', revision: 0, profiles: [] };
+  const registryRefusal = () => archiveRefusal('Archive registry', 'All profiles are unavailable.');
+  let registry: ProfileRegistry;
+  try {
+    registry = registryStat
+      ? (JSON.parse(readFileSync(registryPath, 'utf8')) as ProfileRegistry)
+      : { format: 'circus-health-profiles-v1', revision: 0, profiles: [] };
+  } catch {
+    throw registryRefusal();
+  }
   if (
     !registry ||
     registry.format !== 'circus-health-profiles-v1' ||
     !Array.isArray(registry.profiles) ||
-    registry.profiles.some((p) => !idValid(p.id) || typeof p.placebo !== 'boolean')
+    !Number.isSafeInteger(registry.revision) ||
+    registry.revision < (registryStat ? 1 : 0) ||
+    registry.profiles.some((p) => !p || !idValid(p.id) || typeof p.placebo !== 'boolean')
   )
-    throw Error('Unsupported archive: use a new empty data directory for encrypted profiles');
+    throw registryRefusal();
   if (new Set(registry.profiles.map((p) => p.id)).size !== registry.profiles.length)
-    throw Error('Duplicate profile IDs');
+    throw registryRefusal();
   mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
   const runtime = realpathSync(runtimeDirectory),
     rel = relative(data, runtime),
@@ -304,10 +317,16 @@ export function createEncryptedProfiles({
     registry = published;
     registryPublished = true;
   };
-  const keyring = (id: string): ProfileKeyring =>
-    JSON.parse(
-      readFileSync(resolve(pathFor(id), 'keyring.json')) as unknown as string,
-    ) as ProfileKeyring;
+  const keyring = (id: string): ProfileKeyring => {
+    const path = resolve(pathFor(id), 'keyring.json');
+    try {
+      const ring = JSON.parse(readFileSync(path, 'utf8')) as ProfileKeyring;
+      verifyRing(id, ring);
+      return ring;
+    } catch {
+      throw archiveRefusal('Profile keyring', 'This profile cannot be unlocked.');
+    }
+  };
   const writeKeyring = (id: string, value: ProfileKeyring): void =>
     durableWrite(resolve(pathFor(id), 'keyring.json'), jsonBytes(value));
   function bytesBelow(path: string): number {
@@ -345,8 +364,20 @@ export function createEncryptedProfiles({
     }
   }
   function verifyRing(id: string, ring: ProfileKeyring): void {
-    if (ring.format !== 'circus-health-keyring-v1' || ring.profileId !== id)
-      throw Error('Invalid profile keyring');
+    const wrapped = (value: WrappedKey | undefined): boolean =>
+      value?.algorithm === 'xchacha20poly1305-ietf' &&
+      typeof value.nonce === 'string' &&
+      typeof value.ciphertext === 'string';
+    if (
+      !ring ||
+      ring.format !== 'circus-health-keyring-v1' ||
+      ring.profileId !== id ||
+      typeof ring.active !== 'boolean' ||
+      !wrapped(ring.recovery) ||
+      !Array.isArray(ring.passkeys) ||
+      ring.passkeys.some((passkey) => !passkey || !wrapped(passkey.wrapped))
+    )
+      throw archiveRefusal('Profile keyring', 'This profile cannot be unlocked.');
   }
   function open(
     id: string,
@@ -381,7 +412,10 @@ export function createEncryptedProfiles({
     } catch (error) {
       key.fill(0);
       rmSync(root, { recursive: true, force: true });
-      throw error;
+      throw archiveRefusal(
+        'Profile encrypted index or manifest',
+        'This profile’s records and history are unavailable.',
+      );
     }
     let db: Database | null | undefined;
     let disposeOriginalResolver = () => {};
@@ -456,6 +490,20 @@ export function createEncryptedProfiles({
             hashFile(target) !== row.sha256
           )
             throw Error('Original evidence is missing or changed');
+        }
+      };
+      const rebuildHistory = () => {
+        try {
+          return rebuildRecordDatabase(dbPath, {
+            profileId: id,
+            storage: recordStorage,
+            verifyReferences,
+          });
+        } catch {
+          throw archiveRefusal(
+            'Profile accepted record history',
+            'This profile’s records and history are unavailable.',
+          );
         }
       };
       let cacheHit = false;
@@ -569,6 +617,16 @@ export function createEncryptedProfiles({
           });
         if (placebo) seedSyntheticPlacebo(db, { root, profileId: id, name: name! });
       } else {
+        // Check the selected authority before trusting even a matching cache.
+        // This reads one commit, not the growing history on every write.
+        try {
+          verifyRecordAuthorityHead(recordStorage, id, LATEST_SCHEMA_VERSION);
+        } catch {
+          throw archiveRefusal(
+            'Profile accepted record history',
+            'This profile’s records and history are unavailable.',
+          );
+        }
         const cache = vault.readCache(dbPath);
         if (
           (cache as { schemaVersion?: unknown } | null)?.schemaVersion === LATEST_SCHEMA_VERSION
@@ -594,11 +652,7 @@ export function createEncryptedProfiles({
         }
         if (!db) {
           for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true });
-          rebuildRecordDatabase(dbPath, {
-            profileId: id,
-            storage: recordStorage,
-            verifyReferences,
-          });
+          rebuildHistory();
           db = openDatabase(dbPath, id);
         }
       }
@@ -622,14 +676,20 @@ export function createEncryptedProfiles({
           verifyReferences,
         });
       } catch (error) {
-        if (!cacheHit) throw error;
+        if (!cacheHit) {
+          if (initial) throw error;
+          throw archiveRefusal(
+            'Profile accepted record history',
+            'This profile’s records and history are unavailable.',
+          );
+        }
         clearIntakeStateCache(db);
         clearIntakeLookupCache(db);
         clearSourceTextProjectionCache(db);
         clearSourceDetailsSearchCache(db);
         db.close();
         for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true });
-        rebuildRecordDatabase(dbPath, { profileId: id, storage: recordStorage, verifyReferences });
+        rebuildHistory();
         db = openDatabase(dbPath, id);
         validateProductionIntakeAuthority(db, id);
         (attachPersonalDurability as unknown as AttachVaultDurability)(db, {
