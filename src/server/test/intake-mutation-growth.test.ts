@@ -14,6 +14,7 @@ import { readIntakeEnvelopeText } from '../intake-authority.ts';
 import { readStoredIntakeDetails } from '../intake-state-access.ts';
 import { readIntakeSourcePin } from '../intake-source-pin.ts';
 import { createMutationFixture } from './helpers/intake-mutation-fixture.ts';
+import { installIntakeSqlAudit, SQL_AUDIT_VERSION } from './helpers/intake-sql-audit.ts';
 import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
 
 // The dedicated qualification retains 301 clinical evidence carriers and measures
@@ -84,6 +85,7 @@ for (const fullQualification of [false, true]) {
             );
           };
           const measure = (checkpoint: number) => ({
+            sqlAuditVersion: SQL_AUDIT_VERSION,
             checkpoint,
             cycles: checkpoint + 1,
             applicationMutations: {
@@ -368,34 +370,31 @@ for (const fullQualification of [false, true]) {
           // TEMP audit captures every changed stored value, including accepted-history,
           // intake heads/frames/results and all disposable lookup/rope representations.
           // Its own counters are outside accepted-record capture and allocation authority.
+          let stateAuditBaselineBytes = 0;
           const installSqlAudit = () => {
-            f.db.exec(
-              'CREATE TEMP TABLE mutation_sql_writes(table_name TEXT PRIMARY KEY,inserts INTEGER,updates INTEGER,deletes INTEGER,new_value_bytes INTEGER,old_value_bytes INTEGER)',
+            assert.equal(
+              f.db.prepare('SELECT count(*) AS n FROM __record_state WHERE singleton=1').get()!.n,
+              1,
             );
-            const quote = (value: string) => '"' + value.replaceAll('"', '""') + '"';
-            for (const row of f.db
-              .prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-              )
-              .all()) {
-              const table = String(row.name),
-                columns = f.db
-                  .prepare(`PRAGMA table_info(${quote(table)})`)
-                  .all()
-                  .map((column) => String(column.name));
-              f.db.prepare('INSERT INTO mutation_sql_writes VALUES(?,0,0,0,0,0)').run(table);
-              const bytes = (prefix: string) =>
-                columns
-                  .map((column) => `COALESCE(length(CAST(${prefix}.${quote(column)} AS BLOB)),0)`)
-                  .join('+');
-              const literal = "'" + table.replaceAll("'", "''") + "'";
-              for (const event of ['INSERT', 'UPDATE', 'DELETE'] as const) {
-                const counter = { INSERT: 'inserts', UPDATE: 'updates', DELETE: 'deletes' }[event];
-                f.db.exec(
-                  `CREATE TEMP TRIGGER ${quote('mutation_audit_' + table + '_' + event)} AFTER ${event} ON main.${quote(table)} BEGIN UPDATE mutation_sql_writes SET ${counter}=${counter}+1,new_value_bytes=new_value_bytes+${event === 'DELETE' ? '0' : bytes('NEW')},old_value_bytes=old_value_bytes+${event === 'INSERT' ? '0' : bytes('OLD')} WHERE table_name=${literal}; END`,
-                );
-              }
-            }
+            stateAuditBaselineBytes = sqlInventory().__record_state.storedValueBytes;
+            installIntakeSqlAudit(f.db);
+          };
+          const assertRecordStateAudit = () => {
+            const audit = f.db
+              .prepare("SELECT * FROM mutation_sql_writes WHERE table_name='__record_state'")
+              .get()!;
+            assert.equal(
+              audit.deletes,
+              audit.inserts,
+              'each actual runtime singleton publication replaces its retained state row',
+            );
+            assert.equal(
+              audit.old_value_bytes,
+              stateAuditBaselineBytes +
+                Number(audit.new_value_bytes) -
+                sqlInventory().__record_state.storedValueBytes,
+              'runtime replacement audit accounts for every displaced old singleton value',
+            );
           };
           installSqlAudit();
           for (let i = 1; i <= lastCycle; i++) {
@@ -443,6 +442,7 @@ for (const fullQualification of [false, true]) {
                   ],
                 ].slice(0, f.operationIds.length),
               );
+              assertRecordStateAudit();
               const measurement = {
                 ...measure(i),
                 sqlWrites: f.db
@@ -533,6 +533,7 @@ for (const fullQualification of [false, true]) {
             disposition: 'review_later',
           });
           smallFinished = true;
+          assertRecordStateAudit();
           const smallAPI = {
             after: measure(lastCycle),
             sqlWrites: f.db.prepare('SELECT * FROM mutation_sql_writes ORDER BY table_name').all(),
@@ -554,6 +555,7 @@ for (const fullQualification of [false, true]) {
             'consumer parity must issue real search requests after the draft API interval',
           );
           const report = {
+            sqlAuditVersion: SQL_AUDIT_VERSION,
             qualification: {
               mode: fullQualification ? 'full-300' : 'ci-pipeline',
               lastCycle,

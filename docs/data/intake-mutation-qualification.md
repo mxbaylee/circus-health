@@ -22,15 +22,15 @@ An earlier full attempt passed checkpoints 100 and 200 and published all 301 pro
 
 The maintained test files emit portable JSON diagnostics and write raw qualification artifacts to unique temporary directories outside Git. Their measurements include:
 
-| Representation or work | What is counted                                                                                                                                                                                                   |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Accepted journal       | Every immutable segment and commit, head publication, object count, buffer copy and read, with initial/open/reconstruction intervals separated                                                                    |
-| Intake authority       | Contribution frames, heads and operation receipts; every production-created primitive handle; replayed versions/operations and evidence reads                                                                     |
-| SQLite                 | Every persistent table's row count, stored value bytes and separately serialized row bytes; page count/size/free pages; temporary audit triggers count all inserts/updates/deletes and old/new stored value bytes |
-| History and results    | Contents, metadata and field references; transaction-result total and largest size; source metadata and all `app_meta` authority categories                                                                       |
-| Derived lookup/search  | Individual content, occurrence, link and head writes/deletes; lookup rows; source reads and bytes; search evaluations, reconstruction and selected DTO envelopes                                                  |
-| Host envelope work     | Validation nodes and string units, clone nodes/bytes, serialization/parse calls and bytes, diff nodes/comparisons/alignment/trace cells, array matching, hashes and hydration                                     |
-| Physical source files  | Retained original/proposal count and bytes, independently verified file hashes; actual API read/write payloads, streaming reads/hashes, verification cache hits, fsync and publication calls                      |
+| Representation or work | What is counted                                                                                                                                                                                                                                                              |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Accepted journal       | Every immutable segment and commit, head publication, object count, buffer copy and read, with initial/open/reconstruction intervals separated                                                                                                                               |
+| Intake authority       | Contribution frames, heads and operation receipts; every production-created primitive handle; replayed versions/operations and evidence reads                                                                                                                                |
+| SQLite                 | Every persistent table's row count, stored value bytes and separately serialized row bytes; page count/size/free pages; temporary audit triggers count inserts/updates/deletes and old/new stored value bytes; the dated singleton replacement correction is explained below |
+| History and results    | Contents, metadata and field references; transaction-result total and largest size; source metadata and all `app_meta` authority categories                                                                                                                                  |
+| Derived lookup/search  | Individual content, occurrence, link and head writes/deletes; lookup rows; source reads and bytes; search evaluations, reconstruction and selected DTO envelopes                                                                                                             |
+| Host envelope work     | Validation nodes and string units, clone nodes/bytes, serialization/parse calls and bytes, diff nodes/comparisons/alignment/trace cells, array matching, hashes and hydration                                                                                                |
+| Physical source files  | Retained original/proposal count and bytes, independently verified file hashes; actual API read/write payloads, streaming reads/hashes, verification cache hits, fsync and publication calls                                                                                 |
 
 `intakeWorkCounters(db)` retains numeric totals for the connection, including rolled-back attempts and internally created primitive handles. Warm and reconstruction scopes are separate; cache clearing does not erase earlier counted work. `sourceDTOEnvelopeBytes` measures complete reconstructed original envelopes. `sourceDetailsSearchCounters().dtoDetailsBytes` measures returned source-row details, including compact original markers and proposal details, and must not be presented as full original-envelope bytes. These counters cover different populations, not a same-row compression ratio.
 
@@ -115,13 +115,15 @@ The source-context classification cache in `intake.ts` retains 128 proposal clas
 
 The following cumulative insert/update/delete counts and new/old stored-value bytes cover every persistent table from immediately after the initial accepted cycle through each checkpoint. A changed row contributes its entire stored row size to the audit; these are logical SQL values, not WAL or disk bytes. Derived tables can update and delete replaceable cache rows while accepted history remains retained. Initial creation is excluded from these mutation intervals and is included in the retained inventories above.
 
+The displaced-row deletion counts and old bytes for `__record_state` are independently derived from the saved inventories and directly observed inserts. SQLite with `recursive_triggers=0` omitted the implicit deletes from its `INSERT OR REPLACE` operation; the raw audit retains those original zero fields. At the qualified revision, this table has one checked singleton row (`singleton=1`), one runtime replacement writer, and no observed updates or explicit deletes in these intervals. Thus displaced rows equal observed inserts, and displaced old bytes equal starting stored bytes plus inserted new bytes minus ending stored bytes. This gives 201/33,278, 402/66,645 and 603/100,012 displaced rows/bytes. All other table totals are directly audited. The corrected fixture now tracks that singleton through actual SQL events and separately checks replacement, ignored inserts, updates, deletion and rollback without changing production trigger settings.
+
 | Measure                                       |                                      100 |                                       200 |                                        300 |
 | --------------------------------------------- | ---------------------------------------: | ----------------------------------------: | -----------------------------------------: |
 | `__record_current` I/U/D; new/old bytes       |              510/805/0; 150,234 / 67,058 |          1,020/1,610/0; 300,468 / 134,116 |           1,530/2,415/0; 450,702 / 201,174 |
 | `__record_fields` I/U/D; new/old bytes        |                   4,860/0/0; 837,057 / 0 |                  9,720/0/0; 1,676,138 / 0 |                  14,580/0/0; 2,515,219 / 0 |
 | Lookup projection I/U/D; new/old bytes        |             202/202/0; 148,994 / 130,901 |              404/404/0; 299,237 / 262,746 |               606/606/0; 449,581 / 394,692 |
 | Search projection I/U/D; new/old bytes        | 6,475/2,738/3,547; 2,255,418 / 1,083,672 | 13,059/5,480/7,109; 4,530,552 / 2,173,966 | 19,407/8,254/10,607; 6,789,539 / 3,275,328 |
-| `__record_state` I/U/D; new/old bytes         |                      201/0/0; 33,279 / 0 |                       402/0/0; 66,646 / 0 |                       603/0/0; 100,013 / 0 |
+| `__record_state` I/U/D; new/old bytes         |               201/0/201; 33,279 / 33,278 |                402/0/402; 66,646 / 66,645 |               603/0/603; 100,013 / 100,012 |
 | `__record_transactions` I/U/D; new/old bytes  |                     201/0/0; 125,504 / 0 |                      402/0/0; 251,273 / 0 |                       603/0/0; 377,042 / 0 |
 | `__record_versions` I/U/D; new/old bytes      |                 1,315/0/0; 2,640,003 / 0 |                  2,630/0/0; 5,289,898 / 0 |                   3,945/0/0; 7,938,086 / 0 |
 | `app_meta` I/U/D; new/old bytes               |         404/1,006/0; 1,411,819 / 130,046 |          808/2,012/0; 2,831,880 / 261,402 |         1,212/3,018/0; 4,250,182 / 392,859 |
@@ -194,7 +196,7 @@ After reopening and rebuilding, one already pending proposal changes to “revie
 | Physical whole-file reads / bytes                              |          302 / 341,878 |        906 / 1,083,720 |
 | Physical source writes / bytes                                 |                  0 / 0 |                  0 / 0 |
 
-The complete persistent SQL audit for that save follows. Tables with no mutations are omitted; no unlisted table changes. Counts include inserted history/field/receipt values as well as derived projection maintenance.
+The complete persistent SQL audit for that save follows. Tables with no mutations are omitted; no unlisted table changes. Counts include inserted history/field/receipt values as well as derived projection maintenance. The state-row displaced deletion and 167 old bytes use the same exact conservation derivation from the directly saved pre-small and post-API inventories; raw omitted counters are retained unchanged.
 
 | Table                              | Inserts / updates / deletes | New / old stored-value bytes |
 | ---------------------------------- | --------------------------: | ---------------------------: |
@@ -205,7 +207,7 @@ The complete persistent SQL audit for that save follows. Tables with no mutation
 | `__record_source_text_heads`       |                   0 / 1 / 0 |                1,157 / 1,157 |
 | `__record_source_text_links`       |                   6 / 3 / 0 |                  1,355 / 449 |
 | `__record_source_text_occurrences` |                   6 / 3 / 0 |                  1,620 / 538 |
-| `__record_state`                   |                   1 / 0 / 0 |                      166 / 0 |
+| `__record_state`                   |                   1 / 0 / 1 |                    166 / 167 |
 | `__record_transactions`            |                   1 / 0 / 0 |                      613 / 0 |
 | `__record_versions`                |                   6 / 0 / 0 |                    7,846 / 0 |
 | `app_meta`                         |                   2 / 5 / 0 |                  3,558 / 652 |
