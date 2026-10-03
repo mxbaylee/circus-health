@@ -59,6 +59,8 @@ A fictional growth fixture retains a >100 KiB untouched source and appends 300 g
 
 Source-file details DTOs currently expose the complete envelope, including operational intake state. `sourceFileDetails` receives the database and selected source row. Source-list search also matches the complete details JSON. `sourceDetailsSearch` returns a predicate, joins and bound parameters consumed by both count and page queries. It preserves existing `LIKE` behavior, ordering and pagination. These contracts are broader than stable source metadata and must survive the later cutover through selected-row reconstruction and a scoped search/index strategy.
 
+The [disposable exact source-text projection](../data/source-text-projection.md) now supplies bounded transactional text storage and reconstruction, with copy/cache-loss qualification. It is not yet selected by source-list count/page queries; exact search integration remains open work. Its rows are excluded from accepted capture and portable authority export.
+
 ## Remaining direct source metadata reads
 
 The remaining direct `details_json` consumers concern these stable fields or non-intake envelopes:

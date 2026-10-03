@@ -187,7 +187,7 @@ const internalMeta = (key: string): boolean =>
 const tableNames = (db: Database): string[] =>
   db
     .prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_intake_lookup_*' ORDER BY name",
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_intake_lookup_*' AND name NOT GLOB '__record_source_text_*' ORDER BY name",
     )
     .all()
     .map((r) => r.name as string);

@@ -1,3 +1,4 @@
+import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
 import { sourceAssertionOwnership } from './source-assertion-ownership.ts';
@@ -998,6 +999,7 @@ export function createApp({
         diagnostics.clear(profileId);
         clearIntakeStateCache(db);
         clearIntakeLookupCache(db);
+        clearSourceTextProjectionCache(db);
         db.close();
       }
     },
