@@ -1,9 +1,15 @@
 import { useEffect, useState } from 'react';
-import type { Intake, IntakePackageInventory, IntakePackageMember } from '../../../shared/intake';
+import type {
+  Intake,
+  IntakePackageFailure,
+  IntakePackageInventory,
+  IntakePackageMember,
+} from '../../../shared/intake';
 import { api, useResource } from '../../data/api';
 import { formatBytes } from '../../data/format';
 import { ResourceState } from '../../components/ResourceState';
 import { LoadingIndicator } from '../../components/LoadingIndicator';
+import { PackageProcessingFailures } from './PackageProcessingFailures';
 
 type Structure = {
   jsonPointer: string;
@@ -56,7 +62,11 @@ export function PackageInventory({ intake }: { intake: Intake }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState<string[]>([]);
+  const failureState = useResource<Intake>(`/intakes/${encodeURIComponent(intake.id)}`);
   useEffect(() => inventory.reload(), [intake.version]);
+  useEffect(() => {
+    if (!inventory.loading && !inventory.refreshing) failureState.reload();
+  }, [inventory.loading, inventory.refreshing, inventory.data, inventory.error]);
   async function inspect(
     member: IntakePackageMember,
     window: { jsonPointer?: string; jsonOffset?: number; offset?: number; page?: number } = {},
@@ -77,11 +87,52 @@ export function PackageInventory({ intake }: { intake: Intake }) {
       setError(error instanceof Error ? error.message : 'This member could not be inspected.');
     } finally {
       setBusy(false);
+      failureState.reload();
+    }
+  }
+  async function retryFailure(failure: IntakePackageFailure) {
+    if (failure.retryAction === 'inventory') {
+      inventory.reload();
+      return;
+    }
+    if (!failure.memberId) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await api<MemberRead>(
+        `/intakes/${encodeURIComponent(intake.id)}/package-member`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            memberId: failure.memberId,
+            limit: 50,
+            ...(failure.retryAction === 'read_structure' ? { jsonPointer: '' } : {}),
+          }),
+        },
+      );
+      const resultRead = result.data.metadata
+        ? { ...result.data, ...result.data.metadata }
+        : result.data;
+      setSelected(resultRead.member);
+      setRead(resultRead);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'This operation could not finish.');
+    } finally {
+      setBusy(false);
+      failureState.reload();
     }
   }
   return (
     <section className="intake-package" aria-label="Package contents">
       <h3>Package contents</h3>
+      <a className="text-link" href={intake.contentUrl} target="_blank" rel="noreferrer">
+        Open original: {intake.filename}
+      </a>
+      <PackageProcessingFailures
+        failures={failureState.data ? failureState.data.packageFailures : intake.packageFailures}
+        busy={busy || inventory.loading || !!inventory.refreshing}
+        onRetry={(failure) => void retryFailure(failure)}
+      />
       <ResourceState resource={inventory}>
         {(data) => (
           <>

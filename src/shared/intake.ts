@@ -267,6 +267,24 @@ export interface IntakeClinicalIdentityAttribution {
   manualSourceRecord?: import('./intake-manual-source-record.ts').ManualSourceRecordReceipt;
   evidencedIdentity?: IntakeEvidencedIdentity;
 }
+/** Unfinished package processing; never a clinical acceptance or evidence of full coverage. */
+export interface IntakePackageFailure {
+  sourceFileId: string;
+  sourceHash: string;
+  operationKey: string;
+  originalFilename: string;
+  contentUrl: string;
+  memberId?: string;
+  ordinal?: number;
+  filename?: string;
+  locator?: string;
+  reasonCode: string;
+  detail: string;
+  status: 'pending';
+  scope: 'incomplete';
+  retryAction: 'inventory' | 'read_member' | 'read_structure';
+}
+
 export interface Intake {
   id: string;
   providerId: string;
@@ -291,6 +309,7 @@ export interface Intake {
   version: number;
   contentUrl: string;
   validation: IntakeValidation;
+  packageFailures?: Record<string, IntakePackageFailure>;
   proposals: IntakeProposal[];
   acceptedProposalId: string | null;
   conversionChatId: string | null;

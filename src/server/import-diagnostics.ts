@@ -233,6 +233,7 @@ function safeStringField(key: string, value: string): boolean {
       'acceptances',
       'mapping_rules',
       'missing_assets',
+      'package_failures',
       'unknown',
     ].includes(value);
   if (key === 'method') return /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$/.test(value);

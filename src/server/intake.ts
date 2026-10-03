@@ -37,6 +37,12 @@ import {
 } from './intake-report-source.ts';
 import { receiveIntakeUpload } from './intake-upload.ts';
 import {
+  withVerifiedSourceDescriptor,
+  withPrivateChildStage,
+  childStorageError,
+} from './intake-staged-child.ts';
+export { isUnpublishedIntakeChildError } from './intake-staged-child.ts';
+import {
   assertCurrentProposalSourceText,
   sourceTextProposalId,
 } from './intake-source-text-dependencies.ts';
@@ -480,6 +486,7 @@ function dto(
     version: d.version,
     contentUrl: `/api/sources/${encodeURIComponent(file.id)}/content`,
     validation: d.validation,
+    ...(d.packageFailures ? { packageFailures: d.packageFailures } : {}),
     proposals: d.proposals,
     acceptedProposalId: d.acceptedProposalId,
     imported: d.imported,
@@ -641,7 +648,7 @@ function saveOriginal(
   root: string,
   profileId: string,
   path: string,
-  bytes: Buffer,
+  bytes: Buffer | undefined,
   staged: StagedUpload | null = null,
 ): boolean {
   const profile = profilePaths(root, profileId);
@@ -665,7 +672,7 @@ function saveOriginal(
   if (existsSync(target)) {
     (inspectIntakeFile as unknown as InspectIntakeFile)(
       profileOriginal(root, path, profileId),
-      staged || { bytes: bytes.length, sha256: hash(bytes) },
+      staged || { bytes: bytes!.length, sha256: hash(bytes!) },
     );
     return false;
   }
@@ -696,7 +703,11 @@ function saveOriginal(
         );
       }
     }
-    const fd = openSync(temporary, staged ? 'r' : 'wx', 0o600);
+    const fd = openSync(
+      temporary,
+      staged ? fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW : 'wx',
+      0o600,
+    );
     try {
       if (staged) {
         measureImportPhase(
@@ -708,8 +719,8 @@ function saveOriginal(
       } else
         measureImportPhase(
           'upload_original_copy',
-          () => writeFileSync(fd, bytes),
-          { bytes: bytes.length },
+          () => writeFileSync(fd, bytes!),
+          { bytes: bytes!.length },
           { profileId },
         );
       measureImportPhase('upload_original_fsync', () => fsyncSync(fd), {}, { profileId });
@@ -1778,68 +1789,123 @@ function prepareIntakeImportInternal(
   };
 }
 
-// Conversion may retain bounded child originals or page derivatives before
-// acceptance. They are source evidence, never automatic clinical assertions.
-export function retainIntakeChildren(
-  db: DatabaseSync,
-  root: string,
-  profileId: string,
-  parentId: string,
-  children: IntakeChildInput[],
+interface IntakeChildContext {
+  db: DatabaseSync;
+  root: string;
+  profileId: string;
+  assertRunning?: () => void;
+}
+
+/** Host-only verified descriptor. No extraction-size ceiling applies to ranges. */
+export async function withVerifiedIntakeOriginalDescriptor<T>(
+  context: IntakeChildContext & { id: string },
+  writer: (source: { sourceFd: number; assertRunning: () => void }) => Promise<T>,
+): Promise<T> {
+  const { db, root, profileId, id } = context;
+  const original = getRetainedIntakeOriginalReference(db, root, profileId, id);
+  return withVerifiedSourceDescriptor(
+    { ...original, path: resolve(root, row(db, id).path) },
+    () => {
+      owner(db, profileId);
+      context.assertRunning?.();
+    },
+    (sourceFd, assertRunning) => writer({ sourceFd, assertRunning }),
+  );
+}
+
+function childIdentity(parentId: string, locator: string, digest: string) {
+  const key = hash([parentId, locator, digest].join('\0'));
+  return { key, id: 'intake:' + key };
+}
+function childDescriptor(file: SourceFileRow, d: IntakeDetails) {
+  return {
+    id: file.id,
+    filename: d.originalName,
+    locator: d.locator,
+    derivative: d.derivative,
+    mimeType: file.mime_type,
+    bytes: file.bytes,
+    contentUrl: `/api/sources/${encodeURIComponent(file.id)}/content`,
+  };
+}
+function prepareIntakeChild(
+  context: IntakeChildContext & { parentId: string },
+  parent: SourceFileRow,
+  child: { filename: string; locator: string; derivative?: boolean; bytes?: Buffer },
+  staged: StagedUpload | null = null,
 ) {
-  owner(db, profileId);
-  const parent = row(db, parentId);
-  verifyIntakeOriginal(db, root, profileId, parentId);
-  if (children.length > 300 || children.reduce((n, c) => n + c.bytes.length, 0) > 100 * 1024 * 1024)
-    throw new HttpError(413, 'EXTRACTION_LIMIT', 'Extract fewer members at a time');
-  const files = children.map((child) => {
-    if (
-      !Buffer.isBuffer(child.bytes) ||
-      !child.bytes.length ||
-      child.bytes.length > MAX_INTAKE_BYTES
-    )
-      throw new HttpError(413, 'EXTRACTION_LIMIT', 'An extracted file is empty or exceeds 25 MiB');
-    const digest = hash(child.bytes),
-      key = hash([parentId, child.locator, digest].join('\0')),
-      id = 'intake:' + key,
-      name =
-        basename(child.filename.replaceAll('\\', '/'))
-          .replace(/[\x00-\x1f]/g, '')
-          .slice(0, 200) || 'extracted';
-    const path = `${profilePaths(root, profileId).relativeRoot}/sources/${encodeURIComponent(parent.provider_id)}/intake/${key}/${name}`;
-    saveOriginal(root, profileId, path, child.bytes);
-    const d: IntakeDetails = {
-      originalName: child.filename,
-      createdAt: now(),
-      version: 1,
-      state: 'pending_conversion',
-      validation: validationSummary(validateJSONL(child.bytes)),
-      proposals: [],
-      acceptedProposalId: null,
-      imported: null,
-      parentSourceFileId: parentId,
-      locator: child.locator,
-      derivative: !!child.derivative,
-    };
-    if (d.validation.valid) {
-      d.state = 'ready';
-      const parsed = validateJSONL(child.bytes);
-      if (parsed.valid) recordCandidateVersions({ id, sha256: digest }, d, parsed.entries, null);
-    }
-    return {
-      id,
-      path,
-      providerId: parent.provider_id,
-      bytes: child.bytes,
-      mimeType: mime(child.bytes, name),
-      kind: 'intake_original',
-      coverage: child.derivative
-        ? 'derived_page_render; unreviewed'
-        : 'embedded_original; unreviewed',
-      batchId: parent.batch_id,
-      details: { intake: d },
-    };
-  });
+  const { root, profileId, parentId } = context;
+  const digest = staged?.sha256 ?? hash(child.bytes!),
+    size = staged?.bytes ?? child.bytes!.length,
+    { key, id } = childIdentity(parentId, child.locator, digest),
+    name =
+      basename(child.filename.replaceAll('\\', '/'))
+        .replace(/[\x00-\x1f]/g, '')
+        .slice(0, 200) || 'extracted',
+    path = `${profilePaths(root, profileId).relativeRoot}/sources/${encodeURIComponent(parent.provider_id)}/intake/${key}/${name}`,
+    mimeType = mime(staged?.prefix ?? child.bytes!, name, size),
+    binary =
+      !['application/octet-stream', 'application/json', 'application/x-ndjson'].includes(
+        mimeType,
+      ) || (staged?.prefix ?? child.bytes!).subarray(0, 512).includes(0);
+  const parsed =
+    !binary && size <= MAX_INTAKE_BYTES
+      ? validateJSONL(staged ? readFileSync(staged.path) : child.bytes!)
+      : null;
+  const validation = parsed
+    ? validationSummary(parsed)
+    : {
+        valid: false,
+        rows: 0,
+        exactRepeatedRows: 0,
+        partialRows: 0,
+        unrecognizedRows: 0,
+        preview: [],
+        previewComplete: false,
+        issues: [
+          {
+            line: 0,
+            message: binary
+              ? 'Binary original retained in full; file/page-aware conversion is pending. JSONL validation was not attempted.'
+              : 'Original retained in full. Files above 25 MiB require bounded conversion proposals; JSONL validation was not attempted.',
+          },
+        ],
+      };
+  const d: IntakeDetails = {
+    originalName: child.filename,
+    createdAt: now(),
+    version: 1,
+    state: validation.valid ? 'ready' : 'pending_conversion',
+    validation,
+    proposals: [],
+    acceptedProposalId: null,
+    imported: null,
+    parentSourceFileId: parentId,
+    locator: child.locator,
+    derivative: !!child.derivative,
+  };
+  saveOriginal(root, profileId, path, child.bytes, staged);
+  if (parsed?.valid) recordCandidateVersions({ id, sha256: digest }, d, parsed.entries, null);
+  return {
+    id,
+    path,
+    providerId: parent.provider_id,
+    sha256: digest,
+    size,
+    mimeType,
+    kind: 'intake_original',
+    coverage: child.derivative
+      ? 'derived_page_render; unreviewed'
+      : 'embedded_original; unreviewed',
+    batchId: parent.batch_id,
+    details: { intake: d },
+  };
+}
+function publishIntakeChildren(
+  context: IntakeChildContext,
+  files: ReturnType<typeof prepareIntakeChild>[],
+) {
+  const { db, root, profileId } = context;
   const missing = files.filter(
     (f) => !db.prepare('SELECT 1 FROM source_files WHERE id=?').get(f.id),
   );
@@ -1852,15 +1918,113 @@ export function retainIntakeChildren(
     });
     flushIntake(db, root, profileId);
   }
-  return files.map((f) => ({
-    id: f.id,
-    filename: f.details.intake.originalName,
-    locator: f.details.intake.locator,
-    derivative: f.details.intake.derivative,
-    mimeType: f.mimeType,
-    bytes: f.bytes.length,
-    contentUrl: `/api/sources/${encodeURIComponent(f.id)}/content`,
-  }));
+  return files.map((f) => {
+    const retained = row(db, f.id);
+    return childDescriptor(retained, details(db, retained));
+  });
+}
+
+/** Stream one selected occurrence to a private stage, then use the same durable
+ * original/registration boundary as bounded PDF attachments. */
+export async function withStagedIntakeChild(
+  context: IntakeChildContext & { parentId: string },
+  member: { filename: string; locator: string; bytes: number; sourceHash: string },
+  writer: (files: {
+    sourceFd: number;
+    outputFd: number;
+    assertRunning: () => void;
+  }) => Promise<void>,
+) {
+  const { db, root, profileId, parentId } = context;
+  if (
+    !Number.isSafeInteger(member.bytes) ||
+    member.bytes < 0 ||
+    !/^[a-f0-9]{64}$/.test(member.sourceHash)
+  )
+    throw new HttpError(400, 'PACKAGE_MEMBER', 'Invalid verified member size or hash');
+  const original = getRetainedIntakeOriginalReference(db, root, profileId, parentId),
+    parent = row(db, parentId);
+  let publicationAttempted = false;
+  try {
+    return await withVerifiedSourceDescriptor(
+      { ...original, path: resolve(root, parent.path) },
+      () => {
+        owner(db, profileId);
+        context.assertRunning?.();
+      },
+      async (sourceFd, assertUnchanged) => {
+        const { id } = childIdentity(parentId, member.locator, member.sourceHash);
+        if (db.prepare('SELECT 1 FROM source_files WHERE id=?').get(id)) {
+          const retained = row(db, id),
+            d = details(db, retained);
+          if (
+            d.parentSourceFileId !== parentId ||
+            d.locator !== member.locator ||
+            retained.sha256 !== member.sourceHash ||
+            retained.bytes !== member.bytes
+          )
+            throw new HttpError(409, 'SOURCE_CHANGED', 'Retained member scope changed');
+          return withVerifiedIntakeOriginalDescriptor({ ...context, id }, async () =>
+            childDescriptor(retained, d),
+          );
+        }
+        return withPrivateChildStage(
+          root,
+          member,
+          (outputFd) => writer({ sourceFd, outputFd, assertRunning: assertUnchanged }),
+          (staged) => {
+            assertUnchanged();
+            const file = prepareIntakeChild(
+              context,
+              parent,
+              { filename: member.filename, locator: member.locator },
+              staged,
+            );
+            assertUnchanged();
+            publicationAttempted = true;
+            return publishIntakeChildren(context, [file])[0]!;
+          },
+        );
+      },
+    );
+  } catch (error) {
+    let safeToRecordFailure = false;
+    if (!publicationAttempted)
+      try {
+        verifyIntakeOriginal(db, root, profileId, parentId);
+        safeToRecordFailure = true;
+      } catch {
+        // A changed/locked parent cannot authorize a new failure mutation.
+      }
+    return childStorageError(error, safeToRecordFailure);
+  }
+}
+
+// Keep the Buffer boundary bounded for PDF attachment callers that have not
+// migrated to a streaming producer.
+export function retainIntakeChildren(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  parentId: string,
+  children: IntakeChildInput[],
+) {
+  owner(db, profileId);
+  const parent = row(db, parentId);
+  verifyIntakeOriginal(db, root, profileId, parentId);
+  if (children.length > 300 || children.reduce((n, c) => n + c.bytes.length, 0) > 100 * 1024 * 1024)
+    throw new HttpError(413, 'EXTRACTION_LIMIT', 'Extract fewer members at a time');
+  const context = { db, root, profileId, parentId };
+  const files = children.map((child) => {
+    if (
+      !Buffer.isBuffer(child.bytes) ||
+      !child.bytes.length ||
+      child.bytes.length > MAX_INTAKE_BYTES
+    )
+      throw new HttpError(413, 'EXTRACTION_LIMIT', 'An extracted file is empty or exceeds 25 MiB');
+    return prepareIntakeChild(context, parent, child);
+  });
+  return publishIntakeChildren(context, files);
 }
 
 /** Internal compound review mutations share the existing durable source transaction. */

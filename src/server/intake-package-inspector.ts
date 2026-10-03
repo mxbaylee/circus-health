@@ -1,37 +1,97 @@
 import { createHash } from 'node:crypto';
 import { crc32 } from 'node:zlib';
-import { open, type Entry, type ZipFile } from 'yauzl';
+import { openSync, closeSync, fstatSync, writeSync } from 'node:fs';
+import { fromFd, type Entry, type ZipFile } from 'yauzl';
 import { pathToFileURL } from 'node:url';
 import type { Readable } from 'node:stream';
+import {
+  PackageInspectionError,
+  emptyPackageInspectionWork,
+  type InspectedPackageMember,
+  type PackageInspectionWork,
+} from './intake-package-worker.ts';
 
 const MIB = 1024 * 1024;
-
-// Read central-directory metadata first, then stream each selected member. No
-// archive path is ever extracted or executed. The caller isolates this work in
-// a time-limited Node subprocess, including decompression and hashing.
-export async function inspectPackage(path: string, selected: number | null = null) {
+const add = (left: number, right: number) => {
+  const result = left + right;
+  if (!Number.isSafeInteger(result) || result < 0)
+    throw new PackageInspectionError(
+      'ZIP byte count is outside the supported integer range',
+      'PACKAGE_SIZE',
+    );
+  return result;
+};
+/** Inspector owns this descriptor. Production uses an inherited descriptor in
+ * an isolated process. Original/member filesystem paths never cross its protocol. */
+export async function inspectPackageDescriptor(
+  sourceFd: number,
+  selected: number | null = null,
+  outputFd?: number,
+  progress: (work: PackageInspectionWork) => void = () => {},
+) {
+  const work = emptyPackageInspectionWork();
+  let current: { filename: string; ordinal: number } | undefined;
+  const fail = (message: string, reasonCode: string): never => {
+    throw new PackageInspectionError(message, reasonCode, current?.filename, current?.ordinal, {
+      ...work,
+    });
+  };
+  if ((selected === null) !== (outputFd === undefined))
+    fail('ZIP selection requires a private output descriptor', 'PACKAGE_SELECTION');
+  if (!fstatSync(sourceFd).isFile()) fail('ZIP source is not a regular file', 'PACKAGE_SOURCE');
   const archive = await new Promise<ZipFile>((resolve, reject) =>
-    open(path, { lazyEntries: true, autoClose: false, strictFileNames: true }, (error, zip) =>
-      error ? reject(error) : resolve(zip!),
+    fromFd(
+      sourceFd,
+      { lazyEntries: true, autoClose: false, strictFileNames: true },
+      (error, zip) => {
+        if (error) {
+          closeSync(sourceFd);
+          reject(
+            new PackageInspectionError('ZIP central directory could not be read', 'PACKAGE_FORMAT'),
+          );
+        } else resolve(zip!);
+      },
     ),
   );
-  // Keep errors handled between reads; the active read also observes failures.
   let failure: Error | undefined;
   archive.on('error', (error: Error) => {
     failure = error;
   });
   try {
-    if (archive.entryCount > 10000) throw new Error('ZIP inventory exceeds 10,000 entries');
+    if (archive.entryCount > 10000)
+      fail(
+        'ZIP inventory exceeds the current 10,000-entry processing safeguard; original retained',
+        'PACKAGE_METADATA',
+      );
     const entries = await new Promise<Entry[]>((resolve, reject) => {
-      const entries: Entry[] = [];
-      const seen = new Set<string>();
+      const entries: Entry[] = [],
+        seen = new Set<string>();
       let namesSize = 0,
         expandedSize = 0;
-      archive.once('error', reject);
+      let ended = false;
+      const rejectOnce = (error: unknown) => {
+        if (!ended) {
+          ended = true;
+          reject(error);
+        }
+      };
+      archive.once('error', () =>
+        rejectOnce(
+          new PackageInspectionError(
+            'ZIP inventory contains unsafe names or unreadable metadata',
+            'PACKAGE_FORMAT',
+            current?.filename,
+            current?.ordinal,
+            { ...work },
+          ),
+        ),
+      );
       archive.on('entry', (entry: Entry) => {
+        if (ended) return;
         try {
-          const name = entry.fileName;
-          const parts = name.replace(/\/$/, '').split('/');
+          current = undefined;
+          const name = entry.fileName,
+            parts = name.replace(/\/$/, '').split('/');
           const mode = (entry.externalFileAttributes >>> 16) & 0o170000;
           if (
             !name ||
@@ -42,56 +102,87 @@ export async function inspectPackage(path: string, selected: number | null = nul
             parts.some((part) => ['', '.', '..'].includes(part)) ||
             seen.has(name) ||
             (mode && mode !== 0o100000 && mode !== 0o040000)
-          ) {
-            throw new Error('Unsafe or duplicate ZIP member');
-          }
+          )
+            fail('Unsafe or duplicate ZIP member', 'PACKAGE_UNSAFE');
+          current = { filename: name, ordinal: entries.length };
+          if (
+            ![entry.uncompressedSize, entry.compressedSize].every(
+              (value) => Number.isSafeInteger(value) && value >= 0,
+            )
+          )
+            fail('ZIP member declares an invalid byte count', 'PACKAGE_SIZE');
           seen.add(name);
-          namesSize += Buffer.byteLength(name);
-          if (namesSize > 2 * MIB) throw new Error('ZIP inventory names exceed 2 MiB');
-          if (entry.uncompressedSize > 25 * MIB) throw new Error('ZIP member exceeds 25 MiB');
+          namesSize = add(namesSize, Math.max(Buffer.byteLength(name), entry.fileNameRaw.length));
+          if (namesSize > 2 * MIB)
+            fail(
+              'ZIP inventory names exceed the current 2 MiB processing safeguard; original retained',
+              'PACKAGE_METADATA',
+            );
           if (![0, 8].includes(entry.compressionMethod))
-            throw new Error(
+            fail(
               'Unsupported ZIP compression; export with stored or deflate compression',
+              'PACKAGE_COMPRESSION',
             );
           if (entry.generalPurposeBitFlag & 1)
-            throw new Error('Encrypted ZIP needs an unencrypted export');
+            fail('Encrypted ZIP needs an unencrypted export', 'PACKAGE_ENCRYPTED');
           if (name.endsWith('/')) {
             if (entry.uncompressedSize)
-              throw new Error('ZIP directory contains unexpected payload bytes');
+              fail('ZIP directory contains unexpected payload bytes', 'PACKAGE_DIRECTORY');
           } else {
+            // Yauzl has already decoded ZIP64/Unicode fields. Preserve the
+            // checked raw name for local-header comparison, but do not keep
+            // arbitrary comments/extra-field backing buffers per member.
+            entry.fileNameRaw = Buffer.from(entry.fileNameRaw);
+            entry.extraFieldRaw = Buffer.alloc(0);
+            entry.extraFields = [];
+            entry.fileCommentRaw = Buffer.alloc(0);
+            entry.comment = '';
+            entry.fileComment = '';
             entries.push(entry);
-            expandedSize += entry.uncompressedSize;
-            if (entries.length > 5000 || expandedSize > 100 * MIB)
-              throw new Error('ZIP inventory exceeds 5,000 files or 100 MiB expanded bytes');
+            expandedSize = add(expandedSize, entry.uncompressedSize);
+            if (entries.length > 5000)
+              fail(
+                'ZIP inventory exceeds the current 5,000-file processing safeguard; original retained',
+                'PACKAGE_METADATA',
+              );
           }
+          work.entries++;
+          if (work.entries % 100 === 0) progress({ ...work });
+          // Yauzl can reject the next name before emitting its entry. Do not
+          // misattribute that failure to the preceding valid member.
+          current = undefined;
           archive.readEntry();
         } catch (error) {
-          reject(error);
+          rejectOnce(error);
         }
       });
       archive.once('end', () => {
-        archive.removeListener('error', reject);
-        resolve(entries);
+        if (!ended) {
+          ended = true;
+          resolve(entries);
+        }
       });
       archive.readEntry();
     });
+    current = undefined;
     if (
       selected !== null &&
       (!Number.isSafeInteger(selected) || selected < 0 || selected >= entries.length)
     )
-      throw new Error('ZIP member outside inventory');
-    const output = [];
-    let expanded = 0;
+      fail('ZIP member outside inventory', 'PACKAGE_SELECTION');
+    const members: InspectedPackageMember[] = [];
+    let lastReported = 0;
     for (const [ordinal, entry] of entries.entries()) {
       if (selected !== null && selected !== ordinal) continue;
-      if (failure) throw failure;
+      current = { filename: entry.fileName, ordinal };
+      if (failure) fail('ZIP source could not be read', 'PACKAGE_FORMAT');
       const local = await archive.readLocalFileHeaderPromise(entry);
       if (
         !local.fileName.equals(entry.fileNameRaw) ||
         local.compressionMethod !== entry.compressionMethod ||
         local.generalPurposeBitFlag !== entry.generalPurposeBitFlag
       )
-        throw new Error('ZIP local header does not match inventory');
+        fail('ZIP local header does not match inventory', 'PACKAGE_HEADER');
       const stream = await new Promise<Readable>((resolve, reject) =>
         archive.openReadStream(entry, (error, stream) =>
           error ? reject(error) : resolve(stream!),
@@ -100,57 +191,94 @@ export async function inspectPackage(path: string, selected: number | null = nul
       const digest = createHash('sha256');
       let size = 0,
         checksum = 0;
-      const chunks: Buffer[] = [];
       for await (const value of stream) {
-        const chunk = Buffer.from(value);
-        size += chunk.length;
-        expanded += chunk.length;
-        if (size > 25 * MIB || expanded > 100 * MIB || size > entry.uncompressedSize)
-          throw new Error('ZIP expanded byte limit exceeded');
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        size = add(size, chunk.length);
+        if (size > entry.uncompressedSize)
+          fail('ZIP member size does not match inventory', 'PACKAGE_SIZE');
+        work.memberReadBytes = add(work.memberReadBytes, chunk.length);
+        work.memberChunks++;
+        work.peakChunkBytes = Math.max(work.peakChunkBytes, chunk.length);
         digest.update(chunk);
+        work.hashBytes = add(work.hashBytes, chunk.length);
         checksum = crc32(chunk, checksum);
-        if (selected !== null) chunks.push(chunk);
+        work.crcBytes = add(work.crcBytes, chunk.length);
+        if (outputFd !== undefined) {
+          let offset = 0;
+          while (offset < chunk.length) {
+            const written = writeSync(outputFd, chunk, offset, chunk.length - offset);
+            if (!written) fail('ZIP staging write made no progress', 'PACKAGE_STORAGE');
+            offset += written;
+            work.writtenBytes = add(work.writtenBytes, written);
+          }
+        }
+        if (work.memberReadBytes - lastReported >= MIB) {
+          progress({ ...work });
+          lastReported = work.memberReadBytes;
+        }
       }
       if (size !== entry.uncompressedSize)
-        throw new Error('ZIP member size does not match inventory');
-      if (checksum !== entry.crc32) throw new Error('ZIP member checksum does not match inventory');
-      output.push({
+        fail('ZIP member size does not match inventory', 'PACKAGE_SIZE');
+      if (checksum !== entry.crc32)
+        fail('ZIP member checksum does not match inventory', 'PACKAGE_CHECKSUM');
+      members.push({
         ordinal,
         filename: entry.fileName,
         bytes: size,
         compressedBytes: entry.compressedSize,
         sourceHash: digest.digest('hex'),
-        ...(selected === null ? {} : { data: Buffer.concat(chunks).toString('base64') }),
       });
+      work.membersVerified++;
+      progress({ ...work });
     }
-    if (failure) throw failure;
-    return output;
+    if (failure) fail('ZIP source could not be read', 'PACKAGE_FORMAT');
+    return { members, work };
   } catch (error) {
-    // The library rejects some names before emitting an entry. Preserve the
-    // public refusal message and avoid reflecting an untrusted path in it.
-    if (
-      error instanceof Error &&
-      /^(invalid relative path|absolute path|invalid characters in fileName):/.test(error.message)
-    )
-      throw new Error('Unsafe or duplicate ZIP member');
-    throw error;
+    if (error instanceof PackageInspectionError) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (['ENOSPC', 'EDQUOT', 'EIO', 'EROFS', 'EACCES', 'EBADF'].includes(code || ''))
+      fail('ZIP staging storage is unavailable; original retained', 'PACKAGE_STORAGE');
+    return fail('ZIP member could not be safely decoded; original retained', 'PACKAGE_FORMAT');
   } finally {
     archive.close();
   }
 }
 
+/** Compatibility helper for local fixture callers. Selected payloads require an
+ * output descriptor; no API returns a member-sized Buffer or base64 string. */
+export async function inspectPackage(
+  path: string,
+  selected: number | null = null,
+  outputFd?: number,
+) {
+  return (await inspectPackageDescriptor(openSync(path, 'r'), selected, outputFd)).members;
+}
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const send = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\n');
   try {
-    console.log(
-      JSON.stringify(
-        await inspectPackage(
-          process.argv[2]!,
-          process.argv[3] === undefined ? null : Number(process.argv[3]),
-        ),
-      ),
+    const result = await inspectPackageDescriptor(
+      3,
+      process.argv[2] === undefined ? null : Number(process.argv[2]),
+      process.argv[2] === undefined ? undefined : 4,
+      (work) => {
+        send({ type: 'progress', work });
+      },
     );
+    for (const member of result.members) send({ type: 'member', member });
+    send({ type: 'complete', work: result.work });
   } catch (error) {
-    console.error(error instanceof Error ? error.message : 'ZIP inspection failed');
+    const failure =
+      error instanceof PackageInspectionError
+        ? error
+        : new PackageInspectionError('ZIP inspection failed', 'PACKAGE_FORMAT');
+    send({
+      type: 'error',
+      message: failure.message,
+      reasonCode: failure.reasonCode,
+      filename: failure.filename,
+      ordinal: failure.ordinal,
+      work: failure.work,
+    });
     process.exitCode = 1;
   }
 }

@@ -6,6 +6,8 @@ Status: accounting and UI implementation complete, with synthetic accounting/iso
 
 `GET /api/storage/archive` exposes only aggregate filesystem metadata: active profile directories, other archive files and separately measured runtime files. It reads no private content and does not follow links or scan external copies. Orphaned legacy profile directories count toward other archive files. Inaccessible or changing trees produce a partial lower-bound measurement. `GET /api/profiles/:id/storage/import-estimate?bytes=N` requires unlock and separates original encryption allowance from two runtime original copies plus one extraction/ZIP allowance. Derivatives, record/index growth, nested or multiple archives can require more. Filesystem-reported availability never establishes a mount or cloud quota; unknown remains unknown.
 
+The [streamed package member path](streamed-package-originals.md) retains large ZIP members without whole-member payload buffers. Its stages and expanded children still consume runtime and archive capacity. The existing upload/extraction configuration and conservative admission estimate remain; [CRS-233](../todo/CRS-233.md) owns the unfinished storage-only rule and operator decisions.
+
 ## Original files and reuse
 
 Store byte-identical originals once within each profile. Retain each delivery occurrence, original filename, issuing/acquisition source, timestamp and evidence locator independently. If two distinct PDFs contain the same clinical record, preserve both original PDFs and let the reconciled record reference both occurrences. Clinical deduplication never rewrites or discards a distinct original artifact.

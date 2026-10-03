@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, openSync, closeSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspectPackage } from '../intake-package-inspector.ts';
@@ -19,6 +19,7 @@ const malformed = [
   { name: 'fifo', data: '', mode: 0o010600 },
   { name: 'link', data: 'target', mode: 0o120777 },
   { name: 'corrupt.txt', data: 'fictional', checksum: 0 },
+  { name: 'encrypted.txt', data: 'fictional', encrypted: true },
 ];
 for (const [index, entry] of malformed.entries()) {
   test(`ZIP inspector rejects malformed fixture ${index + 1}`, async (t) => {
@@ -35,11 +36,15 @@ test('ZIP inspector validates central metadata before reading selected data and 
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const path = join(root, 'fixture.zip');
   writeFileSync(path, zipFixture([{ name: 'report-🌿.txt', data: 'fictional' }]));
-  const [member] = await inspectPackage(path, 0);
+  const output = join(root, 'member');
+  const outputFd = openSync(output, 'wx', 0o600);
+  t.after(() => closeSync(outputFd));
+  const [member] = await inspectPackage(path, 0, outputFd);
   assert.equal(member!.filename, 'report-🌿.txt');
-  assert.equal(Buffer.from(member!.data!, 'base64').toString(), 'fictional');
-  await assert.rejects(inspectPackage(path, 1), /outside inventory/);
-  await assert.rejects(inspectPackage(path, NaN), /outside inventory/);
+  assert.equal(readFileSync(output, 'utf8'), 'fictional');
+  assert.equal('data' in member!, false);
+  await assert.rejects(inspectPackage(path, 1, outputFd), /outside inventory/);
+  await assert.rejects(inspectPackage(path, NaN, outputFd), /outside inventory/);
   writeFileSync(
     path,
     zipFixture([
@@ -47,7 +52,23 @@ test('ZIP inspector validates central metadata before reading selected data and 
       { name: '../bad.txt', data: 'bad' },
     ]),
   );
-  await assert.rejects(inspectPackage(path, 0));
+  await assert.rejects(inspectPackage(path, 0, outputFd));
+});
+
+test('ZIP inspector rejects duplicate names and truncated archives', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-zip-incomplete-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, 'fixture.zip');
+  writeFileSync(
+    path,
+    zipFixture([
+      { name: 'duplicate.txt', data: 'first fictional' },
+      { name: 'duplicate.txt', data: 'second fictional' },
+    ]),
+  );
+  await assert.rejects(inspectPackage(path), /Unsafe or duplicate/);
+  writeFileSync(path, zipFixture([{ name: 'fictional.txt', data: 'fictional' }]).subarray(0, 35));
+  await assert.rejects(inspectPackage(path), /central directory/);
 });
 
 test('ZIP inspector rejects disagreement between local and central header filenames', async (t) => {
