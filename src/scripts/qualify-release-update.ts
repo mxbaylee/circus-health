@@ -6,6 +6,7 @@ import type { AddressInfo } from 'node:net';
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -57,6 +58,42 @@ export function releaseSourceFingerprint(directory: string): string {
     hash.update('\0');
   }
   return hash.digest('hex');
+}
+
+/** Prepare a fresh normal clone without changing its release source identity. */
+export function preparePriorReleaseRuntime(
+  priorRepository: string,
+  candidateRepository: string,
+  environment: NodeJS.ProcessEnv,
+): void {
+  // The host launcher imports native flock before Docker starts. Container builds
+  // still install their own pinned dependencies, regardless of this host reuse.
+  const matchingLock = readFileSync(join(priorRepository, 'package-lock.json')).equals(
+    readFileSync(join(candidateRepository, 'package-lock.json')),
+  );
+  const installed = join(candidateRepository, 'node_modules');
+  if (matchingLock && existsSync(installed)) {
+    const destination = join(priorRepository, 'node_modules');
+    // A node_modules/ Git ignore rule matches a real directory, not a symlink.
+    // Keep that directory real and link each pinned dependency inside it.
+    mkdirSync(destination, { mode: 0o700 });
+    for (const entry of readdirSync(installed)) {
+      symlinkSync(join(installed, entry), join(destination, entry));
+    }
+  } else {
+    execFileSync('npm', ['ci', '--no-audit', '--no-fund'], {
+      cwd: priorRepository,
+      env: { ...environment, HUSKY: '0' },
+      timeout: 300000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  }
+  execFileSync('npm', ['run', 'help'], {
+    cwd: priorRepository,
+    env: environment,
+    timeout: 30000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 }
 
 export async function qualifyReleaseUpdate(env: NodeJS.ProcessEnv = process.env) {
@@ -164,27 +201,7 @@ export async function qualifyReleaseUpdate(env: NodeJS.ProcessEnv = process.env)
       { mode: 0o600, flag: 'wx' },
     );
     git(['-C', priorRepository, 'checkout', '--detach', priorRevision]);
-    // The host launcher uses the pinned native flock dependency before Docker starts.
-    // Share ignored dependencies only when the complete lockfiles agree; builds still run npm ci.
-    const matchingLock = readFileSync(join(priorRepository, 'package-lock.json')).equals(
-      readFileSync(join(repository, 'package-lock.json')),
-    );
-    if (matchingLock && existsSync(join(repository, 'node_modules'))) {
-      symlinkSync(join(repository, 'node_modules'), join(priorRepository, 'node_modules'), 'dir');
-    } else {
-      execFileSync('npm', ['ci', '--no-audit', '--no-fund'], {
-        cwd: priorRepository,
-        env: { ...environment, HUSKY: '0' },
-        timeout: 300000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-    }
-    execFileSync('npm', ['run', 'help'], {
-      cwd: priorRepository,
-      env: environment,
-      timeout: 30000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    preparePriorReleaseRuntime(priorRepository, repository, environment);
 
     const priorSource = readBuildSource(priorRepository);
     const candidateSource = readBuildSource(repository);
