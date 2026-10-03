@@ -88,4 +88,4 @@ The [manager growth fixture](../../src/server/test/intake-batch-journal-growth.t
 
 The [journal regressions](../../src/server/test/intake-batch-journal.test.ts) cover mutation aliases, stale writers, retained legacy evidence, corruption and publication interruptions. Encrypted qualification exercises the real vault and its selected-file publication, including pending non-queue dependencies. The fixtures use independently fictional data and local scripted callbacks, with no provider requests.
 
-These checks do not establish hardware power-loss behavior, whole-import capacity or clinical completeness. The separate [full-view processing work](../todo/CRS-228.md), [large-import qualification](../todo/CRS-194.md) and held runner/capacity requirements retain their own evidence boundaries.
+These checks do not establish hardware power-loss behavior, whole-import capacity or clinical completeness. The separate [verified intake-work reuse](intake-processing-work.md), [large-import qualification](../todo/CRS-194.md) and held runner/capacity requirements retain their own evidence boundaries.
