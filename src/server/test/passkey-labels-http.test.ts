@@ -4,8 +4,9 @@ import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { createVaultApp } from '../vault-app.ts';
-import type { ProfilePasskey } from '../encrypted-profiles.ts';
+import { wrapKey } from '../vault-crypto.ts';
 
 interface ApiResult<T = unknown> {
   status: number;
@@ -65,8 +66,17 @@ test('HTTP labels require the owning unlocked session and stay out of public car
   ring.passkeys.push({
     id: 'fictional-key',
     rpID: 'localhost',
+    publicKey: 'fictional-public-key',
+    counter: 0,
+    salt: randomBytes(32).toString('base64url'),
+    wrapped: wrapKey(
+      app.manager.opened.get(profile.id)!.key,
+      randomBytes(32),
+      profile.id,
+      'passkey:fictional-key',
+    ),
     createdAt: '2026-09-12T00:00:00.000Z',
-  } as unknown as ProfilePasskey);
+  });
   app.manager.writeKeyring(profile.id, ring);
   const path = `/api/profiles/${profile.id}`,
     input = { credentialId: 'fictional-key', label: '1Password' };
@@ -76,7 +86,9 @@ test('HTTP labels require the owning unlocked session and stay out of public car
     403,
   );
   assert.equal((await post(path + '/passkeys/rename', { ...input, label: '' })).status, 400);
-  assert.deepEqual((await post(path + '/passkeys/rename', input)).data, {
+  const renamed = await post(path + '/passkeys/rename', input);
+  assert.equal(renamed.status, 200);
+  assert.deepEqual(renamed.data, {
     renamed: true,
     label: '1Password',
   });

@@ -178,9 +178,23 @@ for (const loseCache of [false, true])
     writeFileSync(object, corrupt);
     if (loseCache)
       rmSync(resolve(f.manager.pathFor(id), 'cache'), { recursive: true, force: true });
-    assert.throws(() => f.manager.unlock(id, created.recoveryKit), /authentication|encrypted/i);
+    const manifest = resolve(f.manager.pathFor(id), 'vault/manifest.enc');
+    const before = readFileSync(manifest);
+    assert.throws(
+      () => f.manager.unlock(id, created.recoveryKit),
+      loseCache
+        ? {
+            status: 409,
+            code: 'ARCHIVE_UNSUPPORTED',
+            message:
+              /Profile accepted record history.*records and history are unavailable.*Preserve this archive and use a compatible app release/,
+          }
+        : /Encrypted object authentication failed/,
+    );
     assert.equal(f.manager.opened.has(id), false);
     assert.equal(existsSync(resolve(f.runtimeDirectory, id)), false);
+    assert.deepEqual(readFileSync(manifest), before);
+    assert.deepEqual(readFileSync(object), corrupt, 'failed unlock must retain damaged evidence');
   });
 
 test('copying a locked-then-unlocked archive copies deferred originals under the new key', async (t) => {
