@@ -27,6 +27,7 @@ test('routine child processes cannot inherit operator model credentials or exter
     CRS_DATA_DIR: '/fictional/data',
     CRS_RUNTIME_DIR: '/fictional/runtime',
     CRS_PDF_CONTROLLED_TEST: '1',
+    CRS_INTAKE_MUTATION_QUALIFY: '1',
   };
   assert.deepEqual(testEnvironment(original, 'server'), {
     PATH: '/fictional/bin',

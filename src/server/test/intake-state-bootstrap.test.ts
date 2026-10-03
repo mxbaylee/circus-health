@@ -992,7 +992,7 @@ test('first real publication selects fresh current-format target evidence and pr
     if (String(row.key).includes(':frame:') || String(row.key).endsWith(':head')) {
       const value = JSON.parse(String(row.value));
       assert.equal(value.profileId, targetId);
-      assert.equal(value.format, 'health-intake-state-v2');
+      assert.equal(value.format, 'health-intake-state-v3');
       const original = f.originals.find((entry) => entry.id === value.intakeId)!;
       assert.equal(value.sourceHash, original.hash);
       assert.ok(String(row.key).startsWith(namespace(targetId, original.id, original.hash)));

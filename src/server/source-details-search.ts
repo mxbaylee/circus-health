@@ -41,6 +41,8 @@ export interface SourceDetailsSearchCounters {
   queryAuthorityReads: number;
   queryAuthorityBytes: number;
   dtoRows: number;
+  /** Physical source_files.details_json bytes; original rows are compact metadata.
+   * Full original DTO hydration/serialization is counted by intakeWorkCounters. */
   dtoDetailsBytes: number;
 }
 interface Scope {
@@ -116,8 +118,8 @@ export interface SourceDetailsSearchPlan {
   dispose(error?: unknown): void;
 }
 
-/** Selected DTOs retain the current complete source envelope. Account for those
- * page-only authority reads separately from candidate text reconstruction. */
+/** Count physical selected source-row details bytes, separately from candidate
+ * text reconstruction and the original intake's complete envelope hydration. */
 export function recordSourceDetailsSearchDTORead(db: DatabaseSync, raw: unknown): void {
   const connection = connections.get(db);
   if (!connection?.active) return;

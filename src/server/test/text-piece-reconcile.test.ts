@@ -554,7 +554,7 @@ test('a standalone duplicate cannot steal the identity of text embedded in an un
   );
 });
 
-test('large exact reorder beyond local alignment distance reuses content while unresolved novel text refuses', () => {
+test('large reorder beyond local alignment distance reuses retained content and proves the new scalar separately', () => {
   const a = 'a'.repeat(400);
   const b = 'b'.repeat(400);
   const before = initialize(a + b);
@@ -564,19 +564,145 @@ test('large exact reorder beyond local alignment distance reuses content while u
     0,
     'exact move reuse succeeds beyond the bounded local alignment search',
   );
-  const saved = input(before);
-  assert.throws(
-    () => reconcileTextPieces(before, b + a + 'c'),
-    (error) =>
-      error instanceof TextPieceError &&
-      error.code === 'limit' &&
-      /could not establish exact move reuse/.test(error.message),
-  );
+  assert.equal(moved.plan.matchingMetrics.literalizedReuseUtf16Units, 0);
+  const result = update(before, b + a + 'c');
+  assert.ok(result.plan.matchingMetrics.localAlignmentHandoffs > 0);
+  assert.equal(result.plan.matchingMetrics.novelUtf16Units, 1);
   assert.equal(
-    input(before),
-    saved,
-    'novel unresolved text refuses without replacement publication',
+    result.plan.contentWrites.map((row) => row.text).join(''),
+    'c',
+    'a real novel scalar cannot force retained moved runs into fresh content',
   );
+});
+
+test('unique outer context reserves moved repetitive passages before character alignment', () => {
+  for (const count of [20, 80]) {
+    const groups = Array.from({ length: count }, (_, index) => ({
+      id: `fictional-group-${index}`,
+      revision: 0,
+      discoveryOrder: index,
+      content: `Independently fictional group ${index}: Ω 😀 \\ud800 `.repeat(80),
+    }));
+    const oldOrder = [...groups.slice(1), groups[0]];
+    const nextOrder = [
+      { ...groups[0], revision: 1 },
+      ...groups.slice(2),
+      { ...groups[1], revision: 1 },
+    ];
+    const before = initialize(JSON.stringify({ reportGroups: oldOrder, note: 'outerx' }));
+    const result = update(before, JSON.stringify({ reportGroups: nextOrder, note: 'outery' }));
+    assert.ok(result.plan.matchingMetrics.derivedOperations < 20);
+    assert.ok(result.plan.occurrenceWrites.length < 25);
+    assert.ok(result.plan.linkWrites.length < 30);
+    assert.ok(
+      result.plan.contentWrites.reduce((sum, row) => sum + row.text.length, 0) <= 4,
+      'moving two similar repeated passages must not resend their unchanged bodies',
+    );
+  }
+});
+
+test('residual longest-block search skips candidates that cannot beat an established match', () => {
+  for (const count of [4000, 12000, 20000]) {
+    const a = 'a'.repeat(count),
+      b = 'b'.repeat(count);
+    const result = update(initialize(a + b), b + a + 'c');
+    assert.equal(result.plan.contentWrites.map((row) => row.text).join(''), 'c');
+    assert.ok(
+      result.plan.matchingMetrics.comparisonUtf16Units < 100 * count,
+      'later suffix candidates cannot trigger quadratic exact comparisons',
+    );
+  }
+});
+
+test('genuinely new evidence coalesces tiny residual matches within a proved literal bound', () => {
+  let seed = 210;
+  const fictionalHex = (size: number) =>
+    Array.from({ length: size }, () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return (seed >>> 24).toString(16).padStart(2, '0');
+    }).join('');
+  const middle = Array.from(
+    { length: 3000 },
+    (_, index) => `Fictional unchanged clinical evidence ${index}: value 7.20.\n`,
+  ).join('');
+  const before = initialize(JSON.stringify({ evidence: fictionalHex(1500), middle }));
+  const interior = sequence(before)
+    .filter((row) => row.start > 5000 && row.end < 160000)
+    .map((row) => row.id);
+  assert.ok(interior.length > 5);
+  const result = update(before, JSON.stringify({ evidence: fictionalHex(3500), middle }));
+  const metrics = result.plan.matchingMetrics;
+  assert.ok(metrics.literalizedReuseUtf16Units > 0);
+  assert.ok(metrics.literalizedReuseUtf16Units <= 2 * metrics.novelUtf16Units);
+  assert.ok(
+    result.plan.contentWrites.reduce((sum, row) => sum + row.text.length, 0) <=
+      3 * metrics.novelUtf16Units,
+  );
+  assert.ok(metrics.derivedOperations < 30);
+  retained(before, result.after, interior);
+});
+
+test('large novel replacements and real acceptance JSON retain exact bytes under unchanged work caps', () => {
+  const previous = JSON.stringify({ state: 'pending', acceptance: null });
+  const accepted = JSON.stringify({
+    state: 'accepted',
+    acceptance: {
+      operationId: 'f'.repeat(36),
+      records: Array.from({ length: 5 }, (_, index) => ({
+        id: `fictional-${index}`,
+        result: 'accepted',
+        valueText: '7.20',
+      })),
+    },
+  });
+  // A real acceptance introduces more than 256 novel/changed units. That is
+  // evidence to retain, not a reason to reject every later derived search write.
+  update(initialize(previous), accepted);
+  const result = update(
+    initialize('prefix' + 'a'.repeat(300) + 'suffix'),
+    'prefix' + 'b'.repeat(300) + 'suffix',
+  );
+  assert.equal(result.plan.matchingMetrics.novelUtf16Units, 300);
+  assert.equal(result.plan.contentWrites.map((row) => row.text).join(''), 'b'.repeat(300));
+  refuse(initialize(previous), accepted, { matchingLimits: { maxReuseCandidates: 0 } }, 'limit');
+});
+
+test('residual scalar exhaustion preserves non-BMP boundaries and does not steal reserved occurrences', () => {
+  const a = '😀'.repeat(400);
+  const b = '🪴'.repeat(400);
+  const before = initialize(a + b);
+  const expected = b + a + '😀🦊';
+  const result = update(before, expected);
+  assert.ok(result.plan.matchingMetrics.localAlignmentHandoffs > 0);
+  assert.equal(result.plan.matchingMetrics.novelUtf16Units, 4);
+  assert.ok(
+    result.plan.matchingMetrics.literalizedReuseUtf16Units <=
+      2 * result.plan.matchingMetrics.novelUtf16Units,
+  );
+  assert.equal(result.plan.contentWrites.map((row) => row.text).join(''), '😀🦊');
+});
+
+test('novel text after alignment handoff preserves a large unchanged middle and its interior links', () => {
+  const a = 'a'.repeat(400);
+  const b = 'b'.repeat(400);
+  const middle = Array.from(
+    { length: 3000 },
+    (_, index) => `Fictional retained middle row ${index}: literal evidence.\n`,
+  ).join('');
+  const before = initialize(a + b + middle + 'TAILx');
+  const interior = sequence(before)
+    .filter(
+      (row) => row.start > a.length + b.length && row.end < a.length + b.length + middle.length,
+    )
+    .map((row) => row.id);
+  assert.ok(interior.length > 5);
+  const result = update(before, b + a + '🌿' + middle + 'TAILy');
+  assert.ok(result.plan.matchingMetrics.localAlignmentHandoffs > 0);
+  assert.equal(result.plan.matchingMetrics.novelUtf16Units, 3);
+  assert.equal(result.plan.contentWrites.map((row) => row.text).join(''), '🌿y');
+  retained(before, result.after, interior);
+  assert.ok(result.plan.occurrenceWrites.length < 12);
+  assert.ok(result.plan.linkWrites.length < 12);
 });
 
 test('a partial earlier context window cannot displace an intact complete retained occurrence', () => {

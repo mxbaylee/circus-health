@@ -21,6 +21,7 @@ import { resolve, dirname } from 'node:path';
 import { openDatabase, HttpError, transaction, type Database } from './database.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
 import { stageIntakeStateCopy } from './intake-state-bootstrap.ts';
+import { prepareManualSourceCopy, stageManualSourceCopy } from './intake-manual-copy.ts';
 import {
   preparePortableIntakeCopy,
   assertPortableCopyCoherence,
@@ -432,6 +433,7 @@ export function createProfileLifecycle({
             sourceId,
             id,
           );
+          const manualPlan = prepareManualSourceCopy(databases.get(sourceId)!, root, sourceId, id);
           checkpoint(operation, stage, 'validated');
           transaction(copy, () => {
             copy.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
@@ -453,7 +455,7 @@ export function createProfileLifecycle({
               )
               .all())
               copy.exec(`DROP TABLE IF EXISTS "${String(row.name).replaceAll('"', '""')}"`);
-            stageIntakeStateCopy(copy, plan, {
+            const publication = {
               profileId: id,
               readSelectedHead: () => {
                 for (const base of [stage, root]) {
@@ -469,7 +471,9 @@ export function createProfileLifecycle({
                 }
                 return null;
               },
-            });
+            };
+            stageIntakeStateCopy(copy, plan, publication);
+            stageManualSourceCopy(copy, manualPlan, publication);
             rebindCopyReceipts(copy, sourceId, id);
             copy
               .prepare(

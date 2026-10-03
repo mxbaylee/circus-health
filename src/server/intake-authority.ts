@@ -11,6 +11,11 @@ import {
   type IntakeStateIdentity,
 } from './intake-state-evidence.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
+import {
+  recordIntakeSerialization,
+  recordIntakeWork,
+  withIntakeWork,
+} from './intake-work-accounting.ts';
 
 export const INTAKE_ENVELOPE_FORMAT = 'health-intake-envelope-v1';
 export interface IntakeEnvelopeSource {
@@ -38,6 +43,8 @@ const fail = (reason: string): never => {
 function parse(raw: unknown): unknown {
   if (typeof raw !== 'string') return fail('missing serialized evidence');
   try {
+    recordIntakeWork('jsonParseCalls');
+    recordIntakeWork('jsonParseBytes', Buffer.byteLength(raw));
     return JSON.parse(raw);
   } catch {
     return fail('invalid serialized evidence');
@@ -100,7 +107,7 @@ function members(raw: string): Array<{ name: string; key: string; value: string 
       else if (!depth && (char === ',' || char === '}')) break;
       at++;
     }
-    result.push({ name: JSON.parse(key) as string, key, value: raw.slice(valueStart, at).trim() });
+    result.push({ name: parse(key) as string, key, value: raw.slice(valueStart, at).trim() });
     if (raw[at++] !== ',') break;
   }
   return result;
@@ -121,12 +128,14 @@ function compact(value: unknown, mode: Mode, raw?: string): string {
           : 'null';
         return `${member.key}:${retained}`;
       });
-    return `{"intakeAuthority":${JSON.stringify({ format: INTAKE_ENVELOPE_FORMAT, mode })},${intakes.join(',')}}`;
+    return `{"intakeAuthority":${recordIntakeSerialization(JSON.stringify({ format: INTAKE_ENVELOPE_FORMAT, mode }))},${intakes.join(',')}}`;
   }
-  return JSON.stringify({
-    intakeAuthority: { format: INTAKE_ENVELOPE_FORMAT, mode },
-    intake: compactIntakeMetadata(value),
-  });
+  return recordIntakeSerialization(
+    JSON.stringify({
+      intakeAuthority: { format: INTAKE_ENVELOPE_FORMAT, mode },
+      intake: compactIntakeMetadata(value),
+    }),
+  );
 }
 /** Validate the explicit current representation, never recognize legacy inline state. */
 export function intakeEnvelopeMode(raw: unknown): Mode {
@@ -161,6 +170,9 @@ export function validateIntakeEnvelopeRepresentation(
     value = state;
     text = JSON.stringify(state);
     if (typeof text !== 'string') return fail('missing selected envelope');
+    recordIntakeSerialization(text);
+    recordIntakeWork('envelopeSerializationCalls');
+    recordIntakeWork('envelopeSerializedBytes', Buffer.byteLength(text));
   }
   envelope(value);
   if (compact(value, mode, text) !== detailsJson)
@@ -212,24 +224,40 @@ export function intakeEnvelopeAuthorityBinding(
   return { key, head: head as string };
 }
 
-export function readIntakeEnvelope(db: DatabaseSync, input: IntakeEnvelopeSource): unknown {
-  const source = selectedSource(db, input);
-  if (source.kind !== 'intake_original') return readNonIntakeEnvelope(source.details_json);
-  intakeEnvelopeAuthorityBinding(db, source);
-  const state = createIntakeStateStorage(db, identity(db, source)).read();
-  return validateIntakeEnvelopeRepresentation(source.details_json!, state).value;
+export function readIntakeEnvelope(
+  db: DatabaseSync,
+  input: IntakeEnvelopeSource,
+  sourceDTO = false,
+): unknown {
+  return withIntakeWork(db, 'warm', () => {
+    const source = selectedSource(db, input);
+    if (source.kind !== 'intake_original') return readNonIntakeEnvelope(source.details_json);
+    intakeEnvelopeAuthorityBinding(db, source);
+    const state = createIntakeStateStorage(db, identity(db, source)).read();
+    const selected = validateIntakeEnvelopeRepresentation(source.details_json!, state);
+    recordIntakeWork('envelopeHydrations');
+    if (sourceDTO) {
+      recordIntakeWork('sourceDTOHydrations');
+      recordIntakeWork('sourceDTOEnvelopeBytes', Buffer.byteLength(selected.text));
+    }
+    return selected.value;
+  });
 }
 export function readIntakeEnvelopeText(db: DatabaseSync, input: IntakeEnvelopeSource): string {
-  const source = selectedSource(db, input);
-  if (source.kind !== 'intake_original') {
-    readNonIntakeEnvelope(source.details_json);
-    if (typeof source.details_json !== 'string') return fail('missing source details');
-    return source.details_json;
-  }
-  intakeEnvelopeAuthorityBinding(db, source);
-  const serialized = createIntakeStateStorage(db, identity(db, source)).readSerialized();
-  if (serialized === undefined) return fail('missing selected envelope');
-  return validateIntakeEnvelopeRepresentation(source.details_json!, parse(serialized)).text;
+  return withIntakeWork(db, 'warm', () => {
+    const source = selectedSource(db, input);
+    if (source.kind !== 'intake_original') {
+      readNonIntakeEnvelope(source.details_json);
+      if (typeof source.details_json !== 'string') return fail('missing source details');
+      return source.details_json;
+    }
+    intakeEnvelopeAuthorityBinding(db, source);
+    const serialized = createIntakeStateStorage(db, identity(db, source)).readSerialized();
+    if (serialized === undefined) return fail('missing selected envelope');
+    const text = validateIntakeEnvelopeRepresentation(source.details_json!, parse(serialized)).text;
+    recordIntakeWork('envelopeTextReads');
+    return text;
+  });
 }
 
 export function prepareInitialIntakeEnvelope(input: Record<string, unknown> | string): {
@@ -255,24 +283,26 @@ export function initializeIntakeEnvelope(
   input: IntakeEnvelopeSource,
   next: Record<string, unknown> | string,
 ): void {
-  requireTransaction(db);
-  try {
-    const source = selectedSource(db, input);
-    if (source.kind !== 'intake_original') fail('initial state requires an original');
-    const prepared = prepareInitialIntakeEnvelope(next);
-    if (source.details_json !== prepared.detailsJson) fail('initial compact source mismatch');
-    const selected = identity(db, source);
-    if (
-      db
-        .prepare('SELECT 1 FROM app_meta WHERE key GLOB ? LIMIT 1')
-        .get(intakeNamespace(selected) + '*')
-    )
-      fail('initial authority already exists');
-    createIntakeStateStorage(db, selected).stage(prepared.state, randomUUID());
-  } catch (error) {
-    rejectCurrentTransaction(db, error);
-    throw error;
-  }
+  return withIntakeWork(db, 'warm', () => {
+    requireTransaction(db);
+    try {
+      const source = selectedSource(db, input);
+      if (source.kind !== 'intake_original') fail('initial state requires an original');
+      const prepared = prepareInitialIntakeEnvelope(next);
+      if (source.details_json !== prepared.detailsJson) fail('initial compact source mismatch');
+      const selected = identity(db, source);
+      if (
+        db
+          .prepare('SELECT 1 FROM app_meta WHERE key GLOB ? LIMIT 1')
+          .get(intakeNamespace(selected) + '*')
+      )
+        fail('initial authority already exists');
+      createIntakeStateStorage(db, selected).stage(prepared.state, randomUUID());
+    } catch (error) {
+      rejectCurrentTransaction(db, error);
+      throw error;
+    }
+  });
 }
 /** Ordinary writes may normalize raw initial evidence once; they never regress to raw mode. */
 export function stageIntakeEnvelope(
@@ -280,20 +310,30 @@ export function stageIntakeEnvelope(
   input: IntakeEnvelopeSource,
   next: Record<string, unknown>,
 ): string {
-  requireTransaction(db);
-  try {
-    const source = selectedSource(db, input);
-    if (source.kind !== 'intake_original') fail('operational write requires an original');
-    readIntakeEnvelope(db, source);
-    const state = normalizeIntakeJson(next);
-    envelope(state);
-    const detailsJson = compact(state, 'normalized');
-    createIntakeStateStorage(db, identity(db, source)).stage(state, randomUUID());
-    if (detailsJson !== source.details_json)
-      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(detailsJson, source.id);
-    return JSON.stringify(state);
-  } catch (error) {
-    rejectCurrentTransaction(db, error);
-    throw error;
-  }
+  return withIntakeWork(db, 'warm', () => {
+    requireTransaction(db);
+    try {
+      const source = selectedSource(db, input);
+      if (source.kind !== 'intake_original') fail('operational write requires an original');
+      readIntakeEnvelope(db, source);
+      if (intakeEnvelopeMode(source.details_json) === 'raw') {
+        recordIntakeWork('rawNormalizations');
+        // The selected raw text was already validated above; conversion volume is
+        // accounted by the existing primitive normalization/serialization hooks.
+      }
+      const state = normalizeIntakeJson(next);
+      envelope(state);
+      const detailsJson = compact(state, 'normalized');
+      createIntakeStateStorage(db, identity(db, source)).stage(state, randomUUID());
+      if (detailsJson !== source.details_json)
+        db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(detailsJson, source.id);
+      const serialized = recordIntakeSerialization(JSON.stringify(state));
+      recordIntakeWork('envelopeSerializationCalls');
+      recordIntakeWork('envelopeSerializedBytes', Buffer.byteLength(serialized));
+      return serialized;
+    } catch (error) {
+      rejectCurrentTransaction(db, error);
+      throw error;
+    }
+  });
 }

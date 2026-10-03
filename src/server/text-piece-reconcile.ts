@@ -39,6 +39,9 @@ export interface TextPieceReconcileMetrics {
   anchors: number;
   matchedUtf16Units: number;
   reusedUtf16Units: number;
+  novelUtf16Units: number;
+  literalizedReuseUtf16Units: number;
+  localAlignmentHandoffs: number;
   derivedOperations: number;
 }
 export interface TextPieceReconcilePlan extends TextPiecePlan {
@@ -54,7 +57,6 @@ interface Match {
   length: number;
 }
 class MatchingWork {
-  unresolved = false;
   readonly limits: TextPieceReconcileLimits;
   readonly metrics: TextPieceReconcileMetrics = {
     scanUtf16Units: 0,
@@ -69,6 +71,9 @@ class MatchingWork {
     anchors: 0,
     matchedUtf16Units: 0,
     reusedUtf16Units: 0,
+    novelUtf16Units: 0,
+    literalizedReuseUtf16Units: 0,
+    localAlignmentHandoffs: 0,
     derivedOperations: 0,
   };
   constructor(input?: Partial<TextPieceReconcileLimits>) {
@@ -146,6 +151,7 @@ function anchors(
     hits: number;
     oldHits: number;
     next: number;
+    seed: number;
   }
   const patterns = new Map<string, Pattern>();
   let id = snapshot.head.first;
@@ -160,9 +166,30 @@ function anchors(
     work.count('maxComparisonUtf16Units', length);
     const prior = patterns.get(text);
     if (prior) prior.count++;
-    else patterns.set(text, { text, old: offset, count: 1, hits: 0, oldHits: 0, next: 0 });
+    else patterns.set(text, { text, old: offset, count: 1, hits: 0, oldHits: 0, next: 0, seed: 0 });
     offset += length;
     id = snapshot.links.get(id)!.next;
+  }
+  // Choose discriminating context inside each whole row. A fixed suffix can be
+  // shared by hundreds of otherwise distinct passages, multiplying candidate
+  // comparisons until an ordinary profile exhausts the unchanged work budget.
+  const frequencies = new Map<number, number>();
+  let power16 = 1;
+  for (let i = 1; i < 16; i++) power16 = Math.imul(power16, 31);
+  if (old.length >= 16) {
+    let hash = hashSeed(old, 0, 16, work);
+    for (let at = 0; at <= old.length - 16; at++) {
+      work.count('maxScanUtf16Units');
+      if (at) {
+        work.count('maxHashUtf16Units', 2);
+        hash =
+          (Math.imul(hash - Math.imul(old.charCodeAt(at - 1), power16), 31) +
+            old.charCodeAt(at + 15)) |
+          0;
+      }
+      if (!frequencies.has(hash)) work.count('maxAnchorCandidates');
+      frequencies.set(hash, (frequencies.get(hash) ?? 0) + 1);
+    }
   }
   const seeds = new Map<number, Map<number, Pattern[]>>();
   for (const pattern of patterns.values()) {
@@ -171,11 +198,30 @@ function anchors(
     const size = Math.min(16, pattern.text.length);
     let byHash = seeds.get(size);
     if (!byHash) seeds.set(size, (byHash = new Map()));
-    const hash = hashSeed(pattern.text, pattern.text.length - size, size, work);
-    const bucket = byHash.get(hash);
+    let selected = hashSeed(pattern.text, 0, size, work);
+    if (size === 16) {
+      let hash = selected;
+      let frequency = frequencies.get(hash)!;
+      for (let at = 1; frequency > 1 && at <= pattern.text.length - size; at++) {
+        work.count('maxScanUtf16Units');
+        work.count('maxHashUtf16Units', 2);
+        hash =
+          (Math.imul(hash - Math.imul(pattern.text.charCodeAt(at - 1), power16), 31) +
+            pattern.text.charCodeAt(at + 15)) |
+          0;
+        const count = frequencies.get(hash)!;
+        if (count < frequency) {
+          frequency = count;
+          selected = hash;
+          pattern.seed = at;
+        }
+      }
+    }
+    const bucket = byHash.get(selected);
     if (bucket) bucket.push(pattern);
-    else byHash.set(hash, [pattern]);
+    else byHash.set(selected, [pattern]);
   }
+  frequencies.clear();
   // An occurrence payload may also occur inside another payload or across an
   // old row boundary. Inventory uniqueness alone does not identify its position.
   for (const retained of [true, false]) {
@@ -193,15 +239,16 @@ function anchors(
             (Math.imul(hash - Math.imul(text.charCodeAt(at - 1), power), 31) +
               text.charCodeAt(at + size - 1)) |
             0;
-        // The suffix seed itself may start inside a scalar; only the full
+        // The internal seed itself may start inside a scalar; only the full
         // candidate endpoints determine whether an occurrence can be retained.
         const bucket = byHash.get(hash);
         if (!bucket) continue;
         for (const pattern of bucket) {
           work.count('maxAnchorCandidates');
-          const start = at + size - pattern.text.length;
+          const start = at - pattern.seed;
           if (
             start < 0 ||
+            start + pattern.text.length > text.length ||
             !boundary(text, start) ||
             (retained ? pattern.oldHits > 1 : pattern.oldHits !== 1 || pattern.hits > 1)
           )
@@ -260,8 +307,7 @@ function anchors(
     retained.push(candidate);
     retainedEnd = candidate.next + candidate.length;
   }
-  work.count('maxAlignmentSteps', candidates.length + fixedRows.length);
-  candidates = fixedRows.slice();
+  candidates = [];
   // Unique sliding windows find context inside retained pieces, including moved blocks
   // whose old chunk boundaries straddled a changed neighbour. Repeated windows never
   // establish an occurrence position. Hash collisions only remove possible anchors.
@@ -301,45 +347,109 @@ function anchors(
     for (const window of windows.values()) {
       work.count('maxAlignmentSteps');
       if (window.oldCount !== 1 || window.nextCount !== 1) continue;
-      let lo = 0,
-        hi = fixedRows.length;
-      while (lo < hi) {
-        work.count('maxAlignmentSteps');
-        const mid = (lo + hi) >>> 1;
-        const anchor = fixedRows[mid];
-        if (anchor.old + anchor.length <= window.old) lo = mid + 1;
-        else hi = mid;
-      }
-      const left = fixedRows[lo - 1],
-        right = fixedRows[lo];
-      if (
-        (right && window.old + 16 > right.old) ||
-        window.next < (left ? left.next + left.length : 0) ||
-        window.next + 16 > (right ? right.next : next.length)
-      )
-        continue;
       let i = 0;
       while (i < 16 && work.equal(old, window.old + i, next, window.next + i)) i++;
       if (i === 16) candidates.push({ old: window.old, next: window.next, length: 16 });
     }
   }
-  candidates.sort((a, b) => {
-    work.count('maxAlignmentSteps');
-    return a.old - b.old || b.length - a.length;
-  });
-  // Within each unanchored gap, overlapping old windows are redundant.
-  let end = -1;
-  let write = 0;
-  for (const candidate of candidates) {
-    work.count('maxAlignmentSteps');
-    if (candidate.old < end) continue;
-    candidates[write++] = candidate;
-    end = candidate.old + candidate.length;
-  }
-  candidates.length = write;
-  const result = orderedAnchors(candidates, work);
+  const reserved = reserveContextBlocks(old, next, candidates, retained, work);
+  const result = orderedAnchors(
+    reserved.slice().sort((a, b) => {
+      work.count('maxAlignmentSteps');
+      return a.old - b.old;
+    }),
+    work,
+  );
   work.metrics.anchors = result.length;
-  return { fixed: result, retained };
+  return { fixed: result, retained: reserved };
+}
+/** Reserve context-bound moves before character alignment can pair similar passages. */
+function reserveContextBlocks(
+  old: string,
+  next: string,
+  windows: Match[],
+  retained: Match[],
+  work: MatchingWork,
+): Match[] {
+  const order = (coordinate: 'old' | 'next') => (a: Match, b: Match) => {
+    work.count('maxAlignmentSteps');
+    return a[coordinate] - b[coordinate];
+  };
+  const byOld = retained.slice().sort(order('old'));
+  const byNext = retained.slice().sort(order('next'));
+  const gap = (match: Match, rows: Match[], coordinate: 'old' | 'next', end: number) => {
+    const i = afterPosition(match[coordinate], rows, coordinate, work);
+    const right = rows[i];
+    if (right && match[coordinate] + match.length > right[coordinate]) return null;
+    return {
+      i,
+      start: i ? rows[i - 1][coordinate] + rows[i - 1].length : 0,
+      end: right ? right[coordinate] : end,
+    };
+  };
+  // Windows on one diagonal describe the same exact correspondence. Extending
+  // its first seed once avoids rescanning a long unique passage for every seed.
+  windows.sort((a, b) => {
+    work.count('maxAlignmentSteps');
+    return a.old - a.next - (b.old - b.next) || a.old - b.old;
+  });
+  const blocks: Match[] = [];
+  for (const window of windows) {
+    work.count('maxAlignmentSteps');
+    const prior = blocks.at(-1);
+    if (
+      prior &&
+      prior.old - prior.next === window.old - window.next &&
+      prior.old + prior.length >= window.old + window.length
+    )
+      continue;
+    const a = gap(window, byOld, 'old', old.length);
+    const b = gap(window, byNext, 'next', next.length);
+    if (!a || !b) continue;
+    const block = { ...window };
+    while (
+      block.old > a.start &&
+      block.next > b.start &&
+      work.equal(old, block.old - 1, next, block.next - 1)
+    ) {
+      block.old--;
+      block.next--;
+      block.length++;
+    }
+    while (
+      block.old + block.length < a.end &&
+      block.next + block.length < b.end &&
+      work.equal(old, block.old + block.length, next, block.next + block.length)
+    )
+      block.length++;
+    while (block.length && (!boundary(old, block.old) || !boundary(next, block.next))) {
+      block.old++;
+      block.next++;
+      block.length--;
+    }
+    while (
+      block.length &&
+      (!boundary(old, block.old + block.length) || !boundary(next, block.next + block.length))
+    )
+      block.length--;
+    if (block.length) blocks.push(block);
+  }
+  // Complete rows already occupy both inventories. Of the remaining exact
+  // context blocks, longer ones win; offsets make every ambiguity deterministic.
+  blocks.sort((a, b) => {
+    work.count('maxAlignmentSteps');
+    return b.length - a.length || a.next - b.next || a.old - b.old;
+  });
+  for (const block of blocks) {
+    work.count('maxAlignmentSteps');
+    const a = gap(block, byOld, 'old', old.length);
+    const b = gap(block, byNext, 'next', next.length);
+    if (!a || !b) continue;
+    work.count('maxAlignmentSteps', byOld.length - a.i + byNext.length - b.i + 2);
+    byOld.splice(a.i, 0, block);
+    byNext.splice(b.i, 0, block);
+  }
+  return byNext;
 }
 function orderedAnchors(candidates: Match[], work: MatchingWork): Match[] {
   // Patience alignment uses nonoverlapping next intervals.
@@ -480,11 +590,12 @@ function align(old: string, next: string, a: Range, b: Range, work: MatchingWork
     const get = (row: Int32Array | undefined, d: number, k: number): number =>
       !row || k < -d || k > d ? -1 : row[k + d];
     for (let d = 0; d <= n + m; d++) {
-      // After a bounded local search, try exact unmatched-range move reuse. This
-      // is not a replacement fallback: any novel text with unresolved alignment
-      // refuses below. The hard cumulative work limits always refuse immediately.
+      // After a bounded local search, inventory every remaining old scalar for
+      // exact reuse. Novel text is admitted only after exhausting that inventory;
+      // this never substitutes a whole snapshot for an unresolved alignment.
+      // The hard cumulative work limits always refuse immediately.
       if (d > 256) {
-        work.unresolved = true;
+        work.metrics.localAlignmentHandoffs++;
         break;
       }
       work.count('maxTraceCells', 2 * d + 1);
@@ -545,6 +656,7 @@ interface Desired {
   old?: number;
   next: number;
   length: number;
+  residual?: boolean;
 }
 function desiredRanges(old: string, next: string, matches: Match[], work: MatchingWork): Desired[] {
   const available: Range[] = [];
@@ -590,7 +702,9 @@ function desiredRanges(old: string, next: string, matches: Match[], work: Matchi
       last &&
       last.next + last.length === part.next &&
       ((last.old === undefined && part.old === undefined) ||
-        (last.old !== undefined && part.old === last.old + last.length))
+        (last.old !== undefined &&
+          part.old === last.old + last.length &&
+          last.residual === part.residual))
     )
       last.length += part.length;
     else desired.push(part);
@@ -601,6 +715,7 @@ function desiredRanges(old: string, next: string, matches: Match[], work: Matchi
       const entry = index.get(next.charCodeAt(at));
       let reused = false;
       if (entry) {
+        let best: { source: number; ri: number; length: number } | undefined;
         for (let i = entry.cursor; i < entry.offsets.length; i++) {
           work.count('maxReuseCandidates');
           const source = entry.offsets[i];
@@ -610,6 +725,9 @@ function desiredRanges(old: string, next: string, matches: Match[], work: Matchi
             continue;
           }
           const range = available[ri];
+          // Candidates are visited in source order. A later range which cannot
+          // beat the current block cannot change the earliest-offset tie break.
+          if (best && Math.min(range.end - source, through - at) <= best.length) continue;
           let length = 0;
           while (
             source + length < range.end &&
@@ -620,7 +738,17 @@ function desiredRanges(old: string, next: string, matches: Match[], work: Matchi
           while (length && (!boundary(old, source + length) || !boundary(next, at + length)))
             length--;
           if (!length) continue;
-          add({ old: source, next: at, length });
+          // Prefer an intact block to an earlier one-scalar coincidence. The
+          // latter fragments ordinary JSON acceptance changes into many moves
+          // and can exhaust engine work despite a small logical mutation.
+          // Offsets are ordered, so equal-length ambiguity keeps the earliest.
+          if (!best || length > best.length) best = { source, ri, length };
+          if (length === through - at) break;
+        }
+        if (best) {
+          const { source, ri, length } = best;
+          const range = available[ri];
+          add({ old: source, next: at, length, residual: true });
           work.metrics.reusedUtf16Units += length;
           const replacement: Range[] = [];
           if (range.start < source) replacement.push({ start: range.start, end: source });
@@ -630,16 +758,18 @@ function desiredRanges(old: string, next: string, matches: Match[], work: Matchi
           available.splice(ri, 1, ...replacement);
           at += length;
           reused = true;
-          break;
         }
       }
       if (!reused) {
-        if (work.unresolved)
-          throw new TextPieceError(
-            'limit',
-            'automatic alignment could not establish exact move reuse',
-          );
+        // The index covers every scalar start in the disjoint, unreserved old
+        // ranges. The loop above exhausts all still-available exact candidates
+        // before reaching here, including different non-BMP scalars with the
+        // same leading surrogate. Reserved/consumed occurrences cannot be used
+        // twice. This scalar therefore needs new literal content even if local
+        // Myers alignment stopped. Reference fragmentation remains subject to
+        // the unchanged matching/engine budgets; it is not a locality promise.
         const length = next.codePointAt(at)! > 0xffff ? 2 : 1;
+        work.metrics.novelUtf16Units += length;
         add({ next: at, length });
         at += length;
       }
@@ -652,7 +782,34 @@ function desiredRanges(old: string, next: string, matches: Match[], work: Matchi
     end = match.next + match.length;
   }
   gap(end, next.length);
-  return desired;
+  // Reusing every punctuation mark can cost more than a thousand moves when a
+  // genuinely new proposal is added. Only short residual fragments may become
+  // literal text, within twice the independently proved novel-scalar deficit.
+  // Thus emitted units are at most three times that deficit; a pure move gets
+  // no allowance, and intact/contextual matches can never be literalized here.
+  let allowance = work.metrics.novelUtf16Units * 2;
+  const coalesced: Desired[] = [];
+  for (const original of desired) {
+    work.count('maxAlignmentSteps');
+    const part = { ...original };
+    if (part.residual && part.length <= 32 && part.length <= allowance) {
+      delete part.old;
+      delete part.residual;
+      allowance -= part.length;
+      work.metrics.literalizedReuseUtf16Units += part.length;
+      work.metrics.reusedUtf16Units -= part.length;
+    }
+    const last = coalesced.at(-1);
+    if (
+      last &&
+      last.next + last.length === part.next &&
+      ((last.old === undefined && part.old === undefined) ||
+        (last.old !== undefined && part.old === last.old + last.length))
+    )
+      last.length += part.length;
+    else coalesced.push(part);
+  }
+  return coalesced;
 }
 /** Translate disjoint original-text ranges to sequential scalar-safe engine edits. */
 function editsFor(
@@ -796,8 +953,8 @@ function remainingLimits(
 }
 /**
  * Pure automatic reconciliation. Contextually unique exact anchors precede bounded
- * character alignment; only unmatched ranges can supply moves. Ambiguous residual
- * matches use earliest remaining old scalar offset. No edits or snapshots are retained
+ * character alignment; only unmatched ranges can supply moves. Residual matches
+ * prefer the longest exact block, then the earliest old scalar offset. No edits or snapshots are retained
  * in the returned individual-row plan. Engine metrics include both validation passes.
  */
 export function reconcileTextPieces(

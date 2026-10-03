@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { openSync, readSync, closeSync, fstatSync, statSync } from 'node:fs';
 import { HttpError } from './database.ts';
 import type { IntakeImageEncoding } from './intake-image.ts';
+import { recordIntakeFileWork } from './intake-file-work.ts';
 const MiB = 1024 * 1024;
 
 // PDF parsing runs in one reusable, profile-scoped worker at a time. These are
@@ -70,6 +71,7 @@ export function inspectIntakeFile(
   const fd = openSync(path, 'r'),
     hash = createHash('sha256'),
     chunk = Buffer.allocUnsafe(256 * 1024);
+  recordIntakeFileWork('inspectionBufferBytes', chunk.length);
   const decoder = window ? new TextDecoder('utf-8', { fatal: true }) : null;
   let size = 0,
     characters = 0,
@@ -88,10 +90,17 @@ export function inspectIntakeFile(
     if (!fstatSync(fd).isFile())
       throw new HttpError(409, 'SOURCE_CHANGED', 'Retained original is not a regular file');
     let n;
-    while ((n = readSync(fd, chunk, 0, chunk.length, null))) {
+    while (true) {
+      recordIntakeFileWork('streamReadAttempts');
+      n = readSync(fd, chunk, 0, chunk.length, null);
+      recordIntakeFileWork('streamReadCalls');
+      recordIntakeFileWork('streamReadBytes', n);
+      if (!n) break;
       const bytes = chunk.subarray(0, n);
       size += n;
       hash.update(bytes);
+      recordIntakeFileWork('streamHashCalls');
+      recordIntakeFileWork('streamHashBytes', n);
       if (decoder && validText)
         try {
           decoded(decoder.decode(bytes, { stream: true }));
@@ -130,7 +139,10 @@ export function verifyIntakeFileHash(path: string, expected: { bytes: number; sh
   const stat = statSync(path, { bigint: true });
   const key = `${expected.sha256}:${expected.bytes}:${path}`;
   const identity = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
-  if (verified.get(key) === identity) return;
+  if (verified.get(key) === identity) {
+    recordIntakeFileWork('verificationCacheHits');
+    return;
+  }
   verified.delete(key);
   inspectIntakeFile(path, expected);
   if (verified.size >= VERIFIED_LIMIT) verified.delete(verified.keys().next().value!);

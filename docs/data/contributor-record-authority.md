@@ -36,4 +36,4 @@ The `publicationAttempted` rule remains conservative. After an ambiguous attempt
 
 The plaintext adapter does not change the encrypted product's privacy, recovery-kit or browser-session boundaries. Filesystem checks and fault-injected publication tests do not establish physical power-loss behavior or arbitrary filesystem guarantees. Full source comparison, backup, initial framing and original verification during copy scale with retained state. Existing-profile attachment also performs independent reconstruction and comparison; that opening cost is separate from warm mutation locality.
 
-The contributor backend enables genuine runtime authority; [CRS-210](../todo/CRS-210.md) still owns complete mutation/recovery growth qualification. No large-import, provider or physical-device release gate is closed by this storage contract alone.
+The contributor backend enables genuine runtime authority; [application mutation and recovery qualification](intake-mutation-qualification.md) includes actual filesystem publication faults and independent backend reopening. No large-import, provider or physical-device release gate is closed by this storage contract alone.

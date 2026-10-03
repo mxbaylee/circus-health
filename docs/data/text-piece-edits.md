@@ -20,6 +20,8 @@ A splice replaces `deleteCount` UTF-16 units at `at` with `insert`. A move selec
 
 Each successful edit plan advances the head revision, including an empty or no-op edit list; supplied no-op edits count toward the operation limit and metrics. Sequential insertions can allocate content and ordinals that later edits remove from the selected chain. That immutable content remains in the returned writes and retained inventory, while occurrence/link changes describe the final chain. It is still bounded and counted; a caller seeking no-op suppression or content reclamation must supply that separate policy.
 
+Active edits reuse the boundary indexes returned by scalar-safe splitting. For moves, ascending splits preserve earlier indexes; the planner no longer repeats full-prefix walks to validate those same cuts and recover their indexes. Splices validate their cuts before counting removed bytes. No-op edits still validate scalar boundaries, and all actual scans and array copies remain charged against the same limits. This avoids a demonstrated scan-budget failure for many small edits near the end of a retained chain without changing occurrence identities, ordinal allocation or durable outputs.
+
 Offsets count JavaScript UTF-16 code units, while hashes and byte counters use UTF-8. Endpoints must lie between Unicode scalar values. Raw unpaired surrogates are unsupported and refused explicitly; a literal JSON escape such as `\ud800` is ordinary ASCII text and remains exact. Invalid input is never repaired by replacement characters or normalization.
 
 Malformed rows, wrong sequence identities, missing or cyclic links, stale expected heads, mismatched expected results, unknown edits, unsafe offsets and exhausted limits fail explicitly. The caller's snapshot remains unchanged on failure. A failed edit does not fall back to a complete text replacement or a large replacement spanning unrelated distant edits.
@@ -63,9 +65,9 @@ Each update writes at most one content, occurrence and link row in this fixture.
 
 | Updates | Existing content read bytes | Scan steps | Hash bytes | Logical copied bytes |
 | ------: | --------------------------: | ---------: | ---------: | -------------------: |
-|     100 |                   1,135,999 |     55,149 | 11,487,081 |           40,562,544 |
-|     200 |                   2,271,999 |    200,299 | 26,917,781 |           91,470,894 |
-|     300 |                   3,407,999 |    435,449 | 46,308,481 |          152,769,244 |
+|     100 |                   1,135,999 |     54,949 | 11,487,081 |           40,562,544 |
+|     200 |                   2,271,999 |    199,899 | 26,917,781 |           91,470,894 |
+|     300 |                   3,407,999 |    434,849 | 46,308,481 |          152,769,244 |
 
 | Updates | Validation UTF-16 units | Reconstruction UTF-16 units | Exact comparison UTF-16 units |
 | ------: | ----------------------: | --------------------------: | ----------------------------: |
@@ -77,6 +79,6 @@ Existing-content read counts describe complete retained inventory reads into wor
 
 Deletion metrics separately count occurrence/link rows and the JSON-encoded UTF-8 bytes of each deletion key. They are included in the changed-plan budget; the prefix-growth table has no deletions. Counts describe logical plans, not SQLite allocation, accepted-record journaling or filesystem writes.
 
-Explicit-edit success does not prove that the application can infer edits from two snapshots. [Automatic occurrence alignment and duplicate/move assignment](text-piece-reconciliation.md) are separately implemented and qualified; [disposable transactional storage](source-text-projection.md) is implemented separately, [exact source-search integration](source-details-search.md) is implemented, and original production authority uses the [selected intake envelope chain](intake-envelope-authority.md), and real mutation-growth qualification remains [CRS-210](../todo/CRS-210.md). Originals and accepted versions remain recovery authority. This primitive alone does not qualify installation capacity or large imports.
+Explicit-edit success does not prove that the application can infer edits from two snapshots. [Automatic occurrence alignment and duplicate/move assignment](text-piece-reconciliation.md), [disposable transactional source-text storage](source-text-projection.md) and [exact source-search integration](source-details-search.md) are implemented. Original production authority uses the [selected intake envelope chain](intake-envelope-authority.md); [application mutation qualification](intake-mutation-qualification.md) measures actual writes, recovery and remaining work separately. Originals and accepted versions remain recovery authority. This primitive alone does not qualify installation capacity or large imports.
 
 The 100/200/300 pure-planner measurements above qualify only the described fictional edit plans. They do not qualify actual batch/review/clinical-acceptance mutation growth, PR #35 or heavy imports.

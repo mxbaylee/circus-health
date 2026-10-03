@@ -5,6 +5,7 @@ import {
   type IntakeDetails,
 } from './intake-state-access.ts';
 import { readIntakeEnvelopeText } from './intake-authority.ts';
+import { copiedManualSourceRecordApplies } from './intake-manual-copy.ts';
 import {
   effectiveKnownNames,
   challengedKnownNames,
@@ -86,18 +87,22 @@ import type { OccurrenceAuthorityFinalizer } from './duplicate-review.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   mkdirSync,
-  readFileSync,
-  writeFileSync,
   existsSync,
   openSync,
   closeSync,
-  fsyncSync,
-  renameSync,
   rmSync,
   realpathSync,
-  copyFileSync,
   constants as fsConstants,
 } from 'node:fs';
+import {
+  readIntakeFileSync as readFileSync,
+  writeIntakeFileSync as writeFileSync,
+  fsyncIntakeFileSync as fsyncSync,
+  renameIntakeFileSync as renameSync,
+  copyIntakeFileSync,
+  recordIntakeFileHash,
+  recordIntakeFileWork,
+} from './intake-file-work.ts';
 import { resolve, dirname, basename } from 'node:path';
 import { HttpError, required, safeText, transaction, revision, now, json } from './database.ts';
 import { profilePaths, profileOriginal, safeRelative } from './profile-storage.ts';
@@ -355,7 +360,10 @@ type ExtractionPins = (
   file: SourceFileRow,
 ) => NonNullable<Intake['workflow']>['plans'][number]['pins'];
 type ExtractionUnits = (index: ExtractionIndex, input: PlanInput) => IntakeExtractionUnit[];
-const hash = (x: string | Uint8Array): string => createHash('sha256').update(x).digest('hex');
+const hash = (x: string | Uint8Array): string => {
+  recordIntakeFileHash(x);
+  return createHash('sha256').update(x).digest('hex');
+};
 const meta = (db: DatabaseSync, key: string): string | undefined =>
   (db.prepare('SELECT value FROM app_meta WHERE key=?').get(key) as { value?: string } | undefined)
     ?.value;
@@ -747,7 +755,7 @@ function saveOriginal(
         // copy-and-verify behavior there, never an unverified shortcut.
         measureImportPhase(
           'upload_original_copy',
-          () => copyFileSync(staged.path, temporary, fsConstants.COPYFILE_EXCL),
+          () => copyIntakeFileSync(staged.path, temporary, fsConstants.COPYFILE_EXCL, staged.bytes),
           { bytes: staged.bytes },
           { profileId },
         );
@@ -775,7 +783,10 @@ function saveOriginal(
     }
     measureImportPhase(
       'upload_original_publish',
-      () => renameSync(temporary, target),
+      () => {
+        renameSync(temporary, target);
+        recordIntakeFileWork('publications');
+      },
       {},
       { profileId },
     );
@@ -1379,6 +1390,19 @@ function reviewIntakePrepared(
       profileId,
       people,
       activeReceipts: (receipts) => activeIdentityReceipts(db, receipts),
+      copiedManualSourceApplies: (receipt, selectedProposalId) =>
+        selectedProposalId === proposalId &&
+        copiedManualSourceRecordApplies(
+          db,
+          {
+            profileId,
+            intakeId: id,
+            sourceHash: file.sha256,
+            proposalId: selectedProposalId,
+            proposalHash: inputFile.sha256,
+          },
+          receipt,
+        ),
       resolutionCurrent: (resolution, mapping) => issueResolutionCurrent(db, resolution, mapping),
       ...grounding,
     },

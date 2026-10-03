@@ -1,6 +1,5 @@
 import {
   applyChatChanges,
-  chatChanges,
   chatDecodeBudget,
   ChatDecodeLimitError,
   cloneChatJson,
@@ -9,9 +8,15 @@ import {
   type ChatJson,
 } from './chat-journal-codec.ts';
 
+import { recordIntakeWork, recordIntakeSerialization } from './intake-work-accounting.ts';
+import { intakeStringChanges } from './intake-string-changes.ts';
+
 export type IntakeJson = { [key: string]: ChatJson };
 export type IntakeChange =
-  ChatChange | { op: 'move-key'; path: string[]; key: string; before: string | null };
+  | ChatChange
+  | { op: 'move-key'; path: string[]; key: string; before: string | null }
+  | { op: 'array-splice'; path: string[]; offset: number; remove: number; values: ChatJson[] }
+  | { op: 'array-move'; path: string[]; from: number; to: number };
 
 const MAX_ITEMS = 1_000_000;
 const MAX_DEPTH = 64;
@@ -37,12 +42,15 @@ function indexKey(value: string): boolean {
 
 /** Plain JSON object domain; object undefined is absent, array undefined/holes are null. */
 export function normalizeIntakeJson(value: unknown, budget = chatDecodeBudget()): IntakeJson {
+  recordIntakeWork('normalizeCalls');
   if (!object(value)) fail();
   // Check data descriptors before the shared cloner reads values. Accessors and
   // proxies are outside this plain-data domain; no getter is part of decoding.
   let nodes = budget.nodes;
   const ancestors = new Set<object>();
   const validate = (input: unknown, depth: number): void => {
+    recordIntakeWork('normalizeValidationNodes');
+    if (typeof input === 'string') recordIntakeWork('normalizeValidatedStringUnits', input.length);
     if (--nodes < 0) throw new ChatDecodeLimitError('Intake decoded work limit exceeded');
     if (depth > MAX_DEPTH) fail();
     if (!input || typeof input !== 'object') return;
@@ -69,12 +77,17 @@ export function normalizeIntakeJson(value: unknown, budget = chatDecodeBudget())
     ancestors.delete(input);
   };
   validate(value, 0);
-  return cloneChatJson(value, 0, budget) as IntakeJson;
+  const priorNodes = budget.nodes;
+  const cloned = cloneChatJson(value, 0, budget) as IntakeJson;
+  recordIntakeWork('normalizeCloneNodes', priorNodes - budget.nodes);
+  return cloned;
 }
 
 /** Exact JSON.stringify bytes of the normalized domain, including nested insertion order. */
 export function serializeIntakeJson(value: IntakeJson): string {
-  return JSON.stringify(value);
+  const text = JSON.stringify(value);
+  recordIntakeSerialization(text);
+  return text;
 }
 
 function targetAt(state: IntakeJson, path: string[]): ChatJson {
@@ -133,6 +146,62 @@ function move(state: IntakeJson, raw: Record<string, unknown>, budget: ChatDecod
   for (const name of Object.keys(reordered)) target[name] = reordered[name]!;
 }
 
+function arrayChange(
+  state: IntakeJson,
+  raw: Record<string, unknown>,
+  budget: ChatDecodeBudget,
+): void {
+  const fields =
+    raw.op === 'array-splice'
+      ? ['offset', 'op', 'path', 'remove', 'values']
+      : ['from', 'op', 'path', 'to'];
+  if (
+    Object.keys(raw).sort().join('\0') !== fields.join('\0') ||
+    !Array.isArray(raw.path) ||
+    raw.path.length > MAX_DEPTH
+  )
+    fail();
+  const path: string[] = raw.path;
+  path.forEach(key);
+  const target = targetAt(state, path);
+  if (!Array.isArray(target) || target.length > MAX_ITEMS) fail();
+  const natural = (value: unknown): value is number =>
+    Number.isSafeInteger(value) && Number(value) >= 0;
+  if (raw.op === 'array-move') {
+    if (
+      !natural(raw.from) ||
+      !natural(raw.to) ||
+      raw.from >= target.length ||
+      raw.to >= target.length ||
+      raw.from === raw.to
+    )
+      fail();
+    budget.operations -= 1 + path.length + 2 * target.length;
+    if (budget.operations < 0) throw new ChatDecodeLimitError('Intake decoded work limit exceeded');
+    const value = target.splice(raw.from, 1)[0]!;
+    target.splice(raw.to, 0, value);
+  } else {
+    if (
+      !natural(raw.offset) ||
+      !natural(raw.remove) ||
+      raw.offset + raw.remove > target.length ||
+      !Array.isArray(raw.values) ||
+      raw.values.length > MAX_ITEMS ||
+      target.length - raw.remove + raw.values.length > MAX_ITEMS ||
+      (!raw.remove && !raw.values.length)
+    )
+      fail();
+    budget.operations -= 1 + path.length + target.length + raw.values.length;
+    if (budget.operations < 0) throw new ChatDecodeLimitError('Intake decoded work limit exceeded');
+    // Clone before mutation, sharing the cumulative decoder budget and real depth.
+    const values = raw.values.map((value) => cloneChatJson(value, path.length + 1, budget));
+    const tail = target.slice(raw.offset + raw.remove);
+    target.length = raw.offset;
+    for (const value of values) target.push(value);
+    for (const value of tail) target.push(value);
+  }
+}
+
 export function applyIntakeChanges(
   initial: IntakeJson | undefined,
   raw: unknown,
@@ -146,10 +215,11 @@ export function applyIntakeChanges(
       change &&
       typeof change === 'object' &&
       !Array.isArray(change) &&
-      change.op === 'move-key'
+      ['move-key', 'array-splice', 'array-move'].includes(change.op)
     ) {
       if (!state) fail();
-      move(state, change, budget);
+      if (change.op === 'move-key') move(state, change, budget);
+      else arrayChange(state, change, budget);
     } else {
       const next = applyChatChanges(state, [change], budget);
       if (!object(next)) fail();
@@ -183,15 +253,164 @@ function retainedKeys(current: string[], desired: string[]): Set<string> {
   return retained;
 }
 
-/** Inputs must already be normalized. Diffing traverses them without copying their values. */
+/** Inputs must already be normalized. Host matching traverses the complete view. */
 export function intakeChanges(before: IntakeJson, after: IntakeJson): IntakeChange[] {
+  recordIntakeWork('diffCalls');
   if (!object(before) || !object(after)) fail();
-  const changes: IntakeChange[] = chatChanges(before, after);
-  const order = (current: ChatJson | undefined, target: ChatJson, path: string[]): void => {
-    if (Array.isArray(current) && Array.isArray(target)) {
-      target.forEach((value, index) => order(current[index]!, value, [...path, String(index)]));
+  const changes: IntakeChange[] = [];
+  const diff = (current: ChatJson | undefined, target: ChatJson, path: string[]): void => {
+    recordIntakeWork('diffNodeVisits');
+    if (path.length > MAX_DEPTH || changes.length > MAX_ITEMS) fail();
+    if (current === target) return;
+    if (typeof current === 'string' && typeof target === 'string') {
+      for (const change of intakeStringChanges(current, target, path)) changes.push(change);
+    } else if (Array.isArray(current) && Array.isArray(target)) {
+      if (target.length > MAX_ITEMS) fail();
+      // Exact ordered serialization identities, with FIFO occurrence queues for
+      // duplicates. These indexes are transient and never become durable evidence.
+      const positions = new Map<string, { indices: number[]; cursor: number }>();
+      for (let index = 0; index < current.length; index++) {
+        const text = JSON.stringify(current[index]);
+        recordIntakeWork('arrayMatchSerializedBytes', Buffer.byteLength(text));
+        recordIntakeWork('arrayMatchItems');
+        let entry = positions.get(text);
+        if (!entry) {
+          entry = { indices: [], cursor: 0 };
+          positions.set(text, entry);
+        }
+        entry.indices.push(index);
+      }
+      const used = new Set<number>();
+      const wanted = target.map((value) => {
+        const text = JSON.stringify(value);
+        recordIntakeWork('arrayMatchSerializedBytes', Buffer.byteLength(text));
+        recordIntakeWork('arrayMatchItems');
+        const entry = positions.get(text);
+        const index = entry?.indices[entry.cursor++];
+        if (index !== undefined) used.add(index);
+        return index;
+      });
+      // Match changed/moved objects using unique unchanged leaf evidence. A
+      // large retained member outweighs incidental small metadata matches. This
+      // is transient matching only: no IDs or schema fields are privileged.
+      const members = (
+        value: ChatJson,
+        consume: (text: string) => boolean,
+        sliding = false,
+      ): void => {
+        const add = (names: string[], child: ChatJson, window: boolean) => {
+          const text = JSON.stringify([names, window, child]);
+          recordIntakeWork('arrayMatchSerializedBytes', Buffer.byteLength(text));
+          recordIntakeWork('arrayMatchItems');
+          return consume(text);
+        };
+        const visit = (child: ChatJson, names: string[]) => {
+          if (child && typeof child === 'object') {
+            for (const name of Object.keys(child))
+              visit((child as Record<string, ChatJson>)[name]!, [...names, name]);
+          } else {
+            const exact = add(names, child, false);
+            // A moved string (or nested string leaf) can itself contain small
+            // edits. Exact fixed windows retain its correspondence without
+            // resending the rest of that string after an index shift.
+            if (!exact && typeof child === 'string' && child.length >= 128)
+              for (let offset = 0; offset + 32 <= child.length; offset += sliding ? 1 : 32)
+                add(names, child.slice(offset, offset + 32), true);
+          }
+        };
+        visit(value, []);
+      };
+      const anchors = new Map<string, number | null>();
+      for (let index = 0; index < current.length; index++) {
+        if (used.has(index)) continue;
+        members(current[index]!, (member) => {
+          const previous = anchors.get(member);
+          anchors.set(member, previous === undefined || previous === index ? index : null);
+          return false;
+        });
+      }
+      const candidates: { old: number; next: number; weight: number }[] = [];
+      for (let index = 0; index < target.length; index++) {
+        if (wanted[index] !== undefined) continue;
+        const weights = new Map<number, number>();
+        members(
+          target[index]!,
+          (member) => {
+            const old = anchors.get(member);
+            if (old !== null && old !== undefined) {
+              weights.set(old, (weights.get(old) ?? 0) + member.length);
+              return true;
+            }
+            return false;
+          },
+          true,
+        );
+        for (const [old, weight] of weights) candidates.push({ old, next: index, weight });
+      }
+      candidates.sort((a, b) => b.weight - a.weight || a.next - b.next || a.old - b.old);
+      for (const candidate of candidates) {
+        if (used.has(candidate.old) || wanted[candidate.next] !== undefined) continue;
+        wanted[candidate.next] = candidate.old;
+        used.add(candidate.old);
+      }
+      // Pair residual changed slots after reserving exact and anchored occurrences.
+      const remaining = current.map((_, index) => index).filter((index) => !used.has(index));
+      let cursor = 0;
+      for (let index = 0; index < wanted.length; index++) {
+        if (wanted[index] !== undefined) continue;
+        const old = remaining[cursor++];
+        if (old !== undefined) {
+          wanted[index] = old;
+          used.add(old);
+        }
+      }
+      const live = current.map((_, index) => index);
+      for (let index = live.length - 1; index >= 0;) {
+        if (used.has(live[index]!)) {
+          index--;
+          continue;
+        }
+        const end = index + 1;
+        while (index >= 0 && !used.has(live[index]!)) index--;
+        changes.push({
+          op: 'array-splice',
+          path,
+          offset: index + 1,
+          remove: end - index - 1,
+          values: [],
+        });
+        live.splice(index + 1, end - index - 1);
+      }
+      let fresh = current.length;
+      const added: ChatJson[] = [];
+      const appendAt = live.length;
+      for (let index = 0; index < wanted.length; index++) {
+        if (wanted[index] !== undefined) continue;
+        wanted[index] = fresh++;
+        added.push(target[index]!);
+        live.push(wanted[index]!);
+      }
+      if (added.length)
+        changes.push({ op: 'array-splice', path, offset: appendAt, remove: 0, values: added });
+      const desired = wanted as number[];
+      const retained = retainedKeys(live.map(String), desired.map(String));
+      for (let index = desired.length - 1; index >= 0; index--) {
+        const identity = desired[index]!;
+        if (retained.has(String(identity))) continue;
+        const from = live.indexOf(identity);
+        live.splice(from, 1);
+        const to = index + 1 === desired.length ? live.length : live.indexOf(desired[index + 1]!);
+        live.splice(to, 0, identity);
+        if (from !== to) changes.push({ op: 'array-move', path, from, to });
+      }
+      for (let index = 0; index < target.length; index++) {
+        const old = desired[index]!;
+        if (old < current.length) diff(current[old], target[index]!, [...path, String(index)]);
+      }
     } else if (object(current) && object(target)) {
-      // Chat removes missing members then appends new ones in target order.
+      for (const name of Object.keys(current))
+        if (!Object.hasOwn(target, name)) changes.push({ op: 'remove', path: [...path, name] });
+      for (const name of Object.keys(target)) diff(current[name], target[name]!, [...path, name]);
       const names = Object.keys(current).filter(
         (name) => Object.hasOwn(target, name) && !indexKey(name),
       );
@@ -203,10 +422,9 @@ export function intakeChanges(before: IntakeJson, after: IntakeJson): IntakeChan
         if (!retained.has(name))
           changes.push({ op: 'move-key', path, key: name, before: wanted[index + 1] ?? null });
       }
-      for (const name of Object.keys(target)) order(current[name]!, target[name]!, [...path, name]);
-    }
-    if (changes.length > MAX_ITEMS || path.length > MAX_DEPTH) fail();
+    } else changes.push({ op: 'set', path, value: cloneChatJson(target, path.length) });
+    if (changes.length > MAX_ITEMS) fail();
   };
-  order(before, after, []);
+  diff(before, after, []);
   return changes;
 }

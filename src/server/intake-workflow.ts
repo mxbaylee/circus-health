@@ -292,6 +292,10 @@ export function workflowReview<T extends IntakeReview>(
   self?: IntakeIdentitySelfSnapshot,
   identityContext?: {
     profileId: string;
+    copiedManualSourceApplies?: (
+      receipt: import('../shared/intake-manual-source-record.ts').ManualSourceRecordReceipt,
+      proposalId: string,
+    ) => boolean;
     activeReceipts?: (
       receipts: IntakeWorkflow['identityConfirmations'],
     ) => IntakeWorkflow['identityConfirmations'];
@@ -746,7 +750,9 @@ export function workflowReview<T extends IntakeReview>(
       const manual = details.proposals?.find((p) => p.id === review.proposalId)?.manualSourceRecord;
       if (
         manual &&
-        manual.profileId === identityContext?.profileId &&
+        (manual.profileId === identityContext?.profileId ||
+          (!!review.proposalId &&
+            identityContext?.copiedManualSourceApplies?.(manual, review.proposalId))) &&
         manual.intakeId === file.id &&
         manual.sourceHash === file.sha256 &&
         entriesByRecordId.get(record.id)?.value.id === `manual:${manual.operationId}`
