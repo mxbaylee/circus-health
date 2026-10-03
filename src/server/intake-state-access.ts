@@ -17,6 +17,8 @@ import {
 } from './intake-authority.ts';
 import { createSourceDetailsSearch } from './source-details-search.ts';
 import { reconcileActiveSourceTextProjection } from './source-text-projection.ts';
+import { withIntakeWork } from './intake-work-accounting.ts';
+import { recordIntakeFileHash } from './intake-file-work.ts';
 import type {
   Intake,
   IntakeMetadata,
@@ -185,7 +187,7 @@ export function intakeIdentityConfirmations(db: DatabaseSync): IntakeIdentityRec
 /** Source-file DTOs currently expose the complete envelope, including operational intake state. */
 export function sourceFileDetails(db: DatabaseSync, file: DetailsRow & { id: string }): unknown {
   return file.kind === 'intake_original'
-    ? readIntakeEnvelope(db, file)
+    ? readIntakeEnvelope(db, file, true)
     : readNonIntakeEnvelope(file.details_json);
 }
 /** Source list search includes operational JSON. Both count/page queries use this scoped adapter. */
@@ -212,14 +214,21 @@ export function registerIntakeFile(db: DatabaseSync, file: IntakeFileRegistratio
   if (file.kind === 'intake_original' && (!currentTransactionToken(db) || !db.isTransaction))
     throw Error('Intake registration requires the existing application transaction');
   const prepared =
-    file.kind === 'intake_original' ? prepareInitialIntakeEnvelope(file.details) : null;
+    file.kind === 'intake_original'
+      ? withIntakeWork(db, 'warm', () => prepareInitialIntakeEnvelope(file.details))
+      : null;
+  let sourceHash = file.sha256;
+  if (!sourceHash) {
+    recordIntakeFileHash(file.bytes!);
+    sourceHash = createHash('sha256').update(file.bytes!).digest('hex');
+  }
   db.prepare(
     'INSERT INTO source_files(id,provider_id,path,sha256,bytes,mime_type,kind,coverage_status,batch_id,details_json) VALUES(?,?,?,?,?,?,?,?,?,?)',
   ).run(
     file.id,
     file.providerId ?? null,
     file.path,
-    file.sha256 || createHash('sha256').update(file.bytes!).digest('hex'),
+    sourceHash,
     file.size ?? file.bytes!.length,
     file.mimeType,
     file.kind,

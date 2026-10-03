@@ -80,6 +80,10 @@ Classifications include event kind (order, performed, historical mention or unkn
 
 Create profile builds an empty Self. **Private copy** preserves current accepted real data and originals and changes only the new profile's identity/storage ownership; it is not anonymization. **Create Placebo account** independently generates fictional clinical and personal data without reading another profile. Whole-profile deletion requires the current full display name and version. Individual accepted entries remain append-only and use archive/restore.
 
+Private copy also preserves pending intake review. Manual-source receipt bytes, original authorship, confirmation operation IDs and accepted attribution remain unchanged. For each eligible manual proposal, the host validates the source copy and retains a separate destination-bound proof, allowing the copied pending record to keep its explicit person assignment and proceed through normal review and acceptance. Nested copies validate the current source proof and create a fresh destination proof while retaining earlier receipts. Rebuild restores these proofs from accepted record versions, without another interpretation of the original.
+
+Native manual receipts still require their author profile to match the active profile. A foreign receipt without a validated copy proof cannot assign a person: missing proof leaves the ordinary review warning, and a present corrupt or mismatched proof refuses. Copied proof does not bypass current person, source or stale-review checks. See the [selected-envelope copy contract](../data/intake-envelope-authority.md#copy-and-recovery) and [mutation qualification](../data/intake-mutation-qualification.md).
+
 Contributor documentation and tests use generic or independently fictional examples. Private source archives, development notes, credentials, model output, and local validation artifacts stay outside Git.
 
 The assistant has current profile/page context, warm first greetings, Markdown replies, measured usage, note proposals, explicit attachment associations, field-level historical restoration, and source-mapping proposals. All changes require review/apply. It cannot edit application code, contact providers or activate a rebuild through a shell.
@@ -92,4 +96,4 @@ Component, backend, browser, and encrypted Docker checks cover fictional import 
 
 ## Intake state access
 
-The [operational intake access boundary](intake-state-access.md) centralizes current views, publication, discovery and receipt lookup while preserving the existing source-row representation. The incremental primitive is not yet the production intake authority.
+The [operational intake access boundary](intake-state-access.md) centralizes current views, publication, discovery and receipt lookup. Original-source rows retain compact metadata, while the [selected envelope authority](../data/intake-envelope-authority.md) preserves the complete operational state through the incremental primitive.

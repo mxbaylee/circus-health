@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { applyIntakeChanges, serializeIntakeJson, type IntakeJson } from './intake-state-codec.ts';
 import type { ChatDecodeBudget } from './chat-journal-codec.ts';
-export const FORMAT = 'health-intake-state-v2';
+import { recordIntakeSerialization, recordIntakeWork } from './intake-work-accounting.ts';
+export const FORMAT = 'health-intake-state-v3';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HASH = /^[0-9a-f]{64}$/;
 export const FRAME_BYTES = 64 * 1024;
@@ -60,7 +61,18 @@ export interface Basis {
 export function invalid(message: string): never {
   throw Error(`Invalid intake state: ${message}`);
 }
-export const digest = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex');
+export const digest = (bytes: string | Buffer) => {
+  recordIntakeWork('hashCalls');
+  recordIntakeWork(
+    'hashedBytes',
+    typeof bytes === 'string' ? Buffer.byteLength(bytes) : bytes.length,
+  );
+  return createHash('sha256').update(bytes).digest('hex');
+};
+function copied(bytes: Buffer): Buffer {
+  recordIntakeWork('evidenceBufferCopiedBytes', bytes.length);
+  return bytes;
+}
 export function exact(value: unknown, keys: string[]): asserts value is Record<string, unknown> {
   if (
     !value ||
@@ -86,13 +98,18 @@ function reference(value: unknown): asserts value is Reference {
   hash(value.sha256);
 }
 function same(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  return (
+    recordIntakeSerialization(JSON.stringify(a)) === recordIntakeSerialization(JSON.stringify(b))
+  );
 }
 export function decode(value: unknown, max: number): unknown {
   if (typeof value !== 'string' || Buffer.byteLength(value) > max) invalid('encoded bytes');
-  const bytes = Buffer.from(value);
+  const bytes = copied(Buffer.from(value));
+  recordIntakeWork('evidenceDecodeCopyBytes', bytes.length);
   if (bytes.toString('utf8') !== value) invalid('UTF-8');
   try {
+    recordIntakeWork('jsonParseCalls');
+    recordIntakeWork('jsonParseBytes', bytes.length);
     return JSON.parse(value) as unknown;
   } catch {
     invalid('JSON');
@@ -155,7 +172,7 @@ export function validateIntakeIdentity(identity: IntakeStateIdentity): IntakeSta
   };
 }
 export function intakeNamespace(identity: IntakeStateIdentity): string {
-  return `intake_state_v1:${digest(JSON.stringify(validateIntakeIdentity(identity)))}:`;
+  return `intake_state_v1:${digest(recordIntakeSerialization(JSON.stringify(validateIntakeIdentity(identity))))}:`;
 }
 export function parseIntakeHead(
   raw: unknown,
@@ -207,6 +224,8 @@ export function reconstructIntakeEvidence(
     if (seen.has(ref.id) || frames.length >= caps.frames) invalid('duplicate/frames limit');
     seen.add(ref.id);
     const raw = get(`${prefix}frame:${ref.id}`);
+    recordIntakeWork('evidenceFrameReads');
+    if (typeof raw === 'string') recordIntakeWork('evidenceFrameReadBytes', Buffer.byteLength(raw));
     onFrameRead?.();
     consumed.add(`${prefix}frame:${ref.id}`);
     if (typeof raw !== 'string') invalid('missing contribution');
@@ -252,7 +271,7 @@ export function reconstructIntakeEvidence(
       invalid('predecessor');
     if (typeof frame.data !== 'string' || frame.data.length > (CHUNK_BYTES * 4) / 3 + 4)
       invalid('chunk bytes');
-    const decoded = Buffer.from(frame.data, 'base64');
+    const decoded = copied(Buffer.from(frame.data, 'base64'));
     if (decoded.length > CHUNK_BYTES || decoded.toString('base64') !== frame.data)
       invalid('base64');
     frames.push(frame as unknown as Frame);
@@ -286,22 +305,27 @@ export function reconstructIntakeEvidence(
         frame.payloadHash !== first.payloadHash
       )
         invalid('chunk group');
-      chunks.push(Buffer.from(frame.data, 'base64'));
+      chunks.push(copied(Buffer.from(frame.data, 'base64')));
     }
-    const payload = Buffer.concat(chunks);
+    const payload = copied(Buffer.concat(chunks));
     if (
       digest(payload) !== first.payloadHash ||
-      !Buffer.from(payload.toString('utf8')).equals(payload)
+      !copied(Buffer.from(payload.toString('utf8'))).equals(payload)
     )
       invalid('payload hash/UTF-8');
     const remaining = budget(caps, used);
     const changes = decode(payload.toString('utf8'), caps.bytes);
+    recordIntakeWork('evidenceReplayVersions');
+    if (Array.isArray(changes)) recordIntakeWork('evidenceReplayOperations', changes.length);
     value = applyIntakeChanges(value, changes, remaining);
     used = addDecoded(used, caps, remaining);
     const serializedValue = serializeIntakeJson(value);
     semanticBytes = Buffer.byteLength(serializedValue);
     if (digest(serializedValue) !== first.fingerprint) invalid('result fingerprint');
     const receiptRaw = get(`${prefix}operation:${first.operationId}`);
+    recordIntakeWork('evidenceReceiptReads');
+    if (typeof receiptRaw === 'string')
+      recordIntakeWork('evidenceReceiptReadBytes', Buffer.byteLength(receiptRaw));
     const receipt = decode(receiptRaw, HEAD_BYTES);
     exact(receipt, ['fingerprint', 'result']);
     hash(receipt.fingerprint);
@@ -340,7 +364,7 @@ export function frameIntakeChanges(
     operations: 0,
     stringWork: 0,
   };
-  const payload = Buffer.from(JSON.stringify(changes));
+  const payload = copied(Buffer.from(recordIntakeSerialization(JSON.stringify(changes))));
   if (payload.length > caps.bytes) invalid('operation bytes');
   const chunks = Math.max(1, Math.ceil(payload.length / CHUNK_BYTES));
   const version = (previous?.version ?? 0) + 1;
@@ -351,7 +375,7 @@ export function frameIntakeChanges(
     operationId,
     changed: changes.length > 0,
   };
-  const receipt = JSON.stringify({ fingerprint, result });
+  const receipt = recordIntakeSerialization(JSON.stringify({ fingerprint, result }));
   const staged: Array<{ key: string; serialized: string }> = [];
   let tip: Reference | null = previous?.tip ?? null;
   let used = addDecoded(oldUsage, caps, remaining);
@@ -372,7 +396,7 @@ export function frameIntakeChanges(
       payloadHash: digest(payload),
       data: payload.subarray(chunk * CHUNK_BYTES, (chunk + 1) * CHUNK_BYTES).toString('base64'),
     };
-    const serialized = JSON.stringify(frame);
+    const serialized = recordIntakeSerialization(JSON.stringify(frame));
     if (Buffer.byteLength(serialized) > FRAME_BYTES) invalid('frame bound');
     used = {
       ...used,
@@ -384,7 +408,7 @@ export function frameIntakeChanges(
     staged.push({ key: `${prefix}frame:${id}`, serialized });
   }
   const head: Head = { ...identity, format: FORMAT, version, tip: tip!, usage: used };
-  const serializedHead = JSON.stringify(head);
+  const serializedHead = recordIntakeSerialization(JSON.stringify(head));
   if (Buffer.byteLength(serializedHead) > HEAD_BYTES || Buffer.byteLength(receipt) > HEAD_BYTES)
     invalid('head/receipt bound');
   return { head, serializedHead, frames: staged, receipt, result };

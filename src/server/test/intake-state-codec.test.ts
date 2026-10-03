@@ -238,3 +238,280 @@ test('all small permutations use an LIS-minimal number of moves', () => {
     assert.equal(changes.length, keys.length - longest);
   }
 });
+
+test('array insertion, deletion and rotation retain values with scalar position evidence', () => {
+  const large = 'Independently fictional retained array payload Ω. '.repeat(3000);
+  const a = { id: 'a', large },
+    b = { id: 'b', large },
+    c = { id: 'c', large };
+  for (const [before, after] of [
+    [
+      [a, b, c],
+      [{ id: 'new' }, a, b, c],
+    ],
+    [
+      [a, b, c],
+      [a, c],
+    ],
+    [
+      [a, b, c],
+      [b, c, a],
+    ],
+    [
+      [a, b, c],
+      [c, b, a],
+    ],
+    [
+      [a, a, b, a],
+      [a, b, a],
+    ],
+    [
+      [a, a, b, a],
+      [b, a, a, a],
+    ],
+  ]) {
+    const changes = roundTrip({ values: before }, { values: after });
+    assert.ok(JSON.stringify(changes).length < 600);
+    assert.ok(!JSON.stringify(changes).includes(large));
+  }
+  assert.deepEqual(roundTrip({ values: [a, b, c] }, { values: [b, c, a] }), [
+    { op: 'array-move', path: ['values'], from: 0, to: 2 },
+  ]);
+  const state = normalizeIntakeJson({ values: [a, b] });
+  const retained = (state.values as unknown[])[0];
+  const actual = applyIntakeChanges(state, [
+    { op: 'array-move', path: ['values'], from: 0, to: 1 },
+  ]);
+  assert.equal((actual.values as unknown[])[1], retained);
+  assert.equal(roundTrip({ values: Array(2000).fill(null) }, { values: [] }).length, 1);
+  assert.equal(roundTrip({ values: [] }, { values: Array(2000).fill(null) }).length, 1);
+});
+
+test('array changed-object anchors retain large members across simultaneous edits and moves', () => {
+  const a = { id: 'a', payload: 'A'.repeat(100_000), version: 0 };
+  const b = { id: 'b', payload: 'B'.repeat(100_000), version: 0 };
+  const changes = roundTrip(
+    { values: [a, b] },
+    {
+      values: [
+        { ...b, version: 1 },
+        { ...a, version: 1 },
+      ],
+    },
+  );
+  assert.ok(JSON.stringify(changes).length < 400);
+  const nested = roundTrip(
+    {
+      values: [
+        { nested: { payload: a.payload, version: 0 } },
+        { nested: { payload: b.payload, version: 0 } },
+      ],
+    },
+    {
+      values: [
+        { nested: { payload: b.payload, version: 1 } },
+        { nested: { payload: a.payload, version: 1 } },
+      ],
+    },
+  );
+  assert.ok(JSON.stringify(nested).length < 400);
+  for (const length of [1000, 100_000]) {
+    const editedStrings = roundTrip(
+      { values: ['A'.repeat(length), 'B'.repeat(length)] },
+      { values: ['B'.repeat(length - 1) + 'b', 'A'.repeat(length - 1) + 'a'] },
+    );
+    assert.ok(JSON.stringify(editedStrings).length < 400);
+    const allLeavesEdited = roundTrip(
+      {
+        values: [
+          { text: 'A'.repeat(length), revision: 0 },
+          { text: 'B'.repeat(length), revision: 0 },
+        ],
+      },
+      {
+        values: [
+          { text: 'B'.repeat(length - 1) + 'b', revision: 1 },
+          { text: 'A'.repeat(length - 1) + 'a', revision: 1 },
+        ],
+      },
+    );
+    assert.ok(JSON.stringify(allLeavesEdited).length < 600);
+  }
+  const unique = Array.from({ length: 8000 }, (_, index) => String.fromCharCode(1000 + index)).join(
+    '',
+  );
+  const reverse = unique.split('').reverse().join('');
+  const shiftedStrings = roundTrip(
+    { values: [unique, reverse] },
+    { values: ['!' + reverse.slice(0, -1), '?' + unique.slice(0, -1)] },
+  );
+  assert.ok(JSON.stringify(shiftedStrings).length < 600);
+  const mixed = roundTrip(
+    { values: [a, b, { id: 'c', payload: 'C'.repeat(100_000), version: 0 }] },
+    {
+      values: [
+        { id: 'new' },
+        { id: 'c', payload: 'C'.repeat(100_000), version: 1 },
+        a,
+        { ...b, version: 1 },
+      ],
+    },
+  );
+  assert.ok(JSON.stringify(mixed).length < 900);
+});
+
+test('long string distant edits, decoy anchors and UTF-16 boundaries omit retained middles', () => {
+  const middle = Array.from(
+    { length: 20_000 },
+    (_, index) => `fiction-${index.toString(36).padStart(4, '0')}:`,
+  ).join('');
+  for (const shift of [0, 1, 31, 32, 33]) {
+    const before = 'A'.repeat(32) + middle + 'B'.repeat(32);
+    const after = 'B'.repeat(32) + 'x'.repeat(shift) + middle + 'C'.repeat(32);
+    const changes = roundTrip({ text: before }, { text: after });
+    const emitted = changes.reduce(
+      (total, change) => total + (change.op === 'splice' ? change.text.length : 0),
+      0,
+    );
+    assert.ok(emitted < 256, `shift ${shift} emitted ${emitted} UTF-16 units`);
+  }
+  const repeated = '😀\ud800Z\udc00'.repeat(40_000);
+  for (const offset of [1, 31, 32, 33]) {
+    const before = repeated;
+    const after =
+      repeated.slice(0, offset) + '\udc00new😀' + repeated.slice(offset, -offset) + '\ud800tail';
+    const changes = roundTrip({ text: before }, { text: after });
+    assert.ok(JSON.stringify(changes).length < 2000);
+  }
+  const genuine = roundTrip({ text: 'old' }, { text: 'genuinely changed '.repeat(20_000) });
+  assert.ok(JSON.stringify(genuine).length > 300_000);
+});
+
+test('array delta schemas and cumulative work/depth limits refuse invalid evidence', () => {
+  const state = () => normalizeIntakeJson({ values: [{ a: 1 }, { b: 2 }] });
+  for (const change of [
+    { op: 'array-move', path: ['values'], from: -1, to: 0 },
+    { op: 'array-move', path: ['values'], from: 0, to: 2 },
+    { op: 'array-move', path: ['values'], from: 0, to: 0 },
+    { op: 'array-move', path: ['values'], from: 0, to: 1, extra: true },
+    { op: 'array-move', path: ['values', '01'], from: 0, to: 1 },
+    { op: 'array-move', path: [], from: 0, to: 1 },
+    { op: 'array-splice', path: ['values'], offset: 0, remove: 3, values: [] },
+    { op: 'array-splice', path: ['values'], offset: 0.5, remove: 1, values: [] },
+    { op: 'array-splice', path: ['values'], offset: 0, remove: 0, values: [] },
+    { op: 'array-splice', path: ['values'], offset: 0, remove: 1, values: 'bad' },
+    { op: 'array-splice', path: ['values'], offset: 0, remove: 1, values: [], extra: true },
+  ])
+    assert.throws(() => applyIntakeChanges(state(), [change]), /Invalid intake delta/);
+  const change: IntakeChange = { op: 'array-move', path: ['values'], from: 0, to: 1 };
+  const budget = { ...chatDecodeBudget(), operations: 6 };
+  applyIntakeChanges(state(), [change], budget);
+  assert.equal(budget.operations, 0);
+  assert.throws(() => applyIntakeChanges(state(), [change], budget), ChatDecodeLimitError);
+  const fresh = state(),
+    serialized = serializeIntakeJson(fresh);
+  assert.throws(
+    () =>
+      applyIntakeChanges(
+        fresh,
+        [
+          {
+            op: 'array-splice',
+            path: ['values'],
+            offset: 0,
+            remove: 1,
+            values: [{ nested: { a: 1 } }],
+          },
+        ],
+        { ...chatDecodeBudget(), nodes: 2 },
+      ),
+    ChatDecodeLimitError,
+  );
+  assert.equal(serializeIntakeJson(fresh), serialized);
+  const deepPath = Array(64).fill('nested');
+  const deep: Record<string, unknown> = {};
+  let cursor = deep;
+  for (let i = 0; i < 63; i++) {
+    const next = {};
+    cursor.nested = next;
+    cursor = next;
+  }
+  cursor.nested = [];
+  assert.throws(
+    () =>
+      applyIntakeChanges(normalizeIntakeJson(deep), [
+        { op: 'array-splice', path: deepPath, offset: 0, remove: 0, values: [1] },
+      ]),
+    /Invalid conversation delta/,
+  );
+});
+
+test('distant edits in periodic strings retain whole growing cycles rather than choosing shifted duplicate anchors', () => {
+  for (const size of [100, 1000, 10_000]) {
+    const period = Array.from({ length: size }, (_, index) =>
+      String.fromCharCode(1000 + index),
+    ).join('');
+    const before = period.repeat(126);
+    let after = before;
+    const edits: Array<[number, number, string]> = [
+      [0.03, 4, 'x'],
+      [0.31, 2, 'yz'],
+      [0.48, 6, 'abc'],
+      [0.78, 1, 'defgh'],
+    ];
+    for (const [fraction, remove, text] of edits) {
+      const offset = Math.floor(after.length * fraction);
+      after = after.slice(0, offset) + text + after.slice(offset + remove);
+    }
+    const changes = roundTrip({ text: before }, { text: after });
+    assert.equal(changes.length, 4);
+    assert.equal(
+      changes.reduce(
+        (total, change) => total + (change.op === 'splice' ? change.text.length : 0),
+        0,
+      ),
+      11,
+    );
+  }
+});
+
+test('four distant replacements above the quick alignment distance preserve repeated growing middles', () => {
+  for (const size of [1000, 10_000]) {
+    const period = Array.from({ length: size }, (_, index) =>
+      String.fromCharCode(1000 + index),
+    ).join('');
+    const before = period.repeat(126);
+    let after = before;
+    for (const [fraction, text] of [
+      [0.03, 'x'],
+      [0.31, 'y'],
+      [0.48, 'z'],
+      [0.78, 'w'],
+    ] as const) {
+      const offset = Math.floor(after.length * fraction);
+      after = after.slice(0, offset) + text.repeat(100) + after.slice(offset + 100);
+    }
+    const changes = roundTrip({ text: before }, { text: after });
+    assert.equal(changes.length, 4);
+    assert.equal(
+      changes.reduce((sum, change) => sum + (change.op === 'splice' ? change.text.length : 0), 0),
+      400,
+    );
+  }
+});
+
+test('genuinely large reordered-alphabet changes remain valid, while unresolved matching exhausts explicit work bounds', () => {
+  const text = Array.from({ length: 8201 }, (_, index) => String.fromCharCode(1000 + index)).join(
+    '',
+  );
+  const changes = roundTrip({ text }, { text: text.split('').reverse().join('') });
+  assert.ok(JSON.stringify(changes).length > 8000);
+  assert.throws(
+    () =>
+      intakeChanges(
+        { text: 'A'.repeat(3000) + 'B'.repeat(3000) },
+        { text: 'B'.repeat(3000) + 'A'.repeat(3000) },
+      ),
+    ChatDecodeLimitError,
+  );
+});

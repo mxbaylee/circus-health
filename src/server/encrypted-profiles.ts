@@ -2,6 +2,7 @@ import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
+import { prepareManualSourceCopy, stageManualSourceCopy } from './intake-manual-copy.ts';
 import { personDisplayKey } from '../shared/person-display.ts';
 import { randomUUID, randomBytes } from 'node:crypto';
 import {
@@ -461,6 +462,12 @@ export function createEncryptedProfiles({
       if (initial) {
         if (copyState) {
           const intakePlan = prepareProductionIntakeStateCopy(copyState.db, copyState.id, id);
+          const manualPlan = prepareManualSourceCopy(
+            copyState.db,
+            copyState.root,
+            copyState.id,
+            id,
+          );
           copyState.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
           mkdirSync(resolve(root, 'db'), { recursive: true, mode: 0o700 });
           cpSync(copyState.db.location()!, dbPath);
@@ -483,10 +490,12 @@ export function createEncryptedProfiles({
                 )
                 .all())
                 copied.exec(`DROP TABLE IF EXISTS "${(t.name as string).replaceAll('"', '""')}"`);
-              stageIntakeStateCopy(copied, intakePlan, {
+              const publication = {
                 profileId: id,
                 readSelectedHead: () => recordStorage.read('head'),
-              });
+              };
+              stageIntakeStateCopy(copied, intakePlan, publication);
+              stageManualSourceCopy(copied, manualPlan, publication);
               validateProductionIntakeAuthority(copied, id);
             });
           } finally {

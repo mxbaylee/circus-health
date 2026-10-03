@@ -7,6 +7,11 @@ import {
 } from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
+  createIntakePrimitiveCounters,
+  recordIntakeSerialization,
+  withIntakeWork,
+} from './intake-work-accounting.ts';
+import {
   applyIntakeChanges,
   intakeChanges,
   normalizeIntakeJson,
@@ -35,7 +40,8 @@ import {
   type IntakeStateResult,
 } from './intake-state-evidence.ts';
 export type { IntakeStateIdentity, IntakeStateResult } from './intake-state-evidence.ts';
-const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+const same = (a: unknown, b: unknown) =>
+  recordIntakeSerialization(JSON.stringify(a)) === recordIntakeSerialization(JSON.stringify(b));
 interface Cache {
   committed: Map<string, Basis>;
   candidates: Map<string, Basis>;
@@ -73,7 +79,7 @@ function cacheFor(db: Database): Cache {
   return cache;
 }
 
-/** Internal primitive only; production intake readers/writers have not cut over. */
+/** Selected production intake state, with independent handle and connection work counters. */
 export function createIntakeStateStorage(
   db: Database,
   identity: IntakeStateIdentity,
@@ -86,20 +92,13 @@ export function createIntakeStateStorage(
   const prefix = intakeNamespace(identity);
   const headKey = `${prefix}head`;
   let closed = false;
-  const counters = {
-    coldReconstructions: 0,
-    ancestorReads: 0,
-    candidateCopies: 0,
-    patchOperations: 0,
-    normalizedStateBytes: 0,
-    candidateCopyBytes: 0,
-    framesWritten: 0,
-    frameBytesWritten: 0,
-    readCopies: 0,
-    readCopyBytes: 0,
-    serializedReadBytes: 0,
+  const { counters, count } = createIntakePrimitiveCounters(db);
+  const get = (key: string) => {
+    const value = db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
+    count('metadataReads');
+    if (typeof value === 'string') count('metadataReadBytes', Buffer.byteLength(value));
+    return value;
   };
-  const get = (key: string) => db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
   function ready() {
     if (closed || !db.isOpen) {
       clearIntakeStateCache(db);
@@ -137,11 +136,16 @@ export function createIntakeStateStorage(
         invalid('missing head with retained evidence');
       return undefined;
     }
-    if (remembered && same(remembered.head, head)) return remembered;
-    counters.coldReconstructions++;
-    const reconstructed = reconstructIntakeEvidence(identity, caps, head, get, () => {
-      counters.ancestorReads++;
-    });
+    if (remembered && same(remembered.head, head)) {
+      count('warmLoads');
+      return remembered;
+    }
+    count('coldReconstructions');
+    const reconstructed = withIntakeWork(db, 'reconstruction', () =>
+      reconstructIntakeEvidence(identity, caps, head, get, () => {
+        count('ancestorReads');
+      }),
+    );
     const result: Basis = {
       head: reconstructed.head,
       value: reconstructed.value,
@@ -156,7 +160,7 @@ export function createIntakeStateStorage(
   function normalized(next: unknown): { value: IntakeJson; fingerprint: string } {
     const value = normalizeIntakeJson(next);
     const serialized = serializeIntakeJson(value);
-    counters.normalizedStateBytes += Buffer.byteLength(serialized);
+    count('normalizedStateBytes', Buffer.byteLength(serialized));
     return { value, fingerprint: digest(serialized) };
   }
   function stageNormalized(
@@ -180,11 +184,11 @@ export function createIntakeStateStorage(
     }
     const before = load();
     const changes = before ? intakeChanges(before.value, value) : [{ op: 'set', path: [], value }];
-    counters.patchOperations += changes.length;
+    count('patchOperations', changes.length);
     const candidate = before ? normalizeIntakeJson(before.value) : undefined;
     if (before) {
-      counters.candidateCopies++;
-      counters.candidateCopyBytes += before.semanticBytes;
+      count('candidateCopies');
+      count('candidateCopyBytes', before.semanticBytes);
     }
     const oldUsage = before?.head.usage ?? {
       bytes: 0,
@@ -212,8 +216,8 @@ export function createIntakeStateStorage(
     for (const entry of staged) {
       immutable(entry.key, entry.serialized);
       if (get(entry.key) !== entry.serialized) invalid('staged readback');
-      counters.framesWritten++;
-      counters.frameBytesWritten += Buffer.byteLength(entry.serialized);
+      count('framesWritten');
+      count('frameBytesWritten', Buffer.byteLength(entry.serialized));
     }
     immutable(receiptKey, receipt);
     db.prepare(
@@ -227,45 +231,54 @@ export function createIntakeStateStorage(
   return {
     counters,
     read(): IntakeJson | undefined {
-      const basis = load();
-      if (!basis) return undefined;
-      counters.readCopies++;
-      counters.readCopyBytes += basis.semanticBytes;
-      return normalizeIntakeJson(basis.value);
+      return withIntakeWork(db, 'warm', () => {
+        const basis = load();
+        if (!basis) return undefined;
+        count('readCopies');
+        count('readCopyBytes', basis.semanticBytes);
+        return normalizeIntakeJson(basis.value);
+      });
     },
     readSerialized(): string | undefined {
-      const basis = load();
-      if (!basis) return undefined;
-      counters.serializedReadBytes += basis.semanticBytes;
-      return serializeIntakeJson(basis.value);
+      return withIntakeWork(db, 'warm', () => {
+        const basis = load();
+        if (!basis) return undefined;
+        count('serializedReadBytes', basis.semanticBytes);
+        return serializeIntakeJson(basis.value);
+      });
     },
     stage(next: unknown, operationId: string): IntakeStateResult {
-      try {
-        const { value, fingerprint } = normalized(next);
-        return stageNormalized(value, fingerprint, operationId);
-      } catch (error) {
-        if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
-        clearIntakeStateCache(db);
-        throw error;
-      }
+      return withIntakeWork(db, 'warm', () => {
+        try {
+          const { value, fingerprint } = normalized(next);
+          return stageNormalized(value, fingerprint, operationId);
+        } catch (error) {
+          if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
+          clearIntakeStateCache(db);
+          throw error;
+        }
+      });
     },
     mutate(next: unknown, operationId: string): IntakeStateResult {
-      if (currentTransactionToken(db) || db.isTransaction) invalid('mutate owns outer transaction');
-      const { value, fingerprint } = normalized(next);
-      uuid(operationId);
-      try {
-        // The transaction layer can return a retained result without invoking
-        // its callback. Validate selected authority before that replay shortcut.
-        load();
-        return transaction(db, () => stageNormalized(value, fingerprint, operationId), {
-          operationId,
-          fingerprint: `${prefix}${fingerprint}`,
-          actor: 'intake-state',
-        });
-      } catch (error) {
-        clearIntakeStateCache(db);
-        throw error;
-      }
+      return withIntakeWork(db, 'warm', () => {
+        if (currentTransactionToken(db) || db.isTransaction)
+          invalid('mutate owns outer transaction');
+        const { value, fingerprint } = normalized(next);
+        uuid(operationId);
+        try {
+          // The transaction layer can return a retained result without invoking
+          // its callback. Validate selected authority before that replay shortcut.
+          load();
+          return transaction(db, () => stageNormalized(value, fingerprint, operationId), {
+            operationId,
+            fingerprint: `${prefix}${fingerprint}`,
+            actor: 'intake-state',
+          });
+        } catch (error) {
+          clearIntakeStateCache(db);
+          throw error;
+        }
+      });
     },
     close() {
       closed = true;

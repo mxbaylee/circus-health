@@ -10,6 +10,7 @@ import { safeRelative } from './profile-storage.ts';
 import { validProfileId } from './profiles.ts';
 import { intakeSourcePinKey, parseIntakeSourcePin } from './intake-source-pin.ts';
 import { intakeEnvelopeMode, validateIntakeEnvelopeRepresentation } from './intake-authority.ts';
+import { withIntakeWork } from './intake-work-accounting.ts';
 import { applyIntakeChanges, serializeIntakeJson } from './intake-state-codec.ts';
 import {
   DEFAULT_LIMITS,
@@ -431,7 +432,9 @@ export function validateProductionIntakeAuthority(db: Database, profileId?: stri
   const owner = db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value;
   if (typeof owner !== 'string' || (profileId !== undefined && owner !== profileId))
     invalid('production intake owner');
-  validateProductionIntakeStateCopySnapshot(captureIntakeStateCopySnapshot(db, owner));
+  withIntakeWork(db, 'reconstruction', () =>
+    validateProductionIntakeStateCopySnapshot(captureIntakeStateCopySnapshot(db, owner)),
+  );
 }
 export function validateProductionIntakeStateCopySnapshot(snapshot: IntakeStateCopySnapshot): void {
   inspectSnapshot(snapshot, undefined, { production: true });
@@ -475,7 +478,9 @@ export function prepareIntakeStateCopy(
   } finally {
     db.exec('ROLLBACK');
   }
-  const plan = prepareIntakeStateCopySnapshot(snapshot, targetProfileId, options);
+  const plan = withIntakeWork(db, 'reconstruction', () =>
+    prepareIntakeStateCopySnapshot(snapshot, targetProfileId, options),
+  );
   flushRecordDurability(db);
   return plan;
 }

@@ -521,8 +521,8 @@ test('unsupported earlier authority fails explicitly without resetting retained 
     .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_state_v1:*:head'")
     .get()!;
   const prior = JSON.parse(String(row.value)) as Record<string, unknown>;
-  assert.equal(prior.format, 'health-intake-state-v2');
-  prior.format = 'health-intake-state-v1';
+  assert.equal(prior.format, 'health-intake-state-v3');
+  prior.format = 'health-intake-state-v2';
   transaction(db, () =>
     db.prepare('UPDATE app_meta SET value=? WHERE key=?').run(JSON.stringify(prior), row.key!),
   );

@@ -186,7 +186,7 @@ test('300 contributions keep warm lookups indexed and changed projection writes 
       baseline,
       samples,
       limitation:
-        'Lookup projection mutation fixture only; reconciliation reads the changed full view. Real batch/review/acceptance growth qualification remains CRS-210.',
+        'Lookup projection mutation fixture only; reconciliation reads the changed full view. Real batch/review/acceptance qualification is measured separately in intake-mutation-growth.test.ts.',
     }),
   );
 });
