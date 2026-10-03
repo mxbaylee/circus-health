@@ -610,16 +610,19 @@ function applyEdit(state: State, edit: TextPieceEdit, work: Work): void {
     work.validateText(edit.insert);
     const nextLength = state.length - edit.deleteCount + edit.insert.length;
     bound(nextLength, work.limits.maxTextUtf16Units, 'candidate text units');
-    rangeBoundary(state, edit.at, work);
-    rangeBoundary(state, edit.at + edit.deleteCount, work);
-    if (edit.deleteCount === 0 && edit.insert.length === 0) return;
+    if (edit.deleteCount === 0 && edit.insert.length === 0) {
+      rangeBoundary(state, edit.at, work);
+      return;
+    }
+    // Validate and retain the two boundary indexes in the same walks. Splitting
+    // changes only the private plan state and preserves the removed text bytes.
+    const from = splitAt(state, edit.at, work);
+    const through = splitAt(state, edit.at + edit.deleteCount, work);
     const nextBytes =
       state.bytes -
       rangeBytes(state, edit.at, edit.at + edit.deleteCount, work) +
       Buffer.byteLength(edit.insert);
     bound(nextBytes, work.limits.maxTextBytes, 'candidate text bytes');
-    const from = splitAt(state, edit.at, work);
-    const through = splitAt(state, edit.at + edit.deleteCount, work);
     const inserted = insertPieces(edit.insert, state, work);
     bound(
       state.pieces.length - (through - from) + inserted.length,
@@ -644,16 +647,22 @@ function applyEdit(state: State, edit: TextPieceEdit, work: Work): void {
       invalid('move range');
     const end = edit.from + edit.length;
     if (edit.to > edit.from && edit.to < end) invalid('move destination inside source');
-    rangeBoundary(state, edit.from, work);
-    rangeBoundary(state, end, work);
-    rangeBoundary(state, edit.to, work);
-    if (!edit.length || edit.to === edit.from || edit.to === end) return;
+    if (!edit.length || edit.to === edit.from || edit.to === end) {
+      // Even a no-op must refuse an offset that splits a Unicode scalar.
+      rangeBoundary(state, edit.from, work);
+      rangeBoundary(state, end, work);
+      rangeBoundary(state, edit.to, work);
+      return;
+    }
     // Ascending boundary splits ensure every already assigned boundary index stays valid.
+    // splitAt validates scalar boundaries itself. Retain its indexes instead of
+    // walking the entire prefix again for validation and each index lookup.
     const boundaries = [...new Set([edit.from, end, edit.to])].sort((a, b) => a - b);
-    for (const offset of boundaries) splitAt(state, offset, work);
-    const from = splitAt(state, edit.from, work);
-    const through = splitAt(state, end, work);
-    const to = splitAt(state, edit.to, work);
+    const indexes = new Map<number, number>();
+    for (const offset of boundaries) indexes.set(offset, splitAt(state, offset, work));
+    const from = indexes.get(edit.from)!;
+    const through = indexes.get(end)!;
+    const to = indexes.get(edit.to)!;
     work.scan(4 * state.pieces.length - 2 * (through - from));
     const moved = state.pieces.slice(from, through);
     const rest = state.pieces.slice(0, from).concat(state.pieces.slice(through));

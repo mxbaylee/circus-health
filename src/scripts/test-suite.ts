@@ -51,6 +51,7 @@ export function testEnvironment(env: NodeJS.ProcessEnv, suite: string): NodeJS.P
         'CRS_LAUNCH_TEST',
         'CRS_PASSKEY_DOCKER_TEST',
         'CRS_PDF_CONTROLLED_TEST',
+        'CRS_INTAKE_MUTATION_QUALIFY',
       ].includes(key)
     )
       delete result[key];

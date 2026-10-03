@@ -209,6 +209,58 @@ test('distant sequential edits preserve byte-identical periodic middle across sh
   }
 });
 
+test('many tail edits reuse validated boundary indexes within the unchanged scan budget', () => {
+  // A late clinical acceptance can add many small moves to an already fragmented
+  // retained chain. Repeated prefix walks previously exhausted the scan limit.
+  const text = Array.from(
+    { length: 2400 },
+    (_, index) => String(index).padStart(4, '0') + 'abcdefghijkl',
+  ).join('');
+  const before = initialize(text, { maxContentBytes: 16 });
+  const edits: OracleEdit[] = [];
+  for (let index = 0; index < 60; index++) {
+    edits.push({ op: 'move', from: text.length - 8, length: 1, to: text.length - 64 });
+    edits.push({
+      op: 'splice',
+      offset: text.length - 48,
+      remove: 1,
+      text: index % 2 ? 'Q' : 'Z',
+    });
+  }
+  const result = edit(before, edits);
+  assert.equal(result.plan.metrics.operations, 120);
+  assert.ok(result.plan.metrics.scanSteps < TEXT_PIECE_LIMITS.maxScanSteps);
+  assert.ok(result.plan.occurrenceWrites.length < 100);
+  assert.equal(
+    result.plan.contentWrites
+      .map((row) => row.text)
+      .sort()
+      .join(''),
+    'QZ',
+  );
+  assert.throws(
+    () => edit(before, edits, { maxScanSteps: result.plan.metrics.scanSteps - 1 }),
+    (error: unknown) => error instanceof TextPieceError && error.code === 'limit',
+  );
+});
+
+test('active and no-op edits still refuse boundaries inside a Unicode scalar', () => {
+  const before = initialize('a😀b');
+  for (const edits of [
+    [{ op: 'splice', offset: 2, remove: 0, text: '' }],
+    [{ op: 'splice', offset: 2, remove: 0, text: 'x' }],
+    [{ op: 'splice', offset: 1, remove: 1, text: '' }],
+    [{ op: 'move', from: 2, length: 0, to: 0 }],
+    [{ op: 'move', from: 0, length: 1, to: 2 }],
+    [{ op: 'move', from: 1, length: 1, to: 1 }],
+  ] satisfies OracleEdit[][])
+    assert.throws(
+      () => edit(before, edits),
+      (error: unknown) => error instanceof TextPieceError && error.code === 'invalid',
+    );
+  exact(reconstructTextPieces(before).text, 'a😀b');
+});
+
 test('moves in both directions reuse moved interior occurrences, content and links', () => {
   const text = 'Fictional start|' + '0123456789'.repeat(30_000) + '|Fictional end';
   for (const move of [

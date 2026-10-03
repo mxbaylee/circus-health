@@ -6,9 +6,19 @@ The implemented authority is the [selected intake envelope](intake-envelope-auth
 
 ## Accounting boundaries
 
-The growth harness uses actual original upload/extraction, durable passage reads, batch proposals, review drafts and reviewed clinical acceptance. Every proposal includes a complete fictional clinical observation plus administrative source material. Clinical assertions use independent literal expectations, including `< 0.030`, `+004.500`, `7.20` and `−0.125`, with exact unit, month precision and person scope. It never substitutes an empty clinical payload or uses model output as its acceptance oracle. All provider behavior is fictional; no inference is purchased.
+The [growth harness](../../src/server/test/intake-mutation-growth.test.ts) uses actual original upload/extraction, durable passage reads, batch proposals, review drafts and reviewed clinical acceptance. Every proposal includes a complete fictional clinical observation plus administrative source material. Clinical assertions use independent literal expectations, including `< 0.030`, `+004.500`, `7.20` and `−0.125`, with exact unit, month precision and person scope. It never substitutes an empty clinical payload or uses model output as its acceptance oracle. All provider behavior is fictional; no inference is purchased.
 
 The ordinary growth fixture's `RecordStorage` implements immutable-object and selected-head semantics in memory, with physical original and proposal files. Its counters establish logical accepted bytes and copies, not filesystem crash durability or disk-sector traffic. The separate recovery matrix uses the actual contributor filesystem journal, physical original verifier and newly opened backend instances. The encrypted private-copy test uses the actual encrypted lifecycle.
+
+Routine server CI runs seven real proposal/draft cycles with four clinical acceptances, pending review, reopening, cache loss and a subsequent draft change. The dedicated growth qualification retains 300 additional cycles after its initial accepted record, with clinical acceptance and independent complete-state checks at each 100-cycle checkpoint. Both modes share the same fixture and exact oracle; a passing small test is not a completed 300-cycle receipt. Run the dedicated check explicitly from the repository:
+
+```sh
+CRS_INTAKE_MUTATION_QUALIFY=1 node --test --test-name-pattern='qualification:' src/server/test/intake-mutation-growth.test.ts
+```
+
+Its separate two-hour host hang guard only prevents an abandoned qualification process. It does not change application capacity or model limits, establish an acceptable completion time, or qualify foreground responsiveness. Normal CI retains its existing host watchdog. Checkpoint files are saved to a unique temporary artifact directory as each oracle passes; a stopped trial retains partial evidence and must not be reported as a full success.
+
+An earlier full attempt passed checkpoints 100 and 200, published all 301 proposals, then refused during the fourth clinical acceptance because repeated text-piece boundary walks exhausted the unchanged two-million-step scan budget. That attempt is failed evidence, not a completed 300-cycle receipt. The explicit planner now reuses validated boundary indexes; the captured 121-edit case passes with 1,636,431 combined reconstruction/planning scan steps. Independent comparison of 300 mixed Unicode edit sequences preserves exact planned rows, identities and refusal behavior. Initial/setup, each completed checkpoint and all-phase failure context are retained outside Git; the final report separates the small save API from subsequent consumer/search parity.
 
 The maintained test files emit portable JSON diagnostics and write raw qualification artifacts to unique temporary directories outside Git. Their measurements include:
 
@@ -26,11 +36,11 @@ The maintained test files emit portable JSON diagnostics and write raw qualifica
 
 `withIntakeFileWork` is an optional async-scoped numeric collector. Buffer and text hash counts are distinct; text hashing also includes semantic fingerprints, not only physical files. A failed write can have unknown partial bytes: attempts and failures are reported, while successful payload bytes do not claim to cover the failed portion. Cross-device copy requests are counted as requested bytes, separately from successful direct writes. The collector stores no paths, identities or values and introduces no extra filesystem reads for accounting.
 
-These are logical work and API payload measurements. Activities overlap and cannot be summed into physical disk traffic or total CPU instructions. JavaScript runtime allocation, SQLite VM/index internals, accepted-record internal encode/hash costs, HTTP receiver/response serialization, extraction-worker and encrypted-vault internals are not comprehensively instrumented. Initial creation, one-time raw normalization, opening, cold reconstruction and ordinary mutations have separate evidence; a small changed write does not imply changed-only host computation.
+These are logical work and API payload measurements. Activities overlap and cannot be summed into physical disk traffic or total CPU instructions. JavaScript runtime allocation, SQLite VM/index internals, accepted-record internal encode/hash/replay parsing and validation, HTTP receiver/response serialization, extraction-worker and encrypted-vault internals are not comprehensively instrumented. Rebuild storage I/O spans the complete operation, but reconstruction host counters describe intake work on the final connection: `rebuildRecordDatabase()` uses a separate temporary connection whose internal processing is not included. Initial creation, one-time raw normalization, opening, cold reconstruction and ordinary mutations have separate evidence; a small changed write does not imply changed-only host computation.
 
 ## Array and string locality
 
-The actual selected-authority writer fixture starts with 20, 80 and 160 operational report groups and a growing long string. It warms both lookup and exact-search projections before every measured mutation, then inserts at the front, deletes, rotates, moves and edits two groups, and changes distant string endpoints around an unchanged middle. Reconstruction from retained authority reproduces every exact envelope.
+The [actual selected-authority writer fixture](../../src/server/test/intake-mutation-locality.test.ts) starts with 20, 80 and 160 operational report groups and a growing long string. It warms both lookup and exact-search projections before every measured mutation, then inserts at the front, deletes, rotates, moves and edits two groups, and changes distant string endpoints around an unchanged middle. Reconstruction from retained authority reproduces every exact envelope.
 
 | Groups | One-time raw normalization, accepted bytes | Largest subsequent accepted bytes | Largest frame / decoded delta bytes | Largest changed search bytes |
 | -----: | -----------------------------------------: | --------------------------------: | ----------------------------------: | ---------------------------: |
@@ -46,7 +56,7 @@ Lookup ordering still has a separate cost: front insertion changes 22/82/162 row
 
 ## Recovery, attribution and consumer coverage
 
-Seven application recovery cases cover real human-entered evidence, duplicate and stale review, encrypted private copy, lock/unlock, manager reopening, total cache loss, coherent contributor backup and five reviewed-acceptance publication failures: staging, immutable-object write, before-head publication, published head followed by SQL rollback, and a lost acknowledgement after publication. The five fault cases use the physical contributor journal and fresh backend instances. They independently verify retained clinical literals, exact pending state and order, earlier receipts, physical original/proposal bytes and hashes, selected serialization, search and effective source pins. Retry cannot add a second receipt or lose an earlier decision.
+Seven [application recovery cases](../../src/server/test/intake-mutation-recovery.test.ts) cover real human-entered evidence, duplicate and stale review, encrypted private copy, lock/unlock, manager reopening, total cache loss, coherent contributor backup and five reviewed-acceptance publication failures: staging, immutable-object write, before-head publication, published head followed by SQL rollback, and a lost acknowledgement after publication. The five fault cases use the physical contributor journal and fresh backend instances. They independently verify retained clinical literals, exact pending state and order, earlier receipts, physical original/proposal bytes and hashes, selected serialization, search and effective source pins. Retry cannot add a second receipt or lose an earlier decision.
 
 The contributor backup test rebuilds a selected coherent journal with accepted and still-pending review. Dirty published-head/SQL disagreement refuses backup. A fictional source DOB conflicting with the active person remains blocking before and after reconstruction. These are controlled callback/SQL interruption faults, not a hardware power-loss test or a release Compose recreation qualification.
 
@@ -67,7 +77,7 @@ The twelve consumer files pass 248 tests. The filtered assistant cases pass 38 t
 
 ## Separate processing queue journal
 
-`intake-batch-journal-growth.test.ts` exercises actual manager create/stop/resume operations synchronously without starting inference. It preserves every event and original byte, compares independent durable and public-response state, and reopens the manager.
+The [queue-journal fixture](../../src/server/test/intake-batch-journal-growth.test.ts) exercises actual manager create/stop/resume operations synchronously without starting inference. It preserves every event and original byte, compares independent durable and public-response state, and reopens the manager.
 
 | Subsequent transitions | Retained events | Retained journal bytes | Prior bytes read by the checkpoint write |
 | ---------------------: | --------------: | ---------------------: | ---------------------------------------: |
