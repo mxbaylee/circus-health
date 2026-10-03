@@ -34,7 +34,7 @@ There is no new lifetime event-count or history-byte allowance in the queue jour
 
 ## Counted fictional qualification, 2026-10-03
 
-The following logical work counts come from the current fixtures using production limits. They measure application operations and payload bytes, not physical disk traffic, total CPU instructions or a capacity target. No event pruning, model request or larger resource limit is used. Initial creation and cold reconstruction are separate from each sampled warm save.
+The following logical work counts were measured from the source and fixtures committed at [d09a958](https://github.com/mxbaylee/circus-health/commit/d09a958c85d347bf6bb8b3cefe9412ffffb62167), using production limits. Recorded source hashes were checked against that commit; the revision annotation is a documentation-only follow-up. They measure application operations and payload bytes, not physical disk traffic, total CPU instructions or a capacity target. No event pruning, model request or larger resource limit is used. Initial creation and cold reconstruction are separate from each sampled warm save.
 
 ### Retained history and warm Stop
 
