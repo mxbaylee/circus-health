@@ -8,7 +8,6 @@ import { join } from 'node:path';
 import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
-import { attachRecordDurability } from '../record-versions.ts';
 import { createAssistant } from '../assistant.ts';
 import { readChat, writeChat } from '../assistant-journal.ts';
 import { ProxyModelBridge } from '../proxy-model-bridge.ts';
@@ -23,11 +22,11 @@ async function fixture(t: TestContext, mode: Mode) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-attempt-integration-'));
   const profileId = 'fictional-attempt-owner';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-  attachPersonalDurability(db, { root, profileId });
   const objects = new Map<string, Buffer>();
-  attachRecordDurability(db, {
+  attachPersonalDurability(db, {
+    root,
     profileId,
-    storage: {
+    recordStorage: {
       read: (name) => objects.get(name) || null,
       writeImmutable: (name, bytes) => {
         assert(!objects.has(name));

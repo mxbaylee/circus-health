@@ -1,3 +1,6 @@
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -17,6 +20,7 @@ test('provider PDF source and evidence count saved report items, then refresh af
   const root = mkdtempSync(join(tmpdir(), 'fictional-panel-packet-'));
   const profileId = 'fictional-panel';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -116,11 +120,7 @@ test('provider PDF source and evidence count saved report items, then refresh af
   // Synthetic retained workflow history pins the counting rule independently
   // of ingestion: old accepted versions and repeated occurrences do not inflate
   // current counts, and source-context / named-person rows are not clinical items.
-  const details = JSON.parse(
-    String(
-      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(item.id)!.details_json,
-    ),
-  );
+  const details = JSON.parse(String(readIntakeEnvelopeText(db, { id: item.id })));
   const workflow = details.intake.workflow as IntakeWorkflow;
   const group = workflow.reportGroups!.find((entry) => entry.report?.key === 'fictional-panel')!;
   const members = group.versions.at(-1)!.members;
@@ -140,10 +140,7 @@ test('provider PDF source and evidence count saved report items, then refresh af
     workflow.candidates.push(copy);
     members.push({ candidateId: flag, candidateVersionId: flag, occurrences: [] });
   }
-  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-    JSON.stringify(details),
-    item.id,
-  );
+  writeIntakeFixtureEnvelope(db, item.id, details);
   const included = complete.records.flatMap((record) =>
     record.citations.map((citation) => citation.id),
   );

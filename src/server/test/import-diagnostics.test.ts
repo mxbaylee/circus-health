@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -61,6 +62,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'health-import-diagnostics-'));
   const profileId = 'fictional-profile';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     try {
       db.close();

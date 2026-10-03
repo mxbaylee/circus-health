@@ -3,10 +3,11 @@ import test from 'node:test';
 import { randomUUID } from 'node:crypto';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDatabase } from '../database.ts';
+import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
 import {
@@ -112,6 +113,7 @@ function fixture(t: TestContext, bytes = Buffer.from(originalText), filename = '
   const root = mkdtempSync(join(tmpdir(), 'fictional-identity-'));
   const profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -510,6 +512,7 @@ test('explicit report confirmation clears exact identity-question accounting and
   const target = join(f.root, 'rebuilt-identity-accounting');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target);
   const recovered = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(recovered, { root: target, profileId: f.profileId, initialize: false });
   try {
     const restored = intake.getIntake(recovered, target, f.profileId, f.item.id);
     assert.equal(restored.unansweredCount, 0);
@@ -1587,7 +1590,7 @@ test('typed identity without a generic issue is explicit and every draft rolls b
     attestation: 'confirmed_displayed_identity_questions',
   };
   f.db.exec(
-    "CREATE TEMP TRIGGER reject_explicit_identity BEFORE UPDATE ON source_files BEGIN SELECT RAISE(ABORT, 'fictional publication failure'); END",
+    "CREATE TEMP TRIGGER reject_explicit_identity BEFORE INSERT ON app_meta WHEN NEW.key GLOB 'intake_state_v1:*:frame:*' BEGIN SELECT RAISE(ABORT, 'fictional publication failure'); END",
   );
   await assert.rejects(() =>
     confirmIntakeIdentityScope(f.db, f.root, f.profileId, original.id, input),
@@ -1657,6 +1660,7 @@ test('accepted earlier history and unrelated draft corrections remain intact; la
   const target = join(f.root, 'rebuilt');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target);
   const recovered = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(recovered, { root: target, profileId: f.profileId, initialize: false });
   try {
     assert.deepEqual(intake.getIntake(recovered, target, f.profileId, f.item.id).workflow, stable);
   } finally {
@@ -1685,7 +1689,7 @@ test('an evidenced match auto-allows records and one optional action atomically 
     },
   };
   f.db.exec(
-    "CREATE TEMP TRIGGER reject_identity_and_self BEFORE UPDATE ON source_files BEGIN SELECT RAISE(ABORT, 'fictional identity publication failure'); END",
+    "CREATE TEMP TRIGGER reject_identity_and_self BEFORE INSERT ON app_meta WHEN NEW.key GLOB 'intake_state_v1:*:frame:*' BEGIN SELECT RAISE(ABORT, 'fictional identity publication failure'); END",
   );
   await assert.rejects(
     () => confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input),
@@ -1695,17 +1699,30 @@ test('an evidenced match auto-allows records and one optional action atomically 
   assert.equal(getNote(f.db, 'person-note:self').person.birthDate, '');
   assert.equal(workflow(f).identityConfirmations?.length || 0, 0);
 
-  attachPersonalDurability(f.db, {
-    root: f.root,
-    profileId: f.profileId,
-    initialize: false,
-    writer() {
-      throw new Error('fictional curation publication failure');
-    },
+  // Accepted publication now precedes SQL commit: a failed head write must
+  // roll back both the identity receipt and the optional Self correction.
+  const headPath = join(f.root, 'data/profiles', f.profileId, 'records/head');
+  const rename = fs.renameSync;
+  const injected = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof rename>) => {
+    if (String(args[1]) === headPath)
+      throw new Error('fictional identity head publication failure');
+    return rename(...args);
   });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      () => confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input),
+      /fictional identity head publication failure/,
+    );
+  } finally {
+    injected.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(getNote(f.db, 'person-note:self').person.birthDate, '');
+  assert.equal(workflow(f).identityConfirmations?.length || 0, 0);
   const committed = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input);
-  assert.equal(committed.durability.pending, true);
-  assert.equal(personalDurabilityStatus(f.db).dirty, true);
+  assert.equal(committed.durability.pending, false);
+  assert.equal(personalDurabilityStatus(f.db).dirty, false);
   assert.equal(getNote(f.db, 'person-note:self').person.birthDate, fictionalBirthDate);
   assert.equal(committed.workflow!.identityConfirmations!.length, 1);
   assert.deepEqual(committed.workflow!.identityConfirmations![0]!.selfUpdate, {
@@ -1730,6 +1747,7 @@ test('an evidenced match auto-allows records and one optional action atomically 
   const target = join(f.root, 'rebuilt-self-and-identity');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target);
   const recovered = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(recovered, { root: target, profileId: f.profileId, initialize: false });
   try {
     assert.equal(getNote(recovered, 'person-note:self').person.birthDate, fictionalBirthDate);
     assert.deepEqual(intake.getIntake(recovered, target, f.profileId, f.item.id).workflow, stable);
@@ -2559,6 +2577,7 @@ test('PDF grounding is ephemeral, rebuild restores its human authority, and acce
   const target = join(f.root, 'rebuilt-grounded-pdf');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target);
   const recovered = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(recovered, { root: target, profileId: f.profileId, initialize: false });
   try {
     assert.equal(acceptIntakeReportSelection(recovered, target, f.profileId, input).replayed, true);
     assert.equal(recovered.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
@@ -2667,6 +2686,7 @@ test('confirmed native PDF headers authorize exact source reuse and preserve cha
   const target = join(f.root, 'rebuilt-pdf-source-reuse');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target);
   const recovered = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(recovered, { root: target, profileId: f.profileId, initialize: false });
   try {
     const grounded = await getIntakeIdentityReview(
       recovered,
@@ -2693,6 +2713,7 @@ test('confirmed native PDF headers authorize exact source reuse and preserve cha
     const nextRoot = join(f.root, 'rebuilt-pdf-source-reuse-again');
     const next = rebuildProfile(join(secondBackup.path, 'files'), f.profileId, nextRoot);
     const cold = openDatabase(next.database, f.profileId);
+    attachPersonalDurability(cold, { root: nextRoot, profileId: f.profileId, initialize: false });
     try {
       const current = await getIntakeIdentityReview(
         cold,
@@ -2906,7 +2927,7 @@ test('publication failure rolls back every common draft and receipt', async (t) 
   const scope = await f.preview();
   const before = structuredClone(workflow(f));
   f.db.exec(
-    "CREATE TEMP TRIGGER reject_identity_publication BEFORE UPDATE ON source_files BEGIN SELECT RAISE(ABORT, 'fictional injected publication failure'); END",
+    "CREATE TEMP TRIGGER reject_identity_publication BEFORE INSERT ON app_meta WHEN NEW.key GLOB 'intake_state_v1:*:frame:*' BEGIN SELECT RAISE(ABORT, 'fictional injected publication failure'); END",
   );
   await assert.rejects(() => f.confirm(scope), /fictional injected publication failure/);
   f.db.exec('DROP TRIGGER reject_identity_publication');
@@ -3108,7 +3129,7 @@ test('new Person creation rolls back with failed identity publication and stale 
     personSelection: { newPerson: { fullName: 'Fictional Rollback Family' } },
   };
   f.db.exec(
-    "CREATE TEMP TRIGGER reject_family BEFORE UPDATE ON source_files BEGIN SELECT RAISE(ABORT, 'fictional family publication failure'); END",
+    "CREATE TEMP TRIGGER reject_family BEFORE INSERT ON app_meta WHEN NEW.key GLOB 'intake_state_v1:*:frame:*' BEGIN SELECT RAISE(ABORT, 'fictional family publication failure'); END",
   );
   await assert.rejects(
     () => confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, input),
@@ -3589,11 +3610,13 @@ test('ambiguous printed subject needs an explicit literal name selection and sto
   assert.deepEqual(getNote(f.db, 'person-note:self').person.knownNames, ['Fictional Iris Meadow']);
   // Simulate a pre-upgrade confirmation whose Person projection lacks the new
   // source-name authority. A fresh explicit selection must repair it.
-  f.db
-    .prepare(
-      "UPDATE notes SET profile_json=json_remove(profile_json,'$.sourceKnownNames','$.knownNames') WHERE id='person-note:self'",
-    )
-    .run();
+  transaction(f.db, () =>
+    f.db
+      .prepare(
+        "UPDATE notes SET profile_json=json_remove(profile_json,'$.sourceKnownNames','$.knownNames') WHERE id='person-note:self'",
+      )
+      .run(),
+  );
   const current = await f.preview();
   await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
     ...request(current, 'legacy-confirmation-name-repair'),

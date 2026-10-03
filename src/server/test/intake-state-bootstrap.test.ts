@@ -25,6 +25,7 @@ import {
   type IntakeStateCopySnapshot,
 } from '../intake-state-bootstrap.ts';
 import { intakeDetails, storedIntakeDetails } from '../intake-state-access.ts';
+import { prepareInitialIntakeEnvelope, readIntakeEnvelopeText } from '../intake-authority.ts';
 import { readIntakeSourcePin, writeIntakeSourcePin } from '../intake-source-pin.ts';
 
 const sourceId = 'fictional-bootstrap-source';
@@ -935,8 +936,18 @@ test('unrelated non-intake sources remain unchanged through bootstrap publicatio
   assert.deepEqual(f.targetAuthority.objects, accepted);
 });
 
-test('first real publication selects fresh target evidence and preserves raw/public/pin/clinical state through independent recovery', (t) => {
+test('first real publication selects fresh current-format target evidence and preserves public/pin/clinical state through independent recovery', (t) => {
   const f = fixture(t);
+  transaction(f.source, () => {
+    for (const original of f.originals)
+      f.source
+        .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+        .run(prepareInitialIntakeEnvelope(original.state).detailsJson, original.id);
+  });
+  for (const original of f.originals)
+    f.target
+      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+      .run(prepareInitialIntakeEnvelope(original.state).detailsJson, original.id);
   const plan = prepareIntakeStateCopy(f.source, sourceId, targetId);
   const sourceBefore = snapshot(f.source);
   const sourceAuthorityBefore = acceptedSnapshot(f.sourceAuthority.objects);
@@ -1009,9 +1020,9 @@ test('first real publication selects fresh target evidence and preserves raw/pub
         .prepare('SELECT id,kind,details_json FROM source_files WHERE id=?')
         .get(original.id)! as { id: string; kind: string; details_json: string };
       assert.equal(
-        file.details_json,
-        original.raw,
-        'raw whitespace, duplicate properties and escape spelling stay exact',
+        readIntakeEnvelopeText(db, file),
+        JSON.stringify(original.state),
+        'complete normalized envelope and original intake slot order stay exact',
       );
       const pin = readIntakeSourcePin(db, original.id)!;
       assert.deepEqual(pin, readIntakeSourcePin(f.source, original.id));
@@ -1113,10 +1124,7 @@ test('first real publication selects fresh target evidence and preserves raw/pub
         }).readSerialized(),
         JSON.stringify(entry.state),
       );
-      assert.equal(
-        db.prepare('SELECT details_json FROM source_files WHERE id=?').get(entry.id)!.details_json,
-        entry.raw,
-      );
+      assert.equal(readIntakeEnvelopeText(db, { id: entry.id }), JSON.stringify(entry.state));
       assert.equal(readIntakeSourcePin(db, entry.id)!.version, 3);
       assert.equal(sha(readFileSync(join(f.root, 'source-originals', entry.id))), entry.hash);
     }

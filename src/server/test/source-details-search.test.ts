@@ -15,6 +15,13 @@ import {
   type RecordStorage,
 } from '../record-versions.ts';
 import { updateStoredIntakeDetails, registerIntakeFile } from '../intake-state-access.ts';
+
+import {
+  memoryRecordAuthority,
+  registerRawIntakeFixture,
+} from './helpers/intake-authority-fixture.ts';
+
+const originalOracleBytes = new WeakMap<ReturnType<typeof openDatabase>, Map<string, string>>();
 import { uploadIntake } from '../intake.ts';
 import { newProfile, vaultFixture } from './helpers/vault-fixture.ts';
 import { createApp } from '../index.ts';
@@ -32,6 +39,9 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-search-'));
   const path = join(root, 'cache.sqlite');
   let db = openDatabase(path, 'fictional-search');
+  let authority: ReturnType<typeof memoryRecordAuthority> | undefined;
+  const oracleBytes = new Map<string, string>();
+  originalOracleBytes.set(db, oracleBytes);
   t.after(() => {
     if (db.isOpen) {
       clearSourceDetailsSearchCache(db);
@@ -50,27 +60,52 @@ function fixture(t: TestContext) {
       clearSourceTextProjectionCache(db);
       db.close();
       db = openDatabase(path, 'fictional-search');
+      authority?.attach(db);
+      originalOracleBytes.set(db, oracleBytes);
     },
     insert(id: string, raw: string, kind = 'derived', provider: string | null = null) {
-      db.prepare(
-        'INSERT INTO source_files(id,path,sha256,bytes,mime_type,kind,coverage_status,provider_id,details_json) VALUES(?,?,?,?,?,?,?,?,?)',
-      ).run(
-        id,
-        `fictional/${id}.txt`,
-        'a'.repeat(64),
-        13,
-        'text/plain',
-        kind,
-        'unknown',
-        provider,
-        raw,
-      );
+      if (kind === 'intake_original') {
+        authority ??= memoryRecordAuthority(db);
+        registerRawIntakeFixture(db, id, raw, provider);
+        transaction(db, () =>
+          db
+            .prepare('UPDATE source_files SET path=?,bytes=? WHERE id=?')
+            .run(`fictional/${id}.txt`, 13, id),
+        );
+        oracleBytes.set(id, raw);
+        return;
+      }
+      const insert = () =>
+        db
+          .prepare(
+            'INSERT INTO source_files(id,path,sha256,bytes,mime_type,kind,coverage_status,provider_id,details_json) VALUES(?,?,?,?,?,?,?,?,?)',
+          )
+          .run(
+            id,
+            `fictional/${id}.txt`,
+            'a'.repeat(64),
+            13,
+            'text/plain',
+            kind,
+            'unknown',
+            provider,
+            raw,
+          );
+      if (db.isTransaction) insert();
+      else transaction(db, insert);
     },
   };
 }
 
 /** Frozen prechange query and DTO contract: never uses the new search or details adapters. */
 export function sqlOracle(db: ReturnType<typeof openDatabase>, params: URLSearchParams) {
+  // Materialize a frozen pre-cutover source table, replacing compact rows only
+  // from explicit fixture bytes. Never reconstruct expected envelopes via the adapter.
+  db.exec(
+    'DROP TABLE IF EXISTS temp.__oracle_sources; CREATE TEMP TABLE __oracle_sources AS SELECT * FROM main.source_files',
+  );
+  for (const [id, raw] of originalOracleBytes.get(db) ?? [])
+    db.prepare('UPDATE temp.__oracle_sources SET details_json=? WHERE id=?').run(raw, id);
   const archived =
     "COALESCE((SELECT archived FROM visibility_events WHERE target_type='source_file' AND target_id=f.id ORDER BY version DESC LIMIT 1),0)";
   const visibility =
@@ -100,7 +135,7 @@ export function sqlOracle(db: ReturnType<typeof openDatabase>, params: URLSearch
     where.push('(f.path LIKE ? OR f.details_json LIKE ?)');
     args.push(`%${q}%`, `%${q}%`);
   }
-  const from = ` FROM source_files f LEFT JOIN providers p ON p.id=f.provider_id WHERE ${where.join(' AND ')}`;
+  const from = ` FROM temp.__oracle_sources f LEFT JOIN providers p ON p.id=f.provider_id WHERE ${where.join(' AND ')}`;
   const total = Number(db.prepare('SELECT count(*) n' + from).get(...args)!.n);
   const limit = Math.min(200, Math.max(1, Number(params.get('limit')) || 50));
   const offset = Math.max(0, Number(params.get('offset')) || 0);
@@ -145,8 +180,10 @@ function parity(db: ReturnType<typeof openDatabase>, options: Record<string, str
 
 test('source count/pages and complete DTOs equal independent SQL LIKE for exact raw and normalized envelopes', (t) => {
   const f = fixture(t);
-  f.db.exec(
-    "INSERT INTO providers VALUES('acquired','Fictional acquisition'),('reviewed','Fictional review')",
+  transaction(f.db, () =>
+    f.db.exec(
+      "INSERT INTO providers VALUES('acquired','Fictional acquisition'),('reviewed','Fictional review')",
+    ),
   );
   const raw =
     '{ "first": "Alpha Ω Ä 😀", "dup":"retained hidden", "dup":"visible", "escape":"\\u0041\\ud800", "last": "tail" }';
@@ -179,6 +216,21 @@ test('source count/pages and complete DTOs equal independent SQL LIKE for exact 
       kind,
       'acquired',
     );
+  for (const [id, text] of [
+    [
+      'duplicate-provider',
+      '{ "intake":{"version":0,"metadata":{"sourceProviderId":"acquired","sourceProviderId":"reviewed","source":"First","source":"Last"},"workflow":{}} }',
+    ],
+    [
+      'duplicate-metadata',
+      '{"intake":{"version":0,"metadata":{"sourceProviderId":"acquired","source":"First"},"metadata":{"sourceProviderId":"reviewed","source":"Last"},"workflow":{}}}',
+    ],
+    [
+      'duplicate-intake',
+      '{"intake":{"version":0,"metadata":{"sourceProviderId":"acquired","source":"First"},"workflow":{}},"intake":{"version":0,"metadata":{"sourceProviderId":"reviewed","source":"Last"},"workflow":{}}}',
+    ],
+  ])
+    f.insert(id, text, 'intake_original', 'acquired');
   for (const [id, text] of [
     ['null', 'null'],
     ['array', '[1,"fictional scalar Ω",null]'],
@@ -449,22 +501,16 @@ test('actual source lists survive real encrypted private copy, lock, target rebi
     bytes: Buffer.from('Fictional search evidence Ω.'),
     newProviderName: 'Fictional clinic',
   });
-  transaction(state.db, () => {
-    const details = JSON.parse(
-      String(
-        state.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intake.id)!
-          .details_json,
-      ),
-    );
-    details.intake.workflow = {
-      format: 'health-intake-workflow-v1',
-      fictional: 'Fictional searchable Ω 😀 '.repeat(300),
-    };
-    state.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify(details), intake.id);
-  });
-  parity(state.db, { q: 'searchable Ω' });
+  transaction(state.db, () =>
+    updateStoredIntakeDetails(state.db, intake.id, (details) => {
+      details.workflow = {
+        format: 'health-intake-workflow-v1',
+        fictional: 'Fictional searchable Ω 😀 '.repeat(300),
+      } as unknown as typeof details.workflow;
+    }),
+  );
+  const retained = sourceFiles(state.db, new URLSearchParams({ q: 'searchable Ω' }));
+  assert.equal(retained.total, 1);
   const head = state.recordStorage.read('head');
   const copy = manager.begin({ name: 'Fictional search copy', copyFrom: id });
   await manager.verify(copy.setupId, { acknowledged: true, recovery: copy.recoveryKit });
@@ -474,7 +520,11 @@ test('actual source lists survive real encrypted private copy, lock, target rebi
     [copy.profileId, copy.recoveryKit],
   ] as const) {
     const before = manager.opened.get(profileId)!;
-    parity(before.db, { q: 'searchable Ω' });
+    const expected = {
+      ...retained,
+      data: retained.data.map((row) => ({ ...row, path: row.path.replace(id, profileId) })),
+    };
+    assert.deepEqual(sourceFiles(before.db, new URLSearchParams({ q: 'searchable Ω' })), expected);
     assert.ok(
       sourceFiles(before.db, new URLSearchParams({ q: 'searchable Ω' })).data[0]!.path.includes(
         profileId,
@@ -486,7 +536,10 @@ test('actual source lists survive real encrypted private copy, lock, target rebi
     plan.dispose();
     rmSync(join(manager.pathFor(profileId), 'cache'), { recursive: true, force: true });
     manager.unlock(profileId, recovery);
-    parity(manager.opened.get(profileId)!.db, { q: 'searchable Ω' });
+    assert.deepEqual(
+      sourceFiles(manager.opened.get(profileId)!.db, new URLSearchParams({ q: 'searchable Ω' })),
+      expected,
+    );
   }
 });
 
@@ -523,8 +576,10 @@ test('warmed ordinary intake writes stage changed projection atomically and a ca
     batchId: 'fictional-batch',
     details: { fictional: 'registered searchable evidence' },
   };
-  f.db.exec(
-    "INSERT INTO providers VALUES('fictional-provider','Fictional provider'); INSERT INTO manual_batches(id,title,status,created_at) VALUES('fictional-batch','Fictional batch','in_progress','2026-01-01')",
+  transaction(f.db, () =>
+    f.db.exec(
+      "INSERT INTO providers VALUES('fictional-provider','Fictional provider'); INSERT INTO manual_batches(id,title,status,created_at) VALUES('fictional-batch','Fictional batch','in_progress','2026-01-01')",
+    ),
   );
   assert.throws(
     () =>
@@ -558,6 +613,10 @@ test('warmed ordinary intake writes stage changed projection atomically and a ca
     });
     assert.notEqual(head(), initial, 'supported writer stages projection before any query');
   });
+  const expectedEnvelope = JSON.parse(originalOracleBytes.get(f.db)!.get('original')!);
+  expectedEnvelope.intake.version++;
+  expectedEnvelope.intake.workflow.fictional = 'prefix ' + 'distinct fictional anchor '.repeat(500);
+  originalOracleBytes.get(f.db)!.set('original', JSON.stringify(expectedEnvelope));
   parity(f.db, { q: 'prefix' });
   const selected = head();
   assert.throws(

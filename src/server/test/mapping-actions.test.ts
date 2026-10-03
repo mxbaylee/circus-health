@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -68,6 +69,7 @@ function fixture(t: TestContext) {
     profileId = 'orchid';
   const paths = ensureProfileDirectories(root, profileId),
     db = openDatabase(paths.database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   const raw = JSON.stringify(envelope);
   const intake = uploadIntake(db, root, profileId, {
     filename: 'procedure.jsonl',
@@ -281,6 +283,7 @@ test('accepted mapping is idempotent, leaves raw evidence byte-for-byte unchange
   );
   const rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'rebuilt'));
   const db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: resolve(f.root, 'rebuilt'), profileId: f.profileId });
   try {
     const restored = db
       .prepare('SELECT * FROM procedures WHERE id=?')

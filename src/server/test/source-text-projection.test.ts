@@ -377,7 +377,9 @@ test('malformed derived identities and BLOB content keys repair without launderi
     f.insert('a', expected);
     exact(f.db, 'a', expected);
     f.db
-      .prepare('INSERT INTO __record_source_text_heads VALUES(?,?,?,?,?)')
+      .prepare(
+        'INSERT INTO __record_source_text_heads(source_id,profile_id,source_hash,details_digest,head_json) VALUES(?,?,?,?,?)',
+      )
       .run(malformed, 'fictional-rope', 'a'.repeat(64), 'wrong', '{}');
     exact(f.db, 'a', expected);
     assert.equal(f.db.prepare('SELECT count(*) n FROM __record_source_text_heads').get()!.n, 1);

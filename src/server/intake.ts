@@ -4,6 +4,7 @@ import {
   writeIntakeDetails,
   type IntakeDetails,
 } from './intake-state-access.ts';
+import { readIntakeEnvelopeText } from './intake-authority.ts';
 import {
   effectiveKnownNames,
   challengedKnownNames,
@@ -362,6 +363,7 @@ function owner(db: DatabaseSync, profileId: string): void {
   if (meta(db, 'owner_profile_id') !== profileId)
     throw new HttpError(403, 'PROFILE_BOUNDARY', 'Intake belongs to a different profile');
 }
+export { owner as assertIntakeOwner };
 export function intakeDurability(db: DatabaseSync): Intake['durability'] {
   const mutationRevision = Number(meta(db, 'intake_mutation_revision') || 0),
     persistedRevision = Number(meta(db, 'curation_revision') || 0);
@@ -436,7 +438,7 @@ function checkVersion(db: DatabaseSync, file: SourceFileRow, version: unknown): 
         file.id,
         version,
         details(db, file).version,
-        file.details_json,
+        readIntakeEnvelopeText(db, file),
       ),
     );
 }
@@ -1076,9 +1078,10 @@ function publishIntakeInternal(
 }
 function update(db: DatabaseSync, file: SourceFileRow, d: IntakeDetails): void {
   const before = details(db, file);
+  const rawBefore = readIntakeEnvelopeText(db, file);
   const raw = writeIntakeDetails(db, file, d);
   try {
-    observeIntakeVersion(db, file.id, before, d, raw, file.details_json);
+    observeIntakeVersion(db, file.id, before, d, raw, rawBefore);
   } catch {
     /* Diagnostics do not change publication. */
   }

@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -123,6 +124,7 @@ function fixture(
   const root = mkdtempSync(join(tmpdir(), 'fictional-identity-boundaries-'));
   const profileId = 'fictional-alder';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });

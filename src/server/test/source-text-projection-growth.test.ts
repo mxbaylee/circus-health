@@ -50,7 +50,15 @@ test('100/200/300 actual automatic updates separately measure logical SQL writes
     contents: ['id', 'text'],
     occurrences: ['source_id', 'id', 'content_id', 'start', 'end'],
     links: ['source_id', 'id', 'next'],
-    heads: ['source_id', 'profile_id', 'source_hash', 'details_digest', 'head_json'],
+    heads: [
+      'source_id',
+      'profile_id',
+      'source_hash',
+      'details_digest',
+      'head_json',
+      'authority_key',
+      'authority_head',
+    ],
   };
   const independentlyMeasuredInitialRows = Object.entries(fields).map(([name, columns]) => {
     const sqlColumns = columns

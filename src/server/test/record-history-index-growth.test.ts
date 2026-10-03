@@ -46,7 +46,7 @@ test('300 growing source edits retain one content copy and bounded history refer
     'fictional.txt',
     '0'.repeat(64),
     0,
-    'intake_original',
+    'source_capture',
     JSON.stringify({ workflow: { text: '', step: 0 } }),
   );
   attachRecordDurability(db, { profileId, storage });

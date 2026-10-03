@@ -33,6 +33,7 @@ import * as a from './assets.ts';
 import { profilePaths } from './profile-storage.ts';
 export { PROFILES } from './profiles.ts';
 import { attachPersonalDurability, personalDurabilityStatus, flushPersonal } from './portable.ts';
+import { rebuildContributorDatabase, selectedContributorHead } from './contributor-durability.ts';
 import { createBackup } from './recovery.ts';
 import { createAssistant } from './assistant.ts';
 import { mappingAssistantExtensions } from './mapping-actions.ts';
@@ -176,15 +177,16 @@ export function createApp({
     // profile, reuse another owner's legacy file, or migrate the other stores.
     const paths = readProfileRegistry(root).profiles.map((profile) => {
       const path = profilePaths(root, profile.id).database;
-      if (!existsSync(path))
-        throw new Error(
-          `Missing ${profile.id} database. Restore or rebuild this profile before starting the app.`,
-        );
+      selectedContributorHead(root, profile.id);
       return [profile.id, path] as const;
     });
     try {
-      for (const [profileId, path] of paths) dbs.set(profileId, openDatabase(path, profileId));
-      for (const [profileId, db] of dbs) attachPersonalDurability(db, { root, profileId });
+      for (const [profileId, path] of paths) {
+        if (!existsSync(path)) rebuildContributorDatabase(path, root, profileId);
+        dbs.set(profileId, openDatabase(path, profileId));
+      }
+      for (const [profileId, db] of dbs)
+        attachPersonalDurability(db, { root, profileId, initialize: false });
     } catch (error) {
       for (const db of dbs.values()) db.close();
       throw error;

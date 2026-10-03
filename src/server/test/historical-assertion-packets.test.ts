@@ -1,3 +1,4 @@
+import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -19,6 +20,7 @@ function fixture(t: TestContext) {
   const profileId = 'fictional-household';
   const paths = ensureProfileDirectories(root, profileId);
   const db = openDatabase(paths.database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -27,32 +29,46 @@ function fixture(t: TestContext) {
   const path = `${paths.relativeRoot}/sources/fictional/original.txt`;
   mkdirSync(dirname(resolve(root, path)), { recursive: true });
   writeFileSync(resolve(root, path), original);
-  db.exec("INSERT INTO providers VALUES('issuer','Fictional Clinic')");
-  db.prepare('INSERT INTO source_files(id,provider_id,path,sha256,bytes) VALUES(?,?,?,?,?)').run(
-    'family-file',
-    'issuer',
-    path,
-    createHash('sha256').update(original).digest('hex'),
-    original.length,
+  fixtureTransaction(db, () =>
+    db.exec("INSERT INTO providers VALUES('issuer','Fictional Clinic')"),
+  );
+  fixtureTransaction(db, () =>
+    db
+      .prepare('INSERT INTO source_files(id,provider_id,path,sha256,bytes) VALUES(?,?,?,?,?)')
+      .run(
+        'family-file',
+        'issuer',
+        path,
+        createHash('sha256').update(original).digest('hex'),
+        original.length,
+      ),
   );
   const managed = createNote(db, { kind: 'person', title: 'Fictional Morgan' }).personId!;
   const clinician = createNote(db, { kind: 'person', title: 'Fictional Dr. River' }).personId!;
   function raw(id: string, kind: string, subject?: string) {
-    db.prepare(
-      'INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json) VALUES(?,?,?,?,?)',
-    ).run(
-      id,
-      'family-file',
-      'issuer',
-      kind,
-      JSON.stringify({ data: { display: `PRIVATE ${id}`, patientName: 'Fictional Morgan' } }),
+    fixtureTransaction(db, () =>
+      db
+        .prepare(
+          'INSERT INTO source_records(id,source_file_id,provider_id,kind,raw_json) VALUES(?,?,?,?,?)',
+        )
+        .run(
+          id,
+          'family-file',
+          'issuer',
+          kind,
+          JSON.stringify({ data: { display: `PRIVATE ${id}`, patientName: 'Fictional Morgan' } }),
+        ),
     );
     if (subject) evidence(id, subject, 'report_subject');
   }
   function evidence(id: string, person: string, role: string) {
-    db.prepare(
-      'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES(?,?,?,?,?)',
-    ).run(`${id}:${person}:${role}`, 'person', person, id, role);
+    fixtureTransaction(db, () =>
+      db
+        .prepare(
+          'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES(?,?,?,?,?)',
+        )
+        .run(`${id}:${person}:${role}`, 'person', person, id, role),
+    );
   }
   return { db, root, profileId, managed, clinician, raw, evidence };
 }
@@ -99,8 +115,10 @@ test('historical raw kinds use the same case-insensitive inclusion and omission 
     assert.ok(ids(f.db).includes(kind), kind);
     assert.equal(packet(f.db).unassignedRawAssertionsOmitted, false, kind);
     // Isolate each spelling; prior accepted assertions must not mask an omission.
-    f.db.prepare('DELETE FROM evidence WHERE source_record_id=?').run(kind);
-    f.db.prepare('DELETE FROM source_records WHERE id=?').run(kind);
+    fixtureTransaction(f.db, () =>
+      f.db.prepare('DELETE FROM evidence WHERE source_record_id=?').run(kind),
+    );
+    fixtureTransaction(f.db, () => f.db.prepare('DELETE FROM source_records WHERE id=?').run(kind));
   }
 });
 
@@ -126,14 +144,16 @@ test('legacy mixed-family ownership stays exact and nonidentifying through sourc
   f.raw('no-proof', 'immunization');
   // Old raw payloads and copied mapping-looking fields cannot stand in for an
   // accepted, exact source occurrence. The original remains available to review.
-  f.db.prepare('UPDATE source_records SET raw_json=? WHERE id=?').run(
-    JSON.stringify({
-      clinical: { subject: 'self' },
-      import: { acceptedMapping: { personId: f.managed } },
-      identityConfirmations: [{ outcome: 'this_is_me' }],
-      display: 'PRIVATE no-proof',
-    }),
-    'no-proof',
+  fixtureTransaction(f.db, () =>
+    f.db.prepare('UPDATE source_records SET raw_json=? WHERE id=?').run(
+      JSON.stringify({
+        clinical: { subject: 'self' },
+        import: { acceptedMapping: { personId: f.managed } },
+        identityConfirmations: [{ outcome: 'this_is_me' }],
+        display: 'PRIVATE no-proof',
+      }),
+      'no-proof',
+    ),
   );
   const check = (db: Database) => {
     assert.deepEqual(ids(db), ['self']);
@@ -155,6 +175,7 @@ test('legacy mixed-family ownership stays exact and nonidentifying through sourc
   exportCuration(f.db, f.root, f.profileId);
   const rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'rebuilt'));
   const database = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(database, { root: resolve(f.root, 'rebuilt'), profileId: f.profileId });
   try {
     check(database);
   } finally {
@@ -249,7 +270,9 @@ test('real persisted identity receipts and accepted mappings do not assign a nei
     decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
   });
   f.raw('neighbor', 'condition');
-  f.db.prepare('UPDATE source_records SET source_file_id=? WHERE id=?').run(item.id, 'neighbor');
+  fixtureTransaction(f.db, () =>
+    f.db.prepare('UPDATE source_records SET source_file_id=? WHERE id=?').run(item.id, 'neighbor'),
+  );
   const check = (db: Database) => {
     const receipt = intake.getIntake(db, f.root, f.profileId, item.id).workflow!
       .identityConfirmations![0]!;
@@ -277,6 +300,10 @@ test('real persisted identity receipts and accepted mappings do not assign a nei
   exportCuration(f.db, f.root, f.profileId);
   const rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'receipt-rebuild'));
   const db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, {
+    root: resolve(f.root, 'receipt-rebuild'),
+    profileId: f.profileId,
+  });
   try {
     check(db);
   } finally {
@@ -389,14 +416,22 @@ test('unresolved source filtering shares packet scope and composes with paginati
     f.raw(id!, kind!);
   f.evidence('b-dangling', 'not-a-person', 'report_subject');
   f.evidence('h-owned', 'patient', 'report_subject');
-  f.db
-    .prepare(
-      'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES(?,?,?,?,?)',
-    )
-    .run('normalized', 'observation', 'normalized-observation', 'e-represented', 'source');
-  f.db.exec("INSERT INTO providers VALUES('personal','Personal notes')");
-  f.db.exec("UPDATE source_records SET provider_id='personal' WHERE id='f-private'");
-  f.db.exec("UPDATE source_records SET provider_id=NULL WHERE id='g-unknown-provider'");
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare(
+        'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role) VALUES(?,?,?,?,?)',
+      )
+      .run('normalized', 'observation', 'normalized-observation', 'e-represented', 'source'),
+  );
+  fixtureTransaction(f.db, () =>
+    f.db.exec("INSERT INTO providers VALUES('personal','Personal notes')"),
+  );
+  fixtureTransaction(f.db, () =>
+    f.db.exec("UPDATE source_records SET provider_id='personal' WHERE id='f-private'"),
+  );
+  fixtureTransaction(f.db, () =>
+    f.db.exec("UPDATE source_records SET provider_id=NULL WHERE id='g-unknown-provider'"),
+  );
   setVisibility(f.db, 'source', 'i-archived', { archived: true, version: 0 });
   const query = (extra = '') =>
     sourceRecords(f.db, new URLSearchParams('ownership=unresolved' + extra));

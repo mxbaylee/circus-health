@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 import { openDatabase, revision } from '../database.ts';
 import { createNote, getNote, saveNote, listNotes, personTags } from '../notes.ts';
 import { attachPersonalDurability } from '../portable.ts';
-import { noteHistory, restoreNoteFields } from '../note-history.ts';
+import { noteHistory, restoreNoteFields, previewNoteRestoration } from '../note-history.ts';
 import { randomUUID } from 'node:crypto';
 import { profilePaths } from '../profile-storage.ts';
 import { createApp } from '../index.ts';
@@ -217,7 +217,7 @@ test('Self rejects tag writes, hides legacy roles and cleans current tags on a s
   };
   db.prepare('UPDATE notes SET profile_json=? WHERE id=?').run(JSON.stringify(legacy), initial.id);
   attachPersonalDurability(db, { root, profileId: 'cookie-dough' });
-  const folder = resolve(profilePaths(root, 'cookie-dough').personal, 'snapshots');
+  const folder = resolve(profilePaths(root, 'cookie-dough').records, 'objects');
   const published = new Map(
     readdirSync(folder).map((name) => [name, readFileSync(resolve(folder, name), 'utf8')]),
   );
@@ -257,11 +257,23 @@ test('Self rejects tag writes, hides legacy roles and cleans current tags on a s
   );
   assert.throws(
     () =>
+      previewNoteRestoration(db, root, 'cookie-dough', saved.id, {
+        operationId: randomUUID(),
+        generationId: previous.generationId,
+        fields: ['person.tags'],
+        version: saved.version,
+      }),
+    (error) => hasCode(error, 'INVALID_FIELDS'),
+  );
+  assert.throws(
+    () =>
       restoreNoteFields(db, root, 'cookie-dough', saved.id, {
         operationId: randomUUID(),
         generationId: previous.generationId,
         fields: ['person.tags'],
         version: saved.version,
+        expectedRevision: revision(db),
+        previewToken: 'fictional-forbidden-tags-preview',
       }),
     (error) => hasCode(error, 'INVALID_FIELDS'),
   );

@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -35,6 +36,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-report-queue-')),
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   const self = getNote(db, 'person-note:self');
   saveNote(db, self.id, {
     version: self.version,
@@ -413,6 +415,7 @@ test('queue state and discovery order survive rebuild and cannot cross profile o
     target = join(f.root, 'rebuilt');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target);
   const db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     assert.deepEqual(listIntakeReportQueue(db, target, f.profileId), expected);
     assert.deepEqual(listIntakeImportFeed(db, target, f.profileId, { view: 'all' }), expectedFeed);

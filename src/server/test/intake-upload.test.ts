@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -31,6 +32,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'health-stream-test-')),
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     try {
       db.close();
@@ -309,6 +311,7 @@ test('original above JSONL cap survives streaming upload, conversion, backup and
     target = join(f.root, 'rebuilt'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const restored = intake.verifyIntakeOriginal(db, target, f.profileId, proposed.id);
     assert.equal(inspectIntakeFile(restored.path).sha256, sha256);

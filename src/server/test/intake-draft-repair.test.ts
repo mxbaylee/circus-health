@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -59,6 +60,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-draft-repair-'));
   const profileId = 'orchid';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   const bytes = Buffer.from(
     [envelope('one', '2025-01-01', 'Method A'), envelope('two', '2024-02-02', 'Method B')]
       .map((value) => JSON.stringify(value))
@@ -494,6 +496,7 @@ test('AI draft repair reads retained original, rejects scope escapes, applies on
   const rebuiltRoot = resolve(f.root, 'rebuilt');
   const rebuilt = rebuildProfile(f.root, f.profileId, rebuiltRoot);
   const rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(rebuiltDb, { root: rebuiltRoot, profileId: f.profileId });
   try {
     assert.equal(
       intake.reviewIntake(rebuiltDb, rebuiltRoot, f.profileId, f.uploaded.id).records[0]!.mapping
@@ -700,6 +703,7 @@ test('production assistant keeps repair chats tool-isolated and reads an origina
   const root = mkdtempSync(join(tmpdir(), 'fictional-repair-host-'));
   const profileId = 'cedar';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   const original = Buffer.from(
     'Fictional comparison section\nCollection date: 2025-06-07\nNo other date applies.\n',
   );

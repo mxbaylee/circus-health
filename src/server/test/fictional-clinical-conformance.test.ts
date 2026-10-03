@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
@@ -360,6 +361,7 @@ test('one exact four-page plan and extracted batch retain complete fixture-local
   const root = temporary(t, 'clinical-coverage-');
   const profileId = 'saffron-cookie';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => db.close());
   const source = buildFictionalClinicalConformanceSource(join(root, 'generated'));
   let item: Intake = uploadIntake(db, root, profileId, {

@@ -1,3 +1,5 @@
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -594,7 +596,7 @@ test('an older accepted plain document can append its missing optical projection
   ];
   transaction(state.db, () => {
     const file = state.db.prepare('SELECT * FROM source_files WHERE id=?').get(item.id)!;
-    const all = JSON.parse(String(file.details_json));
+    const all = JSON.parse(readIntakeEnvelopeText(state.db, { id: item.id })!);
     const clinical = projectClinicalReview(state.db, {
       file,
       inputFile: file,
@@ -612,9 +614,7 @@ test('an older accepted plain document can append its missing optical projection
     );
     all.intake.imported.clinical = clinical;
     all.intake.lastReviewToken = legacyReview.reviewToken;
-    state.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify(all), item.id);
+    writeIntakeFixtureEnvelope(state.db, item.id, all);
   });
   const legacyDocument = state.db.prepare('SELECT * FROM documents').get()!;
   const legacyIntake = profileCall(state, profile.id, getIntake, item.id);

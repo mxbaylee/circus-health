@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -57,6 +58,7 @@ function fixture(
     profileId = opened?.profileId || 'cookie-dough';
   const db =
     opened?.db || openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  if (!opened) attachPersonalDurability(db, { root, profileId });
   if (!opened)
     t.after(() => {
       db.close();
@@ -171,6 +173,7 @@ test('grouped numeric corrections update only the shared projection and survive 
   const target = join(f.root, 'grouped-correction-rebuilt');
   const rebuilt = rebuildProfile(f.root, f.profileId, target);
   const db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     assert.deepEqual(getObservation(db, f.recordId), corrected);
   } finally {
@@ -224,6 +227,7 @@ test('supporting incoming original is retained in accepted history while its dra
     target = join(f.root, 'recovered');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const recovered = applyDirectRecordCorrection(db, target, f.profileId, {
       ...preview.request,

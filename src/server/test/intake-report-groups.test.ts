@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -302,6 +303,7 @@ test('durable grouped acceptance, changed identity drafts, proposal replay and r
   const root = mkdtempSync(join(tmpdir(), 'fictional-report-groups-'));
   const profileId = 'cookie-dough';
   let db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   setFictionalSelf(db);
   t.after(() => {
     try {
@@ -405,6 +407,7 @@ test('durable grouped acceptance, changed identity drafts, proposal replay and r
   const rebuilt = rebuildProfile(join(backup.path, 'files'), profileId, target);
   db.close();
   db = openDatabase(rebuilt.database, profileId);
+  attachPersonalDurability(db, { root: target, profileId: profileId });
   const restored = intake.getIntake(db, target, profileId, item.id);
   assert.deepEqual(restored.workflow, item.workflow);
   assert.deepEqual(intake.getIntakeOriginal(db, target, profileId, item.id).bytes, bytes);
@@ -419,6 +422,7 @@ test('an optical report remains one Vision document with independently retained 
   const root = mkdtempSync(join(tmpdir(), 'fictional-optical-report-group-'));
   const profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   setFictionalSelf(db);
   t.after(() => {
     db.close();
@@ -497,6 +501,7 @@ test('legacy literal context links create one provisional report and one source 
   const root = mkdtempSync(join(tmpdir(), 'fictional-linked-report-context-'));
   const profileId = 'cookie-dough';
   let db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     try {
       db.close();
@@ -728,6 +733,7 @@ test('legacy literal context links create one provisional report and one source 
   const rebuilt = rebuildProfile(join(backup.path, 'files'), profileId, target);
   db.close();
   db = openDatabase(rebuilt.database, profileId);
+  attachPersonalDurability(db, { root: target, profileId: profileId });
   const restored = intake.getIntake(db, target, profileId, item.id);
   assert.deepEqual(restored.workflow, retainedWorkflow);
   assert.deepEqual(intake.getIntakeOriginal(db, target, profileId, item.id).bytes, original);
@@ -948,6 +954,7 @@ test('manual report labels work without a model suggestion and stay exact-versio
   const root = mkdtempSync(join(tmpdir(), 'health-manual-report-label-'));
   const profileId = 'fictional-manual-source';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   setFictionalSelf(db);
   t.after(() => {
     db.close();

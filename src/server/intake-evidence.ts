@@ -83,6 +83,62 @@ const literalWindow = ({ intake: _intake, ...window }: ReturnType<typeof readInt
 // encoding in @napi-rs/canvas; JPEG 100 minimizes additional quantization.
 const UPLOADED_IMAGE_QUALITY = 100;
 
+type AutomaticCapture = {
+  readers: Set<() => void>;
+  promise: ReturnType<typeof extractIntakeSourceText>;
+};
+const automaticCaptures = new WeakMap<DatabaseSync, Map<string, AutomaticCapture>>();
+
+async function captureForReader(
+  context: Parameters<typeof extractIntakeSourceText>[0],
+  assertRunning: () => void,
+) {
+  assertRunning();
+  let captures = automaticCaptures.get(context.db);
+  if (!captures) automaticCaptures.set(context.db, (captures = new Map()));
+  const key = JSON.stringify([context.profileId, context.id]);
+  let capture = captures.get(key);
+  if (!capture) {
+    const readers = new Set<() => void>();
+    const promise = Promise.resolve()
+      .then(() =>
+        extractIntakeSourceText({
+          ...context,
+          assertRunning() {
+            let cancellation: unknown;
+            for (const reader of readers) {
+              try {
+                reader();
+                return;
+              } catch (error) {
+                cancellation = error;
+                readers.delete(reader);
+              }
+            }
+            throw cancellation || Error('No active automatic source readers');
+          },
+        }),
+      )
+      .finally(() => {
+        captures!.delete(key);
+        if (!captures!.size) automaticCaptures.delete(context.db);
+      });
+    capture = { readers, promise };
+    captures.set(key, capture);
+  }
+  // Each read owns its cancellation and continuation. Cancelling one reader
+  // must not cancel extraction still needed by another authorized reader.
+  const reader = () => assertRunning();
+  capture.readers.add(reader);
+  try {
+    const result = await capture.promise;
+    assertRunning();
+    return result;
+  } finally {
+    capture.readers.delete(reader);
+  }
+}
+
 export async function captureIntakeSourceTextForRead({
   db,
   root,
@@ -100,14 +156,16 @@ export async function captureIntakeSourceTextForRead({
     const prior = getIntakeSourceText(db, root, profileId, id);
     if (sourceTextExtractionPending(prior)) {
       assertRunning();
-      const captured = await extractIntakeSourceText({
-        db,
-        root,
-        profileId,
-        id,
-        maxPages: 2,
+      const captured = await captureForReader(
+        {
+          db,
+          root,
+          profileId,
+          id,
+          maxPages: 2,
+        },
         assertRunning,
-      });
+      );
       assertRunning();
       onSourceTextCaptured?.({
         intakeId: id,

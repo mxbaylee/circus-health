@@ -1,7 +1,10 @@
+import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
+import { registerIntakeFile } from '../intake-state-access.ts';
+import { transaction } from '../database.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { openDatabase } from '../database.ts';
@@ -21,7 +24,7 @@ import { historicalNotes, getHistoricalNote } from '../historical-notes.ts';
 import { createApp } from '../index.ts';
 import { attachPersonalDurability, exportCuration, rebuildProfile } from '../portable.ts';
 import { hash } from '../assets.ts';
-function fixture(t: TestContext) {
+function fixture(t: TestContext, syntheticAuthority = false) {
   const root = mkdtempSync(resolve(tmpdir(), 'visibility-fixture-')),
     paths = ensureProfileDirectories(root, 'cedar'),
     db = openDatabase(paths.database, 'cedar');
@@ -42,6 +45,8 @@ function fixture(t: TestContext) {
   db.exec(
     "INSERT INTO source_records(id,source_file_id,raw_json) VALUES('same','same','{}'); INSERT INTO medications(id,source_record_id,kind,label,status) VALUES('med','same','order','Example prescription','active'); INSERT INTO test_types(id,label,category) VALUES('test','Example measurement','lab'); INSERT INTO observations(id,source_record_id,test_type_id,label,effective_at,value_text,value_numeric) VALUES('result','same','test','Example result','2026-01-01','1',1)",
   );
+  if (syntheticAuthority) memoryRecordAuthority(db);
+  else attachPersonalDurability(db, { root, profileId: 'cedar' });
   return { root, paths, db };
 }
 const params = (x: Record<string, string> = {}) => new URLSearchParams(x);
@@ -137,73 +142,88 @@ test('archive coordinates personal current use and preserves chart history, sour
   assert.equal(db.prepare('SELECT raw_json FROM source_records').get()?.raw_json, '{}');
 });
 test('original source record filter follows only server-attested proposal lineage with stable archive pagination', (t) => {
-  const { db } = fixture(t);
-  db.exec(
-    "INSERT INTO providers VALUES('reviewed-source','Fictional Reviewed Vision'),('file-source','Fictional Acquisition Service')",
-  );
-  const insertFile = db.prepare(
-    'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-  );
-  insertFile.run('root-original', 'fictional/root.png', 'root-hash', 10, 'intake_original', '{}');
-  db.prepare("UPDATE source_files SET provider_id='file-source' WHERE id='root-original'").run();
-  insertFile.run(
-    'proposal-current',
-    'fictional/current.jsonl',
-    'current-hash',
-    20,
-    'intake_proposal',
-    JSON.stringify({ originalSourceFileId: 'root-original' }),
-  );
-  insertFile.run(
-    'proposal-history',
-    'fictional/history.jsonl',
-    'history-hash',
-    20,
-    'intake_proposal',
-    JSON.stringify({ originalSourceFileId: 'root-original' }),
-  );
-  insertFile.run(
-    'other-original',
-    'fictional/other.png',
-    'other-hash',
-    10,
-    'intake_original',
-    '{}',
-  );
-  insertFile.run(
-    'proposal-unrelated',
-    'fictional/unrelated.jsonl',
-    'unrelated-hash',
-    20,
-    'intake_proposal',
-    JSON.stringify({ originalSourceFileId: 'other-original' }),
-  );
-  const insertRecord = db.prepare(
-    'INSERT INTO source_records(id,source_file_id,raw_json,locator_json) VALUES(?,?,?,?)',
-  );
-  insertRecord.run('direct', 'root-original', '{}', '{}');
-  insertRecord.run(
-    'current',
-    'proposal-current',
-    '{}',
-    JSON.stringify({ originalSourceFileId: 'root-original' }),
-  );
-  insertRecord.run(
-    'history',
-    'proposal-history',
-    '{}',
-    JSON.stringify({ originalSourceFileId: 'root-original' }),
-  );
-  insertRecord.run(
-    'spoofed-locator',
-    'proposal-unrelated',
-    '{}',
-    JSON.stringify({ originalSourceFileId: 'root-original' }),
-  );
-  insertRecord.run('unrelated-direct', 'other-original', '{}', '{}');
-  db.prepare(
-    "UPDATE source_records SET provider_id='reviewed-source' WHERE id IN ('current','history')",
-  ).run();
+  const { db } = fixture(t, true);
+  transaction(db, () => {
+    db.exec(
+      "INSERT INTO providers VALUES('reviewed-source','Fictional Reviewed Vision'),('file-source','Fictional Acquisition Service')",
+    );
+    const insertFile = db.prepare(
+      'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+    );
+    registerIntakeFile(db, {
+      id: 'root-original',
+      providerId: 'file-source',
+      path: 'fictional/root.png',
+      sha256: 'a'.repeat(64),
+      size: 10,
+      mimeType: 'image/png',
+      kind: 'intake_original',
+      coverage: 'unknown',
+      details: { intake: {} },
+    });
+    db.prepare("UPDATE source_files SET provider_id='file-source' WHERE id='root-original'").run();
+    insertFile.run(
+      'proposal-current',
+      'fictional/current.jsonl',
+      'current-hash',
+      20,
+      'intake_proposal',
+      JSON.stringify({ originalSourceFileId: 'root-original' }),
+    );
+    insertFile.run(
+      'proposal-history',
+      'fictional/history.jsonl',
+      'history-hash',
+      20,
+      'intake_proposal',
+      JSON.stringify({ originalSourceFileId: 'root-original' }),
+    );
+    registerIntakeFile(db, {
+      id: 'other-original',
+      providerId: 'file-source',
+      path: 'fictional/other.png',
+      sha256: 'b'.repeat(64),
+      size: 10,
+      mimeType: 'image/png',
+      kind: 'intake_original',
+      coverage: 'unknown',
+      details: { intake: {} },
+    });
+    insertFile.run(
+      'proposal-unrelated',
+      'fictional/unrelated.jsonl',
+      'unrelated-hash',
+      20,
+      'intake_proposal',
+      JSON.stringify({ originalSourceFileId: 'other-original' }),
+    );
+    const insertRecord = db.prepare(
+      'INSERT INTO source_records(id,source_file_id,raw_json,locator_json) VALUES(?,?,?,?)',
+    );
+    insertRecord.run('direct', 'root-original', '{}', '{}');
+    insertRecord.run(
+      'current',
+      'proposal-current',
+      '{}',
+      JSON.stringify({ originalSourceFileId: 'root-original' }),
+    );
+    insertRecord.run(
+      'history',
+      'proposal-history',
+      '{}',
+      JSON.stringify({ originalSourceFileId: 'root-original' }),
+    );
+    insertRecord.run(
+      'spoofed-locator',
+      'proposal-unrelated',
+      '{}',
+      JSON.stringify({ originalSourceFileId: 'root-original' }),
+    );
+    insertRecord.run('unrelated-direct', 'other-original', '{}', '{}');
+    db.prepare(
+      "UPDATE source_records SET provider_id='reviewed-source' WHERE id IN ('current','history')",
+    ).run();
+  });
   setVisibility(db, 'source', 'history', { archived: true, version: 0 });
 
   const visible = sourceRecords(db, params({ originalSourceFileId: 'root-original', limit: '1' }));
@@ -266,7 +286,7 @@ test('visibility mutations enforce origin/profile boundaries and stable archived
   assert.equal((await fetch(base + '/visibility/note/missing')).status, 404);
 });
 test('portable rebuild preserves archive history and immutable links without the working database', (t) => {
-  const { db, root, paths } = fixture(t);
+  const { db, root } = fixture(t);
   attachPersonalDurability(db, { root, profileId: 'cedar' });
   const draft = createNote(db, { kind: 'historical', title: 'Visit', content: 'Frozen' }),
     note = finishNote(db, draft.id, { ...draft });
@@ -280,14 +300,10 @@ test('portable rebuild preserves archive history and immutable links without the
   setVisibility(db, 'note', note.id, { archived: true, version: 2 });
   const expected = visibilityState(db, 'note', note.id);
   exportCuration(db, root, 'cedar');
-  for (const kind of ['personal', 'curation'] as const) {
-    const pointer = JSON.parse(readFileSync(resolve(paths[kind], 'current.json'), 'utf8'));
-    const generation = JSON.parse(readFileSync(resolve(paths[kind], pointer.file), 'utf8'));
-    assert.equal(Object.hasOwn(generation.tables, 'visibility_events'), kind === 'personal');
-  }
   db.close();
   const rebuilt = rebuildProfile(root, 'cedar', resolve(root, 'rebuilt')),
     restored = openDatabase(rebuilt.database, 'cedar');
+  attachPersonalDurability(restored, { root: resolve(root, 'rebuilt'), profileId: 'cedar' });
   try {
     assert.deepEqual(visibilityState(restored, 'note', note.id), expected);
     assert.equal(getNote(restored, linked.id).links[0]!.archived, true);

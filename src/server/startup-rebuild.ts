@@ -14,7 +14,9 @@ import { resolve, relative, isAbsolute, dirname, basename } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { BinaryLike } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { REPO_ROOT, LATEST_SCHEMA_VERSION } from './database.ts';
+import { REPO_ROOT, LATEST_SCHEMA_VERSION, openDatabase } from './database.ts';
+import { hasContributorAuthority } from './contributor-record-storage.ts';
+import { rebuildContributorDatabase, selectedContributorHead } from './contributor-durability.ts';
 import { profilePaths, profileOriginal } from './profile-storage.ts';
 import {
   loadPortable,
@@ -23,6 +25,7 @@ import {
   durableWrite,
   syncDirectory,
   publishedPersonalLineage,
+  logicalDatabaseHash,
 } from './portable.ts';
 import { listChats } from './assistant-journal.ts';
 
@@ -98,6 +101,7 @@ export interface StartupProfileMetric {
   totalMs?: number;
   personal?: GenerationManifest;
   curation?: GenerationManifest;
+  recordHead?: string;
   mappings?: MappingVersion;
   acceptedSourcesSha256?: string;
   inputBytes?: number;
@@ -200,6 +204,10 @@ export function validateDataDirectory(
   for (const profileId of profileIds ||
     readProfileRegistry(root).profiles.map((p: { id: string }) => p.id)) {
     const paths = profilePaths(root, profileId);
+    if (hasContributorAuthority(root, profileId)) {
+      selectedContributorHead(root, profileId);
+      continue;
+    }
     for (const kind of ['personal', 'curation'] as const)
       if (!existsSync(resolve(paths[kind], 'current.json')))
         throw new Error(
@@ -355,10 +363,23 @@ export function rebuildStartup({
     for (const profileId of profileIds!) {
       currentProfile = profileId;
       announce('recover');
-      recoverPendingProfile(root, profileId);
+      if (!hasContributorAuthority(root, profileId)) recoverPendingProfile(root, profileId);
     }
+    const journalPins = new Map(
+      profileIds!
+        .filter((id) => hasContributorAuthority(root, id))
+        .map((id) => [
+          id,
+          {
+            head: selectedContributorHead(root, id),
+            mappings: mappingVersion(root, id),
+          },
+        ]),
+    );
     const pinned = new Map<string, ProfileInputPins>(
-      profileIds!.map((profileId) => [profileId, pinProfileInputs(root, profileId)]),
+      profileIds!
+        .filter((id) => !journalPins.has(id))
+        .map((profileId) => [profileId, pinProfileInputs(root, profileId)]),
     );
     for (const profileId of profileIds!) {
       currentProfile = profileId;
@@ -379,6 +400,35 @@ export function rebuildStartup({
         announce(name);
       };
       phase('read_validate');
+      const journal = journalPins.get(profileId);
+      if (journal) {
+        phase('record_rebuild');
+        const database = resolve(staged, `${profileId}.sqlite`);
+        rebuildContributorDatabase(database, root, profileId);
+        const db = openDatabase(database, profileId);
+        try {
+          Object.assign(activeMetric, {
+            outcome: 'success',
+            recordHead: journal.head,
+            mappings: journal.mappings,
+            totalMs: performance.now() - profileStart,
+            logicalSha256: logicalDatabaseHash(db),
+            databaseBytes: statSync(database).size,
+            chats: listChats(root, profileId).length,
+            peakMemoryBytes: process.resourceUsage().maxRSS * 1024,
+          });
+        } finally {
+          db.close();
+        }
+        if (
+          selectedContributorHead(root, profileId) !== journal.head ||
+          JSON.stringify(mappingVersion(root, profileId)) !== JSON.stringify(journal.mappings)
+        )
+          throw Error('Contributor selected inputs changed during startup');
+        phases.record_rebuild = performance.now() - phaseStart;
+        activeMetric = null;
+        continue;
+      }
       const portable = (loadPortable as unknown as LoadPortable)(root, profileId, pins);
       let historyBytes = 0,
         historyGenerations = 0;

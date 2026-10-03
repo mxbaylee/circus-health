@@ -1,8 +1,8 @@
 # Record journal foundation
 
 `record-versions.ts` provides the approved append-only record format behind an
-injected unlocked vault interface. This is an opt-in replacement for the legacy
-portable snapshot writer; it does not itself implement encryption, credential
+injected unlocked vault interface. This is the accepted-record format used by the encrypted runtime and the default
+contributor durability backend; it does not itself implement encryption, credential
 management, filesystem locking, backups, or the history/restoration HTTP API.
 
 ## Vault interface
@@ -35,8 +35,16 @@ The callback must have access to retained original bytes during reconstruction.
 The compatibility entrypoint is
 `attachPersonalDurability(db, {root, profileId, recordStorage: storage, verifyReferences})`.
 Its status and `exportCuration` use the journal without publishing personal or
-clinical snapshots. Existing legacy startup/backup functions still require their
-legacy inputs; the encrypted runtime must call the record lifecycle above.
+clinical snapshots. Without `recordStorage`, this entrypoint selects the
+[contributor filesystem journal](../../docs/data/contributor-record-authority.md)
+by default. Contributor startup, backup and rebuild retain and select its head,
+immutable objects and sibling `record-authority.json` selector; missing selected
+authority cannot fall back to old portable generations. Explicit
+`portableSnapshots: true` retains the separate portable-format facility only
+when no record authority/history is selected. Portable-only archive recovery
+continues to require its supported original format inputs; it is not an
+automatic journal migration or fallback. The encrypted runtime uses the record
+lifecycle above.
 
 Every existing `transaction(db, fn)` captures changed row identities with temporary
 SQLite triggers, then appends complete versions for only those records plus the

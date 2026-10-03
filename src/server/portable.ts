@@ -1,6 +1,13 @@
 import { resolveClinicalReference } from './clinical-references.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { validatePortableIntakeState } from './intake-state-portable.ts';
+import {
+  attachContributorDurability,
+  rebuildContributorDatabase,
+  copyContributorAuthority,
+  selectedContributorHead,
+} from './contributor-durability.ts';
+import { hasContributorAuthority } from './contributor-record-storage.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   openSync,
@@ -146,6 +153,8 @@ export interface AttachPersonalDurabilityOptions {
   writer?: DurableWriter;
   journalWriter?: DurableWriter;
   initialize?: boolean;
+  /** Explicit standalone legacy portable-format facility; never runtime fallback. */
+  portableSnapshots?: boolean;
   recordStorage?: RecordStorage;
   verifyReferences?: (versions: DurableRecordVersion[]) => void;
 }
@@ -187,7 +196,7 @@ const internalMeta = (key: string): boolean =>
 const tableNames = (db: Database): string[] =>
   db
     .prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_intake_lookup_*' AND name NOT GLOB '__record_source_text_*' ORDER BY name",
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_*' ORDER BY name",
     )
     .all()
     .map((r) => r.name as string);
@@ -577,6 +586,7 @@ export function attachPersonalDurability(
     writer,
     journalWriter = durableWrite,
     initialize = true,
+    portableSnapshots = false,
     recordStorage,
     verifyReferences,
   }: AttachPersonalDurabilityOptions = {},
@@ -584,6 +594,14 @@ export function attachPersonalDurability(
   checkOwner(db, profileId as string);
   if (recordStorage)
     return attachRecordDurability(db, { profileId, storage: recordStorage, verifyReferences });
+  if (!portableSnapshots)
+    return attachContributorDurability(db, root as string, profileId as string, initialize);
+  if (
+    recordDurabilityStatus(db) ||
+    hasContributorAuthority(root as string, profileId as string) ||
+    db.prepare("SELECT 1 FROM sqlite_schema WHERE name='__record_state'").get()
+  )
+    throw Error('Selected record authority cannot attach a second portable publisher');
   ensureProfileDirectories(root as string, profileId as string);
   config.set(db, {
     root,
@@ -751,6 +769,12 @@ export function recoverPendingProfile(
 ): DurableIntent | null {
   const paths = profilePaths(root, profileId),
     pendingPath = resolve(paths.personal, 'pending.json');
+  if (hasContributorAuthority(root, profileId)) {
+    selectedContributorHead(root, profileId);
+    if (existsSync(pendingPath))
+      throw Error('Portable recovery intent conflicts with selected record authority');
+    return null;
+  }
   if (!existsSync(pendingPath)) return null;
   const intent = JSON.parse(readFileSync(pendingPath, 'utf8')) as DurableIntent;
   if (intent.format !== 'circus-health-durable-intent-v1' || intent.profileId !== profileId)
@@ -932,11 +956,19 @@ export function writePortableSources(
   checkOwner(db, profileId);
   const paths = ensureProfileDirectories(outputRoot, profileId);
   const personal = personalSnapshot(db, profileId);
-  const mappings = copyProfileMappings(sourceRoot, profileId, outputRoot);
-  const retained = copyRetainedCurationHistory(sourceRoot, profileId, outputRoot);
-  const history = copyPublishedPersonalHistory(sourceRoot, profileId, outputRoot, {
-    maxRevision: personal.revision,
-  });
+  const sameRoot = resolve(sourceRoot) === resolve(outputRoot);
+  const mappings = sameRoot ? [] : copyProfileMappings(sourceRoot, profileId, outputRoot);
+  const retained = sameRoot
+    ? { paths: [] }
+    : copyRetainedCurationHistory(sourceRoot, profileId, outputRoot);
+  const history = sameRoot
+    ? {
+        files: [],
+        current: publishedPersonalLineage(sourceRoot, profileId).next().value?.manifest ?? null,
+      }
+    : copyPublishedPersonalHistory(sourceRoot, profileId, outputRoot, {
+        maxRevision: personal.revision,
+      });
   personal.history = { format: 'circus-health-personal-lineage-v1', previous: history.current };
   const curation = curationSnapshot(db, sourceRoot, profileId);
   const manifests: Array<[PortableKind, PortableManifest]> = [
@@ -1122,7 +1154,7 @@ export function exportCuration(db: Database, root: string, profileId: string) {
     return { profileId, revision: personal.revision, personal, format: personal.format };
   }
   const state = config.get(db);
-  if (!state) attachPersonalDurability(db, { root, profileId });
+  if (!state) attachPersonalDurability(db, { root, profileId, portableSnapshots: true });
   else if (state.root !== root || state.profileId !== profileId)
     throw new Error('Durability storage location mismatch');
   const current = config.get(db)!;
@@ -1320,6 +1352,8 @@ export function loadPortable(
   return { personal, curation, rows, originals };
 }
 export function rebuildProfile(root: string, profileId: string, targetRoot: string) {
+  if (hasContributorAuthority(root, profileId))
+    return rebuildContributorProfile(root, profileId, targetRoot);
   if (existsSync(resolve(profilePaths(root, profileId).personal, 'pending.json')))
     throw new Error('Pending durable changes require recovery before rebuilding');
   if (
@@ -1364,6 +1398,71 @@ export function rebuildProfile(root: string, profileId: string, targetRoot: stri
       database: profilePaths(targetRoot, profileId).database,
       curationHistory: retainedCuration.receipt,
     };
+    durableWrite(
+      resolve(staged, 'rebuild-receipt.json'),
+      Buffer.from(JSON.stringify(result, null, 2) + '\n'),
+    );
+    if (existsSync(targetRoot)) rmdirSync(targetRoot);
+    renameSync(staged, targetRoot);
+    syncDirectory(dirname(targetRoot));
+    return result;
+  } catch (error) {
+    db?.close();
+    rmSync(staged, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function rebuildContributorProfile(root: string, profileId: string, targetRoot: string) {
+  if (
+    resolve(root) === resolve(targetRoot) ||
+    (existsSync(targetRoot) && readdirSync(targetRoot).length)
+  )
+    throw Error('Rebuild target must be new or empty; live storage is never overwritten');
+  const head = selectedContributorHead(root, profileId),
+    staged = targetRoot + '.rebuild-' + randomUUID();
+  const paths = ensureProfileDirectories(staged, profileId);
+  let db: Database | undefined;
+  try {
+    function copyTree(source: string, target: string): void {
+      if (!existsSync(source)) return;
+      const stat = lstatSync(source);
+      if (stat.isDirectory()) {
+        mkdirSync(target, { recursive: true, mode: 0o700 });
+        for (const name of readdirSync(source))
+          copyTree(resolve(source, name), resolve(target, name));
+        syncDirectory(target);
+      } else if (stat.isFile()) durableWrite(target, readFileSync(source));
+      else throw Error('Rebuild original tree contains nonregular files');
+    }
+    for (const kind of ['sources', 'attachments'] as const)
+      copyTree(profilePaths(root, profileId)[kind], paths[kind]);
+    copyContributorAuthority(root, profileId, staged);
+    const rebuilt = rebuildContributorDatabase(paths.database, staged, profileId);
+    db = openDatabase(paths.database, profileId);
+    writePortableSources(db, root, profileId, staged);
+    copyAssistantJournals(root, profileId, staged);
+    copyIntakeBatchJournals(root, profileId, staged);
+    const result = {
+      ...rebuilt,
+      path: targetRoot,
+      database: profilePaths(targetRoot, profileId).database,
+      schemaVersion: databaseSchemaVersion(db),
+      files: Number(db.prepare('SELECT COUNT(*) n FROM source_files').get()!.n),
+      counts: Object.fromEntries(
+        tableNames(db).map((table) => [
+          table,
+          Number(db!.prepare(`SELECT COUNT(*) n FROM ${quote(table)}`).get()!.n),
+        ]),
+      ),
+      logicalSha256: logicalDatabaseHash(db),
+      databaseBytes: statSync(paths.database).size,
+      curationHistory: null,
+    };
+    db.close();
+    db = undefined;
+    if (selectedContributorHead(root, profileId) !== head)
+      throw Error('Contributor authority changed during rebuild');
     durableWrite(
       resolve(staged, 'rebuild-receipt.json'),
       Buffer.from(JSON.stringify(result, null, 2) + '\n'),

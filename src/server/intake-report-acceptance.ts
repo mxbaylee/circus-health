@@ -15,7 +15,7 @@ import {
   flushIntake,
   getIntake,
   intakeTransaction,
-  listIntakes,
+  assertIntakeOwner,
   prepareIntakeImport,
   reviewIntake,
 } from './intake.ts';
@@ -122,7 +122,9 @@ function request(value: unknown): IntakeReportAcceptanceRequest {
   return structuredClone(value) as unknown as IntakeReportAcceptanceRequest;
 }
 export function acceptanceOwner(db: DatabaseSync, profileId: string): void {
-  listIntakes(db, profileId, { limit: 1 });
+  // Preserve the public recovery error before attempting to hydrate an intake
+  // from a projection that is behind a published acceptance.
+  assertIntakeOwner(db, profileId);
   const durability = personalDurabilityStatus(db);
   if (durability.conflicted || (durability.dirty && durability.lastError))
     throw new HttpError(

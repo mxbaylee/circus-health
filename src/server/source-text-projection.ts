@@ -7,6 +7,11 @@ import {
 } from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
+  intakeEnvelopeAuthorityBinding,
+  readIntakeEnvelopeText,
+  type IntakeEnvelopeSource,
+} from './intake-authority.ts';
+import {
   createTextPiecePlan,
   reconstructTextPieces,
   TEXT_PIECE_LIMITS,
@@ -27,11 +32,12 @@ const PREFIX = '__record_source_text_';
 const DIRTY = '__source_text_dirty';
 const OBSOLETE = '__source_text_obsolete';
 const WORK = '__source_text_reference_work';
+const AUTHORITIES = '__source_text_authorities';
 const schemas = {
   state:
     'singleton INTEGER PRIMARY KEY CHECK(singleton=1),format INTEGER NOT NULL,profile_id TEXT NOT NULL',
   heads:
-    'source_id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,source_hash TEXT NOT NULL,details_digest TEXT NOT NULL,head_json TEXT NOT NULL',
+    'source_id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,source_hash TEXT NOT NULL,details_digest TEXT NOT NULL,head_json TEXT NOT NULL,authority_key TEXT,authority_head TEXT',
   contents: 'id TEXT PRIMARY KEY,text TEXT NOT NULL',
   occurrences:
     'source_id TEXT NOT NULL,id TEXT NOT NULL,content_id TEXT NOT NULL,start INTEGER NOT NULL,end INTEGER NOT NULL,PRIMARY KEY(source_id,id)',
@@ -178,6 +184,7 @@ const mark = (id: string) =>
   `INSERT INTO ${DIRTY} SELECT ${id} WHERE NOT EXISTS(SELECT 1 FROM ${DIRTY} WHERE source_id=${id});`;
 function sourceTracking(db: DatabaseSync): void {
   db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${DIRTY}(source_id TEXT PRIMARY KEY);
+    CREATE TEMP TABLE IF NOT EXISTS ${AUTHORITIES}(authority_key TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE);
     CREATE TEMP TABLE IF NOT EXISTS ${OBSOLETE}(id TEXT PRIMARY KEY);
     CREATE TEMP TABLE IF NOT EXISTS ${WORK}(singleton INTEGER PRIMARY KEY,rows_read INTEGER NOT NULL);
     INSERT OR IGNORE INTO ${WORK} VALUES(1,0);
@@ -186,6 +193,12 @@ function sourceTracking(db: DatabaseSync): void {
     CREATE TEMP TRIGGER IF NOT EXISTS __source_text_delete AFTER DELETE ON main.source_files BEGIN ${mark('OLD.id')} END;`);
 }
 function cacheTracking(db: DatabaseSync): void {
+  for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
+    const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
+    db.exec(
+      `CREATE TEMP TRIGGER IF NOT EXISTS __source_text_authority_${op} AFTER ${op} ON main.app_meta BEGIN ${refs.map((ref) => `INSERT INTO ${DIRTY} SELECT source_id FROM ${AUTHORITIES} a WHERE authority_key=${ref}.key AND NOT EXISTS(SELECT 1 FROM ${DIRTY} d WHERE d.source_id=a.source_id);`).join(' ')} END`,
+    );
+  }
   for (const name of ['heads', 'occurrences', 'links'] as const)
     for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
       const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
@@ -259,7 +272,15 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
     db.exec(
       `DROP INDEX IF EXISTS ${PREFIX}content_references; CREATE INDEX ${PREFIX}content_references ON ${table('occurrences')}(content_id,source_id)`,
     );
+  const authorityIndex = db.prepare(`PRAGMA index_info(${PREFIX}authority)`).all();
+  if (authorityIndex.length !== 1 || authorityIndex[0]!.name !== 'authority_key')
+    db.exec(
+      `DROP INDEX IF EXISTS ${PREFIX}authority; CREATE INDEX ${PREFIX}authority ON ${table('heads')}(authority_key)`,
+    );
   cacheTracking(db);
+  db.exec(
+    `DELETE FROM temp.${AUTHORITIES}; INSERT OR IGNORE INTO temp.${AUTHORITIES} SELECT authority_key,source_id FROM ${table('heads')} WHERE authority_key IS NOT NULL`,
+  );
   if (!valid || cold) {
     db.exec(`INSERT OR IGNORE INTO temp.${DIRTY} SELECT id FROM source_files;
       INSERT OR IGNORE INTO temp.${DIRTY} SELECT source_id FROM ${table('heads')};
@@ -284,12 +305,13 @@ function retained(
   connection: Connection,
   id: string,
   profile: string,
+  validateSelection = false,
 ): Retained | null {
   const row = readRows(
     connection,
     db
       .prepare(
-        `SELECT source_id,CASE WHEN typeof(profile_id)='text' AND length(CAST(profile_id AS BLOB))<=1024 THEN profile_id END profile_id,CASE WHEN typeof(source_hash)='text' AND length(CAST(source_hash AS BLOB))<=1024 THEN source_hash END source_hash,CASE WHEN typeof(details_digest)='text' AND length(details_digest)=64 THEN details_digest END details_digest,CASE WHEN typeof(head_json)='text' AND length(CAST(head_json AS BLOB))<=? THEN head_json ELSE NULL END head_json FROM ${table('heads')} WHERE source_id=?`,
+        `SELECT source_id,CASE WHEN typeof(profile_id)='text' AND length(CAST(profile_id AS BLOB))<=1024 THEN profile_id END profile_id,CASE WHEN typeof(source_hash)='text' AND length(CAST(source_hash AS BLOB))<=1024 THEN source_hash END source_hash,CASE WHEN typeof(details_digest)='text' AND length(details_digest)=64 THEN details_digest END details_digest,CASE WHEN typeof(head_json)='text' AND length(CAST(head_json AS BLOB))<=? THEN head_json ELSE NULL END head_json,CASE WHEN authority_key IS NULL OR (typeof(authority_key)='text' AND length(authority_key)<=128) THEN authority_key ELSE '' END authority_key,CASE WHEN authority_head IS NULL OR (typeof(authority_head)='text' AND length(CAST(authority_head AS BLOB))<=4096) THEN authority_head ELSE '' END authority_head FROM ${table('heads')} WHERE source_id=?`,
       )
       .all(TEXT_PIECE_LIMITS.maxHeadBytes, id),
   )[0];
@@ -300,6 +322,17 @@ function retained(
     typeof row.head_json !== 'string'
   )
     corrupt('head binding');
+  if (row.authority_key !== null) {
+    if (
+      typeof row.authority_key !== 'string' ||
+      !row.authority_key ||
+      typeof row.authority_head !== 'string' ||
+      (validateSelection &&
+        db.prepare('SELECT value FROM app_meta WHERE key=?').get(row.authority_key)?.value !==
+          row.authority_head)
+    )
+      corrupt('selected intake head binding');
+  } else if (row.authority_head !== null) corrupt('unexpected intake head binding');
   let head: TextPieceHead;
   try {
     head = JSON.parse(row.head_json as string) as TextPieceHead;
@@ -383,7 +416,14 @@ function authority(db: DatabaseSync, connection: Connection, id: string): Row | 
     !source.sha256
   )
     fail('selected authority is unavailable or exceeds the text bound');
+  const selected = source as unknown as IntakeEnvelopeSource;
+  const binding = intakeEnvelopeAuthorityBinding(db, selected);
+  source.authority_key = binding.key;
+  source.authority_head = binding.head;
+  if (source.kind === 'intake_original') source.details_json = readIntakeEnvelopeText(db, selected);
   const raw = source.details_json as string;
+  if (Buffer.byteLength(raw) > TEXT_PIECE_LIMITS.maxTextBytes)
+    fail('selected authority exceeds the text bound');
   connection.counters.authorityBytes += Buffer.byteLength(raw);
   let value: unknown;
   try {
@@ -415,6 +455,7 @@ function removeSource(
   id: string,
   obsolete: Set<string>,
 ): void {
+  db.prepare(`DELETE FROM temp.${AUTHORITIES} WHERE source_id=?`).run(id);
   for (const row of db
     .prepare(
       `SELECT DISTINCT CASE WHEN typeof(content_id)='text' AND length(content_id)=64 THEN content_id END content_id FROM ${table('occurrences')} WHERE source_id=?`,
@@ -508,12 +549,25 @@ function apply(
     source_hash: source.sha256,
     details_digest: plan.head.digest,
     head_json: JSON.stringify(plan.head),
+    authority_key: source.authority_key,
+    authority_head: source.authority_head,
   };
   if (bytes(head) > TEXT_PIECE_LIMITS.maxRowBytes) fail('source head binding exceeds row bound');
   db.prepare(
-    `INSERT INTO ${table('heads')} VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET profile_id=excluded.profile_id,source_hash=excluded.source_hash,details_digest=excluded.details_digest,head_json=excluded.head_json`,
-  ).run(id, profile, source.sha256!, plan.head.digest, head.head_json);
+    `INSERT INTO ${table('heads')} VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET profile_id=excluded.profile_id,source_hash=excluded.source_hash,details_digest=excluded.details_digest,head_json=excluded.head_json,authority_key=excluded.authority_key,authority_head=excluded.authority_head`,
+  ).run(
+    id,
+    profile,
+    source.sha256!,
+    plan.head.digest,
+    head.head_json,
+    head.authority_key!,
+    head.authority_head!,
+  );
   write(connection, 'heads', head);
+  db.prepare(`DELETE FROM temp.${AUTHORITIES} WHERE source_id=?`).run(id);
+  if (head.authority_key !== null)
+    db.prepare(`INSERT INTO temp.${AUTHORITIES} VALUES(?,?)`).run(head.authority_key!, id);
 }
 function reconcile(
   db: DatabaseSync,
@@ -542,6 +596,8 @@ function reconcile(
   if (
     before &&
     before.row.source_hash === source.sha256 &&
+    before.row.authority_key === source.authority_key &&
+    before.row.authority_head === source.authority_head &&
     before.row.details_digest === digest &&
     before.text === raw
   )
@@ -727,7 +783,7 @@ export function readSourceTextProjection(
   if (typeof sourceId !== 'string' || !sourceId || Buffer.byteLength(sourceId) > 1024)
     fail('source identity exceeds binding bound');
   return current(db, options, (connection, profile) => {
-    const selected = retained(db, connection, sourceId, profile);
+    const selected = retained(db, connection, sourceId, profile, true);
     if (!selected) return fail('selected source is missing');
     if (options.limits) {
       const result = reconstructTextPieces(selected.snapshot, { limits: options.limits });

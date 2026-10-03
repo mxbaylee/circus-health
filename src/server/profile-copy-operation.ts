@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { HttpError } from './database.ts';
 import { durableWrite, type CompleteLoadedPortable } from './portable.ts';
 import { validProfileId } from './profiles.ts';
+import { selectedContributorHead } from './contributor-durability.ts';
 
 interface SelectedCopyHeads {
   personal: CompleteLoadedPortable['personal']['manifest'];
@@ -17,6 +18,7 @@ export interface ProfileCopyOperation {
   name: string;
   createdAt: string;
   heads?: SelectedCopyHeads;
+  recordHead?: string;
   published?: true;
   publicationAttempted?: true;
 }
@@ -66,6 +68,7 @@ export function readCopyOperation(
     (value!.published !== undefined && value!.published !== true) ||
     (value!.publicationAttempted !== undefined && value!.publicationAttempted !== true) ||
     ((value!.published || value!.publicationAttempted) && !value!.heads) ||
+    (value!.recordHead !== undefined && typeof value!.recordHead !== 'string') ||
     (value!.heads !== undefined &&
       (!value!.heads.personal ||
         !value!.heads.curation ||
@@ -99,20 +102,26 @@ export function writeCopyOperation(root: string, operation: ProfileCopyOperation
 export function selectCopyHeads(
   operation: ProfileCopyOperation,
   portable: CompleteLoadedPortable,
+  root?: string,
 ): ProfileCopyOperation {
   return {
     ...operation,
     heads: { personal: portable.personal.manifest, curation: portable.curation.manifest },
+    ...(root ? { recordHead: selectedContributorHead(root, operation.targetProfileId) } : {}),
   };
 }
 export function verifyCopyHeads(
   operation: ProfileCopyOperation,
   portable: CompleteLoadedPortable,
+  root?: string,
 ): void {
   if (
     !operation.heads ||
     JSON.stringify(operation.heads.personal) !== JSON.stringify(portable.personal.manifest) ||
-    JSON.stringify(operation.heads.curation) !== JSON.stringify(portable.curation.manifest)
+    JSON.stringify(operation.heads.curation) !== JSON.stringify(portable.curation.manifest) ||
+    (root &&
+      (!operation.recordHead ||
+        operation.recordHead !== selectedContributorHead(root, operation.targetProfileId)))
   )
     fail('Published private copy conflicts with its prepared operation; retain it for recovery');
 }

@@ -1,3 +1,5 @@
+import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -19,6 +21,7 @@ test('retained extraction exposes its original separately and keeps absent evide
   const root = mkdtempSync(resolve(tmpdir(), 'circus-original-links-'));
   const profileId = 'orchid';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -63,17 +66,19 @@ test('retained extraction exposes its original separately and keeps absent evide
   assert.notEqual(record.originalFile.id, record.extractionFile.id);
   assert.match(record.originalFile.contentUrl, /\/content$/);
   assert.equal(record.originalMissing, false);
-  db.prepare('UPDATE source_records SET locator_json=? WHERE id=?').run(
-    JSON.stringify({ originalSourceFileId: 'missing-fictional-member' }),
-    id,
+  fixtureTransaction(db, () =>
+    db
+      .prepare('UPDATE source_records SET locator_json=? WHERE id=?')
+      .run(JSON.stringify({ originalSourceFileId: 'missing-fictional-member' }), id),
   );
   const missing = getSourceRecord(db, id);
   assert.equal(missing.originalMissing, true);
   assert.equal(missing.originalFile, null);
   assert.equal(missing.extractionFile?.id, record.extractionFile.id);
-  db.prepare('UPDATE source_records SET locator_json=? WHERE id=?').run(
-    JSON.stringify({ originalSourceFileId: original.id }),
-    id,
+  fixtureTransaction(db, () =>
+    db
+      .prepare('UPDATE source_records SET locator_json=? WHERE id=?')
+      .run(JSON.stringify({ originalSourceFileId: original.id }), id),
   );
 
   // A real metadata edit remains separate from immutable acquisition attribution.

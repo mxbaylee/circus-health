@@ -1,3 +1,6 @@
+import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -50,6 +53,7 @@ function fixture(t: TestContext, scoped = false) {
     profileId = 'orchid',
     paths = ensureProfileDirectories(root, profileId),
     db = openDatabase(paths.database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   if (scoped) {
     const self = getNote(db, 'person-note:self');
     saveNote(db, self.id, {
@@ -352,6 +356,7 @@ for (const [kind, set] of Object.entries(correctionSets) as [
     const after = f.db.prepare(`SELECT * FROM ${table}`).all(),
       rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'rebuilt')),
       db = openDatabase(rebuilt.database, f.profileId);
+    attachPersonalDurability(db, { root: resolve(f.root, 'rebuilt'), profileId: f.profileId });
     try {
       assert.deepEqual(db.prepare(`SELECT * FROM ${table}`).all(), after);
       assert.equal(
@@ -450,6 +455,7 @@ test('assistant previews both originals, preserves conflicting assertions for al
   assert.equal(relationships[0].status, 'proposed');
   const rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'rebuilt')),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: resolve(f.root, 'rebuilt'), profileId: f.profileId });
   try {
     assert.deepEqual(db.prepare('SELECT * FROM record_relationships').all(), relationships);
     assert.deepEqual(db.prepare('SELECT * FROM observations ORDER BY id').all(), rows);
@@ -501,6 +507,7 @@ test('intake paired evidence remains unresolved on its delivery, survives rebuil
   );
   const rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'rebuilt')),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: resolve(f.root, 'rebuilt'), profileId: f.profileId });
   try {
     const again = typedReviewIntake(db, f.root, f.profileId, intake.id);
     assert.equal(again.records[0].comparisons[0].previousDecision!.outcome, 'unresolved');
@@ -690,6 +697,7 @@ test('repeated locators require a reviewed pair, retain one clinical entity, reb
   const rebuiltRoot = resolve(f.root, 'repeat-rebuilt');
   const rebuilt = rebuildProfile(f.root, f.profileId, rebuiltRoot);
   const rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(rebuiltDb, { root: rebuiltRoot, profileId: f.profileId });
   try {
     assert.equal(rebuiltDb.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
     assert.equal(
@@ -983,7 +991,7 @@ test('terminal keep original retains an exact reviewed same-event occurrence thr
           ...terminalInput,
           operationId: 'fictional-terminal-corrupt-target',
         }),
-      /Original checksum failed/,
+      { code: 'SOURCE_CHANGED' },
     );
   } finally {
     writeFileSync(targetPath, targetBytes);
@@ -1047,6 +1055,7 @@ test('terminal keep original retains an exact reviewed same-event occurrence thr
   const rebuiltRoot = resolve(f.root, 'terminal-repeat-rebuilt');
   const rebuilt = rebuildProfile(f.root, f.profileId, rebuiltRoot);
   const rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(rebuiltDb, { root: rebuiltRoot, profileId: f.profileId });
   try {
     assert.deepEqual(rebuiltDb.prepare('SELECT * FROM observations').get(), acceptedObservation);
     assert.deepEqual(
@@ -1164,11 +1173,13 @@ test('actual encrypted profile stores correction and pair histories and rebuilds
     1,
   );
   const deliveries = state.db
-    .prepare("SELECT details_json FROM source_files WHERE kind='intake_original'")
+    .prepare("SELECT id FROM source_files WHERE kind='intake_original'")
     .all();
   assert.ok(
     deliveries.every((row) =>
-      JSON.parse(String(row.details_json)).intake.workflow.questions.some(
+      JSON.parse(
+        readIntakeEnvelopeText(state.db, { id: String(row.id) })!,
+      ).intake.workflow.questions.some(
         (question: { field?: string; status?: string }) =>
           question.field === 'duplicate' && question.status === 'unanswered',
       ),
@@ -1201,24 +1212,32 @@ test('accepted procedure becomes a lab with stable identity, original references
       reason: 'The retained report identifies a creatinine result.',
     };
   const source = f.db.prepare('SELECT * FROM source_records WHERE id=?').get(row.source_record_id)!;
-  f.db
-    .prepare(
-      "INSERT INTO notes(id,kind,status,title,created_at,updated_at) VALUES('finished','historical','draft','Fictional history','2025-01','2025-01')",
-    )
-    .run();
-  f.db
-    .prepare(
-      "INSERT INTO note_links(id,note_id,target_type,target_id) VALUES('retained-link','finished','procedure',?)",
-    )
-    .run(row.id);
-  f.db
-    .prepare("UPDATE notes SET status='finished',finished_at='2025-01' WHERE id='finished'")
-    .run();
-  f.db
-    .prepare(
-      "INSERT INTO visibility_events VALUES('prior-visibility','procedure',?,1,1,'2025-01','Profile owner')",
-    )
-    .run(row.id);
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare(
+        "INSERT INTO notes(id,kind,status,title,created_at,updated_at) VALUES('finished','historical','draft','Fictional history','2025-01','2025-01')",
+      )
+      .run(),
+  );
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare(
+        "INSERT INTO note_links(id,note_id,target_type,target_id) VALUES('retained-link','finished','procedure',?)",
+      )
+      .run(row.id),
+  );
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare("UPDATE notes SET status='finished',finished_at='2025-01' WHERE id='finished'")
+      .run(),
+  );
+  fixtureTransaction(f.db, () =>
+    f.db
+      .prepare(
+        "INSERT INTO visibility_events VALUES('prior-visibility','procedure',?,1,1,'2025-01','Profile owner')",
+      )
+      .run(row.id),
+  );
   const p = previewCorrection(f.db, input),
     request = { ...input, previewToken: p.token, version: p.version, operationId: 'kind-change' };
   assert.equal(p.before.kind, 'procedure');
@@ -1283,6 +1302,10 @@ test('accepted procedure becomes a lab with stable identity, original references
   assert.equal(changedReview.records[0].classification, 'addition');
   const rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'reclassified-rebuild')),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, {
+    root: resolve(f.root, 'reclassified-rebuild'),
+    profileId: f.profileId,
+  });
   try {
     assert.deepEqual(
       db.prepare('SELECT * FROM observations').all(),
@@ -1466,6 +1489,7 @@ test('future classification rule explicitly scopes provider/system/kind/label, p
   );
   const rebuilt = rebuildProfile(f.root, f.profileId, resolve(f.root, 'rule-rebuild')),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: resolve(f.root, 'rule-rebuild'), profileId: f.profileId });
   try {
     const repeat = typedReviewIntake(db, f.root, f.profileId, future.id);
     assert.equal(repeat.records[0].classification, 'duplicate');
@@ -1594,6 +1618,10 @@ test('actual reviewed medication import saves Inactive system default and repeat
       resolve(f.root, 'medication-default-rebuild'),
     ),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, {
+    root: resolve(f.root, 'medication-default-rebuild'),
+    profileId: f.profileId,
+  });
   try {
     assert.deepEqual(
       db.prepare('SELECT * FROM medication_preferences WHERE medication_id=?').get(row.id)!,

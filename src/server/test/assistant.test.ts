@@ -1,3 +1,5 @@
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
 import { ModelToolValidationError } from '../model-tool-validation.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import { fictionalModel } from './fictional-model.ts';
@@ -24,11 +26,11 @@ import { transaction } from '../database.ts';
 import { createAssistant } from '../assistant.ts';
 import { readChat, listChats, writeChat } from '../assistant-journal.ts';
 import { createNote, getNote, saveNote, finishNote } from '../notes.ts';
+import { noteHistory } from '../note-history.ts';
 import { ensureProfileDirectories, profilePaths } from '../profile-storage.ts';
 import {
   attachPersonalDurability,
   exportCuration,
-  publishedPersonalLineage,
   personalDurabilityStatus,
   rebuildProfile,
 } from '../portable.ts';
@@ -285,7 +287,7 @@ test('assistant package tools keep large inventory and JSON reads bounded and ro
   const roles = await call(bridge, 'intake_package', {
     id: item.id,
     action: 'plan_roles',
-    version: plan.version,
+    version: getIntake(db, root, 'cedar', item.id).version,
     planId: plan.planId,
     operationId: 'fictional-roles',
     roles: [
@@ -1126,6 +1128,7 @@ test('a new provider request restores the truthful waiting phase without manufac
   const f = await linkedFictionalOpticalConversion(t);
   const invalid = {
     id: f.item.id,
+    sourceTextRevisionId: f.sourceTextRevisionId,
     version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
     jsonlText: JSON.stringify(fictionalOpticalPeopleEnvelope()),
     summary: 'Fictional rejected structure before another provider request',
@@ -1211,7 +1214,11 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
       },
     });
   await call(bridge, 'intake_read', { id: item.id, page: 1 });
+  let sourceTextRevisionId = (
+    await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
+  ).revisionId;
   await call(bridge, 'intake_propose', {
+    sourceTextRevisionId,
     id: item.id,
     version: getIntake(f.db, f.root, 'cedar', item.id).version,
     jsonlText: row(1),
@@ -1221,7 +1228,11 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
   await tick();
   bridge = f.bridges[1];
   assert.equal(bridge.prompt.conversion.nextReadWindows[0].args.page, 2);
+  sourceTextRevisionId = (
+    await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
+  ).revisionId;
   const batch = () => ({
+    sourceTextRevisionId,
     id: item.id,
     version: getIntake(f.db, f.root, 'cedar', item.id).version,
     planId: plan.id,
@@ -1244,6 +1255,9 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
   assert.equal(required(chat.reading).reason, null);
   assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
   await call(bridge, 'intake_read', { id: item.id, page: 2 });
+  sourceTextRevisionId = (
+    await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
+  ).revisionId;
   const wrongUnit = batch();
   wrongUnit.operationId = 'fictional-wrong-unit-after-read';
   wrongUnit.coverage[0].unitId = 'unit:fictional-wrong';
@@ -2167,7 +2181,9 @@ test('default PDF units require every listed page and leave later targets resuma
     },
     coverage: { status: 'partial', notes: ['No clinical completeness claim is made.'] },
   });
+  let sourceTextRevisionId: string | undefined;
   const batch = (unitIndex: number, operationId: string) => ({
+    sourceTextRevisionId,
     id: item.id,
     version: getIntake(f.db, f.root, 'cedar', item.id).version,
     planId: plan.id,
@@ -2187,6 +2203,9 @@ test('default PDF units require every listed page and leave later targets resuma
   );
   await call(bridge, 'intake_read', { id: item.id, page: 1 });
   await call(bridge, 'intake_read', { id: item.id, page: 2 });
+  sourceTextRevisionId = (
+    await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
+  ).revisionId;
   const firstSaved = await call(bridge, 'intake_batch', batch(0, 'fictional-target-one'));
   assert.equal(firstSaved.pendingWorkCount, 1);
   item = getIntake(f.db, f.root, 'cedar', item.id);
@@ -2201,6 +2220,9 @@ test('default PDF units require every listed page and leave later targets resuma
     hasCode(error, 'CONVERSION_COVERAGE_PENDING'),
   );
   await call(bridge, 'intake_read', { id: item.id, page: 3 });
+  sourceTextRevisionId = (
+    await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
+  ).revisionId;
   const secondSaved = await call(bridge, 'intake_batch', batch(1, 'fictional-target-two'));
   assert.equal(secondSaved.pendingWorkCount, 0);
   item = getIntake(f.db, f.root, 'cedar', item.id);
@@ -2243,6 +2265,7 @@ test('assistant accounts for one exact image only after a visual read and durabl
   const request = {
     id: image.id,
     version: created.version,
+    sourceTextRevisionId: undefined as string | undefined,
     planId: plan.id,
     operationId: 'fictional-image-batch',
     summary: 'The exact fictional image was inspected.',
@@ -2273,6 +2296,10 @@ test('assistant accounts for one exact image only after a visual read and durabl
   );
   const read = await call(bridge, 'intake_read', { id: image.id });
   assert.match(read.imageContent, /^data:image\/png;base64,/);
+  request.sourceTextRevisionId = (
+    await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: image.id })
+  ).revisionId;
+  request.version = getIntake(db, root, 'cedar', image.id).version;
   const saved = await call(bridge, 'intake_batch', request);
   assert.equal(saved.pendingWorkCount, 0);
   let accounting = listIntakeReportQueue(db, root, 'cedar').activity.readingAccounting!;
@@ -2362,7 +2389,11 @@ test('fresh top-level image read prepares the exact plan and preserves later bat
   );
   assert.ok(f.journalReasons.includes('conversion-image-plan-prepared'));
 
+  const sourceTextRevisionId = (
+    await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: current.id })
+  ).revisionId;
   const saved = await call(bridge, 'intake_batch', {
+    sourceTextRevisionId,
     id: current.id,
     version: prepared.version,
     planId: prepared.planId,
@@ -2417,7 +2448,12 @@ test('fresh top-level image read prepares the exact plan and preserves later bat
   );
   assert.deepEqual(
     f.chat.operations.map(({ tool }) => tool),
-    ['health_intake_read', 'health_intake_batch', 'health_intake_question'],
+    [
+      'health_intake_read',
+      'health_intake_source_text',
+      'health_intake_batch',
+      'health_intake_question',
+    ],
   );
   complete(bridge);
   assert.equal(f.chat.status, 'idle');
@@ -2426,6 +2462,7 @@ test('fresh top-level image read prepares the exact plan and preserves later bat
   const destination = resolve(f.root, 'rebuilt-image-bootstrap');
   rebuildProfile(f.root, 'cedar', destination);
   const rebuilt = openDatabase(profilePaths(destination, 'cedar').database, 'cedar');
+  attachPersonalDurability(rebuilt, { root: destination, profileId: 'cedar' });
   try {
     const recovered = getIntake(rebuilt, destination, 'cedar', f.item.id);
     const recoveredPlan = required(recovered.workflow).plans[0]!;
@@ -2486,7 +2523,11 @@ test('concurrent fresh image reads share one exact host plan receipt', async (t)
   );
   const current = getIntake(f.db, f.root, 'cedar', f.item.id);
   const plan = required(current.workflow).plans[0]!;
-  assert.equal(current.version, before.version + 1);
+  assert.equal(
+    current.version,
+    before.version + 3,
+    'one plan plus one extraction and its material source pin',
+  );
   assert.equal(required(current.workflow).plans.length, 1);
   assert.equal(plan.units[0]?.status, 'pending');
   assert.equal(
@@ -2499,6 +2540,65 @@ test('concurrent fresh image reads share one exact host plan receipt', async (t)
   complete(f.bridges[0]);
 });
 
+test('automatic source capture shares publication while retaining each reader cancellation', async (t) => {
+  const { captureIntakeSourceTextForRead } = await import('../intake-evidence.ts');
+  const f = fixture(t);
+  const item = uploadIntake(f.db, f.root, 'cedar', {
+    filename: 'fictional-shared-capture.txt',
+    bytes: Buffer.from('One fictional source shared by two independent readers.'),
+  });
+  let cancelled = false;
+  let cancelledCallbacks = 0;
+  const transitions: unknown[] = [];
+  const context = { db: f.db, root: f.root, profileId: 'cedar', id: item.id, modelContext: true };
+  const first = captureIntakeSourceTextForRead({
+    ...context,
+    assertRunning() {
+      if (cancelled) throw Error('Fictional first reader cancelled');
+    },
+    onSourceTextCaptured() {
+      cancelledCallbacks++;
+    },
+  });
+  const second = captureIntakeSourceTextForRead({
+    ...context,
+    onSourceTextCaptured(transition) {
+      transitions.push(transition);
+    },
+  });
+  cancelled = true;
+  await assert.rejects(first, /first reader cancelled/);
+  await second;
+  assert.equal(cancelledCallbacks, 0);
+  assert.equal(transitions.length, 1);
+  const current = getIntake(f.db, f.root, 'cedar', item.id);
+  await captureIntakeSourceTextForRead({
+    ...context,
+    onSourceTextCaptured(transition) {
+      transitions.push(transition);
+    },
+  });
+  assert.equal(transitions.length, 1, 'completed capture leaves no repeated publication');
+  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).version, current.version);
+
+  const retry = uploadIntake(f.db, f.root, 'cedar', {
+    filename: 'fictional-cancelled-capture.txt',
+    bytes: Buffer.from('A cancelled capture can be attempted by a new reader.'),
+  });
+  let retryCancelled = false;
+  const abandoned = captureIntakeSourceTextForRead({
+    ...context,
+    id: retry.id,
+    assertRunning() {
+      if (retryCancelled) throw Error('Fictional all readers cancelled');
+    },
+  });
+  retryCancelled = true;
+  await assert.rejects(abandoned, /all readers cancelled/);
+  await captureIntakeSourceTextForRead({ ...context, id: retry.id });
+  assert.ok(getIntake(f.db, f.root, 'cedar', retry.id).version > retry.version);
+});
+
 test('retained image bootstrap requires the exact host create-plan receipt fingerprint', async (t) => {
   const f = linkedFreshImage(t);
   await tick();
@@ -2509,18 +2609,11 @@ test('retained image bootstrap requires the exact host create-plan receipt finge
     id.startsWith('host-image-plan:'),
   )!;
   assert.equal(intakePlanPinsCurrent(f.db, 'cedar', current.id, plan.id, operationId), true);
-  const details = JSON.parse(
-    sqlText(
-      f.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(current.id),
-      'details_json',
-    ),
-  );
+  const details = JSON.parse(readIntakeEnvelopeText(f.db, { id: current.id })!);
   details.intake.workflow.operations.find(
     ({ id }: { id: string }) => id === operationId,
   ).fingerprint = 'independently-fictional-wrong-fingerprint';
-  f.db
-    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-    .run(JSON.stringify(details), current.id);
+  writeIntakeFixtureEnvelope(f.db, current.id, details);
   assert.equal(intakePlanPinsCurrent(f.db, 'cedar', current.id, plan.id, operationId), false);
   complete(f.bridges[0]);
 });
@@ -2608,25 +2701,19 @@ test('image bootstrap never replaces plan history or creates a plan for a child 
     required(getIntake(active.db, active.root, 'cedar', active.item.id).workflow).plans.length,
     1,
   );
-  assert.equal(created.version, getIntake(active.db, active.root, 'cedar', active.item.id).version);
+  assert.deepEqual(
+    getIntake(active.db, active.root, 'cedar', active.item.id).workflow?.plans,
+    created.workflow?.plans,
+  );
   complete(active.bridges[0]);
 
   const superseded = linkedFreshImage(t);
   await createIntakePlan(superseded.db, superseded.root, 'cedar', superseded.item.id, {
     version: getIntake(superseded.db, superseded.root, 'cedar', superseded.item.id).version,
   });
-  const details = JSON.parse(
-    sqlText(
-      superseded.db
-        .prepare('SELECT details_json FROM source_files WHERE id=?')
-        .get(superseded.item.id),
-      'details_json',
-    ),
-  );
+  const details = JSON.parse(readIntakeEnvelopeText(superseded.db, { id: superseded.item.id })!);
   details.intake.workflow.plans[0].status = 'superseded';
-  superseded.db
-    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-    .run(JSON.stringify(details), superseded.item.id);
+  writeIntakeFixtureEnvelope(superseded.db, superseded.item.id, details);
   await tick();
   const supersededRead = await call(superseded.bridges[0], 'intake_read', {
     id: superseded.item.id,
@@ -2771,6 +2858,7 @@ test('atomic assistant receipts prevent reapplying a note after a lost journal r
   const destination = resolve(root, 'rebuilt-receipt');
   rebuildProfile(root, 'cedar', destination);
   const rebuilt = openDatabase(profilePaths(destination, 'cedar').database, 'cedar');
+  attachPersonalDurability(rebuilt, { root: destination, profileId: 'cedar' });
   try {
     assert.deepEqual(
       JSON.parse(
@@ -2822,19 +2910,21 @@ test('classification changes retain raw evidence and retry publication without r
     bytes,
   });
   const raw = '{"service":"Original laboratory service","unchanged":1.000}';
-  db.prepare(
-    'INSERT INTO source_records(id,source_file_id,provider_id,raw_json) VALUES(?,?,?,?)',
-  ).run('raw-lab', intake.id, intake.providerId, raw);
-  db.prepare(
-    'INSERT INTO procedures(id,source_record_id,provider_id,label,category,extra_json) VALUES(?,?,?,?,?,?)',
-  ).run(
-    'procedure-lab',
-    'raw-lab',
-    intake.providerId,
-    'Original laboratory service',
-    'unspecified',
-    '{"originalAdditionalField":"retained"}',
-  );
+  transaction(db, () => {
+    db.prepare(
+      'INSERT INTO source_records(id,source_file_id,provider_id,raw_json) VALUES(?,?,?,?)',
+    ).run('raw-lab', intake.id, intake.providerId, raw);
+    db.prepare(
+      'INSERT INTO procedures(id,source_record_id,provider_id,label,category,extra_json) VALUES(?,?,?,?,?,?)',
+    ).run(
+      'procedure-lab',
+      'raw-lab',
+      intake.providerId,
+      'Original laboratory service',
+      'unspecified',
+      '{"originalAdditionalField":"retained"}',
+    );
+  });
   exportCuration(db, root, 'cedar');
   const chat = assistant.create('cedar', {
     message: 'This service should be a laboratory category',
@@ -2867,7 +2957,7 @@ test('classification changes retain raw evidence and retry publication without r
   complete(bridges[0]);
   const original = getIntakeOriginal(db, root, 'cedar', intake.id);
   writeFileSync(original.path, 'Simulated damaged original');
-  assert.throws(() => assistant.apply('cedar', chat.id, proposal.id), /checksum failed/);
+  assert.throws(() => assistant.apply('cedar', chat.id, proposal.id), { code: 'SOURCE_CHANGED' });
   assert.equal(proposal.status, 'failed');
   assert.equal(
     sqlText(
@@ -2901,6 +2991,7 @@ test('classification changes retain raw evidence and retry publication without r
   const destination = resolve(root, 'rebuilt-classification');
   rebuildProfile(root, 'cedar', destination);
   const rebuilt = openDatabase(profilePaths(destination, 'cedar').database, 'cedar');
+  attachPersonalDurability(rebuilt, { root: destination, profileId: 'cedar' });
   try {
     assert.equal(
       sqlText(
@@ -3224,9 +3315,7 @@ test('conversational field restoration uses verified history and changes only ex
     content: 'Earlier content',
     topics: 'Keep this topic',
   });
-  const older = [...publishedPersonalLineage(root, 'cedar')][0].manifest.file.slice(
-    'snapshots/'.length,
-  );
+  const older = required(noteHistory(db, root, 'cedar', note.id).entries[0]).generationId;
   note = saveNote(db, note.id, {
     version: note.version,
     content: 'Current content',
@@ -3236,21 +3325,14 @@ test('conversational field restoration uses verified history and changes only ex
   await tick();
   const history = await call(bridges[0], 'note_history', { noteId: note.id });
   assert.ok(history.entries.some((entry) => entry.generationId === older));
-  const proposal = await call(bridges[0], 'propose_restore', {
-    noteId: note.id,
-    generationId: older,
-    fields: ['content'],
-    version: note.version,
-    reason: 'Restore only the earlier content',
-  });
   let finished = createNote(db, {
     kind: 'historical',
     title: 'Finished history',
     content: 'Earlier',
   });
-  const finishedGeneration = [...publishedPersonalLineage(root, 'cedar')][0].manifest.file.slice(
-    'snapshots/'.length,
-  );
+  const finishedGeneration = required(
+    noteHistory(db, root, 'cedar', finished.id).entries[0],
+  ).generationId;
   finished = saveNote(db, finished.id, { version: finished.version, content: 'Later' });
   finished = finishNote(db, finished.id, {
     version: finished.version,
@@ -3270,6 +3352,13 @@ test('conversational field restoration uses verified history and changes only ex
     /Finished history/,
   );
   assert.equal(getNote(db, note.id).content, 'Current content');
+  const proposal = await call(bridges[0], 'propose_restore', {
+    noteId: note.id,
+    generationId: older,
+    fields: ['content'],
+    version: note.version,
+    reason: 'Restore only the earlier content',
+  });
   complete(bridges[0]);
   assistant.apply('cedar', chat.id, proposal.id);
   const restored = getNote(db, note.id);
@@ -3555,6 +3644,7 @@ test('assistant procedure exceptions survive general rules, repeated deliveries,
   const destination = resolve(root, 'rebuilt-exceptions');
   rebuildProfile(root, 'cedar', destination);
   const rebuilt = openDatabase(profilePaths(destination, 'cedar').database, 'cedar');
+  attachPersonalDurability(rebuilt, { root: destination, profileId: 'cedar' });
   try {
     assert.deepEqual(rebuilt.prepare('SELECT * FROM procedures').get(), corrected);
     assert.equal(previewMappingChange(rebuilt, item.providerId, rule).count, 0);
@@ -3664,6 +3754,7 @@ test('assistant can explicitly replace changed extraction pins and retains both 
   const destination = resolve(root, 'rebuilt-plans');
   rebuildProfile(root, 'cedar', destination);
   const rebuilt = openDatabase(profilePaths(destination, 'cedar').database, 'cedar');
+  attachPersonalDurability(rebuilt, { root: destination, profileId: 'cedar' });
   try {
     assert.deepEqual(
       getIntakePlan(rebuilt, destination, 'cedar', item.id).plans,
@@ -4583,7 +4674,8 @@ async function linkedFictionalOpticalConversion(t: TestContext) {
   await tick();
   const bridge = f.bridges[0];
   await call(bridge, 'intake_read', { id: item.id });
-  return { ...f, item, chat, bridge, literal };
+  const passage = await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id });
+  return { ...f, item, chat, bridge, literal, sourceTextRevisionId: passage.revisionId };
 }
 
 async function linkedFictionalBatchConversion(
@@ -4616,11 +4708,11 @@ async function linkedFictionalBatchConversion(
     required(planned.workflow).plans.find((entry) => entry.status === 'active'),
   );
   await call(bridge, 'intake_read', { id: item.id });
-  // Encrypted fixtures also retain durable source text. Exercise the same read
-  // and exact revision pin required of production readers before proposing.
-  const sourceTextRevisionId = recordStorage
-    ? (await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })).revisionId
-    : undefined;
+  // Both contributor and encrypted runtimes retain durable source text. Read
+  // its actual passages and carry the returned revision into the proposal.
+  const sourceTextRevisionId = (
+    await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
+  ).revisionId;
   const batch = {
     id: item.id,
     ...(sourceTextRevisionId ? { sourceTextRevisionId } : {}),
@@ -5495,18 +5587,12 @@ test('counted-acceptance revalidation fails closed across final host races', asy
   await t.test('changed plan pins and unit state prevent the eligible retry', async (t) => {
     let race: Awaited<ReturnType<typeof eligibleCountedAcceptanceRace>>;
     race = await eligibleCountedAcceptanceRace(t, ({ db }) => {
-      const row = required(
-        db.prepare('SELECT details_json FROM source_files WHERE id=?').get(race.item.id),
-      ) as { details_json: string };
-      const details = JSON.parse(row.details_json);
+      const details = JSON.parse(readIntakeEnvelopeText(db, { id: race.item.id })!);
       details.intake.workflow.plans[0].pins.model = 'fictional-changed-model-pin';
       details.intake.workflow.plans[0].units[1].memberId = 'fictional-changed-member';
       details.intake.workflow.plans[0].units[1].status = 'completed';
       details.intake.workflow.plans[0].units[1].attempts.push('fictional-concurrent-unit');
-      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-        JSON.stringify(details),
-        race.item.id,
-      );
+      writeIntakeFixtureEnvelope(db, race.item.id, details);
     });
     await assert.rejects(call(race.bridge, 'intake_batch', race.secondBatch), (error: unknown) => {
       assert.equal(hasCode(error, 'VERSION_CONFLICT'), true);
@@ -5518,20 +5604,51 @@ test('counted-acceptance revalidation fails closed across final host races', asy
   });
 
   await t.test('durability uncertainty prevents the eligible retry', async (t) => {
+    const storage = encryptedRecordStorage(t);
     let race: Awaited<ReturnType<typeof eligibleCountedAcceptanceRace>>;
-    race = await eligibleCountedAcceptanceRace(t, ({ db }) => {
-      db.prepare(
-        "INSERT INTO app_meta(key,value) VALUES('personal_dirty','1') ON CONFLICT(key) DO UPDATE SET value='1'",
-      ).run();
-      db.prepare(
-        "INSERT INTO app_meta(key,value) VALUES('personal_last_error','fictional publication uncertainty') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      ).run();
+    race = await eligibleCountedAcceptanceRace(
+      t,
+      ({ db }) => {
+        const publish = storage.publishHead;
+        storage.publishHead = (bytes) => {
+          publish(bytes);
+          throw Error('Fictional accepted head acknowledgement lost');
+        };
+        try {
+          assert.throws(
+            () =>
+              askIntakeQuestion(db, race.root, 'cedar', race.item.id, {
+                version: getIntake(db, race.root, 'cedar', race.item.id).version,
+                operationId: 'fictional-lost-ack-question',
+                key: 'fictional-lost-ack-question',
+                prompt: 'Fictional accepted question with missing acknowledgement',
+                locator: 'fictional source',
+              }),
+            /accepted head acknowledgement lost/,
+          );
+        } finally {
+          storage.publishHead = publish;
+        }
+      },
+      undefined,
+      storage,
+    );
+    await assert.rejects(call(race.bridge, 'intake_batch', race.secondBatch), {
+      code: 'VERSION_CONFLICT',
     });
-    await assert.rejects(call(race.bridge, 'intake_batch', race.secondBatch), (error: unknown) => {
-      assert.equal(hasCode(error, 'VERSION_CONFLICT'), true);
-      return true;
-    });
-    assert.equal(getIntake(race.db, race.root, 'cedar', race.item.id).proposals.length, 1);
+    assert.equal(personalDurabilityStatus(race.db).dirty, true);
+    const { rebuildRecordDatabase } = await import('../record-versions.ts');
+    const path = resolve(race.root, 'fictional-recovered-race.sqlite');
+    rebuildRecordDatabase(path, { profileId: 'cedar', storage });
+    const recovered = openDatabase(path, 'cedar');
+    try {
+      attachPersonalDurability(recovered, { profileId: 'cedar', recordStorage: storage });
+      const retained = getIntake(recovered, race.root, 'cedar', race.item.id);
+      assert.equal(retained.proposals.length, 1);
+      assert.ok(!workflowOperationIds(retained).includes(race.secondBatch.operationId));
+    } finally {
+      recovered.close();
+    }
   });
 
   await t.test('a mismatched durable acceptance transaction refuses the retry', async (t) => {
@@ -5560,19 +5677,13 @@ test('counted-acceptance revalidation fails closed across final host races', asy
   await t.test('a newly occupied operation ID prevents the eligible retry', async (t) => {
     let race: Awaited<ReturnType<typeof eligibleCountedAcceptanceRace>>;
     race = await eligibleCountedAcceptanceRace(t, ({ db }) => {
-      const row = required(
-        db.prepare('SELECT details_json FROM source_files WHERE id=?').get(race.item.id),
-      ) as { details_json: string };
-      const details = JSON.parse(row.details_json);
+      const details = JSON.parse(readIntakeEnvelopeText(db, { id: race.item.id })!);
       details.intake.workflow.operations.push({
         id: race.secondBatch.operationId,
         fingerprint: 'fictional-other-request-fingerprint',
         at: '2026-02-10T00:00:00.000Z',
       });
-      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
-        JSON.stringify(details),
-        race.item.id,
-      );
+      writeIntakeFixtureEnvelope(db, race.item.id, details);
     });
     await assert.rejects(call(race.bridge, 'intake_batch', race.secondBatch), (error: unknown) => {
       assert.equal(hasCode(error, 'VERSION_CONFLICT'), true);
@@ -5594,14 +5705,16 @@ test('counted-acceptance revalidation fails closed across final host races', asy
       ({ db }) => {
         const changed = Buffer.from('Changed fictional child source bytes.');
         writeFileSync(childPath, changed);
-        db.prepare('UPDATE source_files SET sha256=@sha256,bytes=@bytes WHERE id=@id').run({
-          sha256: createHash('sha256').update(changed).digest('hex'),
-          bytes: changed.length,
-          id: required(
-            required(getIntake(db, race.root, 'cedar', race.item.id).workflow).plans[0]!.units[1]!
-              .sourceFileId,
-          ),
-        });
+        transaction(db, () =>
+          db.prepare('UPDATE source_files SET sha256=@sha256,bytes=@bytes WHERE id=@id').run({
+            sha256: createHash('sha256').update(changed).digest('hex'),
+            bytes: changed.length,
+            id: required(
+              required(getIntake(db, race.root, 'cedar', race.item.id).workflow).plans[0]!.units[1]!
+                .sourceFileId,
+            ),
+          }),
+        );
       },
       (prepared) => {
         const child = required(
@@ -5615,20 +5728,15 @@ test('counted-acceptance revalidation fails closed across final host races', asy
         );
         const childIntake = getIntake(prepared.db, prepared.root, 'cedar', child.id);
         transaction(prepared.db, () => {
-          const row = required(
-            prepared.db
-              .prepare('SELECT details_json FROM source_files WHERE id=?')
-              .get(prepared.item.id),
-          ) as { details_json: string };
-          const details = JSON.parse(row.details_json);
+          const details = JSON.parse(
+            readIntakeEnvelopeText(prepared.db, { id: prepared.item.id })!,
+          );
           const unit = details.intake.workflow.plans[0].units[1];
           unit.sourceFileId = child.id;
           unit.sourceHash = childIntake.sha256;
           unit.bytes = childIntake.bytes;
           details.intake.version++;
-          prepared.db
-            .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-            .run(JSON.stringify(details), prepared.item.id);
+          writeIntakeFixtureEnvelope(prepared.db, prepared.item.id, details);
         });
         childPath = getRetainedIntakeOriginalReference(
           prepared.db,
@@ -5763,41 +5871,48 @@ test('configuration change and uncertain batch publication remain terminal witho
     0,
   );
 
-  const uncertain = await linkedFictionalBatchConversion(t);
-  attachPersonalDurability(uncertain.db, {
-    root: uncertain.root,
-    profileId: 'cedar',
-    initialize: false,
-    writer() {
-      throw new Error('Fictional publication acknowledgement was unavailable');
-    },
-  });
-  await assert.rejects(call(uncertain.bridge, 'intake_batch', uncertain.batch), {
-    code: 'INTAKE_DURABILITY_PENDING',
-  });
-  assert.equal(uncertain.chat.status, 'idle');
-  assert.equal(required(uncertain.chat.reading).reason, 'tool_error');
-  const retained = getIntake(uncertain.db, uncertain.root, 'cedar', uncertain.item.id);
-  assert.equal(retained.durability?.pending, true);
-  assert.equal(retained.proposals.length, 1);
-  assert.equal(
-    workflowOperationIds(retained).filter((id) => id === uncertain.batch.operationId).length,
-    1,
-  );
-  assert.equal(
-    sqlNumber(uncertain.db.prepare('SELECT count(*) n FROM observations').get(), 'n'),
-    0,
-  );
+  const storage = encryptedRecordStorage(t);
+  const uncertain = await linkedFictionalBatchConversion(t, {}, undefined, storage);
+  const publish = storage.publishHead;
+  storage.publishHead = (bytes) => {
+    publish(bytes);
+    throw new Error('Fictional publication acknowledgement was unavailable');
+  };
   await assert.rejects(
     call(uncertain.bridge, 'intake_batch', uncertain.batch),
-    /no longer running/,
+    /publication acknowledgement was unavailable/,
   );
-  assert.equal(
-    workflowOperationIds(
-      getIntake(uncertain.db, uncertain.root, 'cedar', uncertain.item.id),
-    ).filter((id) => id === uncertain.batch.operationId).length,
-    1,
-  );
+  storage.publishHead = publish;
+  assert.equal(uncertain.chat.status, 'idle');
+  assert.equal(required(uncertain.chat.reading).reason, 'tool_error');
+  assert.equal(personalDurabilityStatus(uncertain.db).dirty, true);
+  const { rebuildRecordDatabase } = await import('../record-versions.ts');
+  const path = resolve(uncertain.root, 'fictional-recovered-batch.sqlite');
+  rebuildRecordDatabase(path, { profileId: 'cedar', storage });
+  const recovered = openDatabase(path, 'cedar');
+  try {
+    attachPersonalDurability(recovered, { profileId: 'cedar', recordStorage: storage });
+    const retained = getIntake(recovered, uncertain.root, 'cedar', uncertain.item.id);
+    assert.equal(retained.durability?.pending, false);
+    assert.equal(retained.proposals.length, 1);
+    assert.equal(
+      workflowOperationIds(retained).filter((id) => id === uncertain.batch.operationId).length,
+      1,
+    );
+    assert.equal(sqlNumber(recovered.prepare('SELECT count(*) n FROM observations').get(), 'n'), 0);
+    await assert.rejects(
+      call(uncertain.bridge, 'intake_batch', uncertain.batch),
+      /no longer running/,
+    );
+    assert.equal(
+      workflowOperationIds(getIntake(recovered, uncertain.root, 'cedar', uncertain.item.id)).filter(
+        (id) => id === uncertain.batch.operationId,
+      ).length,
+      1,
+    );
+  } finally {
+    recovered.close();
+  }
 });
 
 test('stale batch repair is finite across successful reads and operation conflicts never rewrite work', async (t) => {
@@ -5993,6 +6108,7 @@ test('a malformed optical People envelope returns validation for repair without 
   const f = await linkedFictionalOpticalConversion(t);
   const proposal = {
     id: f.item.id,
+    sourceTextRevisionId: f.sourceTextRevisionId,
     version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
     jsonlText: JSON.stringify(fictionalOpticalPeopleEnvelope()),
     summary: 'Fictional optical mapping and clinician',
@@ -6040,6 +6156,7 @@ test('three invalid conversion proposals pause with a durable actionable error e
     await assert.rejects(
       call(f.bridge, 'intake_propose', {
         id: f.item.id,
+        sourceTextRevisionId: f.sourceTextRevisionId,
         version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
         jsonlText: JSON.stringify(fictionalOpticalPeopleEnvelope()),
         summary: 'Fictional invalid structure',
@@ -6111,8 +6228,12 @@ test('new retained candidates continue a partially read window but exact proposa
   });
   await tick();
   await call(f.bridges[0], 'intake_read', { id: item.id });
-  const propose = async (bridge: TestBridge, id: string) =>
-    call(bridge, 'intake_propose', {
+  const propose = async (bridge: TestBridge, id: string) => {
+    const sourceTextRevisionId = (
+      await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
+    ).revisionId;
+    return call(bridge, 'intake_propose', {
+      sourceTextRevisionId,
       id: item.id,
       version: getIntake(f.db, f.root, 'cedar', item.id).version,
       summary: 'Fictional single result; more findings remain in this window',
@@ -6139,6 +6260,7 @@ test('new retained candidates continue a partially read window but exact proposa
         },
       }),
     });
+  };
   await propose(f.bridges[0], 'fictional-first');
   complete(f.bridges[0]);
   await tick();

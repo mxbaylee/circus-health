@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import { fictionalModel } from './fictional-model.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -67,6 +68,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'health-intake-workflow-')),
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     try {
       db.close();
@@ -189,6 +191,7 @@ test('record questions, independently reviewed acceptance and answer history sur
     target = join(f.root, 'rebuilt'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const saved = intake.getIntake(db, target, f.profileId, item.id);
     assert.deepEqual(saved.workflow, item.workflow);
@@ -332,6 +335,7 @@ test('three-page overlapping extraction resumes idempotently and keeps later acc
     target = join(f.root, 'resumed'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     assert.deepEqual(intake.getIntake(db, target, f.profileId, item.id).workflow, item.workflow);
     assert.deepEqual(intake.getIntakeOriginal(db, target, f.profileId, item.id).bytes, bytes);
@@ -478,6 +482,7 @@ test('default PDF units retain dense partial batches and exact cross-boundary re
     target = join(f.root, 'default-window-resumed'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const recovered = intake.getIntake(db, target, f.profileId, item.id);
     assert.deepEqual(recovered.workflow, item.workflow);
@@ -582,6 +587,7 @@ test('batch failures preserve plan progress and changed mappings require an expl
     target = join(f.root, 'restored-plans'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const recovered = intake.getIntake(db, target, f.profileId, item.id);
     assert.deepEqual(recovered.workflow, item.workflow);

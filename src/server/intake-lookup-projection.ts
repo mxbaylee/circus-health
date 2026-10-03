@@ -1,13 +1,23 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { json, observeTransactionOutcome, currentTransactionToken } from './database.ts';
+import {
+  json,
+  observeTransactionOutcome,
+  currentTransactionToken,
+  rejectCurrentTransaction,
+} from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
+import {
+  intakeEnvelopeAuthorityBinding,
+  readIntakeEnvelopeText,
+  type IntakeEnvelopeSource,
+} from './intake-authority.ts';
 
 const PREFIX = '__record_intake_lookup_';
 const VERSION = 1;
 const tables = {
   state: 'singleton,format,profile_id',
-  sources: 'source_id,source_order,kind',
+  sources: 'source_id,source_order,kind,authority_key,authority_head',
   groups: 'source_id,ordinal,discovery_order',
   acceptances: 'source_id,ordinal,operation_id,hash',
   identities: 'source_id,ordinal,hash',
@@ -77,6 +87,7 @@ function schemaVersion(db: DatabaseSync): number {
 }
 function tracking(db: DatabaseSync): void {
   db.exec(`CREATE TEMP TABLE IF NOT EXISTS __intake_lookup_dirty(source_id TEXT PRIMARY KEY);
+    CREATE TEMP TABLE IF NOT EXISTS __intake_lookup_authorities(authority_key TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE);
     CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_insert AFTER INSERT ON main.source_files BEGIN
       INSERT OR IGNORE INTO __intake_lookup_dirty VALUES(NEW.id); END;
     CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_update AFTER UPDATE ON main.source_files BEGIN
@@ -109,13 +120,15 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
     valid &&= actual === columns;
     const info = db.prepare(`PRAGMA table_info(${PREFIX + name})`).all();
     const expectedPk =
-      name === 'state' || name === 'sources'
+      name === 'state'
         ? [1, 0, 0]
-        : name === 'payloads'
-          ? [1, 0]
-          : name === 'groups' || name === 'identities'
-            ? [1, 2, 0]
-            : [1, 2, 0, 0];
+        : name === 'sources'
+          ? [1, 0, 0, 0, 0]
+          : name === 'payloads'
+            ? [1, 0]
+            : name === 'groups' || name === 'identities'
+              ? [1, 2, 0]
+              : [1, 2, 0, 0];
     valid &&= info.every(
       (column, index) =>
         Number(column.pk) === expectedPk[index] &&
@@ -151,7 +164,7 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
     for (const name of Object.keys(tables) as Array<keyof typeof tables>)
       db.exec(`DROP TABLE IF EXISTS ${table(name)}`);
     db.exec(`CREATE TABLE ${table('state')}(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format INTEGER NOT NULL,profile_id TEXT NOT NULL);
-      CREATE TABLE ${table('sources')}(source_id TEXT PRIMARY KEY,source_order INTEGER NOT NULL,kind TEXT NOT NULL);
+      CREATE TABLE ${table('sources')}(source_id TEXT PRIMARY KEY,source_order INTEGER NOT NULL,kind TEXT NOT NULL,authority_key TEXT,authority_head TEXT);
       CREATE TABLE ${table('groups')}(source_id TEXT NOT NULL,ordinal INTEGER NOT NULL,discovery_order INTEGER,PRIMARY KEY(source_id,ordinal));
       CREATE INDEX ${PREFIX}discovery ON ${table('groups')}(discovery_order DESC);
       CREATE TABLE ${table('acceptances')}(source_id TEXT NOT NULL,ordinal INTEGER NOT NULL,operation_id TEXT,hash TEXT NOT NULL,PRIMARY KEY(source_id,ordinal));
@@ -175,6 +188,7 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
     ['operation', 'acceptances', 'operation_id', false],
     ['acceptance_hash', 'acceptances', 'hash', false],
     ['identity_hash', 'identities', 'hash', false],
+    ['authority', 'sources', 'authority_key', false],
   ] as const) {
     const index = db
       .prepare(`PRAGMA index_xinfo(${PREFIX + name})`)
@@ -190,6 +204,15 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
       );
     }
   }
+  for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
+    const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
+    db.exec(
+      `CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_authority_${op} AFTER ${op} ON main.app_meta BEGIN ${refs.map((ref) => `INSERT INTO __intake_lookup_dirty SELECT source_id FROM __intake_lookup_authorities a WHERE authority_key=${ref}.key AND NOT EXISTS(SELECT 1 FROM __intake_lookup_dirty d WHERE d.source_id=a.source_id);`).join(' ')} END`,
+    );
+  }
+  db.exec(
+    `DELETE FROM temp.__intake_lookup_authorities; INSERT OR IGNORE INTO temp.__intake_lookup_authorities SELECT authority_key,source_id FROM ${table('sources')} WHERE authority_key IS NOT NULL`,
+  );
   connection.rebuild = false;
   connection.schema = schemaVersion(db);
 }
@@ -217,7 +240,9 @@ function prune(db: DatabaseSync, connection: Connection, obsolete: Set<string>):
 }
 function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<string> {
   const source = db
-    .prepare('SELECT rowid AS source_order,id,kind,details_json FROM source_files WHERE id=?')
+    .prepare(
+      'SELECT rowid AS source_order,id,kind,sha256,details_json FROM source_files WHERE id=?',
+    )
     .get(id);
   const obsolete = new Set<string>();
   const retainedHere = new Set<string>();
@@ -231,6 +256,7 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
   connection.counters.reconciledSources++;
   connection.counters.authorityReads++;
   if (!source) {
+    db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
     for (const name of ['groups', 'acceptances', 'identities', 'sources'] as const) {
       const result = db.prepare(`DELETE FROM ${table(name)} WHERE source_id=?`).run(id);
       connection.counters.projectionWrites += Number(result.changes);
@@ -238,7 +264,12 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     db.prepare('DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?').run(id);
     return obsolete;
   }
-  const raw = String(source.details_json);
+  const selected = source as unknown as IntakeEnvelopeSource;
+  const binding = intakeEnvelopeAuthorityBinding(db, selected);
+  const raw =
+    source.kind === 'intake_original'
+      ? readIntakeEnvelopeText(db, selected)
+      : String(source.details_json);
   connection.counters.authorityBytes += Buffer.byteLength(raw);
   const validJson = Number(db.prepare('SELECT json_valid(?) valid').get(raw)!.valid) === 1;
   const all = json(raw);
@@ -255,15 +286,32 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     if (entries != null && !Array.isArray(entries)) fail('malformed contribution array');
   }
   const prior = db
-    .prepare(`SELECT source_order,kind FROM ${table('sources')} WHERE source_id=?`)
+    .prepare(
+      `SELECT source_order,kind,authority_key,authority_head FROM ${table('sources')} WHERE source_id=?`,
+    )
     .get(id);
   connection.counters.projectionRowsRead += prior ? 1 : 0;
   connection.counters.projectionReadBytes += prior ? Buffer.byteLength(JSON.stringify(prior)) : 0;
-  if (!prior || prior.source_order !== source.source_order || prior.kind !== source.kind) {
+  if (
+    !prior ||
+    prior.source_order !== source.source_order ||
+    prior.kind !== source.kind ||
+    prior.authority_key !== binding.key ||
+    prior.authority_head !== binding.head
+  ) {
     db.prepare(
-      `INSERT INTO ${table('sources')} VALUES(?,?,?) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind`,
-    ).run(id, source.source_order!, source.kind!);
-    countWrite(connection, { id, source_order: source.source_order, kind: source.kind });
+      `INSERT INTO ${table('sources')} VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind,authority_key=excluded.authority_key,authority_head=excluded.authority_head`,
+    ).run(id, source.source_order!, source.kind!, binding.key, binding.head);
+    countWrite(connection, {
+      id,
+      source_order: source.source_order,
+      kind: source.kind,
+      authority_key: binding.key,
+      authority_head: binding.head,
+    });
+    db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
+    if (binding.key !== null)
+      db.prepare('INSERT INTO temp.__intake_lookup_authorities VALUES(?,?)').run(binding.key, id);
   }
   const fields = {
     groups: 'reportGroups',
@@ -395,10 +443,15 @@ function current(db: DatabaseSync): Connection {
     }
     connection.rebuild = true;
     connection.schema = -1;
+    if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
     throw error;
   }
   if (db.isTransaction && !currentTransactionToken(db)) connection.schema = -1;
   return connection;
+}
+export function reconcileActiveIntakeLookup(db: DatabaseSync): void {
+  const connection = connections.get(db);
+  if (connection && connection.schema !== -1 && currentTransactionToken(db)) current(db);
 }
 export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
   current(db);

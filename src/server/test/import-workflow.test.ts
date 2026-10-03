@@ -6,7 +6,9 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { openDatabase } from '../database.ts';
 import { createApp } from '../index.ts';
-import { rebuildProfile } from '../portable.ts';
+import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
+import { getIntake } from '../intake.ts';
+import { fictionalModel } from './fictional-model.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import type { HealthTool, ProxyModelBridgeOptions } from '../proxy-model-bridge.ts';
 import type { AssistantChat } from '../assistant.ts';
@@ -91,10 +93,12 @@ test(
   'HTTP assistant conversion imports reviewed PDF evidence and survives loss of SQLite',
   { timeout: 15000 },
   async (t) => {
+    fictionalModel(t);
     const root = mkdtempSync(resolve(tmpdir(), 'health-import-workflow-')),
       profileId = 'orchid';
     const paths = ensureProfileDirectories(root, profileId),
       db = openDatabase(paths.database, profileId);
+    attachPersonalDurability(db, { root, profileId });
     const databases = new Map([[profileId, db]]),
       bridgeState: {
         prompts: WorkflowPrompt[];
@@ -108,7 +112,8 @@ test(
     ) => ({
       async start(_instructions: string, tools: HealthTool[]) {
         assert.ok(tools.some((tool) => tool.name === 'health_intake_read'));
-        assert.ok(tools.some((tool) => tool.name === 'health_intake_propose'));
+        assert.ok(tools.some((tool) => tool.name === 'health_intake_source_text'));
+        assert.ok(tools.some((tool) => tool.name === 'health_intake_batch'));
         assert.ok(tools.some((tool) => tool.name === 'health_mapping_review'));
         return { model: 'synthetic-workflow' };
       },
@@ -125,6 +130,11 @@ test(
             arguments: { id: context.intakeId, page: 1 },
             callId: `call-${++callNumber}`,
           })) as WorkflowEvidence;
+          const passage = (await callbacks.onTool({
+            tool: 'health_intake_source_text',
+            arguments: { id: context.intakeId, page: 1 },
+            callId: `call-${++callNumber}`,
+          })) as { revisionId: string };
           const envelope = {
             format: 'health-record-v1',
             id: 'workflow-observation',
@@ -150,11 +160,24 @@ test(
             },
             coverage: { status: 'complete_response', notes: [] },
           };
+          const current = getIntake(db, root, profileId, context.intakeId);
+          const plan = current.workflow!.plans.find((entry) => entry.status === 'active')!;
+          assert.equal(plan.units.length, 1, 'The only PDF page forms one reading unit');
           await callbacks.onTool({
-            tool: 'health_intake_propose',
+            tool: 'health_intake_batch',
             arguments: {
               id: context.intakeId,
-              version: bridgeState.evidence.metadata.intake.version,
+              version: current.version,
+              planId: plan.id,
+              operationId: 'fictional-workflow-page-one',
+              coverage: [
+                {
+                  unitId: plan.units[0]!.id,
+                  kind: 'extracted',
+                  notes: 'Read the only original PDF page and its durable transcript.',
+                },
+              ],
+              sourceTextRevisionId: passage.revisionId,
               jsonlText: JSON.stringify(envelope),
               summary: 'Read the only PDF page and retained its visible value and source locator.',
             },
@@ -276,7 +299,7 @@ test(
     );
     assert.deepEqual(
       conversionChat.operations.map((operation) => operation.tool),
-      ['health_intake_read', 'health_intake_propose'],
+      ['health_intake_read', 'health_intake_source_text', 'health_intake_batch'],
     );
     assert.equal(
       db.prepare('SELECT count(*) n FROM observations').get()?.n,
@@ -403,6 +426,7 @@ test(
     const rebuiltRoot = resolve(root, 'rebuilt'),
       rebuilt = rebuildProfile(root, profileId, rebuiltRoot);
     const recovered = openDatabase(rebuilt.database, profileId);
+    attachPersonalDurability(recovered, { root: rebuiltRoot, profileId });
     try {
       assert.equal(recovered.prepare('PRAGMA integrity_check').get()?.integrity_check, 'ok');
       assert.equal(

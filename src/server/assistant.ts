@@ -79,6 +79,7 @@ import * as q from './queries.ts';
 import * as n from './notes.ts';
 import { createAttachment } from './assets.ts';
 import { activeMappingRules, procedureClassificationException } from './clinical-import.ts';
+import { duplicateRecord, verifyDuplicateOriginals } from './duplicate-review.ts';
 import { noteHistory, restoreNoteFields, previewNoteRestoration } from './note-history.ts';
 import { exportCuration, personalDurabilityStatus } from './portable.ts';
 import type { IntakeReportAcceptanceReceipt, IntakeReportGroup } from '../shared/intake.ts';
@@ -2653,6 +2654,13 @@ export function createAssistant({
             error.code !== 'VERSION_CONFLICT'
           )
             throw error;
+          const currentDurability = personalDurabilityStatus(db);
+          if (
+            currentDurability.dirty ||
+            currentDurability.conflicted ||
+            currentDurability.lastError
+          )
+            throw error;
           const basis = state.batchRevalidationBasis;
           const current = conversionIntake(profileId, chat);
           const currentRawIntake = current
@@ -2698,20 +2706,21 @@ export function createAssistant({
             intakeId,
             batchInput: structuredClone(batchInput),
           });
+          // A published head can survive SQL rollback. Preserve the public CAS
+          // refusal before attempting to hydrate a now-stale intake projection.
+          const retryDurability = personalDurabilityStatus(db);
+          if (retryDurability.dirty || retryDurability.conflicted || retryDurability.lastError)
+            throw error;
           const retryCurrent = conversionIntake(profileId, chat);
           const retryRawIntake = retryCurrent
             ? (readStoredIntakeDetails(db, retryCurrent.id) as unknown as UnknownRecord | undefined)
             : undefined;
-          const retryDurability = personalDurabilityStatus(db);
           if (
             databases.get(profileId) !== db ||
             state.batchRevalidationBasis !== basis ||
             state.modelRequestOrdinal !== basis.requestOrdinal ||
             !retryCurrent ||
             !retryRawIntake ||
-            retryDurability.dirty ||
-            retryDurability.conflicted ||
-            retryDurability.lastError ||
             !exactDisjointCountedAcceptance(
               db,
               basis,
@@ -3608,7 +3617,10 @@ export function createAssistant({
           onTool: (params) => {
             const readsBefore = checkpoint?.seen.length || 0;
             const batchProgressBefore =
-              checkpoint && params.tool === 'health_intake_batch'
+              checkpoint &&
+              active.get(profileId) === state &&
+              state.generation === generation &&
+              params.tool === 'health_intake_batch'
                 ? durableBatchProgress(conversionIntake(profileId, chat))
                 : null;
             return callTool(profileId, chat, params, state, generation)
@@ -4681,6 +4693,15 @@ export function createAssistant({
                   'CLASSIFICATION_CHANGED',
                   'This classification changed. Ask for a refreshed proposal.',
                 );
+              // Changed-record publication no longer hashes a full portable
+              // snapshot. Verify the exact retained evidence this edit relies on.
+              verifyDuplicateOriginals(
+                db,
+                root,
+                profileId,
+                duplicateRecord(db, 'procedure', procedureId),
+                new Set(),
+              );
               const at = new Date().toISOString(),
                 rawExtra = json(row.extra_json),
                 extra = object(rawExtra) ? rawExtra : {};

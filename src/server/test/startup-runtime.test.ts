@@ -13,12 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { request } from 'node:http';
 import { openDatabase, revision, type Database } from '../database.ts';
 import { ensureProfileDirectories, profilePaths } from '../profile-storage.ts';
-import {
-  attachPersonalDurability,
-  exportCuration,
-  recoverPendingProfile,
-  personalDurabilityStatus,
-} from '../portable.ts';
+import { attachPersonalDurability, exportCuration, recoverPendingProfile } from '../portable.ts';
 import { createNote, saveNote } from '../notes.ts';
 import { uploadIntake } from '../intake.ts';
 import { writeChat, readChat } from '../assistant-journal.ts';
@@ -37,14 +32,18 @@ import {
 } from '../runtime.ts';
 import { createBackup, restoreBackup } from '../recovery.ts';
 
-function fixture(t: TestContext, ids: readonly string[] = ['cedar', 'cookie-dough', 'orchid']) {
+function fixture(
+  t: TestContext,
+  ids: readonly string[] = ['cedar', 'cookie-dough', 'orchid'],
+  portableSnapshots = false,
+) {
   const root = mkdtempSync(resolve(tmpdir(), 'health-startup-'));
   const dbs = new Map<string, Database>();
   for (const profileId of ids) {
     const paths = ensureProfileDirectories(root, profileId),
       db = openDatabase(paths.database, profileId);
     dbs.set(profileId, db);
-    attachPersonalDurability(db, { root, profileId });
+    attachPersonalDurability(db, { root, profileId, portableSnapshots });
     exportCuration(db, root, profileId);
   }
   t.after(() => {
@@ -80,8 +79,8 @@ test('startup requires existing durable inputs and a separate disposable databas
     () => rebuildStartup({ ...f, runtimeDirectory: resolve(f.dataDirectory, 'working') }),
     /separate/,
   );
-  rmSync(resolve(profilePaths(f.root, 'orchid').curation, 'current.json'));
-  assert.throws(() => rebuildStartup(f), /Missing orchid curation/);
+  rmSync(resolve(profilePaths(f.root, 'orchid').records, 'head'));
+  assert.throws(() => rebuildStartup(f), /missing|head|authority/i);
 });
 
 test('both runtime entry points reject disk-backed Linux runtime storage before acquiring a writer', async (t) => {
@@ -164,7 +163,7 @@ test('two startups reconstruct all profiles with identical logical content and r
     { id: chatId, title: 'Synthetic chat', updatedAt: '2026-09-11T00:00:00Z', messages: [] },
     'created',
   );
-  const history = readdirSync(resolve(profilePaths(f.root, 'cedar').personal, 'snapshots'));
+  const history = readdirSync(resolve(profilePaths(f.root, 'cedar').records, 'objects'));
   removeWorking(f);
   const phases: string[] = [],
     first = rebuildStartup({ ...f, progress: (x: StartupProgress) => void phases.push(x.phase) });
@@ -173,15 +172,10 @@ test('two startups reconstruct all profiles with identical logical content and r
     first.receipt.profiles.map((x) => x.logicalSha256),
     second.receipt.profiles.map((x) => x.logicalSha256),
   );
-  assert.deepEqual(
-    readdirSync(resolve(profilePaths(f.root, 'cedar').personal, 'snapshots')),
-    history,
-  );
+  assert.deepEqual(readdirSync(resolve(profilePaths(f.root, 'cedar').records, 'objects')), history);
   assert.equal((readChat(f.root, 'cedar', chatId) as { title: string }).title, 'Synthetic chat');
   assert.ok(
-    ['read_validate', 'project', 'index', 'integrity', 'activate'].every((phase) =>
-      phases.includes(phase),
-    ),
+    ['read_validate', 'record_rebuild', 'activate'].every((phase) => phases.includes(phase)),
   );
   for (const p of second.receipt.profiles) {
     assert.ok((p.totalMs ?? 0) > 0 && (p.databaseBytes ?? 0) > 0 && (p.peakMemoryBytes ?? 0) > 0);
@@ -198,7 +192,7 @@ test('two startups reconstruct all profiles with identical logical content and r
 });
 
 test('acknowledged edits survive SIGKILL and total SQLite loss despite failed publication', (t) => {
-  const f = fixture(t, ['cedar']);
+  const f = fixture(t, ['cedar'], true);
   const paths = profilePaths(f.root, 'cedar');
   f.dbs.get('cedar')!.close();
   f.dbs.clear();
@@ -207,7 +201,7 @@ import { openDatabase } from ${JSON.stringify(new URL('../database.ts', import.m
 import { attachPersonalDurability } from ${JSON.stringify(new URL('../portable.ts', import.meta.url).href)};
 import { createNote } from ${JSON.stringify(new URL('../notes.ts', import.meta.url).href)};
 const db = openDatabase(${JSON.stringify(paths.database)}, "cedar");
-attachPersonalDurability(db, { root: ${JSON.stringify(f.root)}, profileId: "cedar", writer() { throw new Error("publication unavailable"); } });
+attachPersonalDurability(db, { root: ${JSON.stringify(f.root)}, profileId: "cedar", portableSnapshots:true, writer() { throw new Error("publication unavailable"); } });
 const note = createNote(db, { title: "Acknowledged before crash", content: "Retain exact accepted text" });
 process.stdout.write(JSON.stringify(note), () => process.kill(process.pid, "SIGKILL"));
 `;
@@ -230,10 +224,11 @@ process.stdout.write(JSON.stringify(note), () => process.kill(process.pid, "SIGK
 });
 
 test('failed durable intent rolls SQLite back before the save is acknowledged', (t) => {
-  const f = fixture(t, ['cedar']),
+  const f = fixture(t, ['cedar'], true),
     db = f.dbs.get('cedar')!,
     before = revision(db);
   attachPersonalDurability(db, {
+    portableSnapshots: true,
     root: f.root,
     profileId: 'cedar',
     journalWriter() {
@@ -246,51 +241,80 @@ test('failed durable intent rolls SQLite back before the save is acknowledged', 
   assert.equal(existsSync(resolve(profilePaths(f.root, 'cedar').personal, 'pending.json')), false);
 });
 
-test('accepted source index and curation survive portable failure and database loss', (t) => {
+test('source registration published before lost acknowledgement survives total SQLite loss without fabricating request success', (t) => {
   const f = fixture(t, ['cedar']),
     db = f.dbs.get('cedar')!;
-  attachPersonalDurability(db, {
-    root: f.root,
-    profileId: 'cedar',
-    writer() {
-      throw new Error('publication unavailable');
-    },
+  const bytes = Buffer.from('Independently fictional source publication evidence Ω.');
+  const head = resolve(profilePaths(f.root, 'cedar').records, 'head');
+  const before = readFileSync(head);
+  const rename = fs.renameSync;
+  let published = false;
+  const fault = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    rename(from, to);
+    if (String(to) === head) {
+      published = true;
+      throw Error('Fictional source publication acknowledgement lost');
+    }
   });
-  const saved = uploadIntake(
-    db,
-    f.root,
-    'cedar',
-    {
-      filename: 'retained.txt',
-      bytes: Buffer.from('Synthetic source evidence'),
-      newProviderName: 'Synthetic issuer',
-    },
-    {
-      exportFn() {
-        throw new Error('export unavailable');
-      },
-    },
+  syncBuiltinESMExports();
+  try {
+    assert.throws(
+      () =>
+        uploadIntake(db, f.root, 'cedar', {
+          filename: 'retained.txt',
+          bytes,
+          newProviderName: 'Synthetic issuer',
+        }),
+      /acknowledgement lost/,
+    );
+  } finally {
+    fault.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(
+    published,
+    true,
+    'the actual selected filesystem head was published before the error',
   );
-  assert.equal(personalDurabilityStatus(db).dirty, true);
+  assert.notDeepEqual(readFileSync(head), before);
+  assert.equal(
+    db.prepare("SELECT count(*) n FROM source_files WHERE kind='intake_original'").get()!.n,
+    0,
+    'the failed request did not fabricate a SQL acknowledgement',
+  );
+  assert.equal(
+    db.prepare("SELECT count(*) n FROM providers WHERE name='Synthetic issuer'").get()!.n,
+    0,
+  );
   removeWorking(f);
   const rebuilt = rebuildStartup(f),
     restored = new DatabaseSync(rebuilt.databases[0][1], { readOnly: true });
-  assert.equal(
-    restored.prepare('SELECT id FROM source_files WHERE id=?').get(saved.id)?.id,
-    saved.id,
-  );
-  assert.equal(
-    restored.prepare("SELECT count(*) AS n FROM providers WHERE name='Synthetic issuer'").get()?.n,
-    1,
-  );
-  restored.close();
+  try {
+    const original = restored
+      .prepare("SELECT id,path,bytes FROM source_files WHERE kind='intake_original'")
+      .get()!;
+    assert.ok(original, 'startup selects the published source registration despite SQL rollback');
+    assert.equal(
+      restored.prepare("SELECT count(*) n FROM source_files WHERE kind='intake_original'").get()!.n,
+      1,
+    );
+    assert.equal(
+      restored.prepare("SELECT count(*) n FROM providers WHERE name='Synthetic issuer'").get()!.n,
+      1,
+    );
+    assert.equal(original.bytes, bytes.length);
+    assert.deepEqual(readFileSync(resolve(f.root, String(original.path))), bytes);
+  } finally {
+    restored.close();
+  }
 });
 
 test('unresolved or corrupt intents block startup and leave durable history in place', (t) => {
-  const f = fixture(t, ['cedar']),
+  const f = fixture(t, ['cedar'], true),
     db = f.dbs.get('cedar')!,
     paths = profilePaths(f.root, 'cedar');
   attachPersonalDurability(db, {
+    portableSnapshots: true,
     root: f.root,
     profileId: 'cedar',
     writer() {
@@ -315,7 +339,7 @@ test('unresolved or corrupt intents block startup and leave durable history in p
 
 test('operational timing retention is bounded independently of personal history', (t) => {
   const f = fixture(t, ['cedar']),
-    history = readdirSync(resolve(profilePaths(f.root, 'cedar').personal, 'snapshots'));
+    history = readdirSync(resolve(profilePaths(f.root, 'cedar').records, 'objects'));
   for (let i = 0; i < 5; i++)
     recordStartupMetrics(
       f.root,
@@ -323,10 +347,7 @@ test('operational timing retention is bounded independently of personal history'
       2,
     );
   assert.equal(readdirSync(resolve(f.dataDirectory, 'operations/startups')).length, 3);
-  assert.deepEqual(
-    readdirSync(resolve(profilePaths(f.root, 'cedar').personal, 'snapshots')),
-    history,
-  );
+  assert.deepEqual(readdirSync(resolve(profilePaths(f.root, 'cedar').records, 'objects')), history);
 });
 
 test('backup from container-local SQLite retains portable generations and conversation history', async (t) => {
@@ -341,7 +362,8 @@ test('backup from container-local SQLite retains portable generations and conver
   );
   removeWorking(f);
   const rebuilt = rebuildStartup(f),
-    db = new DatabaseSync(rebuilt.databases[0][1]);
+    db = openDatabase(rebuilt.databases[0][1], 'cedar');
+  attachPersonalDurability(db, { root: f.root, profileId: 'cedar' });
   const backup = await createBackup(db, f.root, 'cedar');
   db.close();
   const manifest = JSON.parse(readFileSync(resolve(backup.path, 'manifest.json'), 'utf8'));
@@ -354,7 +376,7 @@ test('backup from container-local SQLite retains portable generations and conver
   const target = resolve(f.root, 'restore');
   restoreBackup(backup.path, target);
   assert.equal((readChat(target, 'cedar', chatId) as { title: string }).title, 'Retained chat');
-  assert.ok(readdirSync(resolve(profilePaths(target, 'cedar').personal, 'snapshots')).length > 1);
+  assert.ok(readdirSync(resolve(profilePaths(target, 'cedar').records, 'objects')).length > 1);
 });
 
 test('kernel lease excludes concurrent writers and releases after process loss', async (t) => {
@@ -442,7 +464,7 @@ test('losing the kernel lease aborts an already forwarded POST before another wr
   const address = runtime.server.address() as AddressInfo;
   const origin = `http://127.0.0.1:${address.port}`,
     bytes = Buffer.from(JSON.stringify({ title: 'Must not save after lease loss' }));
-  const pointerPath = resolve(profilePaths(f.root, 'cedar').personal, 'current.json'),
+  const pointerPath = resolve(profilePaths(f.root, 'cedar').records, 'head'),
     previous = readFileSync(pointerPath, 'utf8');
   const forwarded = new Promise((done) => runtime.server.once('request', done));
   let pending: ReturnType<typeof request> | undefined;

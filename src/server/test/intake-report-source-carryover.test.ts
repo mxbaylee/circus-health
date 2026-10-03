@@ -1,3 +1,4 @@
+import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,6 +28,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-source-carryover-')),
     profileId = 'fictional-source-carryover';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   const self = getNote(db, 'person-note:self');
   saveNote(db, self.id, {
     version: self.version,
@@ -466,6 +468,7 @@ test('counted report acceptance carries a reviewed source to unchanged later rep
     target = join(f.root, 'rebuilt-late-pages'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(rebuiltDb, { root: target, profileId: f.profileId });
   try {
     assert.deepEqual(
       intake.getIntake(rebuiltDb, target, f.profileId, item.id).workflow,
@@ -894,6 +897,7 @@ test(
       target = join(f.root, 'rebuilt-explicit-sparse-source'),
       rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
       rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+    attachPersonalDurability(rebuiltDb, { root: target, profileId: f.profileId });
     try {
       assertEveryReviewedResult(rebuiltDb, 190);
       assert.deepEqual(
@@ -1258,6 +1262,7 @@ test(
       target = join(f.root, 'rebuilt-batch-version-source'),
       rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
       rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+    attachPersonalDurability(rebuiltDb, { root: target, profileId: f.profileId });
     try {
       assert.deepEqual(
         observations(rebuiltDb, new URLSearchParams(), true).data.map((row) => [
@@ -1342,6 +1347,7 @@ test('exact reuse enriches only a canonical Unknown source and retains both evid
     target = join(f.root, 'rebuilt-exact-source'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     rebuiltDb = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(rebuiltDb, { root: target, profileId: f.profileId });
   try {
     const rebuiltObservation = observations(rebuiltDb, new URLSearchParams(), true).data[0]!;
     assert.equal(rebuiltObservation.provider, 'Fictional Body Studio');

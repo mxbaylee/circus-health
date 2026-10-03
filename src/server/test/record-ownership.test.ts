@@ -1,3 +1,7 @@
+import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import { recordOwner } from '../record-owner.ts';
 import { ownershipCorrections } from '../ownership-history.ts';
 import { evidenceFor } from '../queries.ts';
@@ -24,10 +28,19 @@ import { clinicalTables, type ClinicalKind } from '../clinical-references.ts';
 import type { HealthRecordEnvelope } from '../../shared/intake.ts';
 import type { OwnershipRequest, OwnershipPreview } from '../../shared/record-ownership.ts';
 
-function fixture(t: TestContext, kind: ClinicalKind = 'observation') {
+function fixture(
+  t: TestContext,
+  kind: ClinicalKind = 'observation',
+  journal?: ReturnType<typeof memoryJournal>,
+) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-ownership-'));
   const profileId = 'fictional-ownership';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, {
+    root,
+    profileId,
+    ...(journal ? { recordStorage: journal.storage } : {}),
+  });
   t.after(() => {
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -200,8 +213,9 @@ test('record history and a later patient packet disclose an accepted ownership c
   const { clinicalRecordHistory } = await import('../clinical-history.ts');
   const { exportSnapshot, exportHtml, exportEvidence } = await import('../note-exports.ts');
   const { attachRecordDurability } = await import('../record-versions.ts');
-  const f = fixture(t);
-  attachRecordDurability(f.db, { profileId: f.profileId, storage: memoryJournal().storage });
+  const journal = memoryJournal();
+  const f = fixture(t, 'observation', journal);
+  attachRecordDurability(f.db, { profileId: f.profileId, storage: journal.storage });
   f.apply(f.preview({ ...f.request, reason: 'Fictional patient-side correction' }));
   const self = getNote(f.db, 'person-note:self');
   f.apply(
@@ -345,8 +359,8 @@ test('ownership history and exact replay survive losing and rebuilding the SQLit
   const { attachRecordDurability, rebuildRecordDatabase, queryRecordHistory } =
     await import('../record-versions.ts');
   const { ownershipSourceAuthority } = await import('../record-ownership-authority.ts');
-  const f = fixture(t),
-    journal = memoryJournal();
+  const journal = memoryJournal(),
+    f = fixture(t, 'observation', journal);
   attachRecordDurability(f.db, { profileId: f.profileId, storage: journal.storage });
   const p = f.preview(),
     operationId = randomUUID(),
@@ -389,8 +403,8 @@ test('ownership history and exact replay survive losing and rebuilding the SQLit
 
 test('failure before journal publication leaves both ownership and its receipt unapplied', async (t) => {
   const { attachRecordDurability } = await import('../record-versions.ts');
-  const f = fixture(t),
-    journal = memoryJournal();
+  const journal = memoryJournal(),
+    f = fixture(t, 'observation', journal);
   attachRecordDurability(f.db, { profileId: f.profileId, storage: journal.storage });
   const head = journal.objects.get('head'),
     p = f.preview(),
@@ -1094,9 +1108,9 @@ test('later new anchored identity questions invalidate a standing report assignm
 
 test('large report correction stages bounded journal objects and exposes no ownership or names before atomic publication', async (t) => {
   const { attachRecordDurability } = await import('../record-versions.ts');
-  const f = fixture(t),
-    report = await confirmedReport(f, 'large', 60),
-    journal = memoryJournal();
+  const journal = memoryJournal(),
+    f = fixture(t, 'observation', journal),
+    report = await confirmedReport(f, 'large', 60);
   attachRecordDurability(f.db, {
     profileId: f.profileId,
     storage: journal.storage,
@@ -1173,9 +1187,11 @@ for (const kind of Object.keys(clinicalTables) as ClinicalKind[])
       extra.import.identityAttributions = [{ groupId: 'fictional-b-only' }];
       extra.import.reviewedReportSources = [{ source: 'fictional-b-only' }];
       extra.import.corrections = [{ operationId: 'fictional-b-only' }];
-      f.db
-        .prepare(`UPDATE ${clinicalTables[kind]} SET extra_json=? WHERE id=?`)
-        .run(JSON.stringify(extra), f.recordId);
+      fixtureTransaction(f.db, () =>
+        f.db
+          .prepare(`UPDATE ${clinicalTables[kind]} SET extra_json=? WHERE id=?`)
+          .run(JSON.stringify(extra), f.recordId),
+      );
     });
     const p = f.preview({ ...f.request, selection: b.selection });
     const reviewed = f.preview({
@@ -1237,17 +1253,19 @@ test('same-owner report confirmation adds no name, source or standing report aut
 
 test('unrelated groups retain the first receipt when a later publication fails and create a new Person only once', async (t) => {
   const { attachRecordDurability, rebuildRecordDatabase } = await import('../record-versions.ts');
-  const f = fixture(t);
+  const journal = memoryJournal();
+  const f = fixture(t, 'observation', journal);
   const other = destinationMatch(f);
   transaction(f.db, () => {
     const row = f.db.prepare('SELECT extra_json FROM observations WHERE id=?').get(other)!;
     const extra = JSON.parse(String(row.extra_json));
     extra.import.acceptedMapping.testLabel = 'Ultraviolet intensity';
-    f.db
-      .prepare('UPDATE observations SET label=?,extra_json=? WHERE id=?')
-      .run('Ultraviolet intensity', JSON.stringify(extra), other);
+    fixtureTransaction(f.db, () =>
+      f.db
+        .prepare('UPDATE observations SET label=?,extra_json=? WHERE id=?')
+        .run('Ultraviolet intensity', JSON.stringify(extra), other),
+    );
   });
-  const journal = memoryJournal();
   let publications = 0;
   attachRecordDurability(f.db, {
     profileId: f.profileId,
@@ -1255,7 +1273,7 @@ test('unrelated groups retain the first receipt when a later publication fails a
       ...journal.storage,
       publishHead(bytes) {
         publications++;
-        if (publications === 3) throw new Error('Fictional later group failure');
+        if (publications === 2) throw new Error('Fictional later group failure');
         journal.storage.publishHead(bytes);
       },
     },
@@ -1283,7 +1301,7 @@ test('unrelated groups retain the first receipt when a later publication fails a
     before + 1,
   );
   assert.deepEqual(f.apply(p, id), { ...result, replayed: true });
-  assert.equal(publications, 3);
+  assert.equal(publications, 2);
   const path = join(f.root, 'group-rebuilt.sqlite');
   rebuildRecordDatabase(path, { profileId: f.profileId, storage: journal.storage });
   const rebuilt = openDatabase(path, f.profileId);
@@ -1321,23 +1339,29 @@ test('unrelated groups retain the first receipt when a later publication fails a
 test('split publication restores from durable versions with attachment metadata, activity and both histories intact', async (t) => {
   const { attachRecordDurability, rebuildRecordDatabase, queryRecordHistory } =
     await import('../record-versions.ts');
-  const f = fixture(t, 'medication'),
-    b = attachedReport(f),
-    journal = memoryJournal();
+  const journal = memoryJournal(),
+    f = fixture(t, 'medication', journal),
+    b = attachedReport(f);
   transaction(f.db, () => {
-    f.db
-      .prepare("UPDATE medication_preferences SET status='current' WHERE medication_id=?")
-      .run(f.recordId);
-    f.db
-      .prepare(
-        "INSERT INTO assets(id,original_name,stored_path,mime_type,bytes,sha256,created_at,attribution,source_file_id) VALUES('fictional-asset','fictional.png','fictional-retained-path','image/png',1,'fictional-hash','2026-01-01','provider-evidence',?)",
-      )
-      .run(b.original.id);
-    f.db
-      .prepare(
-        "INSERT INTO attachments(id,asset_id,owner_type,owner_id,caption,body_location,event_date,person_id,created_at) VALUES('fictional-attachment','fictional-asset','medication',?,'Fictional caption','Left wrist','2026-01-12','patient','2026-01-12')",
-      )
-      .run(f.recordId);
+    fixtureTransaction(f.db, () =>
+      f.db
+        .prepare("UPDATE medication_preferences SET status='current' WHERE medication_id=?")
+        .run(f.recordId),
+    );
+    fixtureTransaction(f.db, () =>
+      f.db
+        .prepare(
+          "INSERT INTO assets(id,original_name,stored_path,mime_type,bytes,sha256,created_at,attribution,source_file_id) VALUES('fictional-asset','fictional.png','fictional-retained-path','image/png',1,'fictional-hash','2026-01-01','provider-evidence',?)",
+        )
+        .run(b.original.id),
+    );
+    fixtureTransaction(f.db, () =>
+      f.db
+        .prepare(
+          "INSERT INTO attachments(id,asset_id,owner_type,owner_id,caption,body_location,event_date,person_id,created_at) VALUES('fictional-attachment','fictional-asset','medication',?,'Fictional caption','Left wrist','2026-01-12','patient','2026-01-12')",
+        )
+        .run(f.recordId),
+    );
   });
   attachRecordDurability(f.db, { profileId: f.profileId, storage: journal.storage });
   const p = f.preview({ ...f.request, selection: b.selection });
@@ -1540,9 +1564,9 @@ test('historical references compose reclassification before and after an ownersh
   const { correctClinicalRecord } = await import('../record-corrections.ts');
   const { resolveClinicalReference } = await import('../clinical-references.ts');
   const { attachRecordDurability } = await import('../record-versions.ts');
-  const f = fixture(t, 'procedure'),
-    dest = destinationMatch(f);
   const journal = memoryJournal();
+  const f = fixture(t, 'procedure', journal),
+    dest = destinationMatch(f);
   attachRecordDurability(f.db, { profileId: f.profileId, storage: journal.storage });
   transaction(f.db, () =>
     correctClinicalRecord(
@@ -1719,10 +1743,10 @@ for (const partial of [false, true])
     const { attachRecordDurability, rebuildRecordDatabase } = await import('../record-versions.ts');
     const { prepareOwnershipEvidence } = await import('../record-ownership.ts');
     const { effectiveKnownNames } = await import('../name-associations.ts');
-    const f = fixture(t),
+    const journal = memoryJournal(),
+      f = fixture(t, 'observation', journal),
       a = await confirmedReport(f, 'transfer-a'),
-      b = await confirmedReport(f, 'transfer-b'),
-      journal = memoryJournal();
+      b = await confirmedReport(f, 'transfer-b');
     attachRecordDurability(f.db, { profileId: f.profileId, storage: journal.storage });
     const first = f.preview({
       ...f.request,
@@ -1839,10 +1863,8 @@ test('name transfer uses its exact supporting report instead of every historical
   const f = fixture(t),
     b = await confirmedReport(f, 'exact-name-report');
   transaction(f.db, () => {
-    const row = f.db
-      .prepare('SELECT details_json FROM source_files WHERE id=?')
-      .get(b.original.id)!;
-    const details = JSON.parse(String(row.details_json));
+    const row = f.db.prepare('SELECT id FROM source_files WHERE id=?').get(b.original.id)!;
+    const details = JSON.parse(readIntakeEnvelopeText(f.db, { id: String(row.id) })!);
     const historical = structuredClone(b.group);
     historical.id = 'fictional-former-group';
     historical.versions.push({
@@ -1851,9 +1873,7 @@ test('name transfer uses its exact supporting report instead of every historical
       members: [],
     });
     details.intake.workflow.reportGroups.push(historical);
-    f.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify(details), b.original.id);
+    writeIntakeFixtureEnvelope(f.db, b.original.id, details);
   });
   const names = previewOwnershipNames(
     f.db,
@@ -1926,7 +1946,9 @@ test('missing legacy name-support evidence stays unknown and cannot establish so
     report = await confirmedReport(f, 'unknown-legacy-support', 1);
   // Simulate an actual older journal with no support entry. Do not synthesize
   // an entry whose independent flags happen to be absent.
-  f.db.prepare("DELETE FROM manual_batches WHERE title='Remembered name support'").run();
+  fixtureTransaction(f.db, () =>
+    f.db.prepare("DELETE FROM manual_batches WHERE title='Remembered name support'").run(),
+  );
   assert.equal(
     f.db
       .prepare("SELECT count(*) n FROM manual_batches WHERE title='Remembered name support'")

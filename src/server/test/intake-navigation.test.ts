@@ -1,3 +1,5 @@
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { attachPersonalDurability } from '../portable.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import { fictionalModel } from './fictional-model.ts';
 import test from 'node:test';
@@ -61,6 +63,7 @@ function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'circus-source-navigation-')),
     profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
     try {
       db.close();
@@ -195,6 +198,7 @@ test('ZIP-wide units pin each original, preserve shared headings and resume part
     target = join(f.root, 'resumed'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
     db = openDatabase(rebuilt.database, f.profileId);
+  attachPersonalDurability(db, { root: target, profileId: f.profileId });
   try {
     const recovered = getIntake(db, target, f.profileId, item.id);
     assert.deepEqual(recovered.workflow, item.workflow);
@@ -238,13 +242,13 @@ test('section search and reference following remain scoped, literal, bounded and
       bytes: Buffer.from('89504e470d0a1a0a', 'hex'),
     },
   ]);
-  const sourceId = String(
-    f.db
-      .prepare(
-        "SELECT id FROM source_files WHERE json_extract(details_json,'$.intake.originalName')='folder/report.html'",
-      )
-      .get()!.id,
-  );
+  const sourceId = intake
+    .listIntakes(f.db, f.profileId, {}, f.root)
+    .data.find(
+      (entry) =>
+        JSON.parse(readIntakeEnvelopeText(f.db, { id: entry.id })!).intake.originalName ===
+        'folder/report.html',
+    )!.id;
   const child = getIntake(f.db, f.root, f.profileId, sourceId);
   const planned = await createIntakePlan(f.db, f.root, f.profileId, sourceId, {
     version: child.version,

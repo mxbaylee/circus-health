@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { openDatabase, transaction } from '../database.ts';
+import { readIntakeEnvelopeText, stageIntakeEnvelope } from '../intake-authority.ts';
 import { uploadIntake, getIntakeOriginal } from '../intake.ts';
 import { rebuildRecordDatabase } from '../record-versions.ts';
 import { exportCuration } from '../portable.ts';
@@ -73,24 +74,14 @@ test('real warmed private copy, target rebinding and total encrypted cache loss 
     newProviderName: 'Fictional clinic',
   });
   transaction(state.db, () => {
-    const details = JSON.parse(
-      String(
-        state.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intake.id)!
-          .details_json,
-      ),
-    );
+    const details = JSON.parse(String(readIntakeEnvelopeText(state.db, { id: intake.id })));
     details.intake.workflow = {
       format: 'health-intake-workflow-v1',
       fictionalText: 'Fictional repeated passage Ω 😀 '.repeat(500),
     };
-    state.db
-      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-      .run(JSON.stringify(details), intake.id);
+    stageIntakeEnvelope(state.db, { id: intake.id }, details);
   });
-  const sourceDetails = String(
-    state.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intake.id)!
-      .details_json,
-  );
+  const sourceDetails = String(readIntakeEnvelopeText(state.db, { id: intake.id }));
   assert.equal(readSourceTextProjection(state.db, intake.id), sourceDetails);
   const sourceHead = state.recordStorage.read('head');
   const copy = manager.begin({ name: 'Fictional rope copy owner', copyFrom: id });
@@ -98,10 +89,7 @@ test('real warmed private copy, target rebinding and total encrypted cache loss 
   const expected = new Map<string, string>();
   const check = (profileId: string) => {
     const current = manager.opened.get(profileId)!;
-    const raw = String(
-      current.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intake.id)!
-        .details_json,
-    );
+    const raw = String(readIntakeEnvelopeText(current.db, { id: intake.id }));
     if (!expected.has(profileId)) expected.set(profileId, raw);
     assert.equal(raw, expected.get(profileId));
     assert.equal(readSourceTextProjection(current.db, intake.id), raw);
@@ -136,13 +124,7 @@ test('real warmed private copy, target rebinding and total encrypted cache loss 
   check(id);
   check(copy.profileId);
   assert.deepEqual(state.recordStorage.read('head'), sourceHead);
-  assert.equal(
-    String(
-      state.db.prepare('SELECT details_json FROM source_files WHERE id=?').get(intake.id)!
-        .details_json,
-    ),
-    sourceDetails,
-  );
+  assert.equal(String(readIntakeEnvelopeText(state.db, { id: intake.id })), sourceDetails);
   for (const [profileId, recovery] of [
     [id, created.recoveryKit],
     [copy.profileId, copy.recoveryKit],

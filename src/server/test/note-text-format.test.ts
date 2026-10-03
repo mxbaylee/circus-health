@@ -8,14 +8,9 @@ import type { TestContext } from 'node:test';
 import type { Note, NoteHistoryEntry } from '../../shared/api.ts';
 import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories, profilePaths } from '../profile-storage.ts';
-import {
-  attachPersonalDurability,
-  publishedPersonalLineage,
-  exportCuration,
-  rebuildProfile,
-} from '../portable.ts';
+import { attachPersonalDurability, exportCuration, rebuildProfile } from '../portable.ts';
 import { createNote, saveNote, getNote, finishNote } from '../notes.ts';
-import { noteHistory, restoreNoteFields } from '../note-history.ts';
+import { noteHistory, restoreNoteFields, previewNoteRestoration } from '../note-history.ts';
 const hasCode = (error: unknown, code: string): boolean =>
   error instanceof Error && 'code' in error && error.code === code;
 function fixture(t: TestContext) {
@@ -32,8 +27,14 @@ function fixture(t: TestContext) {
   });
   return { root, profileId, paths, db };
 }
-const generation = (f: ReturnType<typeof fixture>) =>
-  [...publishedPersonalLineage(f.root, f.profileId)][0].manifest.file.slice('snapshots/'.length);
+const generation = (f: ReturnType<typeof fixture>, id: string) =>
+  String(
+    f.db
+      .prepare(
+        "SELECT version_id FROM __record_versions WHERE entity='notes' AND record_id=? ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(JSON.stringify([id]))!.version_id,
+  );
 
 test('format markers preserve literal legacy bodies, idempotent creation, partial edits and finished content', (t) => {
   const { db } = fixture(t),
@@ -92,7 +93,7 @@ test('selected field restore moves the original marker with its body, including 
       topics: '* literal topic',
       rawThoughts: '# raw',
     }),
-    old = generation(f);
+    old = generation(f, note.id);
   note = saveNote(db, note.id, {
     ...note,
     content: '# Heading',
@@ -105,6 +106,12 @@ test('selected field restore moves the original marker with its body, including 
   assert.ok(history);
   assert.equal(history.fields.find((x) => x.path === 'content')?.previous.format, 'plain-v1');
   note = restoreNoteFields(db, f.root, f.profileId, note.id, {
+    ...previewNoteRestoration(db, f.root, f.profileId, note.id, {
+      generationId: old,
+      fields: ['content', 'rawThoughts'],
+      version: note.version,
+      operationId: randomUUID(),
+    }),
     generationId: old,
     fields: ['content', 'rawThoughts'],
     version: note.version,
@@ -122,13 +129,19 @@ test('selected field restore moves the original marker with its body, including 
       person: { medicalHistory: '# Literal family' },
       textFormats: { content: 'markdown-v1' },
     }),
-    personOld = generation(f);
+    personOld = generation(f, person.id);
   person = saveNote(db, person.id, {
     ...person,
     person: { ...person.person, medicalHistory: '# Formatted family' },
     textFormats: { ...person.textFormats, medicalHistory: 'markdown-v1' },
   });
   person = restoreNoteFields(db, f.root, f.profileId, person.id, {
+    ...previewNoteRestoration(db, f.root, f.profileId, person.id, {
+      generationId: personOld,
+      fields: ['person.medicalHistory'],
+      version: person.version,
+      operationId: randomUUID(),
+    }),
     generationId: personOld,
     fields: ['person.medicalHistory'],
     version: person.version,

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { fictionalModel } from './fictional-model.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -10,7 +12,7 @@ import { uploadIntake, getRetainedIntakeOriginalReference } from '../intake.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { readIntakeBatch, writeIntakeBatch } from '../intake-batch-journal.ts';
 import type { RecordStorage } from '../record-versions.ts';
-import { getIntakeSourceText } from '../intake-source-text.ts';
+import { getIntakeSourceText, publishIntakeSourceText } from '../intake-source-text.ts';
 import type { IntakeBatchReadingState, IntakeProviderWait } from '../../shared/intake-batch.ts';
 async function waitFor(check: () => boolean) {
   const end = Date.now() + 2500;
@@ -24,6 +26,7 @@ function fixture(
   randomValue = 1,
   retryBaseMs = 5,
 ) {
+  fictionalModel(t);
   const root = mkdtempSync(join(tmpdir(), 'circus-provider-wait-')),
     profileId = 'fictional-wait';
   const db = openDatabase(profilePaths(root, profileId).database, profileId);
@@ -264,6 +267,30 @@ test('create reports a stopped restart and reopens a completed item with unfinis
   completed.items[0].resumeAutomaticRun = false;
   completed.items[0].automaticRun = false;
   completed.automaticRun = false;
+  const intakeId = f.batch.items[0].intakeId;
+  const captured = getIntakeSourceText(f.db, f.root, f.profileId, intakeId);
+  assert.equal(captured.status, 'available');
+  const revision = captured.revision!;
+  publishIntakeSourceText(f.db, f.root, f.profileId, intakeId, {
+    operationId: randomUUID(),
+    expectedRevisionId: revision.id,
+    sourceHash: revision.sourceHash,
+    evidence: {
+      adapter: revision.adapter,
+      pages: revision.pages.map((page) => ({ ...page, disposition: 'partial' })),
+      spans: revision.spans,
+      relations: revision.relations,
+      issues: [
+        {
+          id: 'p1-pending',
+          region: { page: 1 },
+          kind: 'coverage',
+          detail: 'Fictional remaining source section',
+          status: 'open',
+        },
+      ],
+    },
+  });
   f.reopenWith(completed);
   const reopened = f.manager.create(f.profileId, {
     operationId: 'fictional-reprocess-complete',

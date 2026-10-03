@@ -88,10 +88,10 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Install scoped PDF extraction dependency
+      - name: Install PDF and source-capture dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes qpdf
+          sudo apt-get install --yes qpdf tesseract-ocr tesseract-ocr-eng
       - name: Install the PDF renderer used by real export tests
         run: npx playwright install --with-deps chromium
       - name: Server tests with isolated fictional fixtures
