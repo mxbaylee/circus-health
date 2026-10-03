@@ -268,7 +268,10 @@ export function createApp({
       const lifecycleMatch = url.pathname.match(/^\/api\/profiles\/([^/]+)(\/copy)?$/);
       if (lifecycleMatch && (method === 'DELETE' || method === 'POST')) {
         const id = decodeURIComponent(lifecycleMatch[1]);
-        if (!dbs.has(id)) throw new HttpError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
+        // A verified published copy retry can recover its target after the source is removed.
+        // The lifecycle still checks the source lease before any unpublished copy.
+        if (!dbs.has(id) && !(method === 'POST' && lifecycleMatch[2]))
+          throw new HttpError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
         const input = await jsonBody(req);
         if (method === 'DELETE' && !lifecycleMatch[2])
           send(res, 200, { data: lifecycle.remove(id, input) });

@@ -5,7 +5,8 @@ import { HttpError, transaction, type Database } from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import { profileOriginal } from './profile-storage.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
-import { readIntakeSourcePin } from './intake-source-pin.ts';
+import { readIntakeSourcePin, parseIntakeSourcePin } from './intake-source-pin.ts';
+import { DEFAULT_LIMITS } from './intake-state-evidence.ts';
 import { affectedSourcePages } from './intake-proposal-dependencies.ts';
 import { visibilityCondition, visibilitySQL } from './visibility.ts';
 import {
@@ -52,8 +53,11 @@ function corrupt(): never {
 const object = (v: unknown): v is Record<string, unknown> =>
   !!v && typeof v === 'object' && !Array.isArray(v);
 const key = (id: string, name: string) => `intake_source_text:v1:${id}:${name}`;
-const read = (db: Database, name: string): string | undefined =>
-  db.prepare('SELECT value FROM app_meta WHERE key=?').get(name)?.value as string | undefined;
+type MetadataReader = Database | { readMetadata(name: string): string | undefined };
+const read = (db: MetadataReader, name: string): string | undefined =>
+  'readMetadata' in db
+    ? db.readMetadata(name)
+    : (db.prepare('SELECT value FROM app_meta WHERE key=?').get(name)?.value as string | undefined);
 const put = (db: Database, name: string, value: unknown) => {
   const text = encode(value),
     previous = read(db, name);
@@ -294,7 +298,7 @@ function chunkBy<T>(items: T[], identity: (item: T) => string, max: number): T[]
 const hashRefs = (value: unknown, max: number): value is string[] =>
   Array.isArray(value) && value.length <= max && value.every((ref) => HASH.test(ref));
 function issueIndexOf(
-  db: Database,
+  db: MetadataReader,
   intakeId: string,
   index: StoredIssueIndex | StoredIssueIndexRefs,
 ): StoredIssueIndex {
@@ -315,7 +319,7 @@ function blob(db: Database, intakeId: string, value: unknown): string {
   put(db, key(intakeId, `blob:${sha}`), value);
   return sha;
 }
-function readBlob(db: Database, intakeId: string, ref: string): unknown {
+function readBlob(db: MetadataReader, intakeId: string, ref: string): unknown {
   if (!HASH.test(ref)) corrupt();
   const raw = read(db, key(intakeId, `blob:${ref}`));
   if (raw === undefined) corrupt();
@@ -324,7 +328,7 @@ function readBlob(db: Database, intakeId: string, ref: string): unknown {
   return value;
 }
 function loadStoredRevision(
-  db: Database,
+  db: MetadataReader,
   profileId: string,
   intakeId: string,
   sourceHash: string,
@@ -386,7 +390,7 @@ function loadStoredRevision(
   };
 }
 function loadRevision(
-  db: Database,
+  db: MetadataReader,
   profileId: string,
   intakeId: string,
   sourceHash: string,
@@ -426,6 +430,111 @@ function loadRevision(
     corrupt();
   }
   return revision;
+}
+
+/** Validate retained source-text metadata with the same decoders used by recovery and rebinding. */
+export function validatePortableIntakeSourceText(
+  tables: Record<string, Record<string, unknown>[]>,
+  profileId: string,
+): void {
+  const metadata = new Map<string, string>();
+  let bytes = 0,
+    count = 0;
+  for (const row of tables.app_meta ?? []) {
+    if (typeof row.key !== 'string' || typeof row.value !== 'string' || metadata.has(row.key))
+      corrupt();
+    if (row.key.startsWith('intake_source_text:')) {
+      bytes += Buffer.byteLength(row.key) + Buffer.byteLength(row.value);
+      if (bytes > DEFAULT_LIMITS.bytes || ++count > 200_000) corrupt();
+    }
+    metadata.set(row.key, row.value);
+  }
+  const originals = new Map(
+    (tables.source_files ?? [])
+      .filter((row) => row.kind === 'intake_original')
+      .map((row) => [row.id, row]),
+  );
+  let decodeBytes = 0;
+  const reader: MetadataReader = {
+    readMetadata(name) {
+      const raw = metadata.get(name);
+      decodeBytes += raw === undefined ? 0 : Buffer.byteLength(raw);
+      if (decodeBytes > DEFAULT_LIMITS.bytes) corrupt();
+      return raw;
+    },
+  };
+  const revisions = new Map<string, Pick<SourceTextRevision, 'intakeId' | 'parentRevisionId'>>();
+  const heads = new Map<string, string>();
+  const namespaces = new Set<string>();
+  const operations: Array<{ intakeId: string; revisionId: string }> = [];
+  for (const [name, raw] of metadata) {
+    if (!name.startsWith('intake_source_text:')) continue;
+    const match =
+      /^intake_source_text:v1:(.+):(head|blob:([0-9a-f]{64})|revision:([0-9a-f-]{36})|operation:([0-9a-f-]{36}))$/.exec(
+        name,
+      );
+    if (!match || !originals.has(match[1])) corrupt();
+    const [, intakeId, kind, blobId, revisionId, operationId] = match;
+    namespaces.add(intakeId);
+    const original = originals.get(intakeId)!;
+    if (kind === 'head') {
+      const head = parse(raw);
+      if (
+        !object(head) ||
+        head.sourceHash !== original.sha256 ||
+        typeof head.revisionId !== 'string' ||
+        !UUID.test(head.revisionId)
+      )
+        corrupt();
+      heads.set(intakeId, head.revisionId);
+    } else if (blobId) readBlob(reader, intakeId, blobId);
+    else if (operationId) {
+      const operation = parse(raw);
+      if (
+        !UUID.test(operationId) ||
+        !object(operation) ||
+        typeof operation.fingerprint !== 'string' ||
+        !HASH.test(operation.fingerprint) ||
+        typeof operation.revisionId !== 'string' ||
+        !UUID.test(operation.revisionId)
+      )
+        corrupt();
+      operations.push({ intakeId, revisionId: operation.revisionId });
+    } else {
+      const revision = loadRevision(
+        reader,
+        profileId,
+        intakeId,
+        String(original.sha256),
+        revisionId,
+      );
+      revisions.set(key(intakeId, `revision:${revisionId}`), {
+        intakeId: revision.intakeId,
+        parentRevisionId: revision.parentRevisionId,
+      });
+    }
+  }
+  const selected = new Set<string>();
+  for (const intakeId of namespaces) if (!heads.has(intakeId)) corrupt();
+  for (const [intakeId, revisionId] of heads) {
+    let next: string | null = revisionId;
+    while (next !== null) {
+      const revisionKey = key(intakeId, `revision:${next}`);
+      const revision = revisions.get(revisionKey);
+      if (!revision || selected.has(revisionKey)) corrupt();
+      selected.add(revisionKey);
+      next = revision.parentRevisionId;
+    }
+  }
+  if (selected.size !== revisions.size) corrupt();
+  for (const { intakeId, revisionId } of operations)
+    if (!selected.has(key(intakeId, `revision:${revisionId}`))) corrupt();
+  for (const [name, raw] of metadata) {
+    if (!name.startsWith('intake_source_pin:v1:')) continue;
+    const intakeId = name.slice('intake_source_pin:v1:'.length);
+    const pin = parseIntakeSourcePin(raw);
+    if (pin?.revisionId && !revisions.has(key(intakeId, `revision:${pin.revisionId}`))) corrupt();
+  }
 }
 export function getIntakeSourceTextReviewHistory(
   db: Database,

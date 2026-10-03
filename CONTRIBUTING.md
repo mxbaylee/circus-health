@@ -88,7 +88,7 @@ Update documentation with contract changes. Cite current implementation and test
 
 ## Working across computers
 
-Every new or edited ticket needs a user story using the canonical [personas and jobs](docs/design/personas.md), with the user benefit and technical ambiguity explained for a product manager. Follow the [ticket template and workflow](docs/todo/readme.md#ticket-writing-and-review). Split at useful complexity boundaries; coherent high-effort work can proceed with independent review, and effort alone does not require owner grading.
+Every new or edited ticket needs a user story grounded in the canonical [personas and jobs](docs/design/personas.md), a plain-English user walkthrough and Given–When–Then acceptance criteria. Use the [ticket guidance and template](docs/todo/readme.md#ticket-writing-and-review) to separate persona goal/value and understandable user experience from technical requirements and ambiguity. Keep the structure proportionate; preserve useful existing contracts rather than mechanically rewriting them or inventing scope. Split at useful complexity boundaries; coherent high-effort work can proceed with independent review, and effort alone does not require owner grading.
 
 Keep short open items in the [single CRS work list](docs/todo/readme.md); give an item its own file only when necessary context justifies it. Preserve durable requirements, owner decisions and review findings in the owning CRS item so another agent can continue without chat history. Transient execution notes may stay in chats or issues. Maintain documentation of current behavior and limitations alongside code.
 

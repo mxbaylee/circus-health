@@ -12,13 +12,28 @@ import {
   renameSync,
   rmSync,
   lstatSync,
-  writeFileSync,
   openSync,
   closeSync,
   fsyncSync,
+  readFileSync,
 } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { openDatabase, HttpError, type Database } from './database.ts';
+import { openDatabase, HttpError, transaction, type Database } from './database.ts';
+import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
+import { stageIntakeStateCopy } from './intake-state-bootstrap.ts';
+import {
+  preparePortableIntakeCopy,
+  assertPortableCopyCoherence,
+} from './intake-state-portable-copy.ts';
+import {
+  copyOperationId,
+  readCopyOperation,
+  newCopyOperation,
+  writeCopyOperation,
+  selectCopyHeads,
+  verifyCopyHeads,
+  type ProfileCopyOperation,
+} from './profile-copy-operation.ts';
 import { ensureProfileDirectories, profilePaths } from './profile-storage.ts';
 import {
   readProfileRegistry,
@@ -31,6 +46,8 @@ import {
   loadPortable,
   durableWrite,
   syncDirectory,
+  projectPortableDatabase,
+  type CompleteLoadedPortable,
 } from './portable.ts';
 import { registerProfileDisplayGuard, selfIdentity, getNote, saveNote } from './notes.ts';
 export interface ProfileRegistryEntry {
@@ -47,6 +64,7 @@ export interface ProfileInfo extends ProfileRegistryEntry {
   nameVersion: number;
   version: number;
   icon?: string;
+  operationId?: string;
 }
 interface ProfileIdentity {
   name: string;
@@ -63,10 +81,27 @@ export interface CreateProfileInput {
   birthDate?: unknown;
   name?: unknown;
   placebo?: unknown;
+  operationId?: unknown;
 }
 export interface RemoveProfileInput {
   confirmationName?: unknown;
   version?: unknown;
+}
+export type ProfileCopyCheckpoint =
+  | 'validated'
+  | 'staged'
+  | 'before-export'
+  | 'exported'
+  | 'before-publication'
+  | 'renamed'
+  | 'published'
+  | 'registered'
+  | 'activated';
+export interface ProfileCopyCheckpointContext {
+  operationId: string;
+  sourceProfileId: string;
+  targetProfileId: string;
+  stageRoot: string;
 }
 export interface CreateProfileLifecycleOptions {
   root: string;
@@ -74,6 +109,10 @@ export interface CreateProfileLifecycleOptions {
   databaseDirectory?: string;
   runtimeRoot?: string;
   busy?: (profileId: string) => boolean;
+  copyCheckpoint?: (
+    checkpoint: ProfileCopyCheckpoint,
+    context: ProfileCopyCheckpointContext,
+  ) => void;
 }
 export interface ProfileLifecycle {
   list(): ProfileInfo[];
@@ -117,8 +156,10 @@ export function createProfileLifecycle({
   databaseDirectory,
   runtimeRoot,
   busy = () => false,
+  copyCheckpoint = () => {},
 }: CreateProfileLifecycleOptions): ProfileLifecycle {
   const locks = new Set<string>();
+  const copyLocks = new Set<string>();
   let closed = false;
   const assertOpen = (): void => {
     if (closed)
@@ -159,10 +200,153 @@ export function createProfileLifecycle({
   const guard = (id: string, db: Database) =>
     registerProfileDisplayGuard(db, (name, icon) => requireDistinctProfile(name, icon, id));
   for (const [id, db] of databases) guard(id, db);
+  function checkpoint(
+    operation: ProfileCopyOperation | null,
+    stageRoot: string,
+    point: ProfileCopyCheckpoint,
+  ): void {
+    if (operation)
+      copyCheckpoint(point, {
+        operationId: operation.operationId,
+        sourceProfileId: operation.sourceProfileId,
+        targetProfileId: operation.targetProfileId,
+        stageRoot,
+      });
+  }
+  function rebindCopyReceipts(
+    copy: Database,
+    sourceProfileId: string,
+    targetProfileId: string,
+  ): void {
+    for (const row of copy
+      .prepare(
+        "SELECT key,value FROM app_meta WHERE key GLOB 'personal_restore_*' OR key GLOB 'personal_assistant_*'",
+      )
+      .all()) {
+      if (typeof row.key !== 'string' || typeof row.value !== 'string')
+        throw new HttpError(409, 'PROFILE_COPY_RECEIPT', 'Source public receipt is invalid');
+      const archiveKey = `private_copy_source_receipt:v1:${sourceProfileId}:${row.key}`;
+      const archived = copy.prepare('SELECT value FROM app_meta WHERE key=?').get(archiveKey);
+      if (archived && archived.value !== row.value)
+        throw new HttpError(
+          409,
+          'PROFILE_COPY_RECEIPT',
+          'Source public receipt conflicts with retained copy evidence',
+        );
+      copy
+        .prepare('INSERT OR IGNORE INTO app_meta(key,value) VALUES(?,?)')
+        .run(archiveKey, row.value);
+      const value = JSON.parse(row.value) as Record<string, unknown>;
+      if (row.key.startsWith('personal_assistant_') && value.intakePersonProposalId !== undefined) {
+        if (
+          value.profileId !== sourceProfileId ||
+          value.kind !== 'person' ||
+          typeof value.intakePersonProposalId !== 'string' ||
+          typeof value.personId !== 'string' ||
+          typeof value.noteId !== 'string' ||
+          !Number.isSafeInteger(value.version) ||
+          Number(value.version) < 1 ||
+          !copy
+            .prepare("SELECT 1 FROM notes WHERE id=? AND kind='person' AND person_id=?")
+            .get(value.noteId, value.personId)
+        )
+          throw new HttpError(
+            409,
+            'PROFILE_COPY_RECEIPT',
+            'Source saved People receipt is invalid',
+          );
+        // Accepted People proposal IDs/versions remain public receipt identity.
+        // Source history/chat receipts are retained above as evidence, not target replay authority.
+        copy
+          .prepare('UPDATE app_meta SET value=? WHERE key=?')
+          .run(JSON.stringify({ ...value, profileId: targetProfileId }), row.key);
+      } else copy.prepare('DELETE FROM app_meta WHERE key=?').run(row.key);
+    }
+  }
+  function activatePublishedCopy(operation: ProfileCopyOperation): ProfileInfo {
+    const id = operation.targetProfileId,
+      final = profilePaths(root, id);
+    safeTree(final.root);
+    const portable = loadPortable(root, id) as CompleteLoadedPortable;
+    const registry = readProfileRegistry(root) as ProfileRegistry;
+    const entry = registry.profiles.find((p) => p.id === id);
+    const active = databases.get(id);
+    const receipt = JSON.parse(
+      readFileSync(resolve(final.root, 'mappings/private-copy.json'), 'utf8'),
+    );
+    if (
+      receipt.format !== 'health-private-copy-v1' ||
+      receipt.operationId !== operation.operationId ||
+      receipt.sourceProfileId !== operation.sourceProfileId ||
+      receipt.targetProfileId !== id
+    )
+      throw new HttpError(
+        409,
+        'PROFILE_COPY_OPERATION',
+        'Published private copy receipt conflicts',
+      );
+    // A completed target can legitimately have newer accepted generations.
+    // Retried operations never change its selected state or user edits.
+    if (entry && active) {
+      if (
+        !operation.published ||
+        entry.placebo ||
+        active.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==
+          id
+      )
+        throw new HttpError(
+          409,
+          'PROFILE_COPY_OPERATION',
+          'Private copy registry binding conflicts',
+        );
+      return { ...profileInfo(active, entry), operationId: operation.operationId };
+    }
+    if (!entry) verifyCopyHeads(operation, portable);
+    else if (!operation.published || entry.placebo)
+      throw new HttpError(409, 'PROFILE_COPY_OPERATION', 'Private copy registry binding conflicts');
+    operation = { ...operation, published: true };
+    writeCopyOperation(root, operation);
+    const location = databaseDirectory
+      ? resolve(databaseDirectory, `${id}.sqlite`)
+      : final.database;
+    let recovered: Database | undefined;
+    try {
+      if (!existsSync(location)) projectPortableDatabase(location, id, portable);
+      recovered = openDatabase(location, id);
+      assertPortableCopyCoherence(recovered, root, id);
+      const identity = selfIdentity(recovered);
+      if (!entry && identity.name !== operation.name)
+        throw new HttpError(
+          409,
+          'PROFILE_COPY_OPERATION',
+          'Published private copy display name conflicts',
+        );
+      requireDistinctProfile(identity.name, identity.icon, id);
+      attachPersonalDurability(recovered, { root, profileId: id, initialize: false });
+      assertOpen();
+      if (!entry) writeProfileRegistry(root, [...registry.profiles, { id, placebo: false }]);
+      else if (entry.placebo)
+        throw new HttpError(
+          409,
+          'PROFILE_COPY_OPERATION',
+          'Private copy registry binding conflicts',
+        );
+      checkpoint(operation, resolve(root, 'data/operations/profile-staging', id), 'registered');
+      guard(id, recovered);
+      databases.set(id, recovered);
+      recovered = undefined;
+      checkpoint(operation, resolve(root, 'data/operations/profile-staging', id), 'activated');
+      return {
+        ...profileInfo(databases.get(id)!, { id, placebo: false }),
+        operationId: operation.operationId,
+      };
+    } finally {
+      recovered?.close();
+    }
+  }
   async function create(input: CreateProfileInput, sourceId?: string): Promise<ProfileInfo> {
     assertOpen();
-    const name = nameOf(input?.name),
-      id = `p-${randomUUID()}`;
+    const name = nameOf(input?.name);
     if (input?.placebo !== undefined && typeof input.placebo !== 'boolean')
       throw new HttpError(400, 'PROFILE_PLACEBO', 'Placebo must be true or false');
     if (sourceId && input?.placebo)
@@ -170,6 +354,36 @@ export function createProfileLifecycle({
         400,
         'PROFILE_PLACEBO',
         'A private copy cannot become a synthetic placebo',
+      );
+    const operationId = sourceId ? copyOperationId(input?.operationId) : undefined;
+    if (operationId && copyLocks.has(operationId))
+      throw new HttpError(
+        409,
+        'PROFILE_BUSY',
+        'This private copy operation is already in progress',
+      );
+    let operation = sourceId ? readCopyOperation(root, operationId!, sourceId, name) : null;
+    if (operation && existsSync(profilePaths(root, operation.targetProfileId).root)) {
+      copyLocks.add(operation.operationId);
+      try {
+        return activatePublishedCopy(operation);
+      } finally {
+        copyLocks.delete(operation.operationId);
+      }
+    }
+    if (
+      operation?.published ||
+      operation?.publicationAttempted ||
+      (operation &&
+        (databases.has(operation.targetProfileId) ||
+          (readProfileRegistry(root) as ProfileRegistry).profiles.some(
+            (p) => p.id === operation!.targetProfileId,
+          )))
+    )
+      throw new HttpError(
+        409,
+        'PROFILE_COPY_OPERATION',
+        'Published private copy is missing; recover it explicitly rather than recopying',
       );
     const placebo = !sourceId && input?.placebo === true;
     const identity = !sourceId && !placebo ? onboardingIdentity(input) : {};
@@ -180,12 +394,20 @@ export function createProfileLifecycle({
         'Wait for this profile’s current work to finish before copying',
       );
     requireDistinctProfile(name, sourceId ? selfIdentity(databases.get(sourceId)!).icon : 'person');
-    if (sourceId) locks.add(sourceId);
+    if (sourceId) {
+      locks.add(sourceId);
+      copyLocks.add(operationId!);
+      operation ??= newCopyOperation(operationId!, sourceId, name);
+    }
+    const id = operation?.targetProfileId ?? `p-${randomUUID()}`;
     const stage = resolve(root, 'data/operations/profile-staging', id);
     let db: Database | null | undefined,
       registered = false;
     let finalDb: string | undefined;
     try {
+      if (operation) writeCopyOperation(root, operation);
+      // A crashed unpublished workspace has no selected authority and is replaced.
+      if (sourceId) rmSync(stage, { recursive: true, force: true });
       const paths = ensureProfileDirectories(stage, id);
       if (sourceId) {
         const source = profilePaths(root, sourceId);
@@ -195,25 +417,55 @@ export function createProfileLifecycle({
         }
         await backup(databases.get(sourceId)!, paths.database);
         assertOpen();
-      }
-      // Rewrite only profile-owned storage references; provider payloads and
-      // original bytes are retained verbatim in this explicitly PRIVATE copy.
-      if (sourceId) {
         const copy = new DatabaseSync(paths.database);
         try {
-          copy.exec('BEGIN IMMEDIATE');
-          copy.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
-          const before = `data/profiles/${sourceId}/`,
-            after = `data/profiles/${id}/`;
-          for (const [table, column] of [
-            ['source_files', 'path'],
-            ['assets', 'stored_path'],
-          ])
-            copy.prepare(`UPDATE ${table} SET ${column}=replace(${column},?,?)`).run(before, after);
-          copy
-            .prepare("DELETE FROM app_meta WHERE key GLOB 'personal_*' OR key='curation_revision'")
-            .run();
-          copy.exec('COMMIT');
+          const plan = preparePortableIntakeCopy(
+            databases.get(sourceId)!,
+            copy,
+            root,
+            sourceId,
+            id,
+          );
+          checkpoint(operation, stage, 'validated');
+          transaction(copy, () => {
+            copy.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
+            const before = `data/profiles/${sourceId}/`,
+              after = `data/profiles/${id}/`;
+            for (const [table, column] of [
+              ['source_files', 'path'],
+              ['assets', 'stored_path'],
+            ])
+              copy
+                .prepare(
+                  `UPDATE ${table} SET ${column}=? || substr(${column},?) WHERE substr(${column},1,?)=?`,
+                )
+                .run(after, before.length + 1, before.length, before);
+            rebindCopiedIntakeSourceText(copy, sourceId, id);
+            for (const row of copy
+              .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
+              )
+              .all())
+              copy.exec(`DROP TABLE IF EXISTS "${String(row.name).replaceAll('"', '""')}"`);
+            stageIntakeStateCopy(copy, plan, {
+              profileId: id,
+              readSelectedHead: () => {
+                for (const base of [stage, root])
+                  for (const kind of ['personal', 'curation'] as const) {
+                    const head = resolve(profilePaths(base, id)[kind], 'current.json');
+                    if (existsSync(head)) return readFileSync(head);
+                  }
+                return null;
+              },
+            });
+            rebindCopyReceipts(copy, sourceId, id);
+            copy
+              .prepare(
+                "DELETE FROM app_meta WHERE key IN ('personal_dirty','personal_persisted_revision','personal_last_error','personal_conflict','curation_revision')",
+              )
+              .run();
+          });
+          checkpoint(operation, stage, 'staged');
         } finally {
           copy.close();
         }
@@ -237,26 +489,36 @@ export function createProfileLifecycle({
           name,
           seed: SYNTHETIC_PLACEBO_SEED,
         });
+      checkpoint(operation, stage, 'before-export');
       attachPersonalDurability(db, { root: stage, profileId: id });
       exportCuration(db, stage, id);
-      if (sourceId) {
+      if (operation) {
         mkdirSync(resolve(paths.root, 'mappings'), { recursive: true });
-        writeFileSync(
+        durableWrite(
           resolve(paths.root, 'mappings/private-copy.json'),
-          JSON.stringify(
-            {
-              format: 'health-private-copy-v1',
-              sourceProfileId: sourceId,
-              createdAt: new Date().toISOString(),
-              scope:
-                'Current accepted state and originals. No prior app generations or chats. Private real-data copy; not anonymized.',
-            },
-            null,
-            2,
+          Buffer.from(
+            JSON.stringify(
+              {
+                format: 'health-private-copy-v1',
+                operationId: operation.operationId,
+                sourceProfileId: sourceId,
+                targetProfileId: id,
+                createdAt: operation.createdAt,
+                scope:
+                  'Current accepted state and originals. No prior app generations or chats. Private real-data copy; not anonymized.',
+              },
+              null,
+              2,
+            ) + '\n',
           ),
         );
       }
-      loadPortable(stage, id);
+      checkpoint(operation, stage, 'exported');
+      const portable = loadPortable(stage, id) as CompleteLoadedPortable;
+      if (operation) {
+        operation = selectCopyHeads(operation, portable);
+        writeCopyOperation(root, operation);
+      }
       const createdIdentity = selfIdentity(db);
       db.close();
       db = null;
@@ -265,6 +527,12 @@ export function createProfileLifecycle({
       finalDb = databaseDirectory ? resolve(databaseDirectory, `${id}.sqlite`) : final.database;
       if (databaseDirectory) {
         mkdirSync(databaseDirectory, { recursive: true, mode: 0o700 });
+        if (existsSync(finalDb))
+          throw new HttpError(
+            409,
+            'PROFILE_COPY_OPERATION',
+            'Copy destination cache already exists',
+          );
         cpSync(paths.database, finalDb);
         rmSync(paths.database);
       }
@@ -285,8 +553,26 @@ export function createProfileLifecycle({
       flushTree(paths.root);
       assertOpen();
       requireDistinctProfile(createdIdentity.name, createdIdentity.icon);
+      checkpoint(operation, stage, 'before-publication');
+      if (existsSync(final.root))
+        throw new HttpError(
+          409,
+          'PROFILE_COPY_OPERATION',
+          'Private copy destination already exists; recover it explicitly',
+        );
+      if (operation) {
+        operation = { ...operation, publicationAttempted: true };
+        writeCopyOperation(root, operation);
+      }
       renameSync(paths.root, final.root);
+      checkpoint(operation, stage, 'renamed');
       syncDirectory(dirname(final.root));
+      if (operation) {
+        operation = { ...operation, published: true };
+        writeCopyOperation(root, operation);
+        checkpoint(operation, stage, 'published');
+        return activatePublishedCopy(operation);
+      }
       db = openDatabase(finalDb, id);
       attachPersonalDurability(db, { root, profileId: id });
       const registry = readProfileRegistry(root) as ProfileRegistry;
@@ -298,14 +584,29 @@ export function createProfileLifecycle({
       db = null;
       return result;
     } finally {
-      if (sourceId) locks.delete(sourceId);
-      db?.close();
-      rmSync(stage, { recursive: true, force: true });
-      // A failed publish retains its complete unregistered profile for recovery.
-      if (!registered && finalDb && databaseDirectory && !existsSync(profilePaths(root, id).root))
-        rmSync(finalDb, { force: true });
+      try {
+        // Only this live operation can prove a failed rename retained its stage.
+        // After restart, absent final storage alone never proves nonpublication.
+        if (
+          operation?.publicationAttempted &&
+          !operation.published &&
+          existsSync(profilePaths(stage, id).root) &&
+          !existsSync(profilePaths(root, id).root)
+        ) {
+          const { publicationAttempted: _attempted, ...unpublished } = operation;
+          writeCopyOperation(root, unpublished);
+        }
+      } finally {
+        if (sourceId) locks.delete(sourceId);
+        if (operationId) copyLocks.delete(operationId);
+        db?.close();
+        rmSync(stage, { recursive: true, force: true });
+        if (!registered && finalDb && databaseDirectory && !existsSync(profilePaths(root, id).root))
+          rmSync(finalDb, { force: true });
+      }
     }
   }
+
   function remove(
     id: string,
     input: RemoveProfileInput,

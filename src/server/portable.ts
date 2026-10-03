@@ -1,5 +1,6 @@
 import { resolveClinicalReference } from './clinical-references.ts';
 import { canonicalLiteral } from './intake-format.ts';
+import { validatePortableIntakeState } from './intake-state-portable.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   openSync,
@@ -1315,6 +1316,7 @@ export function loadPortable(
       throw new Error('Conflicting original metadata');
     originals.set(file.path as string, file as OriginalFile);
   }
+  validatePortableIntakeState(rows, profileId);
   return { personal, curation, rows, originals };
 }
 export function rebuildProfile(root: string, profileId: string, targetRoot: string) {
@@ -1385,6 +1387,7 @@ export function projectPortableDatabase(
   portable: CompleteLoadedPortable,
   { phase = () => {} }: ProjectPortableOptions = {},
 ): ProjectPortableResult {
+  validatePortableIntakeState(portable.rows, profileId);
   if (existsSync(database)) throw new Error('Projection database must be new');
   let db: Database | null | undefined;
   try {

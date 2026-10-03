@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { hash, profileFile } from '../assets.ts';
 import test, { type TestContext } from 'node:test';
 import type { AddressInfo } from 'node:net';
@@ -6,7 +7,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { createApp } from '../index.ts';
-import { rebuildProfile } from '../portable.ts';
+import { rebuildProfile, exportCuration } from '../portable.ts';
 import { openDatabase, type Database } from '../database.ts';
 import { getNote, createNote } from '../notes.ts';
 import { readProfileRegistry, recoverProfileDeletions } from '../profile-registry.ts';
@@ -68,8 +69,14 @@ test('private copy retains current notes and original source owner unchanged', a
       "INSERT INTO source_records(id,source_file_id,raw_json) VALUES('original-record','original',?)",
     )
     .run(raw.toString());
+  exportCuration(databases.get(a.id)!, root, a.id);
   const b = await actions.create(
-    { fullName: 'Playground', birthDate: '1982-04-17', name: 'Playground' },
+    {
+      operationId: randomUUID(),
+      fullName: 'Playground',
+      birthDate: '1982-04-17',
+      name: 'Playground',
+    },
     a.id,
   );
   assert.equal(b.placebo, false);
@@ -160,7 +167,10 @@ test('HTTP empty start creates, copies and deletes profiles with origin and vers
   });
   assert.equal(created.status, 201);
   const p = ((await created.json()) as { data: { id: string; version: number } }).data;
-  const copied = await send(`/${p.id}/copy`, 'POST', { name: 'Private Copy' });
+  const copied = await send(`/${p.id}/copy`, 'POST', {
+    name: 'Private Copy',
+    operationId: randomUUID(),
+  });
   assert.equal(copied.status, 201);
   const copy = ((await copied.json()) as { data: { id: string; version: number } }).data;
   assert.equal(
@@ -183,7 +193,12 @@ test('closing the app during a copy prevents publication', async (t) => {
   const { root, actions } = fixture(t);
   const p = await actions.create({ fullName: 'Source', birthDate: '1982-04-17', name: 'Source' });
   const copy = actions.create(
-    { fullName: 'Never published', birthDate: '1982-04-17', name: 'Never published' },
+    {
+      operationId: randomUUID(),
+      fullName: 'Never published',
+      birthDate: '1982-04-17',
+      name: 'Never published',
+    },
     p.id,
   );
   actions.close();
@@ -199,7 +214,10 @@ test('busy profiles cannot be removed or copied', async (t) => {
     /current work/,
   );
   await assert.rejects(
-    busy.create({ fullName: 'Copy', birthDate: '1982-04-17', name: 'Copy' }, p.id),
+    busy.create(
+      { operationId: randomUUID(), fullName: 'Copy', birthDate: '1982-04-17', name: 'Copy' },
+      p.id,
+    ),
     /current work/,
   );
 });
