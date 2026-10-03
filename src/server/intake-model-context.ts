@@ -28,6 +28,7 @@ export const MODEL_INTAKE_SECTIONS = [
   'acceptances',
   'mapping_rules',
   'missing_assets',
+  'package_failures',
 ] as const;
 
 export type ModelIntakeSection = (typeof MODEL_INTAKE_SECTIONS)[number];
@@ -50,6 +51,7 @@ interface ModelIntakeSource {
   acceptedProposalId?: Intake['acceptedProposalId'];
   imported?: Intake['imported'];
   importHistory?: Intake['importHistory'];
+  packageFailures?: Intake['packageFailures'];
   mappingRules?: unknown[];
   mappingRulesVersion?: string;
 }
@@ -426,6 +428,7 @@ function sectionItems(source: ModelIntakeSource, section: ModelIntakeSection): u
   if (section === 'operations') return source.workflow?.operations || [];
   if (section === 'acceptances') return acceptances(source);
   if (section === 'mapping_rules') return source.mappingRules || [];
+  if (section === 'package_failures') return Object.values(source.packageFailures || {});
   return (plan?.index.missingAssets || []).map(missingAsset);
 }
 
@@ -467,6 +470,7 @@ function sectionCount(source: ModelIntakeSource, section: ModelIntakeSection): n
       (source.acceptedProposalId || source.imported ? 1 : 0) + (source.importHistory?.length || 0)
     );
   if (section === 'mapping_rules') return source.mappingRules?.length || 0;
+  if (section === 'package_failures') return Object.keys(source.packageFailures || {}).length;
   return plan?.index.missingAssets.length || 0;
 }
 
@@ -525,6 +529,11 @@ function summary(source: ModelIntakeSource) {
     mimeType: source.mimeType || null,
     state: source.state || null,
     pendingWorkCount: source.pendingWorkCount ?? null,
+    packageFailures: {
+      pendingCount: sectionCount(source, 'package_failures'),
+      exhaustiveSection: 'package_failures',
+      note: 'Located processing failures retain the original and pending scope. Retry only the named operation; another successful read does not resolve it. These outcomes never accept clinical records.',
+    },
     plan: plan
       ? {
           id: plan.id,
@@ -656,6 +665,7 @@ export function modelIntakeEvidenceContext(
     mimeType: context.mimeType,
     state: context.state,
     pendingWorkCount: context.pendingWorkCount,
+    packageFailures: context.packageFailures,
     plan: context.plan,
     candidates: {
       candidateCount: context.candidates.candidateCount,

@@ -49,6 +49,7 @@ import type {
   IntakeReviewIssue,
   IntakeReviewGroupReference,
   IntakeWorkflow,
+  IntakePackageFailure,
 } from '../shared/intake.ts';
 import type { IntakeEntry } from './intake-format.ts';
 import type { IntakeIdentitySelfSnapshot } from '../shared/intake-identity.ts';
@@ -73,6 +74,7 @@ interface DurableWorkflow extends Omit<IntakeWorkflow, 'questions' | 'decisions'
 }
 
 interface IntakeWorkflowDetails {
+  packageFailures?: Record<string, IntakePackageFailure>;
   workflow?: DurableWorkflow;
   proposals?: {
     id: string;
@@ -1010,7 +1012,11 @@ export function workflowSummary(
       ...projectedWorkflow,
       reportGroups: reportGroupsWithLegacyFallback(projectedWorkflow),
     },
-    needsReview: unanswered > 0 || pendingCandidates > 0 || pendingWork > 0,
+    needsReview:
+      unanswered > 0 ||
+      pendingCandidates > 0 ||
+      pendingWork > 0 ||
+      Object.values(details.packageFailures || {}).some((failure) => failure.status === 'pending'),
     pendingCount: pendingCandidates,
     unansweredCount: unanswered,
     pendingWorkCount: pendingWork,

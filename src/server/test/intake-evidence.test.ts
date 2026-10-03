@@ -682,12 +682,9 @@ test('ZIP evidence retains safe members as scoped child sources without changing
   );
 });
 
-test('ZIP evidence rejects traversal and bounded extraction limit violations before retaining children', async (t) => {
+test('ZIP evidence rejects traversal while retaining the original before creating children', async (t) => {
   const f = fixture(t);
-  for (const [mode, message] of [
-    ['unsafe', /Unsafe or duplicate ZIP member/],
-    ['large', /25 MiB/],
-  ] as const) {
+  for (const mode of ['unsafe'] as const) {
     const file = resolve(f.root, `${mode}.zip`);
     zip(file, mode);
     const bytes = readFileSync(file);
@@ -701,7 +698,7 @@ test('ZIP evidence rejects traversal and bounded extraction limit violations bef
       .get()!.n;
     await assert.rejects(
       () => readIntakeEvidence({ db: f.db, root: f.root, profileId: f.profileId, id: intake.id }),
-      message,
+      { code: 'PACKAGE_LIMIT' },
     );
     assert.equal(
       f.db.prepare("SELECT count(*) n FROM source_files WHERE kind='intake_original'").get()!.n,

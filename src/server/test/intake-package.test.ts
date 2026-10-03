@@ -6,6 +6,9 @@ import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import type { IncomingMessage } from 'node:http';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HttpError, openDatabase } from '../database.ts';
@@ -22,11 +25,13 @@ import { rebuildProfile } from '../portable.ts';
 import { fictionalModel } from './fictional-model.ts';
 import {
   indexIntakePackage,
+  packageInspectionHttpError,
   inventoryIntakePackage,
   readIntakePackageMember,
   validatePackageRolePlan,
 } from '../intake-package.ts';
 import { readJSONStructure } from '../intake-json.ts';
+import { PackageInspectionError } from '../intake-package-worker.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
 import type { IntakeWithWorkflow } from '../intake-continuation.ts';
 
@@ -156,7 +161,11 @@ function fixture(
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
   attachPersonalDurability(db, { root, profileId: profileId });
   t.after(() => {
-    db.close();
+    try {
+      db.close();
+    } catch {
+      /* A lifecycle test may already have locked the database. */
+    }
     rmSync(root, { recursive: true, force: true });
   });
   const file = join(root, 'fictional.zip');
@@ -202,6 +211,16 @@ test('382-member ZIP inventories without extraction, persists every occurrence a
   assert.ok('structure' in first);
   assert.match(first.structure.literal, /1\.000/);
   assert.match(first.structure.literal, /9007199254740993/);
+  const beforeRetry = f.db.prepare('SELECT count(*) n FROM source_files').get()!.n;
+  const retry = await readIntakePackageMember({
+    ...f,
+    memberId: all[0].memberId,
+    jsonPointer: '/items/0',
+  });
+  assert.ok('structure' in retry);
+  assert.equal(retry.sourceFileId, first.sourceFileId);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM source_files').get()!.n, beforeRetry);
+  assert.equal(retry.structure.literal, first.structure.literal);
   const copy = await readIntakePackageMember({
     ...f,
     memberId: all[1].memberId,
@@ -209,7 +228,7 @@ test('382-member ZIP inventories without extraction, persists every occurrence a
   });
   assert.ok('reusedBytes' in copy);
   assert.ok(first.sourceFileId && copy.sourceFileId);
-  assert.equal(copy.reusedBytes, true);
+  assert.equal(copy.reusedBytes, false);
   assert.notEqual(copy.sourceFileId, first.sourceFileId);
   assert.deepEqual(
     getIntakeOriginal(f.db, f.root, f.profileId, first.sourceFileId).bytes,
@@ -251,6 +270,217 @@ test('382-member ZIP inventories without extraction, persists every occurrence a
   await assert.rejects(
     inventoryIntakePackage({ ...f, limit: 51 }),
     (error: unknown) => error instanceof HttpError && error.code === 'PACKAGE_WINDOW',
+  );
+});
+
+test('package worker storage reasons map to capacity and availability responses', () => {
+  for (const [reason, status, code] of [
+    ['PACKAGE_STORAGE_FULL', 507, 'PACKAGE_STORAGE_FULL'],
+    ['PACKAGE_STORAGE', 503, 'PACKAGE_STORAGE'],
+    ['PACKAGE_CRC', 413, 'PACKAGE_LIMIT'],
+  ] as const) {
+    const error = packageInspectionHttpError(
+      new PackageInspectionError('Fictional inspector refusal', reason),
+    );
+    assert.equal(error.status, status);
+    assert.equal(error.code, code);
+  }
+});
+
+test('an actual inspector output write failure preserves its storage code and located member', async (t) => {
+  const f = fixture(t);
+  const index = await indexIntakePackage(f);
+  const member = index.members[0]!;
+  const open = fs.openSync;
+  const injectedOpen = t.mock.method(fs, 'openSync', (...args: Parameters<typeof open>) => {
+    const fd = open(...args);
+    if (
+      String(args[0]).includes('.intake-child-staging/') &&
+      String(args[0]).endsWith('/original')
+    ) {
+      // The subprocess receives a real, empty regular file descriptor. Its
+      // attempted payload write fails through the actual inspector/protocol.
+      fs.closeSync(fd);
+      return open(args[0], fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    }
+    return fd;
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(readIntakePackageMember({ ...f, memberId: member.memberId }), {
+      status: 503,
+      code: 'PACKAGE_STORAGE',
+    });
+    assert.equal(f.db.prepare('SELECT count(*) n FROM source_files').get()!.n, 1);
+    const failures = Object.values(
+      getIntake(f.db, f.root, f.profileId, f.id).packageFailures || {},
+    );
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].operationKey, 'extract:' + member.memberId);
+    assert.equal(failures[0].filename, member.filename);
+    assert.equal(failures[0].reasonCode, 'PACKAGE_STORAGE');
+  } finally {
+    injectedOpen.mock.restore();
+    syncBuiltinESMExports();
+  }
+  await readIntakePackageMember({ ...f, memberId: member.memberId });
+  assert.equal(
+    Object.values(getIntake(f.db, f.root, f.profileId, f.id).packageFailures || {}).length,
+    0,
+  );
+});
+
+test('selected prepublication storage and integrity failures remain located without acknowledging a child', async (t) => {
+  for (const code of ['ENOSPC', 'EIO', 'SOURCE_CHANGED'] as const) {
+    await t.test(code, async (t) => {
+      const f = fixture(t);
+      const index = await indexIntakePackage(f);
+      const member = index.members[0]!;
+      let stageFd: number | undefined;
+      const open = fs.openSync,
+        fsync = fs.fsyncSync,
+        read = fs.readSync;
+      const injectedOpen = t.mock.method(fs, 'openSync', (...args: Parameters<typeof open>) => {
+        const fd = open(...args);
+        if (
+          String(args[0]).includes('.intake-child-staging/') &&
+          String(args[0]).endsWith('/original')
+        )
+          stageFd = fd;
+        return fd;
+      });
+      const injectedSync = t.mock.method(fs, 'fsyncSync', (fd: number) => {
+        if (fd === stageFd && code !== 'SOURCE_CHANGED') {
+          stageFd = undefined;
+          throw Object.assign(Error('Fictional stage storage failure'), { code });
+        }
+        return fsync(fd);
+      });
+      const injectedRead = t.mock.method(fs, 'readSync', (...args: Parameters<typeof read>) => {
+        const n = read(...args);
+        if (args[0] === stageFd && code === 'SOURCE_CHANGED' && n) {
+          stageFd = undefined;
+          const buffer = args[1] as Buffer;
+          buffer[0] ^= 1;
+        }
+        return n;
+      });
+      syncBuiltinESMExports();
+      try {
+        const expected =
+          code === 'ENOSPC' ? 'INTAKE_CHILD_STORAGE' : code === 'EIO' ? 'INTAKE_CHILD_IO' : code;
+        await assert.rejects(readIntakePackageMember({ ...f, memberId: member.memberId }), {
+          code: expected,
+        });
+        assert.equal(f.db.prepare('SELECT count(*) n FROM source_files').get()!.n, 1);
+        const failures = Object.values(
+          getIntake(f.db, f.root, f.profileId, f.id).packageFailures || {},
+        );
+        assert.equal(failures.length, 1);
+        assert.equal(failures[0].operationKey, 'extract:' + member.memberId);
+        assert.equal(failures[0].filename, member.filename);
+        assert.equal(failures[0].locator, member.locator);
+        assert.equal(failures[0].reasonCode, expected);
+      } finally {
+        injectedOpen.mock.restore();
+        injectedSync.mock.restore();
+        injectedRead.mock.restore();
+        syncBuiltinESMExports();
+      }
+      const completed = await readIntakePackageMember({ ...f, memberId: member.memberId });
+      assert.ok(completed.sourceFileId);
+      assert.equal(
+        Object.values(getIntake(f.db, f.root, f.profileId, f.id).packageFailures || {}).length,
+        0,
+      );
+    });
+  }
+});
+
+test('closing the profile database cancels an actual selected ZIP worker before child publication', async (t) => {
+  const f = fixture(t, 'member');
+  const index = await indexIntakePackage(f);
+  const member = index.members[0]!;
+  const open = fs.openSync;
+  let closed = false,
+    workerSignal: NodeJS.Signals | null = null;
+  const spawn = childProcess.spawn;
+  const injectedSpawn = t.mock.method(
+    childProcess,
+    'spawn',
+    (...args: Parameters<typeof spawn>) => {
+      const child = spawn(...args);
+      child.once('close', (_code, signal) => {
+        workerSignal = signal;
+      });
+      return child;
+    },
+  );
+  const injected = t.mock.method(fs, 'openSync', (...args: Parameters<typeof open>) => {
+    const fd = open(...args);
+    if (
+      String(args[0]).includes('.intake-child-staging/') &&
+      String(args[0]).endsWith('/original')
+    ) {
+      // The helper invokes the producer synchronously after opening the stage;
+      // this microtask closes the database after the real worker has spawned.
+      queueMicrotask(() => {
+        closed = true;
+        f.db.close();
+      });
+    }
+    return fd;
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(readIntakePackageMember({ ...f, memberId: member.memberId }));
+    assert.equal(closed, true);
+    assert.equal(workerSignal, 'SIGKILL');
+  } finally {
+    injectedSpawn.mock.restore();
+    injected.mock.restore();
+    syncBuiltinESMExports();
+  }
+  const reopened = openDatabase(
+    ensureProfileDirectories(f.root, f.profileId).database,
+    f.profileId,
+  );
+  attachPersonalDurability(reopened, { root: f.root, profileId: f.profileId });
+  try {
+    assert.equal(reopened.prepare('SELECT count(*) n FROM source_files').get()!.n, 1);
+    assert.equal(
+      Object.values(getIntake(reopened, f.root, f.profileId, f.id).packageFailures || {}).length,
+      0,
+    );
+    assert.deepEqual(fs.readdirSync(join(f.root, '.intake-child-staging')), []);
+  } finally {
+    reopened.close();
+  }
+});
+
+test('invalid JSON structure keeps exact child evidence and a stable located unfinished scope', async (t) => {
+  const f = fixture(t, 'invalidjson');
+  const index = await indexIntakePackage(f);
+  const member = index.members[0]!;
+  await assert.rejects(
+    readIntakePackageMember({ ...f, memberId: member.memberId, jsonPointer: '' }),
+    /Duplicate JSON key/,
+  );
+  const after = getIntake(f.db, f.root, f.profileId, f.id);
+  const failures = Object.values(after.packageFailures || {});
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].operationKey, 'structure:' + member.memberId);
+  assert.equal(failures[0].filename, 'data.json');
+  assert.equal(failures[0].reasonCode, 'JSON_STRUCTURE');
+  assert.equal(f.db.prepare('SELECT count(*) n FROM source_files').get()!.n, 2);
+  await assert.rejects(
+    readIntakePackageMember({ ...f, memberId: member.memberId, jsonPointer: '' }),
+    /Duplicate JSON key/,
+  );
+  assert.equal(getIntake(f.db, f.root, f.profileId, f.id).version, after.version);
+  assert.deepEqual(
+    getIntake(f.db, f.root, f.profileId, f.id).packageFailures,
+    after.packageFailures,
   );
 });
 
@@ -366,16 +596,8 @@ test('package role references report exact root/member ambiguity and reject unsa
   }
 });
 
-test('ZIP safety rejects path, duplicate, symlink, member, cumulative expansion and inventory limits before retaining children', async (t) => {
-  for (const mode of [
-    'unsafe',
-    'duplicate',
-    'symlink',
-    'encrypted',
-    'member',
-    'total',
-    'count',
-  ] as const) {
+test('ZIP safety rejects path, duplicate, symlink, encryption and inventory limits before retaining children', async (t) => {
+  for (const mode of ['unsafe', 'duplicate', 'symlink', 'encrypted', 'count'] as const) {
     await t.test(mode, async (t) => {
       const f = fixture(t, mode);
       await assert.rejects(

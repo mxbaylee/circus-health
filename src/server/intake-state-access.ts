@@ -23,6 +23,7 @@ import { recordIntakeFileHash } from './intake-file-work.ts';
 import type {
   Intake,
   IntakeMetadata,
+  IntakePackageFailure,
   IntakeProposal,
   IntakeState,
   IntakeValidation,
@@ -53,6 +54,7 @@ export interface IntakeDetails {
   version: number;
   state: IntakeState;
   validation: IntakeValidation;
+  packageFailures?: Record<string, IntakePackageFailure>;
   proposals: InternalProposal[];
   acceptedProposalId: string | null;
   imported: Intake['imported'];
