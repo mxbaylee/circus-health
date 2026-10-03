@@ -1,4 +1,5 @@
 import { sourceFileDetails, sourceDetailsSearch } from './intake-state-access.ts';
+import { recordSourceDetailsSearchDTORead } from './source-details-search.ts';
 import { sourceAssertionBoundary } from './source-assertion-ownership.ts';
 import { clinicalRedirect, resolveClinicalReference } from './clinical-references.ts';
 import { clinicalRelationshipProjections } from './clinical-relationships.ts';
@@ -794,31 +795,39 @@ export function sourceFiles(db: Database, params: URLSearchParams): Page<SourceF
   }
   const search = params.get('q');
   const searchPlan = search ? sourceDetailsSearch(db, search) : null;
-  if (searchPlan) {
-    where.push(searchPlan.predicate);
-    args.push(...searchPlan.parameters);
+  try {
+    if (searchPlan) {
+      where.push(searchPlan.predicate);
+      args.push(...searchPlan.parameters);
+    }
+    const from =
+      ' FROM source_files f LEFT JOIN providers p ON p.id=f.provider_id' +
+      (searchPlan?.joins || '') +
+      (where.length ? ' WHERE ' + where.join(' AND ') : '');
+    const total = count(db, 'SELECT COUNT(*) AS n' + from, args);
+    const data = db
+      .prepare('SELECT f.*,p.name AS provider_name' + from + ' ORDER BY f.path LIMIT ? OFFSET ?')
+      .all(...args, pg.limit, pg.offset)
+      .map((valueRow) => {
+        const row = valueRow as SourceFileRow;
+        recordSourceDetailsSearchDTORead(db, row.details_json);
+        return {
+          ...sourceFile(db, row),
+          archived: visibilityState(db, 'source_file', row.id).archived,
+        };
+      });
+    return {
+      data,
+      total,
+      ...pg,
+      complete: pg.offset === 0 && data.length === total,
+    };
+  } catch (error) {
+    searchPlan?.dispose(error);
+    throw error;
+  } finally {
+    searchPlan?.dispose();
   }
-  const from =
-    ' FROM source_files f LEFT JOIN providers p ON p.id=f.provider_id' +
-    (searchPlan?.joins || '') +
-    (where.length ? ' WHERE ' + where.join(' AND ') : '');
-  const total = count(db, 'SELECT COUNT(*) AS n' + from, args);
-  const data = db
-    .prepare('SELECT f.*,p.name AS provider_name' + from + ' ORDER BY f.path LIMIT ? OFFSET ?')
-    .all(...args, pg.limit, pg.offset)
-    .map((valueRow) => {
-      const row = valueRow as SourceFileRow;
-      return {
-        ...sourceFile(db, row),
-        archived: visibilityState(db, 'source_file', row.id).archived,
-      };
-    });
-  return {
-    data,
-    total,
-    ...pg,
-    complete: pg.offset === 0 && data.length === total,
-  };
 }
 export function sourceRecord(r: SourceRecordRow): SourceRecordDTO {
   return {

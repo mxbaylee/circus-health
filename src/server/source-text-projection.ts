@@ -73,6 +73,7 @@ export interface SourceTextProjectionCounters {
 }
 interface Connection {
   schema: number;
+  active: boolean;
   dispose: () => void;
   counters: SourceTextProjectionCounters;
 }
@@ -97,6 +98,7 @@ function connectionFor(db: DatabaseSync): Connection {
   if (existing) return existing;
   const connection: Connection = {
     schema: -1,
+    active: false,
     dispose: () => {},
     counters: {
       builds: 0,
@@ -683,6 +685,7 @@ function current<T>(
       );
       db.exec(`UPDATE temp.${WORK} SET rows_read=0 WHERE singleton=1`);
       db.exec('RELEASE __source_text_reconcile');
+      connection.active = true;
       if (db.isTransaction && !currentTransactionToken(db)) connection.schema = -1;
       return result;
     } catch (error) {
@@ -705,6 +708,12 @@ export function reconcileSourceTextProjection(
   options: SourceTextProjectionOptions = {},
 ): void {
   current(db, options, () => {});
+}
+/** Operational intake writers stage an already-used projection in their existing
+ * application transaction. Cold, direct-SQL and non-application-transaction
+ * producers retain transactional dirty tracking and repair on the next read. */
+export function reconcileActiveSourceTextProjection(db: DatabaseSync): void {
+  if (connections.get(db)?.active && currentTransactionToken(db)) reconcileSourceTextProjection(db);
 }
 /** Bounded exact reconstruction. Warm calls read no source details/operational intake.
  * Limits apply per pure-engine call, not cumulatively across a multi-source batch.

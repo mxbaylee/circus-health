@@ -185,13 +185,17 @@ test('discovery and receipt adapters retain scoped SQL semantics and operational
   assert.equal(retainedReportAcceptance(f.db, 'unknown'), null);
   assert.deepEqual(intakeIdentityConfirmations(f.db), receipts);
   const query = sourceDetailsSearch(f.db, 'fictional-operation');
-  const rows = f.db
-    .prepare(`SELECT f.id FROM source_files f ${query.joins} WHERE ${query.predicate}`)
-    .all(...query.parameters);
-  assert.deepEqual(
-    rows.map((row) => row.id),
-    [f.uploaded.id],
-  );
+  try {
+    const rows = f.db
+      .prepare(`SELECT f.id FROM source_files f ${query.joins} WHERE ${query.predicate}`)
+      .all(...query.parameters);
+    assert.deepEqual(
+      rows.map((row) => row.id),
+      [f.uploaded.id],
+    );
+  } finally {
+    query.dispose();
+  }
 });
 
 test('intake identity is required and package roles are read only from original sources', (t) => {
