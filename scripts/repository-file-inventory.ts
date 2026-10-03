@@ -298,6 +298,7 @@ function classify(path: string): Classification {
       'tsconfig.tests.json',
       'tsconfig.tools.json',
       'vite.config.ts',
+      'vite.passkey-checker.config.ts',
       'commitlint.config.ts',
       'vitest.config.ts',
     ].includes(path)

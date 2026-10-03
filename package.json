@@ -39,7 +39,8 @@
     "build:assets": "npm run brand:check && vite build",
     "qualify:passkeys": "node src/scripts/qualify-physical-passkey.ts",
     "qualify:drive": "node deploy/qualify-drive.ts",
-    "qualify:archive-restore": "node src/scripts/qualify-archive-restore.ts"
+    "qualify:archive-restore": "node src/scripts/qualify-archive-restore.ts",
+    "build:passkey-checker": "vite build --config vite.passkey-checker.config.ts && node src/scripts/passkey-checker-build/check.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "1.0.9",
