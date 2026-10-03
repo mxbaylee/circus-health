@@ -290,6 +290,44 @@ function writeObject(storage: RecordStorage, bytes: Buffer): RecordObjectReferen
   readObject(storage, ref); // Verify staged bytes before publishing acceptance.
   return ref;
 }
+
+function readCommit(
+  storage: RecordStorage,
+  ref: RecordObjectReference,
+  profileId: string,
+  schemaVersion: number,
+): RecordCommit {
+  const commit = JSON.parse(readObject(storage, ref) as unknown as string) as RecordCommit;
+  if (
+    commit.format !== FORMAT ||
+    commit.profileId !== profileId ||
+    commit.schemaVersion !== schemaVersion ||
+    !Number.isSafeInteger(commit.sequence) ||
+    commit.sequence < 1 ||
+    !Array.isArray(commit.segments) ||
+    !Number.isSafeInteger(commit.records) ||
+    commit.records < 0 ||
+    !Number.isSafeInteger(commit.revision) ||
+    commit.revision < 0 ||
+    typeof commit.operationId !== 'string' ||
+    !commit.operationId ||
+    !Number.isFinite(Date.parse(commit.recordedAt))
+  )
+    fail('unsupported or wrong-profile commit');
+  if (commit.previous !== null && !refValid(commit.previous)) fail('invalid commit ancestry');
+  return commit;
+}
+
+/** Read the selected authoritative envelope even when the disposable cache is current. */
+export function verifyRecordAuthorityHead(
+  storage: RecordStorage,
+  profileId: string,
+  schemaVersion: number,
+): void {
+  const head = readHead(storage);
+  if (!head) fail('no committed profile history');
+  readCommit(storage, head as RecordObjectReference, profileId, schemaVersion);
+}
 function committedSince(
   storage: RecordStorage,
   profileId: string,
@@ -303,26 +341,7 @@ function committedSince(
   while (!eq(ref, stop)) {
     if (!ref || seen.has(ref.name)) fail('missing ancestry or cyclic commits');
     seen.add((ref as RecordObjectReference).name);
-    const commit = JSON.parse(
-      readObject(storage, ref as RecordObjectReference) as unknown as string,
-    ) as RecordCommit;
-    if (
-      commit.format !== FORMAT ||
-      commit.profileId !== profileId ||
-      commit.schemaVersion !== schemaVersion ||
-      !Number.isSafeInteger(commit.sequence) ||
-      commit.sequence < 1 ||
-      !Array.isArray(commit.segments) ||
-      !Number.isSafeInteger(commit.records) ||
-      commit.records < 0 ||
-      !Number.isSafeInteger(commit.revision) ||
-      commit.revision < 0 ||
-      typeof commit.operationId !== 'string' ||
-      !commit.operationId ||
-      !Number.isFinite(Date.parse(commit.recordedAt))
-    )
-      fail('unsupported or wrong-profile commit');
-    if (commit.previous !== null && !refValid(commit.previous)) fail('invalid commit ancestry');
+    const commit = readCommit(storage, ref as RecordObjectReference, profileId, schemaVersion);
     const versions = readSegmentVersions(storage, commit);
     result.push({ ref, commit, versions } as IndexedTransaction);
     ref = commit.previous;

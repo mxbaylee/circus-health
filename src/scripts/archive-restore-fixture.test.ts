@@ -4,6 +4,9 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
+import { assertArchiveInventory, inventoryArchive } from './archive-restore-copy.ts';
+import { futureReleaseFixture, releaseArchiveFormats } from './release-update-fixture.ts';
+import { LATEST_SCHEMA_VERSION } from '../server/database.ts';
 import { createVaultApp } from '../server/vault-app.ts';
 import {
   seedArchiveRestoreFixture,
@@ -62,6 +65,31 @@ test('fictional restore oracle uses public acceptance and preserves review, Stop
   const seeded = await seedArchiveRestoreFixture(request);
   assert.equal(modelRequests, 0);
   await request(`/api/profiles/${seeded.profileId}/lock`, { method: 'POST', json: {} });
+  const formats = releaseArchiveFormats(dataDirectory, seeded.recoveryKit);
+  assert.deepEqual(formats, {
+    registry: 'circus-health-profiles-v1',
+    keyring: 'circus-health-keyring-v1',
+    manifest: 'circus-health-vault-head-v2',
+    index: 'circus-health-vault-index-delta-v2',
+    history: 'health-record-versions-v1',
+    acceptedHistorySchema: LATEST_SCHEMA_VERSION,
+    encryptedFraming: 'CIRCUS01',
+    recoveryKit: 'circus-health-recovery-v1',
+    disposableCacheSchema: LATEST_SCHEMA_VERSION,
+  });
+  futureReleaseFixture(dataDirectory, seeded.recoveryKit, 'cache');
+  assert.equal(
+    releaseArchiveFormats(dataDirectory, seeded.recoveryKit).disposableCacheSchema,
+    999999,
+  );
+  const recreated = await request<{ metrics: { cacheHit: boolean } }>(
+    `/api/profiles/${seeded.profileId}/unlock`,
+    { method: 'POST', json: { recovery: seeded.recoveryKit } },
+  );
+  assert.equal(recreated.metrics.cacheHit, false);
+  await verifyArchiveRestoreFixture(request, seeded.oracle);
+  await request(`/api/profiles/${seeded.profileId}/lock`, { method: 'POST', json: {} });
+  assert.deepEqual(releaseArchiveFormats(dataDirectory, seeded.recoveryKit), formats);
   rmSync(resolve(dataDirectory, 'profiles', seeded.profileId, 'cache'), {
     recursive: true,
     force: true,
@@ -86,4 +114,15 @@ test('fictional restore oracle uses public acceptance and preserves review, Stop
   await assert.rejects(verifyArchiveRestoreFixture(request, corrupted), {
     message: 'Fictional archive restore: exact original hash after restore',
   });
+  await request(`/api/profiles/${seeded.profileId}/lock`, { method: 'POST', json: {} });
+  futureReleaseFixture(dataDirectory, seeded.recoveryKit, 'manifest');
+  const protectedFuture = await inventoryArchive(dataDirectory);
+  await assert.rejects(
+    request(`/api/profiles/${seeded.profileId}/unlock`, {
+      method: 'POST',
+      json: { recovery: seeded.recoveryKit },
+    }),
+    /ARCHIVE_UNSUPPORTED/,
+  );
+  await assertArchiveInventory(dataDirectory, protectedFuture);
 });

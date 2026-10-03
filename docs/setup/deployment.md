@@ -16,9 +16,11 @@ Each archive gets a path-derived Compose project and default image tag. Differen
 
 ## Update
 
-Stop the stack cleanly, make a consistent archive backup, update the repository, then run the same `npm run start` command. The launcher rebuilds the application image for the archive. Review release notes and configuration changes before opening an important archive. Do not run two versions against one `CRS_DATA_DIR`.
+Follow the [release update and failed-candidate recovery procedure](release-updates.md). Record current/candidate build identities and review the maintained configuration/format notes, stop the sole writer, verify a complete independent backup and separately retained kits, then start the candidate with the same explicit archive/proxy settings. Verify exact originals, accepted history, corrections, pending review and Stop before treating the candidate as usable. Do not run two versions against one `CRS_DATA_DIR`.
 
-`npm run image:build` builds `circus-health:build` without opening an archive. `CRS_IMAGE=repository:tag` selects an explicit local tag when an operator needs controlled image promotion.
+If startup or unlock refuses unsupported authority, preserve the candidate archive/evidence and recover the prior app only against a fresh isolated copy of the untouched verified backup. This returns the backup's state; post-backup writes, general downgrade compatibility and rollback prevention are not promised.
+
+`npm run image:build` builds `circus-health:build` without opening an archive. The launcher builds the invoking checkout; `CRS_IMAGE=repository:tag` selects the local build tag, not an immutable prebuilt release.
 
 ## Backup and recovery
 
