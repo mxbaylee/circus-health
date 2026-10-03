@@ -7,6 +7,8 @@ import type { IntakePersonProposalState } from '../shared/intake-people.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { json } from './database.ts';
+import { createSourceDetailsSearch } from './source-details-search.ts';
+import { reconcileActiveSourceTextProjection } from './source-text-projection.ts';
 import type {
   Intake,
   IntakeMetadata,
@@ -139,6 +141,7 @@ export function writeIntakeDetails(
     : next;
   const raw = JSON.stringify(all);
   db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(raw, file.id);
+  reconcileActiveSourceTextProjection(db);
   return raw;
 }
 /** Direct operational writers preserve their existing raw version/receipt semantics. */
@@ -176,19 +179,8 @@ export function sourceFileDetails(_db: DatabaseSync, file: DetailsRow & { id: st
   return json(file.details_json);
 }
 /** Source list search includes operational JSON. Both count/page queries use this scoped adapter. */
-export function sourceDetailsSearch(
-  _db: DatabaseSync,
-  query: string,
-): {
-  joins: string;
-  predicate: string;
-  parameters: string[];
-} {
-  return {
-    joins: '',
-    predicate: '(f.path LIKE ? OR f.details_json LIKE ?)',
-    parameters: [`%${query}%`, `%${query}%`],
-  };
+export function sourceDetailsSearch(db: DatabaseSync, query: string) {
+  return createSourceDetailsSearch(db, query);
 }
 
 /** Registration of roots, extracted children and proposals remains in the caller's publication transaction. */
@@ -221,4 +213,5 @@ export function registerIntakeFile(db: DatabaseSync, file: IntakeFileRegistratio
     file.batchId,
     JSON.stringify(file.details),
   );
+  reconcileActiveSourceTextProjection(db);
 }

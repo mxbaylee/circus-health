@@ -1,3 +1,4 @@
+import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
@@ -571,6 +572,7 @@ export function createEncryptedProfiles({
               clearIntakeStateCache(db);
               clearIntakeLookupCache(db);
               clearSourceTextProjectionCache(db);
+              clearSourceDetailsSearchCache(db);
             }
             db?.close();
             db = null;
@@ -609,6 +611,7 @@ export function createEncryptedProfiles({
         clearIntakeStateCache(db);
         clearIntakeLookupCache(db);
         clearSourceTextProjectionCache(db);
+        clearSourceDetailsSearchCache(db);
         db.close();
         for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true });
         rebuildRecordDatabase(dbPath, { profileId: id, storage: recordStorage, verifyReferences });
@@ -679,6 +682,7 @@ export function createEncryptedProfiles({
       cleanup(() => clearIntakeStateCache(db));
       cleanup(() => clearIntakeLookupCache(db));
       cleanup(() => clearSourceTextProjectionCache(db));
+      cleanup(() => clearSourceDetailsSearchCache(db));
       cleanup(() => {
         if (db.isOpen) db.close();
       });
@@ -902,6 +906,7 @@ export function createEncryptedProfiles({
       clearIntakeStateCache(state.db);
       clearIntakeLookupCache(state.db);
       clearSourceTextProjectionCache(state.db);
+      clearSourceDetailsSearchCache(state.db);
       clearChatJournalCache(state.root, id);
       state.disposeOriginalResolver();
       diagnostics.detachSummaryStore(id);

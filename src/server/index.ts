@@ -1,3 +1,4 @@
+import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
@@ -1000,6 +1001,7 @@ export function createApp({
         clearIntakeStateCache(db);
         clearIntakeLookupCache(db);
         clearSourceTextProjectionCache(db);
+        clearSourceDetailsSearchCache(db);
         db.close();
       }
     },
