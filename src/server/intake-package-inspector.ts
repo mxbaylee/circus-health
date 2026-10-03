@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { crc32 } from 'node:zlib';
 import { openSync, closeSync, fstatSync, writeSync } from 'node:fs';
-import { fromFd, type Entry, type ZipFile } from 'yauzl';
+import { fromFd, type Entry, type LocalFileHeader, type ZipFile } from 'yauzl';
 import { pathToFileURL } from 'node:url';
 import type { Readable } from 'node:stream';
 import {
@@ -12,6 +12,37 @@ import {
 } from './intake-package-worker.ts';
 
 const MIB = 1024 * 1024;
+/** With bit 3 clear the local declarations are authoritative. ZIP64 replaces
+ * only sentinel-sized fields, in uncompressed/compressed order; never compare
+ * a legal 0xffffffff marker as though it were the actual member size. */
+function localDeclaredSizes(local: LocalFileHeader) {
+  let compressed = BigInt(local.compressedSize),
+    uncompressed = BigInt(local.uncompressedSize);
+  const expanded64 = local.uncompressedSize === 0xffffffff;
+  const compressed64 = local.compressedSize === 0xffffffff;
+  if (!expanded64 && !compressed64) return { compressed, uncompressed };
+  let zip64: Buffer | undefined;
+  for (let offset = 0; offset < local.extraField.length;) {
+    if (offset + 4 > local.extraField.length) return null;
+    const id = local.extraField.readUInt16LE(offset),
+      size = local.extraField.readUInt16LE(offset + 2);
+    offset += 4;
+    if (offset + size > local.extraField.length) return null;
+    if (id === 0x0001) {
+      if (zip64) return null;
+      zip64 = local.extraField.subarray(offset, offset + size);
+    }
+    offset += size;
+  }
+  if (!zip64 || zip64.length < (Number(expanded64) + Number(compressed64)) * 8) return null;
+  let offset = 0;
+  if (expanded64) {
+    uncompressed = zip64.readBigUInt64LE(offset);
+    offset += 8;
+  }
+  if (compressed64) compressed = zip64.readBigUInt64LE(offset);
+  return { compressed, uncompressed };
+}
 const add = (left: number, right: number) => {
   const result = left + right;
   if (!Number.isSafeInteger(result) || result < 0)
@@ -183,6 +214,19 @@ export async function inspectPackageDescriptor(
         local.generalPurposeBitFlag !== entry.generalPurposeBitFlag
       )
         fail('ZIP local header does not match inventory', 'PACKAGE_HEADER');
+      // Descriptor-based archives legitimately leave local CRC/sizes as zero
+      // or ZIP64 placeholders. Actual bytes are still checked against the
+      // central size and CRC after streaming, as for non-descriptor members.
+      if (!(entry.generalPurposeBitFlag & 0x08)) {
+        const sizes = localDeclaredSizes(local);
+        if (
+          !sizes ||
+          local.crc32 !== entry.crc32 ||
+          sizes.compressed !== BigInt(entry.compressedSize) ||
+          sizes.uncompressed !== BigInt(entry.uncompressedSize)
+        )
+          fail('ZIP local header CRC or sizes do not match inventory', 'PACKAGE_HEADER');
+      }
       const stream = await new Promise<Readable>((resolve, reject) =>
         archive.openReadStream(entry, (error, stream) =>
           error ? reject(error) : resolve(stream!),

@@ -31,6 +31,147 @@ function fixture(t: { after: (fn: () => void) => void }, bytes: Buffer) {
   return { sourceFd, outputFd, output, path };
 }
 
+// Independent small ZIP writer transformations exercise legal local placeholders
+// without allocating multi-gigabyte content merely to use ZIP64 metadata.
+function headerFixture({
+  store,
+  descriptor,
+  zip64,
+  signature = true,
+}: {
+  store: boolean;
+  descriptor: boolean;
+  zip64: boolean;
+  signature?: boolean;
+}) {
+  const original = zipFixture([{ name: 'report.txt', data: 'fictional evidence' }], { store });
+  const nameLength = original.readUInt16LE(26),
+    dataAt = 30 + nameLength;
+  const compressed = original.readUInt32LE(18),
+    expanded = original.readUInt32LE(22);
+  const checksum = original.readUInt32LE(14);
+  const local = Buffer.from(original.subarray(0, dataAt));
+  const central = Buffer.from(original.subarray(dataAt + compressed, original.length - 22));
+  const end = Buffer.from(original.subarray(original.length - 22));
+  const extra = zip64 ? Buffer.alloc(20) : Buffer.alloc(0);
+  if (zip64) {
+    extra.writeUInt16LE(1);
+    extra.writeUInt16LE(16, 2);
+    extra.writeBigUInt64LE(BigInt(expanded), 4);
+    extra.writeBigUInt64LE(BigInt(compressed), 12);
+    local.writeUInt16LE(45, 4);
+    central.writeUInt16LE(45, 6);
+    local.writeUInt16LE(extra.length, 28);
+    central.writeUInt16LE(extra.length, 30);
+    local.writeUInt32LE(0xffffffff, 18);
+    local.writeUInt32LE(0xffffffff, 22);
+    central.writeUInt32LE(0xffffffff, 20);
+    central.writeUInt32LE(0xffffffff, 24);
+  }
+  const localExtra = Buffer.from(extra);
+  let trailer = Buffer.alloc(0);
+  if (descriptor) {
+    local.writeUInt16LE(local.readUInt16LE(6) | 8, 6);
+    central.writeUInt16LE(central.readUInt16LE(8) | 8, 8);
+    local.writeUInt32LE(0, 14);
+    if (zip64) localExtra.fill(0, 4);
+    else {
+      local.writeUInt32LE(0, 18);
+      local.writeUInt32LE(0, 22);
+    }
+    trailer = Buffer.alloc((signature ? 4 : 0) + 4 + (zip64 ? 16 : 8));
+    let offset = 0;
+    if (signature) {
+      trailer.writeUInt32LE(0x08074b50);
+      offset += 4;
+    }
+    trailer.writeUInt32LE(checksum, offset);
+    offset += 4;
+    if (zip64) {
+      trailer.writeBigUInt64LE(BigInt(compressed), offset);
+      trailer.writeBigUInt64LE(BigInt(expanded), offset + 8);
+    } else {
+      trailer.writeUInt32LE(compressed, offset);
+      trailer.writeUInt32LE(expanded, offset + 4);
+    }
+  }
+  const directory = Buffer.concat([central, extra]);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(local.length + localExtra.length + compressed + trailer.length, 16);
+  return Buffer.concat([
+    local,
+    localExtra,
+    original.subarray(dataAt, dataAt + compressed),
+    trailer,
+    directory,
+    end,
+  ]);
+}
+
+for (const store of [true, false]) {
+  for (const [field, offset] of [
+    ['CRC', 14],
+    ['compressed size', 18],
+    ['expanded size', 22],
+  ] as const) {
+    test(`ZIP ${store ? 'stored' : 'deflated'} local ${field} mismatch refuses inventory and selected output before writing`, async (t) => {
+      const bytes = headerFixture({ store, descriptor: false, zip64: false });
+      bytes.writeUInt32LE(0, offset);
+      const setup = fixture(t, bytes);
+      for (const options of [{ sourceFd: setup.sourceFd }, { ...setup, selectedOrdinal: 0 }]) {
+        await assert.rejects(inspectPackageFile(options), (error) => {
+          assert.ok(error instanceof PackageInspectionError);
+          assert.equal(error.reasonCode, 'PACKAGE_HEADER');
+          assert.equal(error.filename, 'report.txt');
+          assert.equal(error.ordinal, 0);
+          assert.equal(error.work?.writtenBytes, 0);
+          return true;
+        });
+      }
+      assert.equal(fstatSync(setup.outputFd).size, 0);
+    });
+  }
+  for (const [descriptor, zip64, signature] of [
+    [true, false, true],
+    [true, false, false],
+    [false, true, true],
+    [true, true, true],
+    [true, true, false],
+  ] as const) {
+    test(`ZIP ${store ? 'stored' : 'deflated'} legal descriptor=${descriptor} ZIP64=${zip64} signature=${signature} retains exact bytes`, async (t) => {
+      const setup = fixture(t, headerFixture({ store, descriptor, zip64, signature }));
+      const inventory = await inspectPackageFile({ sourceFd: setup.sourceFd });
+      const selected = await inspectPackageFile({ ...setup, selectedOrdinal: 0 });
+      assert.deepEqual(selected.members, inventory.members);
+      assert.equal(readFileSync(setup.output, 'utf8'), 'fictional evidence');
+      assert.equal(selected.work.writtenBytes, 18);
+    });
+  }
+}
+
+for (const corruption of [
+  'missing',
+  'truncated',
+  'expanded mismatch',
+  'compressed mismatch',
+] as const) {
+  test(`ZIP64 local ${corruption} refuses safely before selected output`, async (t) => {
+    const bytes = headerFixture({ store: false, descriptor: false, zip64: true });
+    const extra = 30 + bytes.readUInt16LE(26);
+    if (corruption === 'missing') bytes.writeUInt16LE(2, extra);
+    else if (corruption === 'truncated') bytes.writeUInt16LE(8, extra + 2);
+    else bytes.writeBigUInt64LE(0n, extra + (corruption === 'expanded mismatch' ? 4 : 12));
+    const setup = fixture(t, bytes);
+    await assert.rejects(inspectPackageFile({ ...setup, selectedOrdinal: 0 }), (error) => {
+      assert.ok(error instanceof PackageInspectionError);
+      assert.equal(error.reasonCode, 'PACKAGE_HEADER');
+      assert.equal(error.work?.writtenBytes, 0);
+      return true;
+    });
+    assert.equal(fstatSync(setup.outputFd).size, 0);
+  });
+}
+
 test('ZIP worker writes a large selected member through inherited descriptors with bounded counted chunks', async (t) => {
   const bytes = Buffer.alloc(26 * 1024 * 1024, 'fictional source\n');
   const setup = fixture(t, zipFixture([{ name: 'report-🌿.txt', data: bytes }]));

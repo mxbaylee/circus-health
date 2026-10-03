@@ -52,16 +52,16 @@ const json = (data: unknown) =>
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   });
-const inventory = () =>
+const inventory = (members = [member]) =>
   json({
     intakeId: intake.id,
     version: 1,
     planId: null,
     sourceHash: 'b'.repeat(64),
-    totalMembers: 1,
-    totalExpandedBytes: 2,
-    uniqueByteContents: 1,
-    members: [member],
+    totalMembers: members.length,
+    totalExpandedBytes: members.reduce((sum, item) => sum + item.bytes, 0),
+    uniqueByteContents: members.length,
+    members,
     offset: 0,
     nextOffset: null,
     coverage: 'inventory_only',
@@ -72,6 +72,126 @@ beforeEach(() => {
   replaceProfiles([profile]);
   selectProfile(profile);
 });
+
+it.each(['read_member', 'read_structure'] as const)(
+  'clears a prior selected member and navigation when a different %s retry fails',
+  async (retryAction) => {
+    const other: IntakePackageMember = {
+      ...member,
+      memberId: 'member:fictional-other',
+      ordinal: 18,
+      filename: 'reports/fictional-other.json',
+      locator: 'ZIP member reports/fictional-other.json',
+    };
+    const otherFailure = {
+      ...failure('extract:' + other.memberId, retryAction),
+      memberId: other.memberId,
+      ordinal: other.ordinal,
+      filename: other.filename,
+      locator: other.locator,
+    };
+    const failures: Record<string, IntakePackageFailure> = { other: otherFailure };
+    const requests: Record<string, unknown>[] = [];
+    let otherAttempts = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+        const path = String(input);
+        if (path.endsWith(`/intakes/${intake.id}`))
+          return json({ ...intake, packageFailures: { ...failures } });
+        if (path.includes(`/intakes/${intake.id}/package?`)) return inventory([member, other]);
+        if (path.endsWith(`/intakes/${intake.id}/package-member`) && options.method === 'POST') {
+          const body = JSON.parse(String(options.body)) as Record<string, unknown>;
+          requests.push(body);
+          if (body.memberId === member.memberId)
+            return json({
+              member,
+              structure: {
+                jsonPointer: body.jsonPointer || '',
+                type: 'object',
+                totalChildren: body.jsonPointer ? 0 : 1,
+                children: body.jsonPointer
+                  ? []
+                  : [
+                      {
+                        key: 'Earlier member section',
+                        jsonPointer: '/section',
+                        type: 'string',
+                        totalChildren: 0,
+                      },
+                    ],
+                literal: body.jsonPointer ? 'Earlier selected member content' : null,
+                offset: 0,
+                nextOffset: null,
+                nextJSONOffset: null,
+              },
+            });
+          if (body.memberId === other.memberId && ++otherAttempts === 1)
+            return new Response(
+              JSON.stringify({
+                error: {
+                  code: 'PACKAGE_CRC',
+                  message: 'The other member could not be read; original retained.',
+                },
+              }),
+              { status: 413 },
+            );
+          if (body.memberId === other.memberId) {
+            delete failures.other;
+            return json({
+              member: other,
+              structure: {
+                jsonPointer: '',
+                type: 'object',
+                totalChildren: 0,
+                children: [],
+                literal: 'Other member content',
+                offset: 0,
+                nextOffset: null,
+                nextJSONOffset: null,
+              },
+            });
+          }
+        }
+        throw new Error(`Unmocked request: ${options.method || 'GET'} ${path}`);
+      }),
+    );
+    render(<PackageInventory intake={intake} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: member.filename }));
+    await user.click(await screen.findByRole('button', { name: 'Earlier member section' }));
+    expect(await screen.findByText('Earlier selected member content')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Back to parent section' })).toBeVisible();
+    const retryName = retryAction === 'read_structure' ? 'Retry structure' : 'Retry member';
+    await user.click(screen.getByRole('button', { name: retryName }));
+    expect(
+      await screen.findByText('The other member could not be read; original retained.'),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole('region', { name: 'Selected package member' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText('Earlier selected member content')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Back to parent section' }),
+    ).not.toBeInTheDocument();
+    for (const alert of screen.getAllByRole('alert'))
+      expect(within(alert).queryByRole('button', { name: 'Retry member' })).not.toBeInTheDocument();
+    const pending = screen.getByRole('region', { name: 'Unfinished package processing' });
+    expect(within(pending).getByText(other.filename)).toBeVisible();
+    expect(within(pending).getByRole('button', { name: retryName })).toBeVisible();
+    expect(requests.at(-1)).toEqual({
+      memberId: other.memberId,
+      limit: 50,
+      ...(retryAction === 'read_structure' ? { jsonPointer: '' } : {}),
+    });
+    await user.click(within(pending).getByRole('button', { name: retryName }));
+    expect(await screen.findByText('Other member content')).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Back to parent section' }),
+    ).not.toBeInTheDocument();
+    expect(requests.slice(-2).every((request) => request.memberId === other.memberId)).toBe(true);
+  },
+);
 
 it('reloads durable failures after inventory fails, retains the exact original link, and retries inventory without clearing another pending scope', async () => {
   let releaseInventory!: () => void;

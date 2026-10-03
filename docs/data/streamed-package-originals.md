@@ -16,6 +16,8 @@ Package inspection, member extraction and bounded structure failures retain a so
 
 Worker staging exhaustion (`ENOSPC`/`EDQUOT`) returns HTTP 507 with `PACKAGE_STORAGE_FULL` and guidance to free storage. Unavailable writes return HTTP 503 with `PACKAGE_STORAGE`, preserving the distinction from format/processing refusals. Both keep the exact unfinished location and counted partial work. Host-stage failures retain their existing storage/integrity response codes. Cancellation, closed ownership, a changed parent and uncertain durable publication cannot authorize a new failure mutation; recover the existing authority before retrying uncertain writes.
 
+After the final matching failure clears, the stored attention label returns to a provable current state using existing import, proposal and explicit keep-original receipts. Remaining units, candidates, questions or failures still require review. When a historical import and a different latest proposal do not establish their ordering, the label conservatively stays **Needs review**; the pending-failure list and derived review attention remain accurate. A successful read never establishes acceptance of that later proposal. Complete status derivation for this mixed history remains in CRS-232.
+
 ## Current limits
 
 There is no 25 MiB ZIP member-byte cap or 100 MiB aggregate expanded-byte cap on the streamed path. Selection processes one member per operation, so the legacy buffered child API's 300-member/100 MiB-per-call safeguard is not used by ZIP selection. That buffered API still protects other callers, including PDF embedded attachments.

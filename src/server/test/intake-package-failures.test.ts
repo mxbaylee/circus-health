@@ -6,7 +6,16 @@ import test, { type TestContext } from 'node:test';
 import type { IntakePackageFailure } from '../../shared/intake.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import { HttpError, openDatabase } from '../database.ts';
-import { getIntake, getIntakeOriginal, uploadIntake, workflowMutation } from '../intake.ts';
+import {
+  getIntake,
+  getIntakeOriginal,
+  uploadIntake,
+  workflowMutation,
+  proposeConversion,
+  importIntake,
+  reviewIntake,
+  saveIntakeReviewDraft,
+} from '../intake.ts';
 import {
   modelIntakeContext,
   MODEL_INTAKE_CONTEXT_MAX_PAGE_BYTES,
@@ -21,17 +30,20 @@ import { readStoredIntakeDetails } from '../intake-state-access.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { createBackup } from '../recovery.ts';
+import { fictionalModel } from './fictional-model.ts';
 
-function fixture(t: TestContext) {
+function fixture(
+  t: TestContext,
+  bytes = zipFixture([{ name: 'reports/fictional.pdf', data: 'fictional retained evidence' }]),
+  filename = 'fictional-delivery.zip',
+) {
+  fictionalModel(t);
   const root = mkdtempSync(join(tmpdir(), 'fictional-package-failures-'));
   const profileId = 'cookie-dough';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
   attachPersonalDurability(db, { root, profileId });
-  const bytes = zipFixture([
-    { name: 'reports/fictional.pdf', data: 'fictional retained evidence' },
-  ]);
   const intake = uploadIntake(db, root, profileId, {
-    filename: 'fictional-delivery.zip',
+    filename,
     newProviderName: 'Fictional clinic',
     bytes,
   });
@@ -165,6 +177,7 @@ test('accounted units stay accounted while pending package failures prevent comp
   });
   assert.equal(resolved.pendingWorkCount, 0);
   assert.equal(resolved.needsReview, false);
+  assert.equal(resolved.state, 'pending_conversion');
   workflowMutation(f.db, f.root, f.profileId, f.id, { version: resolved.version }, (workflow) => {
     workflow.plans[0].units.push({
       id: 'unit:unfinished',
@@ -180,6 +193,170 @@ test('accounted units stay accounted while pending package failures prevent comp
   });
   assert.equal(stillPending.pendingWorkCount, 1);
   assert.equal(stillPending.needsReview, true);
+  assert.equal(stillPending.state, 'needs_review');
+});
+
+const literalEnvelope = (kind: 'context' | 'record' = 'context') =>
+  JSON.stringify({
+    format: 'health-record-v1',
+    id: 'fictional-literal',
+    kind,
+    payload: 'Fictional literal source context.',
+    provenance: {
+      capturedVia: 'Fictional delivery',
+      sourceSystem: null,
+      sourceRecordId: null,
+      evidenceClass: 'provider_export',
+      locator: 'Fictional original',
+    },
+    coverage: { status: 'unknown', notes: ['Fictional source coverage remains unknown.'] },
+  });
+
+test('final failure resolution restores a validated ready original without accepting source records', (t) => {
+  const f = fixture(t, Buffer.from(literalEnvelope()), 'fictional-context.jsonl');
+  const initial = getIntake(f.db, f.root, f.profileId, f.id);
+  assert.equal(initial.state, 'ready');
+  assert.equal(initial.needsReview, false);
+  recordIntakePackageFailure(f.db, f.root, f.profileId, f.id, failureInput);
+  const resolved = resolveIntakePackageFailure(f.db, f.root, f.profileId, f.id, {
+    operationKey: failureInput.operationKey,
+  });
+  assert.equal(resolved.state, 'ready');
+  assert.equal(resolved.needsReview, false);
+  assert.equal(resolved.imported, null);
+  assert.equal(resolved.acceptedProposalId, null);
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM source_records').get()!.count, 0);
+});
+
+test('final failure resolution preserves an existing import and its accepted proposal receipt', (t) => {
+  const f = fixture(t);
+  const original = getIntake(f.db, f.root, f.profileId, f.id);
+  const proposed = proposeConversion(f.db, f.root, f.profileId, f.id, {
+    version: original.version,
+    jsonlText: literalEnvelope(),
+    summary: 'Fictional source context.',
+  });
+  const imported = importIntake(f.db, f.root, f.profileId, f.id, {
+    version: proposed.version,
+    proposalId: proposed.proposals[0].id,
+  });
+  assert.equal(imported.state, 'imported');
+  const retainedRows = f.db.prepare('SELECT COUNT(*) AS count FROM source_records').get()!.count;
+  const pending = recordIntakePackageFailure(f.db, f.root, f.profileId, f.id, failureInput);
+  assert.equal(pending.state, 'needs_review');
+  const resolved = resolveIntakePackageFailure(f.db, f.root, f.profileId, f.id, {
+    operationKey: failureInput.operationKey,
+  });
+  assert.equal(resolved.state, 'imported');
+  assert.equal(resolved.needsReview, false);
+  assert.deepEqual(resolved.imported, imported.imported);
+  assert.equal(resolved.acceptedProposalId, imported.acceptedProposalId);
+  assert.deepEqual(resolved.importHistory, imported.importHistory);
+  assert.equal(
+    f.db.prepare('SELECT COUNT(*) AS count FROM source_records').get()!.count,
+    retainedRows,
+  );
+});
+
+test('resolution restores a proposed context but keeps other pending candidates in review', (t) => {
+  const f = fixture(t);
+  const original = getIntake(f.db, f.root, f.profileId, f.id);
+  const proposed = proposeConversion(f.db, f.root, f.profileId, f.id, {
+    version: original.version,
+    jsonlText: literalEnvelope(),
+    summary: 'Fictional proposed context.',
+  });
+  assert.equal(proposed.needsReview, false);
+  recordIntakePackageFailure(f.db, f.root, f.profileId, f.id, failureInput);
+  let resolved = resolveIntakePackageFailure(f.db, f.root, f.profileId, f.id, {
+    operationKey: failureInput.operationKey,
+  });
+  assert.equal(resolved.state, 'conversion_proposed');
+  assert.equal(resolved.imported, null);
+  assert.equal(resolved.acceptedProposalId, null);
+  proposeConversion(f.db, f.root, f.profileId, f.id, {
+    version: resolved.version,
+    jsonlText: literalEnvelope('record'),
+    summary: 'Fictional unreviewed record.',
+  });
+  recordIntakePackageFailure(f.db, f.root, f.profileId, f.id, failureInput);
+  resolved = resolveIntakePackageFailure(f.db, f.root, f.profileId, f.id, {
+    operationKey: failureInput.operationKey,
+  });
+  assert.equal(resolved.state, 'needs_review');
+  assert.equal(resolved.needsReview, true);
+  assert.equal(resolved.pendingCount, 1);
+  assert.equal(resolved.imported, null);
+});
+
+test('resolution preserves explicit keep-original disposition and does not let historical decisions override a later proposal', (t) => {
+  const f = fixture(t);
+  const original = getIntake(f.db, f.root, f.profileId, f.id);
+  const proposed = proposeConversion(f.db, f.root, f.profileId, f.id, {
+    version: original.version,
+    jsonlText: literalEnvelope('record'),
+    summary: 'Fictional retained record.',
+  });
+  const review = reviewIntake(f.db, f.root, f.profileId, f.id, proposed.proposals[0].id);
+  const kept = saveIntakeReviewDraft(f.db, f.root, f.profileId, f.id, {
+    version: proposed.version,
+    operationId: 'fictional-keep-original',
+    proposalId: proposed.proposals[0].id,
+    recordId: review.records[0].id,
+    candidateVersionId: review.records[0].candidateVersionId!,
+    disposition: 'keep_original_only',
+  });
+  assert.equal(kept.state, 'kept_original');
+  recordIntakePackageFailure(f.db, f.root, f.profileId, f.id, failureInput);
+  let resolved = resolveIntakePackageFailure(f.db, f.root, f.profileId, f.id, {
+    operationKey: failureInput.operationKey,
+  });
+  assert.equal(resolved.state, 'kept_original');
+  assert.equal(resolved.imported, null);
+  assert.deepEqual(resolved.workflow?.decisions, kept.workflow?.decisions);
+  const later = proposeConversion(f.db, f.root, f.profileId, f.id, {
+    version: resolved.version,
+    jsonlText: literalEnvelope(),
+    summary: 'Later fictional context proposal.',
+  });
+  assert.equal(later.state, 'conversion_proposed');
+  assert.equal(later.needsReview, false);
+  recordIntakePackageFailure(f.db, f.root, f.profileId, f.id, failureInput);
+  resolved = resolveIntakePackageFailure(f.db, f.root, f.profileId, f.id, {
+    operationKey: failureInput.operationKey,
+  });
+  assert.equal(resolved.state, 'conversion_proposed');
+  assert.equal(resolved.imported, null);
+  assert.equal(resolved.acceptedProposalId, null);
+  assert.deepEqual(resolved.workflow?.decisions, later.workflow?.decisions);
+});
+
+test('a historical import cannot falsely complete a different later context proposal after failure resolution', (t) => {
+  const f = fixture(t, Buffer.from(literalEnvelope()), 'fictional-context.jsonl');
+  const original = getIntake(f.db, f.root, f.profileId, f.id);
+  const imported = importIntake(f.db, f.root, f.profileId, f.id, { version: original.version });
+  assert.equal(imported.state, 'imported');
+  const later = proposeConversion(f.db, f.root, f.profileId, f.id, {
+    version: imported.version,
+    jsonlText: literalEnvelope().replace(
+      'Fictional literal source context.',
+      'Later fictional source context.',
+    ),
+    summary: 'Later unaccepted fictional context proposal.',
+  });
+  assert.equal(later.state, 'conversion_proposed');
+  assert.equal(later.needsReview, false);
+  assert.notEqual(later.proposals.at(-1)!.id, later.acceptedProposalId);
+  recordIntakePackageFailure(f.db, f.root, f.profileId, f.id, failureInput);
+  const resolved = resolveIntakePackageFailure(f.db, f.root, f.profileId, f.id, {
+    operationKey: failureInput.operationKey,
+  });
+  assert.equal(resolved.needsReview, false);
+  assert.equal(Object.keys(resolved.packageFailures!).length, 0);
+  assert.equal(resolved.state, 'needs_review');
+  assert.deepEqual(resolved.imported, imported.imported);
+  assert.equal(resolved.acceptedProposalId, imported.acceptedProposalId);
+  assert.deepEqual(resolved.proposals, later.proposals);
 });
 
 test('failure receipts and exact originals survive backup and SQLite rebuild, including no-write replay', async (t) => {

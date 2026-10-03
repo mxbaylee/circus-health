@@ -3,6 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { IntakePackageFailure } from '../shared/intake.ts';
 import { HttpError } from './database.ts';
 import { getIntake, workflowMutation } from './intake.ts';
+import { workflowSummary } from './intake-workflow.ts';
 
 export interface IntakePackageFailureInput {
   operationKey: string;
@@ -142,8 +143,46 @@ export function resolveIntakePackageFailure(
     profileId,
     id,
     { version: intake.version },
-    (_workflow, _file, details) => {
+    (workflow, _file, details) => {
       delete details.packageFailures![slot];
+      // Only retire the attention state this processing failure promoted. The
+      // normal intake paths' existing receipts determine its underlying state;
+      // processing success never creates acceptance or a clinical disposition.
+      if (details.state !== 'needs_review' || workflowSummary(details).needsReview) return;
+      const latestProposal = details.proposals.at(-1);
+      const explicitlyKept = workflow.decisions.some(
+        (decision) =>
+          decision.action === 'keep_original_only' &&
+          (!latestProposal ||
+            ('proposalId' in decision && decision.proposalId === latestProposal.id)) &&
+          workflow.candidates.some(
+            (candidate) =>
+              candidate.id === decision.candidateId &&
+              candidate.versions.some(
+                (version) =>
+                  version.id === decision.candidateVersionId && version.status === 'kept_original',
+              ),
+          ),
+      );
+      // A historical import and a different later proposal do not establish
+      // whether the latest proposal was the person's last reviewed scope.
+      // Keep the legacy attention label rather than invent acceptance priority.
+      if (
+        details.imported &&
+        latestProposal &&
+        latestProposal.id !== details.acceptedProposalId &&
+        !explicitlyKept
+      )
+        return;
+      details.state = details.imported
+        ? 'imported'
+        : explicitlyKept
+          ? 'kept_original'
+          : latestProposal
+            ? 'conversion_proposed'
+            : details.validation.valid
+              ? 'ready'
+              : 'pending_conversion';
     },
   );
 }

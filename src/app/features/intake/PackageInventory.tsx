@@ -96,6 +96,9 @@ export function PackageInventory({ intake }: { intake: Intake }) {
       return;
     }
     if (!failure.memberId) return;
+    setSelected(null);
+    setRead(null);
+    setHistory([]);
     setBusy(true);
     setError('');
     try {
