@@ -90,6 +90,8 @@ For work-count qualification, detach mutable counters, including nested groups, 
 
 The offline local proxy checks build the pinned LiteLLM compatibility image and run its response, native PDF translation, diagnostics and fictional OAuth tests without external network access. These test the adapter and persistence logic, not real account authentication or provider PDF acceptance. Deployment/container and real-provider qualification remain separately opt-in procedures.
 
+The [hosted passkey checker](docs/security/hosted-passkey-checker.md) has an independent static build (`npm run build:passkey-checker`) and a manual publication workflow restricted to reviewed `main`. Its generated assets belong only on `gh-pages`; it does not build or deploy the health application. Controlled checker tests are development evidence, never physical qualification receipts.
+
 Update documentation with contract changes. Cite current implementation and tests for security or durability claims. Keep open requirements and evidence limits intact; fixture tests do not prove real provider, device, filesystem, or model behavior.
 
 ## Working across computers

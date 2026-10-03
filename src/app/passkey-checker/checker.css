@@ -1,0 +1,179 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  background: var(--background);
+  color: var(--ink);
+  line-height: 1.6;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+.checker {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 36px 24px 64px;
+}
+.checker h1 {
+  font-size: clamp(2rem, 5vw, 3rem);
+  line-height: 1.15;
+  margin: 8px 0 20px;
+}
+.checker h2 {
+  font-size: 1.35rem;
+  line-height: 1.35;
+}
+.checker h3 {
+  font-size: 1.12rem;
+}
+.checker p {
+  margin: 12px 0;
+}
+.checker-eyebrow {
+  color: var(--pink);
+  font-weight: 650;
+}
+.checker-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 24px;
+  margin: 24px 0;
+}
+.checker-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 20px 0;
+}
+.checker label {
+  display: block;
+  font-weight: 600;
+}
+.checker input,
+.checker select,
+.checker textarea {
+  display: block;
+  width: 100%;
+  margin: 6px 0;
+  padding: 10px 12px;
+  background: var(--background);
+  color: var(--ink);
+  border: 1px solid var(--control-border);
+  border-radius: 7px;
+  font: inherit;
+}
+.checker textarea {
+  min-height: 92px;
+  resize: vertical;
+}
+.checker button {
+  padding: 10px 14px;
+  border-radius: 7px;
+  border: 1px solid var(--control-border);
+  background: var(--pink-fill);
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.checker button:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--pink);
+}
+.checker button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.checker :focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+}
+.checker a {
+  color: var(--blue);
+  text-underline-offset: 3px;
+}
+.checker-source {
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+.checker-storage,
+.checker-live {
+  border-left: 3px solid var(--blue);
+  padding-left: 16px;
+  margin: 24px 0;
+}
+.checker-live {
+  color: var(--blue);
+}
+.checker-steps {
+  padding-left: 24px;
+}
+.checker-steps > li {
+  padding: 18px 0;
+  border-bottom: 1px solid var(--border);
+}
+.checker-step-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+.checker-step-heading button {
+  max-width: 55%;
+  font-size: 0.9rem;
+}
+.checker-error {
+  color: var(--brand-butter);
+}
+.checker details {
+  margin: 12px 0;
+}
+.checker summary {
+  cursor: pointer;
+  color: var(--blue);
+}
+.checker details li {
+  overflow-wrap: anywhere;
+  margin: 8px 0;
+}
+.checker-observation {
+  margin-top: 28px;
+}
+.checker-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.checker-reset {
+  margin-top: 24px;
+  padding: 18px;
+  border: 1px solid var(--brand-butter);
+  border-radius: 7px;
+}
+.checker footer {
+  margin-top: 36px;
+}
+@media (max-width: 580px) {
+  .checker {
+    padding: 24px 16px 40px;
+  }
+  .checker-panel {
+    padding: 18px;
+  }
+  .checker-fields {
+    grid-template-columns: 1fr;
+  }
+  .checker-step-heading {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .checker-step-heading button {
+    max-width: none;
+  }
+}

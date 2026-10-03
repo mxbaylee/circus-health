@@ -77,6 +77,8 @@ Controlled fictional tests exercise recovery verification, invalid/wrong-profile
 
 ## Physical passkey qualification
 
+The standalone [hosted compatibility checker](hosted-passkey-checker.md) provides a manual browser link, real PRF/fictional-decryption steps and downloadable local reports. Its credentials belong to its hosted relying-party domain. Use it to gather compatibility observations; actual application recovery, session/private access and container recreation still require the installation procedure below.
+
 Run the headed journey only against a fresh, isolated fictional Compose installation. For the supported local installation, use its exact HTTP localhost origin:
 
 ```sh
