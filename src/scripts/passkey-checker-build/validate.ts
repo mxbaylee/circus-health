@@ -49,7 +49,7 @@ export function validateCheckerFiles(directory: string, expectedRevision?: strin
   const info = build as Record<string, unknown>;
   if (
     Object.keys(info).sort().join(',') !== 'revision,version,worktree' ||
-    info.version !== '1' ||
+    info.version !== '2' ||
     !(
       info.revision === 'unknown' ||
       (typeof info.revision === 'string' && /^[a-f0-9]{40}$/.test(info.revision))

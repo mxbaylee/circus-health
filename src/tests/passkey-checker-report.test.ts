@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { reportMarkdown } from '../app/passkey-checker/report.ts';
+import { isVerifiedReturnToA, reportMarkdown } from '../app/passkey-checker/report.ts';
 import { inspectEnvironment } from '../app/passkey-checker/environment.ts';
 import type { CheckerState } from '../app/passkey-checker/types.ts';
 const build = { version: '1', revision: 'fictional', worktree: 'clean' };
@@ -61,6 +61,7 @@ const state = (): CheckerState => ({
 });
 test('partial report separates manual worked from failure, creation from PRF and all remaining release gates', () => {
   const report = reportMarkdown(state());
+  assert.match(report, /Report schema: 2/);
   assert.match(report, /created only; PRF not verified/);
   assert.match(report, /Confirm PRF and fictional encryption, attempt 1: failed/);
   assert.match(report, /cancelled, timed out, or refused/);
@@ -80,6 +81,105 @@ test('partial report separates manual worked from failure, creation from PRF and
   ])
     assert.ok(report.includes(expected));
   assert.match(report, /attempt\\-build/);
+  assert.match(report, /Use A after B is created: unfinished; no automatic evidence/);
+  assert.doesNotMatch(report.split('### Credential B')[1], /Use A after B is created/);
+});
+
+test('legacy PRF failures retain their combined meaning without invented diagnostics', () => {
+  const model = state();
+  model.attempts[1].error = 'missing-prf';
+  const report = reportMarkdown(model);
+  assert.match(report, /No valid 32-byte PRF result was returned/);
+  assert.doesNotMatch(report, /Safe request diagnostics|output shape|input shape/);
+  assert.doesNotMatch(report, /PRF result was absent|PRF representation was invalid/);
+  assert.equal(model.attempts[1].diagnostics, undefined);
+  assert.equal(model.run.build.version, '1');
+  assert.equal(model.attempts[1].build.revision, 'attempt-build');
+});
+
+test('report independently projects diagnostic metadata without exporting unknown or native fields', () => {
+  const model = state();
+  model.attempts[1].diagnostics = {
+    requestMode: 'eval',
+    inputShape: 'array-buffer',
+    inputLength: 32,
+    extensionPresent: true,
+    resultsPresent: true,
+    outputShape: 'array',
+    outputLength: 31,
+    credentialMatched: true,
+    secret: 'never-export-diagnostic-secret',
+    rawId: new Uint8Array([8, 7, 6]),
+    salts: { first: 'never-export-diagnostic-salt' },
+    nativeResponse: { prf: 'never-export-native-response' },
+  } as NonNullable<(typeof model.attempts)[number]['diagnostics']>;
+  const report = reportMarkdown(model);
+  assert.match(report, /Safe request diagnostics: request mode: eval; input shape: array-buffer/);
+  assert.match(report, /output shape: array; output length: 31; returned credential matched: true/);
+  for (const secret of ['never-export', 'rawId', 'nativeResponse'])
+    assert.ok(!report.includes(secret));
+  model.attempts[1].diagnostics = {
+    ...model.attempts[1].diagnostics,
+    outputShape: 'never-export-invalid-known-field',
+  } as unknown as NonNullable<(typeof model.attempts)[number]['diagnostics']>;
+  assert.doesNotMatch(reportMarkdown(model), /Safe request diagnostics|never-export/);
+});
+
+test('A return requires its own verified use after B creation even when B is unconfirmed', () => {
+  const model = state();
+  const returnAttempt = {
+    ...model.attempts[1],
+    id: 'return-to-a',
+    step: 'use-after-b' as const,
+    status: 'verified' as const,
+    startedAt: '2026-10-03T00:01:00.000Z',
+    finishedAt: '2026-10-03T00:02:00.000Z',
+    error: undefined,
+  };
+  model.attempts.push(returnAttempt);
+  let report = reportMarkdown(model);
+  assert.equal(isVerifiedReturnToA(model, returnAttempt), false);
+  assert.match(
+    report,
+    /Use A after B is created, attempt 1: pending or unfinished; no verified result/,
+  );
+  assert.match(report, /B need not be confirmed/);
+  assert.match(report, /do not prove an independent authenticator/);
+  model.credentials.push({ alias: 'B', id: 'Yg', salt: 'fictional' });
+  const creation = {
+    ...model.attempts[0],
+    id: 'create-b',
+    alias: 'B' as const,
+    startedAt: '2026-10-03T00:00:30.000Z',
+    finishedAt: '2026-10-03T00:03:00.000Z',
+  };
+  model.attempts.push(creation);
+  assert.equal(isVerifiedReturnToA(model, returnAttempt), false);
+  creation.finishedAt = returnAttempt.startedAt;
+  assert.equal(isVerifiedReturnToA(model, returnAttempt), true);
+  report = reportMarkdown(model);
+  assert.match(
+    report,
+    /Use A after B is created, attempt 1: verified PRF and fictional decryption/,
+  );
+  assert.match(report, /Confirm PRF and fictional encryption: unfinished/);
+  assert.doesNotMatch(report.split('### Credential B')[1], /Use A after B is created/);
+  model.attempts = model.attempts.filter((attempt) => attempt.id !== returnAttempt.id);
+  model.observations.push({
+    ...model.observations[0],
+    id: 'manual-return',
+    step: 'use-after-b',
+  });
+  model.observations.push({
+    ...model.observations[0],
+    id: 'invalid-b-return',
+    alias: 'B',
+    step: 'use-after-b',
+  });
+  report = reportMarkdown(model);
+  assert.match(report, /Use A after B is created: unfinished; no automatic evidence/);
+  assert.match(report, /Use A after B is created: Worked \(manual\)/);
+  assert.doesNotMatch(report, /Credential B, Use A after B is created/);
 });
 test('allowlisted report redacts credential IDs in supported representations and escapes bounded free text', () => {
   const model = state();

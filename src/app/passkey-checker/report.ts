@@ -1,14 +1,17 @@
-import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, STEP_LABELS } from './types.ts';
+import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, STEP_LABELS, stepsForAlias } from './types.ts';
+import { projectPrfDiagnostics } from './diagnostics.ts';
+import { isVerifiedReturnToA } from './progress.ts';
 import type { CheckerState, Environment, Step } from './types.ts';
 
-export const REPORT_VERSION = 1;
+export { isVerifiedReturnToA } from './progress.ts';
+
+export const REPORT_VERSION = 2;
 const sources = {
   'browser-reported': 'browser-reported hint',
   operator: 'operator',
   unknown: 'unknown',
 } as const;
 const outcomes = { worked: 'Worked', failed: 'Failed', 'could-not-test': "Couldn't test" } as const;
-const steps = Object.keys(STEP_LABELS) as Step[];
 
 /** Allowlisted human report: never serialize the local model or WebAuthn objects. */
 export function reportMarkdown(state: CheckerState): string {
@@ -84,10 +87,14 @@ export function reportMarkdown(state: CheckerState): string {
     '',
     'Creation alone, capability flags and signatures do not pass PRF compatibility. Confirmation verifies an exact-credential 32-byte PRF result and encrypts, decrypts and compares a fictional value. Each verified subsequent use obtains a fresh PRF result, checks the exact credential and decrypts and compares the retained fictional ciphertext. There is no backend signature/challenge verification.',
     '',
+    'Use A after B is created requires B to have been created; B need not be confirmed. This separate fresh-use step must verify A and decrypt its retained fictional value. Earlier uses of A do not complete it. A distinct B credential and successful hosted checks do not prove an independent authenticator.',
+    '',
+    'Safe diagnostic lengths count bytes for buffers/views, items for arrays and characters for strings. An omitted field was unobserved, oversized or not applicable; it does not mean zero or a valid result. Older attempts have no newly inferred diagnostics.',
+    '',
   ];
   for (const alias of ['A', 'B'] as const) {
     lines.push(`### Credential ${alias}`, '');
-    for (const step of steps) {
+    for (const step of stepsForAlias(alias)) {
       const attempts = state.attempts.filter(
         (attempt) => attempt.alias === alias && attempt.step === step,
       );
@@ -97,7 +104,9 @@ export function reportMarkdown(state: CheckerState): string {
         const status =
           attempt.status === 'created' && step === 'create'
             ? 'created only; PRF not verified'
-            : attempt.status === 'verified' && step !== 'create'
+            : attempt.status === 'verified' &&
+                step !== 'create' &&
+                (step !== 'use-after-b' || isVerifiedReturnToA(state, attempt))
               ? 'verified PRF and fictional decryption'
               : attempt.status === 'failed'
                 ? 'failed'
@@ -113,6 +122,28 @@ export function reportMarkdown(state: CheckerState): string {
           `  Started ${safe(attempt.startedAt)}; finished ${attempt.finishedAt ? safe(attempt.finishedAt) : 'unfinished'}. Build: ${buildText(attempt.build)}.`,
         );
         lines.push(...environmentLines(attempt.environment).map((line) => `  ${line}`));
+        // Project again at the export boundary: callers need not have loaded through
+        // the strict store, and arbitrary/native diagnostic values must never leak.
+        const diagnostics = projectPrfDiagnostics(attempt.diagnostics);
+        if (diagnostics) {
+          const fields: string[] = [
+            `request mode: ${diagnostics.requestMode}`,
+            `input shape: ${diagnostics.inputShape}`,
+          ];
+          if (diagnostics.inputLength !== undefined)
+            fields.push(`input length: ${diagnostics.inputLength}`);
+          if (diagnostics.extensionPresent !== undefined)
+            fields.push(`PRF extension present: ${diagnostics.extensionPresent}`);
+          if (diagnostics.resultsPresent !== undefined)
+            fields.push(`PRF results present: ${diagnostics.resultsPresent}`);
+          if (diagnostics.outputShape !== undefined)
+            fields.push(`output shape: ${diagnostics.outputShape}`);
+          if (diagnostics.outputLength !== undefined)
+            fields.push(`output length: ${diagnostics.outputLength}`);
+          if (diagnostics.credentialMatched !== undefined)
+            fields.push(`returned credential matched: ${diagnostics.credentialMatched}`);
+          lines.push(`  Safe request diagnostics: ${fields.join('; ')}.`);
+        }
       }
     }
     lines.push('');
@@ -126,7 +157,7 @@ export function reportMarkdown(state: CheckerState): string {
   if (!state.observations.length) lines.push('No manual observations recorded.');
   for (const observation of state.observations) {
     const alias = observation.alias === 'B' ? 'B' : 'A';
-    const step = Object.hasOwn(STEP_LABELS, observation.step)
+    const step = stepsForAlias(alias).some((step) => step === observation.step)
       ? STEP_LABELS[observation.step as Step]
       : 'General observation';
     lines.push(

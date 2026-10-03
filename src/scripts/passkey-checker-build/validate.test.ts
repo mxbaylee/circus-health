@@ -19,7 +19,7 @@ function fixture(run: (directory: string) => void) {
     );
     writeFileSync(
       join(directory, 'build-info.json'),
-      JSON.stringify({ version: '1', revision, worktree: 'clean' }),
+      JSON.stringify({ version: '2', revision, worktree: 'clean' }),
     );
     run(directory);
   } finally {
@@ -54,7 +54,7 @@ test('publication validates exact clean revision and complete allowlisted output
     );
     writeFileSync(
       join(directory, 'build-info.json'),
-      JSON.stringify({ version: '1', revision, worktree: 'dirty' }),
+      JSON.stringify({ version: '2', revision, worktree: 'dirty' }),
     );
     assert.throws(() => validateCheckerFiles(directory, revision), /exact clean reviewed revision/);
   }));

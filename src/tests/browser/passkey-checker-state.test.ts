@@ -107,6 +107,160 @@ test(
       first.close();
       second.close();
       controller.close();
+      // Seed the original v1 layout directly, before opening it with the new
+      // code. Adding diagnostics must preserve old rows and their provenance.
+      const legacyName = name + '-legacy';
+      const legacyDb = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(legacyName, 1);
+        req.onupgradeneeded = () => {
+          for (const table of ['header', 'credentials', 'attempts', 'observations'])
+            req.result.createObjectStore(table);
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      const legacyBuild = { version: '1', revision: 'fictional-original-build', worktree: 'clean' };
+      const legacyEnvironment = {
+        ...run.environment,
+        provider: { value: 'Fictional original provider', source: 'operator' as const },
+        providerVersion: { value: 'unknown', source: 'unknown' as const },
+      };
+      const legacyRun = { ...run, build: legacyBuild, environment: legacyEnvironment };
+      const legacyFailure = {
+        ...attempt,
+        id: 'legacy-prf-failure',
+        step: 'confirm' as const,
+        status: 'failed' as const,
+        error: 'missing-prf' as const,
+        finishedAt: new Date().toISOString(),
+        build: legacyBuild,
+        environment: legacyEnvironment,
+      };
+      const legacyObservation = {
+        ...observation,
+        build: legacyBuild,
+        environment: legacyEnvironment,
+      };
+      await new Promise<void>((resolve, reject) => {
+        const tx = legacyDb.transaction(
+          ['header', 'credentials', 'attempts', 'observations'],
+          'readwrite',
+        );
+        tx.objectStore('header').put({ run: legacyRun, revision: 7 }, 'current');
+        tx.objectStore('credentials').put({ alias: 'A', id: 'YQ', salt: 'A'.repeat(43) }, 'A');
+        tx.objectStore('attempts').put(legacyFailure, legacyFailure.id);
+        tx.objectStore('observations').put(legacyObservation, legacyObservation.id);
+        tx.oncomplete = () => resolve();
+        tx.onabort = () => reject(tx.error);
+      });
+      const legacyDatabaseVersion = legacyDb.version;
+      legacyDb.close();
+      const legacyStore = await openCheckerStore(indexedDB, legacyName);
+      const legacySnapshot = (await legacyStore.load())!;
+      const diagnostics = {
+        requestMode: 'eval' as const,
+        inputShape: 'array-buffer' as const,
+        inputLength: 32,
+        extensionPresent: true,
+        resultsPresent: true,
+        outputShape: 'array' as const,
+        outputLength: 31,
+        credentialMatched: true,
+      };
+      const diagnosticAttempt = {
+        ...legacyFailure,
+        id: 'fresh-diagnostic-failure',
+        error: 'prf-invalid' as const,
+        build,
+        environment: run.environment,
+        diagnostics,
+      };
+      await legacyStore.commit(legacySnapshot.token, { attempt: diagnosticAttempt });
+      legacyStore.close();
+      const reopened = await openCheckerStore(indexedDB, legacyName);
+      const extended = (await reopened.load())!;
+      const legacyRowsPreserved =
+        JSON.stringify(extended.state.run) === JSON.stringify(legacyRun) &&
+        JSON.stringify(extended.state.attempts.find((row) => row.id === legacyFailure.id)) ===
+          JSON.stringify(legacyFailure) &&
+        JSON.stringify(extended.state.observations[0]) === JSON.stringify(legacyObservation) &&
+        extended.state.attempts.find((row) => row.id === legacyFailure.id)!.diagnostics ===
+          undefined;
+      const diagnosticsRoundTrip =
+        JSON.stringify(
+          extended.state.attempts.find((row) => row.id === diagnosticAttempt.id)?.diagnostics,
+        ) === JSON.stringify(diagnostics);
+      const badDiagnostics = [
+        Object.assign(new Date('2026-10-03T00:00:00.000Z'), diagnostics),
+        Object.assign(new ArrayBuffer(32), diagnostics),
+        Object.assign(new Uint8Array(32), diagnostics),
+        { ...diagnostics, credentialId: 'fictional-unknown-secret' },
+        { ...diagnostics, raw: new Uint8Array([1, 2, 3]) },
+        { ...diagnostics, outputShape: new ArrayBuffer(32) },
+        { ...diagnostics, outputLength: -1 },
+        { ...diagnostics, outputLength: 1.5 },
+        { ...diagnostics, outputLength: 65537 },
+        { ...diagnostics, outputLength: Infinity },
+        { ...diagnostics, credentialMatched: 'true' },
+        { ...diagnostics, requestMode: 'unsupported' },
+        { ...diagnostics, inputShape: 'unknown-native-shape' },
+      ];
+      let invalidDiagnosticsRejected = 0;
+      for (const invalid of badDiagnostics) {
+        try {
+          await reopened.commit(extended.token, {
+            attempt: { ...diagnosticAttempt, diagnostics: invalid } as typeof diagnosticAttempt,
+          });
+        } catch (error) {
+          if ((error as { reason: string }).reason === 'incompatible') invalidDiagnosticsRejected++;
+        }
+      }
+      let bReturnRowsRejected = 0;
+      for (const change of [
+        { attempt: { ...diagnosticAttempt, alias: 'B' as const, step: 'use-after-b' as const } },
+        {
+          observation: { ...legacyObservation, alias: 'B' as const, step: 'use-after-b' as const },
+        },
+      ]) {
+        try {
+          await reopened.commit(extended.token, change);
+        } catch (error) {
+          if ((error as { reason: string }).reason === 'incompatible') bReturnRowsRejected++;
+        }
+      }
+      const rejectedRowsPreservedRevision =
+        (await reopened.load())!.token.revision === extended.token.revision;
+      reopened.close();
+      const corruptDb = await new Promise<IDBDatabase>((resolve) => {
+        const req = indexedDB.open(legacyName, 1);
+        req.onsuccess = () => resolve(req.result);
+      });
+      await new Promise<void>((resolve, reject) => {
+        const tx = corruptDb.transaction('attempts', 'readwrite');
+        tx.objectStore('attempts').put(
+          {
+            ...diagnosticAttempt,
+            diagnostics: { ...diagnostics, rawResponse: { secret: 'fictional-private' } },
+          },
+          diagnosticAttempt.id,
+        );
+        tx.oncomplete = () => resolve();
+        tx.onabort = () => reject(tx.error);
+      });
+      const incompatibleLegacy = await openCheckerStore(indexedDB, legacyName);
+      let corruptDiagnosticsRejected = '';
+      try {
+        await incompatibleLegacy.load();
+      } catch (error) {
+        corruptDiagnosticsRejected = (error as { reason: string }).reason;
+      }
+      incompatibleLegacy.close();
+      const corruptRowsRetained = await new Promise<number>((resolve) => {
+        const req = corruptDb.transaction('attempts').objectStore('attempts').count();
+        req.onsuccess = () => resolve(req.result);
+      });
+      corruptDb.close();
+      await deleteCheckerStore(indexedDB, legacyName);
       // Mutate one raw row to simulate an incompatible stored schema; opening it must not erase anything.
       const db = await new Promise<IDBDatabase>((resolve, reject) => {
         const req = indexedDB.open(name, 1);
@@ -178,6 +332,14 @@ test(
         futureSchema,
         malformedSalt,
         untouchedRevision,
+        legacyDatabaseVersion,
+        legacyRowsPreserved,
+        diagnosticsRoundTrip,
+        invalidDiagnosticsRejected,
+        bReturnRowsRejected,
+        rejectedRowsPreservedRevision,
+        corruptDiagnosticsRejected,
+        corruptRowsRetained,
       };
     });
     assert.deepEqual(evidence, {
@@ -194,6 +356,14 @@ test(
       futureSchema: 'incompatible',
       malformedSalt: 'incompatible',
       untouchedRevision: true,
+      legacyDatabaseVersion: 1,
+      legacyRowsPreserved: true,
+      diagnosticsRoundTrip: true,
+      invalidDiagnosticsRejected: 13,
+      bReturnRowsRejected: 2,
+      rejectedRowsPreservedRevision: true,
+      corruptDiagnosticsRejected: 'incompatible',
+      corruptRowsRetained: 2,
     });
   },
 );

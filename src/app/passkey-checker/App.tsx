@@ -1,17 +1,17 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CheckerController } from './controller';
 import { checkSupport } from './environment';
-import { reportMarkdown } from './report';
-import { ERROR_MESSAGES, ENVIRONMENT_FIELDS } from './types';
-import type { CredentialAlias, EnvironmentField, Observation, Step } from './types';
+import { isVerifiedReturnToA, reportMarkdown } from './report';
+import { ERROR_MESSAGES, ENVIRONMENT_FIELDS, stepsForAlias } from './types';
+import type { CredentialAlias, EnvironmentField, ErrorCode, Observation, Step } from './types';
 
-const steps: Step[] = ['create', 'confirm', 'use-1', 'use-2', 'use-3'];
 const stepNames: Record<Step, string> = {
   create: 'Create a test passkey',
   confirm: 'Confirm the test passkey',
   'use-1': 'Use it again: 1 of 3',
   'use-2': 'Use it again: 2 of 3',
   'use-3': 'Use it again: 3 of 3',
+  'use-after-b': 'Use A after B is created',
 };
 const fieldNames: Record<EnvironmentField, string> = {
   browser: 'Browser',
@@ -27,6 +27,22 @@ const provenance = {
   unknown: 'Unknown',
 };
 const outcomeNames = { worked: 'Worked', failed: 'Failed', 'could-not-test': "Couldn't test" };
+
+function nextAction(alias: CredentialAlias, step: Step, error: ErrorCode): string | undefined {
+  if (error === 'wrong-credential')
+    return `Retry and choose the saved test passkey ${alias} in the native prompt. The returned passkey was not accepted. Labels can help selection, but do not prove that a provider will return the requested passkey.`;
+  if (error === 'prf-absent')
+    return 'This attempt returned no encryption result. Check the browser and provider labels, retain the failed report, and try again only when you can select the intended passkey. This result alone does not establish that every version of this provider is unsupported.';
+  if (error === 'prf-invalid')
+    return 'An encryption result was present but could not be used. Keep this failed report for diagnosis; do not treat a successful prompt as confirmation. Record any visible format message in your notes without including secrets.';
+  if (error === 'missing-prf')
+    return 'This older result did not distinguish an absent encryption result from an unusable one. Retain it and record a fresh attempt for clearer evidence.';
+  if (alias === 'B' && step === 'create' && error === 'invalid-state')
+    return "A provider already holding A may refuse this second creation because the checker asks it to avoid registering A again. That is a possible explanation, not a confirmed cause. Keep A and try another available authenticator after reviewing the provider labels, or record Couldn't test.";
+  if (alias === 'B' && step === 'create' && error === 'unknown-error')
+    return "The cause of this second-creation failure is unknown. Check which authenticator you selected and retain the report. Try another available authenticator after reviewing the provider labels, or record Couldn't test; this result does not establish an exclusion refusal.";
+  return undefined;
+}
 
 function ObservationForm({
   alias,
@@ -62,7 +78,7 @@ function ObservationForm({
             onChange={(event) => setStep(event.target.value as Observation['step'])}
           >
             <option value="general">General / unavailable passkey</option>
-            {steps.map((item) => (
+            {stepsForAlias(alias).map((item) => (
               <option key={item} value={item}>
                 {stepNames[item]}
               </option>
@@ -132,6 +148,10 @@ export default function App({ controller }: { controller: CheckerController }) {
     setNotice('Report download requested. It includes partial and failed steps.');
   };
   const blocked = busy || !canRun;
+  const bCreated = state.credentials.some((credential) => credential.alias === 'B');
+  const aConfirmed = state.credentials.some(
+    (credential) => credential.alias === 'A' && credential.cipher,
+  );
   return (
     <main className="checker">
       <header className="checker-intro">
@@ -231,17 +251,26 @@ export default function App({ controller }: { controller: CheckerController }) {
           compatibility: confirmation establishes encrypted fictional material, and each later use
           must decrypt and match it.
         </p>
+        <p>
+          A and B belong to the same fictional profile. New native prompts use “Fictional
+          compatibility test — passkey A” or “Fictional compatibility test — passkey B” to help
+          selection. Providers may group or ignore these labels, and older saved passkeys may have
+          identical labels. These labels are selection aids, not a proven fix for provider selection
+          failures.
+        </p>
         {(['A', 'B'] as const).map((alias) => {
           const attempts = state.attempts.filter((attempt) => attempt.alias === alias);
           const observations = state.observations.filter(
             (observation) => observation.alias === alias,
           );
-          const complete = steps
+          const complete = stepsForAlias(alias)
             .slice(1)
+            .filter((step) => step !== 'use-after-b')
             .every(
               (step) =>
                 attempts.filter((attempt) => attempt.step === step).at(-1)?.status === 'verified',
             );
+          const returnToA = attempts.filter((attempt) => attempt.step === 'use-after-b').at(-1);
           return (
             <article className="checker-panel" key={alias} aria-labelledby={`passkey-${alias}`}>
               <h3 id={`passkey-${alias}`}>
@@ -250,24 +279,57 @@ export default function App({ controller }: { controller: CheckerController }) {
               </h3>
               {alias === 'B' && (
                 <p>
-                  If another passkey is available, review the provider labels above before testing
-                  it. Each attempt retains the labels used at that moment. A distinct credential
-                  does not prove a different physical device or provider. If unavailable, record
-                  Couldn't test below.
+                  To create B for this same fictional profile, choose another available
+                  authenticator that does not already hold A. A synced copy of A is not a distinct
+                  authenticator. Review the provider labels above before switching; each attempt
+                  retains the labels used at that moment. Keep A in place. If another authenticator
+                  is unavailable, record Couldn't test below. A distinct returned credential does
+                  not by itself prove another physical device or provider.
                 </p>
               )}
               <p>
                 <strong>
                   Automatic result:{' '}
                   {complete
-                    ? 'Confirmation and all three fresh uses verified'
+                    ? 'Initial confirmation and all three fresh uses verified'
                     : 'Incomplete — inspect each step below'}
                 </strong>
               </p>
+              {alias === 'A' && (
+                <p>
+                  <strong>
+                    A retained after B creation:{' '}
+                    {!bCreated
+                      ? 'Not tested — B has not been created.'
+                      : returnToA && isVerifiedReturnToA(state, returnToA)
+                        ? 'Verified — A decrypted its retained fictional value after B was created.'
+                        : returnToA?.status === 'verified'
+                          ? 'Not verified — saved evidence does not establish a return to A after B creation.'
+                          : returnToA?.status === 'failed'
+                            ? 'Failed — inspect the return-to-A step below.'
+                            : returnToA?.status === 'interrupted'
+                              ? 'Interrupted — not verified.'
+                              : returnToA?.status === 'pending'
+                                ? 'Waiting for the browser prompt.'
+                                : 'Not yet verified — use A after B is created.'}
+                  </strong>
+                  {bCreated && (
+                    <>
+                      {' '}
+                      {aConfirmed
+                        ? 'You can check A now even if B confirmation failed or is unfinished.'
+                        : 'Confirm A first, then check it again. B does not need to be confirmed for this check.'}
+                    </>
+                  )}
+                </p>
+              )}
               <ol className="checker-steps">
-                {steps.map((step) => {
+                {stepsForAlias(alias).map((step) => {
                   const history = attempts.filter((attempt) => attempt.step === step);
                   const latest = history.at(-1);
+                  const verified =
+                    latest?.status === 'verified' &&
+                    (step !== 'use-after-b' || isVerifiedReturnToA(state, latest));
                   return (
                     <li key={step}>
                       <div className="checker-step-heading">
@@ -282,7 +344,7 @@ export default function App({ controller }: { controller: CheckerController }) {
                             void controller.runStep(alias, step);
                           }}
                         >
-                          {latest?.status === 'verified' || latest?.status === 'created'
+                          {verified || latest?.status === 'created'
                             ? 'Completed:'
                             : history.length
                               ? 'Retry'
@@ -290,24 +352,38 @@ export default function App({ controller }: { controller: CheckerController }) {
                           {stepNames[step].toLowerCase()} for {alias}
                         </button>
                       </div>
+                      {step === 'use-after-b' && (
+                        <p>
+                          Once B is created and A is confirmed, select A again to check that it
+                          still decrypts its retained fictional value. A's earlier three uses do not
+                          pass this check.
+                        </p>
+                      )}
                       <p>
                         Automatic evidence:{' '}
                         {latest
-                          ? latest.status === 'verified'
+                          ? verified
                             ? step === 'confirm'
                               ? 'Valid PRF returned; fictional encryption established.'
                               : 'Fresh PRF decrypted and matched the fictional value.'
-                            : latest.status === 'created'
-                              ? 'Credential created; PRF compatibility is not yet verified.'
-                              : latest.status === 'failed'
-                                ? 'Failed.'
-                                : latest.status === 'interrupted'
-                                  ? 'Interrupted; not verified.'
-                                  : 'Waiting for the browser prompt.'
+                            : latest.status === 'verified'
+                              ? 'Saved evidence does not establish a return to A after B creation.'
+                              : latest.status === 'created'
+                                ? 'Credential created; PRF compatibility is not yet verified.'
+                                : latest.status === 'failed'
+                                  ? 'Failed.'
+                                  : latest.status === 'interrupted'
+                                    ? 'Interrupted; not verified.'
+                                    : 'Waiting for the browser prompt.'
                           : 'Not attempted.'}
                       </p>
                       {latest?.error && (
-                        <p className="checker-error">{ERROR_MESSAGES[latest.error]}</p>
+                        <>
+                          <p className="checker-error">{ERROR_MESSAGES[latest.error]}</p>
+                          {nextAction(alias, step, latest.error) && (
+                            <p>{nextAction(alias, step, latest.error)}</p>
+                          )}
+                        </>
                       )}
                       {history.length > 0 && (
                         <details>
