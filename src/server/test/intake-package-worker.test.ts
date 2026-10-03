@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import childProcess, { type ChildProcess } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import {
   mkdtempSync,
   writeFileSync,
@@ -279,6 +281,91 @@ test('ZIP worker propagates cancellation after launch and leaves descriptors wit
     (error) => error === cancellation,
   );
   assert.ok(fstatSync(setup.sourceFd).isFile());
+});
+
+test('ZIP worker cancellation exits a real child with its stdout receiver paused and full', async (t) => {
+  const setup = fixture(
+    t,
+    zipFixture(
+      Array.from({ length: 5000 }, (_, index) => ({ name: `fictional-${index}.txt`, data: '' })),
+    ),
+  );
+  const cancellation = new Error('Fixture profile closed while receiver paused');
+  let cancelled = false;
+  let child: ChildProcess | undefined;
+  let resolveFull!: () => void;
+  let rejectFull!: (error: Error) => void;
+  const receiverFull = new Promise<void>((resolve, reject) => {
+    resolveFull = resolve;
+    rejectFull = reject;
+  });
+  let exitSignal: NodeJS.Signals | null | undefined;
+  let resumeReceiver = () => {};
+  const spawn = childProcess.spawn;
+  const mocked = t.mock.method(childProcess, 'spawn', (...args: unknown[]) => {
+    child = Reflect.apply(spawn, childProcess, args) as ChildProcess;
+    const stdout = child.stdout!;
+    stdout.pause();
+    // A readable listener keeps the actual child pipe in non-flowing mode even
+    // when the adapter installs its data listener. Observe the public Node
+    // buffer watermark; do not assume an OS pipe capacity or sample RSS.
+    const observeFull = () => {
+      if (stdout.readableLength >= stdout.readableHighWaterMark) resolveFull();
+    };
+    stdout.on('readable', observeFull);
+    resumeReceiver = () => {
+      stdout.off('readable', observeFull);
+      stdout.resume();
+    };
+    child.once('error', rejectFull);
+    child.once('exit', (_code, signal) => {
+      exitSignal = signal;
+      rejectFull(Error('Fixture worker exited before receiver filled'));
+      resumeReceiver();
+    });
+    return child;
+  });
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    cancelled = true;
+    child?.kill('SIGKILL');
+    resumeReceiver();
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+  };
+  t.after(cleanup);
+  syncBuiltinESMExports();
+  const rejection = assert.rejects(
+    inspectPackageFile({
+      sourceFd: setup.sourceFd,
+      assertRunning: () => {
+        if (cancelled) throw cancellation;
+      },
+    }),
+    (error) => error === cancellation,
+  );
+  try {
+    await receiverFull;
+    assert.ok(child);
+    assert.equal(child.exitCode, null);
+    assert.equal(child.signalCode, null);
+    assert.equal(child.stdout!.isPaused(), true);
+    assert.ok(child.stdout!.readableLength >= child.stdout!.readableHighWaterMark);
+    cancelled = true;
+    // The spawn observer releases readable-mode tracking on exit so normal
+    // stdio close handling drains bytes after cancellation has already won.
+    await rejection;
+    assert.equal(exitSignal, 'SIGKILL');
+    assert.equal(child.signalCode, 'SIGKILL');
+    assert.ok(fstatSync(setup.sourceFd).isFile());
+    assert.ok(fstatSync(setup.outputFd).isFile());
+    assert.equal(fstatSync(setup.outputFd).size, 0);
+  } finally {
+    cleanup();
+    await rejection;
+  }
 });
 
 test('ZIP worker detects source mutation and refuses nonempty output', async (t) => {
