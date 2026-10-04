@@ -495,6 +495,15 @@ fallback remain authoritative; candidate bodies and version hashes are always
 computed afresh. `reviewProposalRevisionReads` and `reviewProposalRevisionHits`
 count these metadata selections separately from complete policy reads.
 
+The revision and durable-status readers reuse their prepared SQL statements per
+database connection. They execute every original SELECT, retain both separate
+revision observations and check the current storage's accepted head on every
+status call. Reentrant SQL callbacks use a fresh statement; successful connection
+close clears the retained statements. This is statement reuse, not a cached
+authority result. The focused 25-status-call comparison eliminates 75 warm
+statement preparations while retaining 75 SQL executions and 25 accepted-head
+reads. It does not establish a complete clinical-workflow latency improvement.
+
 An accumulated question list has an explicit complete selection reference when
 its inline representation exceeds the display budget. Policy iterates that
 selection; it does not substitute the first page or an empty list. Derived issues

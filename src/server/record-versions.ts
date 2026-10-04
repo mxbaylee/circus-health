@@ -17,6 +17,7 @@ import {
   openDatabase,
   databaseSchemaVersion,
   revision,
+  observeDatabaseClose,
   registerTransactionDurability,
   HttpError,
   type Database,
@@ -1145,9 +1146,31 @@ export function attachRecordDurability(
   });
   return recordDurabilityStatus(db)!;
 }
+const statusStatements = new WeakMap<
+  Database,
+  { statement: ReturnType<Database['prepare']>; busy: boolean }
+>();
+function readStatusRow(db: Database): RecordStateRow {
+  const sql = 'SELECT * FROM __record_state WHERE singleton=1';
+  let cached = statusStatements.get(db);
+  if (cached?.busy) return db.prepare(sql).get() as RecordStateRow;
+  if (!cached) {
+    const entry = { statement: db.prepare(sql), busy: false };
+    observeDatabaseClose(db, () => {
+      if (statusStatements.get(db) === entry) statusStatements.delete(db);
+    });
+    statusStatements.set(db, (cached = entry));
+  }
+  cached.busy = true;
+  try {
+    return cached.statement.get() as RecordStateRow;
+  } finally {
+    cached.busy = false;
+  }
+}
 export function recordDurabilityStatus(db: Database): RecordDurabilityStatus | null {
   if (!state.has(db)) return null;
-  const row = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as RecordStateRow;
+  const row = readStatusRow(db);
   const behind = !eq(readHead(state.get(db)!.storage), parseRecordJson(row.head_json));
   return {
     configured: true,

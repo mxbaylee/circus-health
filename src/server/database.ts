@@ -131,8 +131,29 @@ export function managedTimestamp<T>(value: T): T | string {
   return match ? `${match[1]}T${match[2]}Z` : value;
 }
 export const now = () => new Date().toISOString();
-export const revision = (db: DatabaseSync): number =>
-  Number(db.prepare("SELECT value FROM app_meta WHERE key='revision'").get()?.value || 0);
+const revisionStatements = new WeakMap<
+  DatabaseSync,
+  { statement: ReturnType<DatabaseSync['prepare']>; busy: boolean }
+>();
+export const revision = (db: DatabaseSync): number => {
+  const sql = "SELECT value FROM app_meta WHERE key='revision'";
+  let cached = revisionStatements.get(db);
+  // A reentrant SQL function must retain the original fresh-statement behavior.
+  if (cached?.busy) return Number(db.prepare(sql).get()?.value || 0);
+  if (!cached) {
+    const entry = { statement: db.prepare(sql), busy: false };
+    observeDatabaseClose(db, () => {
+      if (revisionStatements.get(db) === entry) revisionStatements.delete(db);
+    });
+    revisionStatements.set(db, (cached = entry));
+  }
+  cached.busy = true;
+  try {
+    return Number(cached.statement.get()?.value || 0);
+  } finally {
+    cached.busy = false;
+  }
+};
 /** Clinical review authority excludes source-text-only journal revisions. */
 export const clinicalReviewRevision = (db: DatabaseSync): number =>
   Number(
