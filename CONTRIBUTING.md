@@ -95,6 +95,12 @@ The server suite includes the real encrypted 5,001-file/10,002-entry package qua
 
 Browser assertions wait for the state they inspect: a queue count or network response can arrive before the associated view renders. Use bounded locator waits and controlled response ordering. Chromium closes when a test is cancelled, and the runtime registers writer cleanup before browser launch.
 
+The draft-recovery upload assertion includes child-process diagnostics only on
+failure. Its checkpoint selects output received since the upload began from the
+existing 8,000-character buffer. A single event-loop turn allows queued output to
+arrive; it is not a child-process barrier or proof that concurrent output belongs
+to the failed request.
+
 Coordinator tests should observe published journal checkpoints before asserting state or simulating the next model result. A dispatch callback can run before its `running` checkpoint is saved. Await terminal publication and assert whether it is `complete` or `paused`, rather than polling for one assumed outcome until a short wall-clock deadline expires. Keep a whole-test timeout as a hang guard, and explicitly set and restore any environment variable whose absence is part of the fixture.
 
 Batch coordinator waits use the owning test's cancellation signal across native host preparation. The appended-selection restart fixture has a 120-second guard for its complete accepted-journal reconstruction and exact operation replay; that recovery measured about a minute on the qualification host. Proposal counts, model-job counts and the recovered selections remain the correctness checks.

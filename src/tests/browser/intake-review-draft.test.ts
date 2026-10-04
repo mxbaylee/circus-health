@@ -154,6 +154,7 @@ test(
     });
     for (const clinical of [false, true]) {
       const value = envelope(clinical);
+      const uploadDiagnostics = runtime.captureDiagnostics();
       const uploaded = await page.request.post(url + prefix + '/intakes', {
         headers: {
           Origin: url,
@@ -168,6 +169,7 @@ test(
         uploaded.status() === 201
           ? undefined
           : JSON.stringify({
+              serverDiagnostics: await uploadDiagnostics(),
               fixture: 'fictional review draft upload',
               clinical,
               error: (await uploaded.json()).error ?? null,

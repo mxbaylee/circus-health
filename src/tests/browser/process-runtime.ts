@@ -1,5 +1,6 @@
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
+import { setImmediate } from 'node:timers/promises';
 import type { TestContext } from 'node:test';
 
 export type ProcessRuntimeOptions = {
@@ -16,12 +17,14 @@ export async function startProcessRuntime(t: TestContext, options: ProcessRuntim
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   let diagnostics = '';
-  child.stdout?.on('data', (value) => {
-    diagnostics = (diagnostics + value).slice(-8000);
-  });
-  child.stderr?.on('data', (value) => {
-    diagnostics = (diagnostics + value).slice(-8000);
-  });
+  let diagnosticOffset = 0;
+  const retainDiagnostics = (value: Buffer) => {
+    const text = value.toString();
+    diagnosticOffset += text.length;
+    diagnostics = (diagnostics + text).slice(-8000);
+  };
+  child.stdout?.on('data', retainDiagnostics);
+  child.stderr?.on('data', retainDiagnostics);
   let closing: Promise<void> | undefined;
   const close = () =>
     (closing ||= (async () => {
@@ -43,5 +46,18 @@ export async function startProcessRuntime(t: TestContext, options: ProcessRuntim
       throw new Error('Browser runtime exited before ready: ' + diagnostics);
     }),
   ]);
-  return { ...ready, close };
+  return {
+    ...ready,
+    close,
+    captureDiagnostics() {
+      const start = diagnosticOffset;
+      return async () => {
+        // Best-effort buffered output since this checkpoint; concurrent requests
+        // can contribute, so this is not guaranteed attribution of the HTTP 500.
+        await setImmediate();
+        const length = Math.min(diagnosticOffset - start, diagnostics.length);
+        return length ? diagnostics.slice(-length) : '';
+      };
+    },
+  };
 }
