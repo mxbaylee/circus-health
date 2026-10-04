@@ -10,7 +10,7 @@ import {
 } from '../../tests/fixtures/large-streamed-zip.ts';
 import {
   createIntakePlan,
-  getIntake,
+  getIntakeRead,
   uploadIntakeStream,
   verifyIntakeOriginal,
 } from '../intake.ts';
@@ -19,7 +19,14 @@ import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file
 import { disposePdfEvidenceSessions } from '../intake-pdf-session.ts';
 import { newProfile, vaultFixture } from './helpers/vault-fixture.ts';
 import { fictionalModel } from './fictional-model.ts';
-import { readStoredIntakeDetails } from '../intake-state-access.ts';
+import { intakeSourceMetadata } from '../intake-state-access.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
+import {
+  selectedFixtureHash,
+  selectedFixtureValue,
+  selectedFixtureOptionalValue,
+} from './helpers/selected-intake.ts';
+import type { IntakePackageFailure } from '../../shared/intake.ts';
 
 // This exercises encrypted authority and disposable-cache recovery using a
 // padded fictional PDF. It does not represent scanned-page/provider quality.
@@ -100,8 +107,36 @@ test('streamed large ZIP children and located failures recover from encrypted au
     [],
     'failed worker writes leave no extraction scratch',
   );
-  const parentBefore = getIntake(state.db, state.root, profileId, intake.id);
-  const childrenBefore = childIds.map((id) => getIntake(state.db, state.root, profileId, id));
+  const snapshot = (id: string) => {
+    const header = getIntakeRead(state.db, state.root, profileId, id);
+    const path = (field: string) => ['intake', field];
+    return {
+      id: header.id,
+      filename: header.filename,
+      parentSourceFileId: header.parentSourceFileId,
+      workflow: isIntakeSummary(header)
+        ? selectedFixtureHash(state.db, id, path('workflow'))
+        : JSON.stringify(header.workflow),
+      proposals: isIntakeSummary(header)
+        ? selectedFixtureValue(state.db, id, path('proposals'))
+        : header.proposals,
+      packageFailures: isIntakeSummary(header)
+        ? selectedFixtureOptionalValue<Record<string, IntakePackageFailure>>(
+            state.db,
+            id,
+            path('packageFailures'),
+          )
+        : header.packageFailures,
+      acceptedProposalId: isIntakeSummary(header)
+        ? selectedFixtureValue(state.db, id, path('acceptedProposalId'))
+        : header.acceptedProposalId,
+      imported: isIntakeSummary(header)
+        ? selectedFixtureValue(state.db, id, path('imported'))
+        : header.imported,
+    };
+  };
+  const parentBefore = snapshot(intake.id);
+  const childrenBefore = childIds.map(snapshot);
   const failures = Object.values(parentBefore.packageFailures || {});
   assert.equal(failures.length, 1);
   assert.equal(failures[0].operationKey, 'extract:' + waiting.memberId);
@@ -136,7 +171,7 @@ test('streamed large ZIP children and located failures recover from encrypted au
   f.manager.unlock(profileId, created.recoveryKit);
   state = f.manager.opened.get(profileId)!;
   assert.equal(state.metrics.cacheHit, false);
-  const parentAfter = getIntake(state.db, state.root, profileId, intake.id);
+  const parentAfter = snapshot(intake.id);
   assert.deepEqual(parentAfter.workflow, parentBefore.workflow);
   assert.deepEqual(parentAfter.packageFailures, parentBefore.packageFailures);
   assert.deepEqual(parentAfter.proposals, parentBefore.proposals);
@@ -147,10 +182,10 @@ test('streamed large ZIP children and located failures recover from encrypted au
     intake.sha256,
   );
   for (const [ordinal, id] of childIds.entries()) {
-    const child = getIntake(state.db, state.root, profileId, id);
+    const child = snapshot(id);
     assert.equal(child.id, childrenBefore[ordinal]!.id);
     assert.equal(child.filename, index.members[ordinal]!.filename);
-    assert.equal(readStoredIntakeDetails(state.db, id)?.locator, index.members[ordinal]!.locator);
+    assert.equal(intakeSourceMetadata(state.db, id)?.locator, index.members[ordinal]!.locator);
     assert.equal(child.parentSourceFileId, intake.id);
     assert.deepEqual(child.workflow, childrenBefore[ordinal]!.workflow);
     assert.deepEqual(child.proposals, childrenBefore[ordinal]!.proposals);
@@ -175,7 +210,7 @@ test('streamed large ZIP children and located failures recover from encrypted au
   assert.equal(counters.renames, 0);
   assert.equal(state.db.prepare('SELECT count(*) n FROM source_files').get()!.n, 3);
   assert.deepEqual(
-    getIntake(state.db, state.root, profileId, intake.id).packageFailures,
+    snapshot(intake.id).packageFailures,
     parentBefore.packageFailures,
     'successful unrelated occurrence does not clear the pending failure',
   );
@@ -190,7 +225,7 @@ test('streamed large ZIP children and located failures recover from encrypted au
     verifyIntakeOriginal(state.db, state.root, profileId, resumed.metadata.sourceFileId).sourceHash,
     pdf.sourceHash,
   );
-  const completed = getIntake(state.db, state.root, profileId, intake.id);
+  const completed = snapshot(intake.id);
   assert.equal(Object.values(completed.packageFailures || {}).length, 0);
   assert.deepEqual(completed.workflow, parentBefore.workflow);
   assert.equal(completed.acceptedProposalId, null);

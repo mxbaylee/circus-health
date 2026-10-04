@@ -21,6 +21,12 @@ const primitiveTemplate = {
   metadataReadBytes: 0,
 };
 const hostTemplate = {
+  identityPolicyReceiptReconstructions: 0,
+  identityPolicyReceiptCacheHits: 0,
+  identityPolicyReceiptNamespaceReads: 0,
+  identityPolicyReceiptNamespaceHits: 0,
+  identityPolicyMembershipResolutions: 0,
+  identityPolicyMembershipResolutionHits: 0,
   identityPreviewFullPreparations: 0,
   identityPreviewArtifactChecks: 0,
   reviewIssuePolicyRows: 0,

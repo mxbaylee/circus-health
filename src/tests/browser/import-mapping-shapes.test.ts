@@ -231,8 +231,8 @@ test(
         recordId: originalReview.records[0].id,
         candidateVersionId: originalReview.records[0].candidateVersionId,
       };
-      await page.goto(url + reportUrl);
-      await fixtureNativeReportReady(page, prefix, reportScope, () => page.reload());
+      await page.goto('about:blank');
+      await fixtureNativeReportReady(page, prefix, reportScope, () => page.goto(url + reportUrl));
       const exactLinks = page.locator('.import-detail-record-link:not([data-saved-record-id])');
       await exactLinks.first().waitFor();
       assert.equal(await exactLinks.count(), 1, 'The report keeps one exact optical record link');
@@ -320,8 +320,10 @@ test(
         url + prefix + '/sources/' + encodeURIComponent(proposalId) + '/content',
       );
       assert.deepEqual(JSON.parse(await proposal.text()), value);
-      await page.goto(url + '/#/import?intake=' + encodeURIComponent(item.id));
-      await fixtureNativeReportReady(page, prefix, reportScope, () => page.reload());
+      await page.goto('about:blank');
+      await fixtureNativeReportReady(page, prefix, reportScope, () =>
+        page.goto(url + '/#/import?intake=' + encodeURIComponent(item.id)),
+      );
       const overviewDestination = page.getByRole('region', {
         name: 'Saved destinations for this report',
       });
@@ -389,13 +391,13 @@ test(
     const queueReportUrl = await fixtureReportUrl(api, prefix, queueItem.id);
     const queueGroupId = new URLSearchParams(queueReportUrl.split('?')[1]).get('group')!;
     async function openQueueRecord(index: number) {
-      await page.goto(url + queueReportUrl);
-      // API seeding bypasses the uploader's queue reload; reopen as a user would.
+      // A fresh document sees API-seeded records through one actual browser read.
+      await page.goto('about:blank');
       await fixtureNativeReportReady(
         page,
         prefix,
         { intakeId: queueItem.id, groupId: queueGroupId },
-        () => page.reload(),
+        () => page.goto(url + queueReportUrl),
       );
       const links = page.locator('.import-detail-record-link:not([data-saved-record-id])');
       await links.first().waitFor();

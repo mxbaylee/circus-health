@@ -13,7 +13,9 @@ import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import type { Browser } from 'playwright';
+import type { Browser, Locator } from 'playwright';
+import type { ClinicalImportCorrectionHistoryPage } from '../../shared/clinical-import-corrections.ts';
+import type { readReviewDraftHistoryPage } from '../../server/intake-review-draft-state.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 
 for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'unclassified'])
@@ -23,7 +25,8 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       : scenario === 'date-and-value'
         ? 'an optional date warning cannot hide a missing result; partial edits retain correction reasons'
         : `record correction and approval while expanded: ${scenario}`,
-    { timeout: 60000 },
+    // Three durable corrections, reloads and history reads share this host hang guard.
+    { timeout: scenario === 'partial' ? 120000 : 60000 },
     async (t) => {
       const partial = scenario === 'partial';
       const wrongKind = scenario === 'document' || scenario === 'unclassified';
@@ -377,6 +380,17 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           response.request().method() === 'POST' &&
           new URL(response.url()).pathname === prefix + '/intakes/report-acceptance',
       );
+      const savedFeedResponse = fixtureBrowserResponse(page, async (response) => {
+        if (
+          response.request().method() !== 'GET' ||
+          new URL(response.url()).pathname !== prefix + '/intakes/import-feed'
+        )
+          return false;
+        const acknowledgement = await acceptedResponse;
+        return (
+          response.request().timing().startTime >= acknowledgement.request().timing().startTime
+        );
+      });
       await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
       const accepted = await acceptedResponse;
       assert.equal(accepted.status(), 200, await accepted.text());
@@ -389,7 +403,12 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       assert.equal(result.receipt.receipts.length, 1);
       assert.equal(result.receipt.receipts[0]!.intakeId, intake.id);
       assert.equal(result.receipt.receipts[0]!.records.length, 1);
+      const savedFeed = await savedFeedResponse;
+      assert.equal(savedFeed.status(), 200, await savedFeed.text());
+      assert.equal(await savedFeed.finished(), null);
+      assert.equal((await savedFeed.json()).data.format, 'health-intake-import-feed-v2');
       await inline.waitFor({ state: 'detached' });
+      await page.locator('.import-record-row').first().waitFor({ state: 'detached' });
       assert.equal(await page.locator('.import-record-row').count(), 0);
       await page
         .getByRole('region', { name: 'Save outcomes' })
@@ -400,22 +419,114 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       assert.equal(destinations.length, 1);
       const saved = destinations[0]!;
       const observation = await request(prefix + '/tests/' + encodeURIComponent(saved.entityId));
-      assert(
-        observation.extra.import.corrections.some(
-          (change: { reason: string }) => change.reason === 'Correction of imported data',
-        ),
+      assert.deepEqual(observation.extra.import.correctionHistorySource, {
+        format: 'health-accepted-contribution-corrections-v1',
+      });
+      const contributions = (await request(
+        prefix +
+          '/record-import-corrections?' +
+          new URLSearchParams({ kind: 'observation', recordId: saved.entityId, limit: '1' }),
+      )) as ClinicalImportCorrectionHistoryPage;
+      assert.equal(contributions.format, 'health-clinical-import-corrections-v1');
+      assert.equal(contributions.kind, 'observation');
+      assert.equal(contributions.recordId, saved.entityId);
+      assert.equal(contributions.complete, true);
+      assert.equal(contributions.nextCursor, null);
+      assert.equal(contributions.entries.length, 1);
+      const contribution = contributions.entries[0]!;
+      const acceptedRecord = result.receipt.receipts[0]!.records[0]!;
+      assert.equal(contribution.intakeId, intake.id);
+      assert.equal(contribution.proposalId, result.receipt.receipts[0]!.proposalId);
+      assert.equal(contribution.candidateId, acceptedRecord.candidateId);
+      assert.equal(contribution.candidateVersionId, acceptedRecord.candidateVersionId);
+      assert.equal(contribution.history.format, 'health-intake-review-draft-history-v1');
+      assert.equal(contribution.history.intakeId, intake.id);
+      const expectedCount = partial ? 3 : dateAndValue ? 2 : 1;
+      assert.equal(contribution.history.corrections, expectedCount);
+      const history = (await request(
+        prefix + '/intakes/' + encodeURIComponent(intake.id) + '/review-history',
+        { reference: contribution.history, section: 'corrections', offset: 0, limit: 20 },
+      )) as ReturnType<typeof readReviewDraftHistoryPage>;
+      assert.equal(history.format, 'health-intake-review-history-page-v1');
+      assert.deepEqual(history.reference, contribution.history);
+      assert.equal(history.section, 'corrections');
+      assert.equal(history.total, expectedCount);
+      assert.equal(history.complete, true);
+      assert.equal(history.nextOffset, null);
+      assert.equal(history.items.length, expectedCount);
+      const corrections = history.items.map((item, index) => {
+        assert.equal(item.ordinal, index);
+        assert.ok('value' in item, 'these small correction entries fit the bounded page');
+        assert.ok(!('issueId' in item.value));
+        assert.ok(item.value.operationId);
+        assert.ok(Number.isFinite(Date.parse(item.value.at)));
+        return item.value;
+      });
+      assert.equal(new Set(corrections.map((change) => change.operationId)).size, expectedCount);
+      assert.deepEqual(
+        corrections.map((change) => change.reason),
+        dateAndValue
+          ? ['Date verified against the original', 'Correction of imported data']
+          : Array(expectedCount).fill('Correction of imported data'),
       );
-      if (dateAndValue)
-        assert(
-          observation.extra.import.corrections.some(
-            (change: { reason: string }) => change.reason === 'Date verified against the original',
-          ),
+      const valueChange = corrections[partial || dateAndValue ? 1 : 0]!;
+      assert.ok(valueChange.before.valueText == null || valueChange.before.valueText === '');
+      assert.equal(valueChange.after.valueText, '4.1');
+      if (dateAndValue) {
+        assert.notEqual(corrections[0]!.before.date, '2032-03-04');
+        assert.equal(corrections[0]!.after.date, '2032-03-04');
+      }
+      if (partial) {
+        assert.equal(corrections[0]!.after.testLabel, 'Potassium');
+        assert.equal(corrections[2]!.after.unit, 'mmol/L');
+      }
+      const assertImportHistoryUI = async (container: Locator) => {
+        await container.waitFor();
+        if (!(await container.evaluate((element) => (element as HTMLDetailsElement).open)))
+          await container.locator(':scope > summary').click();
+        const acceptedHistory = container.getByRole('region', {
+          name: 'Accepted source correction histories',
+          exact: true,
+        });
+        await acceptedHistory.waitFor();
+        const historyResponse = fixtureBrowserResponse(
+          page,
+          (response) =>
+            response.request().method() === 'POST' &&
+            new URL(response.url()).pathname ===
+              prefix + '/intakes/' + encodeURIComponent(intake.id) + '/review-history' &&
+            response.request().postDataJSON().reference.snapshotId ===
+              ('snapshotId' in contribution.history ? contribution.history.snapshotId : undefined),
         );
+        await acceptedHistory
+          .getByRole('button', { name: 'View review history', exact: true })
+          .click();
+        const displayed = await historyResponse;
+        assert.equal(displayed.status(), 200, await displayed.text());
+        assert.equal(await displayed.finished(), null);
+        assert.deepEqual((await displayed.json()).data, history);
+        const pages = acceptedHistory.getByRole('region', {
+          name: 'Review history pages',
+          exact: true,
+        });
+        for (const [index, change] of corrections.entries()) {
+          const item = pages.getByRole('article').nth(index);
+          await item
+            .getByRole('heading', { name: 'Mapping correction ' + (index + 1), exact: true })
+            .waitFor();
+          await item.getByText(change.at + ' · ' + change.reason, { exact: true }).waitFor();
+          assert.deepEqual(JSON.parse(await item.locator('pre').nth(0).innerText()), change.before);
+          assert.deepEqual(JSON.parse(await item.locator('pre').nth(1).innerText()), change.after);
+        }
+        assert.equal(await pages.getByRole('article').count(), expectedCount);
+      };
       await page.goto(url + '/#/tests?result=' + encodeURIComponent(saved.entityId));
-      await page
-        .getByText('Import correction: Correction of imported data', { exact: true })
-        .first()
-        .waitFor();
+      await assertImportHistoryUI(
+        page
+          .getByRole('region', { name: 'Selected result', exact: true })
+          .locator('.record-correction-history')
+          .first(),
+      );
       await page.getByText('Modified during import').first().waitFor();
       await page.getByText('Meadowglass Laboratory', { exact: true }).first().waitFor();
       if (scenario === 'value') {
@@ -445,7 +556,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           })
           .waitFor();
         assert.match(await correctionHistory.innerText(), /4\.1\s*→\s*4\.2/);
-        assert.match(await correctionHistory.innerText(), /Not recorded\s*→\s*4\.1/);
+        await assertImportHistoryUI(correctionHistory);
         const recordedValues = selected
           .locator('details')
           .filter({ has: page.locator('summary').filter({ hasText: /^Recorded values/ }) });
@@ -457,6 +568,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
             exact: true,
           })
           .waitFor();
+        await assertImportHistoryUI(recordedHistory);
       }
       assert.deepEqual(errors, []);
     },

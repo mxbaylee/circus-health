@@ -97,7 +97,11 @@ export function reconcileReviewDraft(
 
 // Drafts live in encrypted intake storage. Memory keeps unsent edits through navigation;
 // no clinical text is written to unencrypted browser storage.
-export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => void) {
+export function useReviewDrafts(
+  profileId: string,
+  onSaved: (intake: Intake) => void,
+  { retainedComparisons = false }: { retainedComparisons?: boolean } = {},
+) {
   const [drafts, setDrafts] = useState<Record<string, LocalReviewDraft>>({});
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -178,7 +182,16 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     setDrafts(next);
   }
   function current(review: IntakeClinicalReviewContext, record: IntakeReviewRecord) {
-    return draftsRef.current[draftKey(review, record)] || initialDraft(record);
+    const draft = draftsRef.current[draftKey(review, record)] || initialDraft(record);
+    // Native relationship controls write their exact choices independently of
+    // this field editor. Keep those retained choices verbatim through later
+    // mapping/resolution edits; an older local decision cannot replace them.
+    return retainedComparisons
+      ? {
+          ...draft,
+          decision: { ...draft.decision, comparisons: record.draft?.decision?.comparisons },
+        }
+      : draft;
   }
   function afterOwnSave(review: IntakeClinicalReviewContext, record: IntakeReviewRecord) {
     const draft = current(review, record);
@@ -306,6 +319,11 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     // edit cannot attach that explanation to a different patch.
     const sendReason = mappingChanged && patch.correctionReason === undefined ? undefined : reason;
     const next = { ...prior, ...patch, correctionReason: reason };
+    if (retainedComparisons)
+      next.decision = {
+        ...next.decision,
+        comparisons: record.draft?.decision?.comparisons,
+      };
     draftsRef.current = { ...draftsRef.current, [key]: next };
     setDrafts(draftsRef.current);
     if (!record.candidateVersionId) return;

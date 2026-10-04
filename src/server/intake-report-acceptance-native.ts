@@ -250,8 +250,11 @@ export async function applyNativeAcceptanceGroup(
             'SELECTION_REVIEW_CHANGED',
             'This record or its source/person dependencies changed. Review this exact record again.',
           );
+        // A partial manifest advances transport revisions before this group.
+        // Its exact selection proof above includes the complete retained draft.
         if (
           selection.useRetainedDecision &&
+          !options.retainResult &&
           !reviewedAtEntry.has(block) &&
           block.reviewToken !== session.review.reviewToken
         )

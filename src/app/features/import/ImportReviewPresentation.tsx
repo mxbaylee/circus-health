@@ -254,6 +254,12 @@ type SheetState =
   | { type: 'correct'; recordIds: string[] }
   | null;
 
+interface PinnedReview {
+  record: ImportReviewRecord;
+  report: ImportReviewReport;
+  contextKey?: string;
+}
+
 const kindIcons: Record<ImportReviewKind | 'All', typeof List> = {
   All: List,
   'Test results': FlaskConical,
@@ -342,11 +348,8 @@ export function ImportReviewPresentation({
   const [fileDragActive, setFileDragActive] = useState(false);
   const [notice, setNotice] = useState('');
   const [expandedRecord, setExpandedRecord] = useState<string | null>(null);
-  const pinnedReview = useRef<{
-    record: ImportReviewRecord;
-    report: ImportReviewReport;
-    contextKey?: string;
-  } | null>(null);
+  const pinnedReview = useRef<PinnedReview | null>(null);
+  const [savedReviewToClose, setSavedReviewToClose] = useState<PinnedReview | null>(null);
   const confirmedSaved = useRef(new Set<string>());
   useEffect(() => {
     if (model?.selectionWindowKey === undefined) return;
@@ -354,20 +357,57 @@ export function ImportReviewPresentation({
     confirmedSaved.current.clear();
   }, [model?.selectionWindowKey]);
   const reviewChangeGeneration = useRef(0);
-  async function openReportContext(type: 'identity' | 'source', reportId: string) {
-    if (actions.busy || (beforeReviewChange && !(await beforeReviewChange()))) return;
+  function closeRecordReview() {
     pinnedReview.current = null;
     setExpandedRecord(null);
+  }
+  async function openReportContext(type: 'identity' | 'source', reportId: string) {
+    if (actions.busy || (beforeReviewChange && !(await beforeReviewChange()))) return;
+    closeRecordReview();
     setSheet({ type, reportId });
   }
   async function openRecordReview(record: ImportReviewRecord) {
     const generation = ++reviewChangeGeneration.current;
     if (beforeReviewChange && !(await beforeReviewChange())) return;
     if (generation !== reviewChangeGeneration.current) return;
+    if (expandedRecord === record.id) {
+      closeRecordReview();
+      return;
+    }
     const report = reports.find((item) => item.id === record.reportId);
     if (report) pinnedReview.current = { record, report, contextKey: model?.contextKey };
-    setExpandedRecord((current) => (current === record.id ? null : record.id));
+    setExpandedRecord(record.id);
   }
+  useEffect(() => {
+    if (!savedReviewToClose) return;
+    if (
+      pinnedReview.current !== savedReviewToClose ||
+      expandedRecord !== savedReviewToClose.record.id ||
+      model?.contextKey !== savedReviewToClose.contextKey
+    ) {
+      setSavedReviewToClose(null);
+      return;
+    }
+    // The save itself marks the embedded editor pending. Wait for that operation
+    // to settle before asking its current guard whether it is safe to close.
+    // A newer unfinished edit still keeps the exact editor mounted.
+    if (actions.busy) return;
+    let current = true;
+    void (async () => {
+      if (beforeReviewChange && !(await beforeReviewChange())) return;
+      if (!current || pinnedReview.current !== savedReviewToClose) return;
+      setRecords((records) =>
+        records.map((record) =>
+          record.id === savedReviewToClose.record.id ? { ...record, status: 'saved' } : record,
+        ),
+      );
+      closeRecordReview();
+      setSavedReviewToClose(null);
+    })();
+    return () => {
+      current = false;
+    };
+  }, [savedReviewToClose, actions.busy, beforeReviewChange, expandedRecord, model?.contextKey]);
   useEffect(() => {
     if (!model) return;
     const contextChanged = presentedContext.current !== model.contextKey;
@@ -436,7 +476,7 @@ export function ImportReviewPresentation({
     if (model?.contextKey) {
       approvalSelection.clearSelected();
       setSheet(null);
-      setExpandedRecord(null);
+      closeRecordReview();
     }
   }, [model?.contextKey]);
   useEffect(() => {
@@ -483,7 +523,7 @@ export function ImportReviewPresentation({
     if (beforeReviewChange && !(await beforeReviewChange())) return;
     if (generation !== reviewChangeGeneration.current) return;
     const next = { view, kind, query, editedOnly, ...patch };
-    setExpandedRecord(null);
+    closeRecordReview();
     setSourceAttention(false);
     setView(next.view);
     setKind(next.kind);
@@ -599,6 +639,7 @@ export function ImportReviewPresentation({
             : actions.onResume;
     if (model && action) {
       const context = model.contextKey;
+      const reviewedPin = pinnedReview.current;
       const approvals = approvalSelection.approvals(ids);
       const succeeded =
         status === 'saved'
@@ -618,15 +659,18 @@ export function ImportReviewPresentation({
       if (status === 'saved' && savedIds.length && presentedContext.current === context) {
         for (const id of savedIds) confirmedSaved.current.add(id);
         if (
-          pinnedReview.current &&
-          savedIds.includes(pinnedReview.current.record.id) &&
-          (!beforeReviewChange || (await beforeReviewChange()))
+          reviewedPin &&
+          pinnedReview.current === reviewedPin &&
+          savedIds.includes(reviewedPin.record.id)
         ) {
-          pinnedReview.current = null;
-          setExpandedRecord(null);
+          setSavedReviewToClose(reviewedPin);
         }
         setRecords((current) =>
-          current.map((record) => (savedIds.includes(record.id) ? { ...record, status } : record)),
+          current.map((record) =>
+            savedIds.includes(record.id) && pinnedReview.current?.record.id !== record.id
+              ? { ...record, status }
+              : record,
+          ),
         );
         approvalSelection.removeSaved(savedIds);
       }
@@ -840,7 +884,7 @@ export function ImportReviewPresentation({
               onClick={() =>
                 void (async () => {
                   if (beforeReviewChange && !(await beforeReviewChange())) return;
-                  setExpandedRecord(null);
+                  closeRecordReview();
                   approvalSelection.clearSelected();
                   sourceSelection.files.forEach((file) => file.select(false));
                   setSourceAttention(true);
@@ -1320,7 +1364,7 @@ export function ImportReviewPresentation({
                             className="import-record-accordion"
                             id={`record-review-${encodeURIComponent(record.id)}`}
                           >
-                            {renderRecordReview(record, () => setExpandedRecord(null))}
+                            {renderRecordReview(record, closeRecordReview)}
                           </div>
                         )}
                       </article>

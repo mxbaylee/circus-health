@@ -379,8 +379,8 @@ test(
     );
     assert.equal(
       second.state,
-      'needs_review',
-      'source capture remains available before clinical proposals',
+      'pending_conversion',
+      'the captured original awaits clinical conversion while its reading is stopped',
     );
     assert.equal(second.collections.proposals.total, 0);
     const secondOriginal = await page.request.get(

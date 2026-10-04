@@ -29,6 +29,7 @@ import {
   workflowDependencyContributions,
   WORKFLOW_DEPENDENCY_POLICY,
 } from './intake-workflow-dependencies.ts';
+import { currentWorkflowReadingCollection } from './intake-workflow-reading-derived.ts';
 
 const empty = (): WorkflowCountFacts => ({
   pendingCount: 0,
@@ -97,34 +98,33 @@ export function readVerifiedWorkflowFactState(
   return { state: 'exact' as const, binding: summary.binding, facts: { ...manifest.facts } };
 }
 
-/** Exact selected reading totals; unavailable dependency generations remain explicit. */
+/** Literal retained-work totals depend on the logical workflow, not the current
+ * source-text or mapping classification. Unavailable logical generations remain
+ * explicit; classified ready/work counts still require the full summary above. */
 export function readVerifiedWorkflowReadingFacts(
   db: Database,
   source: IntakeEnvelopeSource,
-  options: { mappingVersion: string },
+  _options: { mappingVersion: string },
 ) {
-  const summary = readVerifiedWorkflowSummary(db, source, options);
-  if (summary.state !== 'exact') return { state: 'pending' as const };
   const view = openIntakeCollectionEnvelope(db, source);
   const { collections } = selectedEnvelopeStore(db, source);
   const selected = collections.openView();
-  const get = (key: string) => collections.get(selected, 'builds', 'workflow.dependencies', key);
-  if (
-    get('policy') !== WORKFLOW_DEPENDENCY_POLICY ||
-    get('complete') !== JSON.stringify(view.logical) ||
-    get('binding') !== summary.binding
-  )
-    return { state: 'pending' as const };
+  const collection = currentWorkflowReadingCollection(
+    (name, key) => collections.get(selected, 'builds', name, key),
+    JSON.stringify(view.logical),
+  );
+  if (!collection) return { state: 'pending' as const };
+  const get = (key: string) => collections.get(selected, 'builds', collection, key);
   const candidateCount = Number(get('candidateCount')),
     proposalsProduced = Number(get('batchCount'));
   if (![candidateCount, proposalsProduced].every((n) => Number.isSafeInteger(n) && n >= 0))
     throw Error('Invalid selected reading facts');
   const substantiveVersions =
-    collections.rank(selected, 'builds', 'workflow.dependencies', 's;') -
-    collections.rank(selected, 'builds', 'workflow.dependencies', 's:');
+    collections.rank(selected, 'builds', collection, 's;') -
+    collections.rank(selected, 'builds', collection, 's:');
   const candidateVersionCount =
-    collections.rank(selected, 'builds', 'workflow.dependencies', 'v;') -
-    collections.rank(selected, 'builds', 'workflow.dependencies', 'v:');
+    collections.rank(selected, 'builds', collection, 'v;') -
+    collections.rank(selected, 'builds', collection, 'v:');
   return {
     state: 'exact' as const,
     candidateCount,

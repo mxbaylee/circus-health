@@ -2,7 +2,12 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { useReviewDrafts } from '../../app/features/intake/useReviewDrafts';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
-import type { Intake, IntakeReview, IntakeReviewRecord } from '../../shared/intake';
+import type {
+  Intake,
+  IntakePairDecision,
+  IntakeReview,
+  IntakeReviewRecord,
+} from '../../shared/intake';
 
 const profile = { id: 'fictional-draft-scope', name: 'Fictional Person', placebo: true };
 const intake = {
@@ -323,4 +328,83 @@ it('retains referenced resolution history while coalescing only changed decision
   expect(requests[2]).toEqual(requests[1]);
   expect(view.result.current.current(initial, row).history).toEqual(row.draft.history);
   expect(view.result.current.current(initial, row).resolutionsReference?.count).toBe(4000);
+});
+
+it('preserves independently saved native pair choices through resolutions, mapping edits and exact uncertain retries', async () => {
+  const initial = review(7, '42');
+  const requests: Record<string, any>[] = [];
+  let fail = true;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_input, options) => {
+      requests.push(JSON.parse(String(options?.body)));
+      if (fail) {
+        fail = false;
+        throw new TypeError('Fictional uncertain native draft save');
+      }
+      return json({ ...intake, version: 9 });
+    }),
+  );
+  const view = renderHook(() =>
+    useReviewDrafts(profile.id, vi.fn(), { retainedComparisons: true }),
+  );
+  act(() => view.result.current.hydrate(initial));
+  const exactScope = {
+    kind: 'observation' as const,
+    sourceRecordId: 'fictional-original',
+    identity: 'fictional-person',
+    version: 'fictional-version',
+    stateHash: 'fictional-state-hash',
+    evidenceHash: 'fictional-original-bytes-hash',
+  };
+  const pair: IntakePairDecision = {
+    otherRecordId: 'fictional-saved-target',
+    outcome: 'distinct',
+    reason: 'Separate fictional source identifiers; retain literal values.',
+    scope: {
+      format: 'intake-pair-scope-v1',
+      profileId: profile.id,
+      incoming: exactScope,
+      saved: { ...exactScope, recordId: 'fictional-saved-target' },
+      token: 'fictional-exact-saved-pair-scope',
+    },
+  };
+  const paired = review(8, '42');
+  const pairedRecord = paired.records[0]!;
+  pairedRecord.draft = {
+    id: 'native-independent-pair-write',
+    proposalId: paired.proposalId,
+    recordId: record.id,
+    candidateId: record.candidateId!,
+    candidateVersionId: record.candidateVersionId!,
+    mapping: {},
+    disposition: 'pending',
+    at: '2026-10-04T00:00:00Z',
+    resolutions: [],
+    decision: { recordId: record.id, action: 'accept', mapping: {}, comparisons: [pair] },
+  };
+  act(() => {
+    view.result.current.hydrateRecords(paired, [pairedRecord]);
+    view.result.current.update(paired, pairedRecord, {
+      resolutions: [{ issueId: 'fictional-required-question', outcome: 'acknowledged' }],
+    });
+    const current = view.result.current.current(paired, pairedRecord);
+    view.result.current.update(paired, pairedRecord, {
+      decision: { ...current.decision, mapping: { ...current.decision.mapping, valueText: '43' } },
+    });
+  });
+  await act(() => view.result.current.flush());
+  expect(requests).toHaveLength(1);
+  expect(requests[0]!.decision.comparisons).toEqual([pair]);
+  expect(requests[0]!.mapping.valueText).toBe('43');
+  expect(requests[0]!.resolutions).toEqual([
+    { issueId: 'fictional-required-question', outcome: 'acknowledged' },
+  ]);
+  // A newer resource cannot silently substitute another scope in an exact retry.
+  const foreign = structuredClone(pairedRecord);
+  foreign.draft!.decision!.comparisons![0]!.scope!.token = 'foreign-saved-evidence-token';
+  act(() => view.result.current.hydrateRecords({ ...paired, version: 9 }, [foreign]));
+  await act(() => view.result.current.retry());
+  expect(requests).toHaveLength(2);
+  expect(requests[1]).toEqual(requests[0]);
 });

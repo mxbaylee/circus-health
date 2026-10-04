@@ -180,9 +180,9 @@ test(
         recordId: originalReview.records[0].id,
         candidateVersionId: originalReview.records[0].candidateVersionId,
       };
-      await page.goto(url + reportUrl);
+      await page.goto('about:blank');
       await fixtureNativeReportReady(page, prefix, { intakeId: item.id, groupId }, () =>
-        page.reload(),
+        page.goto(url + reportUrl),
       );
       await fixtureNativeRecordReady(page, prefix, recordScope, () =>
         page.locator('.import-detail-record-link:not([data-saved-record-id])').first().click(),

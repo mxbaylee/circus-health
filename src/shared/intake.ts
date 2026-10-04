@@ -1030,7 +1030,7 @@ export interface IntakeImportFeed {
 }
 
 export interface IntakeReportAcceptanceSelection {
-  /** Native fragmented views may approve the exact retained draft under both review tokens. */
+  /** Native views may approve the complete retained draft with its exact selection proof. */
   useRetainedDecision?: true;
   selectionReviewToken?: string;
   recordId: string;

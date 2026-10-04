@@ -4,9 +4,13 @@ import {
   fixtureApi,
   fixtureBrowserResponse,
   fixtureNativeFeedReady,
+  fixtureNativeRecordReady,
   fixtureReview,
 } from './native-intake-fixture.ts';
-import type { ClinicalRecordSectionPage } from '../../shared/intake-clinical-record-sections.ts';
+import type {
+  ClinicalRecordAction,
+  ClinicalRecordSectionPage,
+} from '../../shared/intake-clinical-record-sections.ts';
 import type { IntakeReportAcceptanceResult } from '../../shared/intake.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { NoteHistoryEntry } from '../../shared/api.ts';
@@ -245,14 +249,14 @@ test(
 
     const profile = (await (await page.request.get(url + '/api/profiles')).json()).data[0];
     const prefix = `/api/profiles/${profile.id}`;
-    async function saveOneFromFeed() {
+    async function saveOneRecord(buttonName = 'Confirm & save') {
       const pending = fixtureBrowserResponse(
         page,
         (response) =>
           response.request().method() === 'POST' &&
           new URL(response.url()).pathname === prefix + '/intakes/report-acceptance',
       );
-      await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+      await page.getByRole('button', { name: buttonName, exact: true }).click();
       const response = await pending;
       assert.equal(response.status(), 200, await response.text());
       assert.equal(await response.finished(), null);
@@ -297,7 +301,7 @@ test(
     const uploadResponse = await receipt;
     assert(uploadResponse.ok(), await uploadResponse.text());
     assert.equal((await uploadResponse.json()).data.state, 'ready');
-    await saveOneFromFeed();
+    await saveOneRecord();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
@@ -341,7 +345,7 @@ test(
       mimeType: 'application/x-ndjson',
       buffer: prescriptionOriginal,
     });
-    await saveOneFromFeed();
+    await saveOneRecord();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
@@ -399,7 +403,7 @@ test(
     });
     // A different filename retains a new source occurrence; linking its matching
     // clinical record still requires explicit acceptance.
-    await saveOneFromFeed();
+    await saveOneRecord();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
@@ -445,12 +449,16 @@ test(
       await relatedSummary.click();
     const paired = page.getByRole('region', { name: 'Paired evidence review' });
     await paired.locator('summary').click();
-    await paired.getByLabel('Relationship to Fictional Example').selectOption('distinct');
     await paired
-      .getByLabel('What the originals establish')
+      .getByRole('group', { name: 'Relationship with this record', exact: true })
+      .getByRole('combobox')
+      .selectOption('distinct');
+    await paired
+      .getByLabel('Reason for this relationship', { exact: true })
       .fill('Two separate source record identifiers; retain both literal values.');
     const links = await paired
-      .getByRole('link', { name: 'Open original' })
+      .locator('.clinical-evidence-pair')
+      .getByRole('link')
       .evaluateAll((elements) => elements.map((element) => (element as HTMLAnchorElement).href));
     assert.equal(links.length, 2);
     const originals = await Promise.all(
@@ -460,7 +468,37 @@ test(
     );
     assert(originals.includes(original.toString()));
     assert(originals.includes(secondOriginal.toString()));
-    await page.getByRole('button', { name: 'Confirm and save record', exact: true }).click();
+    const selectedRecord = new URLSearchParams(new URL(page.url()).hash.split('?')[1]),
+      selectedIntake = selectedRecord.get('intake'),
+      selectedId = selectedRecord.get('record');
+    assert.ok(selectedIntake && selectedId);
+    const relationshipSaved = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          prefix + '/intakes/' + encodeURIComponent(selectedIntake) + '/review-record-action',
+    );
+    await fixtureNativeRecordReady(
+      page,
+      prefix,
+      { intakeId: selectedIntake, recordId: selectedId },
+      async () => {
+        await paired.getByRole('button', { name: 'Save this relationship', exact: true }).click();
+        const response = await relationshipSaved;
+        assert.equal(response.status(), 200, await response.text());
+        assert.equal(await response.finished(), null);
+        const command = response.request().postDataJSON() as ClinicalRecordAction;
+        assert.equal(command.recordId, selectedId);
+        assert.ok(command.pair);
+        assert.equal(command.pair.outcome, 'distinct');
+        assert.equal(
+          command.pair.reason,
+          'Two separate source record identifiers; retain both literal values.',
+        );
+      },
+    );
+    await saveOneRecord('Confirm and save record');
     await page.getByText('This exact record was saved to your profile.', { exact: true }).waitFor();
     await page.reload();
     await page

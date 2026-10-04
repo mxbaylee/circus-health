@@ -1398,11 +1398,15 @@ export function ImportRecordDetail({
     !!intake.refreshing ||
     !!intake.error ||
     !!contextError;
-  const drafts = useReviewDrafts(profile?.id || '', () => {
-    review.reload();
-    intake.reload();
-    onChanged();
-  });
+  const drafts = useReviewDrafts(
+    profile?.id || '',
+    () => {
+      review.reload();
+      intake.reload();
+      onChanged();
+    },
+    { retainedComparisons: !!review.selected?.native },
+  );
   const [recentAcceptance, setRecentAcceptance] = useState<{
     scope: string;
     record: IntakeReportAcceptanceReceipt['receipts'][number]['records'][number];
@@ -1916,8 +1920,12 @@ export function ImportRecordDetail({
                   recordId: current.id,
                   candidateId: current.candidateId,
                   candidateVersionId: current.candidateVersionId,
-                  mapping: currentDraft.decision.mapping,
-                  comparisons: currentDraft.decision.comparisons,
+                  ...(selected.native
+                    ? { mapping: {}, useRetainedDecision: true }
+                    : {
+                        mapping: currentDraft.decision.mapping,
+                        comparisons: currentDraft.decision.comparisons,
+                      }),
                 },
               ],
             },

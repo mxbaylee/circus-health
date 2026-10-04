@@ -1056,7 +1056,9 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         );
       const reviewed = reviewedIntakeQueueRecord(record, member.state),
         facts = reviewedMemberFacts(member, reviewed, true),
-        encoded = canonicalLiteral(record),
+        // Transport omits absent optional fields while retaining raw JSON numbers.
+        // canonicalLiteral also serves digest recipes that retain own undefined fields.
+        encoded = JSON.stringify(record),
         detached = JSON.parse(encoded, (_key, value, context) =>
           typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
             ? JSON.rawJSON(context.source)

@@ -155,6 +155,21 @@ intact; cache recovery follows the accepted auxiliary graph. Ledger writes do no
 advance the clinical version. Source or plan changes require reopening the unit
 capability under current pins.
 
+Literal progress totals (retained candidate versions and submitted batches) bind
+to the complete logical workflow index. Source-text or mapping changes leave
+those historical totals intact while classified review and remaining-work
+summaries still require their current source and policy bindings.
+Native proposal publication maintains a separate literal reading projection when
+classification is pending. It shares a verified complete prior index and updates
+only the compiler's appended candidate/version, content-digest and batch scope;
+occurrence-only updates do not add versions. Its exact prospective logical
+binding is selected with the proposal. Missing or stale proof remains pending
+until explicit cold preparation, and this projection cannot establish clinical
+readiness. Cancelled preparation does not select its counters.
+The in-process effect capability is issued by the existing native proposal and
+batch compiler, with immutable affected occurrences and exact before/after roots.
+New mutation composition families need their own complete effect proof.
+
 Manual child-source batches select the child's actual plan and source pins while
 checking acknowledged reads in the parent's conversation ledger. Child PDF
 pages and pending windows are checked separately from the package-member
@@ -445,3 +460,35 @@ can seed this memo. The first cold read may therefore remain uncached; a subsequ
 stable reconstruction enables warm repeats. Lifecycle clearing invalidates pending
 retention attempts. Confirmation and other mutations always rebuild current policy
 and verify their artifacts independently of the presentation memo.
+
+A live selected clinical scope also avoids repeated native v2 identity receipt
+header decoding and snapshot opening. Its private memo keeps at most 32 receipts
+and 256 KiB of encoded header/reference/key data, accounting for the reference
+captured by providers and fixed wrapper overhead. Each lookup authenticates the
+selected view and requires the exact host SQL/source/registry proof. Headers and
+nested reference metadata are detached; complete collection providers have
+immutable counts and guarded traversal, including nested occurrence, issue and
+question proofs. Observed drift, transactions and scope close invalidate retained
+providers through a generation token. Receipt supersession remains a live check
+on every complete ordered traversal; confirmation decisions retain the existing
+policy semantics.
+
+The same live scope retains a receipt locator namespace only after a complete
+traversal of at most 32 entries. Cancelled traversal, an oversized address budget
+or a larger history retains no partial namespace. A separate LRU of at most 32
+membership-provider resolutions shares a 256 KiB structural budget with those
+locators, accounting encoded addresses, group keys, captured member references
+and fixed provider overhead. Resolution reuse authenticates the current selected
+view and the exact host proof; each membership check still verifies every prior
+member, section and occurrence. Immutable providers refuse use after observed
+drift, transaction entry, refused authority or scope close, including after a
+rollback restores the earlier SQL state. First retained duplicate selection and
+later-version fallback remain unchanged. Work counters are attributed explicitly
+by both production scope hosts, including reads outside a global accounting
+scope.
+
+This memo optimizes repeated selectors over a small retained receipt set. The
+existing forward latest-receipt selectors still traverse the complete history.
+More than 32 receipts, aggregate budget pressure or a single oversized header
+fall back to reconstruction; this change makes no history-independent warm-cost
+claim. Legacy inline receipt readers keep their existing behavior.

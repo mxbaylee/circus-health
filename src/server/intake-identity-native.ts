@@ -212,6 +212,7 @@ async function open(
     view,
     catalog,
     metadataBytes: 256 * 1024,
+    identityReceiptWork: (metric) => withIntakeWork(db, 'warm', () => recordIntakeWork(metric)),
     packageEvidence: file.mime_type === 'application/zip' || !!plan?.hasMembers,
     readDraft: (record) =>
       readNativeReviewDraft(

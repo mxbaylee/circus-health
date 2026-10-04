@@ -71,7 +71,7 @@ jobs:
       - run: npm run test:ui
 
   server:
-    name: Server (${{ matrix.shard }}/2)
+    name: Server (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     # Includes real encrypted recovery of a 5,001-file collection; keep this
     # qualification in the required suite rather than skipping it for cost.
@@ -79,7 +79,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     env:
       HUSKY: '0'
     steps:
@@ -99,7 +99,7 @@ jobs:
       - name: Install the PDF renderer used by real export tests
         run: npx playwright install --with-deps chromium
       - name: Server tests with isolated fictional fixtures
-        run: npm run test:server -- --test-shard=${{ matrix.shard }}/2
+        run: npm run test:server -- --test-shard=${{ matrix.shard }}/4
 
   continuation:
     runs-on: ubuntu-latest
@@ -124,13 +124,13 @@ jobs:
         run: npm run test:continuation
 
   browser:
-    name: Browser (${{ matrix.shard }}/2)
+    name: Browser (${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     env:
       HUSKY: '0'
     steps:
@@ -150,7 +150,7 @@ jobs:
       - run: npm run build:assets
       - run: npx playwright install --with-deps chromium
       - name: Browser journeys with scripted third-party boundaries
-        run: npm run test:browser:run -- --test-shard=${{ matrix.shard }}/2
+        run: npm run test:browser:run -- --test-shard=${{ matrix.shard }}/3
 
   brand-assets:
     name: Brand assets (${{ matrix.os }})

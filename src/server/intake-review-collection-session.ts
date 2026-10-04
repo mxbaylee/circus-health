@@ -269,7 +269,7 @@ export function createCollectionClinicalReviewSession(input: {
             },
             0,
           ),
-          size = Buffer.byteLength(canonicalLiteral(record)),
+          size = Buffer.byteLength(JSON.stringify(record)),
           value = { kind: 'record' as const, record },
           blockingIssueCount =
             (record.identityReview?.blocking ? 1 : 0) +
@@ -290,7 +290,7 @@ export function createCollectionClinicalReviewSession(input: {
           record:
             record.questionsReference ||
             record.issuesReference ||
-            Buffer.byteLength(canonicalLiteral(value)) > bytes
+            Buffer.byteLength(JSON.stringify(value)) > bytes
               ? {
                   kind: 'reference',
                   reference: {
@@ -379,7 +379,7 @@ export function createCollectionClinicalReviewSession(input: {
         let bytes = 0,
           index = start;
         for (; index < all.length && items.length < options.items; index++) {
-          const size = Buffer.byteLength(canonicalLiteral(all[index]));
+          const size = Buffer.byteLength(JSON.stringify(all[index]));
           const item: IntakeClinicalReviewPage['items'][number] =
             size > options.bytes
               ? {
@@ -393,7 +393,7 @@ export function createCollectionClinicalReviewSession(input: {
                   },
                 }
               : { kind: 'value', ordinal: index, value: all[index] };
-          const cost = Buffer.byteLength(canonicalLiteral(item));
+          const cost = Buffer.byteLength(JSON.stringify(item));
           if (items.length && bytes + cost > options.bytes) break;
           // A value's wrapper may itself exceed the budget; return a compact reference instead.
           if (cost > options.bytes && item.kind === 'value')
@@ -440,7 +440,7 @@ export function createCollectionClinicalReviewSession(input: {
           bytes > 256 * 1024
         )
           throw new HttpError(409, 'REVIEW_FRAGMENT', 'Refresh this selected review fragment');
-        const data = Buffer.from(canonicalLiteral(all[reference.ordinal]));
+        const data = Buffer.from(JSON.stringify(all[reference.ordinal]));
         if (reference.bytes !== data.length || offset > data.length)
           throw new HttpError(409, 'REVIEW_FRAGMENT', 'Refresh this selected review fragment');
         const end = Math.min(data.length, offset + bytes);

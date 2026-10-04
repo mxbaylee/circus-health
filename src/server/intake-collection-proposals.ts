@@ -72,6 +72,8 @@ export interface PrepareIntakeCollectionProposalInput {
   proposalHeader?: Record<string, unknown> & { id: string };
   entries: readonly IntakeEntry[];
   batchId?: string | null;
+  /** Closed host batch participant; never read from proposal JSONL or tool arguments. */
+  readingBatch?: { planAddress: string; operationId: string };
   operationId: string;
   requestDigest: string;
   domainVersion: number;
@@ -125,6 +127,44 @@ export interface NativeProposalAffected {
     }>;
   }>;
   proposalIds: string[];
+}
+const proposalReadingProofs = new WeakMap<
+  NativeProposalAffected,
+  {
+    db: Database;
+    sourceId: string;
+    sourceHash: string;
+    reader: IntakeCollectionEnvelopeReader;
+    before: string;
+    next: string;
+    batchId: string | null;
+    batch?: Readonly<{ planAddress: string; operationId: string }>;
+  }
+>();
+
+/** A private compiler-issued closure, rather than a caller's list of changed keys,
+ * authorizes literal recounting. The selected source/root checks remain separate. */
+export function assertNativeProposalReadingEffects(
+  db: Database,
+  source: IntakeEnvelopeSource,
+  input: IntakeEnvelopeDerivedPreparation & { affected: NativeProposalAffected },
+  batch?: { planAddress: string; operationId: string },
+) {
+  const proof = proposalReadingProofs.get(input.affected);
+  if (
+    !proof ||
+    proof.db !== db ||
+    proof.sourceId !== source.id ||
+    (source.sha256 !== undefined && proof.sourceHash !== source.sha256) ||
+    proof.reader !== input.reader ||
+    proof.before !== JSON.stringify(input.reader.logical) ||
+    proof.next !== JSON.stringify(input.logical) ||
+    (proof.batchId === null && proof.batch !== undefined) ||
+    (proof.batchId !== null && (!proof.batch || proof.batch.operationId !== proof.batchId)) ||
+    JSON.stringify(batch ? [batch.planAddress, batch.operationId] : null) !==
+      JSON.stringify(proof.batch ? [proof.batch.planAddress, proof.batch.operationId] : null)
+  )
+    throw Error('Literal reading requires the immutable native proposal compiler effects');
 }
 const digest = (text: string) => {
   recordIntakeWork('hashCalls');
@@ -690,7 +730,32 @@ export async function prepareIntakeCollectionProposal(
     assertRunning: input.assertRunning,
     onCheckpoint: input.onCheckpoint,
     prepareDerived: input.prepareDerived
-      ? (value) => input.prepareDerived!({ ...value, affected: contribution.affected() })
+      ? (value) => {
+          const affected = contribution.affected();
+          affected.candidateChanges = affected.candidateChanges.map((change) =>
+            Object.freeze({ ...change }),
+          );
+          Object.freeze(affected.candidateChanges);
+          Object.freeze(affected);
+          proposalReadingProofs.set(affected, {
+            db,
+            sourceId: source.id,
+            sourceHash: input.file.sha256,
+            reader: value.reader,
+            before: JSON.stringify(value.reader.logical),
+            next: JSON.stringify(value.logical),
+            batchId: input.batchId ?? null,
+            ...(input.readingBatch
+              ? {
+                  batch: Object.freeze({
+                    planAddress: input.readingBatch.planAddress,
+                    operationId: input.readingBatch.operationId,
+                  }),
+                }
+              : {}),
+          });
+          return input.prepareDerived!({ ...value, affected });
+        }
       : undefined,
     derivedIntakeState: input.derivedIntakeState,
     additionalLogicalChanges: async () => [

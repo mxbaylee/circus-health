@@ -6,7 +6,8 @@ import {
 import { selectionAuthority } from '../intake-selection-authority.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +19,13 @@ import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { buildVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
 import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
 import { createReportSnapshotCatalog } from '../intake-report-snapshot-catalog.ts';
+import { selectedEnvelopeStore } from '../intake-collection-envelope.ts';
+import { schemaOrdinal } from '../intake-envelope-schema.ts';
+import { IDENTITY_SNAPSHOT_FORMAT } from '../intake-identity-snapshot.ts';
+import { createReportMemberSnapshot } from '../intake-report-member-state.ts';
+import { reviewReadStamp } from '../intake-clinical-review-read-cache.ts';
+import { withIntakeWork, intakeWorkCounters, recordIntakeWork } from '../intake-work-accounting.ts';
+import type { IntakeIdentityScopeReference } from '../../shared/intake-identity.ts';
 import {
   prepareCollectionReviewMembership,
   readCollectionReviewMembership,
@@ -145,7 +153,7 @@ async function fixture(
       reportSource: () => undefined,
     });
   };
-  return { db, details, open };
+  return { db, details, open, root };
 }
 function detailsFor() {
   const details: {
@@ -775,4 +783,568 @@ test('complete group resolution uses indexed work beyond the private cache and r
     idReads >= count,
     'the late duplicate remains visible beyond the cache and first group',
   );
+});
+
+async function nativeReceiptMemoFixture(
+  t: test.TestContext,
+  count = 3,
+  nameBytes = 0,
+  groupCount = 3,
+  idBytes = 0,
+) {
+  const f = await fixture(t),
+    token = 'd'.repeat(64);
+  const reference: IntakeIdentityScopeReference = {
+    format: 'health-intake-identity-scope-v2',
+    profileId: 'fictional-profile',
+    intakeId: file.id,
+    intakeVersion: 1,
+    groupId: 'fictional-policy-group',
+    groupVersionId: 'fictional-policy-version',
+    sourceHash: file.sha256,
+    memberId: null,
+    original: { filename: 'fictional.pdf', contentUrl: '/fictional-original', page: 1 },
+    report: { locator: 'page 1', text: 'Report F27' },
+    subject: { locator: 'page 1', text: 'Iris Meadow' },
+    evidencedIdentity: { fullName: 'Iris Meadow' },
+    verificationMode: 'human_reviewed_original',
+    scopeToken: token,
+    collection: {
+      snapshotId: 'identity:' + token,
+      membership: 1,
+      targets: 1,
+      assignmentTargets: 1,
+      questions: 1,
+      competingSubjects: 1,
+    },
+  };
+  const catalog = createReportSnapshotCatalog(f.db, file),
+    writer = await catalog.fork();
+  const ordinal = schemaOrdinal(0),
+    question = { prompt: 'Read the fictional original', textAnchor: 'Iris Meadow' };
+  const target = {
+    candidateId: 'fictional-candidate',
+    candidateVersionId: 'fictional-version',
+    proposalId,
+    recordId: 'fictional-record',
+    title: 'Fictional record',
+    issueId: 'fictional-issue',
+    hasIssueIds: true,
+    issueCount: 1,
+    hasIssueLookup: true,
+  };
+  const occurrence = { proposalId, recordId: 'fictional-record', batchId: null, locator: 'page 1' };
+  const rows = [
+    { key: '$format', value: IDENTITY_SNAPSHOT_FORMAT },
+    { key: '$scope', value: JSON.stringify(reference) },
+    {
+      key: 'member:' + ordinal,
+      value: JSON.stringify({
+        candidateId: target.candidateId,
+        candidateVersionId: target.candidateVersionId,
+        occurrenceCount: 1,
+      }),
+    },
+    { key: 'occurrence:' + ordinal + ':' + ordinal, value: JSON.stringify(occurrence) },
+    {
+      key: 'questionHash:' + ordinal,
+      value: createHash('sha256').update(canonicalLiteral(question)).digest('hex'),
+    },
+    {
+      key: 'competingSubjects:' + ordinal,
+      value: JSON.stringify({
+        groupId: 'fictional-alternative',
+        groupVersionId: 'fictional-alternative-version',
+        subject: { locator: 'page 1', text: 'Fictional Alternative' },
+      }),
+    },
+  ];
+  for (const section of ['targets', 'assignmentTargets'])
+    rows.push(
+      { key: 'targetHeader:' + section + ':' + ordinal, value: JSON.stringify(target) },
+      {
+        key: 'targetIssue:' + section + ':' + ordinal + ':' + ordinal,
+        value: JSON.stringify(target.issueId),
+      },
+      {
+        key:
+          'targetLookup:' +
+          section +
+          ':' +
+          ordinal +
+          ':' +
+          createHash('sha256').update(target.issueId).digest('hex'),
+        value: '1',
+      },
+    );
+  await writer.putMany(rows);
+  await catalog.publish(reference.collection.snapshotId, writer);
+  const memberWriter = await createReportMemberSnapshot(catalog, 'fictional-policy-members');
+  const member = await memberWriter.include({
+    candidateId: target.candidateId,
+    candidateVersionId: target.candidateVersionId,
+  });
+  await memberWriter.occurrence(member, occurrence);
+  const members = await memberWriter.finish();
+  const collections = selectedEnvelopeStore(f.db, file).collections,
+    operationId = randomUUID();
+  const prepared = collections.prepare(collections.openView(), {
+    operationId,
+    requestDigest: createHash('sha256').update(operationId).digest('hex'),
+    domainVersion: collections.binding(collections.openView())!.logical.domainVersion,
+    changes: await catalog.finalChanges(),
+  });
+  transaction(f.db, () => collections.stage(prepared));
+  f.db.exec('CREATE TABLE fictional_receipt_witness(value TEXT)');
+  const receipts = Array.from({ length: count }, (_, n) => ({
+    operationId: 'fictional-receipt-' + n,
+    outcome: 'this_is_me',
+    at: '2026-10-04',
+    identityAnswers: { birthDate: '1990-01-01', fictionalLexical: JSON.rawJSON('12.00') },
+    scope: reference,
+    ...(nameBytes
+      ? {
+          assignedPerson: {
+            noteId: 'fictional-person-note',
+            personId: 'fictional-family',
+            version: 1,
+            fullName: 'x'.repeat(nameBytes),
+          },
+        }
+      : {}),
+  }));
+  const groups = Array.from({ length: groupCount }, (_, n) => ({
+    id: (n ? 'fictional-policy-group-' + n : reference.groupId) + 'x'.repeat(idBytes),
+    basis: 'report_anchor' as const,
+    sourceFileId: file.id,
+    sourceHash: file.sha256,
+    memberId: null,
+    report: {
+      key: 'fictional-policy-report',
+      title: 'Fictional report',
+      anchor: reference.report,
+      subject: reference.subject,
+    },
+    versions: [
+      { id: reference.groupVersionId, format: 'health-intake-report-group-version-v2', members },
+    ],
+  }));
+  let superseded = false;
+  const open = (
+    transform?: (
+      catalog: ReturnType<typeof createReportSnapshotCatalog>,
+    ) => ReturnType<typeof createReportSnapshotCatalog>,
+    observe?: (view: ReturnType<typeof retainedEnvelopeReader>) => void,
+  ) => {
+    const view = retainedEnvelopeReader({
+      intake: { workflow: { identityConfirmations: receipts, reportGroups: groups } },
+    });
+    observe?.(view);
+    return collectionWorkflowReviewScope({
+      view,
+      catalog: transform
+        ? transform(createReportSnapshotCatalog(f.db, file))
+        : createReportSnapshotCatalog(f.db, file),
+      metadataBytes: 256 * 1024,
+      readCacheState: () => reviewReadStamp(f.db),
+      identityReceiptWork: (metric) => withIntakeWork(f.db, 'warm', () => recordIntakeWork(metric)),
+      packageEvidence: false,
+      activeReceipt: (receipt) =>
+        !(superseded && receipt.operationId === receipts.at(-1)!.operationId),
+      originalFingerprint: () => 'fictional-original-proof',
+      reportSource: () => undefined,
+    });
+  };
+  const scan = (scope: ReturnType<typeof open>) =>
+    withIntakeWork(f.db, 'warm', () => Array.from(scope.receipts || []));
+  return {
+    ...f,
+    open,
+    scan,
+    question,
+    target,
+    groups,
+    priorMembership: [
+      {
+        candidateId: target.candidateId,
+        candidateVersionId: target.candidateVersionId,
+        occurrences: [occurrence],
+      },
+    ],
+    setSuperseded: () => {
+      superseded = true;
+    },
+  };
+}
+
+test('native policy receipt memo reconstructs once, detaches headers and guards nested providers', async (t) => {
+  const f = await nativeReceiptMemoFixture(t),
+    scope = f.open();
+  const first = f.scan(scope),
+    before = intakeWorkCounters(f.db).warm;
+  assert.ok(JSON.stringify(first[0]!.identityAnswers).includes('12.00'));
+  assert.ok(JSON.stringify(f.scan(scope)[0]!.identityAnswers).includes('12.00'));
+  for (let n = 0; n < 64; n++)
+    assert.equal(f.scan(scope).at(-1)!.operationId, 'fictional-receipt-2');
+  const after = intakeWorkCounters(f.db).warm;
+  assert.equal(before.identityPolicyReceiptReconstructions, 3);
+  assert.equal(
+    after.identityPolicyReceiptReconstructions,
+    before.identityPolicyReceiptReconstructions,
+  );
+  assert.equal(after.identityPolicyReceiptCacheHits - before.identityPolicyReceiptCacheHits, 195);
+  assert.equal(after.identityPolicyReceiptNamespaceReads, 1);
+  assert.equal(
+    after.identityPolicyReceiptNamespaceHits - before.identityPolicyReceiptNamespaceHits,
+    65,
+  );
+  first[0]!.scope.original.filename = 'caller mutation';
+  first[0]!.scope.subject.text = 'caller mutation';
+  assert.equal(f.scan(scope)[0]!.scope.original.filename, 'fictional.pdf');
+  assert.equal(f.scan(scope)[0]!.scope.subject.text, 'Iris Meadow');
+  const providers = first[0]!.scope;
+  assert.throws(() => {
+    Object.assign(providers.targets, { length: 99 });
+  }, TypeError);
+  assert.throws(() => {
+    Object.assign(providers.targets, { some: () => false });
+  }, TypeError);
+  const target = Array.from(providers.assignmentTargets!)[0]!,
+    member = Array.from(providers.membership)[0]!,
+    question = Array.from(providers.questions!)[0]!;
+  assert.equal(target.hasIssueId!('fictional-issue'), true);
+  assert.equal(Array.from(target.issueIds!)[0], 'fictional-issue');
+  assert.equal(Array.from(member.occurrences)[0]!.recordId, 'fictional-record');
+  assert.equal('matches' in question && question.matches(f.question), true);
+  f.setSuperseded();
+  assert.equal(
+    f.scan(scope).at(-1)!.operationId,
+    'fictional-receipt-1',
+    'active receipt filtering remains live',
+  );
+  scope.close!();
+  assert.throws(() => Array.from(providers.membership), /proof changed/);
+  assert.throws(() => Array.from(target.issueIds!), /proof changed/);
+  assert.throws(() => target.hasIssueId!('fictional-issue'), /proof changed/);
+  assert.throws(() => Array.from(member.occurrences), /proof changed/);
+  assert.throws(() => 'matches' in question && question.matches(f.question), /proof changed/);
+});
+
+test('native policy receipt memo visits beyond 32 receipts and invalidates peer SQL and rollback', async (t) => {
+  const f = await nativeReceiptMemoFixture(t, 33),
+    scope = f.open();
+  assert.equal(f.scan(scope).at(-1)!.operationId, 'fictional-receipt-32');
+  const before = intakeWorkCounters(f.db).warm;
+  assert.equal(f.scan(scope).length, 33);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptReconstructions -
+      before.identityPolicyReceiptReconstructions,
+    33,
+    'bounded LRU falls back rather than skipping offpage receipts',
+  );
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptNamespaceReads -
+      before.identityPolicyReceiptNamespaceReads,
+    1,
+  );
+  assert.equal(intakeWorkCounters(f.db).warm.identityPolicyReceiptNamespaceHits, 0);
+  scope.close!();
+  const small = await nativeReceiptMemoFixture(t),
+    selected = small.open();
+  const old = small.scan(selected)[0]!,
+    warm = intakeWorkCounters(small.db).warm;
+  using peer = new DatabaseSync(join(small.root, 'cache.sqlite'));
+  peer.prepare('INSERT INTO fictional_receipt_witness VALUES(?)').run('peer policy change');
+  assert.throws(() => Array.from(old.scope.targets), /proof changed/);
+  small.scan(selected);
+  assert.equal(
+    intakeWorkCounters(small.db).warm.identityPolicyReceiptReconstructions -
+      warm.identityPolicyReceiptReconstructions,
+    3,
+  );
+  const beforeTransaction = small.scan(selected)[0]!;
+  small.db.exec('BEGIN');
+  assert.throws(() => Array.from(beforeTransaction.scope.membership), /proof changed/);
+  small.scan(selected);
+  small.db.exec('ROLLBACK');
+  assert.throws(() => Array.from(beforeTransaction.scope.membership), /proof changed/);
+  const rollback = intakeWorkCounters(small.db).warm;
+  small.scan(selected);
+  assert.equal(
+    intakeWorkCounters(small.db).warm.identityPolicyReceiptReconstructions -
+      rollback.identityPolicyReceiptReconstructions,
+    3,
+  );
+  selected.close!();
+  assert.equal(
+    small.scan(small.open()).length,
+    3,
+    'new scope reopens and verifies retained snapshot authority',
+  );
+});
+
+test('native policy receipt memo enforces aggregate and oversized header budgets without omitting receipts', async (t) => {
+  const f = await nativeReceiptMemoFixture(t, 32, 6000),
+    scope = f.open();
+  assert.equal(f.scan(scope).length, 32);
+  const before = intakeWorkCounters(f.db).warm;
+  assert.equal(f.scan(scope).at(-1)!.assignedPerson!.fullName.length, 6000);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptReconstructions -
+      before.identityPolicyReceiptReconstructions,
+    32,
+    'aggregate byte budget evicts before the 32-entry count limit',
+  );
+  scope.close!();
+  const giant = await nativeReceiptMemoFixture(t, 1, 256 * 1024 - 1000),
+    selected = giant.open();
+  assert.equal(giant.scan(selected).length, 1);
+  const oversized = intakeWorkCounters(giant.db).warm;
+  assert.equal(giant.scan(selected).length, 1);
+  assert.equal(
+    intakeWorkCounters(giant.db).warm.identityPolicyReceiptReconstructions -
+      oversized.identityPolicyReceiptReconstructions,
+    1,
+    'oversized complete header is not admitted',
+  );
+  selected.close!();
+});
+
+test('native policy receipt memo does not seed a changed cold proof and refuses changed catalog source', async (t) => {
+  const f = await nativeReceiptMemoFixture(t);
+  using peer = new DatabaseSync(join(f.root, 'cache.sqlite'));
+  let drifted = false;
+  const scope = f.open((catalog) => ({
+    ...catalog,
+    open(id) {
+      const reader = catalog.open(id);
+      if (!drifted) {
+        drifted = true;
+        peer
+          .prepare('INSERT INTO fictional_receipt_witness VALUES(?)')
+          .run('during snapshot construction');
+      }
+      return reader;
+    },
+  }));
+  const first = f.scan(scope),
+    before = intakeWorkCounters(f.db).warm;
+  assert.throws(() => Array.from(first[0]!.scope.targets), /proof changed/);
+  f.scan(scope);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptReconstructions -
+      before.identityPolicyReceiptReconstructions,
+    1,
+    'drifted first construction was not retained',
+  );
+  f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('e'.repeat(64), file.id);
+  try {
+    assert.throws(
+      () => f.scan(scope),
+      /source|Stale|binding|identity|missing selected intake head/i,
+    );
+  } finally {
+    f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run(file.sha256, file.id);
+  }
+  scope.close!();
+  const fresh = f.open(),
+    unwrappedBefore = intakeWorkCounters(f.db).warm;
+  Array.from(fresh.receipts || []);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptReconstructions -
+      unwrappedBefore.identityPolicyReceiptReconstructions,
+    3,
+    'host callback attributes actual opens outside global work scope',
+  );
+  Array.from(fresh.receipts || []);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptCacheHits -
+      unwrappedBefore.identityPolicyReceiptCacheHits,
+    3,
+  );
+  fresh.close!();
+});
+
+test('selected identity membership resolution memo preserves complete checks and frozen providers', async (t) => {
+  const f = await nativeReceiptMemoFixture(t),
+    scope = f.open();
+  const first = f.groups.map((group) => scope.membership(group));
+  for (const provider of first) assert.equal(provider.retains(f.priorMembership), true);
+  // Initial membership construction precedes receipt traversal; both caches use
+  // the same proof epoch, so first receipt decoding cannot invalidate it.
+  f.scan(scope);
+  for (let n = 0; n < 64; n++)
+    for (const group of f.groups)
+      assert.equal(scope.membership(group).retains(f.priorMembership), true);
+  const counts = intakeWorkCounters(f.db).warm;
+  assert.equal(counts.identityPolicyMembershipResolutions, 3);
+  assert.equal(counts.identityPolicyMembershipResolutionHits, 192);
+  const changed = structuredClone(f.priorMembership);
+  changed[0]!.occurrences[0]!.recordId = 'offpage-changed-record';
+  assert.equal(first[0]!.retains(changed), false, 'membership answers remain freshly checked');
+  assert.equal(first[0]!.retains(f.priorMembership), true);
+  assert.throws(() => Object.assign(first[0]!, { retains: () => false }), TypeError);
+  f.groups[0]!.report!.anchor.text = 'caller changed header';
+  assert.equal(scope.membership(f.groups[0]!).retains(f.priorMembership), true);
+  scope.close!();
+  assert.throws(() => first[0]!.retains(f.priorMembership), /proof changed/);
+});
+
+test('selected identity structural caches invalidate peer SQL rollback clear and closed proofs', async (t) => {
+  const f = await nativeReceiptMemoFixture(t),
+    scope = f.open();
+  let provider = scope.membership(f.groups[0]!);
+  f.scan(scope);
+  const before = intakeWorkCounters(f.db).warm;
+  using peer = new DatabaseSync(join(f.root, 'cache.sqlite'));
+  peer.prepare('INSERT INTO fictional_receipt_witness VALUES(?)').run('new current policy');
+  assert.throws(() => provider.retains(f.priorMembership), /proof changed/);
+  provider = scope.membership(f.groups[0]!);
+  assert.equal(provider.retains(f.priorMembership), true);
+  f.scan(scope);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyMembershipResolutions -
+      before.identityPolicyMembershipResolutions,
+    1,
+  );
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptNamespaceReads -
+      before.identityPolicyReceiptNamespaceReads,
+    1,
+  );
+  f.db.exec('BEGIN');
+  assert.throws(() => provider.retains(f.priorMembership), /proof changed/);
+  f.db.exec('ROLLBACK');
+  assert.throws(
+    () => provider.retains(f.priorMembership),
+    /proof changed/,
+    'rollback must not revive observed invalidation',
+  );
+  provider = scope.membership(f.groups[0]!);
+  clearIntakeStateCache(f.db);
+  assert.throws(() => provider.retains(f.priorMembership), /proof changed|Stale|selected/i);
+  scope.close!();
+  assert.throws(() => scope.membership(f.groups[0]!), /closed/);
+});
+
+test('selected identity membership resolution memo falls back beyond count and byte budgets', async (t) => {
+  for (const [count, bytes] of [
+    [33, 0],
+    [32, 7800],
+  ] as const) {
+    const f = await nativeReceiptMemoFixture(t, 1, 0, count, bytes),
+      scope = f.open();
+    for (const group of f.groups)
+      assert.equal(scope.membership(group).retains(f.priorMembership), true);
+    const before = intakeWorkCounters(f.db).warm;
+    for (const group of f.groups)
+      assert.equal(scope.membership(group).retains(f.priorMembership), true);
+    assert.equal(
+      intakeWorkCounters(f.db).warm.identityPolicyMembershipResolutions -
+        before.identityPolicyMembershipResolutions,
+      count,
+      'no incomplete policy when bounded resolutions cannot be retained',
+    );
+    scope.close!();
+  }
+  const unsupported = await nativeReceiptMemoFixture(t, 1, 0, 1, 256 * 1024),
+    refused = unsupported.open();
+  assert.throws(
+    () => refused.membership(unsupported.groups[0]!),
+    /public identity index target/,
+    'an oversized public identity remains an authority refusal',
+  );
+  refused.close!();
+});
+
+test('selected identity receipt locators admit only completed bounded authenticated traversals', async (t) => {
+  const f = await nativeReceiptMemoFixture(t),
+    scope = f.open();
+  const iterator = scope.receipts![Symbol.iterator]();
+  iterator.next();
+  iterator.return?.();
+  f.scan(scope);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptNamespaceReads,
+    2,
+    'cancelled prefix cannot seed complete locator cache',
+  );
+  scope.close!();
+  let refused = false;
+  const guarded = f.open(undefined, (view) => {
+    const address = view.address.bind(view);
+    view.address = (record) => {
+      if (refused) throw Error('Fictional authenticated address refused');
+      return address(record);
+    };
+  });
+  const provider = guarded.membership(f.groups[0]!);
+  f.scan(guarded);
+  refused = true;
+  assert.throws(() => f.scan(guarded), /authenticated address refused/);
+  refused = false;
+  assert.throws(
+    () => provider.retains(f.priorMembership),
+    /proof changed/,
+    'refused address cannot revive prior provider',
+  );
+  const before = intakeWorkCounters(f.db).warm;
+  f.scan(guarded);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyReceiptNamespaceReads -
+      before.identityPolicyReceiptNamespaceReads,
+    1,
+  );
+  guarded.close!();
+});
+
+test('selected identity membership cold drift cannot seed and duplicate headers preserve first membership', async (t) => {
+  const f = await nativeReceiptMemoFixture(t);
+  const firstGroup = f.groups[0]!;
+  f.groups.push({
+    ...firstGroup,
+    report: {
+      ...firstGroup.report,
+      anchor: { locator: 'later duplicate', text: 'Later duplicate' },
+    },
+    versions: [{ ...firstGroup.versions[0]!, id: 'later-version' }],
+  });
+  using peer = new DatabaseSync(join(f.root, 'cache.sqlite'));
+  let changed = false;
+  const scope = f.open((catalog) => ({
+    ...catalog,
+    open(id) {
+      const result = catalog.open(id);
+      if (!changed) {
+        changed = true;
+        peer
+          .prepare('INSERT INTO fictional_receipt_witness VALUES(?)')
+          .run('during membership open');
+      }
+      return result;
+    },
+  }));
+  const old = scope.membership(firstGroup);
+  assert.throws(() => old.retains(f.priorMembership), /proof changed/);
+  const before = intakeWorkCounters(f.db).warm;
+  const fresh = scope.membership(firstGroup);
+  assert.equal(fresh.retains(f.priorMembership), true);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyMembershipResolutions -
+      before.identityPolicyMembershipResolutions,
+    1,
+  );
+  const later = scope.group({ groupId: firstGroup.id, groupVersionId: 'later-version' })!;
+  assert.equal(
+    later.report!.anchor.text,
+    'Later duplicate',
+    'later duplicate version lookup remains complete',
+  );
+  assert.equal(
+    scope.currentVersion(later),
+    firstGroup.versions[0]!.id,
+    'current membership still belongs to first retained group',
+  );
+  assert.equal(scope.membership(later).retains(f.priorMembership), true);
+  scope.close!();
 });

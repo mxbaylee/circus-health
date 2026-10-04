@@ -1647,6 +1647,7 @@ async function publishNativeIntakeProposal(
         },
         entries: parsed.entries!,
         batchId: operationId,
+        readingBatch: batch?.affected,
         operationId: publicationId,
         requestDigest: fingerprint,
         domainVersion: before.rawVersion + 1,
@@ -1666,6 +1667,8 @@ async function publishNativeIntakeProposal(
           const { prepareSourceContextClassificationDerived } =
               await import('./intake-source-context-state.ts'),
             { prepareWorkflowProposalDerived } = await import('./intake-workflow-update.ts'),
+            { prepareWorkflowReadingDerived } =
+              await import('./intake-workflow-reading-derived.ts'),
             { prepareRetainedPlanDerived } = await import('./intake-retained-plan.ts');
           const planChanges = await prepareRetainedPlanDerived(db, profileId, id, {
             ...derived,
@@ -1700,7 +1703,13 @@ async function publishNativeIntakeProposal(
               assertRunning: batch?.assertCurrent ?? assertCurrent,
             },
           );
-          if (classifier.state !== 'ready') return planChanges;
+          const readingChanges = await prepareWorkflowReadingDerived(db, file, {
+            ...derived,
+            packageBatch: batch?.affected,
+            assertRunning: batch?.assertCurrent ?? assertCurrent,
+            onCheckpoint: options.onCheckpoint,
+          });
+          if (classifier.state !== 'ready') return [...planChanges, ...readingChanges];
           assertDerivedCurrent = classifier.assertCurrent;
           assertDerivedPublicationCurrent = classifier.assertPublicationCurrent;
           const changes = await prepareWorkflowProposalDerived(db, file, {
@@ -1717,7 +1726,7 @@ async function publishNativeIntakeProposal(
             },
             onCheckpoint: options.onCheckpoint,
           });
-          return [...planChanges, ...classifier.changes, ...changes];
+          return [...planChanges, ...readingChanges, ...classifier.changes, ...changes];
         },
         assertRunning: batch?.assertCurrent ?? assertCurrent,
         onCheckpoint: options.onCheckpoint,

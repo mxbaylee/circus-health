@@ -243,7 +243,16 @@ test(
     assert.equal(receipt.intakeId, intake.id);
     assert.equal(receipt.proposalId, initial.context.proposalId);
     assert.equal(receipt.intakeVersionBefore, fresh.context.version);
-    assert.equal(receipt.reviewToken, fresh.context.reviewToken);
+    // The parent manifest advances the report's transport revision. The
+    // partial receipt retains the exact human-approved selection separately.
+    assert.ok(!result.receipt.atomic);
+    assert.equal(result.receipt.items.length, 1);
+    assert.equal(result.receipt.items[0]!.status, 'saved');
+    assert.equal(
+      result.receipt.items[0]!.selectionReviewToken,
+      selected.selection.selectionReviewToken,
+    );
+    assert.deepEqual(result.receipt.items[0]!.receipt, receipt);
     assert.equal(receipt.records.length, 1);
     const { candidateId, candidateVersionId, ...destination } = receipt.records[0]!;
     assert.equal(candidateId, selected.selection.candidateId);

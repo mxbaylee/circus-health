@@ -2043,6 +2043,104 @@ for (const succeeds of [true, false])
     } else await waitFor(() => expect(screen.getByLabelText('Open correction')).toBeVisible());
   });
 
+for (const newerDraft of [false, true])
+  it(`closes acknowledged review after its save settles without losing a newer draft: ${newerDraft}`, async () => {
+    const value = sourceModel();
+    value.records[0]!.eligible = true;
+    const save = controlledPromise<boolean>();
+    const onSave = vi.fn(() => save.promise);
+    let busy = false;
+    let dirty = false;
+    const guard = vi.fn(async () => !busy && !dirty);
+    const props = () => ({
+      model: value,
+      actions: { onSave, busy },
+      // The parent supplies the current editor guard on each render.
+      beforeReviewChange: () => guard(),
+      renderRecordReview: () => <input aria-label="Open correction" defaultValue="4.1" />,
+    });
+    const rendered = render(<ImportReviewPresentation {...props()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    await screen.findByLabelText('Open correction');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm & save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    busy = true;
+    dirty = newerDraft;
+    if (newerDraft)
+      fireEvent.change(screen.getByLabelText('Open correction'), { target: { value: '4.2' } });
+    rendered.rerender(<ImportReviewPresentation {...props()} />);
+    save.resolve(true);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled(),
+    );
+    expect(screen.getByLabelText('Open correction')).toBeVisible();
+    busy = false;
+    rendered.rerender(<ImportReviewPresentation {...props()} />);
+    if (newerDraft) {
+      await waitFor(() => expect(guard).toHaveBeenCalledTimes(3));
+      expect(screen.getByLabelText('Open correction')).toHaveValue('4.2');
+      dirty = false;
+      rendered.rerender(<ImportReviewPresentation {...props()} />);
+    }
+    await waitFor(() => expect(screen.queryByLabelText('Open correction')).toBeNull());
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText('Fictional eyewear prescription')).toBeNull();
+  });
+
+for (const replaceContext of [false, true])
+  it(`does not close a replacement editor with an earlier save guard (new context: ${replaceContext})`, async () => {
+    const value = sourceModel();
+    value.records[0]!.eligible = true;
+    const save = controlledPromise<boolean>();
+    const closeCheck = controlledPromise<boolean>();
+    let deferClose = false;
+    const guard = vi.fn(() => (deferClose ? closeCheck.promise : Promise.resolve(true)));
+    const onSave = vi.fn(() => save.promise);
+    const props = {
+      model: value,
+      actions: { onSave },
+      beforeReviewChange: guard,
+      renderRecordReview: () => <input aria-label="Open correction" />,
+    };
+    const rendered = render(<ImportReviewPresentation {...props} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    await screen.findByLabelText('Open correction');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm & save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    deferClose = true;
+    save.resolve(true);
+    await waitFor(() => expect(guard).toHaveBeenCalledTimes(3));
+    if (replaceContext)
+      rendered.rerender(
+        <ImportReviewPresentation
+          {...props}
+          model={sourceModel('another-fictional-profile:active')}
+          beforeReviewChange={async () => true}
+        />,
+      );
+    else {
+      deferClose = false;
+      fireEvent.click(screen.getByRole('button', { name: 'Close review' }));
+    }
+    await waitFor(() => expect(screen.queryByLabelText('Open correction')).toBeNull());
+    if (!replaceContext)
+      rendered.rerender(
+        <ImportReviewPresentation
+          {...props}
+          model={{
+            ...value,
+            records: value.records.map((record) => ({ ...record, status: 'saved' })),
+            filters: { ...value.filters!, view: 'saved' },
+          }}
+        />,
+      );
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    await screen.findByLabelText('Open correction');
+    closeCheck.resolve(true);
+    await closeCheck.promise;
+    await waitFor(() => expect(screen.getByLabelText('Open correction')).toBeVisible());
+  });
+
 function AttentionMock({
   onCount,
   count = 2,

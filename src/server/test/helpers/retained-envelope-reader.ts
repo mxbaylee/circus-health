@@ -1,3 +1,4 @@
+import type { IntakeByteValue } from '../../intake-state-storage.ts';
 import { createSchemaEnvelopeReader } from '../../intake-collection-envelope.ts';
 import {
   ENVELOPE_SCHEMA,
@@ -77,26 +78,53 @@ export function retainedEnvelopeReader(value: unknown) {
     }
   }
   record(0, text.length, 'root', root);
+  const fragmented = new Map<string, IntakeByteValue>(),
+    byteCells = new WeakMap<IntakeByteValue, Buffer>();
+  for (const [key, value] of cells)
+    if (Buffer.byteLength(value) > 8192) {
+      const bytes = Buffer.from(value),
+        reference = {
+          kind: 'bytes',
+          bytes: bytes.length,
+          chunks: Math.ceil(bytes.length / 1024),
+        } as IntakeByteValue;
+      fragmented.set(key, reference);
+      byteCells.set(reference, bytes);
+    }
   const sorted = [...cells].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return createSchemaEnvelopeReader(
     {
       check() {},
-      get: (key) => cells.get(key),
+      get: (key) => fragmented.get(key) || cells.get(key),
       range(after, items, bytes) {
-        const result: Array<{ key: string; value: string }> = [];
+        const result: Array<{ key: string; value: string | IntakeByteValue }> = [];
         let size = 0;
         for (const [key, value] of sorted) {
           if (key <= after) continue;
-          const next = Buffer.byteLength(key) + Buffer.byteLength(value);
+          const selected = fragmented.get(key) || value;
+          const next =
+            Buffer.byteLength(key) +
+            (typeof selected === 'string' ? Buffer.byteLength(selected) : 100);
           if (result.length === items || size + next > bytes)
             return { items: result, complete: false };
-          result.push({ key, value });
+          result.push({ key, value: selected });
           size += next;
         }
         return { items: result, complete: true };
       },
-      chunks() {
-        throw Error('Count fixture has only inline retained cells');
+      chunks(reference, after, bytes = 4096) {
+        const value = byteCells.get(reference);
+        if (!value) throw Error('Foreign retained fixture byte cell');
+        const start = after ? Number(after) : 0,
+          end = Math.min(value.length, start + bytes);
+        const chunks: Buffer[] = [];
+        for (let at = start; at < end; at += 1024)
+          chunks.push(value.subarray(at, Math.min(at + 1024, end)));
+        return {
+          chunks,
+          complete: end === value.length,
+          after: end < value.length ? String(end) : null,
+        };
       },
     },
     { format: ENVELOPE_SCHEMA, mode: 'normalized', root },

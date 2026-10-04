@@ -13,6 +13,10 @@ import type {
 } from '../../shared/intake';
 import type { IntakeIdentityReview } from '../../shared/intake-identity';
 import type { CollectionReportDetail } from '../../shared/intake-clinical-pages';
+import type {
+  ClinicalRecordAction,
+  ClinicalRecordSectionPage,
+} from '../../shared/intake-clinical-record-sections';
 import {
   ImportDetailReview,
   ImportRecordDetail,
@@ -3136,6 +3140,210 @@ it('uses exact section controls for native selected-record related discovery wit
   expect(screen.getByText('0 related records in this search result window.')).toBeVisible();
   expect(requests.some((url) => url.includes('/related-records'))).toBe(false);
 });
+
+it.each([false, true])(
+  'accepts the retained native relationship only with its displayed exact authority (foreign change=%s)',
+  async (foreignChange) => {
+    selectProfile({ id: 'fictional-native-pair-approval', name: 'Rowan', placebo: true });
+    let version = intake.version;
+    let selected = { ...record, selectionReviewToken: 'native-before-pair' };
+    let substituteForeign = false;
+    const actions: ClinicalRecordAction[] = [];
+    const acceptances: Record<string, any>[] = [];
+    const context = () => ({
+      intakeId: intake.id,
+      proposalId: block.proposalId,
+      version,
+      reviewToken: `native-review-${version}`,
+      summary: review.summary,
+      sourceTextStale: false,
+    });
+    const retainedChoice = {
+      otherRecordId: 'fictional-saved-marker',
+      outcome: 'distinct' as const,
+      reason: 'Separate fictional source identifiers; retain both literal values.',
+      scope: {
+        format: 'intake-pair-scope-v1' as const,
+        profileId: 'fictional-native-pair-approval',
+        incoming: {
+          kind: 'observation' as const,
+          sourceRecordId: record.id,
+          identity: 'fictional-incoming',
+          version: 'fictional-incoming-v1',
+          stateHash: 'fictional-incoming-state',
+          evidenceHash: 'fictional-incoming-evidence',
+        },
+        saved: {
+          kind: 'observation' as const,
+          recordId: 'fictional-saved-marker',
+          sourceRecordId: 'fictional-saved-source',
+          identity: 'fictional-saved',
+          version: 'fictional-saved-v1',
+          stateHash: 'fictional-saved-state',
+          evidenceHash: 'fictional-saved-evidence',
+        },
+        token: 'fictional-exact-pair-scope',
+      },
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input, init) => {
+        const url = String(input);
+        if (url.includes('/review-record?'))
+          return response({
+            format: 'health-intake-clinical-record-v2',
+            context: context(),
+            record: {
+              kind: 'record',
+              record: substituteForeign
+                ? { ...selected, selectionReviewToken: 'foreign-native-source-token' }
+                : selected,
+            },
+          });
+        if (url.endsWith(`/intakes/${intake.id}`)) return response({ ...intake, version });
+        if (url.endsWith('/review-record-section')) {
+          const command = JSON.parse(String(init?.body));
+          return response({
+            format: 'health-clinical-record-section-page-v1',
+            context: context(),
+            selection: {
+              proposalId: block.proposalId,
+              recordId: record.id,
+              candidateVersionId: record.candidateVersionId!,
+              selectionReviewToken: selected.selectionReviewToken,
+            },
+            section: command.section,
+            total: 1,
+            nextCursor: null,
+            items: [
+              {
+                ordinal: 0,
+                control: {
+                  kind: 'pair',
+                  otherRecordId: retainedChoice.otherRecordId,
+                  scopeToken: retainedChoice.scope.token,
+                  targetAvailable: true,
+                  reasonReferenced: false,
+                  draftScopeStatus: actions.length ? 'current' : 'none',
+                  ...(actions.length ? retainedChoice : {}),
+                },
+                detail: {
+                  kind: 'value',
+                  value: {
+                    comparison: {
+                      id: retainedChoice.otherRecordId,
+                      title: 'Fictional saved marker',
+                      kind: 'observation',
+                      mapping: { ...record.mapping, valueText: '41' },
+                      evidence: [],
+                    },
+                  },
+                },
+              },
+            ],
+          } satisfies ClinicalRecordSectionPage);
+        }
+        if (url.endsWith('/review-record-action')) {
+          const command = JSON.parse(String(init?.body)) as ClinicalRecordAction;
+          actions.push(command);
+          expect(command.pair).toMatchObject({
+            otherRecordId: retainedChoice.otherRecordId,
+            scopeToken: retainedChoice.scope.token,
+            outcome: retainedChoice.outcome,
+            reason: retainedChoice.reason,
+          });
+          version++;
+          selected = {
+            ...selected,
+            selectionReviewToken: 'native-retained-pair',
+            draft: {
+              id: command.operationId,
+              proposalId: block.proposalId,
+              recordId: record.id,
+              candidateId: record.candidateId!,
+              candidateVersionId: record.candidateVersionId!,
+              mapping: {},
+              disposition: 'pending',
+              at: '2026-10-04T00:00:00Z',
+              resolutions: [],
+              decision: {
+                recordId: record.id,
+                action: 'accept',
+                mapping: {},
+                comparisons: [retainedChoice],
+              },
+            },
+            comparisonDrafts: [{ otherRecordId: retainedChoice.otherRecordId, status: 'current' }],
+          };
+          return response({ ...intake, version });
+        }
+        if (url.endsWith('/intakes/report-acceptance')) {
+          const command = JSON.parse(String(init?.body));
+          acceptances.push(command);
+          return response(acceptedResult(command.operationId));
+        }
+        if (url.endsWith('/test-types') || url.endsWith('/rules')) return response([]);
+        if (url.includes('/accepted-records')) return response([]);
+        if (url.includes('/record-owner')) return response({ personId: 'patient' });
+        throw new Error(`Unexpected native pair request ${url}`);
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <ImportRecordDetail
+          groupId="fictional-report"
+          block={block}
+          recordId={record.id}
+          identityPanel={null}
+          identityRevision={0}
+          sourcePanel={null}
+          commonIdentityIssueIds={new Set()}
+          sourceError=""
+          onBack={() => {}}
+          onChanged={() => {}}
+          onUseSource={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const save = await screen.findByRole('button', { name: 'Confirm and save record' });
+    fireEvent.click(screen.getByText('Find possible related saved records'));
+    const relationship = await screen.findByRole('group', {
+      name: 'Relationship with this record',
+    });
+    fireEvent.change(within(relationship).getByRole('combobox'), { target: { value: 'distinct' } });
+    fireEvent.change(within(relationship).getByLabelText('Reason for this relationship'), {
+      target: { value: retainedChoice.reason },
+    });
+    expect(save).toBeDisabled();
+    fireEvent.click(within(relationship).getByRole('button', { name: 'Save this relationship' }));
+    await waitFor(() => expect(actions).toHaveLength(1));
+    await waitFor(() => expect(save).toBeEnabled());
+    substituteForeign = foreignChange;
+    await userEvent.click(save);
+    if (foreignChange) {
+      expect(
+        await screen.findByText(
+          'This exact record changed. Review the current proposal before saving.',
+        ),
+      ).toBeVisible();
+      expect(acceptances).toHaveLength(0);
+    } else {
+      expect(await screen.findByText('This exact record was saved to your profile.')).toBeVisible();
+      expect(acceptances).toHaveLength(1);
+      expect(acceptances[0]).toMatchObject({ mode: 'partial-v1' });
+      expect(acceptances[0]!.blocks[0].selections).toEqual([
+        {
+          recordId: record.id,
+          candidateId: record.candidateId,
+          candidateVersionId: record.candidateVersionId,
+          selectionReviewToken: 'native-retained-pair',
+          mapping: {},
+          useRetainedDecision: true,
+        },
+      ]);
+    }
+  },
+);
 it('keeps the selected record mounted and report retry actionable while an external report command is uncertain', async () => {
   selectProfile({ id: 'fictional-external-pending', name: 'Fictional Reader', placebo: true });
   vi.stubGlobal(

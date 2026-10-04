@@ -1,6 +1,7 @@
 import { selectedReportGroupLinks, selectedReportGroups } from './intake-selected-report-groups.ts';
 import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
 import { collectSelectedEvidencedIdentity } from './intake-identity-name-evidence.ts';
+import { recordIntakeWork } from './intake-work-accounting.ts';
 import { nativeIdentityPolicyScope } from './intake-identity-snapshot.ts';
 import type { IntakeIdentityScopeReference } from '../shared/intake-identity.ts';
 import type { ClinicalOriginalScope } from './clinical-source-scope.ts';
@@ -25,6 +26,7 @@ import type {
   IdentityPolicyReceipt,
   IdentityPolicyTargets,
   IdentityPolicyMember,
+  SelectedIdentityMembership,
 } from './intake-identity-policy.ts';
 import {
   structuredEvidencedIdentity,
@@ -41,6 +43,16 @@ import { selectedReviewQuestions } from './intake-review-question-selection.ts';
 import { readSelectedManualSourceReceipt } from './intake-manual-receipt.ts';
 
 type IntakeCandidateOccurrence = IntakeCandidateVersion['occurrences'][number];
+type SelectedWorkflowReviewScope = Omit<WorkflowReviewScope, 'membership'> & {
+  membership(group: WorkflowReviewGroup): SelectedIdentityMembership;
+};
+type IdentityReceiptWork =
+  | 'identityPolicyReceiptReconstructions'
+  | 'identityPolicyReceiptCacheHits'
+  | 'identityPolicyReceiptNamespaceReads'
+  | 'identityPolicyReceiptNamespaceHits'
+  | 'identityPolicyMembershipResolutions'
+  | 'identityPolicyMembershipResolutionHits';
 
 export interface IntakeReviewFragmentReference {
   format: 'health-intake-review-fragment-v1';
@@ -113,11 +125,12 @@ export function collectionWorkflowReviewScope(input: {
   metadataBytes: number;
   /** A host-verified SQLite state stamp; omitted hosts perform every read. */
   readCacheState?: () => string | undefined;
+  identityReceiptWork?(metric: IdentityReceiptWork): void;
   packageEvidence: boolean;
   activeReceipt(receipt: IdentityPolicyReceipt): boolean;
   originalFingerprint(group: WorkflowReviewGroup): string;
   reportSource: WorkflowReviewScope['reportSource'];
-}): WorkflowReviewScope & {
+}): SelectedWorkflowReviewScope & {
   canonicalReviewRecords(records: unknown): Iterable<string>;
   latestAcceptedRecord(
     recordId: string,
@@ -379,11 +392,10 @@ export function collectionWorkflowReviewScope(input: {
     }
     return undefined;
   };
-  const membershipFor = (
-    current: IntakeEnvelopeRecord,
-  ): ReturnType<WorkflowReviewScope['membership']> => {
+  const membershipBytes = new WeakMap<SelectedIdentityMembership, number>();
+  const membershipFor = (current: IntakeEnvelopeRecord): SelectedIdentityMembership => {
     const members = snapshot(current);
-    return {
+    const result = {
       retains(prior) {
         return selectedSequence(prior).every((member) => {
           if (members) {
@@ -411,11 +423,207 @@ export function collectionWorkflowReviewScope(input: {
           });
         });
       },
+    } satisfies SelectedIdentityMembership;
+    membershipBytes.set(
+      result,
+      Buffer.byteLength(view.address(current)) +
+        (members ? Buffer.byteLength(JSON.stringify(members.reference)) : 0) +
+        1024,
+    );
+    return result;
+  };
+  // Immutable native receipt snapshots remain complete; only repeated decoding
+  // within this exact live review proof is retained. Legacy receipt readers keep
+  // their original path. Forward full-history selectors still visit every row.
+  const nativeReceiptCache = new Map<
+    string,
+    {
+      header: string;
+      reference: string;
+      collections: IdentityPolicyReceipt['scope'];
+      bytes: number;
+    }
+  >();
+  let nativeReceiptState: string | undefined,
+    nativeReceiptBytes = 0,
+    receiptScopeClosed = false;
+  let nativeReceiptEpoch = {};
+  let receiptLocators: readonly IntakeEnvelopeRecord[] | undefined;
+  let receiptLocatorBytes = 0;
+  const membershipCache = new Map<
+    string,
+    { provider: SelectedIdentityMembership; bytes: number }
+  >();
+  let membershipCacheBytes = 0;
+  const clearNativeReceipts = () => {
+    nativeReceiptEpoch = {};
+    nativeReceiptCache.clear();
+    nativeReceiptBytes = 0;
+    receiptLocators = undefined;
+    receiptLocatorBytes = 0;
+    membershipCache.clear();
+    membershipCacheBytes = 0;
+  };
+  const receiptState = () => {
+    if (receiptScopeClosed) throw Error('Selected native identity receipt scope closed');
+    try {
+      view.address(view.root());
+      return input.readCacheState?.();
+    } catch (error) {
+      clearNativeReceipts();
+      throw error;
+    }
+  };
+  const currentReceiptState = () => {
+    const state = receiptState();
+    if (state !== nativeReceiptState) {
+      clearNativeReceipts();
+      nativeReceiptState = state;
+    }
+    return state;
+  };
+  const receiptProofGuard = (state: string, epoch: object) => {
+    if (receiptScopeClosed || epoch !== nativeReceiptEpoch)
+      throw Error('Selected native identity receipt proof changed');
+    if (receiptState() !== state) {
+      clearNativeReceipts();
+      throw Error('Selected native identity receipt proof changed');
+    }
+  };
+  const receiptWork = (metric: IdentityReceiptWork) =>
+    input.identityReceiptWork ? input.identityReceiptWork(metric) : recordIntakeWork(metric);
+  const decodeNativeReceipt = (entry: {
+    header: string;
+    reference: string;
+    collections: IdentityPolicyReceipt['scope'];
+  }) => {
+    const { format: _format, collection: _collection, ...header } = JSON.parse(entry.reference);
+    const receiptHeader = JSON.parse(entry.header, (_key, value, context) =>
+      typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
+        ? JSON.rawJSON(context.source)
+        : value,
+    ) as Record<string, unknown>;
+    return {
+      ...receiptHeader,
+      scope: { ...header, ...entry.collections },
+    } as IdentityPolicyReceipt;
+  };
+  const guardedNativeCollections = (reference: IntakeIdentityScopeReference, state: string) => {
+    const source = nativeIdentityPolicyScope(catalog, reference),
+      epoch = nativeReceiptEpoch;
+    const guard = () => receiptProofGuard(state, epoch);
+    const sequence = <T>(
+      items: Iterable<T>,
+      count: number,
+      project: (item: T) => T = (item) => item,
+    ) => {
+      const result = selectedSequence(function* () {
+        guard();
+        for (const item of items) {
+          guard();
+          yield project(item);
+        }
+        guard();
+      });
+      Object.defineProperty(result, 'length', { value: count });
+      return Object.freeze(result);
     };
+    const target = (original: import('./intake-identity-policy.ts').IdentityPolicyTarget) => {
+      const item = { ...original };
+      if (original.hasIssueId) {
+        const hasIssueId = original.hasIssueId.bind(original);
+        Object.defineProperty(item, 'hasIssueId', {
+          value: (id: string) => {
+            guard();
+            return hasIssueId(id);
+          },
+        });
+      }
+      if (item.issueIds) {
+        const issues = item.issueIds;
+        item.issueIds = selectedSequence(function* () {
+          guard();
+          for (const issue of issues) {
+            guard();
+            yield issue;
+          }
+          guard();
+        });
+      }
+      return item;
+    };
+    const collections = {
+      targets: sequence(source.targets, reference.collection.targets, target),
+      assignmentTargets: sequence(
+        source.assignmentTargets!,
+        reference.collection.assignmentTargets,
+        target,
+      ),
+      competingSubjects: sequence(
+        source.competingSubjects || [],
+        reference.collection.competingSubjects,
+      ),
+      membership: sequence(source.membership, reference.collection.membership, (member) => {
+        const occurrences = member.occurrences;
+        member.occurrences = selectedSequence(function* () {
+          guard();
+          for (const occurrence of occurrences) {
+            guard();
+            yield occurrence;
+          }
+          guard();
+        });
+        return member;
+      }),
+      questions: sequence(source.questions || [], reference.collection.questions, (question) => {
+        if ('matches' in question) {
+          const matches = question.matches.bind(question);
+          question = {
+            matches: (value) => {
+              guard();
+              return matches(value);
+            },
+          };
+        }
+        return question;
+      }),
+    };
+    return collections as unknown as IdentityPolicyReceipt['scope'];
   };
   const policyReceipt = (record: IntakeEnvelopeRecord): IdentityPolicyReceipt => {
+    const state = currentReceiptState(),
+      key = view.address(record);
+    const cached = state === undefined ? undefined : nativeReceiptCache.get(key);
+    if (cached) {
+      nativeReceiptCache.delete(key);
+      nativeReceiptCache.set(key, cached);
+      receiptWork('identityPolicyReceiptCacheHits');
+      return decodeNativeReceipt(cached);
+    }
+    const constructionEpoch = nativeReceiptEpoch;
     const receiptScope = view.child(record, 'scope');
     if (!receiptScope) throw Error('Missing retained identity scope');
+    const native = value(receiptScope, 'format') === 'health-intake-identity-scope-v2';
+    const receiptValue = (name: string): unknown => {
+      if (!native) return value(record, name);
+      const child = view.child(record, name);
+      if (child) return readIntakeReviewValue(view, child, metadataBytes);
+      if (!view.has(record, name)) return undefined;
+      const pieces: string[] = [];
+      let bytes = 0;
+      for (const piece of view.fieldChunks(record, name)) {
+        bytes += Buffer.byteLength(piece);
+        if (bytes > metadataBytes)
+          throw new IntakeReviewFragmentRequired({
+            format: 'health-intake-review-fragment-v1',
+            logical: view.logical,
+            address: view.address(record),
+            field: name,
+          });
+        pieces.push(piece);
+      }
+      return parseLiteralJSON(pieces.join(''));
+    };
     const header: Record<string, unknown> = {},
       scopeHeader: Record<string, unknown> = {};
     for (const name of [
@@ -429,21 +637,50 @@ export function collectionWorkflowReviewScope(input: {
       'confirmedPrintedName',
       'selfUpdate',
     ]) {
-      const item = value(record, name);
+      const item = receiptValue(name);
       if (item !== undefined)
         header[name] =
           name === 'assignedPerson' || name === 'selfUpdate'
             ? JSON.parse(JSON.stringify(item))
             : item;
     }
-    if (value(receiptScope, 'format') === 'health-intake-identity-scope-v2') {
+    if (native) {
       const reference = JSON.parse(
         JSON.stringify(read<IntakeIdentityScopeReference>(receiptScope)),
       ) as IntakeIdentityScopeReference;
-      return {
-        ...header,
-        scope: nativeIdentityPolicyScope(catalog, reference),
-      } as IdentityPolicyReceipt;
+      receiptWork('identityPolicyReceiptReconstructions');
+      if (state === undefined)
+        return {
+          ...header,
+          scope: nativeIdentityPolicyScope(catalog, reference),
+        } as IdentityPolicyReceipt;
+      const entry = {
+        header: JSON.stringify(header),
+        reference: JSON.stringify(reference),
+        collections: guardedNativeCollections(reference, state),
+        bytes: 0,
+      };
+      // Account both encoded reference copies (text and provider capture), key,
+      // header and fixed wrapper overhead. No cumulative collection is retained.
+      entry.bytes =
+        Buffer.byteLength(entry.header) +
+        2 * Buffer.byteLength(entry.reference) +
+        Buffer.byteLength(key) +
+        1024;
+      if (
+        nativeReceiptEpoch === constructionEpoch &&
+        receiptState() === state &&
+        entry.bytes <= 256 * 1024
+      ) {
+        nativeReceiptCache.set(key, entry);
+        nativeReceiptBytes += entry.bytes;
+        while (nativeReceiptCache.size > 32 || nativeReceiptBytes > 256 * 1024) {
+          const first = nativeReceiptCache.keys().next().value!;
+          nativeReceiptBytes -= nativeReceiptCache.get(first)!.bytes;
+          nativeReceiptCache.delete(first);
+        }
+      }
+      return decodeNativeReceipt(entry);
     }
     for (const name of [
       'profileId',
@@ -500,15 +737,134 @@ export function collectionWorkflowReviewScope(input: {
     });
     return { ...header, scope: scopeHeader } as IdentityPolicyReceipt;
   };
-  const receipts = selectedSequence(function* () {
+  function* receiptRecords(): Generator<IntakeEnvelopeRecord> {
+    const state = currentReceiptState(),
+      epoch = nativeReceiptEpoch;
+    if (state !== undefined && receiptLocators) {
+      receiptWork('identityPolicyReceiptNamespaceHits');
+      for (const record of receiptLocators) {
+        receiptProofGuard(state, epoch);
+        // Authenticate each opaque address even when enumeration was retained.
+        view.address(record);
+        yield record;
+      }
+      receiptProofGuard(state, epoch);
+      return;
+    }
+    receiptWork('identityPolicyReceiptNamespaceReads');
+    let complete: IntakeEnvelopeRecord[] | undefined = state === undefined ? undefined : [];
+    let bytes = 128;
     for (const record of children(workflow, 'identityConfirmations')) {
+      if (complete) {
+        bytes += Buffer.byteLength(view.address(record)) + 128;
+        if (complete.length === 32 || bytes > 256 * 1024) complete = undefined;
+        else complete.push(record);
+      }
+      yield record;
+    }
+    if (
+      state !== undefined &&
+      complete &&
+      nativeReceiptEpoch === epoch &&
+      receiptState() === state
+    ) {
+      // Admit only the entire namespace, never a prefix of a large history.
+      receiptLocators = Object.freeze(complete);
+      receiptLocatorBytes = bytes;
+      while (membershipCacheBytes + receiptLocatorBytes > 256 * 1024 && membershipCache.size) {
+        const oldest = membershipCache.keys().next().value!;
+        membershipCacheBytes -= membershipCache.get(oldest)!.bytes;
+        membershipCache.delete(oldest);
+      }
+    }
+  }
+  const receipts = selectedSequence(function* () {
+    for (const record of receiptRecords()) {
       const receipt = policyReceipt(record);
       if (input.activeReceipt(receipt)) yield receipt;
     }
   });
+  const resolveMembership = (group: WorkflowReviewGroup): SelectedIdentityMembership => {
+    // Preserve first retained duplicate and the original fallback predicate.
+    if (groupRecord(group.id)) return membershipFor(selectedVersion(group));
+    let current:
+      { candidate: IntakeEnvelopeRecord; version: IntakeEnvelopeRecord; id: string } | undefined;
+    for (const fallback of fallbackVersions(group.id)) current = fallback;
+    if (!current) throw Error('Missing fallback clinical membership');
+    const selected = current;
+    const result = {
+      retains(prior) {
+        return selectedSequence(prior).every(
+          (member) =>
+            member.candidateId === value(selected.candidate, 'id') &&
+            member.candidateVersionId === value(selected.version, 'id') &&
+            !member.section &&
+            selectedSequence(member.occurrences).every((wanted) => {
+              for (const occurrence of children(selected.version, 'occurrences'))
+                if (canonicalLiteral(read(occurrence)) === canonicalLiteral(wanted)) return true;
+              return false;
+            }),
+        );
+      },
+    } satisfies SelectedIdentityMembership;
+    membershipBytes.set(
+      result,
+      Buffer.byteLength(view.address(selected.candidate)) +
+        Buffer.byteLength(view.address(selected.version)) +
+        Buffer.byteLength(selected.id) +
+        1024,
+    );
+    return result;
+  };
+  const selectedMembership = (group: WorkflowReviewGroup): SelectedIdentityMembership => {
+    const state = currentReceiptState(),
+      epoch = nativeReceiptEpoch;
+    // A bounded id selects the same first retained group; remaining header fields
+    // have never participated in this membership resolution predicate.
+    const key = group.id,
+      keyBytes = Buffer.byteLength(key);
+    const cached = state === undefined ? undefined : membershipCache.get(key);
+    if (cached) {
+      receiptProofGuard(state!, epoch);
+      membershipCache.delete(key);
+      membershipCache.set(key, cached);
+      receiptWork('identityPolicyMembershipResolutionHits');
+      return cached.provider;
+    }
+    receiptWork('identityPolicyMembershipResolutions');
+    const source = resolveMembership(group);
+    if (state === undefined) return source;
+    const provider = Object.freeze({
+      retains(prior: Parameters<typeof source.retains>[0]) {
+        receiptProofGuard(state, epoch);
+        const result = source.retains(prior);
+        receiptProofGuard(state, epoch);
+        return result;
+      },
+    });
+    const bytes = (membershipBytes.get(source) || 1024) + keyBytes;
+    if (
+      nativeReceiptEpoch === epoch &&
+      receiptState() === state &&
+      bytes + receiptLocatorBytes <= 256 * 1024
+    ) {
+      membershipCache.set(key, { provider, bytes });
+      membershipCacheBytes += bytes;
+      while (membershipCache.size > 32 || membershipCacheBytes + receiptLocatorBytes > 256 * 1024) {
+        const oldest = membershipCache.keys().next().value!;
+        membershipCacheBytes -= membershipCache.get(oldest)!.bytes;
+        membershipCache.delete(oldest);
+      }
+    }
+    return provider;
+  };
   let questionInlineBytes = metadataBytes;
-  const scope: WorkflowReviewScope = {
-    close: input.close,
+  const scope: SelectedWorkflowReviewScope = {
+    close() {
+      receiptScopeClosed = true;
+      clearNativeReceipts();
+      input.close?.();
+    },
     issueSink: input.issueSink,
     bindIdentityWarnings: input.bindIdentityWarnings,
     versionId(proposalId, entry) {
@@ -698,29 +1054,7 @@ export function collectionWorkflowReviewScope(input: {
       for (const fallback of fallbackVersions(group.id)) latest = fallback.id;
       return latest;
     },
-    membership(group) {
-      if (groupRecord(group.id)) return membershipFor(selectedVersion(group));
-      let current:
-        { candidate: IntakeEnvelopeRecord; version: IntakeEnvelopeRecord; id: string } | undefined;
-      for (const fallback of fallbackVersions(group.id)) current = fallback;
-      if (!current) throw Error('Missing fallback clinical membership');
-      const selected = current;
-      return {
-        retains(prior) {
-          return selectedSequence(prior).every(
-            (member) =>
-              member.candidateId === value(selected.candidate, 'id') &&
-              member.candidateVersionId === value(selected.version, 'id') &&
-              !member.section &&
-              selectedSequence(member.occurrences).every((wanted) => {
-                for (const occurrence of children(selected.version, 'occurrences'))
-                  if (canonicalLiteral(read(occurrence)) === canonicalLiteral(wanted)) return true;
-                return false;
-              }),
-          );
-        },
-      };
-    },
+    membership: selectedMembership,
     originalFingerprint: input.originalFingerprint,
     receipts,
     packageEvidence: input.packageEvidence,

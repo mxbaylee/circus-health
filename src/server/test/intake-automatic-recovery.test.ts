@@ -115,6 +115,7 @@ function fixture(
   >[0];
   const calls: Callbacks[] = [];
   const units: string[] = [];
+  let contexts = 0;
   const assistant = createAssistant({
     root,
     databases: new Map([[profileId, db]]),
@@ -122,8 +123,7 @@ function fixture(
     availability: () => ({ available: true, readiness: 'ready' }),
     connectionCheck: async () => ({ available: true, readiness: 'ready' }),
     bridgeFactory(callbacks) {
-      calls.push(callbacks);
-      const n = calls.length;
+      const n = ++contexts;
       return {
         async start() {
           return { model: 'fictional', backend: 'synthetic' };
@@ -141,16 +141,19 @@ function fixture(
             (u) => !u.processingException,
           )!;
           units.push(unit.id);
-          callbacks.onEvent?.('model/requestStarted', {
+          await callbacks.onEvent?.('model/requestStarted', {
             requestId: 'fictional-request-' + n,
             model: 'fictional',
             attempt: n,
             requestBytes: 1,
             requestDigest: 'b'.repeat(64),
           });
+          // Expose only an admitted request, not a bridge whose native startup
+          // is still awaiting its selected checkpoint and source preparation.
+          calls.push(callbacks);
           if (mode === 'pdf' || mode === 'zip') return;
           if (mode === 'initial') {
-            callbacks.onEvent?.('model/requestFinished', {
+            await callbacks.onEvent?.('model/requestFinished', {
               requestId: 'fictional-request-' + n,
               outcome: 'rejected',
               classification: 'context_limit',
@@ -163,7 +166,7 @@ function fixture(
           }
           if (mode === 'unknown') {
             if (n === 1) {
-              callbacks.onEvent?.('model/requestFinished', {
+              await callbacks.onEvent?.('model/requestFinished', {
                 requestId: 'fictional-request-1',
                 outcome: 'unknown',
                 failed: true,
@@ -173,7 +176,7 @@ function fixture(
             return;
           }
           now += 101;
-          callbacks.onEvent?.('model/requestFinished', {
+          await callbacks.onEvent?.('model/requestFinished', {
             requestId: 'fictional-request-' + n,
             outcome: 'response',
             failed: false,
@@ -183,7 +186,7 @@ function fixture(
             callbacks.onExit?.(
               new ModelContextLimitError('Fictional bounded slice ended', 'slice'),
             );
-          else callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+          else await callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
         },
         async cancel() {},
         close() {},
@@ -417,7 +420,7 @@ test('unknown replacement retains its predecessor, and superseded tools cannot p
     1,
     'the current replacement can publish this exact valid mutation',
   );
-  f.calls[0].onEvent?.('model/requestFinished', {
+  await f.calls[0].onEvent?.('model/requestFinished', {
     requestId: 'fictional-request-1',
     outcome: 'response',
     failed: false,
@@ -691,14 +694,22 @@ test('an automatic ZIP media member permits follow-up reads of its verified reta
   });
   const current = getIntakeRead(f.db, f.root, f.profileId, f.source.id);
   const unit = selectedFixturePlan(f.db, f.root, f.profileId, current.id).units[0];
-  const { retainIntakeChildren } = await import('../intake.ts');
-  const [child] = retainIntakeChildren(f.db, f.root, f.profileId, current.id, [
-    { filename: unit.filename!, locator: unit.locator, bytes: pdf() },
-  ]);
-  publishIntakeSourceText(f.db, f.root, f.profileId, child!.id, {
+  const { readIntakePackageMember } = await import('../intake-package.ts');
+  const retained = await readIntakePackageMember({
+    db: f.db,
+    root: f.root,
+    profileId: f.profileId,
+    id: current.id,
+    memberId: unit.memberId!,
+    page: 1,
+  });
+  assert.ok('metadata' in retained && retained.metadata?.sourceFileId);
+  const childId = retained.metadata.sourceFileId;
+  publishIntakeSourceText(f.db, f.root, f.profileId, childId, {
     operationId: randomUUID(),
-    sourceHash: getIntakeRead(f.db, f.root, f.profileId, child!.id).sha256,
-    expectedRevisionId: null,
+    sourceHash: getIntakeRead(f.db, f.root, f.profileId, childId).sha256,
+    expectedRevisionId:
+      getIntakeSourceText(f.db, f.root, f.profileId, childId).revision?.id ?? null,
     evidence: {
       adapter: { name: 'fictional-capture', version: '1' },
       pages: [1, 2, 3].map((page) => ({
@@ -716,7 +727,7 @@ test('an automatic ZIP media member permits follow-up reads of its verified reta
     arguments: { id: current.id, action: 'read_member', memberId: unit.memberId, page: 1 },
     callId: 'package-media',
   })) as { metadata: { sourceFileId: string } };
-  assert.ok(media.metadata.sourceFileId);
+  assert.equal(media.metadata.sourceFileId, childId);
   const text = (await f.calls[0].onTool!({
     tool: 'health_intake_source_text',
     arguments: { id: media.metadata.sourceFileId, page: 1 },
@@ -775,7 +786,7 @@ test('a model-correctable wrong-unit call retries automatically in a fresh scope
     f.tick();
     return f.calls.length === 2;
   });
-  f.calls[1].onEvent?.('model/requestFinished', {
+  await f.calls[1].onEvent?.('model/requestFinished', {
     requestId: 'fictional-request-2',
     outcome: 'response',
     failed: false,

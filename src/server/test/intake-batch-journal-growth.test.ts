@@ -394,21 +394,25 @@ test('actual manager request checkpoints touch one small subtree across growing 
         operationId: `fictional-checkpoints-${itemCount}`,
         intakeIds: originals.map(({ source }) => source.id),
       });
-      const guard = await Promise.race([
-        ready.promise,
-        new Promise<never>((_, reject) => {
-          const timer = setTimeout(
-            () =>
-              reject(
-                Error(
-                  `Guard not published: ${JSON.stringify({ savedReasons, current: { ...manager.get(profileId, created.id), items: manager.get(profileId, created.id).items.map(({ exceptions: _exceptions, ...item }) => item) } })}`,
-                ),
-              ),
-            3000,
+      // The measured invariant begins at dispatch. Native plan preparation is
+      // real host work; the test's hang guard bounds admission, not a 3 s target.
+      const guard = await new Promise<NonNullable<Guard>>((resolve, reject) => {
+        const aborted = () =>
+          reject(
+            Error(
+              `Guard not published: ${JSON.stringify({ savedReasons, current: { ...manager.get(profileId, created.id), items: manager.get(profileId, created.id).items.map(({ exceptions: _exceptions, ...item }) => item) } })}`,
+            ),
           );
-          ready.promise.finally(() => clearTimeout(timer));
-        }),
-      ]);
+        if (t.signal.aborted) {
+          aborted();
+          return;
+        }
+        t.signal.addEventListener('abort', aborted, { once: true });
+        ready.promise.then((value) => {
+          t.signal.removeEventListener('abort', aborted);
+          resolve(value);
+        }, reject);
+      });
       const id = created.id;
       const journal = retainedJournal(root, profileId, id);
       const initial = journal.inspect();

@@ -1168,7 +1168,8 @@ interface AssistantOptions {
   monotonicNow?: () => number;
   timeZone?: () => string;
   actionExtensions?: AssistantActionExtensions;
-  /** Narrow synchronous race seam used only by fictional revalidation tests. */
+  /** Narrow race seam used only by fictional revalidation tests. Native
+   * command preparation may yield; all admission proofs are rechecked afterward. */
   beforeBatchRevalidationRetry?: (context: {
     db: Database;
     profileId: string;
@@ -1182,7 +1183,7 @@ interface AssistantOptions {
       summary: string;
       runId: string;
     }>;
-  }) => void;
+  }) => void | Promise<void>;
 }
 
 interface AssistantService {
@@ -3087,12 +3088,13 @@ export function createAssistant({
             });
             if (!proof) throw error;
             assertRunning();
-            beforeBatchRevalidationRetry?.({
-              db,
-              profileId,
-              intakeId,
-              batchInput: structuredClone(batchInput),
-            });
+            if (beforeBatchRevalidationRetry)
+              await beforeBatchRevalidationRetry({
+                db,
+                profileId,
+                intakeId,
+                batchInput: structuredClone(batchInput),
+              });
             if (!matches() || state.nativeBatchRevalidationBasis !== basis) throw error;
             assertNativeAcceptanceOnlyTransition(proof);
             assertNativeAssistantCoverage(
@@ -3183,12 +3185,13 @@ export function createAssistant({
             )
               throw error;
             assertRunning();
-            beforeBatchRevalidationRetry?.({
-              db,
-              profileId,
-              intakeId,
-              batchInput: structuredClone(batchInput),
-            });
+            if (beforeBatchRevalidationRetry)
+              await beforeBatchRevalidationRetry({
+                db,
+                profileId,
+                intakeId,
+                batchInput: structuredClone(batchInput),
+              });
             // A published head can survive SQL rollback. Preserve the public CAS
             // refusal before attempting to hydrate a now-stale intake projection.
             const retryDurability = personalDurabilityStatus(db);

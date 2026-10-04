@@ -384,6 +384,7 @@ export function prepareCollectionClinicalReview(
         catalog,
         metadataBytes,
         readCacheState,
+        identityReceiptWork: (metric) => withIntakeWork(db, 'warm', () => recordIntakeWork(metric)),
         packageEvidence,
         activeReceipt: (receipt) =>
           !db
@@ -944,7 +945,7 @@ export async function readPreparedCollectionClinicalReview(
           ? session.fragment(input.reference, input.offset, input.bytes)
           : session.selectedRecord(input.recordId, input.candidateVersionId, input.bytes);
     // Detach only emitted bounded transport; no caller gets the private session or record aliases.
-    const value = JSON.parse(canonicalLiteral(output), (_key, value, context) =>
+    const value = JSON.parse(JSON.stringify(output), (_key, value, context) =>
       typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
         ? JSON.rawJSON(context.source)
         : value,

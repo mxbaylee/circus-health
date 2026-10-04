@@ -32,9 +32,9 @@ const presentationHash = (record: object) => {
 };
 
 // The immutable fixture backend retains and verifies the real accepted journal;
-// encrypted backup is independently exercised by native identity route fixtures.
+// encrypted backup is independently exercised by provider qualification.
 test(
-  'actual native partial retained approval rejects a same-count off-page resolution edit',
+  'actual native partial retained approval rejects an off-page edit, accepts its fresh review and replays',
   { timeout: 120000 },
   async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'fictional-selection-authority-')),
@@ -203,6 +203,48 @@ test(
     assert.equal(receipt.items[0].status, 'needs_review');
     assert.equal(receipt.items[0].reasonCode, 'SELECTION_REVIEW_CHANGED');
     assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 0);
+    assert.equal(intakeWorkCounters(db).warm.envelopeHydrations, before);
+
+    // Publishing the partial operation manifest advances transport revisions,
+    // but cannot invalidate an unchanged exact selection's retained approval.
+    const freshBody = {
+      ...body,
+      operationId: randomUUID(),
+      blocks: [
+        {
+          ...body.blocks[0]!,
+          intakeVersion: fresh.review.version,
+          reviewToken: fresh.review.reviewToken,
+          selections: [
+            {
+              ...body.blocks[0]!.selections[0]!,
+              selectionReviewToken: fresh.record.selectionReviewToken!,
+            },
+          ],
+        },
+      ],
+    };
+    const postFresh = () =>
+      fetch(
+        `http://127.0.0.1:${address.port}/api/profiles/${profileId}/intakes/report-acceptance`,
+        {
+          method: 'POST',
+          headers: { origin: 'http://127.0.0.1:5173', 'content-type': 'application/json' },
+          body: JSON.stringify(freshBody),
+        },
+      );
+    const acceptedResponse = await postFresh(),
+      accepted = await acceptedResponse.json();
+    assert.equal(acceptedResponse.status, 200, JSON.stringify(accepted));
+    assert.equal(accepted.data.receipt.acceptedCount, 1, JSON.stringify(accepted));
+    assert.equal(accepted.data.receipt.items[0].status, 'saved');
+    assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 1);
+    const replayResponse = await postFresh(),
+      replay = await replayResponse.json();
+    assert.equal(replayResponse.status, 200, JSON.stringify(replay));
+    assert.equal(replay.data.replayed, true);
+    assert.deepEqual(replay.data.receipt, accepted.data.receipt);
+    assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 1);
     assert.equal(intakeWorkCounters(db).warm.envelopeHydrations, before);
   },
 );
