@@ -540,8 +540,8 @@ authority proof and checks the current owner and caller cancellation guard befor
 resuming. A changed proof refuses the attempt; closing or aborting the generator
 releases its private policy scratch.
 
-Reader and source-attention caches can be populated by another read during those
-gaps. Their fixed synchronous TEMP statements receive neutral credits only after
+Derived reader and source-attention caches use fixed synchronous TEMP statements.
+Those statements receive neutral credits only after
 canonical table/index validation and restrictive SQLite authorization establish
 that they changed their owned disposable objects. Callbacks, dependency reads,
 awaits, failed or partial statements and transaction-bound writes receive no
@@ -565,6 +565,14 @@ refused. Detached children finish cleanup before the next operation enters.
 If cancellation rejects a newly prepared session, queue lease or plan before
 handoff, its producer disposes that result before admitting the next operation.
 Uncoordinated writes, including rolled-back writes, still invalidate held proofs.
+
+Source-attention list preparation joins this operation slot, including its dirty
+count reconciliation. A concurrent attention GET waits for native conversion
+instead of changing its raw SQL witness between checkpoints. Trusted nested
+attention reads retain their active owner, and inherited cancellation or database
+closure prevents later reconciliation work. This leaves attention results and
+maintenance credits unchanged; the conversion proof still refuses uncoordinated
+SQL, including changes followed by rollback.
 
 Native conversion and staged-upload publication use the same operation slot.
 Readiness is checked after admission, so two callers converting the same source

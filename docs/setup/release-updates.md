@@ -86,7 +86,9 @@ These describe current contracts, not proof that a selected pair of releases pas
 
 The candidate also coordinates upload publication, native conversion and short
 background-extraction database phases through the existing operation queue; see
-[import processing](../import/processing.md). Restart into the candidate and
+[import processing](../import/processing.md). Source-attention list preparation
+also joins that queue, so its disposable count updates wait for active conversion
+instead of invalidating its original proof. Restart into the candidate and
 reload open import pages. Network reception and extraction workers stay outside
 the queue; a large participating operation may delay another database operation.
 Exact historical batch-exception replay remains supported, and new native

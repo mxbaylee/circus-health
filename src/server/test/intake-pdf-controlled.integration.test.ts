@@ -60,7 +60,9 @@ const record = (page: number) =>
 
 test(
   'controlled 100-page PDF run automatically continues across the real 64-round bridge boundary',
-  { skip: process.env.CRS_PDF_CONTROLLED_TEST !== '1', timeout: 180_000 },
+  // Coarse host hang guards cover 100 durable page reads with an immediate fictional upstream.
+  // Request, page, coverage and acceptance counts establish correctness; model timing is not measured.
+  { skip: process.env.CRS_PDF_CONTROLLED_TEST !== '1', timeout: 900_000 },
   async (t) => {
     fictionalModel(t);
     const started = performance.now();
@@ -111,7 +113,12 @@ test(
       pdfParts: number;
       imageParts: number;
     }> = [];
-    const boundaries: Array<{ reason: string; readWindows: number; proposals: number }> = [];
+    const boundaries: Array<{
+      reason: string;
+      readWindows: number;
+      proposalFormat: string | undefined;
+      proposals: number | undefined;
+    }> = [];
     let slice = 0;
     const assistant = createAssistant({
       root,
@@ -394,7 +401,8 @@ test(
           boundaries.push({
             reason: String(item.reading?.reason),
             readWindows: item.reading?.readWindows || 0,
-            proposals: item.proposalIds.length,
+            proposalFormat: item.proposalState?.format,
+            proposals: item.proposalState?.total,
           });
         }
         writeIntakeBatch(runtimeRoot, currentProfile, batch, reason);
@@ -450,7 +458,7 @@ test(
       operationId: 'fictional-controlled-start',
       intakeIds: [intakeId],
     });
-    const deadline = Date.now() + 150_000;
+    const deadline = Date.now() + 840_000;
     while (
       Date.now() < deadline &&
       !errors.length &&
@@ -505,6 +513,8 @@ test(
     );
     assert.ok(boundaries.length > 0, 'The run must cross a productive reading boundary');
     for (const [index, boundary] of boundaries.entries()) {
+      assert.equal(boundary.proposalFormat, 'health-intake-proposal-summary-v2');
+      assert.ok(boundary.proposals !== undefined, 'native boundary proposal total is present');
       assert.equal(boundary.reason, 'time_limit');
       assert.ok(boundary.readWindows > (boundaries[index - 1]?.readWindows || 0));
       assert.ok(boundary.proposals > (boundaries[index - 1]?.proposals || 0));

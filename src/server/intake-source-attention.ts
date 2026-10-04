@@ -1,6 +1,11 @@
 /** Disposable changed-source attention counts; originals and revision metadata remain authority. */
 import { setImmediate } from 'node:timers/promises';
 import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
+import {
   execClinicalReviewMaintenance,
   prepareClinicalReviewMaintenance,
 } from './clinical-review-maintenance.ts';
@@ -60,7 +65,25 @@ export async function readPreparedSourceAttention(
   offset: number,
   sectionsFor: (file: { id: string; sha256: string }) => number,
 ): Promise<SourceAttentionQueue> {
+  return runExclusiveClinicalOperation(
+    db,
+    async (operation) =>
+      readPreparedSourceAttentionOwned(db, profileId, offset, sectionsFor, () =>
+        assertClinicalOperation(db, operation),
+      ),
+    { operation: currentClinicalOperation(db) },
+  );
+}
+
+async function readPreparedSourceAttentionOwned(
+  db: Database,
+  profileId: string,
+  offset: number,
+  sectionsFor: (file: { id: string; sha256: string }) => number,
+  assertRunning: () => void,
+): Promise<SourceAttentionQueue> {
   const owner = () => {
+    assertRunning();
     if (
       db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==
       profileId
