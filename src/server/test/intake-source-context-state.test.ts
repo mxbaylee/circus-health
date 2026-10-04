@@ -1,7 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import { randomUUID, createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase, transaction } from '../database.ts';
@@ -355,6 +355,96 @@ test('addressed selector mode change reclassifies untouched IDs and atomically p
     assert.equal(current.isSourceContextVersion(f.versionIds[1]!), false);
   }
 });
+
+for (const scenario of ['rematerialized', 'damaged', 'publication-race'] as const)
+  test(`addressed draft classification verifies ${scenario} physical evidence without rereading other sources`, async (t) => {
+    const f = await fixture(t, 8);
+    await prepareSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id);
+    const path = join(f.root, f.paths.relativeRoot, 'sources', f.sourceIds[0] + '.jsonl');
+    const replace = (bytes: Buffer) => {
+      writeFileSync(path + '.replacement', bytes);
+      renameSync(path + '.replacement', path);
+    };
+    replace(scenario === 'damaged' ? Buffer.alloc(f.bytes[0]!.length, 32) : f.bytes[0]!);
+    const otherPath = join(f.root, f.paths.relativeRoot, 'sources', f.sourceIds[2] + '.jsonl');
+    writeFileSync(otherPath + '.replacement', f.bytes[2]!);
+    renameSync(otherPath + '.replacement', otherPath);
+    const view = openIntakeCollectionEnvelope(f.db, f.file),
+      intake = view.child(view.root(), 'intake')!,
+      flow = view.child(intake, 'workflow')!,
+      candidate = view.find('candidate', flow, 'candidate-0')!,
+      version = view.find('version', candidate, f.versionIds[0]!)!,
+      operationId = randomUUID(),
+      work = createIntakeFileWorkCounters();
+    let derived: PreparedSourceContextDerived | undefined;
+    const result = await withIntakeFileWork(work, () =>
+      prepareIntakeEnvelopeMutation(f.db, f.file, {
+        reader: view,
+        operationId,
+        requestDigest: workflowHash(operationId),
+        domainVersion: view.logical.domainVersion + 1,
+        changes: [{ op: 'set', record: version, field: 'status', jsonText: '"pending"' }],
+        prepareDerived: async (input) => {
+          derived = await prepareSourceContextClassificationDerived(
+            f.db,
+            f.root,
+            f.profileId,
+            f.id,
+            {
+              ...input,
+              impact: 'proposal',
+              affected: {
+                candidateChanges: [
+                  {
+                    candidateId: 'candidate-0',
+                    candidateVersionId: f.versionIds[0]!,
+                    candidateAddress: view.address(candidate),
+                    versionAddress: view.address(version),
+                    kind: 'update',
+                  },
+                ],
+                questionAddresses: [],
+                reportGroupAddresses: [],
+                proposalIds: [],
+              },
+            },
+          );
+          return derived.state === 'ready' ? derived.changes : [];
+        },
+      }),
+    );
+    assert.equal(work.reads, 1, 'Only the addressed rematerialized source is read');
+    assert.equal(work.readBytes, f.bytes[0]!.length);
+    assert.equal(work.bufferHashCalls, 1);
+    assert.equal(work.bufferHashBytes, f.bytes[0]!.length);
+    assert.equal(work.candidateVersionHashCalls, 0);
+    if (scenario === 'damaged') {
+      assert.deepEqual(derived, { state: 'pending', reason: 'source_evidence_unavailable' });
+      assert.equal(intakeSourceVersion(f.db, f.id).version, view.logical.domainVersion);
+      return;
+    }
+    assert.ok(derived?.state === 'ready');
+    const selected = derived;
+    assert.equal(selected.isSourceContextVersion(f.versionIds[0]!), true);
+    if (scenario === 'publication-race') {
+      replace(f.bytes[0]!);
+      assert.throws(() => selected.assertPublicationCurrent(), SourceContextClassificationPending);
+      assert.equal(intakeSourceVersion(f.db, f.id).version, view.logical.domainVersion);
+      return;
+    }
+    transaction(f.db, () => {
+      selected.assertPublicationCurrent();
+      selectedEnvelopeStore(f.db, f.file).collections.stage(result.prepared!);
+    });
+    const current = readSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id);
+    assert.ok(current.state === 'ready');
+    assert.equal(current.isSourceContextVersion(f.versionIds[0]!), true);
+    assert.throws(
+      () => current.isSourceContextVersion(f.versionIds[2]!),
+      SourceContextClassificationPending,
+      'Unselected rematerialized evidence remains unprepared rather than being treated as absent',
+    );
+  });
 
 test('closed metadata retag performs no original work and rejects misclassified candidate changes', async (t) => {
   const f = await fixture(t, 2);

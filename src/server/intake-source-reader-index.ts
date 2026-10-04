@@ -78,6 +78,10 @@ const watched = (row: string) =>
   ]
     .map((pattern) => `${row}.key GLOB '${pattern}'`)
     .join(' OR ');
+// An outer UPSERT can override a trigger's OR IGNORE policy. Avoid the
+// duplicate insertion itself so OLD/NEW and repeated writes safely coalesce.
+const markDirty = (key: string) =>
+  `INSERT INTO ${P}dirty(key) SELECT ${key} WHERE NOT EXISTS(SELECT 1 FROM ${P}dirty WHERE key=${key});`;
 function checked(db: Database) {
   const state = stores.get(db);
   if (
@@ -124,10 +128,10 @@ function ensure(db: Database) {
         ? `(${watched('OLD')} OR ${watched('NEW')}) AND (OLD.key IS NOT NEW.key OR OLD.value IS NOT NEW.value)`
         : `(${watched(row)})`;
     db.exec(
-      `CREATE TEMP TRIGGER ${P}meta_${event} AFTER ${event.toUpperCase()} ON main.app_meta WHEN ${metaChanged} BEGIN INSERT OR IGNORE INTO ${P}dirty VALUES('meta:' || ${row}.key); ${event === 'update' ? `INSERT OR IGNORE INTO ${P}dirty VALUES('meta:' || OLD.key);` : ''} UPDATE ${P}control SET generation=generation+1; END`,
+      `CREATE TEMP TRIGGER ${P}meta_${event} AFTER ${event.toUpperCase()} ON main.app_meta WHEN ${metaChanged} BEGIN ${markDirty(`'meta:' || ${row}.key`)} ${event === 'update' ? markDirty("'meta:' || OLD.key") : ''} UPDATE ${P}control SET generation=generation+1; END`,
     );
     db.exec(
-      `CREATE TEMP TRIGGER ${P}source_${event} AFTER ${event.toUpperCase()} ON main.source_files ${event === 'update' ? 'WHEN OLD.id IS NOT NEW.id OR OLD.sha256 IS NOT NEW.sha256 OR OLD.details_json IS NOT NEW.details_json OR OLD.kind IS NOT NEW.kind' : ''} BEGIN INSERT OR IGNORE INTO ${P}dirty VALUES('source:' || ${row}.id); ${event === 'update' ? `INSERT OR IGNORE INTO ${P}dirty VALUES('source:' || OLD.id);` : ''} UPDATE ${P}control SET generation=generation+1; END`,
+      `CREATE TEMP TRIGGER ${P}source_${event} AFTER ${event.toUpperCase()} ON main.source_files ${event === 'update' ? 'WHEN OLD.id IS NOT NEW.id OR OLD.sha256 IS NOT NEW.sha256 OR OLD.details_json IS NOT NEW.details_json OR OLD.kind IS NOT NEW.kind' : ''} BEGIN ${markDirty(`'source:' || ${row}.id`)} ${event === 'update' ? markDirty("'source:' || OLD.id") : ''} UPDATE ${P}control SET generation=generation+1; END`,
     );
   }
   const state = {

@@ -352,7 +352,7 @@ test(
     await capture('batch-reading-partial-review');
 
     await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
-    await page.getByRole('heading', { name: 'Import', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
     const stoppedResponse = page.waitForResponse(
       (response) => response.url().endsWith('/stop') && response.ok(),
     );
@@ -360,7 +360,14 @@ test(
     const stopped = (await (await stoppedResponse).json()).data;
     assert.equal(stopped.status, 'stopped');
     assert.equal(stopped.items[0].status, 'review_ready');
-    assert.equal(stopped.items[0].proposalIds.length, 1);
+    assert.equal(stopped.items[0].proposalState.format, 'health-intake-proposal-summary-v2');
+    assert.equal(stopped.items[0].proposalState.total, 1);
+    const stoppedFirstReview = await fixtureReview(
+      get,
+      `${prefix}/intakes/${encodeURIComponent(first.id)}/review?proposalId=${encodeURIComponent(firstBlock.proposalId)}`,
+    );
+    assert.equal(stoppedFirstReview.proposalId, firstBlock.proposalId);
+    assert.equal(stoppedFirstReview.records.length, 1, 'Stop retains the exact first proposal');
     assert.equal(stopped.items[1].status, 'paused');
     assert.equal(
       (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).collections.importHistory

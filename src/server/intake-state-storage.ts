@@ -1,3 +1,4 @@
+import { clearNativeIdentityPreviews } from './intake-identity-preview-cache.ts';
 import { clearPreparedClinicalReviewRead } from './intake-clinical-review-read-cache.ts';
 import { clearCollectionQueueReviews } from './intake-report-group-collection.ts';
 import { clearReviewIssueScratch } from './intake-review-issue-scratch.ts';
@@ -110,6 +111,7 @@ function remember(cache: Cache, target: Map<string, CachedBasis>, key: string, v
   }
 }
 export function clearIntakeStateCache(db: Database): void {
+  clearNativeIdentityPreviews(db);
   clearPreparedClinicalReviewRead(db);
   clearCollectionQueueReviews(db);
   clearReviewIssueScratch(db);

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { observeDatabaseClose } from './database.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 import type { CollectionClinicalReviewSession } from './intake-review-collection-session.ts';
@@ -12,7 +13,7 @@ const reviewReadStates = new WeakMap<
   }
 >();
 export function reviewReadStamp(db: DatabaseSync): string | undefined {
-  if (db.isTransaction) return undefined;
+  if (!db.isOpen || db.isTransaction) return undefined;
   const registry = intakeCollectionCacheGeneration(db);
   let state = reviewReadStates.get(db);
   if (!state || state.registry !== registry) {
@@ -28,6 +29,7 @@ export function reviewReadStamp(db: DatabaseSync): string | undefined {
       read,
       readTempSchema: state?.readTempSchema || db.prepare('PRAGMA temp.schema_version'),
     };
+    if (!reviewReadStates.has(db)) observeDatabaseClose(db, () => reviewReadStates.delete(db));
     reviewReadStates.set(db, state);
   }
   const row = state.read.get()!;

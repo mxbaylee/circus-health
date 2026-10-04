@@ -30,6 +30,8 @@ Source-context classification keeps positive and negative results within the ope
 
 A reusable result binds the source ID, kind, path, original hash, byte count, resolved file identity and effective proposal source-text dependency/revision. Every hit checks physical metadata. Changed or replaced files and changed revision bindings require verification again; missing or corrupt evidence does not inherit an earlier classification. An explicitly unsuccessful transaction, failed activation, lock or close clears the relevant state. The DTO's best-effort classification fallback remains separate from review and acceptance verification, which still refuses changed evidence.
 
+An addressed native draft may encounter identical retained bytes rematerialized at a new inode after encrypted cache recovery. Preparation rereads and hashes only the affected source against its unchanged source-row binding, checks its physical identity before and after the read, and then rebinds its existing classification to that verified identity. Damaged bytes remain pending. Publication still rejects a replacement after preparation, and unselected rematerialized sources remain unprepared until their own verification.
+
 The dedicated fictional regression uses 160 mixed positive/negative proposals: the initial scan reads and hashes all 160 files, an unchanged repeated scan reads and hashes none, and adding one source reads and hashes one. Complete-view iteration and physical metadata checks remain. Candidate-version hash inputs have separate counters taken at the actual hashing boundary; these newly instrumented counts are not retroactively present in earlier receipts.
 
 ## Accounting and qualification limits

@@ -2,6 +2,8 @@
 
 Discovery allocation, acceptance replay and ownership name review read the selected intake authority. A disposable SQL cache records source insertion order and binding information; it does not authorize a native receipt or certify that a native contribution is absent.
 
+Connection-local source triggers coalesce dirty IDs with an explicit absence check, so source UPSERTs cannot override their duplicate handling. Updates invalidate both old and new IDs; rollback restores the source rows and derived lookup state together.
+
 For native `health-intake-collections-v4` envelopes, reconciliation stores the checked logical root/domain version and removes any former compatibility payload rows once. It does not reconstruct the workflow, recount its collections or copy receipt text. Auxiliary build/progress/receipt changes leave that logical binding unchanged and write no lookup contributions.
 
 Explicit cold workflow maintenance derives and atomically publishes three lookup indexes alongside the other workflow indexes: maximum discovery group, first acceptance per operation and ordered identity receipt occurrences. They share the checked logical completeness binding and `health-intake-workflow-index-v1` policy. `prepareIntakeLookupIndices` can prepare the same lookup contributions independently, under `health-intake-lookup-index-v1`, without model or review-count work. It checkpoints unselected work, yields between bounded change batches and adopts completeness only after the checked stream finishes. A changed logical root without an updated index reads unavailable. Interactive GET requests never launch a cold rebuild to hide a stale or incomplete index.

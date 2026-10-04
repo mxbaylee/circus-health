@@ -5,6 +5,8 @@ import {
   fixtureReportUrl,
   fixtureSourcePath,
   fixtureBrowserResponse,
+  fixtureNativeReportReady,
+  fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
@@ -170,9 +172,21 @@ test(
       const proposalId = await fixtureProposalId(api, prefix, item.id);
       const reviewPath = path + '/review?proposalId=' + encodeURIComponent(proposalId);
       const originalReview = await fixtureReview(api, reviewPath);
-      await page.goto(url + (await fixtureReportUrl(api, prefix, item.id)));
-      await page.reload();
-      await page.locator('.import-detail-record-link:not([data-saved-record-id])').first().click();
+      const reportUrl = await fixtureReportUrl(api, prefix, item.id);
+      const groupId = new URLSearchParams(reportUrl.split('?')[1]).get('group')!;
+      const recordScope = {
+        intakeId: item.id,
+        proposalId,
+        recordId: originalReview.records[0].id,
+        candidateVersionId: originalReview.records[0].candidateVersionId,
+      };
+      await page.goto(url + reportUrl);
+      await fixtureNativeReportReady(page, prefix, { intakeId: item.id, groupId }, () =>
+        page.reload(),
+      );
+      await fixtureNativeRecordReady(page, prefix, recordScope, () =>
+        page.locator('.import-detail-record-link:not([data-saved-record-id])').first().click(),
+      );
       // The native report identity remains informational when no printed subject exists.
       await page
         .getByText('Identity is not printed clearly in this report.', { exact: true })
@@ -237,7 +251,7 @@ test(
       );
       assert.deepEqual(sent.mapping, sent.decision.mapping);
       assert.equal(sent.answers && typeof sent.answers, 'object');
-      await page.reload();
+      await fixtureNativeRecordReady(page, prefix, recordScope, () => page.reload());
       const reviewActions = page.getByRole('region', { name: 'Review actions' });
       await reviewActions.getByRole('button', { name: 'Return to review', exact: true }).waitFor();
       assert.equal(
@@ -261,9 +275,23 @@ test(
       const rebuilt = await fixtureReview(api, reviewPath);
       assert.deepEqual(rebuilt.records[0].draft, stored.records[0].draft);
       assert.deepEqual(rebuilt.records[0].mapping, stored.records[0].mapping);
-      await page.reload();
+      await fixtureNativeRecordReady(page, prefix, recordScope, () => page.reload());
       await reviewActions.getByRole('button', { name: 'Return to review', exact: true }).waitFor();
+      const returningSince = Date.now();
+      const returned = fixtureBrowserResponse(
+        page,
+        (response) =>
+          new URL(response.url()).pathname === path + '/review-draft' &&
+          response.request().method() === 'POST' &&
+          response.request().timing().startTime >= returningSince &&
+          response.request().postDataJSON().recordId === recordScope.recordId &&
+          response.request().postDataJSON().candidateVersionId === recordScope.candidateVersionId &&
+          response.request().postDataJSON().disposition === 'pending',
+      );
       await reviewActions.getByRole('button', { name: 'Return to review', exact: true }).click();
+      const returnedResponse = await returned;
+      assert.equal(returnedResponse.status(), 200, await returnedResponse.text());
+      assert.equal(await returnedResponse.finished(), null);
       const accepted = fixtureBrowserResponse(page, (response) =>
         response.url().endsWith('/intakes/report-acceptance'),
       );

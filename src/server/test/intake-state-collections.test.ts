@@ -777,3 +777,38 @@ test('nested snapshots preserve immutable contents, reject ordinary reads and bi
   clearIntakeStateCache(db);
   assert.throws(() => store.getReferenced(next, 'first'), /foreign, stale or expired/);
 });
+
+test('live collection views survive unrelated reader churn and still expire at authority boundaries', (t) => {
+  const { db, identity } = fixture(t);
+  const store = createIntakeStateStorage(db, identity).collections;
+  mutate(
+    db,
+    store,
+    [{ area: 'logical', collection: 'members', op: 'put', key: 'one', value: 'first' }],
+    1,
+  );
+  const selected = store.openView();
+  // Other bounded readers can open and discard many views while an in-flight
+  // reader still owns its exact logical view. Handle creation changes no authority.
+  for (let index = 0; index < 256; index++) {
+    const other = createIntakeStateStorage(db, identity).collections;
+    assert.equal(other.get(other.openView(), 'logical', 'members', 'one'), 'first');
+  }
+  assert.equal(store.get(selected, 'logical', 'members', 'one'), 'first');
+  mutate(
+    db,
+    store,
+    [{ area: 'logical', collection: 'members', op: 'put', key: 'one', value: 'second' }],
+    2,
+  );
+  assert.throws(() => store.get(selected, 'logical', 'members', 'one'), /stale collection view/);
+  const current = store.openView();
+  assert.equal(store.get(current, 'logical', 'members', 'one'), 'second');
+  clearIntakeStateCache(db);
+  assert.throws(
+    () => store.get(current, 'logical', 'members', 'one'),
+    /foreign or expired collection view/,
+  );
+  const reopened = createIntakeStateStorage(db, identity).collections;
+  assert.equal(reopened.get(reopened.openView(), 'logical', 'members', 'one'), 'second');
+});

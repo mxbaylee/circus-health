@@ -48,6 +48,57 @@ function fixture(t: TestContext) {
   };
   return { db, body, insert, write, authority };
 }
+test('cached lookup invalidation coalesces source UPSERTs and preserves rename and rollback boundaries', (t) => {
+  const { db, body, insert } = fixture(t);
+  insert('first', 3);
+  insert('other', 100, 'derived');
+  assert.equal(maximumReportDiscoveryOrder(db), 3);
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 3 }, { marker: 100 }]);
+  const dirty = () =>
+    db
+      .prepare('SELECT source_id FROM temp.__intake_lookup_dirty ORDER BY source_id')
+      .all()
+      .map((row) => String(row.source_id));
+  const upsert = db.prepare(`
+    INSERT INTO source_files(id,path,sha256,bytes,kind,details_json)
+    SELECT id,path,sha256,bytes,kind,details_json FROM source_files WHERE id=?
+    ON CONFLICT(id) DO UPDATE SET id=?,details_json=?`);
+
+  // The lookup cache has installed its TEMP triggers before this real UPSERT.
+  // Its conflict policy must not turn repeated OLD/NEW dirty keys into errors.
+  transaction(db, () => {
+    upsert.run('other', 'other', body(200));
+    upsert.run('other', 'other', body(201));
+    assert.deepEqual(dirty(), ['other']);
+  });
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 3 }, { marker: 201 }]);
+  assert.deepEqual(dirty(), []);
+
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        upsert.run('other', 'renamed', body(300));
+        upsert.run('renamed', 'renamed', body(301));
+        assert.deepEqual(dirty(), ['other', 'renamed']);
+        assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 3 }, { marker: 301 }]);
+        assert.equal(maximumReportDiscoveryOrder(db), 3);
+        throw Error('fictional source UPSERT rollback');
+      }),
+    /fictional source UPSERT rollback/,
+  );
+  assert.deepEqual(dirty(), []);
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 3 }, { marker: 201 }]);
+  assert.equal(db.prepare('SELECT id FROM source_files WHERE id=?').get('renamed'), undefined);
+
+  transaction(db, () => {
+    db.prepare('DELETE FROM source_files WHERE id=?').run('other');
+    db.prepare(
+      'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+    ).run('other', 'other.txt', 'a'.repeat(64), 0, 'derived', body(400));
+    assert.deepEqual(dirty(), ['other']);
+  });
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 3 }, { marker: 400 }]);
+});
 test('raw writes, reordered contributions, kind and ID changes preserve scoped lookup ordering', (t) => {
   const { db, body, insert, write } = fixture(t);
   insert('first', 3);

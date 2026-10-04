@@ -4,6 +4,8 @@ import {
   fixtureReportUrl,
   fixtureSourcePath,
   fixtureBrowserResponse,
+  fixtureNativeReportReady,
+  fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
@@ -220,12 +222,21 @@ test(
         'unresolved',
         'The destination mapping does not replace explicit identity review',
       );
-      await page.goto(url + (await fixtureReportUrl(api, prefix, item.id)));
-      await page.reload();
+      const reportUrl = await fixtureReportUrl(api, prefix, item.id);
+      const groupId = new URLSearchParams(reportUrl.split('?')[1]).get('group')!;
+      const reportScope = { intakeId: item.id, groupId };
+      const recordScope = {
+        intakeId: item.id,
+        proposalId,
+        recordId: originalReview.records[0].id,
+        candidateVersionId: originalReview.records[0].candidateVersionId,
+      };
+      await page.goto(url + reportUrl);
+      await fixtureNativeReportReady(page, prefix, reportScope, () => page.reload());
       const exactLinks = page.locator('.import-detail-record-link:not([data-saved-record-id])');
       await exactLinks.first().waitFor();
       assert.equal(await exactLinks.count(), 1, 'The report keeps one exact optical record link');
-      await exactLinks.first().click();
+      await fixtureNativeRecordReady(page, prefix, recordScope, () => exactLinks.first().click());
       // The native report identity remains informational when no printed subject exists.
       await page
         .getByText('Identity is not printed clearly in this report.', { exact: true })
@@ -242,7 +253,21 @@ test(
       await page.getByRole('button', { name: 'This is me', exact: true }).click();
       const choice = page.getByRole('button', { name: 'March 8, 2017', exact: true });
       assert.equal(await choice.count(), 1, 'Related date questions share one decision');
+      const choiceSince = Date.now();
+      const choiceSaved = fixtureBrowserResponse(
+        page,
+        (response) =>
+          new URL(response.url()).pathname === path + '/review-draft' &&
+          response.request().method() === 'POST' &&
+          response.request().timing().startTime >= choiceSince &&
+          response.request().postDataJSON().recordId === recordScope.recordId &&
+          response.request().postDataJSON().candidateVersionId === recordScope.candidateVersionId &&
+          response.request().postDataJSON().mapping?.documentDate === '2017-03-08',
+      );
       await choice.click();
+      const choiceResponse = await choiceSaved;
+      assert.equal(choiceResponse.status(), 200, await choiceResponse.text());
+      assert.equal(await choiceResponse.finished(), null);
       const accepted = fixtureBrowserResponse(
         page,
         (response) => response.url().endsWith('/intakes/report-acceptance') && response.ok(),
@@ -296,13 +321,15 @@ test(
       );
       assert.deepEqual(JSON.parse(await proposal.text()), value);
       await page.goto(url + '/#/import?intake=' + encodeURIComponent(item.id));
-      await page.reload();
+      await fixtureNativeReportReady(page, prefix, reportScope, () => page.reload());
       const overviewDestination = page.getByRole('region', {
         name: 'Saved destinations for this report',
       });
       await overviewDestination.getByRole('link').waitFor();
       assert.equal(await overviewDestination.getByRole('link').count(), 1);
-      await page.locator('.import-detail-record-link:not([data-saved-record-id])').first().click();
+      await fixtureNativeRecordReady(page, prefix, recordScope, () =>
+        page.locator('.import-detail-record-link:not([data-saved-record-id])').first().click(),
+      );
       await page
         .getByText('This exact record is already saved to your profile.', { exact: true })
         .waitFor();
@@ -359,14 +386,31 @@ test(
     const queuePath = `${prefix}/intakes/${encodeURIComponent(queueItem.id)}`;
     const initialQueue = await fixtureReview(api, queuePath + '/review');
     assert.equal(initialQueue.records.length, 20);
+    const queueReportUrl = await fixtureReportUrl(api, prefix, queueItem.id);
+    const queueGroupId = new URLSearchParams(queueReportUrl.split('?')[1]).get('group')!;
     async function openQueueRecord(index: number) {
-      await page.goto(url + (await fixtureReportUrl(api, prefix, queueItem.id)));
+      await page.goto(url + queueReportUrl);
       // API seeding bypasses the uploader's queue reload; reopen as a user would.
-      await page.reload();
+      await fixtureNativeReportReady(
+        page,
+        prefix,
+        { intakeId: queueItem.id, groupId: queueGroupId },
+        () => page.reload(),
+      );
       const links = page.locator('.import-detail-record-link:not([data-saved-record-id])');
       await links.first().waitFor();
       assert.equal(await links.count(), 20, 'The report keeps all twenty exact record links');
-      await links.nth(index).click();
+      await fixtureNativeRecordReady(
+        page,
+        prefix,
+        {
+          intakeId: queueItem.id,
+          proposalId: initialQueue.proposalId,
+          recordId: initialQueue.records[index].id,
+          candidateVersionId: initialQueue.records[index].candidateVersionId,
+        },
+        () => links.nth(index).click(),
+      );
       await page.getByRole('region', { name: 'Review actions' }).waitFor();
     }
     await openQueueRecord(0);
@@ -446,7 +490,17 @@ test(
     await page.getByRole('tab', { name: 'Details', exact: true }).click();
     assert.equal(await page.getByRole('article').count(), 1, 'Details restores the exact editor');
     assert.equal(await page.getByLabel('Result', { exact: true }).inputValue(), '18.5');
-    await page.reload();
+    await fixtureNativeRecordReady(
+      page,
+      prefix,
+      {
+        intakeId: queueItem.id,
+        proposalId: initialQueue.proposalId,
+        recordId: initialQueue.records[2].id,
+        candidateVersionId: initialQueue.records[2].candidateVersionId,
+      },
+      () => page.reload(),
+    );
     assert.equal(await page.getByLabel('Result', { exact: true }).inputValue(), '18.5');
     const resumedQueue = await fixtureReview(api, queuePath + '/review');
     assert.equal(resumedQueue.records[0].reviewState, 'accepted');

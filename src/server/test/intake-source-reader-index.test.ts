@@ -36,6 +36,11 @@ import {
 } from './helpers/intake-authority-fixture.ts';
 import { fictionalModel } from './fictional-model.ts';
 import { isIntakeSummary } from '../../shared/intake-summary.ts';
+import {
+  getIntakeSourceText,
+  publishIntakeSourceText,
+  reviewIntakeSourceText,
+} from '../intake-source-text.ts';
 
 const context = JSON.stringify({
   format: 'health-record-v1',
@@ -65,6 +70,131 @@ function fixture(t: test.TestContext, durable = false) {
   });
   return { root, profileId, db };
 }
+test('reader invalidation coalesces real source review UPSERTs and preserves rename and rollback boundaries', async (t) => {
+  const { db, root, profileId } = fixture(t, true);
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-review.txt',
+    bytes: Buffer.from('Fictional source value 1.00'),
+  });
+  const initial = publishIntakeSourceText(db, root, profileId, source.id, {
+    operationId: randomUUID(),
+    sourceHash: source.sha256,
+    expectedRevisionId: null,
+    evidence: {
+      adapter: { name: 'fictional-native', version: '1' },
+      pages: [{ page: 1, disposition: 'extracted', inspected: false }],
+      spans: [
+        {
+          id: 'fictional-span',
+          text: 'Fictional source value 1.00',
+          region: { page: 1 },
+          provenance: 'native',
+        },
+      ],
+      relations: [],
+      issues: [],
+    },
+  }).revision!;
+  await buildIntakeCollectionEnvelope(db, source);
+  await prepareCollectionReaderCoverage(db, root, profileId, source.id);
+  const read = () => {
+    const { assertCurrent, ...value } = readCollectionReaderCoverage(db, profileId, source.id, {
+      offset: 0,
+      limit: 1,
+    });
+    assertCurrent();
+    return value;
+  };
+  const generation = () =>
+    Number(
+      db.prepare('SELECT generation FROM __intake_reader_control WHERE singleton=1').get()!
+        .generation,
+    );
+  const dirty = () =>
+    db
+      .prepare('SELECT key FROM __intake_reader_dirty ORDER BY key')
+      .all()
+      .map((row) => String(row.key));
+  const before = generation();
+  const corrected = reviewIntakeSourceText(
+    db,
+    root,
+    profileId,
+    source.id,
+    {
+      operationId: randomUUID(),
+      sourceHash: source.sha256,
+      expectedRevisionId: initial.id,
+      action: 'correct',
+      scope: { page: 1 },
+      spans: [{ ...initial.spans[0]!, text: 'Fictional source value 2.00' }],
+      relations: [],
+    },
+    'fictional-owner',
+  ).revision!;
+  assert.equal(corrected.parentRevisionId, initial.id);
+  assert.equal(
+    getIntakeSourceText(db, root, profileId, source.id).revision!.spans[0]!.text,
+    'Fictional source value 2.00',
+  );
+  assert.ok(
+    generation() > before,
+    'actual changed page/span/source pins invalidate the cached observations',
+  );
+  assert.throws(read, { code: 'READER_COVERAGE_PENDING' });
+  const pageKey = 'intake_source_page_hash:v1:' + source.id + ':1';
+  assert.equal(dirty().filter((key) => key === 'meta:' + pageKey).length, 1);
+  await prepareCollectionReaderCoverage(db, root, profileId, source.id);
+  const current = read(),
+    stableGeneration = generation(),
+    stableDirty = dirty();
+  const pageHash = String(db.prepare('SELECT value FROM app_meta WHERE key=?').get(pageKey)!.value);
+  transaction(db, () =>
+    db
+      .prepare(
+        'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+      )
+      .run(pageKey, pageHash),
+  );
+  assert.equal(generation(), stableGeneration, 'unchanged UPSERTs do not manufacture invalidation');
+  assert.deepEqual(read(), current);
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        const upsert = db.prepare(
+          'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+        );
+        upsert.run(pageKey, 'b'.repeat(64));
+        upsert.run(pageKey, 'c'.repeat(64));
+        assert.equal(
+          generation(),
+          stableGeneration + 2,
+          'coalescing does not suppress generations for distinct changes',
+        );
+        assert.equal(dirty().filter((key) => key === 'meta:' + pageKey).length, 1);
+        const renamedPage = pageKey + ':renamed';
+        db.prepare('UPDATE app_meta SET key=? WHERE key=?').run(renamedPage, pageKey);
+        assert.ok(dirty().includes('meta:' + pageKey));
+        assert.ok(dirty().includes('meta:' + renamedPage));
+        const sourceUpsert = db.prepare(
+          "INSERT INTO source_files SELECT * FROM source_files WHERE id=? ON CONFLICT(id) DO UPDATE SET details_json=excluded.details_json || ' '",
+        );
+        sourceUpsert.run(source.id);
+        sourceUpsert.run(source.id);
+        assert.equal(dirty().filter((key) => key === 'source:' + source.id).length, 1);
+        const renamedId = source.id + ':renamed';
+        db.prepare('UPDATE source_files SET id=? WHERE id=?').run(renamedId, source.id);
+        assert.ok(dirty().includes('source:' + source.id));
+        assert.ok(dirty().includes('source:' + renamedId));
+        assert.equal(generation(), stableGeneration + 6);
+        throw Error('fictional rollback');
+      }),
+    /fictional rollback/,
+  );
+  assert.equal(generation(), stableGeneration);
+  assert.deepEqual(dirty(), stableDirty);
+  assert.deepEqual(read(), current, 'rollback retains the previously verified reader observations');
+});
 test(
   'reader aggregate preserves exact occurrences and refreshes only changed dependency fanout',
   { timeout: 120000 },

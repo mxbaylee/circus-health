@@ -153,15 +153,20 @@ function schemaVersion(db: DatabaseSync): number {
   return Number(db.prepare('PRAGMA schema_version').get()!.schema_version);
 }
 function tracking(db: DatabaseSync): void {
+  // An outer UPSERT can override a trigger's OR IGNORE conflict policy.
+  // Avoid inserting repeated OLD/NEW keys, as the authority triggers do.
+  const markDirty = (id: string) =>
+    `INSERT INTO __intake_lookup_dirty(source_id) SELECT ${id}
+      WHERE NOT EXISTS(SELECT 1 FROM __intake_lookup_dirty WHERE source_id=${id});`;
   db.exec(`CREATE TEMP TABLE IF NOT EXISTS __intake_lookup_dirty(source_id TEXT PRIMARY KEY);
     CREATE TEMP TABLE IF NOT EXISTS __intake_lookup_authorities(authority_key TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE);
     CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_insert AFTER INSERT ON main.source_files BEGIN
-      INSERT OR IGNORE INTO __intake_lookup_dirty VALUES(NEW.id); END;
+      ${markDirty('NEW.id')} END;
     CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_update AFTER UPDATE ON main.source_files BEGIN
-      INSERT OR IGNORE INTO __intake_lookup_dirty VALUES(OLD.id);
-      INSERT OR IGNORE INTO __intake_lookup_dirty VALUES(NEW.id); END;
+      ${markDirty('OLD.id')}
+      ${markDirty('NEW.id')} END;
     CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_delete AFTER DELETE ON main.source_files BEGIN
-      INSERT OR IGNORE INTO __intake_lookup_dirty VALUES(OLD.id); END;`);
+      ${markDirty('OLD.id')} END;`);
 }
 function initialize(db: DatabaseSync, connection: Connection, profile: string): void {
   // Reconstruction cannot inherit text retained by an aborted attempt or an

@@ -3,6 +3,8 @@ import {
   fixtureProposalId,
   fixtureDestinations,
   fixtureSourcePath,
+  fixtureNativeReportReady,
+  fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
@@ -264,7 +266,12 @@ test(
           '&group=' +
           encodeURIComponent(block.groupId),
       );
-      await page.reload();
+      await fixtureNativeReportReady(
+        page,
+        prefix,
+        { intakeId: intake.id, groupId: block.groupId },
+        () => page.reload(),
+      );
       const expectedTitle =
         receipt.kind === 'observation'
           ? 'Fictional Sunrise ferritin'
@@ -279,7 +286,12 @@ test(
         (await exactLink.getAttribute('href')) || '',
         new RegExp('record=' + encodeURIComponent(receipt.recordId)),
       );
-      await exactLink.click();
+      await fixtureNativeRecordReady(
+        page,
+        prefix,
+        { intakeId: intake.id, recordId: receipt.recordId, proposalId: block.proposalId },
+        () => exactLink.click(),
+      );
       await page.getByRole('heading', { name: expectedTitle, exact: true }).waitFor();
     }
 

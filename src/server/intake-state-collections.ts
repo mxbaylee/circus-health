@@ -110,7 +110,7 @@ interface PreparedData {
 interface Registry {
   generation: object;
   pages: Map<string, { raw: string; node: IntakeTreeNode }>;
-  views: Map<IntakeCollectionView, ViewData>;
+  views: WeakMap<IntakeCollectionView, ViewData>;
   preparations: Map<PreparedIntakeCollectionMutation, PreparedData>;
   preparedBytes: number;
   byteValues: Map<IntakeByteValue, { prefix: string; root: IntakeTreeRoot }>;
@@ -127,7 +127,7 @@ export function intakeCollectionCacheGeneration(db: Database): object {
 export function clearIntakeCollectionCache(db: Database): void {
   const registry = registries.get(db);
   registry?.pages.clear();
-  registry?.views.clear();
+  if (registry) registry.views = new WeakMap();
   registry?.preparations.clear();
   registry?.byteValues.clear();
   registry?.collectionValues.clear();
@@ -139,7 +139,7 @@ function registryFor(db: Database): Registry {
     value = {
       generation: Object.freeze({}),
       pages: new Map(),
-      views: new Map(),
+      views: new WeakMap(),
       preparations: new Map(),
       preparedBytes: 0,
       byteValues: new Map(),
@@ -489,7 +489,8 @@ export function createIntakeCollections(owner: {
         const view = Object.freeze({}) as IntakeCollectionView,
           registry = registryFor(db);
         registry.views.set(view, selected());
-        if (registry.views.size > 128) registry.views.delete(registry.views.keys().next().value!);
+        // A live reader owns this opaque view until it lets go. Weak keys avoid
+        // retaining discarded handles without evicting another active reader.
         return view;
       });
     },

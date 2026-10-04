@@ -1,4 +1,13 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { stopFixtureImport } from './manual-import-fixture.ts';
+import {
+  fixtureApi,
+  fixtureBrowserResponse,
+  fixtureNativeFeedReady,
+  fixtureReview,
+} from './native-intake-fixture.ts';
+import type { ClinicalRecordSectionPage } from '../../shared/intake-clinical-record-sections.ts';
+import type { IntakeReportAcceptanceResult } from '../../shared/intake.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { NoteHistoryEntry } from '../../shared/api.ts';
 import type { AddressInfo } from 'node:net';
@@ -55,6 +64,10 @@ test(
       await page.locator('input[type=file]').setInputFiles(file);
       const response = await uploaded;
       assert(response.ok(), await response.text());
+      // This journey reviews known JSONL manually. Finish any admitted background
+      // capture before selecting evidence; an unavailable model must not race it.
+      await stopFixtureImport(page, url, prefix, (await response.json()).data.id);
+      await fixtureNativeFeedReady(page, prefix, () => page.reload());
     }
 
     await page.goto(url);
@@ -230,6 +243,25 @@ test(
     await page.getByLabel('Pronouns', { exact: true }).waitFor();
     assert.equal(await page.getByLabel('Pronouns', { exact: true }).inputValue(), 'they/them');
 
+    const profile = (await (await page.request.get(url + '/api/profiles')).json()).data[0];
+    const prefix = `/api/profiles/${profile.id}`;
+    async function saveOneFromFeed() {
+      const pending = fixtureBrowserResponse(
+        page,
+        (response) =>
+          response.request().method() === 'POST' &&
+          new URL(response.url()).pathname === prefix + '/intakes/report-acceptance',
+      );
+      await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+      const response = await pending;
+      assert.equal(response.status(), 200, await response.text());
+      assert.equal(await response.finished(), null);
+      const result = (await response.json()).data as IntakeReportAcceptanceResult;
+      assert.equal(result.receipt.operationId, response.request().postDataJSON().operationId);
+      assert.equal(result.receipt.selectedCount, 1);
+      assert.equal(result.receipt.acceptedCount, 1);
+    }
+
     await page.goto(url + '/#/import');
     const envelope = {
       format: 'health-record-v1',
@@ -265,13 +297,12 @@ test(
     const uploadResponse = await receipt;
     assert(uploadResponse.ok(), await uploadResponse.text());
     assert.equal((await uploadResponse.json()).data.state, 'ready');
-    await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+    await saveOneFromFeed();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
       .getByText('1 saved', { exact: true })
       .waitFor();
-    const profile = (await (await page.request.get(url + '/api/profiles')).json()).data[0];
     const deliveries = (
       await (await page.request.get(`${url}/api/profiles/${profile.id}/intakes`)).json()
     ).data;
@@ -310,7 +341,7 @@ test(
       mimeType: 'application/x-ndjson',
       buffer: prescriptionOriginal,
     });
-    await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+    await saveOneFromFeed();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
@@ -368,7 +399,7 @@ test(
     });
     // A different filename retains a new source occurrence; linking its matching
     // clinical record still requires explicit acceptance.
-    await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+    await saveOneFromFeed();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
@@ -438,14 +469,25 @@ test(
     const retained = (
       await (await page.request.get(`${url}/api/profiles/${profile.id}/intakes`)).json()
     ).data.find((item: { filename: string }) => item.filename === 'fictional-second-results.jsonl');
-    const savedReview = (
-      await (
-        await page.request.get(
-          `${url}/api/profiles/${profile.id}/intakes/${encodeURIComponent(retained.id)}/review`,
-        )
-      ).json()
-    ).data;
-    assert.equal(savedReview.records[0].comparisons[0].previousDecision.outcome, 'distinct');
+    const api = fixtureApi(page, url);
+    const retainedPath = prefix + '/intakes/' + encodeURIComponent(retained.id);
+    const savedReview = await fixtureReview(api, retainedPath + '/review');
+    assert.equal(savedReview.records.length, 1);
+    const savedRecord = savedReview.records[0]!;
+    const comparisons = (await api(retainedPath + '/related-records', {
+      proposalId: savedReview.proposalId,
+      recordId: savedRecord.id,
+      candidateVersionId: savedRecord.candidateVersionId,
+    })) as ClinicalRecordSectionPage;
+    assert.equal(comparisons.format, 'health-clinical-record-section-page-v1');
+    assert.equal(comparisons.section, 'comparisons');
+    assert.equal(comparisons.nextCursor, null);
+    assert.equal(comparisons.total, 1);
+    assert.equal(comparisons.items.length, 1);
+    const pair = comparisons.items[0]!.control;
+    assert.equal(pair.kind, 'pair');
+    assert.ok(pair.kind === 'pair');
+    assert.equal(pair.previousDecision?.outcome, 'distinct');
     await page.goto(url);
     await page.getByLabel('Pronouns', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Fictional Browser Person', exact: true }).click();

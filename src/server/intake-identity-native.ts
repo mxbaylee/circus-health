@@ -1,10 +1,27 @@
 /** Native common identity uses complete repeatable authority and exact scoped references. */
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError, clinicalReviewRevision, now, json } from './database.ts';
+import {
+  HttpError,
+  clinicalReviewRevision,
+  revision as requestRevision,
+  now,
+  json,
+} from './database.ts';
+import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { collectSelectedEvidencedIdentity } from './intake-identity-name-evidence.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import {
+  beginNativeIdentityPreview,
+  nativeIdentityPreviewCurrent,
+  readNativeIdentityPreview,
+  retainNativeIdentityPreview,
+  clearNativeIdentityPreviews,
+} from './intake-identity-preview-cache.ts';
+import { verifyIntakeFileHash } from './intake-files.ts';
+import { profileOriginal } from './profile-storage.ts';
 import {
   assertIntakeOwner,
   verifyIntakeOriginal,
@@ -537,6 +554,7 @@ async function build(
   original: Awaited<ReturnType<typeof evidence>>,
   stored: Rows,
 ) {
+  withIntakeWork(context.db, 'warm', () => recordIntakeWork('identityPreviewFullPreparations'));
   const { db, root, profileId, id, view, workflow, group, scope } = context;
   const currentSelf = selfSnapshot(db),
     people = selectedIdentityPeopleSnapshots(db);
@@ -1333,6 +1351,61 @@ function peoplePreview(db: DatabaseSync) {
     peopleTruncated: rows.length > 100,
   };
 }
+function previewReadKey(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  groupId: string,
+) {
+  source(db, profileId, id);
+  return JSON.stringify([
+    root,
+    profileId,
+    id,
+    groupId,
+    intakeSourceVersion(db, id),
+    clinicalReviewRevision(db),
+    requestRevision(db),
+  ]);
+}
+/** Membership, including accepted/non-target occurrences, determines every required proposal. */
+function verifyPreviewArtifacts(context: Context) {
+  const { db, root, profileId, id } = context;
+  const seen = rows();
+  try {
+    withIntakeWork(db, 'warm', () => recordIntakeWork('identityPreviewArtifactChecks'));
+    verifyIntakeOriginal(db, root, profileId, id);
+    for (const member of context.membership())
+      for (const occurrence of member.occurrences) {
+        context.assertCurrent();
+        const proposalId = occurrence.proposalId;
+        if (!proposalId || seen.get('verifiedProposals', proposalId)) continue;
+        const file = db
+          .prepare('SELECT path,sha256,bytes FROM source_files WHERE id=?')
+          .get(proposalId);
+        if (!file) reject('A required retained proposal no longer exists');
+        withIntakeWork(db, 'warm', () => recordIntakeWork('identityPreviewArtifactChecks'));
+        verifyIntakeFileHash(profileOriginal(root, String(file!.path), profileId), {
+          bytes: Number(file!.bytes),
+          sha256: String(file!.sha256),
+        });
+        seen.put('verifiedProposals', proposalId, true);
+      }
+    withIntakeWork(db, 'warm', () => recordIntakeWork('identityPreviewArtifactChecks'));
+    verifyIntakeOriginal(db, root, profileId, id);
+    context.assertCurrent();
+  } finally {
+    seen.close();
+  }
+}
+function detachIdentityPreview(value: IntakeIdentityReview): IntakeIdentityReview {
+  return JSON.parse(JSON.stringify(value), (_key, item, context) =>
+    typeof item === 'number' && context?.source && JSON.stringify(item) !== context.source
+      ? JSON.rawJSON(context.source)
+      : item,
+  ) as IntakeIdentityReview;
+}
 const sourceLanes = new WeakMap<DatabaseSync, Map<string, Promise<unknown>>>();
 const previewFlights = new WeakMap<DatabaseSync, Map<string, Promise<IntakeIdentityReview>>>();
 function sourceLane<T>(db: DatabaseSync, id: string, work: () => Promise<T>): Promise<T> {
@@ -1356,22 +1429,64 @@ export function getNativeIntakeIdentityReview(
   id: string,
   groupId: string,
 ): Promise<IntakeIdentityReview> {
-  source(db, profileId, id);
+  try {
+    source(db, profileId, id);
+  } catch (error) {
+    clearNativeIdentityPreviews(db);
+    return Promise.reject(error);
+  }
   let flights = previewFlights.get(db);
   if (!flights) previewFlights.set(db, (flights = new Map()));
   const key = JSON.stringify([profileId, root, id, groupId]);
   const current = flights.get(key);
-  if (current) return current;
-  const next = sourceLane(db, id, () =>
-    getNativeIntakeIdentityReviewInner(db, root, profileId, id, groupId),
-  );
+  if (current) return current.then(detachIdentityPreview);
+  const next = sourceLane(db, id, async () => {
+    const epoch = beginNativeIdentityPreview(db),
+      readKey = previewReadKey(db, root, profileId, id, groupId);
+    const cached = readNativeIdentityPreview(db, readKey);
+    if (cached) {
+      const context = await open(db, root, profileId, id, groupId);
+      try {
+        verifyPreviewArtifacts(context);
+        const value = detachIdentityPreview(cached.value);
+        verifyPreviewArtifacts(context);
+        if (
+          cached.stamp === reviewReadStamp(db) &&
+          readKey === previewReadKey(db, root, profileId, id, groupId) &&
+          nativeIdentityPreviewCurrent(db, epoch)
+        )
+          return value;
+      } catch (error) {
+        clearNativeIdentityPreviews(db);
+        throw error;
+      }
+      clearNativeIdentityPreviews(db);
+    }
+    let certificate: { key: string; stamp: string } | undefined;
+    const value = await getNativeIntakeIdentityReviewInner(
+      db,
+      root,
+      profileId,
+      id,
+      groupId,
+      (key, stamp) => {
+        certificate = { key, stamp };
+      },
+    );
+    if (certificate && nativeIdentityPreviewCurrent(db, epoch))
+      retainNativeIdentityPreview(db, certificate.key, certificate.stamp, value, epoch);
+    return value;
+  }).catch((error) => {
+    clearNativeIdentityPreviews(db);
+    throw error;
+  });
   flights.set(key, next);
   void next
     .finally(() => {
       if (flights!.get(key) === next) flights!.delete(key);
     })
     .catch(() => undefined);
-  return next;
+  return next.then(detachIdentityPreview);
 }
 async function getNativeIntakeIdentityReviewInner(
   db: DatabaseSync,
@@ -1379,6 +1494,7 @@ async function getNativeIntakeIdentityReviewInner(
   profileId: string,
   id: string,
   groupId: string,
+  certified?: (key: string, stamp: string) => void,
 ): Promise<IntakeIdentityReview> {
   let context: Context;
   try {
@@ -1401,23 +1517,25 @@ async function getNativeIntakeIdentityReviewInner(
   }
   const stored = rows();
   try {
-    const self = selfSnapshot(db);
-    const correctionRow = db
-      .prepare(
-        "SELECT coverage_json FROM manual_batches WHERE title='Report ownership default' AND json_extract(coverage_json,'$.intakeId')=? AND json_extract(coverage_json,'$.groupId')=? ORDER BY json_extract(coverage_json,'$.revision') DESC,id DESC LIMIT 1",
-      )
-      .get(id, groupId);
-    const correctedAuthority = correctionRow
-      ? (json(correctionRow.coverage_json) as { personId: string; noteId: string })
-      : null;
-    const correctedNote = correctedAuthority ? getNote(db, correctedAuthority.noteId) : null;
-    const correctedPerson =
-      correctedAuthority && correctedNote
+    let self = selfSnapshot(db);
+    const correction = () => {
+      const correctionRow = db
+        .prepare(
+          "SELECT coverage_json FROM manual_batches WHERE title='Report ownership default' AND json_extract(coverage_json,'$.intakeId')=? AND json_extract(coverage_json,'$.groupId')=? ORDER BY json_extract(coverage_json,'$.revision') DESC,id DESC LIMIT 1",
+        )
+        .get(id, groupId);
+      const correctedAuthority = correctionRow
+        ? (json(correctionRow.coverage_json) as { personId: string; noteId: string })
+        : null;
+      const correctedNote = correctedAuthority ? getNote(db, correctedAuthority.noteId) : null;
+      return correctedAuthority && correctedNote
         ? {
             personId: correctedAuthority.personId,
             fullName: correctedNote.person.fullName || correctedNote.title,
           }
         : undefined;
+    };
+    let correctedPerson = correction();
     if (context.group.basis !== 'report_anchor' || !context.group.report?.subject) {
       const initial = await collectGroupIdentity(context, stored);
       const assessment = assessIdentityPolicy({
@@ -1452,7 +1570,17 @@ async function getNativeIntakeIdentityReviewInner(
       stored.db
         .prepare("DELETE FROM rows WHERE section NOT IN ('initialIssues','initialExplicit')")
         .run();
-      built = await build(context, original, stored);
+      context.assertCurrent();
+      // Capture before opening: even the asynchronous context read must belong
+      // to the unchanged full reconstruction. Own writes suppress retention.
+      const constructionStamp = reviewReadStamp(db),
+        constructionKey = previewReadKey(db, root, profileId, id, groupId);
+      context = await open(db, root, profileId, id, groupId);
+      self = selfSnapshot(db);
+      correctedPerson = correction();
+      verifyPreviewArtifacts(context);
+      const freshOriginal = await evidence(context);
+      built = await build(context, freshOriginal, stored);
       const catalog = createReportSnapshotCatalog(db, context.file, {
         catalog: 'report.snapshots',
         catalogArea: 'builds',
@@ -1492,7 +1620,7 @@ async function getNativeIntakeIdentityReviewInner(
                 count: stored.count('warnings'),
               },
             };
-      return {
+      const value: IntakeIdentityReview = {
         ...built.assessment,
         ...built.presentation,
         ...warnings,
@@ -1505,6 +1633,14 @@ async function getNativeIntakeIdentityReviewInner(
         correctedPerson,
         ...peoplePreview(db),
       };
+      verifyPreviewArtifacts(context);
+      if (
+        constructionStamp !== undefined &&
+        constructionStamp === reviewReadStamp(db) &&
+        constructionKey === previewReadKey(db, root, profileId, id, groupId)
+      )
+        certified?.(constructionKey, constructionStamp);
+      return value;
     } catch (error) {
       if (error instanceof IntakeReviewFragmentRequired)
         return {

@@ -461,7 +461,8 @@ test(
       `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(laboratoryGroup.groupId)}`,
     );
     const initialLaboratoryTargets = await readIdentityTargets(initialLaboratoryScope);
-    const initialIdentityResponse = page.waitForResponse(
+    const initialIdentityResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
@@ -499,7 +500,8 @@ test(
       `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(visitGroup.groupId)}`,
     );
     const initialVisitTargets = await readIdentityTargets(initialVisitScope);
-    const visitIdentityResponse = page.waitForResponse(
+    const visitIdentityResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
@@ -867,11 +869,13 @@ test(
       )
         identityPosts.push(request.postDataJSON() as IntakeIdentityConfirmation);
     };
-    const firstIdentityResponse = page.waitForResponse(
+    const firstIdentityResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
-    const confirmedIdentityResponse = page.waitForResponse(
+    const confirmedIdentityResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' &&
         response.url().endsWith('/identity-scope') &&
@@ -961,7 +965,8 @@ test(
       .getByRole('region', { name: 'Report identity', exact: true })
       .getByLabel('Name printed on this report')
       .fill('Fictional Sol Linden');
-    const questionResponse = page.waitForResponse(
+    const questionResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );

@@ -11,6 +11,7 @@ import {
   fixtureDestinations,
   fixtureSourcePath,
   fixtureBrowserResponse,
+  fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
@@ -124,15 +125,15 @@ test(
       record: recordId,
       review: 'full',
     });
-    const initialResponse = fixtureBrowserResponse(
-      page,
-      (response) =>
-        new URL(response.url()).pathname.endsWith('/review-record') &&
-        new URL(response.url()).searchParams.get('recordId') === recordId &&
-        response.ok(),
-    );
     await page.goto(origin + '/#/import?' + params);
-    const initial = (await (await initialResponse).json()).data as IntakeClinicalRecordRead;
+    // Profile creation happened through the real request context. Reload the
+    // document so the application observes that profile before opening its row.
+    const initial = await fixtureNativeRecordReady(
+      page,
+      prefix,
+      { intakeId: intake.id, recordId, proposalId: row.proposalId },
+      () => page.reload(),
+    );
     assert.equal(initial.format, 'health-intake-clinical-record-v2');
     assert.ok(initial.record.kind === 'reference');
     const selected = initial.record;

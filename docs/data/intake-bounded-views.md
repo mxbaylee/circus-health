@@ -136,8 +136,10 @@ alone create unit entries. Changed batches update their exact units, and plan
 replacement changes the affected plan totals. Dependency receipts retain
 reverse joins to observed page/span hashes, source pins, member source metadata
 and package roles. Transactional temporary triggers and role-publication hooks
-invalidate only the affected proposal/unit observations. An unrecognized
-logical transition, changed database connection or missing trigger requires
+invalidate only the affected proposal/unit observations. Dirty keys coalesce
+without relying on conflict policies inherited from an outer UPSERT; every
+actual change still advances the generation, and rollback restores both.
+An unrecognized logical transition, changed database connection or missing trigger requires
 explicit complete preparation; cancelled work never exposes partial totals.
 The index is a cache, not reading or acceptance authority. Tests cover exact
 occurrence pagination, unrelated versus dependent hash changes, cross-source
@@ -426,3 +428,20 @@ People, reading, report and selected-record APIs. Large clinical values expose
 exact fragments and sparse question, mapping and relationship commands;
 approval retains the selected complete decision under both current review
 tokens. Retrying an uncertain command reuses its exact operation and request.
+
+Native common-identity GET previews may retain at most 32 detached response wires,
+with a combined 256 KiB budget including their binding keys. Reuse requires exact
+connection SQL/registry, source, profile, request and clinical-policy equality;
+transactions never reuse or retain previews. Complete retained group membership
+is traversed to verify its original and every required proposal before and after
+returning a warm preview. Physical byte verification retains its existing exact
+file-identity guard and rehashes changed files. The memo retains no policy session
+or provider and clears on lock, rollback, disposal and actual database close.
+
+A cold preview that publishes a snapshot cannot certify its earlier response.
+Only a fresh full reconstruction captured before reopening its context, with an
+unchanged proof through physical checks, serialization and owned-session cleanup,
+can seed this memo. The first cold read may therefore remain uncached; a subsequent
+stable reconstruction enables warm repeats. Lifecycle clearing invalidates pending
+retention attempts. Confirmation and other mutations always rebuild current policy
+and verify their artifacts independently of the presentation memo.

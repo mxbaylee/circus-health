@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import type { Page, Response } from 'playwright';
+import type { Frame, Page, Request, Response } from 'playwright';
 import type { IntakeReviewRecord } from '../../shared/intake.ts';
 import type {
   IntakeClinicalReviewContext,
+  IntakeClinicalRecordRead,
   IntakeClinicalReviewPage,
   IntakeClinicalReviewFragment,
 } from '../../shared/intake-clinical-review.ts';
@@ -178,6 +179,64 @@ export function fixtureSourcePath(prefix: string, contentUrl: string): string {
   return prefix + contentUrl.slice(4);
 }
 
+/** Retain reads that completed during an action, but select only after its
+ * navigation has committed. Requests from a preceding document cannot satisfy
+ * readiness or lose their response bodies when that document is discarded. */
+function nativeBrowserReads(page: Page, prefix: string) {
+  const since = Date.now();
+  let cutoff = since;
+  let document = 0;
+  const requests = new Map<Request, number>();
+  const observed: Response[] = [];
+  const request = (selected: Request) => {
+    if (
+      selected.method() === 'GET' &&
+      new URL(selected.url()).pathname.startsWith(prefix + '/intakes/')
+    )
+      requests.set(selected, document);
+  };
+  const navigation = (frame: Frame) => {
+    if (frame === page.mainFrame()) document += 1;
+  };
+  const response = (selected: Response) => {
+    if (requests.has(selected.request())) observed.push(selected);
+  };
+  page.on('request', request);
+  page.on('framenavigated', navigation);
+  page.on('response', response);
+  return {
+    async action(action: () => Promise<unknown>) {
+      const result = await action();
+      if (
+        result &&
+        typeof result === 'object' &&
+        'request' in result &&
+        typeof result.request === 'function'
+      ) {
+        const selected = result as Response;
+        if (selected.request().isNavigationRequest())
+          cutoff = Math.max(since, selected.request().timing().startTime);
+      }
+    },
+    async read(matches: (url: URL) => boolean) {
+      const predicate = (selected: Response) =>
+        requests.get(selected.request()) === document &&
+        selected.request().timing().startTime >= cutoff &&
+        matches(new URL(selected.url()));
+      const selected =
+        observed.find(predicate) || (await page.waitForResponse(predicate, { timeout: 0 }));
+      assert.equal(selected.status(), 200);
+      assert.equal(await selected.finished(), null);
+      return selected;
+    },
+    close() {
+      page.off('request', request);
+      page.off('framenavigated', navigation);
+      page.off('response', response);
+    },
+  };
+}
+
 /** Await only the actual browser reads for the displayed native window. Cold
  * preparation uses the journey's hang guard; subsequent UI assertions retain
  * their normal short deadline. No server state is prewarmed through page.request. */
@@ -186,28 +245,14 @@ export async function fixtureNativeFeedReady(
   prefix: string,
   action: () => Promise<unknown>,
 ): Promise<CollectionImportFeed> {
-  const since = Date.now();
-  const observed: Response[] = [];
-  const current = (response: Response) =>
-    response.request().method() === 'GET' &&
-    response.request().timing().startTime >= since &&
-    new URL(response.url()).pathname.startsWith(prefix + '/intakes/');
-  const collect = (response: Response) => {
-    if (current(response)) observed.push(response);
-  };
-  page.on('response', collect);
-  const read = async (matches: (url: URL) => boolean) => {
-    const predicate = (response: Response) => current(response) && matches(new URL(response.url()));
-    const response =
-      observed.find(predicate) || (await page.waitForResponse(predicate, { timeout: 0 }));
-    assert.equal(response.status(), 200);
-    assert.equal(await response.finished(), null);
-    return (await response.json()).data;
-  };
+  const reads = nativeBrowserReads(page, prefix);
+  const read = async (matches: (url: URL) => boolean) =>
+    (await (await reads.read(matches)).json()).data;
   try {
-    const feedRead = read((url) => url.pathname === prefix + '/intakes/import-feed');
-    await action();
-    const feed = (await feedRead) as CollectionImportFeed;
+    await reads.action(action);
+    const feed = (await read(
+      (url) => url.pathname === prefix + '/intakes/import-feed',
+    )) as CollectionImportFeed;
     assert.equal(feed.format, 'health-intake-import-feed-v2');
     const scopes = new Map<string, { intakeId: string; groupId: string; identity: boolean }>();
     for (const row of feed.records)
@@ -248,7 +293,7 @@ export async function fixtureNativeFeedReady(
       .waitFor({ state: 'hidden', timeout: 0 });
     return feed;
   } finally {
-    page.off('response', collect);
+    reads.close();
   }
 }
 
@@ -259,4 +304,78 @@ export function fixtureBrowserResponse(
   predicate: (response: Response) => boolean | Promise<boolean>,
 ): Promise<Response> {
   return page.waitForResponse(predicate, { timeout: 0 });
+}
+
+/** Observe this action's selected record fetch, including opaque reference reads.
+ * The helper neither selects a different record nor prepares the host itself. */
+export async function fixtureNativeRecordReady(
+  page: Page,
+  prefix: string,
+  expected: {
+    intakeId: string;
+    recordId: string;
+    proposalId?: string | null;
+    candidateVersionId?: string;
+  },
+  action: () => Promise<unknown>,
+): Promise<IntakeClinicalRecordRead> {
+  const reads = nativeBrowserReads(page, prefix);
+  let response: Response;
+  try {
+    await reads.action(action);
+    response = await reads.read(
+      (selected) =>
+        selected.pathname ===
+          `${prefix}/intakes/${encodeURIComponent(expected.intakeId)}/review-record` &&
+        selected.searchParams.get('recordId') === expected.recordId &&
+        (expected.proposalId === undefined ||
+          selected.searchParams.get('proposalId') === expected.proposalId),
+    );
+  } finally {
+    reads.close();
+  }
+  const selected = (await response.json()).data as IntakeClinicalRecordRead;
+  assert.equal(selected.format, 'health-intake-clinical-record-v2');
+  assert.equal(selected.context.intakeId, expected.intakeId);
+  assert.equal(selected.context.proposalId, new URL(response.url()).searchParams.get('proposalId'));
+  const pins =
+    selected.record.kind === 'record' ? selected.record.record : selected.record.selection;
+  const recordId =
+    selected.record.kind === 'record'
+      ? selected.record.record.id
+      : selected.record.selection.recordId;
+  assert.equal(recordId, expected.recordId);
+  assert.ok(selected.context.reviewToken);
+  assert.ok(pins.candidateVersionId);
+  assert.ok(pins.selectionReviewToken);
+  if (expected.candidateVersionId !== undefined)
+    assert.equal(pins.candidateVersionId, expected.candidateVersionId);
+  return selected;
+}
+
+/** Observe the actual native report fetch for this navigation or reload. */
+export async function fixtureNativeReportReady(
+  page: Page,
+  prefix: string,
+  expected: { intakeId: string; groupId: string },
+  action: () => Promise<unknown>,
+): Promise<CollectionReportDetail> {
+  const reads = nativeBrowserReads(page, prefix);
+  let response: Response;
+  try {
+    await reads.action(action);
+    response = await reads.read(
+      (selected) =>
+        selected.pathname ===
+          prefix + '/intakes/report-queue/' + encodeURIComponent(expected.groupId) &&
+        selected.searchParams.get('intakeId') === expected.intakeId,
+    );
+  } finally {
+    reads.close();
+  }
+  const selected = (await response.json()).data as CollectionReportDetail;
+  assert.equal(selected.format, 'health-intake-report-detail-v2');
+  assert.equal(selected.group.intakeId, expected.intakeId);
+  assert.equal(selected.group.groupId, expected.groupId);
+  return selected;
 }

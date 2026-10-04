@@ -1,17 +1,28 @@
 import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase } from '../database.ts';
-import { ensureProfileDirectories } from '../profile-storage.ts';
+import { profileOriginal, ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
-import { uploadIntake, proposeConversion, proposeConversionRead, getIntake } from '../intake.ts';
+import {
+  uploadIntake,
+  proposeConversion,
+  proposeConversionRead,
+  getIntake,
+  getRetainedIntakeOriginalReference,
+} from '../intake.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import {
+  clearNativeIdentityPreviews,
+  nativeIdentityPreviewCounts,
+} from '../intake-identity-preview-cache.ts';
 import { getNote, saveNote } from '../notes.ts';
 import { createApp } from '../index.ts';
 import { fictionalModel } from './fictional-model.ts';
@@ -688,5 +699,128 @@ test(
     assert.equal(page.total, 2);
     assert.equal(page.items.length, 1);
     assert.ok(page.nextCursor);
+  },
+);
+
+// Actual contributor HTTP proof. This is durable plaintext fixture storage;
+// encrypted-runtime qualification remains in its separate owning fixtures.
+test(
+  'native identity repeated preview verifies artifacts without full preparation and refuses changed originals',
+  { timeout: 120000 },
+  async (t) => {
+    const f = await fixture(t, true, 1, false, undefined, undefined, true);
+    const cold = await f.review();
+    assert.ok(cold.scopeReference);
+    assert.equal(
+      nativeIdentityPreviewCounts(f.db).entries,
+      0,
+      'cold snapshot publication cannot certify earlier output',
+    );
+    const stable = await f.review();
+    assert.equal(
+      nativeIdentityPreviewCounts(f.db).entries,
+      1,
+      'unchanged full reconstruction seeds bounded wire',
+    );
+    const before = { ...intakeWorkCounters(f.db).warm };
+    const [warm, concurrent] = await Promise.all([f.review(), f.review()]);
+    assert.deepEqual(warm, stable);
+    assert.deepEqual(concurrent, stable);
+    assert.equal(
+      intakeWorkCounters(f.db).warm.identityPreviewFullPreparations,
+      before.identityPreviewFullPreparations,
+    );
+    assert.ok(
+      intakeWorkCounters(f.db).warm.identityPreviewArtifactChecks >
+        before.identityPreviewArtifactChecks,
+    );
+    t.diagnostic(
+      JSON.stringify({
+        warmFullPreparations:
+          intakeWorkCounters(f.db).warm.identityPreviewFullPreparations -
+          before.identityPreviewFullPreparations,
+        warmArtifactChecks:
+          intakeWorkCounters(f.db).warm.identityPreviewArtifactChecks -
+          before.identityPreviewArtifactChecks,
+      }),
+    );
+    warm.self.fullName = 'Caller-only mutation';
+    assert.equal((await f.review()).self.fullName, stable.self.fullName);
+    f.db.prepare("UPDATE notes SET title=title WHERE id='person-note:self'").run();
+    const changedBefore = intakeWorkCounters(f.db).warm.identityPreviewFullPreparations;
+    await f.review();
+    assert.ok(
+      intakeWorkCounters(f.db).warm.identityPreviewFullPreparations > changedBefore,
+      'exact SQL change invalidates preview',
+    );
+    assert.equal(
+      nativeIdentityPreviewCounts(f.db).entries,
+      1,
+      'peer mutation starts from a retained preview',
+    );
+    const peerBefore = intakeWorkCounters(f.db).warm.identityPreviewFullPreparations;
+    using peer = new DatabaseSync(ensureProfileDirectories(f.root, f.profileId).database);
+    peer
+      .prepare(
+        "UPDATE notes SET title=title || ' fictional peer mutation' WHERE id='person-note:self'",
+      )
+      .run();
+    await f.review();
+    assert.ok(
+      intakeWorkCounters(f.db).warm.identityPreviewFullPreparations > peerBefore,
+      'peer SQL data_version invalidates preview',
+    );
+    const original = getRetainedIntakeOriginalReference(f.db, f.root, f.profileId, f.original.id),
+      bytes = readFileSync(original.path);
+    const changed = Buffer.from(bytes);
+    changed[changed.length - 1] ^= 1;
+    writeFileSync(original.path, changed);
+    try {
+      const refused = await f.request(
+        'identity-review?groupId=' + encodeURIComponent(f.groupId),
+        undefined,
+        409,
+      );
+      assert.equal(refused.error.code, 'SOURCE_CHANGED');
+      assert.equal(nativeIdentityPreviewCounts(f.db).entries, 0);
+    } finally {
+      writeFileSync(original.path, bytes);
+    }
+    await f.review();
+    assert.equal(nativeIdentityPreviewCounts(f.db).entries, 1);
+    const proposalRow = f.db
+      .prepare("SELECT path FROM source_files WHERE kind='intake_proposal'")
+      .get();
+    assert.ok(proposalRow);
+    const proposalPath = profileOriginal(f.root, String(proposalRow.path), f.profileId),
+      proposalBytes = readFileSync(proposalPath),
+      changedProposal = Buffer.from(proposalBytes);
+    changedProposal[changedProposal.length - 1] ^= 1;
+    writeFileSync(proposalPath, changedProposal);
+    try {
+      const refused = await f.request(
+        'identity-review?groupId=' + encodeURIComponent(f.groupId),
+        undefined,
+        409,
+      );
+      assert.equal(refused.error.code, 'SOURCE_CHANGED');
+      assert.equal(nativeIdentityPreviewCounts(f.db).entries, 0);
+    } finally {
+      writeFileSync(proposalPath, proposalBytes);
+    }
+    // Clear while an asynchronous actual preparation is in flight: its old
+    // lifecycle witness must never populate the new memo generation.
+    const { getNativeIntakeIdentityReview } = await import('../intake-identity-native.ts');
+    const pending = getNativeIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.original.id,
+      f.groupId,
+    );
+    await Promise.resolve();
+    clearNativeIdentityPreviews(f.db);
+    await pending;
+    assert.equal(nativeIdentityPreviewCounts(f.db).entries, 0);
   },
 );

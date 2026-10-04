@@ -451,7 +451,9 @@ for (const mode of ['atomic', 'partial-v1'] as const)
   // below remain the qualification, independently of elapsed time.
   test(
     `compound native pair approval (${mode}) retains reviewed evidence, changed-row snapshots and recovery replay`,
-    { timeout: 180000 },
+    // Full actual acceptance/rebuild/replay measured 76–111 seconds alone.
+    // This host-only integration guard includes concurrent CI fixture work.
+    { timeout: 300000 },
     async (t) => {
       const root = mkdtempSync(join(tmpdir(), 'fictional-native-duplicate-')),
         profileId = 'fictional-profile',

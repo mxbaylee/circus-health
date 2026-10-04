@@ -868,6 +868,50 @@ async function prepareProposalDerived(
         current = row(db, sourceId);
       if (!previous || !current || signature(current) !== previous)
         return { state: 'pending', reason: 'source_changed' };
+      const raw = writers.sources.peek(sourceId);
+      if (raw) {
+        const witness = JSON.parse(raw) as Witness;
+        if (signature(current) !== witness.signature)
+          return { state: 'pending', reason: 'source_changed' };
+        let refreshed: Witness;
+        try {
+          const path = profileOriginal(root, current.path, profileId),
+            identity = physical(path);
+          if (identity === witness.physical) continue;
+          if (current.bytes > MAX_INTAKE_BYTES)
+            return { state: 'pending', reason: 'source_evidence_unavailable' };
+          const bytes = readIntakeFileSync(path);
+          recordIntakeFileHash(bytes);
+          const digest = createHash('sha256').update(bytes).digest('hex');
+          if (bytes.length !== current.bytes || digest !== current.sha256)
+            return { state: 'pending', reason: 'source_evidence_unavailable' };
+          if (physical(path) !== identity) return { state: 'pending', reason: 'source_changed' };
+          refreshed = { ...witness, physical: identity };
+          checkPreparedWitness(refreshed);
+        } catch (error) {
+          if (error instanceof SourceContextClassificationPending)
+            return { state: 'pending', reason: error.reason };
+          return { state: 'pending', reason: 'source_evidence_unavailable' };
+        }
+        assertCurrent();
+        // Recovery can rematerialize identical retained bytes at a new inode.
+        // Reuse their proven classification only after verifying those bytes;
+        // the fresh witness still fences replacement before publication.
+        const oldCache = 'source.context.file.' + workflowHash([resolve(root), profileId, witness]),
+          newCache = 'source.context.file.' + workflowHash([resolve(root), profileId, refreshed]);
+        if (store.get(store.openView(), 'builds', oldCache + '.control', 'complete') !== 'ready')
+          return { state: 'pending', reason: 'not_prepared' };
+        commit(
+          ['versions', 'control'].map((kind) => ({
+            area: 'builds',
+            collection: newCache + '.' + kind,
+            op: 'adoptCollection',
+            fromArea: 'builds',
+            fromCollection: oldCache + '.' + kind,
+          })),
+        );
+        await writers.sources.put(sourceId, JSON.stringify(refreshed));
+      }
     }
     if (active === wasActive) continue;
     if (!active) {
