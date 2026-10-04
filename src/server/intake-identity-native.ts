@@ -5,6 +5,10 @@ import {
   type ClinicalOperation,
 } from './clinical-operation.ts';
 import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
+import {
+  tryBorrowRetainedCollectionClinicalPolicy,
+  type RetainedCollectionClinicalPolicy,
+} from './intake-report-group-collection.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 import { runClinicalReviewWork } from './clinical-review-work.ts';
 /** Native common identity uses complete repeatable authority and exact scoped references. */
@@ -703,12 +707,18 @@ function rows() {
   };
 }
 type Rows = ReturnType<typeof rows>;
-function runNativeIdentityWork<T>(context: Context, stored: Rows, work: Generator<void, T, void>) {
+function runNativeIdentityWork<T>(
+  context: Context,
+  stored: Rows,
+  work: Generator<void, T, void>,
+  assertBorrowed?: () => void,
+) {
   const db = context.db;
   return runClinicalReviewWork(work, {
     capture() {
       context.assertCurrent();
       stored.assertArtifacts();
+      assertBorrowed?.();
       const stamp = reviewPreparationStamp(db);
       if (stamp === undefined) reject('Identity scope preparation requires current authority');
       return () => {
@@ -716,6 +726,7 @@ function runNativeIdentityWork<T>(context: Context, stored: Rows, work: Generato
         if (reviewPreparationStamp(db) !== stamp)
           reject('Identity scope changed during preparation');
         stored.assertArtifacts();
+        assertBorrowed?.();
       };
     },
   });
@@ -729,7 +740,27 @@ async function build(
   const { db, root, profileId, id, view, workflow, group, scope } = context;
   const currentSelf = selfSnapshot(db),
     people = selectedIdentityPeopleSnapshots(db);
-  const run = <T>(work: Generator<void, T, void>) => runNativeIdentityWork(context, stored, work);
+  let cached:
+    | {
+        proposalId: string | null;
+        selected?: Extract<ReturnType<typeof prepareCollectionClinicalReview>, { status: 'ready' }>;
+        borrowed?: RetainedCollectionClinicalPolicy;
+      }
+    | undefined;
+  const closeCached = () => {
+    if (cached?.borrowed) cached.borrowed.close();
+    else cached?.selected?.session.close();
+    cached = undefined;
+  };
+  const assertBorrowed = () => cached?.borrowed?.assertCurrent();
+  const run = async <T>(work: Generator<void, T, void>) => {
+    const borrowed = cached?.borrowed;
+    const assertSelectedBorrow = () => borrowed?.assertCurrent();
+    assertSelectedBorrow();
+    const result = await runNativeIdentityWork(context, stored, work, assertSelectedBorrow);
+    assertSelectedBorrow();
+    return result;
+  };
   let receipts: Iterable<IdentityPolicyReceipt> | undefined;
   const currentReceipts = () =>
     receipts || reject('Prepare the complete current identity receipt selection');
@@ -768,12 +799,7 @@ async function build(
   let occurrenceCount = 0,
     consistentAssignment = true,
     allEvidenced = true;
-  let cached:
-    | {
-        proposalId: string | null;
-        selected: Extract<ReturnType<typeof prepareCollectionClinicalReview>, { status: 'ready' }>;
-      }
-    | undefined;
+
   async function reviewRecord(
     proposalId: string | null,
     recordId: string,
@@ -784,8 +810,8 @@ async function build(
       // Prerequisite preparation may publish accepted derived catalogs. An older
       // borrowed receipt proof is never rebased across those real SQL writes.
       receipts = undefined;
-      cached?.selected.session.close();
-      cached = undefined;
+      assertBorrowed();
+      closeCached();
       const grounding = identityGroundingGeneration(db);
       const assertPreparationCurrent = () => {
         context.assertCurrent();
@@ -796,28 +822,44 @@ async function build(
       await prepareCollectionClinicalReviewDependencies(db, root, profileId, id, proposalId, {
         assertRunning: assertPreparationCurrent,
       });
-      const selected = await prepareCollectionClinicalReviewAsync(
+      const borrowed = tryBorrowRetainedCollectionClinicalPolicy(
         db,
         root,
         profileId,
         id,
         proposalId,
-        { assertRunning: assertPreparationCurrent },
+        assertPreparationCurrent,
       );
-      if (selected.status !== 'ready')
-        return reject(
-          'Prepare this exact retained clinical occurrence before identity confirmation',
+      if (borrowed) {
+        cached = { proposalId, borrowed };
+        borrowed.retainArtifacts((artifacts) => stored.retainArtifacts(artifacts));
+      } else {
+        const selected = await prepareCollectionClinicalReviewAsync(
+          db,
+          root,
+          profileId,
+          id,
+          proposalId,
+          { assertRunning: assertPreparationCurrent },
         );
-      cached = { proposalId, selected };
-      assertPreparationCurrent();
-      stored.retainArtifacts(
-        collectionClinicalProjectionContext(selected.session).verifiedArtifacts(),
-      );
+        if (selected.status !== 'ready')
+          return reject(
+            'Prepare this exact retained clinical occurrence before identity confirmation',
+          );
+        cached = { proposalId, selected };
+        assertPreparationCurrent();
+        stored.retainArtifacts(
+          collectionClinicalProjectionContext(selected.session).verifiedArtifacts(),
+        );
+      }
       // Acquire a new complete selection only after prerequisites and physical
       // authority are verified. Previously borrowed providers stay invalid.
       receipts = await run(scope.receiptsWork!());
     }
-    const record = cached.selected.session.record(recordId, candidateId, candidateVersionId);
+    assertBorrowed();
+    const record = cached.borrowed
+      ? cached.borrowed.record(recordId, candidateId, candidateVersionId)
+      : cached.selected!.session.record(recordId, candidateId, candidateVersionId);
     if (!record) return reject('The current report occurrence differs from the displayed member');
     return record;
   }
@@ -845,7 +887,8 @@ async function build(
           member.candidateVersionId,
         );
         const person = record.identityAttribution?.assignedPerson;
-        if (!occurrenceCount) assignedPerson = person;
+        // This bounded plain DTO is the only record-owned object kept after policy release.
+        if (!occurrenceCount) assignedPerson = person && { ...person };
         else if (person?.personId !== assignedPerson?.personId) consistentAssignment = false;
         occurrenceCount++;
         allEvidenced &&= record.identityReview?.status === 'evidenced_match';
@@ -1034,8 +1077,9 @@ async function build(
           );
       }
     }
+    assertBorrowed();
   } finally {
-    cached?.selected.session.close();
+    closeCached();
   }
   stored.assertArtifacts();
   // A report with no current occurrence still inspects all retained receipts.

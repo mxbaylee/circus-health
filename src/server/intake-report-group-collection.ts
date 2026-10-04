@@ -1,4 +1,8 @@
-import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 import {
   collectionClinicalProjectionContext,
@@ -254,12 +258,95 @@ function reserveQueueSlot() {
   }
 }
 function collectionQueueBinding(db: DatabaseSync, profileId: string) {
-  const hash = createHash('sha256').update(
-    canonicalLiteral([profileId, clinicalReviewRevision(db), intakeClinicalCachePin(db)]),
-  );
+  const hash = createHash('sha256');
+  withIntakeWork(db, 'warm', () => recordIntakeWork('hashCalls'));
+  const update = (input: string) => {
+    hash.update(input);
+    // Charge each actual input independently, including prefixes before later refusal.
+    withIntakeWork(db, 'warm', () => recordIntakeWork('hashedBytes', Buffer.byteLength(input)));
+  };
+  update(canonicalLiteral([profileId, clinicalReviewRevision(db), intakeClinicalCachePin(db)]));
   for (const source of collectionQueueSources(db, profileId))
-    hash.update(canonicalLiteral([source.id, intakeSourceVersion(db, source.id)]));
+    update(canonicalLiteral([source.id, intakeSourceVersion(db, source.id)]));
   return hash.digest('hex');
+}
+/** Internal complete-policy access; records/providers stay local to the pinned consumer. */
+export interface RetainedCollectionClinicalPolicy {
+  assertCurrent(): void;
+  record(
+    recordId: string,
+    candidateId: string,
+    candidateVersionId: string,
+  ): import('../shared/intake.ts').IntakeReviewRecord | undefined;
+  retainArtifacts(retain: (artifacts: Iterable<VerifiedClinicalArtifact>) => void): void;
+  close(): void;
+}
+/** Only borrow an idle completed owner; never construct, refresh or wait for policy here. */
+export function tryBorrowRetainedCollectionClinicalPolicy(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  proposalId: string | null,
+  assertRunning: () => void,
+): RetainedCollectionClinicalPolicy | undefined {
+  const operation = currentClinicalOperation(db);
+  assertClinicalOperation(db, operation);
+  assertRunning();
+  const selected = [...queueCaches].find(
+    (value) =>
+      value.db === db &&
+      value.root === root &&
+      value.profileId === profileId &&
+      !value.closed &&
+      !value.users,
+  );
+  const miss = () => {
+    withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueuePolicyBorrowMisses'));
+    return undefined;
+  };
+  if (db.isTransaction || !selected) return miss();
+  const epoch = queueEpochs.get(db) || 0;
+  // Existing global LRU eviction skips users>0, including other databases across yields.
+  selected.users++;
+  selected.used = ++queueClock;
+  let released = false;
+  const close = () => {
+    if (released) return;
+    released = true;
+    selected.users--;
+  };
+  const assertOwnerCurrent = () => {
+    assertClinicalOperation(db, operation);
+    if (
+      released ||
+      selected.closed ||
+      !queueCaches.has(selected) ||
+      (queueEpochs.get(db) || 0) !== epoch
+    )
+      throw changed();
+  };
+  const assertOwner = () => {
+    assertOwnerCurrent();
+    assertRunning();
+  };
+  try {
+    const borrowed = selected.queue.tryBorrowReview(
+      intakeId,
+      proposalId,
+      assertOwner,
+      assertOwnerCurrent,
+    );
+    if (!borrowed) {
+      close();
+      return miss();
+    }
+    withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueuePolicyBorrowHits'));
+    return { ...borrowed, close };
+  } catch (error) {
+    close();
+    throw error;
+  }
 }
 /** Reuse an exact selected disposable join; no domain change is inferred from cache state. */
 export async function openCollectionReportQueue(db: DatabaseSync, root: string, profileId: string) {
@@ -347,8 +434,10 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
     if (verified.size >= 32) verified.delete(verified.values().next().value!);
     verified.add(id);
   };
+  // Private admission is reachable only through the active clinical owner and users pin.
+  const { tryBorrowReview: _privateBorrow, ...methods } = selected.queue;
   return {
-    ...selected.queue,
+    ...methods,
     assertActive,
     async reviewMember(
       intakeId: string,
@@ -1006,6 +1095,77 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         yield { id: String(row.id), pin: String(row.pin) };
     },
     assertCurrent,
+    tryBorrowReview(
+      intakeId: string,
+      proposalId: string | null,
+      assertOwner: () => void,
+      assertOwnerCurrent: () => void,
+    ): Omit<RetainedCollectionClinicalPolicy, 'close'> | undefined {
+      const key = canonicalLiteral([intakeId, proposalId]),
+        stamp = reviewReadStamp(db);
+      if (
+        closed ||
+        pendingReviews ||
+        discardReleasedReview ||
+        reviewCache?.status !== 'ready' ||
+        reviewKey !== key ||
+        !reviewCertificate ||
+        stamp === undefined ||
+        stamp !== reviewCertificate.stamp ||
+        stamp !== reviewObservedStamp
+      )
+        return undefined;
+      const selected = reviewCache,
+        certificate = reviewCertificate,
+        generation = reviewGeneration;
+      const assertSelected = () => {
+        if (
+          closed ||
+          pendingReviews ||
+          discardReleasedReview ||
+          reviewGeneration !== generation ||
+          reviewCache !== selected ||
+          reviewKey !== key ||
+          reviewCertificate !== certificate ||
+          reviewObservedStamp !== certificate.stamp ||
+          certificate.queueBinding !== binding
+        )
+          throw changed();
+      };
+      const assertBorrowedCurrent = () => {
+        assertOwner();
+        assertSelected();
+        assertCurrent();
+        // Complete consumed physical proof precedes the final cheap original witness.
+        collectionClinicalProjectionContext(selected.session);
+        const sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId)),
+          requestRevision = revision(db);
+        assertOwnerCurrent();
+        assertSelected();
+        if (
+          certificate.sourcePin !== sourcePin ||
+          certificate.requestRevision !== requestRevision ||
+          reviewReadStamp(db) !== certificate.stamp
+        )
+          throw changed();
+      };
+      // Once selected, stale physical/source/callback observations refuse, never fall back.
+      assertBorrowedCurrent();
+      return {
+        assertCurrent: assertBorrowedCurrent,
+        record(recordId, candidateId, candidateVersionId) {
+          assertBorrowedCurrent();
+          const record = selected.session.record(recordId, candidateId, candidateVersionId);
+          assertBorrowedCurrent();
+          return record;
+        },
+        retainArtifacts(retain) {
+          assertBorrowedCurrent();
+          retain(collectionClinicalProjectionContext(selected.session).verifiedArtifacts());
+          assertBorrowedCurrent();
+        },
+      };
+    },
     currentReviewCertificate(
       intakeId: string,
       certificate: CollectionReviewRowCertificate | undefined,

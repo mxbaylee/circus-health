@@ -102,6 +102,13 @@ They neither migrate retained questions nor change accepted evidence or recovery
 compatibility. Their per-question bound is not an aggregate memory or storage
 guarantee, and the focused work counts do not establish whole-import performance.
 
+Identity preparation can also reuse an idle report queue's complete current
+policy under its existing owner and physical-authority checks. Restart and reload
+reviews when updating; retained owners are disposable, with no migration or
+archive-format change. A stale selected owner refuses reuse, and grounding
+changes still require fresh preparation. The focused parity and ownership checks
+do not replace release-build acceptance and encrypted recovery qualification.
+
 ## Repeatable fictional release qualification
 
 Run from a frozen candidate checkout with Docker and the contributor Node/browser prerequisites available. Choose an exact locally available prior commit and a fresh absolute external output directory outside Git:

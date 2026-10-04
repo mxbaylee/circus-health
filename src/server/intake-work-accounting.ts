@@ -66,6 +66,8 @@ const hostTemplate = {
   collectionQueueMemberRows: 0,
   collectionQueueReceiptRecords: 0,
   collectionQueueClinicalReviews: 0,
+  collectionQueuePolicyBorrowHits: 0,
+  collectionQueuePolicyBorrowMisses: 0,
   collectionPublicClinicalReviews: 0,
   collectionQueueSummaryBuilds: 0,
   collectionFeedRebuiltSources: 0,

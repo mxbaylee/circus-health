@@ -594,6 +594,27 @@ owner rather than waiting on a shared request queued behind that owner. Ordinary
 request-body completion is not a disconnect. These operation slots are admission
 queues, not long-lived SQL transactions or a server-wide HTTP lock.
 
+Identity preparation can borrow a complete clinical policy already retained by
+an idle report-queue owner for the exact database, root, profile, intake and
+proposal. It pins that existing owner against eviction, checks its original
+revision, source, raw SQL and complete physical proof, and checks the selected
+owner again across cooperative work. Borrowing neither constructs a queue nor
+refreshes its proof. An unavailable owner takes the ordinary preparation path;
+a failed check after selection refuses the request. Releasing a borrow releases
+only its pin. Closing, clearing or replacing the owner invalidates the borrow.
+Grounding changes still require the second complete policy construction.
+
+The controlled four- and 16-record HTTP flows each add four questions, then use one borrow and one fresh
+post-grounding policy, and return the same complete identity response as cache
+disposal and reconstruction. A separate comparison under unchanged authority
+preserves complete policy and tokens: borrowing performs zero uncached collection-node
+reads, with 40 and 136 node-cache hits, versus 6,089 and 41,028 uncached reads
+for fresh policy construction. It still performs 180 and 612
+SQL witness queries, and hashes 4,120 and 14,008 input bytes. Binding hashes,
+borrow hits and misses are counted explicitly. These are bounded fixture
+results, not whole-request cost comparisons or full encrypted recovery evidence;
+the fixtures do not cover long answer or draft histories.
+
 Participating requests against the same database wait for one another, so a live
 large review can delay another clinical page. Cooperative yields still allow
 unrelated host and source-transport work to run. This coordination does not

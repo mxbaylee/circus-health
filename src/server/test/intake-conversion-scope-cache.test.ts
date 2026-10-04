@@ -51,9 +51,15 @@ async function fixture(t: test.TestContext) {
   const read = (unitId?: string, sessionId = 'fictional-session') =>
     openCollectionConversion(db, root, profileId, source.id, { sessionId, unitId });
   const measured = (unitId?: string, sessionId?: string) => {
-    const before = intakeWorkCounters(db).warm.collectionNodeReads,
-      scope = read(unitId, sessionId);
-    return { scope, reads: intakeWorkCounters(db).warm.collectionNodeReads - before };
+    const before = intakeWorkCounters(db).warm,
+      scope = read(unitId, sessionId),
+      after = intakeWorkCounters(db).warm;
+    const reads = after.collectionNodeReads - before.collectionNodeReads;
+    return {
+      scope,
+      reads,
+      nodeLoads: reads + after.collectionNodeCacheHits - before.collectionNodeCacheHits,
+    };
   };
   return { root, profileId, db, source, units, read, measured };
 }
@@ -87,9 +93,17 @@ test('retained scope reuse preserves selection and bounded two-entry/aggregate f
   assert.equal(read('fictional-absent'), undefined);
   const absentFirst = measured('fictional-absent'),
     absentAgain = measured('fictional-absent');
+  assert.equal(absentFirst.scope, undefined);
+  assert.equal(absentAgain.scope, undefined);
+  // Fresh checked lookups can reuse certified pages without reading their raw bytes.
   assert.ok(
-    absentFirst.reads > warm.reads && absentAgain.reads > warm.reads,
-    'absence is not memoized',
+    absentFirst.nodeLoads > warm.nodeLoads && absentAgain.nodeLoads > warm.nodeLoads,
+    'absence is not memoized: ' +
+      JSON.stringify({
+        warm: { reads: warm.reads, nodeLoads: warm.nodeLoads },
+        first: { reads: absentFirst.reads, nodeLoads: absentFirst.nodeLoads },
+        again: { reads: absentAgain.reads, nodeLoads: absentAgain.nodeLoads },
+      }),
   );
 
   // Opaque source dependency tokens are real pinned metadata. They exercise
