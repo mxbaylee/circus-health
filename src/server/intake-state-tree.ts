@@ -86,33 +86,64 @@ export function decodeIntakeTreeNode(
   if (JSON.stringify(actual) !== JSON.stringify(ref)) invalid('tree reference agreement');
   return result;
 }
+/** A private synchronous read invocation owns provisional pages. Only its
+ * successful final authority check can seal them for another invocation. */
+export interface IntakeTreeReadCertificate {
+  readonly witness: string;
+  readonly registry: object;
+  readonly epoch: object;
+  state: 'active' | 'sealed' | 'expired';
+}
+export interface IntakeTreeCachedNode {
+  raw: string;
+  node: IntakeTreeNode;
+  certificate?: IntakeTreeReadCertificate;
+}
 export function createIntakeTree(
   identity: IntakeStateIdentity,
   read: (hash: string) => unknown,
-  cache: Map<string, { raw: string; node: IntakeTreeNode }>,
+  cache: Map<string, IntakeTreeCachedNode>,
+  readProof?: {
+    certificate: IntakeTreeReadCertificate;
+    check: () => void;
+  },
 ) {
   const pending = new Map<string, { raw: string; node: IntakeTreeNode }>();
   let preparedBytes = 0;
   const load = (ref: IntakeTreeRef): IntakeTreeNode => {
     const staged = pending.get(ref.hash);
     if (staged) return staged.node;
-    const raw = read(ref.hash);
-    recordIntakeWork('collectionNodeReads');
-    if (typeof raw === 'string') recordIntakeWork('collectionReadBytes', Buffer.byteLength(raw));
+    readProof?.check();
     const cached = cache.get(ref.hash);
+    const certificate = readProof?.certificate;
+    const reusable =
+      certificate &&
+      cached?.certificate &&
+      (cached.certificate === certificate ||
+        (cached.certificate.state === 'sealed' &&
+          cached.certificate.witness === certificate.witness &&
+          cached.certificate.registry === certificate.registry &&
+          cached.certificate.epoch === certificate.epoch));
+    const raw = reusable ? cached.raw : read(ref.hash);
+    if (reusable) recordIntakeWork('collectionNodeCacheHits');
+    else {
+      recordIntakeWork('collectionNodeReads');
+      if (typeof raw === 'string') recordIntakeWork('collectionReadBytes', Buffer.byteLength(raw));
+    }
+    readProof?.check();
     if (cached && cached.raw === raw) {
       if (JSON.stringify(cached.node.identity) !== JSON.stringify(identity))
         invalid('cached tree source binding');
-      // References include authenticated summaries; a hash-only hit is not
-      // permission to accept a caller's different count/range/height.
+      // Every hit still checks all authenticated summaries and source binding.
       if (JSON.stringify(reference(cached.node, ref.hash)) !== JSON.stringify(ref))
         invalid('cached tree reference');
       cache.delete(ref.hash);
-      cache.set(ref.hash, cached);
+      // Never mutate another invocation's token or promote a transaction read.
+      cache.set(ref.hash, { raw: cached.raw, node: cached.node, certificate });
       return cached.node;
     }
     const node = decodeIntakeTreeNode(raw, ref, identity);
-    cache.set(ref.hash, { raw: raw as string, node });
+    cache.set(ref.hash, { raw: raw as string, node, certificate });
     if (cache.size > 128) cache.delete(cache.keys().next().value!);
     return node;
   };

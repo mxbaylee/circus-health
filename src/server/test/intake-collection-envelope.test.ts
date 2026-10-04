@@ -822,3 +822,87 @@ test('schema writer batches existing inline cells and preserves exact fragmented
     reopened.close();
   }
 });
+
+// Real accepted schema cells and indexes exercise field resolution and bounded
+// page traversal together; this is metadata work, not an encrypted runtime claim.
+test(
+  'retained schema field and page reads preserve lexical evidence with counted physical readiness',
+  { timeout: 120_000 },
+  async (t) => {
+    const rows = Array.from(
+      { length: 8 },
+      (_, index) => '{"id":"fictional-' + index + '","amount":12.00,"nullable":null}',
+    );
+    const giant = '🦊\\"'.repeat(2500),
+      raw =
+        '{"intake":{"version":1},"records":[' +
+        rows.join(',') +
+        '],"giant":' +
+        JSON.stringify(giant) +
+        '}',
+      { db, source, authority } = fixture(t, raw);
+    await buildIntakeCollectionEnvelope(db, source);
+    const read = authority.storage.read;
+    let heads = 0;
+    authority.storage.read = (name) => {
+      if (name === 'head') heads++;
+      return read(name);
+    };
+    const view = openIntakeCollectionEnvelope(db, source),
+      root = view.root(),
+      fields = intakeEnvelopeFieldAccess(view);
+    const records = view.children(root, 'records', { items: 16, bytes: 32768 });
+    assert.equal(records.total, 8);
+    assert.equal(records.complete, true);
+    const inspect = () => {
+      const values: string[] = [];
+      for (const [index, record] of records.records.entries()) {
+        values.push([...fields.chunks(record, 'id')!].join(''));
+        values.push([...fields.chunks(record, 'amount')!].join(''));
+        values.push([...fields.chunks(record, 'nullable')!].join(''));
+        assert.equal(fields.chunks(record, 'missing'), undefined);
+        const page = view.fields(record, { items: 8, bytes: 32768 });
+        assert.equal(page.total, 3);
+        assert.equal(page.complete, true);
+        assert.deepEqual(page.fields.map((field) => field.name).sort(), [
+          'amount',
+          'id',
+          'nullable',
+        ]);
+        assert.deepEqual(values.slice(-3), ['"fictional-' + index + '"', '12.00', 'null']);
+      }
+      assert.equal([...fields.chunks(root, 'giant')!].join(''), JSON.stringify(giant));
+      return createHash('sha256').update(values.join('|')).digest('hex');
+    };
+    const expected = inspect(),
+      before = structuredClone(intakeWorkCounters(db)),
+      headBefore = heads;
+    assert.equal(inspect(), expected);
+    assert.equal(inspect(), expected);
+    const after = intakeWorkCounters(db),
+      delta = (name: keyof typeof after.warm) => after.warm[name] - before.warm[name];
+    assert.equal(heads - headBefore, 1506, 'physical accepted HEAD observation count is unchanged');
+    assert.ok(
+      delta('collectionNodeReads') < 7486 / 4,
+      'compared with the measured original 7486 reads',
+    );
+    assert.ok(
+      delta('collectionReadBytes') < 6807450 / 4,
+      'compared with the measured original node bytes',
+    );
+    assert.ok(delta('collectionNodeCacheHits') > 0);
+    assert.ok(delta('collectionReadWitnessQueries') > 0);
+    t.diagnostic(
+      JSON.stringify({
+        oracle: expected,
+        nodeReads: delta('collectionNodeReads'),
+        cacheHits: delta('collectionNodeCacheHits'),
+        witnessQueries: delta('collectionReadWitnessQueries'),
+        readBytes: delta('collectionReadBytes'),
+        metadataReads: after.primitive.metadataReads - before.primitive.metadataReads,
+        metadataReadBytes: after.primitive.metadataReadBytes - before.primitive.metadataReadBytes,
+        physicalHeadReads: heads - headBefore,
+      }),
+    );
+  },
+);

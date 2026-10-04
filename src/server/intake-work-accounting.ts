@@ -121,6 +121,8 @@ const hostTemplate = {
   packagePlanUnitIds: 0,
   packagePlanHashBytes: 0,
   collectionNodeReads: 0,
+  collectionReadWitnessQueries: 0,
+  collectionNodeCacheHits: 0,
   collectionReadBytes: 0,
   collectionPreparedBytes: 0,
   collectionPeakPreparedBytes: 0,

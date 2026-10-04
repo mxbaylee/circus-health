@@ -176,12 +176,16 @@ test('unchanged collection reads authenticate selected roots once per SQLite sta
   const after = intakeWorkCounters(db).warm;
   assert.equal(
     after.collectionNodeReads - before.collectionNodeReads,
-    64,
-    'each point read authenticates its directory and value page without unrelated root rereads',
+    0,
+    'an exact sealed per-call certificate avoids repeated directory and value SQL reads',
   );
+  assert.equal(after.collectionNodeCacheHits - before.collectionNodeCacheHits, 64);
+  assert.equal(after.collectionReadWitnessQueries - before.collectionReadWitnessQueries, 192);
   t.diagnostic(
     JSON.stringify({
       nodeReads: after.collectionNodeReads - before.collectionNodeReads,
+      cacheHits: after.collectionNodeCacheHits - before.collectionNodeCacheHits,
+      witnessQueries: after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
       readBytes: after.collectionReadBytes - before.collectionReadBytes,
       hashedBytes: after.hashedBytes - before.hashedBytes,
     }),

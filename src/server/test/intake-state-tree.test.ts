@@ -4,6 +4,9 @@ import {
   createIntakeTree,
   decodeIntakeTreeNode,
   type IntakeTreeNode,
+  type IntakeTreeCachedNode,
+  type IntakeTreeReadCertificate,
+  INTAKE_TREE_PAGE_BYTES,
   type IntakeTreeRoot,
 } from '../intake-state-tree.ts';
 
@@ -98,4 +101,75 @@ test('authenticated page trees preserve sorted exact keys through rotations, del
   assert.throws(() => corrupted.rank(root, '9999'), /schema/);
   assert.throws(() => sharedCacheForeign.rank(root, '9999'), /source binding/);
   assert.throws(() => pages.rank(root, 'a'.repeat(1025)), /key/);
+});
+
+test('sealed readonly page certificates retain at most the existing 128 authenticated pages', () => {
+  const raw = new Map<string, string>(),
+    cache = new Map<string, IntakeTreeCachedNode>(),
+    writer = createIntakeTree(identity, (hash) => raw.get(hash), cache);
+  let root: IntakeTreeRoot = null;
+  for (let index = 0; index < 300; index++)
+    root = writer.put(root, String(index).padStart(4, '0'), '🦊'.repeat(100));
+  for (const page of writer.writes([root])) raw.set(page.hash, page.raw);
+  const proof: IntakeTreeReadCertificate = {
+    witness: 'fictional-exact-read',
+    registry: {},
+    epoch: {},
+    state: 'active',
+  };
+  const reader = createIntakeTree(identity, (hash) => raw.get(hash), cache, {
+    certificate: proof,
+    check() {
+      assert.equal(proof.state, 'active');
+    },
+  });
+  assert.equal([...reader.entries(root)].length, 300);
+  proof.state = 'sealed';
+  assert.equal(cache.size, 128);
+  assert.ok([...cache.values()].every((entry) => entry.certificate === proof));
+  assert.ok(
+    [...cache.values()].every((entry) => Buffer.byteLength(entry.raw) <= INTAKE_TREE_PAGE_BYTES),
+  );
+  assert.ok(
+    [...cache.values()].reduce((bytes, entry) => bytes + Buffer.byteLength(entry.raw), 0) <=
+      128 * INTAKE_TREE_PAGE_BYTES,
+  );
+  assert.deepEqual(Object.keys(proof).sort(), ['epoch', 'registry', 'state', 'witness']);
+  const [hash, cached] = [...cache].at(-1)!;
+  const ref = {
+    hash,
+    count: 1 + (cached.node.left?.count ?? 0) + (cached.node.right?.count ?? 0),
+    height: 1 + Math.max(cached.node.left?.height ?? 0, cached.node.right?.height ?? 0),
+    first: cached.node.left?.first ?? cached.node.key,
+    last: cached.node.right?.last ?? cached.node.key,
+  };
+  let rawReads = 0;
+  const next: IntakeTreeReadCertificate = { ...proof, state: 'active' };
+  const sealed = createIntakeTree(
+    identity,
+    () => {
+      rawReads++;
+      return cached.raw;
+    },
+    cache,
+    {
+      certificate: next,
+      check() {
+        assert.equal(next.state, 'active');
+      },
+    },
+  );
+  assert.throws(() => sealed.load({ ...ref, count: ref.count + 1 }), /cached tree reference/);
+  assert.throws(() => sealed.load({ ...ref, first: 'forged-range' }), /cached tree reference/);
+  const foreign = createIntakeTree(
+    { ...identity, sourceHash: '4'.repeat(64) },
+    () => {
+      rawReads++;
+      return cached.raw;
+    },
+    cache,
+    { certificate: next, check() {} },
+  );
+  assert.throws(() => foreign.load(ref), /cached tree source binding/);
+  assert.equal(rawReads, 0, 'the certified hit still verifies complete reference and source');
 });

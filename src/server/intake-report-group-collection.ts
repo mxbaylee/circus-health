@@ -356,11 +356,15 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
       assertRunning?: () => void,
       retainArtifacts?: (artifacts: Iterable<VerifiedClinicalArtifact>) => void,
     ) {
+      // A reset must invalidate requests already waiting for the DB operation,
+      // even though they have not reached the queue's local review tail yet.
+      const assertReviewGeneration = selected.queue.captureReviewGuard();
       return runExclusiveClinicalOperation(
         db,
         async () => {
           const assertLease = () => {
             assertActive();
+            assertReviewGeneration();
             assertRunning?.();
           };
           assertLease();
@@ -982,6 +986,12 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     reviewGeneration++;
     closeReview();
   };
+  const captureReviewGuard = () => {
+    const generation = reviewGeneration;
+    return () => {
+      if (closed || generation !== reviewGeneration) throw changed();
+    };
+  };
   return {
     get binding() {
       return binding;
@@ -1014,6 +1024,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       scratch.close();
     },
     resetReview,
+    captureReviewGuard,
     releaseReview(success: boolean) {
       // Only an unchanged successful read may retain one completed proposal. Failed
       // leases and transactions cannot seed a session for a later window.
@@ -1146,11 +1157,11 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       assertLease: () => void,
       retainArtifacts?: (artifacts: Iterable<VerifiedClinicalArtifact>) => void,
     ) {
+      const assertReviewGeneration = captureReviewGuard();
       return runExclusiveClinicalOperation(
         db,
         async () => {
-          const generation = reviewGeneration,
-            prior = reviewTail;
+          const prior = reviewTail;
           let release!: () => void;
           reviewTail = new Promise<void>((resolve) => {
             release = resolve;
@@ -1158,7 +1169,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           pendingReviews++;
           const assertRunning = () => {
             assertLease();
-            if (closed || generation !== reviewGeneration) throw changed();
+            assertReviewGeneration();
           };
           await prior;
           try {

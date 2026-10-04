@@ -36,7 +36,8 @@ import {
   decodeIntakeTreeNode,
   intakeTreeRef,
   INTAKE_TREE_VALUE_BYTES,
-  type IntakeTreeNode,
+  type IntakeTreeCachedNode,
+  type IntakeTreeReadCertificate,
   type IntakeTreeRoot,
 } from './intake-state-tree.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
@@ -109,7 +110,7 @@ interface PreparedData {
 }
 interface Registry {
   generation: object;
-  pages: Map<string, { raw: string; node: IntakeTreeNode }>;
+  pages: Map<string, IntakeTreeCachedNode>;
   views: WeakMap<IntakeCollectionView, ViewData>;
   preparations: Map<PreparedIntakeCollectionMutation, PreparedData>;
   preparedBytes: number;
@@ -292,13 +293,24 @@ export function createIntakeCollections(owner: {
     'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS schema',
   );
   readGeneration.setReadBigInts(true);
+  const readTempGeneration = db.prepare('PRAGMA temp.schema_version');
+  readTempGeneration.setReadBigInts(true);
   let validatedSelection:
     { raw: unknown; generation: string; registry: Registry; value: ViewData } | undefined;
   let bridgeTransaction: object | undefined;
+  let readEpoch: object = {};
+  const readWitness = () => {
+    recordIntakeWork('collectionReadWitnessQueries', 2);
+    const stamp = readGeneration.get()!,
+      temp = readTempGeneration.get()!;
+    return `${stamp.changes}:${stamp.external}:${stamp.schema}:${temp.schema_version}`;
+  };
   const get = (key: string) => owner.get(key, key === headKey ? HEAD_BYTES : 32 * 1024);
   const run = <T>(fn: () => T): T =>
     withIntakeWork(db, 'warm', () => {
       try {
+        // A mutator or callback-bearing preparation never inherits an optimistic read.
+        readEpoch = {};
         ready();
         return fn();
       } catch (error) {
@@ -307,10 +319,56 @@ export function createIntakeCollections(owner: {
         throw error;
       }
     });
+  // Audited callers synchronously consume tree iterators and detach bounded
+  // results. No callback-bearing write or asynchronous preparation uses this path.
+  const runRead = <T>(fn: (pages: typeof tree) => T): T =>
+    withIntakeWork(db, 'warm', () => {
+      let certificate: IntakeTreeReadCertificate | undefined;
+      try {
+        ready();
+        if (db.isTransaction) {
+          readEpoch = {};
+          return fn(tree);
+        }
+        const registry = registryFor(db);
+        certificate = {
+          witness: readWitness(),
+          registry: registry.generation,
+          epoch: readEpoch,
+          state: 'active',
+        };
+        const proof = certificate;
+        const check = () => {
+          if (
+            db.isTransaction ||
+            proof.epoch !== readEpoch ||
+            proof.registry !== registryFor(db).generation ||
+            proof.state !== 'active'
+          ) {
+            proof.state = 'expired';
+            invalid('collection read authority changed');
+          }
+        };
+        const result = fn(() => tree({ certificate: proof, check }));
+        // Internal readers return only detached DTOs, buffers and opaque refs.
+        if (result && typeof result === 'object' && ('then' in result || 'next' in result))
+          invalid('collection read must finish synchronously');
+        check();
+        if (readWitness() !== proof.witness) invalid('collection read authority changed');
+        check();
+        proof.state = 'sealed';
+        return result;
+      } catch (error) {
+        if (certificate) certificate.state = 'expired';
+        readEpoch = {};
+        if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
+        owner.invalidate();
+        throw error;
+      }
+    });
   function selected(): ViewData {
     const raw = get(headKey);
-    const stamp = readGeneration.get()!,
-      generation = `${stamp.changes}:${stamp.external}:${stamp.schema}`,
+    const generation = readWitness(),
       registry = registryFor(db);
     // total_changes does not advance on ROLLBACK. Never retain a selection
     // authenticated inside a transaction: a savepoint rollback may restore
@@ -320,7 +378,8 @@ export function createIntakeCollections(owner: {
     // Root authentication is reusable only while this exact SQLite projection
     // stays unchanged. Local writes (including rolled-back writes), external
     // commits, schema changes and authority-cache invalidation all break it.
-    // Accessed tree pages still read and authenticate their current raw bytes.
+    // Raw paths still authenticate every page. Read-only paths can borrow only
+    // an exact generation-certified page and seal it after their final check.
     if (
       validatedSelection &&
       validatedSelection.raw === raw &&
@@ -345,11 +404,12 @@ export function createIntakeCollections(owner: {
     if (!value || value.prefix !== prefix) invalid('foreign or expired collection view');
     return value;
   }
-  function tree() {
+  function tree(proof?: Parameters<typeof createIntakeTree>[3]) {
     return createIntakeTree(
       identity,
       (hash) => get(prefix + 'node:' + hash),
       registryFor(db).pages,
+      proof,
     );
   }
   function readScope(view: IntakeCollectionView, area: IntakeCollectionArea) {
@@ -365,8 +425,9 @@ export function createIntakeCollections(owner: {
     head: IntakeCollectionHead | undefined,
     operationId: string,
     requestDigest: string,
+    pages: typeof tree = tree,
   ) {
-    const raw = tree().get(head?.receipts ?? null, operationId);
+    const raw = pages().get(head?.receipts ?? null, operationId);
     if (raw === undefined) return undefined;
     const value = parseIntakeCollectionReceipt(raw, identity, operationId);
     if (value.requestDigest !== requestDigest) invalid('collection operation replay conflict');
@@ -406,7 +467,7 @@ export function createIntakeCollections(owner: {
       registry.byteValues.delete(registry.byteValues.keys().next().value!);
     return capability;
   }
-  function collectionValue(raw: string): IntakeCollectionValue {
+  function collectionValue(raw: string, pages: typeof tree = tree): IntakeCollectionValue {
     const value = parseIntakeStoredValue(raw);
     if (value.kind !== 'collection') invalid('expected nested collection reference');
     const current = selected(),
@@ -416,7 +477,7 @@ export function createIntakeCollections(owner: {
         count: value.descriptor.root?.count ?? 0,
         bytes: value.descriptor.bytes,
       }) as IntakeCollectionValue;
-    if (value.descriptor.root) tree().load(value.descriptor.root);
+    if (value.descriptor.root) pages().load(value.descriptor.root);
     const values = registryFor(db).collectionValues;
     values.set(capability, {
       prefix,
@@ -485,7 +546,7 @@ export function createIntakeCollections(owner: {
       });
     },
     openView(): IntakeCollectionView {
-      return run(() => {
+      return runRead(() => {
         const view = Object.freeze({}) as IntakeCollectionView,
           registry = registryFor(db);
         registry.views.set(view, selected());
@@ -495,7 +556,7 @@ export function createIntakeCollections(owner: {
       });
     },
     binding(view: IntakeCollectionView): IntakeCollectionHead | undefined {
-      return run(() => {
+      return runRead(() => {
         const value = viewData(view).head;
         return value && structuredClone(value);
       });
@@ -505,9 +566,9 @@ export function createIntakeCollections(owner: {
       area: IntakeCollectionArea,
       name: string,
     ): IntakeCollectionDescriptor | undefined {
-      return run(() => {
+      return runRead((readTree) => {
         collectionName(name);
-        return descriptor(tree().get(readScope(view, area), name));
+        return descriptor(readTree().get(readScope(view, area), name));
       });
     },
     get(
@@ -516,9 +577,9 @@ export function createIntakeCollections(owner: {
       name: string,
       key: string,
     ): string | IntakeByteValue | undefined {
-      return run(() => {
+      return runRead((readTree) => {
         collectionName(name);
-        const pages = tree(),
+        const pages = readTree(),
           collection = descriptor(pages.get(readScope(view, area), name));
         const result = pages.get(collection?.root ?? null, key);
         if (result !== undefined) recordIntakeWork('collectionItemsRead');
@@ -531,9 +592,9 @@ export function createIntakeCollections(owner: {
       name: string,
       key: string,
     ): number {
-      return run(() => {
+      return runRead((readTree) => {
         collectionName(name);
-        const pages = tree(),
+        const pages = readTree(),
           collection = descriptor(pages.get(readScope(view, area), name));
         return pages.rank(collection?.root ?? null, key);
       });
@@ -544,20 +605,20 @@ export function createIntakeCollections(owner: {
       name: string,
       key: string,
     ): IntakeCollectionValue | undefined {
-      return run(() => {
+      return runRead((readTree) => {
         collectionName(name);
-        const pages = tree(),
+        const pages = readTree(),
           collection = descriptor(pages.get(readScope(view, area), name));
         if (collection && collection.kind === 'bytes')
           invalid('byte collections have no nested references');
         const value = pages.get(collection?.root ?? null, key);
-        return value === undefined ? undefined : collectionValue(value);
+        return value === undefined ? undefined : collectionValue(value, readTree);
       });
     },
     preceding(view: IntakeCollectionView, area: IntakeCollectionArea, name: string, key: string) {
-      return run(() => {
+      return runRead((readTree) => {
         collectionName(name);
-        const pages = tree(),
+        const pages = readTree(),
           source = descriptor(pages.get(readScope(view, area), name));
         const item = pages.preceding(source?.root ?? null, key);
         if (!item) return undefined;
@@ -566,38 +627,38 @@ export function createIntakeCollections(owner: {
       });
     },
     precedingReferenced(value: IntakeCollectionValue, key: string) {
-      return run(() => {
+      return runRead((readTree) => {
         const source = referenced(value),
-          item = tree().preceding(source.root, key);
+          item = readTree().preceding(source.root, key);
         if (!item) return undefined;
         recordIntakeWork('collectionItemsRead');
         return { key: item.key, value: publicValue(item.value, source.kind) };
       });
     },
     referenceFrom(value: IntakeCollectionValue, key: string): IntakeCollectionValue | undefined {
-      return run(() => {
+      return runRead((readTree) => {
         const source = referenced(value);
         if (source.kind === 'bytes') invalid('byte collections have no nested references');
-        const raw = tree().get(source.root, key);
-        return raw === undefined ? undefined : collectionValue(raw);
+        const raw = readTree().get(source.root, key);
+        return raw === undefined ? undefined : collectionValue(raw, readTree);
       });
     },
     getReferenced(value: IntakeCollectionValue, key: string): string | IntakeByteValue | undefined {
-      return run(() => {
+      return runRead((readTree) => {
         const source = referenced(value),
-          raw = tree().get(source.root, key);
+          raw = readTree().get(source.root, key);
         if (raw !== undefined) recordIntakeWork('collectionItemsRead');
         return raw === undefined ? undefined : publicValue(raw, source.kind);
       });
     },
     rankReferenced(value: IntakeCollectionValue, key: string): number {
-      return run(() => tree().rank(referenced(value).root, key));
+      return runRead((readTree) => readTree().rank(referenced(value).root, key));
     },
     rangeReferenced(
       value: IntakeCollectionValue,
       options: { after?: string; items: number; bytes: number },
     ) {
-      return run(() => {
+      return runRead((readTree) => {
         const source = referenced(value);
         integer(options.items, 1);
         integer(options.bytes, 1);
@@ -605,7 +666,7 @@ export function createIntakeCollections(owner: {
         const items: Array<{ key: string; value: string | IntakeByteValue }> = [];
         let bytes = 0,
           complete = true;
-        for (const item of tree().entries(source.root, options.after)) {
+        for (const item of readTree().entries(source.root, options.after)) {
           const added = Buffer.byteLength(item.key) + Buffer.byteLength(item.value);
           if (items.length === options.items || bytes + added > options.bytes) {
             complete = false;
@@ -631,12 +692,12 @@ export function createIntakeCollections(owner: {
       name: string,
       options: { after?: string; items: number; bytes: number },
     ) {
-      return run(() => {
+      return runRead((readTree) => {
         collectionName(name);
         integer(options.items, 1);
         integer(options.bytes, 1);
         if (options.items > 100 || options.bytes > 256 * 1024) invalid('reference range budget');
-        const pages = tree(),
+        const pages = readTree(),
           source = descriptor(pages.get(readScope(view, area), name));
         if (source?.kind === 'bytes') invalid('byte collections have no nested references');
         const items: Array<{ key: string; value: IntakeCollectionValue }> = [];
@@ -649,7 +710,7 @@ export function createIntakeCollections(owner: {
             break;
           }
           bytes += added;
-          items.push({ key: item.key, value: collectionValue(item.value) });
+          items.push({ key: item.key, value: collectionValue(item.value, readTree) });
           recordIntakeWork('collectionItemsRead');
         }
         if (!complete && !items.length) invalid('reference range item exceeds byte budget');
@@ -668,12 +729,12 @@ export function createIntakeCollections(owner: {
       name: string,
       options: { after?: string; items: number; bytes: number },
     ) {
-      return run(() => {
+      return runRead((readTree) => {
         collectionName(name);
         integer(options.items, 1);
         integer(options.bytes, 1);
         if (options.items > 100 || options.bytes > 256 * 1024) invalid('collection range budget');
-        const pages = tree(),
+        const pages = readTree(),
           collection = descriptor(pages.get(readScope(view, area), name));
         const items: Array<{ key: string; value: string | IntakeByteValue }> = [];
         let bytes = 0,
@@ -701,7 +762,7 @@ export function createIntakeCollections(owner: {
       });
     },
     readBytes(value: IntakeByteValue, options: { after?: string; items: number; bytes: number }) {
-      return run(() => {
+      return runRead((readTree) => {
         selected();
         const retained = registryFor(db).byteValues.get(value);
         if (!retained || retained.prefix !== prefix) invalid('foreign or expired byte value');
@@ -712,7 +773,7 @@ export function createIntakeCollections(owner: {
         let bytes = 0,
           after: string | null = null,
           complete = true;
-        for (const item of tree().entries(retained.root, options.after)) {
+        for (const item of readTree().entries(retained.root, options.after)) {
           const chunk = Buffer.from(item.value, 'base64');
           if (!chunk.length || chunk.length > 4096 || chunk.toString('base64') !== item.value)
             invalid('byte chunk representation');
@@ -729,9 +790,9 @@ export function createIntakeCollections(owner: {
       });
     },
     replay(operationId: string, requestDigest: string): IntakeCollectionResult | undefined {
-      return run(() => {
+      return runRead((readTree) => {
         uuid(operationId);
-        return receipt(selected().head, operationId, requestDigest);
+        return receipt(selected().head, operationId, requestDigest, readTree);
       });
     },
     prepare(
