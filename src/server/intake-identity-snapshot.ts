@@ -20,6 +20,18 @@ import { createHash } from 'node:crypto';
 import { canonicalLiteral } from './intake-format.ts';
 import { HttpError } from './database.ts';
 export const IDENTITY_SNAPSHOT_FORMAT = 'health-intake-identity-snapshot-v1';
+export function identitySnapshotScopeMatches(
+  reader: ReportSnapshotMapReader,
+  scope: IntakeIdentityScopeReference,
+): boolean {
+  const expected = JSON.stringify(scope);
+  let offset = 0;
+  for (const piece of reader.chunks('$scope')) {
+    if (expected.slice(offset, offset + piece.length) !== piece) return false;
+    offset += piece.length;
+  }
+  return offset === expected.length;
+}
 export function readIdentitySnapshotValue<T>(
   reader: ReportSnapshotMapReader,
   key: string,
@@ -53,7 +65,7 @@ export function openIdentityScopeSnapshot(
   if (
     !reader ||
     reader.get('$format') !== IDENTITY_SNAPSHOT_FORMAT ||
-    reader.get('$scope') !== JSON.stringify(scope)
+    !identitySnapshotScopeMatches(reader, scope)
   )
     throw new HttpError(
       409,

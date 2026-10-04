@@ -200,6 +200,7 @@ export function ImportDetailIdentityPanel({
           <IdentityScopeEvidence
             key={scope!.scopeToken}
             scope={review.scopeReference}
+            warningsReference={review.warningsReference}
             onRefresh={onRetry}
             onQuestionsReviewed={(ready) =>
               setReviewedQuestions(ready ? scope!.scopeToken : undefined)

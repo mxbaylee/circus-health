@@ -280,7 +280,7 @@ test(
           limit: '20',
         });
         if (cursor) query.set('cursor', cursor);
-        const page = await request<IntakeIdentityScopePage>(
+        const page: IntakeIdentityScopePage = await request<IntakeIdentityScopePage>(
           `/intakes/${encodeURIComponent(scope.intakeId)}/identity-scope-page?${query}`,
         );
         assert.equal(page.scopeToken, scope.scopeToken);

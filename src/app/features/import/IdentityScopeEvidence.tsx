@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type {
+  IntakeIdentityReview,
   IntakeIdentityScopePage,
   IntakeIdentityScopeReference,
   IntakeIdentityScopeSection,
@@ -14,14 +15,17 @@ const labels: Record<IntakeIdentityScopeSection, string> = {
   assignmentTargets: 'Records receiving this person choice',
   membership: 'Retained report membership',
   competingSubjects: 'Other printed subjects',
+  warnings: 'Report identity warnings',
 };
 /** The reference identifies complete authority; only the displayed evidence window is retained here. */
 export function IdentityScopeEvidence({
   scope,
+  warningsReference,
   onQuestionsReviewed,
   onRefresh,
 }: {
   scope: IntakeIdentityScopeReference;
+  warningsReference?: IntakeIdentityReview['warningsReference'];
   onQuestionsReviewed: (ready: boolean) => void;
   onRefresh: () => void;
 }) {
@@ -43,6 +47,12 @@ export function IdentityScopeEvidence({
           onRefresh={onRefresh}
         />
       )}
+      {warningsReference && (
+        <p>
+          {warningsReference.count.toLocaleString()} advisory warnings are available in the complete
+          report identity warnings section below.
+        </p>
+      )}
       <button type="button" className="button secondary" onClick={() => setOpen(!open)}>
         {open ? 'Hide identity scope evidence' : 'Inspect affected records and membership'}
       </button>
@@ -55,7 +65,9 @@ export function IdentityScopeEvidence({
               onChange={(event) => setSection(event.target.value as IntakeIdentityScopeSection)}
             >
               {Object.entries(labels)
-                .filter(([key]) => key !== 'questions')
+                .filter(
+                  ([key]) => key !== 'questions' && (key !== 'warnings' || !!warningsReference),
+                )
                 .map(([key, label]) => (
                   <option key={key} value={key}>
                     {label}
@@ -63,7 +75,13 @@ export function IdentityScopeEvidence({
                 ))}
             </select>
           </label>
-          <IdentityScopePage key={section} scope={scope} section={section} onRefresh={onRefresh} />
+          <IdentityScopePage
+            key={section}
+            scope={scope}
+            section={section}
+            expectedCount={section === 'warnings' ? warningsReference?.count : undefined}
+            onRefresh={onRefresh}
+          />
         </>
       )}
     </section>
@@ -72,11 +90,13 @@ export function IdentityScopeEvidence({
 function IdentityScopePage({
   scope,
   section,
+  expectedCount,
   onReviewed,
   onRefresh,
 }: {
   scope: IntakeIdentityScopeReference;
   section: IntakeIdentityScopeSection;
+  expectedCount?: number;
   onReviewed?: (ready: boolean) => void;
   onRefresh: () => void;
 }) {
@@ -93,7 +113,7 @@ function IdentityScopePage({
   const key = JSON.stringify([binding, section, position, revision]);
   const reviewed = useRef(onReviewed);
   reviewed.current = onReviewed;
-  const expected = scope.collection[section];
+  const expected = section === 'warnings' ? (expectedCount ?? 0) : scope.collection[section];
   useEffect(() => {
     setPosition({ offset: 0 });
     setInspected(new Set());

@@ -46,6 +46,7 @@ import {
   IDENTITY_SNAPSHOT_FORMAT,
   openIdentityScopeSnapshot,
   readIdentitySnapshotValue,
+  identitySnapshotScopeMatches,
 } from './intake-identity-snapshot.ts';
 import { schemaOrdinal } from './intake-envelope-schema.ts';
 import {
@@ -1053,17 +1054,61 @@ async function writeSnapshot(
 ) {
   const previous = catalog.open(built.display.collection.snapshotId);
   if (previous) {
-    if (previous.get('$scope') !== JSON.stringify(built.display))
+    if (!identitySnapshotScopeMatches(previous, built.display))
       throw Error('Identity snapshot binding mismatch');
     return;
   }
   const writer = await catalog.fork();
-  await writer.put('$format', IDENTITY_SNAPSHOT_FORMAT);
-  await writer.put('$scope', JSON.stringify(built.display));
-  await writer.put('$warningCount', String(stored.count('warnings')));
+  // Small JSON rows stay in bounded inline batches. Allocating a separate byte
+  // collection for every issue ID or occurrence amplifies unchanged tree paths.
+  let pending: { key: string; value: string }[] = [],
+    pendingBytes = 0;
+  const flush = async () => {
+    if (pending.length) await writer.putMany(pending);
+    pending = [];
+    pendingBytes = 0;
+  };
+  const put = async (key: string, value: string) => {
+    const cost = Buffer.byteLength(key) + Buffer.byteLength(value);
+    if (pending.length && (pending.length === 16 || pendingBytes + cost > 64 * 1024)) await flush();
+    pending.push({ key, value });
+    pendingBytes += cost;
+  };
+  const putText = async (key: string, pieces: Iterable<string>) => {
+    const iterator = pieces[Symbol.iterator](),
+      prefix: string[] = [];
+    let bytes = 0;
+    for (;;) {
+      const next = iterator.next();
+      if (next.done) {
+        await put(key, prefix.join(''));
+        return;
+      }
+      bytes += Buffer.byteLength(next.value);
+      prefix.push(next.value);
+      if (bytes > 16 * 1024) {
+        await flush();
+        await writer.putText(
+          key,
+          (function* () {
+            yield* prefix;
+            for (;;) {
+              const next = iterator.next();
+              if (next.done) return;
+              yield next.value;
+            }
+          })(),
+        );
+        return;
+      }
+    }
+  };
+  await put('$format', IDENTITY_SNAPSHOT_FORMAT);
+  await putText('$scope', [JSON.stringify(built.display)]);
+  await put('$warningCount', String(stored.count('warnings')));
   let warningOrdinal = 0;
   for (const row of stored.raw('warnings'))
-    await writer.putText('warnings:' + schemaOrdinal(warningOrdinal++), row.chunks());
+    await putText('warnings:' + schemaOrdinal(warningOrdinal++), row.chunks());
   for (const section of SECTIONS) {
     if (section === 'membership') continue;
     let index = 0;
@@ -1075,22 +1120,21 @@ async function writeSnapshot(
         let count = 0;
         if (issueIds)
           for (const issueId of issueIds)
-            await writer.put(
+            await put(
               'targetIssue:' + targetKey + ':' + schemaOrdinal(count++),
               JSON.stringify(issueId),
             );
-        await writer.put(
-          'targetHeader:' + targetKey,
+        await putText('targetHeader:' + targetKey, [
           JSON.stringify({ ...header, hasIssueIds: !!issueIds, issueCount: count }),
-        );
+        ]);
       }
       if (section === 'questions') {
         const digest = createHash('sha256');
         for (const piece of row.chunks()) digest.update(piece);
-        await writer.put('questionHash:' + schemaOrdinal(index), digest.digest('hex'));
+        await put('questionHash:' + schemaOrdinal(index), digest.digest('hex'));
       }
       context.assertCurrent();
-      await writer.putText(section + ':' + schemaOrdinal(index++), row.chunks());
+      await putText(section + ':' + schemaOrdinal(index++), row.chunks());
     }
   }
   let index = 0;
@@ -1100,12 +1144,13 @@ async function writeSnapshot(
     let occurrenceCount = 0;
     for (const occurrence of occurrences) {
       context.assertCurrent();
-      await writer.putText('occurrence:' + memberKey + ':' + schemaOrdinal(occurrenceCount++), [
+      await putText('occurrence:' + memberKey + ':' + schemaOrdinal(occurrenceCount++), [
         canonicalLiteral(occurrence),
       ]);
     }
-    await writer.put('member:' + memberKey, canonicalLiteral({ ...header, occurrenceCount }));
-    await writer.putText(
+    await putText('member:' + memberKey, [canonicalLiteral({ ...header, occurrenceCount })]);
+    await flush();
+    await putText(
       'membership:' + memberKey,
       (function* () {
         yield '{';
@@ -1130,6 +1175,7 @@ async function writeSnapshot(
       })(),
     );
   }
+  await flush();
   await catalog.publish(built.display.collection.snapshotId, writer);
 }
 async function collectGroupIdentity(context: Context, stored: Rows) {
