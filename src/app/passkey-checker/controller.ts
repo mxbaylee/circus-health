@@ -2,7 +2,7 @@ import * as operations from './core.ts';
 import { createRun, inspectEnvironment } from './environment.ts';
 import { projectPrfDiagnostics } from './diagnostics.ts';
 import type { DiagnosticObserver } from './diagnostics.ts';
-import { isVerifiedReturnToA } from './progress.ts';
+import { isVerifiedAAfterFailedB, isVerifiedReturnToA, latestBCreation } from './progress.ts';
 import { ENVIRONMENT_FIELDS, stepsForAlias } from './types.ts';
 import type {
   Attempt,
@@ -180,6 +180,18 @@ export async function createCheckerController(
     if (step === 'create')
       return !credential && (alias === 'A' || state.credentials.some((item) => item.alias === 'A'));
     if (step === 'confirm') return !!credential && !credential.cipher;
+    if (step === 'use-after-b-failed') {
+      const failure = latestBCreation(state);
+      return (
+        alias === 'A' &&
+        !!credential?.cipher &&
+        !state.credentials.some((item) => item.alias === 'B') &&
+        failure?.status === 'failed' &&
+        !state.attempts.some(
+          (item) => item.afterAttemptId === failure.id && isVerifiedAAfterFailedB(state, item),
+        )
+      );
+    }
     if (step === 'use-after-b')
       return (
         alias === 'A' &&
@@ -228,15 +240,25 @@ export async function createCheckerController(
     },
     async runStep(alias, step) {
       if (!canRunStep(alias, step)) return;
+      let previousSequence = state.attempts.length;
+      for (const previous of state.attempts)
+        if (previous.sequence !== undefined)
+          previousSequence = Math.max(previousSequence, previous.sequence);
+      if (!Number.isSafeInteger(previousSequence) || previousSequence >= Number.MAX_SAFE_INTEGER) {
+        failed(new CheckerStorageError('incompatible'));
+        return;
+      }
       busy = true;
       const attempt: Attempt = {
         id: identifier(),
         alias,
         step,
         status: 'pending',
+        sequence: previousSequence + 1,
         startedAt: new Date().toISOString(),
         build: structuredClone(options.build),
         environment: structuredClone(state.run.environment),
+        ...(step === 'use-after-b-failed' ? { afterAttemptId: latestBCreation(state)!.id } : {}),
       };
       state.attempts.push(attempt);
       publish();
@@ -273,7 +295,7 @@ export async function createCheckerController(
         attempt.status = step === 'create' ? 'created' : 'verified';
       } catch (error) {
         attempt.status = 'failed';
-        attempt.error = operations.sanitizeError(error);
+        attempt.error = attempt.diagnostics?.applicationError ?? operations.sanitizeError(error);
       }
       attempt.finishedAt = new Date().toISOString();
       publish();

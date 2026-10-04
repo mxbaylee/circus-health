@@ -61,7 +61,7 @@ const state = (): CheckerState => ({
 });
 test('partial report separates manual worked from failure, creation from PRF and all remaining release gates', () => {
   const report = reportMarkdown(state());
-  assert.match(report, /Report schema: 2/);
+  assert.match(report, /Report schema: 3/);
   assert.match(report, /created only; PRF not verified/);
   assert.match(report, /Confirm PRF and fictional encryption, attempt 1: failed/);
   assert.match(report, /cancelled, timed out, or refused/);
@@ -123,6 +123,94 @@ test('report independently projects diagnostic metadata without exporting unknow
     outputShape: 'never-export-invalid-known-field',
   } as unknown as NonNullable<(typeof model.attempts)[number]['diagnostics']>;
   assert.doesNotMatch(reportMarkdown(model), /Safe request diagnostics|never-export/);
+});
+
+test('failure report retains exact validation expectations and safe native distinctions', () => {
+  const model = state();
+  model.attempts[1].error = 'prf-invalid';
+  model.attempts[1].diagnostics = {
+    requestMode: 'eval',
+    inputShape: 'array-buffer',
+    inputLength: 32,
+    operation: 'confirm',
+    stage: 'prf-validation',
+    applicationError: 'prf-invalid',
+    validationRule: 'prf-output-array-bytes',
+    allowCredentialCount: 1,
+    requestCredentialMatched: true,
+    requiredUserVerification: true,
+    extensionPresent: true,
+    extensionShape: 'object',
+    resultsPresent: true,
+    resultsShape: 'object',
+    outputShape: 'array',
+    outputLength: 32,
+    arrayEntriesValid: false,
+    credentialMatched: true,
+  };
+  const report = reportMarkdown(model);
+  assert.match(
+    report,
+    /operation: confirm; stage: prf-validation; application error code: prf-invalid/,
+  );
+  assert.match(report, /allowed credential count: 1/);
+  assert.match(report, /array entries are bytes: false/);
+  assert.match(
+    report,
+    /validation rule: prf-output-array-bytes; expected: 32 integer byte entries between 0 and 255/,
+  );
+  assert.match(report, /output shape: array; output length: 32/);
+  assert.match(
+    report,
+    /InvalidStateError with exclusions is consistent with duplicate exclusion but does not prove it/,
+  );
+  model.attempts[1].diagnostics.nativeErrorName = 'private-provider-message' as never;
+  assert.doesNotMatch(reportMarkdown(model), /Safe request diagnostics|private-provider-message/);
+});
+
+test('failed-B recovery reports retain historical success and locate each newer unfinished failure without IDs', () => {
+  const model = state();
+  const failedB = {
+    ...model.attempts[1],
+    id: 'never-export-first-failed-b-id',
+    alias: 'B' as const,
+    step: 'create' as const,
+    error: 'invalid-state' as const,
+    startedAt: '2026-10-03T00:01:00.000Z',
+    finishedAt: '2026-10-03T00:02:00.000Z',
+  };
+  const recovered = {
+    ...model.attempts[1],
+    id: 'never-export-a-recovery-id',
+    step: 'use-after-b-failed' as const,
+    status: 'verified' as const,
+    error: undefined,
+    afterAttemptId: failedB.id,
+    startedAt: '2026-10-03T00:03:00.000Z',
+    finishedAt: '2026-10-03T00:04:00.000Z',
+  };
+  const newerFailure = {
+    ...failedB,
+    id: 'never-export-newer-failed-b-id',
+    error: 'unknown-error' as const,
+    startedAt: '2026-10-03T00:05:00.000Z',
+    finishedAt: '2026-10-03T00:06:00.000Z',
+  };
+  model.attempts.push(failedB, recovered, newerFailure);
+  const report = reportMarkdown(model);
+  assert.match(
+    report,
+    /Use A after B creation fails, attempt 1: verified PRF and fictional decryption/,
+  );
+  assert.match(report, /Recovery after the latest failed B creation: unfinished/);
+  assert.match(report, /Linked failed B creation: attempt 1/);
+  assert.match(report, /does not verify B or complete two-credential enrollment/);
+  assert.doesNotMatch(report, /never-export|afterAttemptId/);
+  recovered.afterAttemptId = 'never-export-orphan';
+  const orphanReport = reportMarkdown(model);
+  assert.match(orphanReport, /Use A after B creation fails, attempt 1: pending or unfinished/);
+  assert.match(orphanReport, /Linked failed B creation: unavailable or invalid/);
+  assert.doesNotMatch(orphanReport, /never-export|afterAttemptId/);
 });
 
 test('A return requires its own verified use after B creation even when B is unconfirmed', () => {

@@ -24,7 +24,8 @@ export type EnvironmentField = (typeof ENVIRONMENT_FIELDS)[number];
 export type Environment = Record<EnvironmentField, MetadataField>;
 export type CredentialAlias = 'A' | 'B';
 export const KNOWN_TRANSPORTS = ['ble', 'hybrid', 'internal', 'nfc', 'usb'] as const;
-export type Step = 'create' | 'confirm' | 'use-1' | 'use-2' | 'use-3' | 'use-after-b';
+export type Step =
+  'create' | 'confirm' | 'use-1' | 'use-2' | 'use-3' | 'use-after-b' | 'use-after-b-failed';
 export const STEP_LABELS: Record<Step, string> = {
   create: 'Create credential',
   confirm: 'Confirm PRF and fictional encryption',
@@ -32,10 +33,11 @@ export const STEP_LABELS: Record<Step, string> = {
   'use-2': 'Fresh use 2',
   'use-3': 'Fresh use 3',
   'use-after-b': 'Use A after B is created',
+  'use-after-b-failed': 'Use A after B creation fails',
 };
 export function stepsForAlias(alias: CredentialAlias): Step[] {
   const steps: Step[] = ['create', 'confirm', 'use-1', 'use-2', 'use-3'];
-  return alias === 'A' ? [...steps, 'use-after-b'] : steps;
+  return alias === 'A' ? [...steps, 'use-after-b', 'use-after-b-failed'] : steps;
 }
 export const ERROR_MESSAGES = {
   'insecure-context': 'A valid HTTPS secure context is required.',
@@ -84,6 +86,10 @@ export interface Attempt {
   status: 'pending' | 'created' | 'verified' | 'failed' | 'interrupted';
   error?: ErrorCode;
   diagnostics?: PrfDiagnostics;
+  /** Local attempt reference, only for A's check after this exact B creation failed. */
+  afterAttemptId?: string;
+  /** Causal order for new attempts; legacy rows retain their original timestamps. */
+  sequence?: number;
   startedAt: string;
   finishedAt?: string;
   build: BuildInfo;

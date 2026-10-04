@@ -1,8 +1,14 @@
 import { encodePrf, prfFrom, withBinaryPrf } from '../components/passkey-prf.ts';
 import { ERROR_MESSAGES, KNOWN_TRANSPORTS } from './types.ts';
 import type { CredentialAlias, CredentialRecord, ErrorCode, RunHeader } from './types.ts';
-import { describePrfRequest, describePrfResponse, emitPrfDiagnostics } from './diagnostics.ts';
-import type { PrfDiagnostics, PrfDiagnosticsObserver } from './diagnostics.ts';
+import {
+  describePrfRequest,
+  describePrfResponse,
+  diagnosticShape,
+  emitPrfDiagnostics,
+  nativeErrorEvidence,
+} from './diagnostics.ts';
+import type { PrfDiagnostics, PrfDiagnosticsObserver, ValidationRule } from './diagnostics.ts';
 
 export class CheckerError extends Error {
   readonly code: ErrorCode;
@@ -11,9 +17,14 @@ export class CheckerError extends Error {
     this.code = code;
   }
 }
-export function sanitizeError(error: unknown): ErrorCode {
-  if (error instanceof CheckerError) return error.code;
-  const name = error && typeof error === 'object' && 'name' in error ? error.name : '';
+function checkerErrorCode(error: unknown): ErrorCode | undefined {
+  try {
+    return error instanceof CheckerError ? error.code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function errorCodeForName(name: PrfDiagnostics['nativeErrorName']): ErrorCode {
   switch (name) {
     case 'NotAllowedError':
       return 'not-allowed';
@@ -29,16 +40,40 @@ export function sanitizeError(error: unknown): ErrorCode {
       return 'unknown-error';
   }
 }
+export function sanitizeError(error: unknown): ErrorCode {
+  return checkerErrorCode(error) ?? errorCodeForName(nativeErrorEvidence(error).nativeErrorName);
+}
+function fail(diagnostics: PrfDiagnostics, code: ErrorCode, rule: ValidationRule): never {
+  diagnostics.validationRule = rule;
+  throw new CheckerError(code);
+}
+function captureFailure(diagnostics: PrfDiagnostics, error: unknown) {
+  const code = checkerErrorCode(error);
+  if (code) diagnostics.applicationError = code;
+  else {
+    const evidence = nativeErrorEvidence(error);
+    Object.assign(diagnostics, evidence);
+    diagnostics.applicationError = errorCodeForName(evidence.nativeErrorName);
+  }
+}
+function observeShape(diagnostics: PrfDiagnostics, value: unknown) {
+  try {
+    return diagnosticShape(value);
+  } catch {
+    diagnostics.diagnosticsUnavailable = true;
+    return undefined;
+  }
+}
 /** Injection is for controlled unit tests only, never a physical-observation mode. */
 export interface CredentialPort {
   create(options: CredentialCreationOptions): Promise<Credential | null>;
   get(options: CredentialRequestOptions): Promise<Credential | null>;
 }
-function nativePort(run: RunHeader): CredentialPort {
+function nativePort(run: RunHeader, diagnostics: PrfDiagnostics): CredentialPort {
   if (globalThis.location?.protocol !== 'https:' || !globalThis.isSecureContext)
-    throw new CheckerError('insecure-context');
+    fail(diagnostics, 'insecure-context', 'secure-context');
   if (location.origin !== run.origin || location.hostname !== run.rpId)
-    throw new CheckerError('scope-mismatch');
+    fail(diagnostics, 'scope-mismatch', 'relying-party-scope');
   if (
     !globalThis.navigator?.credentials ||
     typeof navigator.credentials.create !== 'function' ||
@@ -46,7 +81,7 @@ function nativePort(run: RunHeader): CredentialPort {
     !globalThis.crypto?.subtle ||
     typeof PublicKeyCredential === 'undefined'
   )
-    throw new CheckerError('unsupported');
+    fail(diagnostics, 'unsupported', 'required-browser-api');
   return {
     create: (options) => navigator.credentials.create(options),
     get: (options) => navigator.credentials.get(options),
@@ -56,16 +91,30 @@ function bytes(value: string): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
 }
 const random = (size: number) => crypto.getRandomValues(new Uint8Array(size));
-function publicCredential(value: Credential | null): PublicKeyCredential {
-  if (!value || value.type !== 'public-key') throw new CheckerError('invalid-credential');
+function publicCredential(
+  value: Credential | null,
+  diagnostics: PrfDiagnostics,
+): PublicKeyCredential {
+  diagnostics.stage = 'credential-validation';
+  diagnostics.credentialReturned = Boolean(value);
+  if (!value) fail(diagnostics, 'invalid-credential', 'credential-returned');
+  diagnostics.credentialTypeMatched = value.type === 'public-key';
+  if (!diagnostics.credentialTypeMatched)
+    fail(diagnostics, 'invalid-credential', 'credential-type');
   const credential = value as PublicKeyCredential;
-  if (
-    Object.prototype.toString.call(credential.rawId) !== '[object ArrayBuffer]' ||
-    credential.rawId.byteLength < 1 ||
-    credential.rawId.byteLength > 1024 ||
-    typeof credential.getClientExtensionResults !== 'function'
-  )
-    throw new CheckerError('invalid-credential');
+  const rawId = credential.rawId;
+  const shape = observeShape(diagnostics, rawId);
+  if (shape) {
+    diagnostics.credentialIdShape = shape.shape;
+    if (shape.length !== undefined) diagnostics.credentialIdLength = shape.length;
+  }
+  if (Object.prototype.toString.call(rawId) !== '[object ArrayBuffer]')
+    fail(diagnostics, 'invalid-credential', 'credential-id-buffer');
+  if (rawId.byteLength < 1 || rawId.byteLength > 1024)
+    fail(diagnostics, 'invalid-credential', 'credential-id-length');
+  diagnostics.extensionReaderPresent = typeof credential.getClientExtensionResults === 'function';
+  if (!diagnostics.extensionReaderPresent)
+    fail(diagnostics, 'invalid-credential', 'extension-reader');
   return credential;
 }
 function context(run: RunHeader, credential: CredentialRecord) {
@@ -128,19 +177,69 @@ function request(
     }) as unknown as PublicKeyCredentialRequestOptions,
   };
 }
+function observeRequest(
+  options: CredentialRequestOptions,
+  credential: CredentialRecord,
+  diagnostics: PrfDiagnostics,
+) {
+  const request = options.publicKey!;
+  const input =
+    diagnostics.requestMode === 'eval'
+      ? request.extensions?.prf?.eval?.first
+      : request.extensions?.prf?.evalByCredential?.[credential.id]?.first;
+  Object.assign(diagnostics, describePrfRequest(diagnostics.requestMode, input));
+  diagnostics.allowCredentialCount = request.allowCredentials!.length;
+  diagnostics.requestCredentialMatched =
+    encodePrf((request.allowCredentials![0].id as Uint8Array).buffer as ArrayBuffer) ===
+    credential.id;
+  diagnostics.requiredUserVerification = request.userVerification === 'required';
+}
 function extractPrf(
   value: Credential | null,
   credential: CredentialRecord,
   diagnostics: PrfDiagnostics,
 ): string {
-  const result = publicCredential(value);
+  const result = publicCredential(value, diagnostics);
+  diagnostics.stage = 'credential-match';
   diagnostics.credentialMatched = encodePrf(result.rawId) === credential.id;
-  if (!diagnostics.credentialMatched) throw new CheckerError('wrong-credential');
+  if (!diagnostics.credentialMatched) fail(diagnostics, 'wrong-credential', 'selected-credential');
+  diagnostics.stage = 'extension-read';
   const extensions = result.getClientExtensionResults();
   const captured = describePrfResponse(diagnostics, extensions);
+  diagnostics.stage = 'prf-validation';
   const prf = prfFrom({ clientExtensionResults: captured });
-  if (!prf)
-    throw new CheckerError(diagnostics.outputShape === 'absent' ? 'prf-absent' : 'prf-invalid');
+  if (!prf) {
+    // Explain a rejected output only after the shared production decoder refuses it.
+    // Do not create another acceptance path or inspect more than a 32-item array.
+    let rule: ValidationRule = 'prf-output-supported-shape';
+    const first = captured.prf.results.first;
+    try {
+      if (first === undefined)
+        rule = !diagnostics.extensionPresent
+          ? 'prf-extension-present'
+          : !diagnostics.resultsPresent
+            ? 'prf-results-present'
+            : 'prf-output-present';
+      else if (Array.isArray(first)) {
+        rule = first.length !== 32 ? 'prf-output-array-length' : 'prf-output-array-bytes';
+        if (first.length === 32) diagnostics.arrayEntriesValid = false;
+      } else if (typeof first === 'string') {
+        rule =
+          first.length !== 43
+            ? 'prf-output-base64url-length'
+            : !/^[A-Za-z0-9_-]{43}$/.test(first)
+              ? 'prf-output-base64url-alphabet'
+              : 'prf-output-base64url-canonical';
+      } else if (
+        diagnostics.outputShape === 'array-buffer' ||
+        diagnostics.outputShape === 'array-buffer-view'
+      )
+        rule = 'prf-output-buffer-length';
+    } catch {
+      diagnostics.diagnosticsUnavailable = true;
+    }
+    fail(diagnostics, first === undefined ? 'prf-absent' : 'prf-invalid', rule);
+  }
   return prf;
 }
 /** Public browser routing hints, never used as proof of authenticator/provider identity. */
@@ -162,51 +261,78 @@ export async function createCredential(
   port?: CredentialPort,
   observer?: PrfDiagnosticsObserver,
 ): Promise<CredentialRecord> {
-  const salt = encodePrf(random(32).buffer);
-  const options: CredentialCreationOptions = {
-    publicKey: withBinaryPrf({
-      challenge: random(32),
-      timeout: 60_000,
-      rp: { name: 'Circus Health fictional compatibility checker', id: run.rpId },
-      user: {
-        id: bytes(run.userId),
-        name: `fictional-${run.id}-passkey-${alias}`,
-        displayName: `Fictional compatibility test — passkey ${alias}`,
-      },
-      pubKeyCredParams: [
-        { type: 'public-key', alg: -8 },
-        { type: 'public-key', alg: -7 },
-        { type: 'public-key', alg: -257 },
-      ],
-      authenticatorSelection: {
-        residentKey: 'required',
-        requireResidentKey: true,
-        userVerification: 'required',
-      },
-      attestation: 'none',
-      excludeCredentials: existing.map((entry) => ({
-        type: 'public-key',
-        id: bytes(entry.id),
-        ...(entry.transports ? { transports: entry.transports } : {}),
-      })),
-      extensions: { credProps: true, prf: { eval: { first: salt } } },
-    }) as unknown as PublicKeyCredentialCreationOptions,
+  const diagnostics: PrfDiagnostics = {
+    requestMode: 'eval',
+    inputShape: 'absent',
+    operation: 'create',
+    stage: 'request-construction',
   };
-  const diagnostics = describePrfRequest('eval', options.publicKey?.extensions?.prf?.eval?.first);
   try {
-    if (existing.some((entry) => entry.alias === alias)) throw new CheckerError('invalid-state');
+    const salt = encodePrf(random(32).buffer);
+    const options: CredentialCreationOptions = {
+      publicKey: withBinaryPrf({
+        challenge: random(32),
+        timeout: 60_000,
+        rp: { name: 'Circus Health fictional compatibility checker', id: run.rpId },
+        user: {
+          id: bytes(run.userId),
+          name: `fictional-${run.id}-passkey-${alias}`,
+          displayName: `Fictional compatibility test — passkey ${alias}`,
+        },
+        pubKeyCredParams: [
+          { type: 'public-key', alg: -8 },
+          { type: 'public-key', alg: -7 },
+          { type: 'public-key', alg: -257 },
+        ],
+        authenticatorSelection: {
+          residentKey: 'required',
+          requireResidentKey: true,
+          userVerification: 'required',
+        },
+        attestation: 'none',
+        excludeCredentials: existing.map((entry) => ({
+          type: 'public-key',
+          id: bytes(entry.id),
+          ...(entry.transports ? { transports: entry.transports } : {}),
+        })),
+        extensions: { credProps: true, prf: { eval: { first: salt } } },
+      }) as unknown as PublicKeyCredentialCreationOptions,
+    };
+    Object.assign(
+      diagnostics,
+      describePrfRequest('eval', options.publicKey?.extensions?.prf?.eval?.first),
+    );
+    const creation = options.publicKey!;
+    diagnostics.excludedCredentialCount = creation.excludeCredentials!.length;
+    diagnostics.userIdLength = (creation.user.id as Uint8Array).byteLength;
+    diagnostics.requiredUserVerification =
+      creation.authenticatorSelection?.userVerification === 'required';
+    diagnostics.requiredResidentKey = creation.authenticatorSelection?.residentKey === 'required';
+    diagnostics.stage = 'preflight';
+    if (existing.some((entry) => entry.alias === alias))
+      fail(diagnostics, 'invalid-state', 'alias-unused');
     // Calling the port precedes the first await, preserving the button's user activation.
-    const result = publicCredential(await (port ?? nativePort(run)).create(options));
+    const adapter = port ?? nativePort(run, diagnostics);
+    diagnostics.stage = 'native-create';
+    const result = publicCredential(await adapter.create(options), diagnostics);
     try {
+      diagnostics.stage = 'extension-read';
       const extensions = result.getClientExtensionResults();
       describePrfResponse(diagnostics, extensions);
     } catch {
+      diagnostics.diagnosticsUnavailable = true;
       // Creation alone is not PRF confirmation; optional evidence cannot lose an enrolled credential.
     }
+    diagnostics.stage = 'credential-match';
     const id = encodePrf(result.rawId);
-    if (existing.some((entry) => entry.id === id)) throw new CheckerError('duplicate-credential');
+    if (existing.some((entry) => entry.id === id))
+      fail(diagnostics, 'duplicate-credential', 'distinct-credential');
     const transports = transportHints(result);
+    diagnostics.stage = 'complete';
     return { alias, id, salt, ...(transports.length ? { transports } : {}) };
+  } catch (error) {
+    captureFailure(diagnostics, error);
+    throw error;
   } finally {
     emitPrfDiagnostics(diagnostics, observer);
   }
@@ -217,12 +343,24 @@ export async function confirmCredential(
   port?: CredentialPort,
   observer?: PrfDiagnosticsObserver,
 ): Promise<CredentialRecord> {
-  const options = request(run, credential, true);
-  const diagnostics = describePrfRequest('eval', options.publicKey?.extensions?.prf?.eval?.first);
+  const diagnostics: PrfDiagnostics = {
+    requestMode: 'eval',
+    inputShape: 'absent',
+    operation: 'confirm',
+    stage: 'request-construction',
+  };
   try {
-    if (credential.cipher) throw new CheckerError('invalid-state');
-    const assertion = await (port ?? nativePort(run)).get(options);
-    const key = await keyFor(extractPrf(assertion, credential, diagnostics), run, credential);
+    const options = request(run, credential, true);
+    observeRequest(options, credential, diagnostics);
+    diagnostics.stage = 'preflight';
+    if (credential.cipher) fail(diagnostics, 'invalid-state', 'credential-unconfirmed');
+    const adapter = port ?? nativePort(run, diagnostics);
+    diagnostics.stage = 'native-get';
+    const assertion = await adapter.get(options);
+    const prf = extractPrf(assertion, credential, diagnostics);
+    diagnostics.stage = 'key-derivation';
+    const key = await keyFor(prf, run, credential);
+    diagnostics.stage = 'encryption';
     const iv = random(12);
     const data = await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv, additionalData: context(run, credential) },
@@ -233,14 +371,24 @@ export async function confirmCredential(
       ...credential,
       cipher: { iv: encodePrf(iv.buffer), data: encodePrf(data) },
     };
-    await decryptAndCompare(key, run, confirmed);
+    await decryptAndCompare(key, run, confirmed, diagnostics);
+    diagnostics.stage = 'complete';
     return confirmed;
+  } catch (error) {
+    captureFailure(diagnostics, error);
+    throw error;
   } finally {
     emitPrfDiagnostics(diagnostics, observer);
   }
 }
-async function decryptAndCompare(key: CryptoKey, run: RunHeader, credential: CredentialRecord) {
-  if (!credential.cipher) throw new CheckerError('unconfirmed');
+async function decryptAndCompare(
+  key: CryptoKey,
+  run: RunHeader,
+  credential: CredentialRecord,
+  diagnostics: PrfDiagnostics,
+) {
+  if (!credential.cipher) fail(diagnostics, 'unconfirmed', 'credential-confirmed');
+  diagnostics.stage = 'decryption';
   try {
     const plaintext = new Uint8Array(
       await crypto.subtle.decrypt(
@@ -253,13 +401,18 @@ async function decryptAndCompare(key: CryptoKey, run: RunHeader, credential: Cre
         bytes(credential.cipher.data),
       ),
     );
+    diagnostics.stage = 'plaintext-comparison';
     const expected = fictionalValue(run, credential);
     const matches =
       plaintext.length === expected.length &&
       plaintext.every((byte, index) => byte === expected[index]);
     plaintext.fill(0);
-    if (!matches) throw new Error();
-  } catch {
+    if (!matches) fail(diagnostics, 'decrypt-failed', 'fictional-plaintext-match');
+  } catch (error) {
+    if (!checkerErrorCode(error)) {
+      Object.assign(diagnostics, nativeErrorEvidence(error));
+      diagnostics.validationRule = 'fictional-decryption';
+    }
     throw new CheckerError('decrypt-failed');
   }
 }
@@ -269,16 +422,28 @@ export async function verifyCredential(
   port?: CredentialPort,
   observer?: PrfDiagnosticsObserver,
 ): Promise<void> {
-  const options = request(run, credential, false);
-  const diagnostics = describePrfRequest(
-    'evalByCredential',
-    options.publicKey?.extensions?.prf?.evalByCredential?.[credential.id]?.first,
-  );
+  const diagnostics: PrfDiagnostics = {
+    requestMode: 'evalByCredential',
+    inputShape: 'absent',
+    operation: 'verify',
+    stage: 'request-construction',
+  };
   try {
-    if (!credential.cipher) throw new CheckerError('unconfirmed');
-    const assertion = await (port ?? nativePort(run)).get(options);
-    const key = await keyFor(extractPrf(assertion, credential, diagnostics), run, credential);
-    await decryptAndCompare(key, run, credential);
+    const options = request(run, credential, false);
+    observeRequest(options, credential, diagnostics);
+    diagnostics.stage = 'preflight';
+    if (!credential.cipher) fail(diagnostics, 'unconfirmed', 'credential-confirmed');
+    const adapter = port ?? nativePort(run, diagnostics);
+    diagnostics.stage = 'native-get';
+    const assertion = await adapter.get(options);
+    const prf = extractPrf(assertion, credential, diagnostics);
+    diagnostics.stage = 'key-derivation';
+    const key = await keyFor(prf, run, credential);
+    await decryptAndCompare(key, run, credential, diagnostics);
+    diagnostics.stage = 'complete';
+  } catch (error) {
+    captureFailure(diagnostics, error);
+    throw error;
   } finally {
     emitPrfDiagnostics(diagnostics, observer);
   }

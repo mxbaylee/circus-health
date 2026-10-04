@@ -172,6 +172,96 @@ describe('standalone checker guidance (controlled tests)', () => {
     expect(f.controller.runStep).toHaveBeenCalledWith('A', 'use-after-b');
   });
 
+  it('offers a fresh A check after failed B creation and keeps failures distinct from enrollment', async () => {
+    const failure: Attempt = {
+      ...bCreation(),
+      id: 'b-failed',
+      status: 'failed',
+      error: 'invalid-state',
+    };
+    const f = fixture(
+      [
+        attempt('confirm', 'verified', 'a-confirmed'),
+        attempt('use-1', 'verified', 'a-use-1'),
+        attempt('use-2', 'verified', 'a-use-2'),
+        attempt('use-3', 'verified', 'a-use-3'),
+        failure,
+      ],
+      [confirmedA],
+    );
+    f.controller.canRunStep = vi.fn(
+      (alias, step) => alias === 'A' && step === 'use-after-b-failed',
+    );
+    render(<App controller={f.controller} />);
+    const card = screen.getByRole('article', { name: 'Passkey A' });
+    expect(within(card).getByText(/Automatic result: Initial confirmation/)).toBeVisible();
+    expect(
+      within(card).getByText(/A retained after failed B creation: Not yet verified/),
+    ).toBeVisible();
+    const button = within(card).getByRole('button', {
+      name: 'Start use a after b creation fails for A',
+    });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(f.controller.runStep).toHaveBeenCalledWith('A', 'use-after-b-failed');
+    const recovery: Attempt = {
+      ...attempt('use-after-b-failed', 'failed', 'a-recovery'),
+      startedAt: '2026-10-03T00:00:02.000Z',
+      afterAttemptId: failure.id,
+      error: 'decrypt-failed',
+    };
+    act(() =>
+      f.publish({
+        state: {
+          ...f.controller.exportModel(),
+          attempts: [...f.controller.exportModel().attempts, recovery],
+        },
+      }),
+    );
+    expect(within(card).getByText(/A retained after failed B creation: Failed/)).toBeVisible();
+    expect(
+      within(card).getByRole('button', { name: 'Retry use a after b creation fails for A' }),
+    ).toBeEnabled();
+    act(() =>
+      f.publish({
+        state: {
+          ...f.controller.exportModel(),
+          attempts: [
+            ...f.controller.exportModel().attempts,
+            { ...recovery, id: 'a-recovered', status: 'verified', error: undefined },
+          ],
+        },
+      }),
+    );
+    expect(within(card).getByText(/A retained after failed B creation: Verified/)).toBeVisible();
+    expect(
+      within(card).getByText(/It does not prove B works or complete two-credential enrollment/),
+    ).toBeVisible();
+    expect(within(card).getByText(/A retained after B creation: Not tested/)).toBeVisible();
+    const bCard = screen.getByRole('article', { name: /Passkey B/ });
+    expect(
+      within(bCard).queryByRole('option', { name: 'Use A after B creation fails' }),
+    ).not.toBeInTheDocument();
+    expect(within(bCard).getByText(/Automatic result: Incomplete/)).toBeVisible();
+    act(() =>
+      f.publish({
+        state: {
+          ...f.controller.exportModel(),
+          attempts: [
+            ...f.controller.exportModel().attempts,
+            { ...failure, id: 'b-later-failure', finishedAt: '2026-10-03T00:00:03.000Z' },
+          ],
+        },
+      }),
+    );
+    expect(
+      within(card).getByText(/A retained after failed B creation: Not yet verified/),
+    ).toBeVisible();
+    expect(
+      within(card).queryByRole('button', { name: /Completed: use a after b creation fails/ }),
+    ).not.toBeInTheDocument();
+  });
+
   it('shows verified, failed and inconsistent retained-A evidence separately from initial uses', async () => {
     const returned = {
       ...attempt('use-after-b', 'verified', 'a-return'),
@@ -395,7 +485,7 @@ describe('standalone checker guidance (controlled tests)', () => {
     expect(
       screen.getByText('Local progress reset. Provider passkeys were not removed.'),
     ).toBeVisible();
-    expect(screen.getAllByText('Automatic evidence: Not attempted.')).toHaveLength(11);
+    expect(screen.getAllByText('Automatic evidence: Not attempted.')).toHaveLength(12);
   });
 
   it('keeps reports available during storage trouble and makes unsaved fallback explicit', async () => {

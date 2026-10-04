@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CheckerController } from './controller';
 import { checkSupport } from './environment';
 import { isVerifiedReturnToA, reportMarkdown } from './report';
+import { isVerifiedAAfterFailedB } from './progress';
 import { ERROR_MESSAGES, ENVIRONMENT_FIELDS, stepsForAlias } from './types';
 import type { CredentialAlias, EnvironmentField, ErrorCode, Observation, Step } from './types';
 
@@ -12,6 +13,7 @@ const stepNames: Record<Step, string> = {
   'use-2': 'Use it again: 2 of 3',
   'use-3': 'Use it again: 3 of 3',
   'use-after-b': 'Use A after B is created',
+  'use-after-b-failed': 'Use A after B creation fails',
 };
 const fieldNames: Record<EnvironmentField, string> = {
   browser: 'Browser',
@@ -38,9 +40,9 @@ function nextAction(alias: CredentialAlias, step: Step, error: ErrorCode): strin
   if (error === 'missing-prf')
     return 'This older result did not distinguish an absent encryption result from an unusable one. Retain it and record a fresh attempt for clearer evidence.';
   if (alias === 'B' && step === 'create' && error === 'invalid-state')
-    return "A provider already holding A may refuse this second creation because the checker asks it to avoid registering A again. That is a possible explanation, not a confirmed cause. Keep A and try another available authenticator after reviewing the provider labels, or record Couldn't test.";
+    return "A provider already holding A may refuse this second creation because the checker asks it to avoid registering A again. That is a possible explanation, not a confirmed cause. Keep A, check A again with the separate failed-creation step, and try another available authenticator after reviewing the provider labels, or record Couldn't test.";
   if (alias === 'B' && step === 'create' && error === 'unknown-error')
-    return "The cause of this second-creation failure is unknown. Check which authenticator you selected and retain the report. Try another available authenticator after reviewing the provider labels, or record Couldn't test; this result does not establish an exclusion refusal.";
+    return "The cause of this second-creation failure is unknown. Check which authenticator you selected and retain the report. Keep A and check it again with the separate failed-creation step. Try another available authenticator after reviewing the provider labels, or record Couldn't test; this result does not establish an exclusion refusal.";
   return undefined;
 }
 
@@ -152,6 +154,17 @@ export default function App({ controller }: { controller: CheckerController }) {
   const aConfirmed = state.credentials.some(
     (credential) => credential.alias === 'A' && credential.cipher,
   );
+  const bFailure = state.attempts
+    .filter(
+      (attempt) =>
+        attempt.alias === 'B' && attempt.step === 'create' && attempt.status === 'failed',
+    )
+    .at(-1);
+  const aRecovery = state.attempts
+    .filter(
+      (attempt) => attempt.step === 'use-after-b-failed' && attempt.afterAttemptId === bFailure?.id,
+    )
+    .at(-1);
   return (
     <main className="checker">
       <header className="checker-intro">
@@ -265,7 +278,7 @@ export default function App({ controller }: { controller: CheckerController }) {
           );
           const complete = stepsForAlias(alias)
             .slice(1)
-            .filter((step) => step !== 'use-after-b')
+            .filter((step) => step !== 'use-after-b' && step !== 'use-after-b-failed')
             .every(
               (step) =>
                 attempts.filter((attempt) => attempt.step === step).at(-1)?.status === 'verified',
@@ -323,13 +336,35 @@ export default function App({ controller }: { controller: CheckerController }) {
                   )}
                 </p>
               )}
+              {alias === 'A' && bFailure && (
+                <p>
+                  <strong>
+                    A retained after failed B creation:{' '}
+                    {aRecovery && isVerifiedAAfterFailedB(state, aRecovery)
+                      ? 'Verified — A decrypted its original fictional value after this B creation failed.'
+                      : aRecovery?.status === 'failed'
+                        ? 'Failed — inspect the recovery check below.'
+                        : aRecovery?.status === 'interrupted'
+                          ? 'Interrupted — not verified.'
+                          : aRecovery?.status === 'pending'
+                            ? 'Waiting for the browser prompt.'
+                            : 'Not yet verified — check A with a fresh prompt.'}
+                  </strong>{' '}
+                  This refers to B's failed creation at {bFailure.finishedAt ?? bFailure.startedAt}.
+                  It does not prove B works or complete two-credential enrollment.
+                </p>
+              )}
               <ol className="checker-steps">
                 {stepsForAlias(alias).map((step) => {
                   const history = attempts.filter((attempt) => attempt.step === step);
-                  const latest = history.at(-1);
+                  const latest =
+                    step === 'use-after-b-failed'
+                      ? history.filter((attempt) => attempt.afterAttemptId === bFailure?.id).at(-1)
+                      : history.at(-1);
                   const verified =
                     latest?.status === 'verified' &&
-                    (step !== 'use-after-b' || isVerifiedReturnToA(state, latest));
+                    (step !== 'use-after-b' || isVerifiedReturnToA(state, latest)) &&
+                    (step !== 'use-after-b-failed' || isVerifiedAAfterFailedB(state, latest));
                   return (
                     <li key={step}>
                       <div className="checker-step-heading">
@@ -360,6 +395,14 @@ export default function App({ controller }: { controller: CheckerController }) {
                           above for A; they may still describe B's provider.
                         </p>
                       )}
+                      {step === 'use-after-b-failed' && (
+                        <p>
+                          After B creation fails, select confirmed A again to check its original
+                          fictional value without resetting this run. Each new B creation failure
+                          needs its own fresh A check; earlier successes do not pass a later check.
+                          Keep A and review its provider labels before opening the prompt.
+                        </p>
+                      )}
                       <p>
                         Automatic evidence:{' '}
                         {latest
@@ -368,7 +411,9 @@ export default function App({ controller }: { controller: CheckerController }) {
                               ? 'Valid PRF returned; fictional encryption established.'
                               : 'Fresh PRF decrypted and matched the fictional value.'
                             : latest.status === 'verified'
-                              ? 'Saved evidence does not establish a return to A after B creation.'
+                              ? step === 'use-after-b-failed'
+                                ? 'Saved evidence does not establish an A check after the linked B creation failure.'
+                                : 'Saved evidence does not establish a return to A after B creation.'
                               : latest.status === 'created'
                                 ? 'Credential created; PRF compatibility is not yet verified.'
                                 : latest.status === 'failed'
@@ -378,6 +423,14 @@ export default function App({ controller }: { controller: CheckerController }) {
                                     : 'Waiting for the browser prompt.'
                           : 'Not attempted.'}
                       </p>
+                      {step === 'use-after-b-failed' && latest?.afterAttemptId && (
+                        <p>
+                          Linked B creation failure:{' '}
+                          {state.attempts.find((item) => item.id === latest.afterAttemptId)
+                            ?.finishedAt ?? 'Unavailable'}
+                          . This check does not verify B.
+                        </p>
+                      )}
                       {latest?.error && (
                         <>
                           <p className="checker-error">{ERROR_MESSAGES[latest.error]}</p>
@@ -397,7 +450,11 @@ export default function App({ controller }: { controller: CheckerController }) {
                                 attempt.status === 'verified' &&
                                 !isVerifiedReturnToA(state, attempt)
                                   ? 'Unfinished evidence — saved evidence does not establish a return to A after B creation.'
-                                  : attempt.status}
+                                  : attempt.step === 'use-after-b-failed' &&
+                                      attempt.status === 'verified' &&
+                                      !isVerifiedAAfterFailedB(state, attempt)
+                                    ? 'Unfinished evidence — saved evidence does not establish an A check after the linked B creation failure.'
+                                    : attempt.status}
                                 {attempt.error ? ` — ${ERROR_MESSAGES[attempt.error]}` : ''}
                               </li>
                             ))}

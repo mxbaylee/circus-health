@@ -6,7 +6,7 @@ import { assertCheckerModule } from './src/scripts/passkey-checker-build/validat
 
 const repository = fileURLToPath(new URL('.', import.meta.url));
 const source = readBuildSource(repository);
-const build = { version: '2', revision: source.revision ?? 'unknown', worktree: source.worktree };
+const build = { version: '3', revision: source.revision ?? 'unknown', worktree: source.worktree };
 export default defineConfig({
   root: fileURLToPath(new URL('./src/app/passkey-checker/', import.meta.url)),
   publicDir: false,

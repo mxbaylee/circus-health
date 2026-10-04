@@ -151,7 +151,7 @@ function validAttempt(value: unknown): value is Attempt {
     keys(
       value,
       ['id', 'alias', 'step', 'status', 'startedAt', 'build', 'environment'],
-      ['error', 'finishedAt', 'diagnostics'],
+      ['error', 'finishedAt', 'diagnostics', 'afterAttemptId', 'sequence'],
     ) &&
     text(value.id) &&
     alias(value.alias) &&
@@ -162,6 +162,11 @@ function validAttempt(value: unknown): value is Attempt {
     date(value.startedAt) &&
     (value.finishedAt === undefined || date(value.finishedAt)) &&
     (value.diagnostics === undefined || isPrfDiagnostics(value.diagnostics)) &&
+    (value.sequence === undefined ||
+      (Number.isSafeInteger(value.sequence) && Number(value.sequence) > 0)) &&
+    (value.step === 'use-after-b-failed'
+      ? text(value.afterAttemptId) && value.afterAttemptId !== value.id
+      : value.afterAttemptId === undefined) &&
     build(value.build) &&
     environment(value.environment) &&
     (value.status !== 'created' || value.step === 'create') &&
@@ -320,6 +325,11 @@ export async function openCheckerStore(
           credentials.length > 2 ||
           !credentials.every(validCredential) ||
           !attempts.every(validAttempt) ||
+          new Set(
+            attempts
+              .filter((attempt) => attempt.sequence !== undefined)
+              .map((attempt) => attempt.sequence),
+          ).size !== attempts.filter((attempt) => attempt.sequence !== undefined).length ||
           !observations.every(validObservation) ||
           credentials.some((value, index) => credentialKeys[index] !== value.alias) ||
           attempts.some((value, index) => attemptKeys[index] !== value.id) ||
@@ -341,7 +351,15 @@ export async function openCheckerStore(
           state: {
             run: header.run,
             credentials,
-            attempts: attempts.sort((a, b) => a.startedAt.localeCompare(b.startedAt)),
+            attempts: attempts.sort((a, b) =>
+              a.sequence === undefined
+                ? b.sequence === undefined
+                  ? a.startedAt.localeCompare(b.startedAt)
+                  : -1
+                : b.sequence === undefined
+                  ? 1
+                  : a.sequence - b.sequence,
+            ),
             observations: observations.sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
           },
           token: { runId: header.run.id, revision: Number(header.revision) },

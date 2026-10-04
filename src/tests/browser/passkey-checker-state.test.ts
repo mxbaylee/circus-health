@@ -53,6 +53,12 @@ test(
       const { createRun, inspectEnvironment } = (await import(
         moduleRoot + 'environment.ts'
       )) as typeof import('../../app/passkey-checker/environment.ts');
+      const { isVerifiedAAfterFailedB, isVerifiedReturnToA } = (await import(
+        moduleRoot + 'progress.ts'
+      )) as typeof import('../../app/passkey-checker/progress.ts');
+      const { fictionalValue } = (await import(
+        moduleRoot + 'core.ts'
+      )) as typeof import('../../app/passkey-checker/core.ts');
       const build = { version: 'fixture', revision: 'fictional-build', worktree: 'clean' };
       const name = 'fictional-checker-state-test';
       const open = () => openCheckerStore(indexedDB, name);
@@ -230,6 +236,162 @@ test(
       }
       const rejectedRowsPreservedRevision =
         (await reopened.load())!.token.revision === extended.token.revision;
+      // Recovery rows preserve an exact failed-creation reference. Their success
+      // never supplies B creation or the separate post-created-B observation.
+      const recoveryName = name + '-recovery';
+      const recoveryStore = await openCheckerStore(indexedDB, recoveryName);
+      let recoveryToken = await recoveryStore.commit(null, { run: legacyRun });
+      recoveryToken = await recoveryStore.commit(recoveryToken, { attempt: legacyFailure });
+      const bFailure = {
+        ...legacyFailure,
+        id: 'b-failure',
+        alias: 'B' as const,
+        step: 'create' as const,
+        error: 'invalid-state' as const,
+        sequence: 2,
+        startedAt: '2026-10-03T00:00:01.000Z',
+        finishedAt: '2026-10-03T00:00:01.000Z',
+      };
+      recoveryToken = await recoveryStore.commit(recoveryToken, { attempt: bFailure });
+      const failedRecovery = {
+        ...legacyFailure,
+        id: 'a-recovery-failed',
+        step: 'use-after-b-failed' as const,
+        afterAttemptId: bFailure.id,
+        error: 'decrypt-failed' as const,
+        sequence: 3,
+        startedAt: bFailure.startedAt,
+        finishedAt: bFailure.finishedAt,
+      };
+      recoveryToken = await recoveryStore.commit(recoveryToken, { attempt: failedRecovery });
+      const successRecovery = {
+        ...failedRecovery,
+        id: 'a-recovery-verified',
+        status: 'verified' as const,
+        error: undefined,
+        sequence: 4,
+        startedAt: bFailure.startedAt,
+        finishedAt: bFailure.finishedAt,
+      };
+      recoveryToken = await recoveryStore.commit(recoveryToken, { attempt: successRecovery });
+      let invalidRecoveryRowsRejected = 0;
+      for (const invalid of [
+        { ...successRecovery, afterAttemptId: undefined },
+        { ...successRecovery, afterAttemptId: '' },
+        { ...successRecovery, afterAttemptId: 5 },
+        { ...successRecovery, afterAttemptId: successRecovery.id },
+        { ...successRecovery, alias: 'B' },
+        { ...successRecovery, step: 'use-1' },
+        { ...successRecovery, afterAttemptId: 'x'.repeat(501) },
+        ...[0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, '4'].map((sequence) => ({
+          ...successRecovery,
+          sequence,
+        })),
+      ]) {
+        try {
+          await recoveryStore.commit(recoveryToken, { attempt: invalid as typeof successRecovery });
+        } catch (error) {
+          if ((error as { reason: string }).reason === 'incompatible')
+            invalidRecoveryRowsRejected++;
+        }
+      }
+      recoveryStore.close();
+      const restoredRecoveryStore = await openCheckerStore(indexedDB, recoveryName);
+      const restoredRecovery = (await restoredRecoveryStore.load())!;
+      const recoveryRowsRoundTrip =
+        JSON.stringify(restoredRecovery.state.attempts) ===
+          JSON.stringify([legacyFailure, bFailure, failedRecovery, successRecovery]) &&
+        restoredRecovery.token.revision === recoveryToken.revision;
+      const recoveryClassification = [
+        isVerifiedAAfterFailedB(restoredRecovery.state, failedRecovery),
+        isVerifiedAAfterFailedB(restoredRecovery.state, successRecovery),
+        isVerifiedReturnToA(restoredRecovery.state, successRecovery),
+        isVerifiedAAfterFailedB(restoredRecovery.state, {
+          ...successRecovery,
+          afterAttemptId: 'orphan',
+        }),
+        isVerifiedAAfterFailedB(restoredRecovery.state, {
+          ...successRecovery,
+          afterAttemptId: failedRecovery.id,
+        }),
+      ];
+      const laterFailure = {
+        ...bFailure,
+        id: 'later-b-failure',
+        sequence: 5,
+        startedAt: '1970-01-01T00:00:00.000Z',
+        finishedAt: '1970-01-01T00:00:00.000Z',
+      };
+      recoveryToken = await restoredRecoveryStore.commit(recoveryToken, { attempt: laterFailure });
+      const record = { alias: 'A' as const, id: 'YQ', salt: 'A'.repeat(43) };
+      const encode = (bytes: Uint8Array) =>
+        btoa(String.fromCharCode(...bytes))
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/, '');
+      recoveryToken = await restoredRecoveryStore.commit(recoveryToken, {
+        credential: {
+          ...record,
+          cipher: {
+            iv: 'A'.repeat(16),
+            data: encode(new Uint8Array(fictionalValue(legacyRun, record).byteLength + 16)),
+          },
+        },
+      });
+      restoredRecoveryStore.close();
+      let recoveryNativeCalls = 0;
+      const recoveryController = await createCheckerController({
+        build,
+        openStore: () => openCheckerStore(indexedDB, recoveryName),
+        core: {
+          createCredential: async () => record,
+          confirmCredential: async () => record,
+          verifyCredential: async () => {
+            recoveryNativeCalls++;
+          },
+        },
+      });
+      const latestFailureReopensAfterReload = recoveryController.canRunStep(
+        'A',
+        'use-after-b-failed',
+      );
+      const legacyUnchangedAfterReopen =
+        JSON.stringify(recoveryController.exportModel().attempts[0]) ===
+        JSON.stringify(legacyFailure);
+      await recoveryController.runStep('A', 'use-after-b-failed');
+      const newestRecovery = recoveryController.exportModel().attempts.at(-1)!;
+      const exactRecoveryAfterReload =
+        newestRecovery.afterAttemptId === laterFailure.id &&
+        newestRecovery.sequence === 6 &&
+        isVerifiedAAfterFailedB(recoveryController.exportModel(), successRecovery) &&
+        isVerifiedAAfterFailedB(recoveryController.exportModel(), {
+          ...newestRecovery,
+          startedAt: '1960-01-01T00:00:00.000Z',
+        });
+      recoveryController.close();
+      const duplicateDb = await new Promise<IDBDatabase>((resolve) => {
+        const req = indexedDB.open(recoveryName);
+        req.onsuccess = () => resolve(req.result);
+      });
+      await new Promise<void>((resolve, reject) => {
+        const tx = duplicateDb.transaction('attempts', 'readwrite');
+        tx.objectStore('attempts').put(
+          { ...successRecovery, sequence: bFailure.sequence },
+          successRecovery.id,
+        );
+        tx.oncomplete = () => resolve();
+        tx.onabort = () => reject(tx.error);
+      });
+      duplicateDb.close();
+      const duplicateStore = await openCheckerStore(indexedDB, recoveryName);
+      let duplicateSequenceRejected = '';
+      try {
+        await duplicateStore.load();
+      } catch (error) {
+        duplicateSequenceRejected = (error as { reason: string }).reason;
+      }
+      duplicateStore.close();
+      await deleteCheckerStore(indexedDB, recoveryName);
       reopened.close();
       const corruptDb = await new Promise<IDBDatabase>((resolve) => {
         const req = indexedDB.open(legacyName, 1);
@@ -340,6 +502,14 @@ test(
         rejectedRowsPreservedRevision,
         corruptDiagnosticsRejected,
         corruptRowsRetained,
+        invalidRecoveryRowsRejected,
+        recoveryRowsRoundTrip,
+        recoveryClassification,
+        latestFailureReopensAfterReload,
+        legacyUnchangedAfterReopen,
+        exactRecoveryAfterReload,
+        recoveryNativeCalls,
+        duplicateSequenceRejected,
       };
     });
     assert.deepEqual(evidence, {
@@ -364,6 +534,14 @@ test(
       rejectedRowsPreservedRevision: true,
       corruptDiagnosticsRejected: 'incompatible',
       corruptRowsRetained: 2,
+      invalidRecoveryRowsRejected: 14,
+      recoveryRowsRoundTrip: true,
+      recoveryClassification: [false, true, false, false, false],
+      latestFailureReopensAfterReload: true,
+      legacyUnchangedAfterReopen: true,
+      exactRecoveryAfterReload: true,
+      recoveryNativeCalls: 1,
+      duplicateSequenceRejected: 'incompatible',
     });
   },
 );
