@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import type { IntakeReviewDraft } from '../shared/intake.ts';
 
 interface Proof {
@@ -17,6 +18,7 @@ interface SelectedDraft {
 export function selectedDraftHandoff(proof: () => Proof | undefined) {
   let records = new WeakMap<object, SelectedDraft>();
   let last: SelectedDraft | undefined;
+  let reading: object | undefined;
   const same = (a: Proof | undefined, b: Proof | undefined) =>
     !!a && !!b && a.state === b.state && a.epoch === b.epoch;
   return {
@@ -26,12 +28,30 @@ export function selectedDraftHandoff(proof: () => Proof | undefined) {
       versionId: string,
       read: () => IntakeReviewDraft | null,
     ) {
+      return finishClinicalReviewWork(
+        this.readWork(proposalId, recordId, versionId, function* () {
+          return read();
+        }),
+      );
+    },
+    *readWork(
+      proposalId: string | null,
+      recordId: string,
+      versionId: string,
+      read: () => Generator<void, IntakeReviewDraft | null, void>,
+    ): Generator<void, IntakeReviewDraft | null, void> {
       last = undefined;
-      const before = proof();
-      const draft = read();
-      const after = proof();
-      if (same(before, after)) last = { proposalId, recordId, versionId, draft, proof: before! };
-      return draft;
+      const pending = (reading = {}),
+        before = proof();
+      try {
+        const draft = yield* read();
+        const after = proof();
+        if (reading === pending && same(before, after))
+          last = { proposalId, recordId, versionId, draft, proof: before! };
+        return draft;
+      } finally {
+        if (reading === pending) reading = undefined;
+      }
     },
     bind(record: { id: string }, draft: IntakeReviewDraft | null) {
       const selected = last;
@@ -54,6 +74,7 @@ export function selectedDraftHandoff(proof: () => Proof | undefined) {
       return undefined;
     },
     clear() {
+      reading = undefined;
       last = undefined;
       records = new WeakMap();
     },

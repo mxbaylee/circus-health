@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { registerLiteralSharedValue } from './intake-format.ts';
 import { createHash } from 'node:crypto';
 import { disposableSqlite } from './disposable-sqlite.ts';
@@ -57,13 +58,20 @@ function* messageChunks(read: () => Iterable<string>) {
 }
 /** Exact prior joined-message commitment, with an explicitly separate bounded presentation. */
 export function ownershipHoldMessage(read: () => Iterable<string>, bytes = 64 * 1024) {
+  return finishClinicalReviewWork(ownershipHoldMessageWork(read, bytes));
+}
+export function* ownershipHoldMessageWork(read: () => Iterable<string>, bytes = 64 * 1024) {
   let message = '',
     count = 0,
     size = 0,
     inline = true;
   const hash = createHash('sha256');
-  for (const part of messageChunks(read)) hash.update(part);
+  for (const part of messageChunks(read)) {
+    hash.update(part);
+    yield;
+  }
   for (const value of read()) {
+    yield;
     if (count++) size++;
     size += Buffer.byteLength(value);
     if (size > bytes) {

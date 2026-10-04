@@ -669,6 +669,15 @@ const feedKinds: IntakeImportFeedKind[] = [
   'unsupported',
   'person',
 ];
+export function matchesImportFeedKind(
+  filter: string | null | undefined,
+  kind: IntakeImportFeedKind,
+) {
+  return (
+    !filter ||
+    (filter === 'documents' ? kind === 'history' || kind === 'unsupported' : filter === kind)
+  );
+}
 export function feedKind(record: IntakeReportQueueRecord): IntakeImportFeedRecord['feedKind'] {
   if (record.mapping.opticalPrescription) return 'vision';
   switch (record.kind) {
@@ -696,7 +705,9 @@ export function listIntakeImportFeed(
     query.length > 300 ||
     (input.state &&
       !['pending', 'deferred', 'accepted', 'kept_original', 'superseded'].includes(input.state)) ||
-    (input.kind && !feedKinds.includes(input.kind as IntakeImportFeedKind)) ||
+    (input.kind &&
+      input.kind !== 'documents' &&
+      !feedKinds.includes(input.kind as IntakeImportFeedKind)) ||
     (input.edited != null && !['true', 'false'].includes(input.edited))
   )
     throw new HttpError(
@@ -782,7 +793,7 @@ export function listIntakeImportFeed(
         .toLowerCase();
       if (query && !searchable.includes(query)) continue;
       kindCounts[record.feedKind]++;
-      if (input.kind && input.kind !== record.feedKind) continue;
+      if (!matchesImportFeedKind(input.kind, record.feedKind)) continue;
       matching.push({
         entry,
         member,

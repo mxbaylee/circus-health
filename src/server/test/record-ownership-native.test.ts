@@ -1,10 +1,12 @@
+import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
+import { prepareOwnershipReportPlan } from '../ownership-report-plan.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { openDatabase } from '../database.ts';
+import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { uploadIntake, reviewIntake, importIntake } from '../intake.ts';
@@ -30,174 +32,381 @@ import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import type { OwnershipRequest } from '../../shared/record-ownership.ts';
 
-test('native records-selected ownership previews and commits a complete large name effect without whole intake hydration', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-native-ownership-host-')),
-    profileId = 'fictional';
-  const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-  attachPersonalDurability(db, { root, profileId });
-  t.after(() => {
-    clearNativeOwnershipPlans(db);
-    db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  const destination = createNote(db, {
-    kind: 'person',
-    title: 'Fictional Person',
-    person: { fullName: 'Fictional Person' },
-  });
-  const envelope = {
-    format: 'health-record-v1',
-    id: 'literal',
-    kind: 'record',
-    payload: { literal: 'Fictional retained evidence' },
-    clinical: {
-      kind: 'observation',
-      subject: 'self',
-      date: '2026-01-12',
-      testLabel: 'Fictional reach',
-      valueText: '12.00',
-      unit: 'cm',
-    },
-    provenance: {
-      sourceSystem: 'Fictional Clinic',
-      sourceRecordId: 'literal',
-      capturedVia: null,
-      evidenceClass: 'provider_export',
-      locator: 'Fictional row 1',
-    },
-    coverage: { status: 'complete_response', notes: [] },
-  };
-  const original = uploadIntake(db, root, profileId, {
-    filename: 'fictional.jsonl',
-    bytes: Buffer.from(JSON.stringify(envelope)),
-    newProviderName: 'Fictional Clinic',
-  });
-  const review = reviewIntake(db, root, profileId, original.id);
-  importIntake(db, root, profileId, original.id, {
-    version: review.version,
-    reviewToken: review.reviewToken,
-    decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
-  });
-  const record = db.prepare('SELECT id,source_record_id FROM observations').get()!;
-  const stored = JSON.parse(readIntakeEnvelopeText(db, { id: original.id }));
-  stored.intake.workflow.identityConfirmations = [
-    {
-      operationId: 'fictional-historical-confirmation',
-      outcome: 'this_is_me',
-      attestation: 'reviewed_original_and_membership',
-      assignedPerson: { personId: 'patient' },
-      confirmedPrintedName: 'Fictional Historical Name',
-      scope: {
-        intakeId: original.id,
-        groupId: 'fictional-historical-group',
-        targets: Array.from({ length: 96 }, (_, i) => ({
-          recordId: i === 0 ? String(record.source_record_id) : 'independent-' + i,
-          padding: 'x'.repeat(1500),
-        })),
+// This host fixture commits ownership, retains 97 receipts, and verifies complete
+// corrected policy, real event-loop progress and cancellation cleanup. The guard
+// accommodates those durable operations; exact evidence and counts remain the oracle.
+test(
+  'native records-selected ownership previews and commits a complete large name effect without whole intake hydration',
+  { timeout: 180000 },
+  async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-native-ownership-host-')),
+      profileId = 'fictional';
+    const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+    attachPersonalDurability(db, { root, profileId });
+    t.after(() => {
+      clearNativeOwnershipPlans(db);
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const destination = createNote(db, {
+      kind: 'person',
+      title: 'Fictional Person',
+      person: { fullName: 'Fictional Person' },
+    });
+    const envelope = {
+      format: 'health-record-v1',
+      id: 'literal',
+      kind: 'record',
+      payload: { literal: 'Fictional retained evidence' },
+      clinical: {
+        kind: 'observation',
+        subject: 'self',
+        date: '2026-01-12',
+        testLabel: 'Fictional reach',
+        valueText: '12.00',
+        unit: 'cm',
       },
-    },
-  ];
-  writeIntakeFixtureEnvelope(db, original.id, stored);
-  const request: OwnershipRequest = {
-    selection: { type: 'records', records: [{ kind: 'observation', recordId: String(record.id) }] },
-    destination: { noteId: destination.id, expectedVersion: destination.version },
-  };
-  const oracle = previewRecordOwnership(db, root, profileId, request);
-  assert.equal(oracle.names.length, 1);
-  assert.equal(oracle.names[0]!.support[0]!.sourceRecordIds.length, 96);
-  await buildIntakeCollectionEnvelope(db, { id: original.id });
-  const before = intakeWorkCounters(db);
-  await prepareOwnershipEvidence(db, root, profileId, request);
-  const preview = await previewNativeRecordOwnership(db, root, profileId, request);
-  assert.equal(preview.namesIncluded, false);
-  assert.equal('names' in preview, false);
-  assert.ok('reportEvidence' in preview);
-  const recordPlan = nativeOwnershipReportPlan(db, profileId, preview.reportEvidence.token),
-    page = recordPlan.page('records');
-  assert.equal(page.total, oracle.records.length);
-  assert.equal(page.items.length, 1);
-  const shown = page.items[0]!;
-  assert.ok('mapping' in shown);
-  assert.deepEqual(shown.mapping, oracle.records[0]!.mapping);
-  assert.ok(!Array.isArray(shown.contributions));
-  assert.equal(shown.contributions.total, oracle.records[0]!.contributions.length);
-  assert.deepEqual(preview.blockers, oracle.blockers);
-  const plan = nativeOwnershipNamePlan(db, profileId, preview.nameEvidence.token);
-  assert.equal(plan.reference.targetTotal, 96);
-  assert.equal(plan.effects().items[0]!.unknownSupport, true);
-  const decided = chooseNativeOwnershipName(
-    db,
-    root,
-    profileId,
-    preview.nameEvidence.token,
-    plan.effects().items[0]!.key,
-    'old',
-  );
-  assert.notEqual(decided.scopeToken, preview.scopeToken);
-  await assert.rejects(
-    commitNativeRecordOwnership(db, root, profileId, {
-      operationId: randomUUID(),
-      request: preview.request,
-      scopeToken: preview.scopeToken,
-      version: preview.version,
-    }),
-    /current ownership evidence/,
-  );
-  const operationId = randomUUID(),
-    command = {
-      operationId,
-      request: decided.request,
-      scopeToken: decided.scopeToken,
-      version: decided.version,
+      provenance: {
+        sourceSystem: 'Fictional Clinic',
+        sourceRecordId: 'literal',
+        capturedVia: null,
+        evidenceClass: 'provider_export',
+        locator: 'Fictional row 1',
+      },
+      coverage: { status: 'complete_response', notes: [] },
     };
-  const receipt = await commitNativeRecordOwnership(db, root, profileId, command);
-  assert.equal(receipt.moved, 1);
-  const assignment = JSON.parse(
-    String(
-      db
-        .prepare(
-          "SELECT coverage_json FROM manual_batches WHERE title='Record ownership source' ORDER BY id LIMIT 1",
+    const original = uploadIntake(db, root, profileId, {
+      filename: 'fictional.jsonl',
+      bytes: Buffer.from(JSON.stringify(envelope)),
+      newProviderName: 'Fictional Clinic',
+    });
+    const review = reviewIntake(db, root, profileId, original.id);
+    importIntake(db, root, profileId, original.id, {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+    });
+    const record = db.prepare('SELECT id,source_record_id FROM observations').get()!;
+    const stored = JSON.parse(readIntakeEnvelopeText(db, { id: original.id }));
+    stored.intake.workflow.identityConfirmations = [
+      {
+        operationId: 'fictional-historical-confirmation',
+        outcome: 'this_is_me',
+        attestation: 'reviewed_original_and_membership',
+        assignedPerson: { personId: 'patient' },
+        confirmedPrintedName: 'Fictional Historical Name',
+        scope: {
+          intakeId: original.id,
+          groupId: 'fictional-historical-group',
+          targets: Array.from({ length: 96 }, (_, i) => ({
+            recordId: i === 0 ? String(record.source_record_id) : 'independent-' + i,
+            padding: 'x'.repeat(1500),
+          })),
+        },
+      },
+    ];
+    const priorReceipt = stored.intake.workflow.identityConfirmations[0];
+    writeIntakeFixtureEnvelope(db, original.id, stored);
+    const request: OwnershipRequest = {
+      selection: {
+        type: 'records',
+        records: [{ kind: 'observation', recordId: String(record.id) }],
+      },
+      destination: { noteId: destination.id, expectedVersion: destination.version },
+    };
+    const oracle = previewRecordOwnership(db, root, profileId, request);
+    assert.equal(oracle.names.length, 1);
+    assert.equal(oracle.names[0]!.support[0]!.sourceRecordIds.length, 96);
+    await buildIntakeCollectionEnvelope(db, { id: original.id });
+    const before = intakeWorkCounters(db);
+    await prepareOwnershipEvidence(db, root, profileId, request);
+    const duringClinicalTurn = async <T>(action: () => void, run: () => Promise<T>) => {
+      let finished = false,
+        fired = false;
+      const poll = () => {
+        if (finished) return;
+        if (!fired && reviewIssueScratchCounts(db).databases > 0) {
+          fired = true;
+          action();
+        } else if (!fired) setImmediate(poll);
+      };
+      setImmediate(poll);
+      try {
+        return await run();
+      } finally {
+        finished = true;
+        assert.equal(fired, true, 'ownership cold policy yielded to unrelated host work');
+      }
+    };
+    let cancelled = false;
+    await assert.rejects(
+      duringClinicalTurn(
+        () => {
+          cancelled = true;
+        },
+        () =>
+          prepareOwnershipReportPlan(db, root, profileId, request, {
+            assertRunning() {
+              if (cancelled) throw Error('fictional ownership cancellation');
+            },
+          }),
+      ),
+      /fictional ownership cancellation/,
+    );
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, rows: 0, scopes: 0 });
+    await assert.rejects(
+      duringClinicalTurn(
+        () => {
+          transaction(db, () =>
+            db
+              .prepare('UPDATE notes SET title=? WHERE id=?')
+              .run('Changed fictional person', destination.id),
+          );
+        },
+        () => prepareOwnershipReportPlan(db, root, profileId, request),
+      ),
+      /changed.*|fresh preview/i,
+    );
+    transaction(db, () =>
+      db.prepare('UPDATE notes SET title=? WHERE id=?').run(destination.title, destination.id),
+    );
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, rows: 0, scopes: 0 });
+    const preview = await previewNativeRecordOwnership(db, root, profileId, request);
+    assert.equal(preview.namesIncluded, false);
+    assert.equal('names' in preview, false);
+    assert.ok('reportEvidence' in preview);
+    const recordPlan = nativeOwnershipReportPlan(db, profileId, preview.reportEvidence.token),
+      page = recordPlan.page('records');
+    assert.equal(page.total, oracle.records.length);
+    assert.equal(page.items.length, 1);
+    const shown = page.items[0]!;
+    assert.ok('mapping' in shown);
+    assert.deepEqual(shown.mapping, oracle.records[0]!.mapping);
+    assert.ok(!Array.isArray(shown.contributions));
+    assert.equal(shown.contributions.total, oracle.records[0]!.contributions.length);
+    assert.deepEqual(preview.blockers, oracle.blockers);
+    const plan = nativeOwnershipNamePlan(db, profileId, preview.nameEvidence.token);
+    assert.equal(plan.reference.targetTotal, 96);
+    assert.equal(plan.effects().items[0]!.unknownSupport, true);
+    const decided = chooseNativeOwnershipName(
+      db,
+      root,
+      profileId,
+      preview.nameEvidence.token,
+      plan.effects().items[0]!.key,
+      'old',
+    );
+    assert.notEqual(decided.scopeToken, preview.scopeToken);
+    await assert.rejects(
+      commitNativeRecordOwnership(db, root, profileId, {
+        operationId: randomUUID(),
+        request: preview.request,
+        scopeToken: preview.scopeToken,
+        version: preview.version,
+      }),
+      /current ownership evidence/,
+    );
+    const operationId = randomUUID(),
+      command = {
+        operationId,
+        request: decided.request,
+        scopeToken: decided.scopeToken,
+        version: decided.version,
+      };
+    const receipt = await commitNativeRecordOwnership(db, root, profileId, command);
+    assert.equal(receipt.moved, 1);
+    const assignment = JSON.parse(
+      String(
+        db
+          .prepare(
+            "SELECT coverage_json FROM manual_batches WHERE title='Record ownership source' ORDER BY id LIMIT 1",
+          )
+          .get()!.coverage_json,
+      ),
+    );
+    assert.equal(assignment.identityIssues.format, 'health-ownership-identity-issues-v1');
+    assert.equal(assignment.identityIssues.snapshot.count, 0);
+    assert.equal(
+      db.prepare('SELECT person_id FROM observations WHERE id=?').get(record.id)!.person_id,
+      destination.personId,
+    );
+    const { replayOwnershipReceiptReference } = await import('../ownership-outcome-page.ts');
+    assert.equal(replayOwnershipReceiptReference(db, profileId, command)?.replayed, true);
+    assert.equal(intakeWorkCounters(db).warm.envelopeHydrations, before.warm.envelopeHydrations);
+    assert.equal(
+      intakeWorkCounters(db).warm.materializationReads,
+      before.warm.materializationReads,
+    );
+    const noOpPreview = await previewNativeRecordOwnership(db, root, profileId, {
+      ...request,
+      destination: { noteId: destination.id, expectedVersion: getNote(db, destination.id).version },
+    });
+    assert.equal(noOpPreview.nameEvidence.total, 0);
+    const snapshotChanges = () => {
+        const counters = intakeWorkCounters(db);
+        return (
+          counters.warm.ownershipSnapshotChangedIds +
+          counters.reconstruction.ownershipSnapshotChangedIds
+        );
+      },
+      beforeNoOp = snapshotChanges();
+    const noOp = await commitNativeRecordOwnership(db, root, profileId, {
+      operationId: randomUUID(),
+      request: noOpPreview.request,
+      scopeToken: noOpPreview.scopeToken,
+      version: noOpPreview.version,
+    });
+    assert.equal(noOp.moved, 0);
+    assert.equal(noOp.unchanged, 1);
+    assert.equal(snapshotChanges(), beforeNoOp);
+    assert.throws(
+      () => nativeOwnershipNamePlan(db, 'another-profile', preview.nameEvidence.token),
+      /current ownership evidence/,
+    );
+    // Exercise the corrected-assignment branch with long retained receipt history,
+    // not merely the no-assignment fast path used by ordinary import reviews.
+    clearNativeOwnershipPlans(db);
+    const policyScratchDirectories = () =>
+      readdirSync(tmpdir())
+        .filter(
+          (name) =>
+            name.startsWith('circus-ownership-policy-') ||
+            name.startsWith('circus-ownership-blockers-'),
         )
-        .get()!.coverage_json,
-    ),
-  );
-  assert.equal(assignment.identityIssues.format, 'health-ownership-identity-issues-v1');
-  assert.equal(assignment.identityIssues.snapshot.count, 0);
-  assert.equal(
-    db.prepare('SELECT person_id FROM observations WHERE id=?').get(record.id)!.person_id,
-    destination.personId,
-  );
-  const { replayOwnershipReceiptReference } = await import('../ownership-outcome-page.ts');
-  assert.equal(replayOwnershipReceiptReference(db, profileId, command)?.replayed, true);
-  assert.equal(intakeWorkCounters(db).warm.envelopeHydrations, before.warm.envelopeHydrations);
-  assert.equal(intakeWorkCounters(db).warm.materializationReads, before.warm.materializationReads);
-  const noOpPreview = await previewNativeRecordOwnership(db, root, profileId, {
-    ...request,
-    destination: { noteId: destination.id, expectedVersion: getNote(db, destination.id).version },
-  });
-  assert.equal(noOpPreview.nameEvidence.total, 0);
-  const snapshotChanges = () => {
-      const counters = intakeWorkCounters(db);
-      return (
-        counters.warm.ownershipSnapshotChangedIds +
-        counters.reconstruction.ownershipSnapshotChangedIds
+        .sort();
+    const beforePolicyScratch = policyScratchDirectories();
+    const { prepareIntakeWorkflowCommand } = await import('../intake-workflow-command.ts');
+    const { intakeSourceVersion } = await import('../intake-state-access.ts');
+    const { selectedEnvelopeStore } = await import('../intake-collection-envelope.ts');
+    console.error('fictional corrected ownership: native baseline committed');
+    const receiptHistory = await prepareIntakeWorkflowCommand(
+      db,
+      { id: original.id },
+      {
+        version: intakeSourceVersion(db, original.id).version,
+        operationId: 'fictional-corrected-receipt-history',
+        request: { fixture: 'fictional-corrected-receipt-history' },
+        createdAt: '2026-01-01',
+        *changes({ workflow }) {
+          for (let index = 0; index < 96; index++)
+            yield {
+              op: 'append',
+              record: workflow,
+              field: 'identityConfirmations',
+              jsonText: JSON.stringify({
+                ...priorReceipt,
+                operationId: 'fictional-unused-receipt-' + index,
+                confirmedPrintedName: undefined,
+                scope: { ...priorReceipt.scope, targets: [] },
+              }),
+            };
+        },
+      },
+    );
+    if (receiptHistory.replayed) throw Error('Expected new fictional native history');
+    transaction(db, () =>
+      selectedEnvelopeStore(db, { id: original.id }).collections.stage(receiptHistory.prepared),
+    );
+    console.error('fictional corrected ownership: native receipt history staged');
+
+    const {
+      prepareCollectionClinicalReview,
+      prepareCollectionClinicalReviewAsync,
+      prepareCollectionClinicalReviewDependencies,
+    } = await import('../intake-review-collection-host.ts');
+    const { collectionClinicalProjectionContext } =
+      await import('../intake-review-collection-session.ts');
+    const { requireCorrectedOwnershipReviewWork } =
+      await import('../record-ownership-authority.ts');
+    const { runClinicalReviewWork } = await import('../clinical-review-work.ts');
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, original.id);
+    console.error('fictional corrected ownership: native dependencies ready');
+    const synchronous = prepareCollectionClinicalReview(db, root, profileId, original.id);
+    assert.equal(synchronous.status, 'ready');
+    if (synchronous.status !== 'ready') throw Error('Expected complete corrected review');
+    const expectedCorrected = JSON.parse(JSON.stringify(synchronous.session.review));
+    assert.equal(
+      expectedCorrected.records[0].identityAttribution.basis,
+      'explicit_ownership_correction',
+    );
+    synchronous.session.close();
+    console.error('fictional corrected ownership: sync parity oracle ready');
+    const cooperative = await prepareCollectionClinicalReviewAsync(
+      db,
+      root,
+      profileId,
+      original.id,
+    );
+    assert.equal(cooperative.status, 'ready');
+    if (cooperative.status !== 'ready') throw Error('Expected complete corrected review');
+    try {
+      assert.deepEqual(JSON.parse(JSON.stringify(cooperative.session.review)), expectedCorrected);
+      const scope = cooperative.session.ownership,
+        originalWork = scope.confirmationWork!.bind(scope);
+      let receiptSteps = 0;
+      scope.confirmationWork = function* (id) {
+        const work = originalWork(id);
+        try {
+          for (;;) {
+            const step = work.next();
+            if (step.done) return step.value;
+            receiptSteps++;
+            yield;
+          }
+        } finally {
+          work.return(undefined);
+        }
+      };
+      const current = cooperative.session.review.records[0]!;
+      const clone = () => ({ ...current, mapping: { ...current.mapping } });
+      const identityWork = (value: typeof current) =>
+        requireCorrectedOwnershipReviewWork(
+          db,
+          value,
+          assignment.identity,
+          { id: original.id, sha256: original.sha256 },
+          undefined,
+          scope,
+        );
+      const value = clone();
+      let observed = 0;
+      const observe = () => {
+        observed = receiptSteps;
+      };
+      setImmediate(observe);
+      await runClinicalReviewWork(identityWork(value), {
+        capture() {
+          return () => collectionClinicalProjectionContext(cooperative.session).assertCurrent();
+        },
+      });
+      assert.ok(
+        observed > 0 && observed < 97,
+        'unrelated host work ran inside corrected receipt traversal',
       );
-    },
-    beforeNoOp = snapshotChanges();
-  const noOp = await commitNativeRecordOwnership(db, root, profileId, {
-    operationId: randomUUID(),
-    request: noOpPreview.request,
-    scopeToken: noOpPreview.scopeToken,
-    version: noOpPreview.version,
-  });
-  assert.equal(noOp.moved, 0);
-  assert.equal(noOp.unchanged, 1);
-  assert.equal(snapshotChanges(), beforeNoOp);
-  assert.throws(
-    () => nativeOwnershipNamePlan(db, 'another-profile', preview.nameEvidence.token),
-    /current ownership evidence/,
-  );
-});
+      assert.equal(receiptSteps, 97);
+      assert.deepEqual(value.identityAttribution, current.identityAttribution);
+      const controller = new AbortController();
+      setImmediate(() => controller.abort(Error('fictional corrected-review cancellation')));
+      await assert.rejects(
+        runClinicalReviewWork(identityWork(clone()), {
+          signal: controller.signal,
+          capture() {
+            return () => collectionClinicalProjectionContext(cooperative.session).assertCurrent();
+          },
+        }),
+        (error: unknown) =>
+          error === controller.signal.reason ||
+          (error instanceof Error &&
+            error.name === 'AbortError' &&
+            error.cause === controller.signal.reason),
+      );
+    } finally {
+      cooperative.session.close();
+    }
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, rows: 0, scopes: 0 });
+    assert.deepEqual(policyScratchDirectories(), beforePolicyScratch);
+  },
+);
 
 test('native whole-report preview pages exact clinical and pending scope and publishes one atomic report correction with durable outcome pages', async (t) => {
   const { nativeOwnershipReportPlan } = await import('../record-ownership-native.ts');

@@ -1,3 +1,6 @@
+import { runClinicalReviewWork } from './clinical-review-work.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { HttpError } from './database.ts';
 /** Complete selected-record report-default holds. Source fan-in stays in the owned SQL plan. */
 import type { Database } from './database.ts';
 import type { OwnershipPreview } from '../shared/record-ownership.ts';
@@ -8,13 +11,32 @@ import type {
 } from './record-ownership-authority.ts';
 import { latestOwnershipDecision, ownershipHash } from './ownership-journal.ts';
 import { OwnershipStoredSequence } from './ownership-preview-store.ts';
-export function ownershipPlanHolds(
+export async function ownershipPlanHolds(
   db: Database,
   sql: Database,
   records: Iterable<OwnershipReportPreviewRecord>,
   sources: ReadonlySet<string>,
-  review: (intakeId: string, sourceId: string) => SelectedOwnershipReviewScope,
+  review: (intakeId: string, sourceId: string) => Promise<SelectedOwnershipReviewScope>,
+  assertCurrent: () => void,
 ) {
+  const prepare = <T>(work: Generator<void, T, void>) =>
+    runClinicalReviewWork(work, {
+      capture() {
+        assertCurrent();
+        const stamp = reviewReadStamp(db);
+        if (stamp === undefined)
+          throw Error('Ownership holds require outside-transaction preparation');
+        return () => {
+          assertCurrent();
+          if (reviewReadStamp(db) !== stamp)
+            throw new HttpError(
+              409,
+              'OWNERSHIP_CHANGED',
+              'Ownership evidence changed during preparation',
+            );
+        };
+      },
+    });
   sql.exec(
     'CREATE TABLE IF NOT EXISTS preview_holds(ordinal INTEGER PRIMARY KEY,id TEXT UNIQUE,value TEXT);DELETE FROM preview_holds;',
   );
@@ -37,15 +59,22 @@ export function ownershipPlanHolds(
         )
         .iterate(key, source.source_id)) {
         const groupId = String(JSON.parse(String(scope.value))).slice(c.sourceFileId.length + 1),
-          complete = review(c.sourceFileId, c.sourceRecordId);
-        if (!complete.remaining(groupId, sources)) continue;
+          complete = await review(c.sourceFileId, c.sourceRecordId);
+        if (
+          !(complete.remainingWork
+            ? await prepare(complete.remainingWork(groupId, sources))
+            : complete.remaining(groupId, sources))
+        )
+          continue;
         const authority = latestOwnershipDecision<OwnershipReportAuthority>(
             db,
             'Report ownership default',
             'groupId',
             groupId,
           ),
-          receipt = complete.lastConfirmation(groupId, record.owner.personId),
+          receipt = complete.lastConfirmationWork
+            ? await prepare(complete.lastConfirmationWork(groupId, record.owner.personId))
+            : complete.lastConfirmation(groupId, record.owner.personId),
           defaultOperationId =
             authority?.personId === record.owner.personId && authority.intakeId === c.sourceFileId
               ? authority.operationId

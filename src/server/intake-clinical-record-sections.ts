@@ -16,7 +16,7 @@ import { assertIntakeOwner } from './intake.ts';
 import { visibilityState } from './visibility.ts';
 import { savedDuplicateOriginalOverlap } from './duplicate-evidence-index.ts';
 import {
-  prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
 import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
@@ -85,7 +85,13 @@ export async function openSelectedClinicalRecord(
     intakeId,
     input.proposalId,
   );
-  const result = prepareCollectionClinicalReview(db, root, profileId, intakeId, input.proposalId);
+  const result = await prepareCollectionClinicalReviewAsync(
+    db,
+    root,
+    profileId,
+    intakeId,
+    input.proposalId,
+  );
   if (result.status !== 'ready')
     throw new HttpError(
       409,

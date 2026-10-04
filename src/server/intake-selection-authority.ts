@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { copyOwnershipHoldMessage } from './ownership-identity-values.ts';
 import { createHash } from 'node:crypto';
 import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
@@ -31,7 +32,11 @@ export function durableSelectionInputs(value: unknown): unknown {
 export const selectionAuthority = (
   value: unknown,
   options: { recordComparisonsUndefined?: boolean } = {},
-): string => {
+): string => finishClinicalReviewWork(selectionAuthorityWork(value, options));
+export function* selectionAuthorityWork(
+  value: unknown,
+  options: { recordComparisonsUndefined?: boolean } = {},
+): Generator<void, string, void> {
   const hash = createHash('sha256');
   const record =
     value && typeof value === 'object' ? (value as { record?: unknown }).record : undefined;
@@ -44,6 +49,9 @@ export const selectionAuthority = (
         }
       : {},
   );
-  for (const chunk of canonicalSelectionChunks(chunks)) hash.update(chunk);
+  for (const chunk of canonicalSelectionChunks(chunks)) {
+    hash.update(chunk);
+    yield;
+  }
   return hash.digest('hex');
-};
+}

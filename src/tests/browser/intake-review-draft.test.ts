@@ -272,7 +272,15 @@ test(
         recursive: true,
         force: true,
       });
-      await api(prefix + '/unlock', { recovery: setup.recovery });
+      // Deleting the cache forces actual encrypted reconstruction on unlock.
+      // This host operation uses the enclosing journey's hang guard.
+      const unlocked = await page.request.post(url + prefix + '/unlock', {
+        headers: { Origin: url },
+        data: { recovery: setup.recovery },
+        timeout: 0,
+      });
+      assert.equal(unlocked.status(), 200, await unlocked.text());
+      assert.equal((await unlocked.json()).data.id, setup.profileId);
       const rebuilt = await fixtureReview(api, reviewPath);
       assert.deepEqual(rebuilt.records[0].draft, stored.records[0].draft);
       assert.deepEqual(rebuilt.records[0].mapping, stored.records[0].mapping);

@@ -1,10 +1,11 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { canonicalReportGroupContextChunks } from './intake-selected-report-groups.ts';
 import { storedIntakeDetails } from './intake-state-access.ts';
 import { retainAcceptedContribution } from './ownership-contributions.ts';
 import { checkedAcceptedReviewDraftHistory } from './intake-review-draft-state.ts';
 import { clinicalTables } from './clinical-references.ts';
 import {
-  requireCorrectedOwnershipReview,
+  requireCorrectedOwnershipReviewWork,
   correctedOccurrence,
   ownershipEnvelopeHash,
 } from './record-ownership-authority.ts';
@@ -245,9 +246,15 @@ export interface BuildReviewInput {
   selected?: {
     sourceScopeProblem: (entry: IntakeEntry) => string | null;
     draft: (recordId: string) => IntakeReviewDraft | null;
+    draftWork?: (recordId: string) => Generator<void, IntakeReviewDraft | null, void>;
     /** Transfer the exact selected draft to the policy stage without changing wire records. */
     retainDraft?: (record: ClinicalReviewRecord, draft: IntakeReviewDraft | null) => void;
     accepted: (recordId: string) => IntakeReviewDecision | undefined;
+    acceptedWork?: (recordId: string) => Generator<void, IntakeReviewDecision | undefined, void>;
+    reportContextWork?: (
+      envelopeId: string,
+      proposalId: string | null,
+    ) => Generator<void, IntakeSourceContext['reportContext'] | undefined, void>;
     reportContext: (
       envelopeId: string,
       proposalId: string | null,
@@ -607,12 +614,17 @@ export function checkClinicalMapping(mapping: ClinicalMapping): string | null {
 
 /** Re-evaluate the subject-dependent classification after derived identity policy is applied. */
 export function refreshClinicalIdentityPolicy(
+  ...input: Parameters<typeof refreshClinicalIdentityPolicyWork>
+): void {
+  finishClinicalReviewWork(refreshClinicalIdentityPolicyWork(...input));
+}
+export function* refreshClinicalIdentityPolicyWork(
   db: DatabaseSync,
   file: SourceFileRow,
   record: IntakeReviewRecord,
   workflow?: IntakeWorkflow,
   selected?: import('./record-ownership-authority.ts').SelectedOwnershipReviewScope,
-): void {
+): Generator<void, void, void> {
   const internal = record as IntakeReviewRecord & {
     problem?: string | null;
     sourceScopeProblem?: string | null;
@@ -621,7 +633,14 @@ export function refreshClinicalIdentityPolicy(
   const clinicalIdentity = (record as IntakeReviewRecord & { ownershipIdentity?: string })
     .ownershipIdentity;
   if (clinicalIdentity)
-    requireCorrectedOwnershipReview(db, record, clinicalIdentity, file, workflow, selected);
+    yield* requireCorrectedOwnershipReviewWork(
+      db,
+      record,
+      clinicalIdentity,
+      file,
+      workflow,
+      selected,
+    );
   const assigned = record.identityAttribution?.assignedPerson;
   if (record.mapping.personId) {
     const person = db
@@ -759,7 +778,10 @@ function previous(
   }
   return changed;
 }
-export function buildClinicalReview(
+export function buildClinicalReview(db: DatabaseSync, input: BuildReviewInput): ClinicalReview {
+  return finishClinicalReviewWork(buildClinicalReviewWork(db, input));
+}
+export function* buildClinicalReviewWork(
   db: DatabaseSync,
   {
     file,
@@ -772,13 +794,13 @@ export function buildClinicalReview(
     acceptedDecisions = [],
     selected,
   }: BuildReviewInput,
-): ClinicalReview {
+): Generator<void, ClinicalReview, void> {
   const rules = activeMappingRules(db, file.provider_id);
   const sourceScopeProblem =
     selected?.sourceScopeProblem ?? clinicalSourceScopeCheck(db, file, entries, inputFile.id);
   const local = new Map<string, PriorRecord>(),
     localIdentity = new Map<string, PriorRecord>();
-  const contextOnly = (entry: IntakeEntry): boolean => {
+  const contextOnly = function* (entry: IntakeEntry): Generator<void, boolean, void> {
     const peopleOnly =
       validatedIntakePeople(entry.value).length > 0 &&
       Object.keys(clinicalMappingEnvelope(entry.value)).length === 0;
@@ -793,10 +815,14 @@ export function buildClinicalReview(
       : latestRecordException(db, identity(entry, file), original);
     if (exception) Object.assign(mapping, { kind: original.kind, ...exception.set });
     const draft = selected
-      ? selected.draft(`${inputFile.id}:line:${entry.line}`)
+      ? selected.draftWork
+        ? yield* selected.draftWork(`${inputFile.id}:line:${entry.line}`)
+        : selected.draft(`${inputFile.id}:line:${entry.line}`)
       : drafts.find((item) => item.recordId === `${inputFile.id}:line:${entry.line}`);
     const accepted = selected
-      ? selected.accepted(`${inputFile.id}:line:${entry.line}`)
+      ? selected.acceptedWork
+        ? yield* selected.acceptedWork(`${inputFile.id}:line:${entry.line}`)
+        : selected.accepted(`${inputFile.id}:line:${entry.line}`)
       : acceptedDecisions.findLast(
           (item) =>
             item.action === 'accept' && item.recordId === `${inputFile.id}:line:${entry.line}`,
@@ -809,7 +835,11 @@ export function buildClinicalReview(
     );
     return !isClinicalKind(mapping.kind);
   };
-  const classifiedEntries = entries.map((entry) => ({ entry, contextOnly: contextOnly(entry) }));
+  const classifiedEntries: { entry: IntakeEntry; contextOnly: boolean }[] = [];
+  for (const entry of entries) {
+    classifiedEntries.push({ entry, contextOnly: yield* contextOnly(entry) });
+    yield;
+  }
   const reviewEntries = classifiedEntries
     .filter((item) => !item.contextOnly)
     .map((item) => item.entry);
@@ -820,58 +850,58 @@ export function buildClinicalReview(
       ? (workflow.reportGroups as IntakeReportGroup[])
       : [];
   })();
-  const sourceContext: IntakeSourceContext[] = classifiedEntries
-    .filter((item) => item.contextOnly)
-    .map(({ entry }) => {
-      const value = entry.value;
-      const reportContext = selected
-        ? selected.reportContext(value.id, proposalId)
-        : retainedGroups
-            .flatMap((group) => group.versions)
-            .findLast(
-              (groupVersion) =>
-                groupVersion.context?.envelopeId === value.id &&
-                groupVersion.members.some((member) =>
-                  member.occurrences.some((occurrence) => occurrence.proposalId === proposalId),
-                ),
-            )?.context;
-      return {
-        id: `${inputFile.id}:line:${entry.line}`,
-        envelopeId: value.id,
-        kind: 'context',
-        title: 'Source context',
-        payload: value.payload,
-        text:
-          typeof value.payload === 'string'
-            ? value.payload
-            : JSON.stringify(value.payload, null, 2),
-        provenance: value.provenance,
-        coverage: value.coverage,
-        notes: [
-          ...value.coverage.notes,
-          ...(Array.isArray(value.uncertainties) ? value.uncertainties : []),
-          ...(Array.isArray(value.reviewIssues)
-            ? value.reviewIssues
-                .filter(
-                  (issue): issue is { kind: 'information'; prompt: string } =>
-                    object(issue) &&
-                    issue.kind === 'information' &&
-                    typeof issue.prompt === 'string',
-                )
-                .map((issue) => issue.prompt)
-            : []),
-        ].filter((note, index, notes) => typeof note === 'string' && notes.indexOf(note) === index),
-        evidence: [
-          {
-            label: 'Original source',
-            locator: value.provenance.locator,
-            contentUrl: `/api/sources/${encodeURIComponent(file.id)}/content`,
-          },
-        ],
-        ...(reportContext ? { reportContext: structuredClone(reportContext) } : {}),
-      };
+  const sourceContext: IntakeSourceContext[] = [];
+  for (const { entry, contextOnly } of classifiedEntries) {
+    yield;
+    if (!contextOnly) continue;
+    const value = entry.value;
+    const reportContext = selected
+      ? selected.reportContextWork
+        ? yield* selected.reportContextWork(value.id, proposalId)
+        : selected.reportContext(value.id, proposalId)
+      : retainedGroups
+          .flatMap((group) => group.versions)
+          .findLast(
+            (groupVersion) =>
+              groupVersion.context?.envelopeId === value.id &&
+              groupVersion.members.some((member) =>
+                member.occurrences.some((occurrence) => occurrence.proposalId === proposalId),
+              ),
+          )?.context;
+    sourceContext.push({
+      id: `${inputFile.id}:line:${entry.line}`,
+      envelopeId: value.id,
+      kind: 'context',
+      title: 'Source context',
+      payload: value.payload,
+      text:
+        typeof value.payload === 'string' ? value.payload : JSON.stringify(value.payload, null, 2),
+      provenance: value.provenance,
+      coverage: value.coverage,
+      notes: [
+        ...value.coverage.notes,
+        ...(Array.isArray(value.uncertainties) ? value.uncertainties : []),
+        ...(Array.isArray(value.reviewIssues)
+          ? value.reviewIssues
+              .filter(
+                (issue): issue is { kind: 'information'; prompt: string } =>
+                  object(issue) && issue.kind === 'information' && typeof issue.prompt === 'string',
+              )
+              .map((issue) => issue.prompt)
+          : []),
+      ].filter((note, index, notes) => typeof note === 'string' && notes.indexOf(note) === index),
+      evidence: [
+        {
+          label: 'Original source',
+          locator: value.provenance.locator,
+          contentUrl: `/api/sources/${encodeURIComponent(file.id)}/content`,
+        },
+      ],
+      ...(reportContext ? { reportContext: structuredClone(reportContext) } : {}),
     });
-  const records: ClinicalReviewRecord[] = reviewEntries.map((entry) => {
+  }
+  const records: ClinicalReviewRecord[] = [];
+  for (const entry of reviewEntries) {
     const original = mappingFrom(entry),
       mapping = {
         ...applyRules(
@@ -888,10 +918,14 @@ export function buildClinicalReview(
     Object.assign(mapping, exception ? { kind: original.kind, ...exception.set } : {});
     const undraftedMapping = { ...mapping },
       draft = selected
-        ? selected.draft(`${inputFile.id}:line:${entry.line}`)
+        ? selected.draftWork
+          ? yield* selected.draftWork(`${inputFile.id}:line:${entry.line}`)
+          : selected.draft(`${inputFile.id}:line:${entry.line}`)
         : drafts.find((d) => d.recordId === `${inputFile.id}:line:${entry.line}`),
       accepted = selected
-        ? selected.accepted(`${inputFile.id}:line:${entry.line}`)
+        ? selected.acceptedWork
+          ? yield* selected.acceptedWork(`${inputFile.id}:line:${entry.line}`)
+          : selected.accepted(`${inputFile.id}:line:${entry.line}`)
         : acceptedDecisions.findLast(
             (item) =>
               item.action === 'accept' && item.recordId === `${inputFile.id}:line:${entry.line}`,
@@ -1050,8 +1084,9 @@ export function buildClinicalReview(
         ),
       );
     selected?.retainDraft?.(result, draft ?? null);
-    return result;
-  });
+    records.push(result);
+    yield;
+  }
   const summary = {
     additions: records.filter((r) => r.classification === 'addition').length,
     duplicates: records.filter((r) => r.classification === 'duplicate').length,
@@ -1088,6 +1123,11 @@ export function buildClinicalReview(
 }
 
 function occurrenceContext(
+  ...input: Parameters<typeof occurrenceContextWork>
+): IntakeOccurrenceContext {
+  return finishClinicalReviewWork(occurrenceContextWork(...input));
+}
+function* occurrenceContextWork(
   db: DatabaseSync,
   file: SourceFileRow,
   inputFile: InputFileRow,
@@ -1096,7 +1136,7 @@ function occurrenceContext(
   record: ClinicalReviewRecord,
   confirmationHashes: Map<IntakeReportSourceConfirmation, string>,
   selectedReportSource?: SelectedClinicalReportSource,
-): IntakeOccurrenceContext {
+): Generator<void, IntakeOccurrenceContext, void> {
   const acquisition = db
     .prepare('SELECT provider_id,sha256,bytes FROM source_files WHERE id=?')
     .get(file.id) as { provider_id: string; sha256: string; bytes: number } | undefined;
@@ -1131,7 +1171,9 @@ function occurrenceContext(
     identityReview: record.identityReview || null,
     reportGroups: record.reportGroups || [],
     reviewedReportSource: selectedReportSource
-      ? selectedReportSource(record, review.proposalId)
+      ? selectedReportSource.work
+        ? yield* selectedReportSource.work(record, review.proposalId)
+        : selectedReportSource(record, review.proposalId)
       : reportSource
         ? {
             confirmationHash,
@@ -1143,17 +1185,18 @@ function occurrenceContext(
         : null,
     evidence: record.evidence,
   };
+  const contextDigest = createHash('sha256');
+  for (const chunk of canonicalReportGroupContextChunks(context)) {
+    contextDigest.update(chunk);
+    yield;
+  }
   return {
     intakeId: review.intakeId,
     intakeVersion: review.version,
     proposalId: review.proposalId,
     candidateId: record.candidateId || '',
     candidateVersionId: record.candidateVersionId || '',
-    contextHash: (() => {
-      const hash = createHash('sha256');
-      for (const chunk of canonicalReportGroupContextChunks(context)) hash.update(chunk);
-      return hash.digest('hex');
-    })(),
+    contextHash: contextDigest.digest('hex'),
     locator: entry.value.provenance.locator,
     originalSourceFileId: file.id,
   };
@@ -1263,7 +1306,7 @@ function verifyRetainedClinicalSourceRecord(
 
 /** Finalize v2 scopes only after candidate/report and identity policy enrichment. */
 /** The same exact commitment fields used by v1 pair authority, resolved from complete selected source coverage. */
-export type SelectedClinicalReportSource = (
+type SelectedClinicalReportSourceValue = (
   record: Pick<IntakeReviewRecord, 'id' | 'candidateId' | 'candidateVersionId' | 'reportGroups'>,
   proposalId: string | null,
 ) => {
@@ -1273,23 +1316,34 @@ export type SelectedClinicalReportSource = (
   extensionId: string | null;
   coverageEntryId: string | null;
 } | null;
+export type SelectedClinicalReportSource = SelectedClinicalReportSourceValue & {
+  work?: (
+    ...input: Parameters<SelectedClinicalReportSourceValue>
+  ) => Generator<void, ReturnType<SelectedClinicalReportSourceValue>, void>;
+};
 export function finalizeClinicalPairScopes(
+  ...input: Parameters<typeof finalizeClinicalPairScopesWork>
+): void {
+  finishClinicalReviewWork(finalizeClinicalPairScopesWork(...input));
+}
+export function* finalizeClinicalPairScopesWork(
   db: DatabaseSync,
   file: SourceFileRow,
   inputFile: InputFileRow,
   entries: IntakeEntry[],
   review: ClinicalReview,
   selectedReportSource?: SelectedClinicalReportSource,
-): void {
+): Generator<void, void, void> {
   const confirmationHashes = new Map<IntakeReportSourceConfirmation, string>();
   const entriesByRecordId = new Map(
     entries.map((entry) => [`${inputFile.id}:line:${entry.line}`, entry]),
   );
   for (const record of review.records) {
+    yield;
     if (!isClinicalKind(record.kind) || !record.comparisonReference) continue;
     const entry = entriesByRecordId.get(record.id);
     if (!entry) throw new Error('Clinical review entry is missing from its retained proposal');
-    const occurrence = occurrenceContext(
+    const occurrence = yield* occurrenceContextWork(
       db,
       file,
       inputFile,
@@ -1312,6 +1366,7 @@ export function finalizeClinicalPairScopes(
       evidence: record.evidence,
     };
     for (const comparison of record.comparisons) {
+      yield;
       const candidate = selectedReportSource
         ? nativeDuplicateRecord(db, record.kind, comparison.id)
         : duplicateRecord(db, record.kind, comparison.id);

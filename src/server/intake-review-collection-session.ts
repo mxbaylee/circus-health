@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { createHash } from 'node:crypto';
 import { inlineReviewRecordIssues, reviewRecordIssues } from './intake-review-issue-state.ts';
 import type { DatabaseSync } from 'node:sqlite';
@@ -5,16 +6,19 @@ import { HttpError } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { selectedReportGroupLinks, selectedReportGroups } from './intake-selected-report-groups.ts';
 import {
-  buildClinicalReview,
-  finalizeClinicalPairScopes,
-  refreshClinicalIdentityPolicy,
+  buildClinicalReviewWork,
+  finalizeClinicalPairScopesWork,
+  refreshClinicalIdentityPolicyWork,
   type BuildReviewInput,
   type ClinicalReview,
   type SelectedClinicalReportSource,
   type SelectedClinicalProjectionScope,
 } from './clinical-import.ts';
-import { workflowReviewSelected, type SelectedWorkflowIdentityContext } from './intake-workflow.ts';
-import { selectionAuthority } from './intake-selection-authority.ts';
+import {
+  workflowReviewSelectedWork,
+  type SelectedWorkflowIdentityContext,
+} from './intake-workflow.ts';
+import { selectionAuthorityWork } from './intake-selection-authority.ts';
 import type { IntakeIdentitySelfSnapshot } from '../shared/intake-identity.ts';
 import type { IntakeReview } from '../shared/intake.ts';
 import type { IntakeValidation } from '../shared/intake.ts';
@@ -65,7 +69,13 @@ export interface CollectionClinicalReviewSession {
     bytes?: number,
   ): IntakeClinicalRecordRead;
 }
+export interface VerifiedClinicalArtifact {
+  id: string;
+  path: string;
+  identity: string;
+}
 export interface CollectionClinicalProjectionContext {
+  verifiedArtifacts(): Iterable<VerifiedClinicalArtifact>;
   readonly db: DatabaseSync;
   readonly profileId: string;
   readonly proposal: Omit<BuildReviewInput, 'drafts' | 'acceptedDecisions' | 'selected'>;
@@ -88,7 +98,12 @@ export function collectionClinicalProjectionContext(
   return context;
 }
 /** Complete bounded JSONL input uses the same pure clinical/identity/pair logic as v1. Package history stays selected. */
-export function createCollectionClinicalReviewSession(input: {
+export function createCollectionClinicalReviewSession(
+  input: Parameters<typeof createCollectionClinicalReviewSessionWork>[0],
+): CollectionClinicalReviewResult {
+  return finishClinicalReviewWork(createCollectionClinicalReviewSessionWork(input));
+}
+export function* createCollectionClinicalReviewSessionWork(input: {
   db: DatabaseSync;
   profileId: string;
   proposal: Omit<BuildReviewInput, 'drafts' | 'acceptedDecisions' | 'selected'>;
@@ -101,9 +116,10 @@ export function createCollectionClinicalReviewSession(input: {
   projection: SelectedClinicalProjectionScope;
   validation: IntakeValidation;
   assertProjectionEvidenceCurrent?(): void;
+  verifiedArtifacts?(): Iterable<VerifiedClinicalArtifact>;
   sourceText: { stale: boolean; revisionId: string | null; dependencyToken: string | null };
   assertCurrent(): void;
-}): CollectionClinicalReviewResult {
+}): Generator<void, CollectionClinicalReviewResult, void> {
   let closed = false;
   const check = input.assertCurrent;
   input = {
@@ -127,26 +143,39 @@ export function createCollectionClinicalReviewSession(input: {
       'CONVERSION_REQUIRED',
       'Original retained; review a bounded JSONL conversion proposal (at most 25 MiB)',
     );
+  let completed = false;
   try {
     const byId = new Map(
       proposal.entries.map((entry) => [`${proposal.inputFile.id}:line:${entry.line}`, entry]),
     );
-    const clinical = buildClinicalReview(db, {
+    const clinical = yield* buildClinicalReviewWork(db, {
       ...proposal,
       selected: {
         sourceScopeProblem: input.sourceScopeProblem,
-        reportContext: scope.reportContext,
+        reportContext: (envelopeId, proposalId) => scope.reportContext(envelopeId, proposalId),
+        reportContextWork: (envelopeId, proposalId) =>
+          scope.reportContextWork(envelopeId, proposalId),
         draft: (id) => {
           const entry = byId.get(id);
           if (!entry) throw Error('Review record is not in the complete selected proposal');
           return scope.draft(proposal.proposalId, id, scope.versionId(proposal.proposalId, entry));
         },
+        draftWork: function* (id) {
+          const entry = byId.get(id);
+          if (!entry) throw Error('Review record is not in the complete selected proposal');
+          return yield* scope.draftWork!(
+            proposal.proposalId,
+            id,
+            scope.versionId(proposal.proposalId, entry),
+          );
+        },
         retainDraft: scope.bindPreparedDraft,
-        accepted: scope.latestAcceptedRecord,
+        accepted: (id) => scope.latestAcceptedRecord(id),
+        acceptedWork: (id) => scope.latestAcceptedRecordWork(id),
       },
     });
     // ClinicalMapping has an internal broader string-kind type; all runtime fields are the same retained review.
-    const review = workflowReviewSelected(
+    const review = yield* workflowReviewSelectedWork(
       proposal.file,
       scope,
       clinical as unknown as IntakeReview,
@@ -154,9 +183,17 @@ export function createCollectionClinicalReviewSession(input: {
       input.self,
       input.identity,
     );
-    for (const record of review.records)
-      refreshClinicalIdentityPolicy(db, proposal.file, record, undefined, input.ownership);
-    finalizeClinicalPairScopes(
+    for (const record of review.records) {
+      yield* refreshClinicalIdentityPolicyWork(
+        db,
+        proposal.file,
+        record,
+        undefined,
+        input.ownership,
+      );
+      yield;
+    }
+    yield* finalizeClinicalPairScopesWork(
       db,
       proposal.file,
       proposal.inputFile,
@@ -170,7 +207,10 @@ export function createCollectionClinicalReviewSession(input: {
     const reviewHash = createHash('sha256').update(
       '[' + canonicalLiteral(review.reviewToken) + ',',
     );
-    for (const piece of scope.canonicalReviewRecords(review.records)) reviewHash.update(piece);
+    for (const piece of scope.canonicalReviewRecords(review.records)) {
+      reviewHash.update(piece);
+      yield;
+    }
     review.reviewToken = reviewHash.update(']').digest('hex');
     review.summary = { additions: 0, duplicates: 0, unsupported: 0, uncertain: 0 };
     for (const record of review.records) {
@@ -200,7 +240,7 @@ export function createCollectionClinicalReviewSession(input: {
           'This proposal uses earlier source text. Read the corrected source and create a new proposal before acceptance.',
       });
     for (const record of review.records)
-      record.selectionReviewToken = selectionAuthority(
+      record.selectionReviewToken = yield* selectionAuthorityWork(
         {
           profileId: input.profileId,
           intakeId: proposal.file.id,
@@ -454,6 +494,11 @@ export function createCollectionClinicalReviewSession(input: {
       },
     };
     projectionContexts.set(session, {
+      *verifiedArtifacts() {
+        input.assertCurrent();
+        if (!input.verifiedArtifacts) throw Error('Clinical artifact proof is unavailable');
+        yield* input.verifiedArtifacts();
+      },
       db,
       profileId: input.profileId,
       proposal,
@@ -465,11 +510,14 @@ export function createCollectionClinicalReviewSession(input: {
         input.assertProjectionEvidenceCurrent?.();
       },
     });
+    completed = true;
     return { status: 'ready', session };
   } catch (error) {
     close();
     if (error instanceof IntakeReviewFragmentRequired)
       return { status: 'fragment_required', reference: error.reference };
     throw error;
+  } finally {
+    if (!completed) close();
   }
 }

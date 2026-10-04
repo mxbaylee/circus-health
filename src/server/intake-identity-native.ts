@@ -1,3 +1,6 @@
+import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
+import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { runClinicalReviewWork } from './clinical-review-work.ts';
 /** Native common identity uses complete repeatable authority and exact scoped references. */
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
@@ -10,7 +13,7 @@ import {
 } from './database.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { canonicalLiteral } from './intake-format.ts';
-import { collectSelectedEvidencedIdentity } from './intake-identity-name-evidence.ts';
+import { collectSelectedEvidencedIdentityWork } from './intake-identity-name-evidence.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 import {
@@ -47,11 +50,16 @@ import {
 } from './intake-review-collection.ts';
 import { createReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
 import { openReportMemberSnapshot } from './intake-report-member-state.ts';
-import { readNativeReviewDraft, prepareNativeDraftHistory } from './intake-review-draft-state.ts';
+import {
+  readNativeReviewDraft,
+  readNativeReviewDraftWork,
+  prepareNativeDraftHistory,
+} from './intake-review-draft-state.ts';
 import { prepareRetainedPlanAccess, readRetainedPlanEvidence } from './intake-retained-plan.ts';
 import {
   prepareCollectionClinicalReviewDependencies,
   prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewAsync,
 } from './intake-review-collection-host.ts';
 import { prepareCollectionWorkflowReadiness } from './intake-workflow-readiness.ts';
 import {
@@ -69,22 +77,22 @@ import {
 import { schemaOrdinal } from './intake-envelope-schema.ts';
 import { INTAKE_TREE_VALUE_BYTES } from './intake-state-tree.ts';
 import {
-  assessIdentityPolicy,
-  collectEvidencedIdentity,
-  currentIdentityRefusal,
-  repeatedIdentityQuestionReceipt,
-  exactCurrentIdentityResolutionOperationId,
-  identityReceiptAppliesToCurrentBoundary,
+  assessIdentityPolicyWork,
+  collectEvidencedIdentityWork,
+  repeatedIdentityQuestionReceiptWork,
+  exactCurrentIdentityResolutionOperationIdWork,
+  identityReceiptAppliesToCurrentBoundaryWork,
   identityOriginalFingerprintForMember,
   identityPersonFingerprint,
-  identityTargetHasIssue,
-  isGenericNameConfirmation,
+  identityTargetHasIssueWork,
+  isGenericNameConfirmationWork,
   iterateCompetingIdentityBoundaries,
+  identityCompetingClaimsEqualWork,
   type IdentityPolicyReceipt,
   type IdentityPolicyMember,
   type IdentityPolicyTarget,
 } from './intake-identity-policy.ts';
-import { retainSelectedIdentityGrounding } from './intake-identity-grounding.ts';
+import { retainSelectedIdentityGroundingWork } from './intake-identity-grounding.ts';
 import { selectedIdentityPeopleSnapshots } from './intake-identity-people.ts';
 import {
   selfSnapshot,
@@ -216,6 +224,14 @@ async function open(
     packageEvidence: file.mime_type === 'application/zip' || !!plan?.hasMembers,
     readDraft: (record) =>
       readNativeReviewDraft(
+        view,
+        record,
+        createReportSnapshotCatalog(db, file, { catalog: 'review.snapshots' }),
+        256 * 1024,
+        { db, source: file },
+      ),
+    readDraftWork: (record) =>
+      readNativeReviewDraftWork(
         view,
         record,
         createReportSnapshotCatalog(db, file, { catalog: 'review.snapshots' }),
@@ -421,11 +437,13 @@ async function evidence(context: Context) {
 /** Private scratch holds cumulative counts and ordered policy facts, never recovery authority. */
 function rows() {
   const scratch = disposableSqlite('fictional-identity-scope-');
+  let artifacts: ReturnType<typeof createClinicalReviewArtifactProof> | undefined;
   scratch.db.exec(
     `CREATE TABLE pieces(section TEXT,key TEXT,ordinal INTEGER,value TEXT,PRIMARY KEY(section,key,ordinal));
     CREATE TABLE counts(section TEXT PRIMARY KEY,count INTEGER NOT NULL);
     CREATE TABLE rows(section TEXT NOT NULL,key TEXT NOT NULL,ordinal INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(section,key));
     CREATE INDEX ordered ON rows(section,ordinal);
+    CREATE TABLE competing_order(key TEXT PRIMARY KEY,id TEXT,ordinal INTEGER);
     CREATE TRIGGER inserted AFTER INSERT ON rows BEGIN INSERT INTO counts VALUES(NEW.section,1) ON CONFLICT(section) DO UPDATE SET count=count+1; END;
     CREATE TRIGGER removed AFTER DELETE ON rows BEGIN UPDATE counts SET count=count-1 WHERE section=OLD.section; END;`,
   );
@@ -443,7 +461,7 @@ function rows() {
         'INSERT INTO rows VALUES(?,?,?,?) ON CONFLICT(section,key) DO UPDATE SET value=excluded.value',
       )
       .run(section, key, count(section), canonicalLiteral(JSON.parse(JSON.stringify(value))));
-  const putStream = (section: string, key: string, pieces: Iterable<string>) => {
+  const putStreamWork = function* (section: string, key: string, pieces: Iterable<string>) {
     scratch.db
       .prepare('INSERT OR IGNORE INTO rows VALUES(?,?,?,?)')
       .run(section, key, count(section), '');
@@ -457,12 +475,94 @@ function rows() {
           .prepare('INSERT INTO pieces VALUES(?,?,?,?)')
           .run(section, key, ordinal++, piece.slice(offset, end));
         offset = end;
+        yield;
       }
   };
-  const raw = function* (section: string) {
-    const order = section === 'competingSubjects' ? 'key' : 'ordinal';
+  const putStream = (...args: Parameters<typeof putStreamWork>) => {
+    const work = putStreamWork(...args);
+    while (!work.next().done) {}
+  };
+
+  const putCompeting = (
+    key: string,
+    claim: NonNullable<IntakeIdentityScope['competingSubjects']>[number],
+  ) => {
+    const ordinal = count('competingSubjects');
+    put('competingSubjects', key, claim);
+    scratch.db
+      .prepare(
+        'INSERT INTO competing_order VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET id=excluded.id',
+      )
+      .run(key, claim.groupId, ordinal);
+  };
+  const sortCompeting = function* (): Generator<void, void, void> {
+    // Same stable localeCompare order as legacy, with fixed-size sorted runs.
+    // Keep occurrence addresses as row keys; public IDs are not unique here.
+    scratch.db.exec(
+      'CREATE TABLE competing_runs(level INTEGER,run INTEGER,ordinal INTEGER,key TEXT,id TEXT,PRIMARY KEY(level,run,ordinal))',
+    );
+    const insert = scratch.db.prepare('INSERT INTO competing_runs VALUES(?,?,?,?,?)');
+    let run = 0,
+      bytes = 0,
+      batch: { key: string; id: string }[] = [];
+    const flush = () => {
+      batch.sort((a, b) => a.id.localeCompare(b.id));
+      for (const [ordinal, item] of batch.entries()) insert.run(0, run, ordinal, item.key, item.id);
+      run++;
+      batch = [];
+      bytes = 0;
+    };
     for (const row of scratch.db
-      .prepare('SELECT key,value FROM rows WHERE section=? ORDER BY ' + order)
+      .prepare('SELECT key,id FROM competing_order ORDER BY ordinal')
+      .iterate()) {
+      const item = { key: String(row.key), id: String(row.id) },
+        size = Buffer.byteLength(item.key) + Buffer.byteLength(item.id);
+      if (batch.length && (batch.length === 32 || bytes + size > 65536)) flush();
+      batch.push(item);
+      bytes += size;
+      yield;
+    }
+    if (batch.length) flush();
+    let level = 0;
+    while (run > 1) {
+      for (let left = 0; left < run; left += 2) {
+        const a = scratch.db
+            .prepare('SELECT key,id FROM competing_runs WHERE level=? AND run=? ORDER BY ordinal')
+            .iterate(level, left),
+          b = scratch.db
+            .prepare('SELECT key,id FROM competing_runs WHERE level=? AND run=? ORDER BY ordinal')
+            .iterate(level, left + 1);
+        let x = a.next(),
+          y = b.next(),
+          ordinal = 0;
+        while (!x.done || !y.done) {
+          const chooseA =
+              y.done || (!x.done && String(x.value.id).localeCompare(String(y.value.id)) <= 0),
+            item = chooseA ? x.value! : y.value!;
+          insert.run(level + 1, Math.floor(left / 2), ordinal++, item.key, item.id);
+          if (chooseA) x = a.next();
+          else y = b.next();
+          yield;
+        }
+      }
+      scratch.db.prepare('DELETE FROM competing_runs WHERE level=?').run(level++);
+      run = Math.ceil(run / 2);
+    }
+    const update = scratch.db.prepare(
+      "UPDATE rows SET ordinal=? WHERE section='competingSubjects' AND key=?",
+    );
+    let ordinal = 0;
+    for (const row of scratch.db
+      .prepare('SELECT key FROM competing_runs WHERE level=? ORDER BY ordinal')
+      .iterate(level)) {
+      update.run(ordinal++, row.key);
+      yield;
+    }
+    scratch.db.exec('DROP TABLE competing_runs');
+  };
+  const raw = function* (section: string) {
+    for (const row of scratch.db
+      .prepare('SELECT key,value FROM rows WHERE section=? ORDER BY ordinal')
       .iterate(section)) {
       const key = String(row.key);
       yield {
@@ -495,11 +595,19 @@ function rows() {
     }
     return value;
   }
-  function putTarget(section: string, key: string, value: Target, issues?: Iterable<string>) {
+  function putTarget(...args: Parameters<typeof putTargetWork>) {
+    const work = putTargetWork(...args);
+    while (!work.next().done) {}
+  }
+  function* putTargetWork(section: string, key: string, value: Target, issues?: Iterable<string>) {
     const { issueIds: _issueIds, ...header } = value;
     const issueSection = 'targetIssues:' + section + ':' + key;
     scratch.db.prepare('DELETE FROM rows WHERE section=?').run(issueSection);
-    if (issues) for (const issueId of issues) put(issueSection, issueId, issueId);
+    if (issues)
+      for (const issueId of issues) {
+        put(issueSection, issueId, issueId);
+        yield;
+      }
     put(section, key, { ...header, ...(issues ? { $issues: true } : {}) });
   }
   function addTargetIssue(section: string, key: string, issueId: string) {
@@ -537,12 +645,25 @@ function rows() {
   };
   return {
     ...scratch,
+    retainArtifacts(
+      values: Parameters<ReturnType<typeof createClinicalReviewArtifactProof>['retain']>[0],
+    ) {
+      artifacts ??= createClinicalReviewArtifactProof(scratch.db, 'identity_artifact_proof');
+      artifacts.retain(values);
+    },
+    assertArtifacts() {
+      artifacts?.assertCurrent();
+    },
     count,
     get,
     put,
     putStream,
+    putStreamWork,
+    putCompeting,
+    sortCompeting,
     target,
     putTarget,
+    putTargetWork,
     addTargetIssue,
     raw,
     sequence,
@@ -550,6 +671,22 @@ function rows() {
   };
 }
 type Rows = ReturnType<typeof rows>;
+function runNativeIdentityWork<T>(context: Context, stored: Rows, work: Generator<void, T, void>) {
+  const db = context.db;
+  return runClinicalReviewWork(work, {
+    capture() {
+      context.assertCurrent();
+      stored.assertArtifacts();
+      const stamp = reviewReadStamp(db);
+      if (stamp === undefined) reject('Identity scope preparation requires current authority');
+      return () => {
+        context.assertCurrent();
+        if (reviewReadStamp(db) !== stamp) reject('Identity scope changed during preparation');
+        stored.assertArtifacts();
+      };
+    },
+  });
+}
 async function build(
   context: Context,
   original: Awaited<ReturnType<typeof evidence>>,
@@ -559,14 +696,31 @@ async function build(
   const { db, root, profileId, id, view, workflow, group, scope } = context;
   const currentSelf = selfSnapshot(db),
     people = selectedIdentityPeopleSnapshots(db);
-  for (const question of intakeReviewChildren(view, workflow, 'questions'))
-    if (
-      !scalar(view, question, 'candidateId') &&
-      scalar(view, question, 'status') !== 'resolved' &&
-      (scalar(view, question, 'field') === 'subject' ||
-        /\b(patient|subject|identity)\b/i.test(scalar<string>(view, question, 'prompt') || ''))
-    )
-      reject('Resolve the delivery identity question before common confirmation');
+  const run = <T>(work: Generator<void, T, void>) => runNativeIdentityWork(context, stored, work);
+  const receipts = await run(scope.receiptsWork!());
+  let inspections = 0;
+  const step = () =>
+    ++inspections % 16 === 0
+      ? run(
+          (function* () {
+            for (let n = 0; n < 16; n++) yield;
+          })(),
+        )
+      : undefined;
+  await run(
+    (function* () {
+      for (const question of intakeReviewChildren(view, workflow, 'questions')) {
+        yield;
+        if (
+          !scalar(view, question, 'candidateId') &&
+          scalar(view, question, 'status') !== 'resolved' &&
+          (scalar(view, question, 'field') === 'subject' ||
+            /\b(patient|subject|identity)\b/i.test(scalar<string>(view, question, 'prompt') || ''))
+        )
+          reject('Resolve the delivery identity question before common confirmation');
+      }
+    })(),
+  );
   type GroundedQuestion = {
     issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor'>;
     receipt: { operationId: string; scope: { scopeToken: string; profileId: string } };
@@ -597,12 +751,23 @@ async function build(
       await prepareCollectionClinicalReviewDependencies(db, root, profileId, id, proposalId, {
         assertRunning: context.assertCurrent,
       });
-      const selected = prepareCollectionClinicalReview(db, root, profileId, id, proposalId);
+      const selected = await prepareCollectionClinicalReviewAsync(
+        db,
+        root,
+        profileId,
+        id,
+        proposalId,
+        { assertRunning: context.assertCurrent },
+      );
       if (selected.status !== 'ready')
         return reject(
           'Prepare this exact retained clinical occurrence before identity confirmation',
         );
       cached = { proposalId, selected };
+      context.assertCurrent();
+      stored.retainArtifacts(
+        collectionClinicalProjectionContext(selected.session).verifiedArtifacts(),
+      );
     }
     const record = cached.selected.session.record(recordId, candidateId, candidateVersionId);
     if (!record) return reject('The current report occurrence differs from the displayed member');
@@ -610,6 +775,8 @@ async function build(
   }
   try {
     for (const member of context.membership()) {
+      const pending = step();
+      if (pending) await pending;
       context.assertCurrent();
       const candidate = view.find('candidate', workflow, member.candidateId),
         version = candidate && view.find('version', candidate, member.candidateVersionId);
@@ -621,6 +788,8 @@ async function build(
       );
       if (!latest || scalar(view, latest, 'id') !== member.candidateVersionId) continue;
       for (const occurrence of member.occurrences) {
+        const pending = step();
+        if (pending) await pending;
         const record = await reviewRecord(
           occurrence.proposalId,
           occurrence.recordId,
@@ -632,25 +801,56 @@ async function build(
         else if (person?.personId !== assignedPerson?.personId) consistentAssignment = false;
         occurrenceCount++;
         allEvidenced &&= record.identityReview?.status === 'evidenced_match';
-        for (const warning of reviewRecordIdentityWarnings(record))
-          stored.put(
-            'warnings',
-            canonicalLiteral([
-              warning.kind,
-              warning.modelBirthDate,
-              warning.savedBirthDate,
-              warning.personName,
-            ]),
-            warning,
-          );
+        await run(
+          (function* () {
+            for (const warning of reviewRecordIdentityWarnings(record)) {
+              yield;
+              stored.put(
+                'warnings',
+                canonicalLiteral([
+                  warning.kind,
+                  warning.modelBirthDate,
+                  warning.savedBirthDate,
+                  warning.personName,
+                ]),
+                warning,
+              );
+            }
+          })(),
+        );
         if (scalar(view, version!, 'status') !== 'pending') continue;
         const genericId =
           'issue:' +
           createHash('sha256')
             .update(JSON.stringify([member.candidateVersionId, 'identity', 'subject']))
             .digest('hex');
-        const identity = reviewRecordIssues(record).filter((issue) => issue.kind === 'identity');
-        for (const issue of identity) stored.put('issues', String(stored.count('issues')), issue);
+        const issueSection = 'occurrenceIssues:' + occurrenceCount,
+          unresolvedSection = issueSection + ':unresolved',
+          additionalSection = issueSection + ':additional';
+        let firstIdentity: IntakeReviewIssue | undefined,
+          genericIdentity: IntakeReviewIssue | undefined,
+          firstUnresolved: IntakeReviewIssue | undefined,
+          genericUnresolved: IntakeReviewIssue | undefined;
+        await run(
+          (function* () {
+            for (const issue of reviewRecordIssues(record)) {
+              yield;
+              if (issue.kind !== 'identity') continue;
+              firstIdentity ??= issue;
+              if (issue.id === genericId) genericIdentity ??= issue;
+              stored.put(issueSection, String(stored.count(issueSection)), issue);
+              if (issue.status === 'unresolved') {
+                firstUnresolved ??= issue;
+                if (issue.id === genericId) genericUnresolved ??= issue;
+                stored.put(unresolvedSection, String(stored.count(unresolvedSection)), issue);
+                if (issue.id !== genericId)
+                  stored.put(additionalSection, String(stored.count(additionalSection)), issue);
+              }
+              stored.put('issues', String(stored.count('issues')), issue);
+            }
+          })(),
+        );
+        const identity = stored.sequence<IntakeReviewIssue>(issueSection);
         const target = (issueId: string): Target => ({
           candidateId: member.candidateId,
           candidateVersionId: member.candidateVersionId,
@@ -666,109 +866,141 @@ async function build(
           record.id,
         ]);
         if (record.reviewState === 'pending')
-          stored.putTarget(
-            'assignmentTargets',
-            key,
-            target(
-              identity.find((issue) => issue.id === genericId)?.id ||
-                identity.at(0)?.id ||
-                genericId,
+          await run(
+            stored.putTargetWork(
+              'assignmentTargets',
+              key,
+              target(genericIdentity?.id || firstIdentity?.id || genericId),
+              identity.length ? identity.map((issue) => issue.id) : undefined,
             ),
-            identity.length ? identity.map((issue) => issue.id) : undefined,
           );
-        const unresolved = identity.filter((issue) => issue.status === 'unresolved');
-        const explicitIssues = identity
-          .filter((issue) => issue.id !== genericId && !issue.selfSuggestion)
-          .filter((issue) => {
-            if (
-              original.pageText?.includes(issue.textAnchor || '\u0000') &&
-              isGenericNameConfirmation(issue, group.report?.subject?.text, currentSelf, people)
-            ) {
-              stored.put('groundedNameQuestions', hash([issue.prompt, issue.textAnchor]), {
-                prompt: issue.prompt,
-                ...(issue.textAnchor ? { textAnchor: issue.textAnchor } : {}),
-              });
-              return false;
-            }
-            const receipt = repeatedIdentityQuestionReceipt({
-              issue,
-              group,
-              receipts: scope.receipts,
-              profileId,
-              intakeId: id,
-              sourceHash: context.file.sha256,
-              originalFingerprint: original.originalFingerprint,
-              grounded: () =>
-                !!issue.textAnchor && original.pageText?.includes(issue.textAnchor) === true,
-            });
-            if (!receipt) return true;
-            stored.put(
-              'groundedQuestions',
-              hash([issue.prompt, issue.textAnchor, receipt.operationId, receipt.scope.scopeToken]),
-              {
-                issue: {
+        const unresolved = stored.sequence<IntakeReviewIssue>(unresolvedSection);
+        const explicitSection = 'occurrenceExplicit:' + occurrenceCount;
+        await run(
+          (function* () {
+            for (const issue of identity) {
+              yield;
+              if (issue.id === genericId || issue.selfSuggestion) continue;
+              if (
+                original.pageText?.includes(issue.textAnchor || '\u0000') &&
+                (yield* isGenericNameConfirmationWork(
+                  issue,
+                  group.report?.subject?.text,
+                  currentSelf,
+                  people,
+                ))
+              ) {
+                stored.put('groundedNameQuestions', hash([issue.prompt, issue.textAnchor]), {
                   prompt: issue.prompt,
                   ...(issue.textAnchor ? { textAnchor: issue.textAnchor } : {}),
-                },
-                receipt: {
-                  operationId: receipt.operationId,
-                  scope: {
-                    scopeToken: receipt.scope.scopeToken,
-                    profileId: receipt.scope.profileId,
+                });
+                continue;
+              }
+              const receipt = yield* repeatedIdentityQuestionReceiptWork({
+                issue,
+                group,
+                receipts,
+                profileId,
+                intakeId: id,
+                sourceHash: context.file.sha256,
+                originalFingerprint: original.originalFingerprint,
+                grounded: () =>
+                  !!issue.textAnchor && original.pageText?.includes(issue.textAnchor) === true,
+              });
+              if (!receipt) {
+                stored.put(explicitSection, String(stored.count(explicitSection)), issue);
+                continue;
+              }
+              stored.put(
+                'groundedQuestions',
+                hash([
+                  issue.prompt,
+                  issue.textAnchor,
+                  receipt.operationId,
+                  receipt.scope.scopeToken,
+                ]),
+                {
+                  issue: {
+                    prompt: issue.prompt,
+                    ...(issue.textAnchor ? { textAnchor: issue.textAnchor } : {}),
+                  },
+                  receipt: {
+                    operationId: receipt.operationId,
+                    scope: {
+                      scopeToken: receipt.scope.scopeToken,
+                      profileId: receipt.scope.profileId,
+                    },
                   },
                 },
-              },
-            );
-            return false;
-          });
-        for (const issue of explicitIssues) {
-          hasUnstructuredIdentityQuestion = true;
-          const resolution = record.draft
-            ? latestReviewDraftResolution(record.draft, issue.id)
-            : undefined;
-          stored.put('explicit', String(stored.count('explicit')), {
-            ...target(issue.id),
-            issueIds: [issue.id],
-            issues: [
-              {
-                id: issue.id,
+              );
+              continue;
+            }
+          })(),
+        );
+        const explicitIssues = stored.sequence<IntakeReviewIssue>(explicitSection);
+        await run(
+          (function* () {
+            for (const issue of explicitIssues) {
+              yield;
+              hasUnstructuredIdentityQuestion = true;
+              const resolution = record.draft
+                ? latestReviewDraftResolution(record.draft, issue.id)
+                : undefined;
+              stored.put('explicit', String(stored.count('explicit')), {
+                ...target(issue.id),
+                issueIds: [issue.id],
+                issues: [
+                  {
+                    id: issue.id,
+                    prompt: issue.prompt,
+                    ...(issue.textAnchor ? { textAnchor: issue.textAnchor } : {}),
+                  },
+                ],
+                resolutions: resolution ? [resolution] : [],
+              });
+            }
+          })(),
+        );
+        if (!unresolved.length || record.reviewState !== 'pending') continue;
+        const additional = stored.sequence<IntakeReviewIssue>(additionalSection);
+        await run(
+          (function* () {
+            for (const issue of additional) {
+              yield;
+              const question = {
                 prompt: issue.prompt,
                 ...(issue.textAnchor ? { textAnchor: issue.textAnchor } : {}),
-              },
-            ],
-            resolutions: resolution ? [resolution] : [],
-          });
-        }
-        if (!unresolved.length || record.reviewState !== 'pending') continue;
-        const additional = unresolved.filter((issue) => issue.id !== genericId);
-        for (const issue of additional) {
-          const question = {
-            prompt: issue.prompt,
-            ...(issue.textAnchor ? { textAnchor: issue.textAnchor } : {}),
-          };
-          stored.put('questions', canonicalLiteral(question), question);
-        }
+              };
+              stored.put('questions', canonicalLiteral(question), question);
+            }
+          })(),
+        );
         if (!stored.target('targets', key))
-          stored.putTarget(
-            'targets',
-            key,
-            target(unresolved.find((issue) => issue.id === genericId)?.id || unresolved.at(0)!.id),
-            additional.length ? unresolved.map((issue) => issue.id) : undefined,
+          await run(
+            stored.putTargetWork(
+              'targets',
+              key,
+              target(genericUnresolved?.id || firstUnresolved!.id),
+              additional.length ? unresolved.map((issue) => issue.id) : undefined,
+            ),
           );
       }
     }
   } finally {
     cached?.selected.session.close();
   }
+  stored.assertArtifacts();
   const dates = originalSubjectBirthDateEvidence(
     original.pageText,
     group.report!.subject!.text,
     group.report!.anchor.text,
   );
-  const collected = collectEvidencedIdentity(
-    stored.sequence<IntakeReviewIssue>('issues'),
-    original.pageText === null || original.patientNameGrounded ? group.report?.subject?.text : '',
-    dates,
+  const collected = await run(
+    collectEvidencedIdentityWork(
+      stored.sequence<IntakeReviewIssue>('issues'),
+      original.pageText === null || original.patientNameGrounded ? group.report?.subject?.text : '',
+      dates,
+    ),
   );
   const personFingerprint = identityPersonFingerprint(
     original.originalFingerprint,
@@ -779,99 +1011,134 @@ async function build(
     ...collected.evidence,
     ...(personFingerprint ? { personFingerprint } : {}),
   };
-  const receiptApplies = (receipt: IdentityPolicyReceipt) =>
-    !!(receipt.scope.assignmentTargets || receipt.scope.targets).length &&
-    identityReceiptAppliesToCurrentBoundary(receipt, {
-      profileId,
-      intakeId: id,
-      groupId: group.id,
-      groupVersionId: context.groupVersionId,
-      sourceHash: context.file.sha256,
-      memberId: group.memberId,
-      original: original.original,
-      report: group.report!.anchor,
-      subject: group.report!.subject!,
-      verificationMode: original.verificationMode,
-      evidencedIdentity,
-      evidenceOriginalFingerprint: original.originalFingerprint,
-      membership: scope.membership(group),
-    });
+  const receiptAppliesWork = function* (
+    receipt: IdentityPolicyReceipt,
+  ): Generator<void, boolean, void> {
+    return (
+      !!(receipt.scope.assignmentTargets || receipt.scope.targets).length &&
+      (yield* identityReceiptAppliesToCurrentBoundaryWork(receipt, {
+        profileId,
+        intakeId: id,
+        groupId: group.id,
+        groupVersionId: context.groupVersionId,
+        sourceHash: context.file.sha256,
+        memberId: group.memberId,
+        original: original.original,
+        report: group.report!.anchor,
+        subject: group.report!.subject!,
+        verificationMode: original.verificationMode,
+        evidencedIdentity,
+        evidenceOriginalFingerprint: original.originalFingerprint,
+        membership: scope.membership(group),
+      }))
+    );
+  };
+  const receiptApplies = (receipt: IdentityPolicyReceipt) => {
+    const work = receiptAppliesWork(receipt);
+    let result = work.next();
+    while (!result.done) result = work.next();
+    return result.value;
+  };
   type Explicit = Target & {
     issueIds: string[];
     issues: { id: string; prompt: string; textAnchor?: string }[];
     resolutions: NonNullable<IntakeReviewRecord['draft']>['resolutions'];
   };
-  for (const occurrence of stored.sequence<Explicit>('explicit')) {
-    const issueId = occurrence.issueIds[0]!;
-    if (
-      exactCurrentIdentityResolutionOperationId({
-        receipts: scope.receipts,
-        occurrences: [occurrence],
-        receiptApplies,
-      })
-    )
-      continue;
-    const key = hash([
-      occurrence.candidateId,
-      occurrence.candidateVersionId,
-      occurrence.proposalId,
-      occurrence.recordId,
-    ]);
-    const existing = stored.target('targets', key);
-    if (existing) stored.addTargetIssue('targets', key, issueId);
-    else
-      stored.putTarget(
-        'targets',
-        key,
-        {
-          candidateId: occurrence.candidateId,
-          candidateVersionId: occurrence.candidateVersionId,
-          proposalId: occurrence.proposalId,
-          recordId: occurrence.recordId,
-          title: occurrence.title,
-          issueId,
-        },
-        [issueId],
-      );
-    const issue = occurrence.issues[0]!,
-      question = {
-        prompt: issue.prompt,
-        ...(issue.textAnchor ? { textAnchor: issue.textAnchor } : {}),
-      };
-    stored.put('questions', canonicalLiteral(question), question);
-  }
-  for (const other of iterateCompetingIdentityBoundaries(
-    group,
+  await run(
     (function* () {
-      for (const record of scope.groupRecords()) yield scope.groupHeader(record);
+      for (const occurrence of stored.sequence<Explicit>('explicit')) {
+        yield;
+        const issueId = occurrence.issueIds[0]!;
+        if (
+          yield* exactCurrentIdentityResolutionOperationIdWork({
+            receipts,
+            occurrences: [occurrence],
+            receiptApplies,
+            receiptAppliesWork,
+          })
+        )
+          continue;
+        const key = hash([
+          occurrence.candidateId,
+          occurrence.candidateVersionId,
+          occurrence.proposalId,
+          occurrence.recordId,
+        ]);
+        const existing = stored.target('targets', key);
+        if (existing) stored.addTargetIssue('targets', key, issueId);
+        else
+          stored.putTarget(
+            'targets',
+            key,
+            {
+              candidateId: occurrence.candidateId,
+              candidateVersionId: occurrence.candidateVersionId,
+              proposalId: occurrence.proposalId,
+              recordId: occurrence.recordId,
+              title: occurrence.title,
+              issueId,
+            },
+            [issueId],
+          );
+        const issue = occurrence.issues[0]!,
+          question = {
+            prompt: issue.prompt,
+            ...(issue.textAnchor ? { textAnchor: issue.textAnchor } : {}),
+          };
+        stored.put('questions', canonicalLiteral(question), question);
+      }
     })(),
-  )) {
-    const record = view.find('reportGroup', workflow, other.id)!,
-      latest = scope.currentGroupVersion(record)!;
-    stored.put('competingSubjects', other.id, {
-      groupId: other.id,
-      groupVersionId: scalar<string>(view, latest, 'id')!,
-      subject: other.report!.subject!,
-    });
-  }
+  );
+  await runClinicalReviewWork(
+    (function* () {
+      for (const record of scope.groupRecords()) {
+        yield;
+        const other = iterateCompetingIdentityBoundaries(group, [scope.groupHeader(record)]).next()
+          .value;
+        if (!other) continue;
+        const latest = scope.currentGroupVersion(record)!;
+        stored.putCompeting(view.address(record), {
+          groupId: other.id,
+          groupVersionId: scalar<string>(view, latest, 'id')!,
+          subject: other.report!.subject!,
+        });
+      }
+      yield* stored.sortCompeting();
+    })(),
+    {
+      capture() {
+        context.assertCurrent();
+        const stamp = reviewReadStamp(db);
+        if (stamp === undefined)
+          reject('Identity scope preparation requires a current authority boundary');
+        return () => {
+          context.assertCurrent();
+          if (reviewReadStamp(db) !== stamp) reject('Identity scope changed during preparation');
+          stored.assertArtifacts();
+        };
+      },
+    },
+  );
   if (stored.count('competingSubjects')) {
     // Preserve the complete alternative readings without concatenating an unbounded banner.
     const prompt =
       'Other extraction claims name a different subject at this same report boundary. Review the original and confirm the displayed subject and person for only the listed records.';
-    stored.putStream(
-      'questions',
-      'competing-boundary',
-      (function* () {
-        yield '{"prompt":' + canonicalLiteral(prompt) + ',"textAnchor":"';
-        let comma = false;
-        for (const row of stored.raw('competingSubjects')) {
-          const claim = JSON.parse([...row.chunks()].join('')) as { subject: { text: string } };
-          if (comma) yield ' / ';
-          comma = true;
-          yield JSON.stringify(claim.subject.text).slice(1, -1);
-        }
-        yield '"}';
-      })(),
+    await run(
+      stored.putStreamWork(
+        'questions',
+        'competing-boundary',
+        (function* () {
+          yield '{"prompt":' + canonicalLiteral(prompt) + ',"textAnchor":"';
+          let comma = false;
+          for (const row of stored.raw('competingSubjects')) {
+            const claim = JSON.parse([...row.chunks()].join('')) as { subject: { text: string } };
+            if (comma) yield ' / ';
+            comma = true;
+            yield JSON.stringify(claim.subject.text).slice(1, -1);
+          }
+          yield '"}';
+        })(),
+      ),
     );
     hasUnstructuredIdentityQuestion = true;
   }
@@ -924,20 +1191,33 @@ async function build(
   }
   const digest = createHash('sha256');
   digest.update('[');
-  for (const piece of canonicalSnapshot()) digest.update(piece);
+  await run(
+    (function* () {
+      for (const piece of canonicalSnapshot()) {
+        digest.update(piece);
+        yield;
+      }
+    })(),
+  );
   digest.update(',' + canonicalLiteral(original.sourceHash) + ']');
   const scopeToken = digest.digest('hex');
+  const memberCount = await run(
+    (function* () {
+      let count = 0;
+      for (const _member of context.membership()) {
+        count++;
+        yield;
+      }
+      return count;
+    })(),
+  );
   const display: IntakeIdentityScopeReference = {
     ...header,
     format: 'health-intake-identity-scope-v2',
     scopeToken,
     collection: {
       snapshotId: 'identity:' + scopeToken,
-      membership: (() => {
-        let count = 0;
-        for (const _member of context.membership()) count++;
-        return count;
-      })(),
+      membership: memberCount,
       targets: stored.count('targets'),
       assignmentTargets: stored.count('assignmentTargets'),
       questions: stored.count('questions'),
@@ -946,42 +1226,68 @@ async function build(
   };
   let explicitlyConfirmedOperationId = stored.count('targets')
     ? undefined
-    : exactCurrentIdentityResolutionOperationId({
-        receipts: scope.receipts,
-        occurrences: stored.sequence<Explicit>('explicit'),
-        receiptApplies,
-      });
+    : await run(
+        exactCurrentIdentityResolutionOperationIdWork({
+          receipts,
+          occurrences: stored.sequence<Explicit>('explicit'),
+          receiptApplies,
+          receiptAppliesWork,
+        }),
+      );
   if (stored.count('competingSubjects')) {
     const claims =
       stored.sequence<NonNullable<IntakeIdentityScope['competingSubjects']>[number]>(
         'competingSubjects',
       );
-    const repair = scope.receipts.findLast(
-      (receipt) =>
-        receiptApplies(receipt) &&
-        receipt.scope.groupId === group.id &&
-        receipt.attestation === 'confirmed_displayed_identity_questions' &&
-        receipt.scope.competingSubjects?.length === claims.length &&
-        claims.every((claim) =>
-          receipt.scope.competingSubjects!.some(
-            (prior) => canonicalLiteral(prior) === canonicalLiteral(claim),
-          ),
-        ) &&
-        stored.count('assignmentTargets') > 0 &&
-        stored
-          .sequence<Target>('assignmentTargets')
-          .every((target) =>
-            (receipt.scope.assignmentTargets || receipt.scope.targets).some(
-              (prior) =>
-                prior.candidateId === target.candidateId &&
-                prior.candidateVersionId === target.candidateVersionId &&
-                prior.proposalId === target.proposalId &&
-                prior.recordId === target.recordId &&
-                selectedSequence(target.issueIds || [target.issueId]).every((issueId) =>
-                  identityTargetHasIssue(prior, issueId),
-                ),
-            ),
-          ),
+    const repair = await run(
+      (function* () {
+        let last: IdentityPolicyReceipt | undefined;
+        for (const receipt of receipts) {
+          yield;
+          if (
+            !(yield* receiptAppliesWork(receipt)) ||
+            receipt.scope.groupId !== group.id ||
+            receipt.attestation !== 'confirmed_displayed_identity_questions' ||
+            receipt.scope.competingSubjects?.length !== claims.length ||
+            !(yield* identityCompetingClaimsEqualWork(claims, receipt.scope.competingSubjects!)) ||
+            !stored.count('assignmentTargets')
+          )
+            continue;
+          let complete = true;
+          for (const target of stored.sequence<Target>('assignmentTargets')) {
+            yield;
+            let found = false;
+            for (const prior of receipt.scope.assignmentTargets || receipt.scope.targets) {
+              yield;
+              if (
+                prior.candidateId !== target.candidateId ||
+                prior.candidateVersionId !== target.candidateVersionId ||
+                prior.proposalId !== target.proposalId ||
+                prior.recordId !== target.recordId
+              )
+                continue;
+              let issues = true;
+              for (const issueId of target.issueIds || [target.issueId]) {
+                yield;
+                if (!(yield* identityTargetHasIssueWork(prior, issueId))) {
+                  issues = false;
+                  break;
+                }
+              }
+              if (issues) {
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              complete = false;
+              break;
+            }
+          }
+          if (complete) last = receipt;
+        }
+        return last;
+      })(),
     );
     if (repair) explicitlyConfirmedOperationId = repair.operationId;
   }
@@ -999,22 +1305,45 @@ async function build(
         }
       : {}),
   };
-  const assessment = assessIdentityPolicy({
-    self: currentSelf,
-    people,
-    nameEvidenceGrounded: original.patientNameGrounded,
-    evidence: evidencedIdentity,
-    evidenceConflicts: collected.conflicts.filter((conflict) => conflict.field !== 'birthDate'),
-    unreadableBirthDate: !!birthDateReview,
-    bannerBirthDates: collected.bannerBirthDates,
-    group,
-    groupVersionId: context.groupVersionId,
-    originalFingerprint: original.originalFingerprint,
-    receipts: scope.receipts,
-    hasUnstructuredIdentityQuestion,
-    explicitlyConfirmedOperationId,
-    currentRefusal: currentIdentityRefusal(stored.sequence<IntakeReviewIssue>('issues')),
-  });
+  const currentRefusal = await run(
+    (function* () {
+      let answer: 'unknown' | 'other_person' | undefined;
+      for (const issue of stored.sequence<IntakeReviewIssue>('issues')) {
+        yield;
+        if (issue.resolution?.outcome === 'other_person') return 'other_person' as const;
+        if (issue.resolution?.outcome === 'unknown') answer = 'unknown';
+      }
+      return answer;
+    })(),
+  );
+  const assessment = await run(
+    assessIdentityPolicyWork({
+      self: currentSelf,
+      people,
+      nameEvidenceGrounded: original.patientNameGrounded,
+      evidence: evidencedIdentity,
+      evidenceConflicts: collected.conflicts.filter((conflict) => conflict.field !== 'birthDate'),
+      unreadableBirthDate: !!birthDateReview,
+      bannerBirthDates: collected.bannerBirthDates,
+      group,
+      groupVersionId: context.groupVersionId,
+      originalFingerprint: original.originalFingerprint,
+      receipts,
+      hasUnstructuredIdentityQuestion,
+      explicitlyConfirmedOperationId,
+      currentRefusal,
+    }),
+  );
+  const confirmationCount = await run(
+    (function* () {
+      let count = 0;
+      for (const receipt of receipts) {
+        yield;
+        if (receipt.scope.groupId === group.id) count++;
+      }
+      return count;
+    })(),
+  );
   const presentation =
     occurrenceCount && consistentAssignment && assignedPerson
       ? {
@@ -1026,6 +1355,7 @@ async function build(
             : 'This report was assigned to ' + assignedPerson.fullName + '.',
         }
       : {};
+  stored.assertArtifacts();
   return {
     display,
     current,
@@ -1034,6 +1364,7 @@ async function build(
     groundedNameQuestions,
     dates,
     presentation,
+    confirmationCount,
   };
 }
 
@@ -1236,6 +1567,16 @@ async function writeSnapshot(
   await catalog.publish(built.display.collection.snapshotId, writer);
 }
 async function collectGroupIdentity(context: Context, stored: Rows) {
+  const run = <T>(work: Generator<void, T, void>) => runNativeIdentityWork(context, stored, work);
+  let inspections = 0;
+  const step = () =>
+    ++inspections % 16 === 0
+      ? run(
+          (function* () {
+            for (let n = 0; n < 16; n++) yield;
+          })(),
+        )
+      : undefined;
   let cached:
     | {
         proposalId: string | null;
@@ -1247,6 +1588,8 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
     | undefined;
   try {
     for (const member of context.membership()) {
+      const pending = step();
+      if (pending) await pending;
       const candidate = context.view.find('candidate', context.workflow, member.candidateId);
       if (!candidate) continue;
       const latest = context.view.childAt(
@@ -1256,6 +1599,8 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
       );
       if (!latest || scalar(context.view, latest, 'id') !== member.candidateVersionId) continue;
       for (const occurrence of member.occurrences) {
+        const pending = step();
+        if (pending) await pending;
         if (!cached || cached.proposalId !== occurrence.proposalId) {
           cached?.session.close();
           await prepareCollectionClinicalReviewDependencies(
@@ -1266,16 +1611,21 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
             occurrence.proposalId,
             { assertRunning: context.assertCurrent },
           );
-          const selected = prepareCollectionClinicalReview(
+          const selected = await prepareCollectionClinicalReviewAsync(
             context.db,
             context.root,
             context.profileId,
             context.id,
             occurrence.proposalId,
+            { assertRunning: context.assertCurrent },
           );
           if (selected.status !== 'ready')
             return reject('Prepare this exact retained clinical occurrence before identity review');
           cached = { proposalId: occurrence.proposalId, session: selected.session };
+          context.assertCurrent();
+          stored.retainArtifacts(
+            collectionClinicalProjectionContext(selected.session).verifiedArtifacts(),
+          );
         }
         const record = cached.session.record(
           occurrence.recordId,
@@ -1288,20 +1638,28 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
           createHash('sha256')
             .update(JSON.stringify([member.candidateVersionId, 'identity', 'subject']))
             .digest('hex');
-        for (const issue of reviewRecordIssues(record))
-          if (issue.kind === 'identity') {
-            stored.put('initialIssues', String(stored.count('initialIssues')), issue);
-            if (issue.id !== genericId && !issue.selfSuggestion)
-              stored.put('initialExplicit', String(stored.count('initialExplicit')), issue);
-          }
+        await run(
+          (function* () {
+            for (const issue of reviewRecordIssues(record)) {
+              yield;
+              if (issue.kind === 'identity') {
+                stored.put('initialIssues', String(stored.count('initialIssues')), issue);
+                if (issue.id !== genericId && !issue.selfSuggestion)
+                  stored.put('initialExplicit', String(stored.count('initialExplicit')), issue);
+              }
+            }
+          })(),
+        );
       }
     }
   } finally {
     cached?.session.close();
   }
-  const collected = collectSelectedEvidencedIdentity(
-    () => stored.sequence<IntakeReviewIssue>('initialIssues'),
-    context.group.report?.subject?.text,
+  const collected = await run(
+    collectSelectedEvidencedIdentityWork(
+      () => stored.sequence<IntakeReviewIssue>('initialIssues'),
+      context.group.report?.subject?.text,
+    ),
   );
   const hasIdentityContext = !!(
     context.group.report?.subject ||
@@ -1310,22 +1668,35 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
     collected.unreadableBirthDate ||
     collected.conflicts.length
   );
-  return {
-    ...collected,
-    hasUnstructuredIdentityQuestion: stored
-      .sequence<IntakeReviewIssue>('initialExplicit')
-      .some(
-        (issue) =>
-          !!(
-            hasIdentityContext ||
-            issue.textAnchor ||
-            issue.questionId ||
-            issue.resolution?.outcome === 'unknown' ||
-            issue.resolution?.outcome === 'other_person'
-          ),
-      ),
-    currentRefusal: currentIdentityRefusal(stored.sequence<IntakeReviewIssue>('initialIssues')),
-  };
+  const hasUnstructuredIdentityQuestion = await run(
+    (function* () {
+      for (const issue of stored.sequence<IntakeReviewIssue>('initialExplicit')) {
+        yield;
+        if (
+          hasIdentityContext ||
+          issue.textAnchor ||
+          issue.questionId ||
+          issue.resolution?.outcome === 'unknown' ||
+          issue.resolution?.outcome === 'other_person'
+        )
+          return true;
+      }
+      return false;
+    })(),
+  );
+  const currentRefusal = await run(
+    (function* () {
+      let answer: 'unknown' | 'other_person' | undefined;
+      for (const issue of stored.sequence<IntakeReviewIssue>('initialIssues')) {
+        yield;
+        if (issue.resolution?.outcome === 'other_person') return 'other_person' as const;
+        if (issue.resolution?.outcome === 'unknown') answer = 'unknown';
+      }
+      return answer;
+    })(),
+  );
+  stored.assertArtifacts();
+  return { ...collected, hasUnstructuredIdentityQuestion, currentRefusal };
 }
 function peoplePreview(db: DatabaseSync) {
   const rows = db
@@ -1460,6 +1831,8 @@ export function getNativeIntakeIdentityReview(
       } catch (error) {
         clearNativeIdentityPreviews(db);
         throw error;
+      } finally {
+        context.scope.close?.();
       }
       clearNativeIdentityPreviews(db);
     }
@@ -1539,33 +1912,42 @@ async function getNativeIntakeIdentityReviewInner(
     let correctedPerson = correction();
     if (context.group.basis !== 'report_anchor' || !context.group.report?.subject) {
       const initial = await collectGroupIdentity(context, stored);
-      const assessment = assessIdentityPolicy({
-        self,
-        people: selectedIdentityPeopleSnapshots(db),
-        nameEvidenceGrounded: false,
-        evidence: initial.evidence,
-        evidenceConflicts: initial.conflicts,
-        unreadableBirthDate: initial.unreadableBirthDate,
-        group: context.group,
-        groupVersionId: context.groupVersionId,
-        originalFingerprint: context.scope.originalFingerprint(context.group),
-        receipts: context.scope.receipts,
-        hasUnstructuredIdentityQuestion: initial.hasUnstructuredIdentityQuestion,
-        currentRefusal: initial.currentRefusal,
-      });
+      const assessment = await runNativeIdentityWork(
+        context,
+        stored,
+        assessIdentityPolicyWork({
+          self,
+          people: selectedIdentityPeopleSnapshots(db),
+          nameEvidenceGrounded: false,
+          evidence: initial.evidence,
+          evidenceConflicts: initial.conflicts,
+          unreadableBirthDate: initial.unreadableBirthDate,
+          group: context.group,
+          groupVersionId: context.groupVersionId,
+          originalFingerprint: context.scope.originalFingerprint(context.group),
+          receipts: await runNativeIdentityWork(context, stored, context.scope.receiptsWork!()),
+          hasUnstructuredIdentityQuestion: initial.hasUnstructuredIdentityQuestion,
+          currentRefusal: initial.currentRefusal,
+        }),
+      );
+      stored.assertArtifacts();
       return { ...assessment, scope: null, self, correctedPerson, ...peoplePreview(db) };
     }
     try {
       const original = await evidence(context);
       let built = await build(context, original, stored);
-      retainSelectedIdentityGrounding(
-        db,
-        context.scope.groundingBoundary(profileId, id, context.file.sha256),
-        context.group,
-        built.groundedQuestions,
-        original.patientNameGrounded,
-        built.groundedNameQuestions,
-        built.dates,
+      await runNativeIdentityWork(
+        context,
+        stored,
+        retainSelectedIdentityGroundingWork(
+          db,
+          context.scope.groundingBoundary(profileId, id, context.file.sha256),
+          context.group,
+          built.groundedQuestions,
+          original.patientNameGrounded,
+          built.groundedNameQuestions,
+          built.dates,
+        ),
       );
       // Rebuild after original proof so clinical and identity preview observe the same policy.
       stored.db
@@ -1576,6 +1958,7 @@ async function getNativeIntakeIdentityReviewInner(
       // to the unchanged full reconstruction. Own writes suppress retention.
       const constructionStamp = reviewReadStamp(db),
         constructionKey = previewReadKey(db, root, profileId, id, groupId);
+      context.scope.close?.();
       context = await open(db, root, profileId, id, groupId);
       self = selfSnapshot(db);
       correctedPerson = correction();
@@ -1625,9 +2008,7 @@ async function getNativeIntakeIdentityReviewInner(
         ...built.assessment,
         ...built.presentation,
         ...warnings,
-        confirmationCount: context.scope.receipts.filter(
-          (receipt) => receipt.scope.groupId === groupId,
-        ).length,
+        confirmationCount: built.confirmationCount,
         scope: null,
         scopeReference: built.display,
         self,
@@ -1674,6 +2055,7 @@ async function getNativeIntakeIdentityReviewInner(
       };
     }
   } finally {
+    context.scope.close?.();
     stored.close();
   }
 }
@@ -1943,13 +2325,26 @@ async function confirmNativeIntakeIdentityScopeInner(
             target.candidateVersionId,
           ]);
           const previous = previousRecord
-            ? readNativeReviewDraft(context.view, previousRecord, draftCatalog, 256 * 1024, {
-                db,
-                source: file,
-              })
+            ? await runNativeIdentityWork(
+                context,
+                stored,
+                readNativeReviewDraftWork(context.view, previousRecord, draftCatalog, 256 * 1024, {
+                  db,
+                  source: file,
+                }),
+              )
             : undefined;
           const targetHash = createHash('sha256');
-          for (const piece of canonicalReviewValueChunks(target)) targetHash.update(piece);
+          await runNativeIdentityWork(
+            context,
+            stored,
+            (function* () {
+              for (const piece of canonicalReviewValueChunks(target)) {
+                yield;
+                targetHash.update(piece);
+              }
+            })(),
+          );
           const draftId = input.operationId + ':' + targetHash.digest('hex');
           const draft: IntakeReviewDraft = {
             ...previous,
@@ -2052,6 +2447,7 @@ async function confirmNativeIntakeIdentityScopeInner(
             () => {
               prepared.assertCurrent();
               context.assertCurrent();
+              stored.assertArtifacts();
               catalog.assertCurrent();
               draftCatalog.assertCurrent();
               const applied = applyIdentityConfirmationPeople(
@@ -2082,6 +2478,7 @@ async function confirmNativeIntakeIdentityScopeInner(
           );
         return response();
       } finally {
+        context.scope.close?.();
         stored.close();
       }
     },

@@ -618,8 +618,7 @@ test(
       message: 'Convert every supplied record for review',
       context: { route: '/sources', intakeId: item.id },
     });
-    await tick();
-    let bridge = f.bridges[0];
+    let bridge = await waitForConversionBridge(t, f, chat);
     assert.equal(bridge.prompt.conversation.firstAcquaintance, false);
     assert.equal(bridge.prompt.conversation.firstAssistantResponse, false);
     const plan = await call<IntakeSummaryV2>(bridge, 'intake_plan', {
@@ -701,8 +700,7 @@ test(
       'running',
       'a supplied window alone does not finish extraction accounting',
     );
-    for (let n = 0; n < 500 && !f.bridges[1]?.prompt.conversion && chat.status === 'running'; n++)
-      await tick();
+    await waitForConversionBridge(t, f, chat, 1);
     assert.equal(bridge.closed, true);
     bridge = f.bridges[1];
     assert.ok(bridge);
@@ -833,7 +831,7 @@ test('productive host slice boundaries are resumable while provider errors stay 
   const chat = f.assistant.create('cedar', { title: 'Fictional bounded context' });
   linkIntakeConversion(f.db, f.root, 'cedar', item.id, chat.id);
   f.assistant.send('cedar', chat.id, { message: 'Read evidence', context: { intakeId: item.id } });
-  await tick();
+  await waitForConversionBridge(t, f, chat);
   await call(f.bridges[0], 'intake_read', { id: item.id });
   f.bridges[0].callbacks.onExit?.(
     new ModelContextLimitError('Fictional local transcript boundary', 'slice'),
@@ -850,7 +848,7 @@ test('productive host slice boundaries are resumable while provider errors stay 
     message: 'Continue retained evidence',
     context: { intakeId: item.id },
   });
-  await tick();
+  await waitForConversionBridge(t, f, chat, 1);
   f.bridges[1].callbacks.onExit?.(new Error('Fictional provider unavailable'));
   assert.equal(chat.status, 'failed');
   assert.equal(chat.reading?.reason, 'error');
@@ -870,8 +868,7 @@ test('a reading deadline retains the in-flight guarded tool result and blocks an
     message: 'Read the fictional delivery',
     context: { intakeId: item.id },
   });
-  await tick();
-  const bridge = f.bridges[0];
+  const bridge = await waitForConversionBridge(t, f, chat);
   assert.ok(bridge);
 
   t.mock.timers.tick(15 * 60 * 1000);
@@ -924,8 +921,7 @@ test('Stop remains immediate after a soft reading deadline', async (t) => {
     message: 'Read the fictional delivery',
     context: { intakeId: item.id },
   });
-  await tick();
-  const bridge = f.bridges[0];
+  const bridge = await waitForConversionBridge(t, f, chat);
   assert.ok(bridge);
 
   t.mock.timers.tick(15 * 60 * 1000);
@@ -950,8 +946,7 @@ test('an absolute reading deadline blocks requests and generations before an ove
     message: 'Read the fictional delivery',
     context: { intakeId: item.id },
   });
-  await tick();
-  const bridge = f.bridges[0];
+  const bridge = await waitForConversionBridge(t, f, chat);
   assert.ok(bridge);
   await assert.doesNotReject(async () => bridge.callbacks.beforeRequest?.());
   await call(bridge, 'intake_read', { id: item.id });
@@ -980,8 +975,7 @@ test('an absolute reading deadline blocks requests and generations before an ove
     message: 'Resume the retained fictional checkpoint',
     context: { intakeId: item.id },
   });
-  await tick();
-  const resumedBridge = f.bridges[1];
+  const resumedBridge = await waitForConversionBridge(t, f, chat, 1);
   assert.ok(resumedBridge);
   await assert.doesNotReject(
     async () => resumedBridge.callbacks.beforeRequest?.(),
@@ -1003,8 +997,7 @@ test('a genuine context limit keeps precedence after the soft reading deadline',
     message: 'Read the fictional delivery',
     context: { intakeId: item.id },
   });
-  await tick();
-  const bridge = f.bridges[0];
+  const bridge = await waitForConversionBridge(t, f, chat);
   assert.ok(bridge);
 
   t.mock.timers.tick(15 * 60 * 1000);
@@ -1031,7 +1024,7 @@ test('repeated source reads pause within one unfinished model turn', async (t) =
     message: 'Read the original',
     context: { intakeId: item.id },
   });
-  await tick();
+  await waitForConversionBridge(t, f, chat);
   await call(f.bridges[0], 'intake_read', { id: item.id });
   await call(f.bridges[0], 'intake_read', { id: item.id });
   await call(f.bridges[0], 'intake_read', { id: item.id });
@@ -1065,7 +1058,7 @@ test('a repeated page read carries a distinct re-read signal through the real re
     message: 'Read the original',
     context: { intakeId: item.id },
   });
-  await tick();
+  await waitForConversionBridge(t, f, chat);
   const read = (page?: number) =>
     call<{ hostTimings?: HostTimings }>(
       f.bridges[0]!,
@@ -1123,7 +1116,7 @@ test('a repeated page read carries a distinct re-read signal through the real re
     message: 'Read the original',
     context: { intakeId: secondItem.id },
   });
-  await tick();
+  await waitForConversionBridge(t, f, secondChat, 1);
   const secondImportFirstRead = await call<{ hostTimings?: HostTimings }>(
     f.bridges[1]!,
     'intake_read',
@@ -1136,6 +1129,7 @@ test('a repeated page read carries a distinct re-read signal through the real re
 test('a retired model bridge rejection cannot stop its productive successor', async (t) => {
   fictionalModel(t);
   const callbacks: BridgeCallbacks[] = [];
+  let admittedTurns = 0;
   let rejectRetired: ((error: Error) => void) | undefined;
   const f = fixture(t, {
     bridgeFactory: (events) => {
@@ -1146,6 +1140,7 @@ test('a retired model bridge rejection cannot stop its productive successor', as
           return { model: 'fictional-late-close' };
         },
         turn() {
+          admittedTurns++;
           return first
             ? new Promise<void>((_resolve, reject) => {
                 rejectRetired = reject;
@@ -1169,14 +1164,22 @@ test('a retired model bridge rejection cannot stop its productive successor', as
     message: 'Read this delivery',
     context: { intakeId: item.id },
   });
-  await tick();
+  while (admittedTurns < 1) {
+    t.signal.throwIfAborted();
+    assert.equal(chat.status, 'running', chat.error ?? 'conversion stopped before its turn');
+    await tick();
+  }
   await callbacks[0]!.onTool!({
     tool: 'health_intake_read',
     arguments: { id: item.id },
     callId: 'fictional-read',
   });
   callbacks[0]!.onEvent!('turn/completed', { turn: { status: 'completed' } });
-  await tick();
+  while (admittedTurns < 2) {
+    t.signal.throwIfAborted();
+    assert.equal(chat.status, 'running', chat.error ?? 'conversion stopped before its successor');
+    await tick();
+  }
   assert.equal(callbacks.length, 2);
   assert.equal(chat.status, 'running');
   assert.equal(chat.error, null);
@@ -1199,7 +1202,7 @@ test('conversion diagnostics bind the original, model run, real progress and ter
     message: 'Read source evidence',
     context: { intakeId: item.id },
   });
-  await tick();
+  await waitForConversionBridge(t, f, chat);
   await call(f.bridges[0], 'intake_read', { id: item.id });
   f.bridges[0].callbacks.onEvent('model/evidenceFallback', {
     durationMs: 12,
@@ -1296,7 +1299,7 @@ test('a new provider request restores the truthful waiting phase without manufac
   const readsBeforeWait = required(f.chat.reading).readWindows;
   assert.equal(required(f.chat.reading).phase, 'preparing_results');
 
-  f.bridge.callbacks.onEvent('model/requestStarted', { turnId: 'fictional-next-request' });
+  await f.bridge.callbacks.onEvent('model/requestStarted', { turnId: 'fictional-next-request' });
 
   assert.equal(required(f.chat.reading).phase, 'waiting_for_model');
   assert.equal(required(f.chat.reading).modelRequests, 1);
@@ -1309,15 +1312,15 @@ test('every physical provider retry attempt reaches cumulative reading request a
   const f = await linkedFictionalOpticalConversion(t);
   const before = required(f.chat.reading).modelRequests || 0;
 
-  f.bridge.callbacks.onEvent('model/requestStarted', {
+  await f.bridge.callbacks.onEvent('model/requestStarted', {
     turnId: 'fictional-transient-attempt-one',
     attempt: 1,
   });
-  f.bridge.callbacks.onEvent('model/requestStarted', {
+  await f.bridge.callbacks.onEvent('model/requestStarted', {
     turnId: 'fictional-transient-attempt-two',
     attempt: 2,
   });
-  f.bridge.callbacks.onEvent('model/requestUsage', {
+  await f.bridge.callbacks.onEvent('model/requestUsage', {
     turnId: 'fictional-transient-attempt-two',
     measured: true,
   });
@@ -1344,8 +1347,7 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
       context: { intakeId: item.id },
     });
   send();
-  await tick();
-  let bridge = f.bridges[0];
+  let bridge = await waitForConversionBridge(t, f, chat);
   await call(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
@@ -1382,8 +1384,7 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
     summary: 'Fictional first page retained',
   });
   complete(bridge);
-  for (let n = 0; n < 500 && !f.bridges[1]?.prompt.conversion && chat.status === 'running'; n++)
-    await tick();
+  await waitForConversionBridge(t, f, chat, 1);
   assert.equal(chat.status, 'running', chat.error ?? '');
   bridge = required(f.bridges[1]);
   assert.equal(bridge.prompt.conversion.pendingWindows?.items[0]?.args.page, 2);
@@ -1452,8 +1453,7 @@ test('three consecutive premature coverage claims pause without publishing a pro
     message: 'Convert the fictional PDF',
     context: { intakeId: item.id },
   });
-  await tick();
-  const bridge = f.bridges[0];
+  const bridge = await waitForConversionBridge(t, f, chat);
   await call(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
@@ -1527,8 +1527,7 @@ async function linkedPdfPackage(t: TestContext, pages: string[], otherMember = f
     message: 'Convert this supplied package',
     context: { intakeId: item.id },
   });
-  await tick();
-  const bridge = f.bridges[0];
+  const bridge = await waitForConversionBridge(t, f, chat);
   const plan = await call<IntakeSummaryV2>(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
@@ -1776,7 +1775,7 @@ test(
 for (const parentNative of [false, true])
   // Actual parent/child authority, partial-tail refusal and publication; no model calls.
   test(
-    `a ${parentNative ? 'native' : 'legacy'} parent requires complete direct child text evidence for a native child plan`,
+    `a ${parentNative ? 'native' : 'migrated legacy'} parent requires complete direct child text evidence for a native child plan`,
     { timeout: 90_000 },
     async (t) => {
       fictionalModel(t);
@@ -1788,12 +1787,40 @@ for (const parentNative of [false, true])
       });
       const chat = f.assistant.create('cedar', { title: 'Fictional child text coverage' });
       linkIntakeConversion(f.db, f.root, 'cedar', item.id, chat.id);
+      if (!parentNative) {
+        // Retain a real pre-upgrade partial member read before the native host starts.
+        // Fresh conversions now prepare native parent plans before model dispatch.
+        await createIntakePlan(f.db, f.root, 'cedar', item.id, {
+          version: item.version,
+          operationId: 'fictional-legacy-parent-plan',
+        });
+        const { inventoryIntakePackage, readIntakePackageMember } =
+          await import('../intake-package.ts');
+        const { conversionCheckpoint, recordConversionRead } =
+          await import('../intake-continuation.ts');
+        const context = { db: f.db, root: f.root, profileId: 'cedar', id: item.id };
+        const inventory = await inventoryIntakePackage(context);
+        const memberId = required(inventory.members[0]).memberId;
+        const args = { id: item.id, action: 'read_member', memberId, limit: 50 };
+        const priorRead = await readIntakePackageMember({ ...context, memberId, limit: 50 });
+        const legacy = getIntake(f.db, f.root, 'cedar', item.id);
+        assert.ok(legacy.workflow);
+        const prior = conversionCheckpoint({}, { ...legacy, workflow: legacy.workflow }, 'cedar');
+        assert.equal(recordConversionRead(prior, 'health_intake_package', args, priorRead), true);
+        assert.ok(prior.seen.length > 0);
+        assert.ok(prior.pending.some((window) => window.args.memberId === memberId));
+        chat.conversionCheckpoint = prior;
+        writeChat(f.root, 'cedar', chat, 'fictional-pre-upgrade-child-coverage-journal');
+        assert.deepEqual(readTestChat(f.root, 'cedar', chat.id).conversionCheckpoint, prior);
+        assert.equal(isNativeAssistantCheckpoint(chat.conversionCheckpoint), false);
+      }
       f.assistant.send('cedar', chat.id, {
         message: 'Convert this supplied package',
         context: { intakeId: item.id },
       });
-      await tick();
-      const bridge = f.bridges[0];
+      const bridge = await waitForConversionBridge(t, f, chat);
+      const parentCheckpoint = chat.conversionCheckpoint;
+      assert.ok(isNativeAssistantCheckpoint(parentCheckpoint));
       if (parentNative)
         await call(bridge, 'intake_plan', {
           id: item.id,
@@ -1820,9 +1847,9 @@ for (const parentNative of [false, true])
         version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
       });
       assert.equal(
-        isNativeAssistantCheckpoint(chat.conversionCheckpoint),
-        parentNative,
-        'creating the child plan never fabricates a parent plan or resets its checkpoint',
+        chat.conversionCheckpoint,
+        parentCheckpoint,
+        'creating the child plan never resets the migrated or native parent checkpoint',
       );
       const plan = selectedFixturePlan(f.db, f.root, 'cedar', childId);
       assert.equal(plan.units.length, 1);
@@ -1893,21 +1920,14 @@ for (const parentNative of [false, true])
         selectedFixturePlan(f.db, f.root, 'cedar', childId).units[0]!.status,
         'completed',
       );
-      if (parentNative)
-        assert.equal(
-          selectedFixturePlan(f.db, f.root, 'cedar', item.id).units[0]!.status,
-          'pending',
-        );
-      else {
-        assert.ok(
-          chat.conversionCheckpoint && !isNativeAssistantCheckpoint(chat.conversionCheckpoint),
-        );
-        assert.ok(
-          chat.conversionCheckpoint.pending.some(
-            (window) => window.args.id === item.id && window.args.memberId === member.memberId,
-          ),
-        );
-      }
+      const parentPlan = required(readPackagePlanScope(f.db, f.root, 'cedar', item.id));
+      assert.equal(required(parentPlan.unit(member.memberId)).status, 'pending');
+      assert.ok(
+        selectedPending(f, item.id, chat).some(
+          (window) => window.args.id === item.id && window.args.memberId === member.memberId,
+        ),
+        'the child receipt leaves the separately retained parent tail pending',
+      );
     },
   );
 
@@ -4697,8 +4717,8 @@ async function linkedFictionalPlanVersionConversion(t: TestContext) {
     message: 'Prepare this fictional delivery for review',
     context: { intakeId: item.id },
   });
-  await tick();
-  return { ...f, item, chat, bridge: required(f.bridges[0]) };
+  const bridge = await waitForConversionBridge(t, f, chat);
+  return { ...f, item, chat, bridge };
 }
 
 test('plan create advertises and recovers its conditional current-version requirement', async (t) => {
@@ -4728,7 +4748,10 @@ test('plan create advertises and recovers its conditional current-version requir
   assert.match(questionTool.description, /answers in Import/);
   assert.doesNotMatch(questionTool.description, /answers in Sources/);
 
-  const before = getIntake(f.db, f.root, 'cedar', f.item.id);
+  const before = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+  assert.ok(isIntakeSummary(before));
+  assert.equal(before.collections.plans.total, 1, 'native startup prepared one admitted plan');
+  const initialPlanId = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).id;
   assert.equal(f.bridge.prompt.conversion.version, before.version);
   await assert.rejects(call(f.bridge, 'intake_plan', { id: f.item.id, action: 'create' }), {
     name: 'ModelToolValidationError',
@@ -4737,7 +4760,10 @@ test('plan create advertises and recovers its conditional current-version requir
   });
   assert.equal(f.chat.status, 'running');
   assert.equal(f.bridge.closed, false);
-  assert.equal(required(getIntake(f.db, f.root, 'cedar', f.item.id).workflow).plans.length, 0);
+  const unchanged = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+  assert.ok(isIntakeSummary(unchanged));
+  assert.equal(unchanged.collections.plans.total, before.collections.plans.total);
+  assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).id, initialPlanId);
   assert.equal(getIntakeRead(f.db, f.root, 'cedar', f.item.id).version, before.version);
 
   await call(f.bridge, 'intake_plan', {
@@ -4747,7 +4773,11 @@ test('plan create advertises and recovers its conditional current-version requir
   });
   const planned = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
   assert.ok(isIntakeSummary(planned));
-  assert.equal(planned.collections.plans.total, 1, 'the corrected retry creates exactly one plan');
+  assert.equal(
+    planned.collections.plans.total,
+    1,
+    'the corrected retry retains exactly one prepared plan',
+  );
   const plan = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id);
   assert.equal(plan.plan.status, 'active');
   await call(f.bridge, 'intake_plan', {
@@ -4782,7 +4812,7 @@ test('fresh conversion turns retain the mapping pin and reject it after mappings
     message: 'Resume the fictional delivery in a fresh turn',
     context: { intakeId: planned.id },
   });
-  await tick();
+  await waitForConversionBridge(t, f, f.chat, 1);
   assert.equal(f.bridges.length, 2, 'the conversion continues in a fresh model turn');
   const resumed = required(f.bridges[1]);
   assert.equal(resumed.prompt.conversion.version, planned.version);
@@ -4839,7 +4869,10 @@ test('fresh conversion turns retain the mapping pin and reject it after mappings
 
 test('three malformed plan-create versions exhaust only the finite validation budget', async (t) => {
   const f = await linkedFictionalPlanVersionConversion(t);
-  const before = getIntake(f.db, f.root, 'cedar', f.item.id);
+  const before = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+  assert.ok(isIntakeSummary(before));
+  assert.equal(before.collections.plans.total, 1, 'native startup prepared one admitted plan');
+  const initialPlanId = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).id;
   const invalidVersions: unknown[] = ['1', Number.NaN, Number.MAX_SAFE_INTEGER + 1];
   for (const [index, version] of invalidVersions.entries()) {
     await assert.rejects(
@@ -4850,7 +4883,10 @@ test('three malformed plan-create versions exhaust only the finite validation bu
       },
     );
     assert.equal(f.chat.status, index < 2 ? 'running' : 'idle');
-    assert.equal(required(getIntake(f.db, f.root, 'cedar', f.item.id).workflow).plans.length, 0);
+    const unchanged = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+    assert.ok(isIntakeSummary(unchanged));
+    assert.equal(unchanged.collections.plans.total, before.collections.plans.total);
+    assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).id, initialPlanId);
     assert.equal(getIntakeRead(f.db, f.root, 'cedar', f.item.id).version, before.version);
   }
   assert.equal(f.bridge.closed, true);
@@ -5217,7 +5253,7 @@ test('explicit context and unreadable dispositions advance bounded accounting wi
     message: 'Account for the source sections',
     context: { intakeId: item.id },
   });
-  await tick();
+  await waitForConversionBridge(t, f, chat);
   await call(f.bridges[0], 'intake_plan', {
     id: item.id,
     action: 'create',
@@ -5226,6 +5262,7 @@ test('explicit context and unreadable dispositions advance bounded accounting wi
   const plan = selectedFixturePlan(f.db, f.root, 'cedar', item.id);
   assert.equal(plan.units.length, 2);
   for (const [index, kind] of ['context', 'unreadable'].entries()) {
+    await waitForConversionBridge(t, f, chat, index);
     await call(f.bridges[index], 'intake_batch', {
       id: item.id,
       version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
@@ -7473,8 +7510,7 @@ async function linkedJSONPointerFixture(t: TestContext) {
     message: 'Read the fictional export',
     context: { intakeId: item.id },
   });
-  await tick();
-  const bridge = f.bridges[0];
+  const bridge = await waitForConversionBridge(t, f, chat);
   await call(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
@@ -8218,9 +8254,7 @@ test('native package assistant dispatch retains scalar checkpoints and acknowled
     message: 'Read the selected native unit',
     context: { route: '/sources', intakeId: source.id },
   });
-  for (let i = 0; i < 200 && !f.bridges[0]; i++) await tick();
-  const bridge = required(f.bridges[0]);
-  for (let i = 0; i < 200 && !bridge.prompt.conversion; i++) await tick();
+  const bridge = await waitForConversionBridge(t, f, chat);
   assert.equal(chat.status, 'running', chat.error || '');
   const checkpoint = chat.conversionCheckpoint;
   assert.ok(checkpoint && 'format' in checkpoint);
@@ -8275,11 +8309,8 @@ test('native direct conversion prepares its first plan before provider dispatch 
     message: 'Read this direct source',
     context: { intakeId: source.id },
   });
-  for (let n = 0; n < 300 && !f.bridges[0] && chat.status === 'running'; n++) await tick();
+  const bridge = await waitForConversionBridge(t, f, chat);
   assert.equal(chat.status, 'running', chat.error ?? '');
-  const bridge = required(f.bridges[0]);
-  for (let n = 0; n < 300 && !bridge.prompt.conversion && chat.status === 'running'; n++)
-    await tick();
   assert.ok(chat.conversionCheckpoint && 'format' in chat.conversionCheckpoint);
   assert.equal(chat.conversionCheckpoint.format, 'health-intake-conversion-checkpoint-v2');
   assert.ok('format' in getIntakeRead(f.db, f.root, 'cedar', source.id));
@@ -8368,10 +8399,8 @@ for (const finalRace of ['unchanged', 'unrelated_write'] as const)
         message: 'Read the fictional source',
         context: { intakeId: source.id },
       });
-      for (let n = 0; n < 300 && !f.bridges[0]?.prompt.conversion && chat.status === 'running'; n++)
-        await tick();
+      const bridge = await waitForConversionBridge(t, f, chat);
       assert.equal(chat.status, 'running', chat.error ?? '');
-      const bridge = required(f.bridges[0]);
       const line = (id: string, locator: string) =>
         JSON.stringify({
           format: 'health-record-v1',

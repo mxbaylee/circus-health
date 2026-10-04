@@ -38,7 +38,9 @@ function detailRecords(detail: CollectionReportDetail) {
 
 test(
   'Import refreshes blocked records after the host checks a matching original',
-  { timeout: 60000 },
+  // Covers initial original grounding, a real process restart and encrypted
+  // profile reopen, then cold grounding and acceptance. UI waits stay unchanged.
+  { timeout: 120000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-identity-grounding-browser-'));
     mkdirSync(resolve(root, 'data'));

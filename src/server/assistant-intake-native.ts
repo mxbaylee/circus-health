@@ -11,6 +11,7 @@ import {
   openCollectionConversion,
   createCollectionCheckpoint,
   collectionConversionResumeContext,
+  collectionConversionUnitLabel,
   assertCollectionConversionCoverage,
   type CollectionConversionCheckpoint,
   type CollectionConversionScope,
@@ -110,8 +111,9 @@ export async function prepareNativeAssistantConversion(
   },
 ) {
   if (
-    host.header.activePlan.state === 'exact' &&
-    host.header.activePlan.plan?.format === 'health-intake-package-plan-v2'
+    host.header.packageSource === true ||
+    (host.header.activePlan.state === 'exact' &&
+      host.header.activePlan.plan?.format === 'health-intake-package-plan-v2')
   )
     await preparePagedPackagePlanCompatibility(host.db, host.root, host.profileId, host.id, {
       assertRunning: options.assertRunning,
@@ -281,13 +283,22 @@ export function nativeAssistantReadingProgress(
   mappingVersion: string,
   reason: string | null = null,
 ) {
-  const resume = nativeAssistantResume(host, checkpoint, mappingVersion),
-    unit = nativeAssistantUnit(host),
+  // Presentation follows the first pending unit, while manual continuation can
+  // retain a different selected unit. Reuse their scope only when it is exact.
+  const pendingScope = nativeAssistantScope(host),
+    resumeScope =
+      pendingScope?.unitId === checkpoint.activeUnitId
+        ? pendingScope
+        : nativeAssistantScope(host, checkpoint.activeUnitId);
+  if (!resumeScope)
+    throw new HttpError(409, 'CONVERSION_CHANGED', 'The selected conversion unit is unavailable');
+  const resume = collectionConversionResumeContext(resumeScope, checkpoint, { mappingVersion }),
+    workUnit = pendingScope ? collectionConversionUnitLabel(pendingScope) : null,
     ready = resume.workflow.state === 'exact' && resume.readingFacts.state === 'exact',
     selectedReason = reason || (ready ? null : 'workflow_preparation_required'),
     timing = checkpoint.pageTiming?.turn === checkpoint.turns ? checkpoint.pageTiming : undefined;
   const reading: IntakeBatchReadingState = {
-    workUnit: unit ? { id: unit.id, locator: unit.locator?.slice(0, 2000) || unit.id } : null,
+    workUnit,
     status: selectedReason ? 'paused' : 'running',
     reason: selectedReason,
     turns: checkpoint.turns,

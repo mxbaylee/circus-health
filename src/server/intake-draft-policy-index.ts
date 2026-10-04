@@ -9,7 +9,9 @@ import {
 } from './intake-collection-envelope.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { schemaKey } from './intake-envelope-schema.ts';
-import { readIntakeReviewValue } from './intake-review-collection.ts';
+import { IntakeReviewFragmentRequired } from './intake-review-collection.ts';
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
+import { parseLiteralJSON } from './intake-format.ts';
 import type { ReviewDraftResolutionPolicy } from './intake-review-draft-selection.ts';
 import type { IntakeIssueResolution } from '../shared/intake.ts';
 
@@ -106,12 +108,30 @@ export function readLegacyDraftPolicyWitnesses(
       throw Error('Invalid legacy draft witness ordinal');
     return witness;
   };
-  const read = (witness: { ordinal: number; address: string }) => {
+  function* readWork(witness: {
+    ordinal: number;
+    address: string;
+  }): Generator<void, IntakeIssueResolution, void> {
     const record = view.childAt(draft, 'resolutions', witness.ordinal);
     if (!record || view.address(record) !== witness.address)
       throw Error('Legacy draft witness does not belong to the selected history');
-    return readIntakeReviewValue<IntakeIssueResolution>(view, record, 256 * 1024);
-  };
+    let size = 0;
+    const pieces: string[] = [];
+    for (const piece of view.recordChunks(record)) {
+      size += Buffer.byteLength(piece);
+      if (size > 256 * 1024)
+        throw new IntakeReviewFragmentRequired({
+          format: 'health-intake-review-fragment-v1',
+          logical: view.logical,
+          address: view.address(record),
+        });
+      pieces.push(piece);
+      yield;
+    }
+    return parseLiteralJSON(pieces.join('')) as IntakeIssueResolution;
+  }
+  const read = (witness: { ordinal: number; address: string }) =>
+    finishClinicalReviewWork(readWork(witness));
   const point = (key: string) => {
     view.address(draft);
     const raw = collections.get(collections.openView(), 'builds', 'envelope.indexes', start + key);
@@ -119,6 +139,9 @@ export function readLegacyDraftPolicyWitnesses(
   };
   const policy: ReviewDraftResolutionPolicy = {
     *values() {
+      for (const resolution of this.valuesWork!()) if (resolution !== undefined) yield resolution;
+    },
+    *valuesWork() {
       view.address(draft);
       const scratch = disposableSqlite('intake-draft-witnesses-');
       try {
@@ -134,6 +157,7 @@ export function readLegacyDraftPolicyWitnesses(
             bytes: 16384,
           });
           for (const item of page.items) {
+            yield;
             if (!item.key.startsWith(start)) break outer;
             const witness = check(item.value);
             put.run(witness.ordinal, witness.address);
@@ -146,7 +170,7 @@ export function readLegacyDraftPolicyWitnesses(
         for (const row of scratch.db
           .prepare('SELECT ordinal,address FROM selected ORDER BY ordinal')
           .iterate())
-          yield read({ ordinal: Number(row.ordinal), address: String(row.address) });
+          yield yield* readWork({ ordinal: Number(row.ordinal), address: String(row.address) });
       } finally {
         scratch.close();
       }

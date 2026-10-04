@@ -21,6 +21,8 @@ const primitiveTemplate = {
   metadataReadBytes: 0,
 };
 const hostTemplate = {
+  reviewProposalRevisionReads: 0,
+  reviewProposalRevisionHits: 0,
   reviewDraftReconstructions: 0,
   reviewDraftHandoffs: 0,
   identityPolicyReceiptReconstructions: 0,
@@ -49,6 +51,9 @@ const hostTemplate = {
   collectionFeedRowCertificateHashes: 0,
   collectionFeedRowCertificateBytes: 0,
   collectionSuggestedSourceLookups: 0,
+  collectionSuggestedSourceHashes: 0,
+  collectionSuggestedSourceHashHits: 0,
+  collectionSuggestedSourceMemberHashes: 0,
   duplicateSnapshotComparedRows: 0,
   duplicateSnapshotChangedRows: 0,
   duplicateSnapshotHashedBytes: 0,

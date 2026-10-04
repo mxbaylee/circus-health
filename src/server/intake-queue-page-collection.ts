@@ -157,7 +157,7 @@ export async function readCollectionReportGroupDetail(
     })();
     if (!pointer) throw new HttpError(404, 'REPORT_GROUP_NOT_FOUND', 'Report group not found');
     const group = await collectionReportGroupSummary(db, root, profileId, queue, pointer),
-      records = readCollectionIntakeReportRecords(
+      records = await readCollectionIntakeReportRecords(
         db,
         root,
         profileId,

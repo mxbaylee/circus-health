@@ -19,8 +19,10 @@ import {
   intakeEnvelopeRecordOrder,
   intakeEnvelopePropertyOrder,
   selectedEnvelopeStore,
+  collectionCellReader,
+  createSchemaEnvelopeReader,
 } from '../intake-collection-envelope.ts';
-import { schemaKey } from '../intake-envelope-schema.ts';
+import { schemaKey, parseSchemaControl } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-envelope-schema-')),
@@ -58,6 +60,84 @@ function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
     source: { id: identity.intakeId, kind: 'intake_original', sha256: identity.sourceHash },
   };
 }
+
+test('named lexical field access resolves once and preserves raw structured, duplicate and fragmented values', async (t) => {
+  const giant = '🦊\\\"'.repeat(9000),
+    raw =
+      '{"intake":{"version":1,"unknown":12.00},"amount":12.00,"amount":13.00,"nullable":null,"giant":' +
+      JSON.stringify(giant) +
+      '}',
+    { db, source } = fixture(t, raw);
+  await buildIntakeCollectionEnvelope(db, source);
+  const selected = collectionCellReader(db, source),
+    control = parseSchemaControl(
+      selected.collections.get(
+        selected.collections.openView(),
+        'logical',
+        'envelope.control',
+        'representation',
+      ),
+    );
+  let corrupt = false;
+  let reads = 0,
+    cancelled = false;
+  const store = {
+    ...selected.store,
+    get(key: string) {
+      if (key.startsWith('f:')) reads++;
+      if (corrupt && key === 'f:' + control.root + ':' + schemaKey('amount'))
+        return JSON.stringify({ type: 'cell', id: 'd'.repeat(64) });
+      return selected.store.get(key);
+    },
+    check() {
+      if (cancelled) throw Error('Fictional cancelled field read');
+      selected.store.check();
+    },
+  };
+  const view = createSchemaEnvelopeReader(store, control, selected.head.logical),
+    record = view.root(),
+    fields = intakeEnvelopeFieldAccess(view);
+  assert.equal(view.has(record, 'amount'), true);
+  assert.equal(view.child(record, 'amount'), undefined);
+  assert.equal([...view.fieldChunks(record, 'amount')].join(''), '13.00');
+  assert.equal(reads, 3);
+  reads = 0;
+  assert.equal([...fields.chunks(record, 'amount')!].join(''), '13.00');
+  assert.equal(reads, 1, 'single authenticated target selection replaces three');
+  assert.equal(fields.chunks(record, 'missing'), undefined);
+  assert.equal([...fields.chunks(record, 'nullable')!].join(''), 'null');
+  assert.equal([...fields.chunks(record, 'intake')!].join(''), '{"version":1,"unknown":12.00}');
+  assert.equal([...fields.chunks(record, 'giant')!].join(''), JSON.stringify(giant));
+  const first = createSchemaEnvelopeReader(
+    store,
+    control,
+    selected.head.logical,
+    undefined,
+    'first',
+  );
+  assert.equal(
+    [...intakeEnvelopeFieldAccess(first).chunks(first.root(), 'amount')!].join(''),
+    '12.00',
+  );
+  assert.throws(() => fields.chunks(first.root(), 'amount'), /foreign record handle/);
+  corrupt = true;
+  assert.throws(() => fields.chunks(record, 'amount'), /field\/order disagreement/);
+  corrupt = false;
+  const interrupted = fields.chunks(record, 'giant')![Symbol.iterator]();
+  assert.equal(interrupted.next().done, false);
+  cancelled = true;
+  assert.throws(() => interrupted.next(), /cancelled field read/);
+  cancelled = false;
+  const pending = fields.chunks(record, 'giant')!;
+  db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('d'.repeat(64), source.id);
+  assert.throws(() => [...pending], {
+    message: 'Intake envelope authority: missing selected intake head',
+  });
+  db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('c'.repeat(64), source.id);
+  const closed = fields.chunks(record, 'amount')!;
+  db.close();
+  assert.throws(() => [...closed], /closed|not open|database/i);
+});
 
 test('selected storage handles reuse only current profile/source bindings and expire on cache disposal', async (t) => {
   const { db, source, identity, authority, path } = fixture(t, { intake: { version: 1 } });

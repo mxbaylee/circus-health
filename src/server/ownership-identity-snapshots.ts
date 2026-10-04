@@ -5,7 +5,7 @@ import { latestOwnershipDecision } from './ownership-journal.ts';
 import { clinicalReviewRevision, type Database } from './database.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { iterateOwnershipStreamContributions } from './ownership-contribution-stream.ts';
-import { prepareCollectionClinicalReview } from './intake-review-collection-host.ts';
+import { prepareCollectionClinicalReviewAsync } from './intake-review-collection-host.ts';
 import type { CollectionClinicalReviewSession } from './intake-review-collection-session.ts';
 import {
   ownershipSourceSnapshotHas,
@@ -56,7 +56,10 @@ export async function prepareOwnershipIdentitySnapshots(
     record(
       intakeId: string,
       recordId: string,
-    ): import('../shared/intake.ts').IntakeReviewRecord | undefined;
+    ):
+      | import('../shared/intake.ts').IntakeReviewRecord
+      | undefined
+      | Promise<import('../shared/intake.ts').IntakeReviewRecord | undefined>;
     factory(intakeId: string): ReturnType<typeof createOwnershipSourceSnapshotPreparation>;
     report?: { intakeId: string; groupId: string };
   },
@@ -69,7 +72,7 @@ export async function prepareOwnershipIdentitySnapshots(
       .prepare('SELECT 1 FROM ownership_identity_snapshots WHERE intake=? AND record=?')
       .get(source.intakeId, source.recordId);
     if (prepared && !source.reportMember) continue;
-    const record = input.record(source.intakeId, source.recordId);
+    const record = await input.record(source.intakeId, source.recordId);
     if (!record) throw Error('Ownership identity source is no longer reviewable');
     const previous = source.identity
       ? ownershipSourceAuthority(db, source.identity)?.identityIssues
@@ -170,12 +173,12 @@ export async function prepareStandaloneOwnershipIdentitySnapshots(
           { assertRunning: assertCurrent },
         );
       },
-      record(intakeId, recordId) {
+      async record(intakeId, recordId) {
         const proposal = recordId.replace(/:line:\d+$/, ''),
           next = JSON.stringify([intakeId, proposal]);
         if (next !== key) {
           selected?.close();
-          const current = prepareCollectionClinicalReview(
+          const current = await prepareCollectionClinicalReviewAsync(
             db,
             root,
             profileId,

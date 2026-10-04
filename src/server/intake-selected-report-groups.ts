@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 /** Complete host-only link traversal and an explicit bounded transport reference. */
 import type { IntakeReviewGroupReference } from '../shared/intake.ts';
 import type {
@@ -18,15 +19,21 @@ export function isSelectedReportGroups(value: unknown): value is IntakeReviewGro
   return !!value && typeof value === 'object' && selections.has(value);
 }
 export function selectedReportGroupLinks(
+  ...input: Parameters<typeof selectedReportGroupLinksWork>
+): IntakeReviewGroupLinks {
+  return finishClinicalReviewWork(selectedReportGroupLinksWork(...input));
+}
+export function* selectedReportGroupLinksWork(
   read: () => Iterable<IntakeReviewGroupReference>,
   selection: IntakeReviewGroupLinksReference['selection'],
   bytes: number,
-): IntakeReviewGroupLinks {
+): Generator<void, IntakeReviewGroupLinks, void> {
   let inline: IntakeReviewGroupReference[] | undefined = [],
     count = 0,
     size = 2;
   let first: IntakeReviewGroupReference | undefined;
   for (const value of read()) {
+    yield;
     first ??= value;
     count++;
     if (inline) {

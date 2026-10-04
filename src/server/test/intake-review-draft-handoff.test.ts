@@ -108,3 +108,29 @@ test('selected draft handoff drops mismatched, failed, undefined and changed con
   handoff.clear();
   assert.equal(consume(), undefined);
 });
+
+test('cooperative draft handoff preserves its original proof and cannot revive cleared or aborted reads', () => {
+  let state = 'fictional-state';
+  const epoch = {},
+    handoff = selectedDraftHandoff(() => ({ state, epoch }));
+  const value = draft(1),
+    record = { id: value.recordId };
+  const read = () =>
+    handoff.readWork(null, record.id, value.candidateVersionId, function* () {
+      yield;
+      return value;
+    });
+  for (const mode of ['current', 'changed', 'cleared', 'aborted'] as const) {
+    const work = read();
+    assert.equal(work.next().done, false);
+    if (mode === 'changed') state = 'different-fictional-state';
+    if (mode === 'cleared') handoff.clear();
+    if (mode === 'aborted') work.return(null);
+    else assert.equal(work.next().value, value);
+    handoff.bind(record, value);
+    assert.equal(
+      handoff.consume(null, record, value.candidateVersionId),
+      mode === 'current' ? value : undefined,
+    );
+  }
+});

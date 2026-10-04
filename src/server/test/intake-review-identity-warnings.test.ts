@@ -5,10 +5,12 @@ import { openDatabase } from '../database.ts';
 import { reviewIssueFactory } from '../intake-review-issue-state.ts';
 import {
   bindReviewIdentityWarnings,
+  bindReviewIdentityWarningsWork,
   reviewRecordIdentityWarnings,
 } from '../intake-review-identity-warnings.ts';
 import {
   modelBirthDateWarningCandidates,
+  modelBirthDateWarningCandidatesWork,
   modelBirthDateWarnings,
 } from '../intake-identity-policy.ts';
 import { canonicalReviewValueChunks } from '../intake-review-question-state.ts';
@@ -94,6 +96,81 @@ test('complete warning policy preserves late facts, exact legacy tokens and sess
       0,
     );
     assert.throws(() => reviewRecordIdentityWarnings(selected).length, /Closed issue policy scope/);
+  } finally {
+    factory.dispose();
+    db.close();
+  }
+});
+
+test('warning work yields through late compatible/non-DOB inputs and keeps complete tokens on interruption', () => {
+  const db = openDatabase(':memory:', 'fictional-warning-work');
+  const factory = reviewIssueFactory(db, {
+    sourceId: 'fictional-source',
+    generation: 'fictional-work',
+    assertCurrent() {},
+  });
+  let visits = 0;
+  function* issues() {
+    for (let n = 0; n < 1000; n++) {
+      visits++;
+      yield n === 999
+        ? { selfSuggestion: { birthDate: '1901-01-01' } }
+        : n % 2
+          ? { selfSuggestion: { birthDate: '1990-03-08' } }
+          : {};
+    }
+  }
+  const input = {
+    issues: issues(),
+    unreadableBirthDate: false,
+    person: { fullName: 'Fictional Iris Meadow', birthDate: '1990-03-08' },
+  };
+  try {
+    const record = makeRecord();
+    const work = bindReviewIdentityWarningsWork(
+      factory,
+      record,
+      modelBirthDateWarningCandidatesWork(input),
+    );
+    assert.equal(work.next().done, false);
+    assert.equal(visits, 1, 'non-DOB inputs yield before the late warning');
+    let turns = 1,
+      next = work.next();
+    while (!next.done) {
+      turns++;
+      next = work.next();
+    }
+    assert.equal(turns, 1001, 'all1000 inputs and the one emitted candidate cooperate');
+    assert.equal(record.identityReview!.warningsReference!.count, 1);
+    assert.equal(reviewRecordIdentityWarnings(record).at(0)!.modelBirthDate, '1901-01-01');
+    const legacy = makeRecord();
+    legacy.identityReview!.warnings = modelBirthDateWarnings({ ...input, issues: issues() });
+    assert.equal(hash(canonicalReviewValueChunks(record)), hash([canonicalLiteral(legacy)]));
+    visits = 0;
+    const interrupted = makeRecord();
+    const pending = bindReviewIdentityWarningsWork(
+      factory,
+      interrupted,
+      modelBirthDateWarningCandidatesWork({ ...input, issues: issues() }),
+    );
+    pending.next();
+    pending.return(undefined);
+    assert.equal(visits, 1);
+    assert.equal(
+      interrupted.identityReview!.warningsReference,
+      undefined,
+      'incomplete traversal publishes no complete warning reference',
+    );
+    factory.dispose();
+    assert.equal(
+      Number(db.prepare('SELECT count(*) n FROM intake_review_issue_policy_v2').get()!.n),
+      0,
+    );
+    assert.equal(
+      Number(db.prepare('SELECT count(*) n FROM intake_review_issue_scope').get()!.n),
+      0,
+    );
+    assert.throws(() => reviewRecordIdentityWarnings(record).length, /Closed issue policy scope/);
   } finally {
     factory.dispose();
     db.close();

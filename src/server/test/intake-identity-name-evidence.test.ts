@@ -1,8 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { collectSelectedEvidencedIdentity } from '../intake-identity-name-evidence.ts';
-import { collectEvidencedIdentity } from '../intake-identity-policy.ts';
+import {
+  collectSelectedEvidencedIdentity,
+  collectSelectedEvidencedIdentityWork,
+} from '../intake-identity-name-evidence.ts';
+import {
+  collectEvidencedIdentity,
+  structuredEvidencedIdentityWork,
+} from '../intake-identity-policy.ts';
 import { canonicalReviewValueChunks } from '../intake-review-question-state.ts';
 import { selectionAuthority } from '../intake-selection-authority.ts';
 
@@ -63,5 +69,58 @@ test('small, unique, missing and printed-boundary evidence keeps existing identi
       const expected = collectEvidencedIdentity(claims(), boundary);
       assert.deepEqual(collectSelectedEvidencedIdentity(claims, boundary), expected);
     }
+  }
+});
+
+test('complete name evidence yields during scratch ingestion, structured hints and canonical reconstruction', () => {
+  let visits = 0;
+  function* claims() {
+    for (let n = 0; n < 1000; n++) {
+      visits++;
+      yield { selfSuggestion: { fullName: name(n) } };
+    }
+  }
+  const work = collectSelectedEvidencedIdentityWork(claims);
+  assert.equal(work.next().done, false);
+  assert.equal(
+    visits,
+    1,
+    'first source inspection returns control before complete scratch ingestion',
+  );
+  let turns = 1;
+  let step = work.next();
+  while (!step.done) {
+    turns++;
+    step = work.next();
+  }
+  assert.equal(turns, 2000, 'every input and every distinct result yields');
+  const result = step.value;
+  const expected = collectEvidencedIdentity(claims());
+  visits = 0;
+  const chunks = canonicalReviewValueChunks(result)[Symbol.iterator]();
+  for (let n = 0; n < 100; n++) {
+    const next = chunks.next();
+    assert.equal(next.done, false);
+    if (visits) break;
+  }
+  assert.equal(visits, 1, 'canonical provider also yields before completing scratch ingestion');
+  chunks.return?.(undefined);
+  assert.equal(canonical(result), canonical(expected));
+  visits = 0;
+  const structured = structuredEvidencedIdentityWork(claims());
+  assert.equal(structured.next().done, false);
+  assert.equal(visits, 1);
+  structured.return({});
+  visits = 0;
+  const aborted = collectSelectedEvidencedIdentityWork(claims);
+  aborted.next();
+  aborted.return(result);
+  assert.equal(visits, 1, 'closing incomplete work does not consume later claims');
+  for (const boundary of ['', 'Patient: Fictional Xaaa Meadow']) {
+    visits = 0;
+    const printed = collectSelectedEvidencedIdentityWork(claims, boundary);
+    assert.equal(printed.next().done, false);
+    assert.equal(visits, 1, 'printed-boundary path yields per contradictory hint too');
+    printed.return(result);
   }
 });

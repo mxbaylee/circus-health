@@ -11,8 +11,13 @@ import {
 import { isIntakeSummary } from '../shared/intake-summary.ts';
 import {
   prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
+import {
+  collectionClinicalProjectionContext,
+  type CollectionClinicalReviewResult,
+} from './intake-review-collection-session.ts';
 import { openIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { retainedIntakeWorkflowCommand } from './intake-workflow-command.ts';
 import { saveIntakeDraftRepairRead } from './intake-draft-repair-native.ts';
@@ -132,12 +137,16 @@ function selection(value: unknown): IntakeDraftRepairSelection {
   };
 }
 
-export function resolveIntakeDraftRepairScope(
+function* intakeDraftRepairScopeSteps(
   db: Database,
   root: string,
   profileId: string,
   input: unknown,
-): IntakeDraftRepairScope {
+): Generator<
+  { intakeId: string; proposalId: string | null },
+  IntakeDraftRepairScope,
+  CollectionClinicalReviewResult
+> {
   const chosen = selection(input);
   const intake = getIntakeRead(db, root, profileId, chosen.intakeId);
   const native = isIntakeSummary(intake);
@@ -195,18 +204,13 @@ export function resolveIntakeDraftRepairScope(
     { status: 'ready' }
   >['session'][] = [];
   try {
-    const rows = chosen.rows.map((selected) => {
+    const rows: IntakeDraftRepairScope['rows'] = [];
+    for (const selected of chosen.rows) {
       const reviewKey = selected.proposalId || '';
       let review = reviews.get(reviewKey);
       if (!review) {
         if (native) {
-          const prepared = prepareCollectionClinicalReview(
-            db,
-            root,
-            profileId,
-            chosen.intakeId,
-            selected.proposalId,
-          );
+          const prepared = yield { intakeId: chosen.intakeId, proposalId: selected.proposalId };
           if (prepared.status !== 'ready')
             throw new HttpError(
               409,
@@ -286,7 +290,7 @@ export function resolveIntakeDraftRepairScope(
           'DRAFT_REPAIR_EVIDENCE',
           'The selected draft has no exact source locator',
         );
-      return {
+      rows.push({
         proposalId: selected.proposalId,
         recordId: selected.recordId,
         candidateVersionId: selected.candidateVersionId,
@@ -297,8 +301,10 @@ export function resolveIntakeDraftRepairScope(
           allowedFields.map((field) => [field, String(mapping[field] ?? '')]),
         ) as Partial<Record<IntakeDraftRepairField, string>>,
         evidence,
-      };
-    });
+      });
+    }
+    // A later selected proposal may yield after an earlier session was built.
+    for (const session of sessions) collectionClinicalProjectionContext(session).assertCurrent();
     const basis = {
       format: 'intake-draft-repair-scope-v2' as const,
       intakeId: intake.id,
@@ -310,6 +316,66 @@ export function resolveIntakeDraftRepairScope(
     return { ...basis, scopeToken: hash([profileId, basis]) };
   } finally {
     for (const session of sessions) session.close();
+  }
+}
+
+export function resolveIntakeDraftRepairScope(
+  db: Database,
+  root: string,
+  profileId: string,
+  input: unknown,
+): IntakeDraftRepairScope {
+  const steps = intakeDraftRepairScopeSteps(db, root, profileId, input);
+  try {
+    let step = steps.next();
+    while (!step.done) {
+      step = steps.next(
+        prepareCollectionClinicalReview(
+          db,
+          root,
+          profileId,
+          step.value.intakeId,
+          step.value.proposalId,
+        ),
+      );
+    }
+    return step.value;
+  } finally {
+    steps.return(undefined as never);
+  }
+}
+
+async function resolveIntakeDraftRepairScopeAsync(
+  db: Database,
+  root: string,
+  profileId: string,
+  input: unknown,
+  options: { assertRunning?: () => void } = {},
+): Promise<IntakeDraftRepairScope> {
+  const steps = intakeDraftRepairScopeSteps(db, root, profileId, input);
+  let pending: CollectionClinicalReviewResult | undefined;
+  try {
+    options.assertRunning?.();
+    let step = steps.next();
+    while (!step.done) {
+      pending = await prepareCollectionClinicalReviewAsync(
+        db,
+        root,
+        profileId,
+        step.value.intakeId,
+        step.value.proposalId,
+        options,
+      );
+      options.assertRunning?.();
+      const prepared = pending;
+      pending = undefined; // The generator owns ready sessions once resumed.
+      step = steps.next(prepared);
+    }
+    options.assertRunning?.();
+    return step.value;
+  } finally {
+    if (pending?.status === 'ready') pending.session.close();
+    steps.return(undefined as never);
   }
 }
 
@@ -370,9 +436,19 @@ export async function prepareIntakeDraftRepairScope(
       );
       options.assertRunning?.();
     }
-  return retained
-    ? currentScope(db, root, profileId, retained)
-    : resolveIntakeDraftRepairScope(db, root, profileId, chosen);
+  if (retained) {
+    const original = verifyIntakeOriginal(db, root, profileId, retained.intakeId);
+    if (original.sourceHash !== retained.originalSha256)
+      throw new HttpError(409, 'DRAFT_REPAIR_STALE', 'The retained original changed; ask again');
+  }
+  const refreshed = await resolveIntakeDraftRepairScopeAsync(db, root, profileId, chosen, options);
+  if (retained && refreshed.scopeToken !== retained.scopeToken)
+    throw new HttpError(
+      409,
+      'DRAFT_REPAIR_STALE',
+      'Selected drafts or evidence changed; ask again',
+    );
+  return refreshed;
 }
 
 type RepairEdit = {
@@ -924,7 +1000,9 @@ export function intakeDraftRepairAssistantExtensions() {
           pdf: context.pdf === true && window.kind === 'pdf_page',
           assertRunning: assertRunning as () => void,
         });
-        currentScope(db, root, profileId, scope);
+        await prepareIntakeDraftRepairScope(db, root, profileId, scope, {
+          assertRunning: assertRunning as () => void,
+        });
         const resultObject: UnknownRecord = object(result) ? result : {};
         const metadata: UnknownRecord = object(resultObject.metadata) ? resultObject.metadata : {};
         const original = object(resultObject.original)

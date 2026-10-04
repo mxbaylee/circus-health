@@ -2439,7 +2439,8 @@ export async function importIntakeRead(
         const { prepareRetainedPlanAccess, readRetainedPlanEvidence, prepareRetainedPlanDerived } =
             await import('./intake-retained-plan.ts'),
           { prepareCollectionWorkflowReadiness } = await import('./intake-workflow-readiness.ts'),
-          { prepareCollectionClinicalReview } = await import('./intake-review-collection-host.ts'),
+          { prepareCollectionClinicalReviewAsync } =
+            await import('./intake-review-collection-host.ts'),
           { collectionClinicalProjectionContext } =
             await import('./intake-review-collection-session.ts'),
           { prepareNativeIntakeAcceptance } = await import('./intake-collection-acceptance.ts'),
@@ -2475,7 +2476,16 @@ export async function importIntakeRead(
         await prepareCollectionClinicalReviewDependencies(db, root, profileId, id, selected, {
           assertRunning,
         });
-        const session = prepareCollectionClinicalReview(db, root, profileId, id, selected);
+        const session = await prepareCollectionClinicalReviewAsync(
+          db,
+          root,
+          profileId,
+          id,
+          selected,
+          {
+            assertRunning,
+          },
+        );
         if (session.status !== 'ready')
           throw new HttpError(
             409,
@@ -4634,8 +4644,10 @@ export async function saveIntakeReviewDraftRead(
         };
         const { prepareCollectionWorkflowReadiness } =
           await import('./intake-workflow-readiness.ts');
-        const { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
-          await import('./intake-review-collection-host.ts');
+        const {
+          prepareCollectionClinicalReviewAsync,
+          prepareCollectionClinicalReviewDependencies,
+        } = await import('./intake-review-collection-host.ts');
         const { collectionClinicalProjectionContext } =
           await import('./intake-review-collection-session.ts');
         const { prepareNativeDraftHistory } = await import('./intake-review-draft-state.ts');
@@ -4676,12 +4688,13 @@ export async function saveIntakeReviewDraftRead(
           input.proposalId || null,
           { assertRunning },
         );
-        const selected = prepareCollectionClinicalReview(
+        const selected = await prepareCollectionClinicalReviewAsync(
           db,
           root,
           profileId,
           id,
           input.proposalId || null,
+          { assertRunning },
         );
         if (selected.status !== 'ready')
           throw new HttpError(

@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 /** Complete advisory warnings share the existing connection-local policy row lifecycle. */
 import { createHash } from 'node:crypto';
 import type { IntakeReviewRecord } from '../shared/intake.ts';
@@ -17,14 +18,21 @@ export interface ReviewIdentityWarningsReference {
 type Row = { id: string; value: IntakeIdentityWarning };
 const providers = new WeakMap<ReviewIdentityWarningsReference, ReviewPolicyValueCollection<Row>>();
 export function bindReviewIdentityWarnings(
+  ...input: Parameters<typeof bindReviewIdentityWarningsWork>
+): void {
+  finishClinicalReviewWork(bindReviewIdentityWarningsWork(...input));
+}
+export function* bindReviewIdentityWarningsWork(
   factory: ReturnType<typeof reviewIssueFactory>,
   record: IntakeReviewRecord,
-  warnings: Iterable<IntakeIdentityWarning>,
-) {
+  warnings: Iterable<IntakeIdentityWarning | undefined>,
+): Generator<void, void, void> {
   const rows = factory<Row>(record);
   const digest = createHash('sha256').update('[');
   let first = true;
   for (const warning of warnings) {
+    yield;
+    if (!warning) continue;
     const json = canonicalLiteral(warning),
       id = createHash('sha256').update(json).digest('hex');
     if (rows.findId!(id)) continue;

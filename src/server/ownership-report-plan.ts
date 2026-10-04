@@ -1,3 +1,5 @@
+import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { identityGroundingGeneration } from './intake-identity-grounding.ts';
 import { ownershipPlanGroups } from './ownership-plan-groups.ts';
 import { ownershipPlanHolds } from './ownership-plan-holds.ts';
 import { prepareOwnershipRecordsSelection } from './ownership-records-selection.ts';
@@ -11,9 +13,10 @@ import {
   restoreOwnershipStreamContribution,
 } from './ownership-contribution-stream.ts';
 import {
-  prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
+import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
 import type { IntakeReview } from '../shared/intake.ts';
 import type { SelectedOwnershipReviewScope } from './record-ownership-authority.ts';
 import { randomUUID, createHash } from 'node:crypto';
@@ -175,6 +178,16 @@ export async function prepareOwnershipReportPlan(
     selection.close();
     throw error;
   }
+  const selectedGrounding = identityGroundingGeneration(db);
+  const assertCurrent = () => {
+    selection.assertCurrent();
+    if (identityGroundingGeneration(db) !== selectedGrounding)
+      throw new HttpError(
+        409,
+        'OWNERSHIP_CHANGED',
+        'Identity evidence changed; prepare a fresh preview',
+      );
+  };
   const store = createOwnershipPreviewStore(
     selection.sql,
     selection.sources,
@@ -182,7 +195,7 @@ export async function prepareOwnershipReportPlan(
     report ? 'all' : 'changed',
   );
   options.onCheckpoint?.('selection-complete');
-  const scopes = createOwnershipScopeIndex(db, selection.sql, selection.assertCurrent);
+  const scopes = createOwnershipScopeIndex(db, selection.sql, assertCurrent);
   selection.sql.exec(
     'CREATE TABLE record_choices(id TEXT PRIMARY KEY,value TEXT); CREATE TABLE relationship_choices(id TEXT PRIMARY KEY); CREATE TABLE ownership_lineage(record_key TEXT PRIMARY KEY,moving TEXT,remaining TEXT); CREATE TABLE contribution_values(record_key TEXT,ordinal INTEGER,value TEXT,PRIMARY KEY(record_key,ordinal));',
   );
@@ -206,26 +219,35 @@ export async function prepareOwnershipReportPlan(
   };
   const relationshipDecision = (id: string) =>
     !!selection.sql.prepare('SELECT 1 FROM relationship_choices WHERE id=?').get(id);
+  const artifacts = createClinicalReviewArtifactProof(selection.sql, 'clinical_artifacts');
+  const assertPreparedCurrent = () => {
+    assertCurrent();
+    artifacts.assertCurrent();
+  };
   let retainedReview:
     | {
         key: string;
         review: IntakeReview;
         ownership: SelectedOwnershipReviewScope;
         record(id: string): import('../shared/intake.ts').IntakeReviewRecord | undefined;
+        assertCurrent(): void;
         close(): void;
       }
     | undefined;
-  const reviewSource = (intakeId: string, sourceId: string) => {
+  const prepareReviewSource = async (intakeId: string, sourceId: string): Promise<void> => {
+    assertCurrent();
     const proposal = sourceId.replace(/:line:\d+$/, ''),
       key = intakeId + ':' + proposal;
     if (retainedReview?.key !== key) {
       retainedReview?.close();
-      const ready = prepareCollectionClinicalReview(
+      retainedReview = undefined;
+      const ready = await prepareCollectionClinicalReviewAsync(
         db,
         root,
         profileId,
         intakeId,
         proposal === intakeId ? null : proposal,
+        { assertRunning: assertCurrent },
       );
       if (ready.status !== 'ready')
         throw new HttpError(
@@ -233,14 +255,32 @@ export async function prepareOwnershipReportPlan(
           'OWNERSHIP_REVIEW_FRAGMENT',
           'Selected report clinical evidence requires its complete addressed reference',
         );
+      // Copy the host's already-verified identities before this one retained
+      // session is replaced. SQL holds the complete fan-in without live sessions.
+      try {
+        artifacts.retain(collectionClinicalProjectionContext(ready.session).verifiedArtifacts());
+      } catch (error) {
+        ready.session.close();
+        throw error;
+      }
       retainedReview = {
         key,
         review: ready.session.review,
         ownership: ready.session.ownership,
         record: (id: string) => ready.session.record(id),
+        assertCurrent: () => collectionClinicalProjectionContext(ready.session).assertCurrent(),
         close: () => ready.session.close(),
       };
     }
+    retainedReview!.assertCurrent();
+    assertCurrent();
+  };
+  const reviewSource = (intakeId: string, sourceId: string) => {
+    assertCurrent();
+    const proposal = sourceId.replace(/:line:\d+$/, '');
+    if (retainedReview?.key !== intakeId + ':' + proposal)
+      throw Error('Ownership source requires cooperative preparation');
+    retainedReview.assertCurrent();
     return retainedReview;
   };
   let plan: Awaited<ReturnType<typeof prepareOwnershipNamePlan>> | undefined;
@@ -265,6 +305,7 @@ export async function prepareOwnershipReportPlan(
       sink: store.sink,
       scopes,
       reviewSource,
+      prepareReviewSource,
       decision,
       relationshipDecision,
       contributions(kind: import('./clinical-references.ts').ClinicalKind, recordId: string) {
@@ -285,7 +326,7 @@ export async function prepareOwnershipReportPlan(
       captureNameScopes() {},
     });
     for (const ref of selection.records()) {
-      selection.assertCurrent();
+      assertCurrent();
       let contributionOrdinal = 0;
       for (const contribution of iterateOwnershipStreamContributions(db, ref.kind, ref.recordId, {
         scopes: () => [],
@@ -300,17 +341,17 @@ export async function prepareOwnershipReportPlan(
           );
         if (contributionOrdinal % 32 === 0) {
           await setImmediate();
-          selection.assertCurrent();
+          assertCurrent();
         }
       }
-      selection.assertCurrent();
+      assertCurrent();
       await previewRecordOwnershipPrepared(
         db,
         root,
         profileId,
         request,
         scopeOptions([ref]),
-        selection.assertCurrent,
+        assertCurrent,
       );
       options.onCheckpoint?.('record-complete');
       await setImmediate();
@@ -324,13 +365,14 @@ export async function prepareOwnershipReportPlan(
       if (!store.sink.relationships.has(choice.decisionId))
         blockers.push('A relationship decision is outside this selection.');
     for (const pending of selection.pending()) {
-      selection.assertCurrent();
-      const partial = previewRecordOwnership(
+      assertCurrent();
+      const partial = await previewRecordOwnershipPrepared(
         db,
         root,
         profileId,
         request,
         scopeOptions([], [pending]),
+        assertCurrent,
       );
       void partial;
       for (const blocker of store.sink.blockerBucket('header', false).values())
@@ -347,15 +389,21 @@ export async function prepareOwnershipReportPlan(
       { ...options, ownedReportScopes: true, scopes },
     );
     options.onCheckpoint?.('names-complete');
-    let holds = ownershipPlanHolds(
-      db,
-      selection.sql,
-      report ? [] : store.records,
-      selection.sources,
-      (intakeId, sourceId) => reviewSource(intakeId, sourceId).ownership,
-    );
+    const prepareHolds = () =>
+      ownershipPlanHolds(
+        db,
+        selection.sql,
+        report ? [] : store.records,
+        selection.sources,
+        async (intakeId, sourceId) => {
+          await prepareReviewSource(intakeId, sourceId);
+          return reviewSource(intakeId, sourceId).ownership;
+        },
+        assertCurrent,
+      );
+    let holds = await prepareHolds();
     const finalize = () => {
-      selection.assertCurrent();
+      assertPreparedCurrent();
       plan!.assertCurrent();
       const header = previewRecordOwnership(db, root, profileId, request, {
         ...scopeOptions(),
@@ -364,13 +412,8 @@ export async function prepareOwnershipReportPlan(
       const bucket = store.sink.blockerBucket('header', false);
       for (const blocker of blockers.values()) bucket.push(blocker);
       Object.assign(header, { blockerEvidence: bucket.reference() });
-      holds = ownershipPlanHolds(
-        db,
-        selection.sql,
-        report ? [] : store.records,
-        selection.sources,
-        (intakeId, sourceId) => reviewSource(intakeId, sourceId).ownership,
-      );
+      // Holds were prepared with complete source policy before synchronous finalization.
+      // Choices rebuild them before refresh; publication never starts cold clinical work.
       if (!report) {
         const decisions = [
           ...selection.sql.prepare('SELECT value FROM record_choices ORDER BY id').iterate(),
@@ -437,7 +480,7 @@ export async function prepareOwnershipReportPlan(
           this.stageSourceSnapshots();
           return;
         }
-        selection.assertCurrent();
+        assertCurrent();
         plan!.assertCurrent();
         if (
           'personId' in header.destination &&
@@ -456,7 +499,7 @@ export async function prepareOwnershipReportPlan(
             { id },
             {
               assertRunning: () => {
-                selection.assertCurrent();
+                assertCurrent();
                 plan!.assertCurrent();
               },
             },
@@ -494,7 +537,10 @@ export async function prepareOwnershipReportPlan(
         }
         identitySnapshots = await prepareOwnershipIdentitySnapshots(db, selection.sql, {
           factory: factoryFor,
-          record: (intakeId, recordId) => reviewSource(intakeId, recordId).record(recordId),
+          record: async (intakeId, recordId) => {
+            await prepareReviewSource(intakeId, recordId);
+            return reviewSource(intakeId, recordId).record(recordId);
+          },
           ...(report ? { report: { intakeId: report.intakeId, groupId: report.groupId } } : {}),
           sources: (function* () {
             for (const item of store.records)
@@ -507,7 +553,7 @@ export async function prepareOwnershipReportPlan(
               yield { intakeId: intakeId!, recordId, reportMember: true };
           })(),
         });
-        selection.assertCurrent();
+        assertCurrent();
         plan!.assertCurrent();
         snapshotPrepared = true;
         this.stageSourceSnapshots();
@@ -535,7 +581,7 @@ export async function prepareOwnershipReportPlan(
       stageSourceSnapshots() {
         if (!snapshotPrepared)
           throw Error('Ownership source snapshots require completed preparation');
-        selection.assertCurrent();
+        assertCurrent();
         plan!.assertCurrent();
         for (const row of selection.sql
           .prepare('SELECT moving,remaining FROM ownership_lineage ORDER BY record_key')
@@ -548,7 +594,7 @@ export async function prepareOwnershipReportPlan(
       reference,
       boundary: selection.boundary,
       occurrences: selection.occurrences,
-      assertCurrent: selection.assertCurrent,
+      assertCurrent: assertPreparedCurrent,
       finalize: refresh,
       requestForGroup(group: OwnershipPreview['commitGroups'][number]): OwnershipRequest {
         // The approved parent can be read after an earlier independent child commits.
@@ -587,7 +633,7 @@ export async function prepareOwnershipReportPlan(
         }
       },
       *choices() {
-        selection.assertCurrent();
+        assertCurrent();
         for (const row of selection.sql
           .prepare('SELECT id,value FROM record_choices ORDER BY id')
           .iterate())
@@ -598,10 +644,11 @@ export async function prepareOwnershipReportPlan(
           yield { relationshipId: String(row.id), withdraw: true };
       },
       async choose(input: unknown) {
-        selection.assertCurrent();
+        assertCurrent();
         plan!.assertCurrent();
         if (!object(input))
           throw new HttpError(400, 'OWNERSHIP_DECISION', 'Choose one displayed report decision');
+        const restoreArtifacts = artifacts.checkpoint();
         const restore = store.checkpoint(),
           previousHeader = header,
           previousReference = { ...reference };
@@ -663,7 +710,7 @@ export async function prepareOwnershipReportPlan(
             )
             .iterate(recordId, recordId, recordId);
           for (const row of affected) {
-            selection.assertCurrent();
+            assertCurrent();
             await previewRecordOwnershipPrepared(
               db,
               root,
@@ -675,10 +722,11 @@ export async function prepareOwnershipReportPlan(
                   recordId: String(row.record_id),
                 },
               ]),
-              selection.assertCurrent,
+              assertCurrent,
             );
             await setImmediate();
           }
+          holds = await prepareHolds();
           refresh();
           selection.sql.exec('RELEASE ownership_choice');
         } catch (error) {
@@ -687,6 +735,7 @@ export async function prepareOwnershipReportPlan(
           } catch {
             /* Profile lock can close the disposable plan while preparation yields. */
           }
+          restoreArtifacts();
           restore();
           header = previousHeader;
           Object.assign(reference, previousReference);
@@ -694,14 +743,14 @@ export async function prepareOwnershipReportPlan(
         }
       },
       assertForTransaction() {
-        selection.assertCurrent();
+        assertPreparedCurrent();
         stageToken = currentTransactionToken(db);
         if (!stageToken) throw Error('Report publication requires its owned atomic transaction');
       },
       preview(): OwnershipCommitView {
         if (!stageToken || stageToken !== currentTransactionToken(db))
           throw Error('Report preview belongs to another transaction');
-        selection.assertCurrent();
+        assertPreparedCurrent();
         return {
           ...header,
           records: store.records,
@@ -711,7 +760,7 @@ export async function prepareOwnershipReportPlan(
         };
       },
       publicPreview(): OwnershipReportPreviewReference {
-        selection.assertCurrent();
+        assertPreparedCurrent();
         const {
           records,
           pending,
@@ -749,7 +798,7 @@ export async function prepareOwnershipReportPlan(
         };
       },
       contributionPage(key: string, source: string | null, after = -1, limit = 16, bytes = 65536) {
-        selection.assertCurrent();
+        assertCurrent();
         plan!.assertCurrent();
         if (
           !/^[a-f0-9]{64}$/.test(key) ||
@@ -824,7 +873,7 @@ export async function prepareOwnershipReportPlan(
         offset: number,
         bytes = 32768,
       ) {
-        selection.assertCurrent();
+        assertCurrent();
         plan!.assertCurrent();
         if (
           !/^[a-f0-9]{64}$/.test(key) ||
@@ -870,7 +919,7 @@ export async function prepareOwnershipReportPlan(
         offset: number,
         bytes = 65536,
       ) {
-        selection.assertCurrent();
+        assertCurrent();
         plan!.assertCurrent();
         if (
           !['records', 'pending', 'relationships', 'holds'].includes(section) ||
@@ -911,7 +960,7 @@ export async function prepareOwnershipReportPlan(
         limit = 32,
         bytes = 65536,
       ) {
-        selection.assertCurrent();
+        assertCurrent();
         plan!.assertCurrent();
         if (
           !Number.isSafeInteger(after) ||

@@ -172,8 +172,8 @@ export function CollectionImportReview({
     const kinds = Object.entries(collectionKind)
       .filter(([, value]) => value === filters.kind)
       .map(([key]) => key);
-    // The server accepts its canonical kind name. Documents are filtered from this bounded page.
-    if (kinds.length === 1) queryParams.set('kind', kinds[0]!);
+    if (filters.kind === 'Documents') queryParams.set('kind', 'documents');
+    else if (kinds.length === 1) queryParams.set('kind', kinds[0]!);
   }
   if (filters.editedOnly) queryParams.set('edited', 'true');
   if (cursor) queryParams.set('cursor', cursor);
@@ -257,6 +257,9 @@ export function CollectionImportReview({
     let live = true;
     const controller = new AbortController();
     const pendingKeys = new Set<string>();
+    // The host serializes groups from one original. Dispatch its next read
+    // after the preceding read settles, before starting its transport timer.
+    const identityLanes = new Map<string, Promise<void>>();
     const reports = new Map<
       string,
       { intakeId: string; groupId: string; version: number; tokens: Set<string> }
@@ -286,40 +289,46 @@ export function CollectionImportReview({
       if (identityLoads.current.get(key) === signature) continue;
       identityLoads.current.set(key, signature);
       pendingKeys.add(key);
-      void api<IntakeIdentityReview>(
-        `/intakes/${encodeURIComponent(report.intakeId)}/identity-review?groupId=${encodeURIComponent(report.groupId)}`,
-        { signal: controller.signal },
-      )
-        .then(({ data: review }) => {
-          pendingKeys.delete(key);
-          if (!live || identityLoads.current.get(key) !== signature) return;
-          if (!review.evidencedIdentity || typeof review.blocking !== 'boolean')
-            throw new Error('Identity response did not match the requested report.');
-          setIdentities((current) => new Map(current).set(key, review));
-          const hasBlocked = data.records.some(
-            (row) =>
-              row.intakeId === report.intakeId &&
-              row.groupId === report.groupId &&
-              (row.detail.kind === 'reference' || row.detail.record.identityReview?.blocking),
-          );
-          // The same verified scope refreshes once even when an unrelated blocker remains.
-          const refreshKey = JSON.stringify([
-            identityProfile,
-            (review.scopeReference || review.scope)?.scopeToken,
-          ]);
-          if (
-            hasBlocked &&
-            hostGroundedIdentity(review) &&
-            identityRefreshes.current.get(key) !== refreshKey
-          ) {
-            identityRefreshes.current.set(key, refreshKey);
-            page.reload();
-          }
-        })
-        .catch(() => {
-          if (live && identityLoads.current.get(key) === signature)
-            identityLoads.current.delete(key);
-        });
+      const previous = identityLanes.get(report.intakeId) || Promise.resolve();
+      const next = previous.then(() => {
+        if (!live || controller.signal.aborted || identityLoads.current.get(key) !== signature)
+          return;
+        return api<IntakeIdentityReview>(
+          `/intakes/${encodeURIComponent(report.intakeId)}/identity-review?groupId=${encodeURIComponent(report.groupId)}`,
+          { signal: controller.signal },
+        )
+          .then(({ data: review }) => {
+            pendingKeys.delete(key);
+            if (!live || identityLoads.current.get(key) !== signature) return;
+            if (!review.evidencedIdentity || typeof review.blocking !== 'boolean')
+              throw new Error('Identity response did not match the requested report.');
+            setIdentities((current) => new Map(current).set(key, review));
+            const hasBlocked = data.records.some(
+              (row) =>
+                row.intakeId === report.intakeId &&
+                row.groupId === report.groupId &&
+                (row.detail.kind === 'reference' || row.detail.record.identityReview?.blocking),
+            );
+            // The same verified scope refreshes once even when an unrelated blocker remains.
+            const refreshKey = JSON.stringify([
+              identityProfile,
+              (review.scopeReference || review.scope)?.scopeToken,
+            ]);
+            if (
+              hasBlocked &&
+              hostGroundedIdentity(review) &&
+              identityRefreshes.current.get(key) !== refreshKey
+            ) {
+              identityRefreshes.current.set(key, refreshKey);
+              page.reload();
+            }
+          })
+          .catch(() => {
+            if (live && identityLoads.current.get(key) === signature)
+              identityLoads.current.delete(key);
+          });
+      });
+      identityLanes.set(report.intakeId, next);
     }
     return () => {
       live = false;

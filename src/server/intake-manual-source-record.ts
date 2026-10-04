@@ -34,7 +34,7 @@ import { workflowHash } from './intake-workflow.ts';
 import { intakeSourceMetadata } from './intake-state-access.ts';
 import { openIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import {
-  prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
 import { readSelectedManualSourceReceipt } from './intake-manual-receipt.ts';
@@ -372,7 +372,13 @@ export async function createManualSourceRecordRead(
     proposalId = identity.value;
   }
   await prepareCollectionClinicalReviewDependencies(db, root, profileId, intakeId, proposalId);
-  const reviewed = prepareCollectionClinicalReview(db, root, profileId, intakeId, proposalId);
+  const reviewed = await prepareCollectionClinicalReviewAsync(
+    db,
+    root,
+    profileId,
+    intakeId,
+    proposalId,
+  );
   if (reviewed.status !== 'ready')
     throw new HttpError(
       409,

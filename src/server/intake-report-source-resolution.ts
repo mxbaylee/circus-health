@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 /** Complete selected source receipt resolution; read paths never build missing authority indexes. */
 import type { Database } from './database.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -86,12 +87,12 @@ const read = <T>(map: ReportSnapshotMapReader, key: string): T => {
     throw Error('Source resolution selected value is unavailable');
   return JSON.parse(value) as T;
 };
-function resolveSelectedReportSource(
+function* resolveSelectedReportSourceWork(
   db: Database,
   source: IntakeEnvelopeSource,
   input: NativeReportSourceRequest,
   providerId?: string,
-): ResolvedNativeReportSource | null {
+): Generator<void, ResolvedNativeReportSource | null, void> {
   const view = openIntakeCollectionEnvelope(db, source),
     intake = view.child(view.root(), 'intake'),
     workflow = intake && view.child(intake, 'workflow');
@@ -153,6 +154,7 @@ function resolveSelectedReportSource(
     );
     const add = spool.db.prepare('INSERT OR IGNORE INTO refs VALUES(?,?)');
     for (const ref of input.references()) {
+      yield;
       catalog.assertCurrent();
       add.run(ref.groupId, ref.groupVersionId);
     }
@@ -165,14 +167,15 @@ function resolveSelectedReportSource(
       !!spool.db
         .prepare('SELECT 1 FROM refs WHERE group_id=? AND version_id=?')
         .get(groupId, versionId);
-    const select = (
+    const select = function* (
       header: ReportSourceConfirmationHeader,
       state: ReportSnapshotMapReader,
-    ): NativeSourceCoverage | undefined => {
+    ): Generator<void, NativeSourceCoverage | undefined, void> {
       const lookup = readSourceResolutionIndex(required(state, 'resolution'));
       if (header.basis === 'explicit_current_members' && occurrence) {
         let original: SourceCoverageTarget | undefined, extension: SourceCoverageTarget | undefined;
         for (const ref of refs()) {
+          yield;
           const selected = lookup.coverage(
             {
               groupId: ref.group_id,
@@ -212,7 +215,8 @@ function resolveSelectedReportSource(
       for (const ref of spool.db
         .prepare('SELECT version_id FROM refs WHERE group_id=?')
         .iterate(header.groupId) as Iterable<{ version_id: string }>) {
-        const found = lookup.extension(ref.version_id, input);
+        yield;
+        const found = yield* lookup.extensionWork(ref.version_id, input);
         if (found && (!extension || found.ordinal > extension.ordinal)) extension = found;
       }
       return extension
@@ -227,12 +231,14 @@ function resolveSelectedReportSource(
     for (const group of spool.db
       .prepare('SELECT DISTINCT group_id FROM refs')
       .iterate() as Iterable<{ group_id: string }>) {
+      yield;
       const pointers = index.reference(
         'r:' + schemaKey(group.group_id, input.candidateId, input.candidateVersionId),
       );
       if (!pointers) continue;
       let before = 'd';
       do {
+        yield;
         catalog.assertCurrent();
         const pointer = pointers.preceding(before);
         if (!pointer || !pointer.key.startsWith('c:')) break;
@@ -255,7 +261,7 @@ function resolveSelectedReportSource(
           throw Error('Source resolution receipt binding mismatch');
         const confirmation = openReportSourceState(catalog, view, record, indexed.state),
           state = catalog.open(indexed.state.snapshotId)!,
-          coverage = select(confirmation.header, state);
+          coverage = yield* select(confirmation.header, state);
         if (
           !coverage ||
           (providerId !== undefined && confirmation.header.sourceProviderId !== providerId)
@@ -288,7 +294,14 @@ export function resolveNativeReportSource(
   source: IntakeEnvelopeSource,
   input: NativeReportSourceRequest,
 ): ResolvedNativeReportSource | null {
-  return resolveSelectedReportSource(db, source, input);
+  return finishClinicalReviewWork(resolveNativeReportSourceWork(db, source, input));
+}
+export function* resolveNativeReportSourceWork(
+  db: Database,
+  source: IntakeEnvelopeSource,
+  input: NativeReportSourceRequest,
+): Generator<void, ResolvedNativeReportSource | null, void> {
+  return yield* resolveSelectedReportSourceWork(db, source, input);
 }
 /** Every prior explicit receipt remains an eligible authorization at its own retained prefix. */
 export function hasHistoricalReportSourceProvider(
@@ -297,5 +310,8 @@ export function hasHistoricalReportSourceProvider(
   input: NativeReportSourceRequest,
   providerId: string,
 ): boolean {
-  return resolveSelectedReportSource(db, source, input, providerId) !== null;
+  return (
+    finishClinicalReviewWork(resolveSelectedReportSourceWork(db, source, input, providerId)) !==
+    null
+  );
 }

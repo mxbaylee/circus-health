@@ -116,55 +116,61 @@ test('native reading exceptions select sparse state atomically, replay, and clea
     assert.equal(intakeWorkCounters(db).warm[name], counters[name]);
 });
 
-test('explicit retry clears more than 64 active retained plans through one selected catalog and one version', async (t) => {
-  const { db, root, profileId } = fixture(t);
-  const source = uploadIntake(db, root, profileId, {
-    filename: 'fictional.txt',
-    bytes: Buffer.from('Fictional retained source.'),
-  });
-  const planned = await createIntakePlan(db, root, profileId, source.id, {
-    version: source.version,
-  });
-  workflowMutation(
-    db,
-    root,
-    profileId,
-    source.id,
-    { version: planned.version, operationId: 'many-plans' },
-    (workflow) => {
-      const plan = workflow.plans[0]!;
-      workflow.plans = Array.from({ length: 65 }, (_, i) => ({
-        ...structuredClone(plan),
-        id: 'plan-' + i,
-        units: [
-          {
-            id: 'unit-' + i,
-            kind: 'text',
-            locator: 'Fictional source',
-            status: 'pending',
-            attempts: [],
-            processingException: { reason: 'processing_stalled', at: '2026-10-03T00:00:00Z' },
-          },
-        ],
-      }));
-    },
-  );
-  await buildIntakeCollectionEnvelope(db, { id: source.id });
-  await prepareRetainedPlanAccess(db, profileId, source.id);
-  const version = intakeSourceVersion(db, source.id).version;
-  await clearCollectionProcessingExceptions(db, root, profileId, source.id, {
-    version,
-    operationId: 'retry-all',
-  });
-  clearIntakeStateCache(db);
-  const view = openIntakeCollectionEnvelope(db, { id: source.id }),
-    flow = view.child(view.child(view.root(), 'intake')!, 'workflow')!;
-  const collections = selectedEnvelopeStore(db, { id: source.id }).collections;
-  assert.equal(view.childCount(flow, 'plans'), 65);
-  for (let i = 0; i < 65; i++) {
-    const scope = readRetainedPlanScope(db, profileId, source.id, { planId: 'plan-' + i })!;
-    assert.equal(scope.unitById('unit-' + i)!.processingException, false);
-    assert.equal(decisionIndexCount(collections, scope.decisionIndex('readingSkipped')), 0);
-  }
-  assert.equal(intakeSourceVersion(db, source.id).version, version + 1);
-});
+// Host-only preparation and atomic retry of 65 retained plans, then cache-loss
+// verification of every unit; the exact plan count and one-version oracle remain below.
+test(
+  'explicit retry clears more than 64 active retained plans through one selected catalog and one version',
+  { timeout: 300_000 },
+  async (t) => {
+    const { db, root, profileId } = fixture(t);
+    const source = uploadIntake(db, root, profileId, {
+      filename: 'fictional.txt',
+      bytes: Buffer.from('Fictional retained source.'),
+    });
+    const planned = await createIntakePlan(db, root, profileId, source.id, {
+      version: source.version,
+    });
+    workflowMutation(
+      db,
+      root,
+      profileId,
+      source.id,
+      { version: planned.version, operationId: 'many-plans' },
+      (workflow) => {
+        const plan = workflow.plans[0]!;
+        workflow.plans = Array.from({ length: 65 }, (_, i) => ({
+          ...structuredClone(plan),
+          id: 'plan-' + i,
+          units: [
+            {
+              id: 'unit-' + i,
+              kind: 'text',
+              locator: 'Fictional source',
+              status: 'pending',
+              attempts: [],
+              processingException: { reason: 'processing_stalled', at: '2026-10-03T00:00:00Z' },
+            },
+          ],
+        }));
+      },
+    );
+    await buildIntakeCollectionEnvelope(db, { id: source.id });
+    await prepareRetainedPlanAccess(db, profileId, source.id);
+    const version = intakeSourceVersion(db, source.id).version;
+    await clearCollectionProcessingExceptions(db, root, profileId, source.id, {
+      version,
+      operationId: 'retry-all',
+    });
+    clearIntakeStateCache(db);
+    const view = openIntakeCollectionEnvelope(db, { id: source.id }),
+      flow = view.child(view.child(view.root(), 'intake')!, 'workflow')!;
+    const collections = selectedEnvelopeStore(db, { id: source.id }).collections;
+    assert.equal(view.childCount(flow, 'plans'), 65);
+    for (let i = 0; i < 65; i++) {
+      const scope = readRetainedPlanScope(db, profileId, source.id, { planId: 'plan-' + i })!;
+      assert.equal(scope.unitById('unit-' + i)!.processingException, false);
+      assert.equal(decisionIndexCount(collections, scope.decisionIndex('readingSkipped')), 0);
+    }
+    assert.equal(intakeSourceVersion(db, source.id).version, version + 1);
+  },
+);

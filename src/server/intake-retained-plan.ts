@@ -24,6 +24,7 @@ import { selectedReadingStateIndex, type IntakeDecisionIndex } from './intake-re
 import { workflowHash } from './intake-workflow.ts';
 import { recordCollectionReaderCoverageTransition } from './intake-source-reader-index.ts';
 import { schemaOrdinal } from './intake-envelope-schema.ts';
+import { HEAD_BYTES } from './intake-state-evidence.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import type { IntakeEnvelopeDerivedPreparation } from './intake-envelope-mutation.ts';
@@ -573,6 +574,30 @@ export function readRetainedPlanScope(
   };
   return {
     format: 'health-intake-retained-expanded-plan-v1' as const,
+    /** Conservative encoded footprint of the captured context, not unit/history
+     * data. Source/binding strings occur in the context and checked schema
+     * reader closures; the allowance covers their copies and bounded heads.
+     * Page providers retain only prefixes/counts. Shared storage caches have
+     * their own bounds. Extend this accounting if a closure starts retaining
+     * decoded collection values or a new variable-sized descriptor. */
+    retainedMetadataBytes() {
+      ctx.assertCurrent();
+      return (
+        4 *
+          Buffer.byteLength(
+            JSON.stringify({
+              source: ctx.source,
+              version: ctx.version,
+              logical: view.logical,
+              name,
+              address,
+              planId,
+              prefix,
+            }),
+          ) +
+        4 * HEAD_BYTES
+      );
+    },
     planId,
     record,
     reader: view,

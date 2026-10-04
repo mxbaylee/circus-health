@@ -39,3 +39,9 @@ export function registerReviewRecordField(
     yield '}';
   });
 }
+
+/** Transfer selected canonical fields when policy detaches a presentation object. */
+export function copyReviewRecordFields(source: object, target: object): void {
+  for (const [field, selected] of fields.get(source) || [])
+    registerReviewRecordField(target, field, selected.transport, selected.chunks);
+}

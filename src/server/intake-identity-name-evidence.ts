@@ -4,13 +4,18 @@ import { DatabaseSync } from 'node:sqlite';
 import { canonicalIdentityName } from '../shared/self-identity.ts';
 import type { IntakeReviewIssue } from '../shared/intake.ts';
 import type { BirthDateEvidence } from './intake-evidence-dates.ts';
-import { collectEvidencedIdentity, printedIdentityName } from './intake-identity-policy.ts';
+import {
+  collectEvidencedIdentity,
+  collectEvidencedIdentityWork,
+  printedIdentityName,
+} from './intake-identity-policy.ts';
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { registerReviewRecordField } from './intake-review-selected-record.ts';
 
-type Claims = () => Iterable<Pick<IntakeReviewIssue, 'selfSuggestion'>>;
+type Claims = () => Iterable<Pick<IntakeReviewIssue, 'selfSuggestion'> | undefined>;
 
 /** Scratch preserves first occurrence order and never becomes recovery authority. */
-function* names(claims: Claims): Generator<string> {
+function* names(claims: Claims): Generator<string | undefined> {
   const scratch = new DatabaseSync('');
   try {
     scratch.exec('PRAGMA temp_store=FILE; PRAGMA cache_size=-1024');
@@ -18,7 +23,8 @@ function* names(claims: Claims): Generator<string> {
     const insert = scratch.prepare('INSERT OR IGNORE INTO names VALUES(?,?,?)');
     let ordinal = 0;
     for (const issue of claims()) {
-      const raw = issue.selfSuggestion?.fullName;
+      yield undefined;
+      const raw = issue?.selfSuggestion?.fullName;
       const value = typeof raw === 'string' ? raw.trim() : '';
       if (value && printedIdentityName(value) === value)
         insert.run(canonicalIdentityName(value), ordinal++, value);
@@ -34,6 +40,10 @@ function* canonicalNames(claims: Claims): Generator<string> {
   yield '"';
   let first = true;
   for (const name of names(claims)) {
+    if (name === undefined) {
+      yield '';
+      continue;
+    }
     if (!first) yield ' / ';
     first = false;
     yield JSON.stringify(name).slice(1, -1);
@@ -43,14 +53,19 @@ function* canonicalNames(claims: Claims): Generator<string> {
 
 /** Native consumers retain a repeatable source for the exact complete conflict commitment. */
 export function collectSelectedEvidencedIdentity(
+  ...input: Parameters<typeof collectSelectedEvidencedIdentityWork>
+): ReturnType<typeof collectEvidencedIdentity> {
+  return finishClinicalReviewWork(collectSelectedEvidencedIdentityWork(...input));
+}
+export function* collectSelectedEvidencedIdentityWork(
   claims: Claims,
   subjectText?: string | null,
   original: BirthDateEvidence = { dates: [], unreadable: false },
-): ReturnType<typeof collectEvidencedIdentity> {
+): Generator<void, ReturnType<typeof collectEvidencedIdentity>, void> {
   // A printed boundary admits only that one canonical name. The established
   // collector is already bounded in this case, including contradictory hints.
   if (subjectText !== undefined && subjectText !== null)
-    return collectEvidencedIdentity(claims(), subjectText, original);
+    return yield* collectEvidencedIdentityWork(claims(), subjectText, original);
   let first: string | undefined,
     second: string | undefined,
     count = 0,
@@ -59,6 +74,8 @@ export function collectSelectedEvidencedIdentity(
     included = true;
   const hash = createHash('sha256').update('"');
   for (const name of names(claims)) {
+    yield;
+    if (name === undefined) continue;
     first ??= name;
     if (count === 1) second = name;
     const separator = count ? ' / ' : '';

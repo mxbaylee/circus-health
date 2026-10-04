@@ -1,3 +1,5 @@
+import { disposableSqlite } from './disposable-sqlite.ts';
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import {
   ownershipIdentityIssueIncluded,
   type OwnershipIdentityIssues,
@@ -7,7 +9,7 @@ import { selectedSequence } from './intake-selected-sequence.ts';
 import {
   ownershipSortedValues,
   ownershipDistinctValues,
-  ownershipHoldMessage,
+  ownershipHoldMessageWork,
   bindOwnershipHoldMessage,
 } from './ownership-identity-values.ts';
 import { selectedReportGroups } from './intake-selected-report-groups.ts';
@@ -139,6 +141,25 @@ export function identityBeforeOwnershipHold(record: IntakeReviewRecord) {
 }
 export interface SelectedOwnershipReviewScope {
   readonly intakeVersion: number;
+  remainingWork?(
+    groupId: string,
+    selectedSources: ReadonlySet<string>,
+  ): Generator<void, boolean, void>;
+  lastConfirmationWork?(
+    groupId: string,
+    personId: string,
+  ): Generator<void, import('./intake-identity-policy.ts').IdentityPolicyReceipt | undefined, void>;
+  firstGroupWork?(
+    references: NonNullable<IntakeReviewRecord['reportGroups']>,
+  ): Generator<void, import('./intake-workflow.ts').WorkflowReviewGroup | undefined, void>;
+  confirmationWork?(
+    operationId: string | undefined,
+  ): Generator<void, import('./intake-identity-policy.ts').IdentityPolicyReceipt | undefined, void>;
+  competingWork?(
+    group: import('./intake-workflow.ts').WorkflowReviewGroup,
+  ): Generator<void, boolean, void>;
+  blockerSink?(): { add(value: string): void; values(): Iterable<string> };
+
   remaining(groupId: string, selectedSources: ReadonlySet<string>): boolean;
   lastConfirmation(
     groupId: string,
@@ -154,110 +175,148 @@ export interface SelectedOwnershipReviewScope {
     operationId: string | undefined,
   ): import('./intake-identity-policy.ts').IdentityPolicyReceipt | undefined;
   competing(group: import('./intake-workflow.ts').WorkflowReviewGroup): boolean;
+  birthDatesWork?(
+    group: import('./intake-workflow.ts').WorkflowReviewGroup,
+  ): Generator<void, import('./intake-evidence-dates.ts').BirthDateEvidence | undefined, void>;
   birthDates(
     group: import('./intake-workflow.ts').WorkflowReviewGroup,
   ): import('./intake-evidence-dates.ts').BirthDateEvidence | undefined;
 }
 /** Recheck original evidence and current refusal independently of the former person's receipt. */
 export function ownershipIdentityBlockers(
+  ...args: Parameters<typeof ownershipIdentityBlockersWork>
+) {
+  return selectedSequence(function* () {
+    for (const value of ownershipIdentityBlockersWork(...args))
+      if (value !== undefined) yield value;
+  });
+}
+export function* ownershipIdentityBlockersWork(
+  ...args: Parameters<typeof ownershipIdentityBlockerSteps>
+): Generator<void | string, void, void> {
+  const scratch = disposableSqlite('circus-ownership-blockers-');
+  try {
+    scratch.db.exec('CREATE TABLE values_(value TEXT PRIMARY KEY)');
+    const put = scratch.db.prepare('INSERT OR IGNORE INTO values_ VALUES(?)');
+    for (const value of ownershipIdentityBlockerSteps(...args)) {
+      if (value === undefined) yield;
+      else if (put.run(value).changes) yield value;
+    }
+  } finally {
+    scratch.close();
+  }
+}
+function* ownershipIdentityBlockerSteps(
   db: Database,
   intakeId: string,
   record: IntakeReviewRecord,
   destinationBirthDate: string | null | undefined,
   selected?: SelectedOwnershipReviewScope,
-) {
-  return ownershipDistinctValues(function* () {
-    const file = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(intakeId);
-    if (!file) {
-      yield 'The retained original is unavailable.';
-      return;
-    }
-    const workflow = selected ? undefined : readStoredIntakeDetails(db, intakeId)?.workflow;
-    const groups = selectedReportGroups(record.reportGroups);
-    const current = identityBeforeOwnershipHold(record);
-    for (const issue of reviewRecordIssues(record))
-      if (
-        issue.kind === 'identity' &&
-        issue.blocking &&
-        issue.status !== 'resolved' &&
-        (issue.textAnchor ||
-          issue.questionId ||
-          !['Does this record belong to you?', current?.message].includes(issue.prompt))
-      )
-        yield 'Answer the report identity question before changing person: ' + issue.prompt;
+): Generator<void | string, void, void> {
+  const file = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(intakeId);
+  if (!file) {
+    yield 'The retained original is unavailable.';
+    return;
+  }
+  const workflow = selected ? undefined : readStoredIntakeDetails(db, intakeId)?.workflow;
+  const groups = selectedReportGroups(record.reportGroups);
+  const current = identityBeforeOwnershipHold(record);
+  for (const issue of reviewRecordIssues(record)) {
+    yield;
     if (
-      reviewRecordIssues(record).some(
-        (i) =>
-          i.kind === 'identity' &&
-          ['unknown', 'other_person'].includes(String(i.resolution?.outcome)),
-      )
+      issue.kind === 'identity' &&
+      issue.blocking &&
+      issue.status !== 'resolved' &&
+      (issue.textAnchor ||
+        issue.questionId ||
+        !['Does this record belong to you?', current?.message].includes(issue.prompt))
     )
+      yield 'Answer the report identity question before changing person: ' + issue.prompt;
+  }
+  for (const issue of reviewRecordIssues(record)) {
+    yield;
+    if (
+      issue.kind === 'identity' &&
+      ['unknown', 'other_person'].includes(String(issue.resolution?.outcome))
+    ) {
       yield 'Resolve the explicit identity refusal before changing person.';
-    for (const ref of groups) {
-      const group = selected
-        ? selected.group(ref.groupId)
-        : workflow?.reportGroups?.find((g) => g.id === ref.groupId);
-      if (!group || (!workflow && !selected)) {
-        yield 'The report boundary changed.';
-        continue;
-      }
-      if (group.basis !== 'report_anchor' || !group.report?.subject) {
-        const before = identityBeforeOwnershipHold(record);
-        if (before?.blocking) yield before.message;
-        if (
-          destinationBirthDate &&
-          before?.evidencedIdentity.birthDate &&
-          !compatibleIdentityBirthDates(before.evidencedIdentity.birthDate, destinationBirthDate)
-        )
-          yield 'The verified source birth date conflicts with the destination.';
-        continue;
-      }
-      if (
-        selected
-          ? selected.competing(group)
-          : competingIdentityBoundaries(group as IntakeReportGroup, workflow!.reportGroups || [])
-              .length
-      )
-        yield 'Resolve competing report identity boundaries before changing person.';
-      const dates = selected
-        ? selected.birthDates(group)
-        : identityOriginalBirthDateEvidenceLookup(db, {
-            profileId: String(
-              db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value,
-            ),
-            intakeId,
-            sourceHash: String(file.sha256),
-            workflow: workflow!,
-          })(group as IntakeReportGroup);
-      if (!dates) yield 'Open the original identity review before changing person.';
-      else if (dates.unreadable || dates.dates.length > 1)
-        yield 'Review the ambiguous printed birth date before changing person.';
-      else if (
-        destinationBirthDate &&
-        dates.dates.some((d) => !compatibleIdentityBirthDates(d, destinationBirthDate))
-      )
-        yield 'The verified source birth date conflicts with the destination. Ordinary ownership correction cannot resolve this discrepancy.';
+      break;
     }
-    const before = identityBeforeOwnershipHold(record);
-    if (!groups.some(() => true) && before?.blocking) yield before.message;
+  }
+  for (const ref of groups) {
+    yield;
+    const group = selected
+      ? selected.group(ref.groupId)
+      : workflow?.reportGroups?.find((g) => g.id === ref.groupId);
+    if (!group || (!workflow && !selected)) {
+      yield 'The report boundary changed.';
+      continue;
+    }
+    if (group.basis !== 'report_anchor' || !group.report?.subject) {
+      const before = identityBeforeOwnershipHold(record);
+      if (before?.blocking) yield before.message;
+      if (
+        destinationBirthDate &&
+        before?.evidencedIdentity.birthDate &&
+        !compatibleIdentityBirthDates(before.evidencedIdentity.birthDate, destinationBirthDate)
+      )
+        yield 'The verified source birth date conflicts with the destination.';
+      continue;
+    }
     if (
-      !groups.some(() => true) &&
-      destinationBirthDate &&
-      before?.evidencedIdentity.birthDate &&
-      !compatibleIdentityBirthDates(before.evidencedIdentity.birthDate, destinationBirthDate)
+      selected
+        ? selected.competingWork
+          ? yield* selected.competingWork(group)
+          : selected.competing(group)
+        : competingIdentityBoundaries(group as IntakeReportGroup, workflow!.reportGroups || [])
+            .length
     )
-      yield 'The verified source birth date conflicts with the destination.';
-  });
+      yield 'Resolve competing report identity boundaries before changing person.';
+    const dates = selected
+      ? selected.birthDatesWork
+        ? yield* selected.birthDatesWork(group)
+        : selected.birthDates(group)
+      : identityOriginalBirthDateEvidenceLookup(db, {
+          profileId: String(
+            db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value,
+          ),
+          intakeId,
+          sourceHash: String(file.sha256),
+          workflow: workflow!,
+        })(group as IntakeReportGroup);
+    if (!dates) yield 'Open the original identity review before changing person.';
+    else if (dates.unreadable || dates.dates.length > 1)
+      yield 'Review the ambiguous printed birth date before changing person.';
+    else if (
+      destinationBirthDate &&
+      dates.dates.some((d) => !compatibleIdentityBirthDates(d, destinationBirthDate))
+    )
+      yield 'The verified source birth date conflicts with the destination. Ordinary ownership correction cannot resolve this discrepancy.';
+  }
+  const before = identityBeforeOwnershipHold(record);
+  if (!groups.some(() => true) && before?.blocking) yield before.message;
+  if (
+    !groups.some(() => true) &&
+    destinationBirthDate &&
+    before?.evidencedIdentity.birthDate &&
+    !compatibleIdentityBirthDates(before.evidencedIdentity.birthDate, destinationBirthDate)
+  )
+    yield 'The verified source birth date conflicts with the destination.';
 }
 /** A correction is current assignment authority only within its exact retained source boundary. */
 export function requireCorrectedOwnershipReview(
+  ...args: Parameters<typeof requireCorrectedOwnershipReviewWork>
+) {
+  return finishClinicalReviewWork(requireCorrectedOwnershipReviewWork(...args));
+}
+export function* requireCorrectedOwnershipReviewWork(
   db: Database,
   record: IntakeReviewRecord,
   identity: string,
   file?: { id: string; sha256: string; details_json?: string },
   workflow?: IntakeWorkflow,
   selected?: SelectedOwnershipReviewScope,
-) {
+): Generator<void, void, void> {
   // A complete current index can prove that there is no correction authority.
   // Missing preparation supplies no absence answer; damaged/stale indexes refuse.
   if (selected && ownershipDecisionQueries(db)?.hasAssignmentPolicy() === false) return;
@@ -265,7 +324,9 @@ export function requireCorrectedOwnershipReview(
     workflow = readStoredIntakeDetails(db, file.id)?.workflow;
   const source = ownershipSourceAuthority(db, identity);
   const group = selected
-    ? selected.firstGroup(record.reportGroups || [])
+    ? selected.firstGroupWork
+      ? yield* selected.firstGroupWork(record.reportGroups || [])
+      : selected.firstGroup(record.reportGroups || [])
     : workflow?.reportGroups?.find((g) =>
         selectedReportGroups(record.reportGroups).some((r) => r.groupId === g.id),
       );
@@ -308,7 +369,9 @@ export function requireCorrectedOwnershipReview(
   const before = identityBeforeOwnershipHold(record);
   // A new explicit confirmation can replace the challenged default after ordinary scope checks.
   const confirmation = selected
-    ? selected.confirmation(record.identityAttribution?.confirmationOperationId)
+    ? selected.confirmationWork
+      ? yield* selected.confirmationWork(record.identityAttribution?.confirmationOperationId)
+      : selected.confirmation(record.identityAttribution?.confirmationOperationId)
     : workflow?.identityConfirmations?.find(
         (r) => r.operationId === record.identityAttribution?.confirmationOperationId,
       );
@@ -334,26 +397,61 @@ export function requireCorrectedOwnershipReview(
       /* unavailable destination remains held */
     }
   }
-  const blockerValues = selectedSequence(function* () {
+  const blockerWork = function* (): Generator<void | string, void, void> {
     if (authority) {
       if (!person || person.archived || person.personId !== authority.personId)
         yield 'Choose an available destination person.';
       else {
-        yield* ownershipIdentityBlockers(db, file!.id, record, person.person.birthDate, selected);
-        if (
-          ownershipIdentityIssues(record).some(
-            (issue) => !ownershipIdentityIssueIncluded(db, authority.identityIssues, issue),
-          )
-        )
-          yield 'New identity evidence or a question needs explicit report review.';
+        yield* ownershipIdentityBlockersWork(
+          db,
+          file!.id,
+          record,
+          person.person.birthDate,
+          selected,
+        );
+        for (const issue of reviewRecordIssues(record)) {
+          yield;
+          if (
+            issue.kind === 'identity' &&
+            (issue.textAnchor ||
+              issue.questionId ||
+              issue.resolution?.outcome === 'unknown' ||
+              issue.resolution?.outcome === 'other_person') &&
+            !ownershipIdentityIssueIncluded(
+              db,
+              authority.identityIssues,
+              ownershipHash([
+                issue.prompt,
+                issue.textAnchor,
+                issue.questionId,
+                issue.resolution?.outcome,
+              ]),
+            )
+          ) {
+            yield 'New identity evidence or a question needs explicit report review.';
+            break;
+          }
+        }
       }
     } else
       yield reportHold
         ? 'A selected record contradicted the earlier report assignment; review this report’s person again.'
         : 'The corrected source or report boundary changed; review its identity again.';
-  });
+  };
+  const sink = selected?.blockerSink?.();
+  if (sink) {
+    for (const value of blockerWork()) {
+      if (value !== undefined) sink.add(value);
+      yield;
+    }
+  }
+  const blockerValues = sink
+    ? selectedSequence(() => sink.values())
+    : ownershipDistinctValues(function* () {
+        for (const value of blockerWork()) if (value !== undefined) yield value;
+      });
   if (!authority || !person || blockerValues.some(() => true)) {
-    const message = ownershipHoldMessage(() => blockerValues);
+    const message = yield* ownershipHoldMessageWork(() => blockerValues);
     delete record.identityAttribution;
     delete record.mapping.personId;
     record.mapping.subject = 'unknown';
@@ -400,11 +498,13 @@ export function requireCorrectedOwnershipReview(
   };
   record.mapping.personId = authority.personId === 'patient' ? undefined : authority.personId;
   record.mapping.subject = authority.personId === 'patient' ? 'self' : 'other';
-  for (const issue of reviewRecordIssues(record))
+  for (const issue of reviewRecordIssues(record)) {
+    yield;
     if (issue.kind === 'identity') {
       issue.blocking = false;
       issue.status = 'resolved';
     }
+  }
   holds.delete(record);
 }
 

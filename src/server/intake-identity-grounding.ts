@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { observeDatabaseClose } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
 import type { BirthDateEvidence } from './intake-evidence-dates.ts';
 import {
   identityOriginalFingerprint,
@@ -26,8 +28,9 @@ const hash = (value: unknown) => createHash('sha256').update(canonicalLiteral(va
 // Ephemeral original-grounding cache, never recovery authority. No page text is retained.
 // Labelled DOB facts, including whether a printed DOB label was unreadable, are
 // re-derived from the exact original after a cold restart.
-// Each unlocked database owns at most 256 scopes, each with at most 100 exact
-// question/receipt proofs. Reopening/rebuilding uses a new database and rechecks
+// Each unlocked database owns at most 256 scopes. Legacy scopes retain at most
+// 100 exact question/receipt proofs; native scopes keep complete proofs on disk.
+// Reopening/rebuilding uses a new database and rechecks
 // the scoped original through the existing asynchronous identity review.
 interface Grounding {
   intakeId: string;
@@ -291,6 +294,9 @@ export interface SelectedIdentityGroundingBoundary {
   sourceHash: string;
   originalFingerprint(group: import('./intake-workflow.ts').WorkflowReviewGroup): string;
   boundaryFingerprint(group: import('./intake-workflow.ts').WorkflowReviewGroup): string;
+  boundaryFingerprintWork?(
+    group: import('./intake-workflow.ts').WorkflowReviewGroup,
+  ): Generator<void, string, void>;
 }
 const selectedOriginalDateKey = (
   boundary: SelectedIdentityGroundingBoundary,
@@ -372,7 +378,78 @@ export function retainSelectedIdentityGrounding(
     if (!next || grounded.get(db)?.get(key) !== next) dispose();
   }
 }
-/** Discard before writes/awaits. Exact source dates survive membership changes; question proofs do not. */
+/** Native preparation owns isolated scratch across guarded turns. Publication is
+ * one synchronous memory transition; no main database transaction or proof-row
+ * write crosses a yield. Legacy callers retain their synchronous SQL wrapper. */
+export function* retainSelectedIdentityGroundingWork(
+  db: DatabaseSync,
+  boundary: SelectedIdentityGroundingBoundary,
+  group: import('./intake-workflow.ts').WorkflowReviewGroup,
+  questions: Iterable<{ issue: Question; receipt: IdentityGroundingReceipt }>,
+  verifiedSubject = false,
+  verifiedNameQuestions: Iterable<Question> = [],
+  birthDates: BirthDateEvidence = { dates: [], unreadable: false },
+): Generator<void, void, void> {
+  const generation = identityGroundingGeneration(db);
+  const assertCurrent = () => {
+    if (!db.isOpen || identityGroundingGeneration(db) !== generation)
+      throw Error('Identity grounding snapshot changed');
+  };
+  assertCurrent();
+  const key = selectedOriginalDateKey(boundary, group);
+  const selectedBoundary = boundary.boundaryFingerprintWork
+    ? yield* boundary.boundaryFingerprintWork(group)
+    : boundary.boundaryFingerprint(group);
+  assertCurrent();
+  const dates = structuredClone(birthDates);
+  const scratch = disposableSqlite('intake-grounding-proofs-');
+  let next: Grounding | undefined;
+  try {
+    scratch.db.exec(
+      'CREATE TABLE proofs(kind TEXT,proof TEXT,PRIMARY KEY(kind,proof)) WITHOUT ROWID',
+    );
+    const add = scratch.db.prepare('INSERT OR IGNORE INTO proofs VALUES(?,?)');
+    for (const { issue, receipt } of questions) {
+      add.run('question', questionKey(issue, receipt));
+      yield;
+    }
+    for (const issue of verifiedNameQuestions) {
+      add.run('name', hash([issue.prompt, issue.textAnchor]));
+      yield;
+    }
+    const digest = createHash('sha256').update(
+      canonicalLiteral([selectedBoundary, verifiedSubject, dates]),
+    );
+    for (const row of scratch.db
+      .prepare('SELECT kind,proof FROM proofs ORDER BY kind,proof')
+      .iterate()) {
+      digest.update('\n' + String(row.kind) + ':' + String(row.proof));
+      yield;
+    }
+    assertCurrent();
+    const proofs = (kind: string) => ({
+      has: (proof: string) =>
+        !!scratch.db.prepare('SELECT 1 FROM proofs WHERE kind=? AND proof=?').get(kind, proof),
+    });
+    next = {
+      intakeId: boundary.intakeId,
+      semanticFingerprint: digest.digest('hex'),
+      boundaryKey: selectedBoundary,
+      questions: proofs('question'),
+      subject: verifiedSubject,
+      nameQuestions: proofs('name'),
+      birthDates: dates,
+      dispose: scratch.close,
+    };
+    publishGrounding(db, key, next);
+  } finally {
+    // Cancellation, iterator failure, drift and identical publication dispose
+    // only this unpublished staging database. The prior complete proof survives.
+    if (!next || grounded.get(db)?.get(key) !== next) scratch.close();
+  }
+}
+/** Guard every asynchronous gap against source/clinical authority. Grounding generation
+ * is also checked before publishing a completed lookup; interrupted work is never memoized. */
 export function selectedIdentityReviewGroundingLookups(
   db: DatabaseSync,
   boundary: SelectedIdentityGroundingBoundary,
@@ -380,36 +457,63 @@ export function selectedIdentityReviewGroundingLookups(
   const generation = identityGroundingGeneration(db);
   type Group = import('./intake-workflow.ts').WorkflowReviewGroup;
   const entries = new WeakMap<Group, { entry?: Grounding; current: boolean }>();
-  const lookup = (group: Group) => {
+  const assertCurrent = () => {
     if (!db.isOpen || identityGroundingGeneration(db) !== generation)
       throw Error('Identity grounding snapshot changed');
+  };
+  function* lookupWork(
+    group: Group,
+  ): Generator<void, { entry?: Grounding; current: boolean }, void> {
+    assertCurrent();
     let value = entries.get(group);
     if (!value) {
       const entry = grounded.get(db)?.get(selectedOriginalDateKey(boundary, group));
       value = {
         entry,
-        current: !!entry && entry.boundaryKey === boundary.boundaryFingerprint(group),
+        current:
+          !!entry &&
+          entry.boundaryKey ===
+            (boundary.boundaryFingerprintWork
+              ? yield* boundary.boundaryFingerprintWork(group)
+              : boundary.boundaryFingerprint(group)),
       };
+      assertCurrent();
       entries.set(group, value);
     }
     return value;
-  };
-  return {
-    subjectGrounded: (group: Group) => {
-      const { entry, current } = lookup(group);
+  }
+  const work = {
+    *subjectGroundedWork(group: Group): Generator<void, boolean, void> {
+      const { entry, current } = yield* lookupWork(group);
       return current && entry?.subject === true;
     },
-    nameQuestionGrounded: (group: Group, issue: Question) => {
-      const { entry, current } = lookup(group);
+    *nameQuestionGroundedWork(group: Group, issue: Question): Generator<void, boolean, void> {
+      const { entry, current } = yield* lookupWork(group);
       return current && entry?.nameQuestions.has(hash([issue.prompt, issue.textAnchor])) === true;
     },
-    grounded: (group: Group, issue: Question, receipt: IdentityGroundingReceipt) => {
-      const { entry, current } = lookup(group);
+    *groundedWork(
+      group: Group,
+      issue: Question,
+      receipt: IdentityGroundingReceipt,
+    ): Generator<void, boolean, void> {
+      const { entry, current } = yield* lookupWork(group);
       return current && entry?.questions.has(questionKey(issue, receipt)) === true;
     },
-    originalBirthDateEvidence: (group: Group) => {
-      const { entry } = lookup(group);
+    *originalBirthDateEvidenceWork(
+      group: Group,
+    ): Generator<void, BirthDateEvidence | undefined, void> {
+      const { entry } = yield* lookupWork(group);
       return entry ? structuredClone(entry.birthDates) : undefined;
     },
+  };
+  return {
+    ...work,
+    subjectGrounded: (group: Group) => finishClinicalReviewWork(work.subjectGroundedWork(group)),
+    nameQuestionGrounded: (group: Group, issue: Question) =>
+      finishClinicalReviewWork(work.nameQuestionGroundedWork(group, issue)),
+    grounded: (group: Group, issue: Question, receipt: IdentityGroundingReceipt) =>
+      finishClinicalReviewWork(work.groundedWork(group, issue, receipt)),
+    originalBirthDateEvidence: (group: Group) =>
+      finishClinicalReviewWork(work.originalBirthDateEvidenceWork(group)),
   };
 }

@@ -1,3 +1,5 @@
+import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
 import type { Database } from './database.ts';
 import { HttpError } from './database.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -62,11 +64,14 @@ export async function readNativeReportSourceReview(
     }),
     scratch = disposableSqlite('circus-source-coverage-');
   let cached:
-    | ReturnType<
-        typeof import('./intake-review-collection-host.ts').prepareCollectionClinicalReview
+    | Awaited<
+        ReturnType<
+          typeof import('./intake-review-collection-host.ts').prepareCollectionClinicalReviewAsync
+        >
       >
     | undefined;
   try {
+    const artifacts = createClinicalReviewArtifactProof(scratch.db, 'clinical_artifacts');
     const pagePin = JSON.stringify([
       scope.scopeToken,
       intakeSourceVersion(db, source.id).logicalBinding,
@@ -79,7 +84,7 @@ export async function readNativeReportSourceReview(
     );
     const targets: IntakeReportSourceReviewTargetV2[] = [],
       sourceEvidence: IntakeReportSourceReviewV2['sourceEvidence']['items'] = [];
-    const { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
+    const { prepareCollectionClinicalReviewAsync, prepareCollectionClinicalReviewDependencies } =
       await import('./intake-review-collection-host.ts');
     let covered = 0,
       index = 0,
@@ -130,7 +135,14 @@ export async function readNativeReportSourceReview(
           entry.proposalId,
           { assertRunning: scope.assertCurrent },
         );
-        cached = prepareCollectionClinicalReview(db, root, profileId, source.id, entry.proposalId);
+        cached = await prepareCollectionClinicalReviewAsync(
+          db,
+          root,
+          profileId,
+          source.id,
+          entry.proposalId,
+          { assertRunning: scope.assertCurrent },
+        );
         cachedProposal = entry.proposalId;
       }
       let detail: IntakeReportSourceReviewTargetV2['detail'] = {
@@ -141,6 +153,7 @@ export async function readNativeReportSourceReview(
         candidateVersionId: entry.candidateVersionId,
       };
       if (cached.status === 'ready') {
+        artifacts.retain(collectionClinicalProjectionContext(cached.session).verifiedArtifacts());
         const record = cached.session.record(
           entry.recordId,
           entry.candidateId,
@@ -202,6 +215,7 @@ export async function readNativeReportSourceReview(
       });
     }
     scope.assertCurrent();
+    artifacts.assertCurrent();
     const total = scope.entryCount;
     return {
       format: 'health-intake-report-source-review-v2',

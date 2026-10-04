@@ -119,6 +119,9 @@ export interface EnvelopeCellReader {
   check(): void;
 }
 export interface IntakeEnvelopeFieldAccess {
+  /** Resolve one named field once and stream its exact selected lexical value.
+   * Missing is distinct from a present JSON null. No values are retained. */
+  chunks(record: IntakeEnvelopeRecord, name: string): Iterable<string> | undefined;
   nameBytes(record: IntakeEnvelopeRecord, key: string): number;
   descriptors(
     record: IntakeEnvelopeRecord,
@@ -766,6 +769,25 @@ export function createSchemaEnvelopeReader(
     return Object.freeze(result.reverse());
   });
   fieldAccessors.set(view, {
+    chunks(record, name) {
+      const item = fieldTarget(record, name);
+      store.check();
+      if (!item) return undefined;
+      if (name === 'metadataHistory' && item.type === 'cell')
+        fail('metadata history requires explicit structured-field upgrade');
+      const selected =
+        item.type === 'record'
+          ? iterateSchemaRecordValue(store, address(resolve(item.id)))
+          : cellChunks(store, 'c:' + item.id);
+      return (function* () {
+        store.check();
+        for (const chunk of selected) {
+          store.check();
+          yield chunk;
+        }
+        store.check();
+      })();
+    },
     nameBytes(record, key) {
       const value = store.get(keyedField(record, key).name);
       if (value === undefined) fail('missing field name');

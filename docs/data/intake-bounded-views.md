@@ -269,9 +269,29 @@ source/version pins, bounded filename, provider, active plan, candidate count an
 durability. They do not reconstruct public collection-summary counts on each
 model event, and the smaller header does not represent omitted collections as
 empty. The public source summary remains a separate projection.
+Decoded assistant headers retain at most 32 entries and 256 KiB of encoded
+headers, source bindings and keys per database. Reuse requires unchanged exact
+SQLite, collection-registry and policy epochs, current profile/source and
+logical/material pins, and a fresh physical accepted-authority check. Transaction
+reads clear and bypass this memo; missing or pending plan headers are not cached.
+Values are frozen, and cache disposal, rollback or authority failure requires a
+fresh selected read. Progress presentation reuses its selected scope while
+keeping the first pending unit's label separate from a manually selected resume
+unit; it does not resolve the same unit again through historical plan lookup.
 Within one synchronous model-event callback, continuation and progress decisions
 share one complete reading projection. A write or asynchronous boundary requires
 a fresh projection; repeated scalar checks do not reopen the same reading scope.
+Retained expanded plans additionally reuse at most two positive unit scopes per
+database under the same exact SQL/registry and current-authority checks. Their
+256 KiB admission budget charges captured source, version and root metadata,
+selected unit/address data and a conservative allowance for bounded reader heads.
+The fixed reader/page-provider references hold point-lookup prefixes and counts,
+not unit or page history arrays; shared storage caches retain their own limits.
+Aggregate pressure evicts scopes, and oversized contexts use the complete cold
+path. Pending-unit and explicit-unit keys remain distinct. Transactions, source
+changes, cache disposal, failed authority checks and database closure discard
+reuse; consumers still perform their normal admission and post-yield checks.
+Direct and inventory-recipe package scopes continue through their existing readers.
 
 The coordinator's current-interpretation check retains at most eight scalar
 results per database, without materializing proposal IDs. Reuse requires the
@@ -283,7 +303,9 @@ positive interpretation witness. Returned results are detached from the cache.
 Assistant startup prepares native plan and reading capabilities before provider
 dispatch, including retained conversions whose source still uses the legacy
 envelope. This preparation imports existing reading evidence before the first
-model context. A pending retained-plan index is prepared before deciding that
+model context. A retained ZIP plan also prepares its source-bound inventory
+compatibility before native member reads, including pre-upgrade checkpoints.
+A pending retained-plan index is prepared before deciding that
 no active plan exists; prior superseded plans remain unchanged when a current
 plan is created. A malformed proposal cannot change the checkpoint representation
 while returning its repairable validation error. Explicit unit/member reads in
@@ -444,6 +466,18 @@ decodes and `reviewDraftHandoffs` counts successful transfers. This avoids a sec
 decode for a record even when the proposal contains more than 32 drafts; it does
 not eliminate the complete historical policy and token reads.
 
+Draft headers resolve each named field once and stream its exact selected lexical
+bytes, including raw numbers, unknown nested fields and fragmented strings.
+Missing fields remain distinct from JSON null. Traversal still checks the current
+selected storage proof; it retains no decoded field values. Within that same live
+scope, proposal source revisions use a separate memo bounded to 32 entries and
+256 KiB including keys, preserving their exact null or absent state. Exact proof
+drift, transactions, failed reads and scope close discard it. The first retained
+proposal and existing dependency-token
+fallback remain authoritative; candidate bodies and version hashes are always
+computed afresh. `reviewProposalRevisionReads` and `reviewProposalRevisionHits`
+count these metadata selections separately from complete policy reads.
+
 An accumulated question list has an explicit complete selection reference when
 its inline representation exceeds the display budget. Policy iterates that
 selection; it does not substitute the first page or an empty list. Derived issues
@@ -461,13 +495,69 @@ and missing scratch is refused instead of treated as no blockers. The issue
 row/read/write and peak-value counters distinguish this disposable policy work
 from durable writes. The derived issue collection is never recovery authority.
 
+Cold native clinical preparation for retained-intake histories shares generator
+implementations with the transaction-bound synchronous policy. Native reads and prepublication preparation
+run at most 16 yielded work units before a real event-loop turn. These units include
+retained question/issue processing, source-scope evidence, report membership and
+receipt checks, and complete canonical review and selection-token inputs. A
+resolved promise alone is not a yield. Every asynchronous gap retains the exact
+connection SQL, registry and grounding stamp and checks the current owner and
+caller cancellation guard before resuming. A changed proof refuses the attempt;
+closing or aborting the generator releases its private policy scratch.
+
+This cooperation does not cover every clinical lookup. The preexisting
+`activeMappingRules`, `latestRecordException` and saved-record `previous` helpers
+still synchronously read, match or sort global decision catalogs and per-identity
+clinical history. Their complete output and legacy ordering need a separate
+catalog/API change, tracked in [CRS-235](../todo/CRS-235.md). Clinical preparation
+therefore has no universal bounded-latency or history-independent-work guarantee.
+The retained-intake checkpoints do not remove that limitation.
+
+Selected questions reuse the complete workflow dependency index and restore its
+retained question ordinals in session-owned SQLite. Separate indexed unpinned and
+exact-version selections preserve legacy ordering without rereading every
+unrelated candidate's questions. When that auxiliary index is not ready, one
+complete cooperative traversal of the retained questions builds the private
+selection instead; a valid review gains no new preparation prerequisite. A
+malformed completed index is refused. The scratch rows are disposable and cannot
+supply an answer or create acceptance authority.
+
+Cold file verification yields between 256 KiB hash chunks. The session retains
+verified physical identities for every source dependency and the selected
+proposal in its private scratch, independently of the bounded open-source cache.
+Publication and later projection admission compare those original identities;
+a changed file refuses the review rather than causing a final synchronous
+rehash. The final identity check remains a synchronous metadata sweep proportional
+to the number of consumed artifacts, so this is not a history-independent latency
+claim. A focused fictional single-record fixture with 96 retained questions
+checks exact synchronous/cooperative policy and token parity, an unrelated HTTP
+response during cold preparation, and scratch cleanup after cancellation or
+rolled-back SQL drift. It does not qualify the complete large-provider or
+physical release journeys.
+
+Report and feed reads serialize use of a shared review session, detach the
+bounded response before releasing it, and close sessions replaced by another
+proposal. Reset and close invalidate waiting readers; releasing an unrelated
+reader does not close a session still in use. Multi-source pages and ownership
+preparations copy host-verified artifact identities into owned scratch before
+closing each session, then check the complete set before returning or applying
+the result. These rows carry process-local integrity signatures and an expected
+count, so changed or missing disposable rows cannot certify current evidence.
+The identities are never refreshed to accept a replacement observed during a
+wait. Final checks still scale with the consumed artifact count.
+
 Original-grounding proofs also have a disposable semantic generation: publishing
 different facts, clearing them or evicting a scope invalidates held clinical
 sessions and feed cursors even when SQLite has not changed. Repeating the same
 complete facts preserves this generation. Native proof iterables stage in
-unpublished scratch rows and stream their deduplicated, ordered fingerprint
-before replacing the prior complete scope. An identical nonempty publication can
-still write temporary SQL rows and invalidate SQL read stamps.
+isolated, unpublished scratch rows and cooperatively stream their deduplicated,
+ordered fingerprint before replacing the prior complete scope. Staging performs
+no main-database writes across asynchronous gaps; final publication may remove
+superseded legacy temporary proof rows and therefore invalidate SQL read stamps.
+Cancelled or invalidated staging leaves the previous complete scope selected.
+Validation checkpoints both complete raw version chunks and every inspected
+competing header, including nonmatches; partial hashes are never retained as
+completed proofs. Scope eviction and database closure release owned proof stores.
 
 Report summaries, member facts and feeds record the retained-source dependencies
 actually opened by clinical review in indexed scratch tables. They check those
@@ -545,3 +635,28 @@ existing forward latest-receipt selectors still traverse the complete history.
 More than 32 receipts, aggregate budget pressure or a single oversized header
 fall back to reconstruction; this change makes no history-independent warm-cost
 claim. Legacy inline receipt readers keep their existing behavior.
+
+Competing identity claims retain every report-group occurrence, including repeated
+public group IDs, with that occurrence's own latest version. Their canonical
+order is the legacy stable `localeCompare` order by group ID; equal IDs retain
+source occurrence order. Bounded scratch runs and a merge preserve this order
+without collecting the entire group scope. Repair compares and consumes one
+retained claim per current occurrence, so an identical claim cannot satisfy a
+second occurrence. A namespace inspection, claim comparison and merge step are
+cooperative work checkpoints under the current authority proof.
+
+Complete name-evidence collection also checkpoints while ingesting claims and
+reading distinct names. Records without a matching group or identity issue still
+produce inspection checkpoints. The canonical conflict provider emits empty
+byte chunks during scratch ingestion; these checkpoints change no canonical
+bytes, legacy hashes or unknown-claim semantics. Synchronous legacy callers drain
+the same work implementation, while native clinical preparation checks the exact
+current boundary between event-loop turns and closes incomplete scratch readers.
+
+Advisory warning preparation checkpoints every inspected issue, including
+unrelated issues and compatible birth-date hints. It hashes and deduplicates the
+complete ordered candidates in private policy rows before publishing a counted
+warning reference. Inline warnings are only a presentation limit. Legacy
+synchronous callers drain the same implementation, preserving canonical IDs and
+ordering. Interrupted preparation publishes no completed reference; closing the
+owning scope disposes partial rows and invalidates retained warning readers.

@@ -13,7 +13,7 @@ import {
 } from './intake-collection-envelope.ts';
 import { intakeReviewChildren, readIntakeReviewValue } from './intake-review-collection.ts';
 import {
-  prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
 import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
@@ -223,7 +223,7 @@ export async function prepareCorrectionSupportingEvidence(
     for (const assertion of assertions) assertion();
   };
   const sessions: Extract<
-    ReturnType<typeof prepareCollectionClinicalReview>,
+    Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>>,
     { status: 'ready' }
   >['session'][] = [];
   const dispose = () => {
@@ -246,12 +246,13 @@ export async function prepareCorrectionSupportingEvidence(
           'CORRECTION_EVIDENCE_CHANGED',
           'Review the current incoming candidate before using its original',
         );
-      const selected = prepareCollectionClinicalReview(
+      const selected = await prepareCollectionClinicalReviewAsync(
         db,
         root,
         profileId,
         ref.intakeId,
         ref.proposalId,
+        { assertRunning: assertCurrent },
       );
       if (selected.status !== 'ready')
         throw new HttpError(

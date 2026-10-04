@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 /** Owned point indexes for complete source receipt resolution. No scratch result grants authority. */
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import type {
@@ -185,10 +186,17 @@ export function readSourceResolutionIndex(map: ReportSnapshotMapReader) {
   return {
     originalMember: (member: SourceMemberIdentity) => members.get(memberKey(member)) === '1',
     extension(versionId: string, member: SourceMemberIdentity) {
+      return finishClinicalReviewWork(this.extensionWork(versionId, member));
+    },
+    *extensionWork(
+      versionId: string,
+      member: SourceMemberIdentity,
+    ): Generator<void, SourceExtensionTarget | undefined, void> {
       const version = map.reference('v:' + schemaKey(versionId));
       if (!version) return undefined;
       let before = 'f';
       do {
+        yield;
         const row = version.preceding(before);
         if (!row || !row.key.startsWith('e:')) return undefined;
         before = row.key;

@@ -1,3 +1,4 @@
+import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 /** Complete filters and counts with bounded native feed rows and referenced group evidence. */
 import type { DatabaseSync } from 'node:sqlite';
 import { createHmac, randomBytes } from 'node:crypto';
@@ -16,7 +17,7 @@ import {
   openCollectionPeopleRead,
   collectionPersonMatchesQuery,
 } from './intake-people-collection.ts';
-import { feedKind } from './intake-report-queue.ts';
+import { feedKind, matchesImportFeedKind } from './intake-report-queue.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { intakeFeedTextMatcher } from './intake-feed-match.ts';
 import {
@@ -36,6 +37,7 @@ import type {
   IntakeReportQueueRecordState,
   IntakeReportQueueCounts,
   IntakeImportFeedKind,
+  IntakeImportFeedFilterKind,
   IntakeImportFeedRecord,
 } from '../shared/intake.ts';
 import type { CollectionReportQueueMember } from './intake-report-queue-collection.ts';
@@ -66,7 +68,7 @@ export interface CollectionImportFeedOptions {
   recordId?: string;
   state?: IntakeReportQueueRecordState;
   q?: string;
-  kind?: IntakeImportFeedKind;
+  kind?: IntakeImportFeedFilterKind;
   edited?: string;
 }
 export interface CollectionFeedRecord {
@@ -95,8 +97,10 @@ type PreparedFeed = {
   clinicalRevision: string;
   grounding: object;
   busy: boolean;
+  disposed?: boolean;
   scratch: ReturnType<typeof disposableSqlite>;
   signingKey: Buffer;
+  artifacts: ReturnType<typeof createClinicalReviewArtifactProof>;
   counts: IntakeReportQueueCounts;
   peopleCounts: { pending: number; later: number; excluded: number; saved: number };
   kindCounts: Record<IntakeImportFeedKind, number>;
@@ -125,8 +129,11 @@ const preparedFeeds = new Set<PreparedFeed>(),
 let feedClock = 0;
 function disposeFeed(feed: PreparedFeed) {
   preparedFeeds.delete(feed);
-  feed.scratch.close();
-  feed.signingKey.fill(0);
+  feed.disposed = true;
+  if (!feed.busy) {
+    feed.scratch.close();
+    feed.signingKey.fill(0);
+  }
 }
 function feedRowSignature(
   db: DatabaseSync,
@@ -154,7 +161,7 @@ export function clearCollectionImportFeeds(db: DatabaseSync) {
   feedEpochs.set(db, (feedEpochs.get(db) || 0) + 1);
   for (const feed of preparedFeeds) if (feed.db === db) disposeFeed(feed);
 }
-function feedWindow(
+async function feedWindow(
   db: DatabaseSync,
   root: string,
   profileId: string,
@@ -167,6 +174,7 @@ function feedWindow(
     after: string;
     peopleAfter: string;
     cursor: (section: string, order: string) => string;
+    assertRunning(): void;
   },
 ) {
   const records: CollectionFeedRecord[] = [],
@@ -208,9 +216,14 @@ function feedWindow(
     }
     const record = cachedFeedRecord(value),
       cached = JSON.parse(String(row.member)) as CachedFeedMember;
-    let fresh: ReturnType<typeof queue.reviewMember> | undefined;
+    let fresh: Awaited<ReturnType<typeof queue.reviewMember>> | undefined;
     if (!queue.currentReviewCertificate(record.intakeId, cached.certificate)) {
-      fresh = queue.reviewMember(record.intakeId, cached.member);
+      fresh = await queue.reviewMember(
+        record.intakeId,
+        cached.member,
+        input.assertRunning,
+        feed.artifacts.retain,
+      );
       record.intakeVersion = fresh.version;
       record.reviewToken = fresh.reviewToken;
       if (record.detail.kind === 'record')
@@ -231,7 +244,12 @@ function feedWindow(
     }
     let size = Buffer.byteLength(canonicalLiteral(record));
     if (size > input.budget && record.detail.kind === 'record') {
-      fresh ??= queue.reviewMember(record.intakeId, cached.member);
+      fresh ??= await queue.reviewMember(
+        record.intakeId,
+        cached.member,
+        input.assertRunning,
+        feed.artifacts.retain,
+      );
       record.detail = {
         kind: 'reference',
         selection: {
@@ -248,6 +266,7 @@ function feedWindow(
       };
       size = Buffer.byteLength(canonicalLiteral(record));
     }
+    input.assertRunning();
     if (fresh) {
       const updated = canonicalLiteral(record),
         member = JSON.stringify({
@@ -317,6 +336,7 @@ function feedWindow(
     peopleGroups.push(group);
     peopleLast = String(row.ordering);
   }
+  input.assertRunning();
   const activity = readCollectionQueueActivity(db, root, profileId, queue);
   queue.assertCurrent();
   for (const { intakeId, certificate } of certificates)
@@ -326,6 +346,7 @@ function feedWindow(
         'REPORT_QUEUE_CURSOR',
         'Review changed while reading; refresh this feed',
       );
+  feed.artifacts.assertCurrent();
   return {
     format: 'health-intake-import-feed-v2' as const,
     view: input.view,
@@ -368,7 +389,7 @@ export async function readCollectionImportFeed(
     budget > 256 * 1024 ||
     (input.state &&
       !['pending', 'deferred', 'accepted', 'kept_original', 'superseded'].includes(input.state)) ||
-    (input.kind && !kinds.includes(input.kind)) ||
+    (input.kind && input.kind !== 'documents' && !kinds.includes(input.kind)) ||
     (input.edited !== undefined && !['true', 'false'].includes(input.edited))
   )
     throw new HttpError(
@@ -381,11 +402,17 @@ export async function readCollectionImportFeed(
     grounding = identityGroundingGeneration(db),
     epoch = feedEpochs.get(db) || 0;
   let scratch = disposableSqlite('circus-import-feed-');
-  let signingKey: Buffer = randomBytes(32);
+  let signingKey: Buffer = randomBytes(32),
+    artifacts = createClinicalReviewArtifactProof(scratch.db, 'clinical_artifacts');
   let readingFeed: PreparedFeed | undefined;
   let reused: PreparedFeed | undefined;
   let retained = false;
   let successfulRead = false;
+  const assertRunning = () => {
+    queue.assertActive();
+    if (readingFeed?.disposed || reused?.disposed || (feedEpochs.get(db) || 0) !== epoch)
+      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this import feed');
+  };
   scratch.db.exec(
     'CREATE TABLE sources(id TEXT PRIMARY KEY,pin TEXT,seen INTEGER,counts TEXT,peopleCounts TEXT,kindCounts TEXT,totalRecords INTEGER,totalPeopleGroups INTEGER,grounding TEXT);CREATE TABLE matches(intake TEXT,groupId TEXT,PRIMARY KEY(intake,groupId));CREATE TABLE records(ordering TEXT PRIMARY KEY,value TEXT,groupValue TEXT,intake TEXT,member TEXT,signature TEXT);CREATE INDEX recordIntake ON records(intake);CREATE TABLE people(ordering TEXT PRIMARY KEY,value TEXT,intake TEXT);CREATE INDEX peopleIntake ON people(intake);CREATE TABLE facts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,ordering TEXT,groupId TEXT,counts TEXT,kind TEXT,included INTEGER,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE INDEX factsGroup ON facts(intake,groupId,included);CREATE TABLE changedCandidates(id TEXT,version TEXT,PRIMARY KEY(id,version));CREATE TABLE changedGroups(ordinal INTEGER PRIMARY KEY);',
   );
@@ -447,13 +474,15 @@ export async function readCollectionImportFeed(
     if (cached && cached.binding === queue.binding && cached.grounding === grounding) {
       cached.used = ++feedClock;
       readingFeed = cached;
-      const result = feedWindow(db, root, profileId, queue, cached, {
+      cached.busy = true;
+      const result = await feedWindow(db, root, profileId, queue, cached, {
         view,
         limit,
         budget,
         after,
         peopleAfter,
         cursor,
+        assertRunning,
       });
       successfulRead = true;
       return result;
@@ -461,6 +490,7 @@ export async function readCollectionImportFeed(
     if (cached) {
       scratch.close();
       scratch = cached.scratch;
+      artifacts = cached.artifacts;
       signingKey.fill(0);
       signingKey = cached.signingKey;
       reused = cached;
@@ -520,7 +550,7 @@ export async function readCollectionImportFeed(
           .run(pointer.intakeId, pointer.ordinal, ordering, JSON.stringify(matching), visible);
       return visible;
     };
-    const visitMember = (
+    const visitMember = async (
       pointer: CollectionReportQueueGroupPointer & { intakeId: string },
       summary: CollectionReportGroupSummary,
       member: CollectionReportQueueMember,
@@ -553,7 +583,7 @@ export async function readCollectionImportFeed(
             record: raw,
             ordinal,
             certificate,
-          } = queue.reviewMember(pointer.intakeId, member),
+          } = await queue.reviewMember(pointer.intakeId, member, assertRunning, artifacts.retain),
           kind = feedKind(raw);
         if (
           (input.recordId && raw.id !== input.recordId) ||
@@ -599,7 +629,7 @@ export async function readCollectionImportFeed(
         }
         factKind = kind;
         kindCounts[kind]++;
-        if (input.kind && input.kind !== kind) return;
+        if (!matchesImportFeedKind(input.kind, kind)) return;
         included = true;
         totalRecords++;
         scratch.db
@@ -850,7 +880,7 @@ export async function readCollectionImportFeed(
                 ordinal: pointer.ordinal,
                 bytes: Buffer.byteLength(canonicalLiteral(summary)),
               };
-            visitMember(pointer, summary, member, groupOrder, groupReference);
+            await visitMember(pointer, summary, member, groupOrder, groupReference);
           }
         }
         scratch.db
@@ -911,7 +941,7 @@ export async function readCollectionImportFeed(
             .run(groupOrder, canonicalLiteral(groupReference), source.id);
         }
         for (const member of queue.members(pointer.intakeId, pointer.ordinal)) {
-          visitMember(pointer, summary, member, groupOrder, groupReference);
+          await visitMember(pointer, summary, member, groupOrder, groupReference);
         }
       }
       scratch.db
@@ -968,9 +998,10 @@ export async function readCollectionImportFeed(
       binding: queue.binding,
       clinicalRevision: queue.clinicalRevision,
       grounding,
-      busy: false,
+      busy: true,
       scratch,
       signingKey,
+      artifacts,
       counts,
       kindCounts,
       peopleCounts,
@@ -998,18 +1029,21 @@ export async function readCollectionImportFeed(
     preparedFeeds.add(feed);
     retained = true;
     readingFeed = feed;
-    const result = feedWindow(db, root, profileId, queue, feed, {
+    const result = await feedWindow(db, root, profileId, queue, feed, {
       view,
       limit,
       budget,
       after,
       peopleAfter,
       cursor,
+      assertRunning,
     });
     successfulRead = true;
     return result;
   } catch (error) {
     if (readingFeed) disposeFeed(readingFeed);
+    // A failed rebuild cannot retain an aggregate whose additions rolled back.
+    if (reused) disposeFeed(reused);
     try {
       scratch.db.exec('ROLLBACK');
     } catch {
@@ -1017,7 +1051,14 @@ export async function readCollectionImportFeed(
     }
     throw error;
   } finally {
-    if (reused) reused.busy = false;
+    for (const feed of new Set([readingFeed, reused])) {
+      if (!feed) continue;
+      feed.busy = false;
+      if (feed.disposed) {
+        feed.scratch.close();
+        feed.signingKey.fill(0);
+      }
+    }
     queue.close({ retainReview: successfulRead });
     if (!retained) {
       scratch.close();

@@ -994,6 +994,8 @@ export interface IntakeReportQueueDetail {
 /** Display categories; vision records retain their original clinical mapping kind. */
 export type IntakeImportFeedKind =
   'test' | 'prescription' | 'vision' | 'procedure' | 'history' | 'unsupported' | 'person';
+/** A display filter may combine canonical row kinds before pagination. */
+export type IntakeImportFeedFilterKind = IntakeImportFeedKind | 'documents';
 export interface IntakeImportFeedRecord extends IntakeReportQueueRecord {
   /** Stable exact-version identity, independent of the current proposal occurrence. */
   feedKey: string;

@@ -1,3 +1,5 @@
+import { copyReviewRecordFields } from './intake-review-selected-record.ts';
+import { finishClinicalReviewWork, someClinicalReviewWork } from './clinical-review-work.ts';
 import {
   bindReviewRecordIssues,
   reviewRecordIssues,
@@ -29,20 +31,21 @@ import { validatedIntakePeople } from './intake-people-format.ts';
 import { recordReportGroups, reportGroupsWithLegacyFallback } from './intake-report-groups.ts';
 import { intakeReportSourceForMember } from './intake-report-source.ts';
 import {
-  assessIdentityPolicy,
-  confirmedPersonReceipt,
+  assessIdentityPolicyWork,
+  confirmedPersonReceiptWork,
   collectEvidencedIdentity,
   structuredEvidencedIdentity,
   isGenericNameConfirmation,
   competingIdentityBoundaries,
   identityBoundaryRepairApplies,
   currentIdentityRefusal,
-  repeatedIdentityQuestionReceipt,
-  exactCurrentIdentityResolutionOperationId,
-  identityReceiptAppliesToCurrentBoundary,
+  repeatedIdentityQuestionReceiptWork,
+  exactCurrentIdentityResolutionOperationIdWork,
+  identityReceiptAppliesToCurrentBoundaryWork,
   identityOriginalFingerprint,
   modelBirthDateWarnings,
   modelBirthDateWarningCandidates,
+  modelBirthDateWarningCandidatesWork,
   type IdentityPolicyPeople,
 } from './intake-identity-policy.ts';
 import type { IdentityGroundingLookup } from './intake-identity-grounding.ts';
@@ -51,7 +54,7 @@ import {
   actionableIssueKind,
   currentReviewDraft,
   issueKind,
-  reviewIssues,
+  reviewIssuesWork,
   type SuggestionEvidenceScope,
 } from './intake-review.ts';
 import { clinicalMappingEnvelope, sourceContextEnvelope } from './clinical-import.ts';
@@ -143,13 +146,13 @@ interface WorkflowSummaryOptions {
   sourceContextVersionIds?: Set<string>;
 }
 
-const typedReviewIssues = reviewIssues as unknown as (
+const typedReviewIssuesWork = reviewIssuesWork as unknown as (
   record: IntakeReview['records'][number],
   entry: IntakeEntry,
   questions: ReturnType<typeof reviewRecordQuestions>,
   metadataScope: SuggestionEvidenceScope,
   sink?: ReviewIssueCollection,
-) => ReviewIssueCollection;
+) => Generator<void, ReviewIssueCollection, void>;
 const typedActionableIssueKind = actionableIssueKind as unknown as (
   prompt: string,
   field?: string | null,
@@ -325,6 +328,10 @@ export interface WorkflowReviewScope {
     record: IntakeReview['records'][number],
     warnings: Iterable<import('../shared/intake-identity.ts').IntakeIdentityWarning>,
   ): void;
+  bindIdentityWarningsWork?(
+    record: IntakeReview['records'][number],
+    warnings: Iterable<import('../shared/intake-identity.ts').IntakeIdentityWarning | undefined>,
+  ): Generator<void, void, void>;
   versionId(proposalId: string | null, entry: IntakeEntry): string;
   references(
     candidateId: string,
@@ -332,13 +339,32 @@ export interface WorkflowReviewScope {
     recordId: string,
     proposalId: string | null,
   ): import('../shared/intake-report-group-links.ts').IntakeReviewGroupLinks;
+  referencesWork?(
+    candidateId: string,
+    versionId: string,
+    recordId: string,
+    proposalId: string | null,
+  ): Generator<void, import('../shared/intake-report-group-links.ts').IntakeReviewGroupLinks, void>;
   reportSource(
     record: IntakeReview['records'][number],
     proposalId: string | null,
   ): string | undefined;
+  reportSourceWork?(
+    record: IntakeReview['records'][number],
+    proposalId: string | null,
+  ): Generator<void, string | undefined, void>;
   questions(candidateId: string, versionId: string): ReviewQuestionSelection;
+  questionsWork?(
+    candidateId: string,
+    versionId: string,
+  ): Generator<void, ReviewQuestionSelection, void>;
   accepted(candidateId: string, versionId: string): boolean;
   draft(proposalId: string | null, recordId: string, versionId: string): IntakeReviewDraft | null;
+  draftWork?(
+    proposalId: string | null,
+    recordId: string,
+    versionId: string,
+  ): Generator<void, IntakeReviewDraft | null, void>;
   bindPreparedDraft?(
     record: Pick<IntakeReview['records'][number], 'id'>,
     draft: IntakeReviewDraft | null,
@@ -350,14 +376,25 @@ export interface WorkflowReviewScope {
   ): IntakeReviewDraft | null | undefined;
   firstVersion(candidateId: string): string | undefined;
   keptOriginal(candidateId: string, versionId: string): boolean;
+  keptOriginalWork?(candidateId: string, versionId: string): Generator<void, boolean, void>;
   group(reference: IntakeReviewGroupReference): WorkflowReviewGroup | undefined;
+  groupWork?(
+    reference: IntakeReviewGroupReference,
+  ): Generator<void, WorkflowReviewGroup | undefined, void>;
   identityGroup(id: string): WorkflowReviewGroup | undefined;
+  identityGroupWork?(id: string): Generator<void, WorkflowReviewGroup | undefined, void>;
   currentVersion(group: WorkflowReviewGroup): string | null;
+  currentVersionWork?(group: WorkflowReviewGroup): Generator<void, string | null, void>;
   membership(
     group: WorkflowReviewGroup,
   ): import('./intake-identity-policy.ts').CurrentIdentityReceiptBoundary['membership'];
   originalFingerprint(group: WorkflowReviewGroup): string;
   receipts: SelectedSequence<import('./intake-identity-policy.ts').IdentityPolicyReceipt>;
+  receiptsWork?(): Generator<
+    void,
+    SelectedSequence<import('./intake-identity-policy.ts').IdentityPolicyReceipt>,
+    void
+  >;
   packageEvidence: boolean;
   manual(
     proposalId: string | null,
@@ -367,6 +404,24 @@ export interface WorkflowReviewScope {
     operationId: string | undefined,
     target: import('../shared/intake-identity.ts').IntakeIdentityScope['targets'][number],
   ): boolean;
+  competingBoundaryUnrepairedWork?(
+    group: WorkflowReviewGroup,
+    operationId: string | undefined,
+    target: import('../shared/intake-identity.ts').IntakeIdentityScope['targets'][number],
+  ): Generator<void, boolean, void>;
+  evidenceWork?(
+    group: WorkflowReviewGroup | null,
+    record: IntakeReview['records'][number],
+    review: IntakeReview,
+    original: import('./intake-evidence-dates.ts').BirthDateEvidence | undefined,
+  ): Generator<
+    void,
+    {
+      collected: ReturnType<typeof collectEvidencedIdentity>;
+      structured: ReturnType<typeof collectEvidencedIdentity>['evidence'];
+    },
+    void
+  >;
   /** Complete proposal/report identity facts, including every off-page occurrence. */
   evidence(
     group: WorkflowReviewGroup | null,
@@ -379,6 +434,19 @@ export interface WorkflowReviewScope {
   };
 }
 export interface SelectedWorkflowIdentityContext {
+  groundedWork?(
+    group: WorkflowReviewGroup,
+    issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor'>,
+    receipt: import('./intake-identity-policy.ts').IdentityGroundingReceipt,
+  ): Generator<void, boolean, void>;
+  originalBirthDateEvidenceWork?(
+    group: WorkflowReviewGroup,
+  ): Generator<void, import('./intake-evidence-dates.ts').BirthDateEvidence | undefined, void>;
+  subjectGroundedWork?(group: WorkflowReviewGroup): Generator<void, boolean, void>;
+  nameQuestionGroundedWork?(
+    group: WorkflowReviewGroup,
+    issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor'>,
+  ): Generator<void, boolean, void>;
   profileId: string;
   people?: IdentityPolicyPeople;
   copiedManualSourceApplies?: NonNullable<
@@ -576,27 +644,52 @@ export function workflowReviewSelected<T extends IntakeReview>(
   self?: IntakeIdentitySelfSnapshot,
   identityContext?: SelectedWorkflowIdentityContext,
 ): T {
+  return finishClinicalReviewWork(
+    workflowReviewSelectedWork(file, scope, review, entries, self, identityContext),
+  );
+}
+export function* workflowReviewSelectedWork<T extends IntakeReview>(
+  file: WorkflowFile,
+  scope: WorkflowReviewScope,
+  review: T,
+  entries: IntakeEntry[],
+  self?: IntakeIdentitySelfSnapshot,
+  identityContext?: SelectedWorkflowIdentityContext,
+): Generator<void, T, void> {
+  const receipts = scope.receiptsWork ? yield* scope.receiptsWork() : scope.receipts;
   const inputFileId = review.proposalId || file.id;
   const entriesByRecordId = new Map(
     entries.map((entry) => [`${inputFileId}:line:${entry.line}`, entry]),
   );
   for (const record of review.records) {
+    yield;
     const entry = entriesByRecordId.get(record.id);
     if (!entry) throw new Error('Clinical review entry is missing from its retained proposal');
     const candidateId = intakeCandidateId(file, entry);
     const versionId = scope.versionId(review.proposalId, entry);
     record.candidateId = candidateId;
     record.candidateVersionId = versionId;
-    record.reportGroups = scope.references(candidateId, versionId, record.id, review.proposalId);
-    const reportSource = scope.reportSource(record, review.proposalId);
+    record.reportGroups = scope.referencesWork
+      ? yield* scope.referencesWork(candidateId, versionId, record.id, review.proposalId)
+      : scope.references(candidateId, versionId, record.id, review.proposalId);
+    const reportSource = scope.reportSourceWork
+      ? yield* scope.reportSourceWork(record, review.proposalId)
+      : scope.reportSource(record, review.proposalId);
     if (reportSource) record.provider = reportSource;
-    bindReviewRecordQuestions(record, scope.questions(candidateId, versionId));
+    bindReviewRecordQuestions(
+      record,
+      scope.questionsWork
+        ? yield* scope.questionsWork(candidateId, versionId)
+        : scope.questions(candidateId, versionId),
+    );
     record.reviewState =
       !record.projectionUpgrade && scope.accepted(candidateId, versionId) ? 'accepted' : 'pending';
     const preparedDraft = scope.preparedDraft?.(review.proposalId, record, versionId);
     record.draft =
       preparedDraft === undefined
-        ? scope.draft(review.proposalId, record.id, versionId)
+        ? scope.draftWork
+          ? yield* scope.draftWork(review.proposalId, record.id, versionId)
+          : scope.draft(review.proposalId, record.id, versionId)
         : preparedDraft;
     // Legacy questions did not pin a version. An old identity answer is history,
     // not confirmation of a changed envelope. Keep the durable question intact.
@@ -615,17 +708,24 @@ export function workflowReviewSelected<T extends IntakeReview>(
           : question,
       );
 
-    const scopedReference = selectedReportGroups(record.reportGroups).find(
-      (reference) => scope.group(reference)?.basis === 'report_anchor',
-    );
-    const scopedReport = scopedReference ? scope.group(scopedReference) : undefined;
+    let scopedReport: WorkflowReviewGroup | undefined;
+    for (const reference of selectedReportGroups(record.reportGroups)) {
+      yield;
+      const candidate = scope.groupWork
+        ? yield* scope.groupWork(reference)
+        : scope.group(reference);
+      if (candidate?.basis === 'report_anchor') {
+        scopedReport = candidate;
+        break;
+      }
+    }
     const issueScope = {
       packageEvidence: scope.packageEvidence,
       reportScoped: !!scopedReport,
       memberId: scopedReport?.memberId || null,
       reportSubject: scopedReport?.report?.subject?.text || null,
     };
-    let issues = typedReviewIssues(
+    let issues = yield* typedReviewIssuesWork(
       record,
       entry,
       reviewRecordQuestions(record),
@@ -646,7 +746,7 @@ export function workflowReviewSelected<T extends IntakeReview>(
           identityConfirmationRequired?: boolean;
         }
       ).identityConfirmationRequired = true;
-      issues = typedReviewIssues(
+      issues = yield* reviewIssuesWork(
         record,
         entry,
         reviewRecordQuestions(record),
@@ -656,6 +756,7 @@ export function workflowReviewSelected<T extends IntakeReview>(
     }
     bindReviewRecordIssues(record, issues);
     for (const issue of issues) {
+      yield;
       const resolution = latestReviewDraftResolution(record.draft, issue.id);
       if (resolution) {
         if (
@@ -667,27 +768,42 @@ export function workflowReviewSelected<T extends IntakeReview>(
             issue.kind === 'identity' &&
             !resolution.dependency &&
             ['this_is_me', 'other_person'].includes(resolution.outcome) &&
-            scope.receipts?.some(
-              (receipt) =>
-                receipt.operationId === resolution.operationId &&
-                receipt.scope.intakeId === file.id &&
-                receipt.scope.sourceHash === file.sha256 &&
-                receipt.outcome ===
-                  (resolution.outcome === 'other_person' ? 'this_is_person' : 'this_is_me') &&
-                selectedReportGroups(record.reportGroups).some(
-                  (group) => group.groupId === receipt.scope.groupId,
-                ) &&
-                (receipt.scope.assignmentTargets || receipt.scope.targets).some(
-                  (target) =>
+            (yield* someClinicalReviewWork(receipts || [], function* (receipt) {
+              if (
+                receipt.operationId !== resolution.operationId ||
+                receipt.scope.intakeId !== file.id ||
+                receipt.scope.sourceHash !== file.sha256 ||
+                receipt.outcome !==
+                  (resolution.outcome === 'other_person' ? 'this_is_person' : 'this_is_me')
+              )
+                return false;
+              if (
+                !(yield* someClinicalReviewWork(
+                  selectedReportGroups(record.reportGroups),
+                  function* (group) {
+                    return group.groupId === receipt.scope.groupId;
+                  },
+                ))
+              )
+                return false;
+              return yield* someClinicalReviewWork(
+                receipt.scope.assignmentTargets || receipt.scope.targets,
+                function* (target) {
+                  return (
                     target.candidateId === record.candidateId &&
                     target.candidateVersionId === record.candidateVersionId &&
                     target.proposalId === review.proposalId &&
                     target.recordId === record.id &&
-                    selectedSequence(target.issueIds || [target.issueId]).some(
-                      (id) => id === issue.id,
-                    ),
-                ),
-            )
+                    (yield* someClinicalReviewWork(
+                      target.issueIds || [target.issueId],
+                      function* (id) {
+                        return id === issue.id;
+                      },
+                    ))
+                  );
+                },
+              );
+            }))
           )
         ) {
           issue.status = 'unresolved';
@@ -719,9 +835,15 @@ export function workflowReviewSelected<T extends IntakeReview>(
           ? { ...question, status: 'unanswered', answers: [] }
           : question,
       );
-    if (scope.keptOriginal(candidateId, versionId)) record.reviewState = 'kept_original';
+    if (
+      scope.keptOriginalWork
+        ? yield* scope.keptOriginalWork(candidateId, versionId)
+        : scope.keptOriginal(candidateId, versionId)
+    )
+      record.reviewState = 'kept_original';
     const suggested: Partial<IntakeClinicalMapping> = {};
     for (const q of reviewRecordQuestions(record)) {
+      yield;
       const issue = issues.findId ? issues.findId(q.id) : issues.find((i) => i.questionId === q.id);
       if (
         q.status === 'answered' &&
@@ -742,19 +864,30 @@ export function workflowReviewSelected<T extends IntakeReview>(
       }
     >();
     for (const record of review.records) {
+      yield;
       const reference = selectedReportGroups(record.reportGroups).find(() => true) || null;
-      const group = reference ? scope.identityGroup(reference.groupId) || null : null;
+      const group = reference
+        ? (scope.identityGroupWork
+            ? yield* scope.identityGroupWork(reference.groupId)
+            : scope.identityGroup(reference.groupId)) || null
+        : null;
       const originalBirthDates = group
-        ? identityContext?.originalBirthDateEvidence?.(group)
+        ? identityContext?.originalBirthDateEvidenceWork
+          ? yield* identityContext.originalBirthDateEvidenceWork(group)
+          : identityContext?.originalBirthDateEvidence?.(group)
         : undefined;
       let collected = group ? groupEvidence.get(group.id) : undefined;
       if (!collected) {
-        collected = scope.evidence(group, record, review, originalBirthDates);
+        collected = scope.evidenceWork
+          ? yield* scope.evidenceWork(group, record, review, originalBirthDates)
+          : scope.evidence(group, record, review, originalBirthDates);
         if (group) groupEvidence.set(group.id, collected);
       }
       const { evidence, conflicts, unreadableBirthDate, bannerBirthDates } = structuredClone(
         collected.collected,
       );
+      for (let index = 0; index < conflicts.length; index++)
+        copyReviewRecordFields(collected.collected.conflicts[index]!, conflicts[index]!);
       const structuredEvidence = structuredClone(collected.structured);
       const ownIdentityIssues = reviewRecordIssues(record).filter(
         (issue) => issue.kind === 'identity',
@@ -787,36 +920,50 @@ export function workflowReviewSelected<T extends IntakeReview>(
           ),
       );
       const currentVersion =
-        (group && scope.currentVersion(group)) || reference?.groupVersionId || null;
+        (group &&
+          (scope.currentVersionWork
+            ? yield* scope.currentVersionWork(group)
+            : scope.currentVersion(group))) ||
+        reference?.groupVersionId ||
+        null;
       const originalFingerprint = group ? scope.originalFingerprint(group) : null;
-      const hasUnstructuredIdentityQuestion = explicitIssues.some(
-        (issue) =>
-          !(
-            group &&
-            identityContext?.nameQuestionGrounded?.(group, issue) &&
-            isGenericNameConfirmation(
-              issue,
-              group.report?.subject?.text,
-              self,
-              identityContext.people || [],
-            )
-          ) &&
-          (!group ||
-            !originalFingerprint ||
-            !identityContext ||
-            !repeatedIdentityQuestionReceipt({
-              issue,
-              group,
-              receipts: scope.receipts,
-              profileId: identityContext.profileId,
-              intakeId: file.id,
-              sourceHash: file.sha256,
-              originalFingerprint,
-              grounded: (receipt) => identityContext.grounded(group, issue, receipt),
-            })),
+      const hasUnstructuredIdentityQuestion = yield* someClinicalReviewWork(
+        explicitIssues,
+        function* (issue) {
+          return (
+            !(
+              group &&
+              (identityContext?.nameQuestionGroundedWork
+                ? yield* identityContext.nameQuestionGroundedWork(group, issue)
+                : identityContext?.nameQuestionGrounded?.(group, issue)) &&
+              isGenericNameConfirmation(
+                issue,
+                group.report?.subject?.text,
+                self,
+                identityContext?.people || [],
+              )
+            ) &&
+            (!group ||
+              !originalFingerprint ||
+              !identityContext ||
+              !(yield* repeatedIdentityQuestionReceiptWork({
+                issue,
+                group,
+                receipts,
+                profileId: identityContext.profileId,
+                intakeId: file.id,
+                sourceHash: file.sha256,
+                originalFingerprint,
+                grounded: (receipt) => identityContext.grounded(group, issue, receipt),
+                groundedWork:
+                  identityContext.groundedWork &&
+                  ((receipt) => identityContext.groundedWork!(group, issue, receipt)),
+              })))
+          );
+        },
       );
-      const explicit = exactCurrentIdentityResolutionOperationId({
-        receipts: scope.receipts,
+      const explicit = yield* exactCurrentIdentityResolutionOperationIdWork({
+        receipts,
         occurrences: explicitIssues.length
           ? [
               {
@@ -831,45 +978,50 @@ export function workflowReviewSelected<T extends IntakeReview>(
               },
             ]
           : [],
-        receiptApplies: (receipt) =>
-          !!group &&
-          !!currentVersion &&
-          identityReceiptAppliesToCurrentBoundary(receipt, {
-            intakeId: file.id,
-            groupId: group.id,
-            groupVersionId: currentVersion,
-            sourceHash: file.sha256,
-            memberId: group.memberId,
-            report: group.report!.anchor,
-            subject: group.report!.subject!,
-            evidencedIdentity: evidence,
-            evidenceOriginalFingerprint: originalFingerprint,
-            membership: scope.membership(group),
-          }),
+        receiptAppliesWork: function* (receipt) {
+          return (
+            !!group &&
+            !!currentVersion &&
+            (yield* identityReceiptAppliesToCurrentBoundaryWork(receipt, {
+              intakeId: file.id,
+              groupId: group.id,
+              groupVersionId: currentVersion,
+              sourceHash: file.sha256,
+              memberId: group.memberId,
+              report: group.report!.anchor,
+              subject: group.report!.subject!,
+              evidencedIdentity: evidence,
+              evidenceOriginalFingerprint: originalFingerprint,
+              membership: scope.membership(group),
+            }))
+          );
+        },
       });
-      const assessment = assessIdentityPolicy({
+      const assessment = yield* assessIdentityPolicyWork({
         self,
         people: identityContext?.people,
         originalEvidenceChecked: !group || originalBirthDates !== undefined,
         unreadableBirthDate,
         bannerBirthDates,
         nameEvidenceGrounded: group
-          ? !!identityContext?.subjectGrounded?.(group)
+          ? identityContext?.subjectGroundedWork
+            ? yield* identityContext.subjectGroundedWork(group)
+            : !!identityContext?.subjectGrounded?.(group)
           : review.proposalId === null && !!structuredEvidence.fullName,
         evidence,
         evidenceConflicts: conflicts,
         group,
         groupVersionId: currentVersion,
         originalFingerprint,
-        receipts: scope.receipts,
+        receipts,
         hasUnstructuredIdentityQuestion,
         explicitlyConfirmedOperationId: explicit,
         currentRefusal: currentIdentityRefusal(ownIdentityIssues),
       });
       const personReceipt =
         group?.report?.subject && currentVersion
-          ? confirmedPersonReceipt({
-              receipts: scope.receipts,
+          ? yield* confirmedPersonReceiptWork({
+              receipts,
               boundary: {
                 profileId: identityContext?.profileId,
                 intakeId: file.id,
@@ -979,14 +1131,20 @@ export function workflowReviewSelected<T extends IntakeReview>(
       }
       if (
         group &&
-        scope.competingBoundaryUnrepaired(group, assessment.attribution?.confirmationOperationId, {
+        (yield* (
+          scope.competingBoundaryUnrepairedWork
+            ? scope.competingBoundaryUnrepairedWork.bind(scope)
+            : function* (...args: Parameters<WorkflowReviewScope['competingBoundaryUnrepaired']>) {
+                return scope.competingBoundaryUnrepaired(...args);
+              }
+        )(group, assessment.attribution?.confirmationOperationId, {
           candidateId: record.candidateId!,
           candidateVersionId: record.candidateVersionId!,
           proposalId: review.proposalId,
           recordId: record.id,
           title: record.title,
           issueId: genericIdentityIssueId,
-        })
+        }))
       ) {
         assessment.status = 'conflict';
         assessment.blocking = true;
@@ -1006,18 +1164,30 @@ export function workflowReviewSelected<T extends IntakeReview>(
         assessment.attribution = undefined;
       }
       const assignedPerson = assessment.attribution?.assignedPerson;
-      const currentAssignedPerson = assessment.attribution
-        ? assignedPerson && assignedPerson.personId !== 'patient'
-          ? identityContext?.people?.find(
-              (person) =>
-                person.personId === assignedPerson.personId &&
-                person.noteId === assignedPerson.noteId,
-            )
-          : {
-              fullName: self.fullName || assignedPerson?.fullName || 'Self',
-              birthDate: self.birthDate,
+      let currentAssignedPerson:
+        | Pick<
+            import('../shared/intake-identity.ts').IntakeIdentityPerson,
+            'fullName' | 'birthDate'
+          >
+        | undefined;
+      if (assessment.attribution) {
+        if (assignedPerson && assignedPerson.personId !== 'patient') {
+          for (const person of identityContext?.people || []) {
+            yield;
+            if (
+              person.personId === assignedPerson.personId &&
+              person.noteId === assignedPerson.noteId
+            ) {
+              currentAssignedPerson = person;
+              break;
             }
-        : undefined;
+          }
+        } else
+          currentAssignedPerson = {
+            fullName: self.fullName || assignedPerson?.fullName || 'Self',
+            birthDate: self.birthDate,
+          };
+      }
       const warningInput = {
         issues: ownIdentityIssues,
         originalBirthDate: evidence.birthDate,
@@ -1026,7 +1196,9 @@ export function workflowReviewSelected<T extends IntakeReview>(
       };
       const showWarnings = !assessment.blocking && (!group || originalBirthDates !== undefined);
       const warnings =
-        showWarnings && !scope.bindIdentityWarnings ? modelBirthDateWarnings(warningInput) : [];
+        showWarnings && !scope.bindIdentityWarnings && !scope.bindIdentityWarningsWork
+          ? modelBirthDateWarnings(warningInput)
+          : [];
       record.identityReview = {
         confidence: assessment.confidence,
         status: assessment.status,
@@ -1039,7 +1211,18 @@ export function workflowReviewSelected<T extends IntakeReview>(
           ? { assignedPerson: assessment.attribution.assignedPerson }
           : {}),
       };
-      if (showWarnings && scope.bindIdentityWarnings)
+      if (showWarnings && scope.bindIdentityWarningsWork)
+        yield* scope.bindIdentityWarningsWork(
+          record,
+          modelBirthDateWarningCandidatesWork({
+            ...warningInput,
+            issues: (function* () {
+              for (const issue of reviewRecordIssues(record))
+                yield issue.kind === 'identity' ? issue : undefined;
+            })(),
+          }),
+        );
+      else if (showWarnings && scope.bindIdentityWarnings)
         scope.bindIdentityWarnings(record, modelBirthDateWarningCandidates(warningInput));
       if (assessment.attribution) {
         record.identityAttribution = assessment.attribution;

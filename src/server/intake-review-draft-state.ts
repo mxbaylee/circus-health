@@ -1,4 +1,5 @@
 /** Immutable review history shares old entries across subsequent draft saves. */
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { randomUUID } from 'node:crypto';
 import type { Database } from './database.ts';
 import { HttpError } from './database.ts';
@@ -7,7 +8,7 @@ import type {
   IntakeCollectionEnvelopeReader,
   IntakeEnvelopeRecord,
 } from './intake-collection-envelope.ts';
-import { selectedEnvelopeStore } from './intake-collection-envelope.ts';
+import { selectedEnvelopeStore, intakeEnvelopeFieldAccess } from './intake-collection-envelope.ts';
 import { schemaKey, schemaOrdinal } from './intake-envelope-schema.ts';
 import {
   createReportSnapshotCatalog,
@@ -33,7 +34,7 @@ import {
 } from './intake-draft-history-legacy.ts';
 import { readLegacyDraftPolicyWitnesses } from './intake-draft-policy-index.ts';
 import {
-  bindReviewDraftResolutions,
+  bindReviewDraftResolutionsWork,
   type ReviewDraftResolutionPolicy,
 } from './intake-review-draft-selection.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
@@ -327,12 +328,17 @@ export async function prepareNativeDraftHistory(
 /** Existing policy asks latest per issue, any nonunknown per issue and last Self
  * confirmation. Preserve all three witnesses and their original relative order. */
 export function readNativeReviewDraft(
+  ...input: Parameters<typeof readNativeReviewDraftWork>
+): IntakeReviewDraft {
+  return finishClinicalReviewWork(readNativeReviewDraftWork(...input));
+}
+export function* readNativeReviewDraftWork(
   view: IntakeCollectionEnvelopeReader,
   record: IntakeEnvelopeRecord,
   catalog: ReportSnapshotCatalog,
   bytes: number,
   context?: { db: Database; source: IntakeEnvelopeSource },
-): IntakeReviewDraft {
+): Generator<void, IntakeReviewDraft, void> {
   const native = scalar(view, record, 'format') === 'health-intake-review-draft-v2';
   if (!native && !context) return readIntakeReviewValue<IntakeReviewDraft>(view, record, bytes);
   const tooLarge = () =>
@@ -351,6 +357,7 @@ export function readNativeReviewDraft(
     if (headerBytes > bytes) throw tooLarge();
     chunks.push(text);
   };
+  const fields = intakeEnvelopeFieldAccess(view);
   for (const name of [
     'format',
     'id',
@@ -365,12 +372,14 @@ export function readNativeReviewDraft(
     'at',
     ...(native ? ['corrections'] : []),
   ]) {
-    if (!view.has(record, name)) continue;
+    const selected = fields.chunks(record, name);
+    if (!selected) continue;
     append((first ? '' : ',') + JSON.stringify(name) + ':');
     first = false;
-    const child = view.child(record, name);
-    for (const piece of child ? view.recordChunks(child) : view.fieldChunks(record, name))
+    for (const piece of selected) {
       append(piece);
+      yield;
+    }
   }
   chunks.push('}');
   const draft = parseLiteralJSON(chunks.join('')) as IntakeReviewDraft;
@@ -379,7 +388,7 @@ export function readNativeReviewDraft(
     const policy = readLegacyDraftPolicyWitnesses(context!.db, context!.source, view, record, {
       bytes: Math.max(0, bytes - headerBytes),
     });
-    return bindReviewDraftResolutions(
+    return yield* bindReviewDraftResolutionsWork(
       { ...draft, history, resolutions: [], resolutionScope: 'policy_witnesses' },
       policy.policy,
       Math.max(0, bytes - headerBytes),
@@ -396,20 +405,33 @@ export function readNativeReviewDraft(
       throw Error('Invalid review history policy index');
     return raw;
   };
-  const read = (position: string) => {
+  function* readWork(position: string): Generator<void, IntakeIssueResolution, void> {
     try {
-      return value<IntakeIssueResolution>(history, 'r:' + position, 256 * 1024);
+      let size = 0;
+      const pieces: string[] = [];
+      for (const piece of history.chunks('r:' + position)) {
+        size += Buffer.byteLength(piece);
+        if (size > 256 * 1024) throw tooLarge();
+        pieces.push(piece);
+        yield;
+      }
+      if (!pieces.length) throw Error('Missing review history entry');
+      return parseLiteralJSON(pieces.join('')) as IntakeIssueResolution;
     } catch (error) {
       if (error instanceof HttpError && error.code === 'REVIEW_HISTORY_FRAGMENT') throw tooLarge();
       throw error;
     }
-  };
+  }
+  const read = (position: string) => finishClinicalReviewWork(readWork(position));
   const point = (key: string) => {
     const raw = history.get(key);
     return raw === undefined ? undefined : read(ordinal(raw));
   };
   const policy: ReviewDraftResolutionPolicy = {
     *values() {
+      for (const resolution of this.valuesWork!()) if (resolution !== undefined) yield resolution;
+    },
+    *valuesWork() {
       history.assertCurrent();
       const scratch = disposableSqlite('intake-native-draft-witnesses-');
       try {
@@ -420,6 +442,7 @@ export function readNativeReviewDraft(
           outer: while (true) {
             const page = history.range({ after, items: 32, bytes: 8192 });
             for (const entry of page.items) {
+              yield;
               if (!entry.key.startsWith(prefix)) break outer;
               put.run(ordinal(entry.value));
             }
@@ -434,7 +457,7 @@ export function readNativeReviewDraft(
         for (const row of scratch.db
           .prepare('SELECT ordinal FROM selected ORDER BY ordinal')
           .iterate())
-          yield read(String(row.ordinal));
+          yield yield* readWork(String(row.ordinal));
       } finally {
         scratch.close();
       }
@@ -443,7 +466,7 @@ export function readNativeReviewDraft(
     known: (issueId) => point('known:' + schemaKey(issueId)),
     self: () => point('$self'),
   };
-  return bindReviewDraftResolutions(
+  return yield* bindReviewDraftResolutionsWork(
     { ...draft, resolutions: [], resolutionScope: 'policy_witnesses' },
     policy,
     Math.max(0, bytes - headerBytes),

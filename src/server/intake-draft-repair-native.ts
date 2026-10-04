@@ -25,7 +25,7 @@ import {
 } from './intake-workflow-command.ts';
 import { prepareCollectionWorkflowReadiness } from './intake-workflow-readiness.ts';
 import {
-  prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
 import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
@@ -149,7 +149,10 @@ export async function saveIntakeDraftRepairRead(
         );
       const reviews = new Map<
         string,
-        Extract<ReturnType<typeof prepareCollectionClinicalReview>, { status: 'ready' }>
+        Extract<
+          Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>>,
+          { status: 'ready' }
+        >
       >();
       try {
         const contexts: ReturnType<typeof collectionClinicalProjectionContext>[] = [];
@@ -174,12 +177,13 @@ export async function saveIntakeDraftRepairRead(
               correction.proposalId,
               { assertRunning },
             );
-            const prepared = prepareCollectionClinicalReview(
+            const prepared = await prepareCollectionClinicalReviewAsync(
               db,
               root,
               profileId,
               id,
               correction.proposalId,
+              { assertRunning },
             );
             if (prepared.status !== 'ready')
               throw new HttpError(

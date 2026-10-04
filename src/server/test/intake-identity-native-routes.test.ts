@@ -15,9 +15,19 @@ import {
   proposeConversionRead,
   getIntake,
   getRetainedIntakeOriginalReference,
+  intakeTransaction,
 } from '../intake.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
+import { selectedEnvelopeStore } from '../intake-collection-envelope.ts';
+import { prepareIntakeWorkflowCommand } from '../intake-workflow-command.ts';
+import {
+  collectionWorkflowReviewScope,
+  readIntakeReviewValue,
+} from '../intake-review-collection.ts';
+import { createReportSnapshotCatalog } from '../intake-report-snapshot-catalog.ts';
+import { readCollectionReviewMembership } from '../intake-review-membership-index.ts';
+import { reviewReadStamp } from '../intake-clinical-review-read-cache.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import {
   clearNativeIdentityPreviews,
@@ -27,10 +37,12 @@ import { getNote, saveNote } from '../notes.ts';
 import { createApp } from '../index.ts';
 import { fictionalModel } from './fictional-model.ts';
 import { readQualificationReview } from '../../scripts/qualification-intake-read.ts';
-import type { HealthRecordEnvelope } from '../../shared/intake.ts';
+import type { HealthRecordEnvelope, IntakeReportGroup } from '../../shared/intake.ts';
+import type { IntakeReportGroupVersionV2 } from '../../shared/intake-report-version.ts';
 import type {
   IntakeIdentityConfirmation,
   IntakeIdentityReview,
+  IntakeIdentityScope,
 } from '../../shared/intake-identity.ts';
 
 const heading = 'Fictional report IVY-61',
@@ -162,6 +174,129 @@ async function fixture(
     ) as Promise<IntakeIdentityReview>;
   return { root, profileId, db, original, proposed, groupId, app, request, review };
 }
+
+// One native ordinary proposal, two retained duplicate occurrences, complete
+// public scope/confirmation/replay and downstream policy. Host-only hang guard.
+test(
+  'actual native identity retains both duplicate competing group occurrences and repairs them once',
+  { timeout: 120000 },
+  async (t) => {
+    const other = ['Patient: Fictional Rowan River', 'Patient: Fictional Willow Brook'];
+    const f = await fixture(
+      t,
+      true,
+      1,
+      false,
+      (n) => envelope('duplicate-' + n),
+      `${heading}\n${subject}\n${other.join('\n')}\nDOB: ${birthDate}\nFictional result`,
+      true,
+    );
+    type NativeGroup = Omit<IntakeReportGroup, 'versions'> & {
+      versions: IntakeReportGroupVersionV2[];
+    };
+    const view = openIntakeCollectionEnvelope(f.db, { id: f.original.id }),
+      intake = view.child(view.root(), 'intake')!,
+      workflow = view.child(intake, 'workflow')!,
+      original = readIntakeReviewValue<NativeGroup>(
+        view,
+        view.find('reportGroup', workflow, f.groupId)!,
+        256 * 1024,
+      );
+    const groups = other.map((text, n): NativeGroup => ({
+      ...original,
+      id: 'duplicate-B',
+      report: { ...original.report!, subject: { ...original.report!.subject!, text } },
+      versions: [{ ...original.versions.at(-1)!, id: 'duplicate-version-' + n }],
+    }));
+    const prepared = await prepareIntakeWorkflowCommand(
+      f.db,
+      { id: f.original.id },
+      {
+        version: f.proposed.version,
+        operationId: 'fictional-duplicate-competing-groups',
+        request: { groups },
+        createdAt: '2026-01-01T00:00:00Z',
+        changes: function* ({ workflow }) {
+          for (const group of groups)
+            yield {
+              op: 'append' as const,
+              record: workflow,
+              field: 'reportGroups',
+              jsonText: JSON.stringify(group),
+            };
+        },
+      },
+    );
+    if (prepared.replayed) throw Error('Unexpected fixture replay');
+    intakeTransaction(
+      f.db,
+      () => selectedEnvelopeStore(f.db, { id: f.original.id }).collections.stage(prepared.prepared),
+      { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
+    );
+    const before = intakeWorkCounters(f.db).warm,
+      review = await f.review(),
+      scope = review.scopeReference!;
+    assert.equal(scope.collection.competingSubjects, 2);
+    const page = await f.request(
+        `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=competingSubjects&limit=1`,
+      ),
+      second = await f.request(
+        `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=competingSubjects&limit=1&cursor=${encodeURIComponent(page.nextCursor)}`,
+      );
+    assert.ok(page.nextCursor);
+    assert.equal(second.nextCursor, null);
+    assert.deepEqual(
+      [page.items[0].value, second.items[0].value],
+      groups.map((group) => ({
+        groupId: group.id,
+        groupVersionId: group.versions[0]!.id,
+        subject: group.report!.subject!,
+      })),
+    );
+    const targets = await f.request(
+      `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=assignmentTargets&limit=1`,
+    );
+    const command: IntakeIdentityConfirmation = {
+      version: scope.intakeVersion,
+      operationId: 'fictional-duplicate-competing-confirm',
+      scope,
+      outcome: 'this_is_me',
+      attestation: 'confirmed_displayed_identity_questions',
+    };
+    await f.request('identity-scope', command);
+    const after = await f.review();
+    assert.equal(after.status, 'prior_confirmation');
+    assert.equal(after.blocking, false);
+    await f.request('identity-scope', command);
+    assert.equal((await f.review()).confirmationCount, 1);
+    const current = openIntakeCollectionEnvelope(f.db, { id: f.original.id });
+    const policy = collectionWorkflowReviewScope({
+      view: current,
+      catalog: createReportSnapshotCatalog(f.db, { id: f.original.id }),
+      metadataBytes: 256 * 1024,
+      membershipIndex: readCollectionReviewMembership(f.db, { id: f.original.id }, current),
+      readCacheState: () => reviewReadStamp(f.db),
+      packageEvidence: false,
+      activeReceipt: () => true,
+      originalFingerprint: () => '',
+      reportSource: () => undefined,
+    });
+    try {
+      assert.equal(
+        policy.competingBoundaryUnrepaired(
+          policy.identityGroup(f.groupId)!,
+          command.operationId,
+          targets.items[0].value as IntakeIdentityScope['targets'][number],
+        ),
+        false,
+        'both actual current occurrences consume their own confirmed witnesses',
+      );
+    } finally {
+      policy.close!();
+    }
+    assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+  },
+);
 for (const native of [false, true])
   // Real accepted authority selection, source review and checkpoint preparation
   // need a host-fixture hang budget; scaling is checked by work counts below.
@@ -822,5 +957,81 @@ test(
     clearNativeIdentityPreviews(f.db);
     await pending;
     assert.equal(nativeIdentityPreviewCounts(f.db).entries, 0);
+  },
+);
+
+// Real native publication + public read/confirmation/replay with an entirely
+// superseded retained prefix; no model work. Host guard covers app and two builds.
+test(
+  'actual native identity handles superseded-only receipt history before fresh confirmation',
+  { timeout: 120000 },
+  async (t) => {
+    const f = await fixture(t, true, 1, false, undefined, undefined, true);
+    const initial = await f.review();
+    const reference = initial.scopeReference!;
+    assert.ok(reference);
+    const operationIds = Array.from({ length: 70 }, (_, n) => 'fictional-superseded-' + n);
+    const prepared = await prepareIntakeWorkflowCommand(
+      f.db,
+      { id: f.original.id },
+      {
+        version: reference.intakeVersion,
+        operationId: 'fictional-superseded-receipt-history',
+        request: { operationIds },
+        createdAt: '2026-01-01T00:00:00Z',
+        *changes({ workflow }) {
+          for (const operationId of operationIds)
+            yield {
+              op: 'append' as const,
+              record: workflow,
+              field: 'identityConfirmations',
+              jsonText: JSON.stringify({
+                operationId,
+                scope: reference,
+                outcome: 'this_is_me',
+                at: '2026-01-01T00:00:00Z',
+              }),
+            };
+        },
+      },
+    );
+    if (prepared.replayed) throw Error('Unexpected fixture replay');
+    intakeTransaction(
+      f.db,
+      () => {
+        selectedEnvelopeStore(f.db, { id: f.original.id }).collections.stage(prepared.prepared);
+        for (const supportOperationId of operationIds)
+          f.db
+            .prepare(
+              "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES(?,'Identity receipt supersession','verified',?,?)",
+            )
+            .run(
+              'supersession:' + supportOperationId,
+              '2026-01-01T00:00:00Z',
+              JSON.stringify({ supportOperationId }),
+            );
+      },
+      { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
+    );
+    clearNativeIdentityPreviews(f.db);
+    const fresh = await f.review();
+    assert.equal(fresh.confirmationCount, 0);
+    assert.equal(fresh.status, initial.status);
+    const scope = fresh.scopeReference!;
+    const command: IntakeIdentityConfirmation = {
+      version: scope.intakeVersion,
+      operationId: 'fictional-after-superseded-confirm',
+      scope,
+      outcome: 'this_is_me',
+      attestation: 'confirmed_displayed_identity_questions',
+    };
+    await f.request('identity-scope', command);
+    const after = await f.review();
+    assert.equal(after.confirmationCount, 1);
+    assert.equal(after.status, 'prior_confirmation');
+    assert.equal(after.blocking, false);
+    await f.request('identity-scope', command);
+    assert.equal((await f.review()).confirmationCount, 1);
+    assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, 0);
   },
 );

@@ -1,4 +1,5 @@
 /** Complete host policy witnesses; transport arrays remain bounded. */
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import type { IntakeIssueResolution, IntakeReviewDraft } from '../shared/intake.ts';
 import { selectedSequence, type SelectedSequence } from './intake-selected-sequence.ts';
 import { registerReviewRecordField } from './intake-review-selected-record.ts';
@@ -6,6 +7,7 @@ import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
 
 export interface ReviewDraftResolutionPolicy {
   values(): Iterable<IntakeIssueResolution>;
+  valuesWork?(): Generator<void | IntakeIssueResolution, void, void>;
   latest(issueId: string): IntakeIssueResolution | undefined;
   known(issueId: string): IntakeIssueResolution | undefined;
   self(): IntakeIssueResolution | undefined;
@@ -13,6 +15,11 @@ export interface ReviewDraftResolutionPolicy {
 const policies = new WeakMap<IntakeReviewDraft, ReviewDraftResolutionPolicy>();
 
 export function bindReviewDraftResolutions(
+  ...input: Parameters<typeof bindReviewDraftResolutionsWork>
+) {
+  return finishClinicalReviewWork(bindReviewDraftResolutionsWork(...input));
+}
+export function* bindReviewDraftResolutionsWork(
   draft: IntakeReviewDraft,
   policy: ReviewDraftResolutionPolicy,
   bytes: number,
@@ -21,7 +28,9 @@ export function bindReviewDraftResolutions(
     used = 2,
     referenced = false;
   const inline: IntakeIssueResolution[] = [];
-  for (const resolution of policy.values()) {
+  for (const resolution of policy.valuesWork?.() ?? policy.values()) {
+    yield;
+    if (resolution === undefined) continue;
     count++;
     if (referenced) continue;
     used += Buffer.byteLength(JSON.stringify(resolution)) + 1;
@@ -37,7 +46,12 @@ export function bindReviewDraftResolutions(
     registerReviewRecordField(draft, 'resolutions', 'resolutionsReference', function* () {
       yield '[';
       let first = true;
-      for (const resolution of policy.values()) {
+      for (const resolution of policy.valuesWork?.() ?? policy.values()) {
+        // Empty chunks expose index preparation without changing canonical bytes.
+        if (resolution === undefined) {
+          yield '';
+          continue;
+        }
         if (!first) yield ',';
         first = false;
         yield* canonicalReviewValueChunks(resolution);

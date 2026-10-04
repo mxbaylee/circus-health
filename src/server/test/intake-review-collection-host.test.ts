@@ -444,105 +444,181 @@ test('native host preserves linked context and suggested-source pair commitments
   assert.deepEqual(native, oracle);
 });
 
-test('native suggested sources select one indexed report and retain later duplicate-group precedence', async (t) => {
-  const { db, root, profileId } = fixture(t),
-    report = {
-      key: 'fictional-source',
-      title: 'Fictional report',
-      anchor: { locator: 'page 1', text: 'Report F27' },
-      subject: null,
-    },
-    clinical = { ...envelope('one'), contextId: 'shared', report },
-    context = {
-      ...envelope('context'),
-      kind: 'context',
-      clinical: undefined,
-      contextId: 'shared',
-      report,
-      payload: {
-        branding: 'Fictional Suggested Clinic',
-        text: 'Fictional Suggested Clinic\nReport F27',
+// Complete 96-group history publication, cold native review and transaction/rollback proofs share this fixture.
+test(
+  'native suggested sources select one indexed report and retain later duplicate-group precedence',
+  { timeout: 120000 },
+  async (t) => {
+    const { db, root, profileId } = fixture(t),
+      report = {
+        key: 'fictional-source',
+        title: 'Fictional report',
+        anchor: { locator: 'page 1', text: 'Report F27' },
+        subject: null,
       },
-    };
-  const intake = uploadIntake(db, root, profileId, {
-    filename: 'fictional.txt',
-    bytes: Buffer.from('Fictional original report F27'),
-    newProviderName: 'Fictional acquisition',
-  });
-  await proposeConversionRead(db, root, profileId, intake.id, {
-    version: intake.version,
-    jsonlText: [clinical, context].map((value) => JSON.stringify(value)).join('\n'),
-    summary: 'Fictional linked report',
-  });
-  const proposalId = String(
-    db
-      .prepare(
-        "SELECT id FROM source_files WHERE kind='intake_proposal' ORDER BY rowid DESC LIMIT 1",
-      )
-      .get()!.id,
-  );
-  const selectedSource = async (verifyCache = false) => {
-    await prepareCollectionClinicalReviewDependencies(db, root, profileId, intake.id, proposalId);
-    const result = prepareCollectionClinicalReview(db, root, profileId, intake.id, proposalId);
-    assert.equal(result.status, 'ready');
-    if (result.status !== 'ready') throw Error('Expected complete fictional review');
-    try {
-      const read = () =>
-        collectionClinicalProjectionContext(result.session).selected.reportSource(
-          result.session.review.records[0]!,
-          proposalId,
-        );
-      const first = read();
-      if (!verifyCache) return first;
-      const lookups = () => intakeWorkCounters(db).warm.collectionSuggestedSourceLookups;
-      const before = lookups();
-      assert.deepEqual(read(), first);
-      assert.equal(lookups(), before, 'unchanged host lookups reuse the uniqueness proof');
-      db.exec('SAVEPOINT fictional_source_lookup');
+      clinical = { ...envelope('one'), contextId: 'shared', report },
+      context = {
+        ...envelope('context'),
+        kind: 'context',
+        clinical: undefined,
+        contextId: 'shared',
+        report,
+        payload: {
+          branding: 'Fictional Suggested Clinic',
+          text: 'Fictional Suggested Clinic\nReport F27',
+        },
+      };
+    const intake = uploadIntake(db, root, profileId, {
+      filename: 'fictional.txt',
+      bytes: Buffer.from('Fictional original report F27'),
+      newProviderName: 'Fictional acquisition',
+    });
+    await proposeConversionRead(db, root, profileId, intake.id, {
+      version: intake.version,
+      jsonlText: [clinical, context].map((value) => JSON.stringify(value)).join('\n'),
+      summary: 'Fictional linked report',
+    });
+    const proposalId = String(
+      db
+        .prepare(
+          "SELECT id FROM source_files WHERE kind='intake_proposal' ORDER BY rowid DESC LIMIT 1",
+        )
+        .get()!.id,
+    );
+    const selectedSource = async (verifyCache = false, verifyHistory = false) => {
+      await prepareCollectionClinicalReviewDependencies(db, root, profileId, intake.id, proposalId);
+      const { prepareCollectionClinicalReviewAsync } =
+        await import('../intake-review-collection-host.ts');
+      const beforePreparation = intakeWorkCounters(db).warm;
+      let finished = false,
+        historyTurns = 0;
+      const pulse = () => {
+        if (finished) return;
+        const counts = intakeWorkCounters(db).warm;
+        if (
+          counts.collectionSuggestedSourceLookups >
+            beforePreparation.collectionSuggestedSourceLookups &&
+          counts.collectionSuggestedSourceHashes ===
+            beforePreparation.collectionSuggestedSourceHashes
+        )
+          historyTurns++;
+        setImmediate(pulse);
+      };
+      if (verifyHistory) setImmediate(pulse);
+      let result;
       try {
-        assert.deepEqual(read(), first);
-        assert.deepEqual(read(), first);
-        assert.equal(
-          lookups(),
-          before + 2,
-          'transactional reads never reuse a selected uniqueness proof',
+        result = await prepareCollectionClinicalReviewAsync(
+          db,
+          root,
+          profileId,
+          intake.id,
+          proposalId,
+          { signal: t.signal },
         );
       } finally {
-        db.exec('ROLLBACK TO fictional_source_lookup; RELEASE fictional_source_lookup');
+        finished = true;
       }
-      assert.deepEqual(read(), first);
-      assert.equal(lookups(), before + 3, 'no transactional proof survives rollback');
-      return first;
-    } finally {
-      result.session.close();
-    }
-  };
-  assert.equal((await selectedSource(true))?.confirmation.source, 'Fictional Suggested Clinic');
-  const source = { id: intake.id },
-    view = openIntakeCollectionEnvelope(db, source),
-    workflow = view.child(view.child(view.root(), 'intake')!, 'workflow')!,
-    group = view.childAt(workflow, 'reportGroups', 0)!,
-    duplicate = JSON.parse([...view.recordChunks(group)].join(''));
-  assert.equal(duplicate.versions[0].format, 'health-intake-report-group-version-v2');
-  duplicate.versions[0].context.sourceSuggestion.value = 'Fictional Later Clinic';
-  const operationId = randomUUID(),
-    mutation = await prepareIntakeEnvelopeMutation(db, source, {
-      reader: view,
-      operationId,
-      requestDigest: createHash('sha256').update(operationId).digest('hex'),
-      domainVersion: view.logical.domainVersion + 1,
-      changes: [
-        {
-          op: 'append',
-          record: workflow,
-          field: 'reportGroups',
-          jsonText: JSON.stringify(duplicate),
-        },
-      ],
-    });
-  transaction(db, () => selectedEnvelopeStore(db, source).collections.stage(mutation.prepared!));
-  assert.equal((await selectedSource())?.confirmation.source, 'Fictional Later Clinic');
-});
+      if (verifyHistory) {
+        assert.ok(
+          historyTurns > 0,
+          'nonmatching retained source groups cooperate before member hashing',
+        );
+        t.diagnostic(JSON.stringify({ nonmatchingSourceGroups: 96, historyTurns }));
+      }
+      assert.equal(result.status, 'ready');
+      if (result.status !== 'ready') throw Error('Expected complete fictional review');
+      try {
+        const read = () =>
+          collectionClinicalProjectionContext(result.session).selected.reportSource(
+            result.session.review.records[0]!,
+            proposalId,
+          );
+        const first = read();
+        if (!verifyCache) return first;
+        const lookups = () => intakeWorkCounters(db).warm.collectionSuggestedSourceLookups;
+        const before = lookups();
+        const hashes = () => intakeWorkCounters(db).warm.collectionSuggestedSourceHashes;
+        const beforeHashes = hashes();
+        assert.deepEqual(read(), first);
+        assert.equal(
+          hashes(),
+          beforeHashes,
+          'complete confirmation hash is reused under the same proof',
+        );
+        assert.equal(lookups(), before, 'unchanged host lookups reuse the uniqueness proof');
+        db.exec('SAVEPOINT fictional_source_lookup');
+        try {
+          assert.deepEqual(read(), first);
+          assert.deepEqual(read(), first);
+          assert.equal(
+            lookups(),
+            before + 2,
+            'transactional reads never reuse a selected uniqueness proof',
+          );
+          assert.equal(
+            hashes(),
+            beforeHashes + 2,
+            'transactions never reuse or retain complete confirmation hashes',
+          );
+        } finally {
+          db.exec('ROLLBACK TO fictional_source_lookup; RELEASE fictional_source_lookup');
+        }
+        assert.deepEqual(read(), first);
+        assert.equal(lookups(), before + 3, 'no transactional proof survives rollback');
+        assert.equal(
+          hashes(),
+          beforeHashes + 3,
+          'rolled back SQL cannot restore an old confirmation hash proof',
+        );
+        return first;
+      } finally {
+        result.session.close();
+      }
+    };
+    assert.equal((await selectedSource(true))?.confirmation.source, 'Fictional Suggested Clinic');
+    const source = { id: intake.id },
+      view = openIntakeCollectionEnvelope(db, source),
+      workflow = view.child(view.child(view.root(), 'intake')!, 'workflow')!,
+      group = view.childAt(workflow, 'reportGroups', 0)!,
+      duplicate = JSON.parse([...view.recordChunks(group)].join(''));
+    assert.equal(duplicate.versions[0].format, 'health-intake-report-group-version-v2');
+    duplicate.versions[0].context.sourceSuggestion.value = 'Fictional Later Clinic';
+    const operationId = randomUUID(),
+      mutation = await prepareIntakeEnvelopeMutation(db, source, {
+        reader: view,
+        operationId,
+        requestDigest: createHash('sha256').update(operationId).digest('hex'),
+        domainVersion: view.logical.domainVersion + 1,
+        changes: [
+          {
+            op: 'append',
+            record: workflow,
+            field: 'reportGroups',
+            jsonText: JSON.stringify(duplicate),
+          },
+          ...Array.from({ length: 96 }, (_, index) => {
+            const unrelated = structuredClone(duplicate);
+            unrelated.id = 'unrelated-retained-' + index;
+            for (const version of unrelated.versions) {
+              delete version.format;
+              version.members = [];
+            }
+            return {
+              op: 'append' as const,
+              record: workflow,
+              field: 'reportGroups',
+              jsonText: JSON.stringify(unrelated),
+            };
+          }),
+        ],
+      });
+    transaction(db, () => selectedEnvelopeStore(db, source).collections.stage(mutation.prepared!));
+    assert.equal(
+      (await selectedSource(false, true))?.confirmation.source,
+      'Fictional Later Clinic',
+    );
+  },
+);
 
 test('native report clinical pages preserve legacy records and reject stale policy cursors', async (t) => {
   const { db, root, profileId } = fixture(t);
@@ -568,13 +644,13 @@ test('native report clinical pages preserve legacy records and reject stale poli
   await prepareCollectionReviewMembership(db, { id: intake.id });
   clearIntakeStateCache(db);
   const before = intakeWorkCounters(db);
-  const first = readCollectionIntakeReportRecords(db, root, profileId, intake.id, {
+  const first = await readCollectionIntakeReportRecords(db, root, profileId, intake.id, {
     groupId,
     limit: 1,
   });
   assert.equal(first.totalRecords, oracle.totalRecords);
   assert.ok(first.nextCursor);
-  const second = readCollectionIntakeReportRecords(db, root, profileId, intake.id, {
+  const second = await readCollectionIntakeReportRecords(db, root, profileId, intake.id, {
     groupId,
     limit: 1,
     cursor: first.nextCursor!,
@@ -648,7 +724,7 @@ test('native report clinical pages preserve legacy records and reject stale poli
   db.exec(
     "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='clinical_review_revision'",
   );
-  assert.throws(
+  await assert.rejects(
     () =>
       readCollectionIntakeReportRecords(db, root, profileId, intake.id, {
         groupId,
@@ -991,132 +1067,153 @@ test('native queue reuses unrelated source joins and filtered counts after one c
   assert.equal(recovered.totalRecords, after.totalRecords);
 });
 
-test('native feed updates one member in a shared report and retains complete filtered counts', async (t) => {
-  const { db, root, profileId } = fixture(t);
-  const report = {
-    key: 'fictional-shared-report',
-    title: 'Shared fictional report',
-    anchor: { locator: 'page 1', text: 'Shared fictional report' },
-    subject: null,
-  };
-  const source = uploadIntake(db, root, profileId, {
-    filename: 'fictional-many.jsonl',
-    newProviderName: 'Fictional clinic',
-    bytes: Buffer.from(
-      Array.from({ length: 8 }, (_, index) =>
-        JSON.stringify({
-          ...envelope('fictional-' + index),
-          report,
-        }),
-      ).join('\n'),
-    ),
-  });
-  await buildIntakeCollectionEnvelope(db, { id: source.id, sha256: source.sha256 });
-  const first = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
-  assert.ok('format' in first);
-  assert.equal(first.totalRecords, 8);
-  const queried = await listIntakeImportFeedRead(db, root, profileId, { limit: '1', q: 'amended' });
-  assert.equal(queried.totalRecords, 0);
-  const opened = prepareCollectionClinicalReview(db, root, profileId, source.id);
-  if (opened.status !== 'ready') throw Error('Expected selected review');
-  const record = opened.session.review.records[5]!;
-  await applyClinicalRecordAction(db, root, profileId, source.id, {
-    proposalId: null,
-    recordId: record.id,
-    candidateVersionId: record.candidateVersionId!,
-    version: opened.session.review.version,
-    reviewToken: opened.session.review.reviewToken,
-    operationId: 'fictional-shared-member-draft',
-    patch: {
-      mapping: { documentTitle: 'Amended fictional title' },
-      correctionPatch: { documentTitle: 'Amended fictional title' },
-      correctionReason: 'Correct fictional label',
-    },
-  });
-  const before = { ...intakeWorkCounters(db).warm };
-  const after = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
-  const changed = await listIntakeImportFeedRead(db, root, profileId, { limit: '1', q: 'amended' });
-  assert.equal(after.totalRecords, 8);
-  assert.equal(changed.totalRecords, 1);
-  assert.equal(changed.totalGroups, 1);
-  const work = intakeWorkCounters(db).warm;
-  assert.equal(work.collectionQueueMemberRows - before.collectionQueueMemberRows, 1);
-  assert.equal(work.collectionQueueSummaryBuilds - before.collectionQueueSummaryBuilds, 0);
-  assert.equal(work.collectionFeedReviewedRecords - before.collectionFeedReviewedRecords, 2);
-  clearCollectionImportFeeds(db);
-  clearCollectionReportQueues(db);
-  clearPreparedCollectionQueues(db);
-  const recovered = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
-  const recoveredQuery = await listIntakeImportFeedRead(db, root, profileId, {
-    limit: '1',
-    q: 'amended',
-  });
-  assert.deepEqual(recovered.counts, after.counts);
-  assert.deepEqual(recovered.kindCounts, after.kindCounts);
-  assert.equal(recovered.totalRecords, after.totalRecords);
-  assert.equal(recoveredQuery.totalRecords, changed.totalRecords);
-  assert.equal(recoveredQuery.totalGroups, changed.totalGroups);
-});
-
-test('native proposal refreshes its affected report and leaves unrelated feed sources prepared', async (t) => {
-  const { db, root, profileId } = fixture(t),
-    report = {
-      key: 'append-report',
-      title: 'Fictional append report',
-      anchor: { locator: 'page 1', text: 'Fictional append report' },
+// Eight native records exercise cold feed preparation, a retained correction, complete filtered counts and cache reconstruction.
+// This is a host-integration hang guard; correctness remains count/evidence based.
+test(
+  'native feed updates one member in a shared report and retains complete filtered counts',
+  { timeout: 180000 },
+  async (t) => {
+    const { db, root, profileId } = fixture(t);
+    const report = {
+      key: 'fictional-shared-report',
+      title: 'Shared fictional report',
+      anchor: { locator: 'page 1', text: 'Shared fictional report' },
       subject: null,
     };
-  const first = uploadIntake(db, root, profileId, {
-    filename: 'append.jsonl',
-    newProviderName: 'Fictional clinic',
-    bytes: Buffer.from(
-      Array.from({ length: 3 }, (_, i) =>
-        JSON.stringify({ ...envelope('append-' + i), report }),
-      ).join('\n'),
-    ),
-  });
-  const unrelated = uploadIntake(db, root, profileId, {
-    filename: 'unrelated.jsonl',
-    providerId: first.providerId,
-    bytes: Buffer.from(JSON.stringify(envelope('unrelated'))),
-  });
-  for (const intake of [first, unrelated])
-    await buildIntakeCollectionEnvelope(db, { id: intake.id });
-  const warmed = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
-  assert.equal(warmed.totalRecords, 4);
-  await proposeConversionRead(db, root, profileId, first.id, {
-    version: first.version,
-    jsonlText: JSON.stringify({ ...envelope('appended'), report }),
-    summary: 'Fictional additional evidence',
-  });
-  const before = { ...intakeWorkCounters(db).warm };
-  const changed = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
-  assert.equal(changed.totalRecords, 5);
-  const counters = intakeWorkCounters(db).warm;
-  assert.equal(counters.collectionQueuePreparedSources - before.collectionQueuePreparedSources, 1);
-  assert.equal(counters.collectionFeedRebuiltSources - before.collectionFeedRebuiltSources, 1);
-  assert.equal(counters.collectionQueueMemberRows - before.collectionQueueMemberRows, 1);
-  const page = await readIntakeReportRecords(db, root, profileId, first.id, { limit: 1 });
-  assert.equal(page.totalRecords, 4);
-  assert.ok(page.nextCursor);
-  const next = await readIntakeReportRecords(db, root, profileId, first.id, {
-    limit: 1,
-    cursor: page.nextCursor!,
-  });
-  assert.equal(next.totalRecords, 4);
-  assert.notDeepEqual(next.records[0], page.records[0]);
-  clearCollectionImportFeeds(db);
-  clearCollectionReportQueues(db);
-  clearPreparedCollectionQueues(db);
-  const recovered = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
-  assert.deepEqual(recovered.counts, changed.counts);
-  assert.equal(recovered.totalRecords, changed.totalRecords);
-  const recoveredNext = await readIntakeReportRecords(db, root, profileId, first.id, {
-    limit: 1,
-    cursor: page.nextCursor!,
-  });
-  assert.deepEqual(recoveredNext.records, next.records);
-});
+    const source = uploadIntake(db, root, profileId, {
+      filename: 'fictional-many.jsonl',
+      newProviderName: 'Fictional clinic',
+      bytes: Buffer.from(
+        Array.from({ length: 8 }, (_, index) =>
+          JSON.stringify({
+            ...envelope('fictional-' + index),
+            report,
+          }),
+        ).join('\n'),
+      ),
+    });
+    await buildIntakeCollectionEnvelope(db, { id: source.id, sha256: source.sha256 });
+    const first = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
+    assert.ok('format' in first);
+    assert.equal(first.totalRecords, 8);
+    const queried = await listIntakeImportFeedRead(db, root, profileId, {
+      limit: '1',
+      q: 'amended',
+    });
+    assert.equal(queried.totalRecords, 0);
+    const opened = prepareCollectionClinicalReview(db, root, profileId, source.id);
+    if (opened.status !== 'ready') throw Error('Expected selected review');
+    const record = opened.session.review.records[5]!;
+    await applyClinicalRecordAction(db, root, profileId, source.id, {
+      proposalId: null,
+      recordId: record.id,
+      candidateVersionId: record.candidateVersionId!,
+      version: opened.session.review.version,
+      reviewToken: opened.session.review.reviewToken,
+      operationId: 'fictional-shared-member-draft',
+      patch: {
+        mapping: { documentTitle: 'Amended fictional title' },
+        correctionPatch: { documentTitle: 'Amended fictional title' },
+        correctionReason: 'Correct fictional label',
+      },
+    });
+    const before = { ...intakeWorkCounters(db).warm };
+    const after = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
+    const changed = await listIntakeImportFeedRead(db, root, profileId, {
+      limit: '1',
+      q: 'amended',
+    });
+    assert.equal(after.totalRecords, 8);
+    assert.equal(changed.totalRecords, 1);
+    assert.equal(changed.totalGroups, 1);
+    const work = intakeWorkCounters(db).warm;
+    assert.equal(work.collectionQueueMemberRows - before.collectionQueueMemberRows, 1);
+    assert.equal(work.collectionQueueSummaryBuilds - before.collectionQueueSummaryBuilds, 0);
+    assert.equal(work.collectionFeedReviewedRecords - before.collectionFeedReviewedRecords, 2);
+    clearCollectionImportFeeds(db);
+    clearCollectionReportQueues(db);
+    clearPreparedCollectionQueues(db);
+    const recovered = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
+    const recoveredQuery = await listIntakeImportFeedRead(db, root, profileId, {
+      limit: '1',
+      q: 'amended',
+    });
+    assert.deepEqual(recovered.counts, after.counts);
+    assert.deepEqual(recovered.kindCounts, after.kindCounts);
+    assert.equal(recovered.totalRecords, after.totalRecords);
+    assert.equal(recoveredQuery.totalRecords, changed.totalRecords);
+    assert.equal(recoveredQuery.totalGroups, changed.totalGroups);
+  },
+);
+
+// Native publication, affected-source preparation and independent-source reuse are checked through actual retained authority.
+// This is a host-integration hang guard; correctness remains count/evidence based.
+test(
+  'native proposal refreshes its affected report and leaves unrelated feed sources prepared',
+  { timeout: 120000 },
+  async (t) => {
+    const { db, root, profileId } = fixture(t),
+      report = {
+        key: 'append-report',
+        title: 'Fictional append report',
+        anchor: { locator: 'page 1', text: 'Fictional append report' },
+        subject: null,
+      };
+    const first = uploadIntake(db, root, profileId, {
+      filename: 'append.jsonl',
+      newProviderName: 'Fictional clinic',
+      bytes: Buffer.from(
+        Array.from({ length: 3 }, (_, i) =>
+          JSON.stringify({ ...envelope('append-' + i), report }),
+        ).join('\n'),
+      ),
+    });
+    const unrelated = uploadIntake(db, root, profileId, {
+      filename: 'unrelated.jsonl',
+      providerId: first.providerId,
+      bytes: Buffer.from(JSON.stringify(envelope('unrelated'))),
+    });
+    for (const intake of [first, unrelated])
+      await buildIntakeCollectionEnvelope(db, { id: intake.id });
+    const warmed = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
+    assert.equal(warmed.totalRecords, 4);
+    await proposeConversionRead(db, root, profileId, first.id, {
+      version: first.version,
+      jsonlText: JSON.stringify({ ...envelope('appended'), report }),
+      summary: 'Fictional additional evidence',
+    });
+    const before = { ...intakeWorkCounters(db).warm };
+    const changed = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
+    assert.equal(changed.totalRecords, 5);
+    const counters = intakeWorkCounters(db).warm;
+    assert.equal(
+      counters.collectionQueuePreparedSources - before.collectionQueuePreparedSources,
+      1,
+    );
+    assert.equal(counters.collectionFeedRebuiltSources - before.collectionFeedRebuiltSources, 1);
+    assert.equal(counters.collectionQueueMemberRows - before.collectionQueueMemberRows, 1);
+    const page = await readIntakeReportRecords(db, root, profileId, first.id, { limit: 1 });
+    assert.equal(page.totalRecords, 4);
+    assert.ok(page.nextCursor);
+    const next = await readIntakeReportRecords(db, root, profileId, first.id, {
+      limit: 1,
+      cursor: page.nextCursor!,
+    });
+    assert.equal(next.totalRecords, 4);
+    assert.notDeepEqual(next.records[0], page.records[0]);
+    clearCollectionImportFeeds(db);
+    clearCollectionReportQueues(db);
+    clearPreparedCollectionQueues(db);
+    const recovered = await listIntakeImportFeedRead(db, root, profileId, { limit: '1' });
+    assert.deepEqual(recovered.counts, changed.counts);
+    assert.equal(recovered.totalRecords, changed.totalRecords);
+    const recoveredNext = await readIntakeReportRecords(db, root, profileId, first.id, {
+      limit: 1,
+      cursor: page.nextCursor!,
+    });
+    assert.deepEqual(recoveredNext.records, next.records);
+  },
+);
 
 test('selected native host keeps an oversized linked-group sequence reachable with exact legacy tokens', async (t) => {
   const { db, root, profileId } = fixture(t),
@@ -1638,93 +1735,99 @@ test('private public review cache binds source and proposal files and refuses co
   }
 });
 
-test('native feed retains one exact proposal across changed-source windows and detaches queue records', async (t) => {
-  const { db, root, profileId } = fixture(t);
-  const source = uploadIntake(db, root, profileId, {
-    filename: 'fictional-retained-feed.jsonl',
-    newProviderName: 'Fictional clinic',
-    bytes: Buffer.from(
-      Array.from({ length: 4 }, (_, index) => JSON.stringify(envelope('retained-' + index))).join(
-        '\n',
+// Consecutive durable corrections, stale windows and detached queue rows share one complete host fixture.
+// This is a host-integration hang guard; correctness remains count/evidence based.
+test(
+  'native feed retains one exact proposal across changed-source windows and detaches queue records',
+  { timeout: 90000 },
+  async (t) => {
+    const { db, root, profileId } = fixture(t);
+    const source = uploadIntake(db, root, profileId, {
+      filename: 'fictional-retained-feed.jsonl',
+      newProviderName: 'Fictional clinic',
+      bytes: Buffer.from(
+        Array.from({ length: 4 }, (_, index) => JSON.stringify(envelope('retained-' + index))).join(
+          '\n',
+        ),
       ),
-    ),
-  });
-  await buildIntakeCollectionEnvelope(db, { id: source.id });
-  const options = { view: 'all', limit: '1' };
-  await listIntakeImportFeedRead(db, root, profileId, options);
-  const correct = async (title: string) => {
-    const opened = prepareCollectionClinicalReview(db, root, profileId, source.id);
-    if (opened.status !== 'ready') throw Error('Expected retained review');
-    try {
-      const record = opened.session.review.records[0]!;
-      await applyClinicalRecordAction(db, root, profileId, source.id, {
-        proposalId: null,
-        recordId: record.id,
-        candidateVersionId: record.candidateVersionId!,
-        version: opened.session.review.version,
-        reviewToken: opened.session.review.reviewToken,
-        operationId: randomUUID(),
-        patch: {
-          mapping: { documentTitle: title },
-          correctionPatch: { documentTitle: title },
-          correctionReason: 'Fictional correction',
-        },
-      });
-    } finally {
-      opened.session.close();
-    }
-  };
-  await correct('First retained correction');
-  const first = await listIntakeImportFeedRead(db, root, profileId, options);
-  assert.ok('format' in first);
-  assert.ok(first.nextCursor);
-  const before = intakeWorkCounters(db).warm.collectionQueueClinicalReviews;
-  const [second, simultaneous] = await Promise.all([
-    listIntakeImportFeedRead(db, root, profileId, { ...options, cursor: first.nextCursor! }),
-    listIntakeImportFeedRead(db, root, profileId, { ...options, cursor: first.nextCursor! }),
-  ]);
-  assert.ok('format' in second && 'format' in simultaneous);
-  assert.equal(canonicalLiteral(second.records), canonicalLiteral(simultaneous.records));
-  const third = await listIntakeImportFeedRead(db, root, profileId, {
-    ...options,
-    cursor: second.nextCursor!,
-  });
-  assert.ok('format' in third);
-  assert.equal(
-    intakeWorkCounters(db).warm.collectionQueueClinicalReviews,
-    before,
-    'unseen rows use the exact completed current proposal, not another full review',
-  );
-  assert.notEqual(first.records[0]!.feedKey, third.records[0]!.feedKey);
-  const queue = await openCollectionReportQueue(db, root, profileId);
-  const pointer = [...queue.groups('all')][0]!;
-  const member = [...queue.members(source.id, pointer.ordinal)][0]!;
-  const original = queue.reviewMember(source.id, member);
-  assert.equal('session' in original, false);
-  const exact = canonicalLiteral(original.record);
-  original.record.mapping.documentTitle = 'Forged detached title';
-  original.record.evidence.push({ label: 'Forged detached evidence', locator: 'Fictional page' });
-  original.facts.counts.questions = 999;
-  if (original.certificate) original.certificate.sourcePin = 'forged';
-  assert.equal(canonicalLiteral(queue.reviewMember(source.id, member).record), exact);
-  queue.close({ retainReview: true });
-  assert.equal(reviewIssueScratchCounts(db).databases, 1);
-  const held = await openCollectionReportQueue(db, root, profileId);
-  await correct('Second retained correction');
-  assert.throws(() => held.reviewMember(source.id, member), /Refresh|changed/i);
-  held.close();
-  await listIntakeImportFeedRead(db, root, profileId, options);
-  assert.equal(reviewIssueScratchCounts(db).databases, 1);
-  await assert.rejects(() => openCollectionReportQueue(db, root, 'wrong-profile'));
-  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
-  await listIntakeImportFeedRead(db, root, profileId, options);
-  clearIntakeStateCache(db);
-  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
-  await listIntakeImportFeedRead(db, root, profileId, options);
-  assert.equal(reviewIssueScratchCounts(db).databases, 1);
-  db.close();
-  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
-});
+    });
+    await buildIntakeCollectionEnvelope(db, { id: source.id });
+    const options = { view: 'all', limit: '1' };
+    await listIntakeImportFeedRead(db, root, profileId, options);
+    const correct = async (title: string) => {
+      const opened = prepareCollectionClinicalReview(db, root, profileId, source.id);
+      if (opened.status !== 'ready') throw Error('Expected retained review');
+      try {
+        const record = opened.session.review.records[0]!;
+        await applyClinicalRecordAction(db, root, profileId, source.id, {
+          proposalId: null,
+          recordId: record.id,
+          candidateVersionId: record.candidateVersionId!,
+          version: opened.session.review.version,
+          reviewToken: opened.session.review.reviewToken,
+          operationId: randomUUID(),
+          patch: {
+            mapping: { documentTitle: title },
+            correctionPatch: { documentTitle: title },
+            correctionReason: 'Fictional correction',
+          },
+        });
+      } finally {
+        opened.session.close();
+      }
+    };
+    await correct('First retained correction');
+    const first = await listIntakeImportFeedRead(db, root, profileId, options);
+    assert.ok('format' in first);
+    assert.ok(first.nextCursor);
+    const before = intakeWorkCounters(db).warm.collectionQueueClinicalReviews;
+    const [second, simultaneous] = await Promise.all([
+      listIntakeImportFeedRead(db, root, profileId, { ...options, cursor: first.nextCursor! }),
+      listIntakeImportFeedRead(db, root, profileId, { ...options, cursor: first.nextCursor! }),
+    ]);
+    assert.ok('format' in second && 'format' in simultaneous);
+    assert.equal(canonicalLiteral(second.records), canonicalLiteral(simultaneous.records));
+    const third = await listIntakeImportFeedRead(db, root, profileId, {
+      ...options,
+      cursor: second.nextCursor!,
+    });
+    assert.ok('format' in third);
+    assert.equal(
+      intakeWorkCounters(db).warm.collectionQueueClinicalReviews,
+      before,
+      'unseen rows use the exact completed current proposal, not another full review',
+    );
+    assert.notEqual(first.records[0]!.feedKey, third.records[0]!.feedKey);
+    const queue = await openCollectionReportQueue(db, root, profileId);
+    const pointer = [...queue.groups('all')][0]!;
+    const member = [...queue.members(source.id, pointer.ordinal)][0]!;
+    const original = await queue.reviewMember(source.id, member);
+    assert.equal('session' in original, false);
+    const exact = canonicalLiteral(original.record);
+    original.record.mapping.documentTitle = 'Forged detached title';
+    original.record.evidence.push({ label: 'Forged detached evidence', locator: 'Fictional page' });
+    original.facts.counts.questions = 999;
+    if (original.certificate) original.certificate.sourcePin = 'forged';
+    assert.equal(canonicalLiteral((await queue.reviewMember(source.id, member)).record), exact);
+    queue.close({ retainReview: true });
+    assert.equal(reviewIssueScratchCounts(db).databases, 1);
+    const held = await openCollectionReportQueue(db, root, profileId);
+    await correct('Second retained correction');
+    await assert.rejects(() => held.reviewMember(source.id, member), /Refresh|changed/i);
+    held.close();
+    await listIntakeImportFeedRead(db, root, profileId, options);
+    assert.equal(reviewIssueScratchCounts(db).databases, 1);
+    await assert.rejects(() => openCollectionReportQueue(db, root, 'wrong-profile'));
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+    await listIntakeImportFeedRead(db, root, profileId, options);
+    clearIntakeStateCache(db);
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+    await listIntakeImportFeedRead(db, root, profileId, options);
+    assert.equal(reviewIssueScratchCounts(db).databases, 1);
+    db.close();
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+  },
+);
 
 test('concurrent cold queue opens preserve the global four-queue bound', async (t) => {
   const { db, root, profileId } = fixture(t);
@@ -1743,3 +1846,339 @@ test('concurrent cold queue opens preserve the global four-queue bound', async (
   clearCollectionReportQueues(db);
   assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
 });
+
+test(
+  'cooperative cold clinical review serves another HTTP request and preserves complete single-record policy',
+  { timeout: 120000 },
+  async (t) => {
+    const { createServer } = await import('node:http');
+    const { prepareCollectionClinicalReviewAsync } =
+      await import('../intake-review-collection-host.ts');
+    const { db, root, profileId } = fixture(t);
+    const source = uploadIntake(db, root, profileId, {
+      filename: 'fictional-cooperative-history.jsonl',
+      newProviderName: 'Fictional clinic',
+      bytes: Buffer.from(JSON.stringify(envelope('cooperative-history'))),
+    });
+    const saved = JSON.parse(readIntakeEnvelopeText(db, { id: source.id }));
+    const candidate = saved.intake.workflow.candidates[0];
+    saved.intake.workflow.questions = Array.from({ length: 96 }, (_, index) => ({
+      id: 'fictional-cooperative-question-' + index,
+      key: 'fictional-cooperative-key-' + index,
+      locator: 'page 1',
+      candidateId: candidate.id,
+      candidateVersionId: index % 2 ? candidate.versions[0].id : null,
+      prompt: 'Confirm fictional retained reading ' + index,
+      field: 'documentTitle',
+      status: 'unanswered',
+      answers: [],
+      createdAt: '2026-01-01',
+    }));
+    writeIntakeFixtureEnvelope(db, source.id, saved);
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+    const sync = prepareCollectionClinicalReview(db, root, profileId, source.id);
+    assert.equal(sync.status, 'ready');
+    if (sync.status !== 'ready') throw Error('Expected complete synchronous oracle');
+    const expected = canonicalLiteral(sync.session.review);
+    const expectedToken = sync.session.review.records[0]!.selectionReviewToken;
+    sync.session.close();
+    let completed = false,
+      ticks = 0,
+      stopped = false;
+    const server = createServer((_request, response) => {
+      const owner = db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()!
+        .value;
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ owner, reviewCompleted: completed }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => {
+      stopped = true;
+      server.closeAllConnections();
+      server.close();
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw Error('Expected fictional HTTP server');
+    const heartbeat = () => {
+      if (!stopped) {
+        ticks++;
+        setImmediate(heartbeat);
+      }
+    };
+    setImmediate(heartbeat);
+    const otherRequest = fetch(`http://127.0.0.1:${address.port}/unrelated-profile-header`);
+    const pending = prepareCollectionClinicalReviewAsync(db, root, profileId, source.id).then(
+      (result) => {
+        completed = true;
+        return result;
+      },
+    );
+    const response = await otherRequest;
+    assert.deepEqual(await response.json(), { owner: profileId, reviewCompleted: false });
+    const ready = await pending;
+    stopped = true;
+    assert.equal(ready.status, 'ready');
+    assert.ok(ticks > 1, 'actual event-loop heartbeat advanced during cold single-record policy');
+    if (ready.status !== 'ready') throw Error('Expected complete cooperative review');
+    assert.equal(canonicalLiteral(ready.session.review), expected);
+    assert.equal(ready.session.review.records[0]!.selectionReviewToken, expectedToken);
+    assert.equal(ready.session.review.records[0]!.questions?.length, 96);
+    ready.session.close();
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+    t.diagnostic(
+      JSON.stringify({ coldReviewHeartbeatTurns: ticks, completeRetainedQuestions: 96 }),
+    );
+
+    const controller = new AbortController();
+    setImmediate(() => controller.abort());
+    await assert.rejects(
+      prepareCollectionClinicalReviewAsync(db, root, profileId, source.id, null, {
+        signal: controller.signal,
+      }),
+      { name: 'AbortError' },
+    );
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+
+    setImmediate(() => {
+      db.exec('BEGIN');
+      db.prepare("UPDATE app_meta SET value=value WHERE key='owner_profile_id'").run();
+      db.exec('ROLLBACK');
+    });
+    await assert.rejects(
+      prepareCollectionClinicalReviewAsync(db, root, profileId, source.id),
+      /Review changed while preparing/,
+    );
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+  },
+);
+
+test('clinical question selection falls back completely without a reverse index and preserves retained order', async (t) => {
+  const { prepareCollectionClinicalReviewAsync } =
+    await import('../intake-review-collection-host.ts');
+  const { db, root, profileId } = fixture(t);
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-question-fallback.jsonl',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from(JSON.stringify(envelope('question-fallback'))),
+  });
+  const saved = JSON.parse(readIntakeEnvelopeText(db, { id: source.id }));
+  const candidate = saved.intake.workflow.candidates[0];
+  const ids = ['fictional-question-12', 'fictional-question-2', 'fictional-question-1'];
+  saved.intake.workflow.questions = ids.map((id, index) => ({
+    id,
+    key: id,
+    candidateId: candidate.id,
+    candidateVersionId: index === 1 ? null : candidate.versions[0].id,
+    prompt: 'Confirm fictional reading ' + id,
+    field: 'documentTitle',
+    locator: 'page 1',
+    status: 'unanswered',
+    answers: [],
+    createdAt: '2026-01-01',
+  }));
+  writeIntakeFixtureEnvelope(db, source.id, saved);
+  const legacy = reviewIntake(db, root, profileId, source.id);
+  await buildIntakeCollectionEnvelope(db, { id: source.id });
+  await prepareCollectionReviewMembership(db, source);
+  // No workflow dependency preparation: this was a valid complete native reader before the optimization.
+  const fallback = await prepareCollectionClinicalReviewAsync(db, root, profileId, source.id);
+  if (fallback.status !== 'ready') throw Error('Expected complete fallback question scope');
+  assert.deepEqual(
+    fallback.session.review.records[0]!.questions!.map((question) => question.id),
+    ids,
+  );
+  assert.equal(fallback.session.review.reviewToken, legacy.reviewToken);
+  assert.equal(
+    fallback.session.review.records[0]!.selectionReviewToken,
+    legacy.records[0]!.selectionReviewToken,
+  );
+  const token = fallback.session.review.reviewToken;
+  fallback.session.close();
+  await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+  const indexed = await prepareCollectionClinicalReviewAsync(db, root, profileId, source.id);
+  if (indexed.status !== 'ready') throw Error('Expected complete indexed question scope');
+  assert.deepEqual(
+    indexed.session.review.records[0]!.questions!.map((question) => question.id),
+    ids,
+  );
+  assert.equal(indexed.session.review.reviewToken, token);
+  indexed.session.close();
+  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+});
+
+// This guard covers complete 33-record legacy/native policy, unrelated HTTP and two nested refusal attempts.
+// Assertions use complete commitments and work counts, not a runtime target.
+test(
+  'cooperative suggested source hashes complete shared membership once and guards nested history yields',
+  { timeout: 180000 },
+  async (t) => {
+    const { prepareCollectionClinicalReviewAsync } =
+      await import('../intake-review-collection-host.ts');
+    const { createServer } = await import('node:http');
+    const { db, root, profileId } = fixture(t);
+    const count = 33;
+    const phaseStart = performance.now();
+    const phase = (name: string) =>
+      t.diagnostic(
+        JSON.stringify({
+          sharedReportPhase: name,
+          elapsedMs: Math.round(performance.now() - phaseStart),
+        }),
+      );
+    const report = {
+      key: 'shared-cooperative-report',
+      title: 'Fictional shared report',
+      anchor: { locator: 'page 1', text: 'Report C33' },
+      subject: null,
+    };
+    const records = Array.from({ length: count }, (_, i) => ({
+      ...envelope('shared-' + i),
+      contextId: 'shared',
+      report,
+    }));
+    const context = {
+      ...envelope('context'),
+      kind: 'context',
+      clinical: undefined,
+      contextId: 'shared',
+      report,
+      payload: { branding: 'Fictional Shared Clinic', text: 'Fictional Shared Clinic\nReport C33' },
+    };
+    const source = uploadIntake(db, root, profileId, {
+      filename: 'fictional-shared-report.jsonl',
+      newProviderName: 'Fictional acquisition',
+      bytes: Buffer.from([...records, context].map((v) => JSON.stringify(v)).join('\n')),
+    });
+    const saved = JSON.parse(readIntakeEnvelopeText(db, { id: source.id }));
+    const group = saved.intake.workflow.reportGroups[0];
+    const members = group.versions[0].members.length;
+    assert.equal(members, count);
+    // Retain duplicate group precedence while measuring the shared membership itself.
+    const duplicate = structuredClone(group);
+    duplicate.versions[0].contextState = 'mixed';
+    saved.intake.workflow.reportGroups.push(duplicate);
+    writeIntakeFixtureEnvelope(db, source.id, saved);
+    phase('retained fictional setup complete');
+    const legacy = reviewIntake(db, root, profileId, source.id);
+    phase('complete legacy oracle ready');
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+    phase('native dependencies ready');
+    let completed = false,
+      stopped = false,
+      hashTurns = 0;
+    const server = createServer((_request, response) => {
+      response.setHeader('Content-Type', 'application/json');
+      response.end(
+        JSON.stringify({
+          owner: db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()!.value,
+          completed,
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => {
+      stopped = true;
+      server.closeAllConnections();
+      server.close();
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw Error('Expected HTTP fixture');
+    const before = intakeWorkCounters(db).warm;
+    let request: Promise<Response> | undefined;
+    const heartbeat = () => {
+      if (stopped) return;
+      const hashes =
+        intakeWorkCounters(db).warm.collectionSuggestedSourceMemberHashes -
+        before.collectionSuggestedSourceMemberHashes;
+      if (hashes > 0 && hashes < members) {
+        hashTurns++;
+        request ??= fetch(`http://127.0.0.1:${address.port}/unrelated-profile-header`);
+      }
+      setImmediate(heartbeat);
+    };
+    setImmediate(heartbeat);
+    const ready = await prepareCollectionClinicalReviewAsync(db, root, profileId, source.id, null, {
+      signal: t.signal,
+    });
+    completed = true;
+    phase('complete cooperative review ready');
+    assert.equal(ready.status, 'ready');
+    if (ready.status !== 'ready') throw Error('Expected complete shared report');
+    assert.ok(request, 'an actual HTTP request starts inside complete membership hashing');
+    const response = await request;
+    assert.deepEqual(await response.json(), { owner: profileId, completed: false });
+    assert.ok(hashTurns > 0);
+    const after = intakeWorkCounters(db).warm;
+    assert.equal(after.collectionSuggestedSourceHashes - before.collectionSuggestedSourceHashes, 1);
+    assert.equal(
+      after.collectionSuggestedSourceMemberHashes - before.collectionSuggestedSourceMemberHashes,
+      members,
+    );
+    assert.ok(
+      after.collectionSuggestedSourceHashHits - before.collectionSuggestedSourceHashHits >=
+        count - 1,
+    );
+    const native = { ...ready.session.review };
+    if (legacy.sourceTextStale === undefined) delete native.sourceTextStale;
+    assert.deepEqual(
+      native,
+      legacy,
+      'complete review and comparison/selection tokens retain legacy canonical commitments',
+    );
+    stopped = true;
+    t.diagnostic(
+      JSON.stringify({
+        sharedRecords: count,
+        completeMembers: members,
+        nestedHashTurns: hashTurns,
+        completeHashes: 1,
+      }),
+    );
+    const { runClinicalReviewWork } = await import('../clinical-review-work.ts');
+    const { reviewReadStamp } = await import('../intake-clinical-review-read-cache.ts');
+    const projection = collectionClinicalProjectionContext(ready.session);
+    const pairSource = projection.selected.pairSource;
+    assert.ok(pairSource.work);
+    for (const mode of ['abort', 'rollback'] as const) {
+      // A real intervening SQL write invalidates the completed hash memo; each
+      // attempt must traverse complete membership again before retaining a hash.
+      db.prepare("UPDATE app_meta SET value=value WHERE key='owner_profile_id'").run();
+      const controller = new AbortController();
+      const start = intakeWorkCounters(db).warm.collectionSuggestedSourceMemberHashes;
+      let finished = false;
+      const interfere = () => {
+        if (finished) return;
+        if (intakeWorkCounters(db).warm.collectionSuggestedSourceMemberHashes > start) {
+          if (mode === 'abort') controller.abort();
+          else {
+            db.exec('BEGIN');
+            db.prepare("UPDATE app_meta SET value=value WHERE key='owner_profile_id'").run();
+            db.exec('ROLLBACK');
+          }
+        } else setImmediate(interfere);
+      };
+      setImmediate(interfere);
+      try {
+        await assert.rejects(
+          runClinicalReviewWork(pairSource.work!(ready.session.review.records[0]!, null), {
+            signal: controller.signal,
+            capture() {
+              projection.assertCurrent();
+              const stamp = reviewReadStamp(db);
+              return () => {
+                projection.assertCurrent();
+                assert.equal(reviewReadStamp(db), stamp, 'nested source proof changed');
+              };
+            },
+          }),
+          mode === 'abort' ? { name: 'AbortError' } : /nested source proof changed/,
+        );
+      } finally {
+        finished = true;
+      }
+      t.diagnostic('shared report: nested ' + mode + ' refused');
+    }
+    ready.session.close();
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+  },
+);

@@ -717,3 +717,67 @@ for (const family of [false, true])
       db.close();
     }
   });
+
+test('selected clinical dependency work checkpoints unrelated exception history without adding authority', async (t) => {
+  const { clinicalSourceScopeRecordIds, clinicalSourceScopeRecordIdsWork } =
+    await import('../clinical-source-scope.ts');
+  const { runClinicalReviewWork } = await import('../clinical-review-work.ts');
+  const { reviewReadStamp } = await import('../intake-clinical-review-read-cache.ts');
+  const { db } = fixture(t);
+  const put = db.prepare(
+    "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES(?,'Import record exception','verified','2026-01-01',?)",
+  );
+  for (let i = 0; i < 97; i++)
+    put.run(
+      'fictional-unrelated-' + i,
+      JSON.stringify({
+        recordException: { identityKey: 'unrelated-' + i, recordId: 'unrelated-record-' + i },
+      }),
+    );
+  const work = function* (): Generator<void, string[], void> {
+    const selected: string[] = [];
+    for (const id of clinicalSourceScopeRecordIdsWork(db, 'absent-fictional-identity')) {
+      yield;
+      if (id !== undefined) selected.push(id);
+    }
+    return selected;
+  };
+  const capture = () => {
+    const stamp = reviewReadStamp(db);
+    return () => assert.equal(reviewReadStamp(db), stamp, 'dependency proof changed');
+  };
+  let done = false,
+    turns = 0;
+  const pulse = () => {
+    if (!done) {
+      turns++;
+      setImmediate(pulse);
+    }
+  };
+  setImmediate(pulse);
+  try {
+    assert.deepEqual(await runClinicalReviewWork(work(), { capture }), [
+      ...clinicalSourceScopeRecordIds(db, 'absent-fictional-identity'),
+    ]);
+  } finally {
+    done = true;
+  }
+  assert.ok(turns >= 6, 'unrelated retained rows cooperate even when no dependency is emitted');
+  const controller = new AbortController();
+  setImmediate(() => controller.abort());
+  await assert.rejects(runClinicalReviewWork(work(), { capture, signal: controller.signal }), {
+    name: 'AbortError',
+  });
+  setImmediate(() => {
+    db.exec('BEGIN');
+    db.prepare("UPDATE app_meta SET value=value WHERE key='owner_profile_id'").run();
+    db.exec('ROLLBACK');
+  });
+  await assert.rejects(runClinicalReviewWork(work(), { capture }), /dependency proof changed/);
+  assert.equal(
+    db
+      .prepare("SELECT count(*) AS n FROM manual_batches WHERE title='Import record exception'")
+      .get()!.n,
+    97,
+  );
+});

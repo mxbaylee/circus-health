@@ -1,3 +1,8 @@
+import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import {
+  collectionClinicalProjectionContext,
+  type VerifiedClinicalArtifact,
+} from './intake-review-collection-session.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete native report summaries. Pages never become a clinical decision scope. */
@@ -32,7 +37,7 @@ import {
   type CollectionReportQueueGroupPointer,
 } from './intake-report-queue-collection.ts';
 import { openCollectionPeopleRead } from './intake-people-collection.ts';
-import { prepareCollectionClinicalReview } from './intake-review-collection-host.ts';
+import { prepareCollectionClinicalReviewAsync } from './intake-review-collection-host.ts';
 import { reviewedIntakeQueueRecord } from './intake-report-queue.ts';
 import { clinicalMappingLabel } from './clinical-import.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
@@ -326,6 +331,9 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
   cache.used = ++queueClock;
   let released = false;
   const selected = cache;
+  const assertActive = () => {
+    if (released || selected.closed) throw changed();
+  };
   const verified = new Set<string>();
   const rememberVerified = (id: string) => {
     if (verified.size >= 32) verified.delete(verified.values().next().value!);
@@ -333,8 +341,18 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
   };
   return {
     ...selected.queue,
-    reviewMember(intakeId: string, member: CollectionReportQueueMember) {
-      if (released || selected.closed) throw changed();
+    assertActive,
+    async reviewMember(
+      intakeId: string,
+      member: CollectionReportQueueMember,
+      assertRunning?: () => void,
+      retainArtifacts?: (artifacts: Iterable<VerifiedClinicalArtifact>) => void,
+    ) {
+      const assertLease = () => {
+        assertActive();
+        assertRunning?.();
+      };
+      assertLease();
       try {
         selected.queue.assertCurrent();
         if (!verified.has(intakeId)) {
@@ -349,11 +367,19 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
           verifyIntakeFileHash(profileOriginal(root, file.path, profileId), file);
           rememberVerified(member.proposalId);
         }
-        return selected.queue.reviewMember(intakeId, member);
       } catch (error) {
         selected.queue.resetReview();
         throw error;
       }
+      const result = await selected.queue.reviewMember(
+        intakeId,
+        member,
+        assertLease,
+        retainArtifacts,
+      );
+      assertLease();
+      selected.queue.assertCurrent();
+      return result;
     },
     close(options: { retainReview?: boolean } = {}) {
       if (released) return;
@@ -483,6 +509,8 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
   const refresh = async () => {
     const expected = bindingNow(),
       currentRevision = intakeClinicalCachePin(db);
+    const proofScratch = disposableSqlite('circus-queue-refresh-proof-');
+    const artifacts = createClinicalReviewArtifactProof(proofScratch.db, 'clinical_artifacts');
     cache.exec('BEGIN;UPDATE sources SET seen=0,dirty=0');
     try {
       for (const source of collectionQueueSources(db, profileId)) {
@@ -664,7 +692,8 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
             }
           }
         if (narrow) {
-          let prepared: ReturnType<typeof prepareCollectionClinicalReview> | undefined,
+          let prepared:
+              Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>> | undefined,
             proposal: string | null | undefined;
           try {
             for (const candidate of cache
@@ -703,13 +732,17 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                 ) {
                   if (!prepared || proposal !== member.proposalId) {
                     if (prepared?.status === 'ready') prepared.session.close();
-                    prepared = prepareCollectionClinicalReview(
+                    const preparationStamp = reviewReadStamp(db);
+                    prepared = await prepareCollectionClinicalReviewAsync(
                       db,
                       root,
                       profileId,
                       source.id,
                       member.proposalId,
                       {
+                        assertRunning: () => {
+                          if (reviewReadStamp(db) !== preparationStamp) throw changed();
+                        },
                         groundingDependency: (dependency) =>
                           retainGroundingDependency(source.id, dependency),
                       },
@@ -721,6 +754,9 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                   }
                   if (prepared.status !== 'ready')
                     throw new IntakeReviewFragmentRequired(prepared.reference);
+                  artifacts.retain(
+                    collectionClinicalProjectionContext(prepared.session).verifiedArtifacts(),
+                  );
                   const selected = prepared.session.record(
                     member.recordId,
                     member.candidateId,
@@ -891,12 +927,15 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         }
       }
       if (bindingNow() !== expected) throw changed();
+      artifacts.assertCurrent();
       cache.exec('COMMIT');
       binding = expected;
       clinicalRevision = currentRevision;
     } catch (error) {
       cache.exec('ROLLBACK');
       throw error;
+    } finally {
+      proofScratch.close();
     }
   };
   try {
@@ -905,19 +944,28 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     scratch.close();
     throw error;
   }
+  let closed = false;
   const assertCurrent = () => {
-    if (bindingNow() !== binding) throw changed();
+    if (closed || bindingNow() !== binding) throw changed();
   };
-  let reviewCache: ReturnType<typeof prepareCollectionClinicalReview> | undefined,
+  let reviewCache: Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>> | undefined,
     reviewKey = '',
     reviewObservedStamp: string | undefined,
     reviewCertificate: CollectionReviewRowCertificate | undefined;
-  const resetReview = () => {
+  let reviewGeneration = 0,
+    pendingReviews = 0,
+    discardReleasedReview = false,
+    reviewTail: Promise<void> = Promise.resolve();
+  const closeReview = () => {
     if (reviewCache?.status === 'ready') reviewCache.session.close();
     reviewCache = undefined;
     reviewKey = '';
     reviewObservedStamp = undefined;
     reviewCertificate = undefined;
+  };
+  const resetReview = () => {
+    reviewGeneration++;
+    closeReview();
   };
   return {
     get binding() {
@@ -946,6 +994,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       );
     },
     close() {
+      closed = true;
       resetReview();
       scratch.close();
     },
@@ -963,7 +1012,12 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           reviewCertificate.queueBinding === bindingNow()
         );
       } finally {
-        if (!retained) resetReview();
+        if (!retained) {
+          // Closing another lease cannot invalidate the session being prepared by
+          // a live reader. Its own lease guard handles cancellation at each gap.
+          if (pendingReviews) discardReleasedReview = true;
+          else closeReview();
+        }
       }
     },
     summary(intakeId: string, ordinal: number) {
@@ -1071,82 +1125,122 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           },
         };
     },
-    reviewMember(intakeId: string, member: CollectionReportQueueMember) {
-      assertCurrent();
-      const key = canonicalLiteral([intakeId, member.proposalId]),
-        stamp = reviewReadStamp(db),
-        requestRevision = revision(db),
-        sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
-      if (
-        !reviewCache ||
-        reviewKey !== key ||
-        stamp === undefined ||
-        stamp !== reviewObservedStamp ||
-        reviewCertificate?.requestRevision !== requestRevision ||
-        reviewCertificate?.sourcePin !== sourcePin ||
-        reviewCertificate?.queueBinding !== binding
-      ) {
-        resetReview();
-        withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueClinicalReviews'));
-        reviewCache = prepareCollectionClinicalReview(
-          db,
-          root,
-          profileId,
-          intakeId,
-          member.proposalId,
-          { groundingDependency: (dependency) => retainGroundingDependency(intakeId, dependency) },
-        );
-        reviewKey = key;
-        reviewObservedStamp = reviewReadStamp(db);
-        reviewCertificate =
-          stamp !== undefined &&
-          stamp === reviewObservedStamp &&
-          requestRevision === revision(db) &&
-          sourcePin === canonicalLiteral(intakeSourceVersion(db, intakeId))
-            ? { stamp, requestRevision, sourcePin, queueBinding: binding }
-            : undefined;
-      }
-      if (reviewCache.status !== 'ready')
-        throw new IntakeReviewFragmentRequired(reviewCache.reference);
-      const record = reviewCache.session.record(
-        member.recordId,
-        member.candidateId,
-        member.candidateVersionId,
-      );
-      if (!record)
-        throw new HttpError(
-          409,
-          'REPORT_REFERENCE_UNAVAILABLE',
-          'A report reference no longer matches its retained proposal',
-        );
-      const reviewed = reviewedIntakeQueueRecord(record, member.state),
-        facts = reviewedMemberFacts(member, reviewed, true),
-        // Transport omits absent optional fields while retaining raw JSON numbers.
-        // canonicalLiteral also serves digest recipes that retain own undefined fields.
-        encoded = JSON.stringify(record),
-        detached = JSON.parse(encoded, (_key, value, context) =>
-          typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
-            ? JSON.rawJSON(context.source)
-            : value,
-        ) as typeof record;
-      withIntakeWork(db, 'warm', () => {
-        const bytes = Buffer.byteLength(encoded);
-        recordIntakeWork('serializationCalls');
-        recordIntakeWork('serializedBytes', bytes);
-        recordIntakeWork('jsonParseCalls');
-        recordIntakeWork('jsonParseBytes', bytes);
+    async reviewMember(
+      intakeId: string,
+      member: CollectionReportQueueMember,
+      assertLease: () => void,
+      retainArtifacts?: (artifacts: Iterable<VerifiedClinicalArtifact>) => void,
+    ) {
+      const generation = reviewGeneration,
+        prior = reviewTail;
+      let release!: () => void;
+      reviewTail = new Promise<void>((resolve) => {
+        release = resolve;
       });
-      return {
-        certificate: reviewCertificate && { ...reviewCertificate },
-        version: reviewCache.session.review.version,
-        reviewToken: reviewCache.session.review.reviewToken,
-        recordBytes: Buffer.byteLength(encoded),
-        // Complete policy providers stay private. Transport contains their existing
-        // references; small policy facts are computed before detaching the row.
-        record: { ...detached, queueState: reviewed.queueState, selectable: reviewed.selectable },
-        facts,
-        ordinal: reviewCache.session.review.records.indexOf(record),
+      pendingReviews++;
+      const assertRunning = () => {
+        assertLease();
+        if (closed || generation !== reviewGeneration) throw changed();
       };
+      await prior;
+      try {
+        assertRunning();
+        assertCurrent();
+        const key = canonicalLiteral([intakeId, member.proposalId]),
+          stamp = reviewReadStamp(db),
+          requestRevision = revision(db),
+          sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
+        if (
+          !reviewCache ||
+          reviewKey !== key ||
+          stamp === undefined ||
+          stamp !== reviewObservedStamp ||
+          reviewCertificate?.requestRevision !== requestRevision ||
+          reviewCertificate?.sourcePin !== sourcePin ||
+          reviewCertificate?.queueBinding !== binding
+        ) {
+          closeReview();
+          withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueClinicalReviews'));
+          reviewCache = await prepareCollectionClinicalReviewAsync(
+            db,
+            root,
+            profileId,
+            intakeId,
+            member.proposalId,
+            {
+              assertRunning,
+              groundingDependency: (dependency) => retainGroundingDependency(intakeId, dependency),
+            },
+          );
+          assertRunning();
+          reviewKey = key;
+          reviewObservedStamp = reviewReadStamp(db);
+          reviewCertificate =
+            stamp !== undefined &&
+            stamp === reviewObservedStamp &&
+            requestRevision === revision(db) &&
+            sourcePin === canonicalLiteral(intakeSourceVersion(db, intakeId))
+              ? { stamp, requestRevision, sourcePin, queueBinding: binding }
+              : undefined;
+        }
+        assertRunning();
+        assertCurrent();
+        if (reviewCache.status !== 'ready')
+          throw new IntakeReviewFragmentRequired(reviewCache.reference);
+        // A queued lease may have waited after its initial file verification.
+        // Recheck every consumed physical identity before using a warm session.
+        const projection = collectionClinicalProjectionContext(reviewCache.session);
+        retainArtifacts?.(projection.verifiedArtifacts());
+        const record = reviewCache.session.record(
+          member.recordId,
+          member.candidateId,
+          member.candidateVersionId,
+        );
+        if (!record)
+          throw new HttpError(
+            409,
+            'REPORT_REFERENCE_UNAVAILABLE',
+            'A report reference no longer matches its retained proposal',
+          );
+        const reviewed = reviewedIntakeQueueRecord(record, member.state),
+          facts = reviewedMemberFacts(member, reviewed, true),
+          // Transport omits absent optional fields while retaining raw JSON numbers.
+          // canonicalLiteral also serves digest recipes that retain own undefined fields.
+          encoded = JSON.stringify(record),
+          detached = JSON.parse(encoded, (_key, value, context) =>
+            typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
+              ? JSON.rawJSON(context.source)
+              : value,
+          ) as typeof record;
+        withIntakeWork(db, 'warm', () => {
+          const bytes = Buffer.byteLength(encoded);
+          recordIntakeWork('serializationCalls');
+          recordIntakeWork('serializedBytes', bytes);
+          recordIntakeWork('jsonParseCalls');
+          recordIntakeWork('jsonParseBytes', bytes);
+        });
+        return {
+          certificate: reviewCertificate && { ...reviewCertificate },
+          version: reviewCache.session.review.version,
+          reviewToken: reviewCache.session.review.reviewToken,
+          recordBytes: Buffer.byteLength(encoded),
+          // Complete policy providers stay private. Transport contains their existing
+          // references; small policy facts are computed before detaching the row.
+          record: { ...detached, queueState: reviewed.queueState, selectable: reviewed.selectable },
+          facts,
+          ordinal: reviewCache.session.review.records.indexOf(record),
+        };
+      } catch (error) {
+        closeReview();
+        throw error;
+      } finally {
+        pendingReviews--;
+        if (!pendingReviews && discardReleasedReview) {
+          discardReleasedReview = false;
+          closeReview();
+        }
+        release();
+      }
     },
     *groups(
       view: IntakeReportQueueView = 'all',
@@ -1296,6 +1390,7 @@ export async function collectionReportGroupSummary(
   );
   let sourceReview: CollectionReportGroupSummary['sourceReview'] = null;
   try {
+    const artifacts = createClinicalReviewArtifactProof(coverageDb, 'clinical_artifacts');
     const report = group && view.child(group, 'report');
     if (group && pointer.basis === 'report_anchor' && report && view.has(report, 'anchor')) {
       const scope = await prepareNativeReportSourceReviewScope(db, source, {
@@ -1345,7 +1440,7 @@ export async function collectionReportGroupSummary(
         queue.cacheMemberFacts(intakeId, member, reviewedMemberFacts(member));
         continue;
       }
-      const { facts } = queue.reviewMember(intakeId, member);
+      const { facts } = await queue.reviewMember(intakeId, member, undefined, artifacts.retain);
       queue.cacheMemberFacts(intakeId, member, {
         ...facts,
         title: isCurrent && pointer.basis === 'candidate_fallback' ? facts.title : undefined,
@@ -1479,6 +1574,7 @@ export async function collectionReportGroupSummary(
       : null;
     queue.assertCurrent();
     if (identityGroundingGeneration(db) !== grounding) throw changed();
+    artifacts.assertCurrent();
     const summary: CollectionReportGroupSummary = {
       format: 'health-intake-report-group-v2',
       intakeId,

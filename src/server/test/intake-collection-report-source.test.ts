@@ -346,6 +346,7 @@ import { schemaKey } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import {
   resolveNativeReportSource,
+  resolveNativeReportSourceWork,
   selectNativeReportSourceLocator,
 } from '../intake-report-source-resolution.ts';
 import type { IntakeReportGroupVersionV2 } from '../../shared/intake-report-version.ts';
@@ -356,7 +357,8 @@ for (const basis of ['manual_report_label', 'explicit_current_members'] as const
       basis +
       ' extension selects atomic catalog and preserves legacy receipt grammar',
     // Cold codec/index publication, three receipt scopes, giant canonical evidence and warm replay share this fixture.
-    { timeout: 60_000 },
+    // Manual source coverage adds 96 retained extensions, complete legacy/native parity and replay; its larger guard covers that complete fixture work.
+    { timeout: basis === 'manual_report_label' ? 180_000 : 60_000 },
     async (t) => {
       const f = fixture(basis);
       if (basis === 'explicit_current_members') {
@@ -410,6 +412,16 @@ for (const basis of ['manual_report_label', 'explicit_current_members'] as const
             at: '2025-01-02',
           },
         ];
+      if (basis === 'manual_report_label')
+        f.workflow.reportSourceConfirmations![0]!.extensions!.push(
+          ...Array.from({ length: 96 }, (_, index) => ({
+            id: 'retained-nonmatching-' + index,
+            groupVersionId: 'version-old',
+            contextId: 'unmatched-' + index,
+            members: [],
+            at: '2025-01-03',
+          })),
+        );
       const root = mkdtempSync(join(tmpdir(), 'fictional-source-extensions-')),
         identity = {
           profileId: 'fictional',
@@ -648,6 +660,75 @@ for (const basis of ['manual_report_label', 'explicit_current_members'] as const
         assert.equal(expected.coverage.contextId, 'legacy-context');
         assert.equal(actual.coverage.contextId, expected.coverage.contextId);
         assert.equal(actual.confirmation.operationId, expected.confirmation.operationId);
+        const { runClinicalReviewWork } = await import('../clinical-review-work.ts');
+        const { reviewReadStamp } = await import('../intake-clinical-review-read-cache.ts');
+        const { readdirSync } = await import('node:fs');
+        const scratch = () =>
+          readdirSync(tmpdir())
+            .filter((name) => name.startsWith('circus-source-scope-'))
+            .sort();
+        const initialScratch = scratch();
+        const work = () =>
+          resolveNativeReportSourceWork(db, source, {
+            candidateId: member.candidateId,
+            candidateVersionId: member.candidateVersionId,
+            references: function* () {
+              for (let index = 0; index < 96; index++)
+                yield { groupId: 'unrelated-' + index, groupVersionId: 'unrelated' };
+              yield* refs;
+            },
+          });
+        const capture = () => {
+          const stamp = reviewReadStamp(db);
+          return () => assert.equal(reviewReadStamp(db), stamp, 'exact resolver SQL proof');
+        };
+        let turns = 0,
+          done = false;
+        const pulse = () => {
+          if (!done) {
+            turns++;
+            setImmediate(pulse);
+          }
+        };
+        setImmediate(pulse);
+        try {
+          assert.deepEqual(await runClinicalReviewWork(work(), { capture }), actual);
+        } finally {
+          done = true;
+        }
+        assert.ok(
+          turns > 6,
+          'reference and nonmatching extension history expose real cooperative turns',
+        );
+        assert.deepEqual(scratch(), initialScratch);
+        const controller = new AbortController();
+        setImmediate(() => controller.abort());
+        await assert.rejects(
+          runClinicalReviewWork(work(), { capture, signal: controller.signal }),
+          { name: 'AbortError' },
+        );
+        assert.deepEqual(
+          scratch(),
+          initialScratch,
+          'cancelled resolver closes its reference spool',
+        );
+        setImmediate(() => {
+          db.exec('BEGIN');
+          db.prepare("UPDATE app_meta SET value=value WHERE key='owner_profile_id'").run();
+          db.exec('ROLLBACK');
+        });
+        await assert.rejects(
+          runClinicalReviewWork(work(), { capture }),
+          /exact resolver SQL proof/,
+        );
+        assert.deepEqual(scratch(), initialScratch, 'refused resolver closes its reference spool');
+        t.diagnostic(
+          JSON.stringify({
+            explicitReferenceCount: 97,
+            nonmatchingExtensions: 97,
+            cooperativeTurns: turns,
+          }),
+        );
       }
       assert.equal(
         resolveNativeReportSource(db, source, {
@@ -729,7 +810,7 @@ for (const basis of ['manual_report_label', 'explicit_current_members'] as const
       const after = JSON.parse([...iterateIntakeEnvelopeText(db, source)].join(''));
       assert.equal(
         after.intake.workflow.reportSourceConfirmations[0].extensions.length,
-        basis === 'manual_report_label' ? 3 : 1,
+        f.workflow.reportSourceConfirmations![0]!.extensions!.length,
       );
       assert.throws(() => resolveNativeReportSource(db, source, request), /stale|foreign/);
     },

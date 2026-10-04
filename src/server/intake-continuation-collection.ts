@@ -5,8 +5,10 @@ import {
   prepareReadingPendingIndex,
   beginReadingPendingIndexUpdate,
 } from './intake-reading-pending-index.ts';
-import { HttpError, type Database } from './database.ts';
-import { assertIntakeOwner } from './intake.ts';
+import { HttpError, observeDatabaseClose, type Database } from './database.ts';
+import { assertIntakeOwner, getIntakeEvidenceHeader } from './intake.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { recordDurabilityStatus } from './record-versions.ts';
 import { readPackagePlanScope, readPackageUnitPage } from './intake-package-plan.ts';
 import { nextPendingPagedPackageUnit } from './intake-package-batch.ts';
 import { readRetainedPlanScope } from './intake-retained-plan.ts';
@@ -132,6 +134,53 @@ function owner(scope: CollectionConversionScope) {
     );
   return value;
 }
+const SCOPE_CACHE_BYTES = 256 * 1024;
+const scopeCaches = new WeakMap<
+  Database,
+  {
+    stamp: string;
+    bytes: number;
+    values: Map<string, { scope: CollectionConversionScope; bytes: number }>;
+  }
+>();
+const observedScopeDatabases = new WeakSet<Database>();
+function retainedScopeBytes(scope: CollectionConversionScope) {
+  const value = owner(scope);
+  if (value.plan.kind !== 'retained' || !value.retainedUnit || !value.logical) return undefined;
+  const unit = value.retainedUnit,
+    plan = value.plan.scope,
+    records = [
+      unit.record,
+      unit.coverageRecord,
+      unit.exceptionRecord,
+      unit.memberRecord,
+      plan.record,
+      plan.pinsRecord,
+      plan.indexRecord,
+    ];
+  return (
+    plan.retainedMetadataBytes() +
+    Buffer.byteLength(
+      JSON.stringify([
+        scope,
+        value.logical,
+        value.unit,
+        value.ordinal,
+        value.planAddress,
+        {
+          id: unit.id,
+          kind: unit.kind,
+          status: unit.status,
+          ordinal: unit.ordinal,
+          attemptCount: unit.attemptCount,
+          processingException: unit.processingException,
+          pages: { count: unit.pages.count, uniqueCount: unit.pages.uniqueCount },
+        },
+        records.map((record) => (record ? plan.reader.address(record) : null)),
+      ]),
+    )
+  );
+}
 /** Call after source capture has selected its new pins. Units can be selected
  * explicitly for manual reads; omitted unitId uses the checked first gap. */
 export function openCollectionConversion(
@@ -143,6 +192,77 @@ export function openCollectionConversion(
 ): CollectionConversionScope | undefined {
   if (!options.sessionId || Buffer.byteLength(options.sessionId) > 200)
     throw Error('Invalid conversion session identity');
+  try {
+    const stamp = reviewReadStamp(db);
+    if (!stamp) scopeCaches.delete(db);
+    const key = JSON.stringify([
+      root,
+      profileId,
+      intakeId,
+      options.sessionId,
+      options.unitId ?? null,
+    ]);
+    if (!stamp || Buffer.byteLength(key) > 4096)
+      return openSelectedConversion(db, root, profileId, intakeId, options);
+    let cache = scopeCaches.get(db);
+    if (!cache || cache.stamp !== stamp) {
+      cache = { stamp, bytes: 0, values: new Map() };
+      scopeCaches.set(db, cache);
+      if (!observedScopeDatabases.has(db)) {
+        observedScopeDatabases.add(db);
+        observeDatabaseClose(db, () => scopeCaches.delete(db));
+      }
+    }
+    const cached = cache.values.get(key);
+    if (cached) {
+      const source = getIntakeEvidenceHeader(db, root, profileId, intakeId),
+        selected = owner(cached.scope),
+        durability = recordDurabilityStatus(db);
+      if (!durability?.configured || durability.dirty)
+        throw Error('The reading scope requires current accepted authority');
+      if (
+        source.workflowState !== 'selected' ||
+        source.sourceHash !== cached.scope.sourceHash ||
+        source.version !== cached.scope.version ||
+        selected.root !== root ||
+        !selected.logical
+      )
+        throw new HttpError(409, 'CONVERSION_CHANGED', 'The selected reading source changed');
+      if (reviewReadStamp(db) === stamp) {
+        cache.values.delete(key);
+        cache.values.set(key, cached);
+        return cached.scope;
+      }
+      scopeCaches.delete(db);
+      return openSelectedConversion(db, root, profileId, intakeId, options);
+    }
+    const scope = openSelectedConversion(db, root, profileId, intakeId, options);
+    if (!scope) return undefined;
+    const metadataBytes = retainedScopeBytes(scope);
+    if (metadataBytes === undefined) return scope;
+    const bytes = metadataBytes + Buffer.byteLength(key);
+    if (bytes <= SCOPE_CACHE_BYTES && reviewReadStamp(db) === stamp) {
+      cache.values.set(key, { scope, bytes });
+      cache.bytes += bytes;
+      while (cache.values.size > 2 || cache.bytes > SCOPE_CACHE_BYTES) {
+        const first = cache.values.keys().next().value!;
+        cache.bytes -= cache.values.get(first)!.bytes;
+        cache.values.delete(first);
+      }
+    }
+    return scope;
+  } catch (error) {
+    scopeCaches.delete(db);
+    throw error;
+  }
+}
+function openSelectedConversion(
+  db: Database,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  options: { sessionId: string; unitId?: string },
+): CollectionConversionScope | undefined {
   const selectedStore = selectedEnvelopeStore(db, { id: intakeId }).collections;
   const nativeSelected =
     selectedStore.get(selectedStore.openView(), 'logical', 'package.selection', 'active') !==
@@ -208,6 +328,7 @@ export function openCollectionConversion(
       kind: selected.kind!,
       sourceFileId: intakeId,
       sourceHash: direct.plan.pins.sourceHash,
+      locator: selected.locator?.slice(0, 2000),
     };
     ordinal = selected.ordinal;
     if (selected.kind === 'pdf') {
@@ -326,6 +447,21 @@ export function openCollectionConversion(
     })(),
   });
   return scope;
+}
+
+/** Presentation for an already selected scope. The caller independently chooses
+ * the first pending unit; a manually selected resume unit need not be that unit. */
+export function collectionConversionUnitLabel(scope: CollectionConversionScope) {
+  const selected = owner(scope);
+  let locator = selected.unit.locator;
+  if (selected.retainedUnit) {
+    const { reader, record } = selected.retainedUnit;
+    const value = reader.field(record, 'locator', { bytes: 2000 });
+    locator =
+      value.kind === 'value' && typeof value.value === 'string' ? value.value : scope.unitId;
+  }
+  owner(scope);
+  return { id: scope.unitId, locator: locator?.slice(0, 2000) || scope.unitId };
 }
 const collectionName = (scope: CollectionConversionScope) => 'reading.' + scope.ledgerId;
 const sessionName = (scope: CollectionConversionScope) =>

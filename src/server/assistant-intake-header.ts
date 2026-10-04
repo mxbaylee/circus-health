@@ -12,6 +12,8 @@ import { summaryFilename } from './intake-summary-name.ts';
 import { collectionActiveIntakePlanHeader } from './intake-summary.ts';
 import { readDirectPlanHeader } from './intake-direct-plan.ts';
 import { readPackagePlanScope } from './intake-package-plan.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { recordDurabilityStatus } from './record-versions.ts';
 
 export type NativeAssistantSourceHeader = IntakeFilename & {
   format: 'health-intake-assistant-source-v1';
@@ -24,14 +26,116 @@ export type NativeAssistantSourceHeader = IntakeFilename & {
   durability: IntakeSummaryV2['durability'];
 };
 
+const HEADER_CACHE_BYTES = 256 * 1024;
+interface HeaderEntry {
+  source: string;
+  logical: string;
+  value: NativeAssistantSourceHeader;
+  bytes: number;
+}
+const headers = new WeakMap<
+  Database,
+  { stamp: string; values: Map<string, HeaderEntry>; bytes: number }
+>();
+function freezeHeader(value: unknown): void {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return;
+  for (const child of Object.values(value)) freezeHeader(child);
+  Object.freeze(value);
+}
+function currentAuthority(db: Database): void {
+  const durability = recordDurabilityStatus(db);
+  if (!durability?.configured || durability.dirty)
+    throw Error('The selected assistant source requires current accepted authority');
+}
+
 export function readNativeAssistantSourceHeader(
   db: Database,
   root: string,
   profileId: string,
   id: string,
 ): NativeAssistantSourceHeader | undefined {
-  const source = getIntakeEvidenceHeader(db, root, profileId, id);
-  if (source.workflowState !== 'selected') return undefined;
+  // Only detached, bounded header values are retained. Every reuse still checks
+  // the actual profile/source and physical accepted head; SQL stamps alone do
+  // not prove that encrypted/contributor authority remains available.
+  const stamp = reviewReadStamp(db);
+  if (!stamp) headers.delete(db);
+  try {
+    const source = getIntakeEvidenceHeader(db, root, profileId, id);
+    if (source.workflowState !== 'selected') {
+      headers.delete(db);
+      return undefined;
+    }
+    const current = intakeSourceVersion(db, id);
+    currentAuthority(db);
+    const key = JSON.stringify([root, profileId, id]),
+      sourceBinding = JSON.stringify(source);
+    let cache = headers.get(db);
+    if (!cache || cache.stamp !== stamp) {
+      headers.delete(db);
+      cache = stamp ? { stamp, values: new Map(), bytes: 0 } : undefined;
+      if (cache) headers.set(db, cache);
+    }
+    const cached = cache?.values.get(key);
+    if (
+      cached &&
+      cached.source === sourceBinding &&
+      cached.logical === current.logicalBinding &&
+      cached.value.version === current.version &&
+      reviewReadStamp(db) === stamp
+    ) {
+      cache!.values.delete(key);
+      cache!.values.set(key, cached);
+      return cached.value;
+    }
+    const value = readSelectedHeader(db, root, profileId, id, source, current);
+    const bytes =
+      Buffer.byteLength(key) +
+      Buffer.byteLength(sourceBinding) +
+      Buffer.byteLength(current.logicalBinding || '') +
+      Buffer.byteLength(JSON.stringify(value));
+    if (
+      cache &&
+      current.logicalBinding &&
+      value.activePlan.state === 'exact' &&
+      value.activePlan.plan &&
+      Buffer.byteLength(key) <= 4096 &&
+      bytes <= HEADER_CACHE_BYTES &&
+      reviewReadStamp(db) === stamp
+    ) {
+      freezeHeader(value);
+      const prior = cache.values.get(key);
+      if (prior) cache.bytes -= prior.bytes;
+      cache.values.delete(key);
+      cache.values.set(key, {
+        source: sourceBinding,
+        logical: current.logicalBinding,
+        value,
+        bytes,
+      });
+      cache.bytes += bytes;
+      while (cache.values.size > 32 || cache.bytes > HEADER_CACHE_BYTES) {
+        const first = cache.values.keys().next().value!;
+        cache.bytes -= cache.values.get(first)!.bytes;
+        cache.values.delete(first);
+      }
+    }
+    return value;
+  } catch (error) {
+    // A temporary repair or a failed authority check cannot revive an older
+    // successful stamp after rollback, cache disposal, profile lock or recovery.
+    headers.delete(db);
+    throw error;
+  }
+}
+
+function readSelectedHeader(
+  db: Database,
+  root: string,
+  profileId: string,
+  id: string,
+  source: ReturnType<typeof getIntakeEvidenceHeader>,
+  current: ReturnType<typeof intakeSourceVersion>,
+): NativeAssistantSourceHeader {
   const providerId = String(source.providerId || '');
   if (Buffer.byteLength(providerId) > 16384)
     throw new HttpError(
@@ -42,13 +146,12 @@ export function readNativeAssistantSourceHeader(
   const view = openIntakeCollectionEnvelope(db, { id }),
     intake = view.child(view.root(), 'intake');
   if (!intake) throw Error('The selected assistant source header is unavailable');
-  const current = intakeSourceVersion(db, id),
-    pins = {
-      sourceHash: source.sourceHash,
-      logicalRoot: view.logical.root?.hash || '',
-      domainVersion: view.logical.domainVersion,
-      version: current.version,
-    };
+  const pins = {
+    sourceHash: source.sourceHash,
+    logicalRoot: view.logical.root?.hash || '',
+    domainVersion: view.logical.domainVersion,
+    version: current.version,
+  };
   if (
     !pins.logicalRoot ||
     pins.domainVersion !== current.rawVersion ||

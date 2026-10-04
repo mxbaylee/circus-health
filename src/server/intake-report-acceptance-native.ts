@@ -26,7 +26,7 @@ import {
 } from './intake-retained-plan.ts';
 import { prepareCollectionWorkflowReadiness } from './intake-workflow-readiness.ts';
 import {
-  prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
 import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
@@ -91,12 +91,13 @@ export async function applyNativeAcceptanceGroup(
         // an ordinary write (including one imitating a maintenance actor)
         // invalidates this proof before any refreshed token can be used.
         if (!hasIntakeCollectionEnvelope(db, { id: block.intakeId })) continue;
-        const entry = prepareCollectionClinicalReview(
+        const entry = await prepareCollectionClinicalReviewAsync(
           db,
           root,
           profileId,
           block.intakeId,
           block.proposalId,
+          { assertRunning: () => pairPreparation.assertCurrent() },
         );
         if (entry.status !== 'ready') continue;
         try {
@@ -179,7 +180,9 @@ export async function applyNativeAcceptanceGroup(
       );
     const lookup = await prepareIntakeLookupIndices(db, { assertRunning });
     let discoveryOrder = maximumReportDiscoveryOrder(db);
-    const members: NativeAcceptanceGroupMember[] = selected.blocks.map((block) => {
+    const members: NativeAcceptanceGroupMember[] = [];
+    for (const block of selected.blocks) {
+      assertRunning();
       const version = intakeSourceVersion(db, block.intakeId);
       if (!options.retainResult && version.version !== block.intakeVersion)
         throw new HttpError(
@@ -196,12 +199,13 @@ export async function applyNativeAcceptanceGroup(
           'SELECTION_REVIEW_CHANGED',
           'This selection could not be reviewed. Refresh its exact record before saving.',
         );
-      const result = prepareCollectionClinicalReview(
+      const result = await prepareCollectionClinicalReviewAsync(
         db,
         root,
         profileId,
         block.intakeId,
         block.proposalId,
+        { assertRunning },
       );
       if (result.status !== 'ready')
         throw new HttpError(
@@ -265,7 +269,7 @@ export async function applyNativeAcceptanceGroup(
           );
       }
       const evidence = readRetainedPlanEvidence(db, profileId, block.intakeId);
-      return {
+      members.push({
         session,
         expectedVersion: options.retainResult ? version.version : block.intakeVersion,
         reviewToken:
@@ -337,8 +341,8 @@ export async function applyNativeAcceptanceGroup(
           contextLookup: buildReportContextLookup(context.proposal.entries),
         },
         nextDiscoveryOrder: () => ++discoveryOrder,
-      };
-    });
+      });
+    }
     const publicationChecks = new Map<string, () => void>();
     const { prepareClinicalSourceFingerprintIndex } =
       await import('./intake-clinical-source-index.ts');

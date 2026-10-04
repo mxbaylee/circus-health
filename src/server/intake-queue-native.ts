@@ -453,7 +453,7 @@ export async function readIntakeReportRecords(
   await prepareCollectionQueueRead(db, root, profileId);
   const queue = await openCollectionReportQueue(db, root, profileId);
   try {
-    return readCollectionIntakeReportRecords(db, root, profileId, id, input, queue);
+    return await readCollectionIntakeReportRecords(db, root, profileId, id, input, queue);
   } finally {
     queue.close();
   }

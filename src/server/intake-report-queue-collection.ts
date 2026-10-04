@@ -1,3 +1,5 @@
+import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete selected report membership traversal for native clinical record queues. */
 import { createHash } from 'node:crypto';
@@ -18,7 +20,7 @@ import {
   readIntakeReviewValue,
   IntakeReviewFragmentRequired,
 } from './intake-review-collection.ts';
-import { prepareCollectionClinicalReview } from './intake-review-collection-host.ts';
+import { prepareCollectionClinicalReviewAsync } from './intake-review-collection-host.ts';
 import type { IntakeClinicalReviewReference } from './intake-review-collection-session.ts';
 import { reviewedIntakeQueueRecord } from './intake-report-queue.ts';
 import type { IntakeReportMembersReference } from '../shared/intake-report-version.ts';
@@ -394,7 +396,7 @@ export interface CollectionIntakeReportRecordPage {
   nextCursor: string | null;
 }
 /** Native report-detail/import record slice; every row is enriched from its COMPLETE bounded proposal. */
-export function readCollectionIntakeReportRecords(
+export async function readCollectionIntakeReportRecords(
   db: DatabaseSync,
   root: string,
   profileId: string,
@@ -407,7 +409,7 @@ export function readCollectionIntakeReportRecords(
     bytes?: number;
   } = {},
   queue?: Awaited<ReturnType<typeof openCollectionReportQueue>>,
-): CollectionIntakeReportRecordPage {
+): Promise<CollectionIntakeReportRecordPage> {
   assertIntakeOwner(db, profileId);
   const view = input.view || 'active',
     limit = input.limit ?? 50,
@@ -484,98 +486,118 @@ export function readCollectionIntakeReportRecords(
     pageFull = false;
   // Keep at most one complete bounded proposal review; never one full review per package member.
   let cachedProposal: string | null | undefined,
-    cached: ReturnType<typeof prepareCollectionClinicalReview> | undefined;
-  for (const member of window
-    ? window.members()
-    : collectionReportQueueMembers(db, profileId, intakeId)) {
-    if (input.groupId && member.groupId !== input.groupId) continue;
-    if (view !== 'all' && member.state !== (view === 'active' ? 'pending' : 'deferred')) continue;
-    if (!window) totalRecords++;
-    const order =
-      member.groupOrder +
-      ':' +
-      String(member.groupOrdinal).padStart(12, '0') +
-      ':' +
-      String(member.memberOrder).padStart(12, '0') +
-      ':' +
-      JSON.stringify([member.candidateId, member.candidateVersionId]);
-    if (order <= after) continue;
-    if (pageFull || records.length >= limit) {
-      remaining = true;
-      continue;
-    }
-    if (!cached || cachedProposal !== member.proposalId) {
-      cached = prepareCollectionClinicalReview(db, root, profileId, intakeId, member.proposalId);
-      cachedProposal = member.proposalId;
-    }
-    if (cached.status !== 'ready') throw new IntakeReviewFragmentRequired(cached.reference);
-    const record = cached.session.record(
-      member.recordId,
-      member.candidateId,
-      member.candidateVersionId,
-    );
-    if (!record)
-      throw new HttpError(
-        409,
-        'REPORT_REFERENCE_UNAVAILABLE',
-        'A report reference no longer matches its retained proposal; inspect the original',
+    cached: Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>> | undefined;
+  const physical = disposableSqlite('circus-report-record-proof-');
+  try {
+    const artifacts = createClinicalReviewArtifactProof(physical.db, 'clinical_artifacts');
+    for (const member of window
+      ? window.members()
+      : collectionReportQueueMembers(db, profileId, intakeId)) {
+      if (input.groupId && member.groupId !== input.groupId) continue;
+      if (view !== 'all' && member.state !== (view === 'active' ? 'pending' : 'deferred')) continue;
+      if (!window) totalRecords++;
+      const order =
+        member.groupOrder +
+        ':' +
+        String(member.groupOrdinal).padStart(12, '0') +
+        ':' +
+        String(member.memberOrder).padStart(12, '0') +
+        ':' +
+        JSON.stringify([member.candidateId, member.candidateVersionId]);
+      if (order <= after) continue;
+      if (pageFull || records.length >= limit) {
+        remaining = true;
+        continue;
+      }
+      if (!cached || cachedProposal !== member.proposalId) {
+        if (cached?.status === 'ready') cached.session.close();
+        cached = undefined;
+        cached = await prepareCollectionClinicalReviewAsync(
+          db,
+          root,
+          profileId,
+          intakeId,
+          member.proposalId,
+          { assertRunning: () => queue?.assertActive() },
+        );
+        cachedProposal = member.proposalId;
+      }
+      if (cached.status !== 'ready') throw new IntakeReviewFragmentRequired(cached.reference);
+      artifacts.retain(collectionClinicalProjectionContext(cached.session).verifiedArtifacts());
+      const record = cached.session.record(
+        member.recordId,
+        member.candidateId,
+        member.candidateVersionId,
       );
-    const reviewed = reviewedIntakeQueueRecord(record, member.state),
-      selectable = reviewed.selectable;
-    const row = {
-      groupId: member.groupId,
-      proposalId: member.proposalId,
-      reviewToken: cached.session.review.reviewToken,
-      queueState: member.state,
-      selectable,
-    };
-    const expanded: CollectionIntakeReportRecordPage['records'][number] = {
-      ...row,
-      kind: 'record',
-      record: reviewed,
-    };
-    const cost = Buffer.byteLength(canonicalLiteral(expanded));
-    const item: CollectionIntakeReportRecordPage['records'][number] =
-      cost > byteBudget
-        ? {
-            ...row,
-            kind: 'record_reference',
-            selection: { recordId: record.id, candidateVersionId: record.candidateVersionId },
-            reference: {
-              format: 'health-intake-clinical-review-reference-v2',
-              reviewToken: cached.session.review.reviewToken,
-              section: 'records',
-              ordinal: cached.session.review.records.indexOf(record),
-              bytes: Buffer.byteLength(canonicalLiteral(record)),
-            },
-          }
-        : expanded;
-    const size = Buffer.byteLength(canonicalLiteral(item));
-    if (records.length && usedBytes + size > byteBudget) {
-      pageFull = true;
-      remaining = true;
-      continue;
+      if (!record)
+        throw new HttpError(
+          409,
+          'REPORT_REFERENCE_UNAVAILABLE',
+          'A report reference no longer matches its retained proposal; inspect the original',
+        );
+      const reviewed = reviewedIntakeQueueRecord(record, member.state),
+        selectable = reviewed.selectable;
+      const row = {
+        groupId: member.groupId,
+        proposalId: member.proposalId,
+        reviewToken: cached.session.review.reviewToken,
+        queueState: member.state,
+        selectable,
+      };
+      const expanded: CollectionIntakeReportRecordPage['records'][number] = {
+        ...row,
+        kind: 'record',
+        record: reviewed,
+      };
+      const cost = Buffer.byteLength(canonicalLiteral(expanded));
+      const item: CollectionIntakeReportRecordPage['records'][number] =
+        cost > byteBudget
+          ? {
+              ...row,
+              kind: 'record_reference',
+              selection: { recordId: record.id, candidateVersionId: record.candidateVersionId },
+              reference: {
+                format: 'health-intake-clinical-review-reference-v2',
+                reviewToken: cached.session.review.reviewToken,
+                section: 'records',
+                ordinal: cached.session.review.records.indexOf(record),
+                bytes: Buffer.byteLength(canonicalLiteral(record)),
+              },
+            }
+          : expanded;
+      const size = Buffer.byteLength(canonicalLiteral(item));
+      if (records.length && usedBytes + size > byteBudget) {
+        pageFull = true;
+        remaining = true;
+        continue;
+      }
+      records.push(item);
+      usedBytes += size;
+      last = order;
     }
-    records.push(item);
-    usedBytes += size;
-    last = order;
+    const current = intakeSourceVersion(db, intakeId);
+    queue?.assertCurrent();
+    if (
+      current.logicalBinding !== binding.logicalBinding ||
+      current.version !== binding.version ||
+      clinicalReviewRevision(db) !== policy
+    )
+      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+    artifacts.assertCurrent();
+    return {
+      format: 'health-intake-report-record-page-v2',
+      scope: 'clinical_records',
+      intakeId,
+      version: binding.version,
+      view,
+      records,
+      totalRecords,
+      nextCursor: remaining
+        ? Buffer.from(JSON.stringify([query, last])).toString('base64url')
+        : null,
+    };
+  } finally {
+    if (cached?.status === 'ready') cached.session.close();
+    physical.close();
   }
-  const current = intakeSourceVersion(db, intakeId);
-  queue?.assertCurrent();
-  if (
-    current.logicalBinding !== binding.logicalBinding ||
-    current.version !== binding.version ||
-    clinicalReviewRevision(db) !== policy
-  )
-    throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-  return {
-    format: 'health-intake-report-record-page-v2',
-    scope: 'clinical_records',
-    intakeId,
-    version: binding.version,
-    view,
-    records,
-    totalRecords,
-    nextCursor: remaining ? Buffer.from(JSON.stringify([query, last])).toString('base64url') : null,
-  };
 }

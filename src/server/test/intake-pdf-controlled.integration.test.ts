@@ -13,7 +13,16 @@ import { openDatabase } from '../database.ts';
 import { writeIntakeBatch } from '../intake-batch-journal.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { disposePdfEvidenceSessions } from '../intake-pdf-session.ts';
-import { createIntakePlan, getIntake, getIntakeOriginal, uploadIntake } from '../intake.ts';
+import {
+  createIntakePlan,
+  getIntake,
+  getIntakeRead,
+  getIntakeOriginal,
+  uploadIntake,
+} from '../intake.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
+import { prepareRetainedPlanAccess, readRetainedPlanScope } from '../intake-retained-plan.ts';
+import { selectedFixtureValue } from './helpers/selected-intake.ts';
 import { publishIntakeSourceText } from '../intake-source-text.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { profilePaths } from '../profile-storage.ts';
@@ -111,6 +120,7 @@ test(
       connectionCheck: async () => ({ available: true, readiness: 'ready' }),
       bridgeFactory: (options) => {
         const currentSlice = ++slice;
+        let dispatchedUnitId = '';
         // A batch requested at the round cap may not have executed. Its new
         // context rereads the ten relevant passages before attempting it again.
         if (phase === 'batch') beginText(nextPage - 10, nextPage - 1, 'batch');
@@ -151,10 +161,15 @@ test(
                   page,
                 );
                 pagesRead.push(page);
-                version = integer(context.version);
-                const units = context.currentUnits;
-                assert.ok(Array.isArray(units) && units.length === 1);
-                unitId = String(object(units[0]).id);
+                assert.equal(context.format, 'health-intake-model-evidence-context-v2');
+                const pins = object(context.pins);
+                assert.equal(pins.sourceId, intakeId);
+                assert.equal(pins.sourceHash, fixture.sourceHash);
+                version = integer(pins.version);
+                // Evidence metadata does not expand the retained unit collection.
+                // The real initial model context supplies this slice's exact unit.
+                assert.ok(dispatchedUnitId);
+                unitId = dispatchedUnitId;
                 nextPage = page + 1;
                 // Keep each real original read beside its durable passage;
                 // transcript retrieval must not consume a long no-progress run.
@@ -207,7 +222,9 @@ test(
                   if (sourceTextPage > lastTextPage) phase = afterText;
                 }
               } else if (params.tool === 'health_intake_plan') {
-                version = integer(result.version);
+                assert.equal(result.format, 'health-intake-model-context-v2');
+                assert.equal(result.state, 'ready');
+                version = integer(object(result.pins).version);
                 assert.equal(phase, 'context');
                 phase = 'read';
               } else if (params.tool === 'health_intake_batch') {
@@ -251,6 +268,23 @@ test(
           },
           fetchImpl: async (_url, init) => {
             const body = object(JSON.parse(String(init?.body)));
+            if (!dispatchedUnitId) {
+              assert.ok(Array.isArray(body.messages));
+              const initial = body.messages.map(object).find((message) => message.role === 'user');
+              assert.ok(initial && typeof initial.content === 'string');
+              const context = object(
+                JSON.parse(initial.content.slice(initial.content.indexOf('{'))),
+              );
+              const conversion = object(context.conversion);
+              assert.equal(conversion.format, 'health-intake-conversion-resume-v2');
+              assert.equal(conversion.intakeId, intakeId);
+              assert.equal(conversion.sourceHash, fixture.sourceHash);
+              assert.equal(conversion.planId, planId);
+              const unit = object(conversion.unit);
+              assert.equal(unit.pageCount, 50);
+              assert.ok(typeof unit.id === 'string' && unit.id);
+              dispatchedUnitId = unit.id;
+            }
             const size = proxyTranscriptSize(body);
             let pdfParts = 0;
             let imageParts = 0;
@@ -424,9 +458,9 @@ test(
     )
       await new Promise((resolve) => setTimeout(resolve, 20));
     const finalBatch = manager.get(profileId, batch.id);
-    const final = getIntake(db, root, profileId, intakeId);
+    const final = getIntakeRead(db, root, profileId, intakeId);
+    assert.ok(isIntakeSummary(final), 'automatic startup selects native retained authority');
     const item = finalBatch.items[0]!;
-    const plan = final.workflow?.plans.find((value) => value.id === planId);
     t.diagnostic(
       JSON.stringify({
         boundaries,
@@ -443,6 +477,11 @@ test(
       'complete',
       JSON.stringify({ phase, pages: pagesRead.length, batch: finalBatch }),
     );
+    // Startup migrates the seeded legacy recipe. Observe its selected unit
+    // receipts directly; forcing a legacy Intake DTO would mask tool failures.
+    await prepareRetainedPlanAccess(db, profileId, intakeId);
+    const plan = readRetainedPlanScope(db, profileId, intakeId, { planId });
+    assert.ok(plan);
     assert.equal(phase, 'complete');
     assert.deepEqual(
       pagesRead,
@@ -500,15 +539,24 @@ test(
     assert.equal(item.reading?.readyRecords, 100);
     assert.equal(item.reading?.modelRequests, requests.length);
     assert.equal(item.reading?.modelUsageIncomplete, true);
-    assert.equal(plan?.batches.length, 10);
-    assert.equal(plan?.units.length, 2);
-    assert.ok(plan?.units.every((unit) => unit.pages?.length === 50));
+    assert.equal(plan.reader.childCount(plan.record, 'batches'), 10);
+    assert.equal(plan.unitCount, 2);
+    for (const expected of initialPlan.units) {
+      const unit: ReturnType<NonNullable<ReturnType<typeof readRetainedPlanScope>>['unitById']> =
+        plan.unitById(expected.id);
+      assert.ok(unit);
+      assert.equal(unit.pages.count, 50);
+      assert.ok(unit.coverageRecord);
+      assert.deepEqual(plan.reader.field(unit.coverageRecord, 'kind', { bytes: 256 }), {
+        kind: 'value',
+        value: 'extracted',
+      });
+    }
     assert.equal(new Set(unitReceipts.map((receipt) => receipt.operationId)).size, 10);
     assert.equal(unitReceipts.filter((receipt) => receipt.coverage === 'inspected').length, 8);
     assert.equal(unitReceipts.filter((receipt) => receipt.coverage === 'extracted').length, 2);
-    assert.ok(plan?.units.every((unit) => unit.coverage?.kind === 'extracted'));
-    assert.equal(final.proposals.length, 10);
-    assert.equal(final.imported, null);
+    assert.equal(final.collections.proposals.total, 10);
+    assert.equal(selectedFixtureValue(db, intakeId, ['intake', 'imported']), null);
     assert.equal(db.prepare('SELECT count(*) AS n FROM documents').get()?.n, 0);
     assert.equal(
       createHash('sha256')
@@ -554,7 +602,7 @@ test(
       unitReceipts,
       finalReading: item.reading,
       finalReadingJob: item.readingJob,
-      reviewableProposals: final.proposals.length,
+      reviewableProposals: final.collections.proposals.total,
       readyRecords: item.reading?.readyRecords,
       acceptedDocuments: 0,
       originalSha256Unchanged: true,

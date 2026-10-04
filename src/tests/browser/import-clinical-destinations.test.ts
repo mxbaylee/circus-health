@@ -4,7 +4,9 @@ import {
   fixtureDestinations,
   fixtureSourcePath,
   fixtureNativeReportReady,
+  fixtureNativeFeedReady,
   fixtureNativeRecordReady,
+  fixtureBrowserResponse,
 } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
@@ -16,6 +18,8 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
+import type { IntakeAcceptedDestinations } from '../../shared/intake-summary.ts';
 
 const originalBytes = Buffer.from(
   [
@@ -102,7 +106,8 @@ const entries = [
 
 test(
   'encrypted acceptance links to exact observation, performed procedure, and retained document DTOs',
-  { timeout: 60000 },
+  // Three saved destinations, exact DTO/original checks and a final encrypted reload.
+  { timeout: 120000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-clinical-destinations-'));
     mkdirSync(resolve(root, 'data'));
@@ -248,6 +253,14 @@ test(
 
     const savedFeed = await request(prefix + '/intakes/import-feed?view=all&state=accepted');
     const savedBlocks = new Map<string, { groupId: string }>();
+    async function openSavedReport(groupId: string) {
+      // Observe the one new document's exact report read, rather than discard
+      // an in-flight read with an immediate reload.
+      await page.goto('about:blank');
+      return fixtureNativeReportReady(page, prefix, { intakeId: intake.id, groupId }, () =>
+        page.goto(url + '/#/import?' + new URLSearchParams({ intake: intake.id, group: groupId })),
+      );
+    }
     for (const receipt of receiptRecords) {
       const block = savedFeed.records.find(
         (candidate: {
@@ -259,19 +272,7 @@ test(
       );
       assert(block, `saved Import feed retains exact ${receipt.kind} report record`);
       savedBlocks.set(receipt.recordId, block);
-      await page.goto(
-        url +
-          '/#/import?intake=' +
-          encodeURIComponent(intake.id) +
-          '&group=' +
-          encodeURIComponent(block.groupId),
-      );
-      await fixtureNativeReportReady(
-        page,
-        prefix,
-        { intakeId: intake.id, groupId: block.groupId },
-        () => page.reload(),
-      );
+      await openSavedReport(block.groupId);
       const expectedTitle =
         receipt.kind === 'observation'
           ? 'Fictional Sunrise ferritin'
@@ -295,13 +296,7 @@ test(
       await page.getByRole('heading', { name: expectedTitle, exact: true }).waitFor();
     }
 
-    await page.goto(
-      url +
-        '/#/import?intake=' +
-        encodeURIComponent(intake.id) +
-        '&group=' +
-        encodeURIComponent(savedBlocks.get(observationReceipt.recordId)!.groupId),
-    );
+    await openSavedReport(savedBlocks.get(observationReceipt.recordId)!.groupId);
     const observationLink = page
       .getByRole('region', { name: 'Saved destinations for this report' })
       .getByRole('link')
@@ -331,13 +326,7 @@ test(
     assert.equal(observation.extra.import.acceptedMapping.eventKind, 'performed');
     assert.equal(observation.evidence[0].locator.originalSourceFileId, intake.id);
 
-    await page.goto(
-      url +
-        '/#/import?intake=' +
-        encodeURIComponent(intake.id) +
-        '&group=' +
-        encodeURIComponent(savedBlocks.get(procedureReceipt.recordId)!.groupId),
-    );
+    await openSavedReport(savedBlocks.get(procedureReceipt.recordId)!.groupId);
     const procedureLink = page
       .getByRole('region', { name: 'Saved destinations for this report' })
       .getByRole('link')
@@ -368,13 +357,7 @@ test(
     assert.equal(procedure.extra.import.acceptedMapping.eventKind, 'performed');
     assert.equal(procedure.evidence[0].locator.originalSourceFileId, intake.id);
 
-    await page.goto(
-      url +
-        '/#/import?intake=' +
-        encodeURIComponent(intake.id) +
-        '&group=' +
-        encodeURIComponent(savedBlocks.get(documentReceipt.recordId)!.groupId),
-    );
+    await openSavedReport(savedBlocks.get(documentReceipt.recordId)!.groupId);
     const documentLink = page
       .getByRole('region', { name: 'Saved destinations for this report' })
       .getByRole('link')
@@ -399,8 +382,51 @@ test(
     assert.equal(document.evidence[0].locator.originalSourceFileId, intake.id);
 
     await page.goto(url + '/#/import');
-    await page.reload();
+    await fixtureNativeFeedReady(page, prefix, () => page.reload());
+    const savedSince = Date.now();
+    const savedFeedReady = fixtureBrowserResponse(page, (response) => {
+      const selected = new URL(response.url());
+      return (
+        response.request().method() === 'GET' &&
+        response.request().timing().startTime >= savedSince &&
+        selected.pathname === prefix + '/intakes/import-feed' &&
+        selected.searchParams.get('state') === 'accepted'
+      );
+    });
+    const savedDestinationReady = fixtureBrowserResponse(page, (response) => {
+      const selected = new URL(response.url());
+      return (
+        response.request().method() === 'GET' &&
+        response.request().timing().startTime >= savedSince &&
+        selected.pathname === intakePath + '/accepted-destinations' &&
+        selected.searchParams.get('groupId') ===
+          savedBlocks.get(observationReceipt.recordId)!.groupId &&
+        selected.searchParams.get('proposalId') === proposalId &&
+        selected.searchParams.getAll('recordId').includes(observationReceipt.recordId)
+      );
+    });
     await page.getByRole('combobox', { name: 'Review status' }).selectOption('saved');
+    const savedFeedResponse = await savedFeedReady;
+    assert.equal(savedFeedResponse.status(), 200, await savedFeedResponse.text());
+    assert.equal(await savedFeedResponse.finished(), null);
+    const savedWindow = (await savedFeedResponse.json()).data as CollectionImportFeed;
+    assert.equal(savedWindow.format, 'health-intake-import-feed-v2');
+    assert.equal(savedWindow.totalRecords, 3);
+    assert.equal(savedWindow.counts.accepted, 3);
+    const savedDestinationResponse = await savedDestinationReady;
+    assert.equal(savedDestinationResponse.status(), 200, await savedDestinationResponse.text());
+    assert.equal(await savedDestinationResponse.finished(), null);
+    const savedDestination = (await savedDestinationResponse.json())
+      .data as IntakeAcceptedDestinations;
+    assert.equal(savedDestination.format, 'health-intake-accepted-destinations-v1');
+    assert.equal(savedDestination.intakeId, intake.id);
+    assert.equal(savedDestination.version, accepted.version);
+    assert.equal(savedDestination.groupId, savedBlocks.get(observationReceipt.recordId)!.groupId);
+    assert.equal(savedDestination.proposalId, proposalId);
+    assert.deepEqual(
+      savedDestination.records.map((record) => [record.recordId, record.entityId]),
+      [[observationReceipt.recordId, observationReceipt.entityId]],
+    );
     const savedObservation = page
       .locator('.import-record-destination')
       .getByRole('link')

@@ -11,7 +11,7 @@ import { launchBrowser, newTestPage } from './harness.ts';
 import { startProcessRuntime } from './process-runtime.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
-import type { Browser } from 'playwright';
+import type { Browser, Response } from 'playwright';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
 import type { CollectionReportDetail } from '../../shared/intake-clinical-pages.ts';
 import test from 'node:test';
@@ -447,6 +447,32 @@ test(
     const queueReportUrl = await fixtureReportUrl(api, prefix, queueItem.id);
     const queueGroupId = new URLSearchParams(queueReportUrl.split('?')[1]).get('group')!;
     const queueLinkSelector = '.import-detail-record-link:not([data-saved-record-id])';
+    function acknowledgementTime(response: Response) {
+      const timing = response.request().timing();
+      assert.ok(timing.responseStart >= 0);
+      return timing.startTime + timing.responseStart;
+    }
+    async function reportAfterAcknowledgement(acknowledgedAt: () => number | undefined) {
+      const response = await fixtureBrowserResponse(page, (response) => {
+        const since = acknowledgedAt();
+        const selected = new URL(response.url());
+        return (
+          since !== undefined &&
+          response.request().method() === 'GET' &&
+          response.request().timing().startTime >= since &&
+          selected.pathname ===
+            prefix + '/intakes/report-queue/' + encodeURIComponent(queueGroupId) &&
+          selected.searchParams.get('intakeId') === queueItem.id
+        );
+      });
+      assert.equal(response.status(), 200);
+      assert.equal(await response.finished(), null);
+      const detail = (await response.json()).data as CollectionReportDetail;
+      assert.equal(detail.format, 'health-intake-report-detail-v2');
+      assert.equal(detail.group.intakeId, queueItem.id);
+      assert.equal(detail.group.groupId, queueGroupId);
+      return detail;
+    }
     async function assertQueuePage(detail: CollectionReportDetail) {
       assert.equal(detail.records.totalRecords, 20, 'The complete report still has twenty records');
       const expectedIds = detail.records.records.map((row) =>
@@ -477,15 +503,33 @@ test(
       );
       return expectedIds;
     }
-    async function openQueueRecord(index: number) {
-      // A fresh document sees API-seeded records through one actual browser read.
-      await page.goto('about:blank');
-      const firstPage = await fixtureNativeReportReady(
-        page,
-        prefix,
-        { intakeId: queueItem.id, groupId: queueGroupId },
-        () => page.goto(url + queueReportUrl),
-      );
+    async function openQueueRecord(index: number, refreshedReport?: CollectionReportDetail) {
+      let firstPage: CollectionReportDetail;
+      if (refreshedReport) {
+        // The record link came from this report. Browser Back changes the feed
+        // scope, so await the actual report read after that native feed refresh.
+        const current = new URLSearchParams(new URL(page.url()).hash.split('?')[1]);
+        assert.equal(current.get('intake'), queueItem.id);
+        assert.equal(current.get('group'), queueGroupId);
+        assert.equal(current.get('record'), initialQueue.records[index - 1].id);
+        firstPage = await fixtureNativeReportReady(
+          page,
+          prefix,
+          { intakeId: queueItem.id, groupId: queueGroupId },
+          () => page.goBack(),
+        );
+        await page.waitForURL(url + queueReportUrl);
+        assert.equal(firstPage.records.version, refreshedReport.records.version);
+      } else {
+        // A fresh document sees API-seeded records through one actual browser read.
+        await page.goto('about:blank');
+        firstPage = await fixtureNativeReportReady(
+          page,
+          prefix,
+          { intakeId: queueItem.id, groupId: queueGroupId },
+          () => page.goto(url + queueReportUrl),
+        );
+      }
       const firstIds = await assertQueuePage(firstPage);
       if (index === 0) {
         // The byte budget can split this report before the record-count limit.
@@ -542,13 +586,39 @@ test(
       )
         imports.push(request.postDataJSON());
     });
-    const firstSave = fixtureBrowserResponse(
-      page,
-      (response) => response.url().endsWith(prefix + '/intakes/report-acceptance') && response.ok(),
-    );
+    let saveAcknowledgedAt: number | undefined;
+    const firstSave = fixtureBrowserResponse(page, (response) => {
+      if (
+        !response.url().endsWith(prefix + '/intakes/report-acceptance') ||
+        response.request().method() !== 'POST'
+      )
+        return false;
+      const request = response.request().postDataJSON() as IntakeReportAcceptanceRequest;
+      if (
+        !request.blocks.some(
+          (block) =>
+            block.intakeId === queueItem.id &&
+            block.selections.some((selection) => selection.recordId === initialQueue.records[0].id),
+        )
+      )
+        return false;
+      saveAcknowledgedAt = acknowledgementTime(response);
+      return true;
+    });
+    const savedReportRead = reportAfterAcknowledgement(() => saveAcknowledgedAt);
     await page.getByRole('button', { name: 'Confirm and save record', exact: true }).click();
-    await firstSave;
-    await openQueueRecord(1);
+    const savedReceipt = await firstSave;
+    assert.equal(savedReceipt.status(), 200);
+    assert.equal(await savedReceipt.finished(), null);
+    assert.equal((await savedReceipt.json()).data.receipt.acceptedCount, 1);
+    const savedReport = await savedReportRead;
+    const savedRow = savedReport.records.records.find(
+      (row) =>
+        (row.kind === 'record' ? row.record.id : row.selection.recordId) ===
+        initialQueue.records[0].id,
+    );
+    assert.equal(savedRow?.queueState, 'accepted');
+    await openQueueRecord(1, savedReport);
     assert.equal(imports.length, 1);
     assert.equal(imports[0].blocks.length, 1);
     assert.equal(imports[0].blocks[0].intakeId, queueItem.id);
@@ -562,29 +632,85 @@ test(
       ).length,
       1,
     );
-    const deferredSave = fixtureBrowserResponse(
-      page,
-      (response) =>
-        response.url().endsWith(queuePath + '/review-draft') &&
-        response.ok() &&
-        response.request().postDataJSON().disposition === 'review_later',
-    );
+    let deferAcknowledgedAt: number | undefined;
+    const deferredSave = fixtureBrowserResponse(page, (response) => {
+      if (
+        !response.url().endsWith(queuePath + '/review-draft') ||
+        response.request().method() !== 'POST'
+      )
+        return false;
+      const request = response.request().postDataJSON();
+      if (request.recordId !== initialQueue.records[1].id || request.disposition !== 'review_later')
+        return false;
+      deferAcknowledgedAt = acknowledgementTime(response);
+      return true;
+    });
+    const deferredReportRead = reportAfterAcknowledgement(() => deferAcknowledgedAt);
     await page
       .locator('.intake-guided-actions')
       .getByRole('button', { name: 'Review later', exact: true })
       .click();
-    await deferredSave;
-    await openQueueRecord(2);
+    const deferReceipt = await deferredSave;
+    assert.equal(deferReceipt.status(), 200);
+    assert.equal(await deferReceipt.finished(), null);
+    const deferredReport = await deferredReportRead;
+    const deferredRow = deferredReport.records.records.find(
+      (row) =>
+        (row.kind === 'record' ? row.record.id : row.selection.recordId) ===
+        initialQueue.records[1].id,
+    );
+    assert.equal(deferredRow?.queueState, 'deferred');
+    await openQueueRecord(2, deferredReport);
     assert.equal(await page.getByRole('article').count(), 1);
-    const edited = fixtureBrowserResponse(
-      page,
-      async (response) =>
-        response.url().endsWith(queuePath + '/review-draft') &&
-        response.ok() &&
-        response.request().postDataJSON().mapping?.valueText === '18.5',
+    let editAcknowledgedAt: number | undefined;
+    const edited = fixtureBrowserResponse(page, (response) => {
+      if (
+        !response.url().endsWith(queuePath + '/review-draft') ||
+        response.request().method() !== 'POST' ||
+        response.request().postDataJSON().mapping?.valueText !== '18.5'
+      )
+        return false;
+      editAcknowledgedAt = acknowledgementTime(response);
+      return true;
+    });
+    // Qualify a completed save followed by reload. Observe the actual post-edit
+    // selected record, report and feed reads before exercising that reload.
+    const editReads = Promise.all(
+      [
+        queuePath + '/review-record',
+        prefix + '/intakes/report-queue/' + encodeURIComponent(queueGroupId),
+        prefix + '/intakes/import-feed',
+      ].map(async (path) => {
+        const response = await fixtureBrowserResponse(
+          page,
+          (response) =>
+            editAcknowledgedAt !== undefined &&
+            response.request().method() === 'GET' &&
+            response.request().timing().startTime >= editAcknowledgedAt &&
+            new URL(response.url()).pathname === path,
+        );
+        assert.equal(response.status(), 200);
+        assert.equal(await response.finished(), null);
+        return (await response.json()).data;
+      }),
     );
     await page.getByLabel('Result', { exact: true }).fill('18.5');
-    await edited;
+    const editReceipt = await edited;
+    assert.equal(editReceipt.status(), 200);
+    assert.equal(await editReceipt.finished(), null);
+    const [editedRecord, editedReport, editedFeed] = await editReads;
+    assert.equal(editedRecord.format, 'health-intake-clinical-record-v2');
+    assert.equal(
+      editedRecord.record.kind === 'record'
+        ? editedRecord.record.record.id
+        : editedRecord.record.selection.recordId,
+      initialQueue.records[2].id,
+    );
+    if (editedRecord.record.kind === 'record')
+      assert.equal(editedRecord.record.record.draft.mapping.valueText, '18.5');
+    assert.equal(editedReport.format, 'health-intake-report-detail-v2');
+    assert.equal(editedReport.records.version, editedRecord.context.version);
+    assert.equal(editedFeed.format, 'health-intake-import-feed-v2');
     await page.getByRole('tab', { name: 'Details', exact: true }).focus();
     await page.keyboard.press('ArrowRight');
     assert(

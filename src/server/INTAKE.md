@@ -207,7 +207,9 @@ Read caches never authorize acceptance. Returned selected rows refresh their rev
 
 ## Global Import feed
 
-`GET /intakes/import-feed` returns a bounded record window across report groups for the dedicated Import page. It accepts the queue's `view`, `limit` (1–100, default 50) and opaque `cursor`, plus `q` (up to 300 characters), `kind=test|prescription|vision|procedure|history|unsupported|person`, `edited=true|false`, and optional `state=pending|deferred|accepted|kept_original|superseded`. Saved uses `view=all&state=accepted`; Excluded uses `view=all&state=kept_original` and retains originals.
+`GET /intakes/import-feed` returns a bounded record window across report groups for the dedicated Import page. It accepts the queue's `view`, `limit` (1–100, default 50) and opaque `cursor`, plus `q` (up to 300 characters), `kind=test|prescription|vision|procedure|history|unsupported|documents|person`, `edited=true|false`, and optional `state=pending|deferred|accepted|kept_original|superseded`. Saved uses `view=all&state=accepted`; Excluded uses `view=all&state=kept_original` and retains originals.
+
+The `documents` filter includes both `history` and `unsupported` records before pagination, so the Documents tab can reach its first matching page without traversing unrelated records. Rows keep their canonical `feedKind`, and `kindCounts` keeps the separate pre-kind counts.
 
 The response includes group headers, exact proposal `blocks`, matching totals, pre-kind `kindCounts`, global clinical state `counts`, `nextCursor` and reading `activity`. Records add durable `feedKey`, stable `feedOrder`, `feedKind` and `manuallyEdited` to the existing review fields. The manual-edit marker compares clinical values against the undrafted mapped proposal; merely saving an unchanged full draft or choosing Review later does not set it. Identity/source confirmation and automatic reusable-rule application are distinct from a manual clinical edit. Cursors bind profile, view and filters; they are navigation state, never write authorization. Completing earlier rows does not shift later cursor results. A changed candidate version has a different key.
 

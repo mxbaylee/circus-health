@@ -58,7 +58,7 @@ async function prepareNativePartialReviews(
   const { buildIntakeCollectionEnvelope } = await import('./intake-envelope-build.ts');
   const { prepareRetainedPlanAccess } = await import('./intake-retained-plan.ts');
   const { prepareCollectionWorkflowReadiness } = await import('./intake-workflow-readiness.ts');
-  const { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
+  const { prepareCollectionClinicalReviewAsync, prepareCollectionClinicalReviewDependencies } =
     await import('./intake-review-collection-host.ts');
   const { intakeSourceMetadata } = await import('./intake-state-access.ts');
   const { activeMappingRules } = await import('./clinical-import.ts');
@@ -67,7 +67,7 @@ async function prepareNativePartialReviews(
   const { intakeFilenameDisplay } = await import('../shared/intake-summary.ts');
   const prepared = new Map<string, ReviewSource | Error>();
   const sessions: Extract<
-    ReturnType<typeof prepareCollectionClinicalReview>,
+    Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>>,
     { status: 'ready' }
   >['session'][] = [];
   const close = () => {
@@ -111,7 +111,13 @@ async function prepareNativePartialReviews(
             id,
             block.proposalId,
           );
-          const result = prepareCollectionClinicalReview(db, root, profileId, id, block.proposalId);
+          const result = await prepareCollectionClinicalReviewAsync(
+            db,
+            root,
+            profileId,
+            id,
+            block.proposalId,
+          );
           if (result.status !== 'ready')
             throw new HttpError(
               409,

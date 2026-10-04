@@ -1,3 +1,5 @@
+import { indexedReviewQuestions } from './intake-review-question-index.ts';
+import { finishClinicalReviewWork, runClinicalReviewWork } from './clinical-review-work.ts';
 import { revision } from './database.ts';
 import {
   reviewReadStamp,
@@ -16,10 +18,13 @@ import { reviewIssueFactory, createReviewIssueScratch } from './intake-review-is
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
-import { assertIntakeOwner, verifyIntakeOriginal } from './intake.ts';
+import { assertIntakeOwner } from './intake.ts';
 import { HttpError, clinicalReviewRevision, safeText } from './database.ts';
 import { getNote } from './notes.ts';
-import { bindReviewIdentityWarnings } from './intake-review-identity-warnings.ts';
+import {
+  bindReviewIdentityWarnings,
+  bindReviewIdentityWarningsWork,
+} from './intake-review-identity-warnings.ts';
 import {
   effectiveKnownNames,
   challengedKnownNames,
@@ -42,7 +47,7 @@ import {
   prepareCollectionReviewMembership,
 } from './intake-review-membership-index.ts';
 import { prepareIntakeSourceDependencyHeaders } from './intake-source-text-dependencies.ts';
-import { verifyIntakeFileHash } from './intake-files.ts';
+import { verifyIntakeFileHashWork, intakeFileIdentity } from './intake-files.ts';
 import {
   canonicalLiteral,
   validateJSONL,
@@ -61,18 +66,19 @@ import {
 } from './intake-review-question-state.ts';
 import { openReportMemberSnapshot } from './intake-report-member-state.ts';
 import {
-  resolveNativeReportSource,
+  resolveNativeReportSourceWork,
   hasHistoricalReportSourceProvider,
 } from './intake-report-source-resolution.ts';
 import { workflowHash } from './intake-workflow.ts';
-import { readNativeReviewDraft } from './intake-review-draft-state.ts';
+import { readNativeReviewDraft, readNativeReviewDraftWork } from './intake-review-draft-state.ts';
 import { prepareCollectionWorkflowReadiness } from './intake-workflow-readiness.ts';
 import { activeMappingRules } from './clinical-import.ts';
 import { prepareDuplicateEvidenceIndex } from './duplicate-evidence-index.ts';
 import { prepareOwnershipDecisionIndex } from './ownership-decision-index.ts';
 import {
   clinicalSourceScopeCheck,
-  clinicalSourceScopeDependencyIds,
+  prepareClinicalSourceScopeCheckWork,
+  clinicalSourceScopeDependencyIdsWork,
   type ClinicalScopeOriginal,
 } from './clinical-source-scope.ts';
 import type {
@@ -87,7 +93,8 @@ import {
   IntakeReviewFragmentRequired,
 } from './intake-review-collection.ts';
 import {
-  createCollectionClinicalReviewSession,
+  createCollectionClinicalReviewSessionWork,
+  collectionClinicalProjectionContext,
   type CollectionClinicalReviewResult,
 } from './intake-review-collection-session.ts';
 import type {
@@ -153,23 +160,6 @@ export async function prepareCollectionClinicalReviewDependencies(
     revision = clinicalReviewRevision(db),
     view = openIntakeCollectionEnvelope(db, original),
     intake = view.child(view.root(), 'intake')!;
-  if (proposalId && !view.find('proposal', intake, proposalId))
-    throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
-  verifyIntakeOriginal(db, root, profileId, intakeId);
-  const inputFile = proposalId ? requiredFile(db, proposalId) : original;
-  if (inputFile.bytes > MAX_INTAKE_BYTES)
-    throw new HttpError(413, 'CONVERSION_REQUIRED', 'Review a bounded JSONL conversion proposal');
-  const path = profileOriginal(root, inputFile.path, profileId);
-  verifyIntakeFileHash(path, inputFile);
-  const bytes = readFileSync(path);
-  if (
-    bytes.length !== inputFile.bytes ||
-    createHash('sha256').update(bytes).digest('hex') !== inputFile.sha256
-  )
-    throw new HttpError(409, 'SOURCE_CHANGED', 'Review source changed');
-  const validation = validateJSONL(bytes);
-  if (!validation.valid)
-    throw new HttpError(400, 'INVALID_JSONL', 'Convert the original before clinical review');
   const assertCurrent = () => {
     options.assertRunning?.();
     assertIntakeOwner(db, profileId);
@@ -181,10 +171,78 @@ export async function prepareCollectionClinicalReviewDependencies(
     )
       throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
   };
+  const verify = async (file: File) =>
+    runClinicalReviewWork(
+      verifyIntakeFileHashWork(profileOriginal(root, file.path, profileId), file),
+      {
+        capture() {
+          assertCurrent();
+          const stamp = reviewReadStamp(db);
+          if (stamp === undefined)
+            throw new HttpError(
+              409,
+              'INTAKE_REVIEW_CHANGED',
+              'Clinical verification cannot cross a transaction',
+            );
+          return () => {
+            assertCurrent();
+            if (reviewReadStamp(db) !== stamp)
+              throw new HttpError(
+                409,
+                'INTAKE_REVIEW_CHANGED',
+                'Review changed while verifying its original',
+              );
+          };
+        },
+      },
+    );
+  if (proposalId && !view.find('proposal', intake, proposalId))
+    throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
+  await verify(original);
+  const inputFile = proposalId ? requiredFile(db, proposalId) : original;
+  if (inputFile.bytes > MAX_INTAKE_BYTES)
+    throw new HttpError(413, 'CONVERSION_REQUIRED', 'Review a bounded JSONL conversion proposal');
+  const path = profileOriginal(root, inputFile.path, profileId);
+  await verify(inputFile);
+  const bytes = readFileSync(path);
+  if (
+    bytes.length !== inputFile.bytes ||
+    createHash('sha256').update(bytes).digest('hex') !== inputFile.sha256
+  )
+    throw new HttpError(409, 'SOURCE_CHANGED', 'Review source changed');
+  const validation = validateJSONL(bytes);
+  if (!validation.valid)
+    throw new HttpError(400, 'INVALID_JSONL', 'Convert the original before clinical review');
   // A small cache removes nearby duplicate evidence without retaining a set
   // proportional to the installation's accepted source history.
   const prepared = new Set<string>();
-  for (const id of clinicalSourceScopeDependencyIds(db, original, validation.entries!)) {
+  let dependencyInspections = 0;
+  for (const id of clinicalSourceScopeDependencyIdsWork(db, original, validation.entries!)) {
+    if (++dependencyInspections % 16 === 0) {
+      await runClinicalReviewWork(
+        (function* () {
+          for (let n = 0; n < 16; n++) yield;
+        })(),
+        {
+          capture() {
+            assertCurrent();
+            const stamp = reviewReadStamp(db);
+            if (stamp === undefined)
+              throw Error('Clinical dependencies cannot cross a transaction');
+            return () => {
+              assertCurrent();
+              if (reviewReadStamp(db) !== stamp)
+                throw new HttpError(
+                  409,
+                  'INTAKE_REVIEW_CHANGED',
+                  'Review changed while preparing dependencies',
+                );
+            };
+          },
+        },
+      );
+    }
+    if (id === undefined) continue;
     assertCurrent();
     if (prepared.has(id)) continue;
     await prepareIntakeSourceDependencyHeaders(db, id, { assertRunning: assertCurrent });
@@ -219,19 +277,62 @@ export async function prepareCollectionClinicalReviewDependencies(
     prepared.add(id);
   }
   assertCurrent();
-  verifyIntakeFileHash(path, inputFile);
+  await verify(inputFile);
   await prepareDuplicateEvidenceIndex(db, { assertRunning: assertCurrent });
   await prepareOwnershipDecisionIndex(db, { assertRunning: assertCurrent });
 }
 /** Pending native migration/index state fails explicitly; this host never falls back to whole-workflow reads. */
 export function prepareCollectionClinicalReview(
+  ...input: Parameters<typeof prepareCollectionClinicalReviewWork>
+): CollectionClinicalReviewResult {
+  return finishClinicalReviewWork(prepareCollectionClinicalReviewWork(...input));
+}
+export async function prepareCollectionClinicalReviewAsync(
+  ...input: Parameters<typeof prepareCollectionClinicalReviewWork>
+): Promise<CollectionClinicalReviewResult> {
+  const [db, , profileId] = input;
+  if (db.isTransaction) throw Error('Cooperative clinical review cannot hold a transaction');
+  input[5]?.assertRunning?.();
+  const result = await runClinicalReviewWork(prepareCollectionClinicalReviewWork(...input), {
+    signal: input[5]?.signal,
+    capture() {
+      input[5]?.assertRunning?.();
+      assertIntakeOwner(db, profileId);
+      const stamp = reviewReadStamp(db);
+      if (stamp === undefined) throw Error('Clinical review authority is unavailable');
+      return () => {
+        input[5]?.assertRunning?.();
+        assertIntakeOwner(db, profileId);
+        if (reviewReadStamp(db) !== stamp)
+          throw new HttpError(
+            409,
+            'INTAKE_REVIEW_CHANGED',
+            'Review changed while preparing; refresh this review',
+          );
+      };
+    },
+  });
+  try {
+    input[5]?.assertRunning?.();
+    return result;
+  } catch (error) {
+    if (result.status === 'ready') result.session.close();
+    throw error;
+  }
+}
+function* prepareCollectionClinicalReviewWork(
   db: DatabaseSync,
   root: string,
   profileId: string,
   intakeId: string,
   proposalId: string | null = null,
-  options: { metadataBytes?: number; groundingDependency?: (intakeId: string) => void } = {},
-): CollectionClinicalReviewResult {
+  options: {
+    metadataBytes?: number;
+    groundingDependency?: (intakeId: string) => void;
+    signal?: AbortSignal;
+    assertRunning?: () => void;
+  } = {},
+): Generator<void, CollectionClinicalReviewResult, void> {
   assertIntakeOwner(db, profileId);
   const metadataBytes = options.metadataBytes ?? 256 * 1024;
   const file = requiredFile(db, intakeId, true);
@@ -241,7 +342,7 @@ export function prepareCollectionClinicalReview(
       'INTAKE_REVIEW_PENDING_MIGRATION',
       'Prepare this retained intake for selected clinical review',
     );
-  verifyIntakeOriginal(db, root, profileId, intakeId);
+  yield* verifyIntakeFileHashWork(profileOriginal(root, file.path, profileId), file);
   const initialVersion = intakeSourceVersion(db, intakeId),
     initialRevision = clinicalReviewRevision(db),
     initialGrounding = identityGroundingGeneration(db);
@@ -257,12 +358,19 @@ export function prepareCollectionClinicalReview(
       throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
   };
   const issueScratch = createReviewIssueScratch(db);
+  issueScratch.db.exec(
+    'CREATE TABLE consumed_source_files (id TEXT PRIMARY KEY, path TEXT, identity TEXT)',
+  );
+  const retainConsumedFile = issueScratch.db.prepare(
+    'INSERT OR IGNORE INTO consumed_source_files (id) VALUES (?)',
+  );
   let retainedIssueScratch = false;
   try {
     const opened = new Map<string, ReturnType<typeof open>>();
     function open(original: ClinicalScopeOriginal) {
       options.groundingDependency?.(original.id);
       const retained = requiredFile(db, original.id, true);
+      retainConsumedFile.run(retained.id);
       if (retained.sha256 !== original.sha256)
         throw new HttpError(409, 'SOURCE_CHANGED', 'The retained original changed');
       if (!hasIntakeCollectionEnvelope(db, retained))
@@ -375,12 +483,24 @@ export function prepareCollectionClinicalReview(
         issueScratch.db,
       );
       const scope = collectionWorkflowReviewScope({
+        policySql: issueScratch.db,
         issueSink,
         bindIdentityWarnings: (record, warnings) =>
           bindReviewIdentityWarnings(issueSink, record, warnings),
+        bindIdentityWarningsWork: (record, warnings) =>
+          bindReviewIdentityWarningsWork(issueSink, record, warnings),
         close: issueSink.dispose,
         questionState: openReviewQuestionState(db, retained, view),
+        questionIndex: indexedReviewQuestions(db, retained, view, issueScratch.db, metadataBytes),
         membershipIndex: readCollectionReviewMembership(db, retained, view),
+        readDraftWork: (record) =>
+          readNativeReviewDraftWork(
+            view,
+            record,
+            createReportSnapshotCatalog(db, retained, { catalog: 'review.snapshots' }),
+            metadataBytes,
+            { db, source: retained },
+          ),
         readDraft: (record) =>
           readNativeReviewDraft(
             view,
@@ -409,14 +529,17 @@ export function prepareCollectionClinicalReview(
             group.memberId ? member(group.memberId) : undefined,
           ),
         reportSource(record, selectedProposal) {
+          return finishClinicalReviewWork(scope.reportSourceWork!(record, selectedProposal));
+        },
+        *reportSourceWork(record, selectedProposal) {
           if (!record.candidateId || !record.candidateVersionId) return undefined;
-          const occurrence = scope.occurrence(
+          const occurrence = yield* scope.occurrenceWork(
             record.candidateId,
             record.candidateVersionId,
             record.id,
             selectedProposal,
           );
-          const source = resolveNativeReportSource(db, retained, {
+          const source = yield* resolveNativeReportSourceWork(db, retained, {
             candidateId: record.candidateId,
             candidateVersionId: record.candidateVersionId,
             references: () => selectedReportGroups(record.reportGroups),
@@ -443,6 +566,8 @@ export function prepareCollectionClinicalReview(
             : null,
         subjectGrounded: grounding.subjectGrounded,
         questionGrounded: grounding.grounded,
+        subjectGroundedWork: grounding.subjectGroundedWork,
+        questionGroundedWork: grounding.groundedWork,
       });
       return {
         retained,
@@ -455,6 +580,7 @@ export function prepareCollectionClinicalReview(
         grounding,
         sourceScope,
         uniqueVersion,
+        readCacheState,
       };
     }
     function validateProvider(id: string, name: string, materialize = false) {
@@ -480,20 +606,24 @@ export function prepareCollectionClinicalReview(
     const current = sourceFor(file),
       { view, intake, read, scope, grounding } = current;
     // V1 reviewedSource validates every retained provider binding, including off-page receipts.
-    function validateAllProviders(materialize = false) {
+    function* validateAllProviders(materialize = false): Generator<void, void, void> {
       for (const confirmation of intakeReviewChildren(
         view,
         current.workflow,
         'reportSourceConfirmations',
-      ))
+      )) {
+        yield;
         validateProvider(
           read<string>(confirmation, 'sourceProviderId')!,
           read<string>(confirmation, 'source')!,
           materialize,
         );
+      }
       for (const group of intakeReviewChildren(view, current.workflow, 'reportGroups')) {
+        yield;
         if (read(group, 'basis') !== 'report_anchor') continue;
         for (const version of intakeReviewChildren(view, group, 'versions')) {
+          yield;
           if (read(version, 'contextState') === 'mixed') continue;
           const context = read<IntakeReportContextReference>(version, 'context');
           if (context?.status !== 'linked' || !context.sourceSuggestion?.value.trim()) continue;
@@ -511,7 +641,7 @@ export function prepareCollectionClinicalReview(
         }
       }
     }
-    validateAllProviders();
+    yield* validateAllProviders();
     const proposal = proposalId ? view.find('proposal', intake, proposalId) : undefined;
     if (proposalId && !proposal)
       throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
@@ -531,6 +661,39 @@ export function prepareCollectionClinicalReview(
     const validation = validateJSONL(bytes);
     if (!validation.valid)
       throw new HttpError(400, 'INVALID_JSONL', 'Convert the original before clinical review');
+    const rememberPhysical = issueScratch.db.prepare(
+      'INSERT OR REPLACE INTO consumed_source_files VALUES (?, ?, ?)',
+    );
+    for (const id of clinicalSourceScopeDependencyIdsWork(db, file, validation.entries!)) {
+      yield;
+      if (id === undefined) continue;
+      const dependency = requiredFile(db, id, true),
+        path = profileOriginal(root, dependency.path, profileId);
+      const identity = yield* verifyIntakeFileHashWork(path, dependency);
+      rememberPhysical.run(id, path, identity);
+      yield;
+    }
+    const proposalPath = profileOriginal(root, inputFile.path, profileId);
+    rememberPhysical.run(
+      inputFile.id,
+      proposalPath,
+      yield* verifyIntakeFileHashWork(proposalPath, inputFile),
+    );
+    const assertPhysicalEvidenceCurrent = () => {
+      for (const row of issueScratch.db
+        .prepare('SELECT path,identity FROM consumed_source_files ORDER BY id')
+        .iterate())
+        if (
+          typeof row.path !== 'string' ||
+          typeof row.identity !== 'string' ||
+          intakeFileIdentity(row.path) !== row.identity
+        )
+          throw new HttpError(
+            409,
+            'SOURCE_CHANGED',
+            'Retained clinical evidence changed; refresh this review',
+          );
+    };
     const metadata = read<IntakeMetadata>(intake, 'metadata');
     const reviewed = {
       ...file,
@@ -577,12 +740,14 @@ export function prepareCollectionClinicalReview(
           measured ??
           (proposalRevision === parentRevision && proposalDependency === parentDependency)
         ));
-    const reportSource = (
+    const reportSource = (...input: Parameters<typeof reportSourceWork>) =>
+      finishClinicalReviewWork(reportSourceWork(...input));
+    function* reportSourceWork(
       record: Parameters<SelectedClinicalReportSource>[0],
       selectedProposal: string | null,
-    ) => {
+    ) {
       if (!record.candidateId || !record.candidateVersionId) return null;
-      const source = resolveNativeReportSource(db, file, {
+      const source = yield* resolveNativeReportSourceWork(db, file, {
         candidateId: record.candidateId,
         candidateVersionId: record.candidateVersionId,
         references: () => selectedReportGroups(record.reportGroups),
@@ -592,10 +757,16 @@ export function prepareCollectionClinicalReview(
         validateProvider(source.confirmation.sourceProviderId, source.confirmation.source);
         return source;
       }
-      return suggestedSource(current, record);
-    };
-    const pairSource: SelectedClinicalReportSource = (record, selectedProposal) => {
-      const source = reportSource(record, selectedProposal);
+      return yield* suggestedSourceWork(current, record);
+    }
+    const pairSource: SelectedClinicalReportSource = (record, selectedProposal) =>
+      finishClinicalReviewWork(pairSourceWork(record, selectedProposal));
+    pairSource.work = pairSourceWork;
+    function* pairSourceWork(
+      record: Parameters<SelectedClinicalReportSource>[0],
+      selectedProposal: string | null,
+    ): Generator<void, ReturnType<SelectedClinicalReportSource>, void> {
+      const source = yield* reportSourceWork(record, selectedProposal);
       return source
         ? {
             confirmationHash: source.confirmationHash,
@@ -605,16 +776,26 @@ export function prepareCollectionClinicalReview(
             coverageEntryId: source.coverage.coverageEntryId || null,
           }
         : null;
-    };
-    function suggestedSource(
+    }
+    // Only completed canonical hashes are retained, within this owned session.
+    const suggestedHashes = new Map<string, string>();
+    let suggestedHashBytes = 0;
+    let suggestedHashState: string | undefined;
+    function suggestedSource(...input: Parameters<typeof suggestedSourceWork>) {
+      return finishClinicalReviewWork(suggestedSourceWork(...input));
+    }
+    function* suggestedSourceWork(
       current: ReturnType<typeof open>,
       record: Pick<IntakeReviewRecord, 'candidateId' | 'candidateVersionId' | 'reportGroups'>,
       providerId?: string,
-    ):
+    ): Generator<
+      void,
       | (NonNullable<ReturnType<SelectedClinicalProjectionScope['reportSource']>> & {
           confirmationHash: string;
         })
-      | null {
+      | null,
+      void
+    > {
       const { view, read, workflow, catalog } = current;
       function* versions() {
         const references = selectedReportGroups(record.reportGroups)[Symbol.iterator]();
@@ -636,6 +817,7 @@ export function prepareCollectionClinicalReview(
         }
         const groupCount = workflow ? view.childCount(workflow, 'reportGroups') : 0;
         for (let g = groupCount - 1; g >= 0; g--) {
+          yield undefined;
           const group = view.childAt(workflow!, 'reportGroups', g)!;
           if (read(group, 'basis') !== 'report_anchor') continue;
           const groupId = read<string>(group, 'id')!;
@@ -645,14 +827,19 @@ export function prepareCollectionClinicalReview(
           }
         }
       }
-      for (const { version, groupId, versionId } of versions()) {
-        if (
-          !selectedReportGroups(record.reportGroups).some(
-            (ref) => ref.groupId === groupId && ref.groupVersionId === versionId,
-          ) ||
-          read(version, 'contextState') === 'mixed'
-        )
-          continue;
+      for (const selectedVersion of versions()) {
+        yield;
+        if (!selectedVersion) continue;
+        const { group, version, groupId, versionId } = selectedVersion;
+        let referenced = false;
+        for (const ref of selectedReportGroups(record.reportGroups)) {
+          yield;
+          if (ref.groupId === groupId && ref.groupVersionId === versionId) {
+            referenced = true;
+            break;
+          }
+        }
+        if (!referenced || read(version, 'contextState') === 'mixed') continue;
         const context = read<IntakeReportContextReference>(version, 'context');
         if (context?.status !== 'linked' || !context.sourceSuggestion?.value.trim()) continue;
         const members =
@@ -683,7 +870,8 @@ export function prepareCollectionClinicalReview(
         };
         let present = !!selected;
         if (!members)
-          for (const member of identities())
+          for (const member of identities()) {
+            yield;
             if (
               member.candidateId === record.candidateId &&
               member.candidateVersionId === record.candidateVersionId
@@ -691,6 +879,7 @@ export function prepareCollectionClinicalReview(
               present = true;
               break;
             }
+          }
         if (!present) continue;
         const name =
           safeText(context.sourceSuggestion.value.trim(), 'source name', 200).trim() ||
@@ -720,34 +909,80 @@ export function prepareCollectionClinicalReview(
         };
         if (providerId !== undefined && provider.id !== providerId) continue;
         validateProvider(provider.id, provider.name);
-        const hash = createHash('sha256');
-        hash.update('{');
-        let comma = false;
-        for (const name of [...Object.keys(header), 'members'].sort()) {
-          if (comma) hash.update(',');
-          comma = true;
-          hash.update(JSON.stringify(name) + ':');
-          if (name === 'members') {
-            hash.update('[');
-            let comma = false;
-            for (const member of identities()) {
-              if (comma) hash.update(',');
-              comma = true;
-              hash.update(canonicalLiteral(member));
-            }
-            hash.update(']');
-          } else hash.update(canonicalLiteral(header[name as keyof typeof header]));
+        const state = current.readCacheState();
+        if (state !== suggestedHashState || state === undefined) {
+          suggestedHashes.clear();
+          suggestedHashBytes = 0;
+          suggestedHashState = state;
         }
-        hash.update('}');
+        const key = JSON.stringify([
+          current.retained.id,
+          view.logical,
+          view.address(group),
+          view.address(version),
+          header,
+        ]);
+        let confirmationHash = state === undefined ? undefined : suggestedHashes.get(key);
+        if (confirmationHash !== undefined) {
+          suggestedHashes.delete(key);
+          suggestedHashes.set(key, confirmationHash);
+          withIntakeWork(db, 'warm', () => recordIntakeWork('collectionSuggestedSourceHashHits'));
+        } else {
+          withIntakeWork(db, 'warm', () => recordIntakeWork('collectionSuggestedSourceHashes'));
+          const hash = createHash('sha256');
+          hash.update('{');
+          let comma = false;
+          for (const name of [...Object.keys(header), 'members'].sort()) {
+            if (comma) hash.update(',');
+            comma = true;
+            hash.update(JSON.stringify(name) + ':');
+            if (name === 'members') {
+              hash.update('[');
+              let comma = false;
+              for (const member of identities()) {
+                yield;
+                withIntakeWork(db, 'warm', () =>
+                  recordIntakeWork('collectionSuggestedSourceMemberHashes'),
+                );
+                if (comma) hash.update(',');
+                comma = true;
+                hash.update(canonicalLiteral(member));
+              }
+              hash.update(']');
+            } else hash.update(canonicalLiteral(header[name as keyof typeof header]));
+          }
+          hash.update('}');
+          confirmationHash = hash.digest('hex');
+          const bytes = Buffer.byteLength(key) + Buffer.byteLength(confirmationHash);
+          if (state !== undefined && state === current.readCacheState() && bytes <= 256 * 1024) {
+            while (suggestedHashes.size >= 32 || suggestedHashBytes + bytes > 256 * 1024) {
+              const oldest = suggestedHashes.keys().next().value!;
+              suggestedHashBytes -=
+                Buffer.byteLength(oldest) + Buffer.byteLength(suggestedHashes.get(oldest)!);
+              suggestedHashes.delete(oldest);
+            }
+            suggestedHashes.set(key, confirmationHash);
+            suggestedHashBytes += bytes;
+          }
+        }
         return {
-          confirmationHash: hash.digest('hex'),
+          confirmationHash,
           confirmation: header,
           coverage: { groupVersionId: versionId, contextId: context.contextId },
         };
       }
       return null;
     }
-    const result = createCollectionClinicalReviewSession({
+    issueScratch.db.exec(
+      'CREATE TABLE source_scope_answers (line INTEGER PRIMARY KEY, problem TEXT)',
+    );
+    const writeScopeAnswer = issueScratch.db.prepare(
+      'INSERT INTO source_scope_answers VALUES (?, ?)',
+    );
+    const readScopeAnswer = issueScratch.db.prepare(
+      'SELECT problem FROM source_scope_answers WHERE line=?',
+    );
+    const result = yield* createCollectionClinicalReviewSessionWork({
       db,
       profileId,
       proposal: {
@@ -761,7 +996,15 @@ export function prepareCollectionClinicalReview(
           : {}),
       },
       scope,
-      sourceScopeProblem: clinicalSourceScopeCheck(
+      sourceScopeProblem: yield* prepareClinicalSourceScopeCheckWork(
+        {
+          set(entry, problem) {
+            writeScopeAnswer.run(entry.line, problem);
+          },
+          get(entry) {
+            return readScopeAnswer.get(entry.line)?.problem as string | null | undefined;
+          },
+        },
         db,
         reviewed,
         validation.entries!,
@@ -788,10 +1031,14 @@ export function prepareCollectionClinicalReview(
             receipt,
           ),
       },
-      ownership: scope.ownershipScope(grounding.originalBirthDateEvidence, initialVersion.version),
+      ownership: scope.ownershipScope(
+        grounding.originalBirthDateEvidence,
+        initialVersion.version,
+        grounding.originalBirthDateEvidenceWork,
+      ),
       reportSource: pairSource,
       projection: {
-        materializeSourceProviders: () => validateAllProviders(true),
+        materializeSourceProviders: () => finishClinicalReviewWork(validateAllProviders(true)),
         sourceScope: (entries) =>
           clinicalSourceScopeCheck(
             db,
@@ -820,12 +1067,19 @@ export function prepareCollectionClinicalReview(
         },
       },
       validation: validationSummary(validation),
-      assertProjectionEvidenceCurrent() {
-        verifyIntakeOriginal(db, root, profileId, intakeId);
-        verifyIntakeFileHash(profileOriginal(root, inputFile.path, profileId), {
-          bytes: inputFile.bytes,
-          sha256: inputFile.sha256,
-        });
+      assertProjectionEvidenceCurrent: assertPhysicalEvidenceCurrent,
+      *verifiedArtifacts() {
+        for (const row of issueScratch.db
+          .prepare('SELECT id,path,identity FROM consumed_source_files ORDER BY id')
+          .iterate()) {
+          if (
+            typeof row.id !== 'string' ||
+            typeof row.path !== 'string' ||
+            typeof row.identity !== 'string'
+          )
+            throw Error('Incomplete clinical artifact proof');
+          yield { id: row.id, path: row.path, identity: row.identity };
+        }
       },
       sourceText: {
         stale,
@@ -835,6 +1089,14 @@ export function prepareCollectionClinicalReview(
       assertCurrent,
     });
     if (result.status === 'ready') {
+      try {
+        // All consumed source dependencies remain covered even after the bounded opened-scope LRU evicts them.
+        assertPhysicalEvidenceCurrent();
+        assertCurrent();
+      } catch (error) {
+        result.session.close();
+        throw error;
+      }
       const close = result.session.close;
       result.session.close = () => {
         try {
@@ -935,18 +1197,20 @@ export async function readPreparedCollectionClinicalReview(
       if (isPreparedClinicalReviewReadCurrent(db, attempt)) discardPreparedClinicalReviewRead(db);
       cached = undefined;
     }
-    verifyIntakeOriginal(db, root, profileId, intakeId);
-    if (proposalId) {
-      const file = requiredFile(db, proposalId, false);
-      verifyIntakeFileHash(profileOriginal(root, file.path, profileId), file);
-    }
     if (!cached) {
       withIntakeWork(db, 'warm', () => recordIntakeWork('collectionPublicClinicalReviews'));
-      const prepared = prepareCollectionClinicalReview(db, root, profileId, intakeId, proposalId);
+      const prepared = await prepareCollectionClinicalReviewAsync(
+        db,
+        root,
+        profileId,
+        intakeId,
+        proposalId,
+      );
       if (prepared.status !== 'ready') return prepared;
       owned = prepared.session;
     }
     const session = cached?.session || owned!;
+    collectionClinicalProjectionContext(session).assertCurrent();
     const output =
       input.kind === 'page'
         ? session.page(input.section, input.options)

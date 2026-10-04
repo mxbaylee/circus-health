@@ -1,3 +1,8 @@
+import {
+  finishClinicalReviewWork,
+  findClinicalReviewWork,
+  someClinicalReviewWork,
+} from './clinical-review-work.ts';
 import { selectedSequence, type SelectedSequence } from './intake-selected-sequence.ts';
 import { storedIntakeDetails } from './intake-state-access.ts';
 import { latestOwnershipDecision } from './ownership-journal.ts';
@@ -8,8 +13,8 @@ import { canonicalLiteral, parseLiteralJSON, type IntakeEntry } from './intake-f
 import { clinicalSourceIdentityV1 } from './intake-source-identity.ts';
 import {
   identityOriginalFingerprint,
-  identityReceiptAppliesToCurrentBoundary,
-  repeatedIdentityQuestionReceipt,
+  identityReceiptAppliesToCurrentBoundaryWork,
+  repeatedIdentityQuestionReceiptWork,
 } from './intake-identity-policy.ts';
 import {
   identityGroundingLookup,
@@ -67,6 +72,11 @@ export interface ClinicalSourceScopeVersion {
   id: string;
   membership: import('./intake-identity-policy.ts').CurrentIdentityReceiptBoundary['membership'];
   hasOccurrence(candidateVersionId: string, recordId: string, proposalId?: string | null): boolean;
+  hasOccurrenceWork?(
+    candidateVersionId: string,
+    recordId: string,
+    proposalId?: string | null,
+  ): Generator<void, boolean, void>;
 }
 export interface ClinicalOriginalScope {
   profileId: string;
@@ -76,15 +86,26 @@ export interface ClinicalOriginalScope {
   childBoundary: string | null;
   groups(): SelectedSequence<ClinicalSourceScopeGroup>;
   version(group: ClinicalSourceScopeGroup, id?: string): ClinicalSourceScopeVersion | undefined;
+  versionWork?(
+    group: ClinicalSourceScopeGroup,
+    id?: string,
+  ): Generator<void, ClinicalSourceScopeVersion | undefined, void>;
   receipts(): SelectedSequence<import('./intake-identity-policy.ts').IdentityPolicyReceipt>;
   originalFingerprint(group: ClinicalSourceScopeGroup): string;
   subjectGrounded(group: ClinicalSourceScopeGroup): boolean;
+  subjectGroundedWork?(group: ClinicalSourceScopeGroup): Generator<void, boolean, void>;
+  questionGroundedWork?(
+    group: ClinicalSourceScopeGroup,
+    issue: { prompt: string; textAnchor: string },
+    receipt: import('./intake-identity-policy.ts').IdentityGroundingReceipt,
+  ): Generator<void, boolean, void>;
   questionGrounded(
     group: ClinicalSourceScopeGroup,
     issue: { prompt: string; textAnchor: string },
     receipt: import('./intake-identity-policy.ts').IdentityGroundingReceipt,
   ): boolean;
   acceptedRecords(): Iterable<Record<string, unknown>>;
+  acceptedRecordsWork?(): Iterable<Record<string, unknown> | void>;
 }
 
 interface Evidence {
@@ -95,13 +116,13 @@ interface Evidence {
   occurrence: string;
   childBoundary: string | null;
 }
-function evidenceFor(
+function* evidenceFor(
   value: HealthRecordEnvelope,
   original: ClinicalScopeOriginal,
   originalScope: ClinicalOriginalScope,
   recordId: string,
   retained = false,
-): Evidence {
+): Generator<void, Evidence, void> {
   const { packageSource, childBoundary } = originalScope;
   const report = value.report;
   const unsupportedMember =
@@ -134,13 +155,30 @@ function evidenceFor(
     'candidate-version:' + createHash('sha256').update(canonicalLiteral(value)).digest('hex');
   // Existing original-review receipts support headers on the retained page;
   // callers must not copy those headers into each clinical payload to qualify.
+  function* versionFor(group: ClinicalSourceScopeGroup, id?: string) {
+    return originalScope.versionWork
+      ? yield* originalScope.versionWork(group, id)
+      : originalScope.version(group, id);
+  }
+  function* occurrenceIn(
+    current: ClinicalSourceScopeVersion,
+    version: string,
+    recordId: string,
+    proposalId?: string | null,
+  ) {
+    return current.hasOccurrenceWork
+      ? yield* current.hasOccurrenceWork(version, recordId, proposalId)
+      : current.hasOccurrence(version, recordId, proposalId);
+  }
   const confirmed =
     !literal &&
-    originalScope.receipts().some((receipt) => {
-      const group = originalScope.groups().find((item) => item.id === receipt.scope.groupId);
+    (yield* someClinicalReviewWork(originalScope.receipts(), function* (receipt) {
+      const group = yield* findClinicalReviewWork(originalScope.groups(), function* (item) {
+        return item.id === receipt.scope.groupId;
+      });
       const current = retained
-        ? group && originalScope.version(group, receipt.scope.groupVersionId)
-        : group && originalScope.version(group);
+        ? group && (yield* versionFor(group, receipt.scope.groupVersionId))
+        : group && (yield* versionFor(group));
       return (
         !!group &&
         !!current &&
@@ -149,10 +187,13 @@ function evidenceFor(
         canonicalLiteral(group.report?.anchor) === canonicalLiteral(report.anchor) &&
         canonicalLiteral(group.report?.subject) === canonicalLiteral(report.subject) &&
         ['this_is_me', 'this_is_person'].includes(receipt.outcome) &&
-        (receipt.scope.assignmentTargets || receipt.scope.targets).some(
-          (target) => target.recordId === recordId && target.candidateVersionId === version,
-        ) &&
-        identityReceiptAppliesToCurrentBoundary(receipt, {
+        (yield* someClinicalReviewWork(
+          receipt.scope.assignmentTargets || receipt.scope.targets,
+          function* (target) {
+            return target.recordId === recordId && target.candidateVersionId === version;
+          },
+        )) &&
+        (yield* identityReceiptAppliesToCurrentBoundaryWork(receipt, {
           intakeId: original.id,
           groupId: group.id,
           groupVersionId: current.id,
@@ -163,13 +204,13 @@ function evidenceFor(
           membership: current.membership,
           evidencedIdentity: receipt.scope.evidencedIdentity,
           evidenceOriginalFingerprint: originalScope.originalFingerprint(group),
-        })
+        }))
       );
-    });
+    }));
   const grounded =
     !confirmed &&
-    originalScope.groups().some((group) => {
-      const current = originalScope.version(group);
+    (yield* someClinicalReviewWork(originalScope.groups(), function* (group) {
+      const current = yield* versionFor(group);
       if (
         !current ||
         group.sourceFileId !== original.id ||
@@ -177,7 +218,7 @@ function evidenceFor(
         canonicalLiteral(group.report?.anchor) !== canonicalLiteral(report.anchor) ||
         canonicalLiteral(group.report?.subject) !== canonicalLiteral(report.subject) ||
         group.memberId !== (report.memberId || null) ||
-        !current.hasOccurrence(version, recordId)
+        !(yield* occurrenceIn(current, version, recordId))
       )
         return false;
       // A null-proposal occurrence with the original's own line ID is literal
@@ -185,10 +226,15 @@ function evidenceFor(
       if (
         recordId.startsWith(`${original.id}:line:`) &&
         /^[1-9]\d*$/.test(recordId.slice(`${original.id}:line:`.length)) &&
-        current.hasOccurrence(version, recordId, null)
+        (yield* occurrenceIn(current, version, recordId, null))
       )
         return true;
-      if (originalScope.subjectGrounded(group)) return true;
+      if (
+        originalScope.subjectGroundedWork
+          ? yield* originalScope.subjectGroundedWork(group)
+          : originalScope.subjectGrounded(group)
+      )
+        return true;
       const clinicalIssues = object(value.clinical).reviewIssues;
       const questions = [
         ...(Array.isArray(value.reviewIssues) ? value.reviewIssues : []),
@@ -201,13 +247,13 @@ function evidenceFor(
             typeof issue.prompt === 'string' &&
             typeof issue.textAnchor === 'string',
         );
-      return questions.some((question) =>
-        originalScope.receipts().some((receipt) => {
+      return yield* someClinicalReviewWork(questions, function* (question) {
+        return yield* someClinicalReviewWork(originalScope.receipts(), function* (receipt) {
           const issue = {
             prompt: String(question.prompt),
             textAnchor: String(question.textAnchor),
           };
-          return !!repeatedIdentityQuestionReceipt({
+          return !!(yield* repeatedIdentityQuestionReceiptWork({
             issue,
             group,
             receipts: [receipt],
@@ -216,10 +262,13 @@ function evidenceFor(
             sourceHash: original.sha256,
             originalFingerprint: originalScope.originalFingerprint(group),
             grounded: (candidate) => originalScope.questionGrounded(group, issue, candidate),
-          });
-        }),
-      );
-    });
+            groundedWork:
+              originalScope.questionGroundedWork &&
+              ((candidate) => originalScope.questionGroundedWork!(group, issue, candidate)),
+          }));
+        });
+      });
+    }));
   // A prior accepted occurrence already has a durable scoped attribution.
   // Rebuilding SQLite must not turn its cold, non-authoritative grounding cache
   // into a demand to re-review every historical PDF page.
@@ -227,47 +276,55 @@ function evidenceFor(
     retained &&
     !confirmed &&
     !grounded &&
-    selectedSequence(originalScope.acceptedRecords()).some((record) => {
-      if (record.recordId !== recordId) return false;
-      const attribution = object(record.identityAttribution);
-      if (
-        ![
-          'explicit_report_confirmation',
-          'same_original_person_confirmation',
-          'explicit_person_confirmation',
-          'matched_saved_self',
-          'matched_saved_person',
-        ].includes(String(attribution.basis))
-      )
-        return false;
-      const group = originalScope.groups().find((item) => item.id === attribution.groupId);
-      const historical = group && originalScope.version(group, String(attribution.groupVersionId));
-      const receipt = originalScope
-        .receipts()
-        .find((item) => item.operationId === attribution.confirmationOperationId);
-      const exactAcceptedOccurrence =
-        !!group &&
-        !!historical &&
-        group.sourceFileId === original.id &&
-        group.sourceHash === original.sha256 &&
-        group.memberId === (report.memberId || null) &&
-        canonicalLiteral(group.report?.anchor) === canonicalLiteral(report.anchor) &&
-        canonicalLiteral(group.report?.subject) === canonicalLiteral(report.subject) &&
-        historical.hasOccurrence(version, recordId);
-      if (!exactAcceptedOccurrence) return false;
-      const originalFingerprint = originalScope.originalFingerprint(group!);
-      if (['matched_saved_self', 'matched_saved_person'].includes(String(attribution.basis)))
-        return attribution.originalSubjectFingerprint === originalFingerprint;
-      return (
-        !!receipt &&
-        ['this_is_me', 'this_is_person'].includes(receipt.outcome) &&
-        receipt.scope.memberId === group!.memberId &&
-        receipt.scope.intakeId === original.id &&
-        receipt.scope.sourceHash === original.sha256 &&
-        receipt.scope.evidenceOriginalFingerprint === originalFingerprint &&
-        receipt.scope.subject.text === report.subject!.text
-      );
-    });
+    (yield* someClinicalReviewWork(
+      originalScope.acceptedRecordsWork
+        ? originalScope.acceptedRecordsWork()
+        : originalScope.acceptedRecords(),
+      function* (record) {
+        if (!record) return false;
+        if (record.recordId !== recordId) return false;
+        const attribution = object(record.identityAttribution);
+        if (
+          ![
+            'explicit_report_confirmation',
+            'same_original_person_confirmation',
+            'explicit_person_confirmation',
+            'matched_saved_self',
+            'matched_saved_person',
+          ].includes(String(attribution.basis))
+        )
+          return false;
+        const group = yield* findClinicalReviewWork(originalScope.groups(), function* (item) {
+          return item.id === attribution.groupId;
+        });
+        const historical = group && (yield* versionFor(group, String(attribution.groupVersionId)));
+        const receipt = yield* findClinicalReviewWork(originalScope.receipts(), function* (item) {
+          return item.operationId === attribution.confirmationOperationId;
+        });
+        const exactAcceptedOccurrence =
+          !!group &&
+          !!historical &&
+          group.sourceFileId === original.id &&
+          group.sourceHash === original.sha256 &&
+          group.memberId === (report.memberId || null) &&
+          canonicalLiteral(group.report?.anchor) === canonicalLiteral(report.anchor) &&
+          canonicalLiteral(group.report?.subject) === canonicalLiteral(report.subject) &&
+          (yield* occurrenceIn(historical, version, recordId));
+        if (!exactAcceptedOccurrence) return false;
+        const originalFingerprint = originalScope.originalFingerprint(group!);
+        if (['matched_saved_self', 'matched_saved_person'].includes(String(attribution.basis)))
+          return attribution.originalSubjectFingerprint === originalFingerprint;
+        return (
+          !!receipt &&
+          ['this_is_me', 'this_is_person'].includes(receipt.outcome) &&
+          receipt.scope.memberId === group!.memberId &&
+          receipt.scope.intakeId === original.id &&
+          receipt.scope.sourceHash === original.sha256 &&
+          receipt.scope.evidenceOriginalFingerprint === originalFingerprint &&
+          receipt.scope.subject.text === report.subject!.text
+        );
+      },
+    ));
   if (confirmed || grounded || acceptedProof)
     result.scope = { subject: report.subject.text, member: report.memberId || null };
   return result;
@@ -301,12 +358,18 @@ function compatible(left: Evidence, right: Evidence | null): boolean {
 
 /** Exact accepted occurrence selector shared by dependency preparation and policy. */
 export function* clinicalSourceScopeRecordIds(
+  ...input: Parameters<typeof clinicalSourceScopeRecordIdsWork>
+): Generator<string> {
+  for (const id of clinicalSourceScopeRecordIdsWork(...input)) if (id !== undefined) yield id;
+}
+export function* clinicalSourceScopeRecordIdsWork(
   db: DatabaseSync,
   identity: string,
-): Generator<string> {
+): Generator<string | void> {
   for (const row of db
     .prepare("SELECT coverage_json FROM manual_batches WHERE title='Import record exception'")
     .iterate()) {
+    yield;
     const exception = object(parse(row.coverage_json).recordException);
     if (exception.identityKey === identity)
       yield typeof exception.recordId === 'string' ? exception.recordId : '';
@@ -322,6 +385,7 @@ export function* clinicalSourceScopeRecordIds(
       for (const evidence of db
         .prepare('SELECT source_record_id FROM evidence WHERE entity_type=? AND entity_id=?')
         .iterate(kind, String(row.id))) {
+        yield;
         const correction = latestOwnershipDecision<{
           recordId: string;
           kind: string;
@@ -361,14 +425,21 @@ function retainedSourceRow(db: DatabaseSync, recordId: string) {
 }
 /** A repeatable complete dependency walk; duplicate IDs may be yielded without retaining an unbounded set. */
 export function* clinicalSourceScopeDependencyIds(
+  ...input: Parameters<typeof clinicalSourceScopeDependencyIdsWork>
+): Generator<string> {
+  for (const id of clinicalSourceScopeDependencyIdsWork(...input)) if (id !== undefined) yield id;
+}
+export function* clinicalSourceScopeDependencyIdsWork(
   db: DatabaseSync,
   file: { id?: string; sha256: string },
   entries: IntakeEntry[],
-): Generator<string> {
+): Generator<string | void> {
   if (file.id) yield file.id;
   const identities = new Set(entries.map((entry) => clinicalSourceIdentityV1(entry, file)));
   for (const identity of identities)
-    for (const id of clinicalSourceScopeRecordIds(db, identity)) {
+    for (const id of clinicalSourceScopeRecordIdsWork(db, identity)) {
+      yield;
+      if (id === undefined) continue;
       const { row } = retainedSourceRow(db, id);
       if (!row || literalEnvelope(row.raw_json).format !== 'health-record-v1') continue;
       const originalId = parse(row.locator_json).originalSourceFileId || row.source_file_id;
@@ -384,12 +455,35 @@ export function* clinicalSourceScopeDependencyIds(
  * projection; never reuse a review's cached result to authorize an acceptance.
  * Neither persisted identity domain nor accepted source envelopes are changed. */
 export function clinicalSourceScopeCheck(
+  ...input: Parameters<typeof clinicalSourceScopeCheckerWork>
+): (entry: IntakeEntry) => string | null {
+  const check = finishClinicalReviewWork(clinicalSourceScopeCheckerWork(...input));
+  return (entry) => finishClinicalReviewWork(check(entry));
+}
+/** Complete answers for the exact input proposal, computed before publishing any clinical session. */
+export function* prepareClinicalSourceScopeCheckWork(
+  answers: {
+    set(entry: IntakeEntry, value: string | null): void;
+    get(entry: IntakeEntry): string | null | undefined;
+  },
+  ...input: Parameters<typeof clinicalSourceScopeCheckerWork>
+): Generator<void, (entry: IntakeEntry) => string | null, void> {
+  const check = yield* clinicalSourceScopeCheckerWork(...input);
+  for (const entry of input[2]) answers.set(entry, yield* check(entry));
+  return (entry) => {
+    const result = answers.get(entry);
+    if (result === undefined)
+      throw Error('Clinical source check is outside its complete selected proposal');
+    return result;
+  };
+}
+function* clinicalSourceScopeCheckerWork(
   db: DatabaseSync,
   file: { id?: string; sha256: string; mime_type?: string; details_json?: string },
   entries: IntakeEntry[],
   inputFileId = file.id || '',
   selectedScope?: (original: ClinicalScopeOriginal) => ClinicalOriginalScope,
-): (entry: IntakeEntry) => string | null {
+): Generator<void, (entry: IntakeEntry) => Generator<void, string | null, void>, void> {
   const incomingOriginal: ClinicalScopeOriginal = { ...file, id: file.id || '' };
   const profileId = String(
     db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value || '',
@@ -486,7 +580,7 @@ export function clinicalSourceScopeCheck(
     return originalCache.get(id)!;
   };
   const retainedCache = new Map<string, Evidence | null>();
-  const retained = (recordId: string): Evidence | null => {
+  const retained = function* (recordId: string): Generator<void, Evidence | null, void> {
     if (retainedCache.has(recordId)) return retainedCache.get(recordId)!;
     const selected = retainedSourceRow(db, recordId),
       row = selected.row;
@@ -496,7 +590,7 @@ export function clinicalSourceScopeCheck(
     const original = typeof originalId === 'string' ? originalFor(originalId) : null;
     const result =
       row && raw.format === 'health-record-v1' && original?.sha256
-        ? evidenceFor(
+        ? yield* evidenceFor(
             raw as unknown as HealthRecordEnvelope,
             original,
             scopeFor(original),
@@ -508,15 +602,12 @@ export function clinicalSourceScopeCheck(
     retainedCache.set(recordId, result);
     return result;
   };
-  function* accepted(identity: string): Generator<Evidence | null> {
-    for (const recordId of clinicalSourceScopeRecordIds(db, identity)) yield retained(recordId);
-  }
   const incoming = new Map<string, Evidence[]>();
   const entryEvidence = new Map<IntakeEntry, Evidence>();
   for (const entry of entries) {
     const identity = clinicalSourceIdentityV1(entry, file);
     const peers = incoming.get(identity) || [];
-    const evidence = evidenceFor(
+    const evidence = yield* evidenceFor(
       entry.value,
       incomingOriginal,
       scopeFor(incomingOriginal),
@@ -526,19 +617,25 @@ export function clinicalSourceScopeCheck(
     peers.push(evidence);
     incoming.set(identity, peers);
   }
-  return (entry) => {
+  return function* (entry) {
     const identity = clinicalSourceIdentityV1(entry, file);
     const evidence =
       entryEvidence.get(entry) ||
-      evidenceFor(
+      (yield* evidenceFor(
         entry.value,
         incomingOriginal,
         scopeFor(incomingOriginal),
         `${inputFileId}:line:${entry.line}`,
-      );
-    return selectedSequence(accepted(identity)).some((prior) => !compatible(evidence, prior)) ||
-      (incoming.get(identity) || []).some((prior) => !compatible(evidence, prior))
-      ? CLINICAL_SOURCE_SCOPE_COLLISION
-      : null;
+      ));
+    for (const recordId of clinicalSourceScopeRecordIdsWork(db, identity)) {
+      yield;
+      if (recordId === undefined) continue;
+      if (!compatible(evidence, yield* retained(recordId))) return CLINICAL_SOURCE_SCOPE_COLLISION;
+    }
+    for (const prior of incoming.get(identity) || []) {
+      yield;
+      if (!compatible(evidence, prior)) return CLINICAL_SOURCE_SCOPE_COLLISION;
+    }
+    return null;
   };
 }

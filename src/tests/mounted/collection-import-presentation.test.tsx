@@ -411,6 +411,213 @@ it('grounds only displayed report identity and refreshes readiness once without 
   expect(identityGroups.length).toBeLessThanOrEqual(3);
   expect(screen.getAllByRole('checkbox', { name: /Select Fictional glucose/ })).toHaveLength(2);
 });
+function mountIdentityWindow(initial: CollectionImportFeed, reload = vi.fn()) {
+  const firstPage = { reload, error: null };
+  const view = (current: CollectionImportFeed) => (
+    <MemoryRouter initialEntries={['/import']}>
+      <CollectionImportReview
+        initial={current}
+        path="/intakes/import-feed?view=active&state=pending&limit=40&bytes=65536"
+        firstPage={firstPage}
+        onChanged={vi.fn()}
+        sourceProps={{ onChanged: vi.fn() }}
+        onUpload={vi.fn()}
+        busy={false}
+        status=""
+        error=""
+      />
+    </MemoryRouter>
+  );
+  const mounted = render(view(initial));
+  return {
+    ...mounted,
+    replace: (current: CollectionImportFeed) => mounted.rerender(view(current)),
+  };
+}
+function heldIdentity() {
+  let resolve!: (response: Response) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<Response>((accept, refuse) => {
+    resolve = accept;
+    reject = refuse;
+  });
+  return { promise, release: (value: unknown = identity) => resolve(json(value)), reject };
+}
+function identityDispatchFetch(
+  load: (url: URL, signal: AbortSignal | null | undefined) => Promise<Response>,
+) {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, options: RequestInit = {}) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.endsWith('/identity-review')) return load(url, options.signal);
+      if (url.pathname.includes('/report-queue/')) {
+        const groupId = decodeURIComponent(url.pathname.split('/').at(-1)!);
+        const intakeId = url.searchParams.get('intakeId')!;
+        return json({
+          format: 'health-intake-report-detail-v2',
+          group: { ...header(groupId), intakeId, records: { intakeId, groupId } },
+        });
+      }
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+}
+it('dispatches a source second identity group only after its first settles while another source stays concurrent', async () => {
+  const first = heldIdentity();
+  const calls: string[] = [];
+  identityDispatchFetch(async (url) => {
+    const group = url.searchParams.get('groupId')!;
+    calls.push(group);
+    return group === 'first-group' ? first.promise : json(identity);
+  });
+  const independent = { ...record('independent', 'independent-group'), intakeId: 'other-intake' };
+  mountIdentityWindow(
+    feed([record('first', 'first-group'), record('second', 'second-group'), independent]),
+  );
+  await waitFor(() => expect(calls).toEqual(['first-group', 'independent-group']));
+  await act(async () => first.release());
+  await waitFor(() => expect(calls).toEqual(['first-group', 'independent-group', 'second-group']));
+});
+it('releases the next identity group after a failed first read without retrying the failed group', async () => {
+  const first = heldIdentity();
+  const calls: string[] = [];
+  identityDispatchFetch(async (url) => {
+    const group = url.searchParams.get('groupId')!;
+    calls.push(group);
+    return group === 'first-group' ? first.promise : json(identity);
+  });
+  mountIdentityWindow(feed([record('first', 'first-group'), record('second', 'second-group')]));
+  await waitFor(() => expect(calls).toEqual(['first-group']));
+  await act(async () => first.reject(new Error('Controlled first identity read failed')));
+  await waitFor(() => expect(calls).toEqual(['first-group', 'second-group']));
+  await act(async () => {});
+  expect(calls).toEqual(['first-group', 'second-group']);
+});
+it('cancels a queued identity group on unmount', async () => {
+  const first = heldIdentity();
+  const calls: string[] = [];
+  let dispatchedSignal: AbortSignal | null | undefined;
+  identityDispatchFetch(async (url, signal) => {
+    calls.push(url.searchParams.get('groupId')!);
+    dispatchedSignal = signal;
+    return first.promise;
+  });
+  const mounted = mountIdentityWindow(
+    feed([record('first', 'first-group'), record('second', 'second-group')]),
+  );
+  await waitFor(() => expect(calls).toEqual(['first-group']));
+  mounted.unmount();
+  expect(dispatchedSignal?.aborted).toBe(true);
+  await act(async () => first.release());
+  expect(calls).toEqual(['first-group']);
+});
+it('cancels old queued identity work on refresh and preserves the newer same-signature request after old completion', async () => {
+  const oldFirst = heldIdentity(),
+    freshFirst = heldIdentity();
+  const calls: string[] = [],
+    signals: Array<AbortSignal | null | undefined> = [];
+  identityDispatchFetch(async (url, signal) => {
+    const group = url.searchParams.get('groupId')!;
+    calls.push(group);
+    signals.push(signal);
+    return group === 'first-group'
+      ? calls.length === 1
+        ? oldFirst.promise
+        : freshFirst.promise
+      : json(identity);
+  });
+  const initial = feed([record('first', 'first-group'), record('second', 'second-group')]);
+  const mounted = mountIdentityWindow(initial);
+  await waitFor(() => expect(calls).toEqual(['first-group']));
+  mounted.replace({
+    ...initial,
+    records: [...initial.records],
+  });
+  await waitFor(() => expect(calls).toEqual(['first-group', 'first-group']));
+  expect(signals[0]?.aborted).toBe(true);
+  expect(signals[1]?.aborted).toBe(false);
+  await act(async () => oldFirst.release());
+  expect(calls).toEqual(['first-group', 'first-group']);
+  await act(async () =>
+    freshFirst.release({
+      ...identity,
+      evidencedIdentity: { fullName: 'Fictional Fresh Identity' },
+    }),
+  );
+  await waitFor(() => expect(calls).toEqual(['first-group', 'first-group', 'second-group']));
+  expect(await screen.findByText(/Fictional Fresh Identity/)).toBeInTheDocument();
+  // A successfully settled shared transport closes its controller as well.
+  expect(signals[1]?.aborted).toBe(true);
+});
+it('cancels queued old-profile identity work and dispatches only the new profile after replacement', async () => {
+  const oldFirst = heldIdentity(),
+    freshFirst = heldIdentity();
+  const calls: Array<{ path: string; group: string }> = [];
+  identityDispatchFetch(async (url) => {
+    const group = url.searchParams.get('groupId')!;
+    calls.push({ path: url.pathname, group });
+    return group === 'first-group'
+      ? calls.length === 1
+        ? oldFirst.promise
+        : freshFirst.promise
+      : json(identity);
+  });
+  const initial = feed([record('first', 'first-group'), record('second', 'second-group')]);
+  const mounted = mountIdentityWindow(initial);
+  await waitFor(() => expect(calls).toHaveLength(1));
+  await act(async () => {
+    const replacement = { ...profile, id: 'replacement-identity-profile' };
+    replaceProfiles([profile, replacement]);
+    selectProfile(replacement);
+    mounted.replace({
+      ...initial,
+      records: initial.records.map((row) => ({
+        ...row,
+        intakeId: 'replacement-intake',
+        reviewToken: 'replacement-' + row.groupId,
+      })),
+    });
+  });
+  await waitFor(() => expect(calls).toHaveLength(2));
+  expect(calls[1]!.path).toContain(
+    '/profiles/replacement-identity-profile/intakes/replacement-intake/',
+  );
+  await act(async () => oldFirst.release());
+  expect(calls).toHaveLength(2);
+  await act(async () => freshFirst.release());
+  await waitFor(() => expect(calls).toHaveLength(3));
+  expect(calls.map((call) => call.group)).toEqual(['first-group', 'first-group', 'second-group']);
+  expect(calls[2]!.path).toContain('/profiles/replacement-identity-profile/');
+});
+it('refreshes once for each sequential grounded scope and does not repeat for an unchanged displayed window', async () => {
+  const first = heldIdentity();
+  const calls: string[] = [];
+  const reload = vi.fn();
+  identityDispatchFetch(async (url) => {
+    const group = url.searchParams.get('groupId')!;
+    calls.push(group);
+    return group === 'first-group'
+      ? first.promise
+      : json({ ...identity, status: 'evidenced_match', scope: { scopeToken: 'second-scope' } });
+  });
+  const initial = feed([
+    record('first', 'first-group', true),
+    record('second', 'second-group', true),
+  ]);
+  const mounted = mountIdentityWindow(initial, reload);
+  await waitFor(() => expect(calls).toEqual(['first-group']));
+  expect(reload).not.toHaveBeenCalled();
+  await act(async () =>
+    first.release({ ...identity, status: 'evidenced_match', scope: { scopeToken: 'first-scope' } }),
+  );
+  await waitFor(() => expect(reload).toHaveBeenCalledTimes(2));
+  mounted.replace({ ...initial, records: [...initial.records] });
+  await act(async () => {});
+  expect(calls).toEqual(['first-group', 'second-group']);
+  expect(reload).toHaveBeenCalledTimes(2);
+});
+
 it('shares the native first feed with ImportPage and refreshes the exact visible window after parent changes', async () => {
   let releaseBatch!: (response: Response) => void;
   let releaseIdentity!: () => void;
@@ -878,3 +1085,89 @@ for (const fallback of [false, true])
     expect(await screen.findByText('Fictional previous page')).toBeVisible();
     expect(warning.mock.calls.flat().join(' ')).not.toContain('only supports one blocker');
   });
+
+it('opens the complete Documents union before paging and clears unrelated page selection', async () => {
+  const initial = feed(Array.from({ length: 40 }, (_, index) => record('test-' + index)));
+  initial.totalRecords = 42;
+  initial.counts.pending = 42;
+  initial.kindCounts = { ...initial.kindCounts, test: 40, history: 1, unsupported: 1 };
+  initial.nextCursor = 'unfiltered-next';
+  const document = (id: string, kind: 'history' | 'unsupported') => {
+    const row = record(id);
+    row.feedKind = kind;
+    if (row.detail.kind !== 'record') throw Error('Expected fictional inline record');
+    row.detail.record.feedKind = kind;
+    row.detail.record.title = id;
+    row.detail.record.kind = kind === 'history' ? 'document' : 'unsupported';
+    row.detail.record.mapping = { kind: row.detail.record.kind, documentTitle: id };
+    row.detail.record.selectable = kind === 'history';
+    return row;
+  };
+  const history = document('Fictional history document', 'history'),
+    unsupported = document('Fictional unsupported document', 'unsupported'),
+    reads: URL[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.endsWith('/import-feed')) {
+        reads.push(url);
+        if (url.searchParams.get('kind') === 'documents') {
+          const next = url.searchParams.get('cursor') === 'documents-next';
+          return json({
+            ...initial,
+            records: [next ? unsupported : history],
+            totalRecords: 2,
+            nextCursor: next ? null : 'documents-next',
+          });
+        }
+        return json(initial);
+      }
+      if (url.pathname.includes('/report-queue/'))
+        return json({ format: 'health-intake-report-detail-v2', group: header('visible-group') });
+      if (url.pathname.endsWith('/identity-review')) return json(identity);
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  mount(initial);
+  const previous = await screen.findByRole('checkbox', { name: 'Select Fictional glucose test-0' });
+  await waitFor(() => expect(previous).toBeEnabled());
+  fireEvent.click(previous);
+  expect(previous).toBeChecked();
+  fireEvent.click(screen.getByRole('tab', { name: /^Documents\s*2$/ }));
+  const selected = await screen.findByRole('checkbox', {
+    name: 'Select Fictional history document',
+  });
+  expect(screen.getByRole('tab', { name: /^Documents\s*2$/ })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  expect(
+    screen.queryByRole('checkbox', { name: 'Select Fictional glucose test-0' }),
+  ).not.toBeInTheDocument();
+  expect(selected).not.toBeChecked();
+  fireEvent.click(selected);
+  expect(selected).toBeChecked();
+  fireEvent.click(screen.getByRole('button', { name: 'Next records' }));
+  const next = await screen.findByRole('checkbox', {
+    name: 'Select Fictional unsupported document',
+  });
+  expect(next).not.toBeChecked();
+  expect(
+    screen.queryByRole('checkbox', { name: 'Select Fictional history document' }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  expect(
+    reads.some(
+      (url) => url.searchParams.get('kind') === 'documents' && !url.searchParams.has('cursor'),
+    ),
+  ).toBe(true);
+  expect(
+    reads.some(
+      (url) =>
+        url.searchParams.get('kind') === 'documents' &&
+        url.searchParams.get('cursor') === 'documents-next',
+    ),
+  ).toBe(true);
+  expect(reads.some((url) => url.searchParams.get('cursor') === 'unfiltered-next')).toBe(false);
+});

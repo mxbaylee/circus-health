@@ -1,12 +1,17 @@
-import { selectedReportGroupLinks, selectedReportGroups } from './intake-selected-report-groups.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
+import { finishClinicalReviewWork, everyClinicalReviewWork } from './clinical-review-work.ts';
+import {
+  selectedReportGroupLinksWork,
+  selectedReportGroups,
+} from './intake-selected-report-groups.ts';
 import { selectedDraftHandoff } from './intake-review-draft-handoff.ts';
 import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
-import { collectSelectedEvidencedIdentity } from './intake-identity-name-evidence.ts';
+import { collectSelectedEvidencedIdentityWork } from './intake-identity-name-evidence.ts';
 import { recordIntakeWork } from './intake-work-accounting.ts';
 import { nativeIdentityPolicyScope } from './intake-identity-snapshot.ts';
 import type { IntakeIdentityScopeReference } from '../shared/intake-identity.ts';
 import type { ClinicalOriginalScope } from './clinical-source-scope.ts';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { canonicalLiteral, parseLiteralJSON } from './intake-format.ts';
 import {
   intakeEnvelopeRecordOrder,
@@ -30,8 +35,9 @@ import type {
   SelectedIdentityMembership,
 } from './intake-identity-policy.ts';
 import {
-  structuredEvidencedIdentity,
+  structuredEvidencedIdentityWork,
   iterateCompetingIdentityBoundaries,
+  identityCompetingClaimsEqualWork,
 } from './intake-identity-policy.ts';
 import {
   intakeCandidateVersionIdForRevision,
@@ -48,6 +54,8 @@ type SelectedWorkflowReviewScope = Omit<WorkflowReviewScope, 'membership'> & {
   membership(group: WorkflowReviewGroup): SelectedIdentityMembership;
 };
 type IdentityReceiptWork =
+  | 'reviewProposalRevisionReads'
+  | 'reviewProposalRevisionHits'
   | 'reviewDraftReconstructions'
   | 'reviewDraftHandoffs'
   | 'identityPolicyReceiptReconstructions'
@@ -113,15 +121,42 @@ const hashChunks = (chunks: Iterable<string>) => {
   return hash.digest('hex');
 };
 
+function* hashChunksWork(chunks: Iterable<string>): Generator<void, string, void> {
+  const hash = createHash('sha256');
+  for (const chunk of chunks) {
+    for (let offset = 0; offset < chunk.length;) {
+      let end = Math.min(offset + 64 * 1024, chunk.length);
+      // Keep UTF-16 pairs together so chunk boundaries preserve the UTF-8 digest.
+      if (
+        end < chunk.length &&
+        chunk.charCodeAt(end - 1) >= 0xd800 &&
+        chunk.charCodeAt(end - 1) <= 0xdbff
+      )
+        end--;
+      hash.update(chunk.slice(offset, end));
+      offset = end;
+      yield;
+    }
+    yield;
+  }
+  return hash.digest('hex');
+}
+
 /** Complete joins over selected authority. The host supplies current source, policy and inventory proofs. */
 export function collectionWorkflowReviewScope(input: {
   close?(): void;
+  policySql?: import('node:sqlite').DatabaseSync;
   issueSink?: import('./intake-workflow.ts').WorkflowReviewScope['issueSink'];
   bindIdentityWarnings?: import('./intake-workflow.ts').WorkflowReviewScope['bindIdentityWarnings'];
+  bindIdentityWarningsWork?: import('./intake-workflow.ts').WorkflowReviewScope['bindIdentityWarningsWork'];
   questionState?: ReturnType<
     typeof import('./intake-review-question-state.ts').openReviewQuestionState
   >;
+  questionIndex?: ReturnType<
+    typeof import('./intake-review-question-index.ts').indexedReviewQuestions
+  >;
   readDraft?: (record: IntakeEnvelopeRecord) => IntakeReviewDraft;
+  readDraftWork?: (record: IntakeEnvelopeRecord) => Generator<void, IntakeReviewDraft, void>;
   membershipIndex?: import('./intake-review-membership-index.ts').CollectionReviewMembership;
   view: IntakeCollectionEnvelopeReader;
   catalog: ReportSnapshotCatalog;
@@ -133,15 +168,29 @@ export function collectionWorkflowReviewScope(input: {
   activeReceipt(receipt: IdentityPolicyReceipt): boolean;
   originalFingerprint(group: WorkflowReviewGroup): string;
   reportSource: WorkflowReviewScope['reportSource'];
+  reportSourceWork?: WorkflowReviewScope['reportSourceWork'];
 }): SelectedWorkflowReviewScope & {
   canonicalReviewRecords(records: unknown): Iterable<string>;
   latestAcceptedRecord(
     recordId: string,
   ): import('../shared/intake.ts').IntakeReviewDecision | undefined;
+  latestAcceptedRecordWork(
+    recordId: string,
+  ): Generator<void, import('../shared/intake.ts').IntakeReviewDecision | undefined, void>;
   reportContext(
     envelopeId: string,
     proposalId: string | null,
   ): IntakeSourceContext['reportContext'] | undefined;
+  reportContextWork(
+    envelopeId: string,
+    proposalId: string | null,
+  ): Generator<void, IntakeSourceContext['reportContext'] | undefined, void>;
+  occurrenceWork(
+    candidateId: string,
+    versionId: string,
+    recordId: string,
+    proposalId: string | null,
+  ): Generator<void, IntakeCandidateOccurrence | undefined, void>;
   groupRecords(): Iterable<IntakeEnvelopeRecord>;
   groupHeader(record: IntakeEnvelopeRecord): WorkflowReviewGroup;
   currentGroupVersion(record: IntakeEnvelopeRecord): IntakeEnvelopeRecord | undefined;
@@ -159,6 +208,7 @@ export function collectionWorkflowReviewScope(input: {
   ownershipScope(
     birthDates: import('./record-ownership-authority.ts').SelectedOwnershipReviewScope['birthDates'],
     intakeVersion: number,
+    birthDatesWork?: import('./record-ownership-authority.ts').SelectedOwnershipReviewScope['birthDatesWork'],
   ): import('./record-ownership-authority.ts').SelectedOwnershipReviewScope;
   clinicalSourceScope(
     proofs: Pick<
@@ -169,6 +219,8 @@ export function collectionWorkflowReviewScope(input: {
       | 'childBoundary'
       | 'subjectGrounded'
       | 'questionGrounded'
+      | 'subjectGroundedWork'
+      | 'questionGroundedWork'
     >,
   ): ClinicalOriginalScope;
 } {
@@ -275,13 +327,13 @@ export function collectionWorkflowReviewScope(input: {
         return member;
     return undefined;
   };
-  const contains = (
+  function* containsWork(
     record: IntakeEnvelopeRecord,
     candidateId: string,
     versionId: string,
     recordId: string,
     proposalId: string | null,
-  ): boolean => {
+  ): Generator<void, boolean, void> {
     if (input.membershipIndex)
       return input.membershipIndex.contains(record, candidateId, versionId, recordId, proposalId);
     const members = snapshot(record);
@@ -291,10 +343,12 @@ export function collectionWorkflowReviewScope(input: {
       do {
         const page = members.members({ after, items: 64, bytes: 128 * 1024 });
         for (const member of page.members) {
+          yield;
           if (member.candidateId !== candidateId || member.candidateVersionId !== versionId)
             continue;
           let occurrenceAfter: string | undefined;
           do {
+            yield;
             const occurrences = members.occurrences(member, {
               after: occurrenceAfter,
               items: 64,
@@ -319,97 +373,183 @@ export function collectionWorkflowReviewScope(input: {
       } while (true);
     }
     for (const member of children(record, 'members')) {
+      yield;
       if (
         value(member, 'candidateId') !== candidateId ||
         value(member, 'candidateVersionId') !== versionId
       )
         continue;
-      for (const occurrence of children(member, 'occurrences'))
+      for (const occurrence of children(member, 'occurrences')) {
+        yield;
         if (
           value(occurrence, 'recordId') === recordId &&
           value(occurrence, 'proposalId') === proposalId
         )
           return true;
+      }
     }
     return false;
-  };
+  }
   const fallbackGroupId = (candidate: IntakeEnvelopeRecord) =>
     'report-group:' + hashChunks([canonicalLiteral(['candidate', value(candidate, 'id')])]);
-  const coveredVersion = (candidateId: string, versionId: string): boolean => {
+  const policyNamespace = 'scope_' + randomUUID().replaceAll('-', '') + '_';
+  let fallbackScratch: ReturnType<typeof disposableSqlite> | undefined;
+  let fallbackDb: import('node:sqlite').DatabaseSync | undefined;
+  let fallbackCandidatesPrepared = false,
+    fallbackSelection = 0,
+    fallbackClosed = false;
+  const fallbackStore = () => {
+    if (fallbackClosed) throw Error('Selected fallback scope closed');
+    view.address(view.root());
+    if (!fallbackDb) {
+      if (!input.policySql) fallbackScratch = disposableSqlite('circus-review-fallback-');
+      fallbackDb = input.policySql || fallbackScratch!.db;
+      fallbackDb.exec(
+        `CREATE TABLE ${policyNamespace}candidates(group_id TEXT,ordinal INTEGER,address TEXT,PRIMARY KEY(group_id,ordinal)); CREATE TABLE ${policyNamespace}versions(group_id TEXT,ordinal INTEGER,candidate TEXT,version TEXT,id TEXT,PRIMARY KEY(group_id,ordinal)); CREATE INDEX ${policyNamespace}version_id ON ${policyNamespace}versions(group_id,id,ordinal); CREATE TABLE ${policyNamespace}complete(group_id TEXT PRIMARY KEY); CREATE TABLE ${policyNamespace}refs(selection INTEGER,ordinal INTEGER,value TEXT,PRIMARY KEY(selection,ordinal)); CREATE TABLE ${policyNamespace}active_receipts(selection INTEGER,ordinal INTEGER,address TEXT,PRIMARY KEY(selection,ordinal));`,
+      );
+    }
+    return fallbackDb;
+  };
+  function* coveredVersionWork(
+    candidateId: string,
+    versionId: string,
+  ): Generator<void, boolean, void> {
     if (input.membershipIndex) return input.membershipIndex.covered(candidateId, versionId);
-    for (const group of groupRecords())
+    for (const group of groupRecords()) {
+      yield;
       for (const version of children(group, 'versions')) {
+        yield;
         const members = snapshot(version);
-        if (
-          members
-            ? !!members.member(candidateId, versionId)
-            : !!memberRecord(version, candidateId, versionId)
-        )
-          return true;
+        if (members) {
+          if (members.member(candidateId, versionId)) return true;
+        } else
+          for (const member of children(version, 'members')) {
+            yield;
+            if (
+              value(member, 'candidateId') === candidateId &&
+              value(member, 'candidateVersionId') === versionId
+            )
+              return true;
+          }
       }
+    }
     return false;
-  };
-  const fallbackVersionId = (groupId: string, version: IntakeEnvelopeRecord) => {
-    function* pieces() {
-      yield '[' + canonicalLiteral(groupId) + ',' + canonicalLiteral(value(version, 'id')) + ',[';
-      let comma = false;
-      for (const occurrence of children(version, 'occurrences')) {
-        if (comma) yield ',';
-        comma = true;
-        yield canonicalLiteral(read(occurrence));
-      }
-      yield ']]';
-    }
-    return 'report-group-version:' + hashChunks(pieces());
-  };
-  function* fallbackVersions(groupId: string) {
-    // Every later duplicate candidate prepends its fallback versions to the earlier group.
-    const count = workflow ? view.childCount(workflow, 'candidates') : 0;
-    for (let index = count - 1; index >= 0; index--) {
-      const candidate = view.childAt(workflow!, 'candidates', index)!;
-      if (fallbackGroupId(candidate) !== groupId) continue;
-      for (const version of children(candidate, 'versions'))
-        if (
-          !value(version, 'sourceContext') &&
-          !coveredVersion(value<string>(candidate, 'id')!, value<string>(version, 'id')!)
-        )
-          yield { candidate, version, id: fallbackVersionId(groupId, version) };
-    }
   }
-  const fallbackHeader = (id: string): WorkflowReviewGroup | undefined => {
+  function* fallbackVersionIdWork(
+    groupId: string,
+    version: IntakeEnvelopeRecord,
+  ): Generator<void, string, void> {
+    const hash = createHash('sha256');
+    hash.update(
+      '[' + canonicalLiteral(groupId) + ',' + canonicalLiteral(value(version, 'id')) + ',[',
+    );
+    let comma = false;
+    for (const occurrence of children(version, 'occurrences')) {
+      yield;
+      if (comma) hash.update(',');
+      comma = true;
+      for (const piece of canonicalReviewValueChunks(read(occurrence))) {
+        hash.update(piece);
+        yield;
+      }
+    }
+    hash.update(']]');
+    return 'report-group-version:' + hash.digest('hex');
+  }
+  function* prepareFallbackCandidatesWork(): Generator<void, void, void> {
+    const sql = fallbackStore();
+    if (fallbackCandidatesPrepared) return;
+    sql.exec(`DELETE FROM ${policyNamespace}candidates`);
+    let ordinal = 0;
     for (const candidate of children(workflow, 'candidates')) {
-      if (fallbackGroupId(candidate) !== id) continue;
-      for (const version of children(candidate, 'versions'))
+      yield;
+      sql
+        .prepare(`INSERT INTO ${policyNamespace}candidates VALUES(?,?,?)`)
+        .run(fallbackGroupId(candidate), ordinal++, view.address(candidate));
+    }
+    fallbackCandidatesPrepared = true;
+  }
+  function* prepareFallbackGroupWork(groupId: string): Generator<void, void, void> {
+    const sql = fallbackStore();
+    if (sql.prepare(`SELECT 1 FROM ${policyNamespace}complete WHERE group_id=?`).get(groupId))
+      return;
+    yield* prepareFallbackCandidatesWork();
+    sql.prepare(`DELETE FROM ${policyNamespace}versions WHERE group_id=?`).run(groupId);
+    let ordinal = 0;
+    // Later duplicate candidates prepend their versions, preserving the legacy recipe.
+    for (const row of sql
+      .prepare(
+        `SELECT address FROM ${policyNamespace}candidates WHERE group_id=? ORDER BY ordinal DESC`,
+      )
+      .iterate(groupId)) {
+      yield;
+      const candidate = view.resolve(String(row.address));
+      for (const version of children(candidate, 'versions')) {
+        yield;
         if (
           !value(version, 'sourceContext') &&
-          !coveredVersion(value<string>(candidate, 'id')!, value<string>(version, 'id')!)
-        )
-          return {
-            id,
-            basis: 'candidate_fallback',
-            sourceFileId: null,
-            sourceHash: null,
-            memberId: null,
-            report: null,
-          };
+          !(yield* coveredVersionWork(
+            value<string>(candidate, 'id')!,
+            value<string>(version, 'id')!,
+          ))
+        ) {
+          const id = yield* fallbackVersionIdWork(groupId, version);
+          sql
+            .prepare(`INSERT INTO ${policyNamespace}versions VALUES(?,?,?,?,?)`)
+            .run(groupId, ordinal++, view.address(candidate), view.address(version), id);
+        }
+      }
     }
-    return undefined;
-  };
+    sql.prepare(`INSERT INTO ${policyNamespace}complete VALUES(?)`).run(groupId);
+  }
+  function* fallbackVersions(groupId: string) {
+    finishClinicalReviewWork(prepareFallbackGroupWork(groupId));
+    for (const row of fallbackStore()
+      .prepare(
+        `SELECT candidate,version,id FROM ${policyNamespace}versions WHERE group_id=? ORDER BY ordinal`,
+      )
+      .iterate(groupId))
+      yield {
+        candidate: view.resolve(String(row.candidate)),
+        version: view.resolve(String(row.version)),
+        id: String(row.id),
+      };
+  }
+  function* fallbackHeaderWork(id: string): Generator<void, WorkflowReviewGroup | undefined, void> {
+    yield* prepareFallbackGroupWork(id);
+    if (
+      !fallbackStore()
+        .prepare(`SELECT 1 FROM ${policyNamespace}versions WHERE group_id=? LIMIT 1`)
+        .get(id)
+    )
+      return undefined;
+    return {
+      id,
+      basis: 'candidate_fallback',
+      sourceFileId: null,
+      sourceHash: null,
+      memberId: null,
+      report: null,
+    };
+  }
   const membershipBytes = new WeakMap<SelectedIdentityMembership, number>();
   const membershipFor = (current: IntakeEnvelopeRecord): SelectedIdentityMembership => {
     const members = snapshot(current);
     const result = {
       retains(prior) {
-        return selectedSequence(prior).every((member) => {
+        return finishClinicalReviewWork(this.retainsWork!(prior));
+      },
+      *retainsWork(prior): Generator<void, boolean, void> {
+        return yield* everyClinicalReviewWork(prior, function* (member) {
           if (members) {
             const selected = members.member(member.candidateId, member.candidateVersionId);
             return (
               !!selected &&
-              hashChunks(members.canonicalSection(selected)) ===
+              (yield* hashChunksWork(members.canonicalSection(selected))) ===
                 hashChunks([canonicalLiteral(member.section || null)]) &&
-              selectedSequence(member.occurrences).every((occurrence) =>
-                members.hasOccurrence(selected, occurrence),
-              )
+              (yield* everyClinicalReviewWork(member.occurrences, function* (occurrence) {
+                return members.hasOccurrence(selected, occurrence);
+              }))
             );
           }
           const selected = memberRecord(current, member.candidateId, member.candidateVersionId);
@@ -419,9 +559,11 @@ export function collectionWorkflowReviewScope(input: {
               canonicalLiteral(member.section || null)
           )
             return false;
-          return selectedSequence(member.occurrences).every((wanted) => {
-            for (const occurrence of children(selected, 'occurrences'))
+          return yield* everyClinicalReviewWork(member.occurrences, function* (wanted) {
+            for (const occurrence of children(selected, 'occurrences')) {
+              yield;
               if (canonicalLiteral(read(occurrence)) === canonicalLiteral(wanted)) return true;
+            }
             return false;
           });
         });
@@ -458,6 +600,11 @@ export function collectionWorkflowReviewScope(input: {
     { provider: SelectedIdentityMembership; bytes: number }
   >();
   let membershipCacheBytes = 0;
+  const proposalRevisions = new Map<
+    string,
+    { revision: string | null | undefined; bytes: number }
+  >();
+  let proposalRevisionBytes = 0;
   const clearNativeReceipts = () => {
     nativeReceiptEpoch = {};
     nativeReceiptCache.clear();
@@ -466,6 +613,8 @@ export function collectionWorkflowReviewScope(input: {
     receiptLocatorBytes = 0;
     membershipCache.clear();
     membershipCacheBytes = 0;
+    proposalRevisions.clear();
+    proposalRevisionBytes = 0;
   };
   const receiptState = () => {
     if (receiptScopeClosed) throw Error('Selected native identity receipt scope closed');
@@ -796,22 +945,39 @@ export function collectionWorkflowReviewScope(input: {
     if (groupRecord(group.id)) return membershipFor(selectedVersion(group));
     let current:
       { candidate: IntakeEnvelopeRecord; version: IntakeEnvelopeRecord; id: string } | undefined;
-    for (const fallback of fallbackVersions(group.id)) current = fallback;
+    finishClinicalReviewWork(prepareFallbackGroupWork(group.id));
+    const last = fallbackStore()
+      .prepare(
+        `SELECT candidate,version,id FROM ${policyNamespace}versions WHERE group_id=? ORDER BY ordinal DESC LIMIT 1`,
+      )
+      .get(group.id);
+    if (last)
+      current = {
+        candidate: view.resolve(String(last.candidate)),
+        version: view.resolve(String(last.version)),
+        id: String(last.id),
+      };
     if (!current) throw Error('Missing fallback clinical membership');
     const selected = current;
     const result = {
       retains(prior) {
-        return selectedSequence(prior).every(
-          (member) =>
+        return finishClinicalReviewWork(this.retainsWork!(prior));
+      },
+      *retainsWork(prior): Generator<void, boolean, void> {
+        return yield* everyClinicalReviewWork(prior, function* (member) {
+          return (
             member.candidateId === value(selected.candidate, 'id') &&
             member.candidateVersionId === value(selected.version, 'id') &&
             !member.section &&
-            selectedSequence(member.occurrences).every((wanted) => {
-              for (const occurrence of children(selected.version, 'occurrences'))
+            (yield* everyClinicalReviewWork(member.occurrences, function* (wanted) {
+              for (const occurrence of children(selected.version, 'occurrences')) {
+                yield;
                 if (canonicalLiteral(read(occurrence)) === canonicalLiteral(wanted)) return true;
+              }
               return false;
-            }),
-        );
+            }))
+          );
+        });
       },
     } satisfies SelectedIdentityMembership;
     membershipBytes.set(
@@ -842,6 +1008,14 @@ export function collectionWorkflowReviewScope(input: {
     const source = resolveMembership(group);
     if (state === undefined) return source;
     const provider = Object.freeze({
+      *retainsWork(prior: Parameters<typeof source.retains>[0]): Generator<void, boolean, void> {
+        receiptProofGuard(state, epoch);
+        const result = source.retainsWork
+          ? yield* source.retainsWork(prior)
+          : source.retains(prior);
+        receiptProofGuard(state, epoch);
+        return result;
+      },
       retains(prior: Parameters<typeof source.retains>[0]) {
         receiptProofGuard(state, epoch);
         const result = source.retains(prior);
@@ -865,77 +1039,159 @@ export function collectionWorkflowReviewScope(input: {
     }
     return provider;
   };
+  let ownershipPolicyScratch: ReturnType<typeof disposableSqlite> | undefined;
+  let ownershipPolicyDb: import('node:sqlite').DatabaseSync | undefined;
+  let ownershipPolicyScope = 0;
   let questionInlineBytes = metadataBytes;
   const scope: SelectedWorkflowReviewScope = {
     close() {
       draftHandoff.clear();
       receiptScopeClosed = true;
       clearNativeReceipts();
+      fallbackClosed = true;
+      fallbackScratch?.close();
+      fallbackDb = undefined;
+      fallbackScratch = undefined;
+      ownershipPolicyDb = undefined;
+      ownershipPolicyScratch?.close();
+      ownershipPolicyScratch = undefined;
       input.close?.();
     },
     issueSink: input.issueSink,
     bindIdentityWarnings: input.bindIdentityWarnings,
+    bindIdentityWarningsWork: input.bindIdentityWarningsWork,
     versionId(proposalId, entry) {
-      const proposal = proposalId ? view.find('proposal', intake, proposalId) : undefined;
-      const revision =
-        proposal &&
-        (value<string>(proposal, 'sourceTextDependencyToken') ||
-          value<string>(proposal, 'sourceTextRevisionId'));
-      return intakeCandidateVersionIdForRevision(entry, revision);
-    },
-    references(candidateId, versionId, recordId, proposalId) {
-      const references = function* (): Generator<IntakeReviewGroupReference> {
-        if (input.membershipIndex) {
-          for (const reference of input.membershipIndex.references(
-            candidateId,
-            versionId,
-            recordId,
-            proposalId,
-          )) {
-            yield reference;
-          }
-        } else
-          for (const group of groupRecords()) {
-            for (const version of children(group, 'versions')) {
-              if (!contains(version, candidateId, versionId, recordId, proposalId)) continue;
-              const reference = {
-                groupId: value<string>(group, 'id')!,
-                groupVersionId: value<string>(version, 'id')!,
-              };
-              yield reference;
-              break;
+      if (!proposalId) return intakeCandidateVersionIdForRevision(entry, undefined);
+      try {
+        const state = currentReceiptState(),
+          epoch = nativeReceiptEpoch;
+        const cached =
+          state === undefined || !proposalId ? undefined : proposalRevisions.get(proposalId);
+        if (cached) {
+          receiptProofGuard(state!, epoch);
+          proposalRevisions.delete(proposalId!);
+          proposalRevisions.set(proposalId!, cached);
+          receiptWork('reviewProposalRevisionHits');
+          return intakeCandidateVersionIdForRevision(entry, cached.revision);
+        }
+        receiptWork('reviewProposalRevisionReads');
+        const proposal = proposalId ? view.find('proposal', intake, proposalId) : undefined;
+        const revision =
+          proposal &&
+          (value<string>(proposal, 'sourceTextDependencyToken') ||
+            value<string>(proposal, 'sourceTextRevisionId'));
+        // Only immutable scalar metadata is retained. Candidate bodies and their
+        // version hashes are always evaluated by the original recipe below.
+        if (
+          proposalId &&
+          state !== undefined &&
+          (revision == null || typeof revision === 'string')
+        ) {
+          const size = Buffer.byteLength(JSON.stringify([proposalId, revision]));
+          if (
+            currentReceiptState() === state &&
+            nativeReceiptEpoch === epoch &&
+            size <= 256 * 1024
+          ) {
+            proposalRevisions.set(proposalId, { revision, bytes: size });
+            proposalRevisionBytes += size;
+            while (proposalRevisions.size > 32 || proposalRevisionBytes > 256 * 1024) {
+              const oldest = proposalRevisions.keys().next().value!;
+              proposalRevisionBytes -= proposalRevisions.get(oldest)!.bytes;
+              proposalRevisions.delete(oldest);
             }
           }
-        if (!coveredVersion(candidateId, versionId)) {
-          const groupId =
-            'report-group:' + hashChunks([canonicalLiteral(['candidate', candidateId])]);
-          outer: for (const fallback of fallbackVersions(groupId)) {
-            if (
-              value(fallback.candidate, 'id') !== candidateId ||
-              value(fallback.version, 'id') !== versionId
-            )
+        }
+        return intakeCandidateVersionIdForRevision(entry, revision);
+      } catch (error) {
+        clearNativeReceipts();
+        throw error;
+      }
+    },
+    references(candidateId, versionId, recordId, proposalId) {
+      return finishClinicalReviewWork(
+        this.referencesWork!(candidateId, versionId, recordId, proposalId),
+      );
+    },
+    *referencesWork(candidateId, versionId, recordId, proposalId) {
+      const sql = fallbackStore(),
+        selection = ++fallbackSelection;
+      let ordinal = 0;
+      const retain = (reference: IntakeReviewGroupReference) =>
+        sql
+          .prepare(`INSERT INTO ${policyNamespace}refs VALUES(?,?,?)`)
+          .run(selection, ordinal++, JSON.stringify(reference));
+      if (input.membershipIndex) {
+        for (const reference of input.membershipIndex.references(
+          candidateId,
+          versionId,
+          recordId,
+          proposalId,
+        )) {
+          yield;
+          retain(reference);
+        }
+      } else
+        for (const group of groupRecords()) {
+          yield;
+          for (const version of children(group, 'versions')) {
+            yield;
+            if (!(yield* containsWork(version, candidateId, versionId, recordId, proposalId)))
               continue;
-            for (const occurrence of children(fallback.version, 'occurrences'))
-              if (
-                value(occurrence, 'recordId') === recordId &&
-                value(occurrence, 'proposalId') === proposalId
-              ) {
-                yield { groupId, groupVersionId: fallback.id };
-                break outer;
-              }
+            retain({
+              groupId: value<string>(group, 'id')!,
+              groupVersionId: value<string>(version, 'id')!,
+            });
+            break;
           }
         }
+      if (!(yield* coveredVersionWork(candidateId, versionId))) {
+        const groupId =
+          'report-group:' + hashChunks([canonicalLiteral(['candidate', candidateId])]);
+        yield* prepareFallbackGroupWork(groupId);
+        outer: for (const fallback of fallbackVersions(groupId)) {
+          yield;
+          if (
+            value(fallback.candidate, 'id') !== candidateId ||
+            value(fallback.version, 'id') !== versionId
+          )
+            continue;
+          for (const occurrence of children(fallback.version, 'occurrences')) {
+            yield;
+            if (
+              value(occurrence, 'recordId') === recordId &&
+              value(occurrence, 'proposalId') === proposalId
+            ) {
+              retain({ groupId, groupVersionId: fallback.id });
+              break outer;
+            }
+          }
+        }
+      }
+      const references = function* () {
+        fallbackStore();
+        for (const row of sql
+          .prepare(`SELECT value FROM ${policyNamespace}refs WHERE selection=? ORDER BY ordinal`)
+          .iterate(selection))
+          yield JSON.parse(String(row.value)) as IntakeReviewGroupReference;
       };
-      return selectedReportGroupLinks(
+      return yield* selectedReportGroupLinksWork(
         references,
         { candidateId, candidateVersionId: versionId, recordId, proposalId },
         metadataBytes,
       );
     },
     reportSource: input.reportSource,
+    reportSourceWork: input.reportSourceWork,
     questions(candidateId, versionId) {
+      return finishClinicalReviewWork(this.questionsWork!(candidateId, versionId));
+    },
+    *questionsWork(candidateId, versionId) {
+      if (input.questionIndex) yield* input.questionIndex.prepare(candidateId);
       const selected = function* () {
-        for (const question of children(workflow, 'questions')) {
+        for (const question of input.questionIndex
+          ? input.questionIndex.records(candidateId, versionId)
+          : children(workflow, 'questions')) {
           if (value(question, 'candidateId') !== candidateId) continue;
           const selectedVersion = value(question, 'candidateVersionId');
           if (!selectedVersion || selectedVersion === versionId) yield question;
@@ -948,6 +1204,7 @@ export function collectionWorkflowReviewScope(input: {
         count = 0,
         referenced = false;
       for (const question of selected()) {
+        yield;
         count++;
         if (referenced) continue;
         const item = readQuestion(question);
@@ -984,7 +1241,10 @@ export function collectionWorkflowReviewScope(input: {
       return !!view.lookup('accepted-candidate-version', [JSON.stringify(candidateId), versionId]);
     },
     draft(proposalId, recordId, versionId) {
-      return draftHandoff.read(proposalId, recordId, versionId, () => {
+      return finishClinicalReviewWork(this.draftWork!(proposalId, recordId, versionId));
+    },
+    *draftWork(proposalId, recordId, versionId) {
+      return yield* draftHandoff.readWork(proposalId, recordId, versionId, function* () {
         if (!workflow || view.childCount(workflow, 'reviewDrafts') === 0) return null;
         const result = view.lookup('draft-record-version-last', [
           proposalId || '',
@@ -993,6 +1253,7 @@ export function collectionWorkflowReviewScope(input: {
         ]);
         if (!result) return null;
         receiptWork('reviewDraftReconstructions');
+        if (input.readDraftWork) return yield* input.readDraftWork(result);
         if (input.readDraft) return input.readDraft(result);
         const draft = read<IntakeReviewDraft>(result);
         if (draft.format === 'health-intake-review-draft-v2')
@@ -1012,13 +1273,21 @@ export function collectionWorkflowReviewScope(input: {
       return first && value<string>(first, 'id');
     },
     keptOriginal(candidateId, versionId) {
+      return finishClinicalReviewWork(this.keptOriginalWork!(candidateId, versionId));
+    },
+    *keptOriginalWork(candidateId, versionId) {
       // The original policy uses .some across duplicate version IDs under the FIRST candidate.
-      for (const item of children(candidate(candidateId), 'versions'))
+      for (const item of children(candidate(candidateId), 'versions')) {
+        yield;
         if (value(item, 'id') === versionId && value(item, 'status') === 'kept_original')
           return true;
+      }
       return false;
     },
     group(reference) {
+      return finishClinicalReviewWork(this.groupWork!(reference));
+    },
+    *groupWork(reference) {
       const state = input.readCacheState?.(),
         key = JSON.stringify([reference.groupId, reference.groupVersionId]);
       if (state !== referenceState) {
@@ -1031,28 +1300,37 @@ export function collectionWorkflowReviewScope(input: {
         referenceCache.set(key, result);
         return result;
       }
-      const resolve = (): WorkflowReviewGroup | undefined => {
+      const resolve = function* (): Generator<void, WorkflowReviewGroup | undefined, void> {
         // The first retained ID match is also the first complete predicate match when
         // it contains this version. Address it through the complete index before
         // considering later repeated IDs; normal unique groups need no namespace scan.
         const first = groupRecord(reference.groupId);
         if (first)
-          for (const version of children(first, 'versions'))
+          for (const version of children(first, 'versions')) {
+            yield;
             if (value(version, 'id') === reference.groupVersionId) return groupHeader(first);
+          }
         // Legacy .find includes the version predicate, so a later repeated group ID can qualify.
         for (const record of groupRecords()) {
+          yield;
           if (value(record, 'id') !== reference.groupId) continue;
-          for (const version of children(record, 'versions'))
+          for (const version of children(record, 'versions')) {
+            yield;
             if (value(version, 'id') === reference.groupVersionId) return groupHeader(record);
-        }
-        for (const fallback of fallbackVersions(reference.groupId))
-          if (fallback.id === reference.groupVersionId) {
-            const existing = groupRecord(reference.groupId);
-            return existing ? groupHeader(existing) : fallbackHeader(reference.groupId);
           }
+        }
+        yield* prepareFallbackGroupWork(reference.groupId);
+        if (
+          fallbackStore()
+            .prepare(`SELECT 1 FROM ${policyNamespace}versions WHERE group_id=? AND id=? LIMIT 1`)
+            .get(reference.groupId, reference.groupVersionId)
+        ) {
+          const existing = groupRecord(reference.groupId);
+          return existing ? groupHeader(existing) : yield* fallbackHeaderWork(reference.groupId);
+        }
         return undefined;
       };
-      const result = resolve();
+      const result = yield* resolve();
       if (state !== undefined && state === input.readCacheState?.()) {
         if (referenceCache.size >= 32) referenceCache.delete(referenceCache.keys().next().value!);
         referenceCache.set(key, result);
@@ -1060,26 +1338,65 @@ export function collectionWorkflowReviewScope(input: {
       return result;
     },
     identityGroup(id) {
+      return finishClinicalReviewWork(this.identityGroupWork!(id));
+    },
+    *identityGroupWork(id) {
       const record = groupRecord(id);
-      return record ? groupHeader(record) : fallbackHeader(id);
+      return record ? groupHeader(record) : yield* fallbackHeaderWork(id);
     },
     currentVersion(group) {
+      return finishClinicalReviewWork(this.currentVersionWork!(group));
+    },
+    *currentVersionWork(group) {
       const record = groupRecord(group.id),
         current = record && currentGroupVersion(record);
       if (current) return value<string>(current, 'id') || null;
-      let latest: string | null = null;
-      for (const fallback of fallbackVersions(group.id)) latest = fallback.id;
-      return latest;
+      yield* prepareFallbackGroupWork(group.id);
+      const last = fallbackStore()
+        .prepare(
+          `SELECT id FROM ${policyNamespace}versions WHERE group_id=? ORDER BY ordinal DESC LIMIT 1`,
+        )
+        .get(group.id);
+      return last ? String(last.id) : null;
     },
     membership: selectedMembership,
     originalFingerprint: input.originalFingerprint,
     receipts,
+    *receiptsWork() {
+      const sql = fallbackStore(),
+        selection = ++fallbackSelection,
+        state = input.readCacheState?.();
+      let ordinal = 0;
+      for (const record of receiptRecords()) {
+        yield;
+        const receipt = policyReceipt(record);
+        if (input.activeReceipt(receipt))
+          sql
+            .prepare(`INSERT INTO ${policyNamespace}active_receipts VALUES(?,?,?)`)
+            .run(selection, ordinal++, view.address(record));
+      }
+      return selectedSequence(function* () {
+        fallbackStore();
+        if (state !== input.readCacheState?.()) throw Error('Selected identity receipts changed');
+        for (const row of sql
+          .prepare(
+            `SELECT address FROM ${policyNamespace}active_receipts WHERE selection=? ORDER BY ordinal`,
+          )
+          .iterate(selection))
+          yield policyReceipt(view.resolve(String(row.address)));
+      });
+    },
     packageEvidence: input.packageEvidence,
     manual(proposalId) {
       const proposal = proposalId ? view.find('proposal', intake, proposalId) : undefined;
       return proposal && readSelectedManualSourceReceipt(view, proposal);
     },
     competingBoundaryUnrepaired(group, operationId, target) {
+      return finishClinicalReviewWork(
+        scope.competingBoundaryUnrepairedWork!(group, operationId, target),
+      );
+    },
+    *competingBoundaryUnrepairedWork(group, operationId, target) {
       const state = input.readCacheState?.();
       if (state !== competingState) {
         noCompetingBoundary.clear();
@@ -1087,32 +1404,41 @@ export function collectionWorkflowReviewScope(input: {
       }
       const boundaryKey = state === undefined ? undefined : hashChunks([canonicalLiteral(group)]);
       if (boundaryKey && noCompetingBoundary.has(boundaryKey)) return false;
-      const receipt = receipts.find((receipt) => receipt.operationId === operationId);
-      const claims = receipt?.scope.competingSubjects;
-      const headers = function* () {
-        for (const item of groupRecords()) yield groupHeader(item);
-      };
-      let count = 0;
-      for (const other of iterateCompetingIdentityBoundaries(group, headers())) {
-        count++;
-        if (
-          !receipt ||
-          receipt.scope.groupId !== group.id ||
-          receipt.attestation !== 'confirmed_displayed_identity_questions' ||
-          !claims?.length ||
-          count > claims.length
-        )
-          return true;
-        if (
-          !claims.some(
-            (claim) =>
-              claim.groupId === other.id &&
-              claim.groupVersionId === scope.currentVersion(other) &&
-              canonicalLiteral(claim.subject) === canonicalLiteral(other.report!.subject),
-          )
-        )
-          return true;
+      let receipt: IdentityPolicyReceipt | undefined;
+      const activeReceipts = yield* scope.receiptsWork!();
+      for (const candidate of activeReceipts) {
+        yield;
+        if (candidate.operationId === operationId) {
+          receipt = candidate;
+          break;
+        }
       }
+      const claims = receipt?.scope.competingSubjects;
+      let count = 0;
+      const current = function* () {
+        for (const record of groupRecords()) {
+          const other = iterateCompetingIdentityBoundaries(group, [groupHeader(record)]).next()
+            .value;
+          if (!other) {
+            yield undefined;
+            continue;
+          }
+          count++;
+          const latest = currentGroupVersion(record);
+          if (!latest) throw Error('Competing report has no current version');
+          yield {
+            groupId: other.id,
+            groupVersionId: value<string>(latest, 'id')!,
+            subject: other.report!.subject!,
+          };
+        }
+      };
+      const authorized =
+        receipt &&
+        receipt.scope.groupId === group.id &&
+        receipt.attestation === 'confirmed_displayed_identity_questions' &&
+        claims?.length;
+      const same = yield* identityCompetingClaimsEqualWork(current(), authorized ? claims! : []);
       if (!count) {
         if (boundaryKey) {
           if (noCompetingBoundary.size >= 32)
@@ -1121,38 +1447,66 @@ export function collectionWorkflowReviewScope(input: {
         }
         return false;
       }
-      return (
-        count !== claims!.length ||
-        !(receipt!.scope.assignmentTargets || receipt!.scope.targets).some(
-          (prior) =>
-            prior.candidateId === target.candidateId &&
-            prior.candidateVersionId === target.candidateVersionId &&
-            prior.proposalId === target.proposalId &&
-            prior.recordId === target.recordId &&
-            (target.issueIds || [target.issueId]).every((issueId) =>
-              selectedSequence(prior.issueIds || [prior.issueId]).some((id) => id === issueId),
-            ),
+      if (!authorized || !same) return true;
+      for (const prior of receipt!.scope.assignmentTargets || receipt!.scope.targets) {
+        yield;
+        if (
+          prior.candidateId !== target.candidateId ||
+          prior.candidateVersionId !== target.candidateVersionId ||
+          prior.proposalId !== target.proposalId ||
+          prior.recordId !== target.recordId
         )
-      );
+          continue;
+        let complete = true;
+        for (const issueId of target.issueIds || [target.issueId]) {
+          yield;
+          let found = prior.hasIssueId?.(issueId) || false;
+          if (!prior.hasIssueId)
+            for (const id of prior.issueIds || [prior.issueId]) {
+              yield;
+              if (id === issueId) {
+                found = true;
+                break;
+              }
+            }
+          if (!found) {
+            complete = false;
+            break;
+          }
+        }
+        if (complete) return false;
+      }
+      return true;
     },
-    evidence(group, record, review, original) {
-      // The supplied review is the complete bounded proposal, not a display page.
+    evidence(...args) {
+      return finishClinicalReviewWork(scope.evidenceWork!(...args));
+    },
+    *evidenceWork(group, record, review, original) {
+      // Sentinel inspections cooperate even for records/links without claims.
       const issues = function* () {
         for (const candidate of group ? review.records : [record]) {
-          if (
-            group &&
-            !selectedReportGroups(candidate.reportGroups).some(
-              (reference) => reference.groupId === group.id,
-            )
-          )
-            continue;
+          yield undefined;
+          let member = !group;
+          if (group)
+            for (const reference of selectedReportGroups(candidate.reportGroups)) {
+              yield undefined;
+              if (reference.groupId === group.id) {
+                member = true;
+                break;
+              }
+            }
+          if (!member) continue;
           for (const issue of reviewRecordIssues(candidate))
-            if (issue.kind === 'identity') yield issue;
+            yield issue.kind === 'identity' ? issue : undefined;
         }
       };
       return {
-        collected: collectSelectedEvidencedIdentity(issues, group?.report?.subject?.text, original),
-        structured: structuredEvidencedIdentity(issues()),
+        collected: yield* collectSelectedEvidencedIdentityWork(
+          issues,
+          group?.report?.subject?.text,
+          original,
+        ),
+        structured: yield* structuredEvidencedIdentityWork(issues()),
       };
     },
   };
@@ -1167,10 +1521,15 @@ export function collectionWorkflowReviewScope(input: {
     groupHeader,
     currentGroupVersion,
     latestAcceptedRecord(recordId) {
+      return finishClinicalReviewWork(this.latestAcceptedRecordWork(recordId));
+    },
+    *latestAcceptedRecordWork(recordId) {
       let latest: IntakeEnvelopeRecord | undefined;
-      for (const decision of children(workflow, 'decisions'))
+      for (const decision of children(workflow, 'decisions')) {
+        yield;
         if (value(decision, 'action') === 'accept' && value(decision, 'recordId') === recordId)
           latest = decision;
+      }
       return latest ? read<import('../shared/intake.ts').IntakeReviewDecision>(latest) : undefined;
     },
     groundingBoundary(profileId, intakeId, sourceHash) {
@@ -1180,53 +1539,89 @@ export function collectionWorkflowReviewScope(input: {
         sourceHash,
         originalFingerprint: input.originalFingerprint,
         boundaryFingerprint(group) {
-          function* pieces() {
-            yield canonicalLiteral([
+          return finishClinicalReviewWork(this.boundaryFingerprintWork!(group));
+        },
+        *boundaryFingerprintWork(group) {
+          const digest = createHash('sha256');
+          digest.update(
+            canonicalLiteral([
               'selected-intake-identity-v1',
               profileId,
               intakeId,
               sourceHash,
               input.originalFingerprint(group),
               group,
-            ]);
-            const record = groupRecord(group.id),
-              current = record && currentGroupVersion(record);
-            if (current) yield* view.recordChunks(current);
-            else yield canonicalLiteral(scope.currentVersion(group));
-            for (const record of groupRecords()) {
-              const other = groupHeader(record);
-              if (!iterateCompetingIdentityBoundaries(group, [other]).next().done)
-                yield canonicalLiteral([other.id, other.report?.subject]);
+            ]),
+          );
+          yield;
+          const record = groupRecord(group.id),
+            current = record && currentGroupVersion(record);
+          if (current) {
+            // Preserve raw selected-version bytes, including unknown fields and
+            // number spellings. A canonical re-encoding changes existing proofs.
+            for (const chunk of view.recordChunks(current)) {
+              digest.update(chunk);
+              yield;
             }
+          } else {
+            digest.update(
+              canonicalLiteral(
+                scope.currentVersionWork
+                  ? yield* scope.currentVersionWork(group)
+                  : scope.currentVersion(group),
+              ),
+            );
+            yield;
           }
-          return hashChunks(pieces());
+          for (const record of groupRecords()) {
+            const other = groupHeader(record);
+            if (!iterateCompetingIdentityBoundaries(group, [other]).next().done)
+              digest.update(canonicalLiteral([other.id, other.report?.subject]));
+            // Noncompeting historical groups are inspected work too.
+            yield;
+          }
+          return digest.digest('hex');
         },
       };
     },
-    ownershipScope(birthDates, intakeVersion) {
+    ownershipScope(birthDates, intakeVersion, birthDatesWork) {
       return {
         intakeVersion,
         remaining(groupId, selectedSources) {
+          return finishClinicalReviewWork(this.remainingWork!(groupId, selectedSources));
+        },
+        *remainingWork(groupId, selectedSources) {
           const group = groupRecord(groupId),
             current = group && currentGroupVersion(group);
           if (!current) return false;
           const members = snapshot(current);
           if (members) {
             for (let ordinal = 0; ordinal < members.reference.memberCount; ordinal++) {
+              yield;
               const member = members.memberAt(ordinal)!;
-              for (let occurrence = 0; occurrence < member.occurrenceCount; occurrence++)
+              for (let occurrence = 0; occurrence < member.occurrenceCount; occurrence++) {
+                yield;
                 if (!selectedSources.has(members.occurrenceRecordId(member, occurrence)!))
                   return true;
+              }
             }
           } else
-            for (const member of children(current, 'members'))
-              for (const occurrence of children(member, 'occurrences'))
+            for (const member of children(current, 'members')) {
+              yield;
+              for (const occurrence of children(member, 'occurrences')) {
+                yield;
                 if (!selectedSources.has(value<string>(occurrence, 'recordId')!)) return true;
+              }
+            }
           return false;
         },
         lastConfirmation(groupId, personId) {
+          return finishClinicalReviewWork(this.lastConfirmationWork!(groupId, personId));
+        },
+        *lastConfirmationWork(groupId, personId) {
           let result: IdentityPolicyReceipt | undefined;
           for (const record of children(workflow, 'identityConfirmations')) {
+            yield;
             const receipt = policyReceipt(record);
             if (
               receipt.scope.groupId === groupId &&
@@ -1240,12 +1635,16 @@ export function collectionWorkflowReviewScope(input: {
         currentVersion: scope.currentVersion,
         group: scope.identityGroup,
         firstGroup(references) {
+          return finishClinicalReviewWork(this.firstGroupWork!(references));
+        },
+        *firstGroupWork(references) {
           let first: IntakeEnvelopeRecord | undefined,
             ordinal = Infinity;
           // References are the complete selected membership sequence. Resolve
           // each public ID's first retained group, then preserve collection order
           // even when duplicated IDs occur in a different reference order.
           for (const reference of selectedReportGroups(references)) {
+            yield;
             const record = groupRecord(reference.groupId);
             if (!record) continue;
             const position = intakeEnvelopeRecordOrder(view, record).at(-1)!;
@@ -1257,17 +1656,58 @@ export function collectionWorkflowReviewScope(input: {
           return first ? groupHeader(first) : undefined;
         },
         confirmation(operationId) {
-          for (const record of children(workflow, 'identityConfirmations'))
+          return finishClinicalReviewWork(this.confirmationWork!(operationId));
+        },
+        *confirmationWork(operationId) {
+          for (const record of children(workflow, 'identityConfirmations')) {
+            yield;
             if (value(record, 'operationId') === operationId) return policyReceipt(record);
+          }
           return undefined;
         },
         competing(group) {
-          function* groups() {
-            for (const record of groupRecords()) yield groupHeader(record);
+          return finishClinicalReviewWork(this.competingWork!(group));
+        },
+        *competingWork(group) {
+          for (const record of groupRecords()) {
+            yield;
+            if (!iterateCompetingIdentityBoundaries(group, [groupHeader(record)]).next().done)
+              return true;
           }
-          return !iterateCompetingIdentityBoundaries(group, groups()).next().done;
+          return false;
+        },
+        blockerSink() {
+          if (receiptScopeClosed) throw Error('Selected ownership scope closed');
+          if (!ownershipPolicyDb) {
+            if (!input.policySql)
+              ownershipPolicyScratch = disposableSqlite('circus-ownership-policy-');
+            ownershipPolicyDb = input.policySql || ownershipPolicyScratch!.db;
+            ownershipPolicyDb.exec(
+              `CREATE TABLE ${policyNamespace}blockers(scope INTEGER,ordinal INTEGER PRIMARY KEY,value TEXT,UNIQUE(scope,value))`,
+            );
+          }
+          const sql = ownershipPolicyDb,
+            id = ++ownershipPolicyScope;
+          return {
+            add(value: string) {
+              sql
+                .prepare(
+                  `INSERT OR IGNORE INTO ${policyNamespace}blockers(scope,value) VALUES(?,?)`,
+                )
+                .run(id, value);
+            },
+            *values() {
+              for (const row of sql
+                .prepare(
+                  `SELECT value FROM ${policyNamespace}blockers WHERE scope=? ORDER BY ordinal`,
+                )
+                .iterate(id))
+                yield String(row.value);
+            },
+          };
         },
         birthDates,
+        birthDatesWork,
       };
     },
     clinicalSourceScope(proofs) {
@@ -1287,16 +1727,28 @@ export function collectionWorkflowReviewScope(input: {
             }
           }),
         version(group, id) {
+          return finishClinicalReviewWork(this.versionWork!(group, id));
+        },
+        *versionWork(
+          group,
+          id,
+        ): Generator<
+          void,
+          import('./clinical-source-scope.ts').ClinicalSourceScopeVersion | undefined,
+          void
+        > {
           const record = retainedGroups.get(group);
           if (!record) throw Error('Foreign selected clinical source group');
           let selected: IntakeEnvelopeRecord | undefined;
           if (id === undefined) selected = currentGroupVersion(record);
           else
-            for (const version of children(record, 'versions'))
+            for (const version of children(record, 'versions')) {
+              yield;
               if (value(version, 'id') === id) {
                 selected = version;
                 break;
               }
+            }
           if (!selected) return undefined;
           const current = selected,
             members = snapshot(current);
@@ -1304,12 +1756,19 @@ export function collectionWorkflowReviewScope(input: {
             id: value<string>(current, 'id')!,
             membership: membershipFor(current),
             hasOccurrence(versionId, recordId, proposalId) {
+              return finishClinicalReviewWork(
+                this.hasOccurrenceWork!(versionId, recordId, proposalId),
+              );
+            },
+            *hasOccurrenceWork(versionId, recordId, proposalId): Generator<void, boolean, void> {
               if (members) {
                 for (let index = 0; index < members.reference.memberCount; index++) {
+                  yield;
                   const member = members.memberAt(index)!;
                   if (member.candidateVersionId !== versionId) continue;
                   let after: string | undefined;
                   do {
+                    yield;
                     const page = members.occurrences(member, {
                       after,
                       items: 64,
@@ -1331,13 +1790,16 @@ export function collectionWorkflowReviewScope(input: {
                 }
               } else
                 for (const member of children(current, 'members')) {
+                  yield;
                   if (value(member, 'candidateVersionId') !== versionId) continue;
-                  for (const occurrence of children(member, 'occurrences'))
+                  for (const occurrence of children(member, 'occurrences')) {
+                    yield;
                     if (
                       value(occurrence, 'recordId') === recordId &&
                       (proposalId === undefined || value(occurrence, 'proposalId') === proposalId)
                     )
                       return true;
+                  }
                 }
               return false;
             },
@@ -1351,41 +1813,61 @@ export function collectionWorkflowReviewScope(input: {
         originalFingerprint: (group) =>
           input.originalFingerprint({ ...group, basis: 'report_anchor' }),
         *acceptedRecords() {
+          for (const record of this.acceptedRecordsWork!()) if (record !== undefined) yield record;
+        },
+        *acceptedRecordsWork() {
           const imported = view.child(intake, 'imported');
           function* batches() {
             if (imported) yield imported;
             yield* children(intake, 'importHistory');
           }
           for (const batch of batches()) {
+            yield;
             const clinical = view.child(batch, 'clinical');
-            for (const record of children(clinical, 'records'))
+            for (const record of children(clinical, 'records')) {
+              yield;
               yield read<Record<string, unknown>>(record);
+            }
           }
         },
       };
     },
     occurrence(candidateId, versionId, recordId, proposalId) {
-      for (const occurrence of children(version(candidateId, versionId), 'occurrences'))
+      return finishClinicalReviewWork(
+        this.occurrenceWork(candidateId, versionId, recordId, proposalId),
+      );
+    },
+    *occurrenceWork(candidateId, versionId, recordId, proposalId) {
+      for (const occurrence of children(version(candidateId, versionId), 'occurrences')) {
+        yield;
         if (
           value(occurrence, 'recordId') === recordId &&
           value(occurrence, 'proposalId') === proposalId
         )
           return read<IntakeCandidateOccurrence>(occurrence);
+      }
       return undefined;
     },
     reportContext(envelopeId, proposalId) {
+      return finishClinicalReviewWork(this.reportContextWork(envelopeId, proposalId));
+    },
+    *reportContextWork(envelopeId, proposalId) {
       let result: IntakeSourceContext['reportContext'] | undefined;
-      for (const group of groupRecords())
+      for (const group of groupRecords()) {
+        yield;
         for (const version of children(group, 'versions')) {
+          yield;
           const context = value<IntakeSourceContext['reportContext']>(version, 'context');
           if (context?.envelopeId !== envelopeId) continue;
           const members = snapshot(version);
           let matches = false;
           if (members) {
             for (let index = 0; index < members.reference.memberCount && !matches; index++) {
+              yield;
               const member = members.memberAt(index)!;
               let after: string | undefined;
               do {
+                yield;
                 const page = members.occurrences(member, {
                   after,
                   items: 64,
@@ -1401,11 +1883,16 @@ export function collectionWorkflowReviewScope(input: {
               } while (true);
             }
           } else
-            for (const member of children(version, 'members'))
-              for (const occurrence of children(member, 'occurrences'))
+            for (const member of children(version, 'members')) {
+              yield;
+              for (const occurrence of children(member, 'occurrences')) {
+                yield;
                 if (value(occurrence, 'proposalId') === proposalId) matches = true;
+              }
+            }
           if (matches) result = context;
         }
+      }
       return result;
     },
   };

@@ -52,7 +52,7 @@ import {
 import type { OwnershipReportPreviewRecord } from '../shared/ownership-report-reference.ts';
 import { ownershipHash as digest, appendOwnershipDecision } from './ownership-journal.ts';
 import {
-  ownershipIdentityBlockers,
+  ownershipIdentityBlockersWork,
   ownershipReportHolds,
   ownershipReportBoundary,
   ownershipEnvelopeHash,
@@ -280,6 +280,7 @@ export interface OwnedReportOwnershipSelection {
   boundary: string;
 }
 /** Read-only preview. Publication repeats all reads under the same durable transaction. */
+type OwnershipPreviewStep = void | { intakeId: string; sourceId: string };
 function* ownershipPreviewSteps(
   db: Database,
   root: string,
@@ -291,6 +292,7 @@ function* ownershipPreviewSteps(
     selection?: OwnedReportOwnershipSelection;
     sink?: OwnershipPreviewSink;
     scopes?: OwnershipScopeIndex;
+    prepareReviewSource?: (intakeId: string, sourceId: string) => Promise<void>;
     reviewSource?: (
       intakeId: string,
       sourceId: string,
@@ -304,7 +306,7 @@ function* ownershipPreviewSteps(
       request: OwnershipRequest,
     ) => void;
   },
-): Generator<void, OwnershipPreview> {
+): Generator<OwnershipPreviewStep, OwnershipPreview> {
   owner(db, profileId);
   const selected = request(input);
   const destination =
@@ -379,7 +381,10 @@ function* ownershipPreviewSteps(
     const records: OwnershipPreviewRecord[] = [];
     let visited = 0;
     for (const ref of selection.refs) {
-      const item = yield* (function* (): Generator<void, OwnershipReportPreviewRecord> {
+      const item = yield* (function* (): Generator<
+        OwnershipPreviewStep,
+        OwnershipReportPreviewRecord
+      > {
         const record = clinicalRecord(db, ref.kind, ref.recordId);
         const version = digest(record.row);
         if (ref.version !== undefined && ref.version !== version)
@@ -449,19 +454,23 @@ function* ownershipPreviewSteps(
           if (++visited % 32 === 0) yield;
         }
         for (const c of included) {
+          if (owned?.prepareReviewSource)
+            yield { intakeId: c.intakeId, sourceId: c.sourceRecordId };
           const selectedReview = getReview(c.intakeId, c.sourceRecordId);
           const occurrence = selectedReview.review.records.find((r) => r.id === c.sourceRecordId);
           if (!occurrence) blockers.push('The accepted source no longer has a reviewable mapping.');
           else {
             pins.push(digest(occurrence.identityReview));
-            for (const blocker of ownershipIdentityBlockers(
+            for (const blocker of ownershipIdentityBlockersWork(
               db,
               c.intakeId,
               occurrence,
               'personId' in destination ? destination.birthDate : null,
               selectedReview.ownership,
-            ))
-              blockers.push(blocker);
+            )) {
+              if (blocker === undefined) yield;
+              else blockers.push(blocker);
+            }
           }
           if (++visited % 32 === 0) yield;
         }
@@ -764,18 +773,22 @@ function* ownershipPreviewSteps(
     };
     for (const p of selection.pending) {
       if (selected.selection.type !== 'report') continue;
+      if (owned?.prepareReviewSource)
+        yield { intakeId: selected.selection.intakeId, sourceId: p.recordId };
       const selectedReview = getReview(selected.selection.intakeId, p.recordId);
       const occurrence = selectedReview.review.records.find((r) => r.id === p.recordId);
       if (!occurrence) blockers.push('A pending report member changed.');
       else {
-        for (const blocker of ownershipIdentityBlockers(
+        for (const blocker of ownershipIdentityBlockersWork(
           db,
           selected.selection.intakeId,
           occurrence,
           'personId' in destination ? destination.birthDate : null,
           selectedReview.ownership,
-        ))
-          blockers.push(blocker);
+        )) {
+          if (blocker === undefined) yield;
+          else blockers.push(blocker);
+        }
         if (
           (occurrence.identityAttribution?.assignedPerson?.personId || 'patient') !== destinationId
         )
@@ -903,7 +916,8 @@ export async function previewRecordOwnershipPrepared(
       assertCurrent();
       const step = steps.next();
       if (step.done) return step.value;
-      await setImmediate();
+      if (step.value) await owned!.prepareReviewSource!(step.value.intakeId, step.value.sourceId);
+      else await setImmediate();
       assertCurrent();
     }
   } finally {

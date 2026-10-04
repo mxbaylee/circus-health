@@ -1,3 +1,4 @@
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { createHash } from 'node:crypto';
 import { openSync, readSync, closeSync, fstatSync, statSync } from 'node:fs';
 import { HttpError } from './database.ts';
@@ -63,11 +64,18 @@ export function intakeLimits(env = process.env) {
   };
 }
 // Hash and text inspection keep one bounded file chunk; originals are never rewritten.
-export function inspectIntakeFile(
+export function inspectIntakeFile(...input: Parameters<typeof inspectIntakeFileWork>) {
+  return finishClinicalReviewWork(inspectIntakeFileWork(...input));
+}
+export function* inspectIntakeFileWork(
   path: string,
   expected: { bytes?: number | null; sha256?: string | null } = {},
   window: { offset: number; limit: number } | null = null,
-) {
+): Generator<
+  void,
+  { bytes: number; sha256: string; text: string | null; totalCharacters: number | null },
+  void
+> {
   const fd = openSync(path, 'r'),
     hash = createHash('sha256'),
     chunk = Buffer.allocUnsafe(256 * 1024);
@@ -101,6 +109,7 @@ export function inspectIntakeFile(
       hash.update(bytes);
       recordIntakeFileWork('streamHashCalls');
       recordIntakeFileWork('streamHashBytes', n);
+      yield;
       if (decoder && validText)
         try {
           decoded(decoder.decode(bytes, { stream: true }));
@@ -135,18 +144,32 @@ export function inspectIntakeFile(
 // ctime, and a replacement changes the inode, so either forces a full rehash.
 const verified = new Map<string, string>();
 const VERIFIED_LIMIT = 256;
-export function verifyIntakeFileHash(path: string, expected: { bytes: number; sha256: string }) {
+export function intakeFileIdentity(path: string): string {
   const stat = statSync(path, { bigint: true });
+  if (!stat.isFile())
+    throw new HttpError(409, 'SOURCE_CHANGED', 'Retained original is not a regular file');
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+}
+export function verifyIntakeFileHash(path: string, expected: { bytes: number; sha256: string }) {
+  finishClinicalReviewWork(verifyIntakeFileHashWork(path, expected));
+}
+export function* verifyIntakeFileHashWork(
+  path: string,
+  expected: { bytes: number; sha256: string },
+): Generator<void, string, void> {
   const key = `${expected.sha256}:${expected.bytes}:${path}`;
-  const identity = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+  const identity = intakeFileIdentity(path);
   if (verified.get(key) === identity) {
     recordIntakeFileWork('verificationCacheHits');
-    return;
+    return identity;
   }
   verified.delete(key);
-  inspectIntakeFile(path, expected);
+  yield* inspectIntakeFileWork(path, expected);
+  if (intakeFileIdentity(path) !== identity)
+    throw new HttpError(409, 'SOURCE_CHANGED', 'Retained original changed during verification');
   if (verified.size >= VERIFIED_LIMIT) verified.delete(verified.keys().next().value!);
   verified.set(key, identity);
+  return identity;
 }
 export function assertExtractionSize(bytes: number) {
   const maximum = intakeLimits().extractionBytes;

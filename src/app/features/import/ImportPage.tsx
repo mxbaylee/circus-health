@@ -28,6 +28,7 @@ import type {
   IntakeDraftRepairUpdate,
   IntakeImportFeed,
   IntakeImportFeedRecord,
+  IntakeImportFeedFilterKind,
   IntakeReportAcceptanceRequest,
   IntakeReportQueueGroup,
   IntakeReportSourceResult,
@@ -134,12 +135,12 @@ const kind: Record<IntakeImportFeedRecord['feedKind'], ImportReviewKind> = {
   history: 'Documents',
   unsupported: 'Documents',
 };
-const feedKind: Partial<Record<ImportReviewKind, IntakeImportFeedRecord['feedKind'] | 'person'>> = {
+const feedKind: Partial<Record<ImportReviewKind, IntakeImportFeedFilterKind>> = {
   'Test results': 'test',
   Prescriptions: 'prescription',
   Vision: 'vision',
   Procedures: 'procedure',
-  Documents: 'history',
+  Documents: 'documents',
   People: 'person',
 };
 
@@ -1032,7 +1033,7 @@ export function ImportPage() {
             Prescriptions: data.kindCounts.prescription,
             Vision: data.kindCounts.vision,
             Procedures: data.kindCounts.procedure,
-            Documents: data.kindCounts.history,
+            Documents: data.kindCounts.history + data.kindCounts.unsupported,
             People: peopleCount,
           }
         : undefined,

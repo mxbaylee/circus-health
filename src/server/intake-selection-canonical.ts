@@ -15,17 +15,18 @@ class Cursor {
   constructor(chunks: Iterable<string>) {
     this.input = chunks[Symbol.iterator]();
   }
-  peek(): string {
+  *peek(): Generator<string, string, void> {
     while (this.offset === this.chunk.length && !this.done) {
       const next = this.input.next();
       this.done = !!next.done;
       this.chunk = next.done ? '' : next.value;
       this.offset = 0;
+      yield '';
     }
     return this.chunk[this.offset] || '';
   }
-  take(): string {
-    const char = this.peek();
+  *take(): Generator<string, string, void> {
+    const char = yield* this.peek();
     if (char) this.offset++;
     return char;
   }
@@ -40,12 +41,12 @@ export function* canonicalSelectionChunks(chunks: Iterable<string>): Generator<s
     let buffer = '',
       literal: string | undefined = '',
       escaped = false;
-    const first = cursor.take();
+    const first = yield* cursor.take();
     if (first !== '"') throw Error('Invalid canonical selected string');
     if (emit) buffer = first;
     if (capture) literal = first;
     for (;;) {
-      const char = cursor.take();
+      const char = yield* cursor.take();
       if (!char) throw Error('Incomplete canonical selected string');
       if (emit) buffer += char;
       if (capture && literal !== undefined)
@@ -68,10 +69,10 @@ export function* canonicalSelectionChunks(chunks: Iterable<string>): Generator<s
     let buffer = '',
       escaped = false,
       written = false;
-    if (cursor.take() !== '"') throw Error('Invalid canonical selected key');
+    if ((yield* cursor.take()) !== '"') throw Error('Invalid canonical selected key');
     buffer = '"';
     for (;;) {
-      const char = cursor.take();
+      const char = yield* cursor.take();
       if (!char) throw Error('Incomplete canonical selected key');
       buffer += char;
       const end = char === '"' && !escaped;
@@ -98,7 +99,7 @@ export function* canonicalSelectionChunks(chunks: Iterable<string>): Generator<s
     // Retained intake JSON already limits literal depth to 100; reserve room
     // for the surrounding review and selection records without unbounded stacks.
     if (path.length > 128) throw Error('Canonical selected evidence exceeds retained depth');
-    const next = cursor.peek();
+    const next = yield* cursor.peek();
     // The historical canonical recipe represents undefined array entries as holes.
     if (next === ',' || next === ']') return;
     if (next === '"') {
@@ -106,33 +107,34 @@ export function* canonicalSelectionChunks(chunks: Iterable<string>): Generator<s
       return;
     }
     if (next === '[') {
-      cursor.take();
+      yield* cursor.take();
       if (emit) yield '[';
       let first = true;
-      while (cursor.peek() !== ']') {
+      while ((yield* cursor.peek()) !== ']') {
         if (!first) {
-          if (cursor.take() !== ',') throw Error('Invalid canonical selected array');
+          if ((yield* cursor.take()) !== ',') throw Error('Invalid canonical selected array');
           if (emit) yield ',';
         }
         first = false;
         yield* value(emit, [...path, '[]']);
       }
-      cursor.take();
+      yield* cursor.take();
       if (emit) yield ']';
       return;
     }
     if (next === '{') {
-      cursor.take();
+      yield* cursor.take();
       if (emit) yield '{';
       let first = true,
         emitted = false,
         pair = false;
-      while (cursor.peek() !== '}') {
-        if (!first && cursor.take() !== ',') throw Error('Invalid canonical selected object');
+      while ((yield* cursor.peek()) !== '}') {
+        if (!first && (yield* cursor.take()) !== ',')
+          throw Error('Invalid canonical selected object');
         first = false;
         const field = yield* fieldName(emit, emitted),
           key = field.key || '';
-        if (cursor.take() !== ':') throw Error('Invalid canonical selected field');
+        if ((yield* cursor.take()) !== ':') throw Error('Invalid canonical selected field');
         const include: boolean = emit && !ephemeral.has(key) && !(pair && pairPins.has(key));
         if (include) {
           if (!field.written) {
@@ -142,20 +144,20 @@ export function* canonicalSelectionChunks(chunks: Iterable<string>): Generator<s
           emitted = true;
           yield ':';
         }
-        if (key === 'format' && cursor.peek() === '"') {
+        if (key === 'format' && (yield* cursor.peek()) === '"') {
           // Decode this one scalar discriminator, never a retained evidence body.
           const format: string | undefined = yield* string(include, true);
           pair = format !== undefined && JSON.parse(format) === 'intake-pair-scope-v2';
         } else yield* value(include, [...path, key]);
       }
-      cursor.take();
+      yield* cursor.take();
       if (emit) yield '}';
       return;
     }
     let buffer = '',
       seen = false;
-    while (cursor.peek() && ![',', ']', '}'].includes(cursor.peek())) {
-      const char = cursor.take();
+    while ((yield* cursor.peek()) && ![',', ']', '}'].includes(yield* cursor.peek())) {
+      const char = yield* cursor.take();
       seen = true;
       if (emit) buffer += char;
       if (buffer.length >= 8192) {
@@ -168,7 +170,7 @@ export function* canonicalSelectionChunks(chunks: Iterable<string>): Generator<s
   }
   try {
     yield* value(true, []);
-    if (cursor.peek()) throw Error('Trailing canonical selected evidence');
+    if (yield* cursor.peek()) throw Error('Trailing canonical selected evidence');
   } finally {
     cursor.close();
   }
