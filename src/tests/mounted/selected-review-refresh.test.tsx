@@ -372,7 +372,39 @@ it('uses one parent navigation guard for ordinary drafts and sparse native recor
         });
       if (url.endsWith('/review-record-section')) {
         const body = JSON.parse(String(init?.body));
-        return json(page(body.section, body.section === 'issues' ? [issue] : []));
+        return json(
+          page(
+            body.section,
+            body.section === 'comparisons'
+              ? [
+                  {
+                    ordinal: 0,
+                    control: {
+                      kind: 'pair',
+                      otherRecordId: 'fictional-saved-record',
+                      scopeToken: 'fictional-pair-scope',
+                      targetAvailable: true,
+                      reasonReferenced: false,
+                    },
+                    detail: {
+                      kind: 'value',
+                      value: {
+                        comparison: {
+                          id: 'fictional-saved-record',
+                          kind: 'document',
+                          title: 'Fictional saved report',
+                          date: '2026-01-02',
+                          mapping: record.mapping,
+                          evidence: [],
+                          previousDecision: null,
+                        },
+                      },
+                    },
+                  },
+                ]
+              : [],
+          ),
+        );
       }
       if (url.includes('/intakes?')) return json([]);
       throw new Error('Unexpected ' + url);
@@ -404,16 +436,19 @@ it('uses one parent navigation guard for ordinary drafts and sparse native recor
   );
   render(<RouterProvider router={router} />);
   fireEvent.click(await screen.findByText('Find possible related saved records'));
-  fireEvent.click(screen.getByRole('button', { name: 'Resolve questions or correct this record' }));
-  fireEvent.change(await screen.findByLabelText('Review section'), { target: { value: 'issues' } });
-  fireEvent.click(await screen.findByRole('button', { name: 'Question 1 · required' }));
-  fireEvent.change(screen.getByLabelText('Corrected reading'), { target: { value: '2026-06-07' } });
+  fireEvent.click(await screen.findByText('Fictional saved report · 2026-01-02'));
+  fireEvent.change(screen.getByLabelText('Reason for this relationship'), {
+    target: { value: 'These fictional reports describe different events.' },
+  });
   await act(async () => {
     void router.navigate('/other');
   });
   expect(
     await screen.findByText(/Your review draft could not save. Stay here to retry before leaving/),
   ).toBeVisible();
+  expect(router.state.blockers.size).toBe(1);
   expect(screen.queryByText('Other page destination')).not.toBeInTheDocument();
-  expect(screen.getByLabelText('Corrected reading')).toHaveValue('2026-06-07');
+  expect(screen.getByLabelText('Reason for this relationship')).toHaveValue(
+    'These fictional reports describe different events.',
+  );
 });

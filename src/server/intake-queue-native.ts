@@ -44,7 +44,10 @@ import {
 } from './intake-queue-transitions.ts';
 import { openIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
-import { openCollectionReportQueue } from './intake-report-group-collection.ts';
+import {
+  openCollectionReportQueue,
+  clearCollectionQueueReviews,
+} from './intake-report-group-collection.ts';
 type PreparedQueue = {
   binding: string;
   revision: string;
@@ -109,6 +112,9 @@ export async function prepareCollectionQueueRead(
   active.set(key, operation);
   try {
     await operation;
+  } catch (error) {
+    clearCollectionQueueReviews(db);
+    throw error;
   } finally {
     if (active.get(key) === operation) active.delete(key);
   }

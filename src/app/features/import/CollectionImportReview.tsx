@@ -69,6 +69,12 @@ import { confirmedSelectionIds, rejectedSelectionIds } from './partial-save-plan
 const message = (error: unknown) =>
   error instanceof Error ? error.message : 'This review could not finish. Refresh and try again.';
 const label = (value: unknown, fallback: string) => (typeof value === 'string' ? value : fallback);
+const feedQueryKey = (path: string) => {
+  const [pathname, search] = path.split('?');
+  const params = new URLSearchParams(search);
+  params.sort();
+  return `${pathname}?${params}`;
+};
 const selectionUrl = (
   intakeId: string,
   groupId: string,
@@ -91,6 +97,7 @@ export function CollectionImportReview({
   selectionLoading,
   selectionError,
   path,
+  firstPage,
   onChanged,
   sourceProps,
   onUpload,
@@ -104,6 +111,7 @@ export function CollectionImportReview({
   selectionLoading?: boolean;
   selectionError?: string;
   path: string;
+  firstPage?: { reload: () => void; refreshing?: boolean; error: Error | null };
   onChanged: () => void;
   sourceProps: SourceBrowserProps;
   onUpload: (files: File[]) => Promise<void>;
@@ -153,6 +161,8 @@ export function CollectionImportReview({
   queryParams.set('bytes', '65536');
   for (const field of ['state', 'q', 'cursor', 'peopleCursor', 'kind', 'edited'])
     queryParams.delete(field);
+  if (filters.view === 'review') queryParams.set('state', 'pending');
+  if (filters.view === 'later') queryParams.set('state', 'deferred');
   if (filters.view === 'saved') queryParams.set('state', 'accepted');
   if (filters.view === 'excluded') queryParams.set('state', 'kept_original');
   if (filters.query) queryParams.set('q', filters.query);
@@ -167,7 +177,19 @@ export function CollectionImportReview({
   if (cursor) queryParams.set('cursor', cursor);
   if (peopleCursor) queryParams.set('peopleCursor', peopleCursor);
   const ownPath = `/intakes/import-feed?${queryParams}`;
-  const page = useResource<CollectionImportFeed>(detailRequested ? null : ownPath);
+  const usesFirstPage = !!firstPage && feedQueryKey(path) === feedQueryKey(ownPath);
+  const pagedFeed = useResource<CollectionImportFeed>(
+    detailRequested || usesFirstPage ? null : ownPath,
+  );
+  const page = usesFirstPage ? { ...firstPage, data: initial, loading: false } : pagedFeed;
+  const observedInitial = useRef(initial);
+  useEffect(() => {
+    if (observedInitial.current === initial) return;
+    observedInitial.current = initial;
+    // Batch/source changes arrive through the parent. A filtered or later
+    // window must reread its own exact query after that change as well.
+    if (firstPage && !usesFirstPage && !detailRequested) pagedFeed.reload();
+  }, [initial, firstPage, usesFirstPage, detailRequested, pagedFeed.reload]);
   useEffect(() => {
     setCursor(undefined);
     setPeopleCursor(undefined);
@@ -175,7 +197,8 @@ export function CollectionImportReview({
   }, [path, filters, profile?.id]);
   const data =
     page.data ||
-    (!cursor &&
+    (!firstPage &&
+    !cursor &&
     !peopleCursor &&
     view === initial.view &&
     filters.kind === 'All' &&
@@ -326,9 +349,12 @@ export function CollectionImportReview({
     },
   };
   const refresh = () => {
-    page.reload();
+    if (firstPage) firstPage.reload();
+    else {
+      page.reload();
+      onChanged();
+    }
     peoplePage.reload();
-    onChanged();
   };
   const acceptance = useReportAcceptance(profile?.id || '', (result) => {
     setReceipt(result.receipt);
@@ -366,7 +392,13 @@ export function CollectionImportReview({
     !!acceptance.recoveryOperationId ||
     bulk.pending ||
     repairPending;
-  const authorityUnavailable = !!page.error || page.loading || page.refreshing;
+  const authorityUnavailable =
+    !!page.error ||
+    page.loading ||
+    page.refreshing ||
+    !!firstPage?.error ||
+    firstPage?.refreshing ||
+    (!!firstPage && !usesFirstPage && observedInitial.current !== initial);
   const selectionWindowKey = JSON.stringify([
     activeScope,
     peopleGroup?.intakeId,
@@ -469,6 +501,7 @@ export function CollectionImportReview({
       if (
         mutationPending ||
         sourcePending ||
+        authorityUnavailable ||
         peoplePage.loading ||
         peoplePage.refreshing ||
         peoplePage.error
@@ -646,9 +679,9 @@ export function CollectionImportReview({
         onCheck={() => void acceptance.checkReceipt()}
         onRetry={() => void acceptance.retry()}
       />
-      {(actionError || page.error) && (
+      {(actionError || page.error || firstPage?.error) && (
         <p role="alert">
-          {actionError || page.error?.message}
+          {actionError || page.error?.message || firstPage?.error?.message}
           <button type="button" disabled={mutationPending} onClick={refresh}>
             Refresh import review
           </button>

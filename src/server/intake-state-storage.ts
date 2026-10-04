@@ -1,4 +1,5 @@
 import { clearPreparedClinicalReviewRead } from './intake-clinical-review-read-cache.ts';
+import { clearCollectionQueueReviews } from './intake-report-group-collection.ts';
 import { clearReviewIssueScratch } from './intake-review-issue-scratch.ts';
 import {
   currentTransactionToken,
@@ -110,6 +111,7 @@ function remember(cache: Cache, target: Map<string, CachedBasis>, key: string, v
 }
 export function clearIntakeStateCache(db: Database): void {
   clearPreparedClinicalReviewRead(db);
+  clearCollectionQueueReviews(db);
   clearReviewIssueScratch(db);
   clearIntakeCollectionCache(db);
   clearIntakeMaintenancePublications(db);

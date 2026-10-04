@@ -195,7 +195,10 @@ test(
     async function openFullReview(label: string) {
       const record = page.locator('.import-record').filter({ hasText: label }).first();
       await record.waitFor();
-      await record.getByRole('button', { name: 'Review exact record', exact: true }).click();
+      await record.getByRole('button', { name: 'Review', exact: true }).click();
+      const exact = record.getByRole('link', { name: 'Open full review', exact: true });
+      assert.match((await exact.getAttribute('href')) || '', /[?&]record=/);
+      await exact.click();
       await page.getByRole('region', { name: 'Review actions' }).waitFor();
     }
 

@@ -3,6 +3,7 @@ import {
   fixtureProposalId,
   fixtureReportUrl,
   fixtureSourcePath,
+  fixtureBrowserResponse,
 } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
@@ -242,7 +243,8 @@ test(
       const choice = page.getByRole('button', { name: 'March 8, 2017', exact: true });
       assert.equal(await choice.count(), 1, 'Related date questions share one decision');
       await choice.click();
-      const accepted = page.waitForResponse(
+      const accepted = fixtureBrowserResponse(
+        page,
         (response) => response.url().endsWith('/intakes/report-acceptance') && response.ok(),
       );
       await page.getByRole('button', { name: 'Confirm and save record', exact: true }).click();
@@ -378,7 +380,8 @@ test(
       )
         imports.push(request.postDataJSON());
     });
-    const firstSave = page.waitForResponse(
+    const firstSave = fixtureBrowserResponse(
+      page,
       (response) => response.url().endsWith(prefix + '/intakes/report-acceptance') && response.ok(),
     );
     await page.getByRole('button', { name: 'Confirm and save record', exact: true }).click();
@@ -397,7 +400,8 @@ test(
       ).length,
       1,
     );
-    const deferredSave = page.waitForResponse(
+    const deferredSave = fixtureBrowserResponse(
+      page,
       (response) =>
         response.url().endsWith(queuePath + '/review-draft') &&
         response.ok() &&
@@ -410,7 +414,8 @@ test(
     await deferredSave;
     await openQueueRecord(2);
     assert.equal(await page.getByRole('article').count(), 1);
-    const edited = page.waitForResponse(
+    const edited = fixtureBrowserResponse(
+      page,
       async (response) =>
         response.url().endsWith(queuePath + '/review-draft') &&
         response.ok() &&

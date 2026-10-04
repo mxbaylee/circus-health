@@ -16,7 +16,12 @@ import { setVisibility } from '../visibility.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
 import { mappingFrom, clinicalSourceVersion } from '../clinical-import.ts';
 import { canonicalLiteral, INTAKE_SCHEMA_INSTRUCTIONS } from '../intake-format.ts';
-import { issueKind, resolutionFields, reviewIssues } from '../intake-review.ts';
+import {
+  issueKind,
+  resolutionFields,
+  reviewIssues,
+  validateDraftMapping,
+} from '../intake-review.ts';
 import { issueResolutionCurrent, issueResolutionDependency } from '../intake-issue-dependencies.ts';
 import { intakeCandidateId, workflowHash } from '../intake-workflow.ts';
 import type {
@@ -31,6 +36,37 @@ import type {
 import type { IntakeWithWorkflow } from '../intake-continuation.ts';
 
 type TestIssue = Partial<IntakeReviewIssue> & Pick<IntakeReviewIssue, 'kind' | 'prompt'>;
+
+test('draft edits preserve unchanged metadata after canonical native transport', () => {
+  const baseline = {
+    kind: 'observation' as const,
+    valueText: '4.00',
+    mappingOrigins: { kind: 'clinical', documentTitle: 'envelope', text: 'payload' },
+    assets: ['fictional-first', 'fictional-second'],
+    uncertainties: ['Fictional first question', 'Fictional second question'],
+    reviewIssues: [{ prompt: 'Fictional patient question', kind: 'identity', field: 'subject' }],
+  };
+  const transported = JSON.parse(canonicalLiteral(baseline));
+  assert.notEqual(
+    JSON.stringify(transported.mappingOrigins),
+    JSON.stringify(baseline.mappingOrigins),
+  );
+  assert.deepEqual(validateDraftMapping({ ...transported, valueText: '4.10' }, baseline), {
+    kind: 'observation',
+    valueText: '4.10',
+  });
+  for (const altered of [
+    { ...transported, mappingOrigins: { ...transported.mappingOrigins, kind: 'envelope' } },
+    { ...transported, assets: [...transported.assets].reverse() },
+    { ...transported, uncertainties: [...transported.uncertainties].reverse() },
+    {
+      ...transported,
+      reviewIssues: [{ ...transported.reviewIssues[0], prompt: 'Changed question' }],
+    },
+    { ...transported, unexpected: 'Fictional injected metadata' },
+  ])
+    assert.throws(() => validateDraftMapping(altered, baseline), { code: 'IMPORT_MAPPING' });
+});
 interface TestEnvelope extends HealthRecordEnvelope {
   clinical?: IntakeClinicalMapping;
   reviewIssues?: TestIssue[];

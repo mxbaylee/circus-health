@@ -119,6 +119,25 @@ function fixture() {
   return { before, fresh, decision, commit, record, review };
 }
 type Scenario = ReturnType<typeof fixture>;
+function withCertifiedPreparation(s: Scenario) {
+  s.commit.revision = 51;
+  s.fresh.requestRevision = 51;
+  s.commit.transition = {
+    format: 'health-intake-own-draft-transition-v1',
+    profileId: s.commit.profileId,
+    intakeId: s.commit.intakeId,
+    proposalId: s.commit.request.proposalId,
+    recordId: s.commit.request.recordId,
+    candidateId: s.commit.candidateId,
+    candidateVersionId: s.commit.request.candidateVersionId,
+    operationId: s.commit.request.operationId,
+    fromVersion: s.commit.request.version,
+    toVersion: s.commit.version,
+    fromRevision: s.before.requestRevision,
+    toRevision: s.commit.revision,
+  };
+  return s;
+}
 const refresh = (s: Scenario, commit: ReviewDraftPairCommit | undefined = s.commit) =>
   refreshPairScopesAfterOwnDraft('fictional-profile', s.review, s.record, s.decision, commit);
 
@@ -128,6 +147,98 @@ it('advances only the transport pins of one exact acknowledged own draft write',
   expect(result.comparisons?.[0]).toEqual({ ...s.decision.comparisons![0], scope: s.fresh });
   expect(s.decision.comparisons![0].scope).toEqual(s.before);
   expect(result.mapping).toEqual(s.decision.mapping);
+});
+
+it('accepts only an exact server acknowledgement across certified native preparation', () => {
+  const s = withCertifiedPreparation(fixture());
+  expect(refresh(s).comparisons?.[0]?.scope).toEqual(s.fresh);
+  delete s.commit.transition;
+  expect(refresh(s)).toBe(s.decision);
+});
+
+it.each<[string, (s: Scenario) => void]>([
+  [
+    'another operation',
+    (s) => {
+      s.commit.transition!.operationId = 'foreign-operation';
+    },
+  ],
+  [
+    'another profile',
+    (s) => {
+      s.commit.transition!.profileId = 'foreign-profile';
+    },
+  ],
+  [
+    'another candidate',
+    (s) => {
+      s.commit.transition!.candidateVersionId = 'foreign-version';
+    },
+  ],
+  [
+    'another record',
+    (s) => {
+      s.commit.transition!.recordId = 'foreign-record';
+    },
+  ],
+  [
+    'another proposal',
+    (s) => {
+      s.commit.transition!.proposalId = 'foreign-proposal';
+    },
+  ],
+  [
+    'another intake',
+    (s) => {
+      s.commit.transition!.intakeId = 'foreign-intake';
+    },
+  ],
+  [
+    'a different starting revision',
+    (s) => {
+      s.commit.transition!.fromRevision++;
+    },
+  ],
+  [
+    'a different ending revision',
+    (s) => {
+      s.commit.transition!.toRevision++;
+    },
+  ],
+  [
+    'an invalid revision',
+    (s) => {
+      s.commit.transition!.fromRevision = Number.NaN;
+    },
+  ],
+  [
+    'a different starting version',
+    (s) => {
+      s.commit.transition!.fromVersion++;
+    },
+  ],
+  [
+    'a different final version',
+    (s) => {
+      s.commit.transition!.toVersion++;
+    },
+  ],
+  [
+    'a later ordinary write',
+    (s) => {
+      s.fresh.requestRevision++;
+    },
+  ],
+  [
+    'changed evidence',
+    (s) => {
+      s.fresh.incoming.evidenceHash = 'different';
+    },
+  ],
+])('refuses a native transition with %s', (_name, change) => {
+  const s = withCertifiedPreparation(fixture());
+  change(s);
+  expect(refresh(s)).toBe(s.decision);
 });
 
 it.each<[string, (s: Scenario) => void]>([
@@ -351,8 +462,8 @@ it.each(['unchanged', 'assets', 'sourceSystem', 'mappingOrigins', 'unknownField'
   },
 );
 
-function mountedFixture() {
-  const s = fixture();
+function mountedFixture(certifiedPreparation = false) {
+  const s = certifiedPreparation ? withCertifiedPreparation(fixture()) : fixture();
   const profile = { id: 'fictional-profile', name: 'Fictional Person', placebo: true };
   replaceProfiles([profile]);
   selectProfile(profile);
@@ -374,8 +485,20 @@ function mountedFixture() {
     s.record.draft = draft as NonNullable<IntakeReviewRecord['draft']>;
     return new Response(
       JSON.stringify({
-        data: { id: s.commit.intakeId, version: 8, workflow: { reviewDrafts: [draft] } },
-        meta: { revision: 11 },
+        data: {
+          id: s.commit.intakeId,
+          version: 8,
+          workflow: { reviewDrafts: [draft] },
+          ...(s.commit.transition
+            ? {
+                reviewDraftTransition: {
+                  ...s.commit.transition,
+                  operationId: sent!.operationId,
+                },
+              }
+            : {}),
+        },
+        meta: { revision: s.commit.revision },
       }),
       { headers: { 'Content-Type': 'application/json' } },
     );
@@ -414,6 +537,26 @@ it('keeps a human pair choice current after its successful timed autosave and fr
     f.view.result.current.current(f.s.review, f.s.record).decision.comparisons![0].scope,
   ).toEqual(f.s.fresh);
   expect(f.view.result.current.pending()).toBe(false);
+  expect(fetch).toHaveBeenCalledOnce();
+});
+
+it('retains a native acknowledgement in the mounted editor and uses it only for its exact saved choice', async () => {
+  const f = mountedFixture(true);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_url, init) => {
+      f.capture(init?.body);
+      return f.success();
+    }),
+  );
+  f.edit();
+  await act(async () => {
+    expect(await f.view.result.current.flush()).toBe(true);
+  });
+  act(() => f.view.result.current.hydrate(f.s.review));
+  expect(
+    f.view.result.current.current(f.s.review, f.s.record).decision.comparisons![0].scope,
+  ).toEqual(f.s.fresh);
   expect(fetch).toHaveBeenCalledOnce();
 });
 

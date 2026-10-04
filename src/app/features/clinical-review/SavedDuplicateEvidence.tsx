@@ -96,7 +96,7 @@ function SavedEvidenceReader({
     };
   }, [reference.url, after, before, profileId]);
   return (
-    <section aria-label="Saved original evidence">
+    <section className="saved-duplicate-evidence" aria-label="Saved original evidence">
       <p>{reference.count} retained evidence items, shown one page at a time.</p>
       {error && <p role="alert">{error}</p>}
       {!page && !error && <p>Loading saved evidence…</p>}

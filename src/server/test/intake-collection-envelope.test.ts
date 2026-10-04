@@ -678,3 +678,67 @@ test('narrow structured replacements and import archive retain untouched descend
     /Put requires addressed dictionary/,
   );
 });
+
+test('schema writer batches existing inline cells and preserves exact fragmented bytes after reopening', async (t) => {
+  const { db, source, identity, authority, path } = fixture(t, { intake: { version: 1 } });
+  await buildIntakeCollectionEnvelope(db, source);
+  const { createEnvelopeBuildWriter } = await import('../intake-envelope-build.ts');
+  const { collectionCellReader } = await import('../intake-collection-envelope.ts');
+  let checkpoints = 0;
+  const build = 'fictional-inline-cell-count';
+  const writer = createEnvelopeBuildWriter(db, source, build, 1, {
+    onCheckpoint() {
+      checkpoints++;
+    },
+  });
+  const literal = JSON.stringify('Patient: Fictional alternative ' + 'z'.repeat(3900));
+  for (let n = 0; n < 64; n++) {
+    if (n % 2) await writer.cellPieces('c:' + n, [literal.slice(0, 700), literal.slice(700)]);
+    else await writer.cell('c:' + n, literal);
+  }
+  await writer.flush();
+  assert.equal(checkpoints, 1, '64 supported inline cells publish one bounded checkpoint');
+  const first = collectionCellReader(db, source, 'builds', build).store;
+  for (let n = 0; n < 64; n++) assert.equal(first.get('c:' + n), literal);
+  const escaped = '\\'.repeat(5000),
+    giant = 'Fictional 🌿 '.repeat(1400);
+  assert.ok(Buffer.byteLength(escaped) < 8192);
+  assert.ok(Buffer.byteLength(JSON.stringify({ kind: 'inline', text: escaped })) > 8192);
+  await writer.cell('escaped', escaped);
+  await writer.cellPieces('giant', [giant.slice(0, 11), giant.slice(11)]);
+  await writer.flush();
+  const read = (selected: typeof first, key: string) => {
+    selected.check();
+    const value = selected.get(key);
+    assert.ok(value);
+    if (typeof value === 'string') return value;
+    const parts: Buffer[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const page = selected.chunks(value, after, 4096);
+      assert.ok(page.chunks.every((chunk) => chunk.byteLength <= 4096));
+      parts.push(...page.chunks);
+      if (page.complete) break;
+      assert.ok(page.after && page.after !== after);
+      after = page.after;
+    }
+    return Buffer.concat(parts).toString('utf8');
+  };
+  first.check();
+  assert.equal(typeof first.get('escaped'), 'object', 'encoded wrapper overflow stays fragmented');
+  assert.equal(read(first, 'escaped'), escaped);
+  assert.equal(read(first, 'giant'), giant);
+  clearIntakeStateCache(db);
+  db.close();
+  const reopened = openDatabase(path, identity.profileId);
+  try {
+    authority.attach(reopened);
+    const retained = collectionCellReader(reopened, source, 'builds', build).store;
+    assert.equal(retained.get('c:63'), literal);
+    assert.equal(read(retained, 'escaped'), escaped);
+    assert.equal(read(retained, 'giant'), giant);
+  } finally {
+    clearIntakeStateCache(reopened);
+    reopened.close();
+  }
+});

@@ -430,7 +430,7 @@ it.each(['/import', '/import?q=fictional'])(
   },
 );
 
-it('retries only an unchanged source scope and stops for changed scope or queue view', async () => {
+it('retries only an unchanged source scope and stops for changed scope or report navigation', async () => {
   const profileId = 'fictional-source-path-guard';
   selectProfile({ id: profileId, name: 'Rowan', placebo: true });
   const sourceGroup: IntakeReportQueueGroup = {
@@ -596,13 +596,10 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
     }),
   );
   const user = userEvent.setup();
-  render(
-    <RouterProvider
-      router={createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
-        initialEntries: ['/import'],
-      })}
-    />,
-  );
+  const router = createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
+    initialEntries: ['/import'],
+  });
+  render(<RouterProvider router={router} />);
 
   await user.click(
     await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
@@ -615,6 +612,7 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
   expect(sourcePosts[0]!.version).toBe(1);
   expect(sourcePosts[1]!.version).toBe(2);
   expect(sourcePosts[1]!.scopeToken).toBe(sameScopeRefresh.scopeToken);
+  expect(sourceReviewReads, 'after unchanged-scope retry').toBe(2);
 
   await user.click(
     await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
@@ -626,10 +624,12 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
     await screen.findByRole('button', { name: 'Use Fictional BodySpec for 2 records' }),
   ).toBeEnabled();
   expect(sourcePosts).toHaveLength(3);
+  expect(sourceReviewReads, 'after changed scope disclosure').toBe(5);
   await user.click(screen.getByRole('button', { name: 'Use Fictional BodySpec for 2 records' }));
   await waitFor(() => expect(sourcePosts).toHaveLength(4));
   expect(sourcePosts[3]!.operationId).not.toBe(sourcePosts[2]!.operationId);
   expect(sourcePosts[3]!.scopeToken).toBe(changedScopeRefresh.scopeToken);
+  expect(sourceReviewReads, 'after deliberate changed-scope save').toBe(5);
 
   await user.click(
     await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
@@ -638,8 +638,14 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
     await screen.findByRole('button', { name: 'Use Fictional BodySpec for 1 record' }),
   );
   await waitFor(() => expect(sourcePosts).toHaveLength(5));
+  expect(sourceReviewReads, 'before abandoning the pending scope').toBe(6);
   await user.click(screen.getByRole('button', { name: 'Close' }));
-  await user.selectOptions(screen.getByRole('combobox', { name: 'Review status' }), 'later');
+  expect(screen.getByRole('combobox', { name: 'Review status' })).toBeDisabled();
+  await act(async () => {
+    await router.navigate('/import?intake=fictional-intake&group=fictional-report&review=full');
+  });
+  expect(await screen.findByRole('region', { name: 'Exact selected report' })).toBeVisible();
+  expect(sourceReviewReads, 'after closing and navigating to the exact report').toBe(6);
   releasePost(
     new Response(
       JSON.stringify({
@@ -1399,7 +1405,7 @@ it('clears a retained identity action before refreshing a back-forward cached Im
     expect(screen.getByRole('button', { name: /Review person for/ })).toBeEnabled(),
   );
   fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
-  expect(screen.getByRole('button', { name: 'This is me' })).toBeEnabled();
+  expect(await screen.findByRole('button', { name: 'This is me' })).toBeEnabled();
 
   const restored = new Event('pageshow');
   Object.defineProperty(restored, 'persisted', { value: true });

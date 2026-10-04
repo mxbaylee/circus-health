@@ -4,6 +4,7 @@ import {
   fixtureProposalId,
   fixtureReportUrl,
   fixtureSourcePath,
+  fixtureBrowserResponse,
 } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
@@ -183,7 +184,8 @@ test(
       );
       await page.getByRole('button', { name: 'This is me', exact: true }).click();
       await page.getByRole('button', { name: 'Keep unconfirmed', exact: true }).click();
-      const choicesSaved = page.waitForResponse(
+      const choicesSaved = fixtureBrowserResponse(
+        page,
         (response) =>
           response.url().endsWith('/review-draft') &&
           response.ok() &&
@@ -191,7 +193,8 @@ test(
       );
       await page.getByRole('button', { name: 'Leave uncertain', exact: true }).click();
       await choicesSaved;
-      const deferred = page.waitForResponse(
+      const deferred = fixtureBrowserResponse(
+        page,
         (response) =>
           response.url().endsWith('/review-draft') &&
           response.ok() &&
@@ -261,7 +264,7 @@ test(
       await page.reload();
       await reviewActions.getByRole('button', { name: 'Return to review', exact: true }).waitFor();
       await reviewActions.getByRole('button', { name: 'Return to review', exact: true }).click();
-      const accepted = page.waitForResponse((response) =>
+      const accepted = fixtureBrowserResponse(page, (response) =>
         response.url().endsWith('/intakes/report-acceptance'),
       );
       await reviewActions

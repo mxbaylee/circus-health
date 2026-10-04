@@ -185,6 +185,17 @@ test('Import detail keeps a readable record and reachable explicit actions on mo
   ] as const) {
     await page.setViewportSize(viewport);
     assert.equal(
+      await page
+        .getByRole('status')
+        .filter({ hasText: 'Identity is not printed clearly' })
+        .evaluate((element) => {
+          const content = element.querySelector('div')!;
+          return content.getBoundingClientRect().width > element.getBoundingClientRect().width / 2;
+        }),
+      true,
+      `${name} gives the identity warning readable content width`,
+    );
+    assert.equal(
       await workspace.evaluate((element) => {
         // The responsive workspace uses block flow. Its inactive grid declaration
         // can still serialize minmax() values, which are not rendered columns.

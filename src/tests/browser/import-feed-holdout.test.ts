@@ -1,4 +1,5 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { fixtureBrowserResponse } from './native-intake-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -362,7 +363,26 @@ test(
       await page.goto(
         url + '/#/import?' + new URLSearchParams({ intake: intakeId, group: group.groupId }),
       );
+      const started = Date.now();
+      const opened = fixtureBrowserResponse(page, (response) => {
+        const target = new URL(response.url());
+        return (
+          response.request().method() === 'GET' &&
+          response.request().timing().startTime >= started &&
+          target.pathname ===
+            prefix + '/intakes/report-queue/' + encodeURIComponent(group.groupId) &&
+          target.searchParams.get('intakeId') === intakeId
+        );
+      });
       await page.reload();
+      const response = await opened;
+      assert.equal(response.status(), 200, await response.text());
+      assert.equal(await response.finished(), null);
+      const detail = (await response.json()).data as CollectionReportDetail;
+      assert.equal(detail.format, 'health-intake-report-detail-v2');
+      assert.equal(detail.group.intakeId, intakeId);
+      assert.equal(detail.group.groupId, group.groupId);
+      assert.equal(detail.group.title, group.title);
       try {
         await page.getByRole('heading', { name: String(group.title), exact: true }).waitFor();
       } catch (cause) {

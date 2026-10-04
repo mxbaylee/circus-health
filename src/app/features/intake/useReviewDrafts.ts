@@ -1,4 +1,5 @@
 import type { IntakeClinicalReviewContext } from '../../../shared/intake-clinical-review';
+import type { IntakeReviewDraftTransition } from '../../../shared/intake-review-draft-transition';
 import { readSelectedClinicalReview } from '../../data/intake-clinical-review';
 import { useEffect, useRef, useState } from 'react';
 import type {
@@ -222,7 +223,9 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
           failedWork.current = { key, work };
           pairCommits.current.delete(key);
           const pairGeneration = pairEpoch.current;
-          const result = await api<Intake>(
+          const result = await api<
+            Intake & { reviewDraftTransition?: IntakeReviewDraftTransition }
+          >(
             `/api/profiles/${encodeURIComponent(profileId)}/intakes/${encodeURIComponent(work.intakeId)}/review-draft`,
             {
               method: 'POST',
@@ -243,6 +246,9 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
               request: structuredClone({ ...work.body, version: work.version }),
               version: result.data.version,
               revision: result.meta.revision,
+              ...(result.data.reviewDraftTransition
+                ? { transition: structuredClone(result.data.reviewDraftTransition) }
+                : {}),
             });
           observe(result.data);
           baselines.current.set(key, { ...work.body.mapping });

@@ -191,162 +191,168 @@ test('direct native import retains fresh same-event evidence through own mainten
   }
 });
 
-test('native duplicate snapshots preserve custody through accepted kind changes and return to an earlier kind', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-duplicate-kind-')),
-    profileId = 'fictional-profile',
-    db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-  attachPersonalDurability(db, { root, profileId });
-  t.after(() => {
-    clearIntakeStateCache(db);
-    db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  const upload = (id: string, kind: 'document' | 'observation') =>
-    uploadIntake(db, root, profileId, {
-      filename: id + '.jsonl',
-      newProviderName: 'Fictional clinic',
-      bytes: Buffer.from(
-        JSON.stringify(
-          kind === 'document'
-            ? envelope(id)
-            : {
-                ...envelope(id),
-                kind: 'record',
-                clinical: {
-                  kind: 'observation',
-                  subject: 'unknown',
-                  date: '2026-01-01',
-                  testLabel: 'Fictional classification value',
-                  valueText: '12.00',
-                  unit: 'fictional units',
+// The complete custody journey applies and replays multiple real accepted kind changes.
+// This host-only hang guard is separate from its exact evidence and operation-count assertions.
+test(
+  'native duplicate snapshots preserve custody through accepted kind changes and return to an earlier kind',
+  { timeout: 90000 },
+  async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-duplicate-kind-')),
+      profileId = 'fictional-profile',
+      db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+    attachPersonalDurability(db, { root, profileId });
+    t.after(() => {
+      clearIntakeStateCache(db);
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const upload = (id: string, kind: 'document' | 'observation') =>
+      uploadIntake(db, root, profileId, {
+        filename: id + '.jsonl',
+        newProviderName: 'Fictional clinic',
+        bytes: Buffer.from(
+          JSON.stringify(
+            kind === 'document'
+              ? envelope(id)
+              : {
+                  ...envelope(id),
+                  kind: 'record',
+                  clinical: {
+                    kind: 'observation',
+                    subject: 'unknown',
+                    date: '2026-01-01',
+                    testLabel: 'Fictional classification value',
+                    valueText: '12.00',
+                    unit: 'fictional units',
+                  },
                 },
-              },
+          ),
         ),
-      ),
+      });
+    const saved = upload('saved-kind', 'document'),
+      review = reviewIntake(db, root, profileId, saved.id);
+    importIntake(db, root, profileId, saved.id, {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
     });
-  const saved = upload('saved-kind', 'document'),
-    review = reviewIntake(db, root, profileId, saved.id);
-  importIntake(db, root, profileId, saved.id, {
-    version: review.version,
-    reviewToken: review.reviewToken,
-    decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
-  });
-  const targetId = String(db.prepare('SELECT id FROM documents').get()!.id),
-    originalEvidence = db.prepare('SELECT * FROM evidence WHERE entity_id=?').get(targetId)!;
-  transaction(db, () => {
-    for (let index = 0; index < 16; index++)
-      db.prepare(
-        'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES(?,?,?,?,?,?)',
-      ).run(
-        'kind-evidence-' + String(index).padStart(3, '0'),
-        'document',
-        targetId,
-        originalEvidence.source_record_id!,
-        'fictional_support_' + index,
-        originalEvidence.locator_json!,
-      );
-  });
-  const expected = canonicalLiteral(duplicateRecord(db, 'document', targetId).evidence);
-  const latest = () =>
-    JSON.parse(
-      String(
-        db
-          .prepare(
-            "SELECT json_extract(coverage_json,'$.duplicateDecision.evidence.right') AS reference FROM manual_batches WHERE json_extract(coverage_json,'$.duplicateDecision.right.id')=? AND json_extract(coverage_json,'$.duplicateDecision.evidenceBasis')='reviewed-pre-projection-v1' ORDER BY json_extract(coverage_json,'$.duplicateDecision.sequence') DESC LIMIT 1",
-          )
-          .get(targetId)!.reference,
-      ),
-    ) as RetainedDuplicateEvidenceReference;
-  async function compare(id: string, kind: 'document' | 'observation') {
-    const source = upload(id, kind);
-    await buildIntakeCollectionEnvelope(db, { id: source.id, sha256: source.sha256 });
-    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
-    const selected = prepareCollectionClinicalReview(db, root, profileId, source.id);
-    if (selected.status !== 'ready') throw Error('Expected complete kind-change review');
-    const record = selected.session.review.records[0]!,
-      comparison = selectedClinicalPair(db, selected.session.review, record, targetId);
-    assert.ok(comparison?.scope);
-    const result = await acceptIntakeReportSelectionAsync(db, root, profileId, {
-      operationId: randomUUID(),
-      blocks: [
-        {
-          intakeId: source.id,
-          proposalId: null,
-          intakeVersion: selected.session.review.version,
-          reviewToken: selected.session.review.reviewToken,
-          selections: [
-            {
-              recordId: record.id,
-              candidateId: record.candidateId!,
-              candidateVersionId: record.candidateVersionId!,
-              mapping: {},
-              comparisons: [
-                {
-                  otherRecordId: targetId,
-                  scope: comparison.scope,
-                  outcome: 'distinct',
-                  reason: 'Fictional evidence supports different visits.',
-                },
-              ],
-            },
-          ],
-        },
-      ],
+    const targetId = String(db.prepare('SELECT id FROM documents').get()!.id),
+      originalEvidence = db.prepare('SELECT * FROM evidence WHERE entity_id=?').get(targetId)!;
+    transaction(db, () => {
+      for (let index = 0; index < 16; index++)
+        db.prepare(
+          'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES(?,?,?,?,?,?)',
+        ).run(
+          'kind-evidence-' + String(index).padStart(3, '0'),
+          'document',
+          targetId,
+          originalEvidence.source_record_id!,
+          'fictional_support_' + index,
+          originalEvidence.locator_json!,
+        );
     });
-    assert.equal(result.receipt.acceptedCount, 1);
-    return latest();
-  }
-  function reclassify(kind: 'document' | 'observation', set: Record<string, string>) {
-    const request = {
-        kind,
-        recordId: targetId,
-        set,
-        reason: 'The fictional original supports the reviewed classification.',
-      },
-      preview = previewDirectRecordCorrection(db, root, profileId, request);
-    applyDirectRecordCorrection(db, root, profileId, {
-      ...request,
-      version: preview.version,
-      previewToken: preview.previewToken,
-      operationId: randomUUID(),
-    });
-  }
-  const first = await compare('incoming-kind-a', 'document');
-  reclassify('document', {
-    kind: 'observation',
-    testLabel: 'Fictional classification value',
-    valueText: '12.00',
-    unit: 'fictional units',
-  });
-  let before = intakeWorkCounters(db).warm.duplicateSnapshotChangedRows;
-  const second = await compare('incoming-kind-b', 'observation');
-  assert.equal(intakeWorkCounters(db).warm.duplicateSnapshotChangedRows - before, 0);
-  assert.equal(second.source.intakeId, first.source.intakeId);
-  assert.notEqual(second.snapshotId, first.snapshotId);
-  reclassify('observation', {
-    kind: 'document',
-    documentTitle: 'Shared fictional visit',
-    text: 'Fictional reviewed narrative',
-  });
-  before = intakeWorkCounters(db).warm.duplicateSnapshotChangedRows;
-  const third = await compare('incoming-kind-c', 'document');
-  assert.equal(intakeWorkCounters(db).warm.duplicateSnapshotChangedRows - before, 0);
-  assert.equal(third.source.intakeId, first.source.intakeId);
-  assert.notEqual(third.snapshotId, first.snapshotId);
-  for (const [reference, kind] of [
-    [first, 'document'],
-    [second, 'observation'],
-    [third, 'document'],
-  ] as const) {
-    const retained = await prepareRetainedDuplicateEvidenceSnapshot(db, reference);
-    try {
-      assert.deepEqual(retained.target, [kind, targetId]);
-      assert.equal([...retained.chunks()].join(''), expected);
-    } finally {
-      retained.close();
+    const expected = canonicalLiteral(duplicateRecord(db, 'document', targetId).evidence);
+    const latest = () =>
+      JSON.parse(
+        String(
+          db
+            .prepare(
+              "SELECT json_extract(coverage_json,'$.duplicateDecision.evidence.right') AS reference FROM manual_batches WHERE json_extract(coverage_json,'$.duplicateDecision.right.id')=? AND json_extract(coverage_json,'$.duplicateDecision.evidenceBasis')='reviewed-pre-projection-v1' ORDER BY json_extract(coverage_json,'$.duplicateDecision.sequence') DESC LIMIT 1",
+            )
+            .get(targetId)!.reference,
+        ),
+      ) as RetainedDuplicateEvidenceReference;
+    async function compare(id: string, kind: 'document' | 'observation') {
+      const source = upload(id, kind);
+      await buildIntakeCollectionEnvelope(db, { id: source.id, sha256: source.sha256 });
+      await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+      const selected = prepareCollectionClinicalReview(db, root, profileId, source.id);
+      if (selected.status !== 'ready') throw Error('Expected complete kind-change review');
+      const record = selected.session.review.records[0]!,
+        comparison = selectedClinicalPair(db, selected.session.review, record, targetId);
+      assert.ok(comparison?.scope);
+      const result = await acceptIntakeReportSelectionAsync(db, root, profileId, {
+        operationId: randomUUID(),
+        blocks: [
+          {
+            intakeId: source.id,
+            proposalId: null,
+            intakeVersion: selected.session.review.version,
+            reviewToken: selected.session.review.reviewToken,
+            selections: [
+              {
+                recordId: record.id,
+                candidateId: record.candidateId!,
+                candidateVersionId: record.candidateVersionId!,
+                mapping: {},
+                comparisons: [
+                  {
+                    otherRecordId: targetId,
+                    scope: comparison.scope,
+                    outcome: 'distinct',
+                    reason: 'Fictional evidence supports different visits.',
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      });
+      assert.equal(result.receipt.acceptedCount, 1);
+      return latest();
     }
-  }
-});
+    function reclassify(kind: 'document' | 'observation', set: Record<string, string>) {
+      const request = {
+          kind,
+          recordId: targetId,
+          set,
+          reason: 'The fictional original supports the reviewed classification.',
+        },
+        preview = previewDirectRecordCorrection(db, root, profileId, request);
+      applyDirectRecordCorrection(db, root, profileId, {
+        ...request,
+        version: preview.version,
+        previewToken: preview.previewToken,
+        operationId: randomUUID(),
+      });
+    }
+    const first = await compare('incoming-kind-a', 'document');
+    reclassify('document', {
+      kind: 'observation',
+      testLabel: 'Fictional classification value',
+      valueText: '12.00',
+      unit: 'fictional units',
+    });
+    let before = intakeWorkCounters(db).warm.duplicateSnapshotChangedRows;
+    const second = await compare('incoming-kind-b', 'observation');
+    assert.equal(intakeWorkCounters(db).warm.duplicateSnapshotChangedRows - before, 0);
+    assert.equal(second.source.intakeId, first.source.intakeId);
+    assert.notEqual(second.snapshotId, first.snapshotId);
+    reclassify('observation', {
+      kind: 'document',
+      documentTitle: 'Shared fictional visit',
+      text: 'Fictional reviewed narrative',
+    });
+    before = intakeWorkCounters(db).warm.duplicateSnapshotChangedRows;
+    const third = await compare('incoming-kind-c', 'document');
+    assert.equal(intakeWorkCounters(db).warm.duplicateSnapshotChangedRows - before, 0);
+    assert.equal(third.source.intakeId, first.source.intakeId);
+    assert.notEqual(third.snapshotId, first.snapshotId);
+    for (const [reference, kind] of [
+      [first, 'document'],
+      [second, 'observation'],
+      [third, 'document'],
+    ] as const) {
+      const retained = await prepareRetainedDuplicateEvidenceSnapshot(db, reference);
+      try {
+        assert.deepEqual(retained.target, [kind, targetId]);
+        assert.equal([...retained.chunks()].join(''), expected);
+      } finally {
+        retained.close();
+      }
+    }
+  },
+);
 
 test('native terminal pair composes its first saved-evidence snapshot with the incoming draft', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-native-terminal-')),

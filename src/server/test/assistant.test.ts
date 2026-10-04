@@ -46,7 +46,7 @@ import {
   diagnosticFailureFields,
 } from '../import-diagnostics.ts';
 import { createPrivateImportTrace } from '../import-private-trace.ts';
-import { listIntakeReportQueue } from '../intake-report-queue.ts';
+import { listIntakeReportQueueRead } from '../intake-queue-native.ts';
 import { ModelContextLimitError } from '../model-config.ts';
 import {
   uploadIntake,
@@ -56,7 +56,8 @@ import {
   getRetainedIntakeOriginalReference,
   linkIntakeConversion,
   askIntakeQuestion,
-  answerIntakeQuestion,
+  askIntakeQuestionRead,
+  answerIntakeQuestionRead,
   createIntakePlan,
   intakePlanPinsCurrent,
   retainIntakeChildren,
@@ -73,8 +74,13 @@ import { vaultFixture, newProfile } from './helpers/vault-fixture.ts';
 import type { HealthTool } from '../proxy-model-bridge.ts';
 import { selectedFixturePlan } from './helpers/selected-plan.ts';
 import { readPackagePlanScope } from '../intake-package-plan.ts';
+import { prepareDirectPlanAccess, readDirectPlanScope } from '../intake-direct-plan.ts';
+import { intakeSourceVersion } from '../intake-state-access.ts';
 import { decisionIndexCount } from '../intake-reading-state.ts';
-import { selectedEnvelopeStore } from '../intake-collection-envelope.ts';
+import {
+  openIntakeCollectionEnvelope,
+  selectedEnvelopeStore,
+} from '../intake-collection-envelope.ts';
 import type { IntakeSummaryV2, IntakeRead } from '../../shared/intake-summary.ts';
 import { isIntakeSummary } from '../../shared/intake-summary.ts';
 import {
@@ -88,6 +94,18 @@ import type { ProposalSourceTextHandoff } from '../../shared/intake-source-text.
 import { getIntakeIdentityScope, confirmIntakeIdentityScope } from '../intake-identity.ts';
 
 type AssistantOptions = Parameters<typeof createAssistant>[0];
+type NativeModelContext = Awaited<
+  ReturnType<typeof import('../intake-model-collection.ts').prepareCollectionModelContext>
+>;
+function assertNativeModelPins(
+  value: unknown,
+): asserts value is import('../intake-model-context-v4.ts').ModelIntakePinsV2 {
+  assert.ok(value && typeof value === 'object' && !Array.isArray(value));
+  for (const key of ['sourceId', 'sourceHash', 'logicalRoot', 'sourceTextPin', 'mappingVersion'])
+    assert.equal(typeof Reflect.get(value, key), 'string');
+  for (const key of ['version', 'domainVersion'])
+    assert.ok(Number.isSafeInteger(Reflect.get(value, key)) && Reflect.get(value, key) >= 0);
+}
 type AssistantChat = ReturnType<ReturnType<typeof createAssistant>['get']>;
 type BridgeFactory = NonNullable<AssistantOptions['bridgeFactory']>;
 type BridgeCallbacks = Parameters<BridgeFactory>[0];
@@ -257,6 +275,16 @@ const workflowOperationIds = (intake: ReturnType<typeof getIntake>): string[] =>
       operations: Array<{ id: string }>;
     }
   ).operations.map((entry) => entry.id);
+const selectedWorkflowHasOperation = (
+  db: ReturnType<typeof openDatabase>,
+  id: string,
+  operationId: string,
+) => {
+  const view = openIntakeCollectionEnvelope(db, { id }),
+    intake = required(view.child(view.root(), 'intake')),
+    workflow = required(view.child(intake, 'workflow'));
+  return !!view.find('operation', workflow, operationId);
+};
 
 const proposalCount = (...args: Parameters<typeof getIntakeRead>) => {
   const value = getIntakeRead(...args);
@@ -327,26 +355,23 @@ test('assistant package tools keep large inventory and JSON reads bounded and ro
     jsonPointer: '/items/0',
   });
   assert.match(read.structure.literal, /1\.000/);
-  const roles = await call<import('../../shared/intake-package-plan.ts').IntakePackagePlanResult>(
-    bridge,
-    'intake_package',
-    {
-      id: item.id,
-      action: 'plan_roles',
-      version: getIntakeRead(db, root, 'cedar', item.id).version,
-      planId: planId,
-      operationId: 'fictional-roles',
-      roles: [
-        {
-          memberId,
-          role: 'unknown',
-          reason: 'Literal JSON source ID read; issuer remains unknown.',
-          coverage: 'pending',
-        },
-      ],
-    },
-  );
-  assert.equal(roles.plan.unitCount, 382);
+  const roles = await call<IntakeSummaryV2>(bridge, 'intake_package', {
+    id: item.id,
+    action: 'plan_roles',
+    version: getIntakeRead(db, root, 'cedar', item.id).version,
+    planId: planId,
+    operationId: 'fictional-roles',
+    roles: [
+      {
+        memberId,
+        role: 'unknown',
+        reason: 'Literal JSON source ID read; issuer remains unknown.',
+        coverage: 'pending',
+      },
+    ],
+  });
+  assert.ok(roles.activePlan.state === 'exact' && roles.activePlan.plan);
+  assert.equal(roles.activePlan.plan.unitCount, 382);
   const roleScope = required(readPackagePlanScope(db, root, 'cedar', item.id));
   assert.equal(roleScope.memberState(memberId)?.role?.role, 'unknown');
   assert.equal(roleScope.memberState(memberId)?.role?.coverage, 'pending');
@@ -369,7 +394,7 @@ test('assistant package tools keep large inventory and JSON reads bounded and ro
   const batch = await call<IntakeSummaryV2>(bridge, 'intake_batch', {
     id: item.id,
     version: roles.version,
-    planId: roles.plan.id,
+    planId: roles.activePlan.plan.id,
     operationId: 'fictional-batch',
     summary: 'One member read; remaining occurrences are pending.',
     jsonlText: JSON.stringify({
@@ -693,7 +718,7 @@ test('linked ZIP conversion supplies multiple literal records per window and res
   );
   assert.deepEqual(
     readTestChat(f.root, 'cedar', chat.id).conversionCheckpoint,
-    chat.conversionCheckpoint,
+    JSON.parse(JSON.stringify(chat.conversionCheckpoint)),
   );
 });
 
@@ -819,7 +844,7 @@ test('a reading deadline retains the in-flight guarded tool result and blocks an
 
   let boundaryError: unknown;
   try {
-    bridge.callbacks.beforeRequest?.();
+    await bridge.callbacks.beforeRequest?.();
   } catch (error) {
     boundaryError = error;
   }
@@ -880,12 +905,12 @@ test('an absolute reading deadline blocks requests and generations before an ove
   await tick();
   const bridge = f.bridges[0];
   assert.ok(bridge);
-  assert.doesNotThrow(() => bridge.callbacks.beforeRequest?.());
+  await assert.doesNotReject(async () => bridge.callbacks.beforeRequest?.());
   await call(bridge, 'intake_read', { id: item.id });
 
   monotonicNow = 15 * 60 * 1000;
-  assert.throws(
-    () => bridge.callbacks.beforeRequest?.(),
+  await assert.rejects(
+    async () => bridge.callbacks.beforeRequest?.(),
     ModelContextLimitError,
     'the absolute deadline denies admission before the overdue timer callback runs',
   );
@@ -910,8 +935,8 @@ test('an absolute reading deadline blocks requests and generations before an ove
   await tick();
   const resumedBridge = f.bridges[1];
   assert.ok(resumedBridge);
-  assert.doesNotThrow(
-    () => resumedBridge.callbacks.beforeRequest?.(),
+  await assert.doesNotReject(
+    async () => resumedBridge.callbacks.beforeRequest?.(),
     'an explicit later resume receives a new run-scoped deadline',
   );
 });
@@ -1531,153 +1556,162 @@ test('real package member page reads retain cursors, report rereads, and stop an
   assert.equal(f.bridges.length, 1);
 });
 
-test('retained child batch coverage is checked against its own plan and cannot bypass unread PDF pages', async (t) => {
-  const f = await linkedPdfPackage(
-    t,
-    ['Fictional first page', 'Fictional unread second page'],
-    true,
-  );
-  const childId = f.first.metadata.sourceFileId;
-  assert.equal(f.first.metadata.original.nextPage, 2);
-  await call(f.bridge, 'intake_plan', {
-    id: childId,
-    action: 'create',
-    version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
-  });
-  const child = getIntakeRead(f.db, f.root, 'cedar', childId);
-  const childPlan = selectedFixturePlan(f.db, f.root, 'cedar', childId);
-  assert.equal(required(childPlan.units[0]).pages?.length, 2);
-  await assert.rejects(
-    call(f.bridge, 'intake_batch', {
-      id: childId,
-      version: child.version,
-      planId: childPlan.id,
-      operationId: 'fictional-premature-child-coverage',
-      jsonlText: f.jsonlText,
-      summary: 'Fictional attempted premature coverage',
-      coverage: [
-        {
-          unitId: childPlan.units[0].id,
-          kind: 'extracted',
-          notes: 'Only first page was inspected through its parent member',
-        },
-      ],
-    }),
-    { code: 'CONVERSION_COVERAGE_PENDING' },
-  );
-  assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 0);
-  assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', childId).units[0]!.status, 'pending');
-  assert.equal(f.chat.status, 'running');
-  await f.bridge.callbacks.beforeRequest?.();
-  assert.equal(required(f.chat.reading).reason, null);
-  assert.ok(
-    selectedPending(f, f.item.id, f.chat).some(
-      (window) => window.args.memberId === f.member.memberId && window.args.page === 2,
-    ),
-  );
-  const childBatch = () => ({
-    id: childId,
-    version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
-    planId: childPlan.id,
-    operationId: 'fictional-actual-child-coverage',
-    jsonlText: f.jsonlText,
-    summary: 'Both exact child pages were read',
-    coverage: [
-      {
-        unitId: childPlan.units[0]!.id,
-        kind: 'extracted',
-        notes: 'Every page in the child plan was directly read',
-      },
-    ],
-  });
-  await call(f.bridge, 'intake_read', { id: childId, page: 1 });
-  await assert.rejects(call(f.bridge, 'intake_batch', childBatch()), {
-    code: 'CONVERSION_COVERAGE_PENDING',
-  });
-  assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 0);
-  const otherUnit = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units[1]!;
-  await call(f.bridge, 'intake_plan', { id: f.item.id, action: 'read_unit', unitId: otherUnit.id });
-  assert.ok(isNativeAssistantCheckpoint(f.chat.conversionCheckpoint));
-  assert.equal(f.chat.conversionCheckpoint.activeUnitId, otherUnit.id);
-  const { clearIntakeStateCache } = await import('../intake-state-storage.ts');
-  clearIntakeStateCache(f.db);
-  const { nativeAssistantScope } = await import('../assistant-intake-native.ts');
-  const { collectionConversionSourceUnit } = await import('../intake-continuation-collection.ts');
-  const parentHeader = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
-  assert.ok(isIntakeSummary(parentHeader));
-  const unrelatedScope = nativeAssistantScope(
-    nativeAssistantConversion(f.db, f.root, 'cedar', f.chat.id, parentHeader),
-    otherUnit.id,
-  )!;
-  assert.equal(
-    collectionConversionSourceUnit(unrelatedScope, childId),
-    f.member.unitId,
-    'the acknowledged child selects its persisted parent ledger after cache loss and another displayed unit',
-  );
-  // The route is part of recovered authority, not only the live SQLite/cache.
-  exportCuration(f.db, f.root, 'cedar');
-  const recoveredRoot = resolve(f.root, 'recovered-child-reading');
-  rebuildProfile(f.root, 'cedar', recoveredRoot);
-  const recoveredDB = openDatabase(profilePaths(recoveredRoot, 'cedar').database, 'cedar');
-  attachPersonalDurability(recoveredDB, { root: recoveredRoot, profileId: 'cedar' });
-  try {
-    const recoveredHeader = getIntakeRead(recoveredDB, recoveredRoot, 'cedar', f.item.id);
-    assert.ok(isIntakeSummary(recoveredHeader));
-    const recoveredHost = nativeAssistantConversion(
-      recoveredDB,
-      recoveredRoot,
-      'cedar',
-      f.chat.id,
-      recoveredHeader,
+test(
+  'retained child batch coverage is checked against its own plan and cannot bypass unread PDF pages',
+  // Real parent/child PDF reads and a fresh durable reconstruction; no model calls.
+  { timeout: 120_000 },
+  async (t) => {
+    const f = await linkedPdfPackage(
+      t,
+      ['Fictional first page', 'Fictional unread second page'],
+      true,
     );
-    const { prepareNativeAssistantConversion } = await import('../assistant-intake-native.ts');
-    await prepareNativeAssistantConversion(recoveredHost, {
-      mappingVersion: createHash('sha256')
-        .update(JSON.stringify(activeMappingRules(recoveredDB, recoveredHeader.providerId)))
-        .digest('hex'),
+    const childId = f.first.metadata.sourceFileId;
+    assert.equal(f.first.metadata.original.nextPage, 2);
+    await call(f.bridge, 'intake_plan', {
+      id: childId,
+      action: 'create',
+      version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
     });
-    const recoveredScope = nativeAssistantScope(recoveredHost, otherUnit.id)!;
-    assert.equal(collectionConversionSourceUnit(recoveredScope, childId), f.member.unitId);
-  } finally {
-    recoveredDB.close();
-  }
-  await call(f.bridge, 'intake_read', { id: childId, page: 2 });
-  const currentChild = getIntakeRead(f.db, f.root, 'cedar', childId);
-  assert.ok(isIntakeSummary(currentChild));
-  const childScope = nativeAssistantScope(
-    nativeAssistantConversion(f.db, f.root, 'cedar', f.chat.id, currentChild),
-    childPlan.units[0]!.id,
-  )!;
-  const { assertCollectionChildConversionCoverage } =
-    await import('../intake-continuation-collection.ts');
-  await assert.rejects(
-    assertCollectionChildConversionCoverage(unrelatedScope, [childScope], {
+    const child = getIntakeRead(f.db, f.root, 'cedar', childId);
+    const childPlan = selectedFixturePlan(f.db, f.root, 'cedar', childId);
+    assert.equal(required(childPlan.units[0]).pages?.length, 2);
+    await assert.rejects(
+      call(f.bridge, 'intake_batch', {
+        id: childId,
+        version: child.version,
+        planId: childPlan.id,
+        operationId: 'fictional-premature-child-coverage',
+        jsonlText: f.jsonlText,
+        summary: 'Fictional attempted premature coverage',
+        coverage: [
+          {
+            unitId: childPlan.units[0].id,
+            kind: 'extracted',
+            notes: 'Only first page was inspected through its parent member',
+          },
+        ],
+      }),
+      { code: 'CONVERSION_COVERAGE_PENDING' },
+    );
+    assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 0);
+    assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', childId).units[0]!.status, 'pending');
+    assert.equal(f.chat.status, 'running');
+    await f.bridge.callbacks.beforeRequest?.();
+    assert.equal(required(f.chat.reading).reason, null);
+    assert.ok(
+      selectedPending(f, f.item.id, f.chat).some(
+        (window) => window.args.memberId === f.member.memberId && window.args.page === 2,
+      ),
+    );
+    const childBatch = () => ({
+      id: childId,
+      version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
       planId: childPlan.id,
+      operationId: 'fictional-actual-child-coverage',
+      jsonlText: f.jsonlText,
+      summary: 'Both exact child pages were read',
       coverage: [
         {
           unitId: childPlan.units[0]!.id,
           kind: 'extracted',
-          notes: 'Fictional wrong member ledger',
+          notes: 'Every page in the child plan was directly read',
         },
       ],
-    }),
-    /Read does not belong to the retained package occurrence/,
-  );
-  const source = await call<{ revisionId: string }>(f.bridge, 'intake_source_text', {
-    id: childId,
-  });
-  await call(f.bridge, 'intake_batch', {
-    ...childBatch(),
-    sourceTextRevisionId: source.revisionId,
-  });
-  assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 1);
-  assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', childId).units[0]!.status, 'completed');
-  assert.equal(
-    selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units[0]!.status,
-    'pending',
-    'a child receipt does not invent parent member extraction coverage',
-  );
-});
+    });
+    await call(f.bridge, 'intake_read', { id: childId, page: 1 });
+    await assert.rejects(call(f.bridge, 'intake_batch', childBatch()), {
+      code: 'CONVERSION_COVERAGE_PENDING',
+    });
+    assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 0);
+    const otherUnit = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units[1]!;
+    await call(f.bridge, 'intake_plan', {
+      id: f.item.id,
+      action: 'read_unit',
+      unitId: otherUnit.id,
+    });
+    assert.ok(isNativeAssistantCheckpoint(f.chat.conversionCheckpoint));
+    assert.equal(f.chat.conversionCheckpoint.activeUnitId, otherUnit.id);
+    const { clearIntakeStateCache } = await import('../intake-state-storage.ts');
+    clearIntakeStateCache(f.db);
+    const { nativeAssistantScope } = await import('../assistant-intake-native.ts');
+    const { collectionConversionSourceUnit } = await import('../intake-continuation-collection.ts');
+    const parentHeader = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+    assert.ok(isIntakeSummary(parentHeader));
+    const unrelatedScope = nativeAssistantScope(
+      nativeAssistantConversion(f.db, f.root, 'cedar', f.chat.id, parentHeader),
+      otherUnit.id,
+    )!;
+    assert.equal(
+      collectionConversionSourceUnit(unrelatedScope, childId),
+      f.member.unitId,
+      'the acknowledged child selects its persisted parent ledger after cache loss and another displayed unit',
+    );
+    // The route is part of recovered authority, not only the live SQLite/cache.
+    exportCuration(f.db, f.root, 'cedar');
+    const recoveredRoot = resolve(f.root, 'recovered-child-reading');
+    rebuildProfile(f.root, 'cedar', recoveredRoot);
+    const recoveredDB = openDatabase(profilePaths(recoveredRoot, 'cedar').database, 'cedar');
+    attachPersonalDurability(recoveredDB, { root: recoveredRoot, profileId: 'cedar' });
+    try {
+      const recoveredHeader = getIntakeRead(recoveredDB, recoveredRoot, 'cedar', f.item.id);
+      assert.ok(isIntakeSummary(recoveredHeader));
+      const recoveredHost = nativeAssistantConversion(
+        recoveredDB,
+        recoveredRoot,
+        'cedar',
+        f.chat.id,
+        recoveredHeader,
+      );
+      const { prepareNativeAssistantConversion } = await import('../assistant-intake-native.ts');
+      await prepareNativeAssistantConversion(recoveredHost, {
+        mappingVersion: createHash('sha256')
+          .update(JSON.stringify(activeMappingRules(recoveredDB, recoveredHeader.providerId)))
+          .digest('hex'),
+      });
+      const recoveredScope = nativeAssistantScope(recoveredHost, otherUnit.id)!;
+      assert.equal(collectionConversionSourceUnit(recoveredScope, childId), f.member.unitId);
+    } finally {
+      recoveredDB.close();
+    }
+    await call(f.bridge, 'intake_read', { id: childId, page: 2 });
+    const currentChild = getIntakeRead(f.db, f.root, 'cedar', childId);
+    assert.ok(isIntakeSummary(currentChild));
+    const childScope = nativeAssistantScope(
+      nativeAssistantConversion(f.db, f.root, 'cedar', f.chat.id, currentChild),
+      childPlan.units[0]!.id,
+    )!;
+    const { assertCollectionChildConversionCoverage } =
+      await import('../intake-continuation-collection.ts');
+    await assert.rejects(
+      assertCollectionChildConversionCoverage(unrelatedScope, [childScope], {
+        planId: childPlan.id,
+        coverage: [
+          {
+            unitId: childPlan.units[0]!.id,
+            kind: 'extracted',
+            notes: 'Fictional wrong member ledger',
+          },
+        ],
+      }),
+      /Read does not belong to the retained package occurrence/,
+    );
+    const source = await call<{ revisionId: string }>(f.bridge, 'intake_source_text', {
+      id: childId,
+    });
+    await call(f.bridge, 'intake_batch', {
+      ...childBatch(),
+      sourceTextRevisionId: source.revisionId,
+    });
+    assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 1);
+    assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', childId).units[0]!.status, 'completed');
+    assert.equal(
+      selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units[0]!.status,
+      'pending',
+      'a child receipt does not invent parent member extraction coverage',
+    );
+  },
+);
 
 for (const parentNative of [false, true])
   test(`a ${parentNative ? 'native' : 'legacy'} parent requires complete direct child text evidence for a native child plan`, async (t) => {
@@ -2577,7 +2611,7 @@ test('assistant accounts for one exact image only after a visual read and durabl
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a1sAAAAASUVORK5CYII=',
     'base64',
   );
-  let image: Intake = uploadIntake(db, root, 'cedar', {
+  let image: IntakeRead = uploadIntake(db, root, 'cedar', {
     filename: 'fictional-prescription.png',
     newProviderName: 'Fictional vision office',
     bytes,
@@ -2595,9 +2629,11 @@ test('assistant accounts for one exact image only after a visual read and durabl
     version: image.version,
     action: 'create',
   });
-  image = getIntake(db, root, 'cedar', image.id);
-  const plan = required(image.workflow).plans.find((item) => item.status === 'active')!;
-  assert.equal(plan.index.kind, 'image');
+  image = getIntakeRead(db, root, 'cedar', image.id);
+  const plan = selectedFixturePlan(db, root, 'cedar', image.id);
+  assert.ok('sourceIndex' in plan.plan);
+  assert.equal(plan.plan.sourceIndex.kind, 'image');
+  assert.equal(plan.pins.sourceHash, image.sha256);
   assert.deepEqual(
     plan.units.map(({ kind, locator, status }) => ({ kind, locator, status })),
     [{ kind: 'image', locator: 'whole retained image', status: 'pending' }],
@@ -2640,21 +2676,36 @@ test('assistant accounts for one exact image only after a visual read and durabl
     await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: image.id })
   ).revisionId;
   request.version = getIntakeRead(db, root, 'cedar', image.id).version;
-  const saved = await call(bridge, 'intake_batch', request);
-  assert.equal(saved.pendingWorkCount, 0);
-  let accounting = listIntakeReportQueue(db, root, 'cedar').activity.readingAccounting!;
-  assert.equal(accounting.state, 'accounted');
-  assert.equal(accounting.allSourceOccurrencesAccounted, true);
-  assert.equal(accounting.units.extractedClaims, 1);
-  assert.equal(accounting.clinicalExtraction, 'unknown');
+  const saved = await call<IntakeRead>(bridge, 'intake_batch', request);
+  assert.ok(isIntakeSummary(saved));
+  assert.ok(isNativeAssistantCheckpoint(chat.conversionCheckpoint));
+  const resume = nativeAssistantResume(
+    nativeAssistantConversion(db, root, 'cedar', chat.id, saved),
+    chat.conversionCheckpoint,
+    plan.pins.mappingVersion,
+  );
+  assert.equal(resume.reading.totalUnits, 1);
+  assert.equal(resume.reading.accountedUnits, 1);
+  assert.equal(resume.reading.remainingUnits, 0);
+  assert.equal(resume.coverage, 'reading_progress_only');
+  let queue = await listIntakeReportQueueRead(db, root, 'cedar');
+  assert.ok('format' in queue.activity);
+  assert.deepEqual(queue.activity.remainingUnits, { state: 'exact', value: 0 });
+  assert.equal(queue.activity.extractionUnknownFiles, 1);
+  assert.equal(queue.activity.extractionComplete, false);
+  const extracted = required(readDirectPlanScope(db, 'cedar', image.id));
+  assert.equal(extracted.unitCount, 1);
+  assert.equal(extracted.unitAt(0)?.coverage?.kind, 'extracted');
+  assert.equal(extracted.unitAt(0)?.status, 'completed');
 
   await call(bridge, 'intake_read', { id: image.id });
   await call(bridge, 'intake_batch', request);
-  image = getIntake(db, root, 'cedar', image.id);
-  assert.equal(required(image.workflow).plans[0]!.batches.length, 1);
-  accounting = listIntakeReportQueue(db, root, 'cedar').activity.readingAccounting!;
-  assert.equal(accounting.units.total, 1);
-  assert.equal(accounting.units.extractedClaims, 1);
+  const retained = required(readDirectPlanScope(db, 'cedar', image.id));
+  assert.equal(retained.reader.childCount(retained.record, 'batches'), 1);
+  assert.equal(retained.unitCount, 1);
+  assert.equal(retained.unitAt(0)?.coverage?.kind, 'extracted');
+  queue = await listIntakeReportQueueRead(db, root, 'cedar');
+  assert.deepEqual(queue.activity.remainingUnits, { state: 'exact', value: 0 });
   complete(bridge);
 });
 
@@ -4005,9 +4056,8 @@ test('assistant procedure exceptions survive general rules, repeated deliveries,
 test('assistant can explicitly replace changed extraction pins and retains both plans after restart', async (t) => {
   fictionalModel(t);
   const { saveMappingRule } = await import('../clinical-import.ts');
-  const { getIntakePlan } = await import('../intake.ts');
   const { assistant, bridges, root, db, databases, options } = fixture(t);
-  let item: Intake = uploadIntake(db, root, 'cedar', {
+  let item: IntakeRead = uploadIntake(db, root, 'cedar', {
     filename: 'source.html',
     newProviderName: 'Fictional',
     bytes: Buffer.from('<html><body><p>Literal evidence</p></body></html>'),
@@ -4015,26 +4065,19 @@ test('assistant can explicitly replace changed extraction pins and retains both 
   assistant.create('cedar', { message: 'Plan extraction' });
   await tick();
   const bridge = bridges[0];
-  assert.ok(
-    required(
-      required(bridge.tools.find((tool) => tool.name === 'health_intake_plan')).inputSchema
-        .properties,
-    ).replacePlanId,
+  const schema = required(
+    required(bridge.tools.find((tool) => tool.name === 'health_intake_plan')).inputSchema
+      .properties,
   );
-  assert.ok(
-    required(
-      required(bridge.tools.find((tool) => tool.name === 'health_intake_plan')).inputSchema
-        .properties,
-    ).mappingVersion,
-  );
-  const created = await call(bridge, 'intake_plan', {
+  assert.ok(schema.replacePlanId);
+  assert.ok(schema.mappingVersion);
+  const created = await call<IntakeSummaryV2>(bridge, 'intake_plan', {
     id: item.id,
     version: item.version,
     action: 'create',
   });
-  item = getIntake(db, root, 'cedar', item.id);
-  const first = structuredClone(required(required(item.workflow).plans[0]));
-  const { transaction } = await import('../database.ts');
+  item = getIntakeRead(db, root, 'cedar', item.id);
+  const first = structuredClone(selectedFixturePlan(db, root, 'cedar', item.id));
   transaction(db, () =>
     saveMappingRule(
       db,
@@ -4045,47 +4088,63 @@ test('assistant can explicitly replace changed extraction pins and retains both 
   );
   await assert.rejects(
     () => call(bridge, 'intake_plan', { id: item.id, version: item.version, action: 'create' }),
-    (e: unknown) => hasCode(e, 'PLAN_CHANGED'),
+    (error: unknown) => hasCode(error, 'PLAN_CHANGED'),
   );
-  const replaced = await call(bridge, 'intake_plan', {
+  const replaced = await call<IntakeSummaryV2>(bridge, 'intake_plan', {
     id: item.id,
     version: item.version,
     action: 'create',
     replacePlanId: first.id,
   });
   assert.ok(created.version < replaced.version);
-  item = getIntake(db, root, 'cedar', item.id);
-  assert.deepEqual(required(item.workflow).plans[0], { ...first, status: 'superseded' });
-  assert.equal(required(item.workflow).plans[1].status, 'active');
+  item = getIntakeRead(db, root, 'cedar', item.id);
+  assert.ok(isIntakeSummary(item));
+  assert.equal(item.collections.plans.total, 2);
+  const retainedFirst = selectedFixturePlan(db, root, 'cedar', item.id, { planId: first.id });
+  assert.deepEqual(retainedFirst, {
+    ...first,
+    plan: { ...first.plan, status: 'superseded' },
+    // Addressed unit metadata carries the current public pin even for retained plans.
+    units: first.units.map((unit) => ({
+      ...unit,
+      ...('metadata' in unit ? { metadata: { ...unit.metadata, version: item.version } } : {}),
+    })),
+  });
+  const activePlan = structuredClone(selectedFixturePlan(db, root, 'cedar', item.id));
+  assert.equal(activePlan.plan.status, 'active');
+  assert.notEqual(activePlan.id, first.id);
   complete(bridge);
   assistant.close();
   const restarted = createAssistant({ root, databases, ...options });
   t.after(() => restarted.close());
   const resumed = restarted.create('cedar', { message: 'Resume saved extraction' });
   await tick();
-  const modelPlan = (await call(required(bridges.at(-1)), 'intake_plan', {
+  const modelPlan = await call<NativeModelContext>(required(bridges.at(-1)), 'intake_plan', {
     id: item.id,
     action: 'read',
-    version: item.version,
-    mappingVersion: replaced.mappingRules.version,
+    freshStart: true,
     section: 'units',
-  })) as unknown as {
-    plan: { id: string };
-    page: { complete: boolean; items: { id: string }[] };
-  };
-  assert.equal(modelPlan.plan.id, required(item.workflow).plans[1].id);
-  assert.equal(modelPlan.page.complete, true);
+  });
+  assert.equal(modelPlan.format, 'health-intake-model-context-v2');
+  assertNativeModelPins(modelPlan.pins);
+  assert.equal(modelPlan.pins.version, item.version);
+  assert.equal(modelPlan.pins.mappingVersion, activePlan.pins.mappingVersion);
+  assert.equal(modelPlan.complete, true);
+  assert.ok(Array.isArray(modelPlan.items));
   assert.deepEqual(
-    modelPlan.page.items.map(({ id }) => id),
-    required(item.workflow).plans[1].units.map(({ id }) => id),
+    modelPlan.items.map((entry) => entry.value.id),
+    activePlan.units.map(({ id }) => id),
   );
+  const unitCursor = modelPlan.items[0].valueFragments.unit.cursor;
+  assert.equal(typeof unitCursor, 'string');
   await assert.rejects(
     call(required(bridges.at(-1)), 'intake_plan', {
       id: item.id,
       action: 'read',
       version: item.version - 1,
-      mappingVersion: replaced.mappingRules.version,
+      mappingVersion: modelPlan.pins.mappingVersion,
       section: 'units',
+      cursor: unitCursor,
     }),
     (error: unknown) => hasCode(error, 'MODEL_CONTEXT_CHANGED'),
   );
@@ -4096,10 +4155,16 @@ test('assistant can explicitly replace changed extraction pins and retains both 
   const rebuilt = openDatabase(profilePaths(destination, 'cedar').database, 'cedar');
   attachPersonalDurability(rebuilt, { root: destination, profileId: 'cedar' });
   try {
-    assert.deepEqual(
-      getIntakePlan(rebuilt, destination, 'cedar', item.id).plans,
-      required(item.workflow).plans,
-    );
+    for (const expected of [retainedFirst, activePlan]) {
+      await prepareDirectPlanAccess(rebuilt, 'cedar', item.id, { planId: expected.id });
+      assert.deepEqual(
+        selectedFixturePlan(rebuilt, destination, 'cedar', item.id, { planId: expected.id }),
+        expected,
+      );
+    }
+    const recovered = getIntakeRead(rebuilt, destination, 'cedar', item.id);
+    assert.ok(isIntakeSummary(recovered));
+    assert.equal(recovered.collections.plans.total, 2);
   } finally {
     rebuilt.close();
   }
@@ -4108,41 +4173,37 @@ test('assistant can explicitly replace changed extraction pins and retains both 
 test('fresh plan context starts at one captured current pin pair and stale continuations cannot mix', async (t) => {
   const { saveMappingRule } = await import('../clinical-import.ts');
   const f = await linkedFictionalPlanVersionConversion(t);
-  const created = await call(f.bridge, 'intake_plan', {
+  await call(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'create',
     version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
   });
-  const beforeRead = structuredClone(getIntake(f.db, f.root, 'cedar', f.item.id));
-  const first = await call(f.bridge, 'intake_plan', {
+  const beforeRead = intakeSourceVersion(f.db, f.item.id);
+  const selected = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id);
+  const first = await call<NativeModelContext>(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'read',
     freshStart: true,
     section: 'units',
     offset: 0,
   });
-
-  assert.equal(first.page?.section, 'units');
-  assert.equal(first.page?.offset, 0);
-  assert.equal(first.contextStart?.kind, 'fresh_section_v1');
-  assert.equal(first.contextStart?.section, first.page?.section);
-  assert.equal(first.contextStart?.offset, first.page?.offset);
-  assert.equal(first.contextStart?.version, first.version);
-  assert.equal(first.contextStart?.mappingVersion, first.mappingRules.version);
-  assert.equal(first.contextStart?.sourceHash, first.sourceHash);
-  assert.match(required(first.contextStart).instruction, /every previously assembled/);
-  assert.match(required(first.contextStart).instruction, /partial section/);
-  assert.match(required(first.contextStart).instruction, /Never combine any section or page/);
-  assert.match(
-    required(first.contextStart).instruction,
-    /reuse a batch assembled under older pins/,
-  );
-  assert.deepEqual(getIntake(f.db, f.root, 'cedar', f.item.id), beforeRead);
-
+  assert.equal(first.format, 'health-intake-model-context-v2');
+  assert.equal(first.section, 'units');
+  assert.equal(first.scope, 'section');
+  assertNativeModelPins(first.pins);
+  assert.equal(first.pins.version, beforeRead.version);
+  assert.equal(first.pins.sourceId, f.item.id);
+  assert.equal(first.pins.sourceHash, f.item.sha256);
+  assert.equal(first.pins.mappingVersion, selected.pins.mappingVersion);
+  assert.match(String(first.scopeInstructions), /complete page covers only its named scope/);
+  assert.deepEqual(intakeSourceVersion(f.db, f.item.id), beforeRead);
+  assert.ok(Array.isArray(first.items) && first.items.length > 0);
+  const cursor = first.items[0].valueFragments.unit.cursor;
+  assert.equal(typeof cursor, 'string');
   transaction(f.db, () =>
     saveMappingRule(
       f.db,
-      beforeRead.providerId,
+      f.item.providerId,
       {
         match: { kind: 'procedure', label: 'Fictional fresh context procedure' },
         set: { procedureCategory: 'laboratory' },
@@ -4154,37 +4215,41 @@ test('fresh plan context starts at one captured current pin pair and stale conti
     call(f.bridge, 'intake_plan', {
       id: f.item.id,
       action: 'read',
-      version: first.version,
-      mappingVersion: first.mappingRules.version,
+      version: first.pins.version,
+      mappingVersion: first.pins.mappingVersion,
       section: 'units',
-      offset: 1,
+      cursor,
     }),
     (error: unknown) => {
       assert.equal(hasCode(error, 'MODEL_CONTEXT_CHANGED'), true);
-      assert.match(error instanceof Error ? error.message : '', /every previously assembled/);
-      assert.match(error instanceof Error ? error.message : '', /freshStart true at offset 0/);
+      assert.match(
+        error instanceof Error ? error.message : '',
+        /Discard previously assembled pages and partial fields/,
+      );
+      assert.match(
+        error instanceof Error ? error.message : '',
+        /freshStart true and no cursor or version pins/,
+      );
       assert.match(error instanceof Error ? error.message : '', /Never combine pages/);
       return true;
     },
   );
-  const restarted = await call(f.bridge, 'intake_plan', {
+  const restarted = await call<NativeModelContext>(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'read',
     freshStart: true,
     section: 'units',
   });
-  assert.equal(restarted.version, first.version);
-  assert.notEqual(restarted.mappingRules.version, first.mappingRules.version);
-  assert.equal(restarted.contextStart?.mappingVersion, restarted.mappingRules.version);
-  assert.equal(restarted.mappingRules.planVersion, created.mappingRules.version);
-  assert.equal(restarted.mappingRules.consistentWithPlan, false);
-  assert.equal(restarted.plan?.id, created.plan?.id);
-  const afterRestart = getIntake(f.db, f.root, 'cedar', f.item.id);
-  assert.equal(afterRestart.version, beforeRead.version);
-  assert.equal(afterRestart.sha256, beforeRead.sha256);
-  assert.deepEqual(afterRestart.workflow, beforeRead.workflow);
-  assert.deepEqual(afterRestart.proposals, beforeRead.proposals);
-  assert.deepEqual(afterRestart.importHistory, beforeRead.importHistory);
+  assertNativeModelPins(restarted.pins);
+  assert.equal(restarted.pins.version, first.pins.version);
+  assert.notEqual(restarted.pins.mappingVersion, first.pins.mappingVersion);
+  assert.equal(restarted.pins.sourceHash, first.pins.sourceHash);
+  assert.deepEqual(
+    intakeSourceVersion(f.db, f.item.id),
+    beforeRead,
+    'fresh context writes no workflow, proposal, or accepted history',
+  );
+  assert.deepEqual(selectedFixturePlan(f.db, f.root, 'cedar', f.item.id), selected);
   f.assistant.cancel('cedar', f.chat.id);
 });
 
@@ -4260,12 +4325,12 @@ test('fresh plan context rejects every malformed envelope before dispatch', asyn
   for (const item of cases)
     await t.test(item.name, async (child) => {
       const f = await linkedFictionalPlanVersionConversion(child);
-      const before = structuredClone(getIntake(f.db, f.root, 'cedar', f.item.id));
+      const before = intakeSourceVersion(f.db, f.item.id);
       await assert.rejects(call(f.bridge, 'intake_plan', { id: f.item.id, ...item.args }), {
         name: 'ModelToolValidationError',
         code: 'MODEL_CONTEXT_FRESH_START',
       });
-      assert.deepEqual(getIntake(f.db, f.root, 'cedar', f.item.id), before);
+      assert.deepEqual(intakeSourceVersion(f.db, f.item.id), before);
       assert.equal(f.chat.status, 'running');
       assert.equal(f.bridge.closed, false);
       f.assistant.cancel('cedar', f.chat.id);
@@ -4275,7 +4340,7 @@ test('fresh plan context rejects every malformed envelope before dispatch', asyn
 test('fresh plan context malformed repair and repeated reads remain finitely bounded', async (t) => {
   await t.test('third malformed envelope pauses through the bounded repair path', async (child) => {
     const f = await linkedFictionalPlanVersionConversion(child);
-    const before = structuredClone(getIntake(f.db, f.root, 'cedar', f.item.id));
+    const before = intakeSourceVersion(f.db, f.item.id);
     for (let attempt = 1; attempt <= 3; attempt++) {
       await assert.rejects(
         call(f.bridge, 'intake_plan', {
@@ -4290,7 +4355,7 @@ test('fresh plan context malformed repair and repeated reads remain finitely bou
     }
     assert.equal(required(f.chat.reading).reason, 'tool_error');
     assert.equal(f.bridge.closed, true);
-    assert.deepEqual(getIntake(f.db, f.root, 'cedar', f.item.id), before);
+    assert.deepEqual(intakeSourceVersion(f.db, f.item.id), before);
   });
 
   await t.test('third unchanged fresh start pauses without another page', async (child) => {
@@ -4300,7 +4365,7 @@ test('fresh plan context malformed repair and repeated reads remain finitely bou
       action: 'create',
       version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
     });
-    const before = structuredClone(getIntake(f.db, f.root, 'cedar', f.item.id));
+    const before = intakeSourceVersion(f.db, f.item.id);
     const args = {
       id: f.item.id,
       action: 'read',
@@ -4322,7 +4387,7 @@ test('fresh plan context malformed repair and repeated reads remain finitely bou
     assert.equal(f.chat.status, 'idle');
     assert.equal(required(f.chat.reading).reason, 'no_progress');
     assert.equal(f.bridge.closed, true);
-    assert.deepEqual(getIntake(f.db, f.root, 'cedar', f.item.id), before);
+    assert.deepEqual(intakeSourceVersion(f.db, f.item.id), before);
     assert.equal(sqlNumber(f.db.prepare('SELECT count(*) n FROM observations').get(), 'n'), 0);
     assert.equal(sqlNumber(f.db.prepare('SELECT count(*) n FROM source_records').get(), 'n'), 0);
   });
@@ -4343,8 +4408,8 @@ test('fresh plan context malformed repair and repeated reads remain finitely bou
     };
     for (let attempt = 1; attempt <= 2; attempt++) {
       await call(f.bridge, 'intake_plan', args);
-      const current = getIntake(f.db, f.root, 'cedar', f.item.id);
-      askIntakeQuestion(f.db, f.root, 'cedar', f.item.id, {
+      const current = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+      await askIntakeQuestionRead(f.db, f.root, 'cedar', f.item.id, {
         version: current.version,
         operationId: `fictional-fresh-version-churn-${attempt}`,
         key: `fictional-fresh-version-question-${attempt}`,
@@ -4355,12 +4420,14 @@ test('fresh plan context malformed repair and repeated reads remain finitely bou
     await assert.rejects(call(f.bridge, 'intake_plan', args), {
       code: 'CONVERSION_NO_PROGRESS',
     });
-    const after = getIntake(f.db, f.root, 'cedar', f.item.id);
-    const afterWorkflow = required(after.workflow);
-    assert.equal(afterWorkflow.candidates.length, 0);
+    const after = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+    assert.ok(isIntakeSummary(after));
+    assert.equal(after.collections.candidates.total, 0);
+    assert.equal(after.collections.plans.total, 1);
     assert.equal(
-      afterWorkflow.plans.flatMap((plan) => plan.units).filter((unit) => unit.status !== 'pending')
-        .length,
+      selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units.filter(
+        (unit) => unit.status !== 'pending',
+      ).length,
       0,
     );
     assert.equal(f.chat.status, 'idle');
@@ -4379,17 +4446,19 @@ test('fresh plan context malformed repair and repeated reads remain finitely bou
     await call(f.bridge, 'intake_plan', args);
     await call(f.bridge, 'intake_plan', args);
     await call(f.bridge, 'intake_batch', f.batch);
-    const advanced = getIntake(f.db, f.root, 'cedar', f.item.id);
-    const advancedWorkflow = required(advanced.workflow);
-    assert.equal(advancedWorkflow.candidates.length, 1);
+    const advanced = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+    assert.ok(isIntakeSummary(advanced));
+    assert.equal(advanced.collections.candidates.total, 1);
+    assert.equal(advanced.collections.plans.total, 1);
     assert.equal(
-      advancedWorkflow.plans
-        .flatMap((plan) => plan.units)
-        .filter((unit) => unit.status !== 'pending').length,
+      selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units.filter(
+        (unit) => unit.status !== 'pending',
+      ).length,
       1,
     );
-    const restarted = await call(f.bridge, 'intake_plan', args);
-    assert.equal(restarted.version, advanced.version);
+    const restarted = await call<NativeModelContext>(f.bridge, 'intake_plan', args);
+    assertNativeModelPins(restarted.pins);
+    assert.equal(restarted.pins.version, advanced.version);
     assert.equal(f.chat.status, 'running');
     f.assistant.cancel('cedar', f.chat.id);
   });
@@ -4457,17 +4526,20 @@ test('plan create advertises and recovers its conditional current-version requir
     action: 'create',
     version: before.version,
   });
-  const planned = getIntake(f.db, f.root, 'cedar', f.item.id);
-  const plans = required(planned.workflow).plans;
-  assert.equal(plans.length, 1, 'the corrected retry creates exactly one plan');
-  assert.equal(plans[0]!.status, 'active');
+  const planned = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+  assert.ok(isIntakeSummary(planned));
+  assert.equal(planned.collections.plans.total, 1, 'the corrected retry creates exactly one plan');
+  const plan = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id);
+  assert.equal(plan.plan.status, 'active');
   await call(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'read_unit',
-    unitId: required(plans[0]!.units[0]).id,
+    unitId: required(plan.units[0]).id,
   });
   assert.equal(f.chat.status, 'running', 'read_unit remains valid without a global version field');
-  assert.equal(required(getIntake(f.db, f.root, 'cedar', f.item.id).workflow).plans.length, 1);
+  const final = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+  assert.ok(isIntakeSummary(final));
+  assert.equal(final.collections.plans.total, 1);
   f.assistant.cancel('cedar', f.chat.id);
 });
 
@@ -4478,10 +4550,15 @@ test('fresh conversion turns retain the mapping pin and reject it after mappings
     action: 'create',
     version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
   });
-  const planned = getIntake(f.db, f.root, 'cedar', f.item.id);
-  const plan = required(required(planned.workflow).plans.find((item) => item.status === 'active'));
+  const planned = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+  const plan = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id);
 
-  f.assistant.cancel('cedar', f.chat.id);
+  f.bridge.callbacks.onExit?.(
+    new ModelContextLimitError('Fictional manual initial context limit', 'initial'),
+  );
+  assert.equal(f.chat.status, 'idle');
+  assert.equal(f.chat.reading?.reason, 'context_limit');
+  assert.equal(f.chat.conversionCheckpoint?.contextTier, 1);
   f.assistant.send('cedar', f.chat.id, {
     message: 'Resume the fictional delivery in a fresh turn',
     context: { intakeId: planned.id },
@@ -4491,15 +4568,28 @@ test('fresh conversion turns retain the mapping pin and reject it after mappings
   const resumed = required(f.bridges[1]);
   assert.equal(resumed.prompt.conversion.version, planned.version);
   assert.equal(resumed.prompt.conversion.mappingVersion, plan.pins.mappingVersion);
+  assert.match(
+    resumed.prompt.conversion.instructions,
+    /finish and publish all unproposed records from the current window/,
+  );
+  assert.match(resumed.prompt.conversion.instructions, /Do not accept\/import/);
+  assert.doesNotMatch(
+    resumed.prompt.conversion.instructions,
+    /dispatched unit|Publish only with health_intake_batch/,
+  );
 
-  const firstRead = await call(resumed, 'intake_plan', {
+  const firstRead = await call<NativeModelContext>(resumed, 'intake_plan', {
     id: planned.id,
     action: 'read',
-    version: resumed.prompt.conversion.version,
-    mappingVersion: resumed.prompt.conversion.mappingVersion,
+    freshStart: true,
     section: 'units',
   });
-  assert.equal(firstRead.mappingRules.consistentWithPlan, true);
+  assertNativeModelPins(firstRead.pins);
+  assert.equal(firstRead.pins.version, resumed.prompt.conversion.version);
+  assert.equal(firstRead.pins.mappingVersion, resumed.prompt.conversion.mappingVersion);
+  assert.ok(Array.isArray(firstRead.items) && firstRead.items.length > 0);
+  const cursor = firstRead.items[0].valueFragments.unit.cursor;
+  assert.equal(typeof cursor, 'string');
 
   const { saveMappingRule } = await import('../clinical-import.ts');
   transaction(f.db, () =>
@@ -4520,6 +4610,7 @@ test('fresh conversion turns retain the mapping pin and reject it after mappings
       version: resumed.prompt.conversion.version,
       mappingVersion: resumed.prompt.conversion.mappingVersion,
       section: 'units',
+      cursor,
     }),
     (error: unknown) => hasCode(error, 'MODEL_CONTEXT_CHANGED'),
   );
@@ -4570,7 +4661,9 @@ test('a supplied stale numeric plan-create version remains terminal', async (t) 
   assert.equal(f.chat.status, 'idle');
   assert.equal(f.bridge.closed, true);
   assert.equal(required(f.chat.reading).reason, 'tool_error');
-  assert.equal(required(getIntake(f.db, f.root, 'cedar', f.item.id).workflow).plans.length, 1);
+  const final = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+  assert.ok(isIntakeSummary(final));
+  assert.equal(final.collections.plans.total, 1);
 });
 
 test('retained v2 individual exceptions resolve delivery defaults from originals without rewriting the journal', async (t) => {
@@ -5043,10 +5136,7 @@ async function linkedFictionalBatchConversion(
     action: 'create',
     version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
   });
-  const planned = getIntake(f.db, f.root, 'cedar', item.id);
-  const plan = required(
-    required(planned.workflow).plans.find((entry) => entry.status === 'active'),
-  );
+  const plan = selectedFixturePlan(f.db, f.root, 'cedar', item.id);
   await call(bridge, 'intake_read', { id: item.id });
   // Both contributor and encrypted runtimes retain durable source text. Read
   // its actual passages and carry the returned revision into the proposal.
@@ -5103,14 +5193,14 @@ test('host source capture advances multi-page reads without waiving fresh passag
   const { getIntakeSourceText, reviewIntakeSourceText } = await import('../intake-source-text.ts');
   const first = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
   assert.ok(first.issues.some((issue) => issue.id === 'p3-pending'));
-  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await assert.doesNotReject(async () => f.bridge.callbacks.beforeRequest?.());
   await call(f.bridge, 'intake_read', { id: f.item.id, offset: 12000 });
   const next = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
   assert.notEqual(next.id, first.id);
   assert.ok(!next.issues.some((issue) => issue.id === 'p3-pending'));
-  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await assert.doesNotReject(async () => f.bridge.callbacks.beforeRequest?.());
   await call(f.bridge, 'intake_source_text', { id: f.item.id, revisionId: next.id });
-  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await assert.doesNotReject(async () => f.bridge.callbacks.beforeRequest?.());
   reviewIntakeSourceText(
     f.db,
     f.root,
@@ -5133,7 +5223,7 @@ test('host source capture advances multi-page reads without waiving fresh passag
     },
     'fictional-owner',
   );
-  assert.throws(() => f.bridge.callbacks.beforeRequest?.(), /Source text changed/);
+  await assert.rejects(async () => f.bridge.callbacks.beforeRequest?.(), /Source text changed/);
 });
 
 test('host source capture cannot rebase a human correction that preceded its next page read', async (t) => {
@@ -5174,7 +5264,7 @@ test('host source capture cannot rebase a human correction that preceded its nex
     next.spans.filter((span) => span.region.page === 1),
     corrected.revision!.spans.filter((span) => span.region.page === 1),
   );
-  assert.throws(() => f.bridge.callbacks.beforeRequest?.(), /Source text changed/);
+  await assert.rejects(async () => f.bridge.callbacks.beforeRequest?.(), /Source text changed/);
 });
 
 test('host source capture does not substitute for reading the new durable passage before proposing', async (t) => {
@@ -5187,7 +5277,7 @@ test('host source capture does not substitute for reading the new durable passag
   const { getIntakeSourceText } = await import('../intake-source-text.ts');
   await call(f.bridge, 'intake_read', { id: f.item.id, offset: 12000 });
   const next = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
-  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await assert.doesNotReject(async () => f.bridge.callbacks.beforeRequest?.());
   await assert.rejects(
     call(f.bridge, 'intake_propose', {
       id: f.item.id,
@@ -5250,7 +5340,7 @@ for (const extension of ['txt', 'json'])
     const current = getIntakeSourceText(f.db, f.root, 'cedar', first.sourceFileId).revision!;
     assert.notEqual(current.id, read.revisionId);
     assert.ok(!current.issues.some((issue) => /^p\d+-pending$/.test(issue.id)));
-    assert.doesNotThrow(() => bridge.callbacks.beforeRequest?.());
+    await assert.doesNotReject(async () => bridge.callbacks.beforeRequest?.());
   });
 
 test('default-on diagnostics retain the precise wrapped batch validation failure without document text', async (t) => {
@@ -5503,7 +5593,7 @@ async function eligibleCountedAcceptanceRace(
 
 test('a user review during model work requires a fresh plan before the same batch can remain pending', async (t) => {
   const f = await linkedFictionalBatchConversion(t);
-  const asked = askIntakeQuestion(f.db, f.root, 'cedar', f.item.id, {
+  const asked = await askIntakeQuestionRead(f.db, f.root, 'cedar', f.item.id, {
     version: f.batch.version,
     operationId: 'fictional-question-before-model-work',
     key: 'fictional-user-review-question',
@@ -5511,11 +5601,23 @@ test('a user review during model work requires a fresh plan before the same batc
     locator: 'fictional line 1',
   });
   f.batch.version = asked.version;
-  const question = required(required(asked.workflow).questions.at(-1));
-  answerIntakeQuestion(f.db, f.root, 'cedar', f.item.id, {
+  const questionView = openIntakeCollectionEnvelope(f.db, { id: f.item.id }),
+    questionWorkflow = required(
+      questionView.child(required(questionView.child(questionView.root(), 'intake')), 'workflow'),
+    ),
+    question = required(
+      questionView.childAt(
+        questionWorkflow,
+        'questions',
+        questionView.childCount(questionWorkflow, 'questions') - 1,
+      ),
+    ),
+    questionId = questionView.field(question, 'id', { bytes: 8192 });
+  assert.ok(questionId.kind === 'value' && typeof questionId.value === 'string');
+  await answerIntakeQuestionRead(f.db, f.root, 'cedar', f.item.id, {
     version: f.batch.version,
     operationId: 'fictional-user-review-answer',
-    questionId: question.id,
+    questionId: questionId.value,
     answer: 'Yes, the fictional reviewer inspected the displayed source evidence.',
   });
 
@@ -5533,32 +5635,27 @@ test('a user review during model work requires a fresh plan before the same batc
   assert.equal(f.chat.status, 'running');
   assert.equal(f.bridge.closed, false);
   assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
-  assert.ok(
-    workflowOperationIds(getIntake(f.db, f.root, 'cedar', f.item.id)).includes(
-      'fictional-user-review-answer',
-    ),
-  );
-  assert.ok(
-    !workflowOperationIds(getIntake(f.db, f.root, 'cedar', f.item.id)).includes(
-      f.batch.operationId,
-    ),
-  );
+  assert.ok(selectedWorkflowHasOperation(f.db, f.item.id, 'fictional-user-review-answer'));
+  assert.ok(!selectedWorkflowHasOperation(f.db, f.item.id, f.batch.operationId));
   assert.equal(sqlNumber(f.db.prepare('SELECT count(*) n FROM observations').get(), 'n'), 0);
 
-  const refreshed = await call(f.bridge, 'intake_plan', {
+  const refreshed = await call<NativeModelContext>(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'read',
     freshStart: true,
     section: 'units',
     offset: 0,
   });
-  assert.equal(refreshed.contextStart?.kind, 'fresh_section_v1');
-  assert.equal(refreshed.version, getIntakeRead(f.db, f.root, 'cedar', f.item.id).version);
-  await call(f.bridge, 'intake_batch', { ...f.batch, version: refreshed.version });
+  assert.equal(refreshed.format, 'health-intake-model-context-v2');
+  assert.equal(refreshed.section, 'units');
+  assertNativeModelPins(refreshed.pins);
+  assert.equal(refreshed.pins.sourceId, f.item.id);
+  assert.equal(refreshed.pins.sourceHash, f.item.sha256);
+  assert.equal(refreshed.pins.version, getIntakeRead(f.db, f.root, 'cedar', f.item.id).version);
+  await call(f.bridge, 'intake_batch', { ...f.batch, version: refreshed.pins.version });
 
-  const retained = getIntake(f.db, f.root, 'cedar', f.item.id);
-  assert.equal(retained.proposals.length, 1);
-  assert.ok(workflowOperationIds(retained).includes(f.batch.operationId));
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);
+  assert.ok(selectedWorkflowHasOperation(f.db, f.item.id, f.batch.operationId));
   assert.equal(sqlNumber(f.db.prepare('SELECT count(*) n FROM observations').get(), 'n'), 0);
   assert.equal(sqlNumber(f.db.prepare('SELECT count(*) n FROM source_records').get(), 'n'), 0);
   f.assistant.cancel('cedar', f.chat.id);
@@ -7038,7 +7135,7 @@ test('a deferred model proposal survives an unrelated append but rejects a later
         },
         async turn() {
           const currentTurn = turn++;
-          callbacks.beforeRequest?.();
+          await callbacks.beforeRequest?.();
           callbacks.onEvent?.('turn/started', { turn: { id: `deferred-${currentTurn}` } });
           const passage = (await callbacks.onTool?.({
             tool: 'health_intake_source_text',
@@ -7181,7 +7278,7 @@ test('a passage read cannot erase a human correction that arrived during a provi
   const f = await linkedFictionalBatchConversion(t, {}, undefined, encryptedRecordStorage(t));
   const { getIntakeSourceText, reviewIntakeSourceText } = await import('../intake-source-text.ts');
   const prior = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
-  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await assert.doesNotReject(async () => f.bridge.callbacks.beforeRequest?.());
   reviewIntakeSourceText(
     f.db,
     f.root,
@@ -7320,7 +7417,7 @@ test('approving unchanged source text during conversion neither restarts reading
     'fictional-owner',
   );
   assert.notEqual(approved.revision!.id, prior.id);
-  assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
+  await assert.doesNotReject(async () => f.bridge.callbacks.beforeRequest?.());
   await call(f.bridge, 'intake_batch', f.batch);
   assert.equal(f.chat.status, 'running');
   assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);

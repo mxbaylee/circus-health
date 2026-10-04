@@ -1,6 +1,10 @@
 import { launchBrowser, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
-import { fixtureApi, fixtureAssertNoAccepted } from './native-intake-fixture.ts';
+import {
+  fixtureApi,
+  fixtureAssertNoAccepted,
+  fixtureBrowserResponse,
+} from './native-intake-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -112,7 +116,18 @@ test(
     await open(second);
     await second.getByRole('textbox', { name: /Passage 1/ }).waitFor();
     await passage.fill(original + '\nHuman verified missing administrative annotation.');
+    const savedCorrection = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          `${prefix}/intakes/${encodeURIComponent(intake.id)}/source-text` &&
+        response.request().postDataJSON().action === 'correct',
+    );
     await page.getByRole('button', { name: 'Save transcription correction', exact: true }).click();
+    const correctionResponse = await savedCorrection;
+    assert.equal(correctionResponse.status(), 200, await correctionResponse.text());
+    assert.equal(await correctionResponse.finished(), null);
     await page
       .getByText(
         'Correction saved. Other source questions remain until you explicitly inspect this page. Accepted clinical record versions are unchanged.',

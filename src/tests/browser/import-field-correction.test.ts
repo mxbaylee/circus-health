@@ -1,6 +1,11 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
-import { fixtureDestinations, fixtureAssertNoAccepted } from './native-intake-fixture.ts';
+import {
+  fixtureDestinations,
+  fixtureAssertNoAccepted,
+  fixtureNativeFeedReady,
+  fixtureBrowserResponse,
+} from './native-intake-fixture.ts';
 import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -188,7 +193,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         ].join('\n'),
       });
       await page.goto(url + '/#/import');
-      await page.reload();
+      await fixtureNativeFeedReady(page, prefix, () => page.reload());
       await page.getByRole('button', { name: 'Review', exact: true }).waitFor();
       if (!wrongKind) {
         assert.match(await page.locator('.import-record-row').innerText(), /Value to review/);
@@ -199,6 +204,20 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       await page.getByRole('button', { name: 'Review', exact: true }).click();
       assert.equal(new URL(page.url()).hash, '#/import');
       const inline = page.locator('.import-record-accordion');
+      const updateCorrection = async () => {
+        const saved = fixtureBrowserResponse(
+          page,
+          (response) =>
+            response.request().method() === 'POST' &&
+            new URL(response.url()).pathname ===
+              `${prefix}/intakes/${encodeURIComponent(intake.id)}/review-draft`,
+        );
+        await inline.getByRole('button', { name: 'Update', exact: true }).click();
+        const response = await saved;
+        assert.equal(response.status(), 200, await response.text());
+        assert.equal(await response.finished(), null);
+        await inline.waitFor({ state: 'detached' });
+      };
       await inline.getByRole('img', { name: 'cookie-doe-lab.pdf, page 2 of 2' }).waitFor();
       if (wrongKind) {
         await inline.getByLabel('Document text', { exact: true }).waitFor();
@@ -226,8 +245,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       }
       if (partial) {
         await inline.getByRole('textbox', { name: 'Test name', exact: true }).fill('Potassium');
-        await inline.getByRole('button', { name: 'Update', exact: true }).click();
-        await inline.waitFor({ state: 'detached' });
+        await updateCorrection();
         await page.reload();
         await page.getByRole('button', { name: 'Review', exact: true }).waitFor();
         assert(
@@ -244,8 +262,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         await inline
           .getByRole('textbox', { name: 'Correction reason' })
           .fill('Date verified against the original');
-        await inline.getByRole('button', { name: 'Update', exact: true }).click();
-        await inline.waitFor({ state: 'detached' });
+        await updateCorrection();
         await page.reload();
         assert(
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
@@ -257,8 +274,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       await inline.getByRole('textbox', { name: 'Result', exact: true }).fill('4.1');
       if (screenshots && dateAndValue)
         await inline.screenshot({ path: resolve(screenshots, 'potassium-correction-reason.png') });
-      await inline.getByRole('button', { name: 'Update', exact: true }).click();
-      await inline.waitFor({ state: 'detached' });
+      await updateCorrection();
       if (partial) {
         await page.reload();
         await page.getByRole('button', { name: 'Review', exact: true }).waitFor();
@@ -271,8 +287,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         for (const label of ['Test name', 'Result', 'Unit', 'Date'])
           assert.equal(await inline.getByLabel(label, { exact: true }).count(), 1);
         await inline.getByRole('textbox', { name: 'Unit', exact: true }).fill('mmol/L');
-        await inline.getByRole('button', { name: 'Update', exact: true }).click();
-        await inline.waitFor({ state: 'detached' });
+        await updateCorrection();
       }
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
       await page.reload();
@@ -292,6 +307,17 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           selected.detail.kind === 'record'
             ? selected.detail.record.id
             : selected.detail.selection.recordId;
+        const reopeningSince = Date.now();
+        const reopenedRead = fixtureBrowserResponse(page, (response) => {
+          const selected = new URL(response.url());
+          return (
+            response.request().method() === 'GET' &&
+            response.request().timing().startTime >= reopeningSince &&
+            selected.pathname ===
+              `${prefix}/intakes/${encodeURIComponent(intake.id)}/review-record` &&
+            selected.searchParams.get('recordId') === recordId
+          );
+        });
         await page.goto(
           url +
             '/#/import?' +
@@ -302,6 +328,24 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
               proposal: selected.proposalId || 'original',
             }),
         );
+        const reopenedResponse = await reopenedRead;
+        assert.equal(reopenedResponse.status(), 200, await reopenedResponse.text());
+        assert.equal(await reopenedResponse.finished(), null);
+        const reopened = (await reopenedResponse.json())
+          .data as import('../../shared/intake-clinical-review.ts').IntakeClinicalRecordRead;
+        assert.equal(reopened.format, 'health-intake-clinical-record-v2');
+        assert.equal(reopened.record.kind, 'record');
+        assert.equal(reopened.context.proposalId, selected.proposalId);
+        if (reopened.record.kind === 'record') {
+          assert.equal(reopened.record.record.id, recordId);
+          assert.equal(reopened.record.record.mapping.valueText, '4.1');
+          assert.equal(
+            reopened.record.record.candidateVersionId,
+            selected.detail.kind === 'record'
+              ? selected.detail.record.candidateVersionId
+              : selected.detail.selection.candidateVersionId,
+          );
+        }
         await page
           .locator('.import-record-accordion')
           .getByRole('img', { name: 'cookie-doe-lab.pdf, page 2 of 2' })
@@ -327,7 +371,24 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       }
       await page.getByRole('button', { name: 'Review', exact: true }).click();
       await inline.waitFor();
+      const acceptedResponse = fixtureBrowserResponse(
+        page,
+        (response) =>
+          response.request().method() === 'POST' &&
+          new URL(response.url()).pathname === prefix + '/intakes/report-acceptance',
+      );
       await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+      const accepted = await acceptedResponse;
+      assert.equal(accepted.status(), 200, await accepted.text());
+      assert.equal(await accepted.finished(), null);
+      const result = (await accepted.json())
+        .data as import('../../shared/intake.ts').IntakeReportAcceptanceResult;
+      assert.equal(result.receipt.operationId, accepted.request().postDataJSON().operationId);
+      assert.equal(result.receipt.selectedCount, 1);
+      assert.equal(result.receipt.acceptedCount, 1);
+      assert.equal(result.receipt.receipts.length, 1);
+      assert.equal(result.receipt.receipts[0]!.intakeId, intake.id);
+      assert.equal(result.receipt.receipts[0]!.records.length, 1);
       await inline.waitFor({ state: 'detached' });
       assert.equal(await page.locator('.import-record-row').count(), 0);
       await page

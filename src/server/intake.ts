@@ -35,6 +35,7 @@ import { reviewRecordQuestions } from './intake-review-question-selection.ts';
 import { selectedReportGroups } from './intake-selected-report-groups.ts';
 import { selectionAuthority, durableSelectionInputs } from './intake-selection-authority.ts';
 import { observeIntakePairPreparation } from './intake-pair-preparation.ts';
+import type { IntakeReviewDraftTransition } from '../shared/intake-review-draft-transition.ts';
 import { intakePairScope, nativeDuplicateRecord } from './duplicate-review.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { observeIntakeVersion, intakeVersionConflictFacts } from './import-version-diagnostics.ts';
@@ -4612,6 +4613,7 @@ export async function saveIntakeReviewDraftRead(
   if (retainedIntakeWorkflowCommand(db, file, { operationId: input.operationId, request }))
     return response();
   checkVersion(db, file, input.version);
+  const pairEntryRevision = revision(db);
   const pairPreparation = observeIntakePairPreparation(db);
   try {
     return await withVerifiedIntakeOriginalDescriptor(
@@ -4802,6 +4804,7 @@ export async function saveIntakeReviewDraftRead(
               { ...calculated.decision, comparisons },
             );
           }
+          let draftTransition: IntakeReviewDraftTransition | undefined;
           try {
             const prepared = await prepareIntakeWorkflowCommand(db, file, {
               version: input.version,
@@ -4941,11 +4944,13 @@ export async function saveIntakeReviewDraftRead(
                 ];
               },
             });
-            if (!prepared.replayed)
+            if (!prepared.replayed) {
+              let beforeCommit: number | undefined;
               intakeTransaction(
                 db,
                 () => {
                   assertRunning();
+                  beforeCommit = revision(db);
                   prepared.assertCurrent();
                   context.assertCurrent();
                   history.assertCurrent();
@@ -4955,10 +4960,34 @@ export async function saveIntakeReviewDraftRead(
                 },
                 { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
               );
+              if (beforeCommit !== undefined && revision(db) === beforeCommit + 1)
+                draftTransition = {
+                  format: 'health-intake-own-draft-transition-v1',
+                  profileId,
+                  intakeId: id,
+                  proposalId: input.proposalId || null,
+                  recordId: record.id,
+                  candidateId: record.candidateId!,
+                  candidateVersionId: record.candidateVersionId!,
+                  operationId: input.operationId,
+                  fromVersion: input.version,
+                  toVersion: input.version + 1,
+                  fromRevision: pairEntryRevision,
+                  toRevision: beforeCommit + 1,
+                };
+            }
           } finally {
             if (projection) disposePreparedClinicalProjection(projection);
           }
-          return response();
+          const result = response();
+          return {
+            ...result,
+            ...(draftTransition &&
+            result.version === draftTransition.toVersion &&
+            revision(db) === draftTransition.toRevision
+              ? { reviewDraftTransition: draftTransition }
+              : {}),
+          };
         } finally {
           selected.session.close();
         }

@@ -102,6 +102,7 @@ import {
   recordConversionRead,
   deferConversionRead,
   conversionResumeContext as legacyConversionResumeContext,
+  conversionResumeInstructions,
   conversionReadingState as legacyConversionReadingState,
   recordConversionPageTiming,
   conversionReadKey,
@@ -1968,7 +1969,11 @@ export function createAssistant({
       throw Error('Conversion checkpoint representation changed');
     return legacyConversionReadingState(checkpoint, intake, reason);
   };
-  const conversionResumeContext = (checkpoint: ConversionCheckpoint, intake: ConversionIntake) => {
+  const conversionResumeContext = (
+    checkpoint: ConversionCheckpoint,
+    intake: ConversionIntake,
+    automatic = false,
+  ) => {
     if (isNativeAssistantCheckpoint(checkpoint) && isNativeAssistantConversion(intake)) {
       const resume = nativeAssistantResume(
         intake,
@@ -1977,6 +1982,7 @@ export function createAssistant({
       );
       return {
         ...resume,
+        instructions: conversionResumeInstructions(automatic),
         pendingUnits: resume.reading.remainingUnits,
         pendingReadWindows: resume.reading.pendingReadWindows,
       };
@@ -5087,7 +5093,7 @@ export function createAssistant({
                         pendingUnits: nativeProgress.resume.reading.remainingUnits,
                         pendingReadWindows: nativeProgress.resume.reading.pendingReadWindows,
                       }
-                    : conversionResumeContext(checkpoint, current);
+                    : conversionResumeContext(checkpoint, current, !!options.beforeModelRequest);
                   const accounted = !isNativeAssistantConversion(current)
                     ? accountedIntakeUnitIds(current)
                     : [];
@@ -5244,6 +5250,7 @@ export function createAssistant({
                 ...conversionResumeContext(
                   checkpoint,
                   required(conversionIntake(profileId, chat), 'Source missing'),
+                  !!options.beforeModelRequest,
                 ),
                 ...(isNativeAssistantCheckpoint(checkpoint)
                   ? {}
@@ -5253,8 +5260,9 @@ export function createAssistant({
                       currentWindow: null,
                       nextReadWindows: [],
                     }),
-                instructions:
-                  'Read the dispatched unit using the scoped host tools and supporting source-text pages. Publish only with health_intake_batch and this unit coverage. Retained candidate versions and receipts are available through paginated plan reads. Never accept/import.',
+                instructions: options.beforeModelRequest
+                  ? 'Read the dispatched unit using the scoped host tools and supporting source-text pages. Publish only with health_intake_batch and this unit coverage. Retained candidate versions and receipts are available through paginated plan reads. Never accept/import.'
+                  : conversionResumeInstructions(false),
               },
             }
           : chat.context?.intakeRepair
@@ -5305,6 +5313,7 @@ export function createAssistant({
                           conversionIntake(profileId, chat),
                           'This conversion is no longer linked to the selected delivery',
                         ),
+                        !!options.beforeModelRequest,
                       ),
                     }
                   : {}),

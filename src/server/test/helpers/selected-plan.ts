@@ -10,23 +10,28 @@ export function selectedFixturePlan(
   root: string,
   profileId: string,
   id: string,
+  options: { planId?: string } = {},
 ) {
   const header = getIntakeRead(db, root, profileId, id);
   assert.ok(isIntakeSummary(header), 'automatic dispatch uses native selected authority');
   if (header.activePlan.plan?.format === 'health-intake-package-plan-v2') {
-    const scope = readPackagePlanScope(db, root, profileId, id)!;
+    const scope = readPackagePlanScope(db, root, profileId, id, options)!;
     assert.ok(scope.plan.unitCount <= 100, 'bounded fictional package');
     return {
       id: scope.planId,
+      pins: scope.plan.pins,
+      plan: scope.plan,
       units: Array.from(scope.inventory.range({ offset: 0, limit: 100 })).map((member) =>
         scope.unit(member.memberId)!,
       ),
     };
   }
-  const scope = readDirectPlanScope(db, profileId, id)!;
+  const scope = readDirectPlanScope(db, profileId, id, options)!;
   assert.ok(scope.unitCount <= 100, 'bounded fictional direct plan');
   return {
     id: scope.planId,
+    pins: scope.plan.pins,
+    plan: scope.plan,
     units: Array.from({ length: scope.unitCount }, (_, i) => scope.unitAt(i)!),
   };
 }

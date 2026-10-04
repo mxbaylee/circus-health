@@ -1,3 +1,4 @@
+import { fixtureNativeFeedReady } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
@@ -110,7 +111,7 @@ test(
       }),
     });
     await page.goto(url + '/#/import');
-    await page.reload();
+    await fixtureNativeFeedReady(page, prefix, () => page.reload());
     await page.getByText('Fictional link measure', { exact: true }).waitFor();
     const openAndCheck = async (link: Locator) => {
       const openerUrl = page.url();

@@ -85,6 +85,27 @@ async function fixture(
     newProviderName: 'Invented Clinic',
   });
   if (nativeProposal) await buildIntakeCollectionEnvelope(db, { id: original.id });
+  // Native ordinary-import qualification starts the verified contributor app
+  // before publishing the proposal. Separate recovery fixtures retain cold
+  // startup after publication and qualify reconstruction explicitly.
+  const startApp = async () => {
+    const app = createApp({
+      root,
+      databases: new Map([[profileId, db]]),
+      intakeBatchOptions: { authorized: () => false },
+    });
+    await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+    const address = app.server.address();
+    assert.ok(address && typeof address === 'object');
+    const base = `http://127.0.0.1:${address.port}/api/profiles/${profileId}/intakes/${encodeURIComponent(original.id)}/`;
+    t.after(() => {
+      app.close();
+      if (db.isOpen) db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    return { app, base };
+  };
+  const started = nativeProposal ? await startApp() : undefined;
   const proposed = await (nativeProposal ? proposeConversionRead : proposeConversion)(
     db,
     root,
@@ -108,20 +129,7 @@ async function fixture(
       })()
     : getIntake(db, root, profileId, original.id).workflow!.reportGroups![0]!.id;
   if (native && !nativeProposal) await buildIntakeCollectionEnvelope(db, { id: original.id });
-  const app = createApp({
-    root,
-    databases: new Map([[profileId, db]]),
-    intakeBatchOptions: { authorized: () => false },
-  });
-  await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
-  const address = app.server.address();
-  assert.ok(address && typeof address === 'object');
-  const base = `http://127.0.0.1:${address.port}/api/profiles/${profileId}/intakes/${encodeURIComponent(original.id)}/`;
-  t.after(() => {
-    app.close();
-    if (db.isOpen) db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
+  const { app, base } = started || (await startApp());
   const request = async (action: string, input?: unknown, status = 200) => {
     const response = await fetch(
       base + action,
@@ -413,8 +421,13 @@ test('native common identity preserves a complete giant competing-subject questi
     undefined,
     true,
   );
+  // This fixture opens only identity/snapshot endpoints; no public clinical
+  // read session is intentionally retained. These counts track identity-owned cleanup.
+  const beforeWork = intakeWorkCounters(f.db).warm,
+    beforeScratch = reviewIssueScratchCounts(f.db);
   const review = await f.review(),
     scope = review.scopeReference!;
+  assert.deepEqual(reviewIssueScratchCounts(f.db), beforeScratch);
   assert.equal(review.confirmationCount, 0);
   assert.ok(scope);
   assert.equal(scope.collection.assignmentTargets, 1);
@@ -467,6 +480,11 @@ test('native common identity preserves a complete giant competing-subject questi
   assert.equal(after.blocking, false);
   assert.equal(after.confirmationCount, 1);
   await f.request('identity-scope', input);
+  const afterWork = intakeWorkCounters(f.db).warm;
+  assert.equal(afterWork.sourceDTOHydrations, beforeWork.sourceDTOHydrations);
+  assert.equal(afterWork.envelopeHydrations, beforeWork.envelopeHydrations);
+  assert.equal(afterWork.envelopeTextReads, beforeWork.envelopeTextReads);
+  assert.deepEqual(reviewIssueScratchCounts(f.db), beforeScratch);
 });
 
 // This durable fixture confirms >256 KiB of independent witnesses, reconstructs

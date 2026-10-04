@@ -195,7 +195,7 @@ export function ImportPage() {
     const selection = new URLSearchParams(selectionQuery);
     const groupId = selection.get('group') || selection.get('report');
     const intakeId = selection.get('intake');
-    const params = new URLSearchParams({ view, state, limit: '100' });
+    const params = new URLSearchParams({ view, state, limit: '40', bytes: '65536' });
     if ((groupId || intakeId) && !selection.has('person')) {
       params.set('view', 'all');
       params.delete('state');
@@ -2026,6 +2026,7 @@ export function ImportPage() {
         selectionLoading={activeHistoricalSelection?.loading}
         selectionError={activeHistoricalSelection?.error}
         path={feedPath}
+        firstPage={feed}
         onChanged={feed.reload}
         sourceProps={sourceReviewProps}
         onUpload={upload}

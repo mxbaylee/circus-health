@@ -659,6 +659,13 @@ export function collectionWorkflowReviewScope(input: {
         return result;
       }
       const resolve = (): WorkflowReviewGroup | undefined => {
+        // The first retained ID match is also the first complete predicate match when
+        // it contains this version. Address it through the complete index before
+        // considering later repeated IDs; normal unique groups need no namespace scan.
+        const first = groupRecord(reference.groupId);
+        if (first)
+          for (const version of children(first, 'versions'))
+            if (value(version, 'id') === reference.groupVersionId) return groupHeader(first);
         // Legacy .find includes the version predicate, so a later repeated group ID can qualify.
         for (const record of groupRecords()) {
           if (value(record, 'id') !== reference.groupId) continue;

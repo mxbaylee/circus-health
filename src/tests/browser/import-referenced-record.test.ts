@@ -6,7 +6,12 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
-import { fixtureApi, fixtureDestinations, fixtureSourcePath } from './native-intake-fixture.ts';
+import {
+  fixtureApi,
+  fixtureDestinations,
+  fixtureSourcePath,
+  fixtureBrowserResponse,
+} from './native-intake-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
 import type {
@@ -119,7 +124,8 @@ test(
       record: recordId,
       review: 'full',
     });
-    const initialResponse = page.waitForResponse(
+    const initialResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         new URL(response.url()).pathname.endsWith('/review-record') &&
         new URL(response.url()).searchParams.get('recordId') === recordId &&
@@ -142,7 +148,8 @@ test(
     const chunks: Buffer[] = [];
     let offset: number | null = 0;
     do {
-      const nextResponse = page.waitForResponse(
+      const nextResponse = fixtureBrowserResponse(
+        page,
         (response) =>
           new URL(response.url()).pathname.endsWith('/review-fragment') &&
           response.ok() &&
@@ -186,10 +193,12 @@ test(
     assert.equal(retainedDraft.candidateVersionId, selected.selection.candidateVersionId);
     assert.equal(retainedDraft.mapping.text, documentText);
     await save.and(page.locator(':enabled')).waitFor();
-    const freshResponse = page.waitForResponse(
+    const freshResponse = fixtureBrowserResponse(
+      page,
       (response) => new URL(response.url()).pathname.endsWith('/review-record') && response.ok(),
     );
-    const acceptedResponse = page.waitForResponse(
+    const acceptedResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         new URL(response.url()).pathname.endsWith('/intakes/report-acceptance') &&
         response.request().method() === 'POST',

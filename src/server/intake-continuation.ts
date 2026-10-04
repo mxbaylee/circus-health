@@ -627,10 +627,15 @@ export function conversionResumeContext(
         }
       : {}),
     proposalIds: intake.proposals.slice(-10).map((proposal) => proposal.id),
-    instructions: checkpoint.activeUnitId
-      ? 'This automatic slice owns only the listed remainingUnit. Use health_intake_plan read_unit for its literal text or page/member coordinates, then read its exact pages/member and current supportingSourcePages with health_intake_source_text passage. Publish through health_intake_batch with only this unit coverage and current source-text revision. Do not use health_intake_propose, create/replace plans, search/follow other source units or retarget a source. Other units remain queued for later contexts. Read_member may return a verified retained child sourceFileId for this member. Paginated plan reads may retrieve candidate/receipt metadata. Retain all distinct records and honest partial coverage; never accept/import.'
-      : 'Resume this conversion without a greeting or introduction. Read cursors describe reading only, never extraction completion. When the latest user message explicitly prioritizes a different supplied section, inspect that section first and keep unfinished windows pending. Otherwise finish and publish all unproposed records from the current window before moving on; preserve stable source IDs and locators and do not repeat the first record. Inspect the remaining child pointers/pages, including every record in a large JSON array. Use one bounded proposal for multiple fully read records when practical, rather than one proposal per small record. Publish bounded batches and honest partial coverage; one proposal or a fully read window does not prove all entities were extracted. Do not accept/import. If progress is blocked, explain the blocker briefly.',
+    instructions: conversionResumeInstructions(!!checkpoint.activeUnitId),
   };
+}
+
+/** The host admission mode, not a selected native ledger unit, chooses the scope. */
+export function conversionResumeInstructions(automatic: boolean): string {
+  return automatic
+    ? 'This automatic slice owns only the listed remainingUnit. Use health_intake_plan read_unit for its literal text or page/member coordinates, then read its exact pages/member and current supportingSourcePages with health_intake_source_text passage. Publish through health_intake_batch with only this unit coverage and current source-text revision. Do not use health_intake_propose, create/replace plans, search/follow other source units or retarget a source. Other units remain queued for later contexts. Read_member may return a verified retained child sourceFileId for this member. Paginated plan reads may retrieve candidate/receipt metadata. Retain all distinct records and honest partial coverage; never accept/import.'
+    : 'Resume this conversion without a greeting or introduction. Read cursors describe reading only, never extraction completion. When the latest user message explicitly prioritizes a different supplied section, inspect that section first and keep unfinished windows pending. Otherwise finish and publish all unproposed records from the current window before moving on; preserve stable source IDs and locators and do not repeat the first record. Inspect the remaining child pointers/pages, including every record in a large JSON array. Use one bounded proposal for multiple fully read records when practical, rather than one proposal per small record. Publish bounded batches and honest partial coverage; one proposal or a fully read window does not prove all entities were extracted. Do not accept/import. If progress is blocked, explain the blocker briefly.';
 }
 
 /** Observed completion intervals reset with the actual model context, not a percentage estimate. */

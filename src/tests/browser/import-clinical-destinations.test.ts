@@ -271,14 +271,16 @@ test(
           : receipt.kind === 'procedure'
             ? 'Fictional Sunrise guided imaging'
             : 'Fictional Sunrise retained report';
-      const exactLink = page
-        .locator('.import-detail-record-link:not([data-saved-record-id])')
-        .filter({ hasText: expectedTitle });
+      const exactLink = page.locator(
+        `.import-detail-record-link:not([data-saved-record-id])[href*='record=${encodeURIComponent(receipt.recordId)}']`,
+      );
       await exactLink.waitFor();
       assert.match(
         (await exactLink.getAttribute('href')) || '',
         new RegExp('record=' + encodeURIComponent(receipt.recordId)),
       );
+      await exactLink.click();
+      await page.getByRole('heading', { name: expectedTitle, exact: true }).waitFor();
     }
 
     await page.goto(

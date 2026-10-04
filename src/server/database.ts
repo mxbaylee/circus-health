@@ -194,6 +194,47 @@ export function rejectCurrentTransaction(db: DatabaseSync, error: unknown): void
   transactionFailures.set(db, error);
 }
 const outcomeObservers = new WeakMap<DatabaseSync, Set<(outcome: TransactionOutcome) => void>>();
+const closeObservers = new WeakMap<DatabaseSync, Set<() => void>>();
+/** Dispose connection-owned resources after actual close, including explicit
+ * resource management. Cleanup cannot replace the native close result or
+ * prevent another observer from releasing its resources. */
+export function observeDatabaseClose(db: DatabaseSync, observer: () => void): () => void {
+  if (!db.isOpen) throw Error('Cannot observe a closed database');
+  let observers = closeObservers.get(db);
+  if (!observers) {
+    closeObservers.set(db, (observers = new Set()));
+    const notify = () => {
+      if (db.isOpen) return;
+      const pending = [...(closeObservers.get(db) ?? [])];
+      closeObservers.get(db)?.clear();
+      for (const cleanup of pending) {
+        try {
+          cleanup();
+        } catch {
+          /* Disposable cleanup cannot change the close acknowledgement. */
+        }
+      }
+    };
+    const close = db.close;
+    db.close = function () {
+      try {
+        return close.call(this);
+      } finally {
+        if (this === db) notify();
+      }
+    };
+    const dispose = db[Symbol.dispose];
+    db[Symbol.dispose] = function () {
+      try {
+        return dispose.call(this);
+      } finally {
+        if (this === db) notify();
+      }
+    };
+  }
+  observers.add(observer);
+  return () => observers.delete(observer);
+}
 const beforePublicationObservers = new WeakMap<DatabaseSync, Set<(token: object) => void>>();
 /** Read-only witnesses inspect the complete caller write set before owner
  * revision/durability bookkeeping. Observer failure can only suppress its own

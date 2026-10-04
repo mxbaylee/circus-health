@@ -6,9 +6,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { openDatabase } from '../database.ts';
+import { openDatabase, observeTransactionOutcome, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { createApp } from '../index.ts';
+import { readQualificationReview } from '../../scripts/qualification-intake-read.ts';
+import type { ClinicalRecordSectionPage } from '../../shared/intake-clinical-record-sections.ts';
+import type { IntakeEvidenceComparison } from '../../shared/intake.ts';
+import type { IntakeReviewDraftTransition } from '../../shared/intake-review-draft-transition.ts';
 import { refreshPairScopesAfterOwnDraft } from '../../app/features/intake/review-draft-pair-scope.ts';
 import type { ReviewDraftPairCommit } from '../../app/features/intake/review-draft-pair-scope.ts';
 import type {
@@ -18,7 +22,12 @@ import type {
   IntakeReviewDraftUpdate,
 } from '../../shared/intake.ts';
 
-for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] as const) {
+for (const change of [
+  'none',
+  'unrelated mutation',
+  'clinical mapping changed',
+  'ordinary write during preparation',
+] as const) {
   test(`real draft HTTP roundtrip refreshes only its own pair pins: ${change}`, async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'fictional-own-draft-pair-'));
     const profileId = 'cookie-dough';
@@ -40,6 +49,34 @@ for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] 
       const result = await response.json();
       assert.equal(response.status, status, JSON.stringify(result));
       return result as { data: T; meta: { revision: number }; error?: { code: string } };
+    }
+    async function review(path: string) {
+      const current = await readQualificationReview(
+        async <T>(page: string) => (await request<T>(page)).data,
+        path + '/review',
+      );
+      for (const record of current.records) {
+        const page = (
+          await request<ClinicalRecordSectionPage>(path + '/related-records', {
+            proposalId: current.proposalId,
+            recordId: record.id,
+            candidateVersionId: record.candidateVersionId,
+          })
+        ).data;
+        assert.equal(page.format, 'health-clinical-record-section-page-v1');
+        assert.equal(page.section, 'comparisons');
+        assert.equal(page.nextCursor, null, 'the small fictional pair is completely inspected');
+        assert.equal(page.items.length, page.total);
+        record.comparisons = page.items.map((item) => {
+          assert.equal(item.control.kind, 'pair');
+          assert.equal(item.detail.kind, 'value');
+          assert.ok(item.detail.kind === 'value');
+          const { comparison } = item.detail.value as { comparison: IntakeEvidenceComparison };
+          assert.ok(comparison);
+          return comparison;
+        });
+      }
+      return current;
     }
     async function upload(id: string, valueText: string) {
       const bytes = JSON.stringify({
@@ -98,12 +135,11 @@ for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] 
       ],
     });
     const first = await upload('fictional-first', '7.5');
-    const firstReview = (await request<IntakeReview>(`/${encodeURIComponent(first.id)}/review`))
-      .data;
+    const firstReview = await review(`/${encodeURIComponent(first.id)}`);
     await request('/report-acceptance', accept(firstReview));
     const second = await upload('fictional-second', '9.25');
     const path = `/${encodeURIComponent(second.id)}`;
-    const before = (await request<IntakeReview>(path + '/review')).data;
+    const before = await review(path);
     const record = before.records[0]!;
     assert.equal(record.comparisons!.length, 1);
     const decision: IntakeReviewDecision = {
@@ -131,7 +167,43 @@ for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] 
       answers: {},
       decision,
     };
-    const saved = await request<Intake>(path + '/review-draft', draft);
+    if (change === 'ordinary write during preparation') {
+      let intervened = false;
+      const stop = observeTransactionOutcome(db, (outcome) => {
+        if (outcome.intakeMaintenance && !intervened) {
+          intervened = true;
+          transaction(db, () => {});
+        }
+      });
+      try {
+        const rejected = await request(path + '/review-draft', draft, 409);
+        assert.equal(intervened, true);
+        assert.equal(rejected.error!.code, 'DUPLICATE_SCOPE_CHANGED');
+        assert.equal(rejected.data, undefined, 'failed preparation grants no transition');
+        assert.equal((await request<Intake>(path)).data.version, before.version);
+        assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+      } finally {
+        stop();
+      }
+      return;
+    }
+    type DraftResponse = Intake & { reviewDraftTransition?: IntakeReviewDraftTransition };
+    const saved = await request<DraftResponse>(path + '/review-draft', draft);
+    const transition = saved.data.reviewDraftTransition;
+    assert.ok(transition, 'a fresh native save acknowledges its exact preparation transition');
+    assert.equal(transition.operationId, draft.operationId);
+    assert.equal(transition.toRevision, saved.meta.revision);
+    assert.equal(transition.toVersion, saved.data.version);
+    assert.equal(
+      transition.fromRevision,
+      record.comparisons![0]!.scope!.format === 'intake-pair-scope-v2'
+        ? record.comparisons![0]!.scope!.requestRevision
+        : -1,
+    );
+    assert.ok(
+      transition.toRevision > transition.fromRevision + 1,
+      'fixture exercises certified maintenance',
+    );
     const commit: ReviewDraftPairCommit = {
       profileId,
       intakeId: second.id,
@@ -139,6 +211,7 @@ for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] 
       request: draft,
       version: saved.data.version,
       revision: saved.meta.revision,
+      transition,
     };
     if (change === 'unrelated mutation') await upload('fictional-unrelated', '101');
     if (change === 'clinical mapping changed') {
@@ -151,7 +224,7 @@ for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] 
         decision: { ...decision, mapping },
       });
     }
-    const fresh = (await request<IntakeReview>(path + '/review')).data;
+    const fresh = await review(path);
     const current = fresh.records[0]!;
     const stripped = Object.keys(decision.mapping).filter(
       (key) => !Object.hasOwn(current.draft!.mapping, key),
@@ -169,6 +242,19 @@ for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] 
     );
     const refreshed = refreshPairScopesAfterOwnDraft(profileId, fresh, current, decision, commit);
     if (change === 'none') {
+      const replay = await request<DraftResponse>(path + '/review-draft', draft);
+      assert.equal(
+        replay.data.reviewDraftTransition,
+        undefined,
+        'replay cannot manufacture own-write proof',
+      );
+      assert.equal(
+        refreshPairScopesAfterOwnDraft(profileId, fresh, current, decision, {
+          ...commit,
+          transition: undefined,
+        }),
+        decision,
+      );
       assert.deepEqual(refreshed.comparisons![0]!.scope, current.comparisons![0]!.scope);
       assert.notEqual(
         refreshed.comparisons![0]!.scope!.token,
@@ -179,12 +265,7 @@ for (const change of ['none', 'unrelated mutation', 'clinical mapping changed'] 
     } else {
       assert.equal(refreshed, decision);
       const rejected = await request('/report-acceptance', accept(fresh, refreshed), 409);
-      assert.equal(
-        rejected.error!.code,
-        change === 'clinical mapping changed'
-          ? 'ANSWER_REVIEW_REQUIRED'
-          : 'DUPLICATE_SCOPE_CHANGED',
-      );
+      assert.equal(rejected.error!.code, 'DUPLICATE_SCOPE_CHANGED');
       assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
     }
   });

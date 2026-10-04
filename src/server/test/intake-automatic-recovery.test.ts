@@ -128,7 +128,14 @@ function fixture(
         async start() {
           return { model: 'fictional', backend: 'synthetic' };
         },
-        async turn() {
+        async turn(prompt) {
+          if (mode === 'pdf' || mode === 'zip') {
+            const context = JSON.parse(prompt.slice(prompt.indexOf('{')));
+            assert.match(context.conversion.instructions, /This automatic slice owns only/);
+            assert.match(context.conversion.instructions, /only this unit coverage/);
+            assert.match(context.conversion.instructions, /never accept\/import/);
+            assert.doesNotMatch(context.conversion.instructions, /Otherwise finish and publish/);
+          }
           await callbacks.beforeRequest?.();
           const unit = selectedFixturePlan(db, root, profileId, source.id).units.find(
             (u) => !u.processingException,

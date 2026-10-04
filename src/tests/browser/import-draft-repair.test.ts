@@ -1,6 +1,11 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
-import { fixtureApi, fixtureProposalId, fixtureReview } from './native-intake-fixture.ts';
+import {
+  fixtureApi,
+  fixtureProposalId,
+  fixtureReview,
+  fixtureNativeFeedReady,
+} from './native-intake-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AppOptions } from '../../server/index.ts';
 import type { Browser } from 'playwright';
@@ -196,7 +201,7 @@ test(
     const proposedBody = await proposedResponse.json();
     assert(proposedResponse.ok(), JSON.stringify(proposedBody));
     await page.goto(url + '/#/import');
-    await page.reload();
+    await fixtureNativeFeedReady(page, prefix, () => page.reload());
     await page.getByText('Fictional original-only date', { exact: true }).waitFor();
     assert.match(await page.locator('body').innerText(), /Fictional original-only date/);
     await page

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import type { Page } from 'playwright';
+import type { Page, Response } from 'playwright';
 import type { IntakeReviewRecord } from '../../shared/intake.ts';
 import type {
   IntakeClinicalReviewContext,
@@ -176,4 +176,87 @@ export function fixtureSourcePath(prefix: string, contentUrl: string): string {
   if (contentUrl.startsWith(prefix + '/sources/')) return contentUrl;
   assert.match(contentUrl, /^\/api\/sources\//);
   return prefix + contentUrl.slice(4);
+}
+
+/** Await only the actual browser reads for the displayed native window. Cold
+ * preparation uses the journey's hang guard; subsequent UI assertions retain
+ * their normal short deadline. No server state is prewarmed through page.request. */
+export async function fixtureNativeFeedReady(
+  page: Page,
+  prefix: string,
+  action: () => Promise<unknown>,
+): Promise<CollectionImportFeed> {
+  const since = Date.now();
+  const observed: Response[] = [];
+  const current = (response: Response) =>
+    response.request().method() === 'GET' &&
+    response.request().timing().startTime >= since &&
+    new URL(response.url()).pathname.startsWith(prefix + '/intakes/');
+  const collect = (response: Response) => {
+    if (current(response)) observed.push(response);
+  };
+  page.on('response', collect);
+  const read = async (matches: (url: URL) => boolean) => {
+    const predicate = (response: Response) => current(response) && matches(new URL(response.url()));
+    const response =
+      observed.find(predicate) || (await page.waitForResponse(predicate, { timeout: 0 }));
+    assert.equal(response.status(), 200);
+    assert.equal(await response.finished(), null);
+    return (await response.json()).data;
+  };
+  try {
+    const feedRead = read((url) => url.pathname === prefix + '/intakes/import-feed');
+    await action();
+    const feed = (await feedRead) as CollectionImportFeed;
+    assert.equal(feed.format, 'health-intake-import-feed-v2');
+    const scopes = new Map<string, { intakeId: string; groupId: string; identity: boolean }>();
+    for (const row of feed.records)
+      scopes.set(JSON.stringify([row.intakeId, row.groupId]), {
+        intakeId: row.intakeId,
+        groupId: row.groupId,
+        identity: true,
+      });
+    const people = feed.people.groups[0];
+    if (people && !scopes.has(JSON.stringify([people.intakeId, people.groupId])))
+      scopes.set(JSON.stringify([people.intakeId, people.groupId]), { ...people, identity: false });
+    await Promise.all(
+      [...scopes.values()].flatMap((scope) => [
+        read(
+          (url) =>
+            url.pathname ===
+              prefix + '/intakes/report-queue/' + encodeURIComponent(scope.groupId) &&
+            url.searchParams.get('intakeId') === scope.intakeId,
+        ),
+        ...(scope.identity
+          ? [
+              read(
+                (url) =>
+                  url.pathname ===
+                    prefix +
+                      '/intakes/' +
+                      encodeURIComponent(scope.intakeId) +
+                      '/identity-review' && url.searchParams.get('groupId') === scope.groupId,
+              ),
+            ]
+          : []),
+      ]),
+    );
+    await page
+      .locator('.import-report-header')
+      .getByText('Opening report details…', { exact: true })
+      .first()
+      .waitFor({ state: 'hidden', timeout: 0 });
+    return feed;
+  } finally {
+    page.off('response', collect);
+  }
+}
+
+/** The public native read/write may prepare complete bounded dependency scopes.
+ * Keep the test hang guard while checking the actual response and UI separately. */
+export function fixtureBrowserResponse(
+  page: Page,
+  predicate: (response: Response) => boolean | Promise<boolean>,
+): Promise<Response> {
+  return page.waitForResponse(predicate, { timeout: 0 });
 }

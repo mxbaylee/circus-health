@@ -459,7 +459,7 @@ export function validateDraftMapping(
             key as keyof IntakeClinicalMapping,
             value,
           )
-        : JSON.stringify(value) !== JSON.stringify((baseline as UnknownRecord)[key]),
+        : canonicalLiteral(value) !== canonicalLiteral((baseline as UnknownRecord)[key]),
     )
   )
     throw new HttpError(

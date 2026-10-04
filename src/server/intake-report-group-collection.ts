@@ -3,8 +3,10 @@ import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete native report summaries. Pages never become a clinical decision scope. */
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError, clinicalReviewRevision, revision } from './database.ts';
-import { assertIntakeOwner } from './intake.ts';
+import { HttpError, clinicalReviewRevision, revision, observeDatabaseClose } from './database.ts';
+import { assertIntakeOwner, verifyIntakeOriginal } from './intake.ts';
+import { verifyIntakeFileHash } from './intake-files.ts';
+import { profileOriginal } from './profile-storage.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
 import {
@@ -212,6 +214,7 @@ export interface CollectionReviewRowCertificate {
 }
 const queueCaches = new Set<QueueCache>(),
   queueEpochs = new WeakMap<DatabaseSync, number>();
+const observedQueues = new WeakSet<DatabaseSync>();
 let queueClock = 0;
 function closeQueueCache(cache: QueueCache) {
   cache.closed = true;
@@ -221,6 +224,23 @@ function closeQueueCache(cache: QueueCache) {
 export function clearCollectionReportQueues(db: DatabaseSync) {
   queueEpochs.set(db, (queueEpochs.get(db) || 0) + 1);
   for (const cache of queueCaches) if (cache.db === db) closeQueueCache(cache);
+}
+export function clearCollectionQueueReviews(db: DatabaseSync) {
+  for (const cache of queueCaches) if (cache.db === db) cache.queue.resetReview();
+}
+function reserveQueueSlot() {
+  while (queueCaches.size >= 4) {
+    let oldest: QueueCache | undefined;
+    for (const prior of queueCaches)
+      if (!prior.users && (!oldest || prior.used < oldest.used)) oldest = prior;
+    if (!oldest)
+      throw new HttpError(
+        503,
+        'REPORT_QUEUE_BUSY',
+        'Other report windows are active; retry this window',
+      );
+    closeQueueCache(oldest);
+  }
 }
 function collectionQueueBinding(db: DatabaseSync, profileId: string) {
   const hash = createHash('sha256').update(
@@ -232,6 +252,22 @@ function collectionQueueBinding(db: DatabaseSync, profileId: string) {
 }
 /** Reuse an exact selected disposable join; no domain change is inferred from cache state. */
 export async function openCollectionReportQueue(db: DatabaseSync, root: string, profileId: string) {
+  try {
+    return await openCollectionReportQueueNow(db, root, profileId);
+  } catch (error) {
+    clearCollectionQueueReviews(db);
+    throw error;
+  }
+}
+async function openCollectionReportQueueNow(db: DatabaseSync, root: string, profileId: string) {
+  if (!observedQueues.has(db)) {
+    observeDatabaseClose(db, () => {
+      observedQueues.delete(db);
+      clearCollectionReportQueues(db);
+    });
+    observedQueues.add(db);
+  }
+  if (db.isTransaction) clearCollectionQueueReviews(db);
   const binding = collectionQueueBinding(db, profileId),
     epoch = queueEpochs.get(db) || 0;
   let cache = [...queueCaches].find(
@@ -268,22 +304,16 @@ export async function openCollectionReportQueue(db: DatabaseSync, root: string, 
     for (const prior of queueCaches)
       if (prior.db === db && prior.root === root && prior.profileId === profileId && !prior.users)
         closeQueueCache(prior);
-    while (queueCaches.size >= 4) {
-      let oldest: QueueCache | undefined;
-      for (const prior of queueCaches)
-        if (!prior.users && (!oldest || prior.used < oldest.used)) oldest = prior;
-      if (!oldest)
-        throw new HttpError(
-          503,
-          'REPORT_QUEUE_BUSY',
-          'Other report windows are active; retry this window',
-        );
-      closeQueueCache(oldest);
-    }
+    reserveQueueSlot();
     const queue = await buildCollectionReportQueue(db, root, profileId);
-    if ((queueEpochs.get(db) || 0) !== epoch || queue.binding !== binding) {
+    try {
+      if ((queueEpochs.get(db) || 0) !== epoch || queue.binding !== binding) throw changed();
+      // Other cold opens may have published while this preparation awaited IO.
+      // Recheck the global bound immediately before publishing this queue.
+      reserveQueueSlot();
+    } catch (error) {
       queue.close();
-      throw changed();
+      throw error;
     }
     cache = { db, root, profileId, binding, queue, users: 0, used: ++queueClock, closed: false };
     queueCaches.add(cache);
@@ -292,13 +322,40 @@ export async function openCollectionReportQueue(db: DatabaseSync, root: string, 
   cache.used = ++queueClock;
   let released = false;
   const selected = cache;
+  const verified = new Set<string>();
+  const rememberVerified = (id: string) => {
+    if (verified.size >= 32) verified.delete(verified.values().next().value!);
+    verified.add(id);
+  };
   return {
     ...selected.queue,
-    close() {
+    reviewMember(intakeId: string, member: CollectionReportQueueMember) {
+      if (released || selected.closed) throw changed();
+      try {
+        selected.queue.assertCurrent();
+        if (!verified.has(intakeId)) {
+          verifyIntakeOriginal(db, root, profileId, intakeId);
+          rememberVerified(intakeId);
+        }
+        if (member.proposalId && !verified.has(member.proposalId)) {
+          const file = db
+            .prepare('SELECT path,sha256,bytes FROM source_files WHERE id=?')
+            .get(member.proposalId) as { path: string; sha256: string; bytes: number } | undefined;
+          if (!file) throw changed();
+          verifyIntakeFileHash(profileOriginal(root, file.path, profileId), file);
+          rememberVerified(member.proposalId);
+        }
+        return selected.queue.reviewMember(intakeId, member);
+      } catch (error) {
+        selected.queue.resetReview();
+        throw error;
+      }
+    },
+    close(options: { retainReview?: boolean } = {}) {
       if (released) return;
       released = true;
       selected.users--;
-      selected.queue.resetReview();
+      selected.queue.releaseReview(options.retainReview === true);
     },
     assertCurrent() {
       if (released || selected.closed) throw changed();
@@ -803,6 +860,13 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     reviewKey = '',
     reviewObservedStamp: string | undefined,
     reviewCertificate: CollectionReviewRowCertificate | undefined;
+  const resetReview = () => {
+    if (reviewCache?.status === 'ready') reviewCache.session.close();
+    reviewCache = undefined;
+    reviewKey = '';
+    reviewObservedStamp = undefined;
+    reviewCertificate = undefined;
+  };
   return {
     get binding() {
       return binding;
@@ -829,14 +893,25 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       );
     },
     close() {
-      if (reviewCache?.status === 'ready') reviewCache.session.close();
-      reviewCache = undefined;
+      resetReview();
       scratch.close();
     },
-    resetReview() {
-      if (reviewCache?.status === 'ready') reviewCache.session.close();
-      reviewCache = undefined;
-      reviewKey = '';
+    resetReview,
+    releaseReview(success: boolean) {
+      // Only an unchanged successful read may retain one completed proposal. Failed
+      // leases and transactions cannot seed a session for a later window.
+      let retained = false;
+      try {
+        retained = !!(
+          success &&
+          reviewCertificate &&
+          reviewCertificate.stamp === reviewReadStamp(db) &&
+          reviewCertificate.requestRevision === revision(db) &&
+          reviewCertificate.queueBinding === bindingNow()
+        );
+      } finally {
+        if (!retained) resetReview();
+      }
     },
     summary(intakeId: string, ordinal: number) {
       const row = cache
@@ -933,17 +1008,21 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         };
     },
     reviewMember(intakeId: string, member: CollectionReportQueueMember) {
+      assertCurrent();
       const key = canonicalLiteral([intakeId, member.proposalId]),
-        stamp = reviewReadStamp(db);
+        stamp = reviewReadStamp(db),
+        requestRevision = revision(db),
+        sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
       if (
         !reviewCache ||
         reviewKey !== key ||
         stamp === undefined ||
-        stamp !== reviewObservedStamp
+        stamp !== reviewObservedStamp ||
+        reviewCertificate?.requestRevision !== requestRevision ||
+        reviewCertificate?.sourcePin !== sourcePin ||
+        reviewCertificate?.queueBinding !== binding
       ) {
-        if (reviewCache?.status === 'ready') reviewCache.session.close();
-        const requestRevision = revision(db),
-          sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
+        resetReview();
         withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueClinicalReviews'));
         reviewCache = prepareCollectionClinicalReview(
           db,
@@ -975,10 +1054,30 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           'REPORT_REFERENCE_UNAVAILABLE',
           'A report reference no longer matches its retained proposal',
         );
+      const reviewed = reviewedIntakeQueueRecord(record, member.state),
+        facts = reviewedMemberFacts(member, reviewed, true),
+        encoded = canonicalLiteral(record),
+        detached = JSON.parse(encoded, (_key, value, context) =>
+          typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
+            ? JSON.rawJSON(context.source)
+            : value,
+        ) as typeof record;
+      withIntakeWork(db, 'warm', () => {
+        const bytes = Buffer.byteLength(encoded);
+        recordIntakeWork('serializationCalls');
+        recordIntakeWork('serializedBytes', bytes);
+        recordIntakeWork('jsonParseCalls');
+        recordIntakeWork('jsonParseBytes', bytes);
+      });
       return {
-        certificate: reviewCertificate,
-        session: reviewCache.session,
-        record: reviewedIntakeQueueRecord(record, member.state),
+        certificate: reviewCertificate && { ...reviewCertificate },
+        version: reviewCache.session.review.version,
+        reviewToken: reviewCache.session.review.reviewToken,
+        recordBytes: Buffer.byteLength(encoded),
+        // Complete policy providers stay private. Transport contains their existing
+        // references; small policy facts are computed before detaching the row.
+        record: { ...detached, queueState: reviewed.queueState, selectable: reviewed.selectable },
+        facts,
         ordinal: reviewCache.session.review.records.indexOf(record),
       };
     },
@@ -1178,29 +1277,17 @@ export async function collectionReportGroupSummary(
         queue.cacheMemberFacts(intakeId, member, reviewedMemberFacts(member));
         continue;
       }
-      const { record } = queue.reviewMember(intakeId, member);
-      queue.cacheMemberFacts(
-        intakeId,
-        member,
-        reviewedMemberFacts(member, record, !!isCurrent && pointer.basis === 'candidate_fallback'),
-      );
+      const { facts } = queue.reviewMember(intakeId, member);
+      queue.cacheMemberFacts(intakeId, member, {
+        ...facts,
+        title: isCurrent && pointer.basis === 'candidate_fallback' ? facts.title : undefined,
+      });
       if (pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
-        fallbackTitle = clinicalMappingLabel(record.mapping).trim();
+        fallbackTitle = facts.title || '';
       if (member.state !== 'pending' && member.state !== 'deferred') continue;
-      if (!record.selectable) tally.blocked++;
-      tally.questions += reviewRecordIssues(record).filter(
-        (issue) => issue.kind !== 'information' && issue.status !== 'resolved',
-      ).length;
-      const date = record.mapping.documentDate || record.mapping.date;
-      dates.add(
-        typeof date === 'string' &&
-          /^\d{4}(?:-\d{2}(?:-\d{2})?)?$/.test(date) &&
-          !reviewRecordIssues(record).some(
-            (issue) => issue.kind === 'date' && issue.status !== 'resolved',
-          )
-          ? date
-          : null,
-      );
+      tally.blocked += facts.counts.blocked;
+      tally.questions += facts.counts.questions;
+      dates.add(facts.date ?? null);
     }
     for (const row of queue.saved(intakeId, pointer.ordinal))
       coverageDb.prepare('INSERT INTO sources VALUES(?,?,?)').run('saved', row.source, row.count);

@@ -79,7 +79,8 @@ export async function readNativeReportSourceReview(
     );
     const targets: IntakeReportSourceReviewTargetV2[] = [],
       sourceEvidence: IntakeReportSourceReviewV2['sourceEvidence']['items'] = [];
-    const { prepareCollectionClinicalReview } = await import('./intake-review-collection-host.ts');
+    const { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
+      await import('./intake-review-collection-host.ts');
     let covered = 0,
       index = 0,
       targetBytes = 0,
@@ -121,6 +122,14 @@ export async function readNativeReportSourceReview(
       if (index++ < targetStart || targets.length >= limit || targetFull) continue;
       if (!cached || cachedProposal !== entry.proposalId) {
         if (cached?.status === 'ready') cached.session.close();
+        await prepareCollectionClinicalReviewDependencies(
+          db,
+          root,
+          profileId,
+          source.id,
+          entry.proposalId,
+          { assertRunning: scope.assertCurrent },
+        );
         cached = prepareCollectionClinicalReview(db, root, profileId, source.id, entry.proposalId);
         cachedProposal = entry.proposalId;
       }

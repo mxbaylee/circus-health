@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDatabase, transaction } from '../database.ts';
+import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { observeDatabaseClose, openDatabase, transaction } from '../database.ts';
 import {
   maximumReportDiscoveryOrder,
   retainedReportAcceptance,
@@ -20,7 +22,7 @@ function fixture(t: TestContext) {
   const db = openDatabase(join(root, 'cache.sqlite'), 'fictional-profile');
   const authority = memoryRecordAuthority(db);
   t.after(() => {
-    db.close();
+    if (db.isOpen) db.close();
     rmSync(root, { recursive: true, force: true });
   });
   const body = (n: number) =>
@@ -387,6 +389,7 @@ test('rolled-back payload memo is discarded before reconstruction and retry', (t
   );
   const failed = { ...intakeLookupCounters(db) };
   assert.equal(failed.hashedPayloadBytes - before.hashedPayloadBytes, payloadBytes(77));
+  assert.equal(failed.payloadMemoClosed, failed.payloadMemoCreated);
   assert.deepEqual(
     db.prepare('SELECT * FROM __record_intake_lookup_payloads ORDER BY hash').all(),
     retainedRows,
@@ -406,4 +409,73 @@ test('rolled-back payload memo is discarded before reconstruction and retry', (t
     payloadBytes(77),
     'an aborted new payload must be hashed again on retry',
   );
+});
+
+test('private payload memo prunes deleted evidence and closes on clear and actual connection close', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 1);
+  maximumReportDiscoveryOrder(db);
+  const counters = intakeLookupCounters(db);
+  assert.equal(counters.payloadMemoCreated, 1);
+  assert.equal(counters.payloadMemoClosed, 0);
+  const bytes = counters.hashedPayloadBytes;
+  transaction(db, () => db.prepare('DELETE FROM source_files WHERE id=?').run('first'));
+  assert.equal(maximumReportDiscoveryOrder(db), 0);
+  insert('second', 1);
+  assert.equal(maximumReportDiscoveryOrder(db), 1);
+  assert.equal(counters.hashedPayloadBytes, 2 * bytes, 'deleted payloads leave the private memo');
+  assert.equal(counters.payloadMemoCreated, 1, 'ordinary mutation reuses one private database');
+  clearIntakeLookupCache(db);
+  assert.equal(counters.payloadMemoClosed, 1);
+  clearIntakeLookupCache(db);
+  assert.equal(counters.payloadMemoClosed, 1, 'disposal is idempotent');
+  assert.equal(maximumReportDiscoveryOrder(db), 1);
+  const cold = intakeLookupCounters(db);
+  assert.equal(cold.hashedPayloadBytes, bytes, 'clear requires actual cold payload verification');
+  db.close();
+  assert.equal(cold.payloadMemoClosed, cold.payloadMemoCreated);
+});
+
+test('forged public payload-to-hash rows never seed the private verification memo', (t) => {
+  const { db, body, insert, write } = fixture(t);
+  insert('first', 1);
+  maximumReportDiscoveryOrder(db);
+  const receipt = { receipt: { operationId: 'same' }, marker: 77 };
+  const text = JSON.stringify(receipt);
+  db.prepare('UPDATE __record_intake_lookup_payloads SET payload=? WHERE payload LIKE ?').run(
+    text,
+    '%receipt%',
+  );
+  clearIntakeLookupCache(db);
+  write('first', body(77));
+  assert.deepEqual(retainedReportAcceptance(db, 'same'), receipt);
+  assert.equal(
+    db.prepare('SELECT hash FROM __record_intake_lookup_payloads WHERE payload=?').get(text)!.hash,
+    createHash('sha256').update(text).digest('hex'),
+  );
+  assert.equal(
+    intakeLookupCounters(db).hashedPayloadBytes,
+    Buffer.byteLength(text) + Buffer.byteLength(JSON.stringify({ marker: 77 })),
+    'cold authority text is hashed even when a public row claims to know its digest',
+  );
+});
+
+test('database close observers preserve native results, unsubscription and independent cleanup', () => {
+  for (const method of ['close', Symbol.dispose] as const) {
+    const db = new DatabaseSync(':memory:');
+    const events: string[] = [];
+    const stop = observeDatabaseClose(db, () => events.push('removed'));
+    stop();
+    observeDatabaseClose(db, () => {
+      assert.equal(db.isOpen, false);
+      events.push('throwing');
+      throw Error('fictional cleanup failure');
+    });
+    observeDatabaseClose(db, () => events.push('remaining'));
+    assert.doesNotThrow(() => db[method]());
+    assert.deepEqual(events, ['throwing', 'remaining']);
+    assert.throws(() => db.close(), { code: 'ERR_INVALID_STATE' });
+    assert.doesNotThrow(() => db[Symbol.dispose]());
+    assert.deepEqual(events, ['throwing', 'remaining']);
+  }
 });

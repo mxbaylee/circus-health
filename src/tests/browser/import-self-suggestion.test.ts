@@ -11,7 +11,7 @@ import type { Browser } from 'playwright';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
@@ -85,15 +85,16 @@ test(
     assert.equal(initialSelf.person.fullName, '');
     assert.equal(initialSelf.person.birthDate, '');
 
+    const original = Buffer.from(
+      'Fictional source evidence. Patient: Fictional Source Rowan; DOB: 1990-03-12.',
+    );
     const uploaded = await page.request.post(url + prefix + '/intakes', {
       headers: {
         Origin: url,
         'Content-Type': 'text/plain',
         'X-Filename': 'fictional-self-evidence.txt',
       },
-      data: Buffer.from(
-        'Fictional source evidence. Patient: Fictional Source Rowan; DOB: 1990-03-12.',
-      ),
+      data: original,
     });
     assert.equal(uploaded.status(), 201);
     let intake = await stopFixtureImport(page, url, prefix, (await uploaded.json()).data.id);
@@ -263,7 +264,26 @@ test(
       0,
       'the refreshed report has no second confirmation control after the name was retained and the selected birth date was filled',
     );
-    await page.goto(url + fixtureSourcePath(prefix, intake.contentUrl));
+    // Text originals download; inspect those exact bytes, then exercise Back
+    // from the application's retained-file view rather than an attachment URL.
+    const originalUrl = url + fixtureSourcePath(prefix, intake.contentUrl);
+    const download = page.waitForEvent('download');
+    await assert.rejects(page.goto(originalUrl), /Download is starting/);
+    const downloaded = await download;
+    const downloadedPath = await downloaded.path();
+    assert.ok(downloadedPath);
+    assert.deepEqual(readFileSync(downloadedPath), original);
+    const sourceId = decodeURIComponent(
+      new URL(originalUrl).pathname.split('/sources/')[1]!.replace(/\/content$/, ''),
+    );
+    await page.goto(url + '/#/sources?file=' + encodeURIComponent(sourceId));
+    await page.getByRole('heading', { name: 'fictional-self-evidence.txt', exact: true }).waitFor();
+    assert.equal(
+      await page
+        .getByRole('link', { name: 'Open original file', exact: true })
+        .getAttribute('href'),
+      new URL(originalUrl).pathname,
+    );
     const returnedIdentity = readIdentity();
     await page.goBack({ waitUntil: 'domcontentloaded' });
     await returnedIdentity;

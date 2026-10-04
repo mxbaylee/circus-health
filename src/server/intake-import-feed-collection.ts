@@ -206,8 +206,8 @@ function feedWindow(
     let fresh: ReturnType<typeof queue.reviewMember> | undefined;
     if (!queue.currentReviewCertificate(record.intakeId, cached.certificate)) {
       fresh = queue.reviewMember(record.intakeId, cached.member);
-      record.intakeVersion = fresh.session.review.version;
-      record.reviewToken = fresh.session.review.reviewToken;
+      record.intakeVersion = fresh.version;
+      record.reviewToken = fresh.reviewToken;
       if (record.detail.kind === 'record')
         record.detail.record = {
           ...fresh.record,
@@ -221,7 +221,7 @@ function feedWindow(
           ...record.detail.reference,
           reviewToken: record.reviewToken,
           ordinal: fresh.ordinal,
-          bytes: Buffer.byteLength(canonicalLiteral(fresh.session.review.records[fresh.ordinal])),
+          bytes: fresh.recordBytes,
         };
     }
     let size = Buffer.byteLength(canonicalLiteral(record));
@@ -238,7 +238,7 @@ function feedWindow(
           reviewToken: record.reviewToken,
           section: 'records',
           ordinal: fresh.ordinal,
-          bytes: Buffer.byteLength(canonicalLiteral(fresh.session.review.records[fresh.ordinal])),
+          bytes: fresh.recordBytes,
         },
       };
       size = Buffer.byteLength(canonicalLiteral(record));
@@ -379,6 +379,7 @@ export async function readCollectionImportFeed(
   let readingFeed: PreparedFeed | undefined;
   let reused: PreparedFeed | undefined;
   let retained = false;
+  let successfulRead = false;
   scratch.db.exec(
     'CREATE TABLE sources(id TEXT PRIMARY KEY,pin TEXT,seen INTEGER,counts TEXT,peopleCounts TEXT,kindCounts TEXT,totalRecords INTEGER,totalPeopleGroups INTEGER);CREATE TABLE matches(intake TEXT,groupId TEXT,PRIMARY KEY(intake,groupId));CREATE TABLE records(ordering TEXT PRIMARY KEY,value TEXT,groupValue TEXT,intake TEXT,member TEXT,signature TEXT);CREATE INDEX recordIntake ON records(intake);CREATE TABLE people(ordering TEXT PRIMARY KEY,value TEXT,intake TEXT);CREATE INDEX peopleIntake ON people(intake);CREATE TABLE facts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,ordering TEXT,groupId TEXT,counts TEXT,kind TEXT,included INTEGER,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE INDEX factsGroup ON facts(intake,groupId,included);CREATE TABLE changedCandidates(id TEXT,version TEXT,PRIMARY KEY(id,version));CREATE TABLE changedGroups(ordinal INTEGER PRIMARY KEY);',
   );
@@ -439,7 +440,7 @@ export async function readCollectionImportFeed(
     if (cached && cached.binding === queue.binding) {
       cached.used = ++feedClock;
       readingFeed = cached;
-      return feedWindow(db, root, profileId, queue, cached, {
+      const result = feedWindow(db, root, profileId, queue, cached, {
         view,
         limit,
         budget,
@@ -447,6 +448,8 @@ export async function readCollectionImportFeed(
         peopleAfter,
         cursor,
       });
+      successfulRead = true;
+      return result;
     }
     if (cached) {
       scratch.close();
@@ -537,7 +540,9 @@ export async function readCollectionImportFeed(
         )
           return;
         const {
-            session,
+            version,
+            reviewToken,
+            recordBytes,
             record: raw,
             ordinal,
             certificate,
@@ -609,8 +614,8 @@ export async function readCollectionImportFeed(
             groupId: pointer.groupId,
             groupOrdinal: pointer.ordinal,
             proposalId: member.proposalId,
-            intakeVersion: session.review.version,
-            reviewToken: session.review.reviewToken,
+            intakeVersion: version,
+            reviewToken: reviewToken,
             feedKind: kind,
             feedKey: record.feedKey,
             feedOrder: order,
@@ -625,10 +630,10 @@ export async function readCollectionImportFeed(
               selection: { recordId: record.id, candidateVersionId: record.candidateVersionId },
               reference: {
                 format: 'health-intake-clinical-review-reference-v2',
-                reviewToken: session.review.reviewToken,
+                reviewToken: reviewToken,
                 section: 'records',
                 ordinal,
-                bytes: Buffer.byteLength(canonicalLiteral(session.review.records[ordinal])),
+                bytes: recordBytes,
               },
             },
           };
@@ -971,7 +976,7 @@ export async function readCollectionImportFeed(
     preparedFeeds.add(feed);
     retained = true;
     readingFeed = feed;
-    return feedWindow(db, root, profileId, queue, feed, {
+    const result = feedWindow(db, root, profileId, queue, feed, {
       view,
       limit,
       budget,
@@ -979,6 +984,8 @@ export async function readCollectionImportFeed(
       peopleAfter,
       cursor,
     });
+    successfulRead = true;
+    return result;
   } catch (error) {
     if (readingFeed) disposeFeed(readingFeed);
     try {
@@ -989,7 +996,7 @@ export async function readCollectionImportFeed(
     throw error;
   } finally {
     if (reused) reused.busy = false;
-    queue.close();
+    queue.close({ retainReview: successfulRead });
     if (!retained) {
       scratch.close();
       signingKey.fill(0);

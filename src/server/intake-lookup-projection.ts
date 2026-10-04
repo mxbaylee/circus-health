@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import {
   json,
+  observeDatabaseClose,
   observeTransactionOutcome,
   currentTransactionToken,
   rejectCurrentTransaction,
@@ -23,6 +24,7 @@ import {
   INTAKE_LOOKUP_SCOPE_BYTES,
 } from './intake-lookup-contributions.ts';
 import { readNativeIntakeLookupTarget } from './intake-lookup-state.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
 export {
   prepareIntakeLookupIndices,
   intakeDiscoveryRevision,
@@ -53,13 +55,15 @@ export interface IntakeLookupCounters {
   cleanupQueries: number;
   projectionWrites: number;
   projectionBytes: number;
+  payloadMemoCreated: number;
+  payloadMemoClosed: number;
 }
 interface Connection {
   dispose: () => void;
   rebuild: boolean;
   schema: number;
   counters: IntakeLookupCounters;
-  hashes: Map<string, string>;
+  hashes?: ReturnType<typeof disposableSqlite>;
   entries: WeakMap<object, Map<string, ProjectionRow>>;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
@@ -71,15 +75,37 @@ const fail = (reason: string): never => {
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 function clearPayloadMemo(connection: Connection): void {
-  connection.hashes.clear();
+  if (connection.hashes) {
+    connection.hashes.close();
+    connection.hashes = undefined;
+    connection.counters.payloadMemoClosed++;
+  }
   connection.entries = new WeakMap();
+}
+function payloadMemo(connection: Connection) {
+  if (!connection.hashes) {
+    const scratch = disposableSqlite('circus-intake-lookup-memo-');
+    try {
+      // The exact text key avoids hashing unchanged payloads merely to find
+      // their verified digest. SQLite retains a fixed page cache rather than
+      // a JS Map containing the complete legacy receipt corpus.
+      scratch.db.exec(
+        'CREATE TABLE verified_payloads(payload TEXT PRIMARY KEY,hash TEXT NOT NULL) WITHOUT ROWID',
+      );
+      connection.hashes = scratch;
+      connection.counters.payloadMemoCreated++;
+    } catch (error) {
+      scratch.close();
+      throw error;
+    }
+  }
+  return connection.hashes.db;
 }
 function create(db: DatabaseSync): Connection {
   const connection: Connection = {
     dispose: () => {},
     rebuild: false,
     schema: -1,
-    hashes: new Map(),
     entries: new WeakMap(),
     counters: {
       builds: 0,
@@ -95,14 +121,22 @@ function create(db: DatabaseSync): Connection {
       cleanupQueries: 0,
       projectionWrites: 0,
       projectionBytes: 0,
+      payloadMemoCreated: 0,
+      payloadMemoClosed: 0,
     },
   };
-  connection.dispose = observeTransactionOutcome(db, (outcome) => {
+  const stopOutcome = observeTransactionOutcome(db, (outcome) => {
     if (!outcome.succeeded) {
       clearPayloadMemo(connection);
       connection.schema = -1;
     }
   });
+  const stopClose = observeDatabaseClose(db, () => clearIntakeLookupCache(db));
+  connection.dispose = () => {
+    stopOutcome();
+    stopClose();
+    clearPayloadMemo(connection);
+  };
   connections.set(db, connection);
   return connection;
 }
@@ -280,7 +314,9 @@ function prune(db: DatabaseSync, connection: Connection, obsolete: Set<string>):
         .prepare(`DELETE FROM ${table('payloads')} WHERE hash=? RETURNING payload`)
         .get(hash);
       if (removed) {
-        connection.hashes.delete(String(removed.payload));
+        connection.hashes?.db
+          .prepare('DELETE FROM verified_payloads WHERE payload=?')
+          .run(String(removed.payload));
         countWrite(connection, { hash, deleted: true });
       }
     }
@@ -485,15 +521,16 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     const text = typeof value === 'string' ? value : JSON.stringify(value);
     if (typeof value !== 'string')
       connection.counters.serializedPayloadBytes += Buffer.byteLength(text);
-    let hash = connection.hashes.get(text);
+    const memo = payloadMemo(connection);
+    let hash = memo.prepare('SELECT hash FROM verified_payloads WHERE payload=?').get(text)?.hash;
     if (!hash) {
       connection.counters.hashedPayloadBytes += Buffer.byteLength(text);
       hash = digest(text);
-      // Only one legacy payload memo survives. Native readers retain no receipt
-      // payloads, and a corpus-wide memo is unnecessary for correctness.
-      connection.hashes.clear();
-      connection.hashes.set(text, hash);
+      // Only an actual digest of selected authority text can populate this
+      // private index. Public disposable projection rows are never its proof.
+      memo.prepare('INSERT INTO verified_payloads VALUES(?,?)').run(text, hash);
     }
+    if (typeof hash !== 'string') return fail('invalid private payload memo');
     retainedHere.add(hash);
     const stored = db.prepare(`SELECT payload FROM ${table('payloads')} WHERE hash=?`).get(hash);
     readRows(connection, stored ? [stored] : []);

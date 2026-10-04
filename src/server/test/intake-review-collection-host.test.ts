@@ -90,7 +90,7 @@ function fixture(t: test.TestContext) {
     clearCollectionReportQueues(db);
     clearPreparedCollectionQueues(db);
     clearIntakeStateCache(db);
-    db.close();
+    if (db.isOpen) db.close();
     rmSync(root, { recursive: true, force: true });
   });
   return { db, root, profileId };
@@ -1493,4 +1493,110 @@ test('private public review cache binds source and proposal files and refuses co
   } finally {
     peer.close();
   }
+});
+
+test('native feed retains one exact proposal across changed-source windows and detaches queue records', async (t) => {
+  const { db, root, profileId } = fixture(t);
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-retained-feed.jsonl',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from(
+      Array.from({ length: 4 }, (_, index) => JSON.stringify(envelope('retained-' + index))).join(
+        '\n',
+      ),
+    ),
+  });
+  await buildIntakeCollectionEnvelope(db, { id: source.id });
+  const options = { view: 'all', limit: '1' };
+  await listIntakeImportFeedRead(db, root, profileId, options);
+  const correct = async (title: string) => {
+    const opened = prepareCollectionClinicalReview(db, root, profileId, source.id);
+    if (opened.status !== 'ready') throw Error('Expected retained review');
+    try {
+      const record = opened.session.review.records[0]!;
+      await applyClinicalRecordAction(db, root, profileId, source.id, {
+        proposalId: null,
+        recordId: record.id,
+        candidateVersionId: record.candidateVersionId!,
+        version: opened.session.review.version,
+        reviewToken: opened.session.review.reviewToken,
+        operationId: randomUUID(),
+        patch: {
+          mapping: { documentTitle: title },
+          correctionPatch: { documentTitle: title },
+          correctionReason: 'Fictional correction',
+        },
+      });
+    } finally {
+      opened.session.close();
+    }
+  };
+  await correct('First retained correction');
+  const first = await listIntakeImportFeedRead(db, root, profileId, options);
+  assert.ok('format' in first);
+  assert.ok(first.nextCursor);
+  const before = intakeWorkCounters(db).warm.collectionQueueClinicalReviews;
+  const [second, simultaneous] = await Promise.all([
+    listIntakeImportFeedRead(db, root, profileId, { ...options, cursor: first.nextCursor! }),
+    listIntakeImportFeedRead(db, root, profileId, { ...options, cursor: first.nextCursor! }),
+  ]);
+  assert.ok('format' in second && 'format' in simultaneous);
+  assert.equal(canonicalLiteral(second.records), canonicalLiteral(simultaneous.records));
+  const third = await listIntakeImportFeedRead(db, root, profileId, {
+    ...options,
+    cursor: second.nextCursor!,
+  });
+  assert.ok('format' in third);
+  assert.equal(
+    intakeWorkCounters(db).warm.collectionQueueClinicalReviews,
+    before,
+    'unseen rows use the exact completed current proposal, not another full review',
+  );
+  assert.notEqual(first.records[0]!.feedKey, third.records[0]!.feedKey);
+  const queue = await openCollectionReportQueue(db, root, profileId);
+  const pointer = [...queue.groups('all')][0]!;
+  const member = [...queue.members(source.id, pointer.ordinal)][0]!;
+  const original = queue.reviewMember(source.id, member);
+  assert.equal('session' in original, false);
+  const exact = canonicalLiteral(original.record);
+  original.record.mapping.documentTitle = 'Forged detached title';
+  original.record.evidence.push({ label: 'Forged detached evidence', locator: 'Fictional page' });
+  original.facts.counts.questions = 999;
+  if (original.certificate) original.certificate.sourcePin = 'forged';
+  assert.equal(canonicalLiteral(queue.reviewMember(source.id, member).record), exact);
+  queue.close({ retainReview: true });
+  assert.equal(reviewIssueScratchCounts(db).databases, 1);
+  const held = await openCollectionReportQueue(db, root, profileId);
+  await correct('Second retained correction');
+  assert.throws(() => held.reviewMember(source.id, member), /Refresh|changed/i);
+  held.close();
+  await listIntakeImportFeedRead(db, root, profileId, options);
+  assert.equal(reviewIssueScratchCounts(db).databases, 1);
+  await assert.rejects(() => openCollectionReportQueue(db, root, 'wrong-profile'));
+  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+  await listIntakeImportFeedRead(db, root, profileId, options);
+  clearIntakeStateCache(db);
+  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+  await listIntakeImportFeedRead(db, root, profileId, options);
+  assert.equal(reviewIssueScratchCounts(db).databases, 1);
+  db.close();
+  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+});
+
+test('concurrent cold queue opens preserve the global four-queue bound', async (t) => {
+  const { db, root, profileId } = fixture(t);
+  const results = await Promise.allSettled(
+    Array.from({ length: 6 }, () => openCollectionReportQueue(db, root, profileId)),
+  );
+  const ready = results.filter((result) => result.status === 'fulfilled');
+  const refused = results.filter((result) => result.status === 'rejected');
+  try {
+    assert.equal(ready.length, 4);
+    assert.equal(refused.length, 2);
+    for (const result of refused) assert.equal(result.reason.code, 'REPORT_QUEUE_BUSY');
+  } finally {
+    for (const result of ready) result.value.close();
+  }
+  clearCollectionReportQueues(db);
+  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
 });

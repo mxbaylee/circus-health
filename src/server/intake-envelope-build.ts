@@ -1,4 +1,5 @@
 /** One explicit legacy decode followed by bounded accepted build checkpoints. */
+import { reportSnapshotInlineTextFits } from './intake-report-snapshot-catalog.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import type { Database } from './database.ts';
@@ -140,7 +141,7 @@ export function createEnvelopeBuildWriter(
     if (changes.length >= 64) await flush();
   };
   const cell = async (key: string, text: string) => {
-    if (Buffer.byteLength(text) <= 3000) {
+    if (reportSnapshotInlineTextFits(text)) {
       await put(key, text);
       return;
     }
@@ -177,20 +178,26 @@ export function createEnvelopeBuildWriter(
       high = '';
     const append = async (text: string) => {
       if (!text) return;
-      if (!blob && Buffer.byteLength(small) + Buffer.byteLength(text) <= 3000) {
+      if (!blob && reportSnapshotInlineTextFits(small + text)) {
         small += text;
         return;
       }
       if (!blob) {
         await flush();
         blob = 'blob.' + randomUUID();
-        if (small)
+        // A supported inline buffer can exceed one byte leaf. Once promoted,
+        // preserve the existing bounded UTF8 leaf format instead of appending it whole.
+        for (let at = 0; at < small.length;) {
+          let end = Math.min(at + 1024, small.length);
+          if (end < small.length && /[\uD800-\uDBFF]/.test(small[end - 1]!)) end--;
           changes.push({
             area: 'builds',
             collection: blob,
             op: 'appendBytes',
-            bytes: Buffer.from(small),
+            bytes: Buffer.from(small.slice(at, end)),
           });
+          at = end;
+        }
         small = '';
       }
       changes.push({

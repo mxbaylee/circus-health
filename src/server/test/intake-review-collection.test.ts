@@ -1,3 +1,4 @@
+import { retainedEnvelopeReader } from './helpers/retained-envelope-reader.ts';
 import {
   selectedReportGroups,
   canonicalReportGroupContextChunks,
@@ -691,5 +692,87 @@ test('ownership first-group point lookup preserves retained collection order and
   assert.equal(
     ownership.firstGroup([{ groupId: 'synthetic-fallback', groupVersionId: 'version' }]),
     undefined,
+  );
+});
+
+test('complete group resolution uses indexed work beyond the private cache and retains later duplicate versions', () => {
+  const count = 71,
+    details = detailsFor(),
+    original = details.workflow!.reportGroups![0]!;
+  details.workflow!.reportGroups = Array.from({ length: count }, (_, n) => ({
+    ...structuredClone(original),
+    id: 'fictional-counted-group-' + n,
+    report: { ...original.report!, title: 'Fictional counted group ' + n },
+    versions: [
+      { ...structuredClone(original.versions[0]!), id: 'fictional-version-' + n, members: [] },
+    ],
+  }));
+  details.workflow!.reportGroups.push({
+    ...structuredClone(details.workflow!.reportGroups[0]!),
+    report: { ...original.report!, title: 'Fictional later duplicate' },
+    versions: [
+      { ...structuredClone(original.versions[0]!), id: 'fictional-later-version', members: [] },
+    ],
+  });
+  const view = retainedEnvelopeReader({ intake: { version: 1, ...details } });
+  // Resolution must never consult report snapshots: this fixture tests the native
+  // schema index and complete duplicate fallback independently of snapshot builds.
+  const catalog = new Proxy({} as ReturnType<typeof createReportSnapshotCatalog>, {
+    get() {
+      throw Error('Group resolution unexpectedly read a report snapshot');
+    },
+  });
+  let idReads = 0,
+    groupPages = 0,
+    pointReads = 0;
+  const field = view.field,
+    children = view.children,
+    find = view.find;
+  view.field = (record, name, options) => {
+    if (record.kind === 'reportGroup' && name === 'id') idReads++;
+    return field(record, name, options);
+  };
+  view.children = (record, name, options) => {
+    if (name === 'reportGroups') groupPages++;
+    return children(record, name, options);
+  };
+  view.find = (kind, record, id) => {
+    if (kind === 'reportGroup') pointReads++;
+    return find(kind, record, id);
+  };
+  const scope = collectionWorkflowReviewScope({
+    view,
+    catalog,
+    metadataBytes: 128 * 1024,
+    readCacheState: () => 'fictional-stable-selected-state',
+    packageEvidence: false,
+    activeReceipt: () => true,
+    originalFingerprint: () => 'fictional-original-fingerprint',
+    reportSource: () => undefined,
+  });
+  for (let pass = 0; pass < 3; pass++)
+    for (let n = 0; n < count; n++) {
+      const selected = scope.group({
+        groupId: 'fictional-counted-group-' + n,
+        groupVersionId: 'fictional-version-' + n,
+      });
+      assert.equal(selected?.report?.title, 'Fictional counted group ' + n);
+    }
+  assert.equal(pointReads, count * 3, 'every cache miss addresses the complete retained index');
+  assert.equal(groupPages, 0, 'unique exact-version groups never enumerate the namespace');
+  assert.ok(
+    idReads <= count * 3 * 2,
+    'group header work stays linear despite exceeding the 32-entry cache',
+  );
+  idReads = 0;
+  const later = scope.group({
+    groupId: 'fictional-counted-group-0',
+    groupVersionId: 'fictional-later-version',
+  });
+  assert.equal(later?.report?.title, details.workflow!.reportGroups!.at(-1)!.report!.title);
+  assert.ok(groupPages > 0, 'a first-group version mismatch traverses complete later duplicates');
+  assert.ok(
+    idReads >= count,
+    'the late duplicate remains visible beyond the cache and first group',
   );
 });

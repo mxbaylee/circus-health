@@ -16,6 +16,7 @@ import {
   type ImportReviewModel,
 } from '../../app/features/import/ImportReviewPresentation';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
+import { ImportPage } from '../../app/features/import/ImportPage';
 vi.mock('../../app/features/import/ImportSourceTextBrowser', () => ({
   ImportSourceTextBrowser: () => null,
 }));
@@ -356,6 +357,205 @@ it('grounds only displayed report identity and refreshes readiness once without 
   expect(new Set(identityGroups)).toEqual(new Set(['visible-group']));
   expect(identityGroups.length).toBeLessThanOrEqual(3);
   expect(screen.getAllByRole('checkbox', { name: /Select Fictional glucose/ })).toHaveLength(2);
+});
+it('shares the native first feed with ImportPage and refreshes the exact visible window after parent changes', async () => {
+  let releaseBatch!: (response: Response) => void;
+  let releaseIdentity!: () => void;
+  const identityReady = new Promise<void>((resolve) => {
+    releaseIdentity = resolve;
+  });
+  let grounded = false;
+  let revised = false;
+  const feeds: URL[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.endsWith('/import-feed')) {
+        feeds.push(url);
+        expect(url.searchParams.get('limit')).toBe('40');
+        expect(url.searchParams.get('bytes')).toBe('65536');
+        return json(
+          feed([
+            record(
+              url.searchParams.has('cursor') ? (revised ? 'updated-next' : 'next') : 'first',
+              'visible-group',
+              !grounded,
+            ),
+          ]),
+        );
+      }
+      if (url.pathname.endsWith('/intake-batches'))
+        return new Promise<Response>((resolve) => {
+          releaseBatch = resolve;
+        });
+      if (url.pathname.endsWith('/intakes/limits'))
+        return json({ uploadBytes: 1024, extractionBytes: 1024 });
+      if (url.pathname.includes('/report-queue/'))
+        return json({ format: 'health-intake-report-detail-v2', group: header('visible-group') });
+      if (url.pathname.endsWith('/identity-review')) {
+        await identityReady;
+        grounded = true;
+        return json({
+          ...identity,
+          status: 'evidenced_match',
+          scope: { scopeToken: 'grounded-scope' },
+        });
+      }
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  render(
+    <MemoryRouter initialEntries={['/import']}>
+      <ImportPage />
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  await act(async () => {});
+  expect(feeds).toHaveLength(1);
+  await act(async () => {
+    releaseBatch(
+      json([
+        {
+          id: 'fictional-batch',
+          status: 'complete',
+          items: [{ intakeId: 'fictional-intake', status: 'review_ready', reason: null }],
+        },
+      ]),
+    );
+  });
+  await waitFor(() => expect(feeds).toHaveLength(2));
+  expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  await act(async () => {
+    releaseIdentity();
+  });
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeEnabled());
+  expect(feeds).toHaveLength(3);
+  fireEvent.click(screen.getByRole('button', { name: 'Next records' }));
+  expect(
+    await screen.findByRole('checkbox', { name: 'Select Fictional glucose next' }),
+  ).toBeEnabled();
+  expect(feeds).toHaveLength(4);
+  expect(feeds.at(-1)!.searchParams.get('cursor')).toBe('next');
+  revised = true;
+  const restored = new Event('pageshow');
+  Object.defineProperty(restored, 'persisted', { value: true });
+  fireEvent(window, restored);
+  expect(
+    await screen.findByRole('checkbox', { name: 'Select Fictional glucose updated-next' }),
+  ).toBeEnabled();
+  expect(
+    screen.queryByRole('checkbox', { name: 'Select Fictional glucose first' }),
+  ).not.toBeInTheDocument();
+  expect(feeds).toHaveLength(6);
+  expect(feeds.at(-1)!.searchParams.get('cursor')).toBe('next');
+});
+it('blocks stale later-window writes after a failed parent refresh and retries the same cursor', async () => {
+  let parentReads = 0;
+  let cursorReads = 0;
+  let writes = 0;
+  let releaseParent!: (value: Response) => void;
+  let releaseCursor!: (value: Response) => void;
+  const first = feed([record('first')]);
+  const next = feed([record('next')]);
+  const fresh = feed([record('fresh-next')]);
+  const failed = () =>
+    new Response(
+      JSON.stringify({
+        error: { code: 'FICTIONAL_REFRESH_FAILURE', message: 'Fictional parent refresh failed.' },
+      }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } },
+    );
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.endsWith('/import-feed')) {
+        if (url.searchParams.has('cursor')) {
+          expect(url.searchParams.get('cursor')).toBe('next');
+          cursorReads++;
+          if (cursorReads === 2)
+            return new Promise<Response>((resolve) => {
+              releaseCursor = resolve;
+            });
+          return json(cursorReads === 1 ? next : fresh);
+        }
+        parentReads++;
+        if (parentReads === 2 || parentReads === 4) return failed();
+        if (parentReads === 3)
+          return new Promise<Response>((resolve) => {
+            releaseParent = resolve;
+          });
+        return json(first);
+      }
+      if (url.pathname.endsWith('/intake-batches')) return json([]);
+      if (url.pathname.endsWith('/intakes/limits'))
+        return json({ uploadBytes: 1024, extractionBytes: 1024 });
+      if (url.pathname.includes('/report-queue/'))
+        return json({ format: 'health-intake-report-detail-v2', group: header('visible-group') });
+      if (url.pathname.endsWith('/identity-review')) return json(identity);
+      if (url.pathname.endsWith('/review-record'))
+        return json({
+          format: 'health-intake-clinical-record-v2',
+          context: {
+            intakeId: 'fictional-intake',
+            proposalId: 'fictional-proposal',
+            version: 7,
+            reviewToken: 'ready-token',
+          },
+          record: next.records[0]!.detail,
+        });
+      if (url.pathname.endsWith('/review-draft')) {
+        expect(JSON.parse(String(init?.body)).disposition).toBe('review_later');
+        writes++;
+        return json({});
+      }
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  render(
+    <MemoryRouter initialEntries={['/import']}>
+      <ImportPage />
+    </MemoryRouter>,
+  );
+  await screen.findByRole('checkbox', { name: 'Select Fictional glucose first' });
+  fireEvent.click(screen.getByRole('button', { name: 'Next records' }));
+  await screen.findByRole('checkbox', { name: 'Select Fictional glucose next' });
+  fireEvent.click(screen.getByRole('button', { name: 'Later' }));
+  await screen.findByText('Fictional parent refresh failed.');
+  expect(writes).toBe(1);
+  expect(parentReads).toBe(2);
+  expect(cursorReads).toBe(1);
+  expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Later' }));
+  await act(async () => {});
+  expect(writes).toBe(1);
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh import review' }));
+  await waitFor(() => expect(parentReads).toBe(3));
+  expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  await act(async () => {
+    releaseParent(json(first));
+  });
+  await waitFor(() => expect(cursorReads).toBe(2));
+  expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  await act(async () => {
+    releaseCursor(json(fresh));
+  });
+  await screen.findByRole('checkbox', { name: 'Select Fictional glucose fresh-next' });
+  expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeEnabled();
+  expect(
+    screen.queryByRole('checkbox', { name: 'Select Fictional glucose first' }),
+  ).not.toBeInTheDocument();
+  const restored = new Event('pageshow');
+  Object.defineProperty(restored, 'persisted', { value: true });
+  fireEvent(window, restored);
+  await screen.findByText('Fictional parent refresh failed.');
+  expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh import review' }));
+  await waitFor(() => expect(cursorReads).toBe(3));
+  expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeEnabled();
+  expect(parentReads).toBe(5);
+  expect(writes).toBe(1);
 });
 it('opens a direct selected record inline without replacing the import route', async () => {
   const data = feed([record('first')]);
