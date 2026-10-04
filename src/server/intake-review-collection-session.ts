@@ -76,6 +76,8 @@ export interface VerifiedClinicalArtifact {
 }
 export interface CollectionClinicalProjectionContext {
   verifiedArtifacts(): Iterable<VerifiedClinicalArtifact>;
+  consumedArtifactIds(): Iterable<string>;
+  beginProjectionConsumption(): () => void;
   readonly db: DatabaseSync;
   readonly profileId: string;
   readonly proposal: Omit<BuildReviewInput, 'drafts' | 'acceptedDecisions' | 'selected'>;
@@ -83,6 +85,8 @@ export interface CollectionClinicalProjectionContext {
   readonly selected: SelectedClinicalProjectionScope;
   readonly validation: IntakeValidation;
   assertCurrent(): void;
+  /** Projection plans pair this logical guard with their own copied physical proof. */
+  assertAuthorityCurrent(): void;
 }
 const projectionContexts = new WeakMap<
   CollectionClinicalReviewSession,
@@ -117,6 +121,8 @@ export function* createCollectionClinicalReviewSessionWork(input: {
   validation: IntakeValidation;
   assertProjectionEvidenceCurrent?(): void;
   verifiedArtifacts?(): Iterable<VerifiedClinicalArtifact>;
+  consumedArtifactIds?(): Iterable<string>;
+  beginProjectionConsumption?(): () => void;
   sourceText: { stale: boolean; revisionId: string | null; dependencyToken: string | null };
   assertCurrent(): void;
 }): Generator<void, CollectionClinicalReviewResult, void> {
@@ -494,6 +500,18 @@ export function* createCollectionClinicalReviewSessionWork(input: {
       },
     };
     projectionContexts.set(session, {
+      beginProjectionConsumption() {
+        input.assertCurrent();
+        if (!input.beginProjectionConsumption)
+          throw Error('Clinical projection consumption checkpoint is unavailable');
+        return input.beginProjectionConsumption();
+      },
+      *consumedArtifactIds() {
+        input.assertCurrent();
+        if (!input.consumedArtifactIds)
+          throw Error('Clinical consumed artifact proof is unavailable');
+        yield* input.consumedArtifactIds();
+      },
       *verifiedArtifacts() {
         input.assertCurrent();
         if (!input.verifiedArtifacts) throw Error('Clinical artifact proof is unavailable');
@@ -505,6 +523,9 @@ export function* createCollectionClinicalReviewSessionWork(input: {
       review: clinical,
       selected: input.projection,
       validation: input.validation,
+      assertAuthorityCurrent() {
+        input.assertCurrent();
+      },
       assertCurrent() {
         input.assertCurrent();
         input.assertProjectionEvidenceCurrent?.();

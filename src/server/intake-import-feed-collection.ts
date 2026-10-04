@@ -2,6 +2,7 @@ import { createClinicalReviewArtifactProof } from './clinical-review-artifact-pr
 /** Complete filters and counts with bounded native feed rows and referenced group evidence. */
 import type { DatabaseSync } from 'node:sqlite';
 import { createHmac, randomBytes } from 'node:crypto';
+import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
 import { HttpError } from './database.ts';
 import {
   identityGroundingGeneration,
@@ -177,14 +178,11 @@ async function feedWindow(
     assertRunning(): void;
   },
 ) {
+  const preparationStamp = reviewPreparationStamp(db);
   const records: CollectionFeedRecord[] = [],
     groups = new Map<string, CollectionReportGroupReference>(),
     peopleGroups: CollectionReportGroupReference[] = [],
-    verified = new Set<string>(),
-    certificates: Array<{
-      intakeId: string;
-      certificate: NonNullable<CachedFeedMember['certificate']>;
-    }> = [];
+    verified = new Set<string>();
   let used = 0,
     more = false,
     peopleMore = false,
@@ -307,8 +305,6 @@ async function feedWindow(
       verifyIntakeFileHash(profileOriginal(root, source.path, profileId), source);
       verified.add(record.proposalId);
     }
-    const certificate = fresh ? fresh.certificate : cached.certificate;
-    if (certificate) certificates.push({ intakeId: record.intakeId, certificate });
     records.push(record);
     used += size;
     last = String(row.ordering);
@@ -338,15 +334,17 @@ async function feedWindow(
   }
   input.assertRunning();
   const activity = readCollectionQueueActivity(db, root, profileId, queue);
-  queue.assertCurrent();
-  for (const { intakeId, certificate } of certificates)
-    if (!queue.currentReviewCertificate(intakeId, certificate))
-      throw new HttpError(
-        409,
-        'REPORT_QUEUE_CURSOR',
-        'Review changed while reading; refresh this feed',
-      );
   feed.artifacts.assertCurrent();
+  queue.assertCurrent();
+  // Each cached row was admitted against its raw certificate above. A later
+  // row's awaited preparation may perform certified disposable maintenance;
+  // preserve the authority of every admitted row across the complete window.
+  if (preparationStamp === undefined || preparationStamp !== reviewPreparationStamp(db))
+    throw new HttpError(
+      409,
+      'REPORT_QUEUE_CURSOR',
+      'Review changed while reading; refresh this feed',
+    );
   return {
     format: 'health-intake-import-feed-v2' as const,
     view: input.view,

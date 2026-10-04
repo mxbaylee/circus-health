@@ -1,5 +1,6 @@
 import { indexedReviewQuestions } from './intake-review-question-index.ts';
 import { finishClinicalReviewWork, runClinicalReviewWork } from './clinical-review-work.ts';
+import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
 import { revision } from './database.ts';
 import {
   reviewReadStamp,
@@ -177,7 +178,7 @@ export async function prepareCollectionClinicalReviewDependencies(
       {
         capture() {
           assertCurrent();
-          const stamp = reviewReadStamp(db);
+          const stamp = reviewPreparationStamp(db);
           if (stamp === undefined)
             throw new HttpError(
               409,
@@ -186,7 +187,7 @@ export async function prepareCollectionClinicalReviewDependencies(
             );
           return () => {
             assertCurrent();
-            if (reviewReadStamp(db) !== stamp)
+            if (reviewPreparationStamp(db) !== stamp)
               throw new HttpError(
                 409,
                 'INTAKE_REVIEW_CHANGED',
@@ -226,12 +227,12 @@ export async function prepareCollectionClinicalReviewDependencies(
         {
           capture() {
             assertCurrent();
-            const stamp = reviewReadStamp(db);
+            const stamp = reviewPreparationStamp(db);
             if (stamp === undefined)
               throw Error('Clinical dependencies cannot cross a transaction');
             return () => {
               assertCurrent();
-              if (reviewReadStamp(db) !== stamp)
+              if (reviewPreparationStamp(db) !== stamp)
                 throw new HttpError(
                   409,
                   'INTAKE_REVIEW_CHANGED',
@@ -298,12 +299,12 @@ export async function prepareCollectionClinicalReviewAsync(
     capture() {
       input[5]?.assertRunning?.();
       assertIntakeOwner(db, profileId);
-      const stamp = reviewReadStamp(db);
+      const stamp = reviewPreparationStamp(db);
       if (stamp === undefined) throw Error('Clinical review authority is unavailable');
       return () => {
         input[5]?.assertRunning?.();
         assertIntakeOwner(db, profileId);
-        if (reviewReadStamp(db) !== stamp)
+        if (reviewPreparationStamp(db) !== stamp)
           throw new HttpError(
             409,
             'INTAKE_REVIEW_CHANGED',
@@ -370,7 +371,6 @@ function* prepareCollectionClinicalReviewWork(
     function open(original: ClinicalScopeOriginal) {
       options.groundingDependency?.(original.id);
       const retained = requiredFile(db, original.id, true);
-      retainConsumedFile.run(retained.id);
       if (retained.sha256 !== original.sha256)
         throw new HttpError(409, 'SOURCE_CHANGED', 'The retained original changed');
       if (!hasIntakeCollectionEnvelope(db, retained))
@@ -513,6 +513,11 @@ function* prepareCollectionClinicalReviewWork(
         catalog,
         metadataBytes,
         readCacheState,
+        readProofState: () => {
+          assertCurrent();
+          view.address(view.root());
+          return reviewPreparationStamp(db);
+        },
         identityReceiptWork: (metric) => withIntakeWork(db, 'warm', () => recordIntakeWork(metric)),
         packageEvidence,
         activeReceipt: (receipt) =>
@@ -595,6 +600,7 @@ function* prepareCollectionClinicalReviewWork(
         db.prepare('INSERT INTO providers(id,name) VALUES(?,?)').run(id, name);
     }
     const sourceFor = (original: ClinicalScopeOriginal) => {
+      retainConsumedFile.run(original.id);
       let current = opened.get(original.id);
       if (!current) {
         current = open(original);
@@ -1068,6 +1074,22 @@ function* prepareCollectionClinicalReviewWork(
       },
       validation: validationSummary(validation),
       assertProjectionEvidenceCurrent: assertPhysicalEvidenceCurrent,
+      beginProjectionConsumption() {
+        const last = issueScratch.db
+          .prepare('SELECT COALESCE(max(rowid),0) AS ordinal FROM consumed_source_files')
+          .get()!.ordinal;
+        return () => {
+          issueScratch.db.prepare('DELETE FROM consumed_source_files WHERE rowid>?').run(last);
+        };
+      },
+      *consumedArtifactIds() {
+        for (const row of issueScratch.db
+          .prepare('SELECT id FROM consumed_source_files ORDER BY id')
+          .iterate()) {
+          if (typeof row.id !== 'string') throw Error('Incomplete clinical consumed source');
+          yield row.id;
+        }
+      },
       *verifiedArtifacts() {
         for (const row of issueScratch.db
           .prepare('SELECT id,path,identity FROM consumed_source_files ORDER BY id')
@@ -1183,6 +1205,7 @@ export async function readPreparedCollectionClinicalReview(
     await prepareCollectionClinicalReviewDependencies(db, root, profileId, intakeId, proposalId);
     const key = canonicalLiteral([root, profileId, intakeId, proposalId]),
       stamp = reviewReadStamp(db),
+      preparationStamp = reviewPreparationStamp(db),
       requestRevision = revision(db),
       sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
     let cached = preparedClinicalReviewRead(db);
@@ -1227,15 +1250,26 @@ export async function readPreparedCollectionClinicalReview(
     if (
       requestRevision !== revision(db) ||
       sourcePin !== canonicalLiteral(intakeSourceVersion(db, intakeId)) ||
-      (stamp !== undefined && stamp !== reviewReadStamp(db))
+      (preparationStamp !== undefined && preparationStamp !== reviewPreparationStamp(db))
     )
       throw new HttpError(
         409,
         'INTAKE_REVIEW_CHANGED',
         'Review changed while reading; refresh this review',
       );
-    if (stamp !== undefined && !cached && isPreparedClinicalReviewReadCurrent(db, attempt)) {
-      retainPreparedClinicalReviewRead(db, { key, stamp, sourcePin, requestRevision, session });
+    const completedStamp = reviewReadStamp(db);
+    if (
+      completedStamp !== undefined &&
+      !cached &&
+      isPreparedClinicalReviewReadCurrent(db, attempt)
+    ) {
+      retainPreparedClinicalReviewRead(db, {
+        key,
+        stamp: completedStamp,
+        sourcePin,
+        requestRevision,
+        session,
+      });
       owned = undefined;
     }
     return { status: 'ready', value };

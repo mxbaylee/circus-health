@@ -1,6 +1,7 @@
 import {
   setCollectionProcessingException,
   clearCollectionProcessingExceptions,
+  clearCollectionProcessingException,
 } from './intake-processing-exceptions.ts';
 import { randomUUID } from 'node:crypto';
 import { modelRecoveryKey } from './model-bridge.ts';
@@ -1343,6 +1344,85 @@ export function createIntakeBatchManager({
       finishItem(profileId, batch, item, 'paused', 'source_changed', intake, linkedChat);
       schedule(profileId, batch.id);
       return;
+    }
+
+    if (item.forceModelResume && item.exceptions?.some((e) => e.reason === 'processing_stalled')) {
+      const sourceText = getIntakeSourceText(db, root, profileId, item.intakeId),
+        sourceUnitId = 'source:' + item.intakeId;
+      const isSourceException = (exception: NonNullable<IntakeBatchItem['exceptions']>[number]) => {
+        if (
+          item.stalls?.unitId === exception.unitId ||
+          item.reading?.workUnit?.id === exception.unitId
+        )
+          return false;
+        if (exception.unitId === sourceUnitId) return true;
+        const pageText = exception.unitId.slice((sourceUnitId + ':page:').length);
+        if (
+          exception.unitId.startsWith(sourceUnitId + ':page:') &&
+          /^[1-9]\d*$/.test(pageText) &&
+          Number.isSafeInteger(Number(pageText))
+        )
+          return true;
+        return (
+          sourceText.status === 'available' &&
+          sourceText.revision.issues.some(
+            (issue) =>
+              issue.id === exception.unitId &&
+              /-(failed|processing-stalled|ocr-unavailable)$/.test(issue.id),
+          )
+        );
+      };
+      const assertRetryCurrent = () => {
+        if (
+          !live(profileId, expected) ||
+          dbFor(profileId) !== db ||
+          batches.get(key(profileId, batch.id)) !== batch ||
+          !batch.items.includes(item) ||
+          batch.status !== 'running' ||
+          item.status !== 'starting' ||
+          !item.forceModelResume ||
+          !authorized(profileId, item.intakeId, 'publish')
+        )
+          throw Error('Import processing stopped');
+      };
+      for (const exception of item.exceptions) {
+        if (exception.reason !== 'processing_stalled' || isSourceException(exception)) continue;
+        assertRetryCurrent();
+        intake = getIntake(db, root, profileId, item.intakeId);
+        if (intake.sha256 !== item.sourceHash)
+          throw new HttpError(409, 'SOURCE_CHANGED', 'The pinned original changed');
+        const operationId =
+          'resume-stall:' + batch.id + ':' + exception.unitId + ':' + (item.exceptionEpoch || 0);
+        if (isIntakeSummary(intake))
+          await clearCollectionProcessingException(db, root, profileId, item.intakeId, {
+            version: intake.version,
+            operationId,
+            unitId: exception.unitId,
+            assertRunning: assertRetryCurrent,
+          });
+        else
+          workflowMutation(
+            db,
+            root,
+            profileId,
+            item.intakeId,
+            { version: intake.version, operationId },
+            (workflow) => {
+              const unit = workflow.plans
+                .find((plan) => plan.status === 'active')
+                ?.units.find((unit) => unit.id === exception.unitId);
+              if (!unit)
+                throw new HttpError(409, 'PLAN_CHANGED', 'Active extraction unit not found');
+              delete unit.processingException;
+            },
+          );
+        assertRetryCurrent();
+        item.exceptionEpoch = (item.exceptionEpoch || 0) + 1;
+        item.exceptions = item.exceptions.filter((retained) => retained !== exception);
+        if (item.stalls?.unitId === exception.unitId) item.stalls = undefined;
+        save(profileId, batch, 'processing-stall-resumed');
+      }
+      intake = getIntake(db, root, profileId, item.intakeId);
     }
 
     if (recordDurabilityStatus(db) && !hasActivePlan(intake)) {

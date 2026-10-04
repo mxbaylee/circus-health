@@ -575,6 +575,7 @@ export async function readCollectionIntakeReportRecords(
       usedBytes += size;
       last = order;
     }
+    artifacts.assertCurrent();
     const current = intakeSourceVersion(db, intakeId);
     queue?.assertCurrent();
     if (
@@ -583,7 +584,6 @@ export async function readCollectionIntakeReportRecords(
       clinicalReviewRevision(db) !== policy
     )
       throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-    artifacts.assertCurrent();
     return {
       format: 'health-intake-report-record-page-v2',
       scope: 'clinical_records',

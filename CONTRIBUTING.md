@@ -84,6 +84,21 @@ Browser assertions wait for the state they inspect: a queue count or network res
 
 Coordinator tests should observe published journal checkpoints before asserting state or simulating the next model result. A dispatch callback can run before its `running` checkpoint is saved. Await terminal publication and assert whether it is `complete` or `paused`, rather than polling for one assumed outcome until a short wall-clock deadline expires. Keep a whole-test timeout as a hang guard, and explicitly set and restore any environment variable whose absence is part of the fixture.
 
+Batch coordinator waits use the owning test's cancellation signal across native host preparation. The appended-selection restart fixture has a 120-second guard for its complete accepted-journal reconstruction and exact operation replay; that recovery measured about a minute on the qualification host. Proposal counts, model-job counts and the recovered selections remain the correctness checks.
+
+The explicit partial Resume fixture uses 90 seconds for six synthetic request
+windows, three retained stalls, coordinator recreation and another exact proposal;
+its cumulative request accounting and no-acceptance checks stay intact. The native
+fallback-reference fixture uses 120 seconds for publication of 96 unrelated
+candidates and 96 historical occurrences, complete policy/token parity and
+cancellation cleanup. Their complete host runs measured about 44 and 68 seconds,
+respectively; these guards do not constrain model response time.
+
+The native repair-scope fixture uses 120 seconds for repeated complete policy
+preparations over 96 retained drafts, including cancellation, cross-source
+invalidation and scratch cleanup. Its complete host run measured about 36 seconds;
+the policy parity and refusal assertions establish correctness.
+
 Node suites run at most two files concurrently, and browser suites run one. These fixtures perform real PDF extraction, encryption and archive rebuilds; allowing concurrency to grow with the host CPU count can starve their bounded waits. HTTP upload tests should observe the automatically queued conversion rather than start a competing conversion immediately after upload. Large report fixtures establish each report-wide identity once; they retain representative row/version counts and full acceptance/rebuild assertions.
 
 The workflows in `.github/workflows/` run the full validation lanes on pull requests and remain useful for reproducing individual jobs or shards locally when CI failures persist. Server tests use four deterministic file shards and browser tests use three, with fail-fast disabled so one failure does not hide another lane's results. These distribute the complete suites across the existing job budgets, including large encrypted recovery and browser journeys. Each browser runner builds assets once; the unit lane owns type checking. The ordinary `build` command still includes type checking. To reproduce a server shard locally, append `-- --test-shard=1/4` through `4/4` to `npm run test:server`; for a browser shard, append `-- --test-shard=1/3` through `3/3` to `npm run test:browser:run`. Console logs retain assertions and the slow-test summary. On GitHub Actions, the reporter also publishes up to 50 bounded failure annotations containing test names and error causes, with an explicit omission notice if more failures occur. These help identify failures when full logs are unavailable; they do not change test results or budgets. Reruns are explicit validation runs, not a mechanism to turn a flaky test green.

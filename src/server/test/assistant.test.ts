@@ -7628,6 +7628,8 @@ test('default diagnostics explain stale batch refresh and repeated window stop w
     id: f.item.id,
     action: 'read',
     freshStart: true,
+    section: 'questions',
+    offset: 0,
   });
   let stopped = false;
   for (let count = 0; count < 6; count++) {
@@ -8099,12 +8101,12 @@ for (const resolvesCoverage of [false, true])
     const f = await linkedFictionalBatchConversion(t, { diagnostics });
     await call(f.bridge, 'intake_batch', f.batch);
     complete(f.bridge);
-    await tick();
+    await waitForConversionBridge(t, f, f.chat, 1);
     assert.equal(f.bridges.length, 2);
     assert.equal(f.chat.reading?.pendingReadWindows, 0);
     assert.equal(f.chat.reading?.remainingUnits, 1);
     complete(f.bridges[1]!);
-    await tick();
+    await waitForConversionBridge(t, f, f.chat, 2);
     assert.equal(
       f.bridges.length,
       3,

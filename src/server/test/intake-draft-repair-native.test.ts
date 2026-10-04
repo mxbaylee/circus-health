@@ -246,153 +246,159 @@ test('native repair composes ordered fields and records in one version with exac
     assert.equal(intakeWorkCounters(db).warm[name], before[name]);
 });
 
-test('native repair scope cooperates inside history, preserves policy, and closes on cross-source change or cancellation', async (t) => {
-  const { prepareIntakeDraftRepairScope, resolveIntakeDraftRepairScope } =
-    await import('../intake-draft-repair.ts');
-  const { prepareCollectionClinicalReviewDependencies } =
-    await import('../intake-review-collection-host.ts');
-  const root = mkdtempSync(join(tmpdir(), 'fictional-repair-scope-cooperation-')),
-    profileId = 'fictional',
-    db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-  attachPersonalDurability(db, { root, profileId });
-  t.after(() => {
-    clearIntakeStateCache(db);
-    db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  const source = uploadIntake(db, root, profileId, {
-    filename: 'fictional.jsonl',
-    newProviderName: 'Fictional Clinic',
-    bytes: Buffer.from(
-      JSON.stringify({
-        format: 'health-record-v1',
-        id: 'one',
-        kind: 'record',
-        payload: { literal: 'Independent fictional history' },
-        clinical: {
-          kind: 'observation',
-          subject: 'self',
-          testLabel: 'Fictional scope',
-          valueText: '12',
-          unit: 'fictional units',
-          date: '2025-01-01',
-          method: 'Original method',
-        },
-        provenance: {
-          capturedVia: null,
-          sourceSystem: 'Fictional Clinic',
-          sourceRecordId: 'one',
-          evidenceClass: 'provider_export',
-          locator: 'characters 0–30',
-        },
-        coverage: { status: 'complete_response', notes: [] },
-        report: {
-          key: 'fictional-report',
-          title: 'Fictional panel',
-          anchor: { locator: 'characters 0–30', text: 'Fictional report' },
-          subject: null,
-        },
-      }),
-    ),
-  });
-  const record = reviewIntake(db, root, profileId, source.id).records[0]!;
-  workflowMutation(
-    db,
-    root,
-    profileId,
-    source.id,
-    { version: source.version, operationId: 'fictional-history' },
-    (workflow) => {
-      for (let i = 0; i < 96; i++)
-        workflow.reviewDrafts.push({
-          id: 'history-' + i,
-          proposalId: null,
-          recordId: record.id,
-          candidateId: record.candidateId!,
-          candidateVersionId: record.candidateVersionId!,
-          mapping: { method: 'Retained method' },
-          resolutions: [],
-          disposition: 'review_later',
-          answers: {},
-          at: '2026-01-01T00:00:00Z',
-        });
-    },
-  );
-  await buildIntakeCollectionEnvelope(db, { id: source.id });
-  await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id, null);
-  const chosen = {
-    format: 'intake-draft-repair-selection-v1',
-    intakeId: source.id,
-    groupId: firstReportGroup(record.reportGroups)!.groupId,
-    rows: [
-      {
-        proposalId: null,
-        recordId: record.id,
-        candidateVersionId: record.candidateVersionId!,
-        fields: ['method', 'date'],
-      },
-    ],
-  };
-  const expected = resolveIntakeDraftRepairScope(db, root, profileId, chosen);
-  const assertClosed = () =>
-    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, rows: 0, scopes: 0 });
-  assertClosed();
-  // Observe real host turns while policy scratch is owned; dependency awaits alone
-  // cannot satisfy this assertion.
-  const duringClinicalTurn = async <T>(action: () => void, run: () => Promise<T>) => {
-    let finished = false,
-      fired = false;
-    const poll = () => {
-      if (finished) return;
-      if (!fired && reviewIssueScratchCounts(db).databases > 0) {
-        fired = true;
-        action();
-      } else if (!fired) setImmediate(poll);
-    };
-    setImmediate(poll);
-    try {
-      return await run();
-    } finally {
-      finished = true;
-      assert.equal(fired, true, 'unrelated host work ran during native clinical preparation');
-    }
-  };
-  assert.deepEqual(
-    await duringClinicalTurn(
-      () => {},
-      () => prepareIntakeDraftRepairScope(db, root, profileId, chosen),
-    ),
-    expected,
-  );
-  assertClosed();
-  let cancelled = false;
-  await assert.rejects(
-    duringClinicalTurn(
-      () => {
-        cancelled = true;
-      },
-      () =>
-        prepareIntakeDraftRepairScope(db, root, profileId, chosen, {
-          assertRunning() {
-            if (cancelled) throw Error('fictional repair cancellation');
+// Multiple complete preparations over 96 retained drafts exercise parity,
+// cancellation and authority changes. This is a host-fixture hang guard.
+test(
+  'native repair scope cooperates inside history, preserves policy, and closes on cross-source change or cancellation',
+  { timeout: 120000 },
+  async (t) => {
+    const { prepareIntakeDraftRepairScope, resolveIntakeDraftRepairScope } =
+      await import('../intake-draft-repair.ts');
+    const { prepareCollectionClinicalReviewDependencies } =
+      await import('../intake-review-collection-host.ts');
+    const root = mkdtempSync(join(tmpdir(), 'fictional-repair-scope-cooperation-')),
+      profileId = 'fictional',
+      db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+    attachPersonalDurability(db, { root, profileId });
+    t.after(() => {
+      clearIntakeStateCache(db);
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const source = uploadIntake(db, root, profileId, {
+      filename: 'fictional.jsonl',
+      newProviderName: 'Fictional Clinic',
+      bytes: Buffer.from(
+        JSON.stringify({
+          format: 'health-record-v1',
+          id: 'one',
+          kind: 'record',
+          payload: { literal: 'Independent fictional history' },
+          clinical: {
+            kind: 'observation',
+            subject: 'self',
+            testLabel: 'Fictional scope',
+            valueText: '12',
+            unit: 'fictional units',
+            date: '2025-01-01',
+            method: 'Original method',
+          },
+          provenance: {
+            capturedVia: null,
+            sourceSystem: 'Fictional Clinic',
+            sourceRecordId: 'one',
+            evidenceClass: 'provider_export',
+            locator: 'characters 0–30',
+          },
+          coverage: { status: 'complete_response', notes: [] },
+          report: {
+            key: 'fictional-report',
+            title: 'Fictional panel',
+            anchor: { locator: 'characters 0–30', text: 'Fictional report' },
+            subject: null,
           },
         }),
-    ),
-    /fictional repair cancellation/,
-  );
-  assertClosed();
-  // A same-value write outside this intake must still invalidate the exact SQL
-  // snapshot used by the cooperative policy; no stale scope may escape.
-  await assert.rejects(
-    duringClinicalTurn(
-      () => {
-        db.prepare("UPDATE app_meta SET value=value WHERE key='owner_profile_id'").run();
+      ),
+    });
+    const record = reviewIntake(db, root, profileId, source.id).records[0]!;
+    workflowMutation(
+      db,
+      root,
+      profileId,
+      source.id,
+      { version: source.version, operationId: 'fictional-history' },
+      (workflow) => {
+        for (let i = 0; i < 96; i++)
+          workflow.reviewDrafts.push({
+            id: 'history-' + i,
+            proposalId: null,
+            recordId: record.id,
+            candidateId: record.candidateId!,
+            candidateVersionId: record.candidateVersionId!,
+            mapping: { method: 'Retained method' },
+            resolutions: [],
+            disposition: 'review_later',
+            answers: {},
+            at: '2026-01-01T00:00:00Z',
+          });
       },
-      () => prepareIntakeDraftRepairScope(db, root, profileId, expected),
-    ),
-    { code: 'INTAKE_REVIEW_CHANGED' },
-  );
-  assertClosed();
-  assert.deepEqual(await prepareIntakeDraftRepairScope(db, root, profileId, expected), expected);
-  assertClosed();
-});
+    );
+    await buildIntakeCollectionEnvelope(db, { id: source.id });
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id, null);
+    const chosen = {
+      format: 'intake-draft-repair-selection-v1',
+      intakeId: source.id,
+      groupId: firstReportGroup(record.reportGroups)!.groupId,
+      rows: [
+        {
+          proposalId: null,
+          recordId: record.id,
+          candidateVersionId: record.candidateVersionId!,
+          fields: ['method', 'date'],
+        },
+      ],
+    };
+    const expected = resolveIntakeDraftRepairScope(db, root, profileId, chosen);
+    const assertClosed = () =>
+      assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, rows: 0, scopes: 0 });
+    assertClosed();
+    // Observe real host turns while policy scratch is owned; dependency awaits alone
+    // cannot satisfy this assertion.
+    const duringClinicalTurn = async <T>(action: () => void, run: () => Promise<T>) => {
+      let finished = false,
+        fired = false;
+      const poll = () => {
+        if (finished) return;
+        if (!fired && reviewIssueScratchCounts(db).databases > 0) {
+          fired = true;
+          action();
+        } else if (!fired) setImmediate(poll);
+      };
+      setImmediate(poll);
+      try {
+        return await run();
+      } finally {
+        finished = true;
+        assert.equal(fired, true, 'unrelated host work ran during native clinical preparation');
+      }
+    };
+    assert.deepEqual(
+      await duringClinicalTurn(
+        () => {},
+        () => prepareIntakeDraftRepairScope(db, root, profileId, chosen),
+      ),
+      expected,
+    );
+    assertClosed();
+    let cancelled = false;
+    await assert.rejects(
+      duringClinicalTurn(
+        () => {
+          cancelled = true;
+        },
+        () =>
+          prepareIntakeDraftRepairScope(db, root, profileId, chosen, {
+            assertRunning() {
+              if (cancelled) throw Error('fictional repair cancellation');
+            },
+          }),
+      ),
+      /fictional repair cancellation/,
+    );
+    assertClosed();
+    // A same-value write outside this intake must still invalidate the exact SQL
+    // snapshot used by the cooperative policy; no stale scope may escape.
+    await assert.rejects(
+      duringClinicalTurn(
+        () => {
+          db.prepare("UPDATE app_meta SET value=value WHERE key='owner_profile_id'").run();
+        },
+        () => prepareIntakeDraftRepairScope(db, root, profileId, expected),
+      ),
+      { code: 'INTAKE_REVIEW_CHANGED' },
+    );
+    assertClosed();
+    assert.deepEqual(await prepareIntakeDraftRepairScope(db, root, profileId, expected), expected);
+    assertClosed();
+  },
+);

@@ -450,6 +450,9 @@ deduplication and sorting use private disposable SQLite; each iterator closes it
 scratch database on completion or abandonment. Current issue lookups read the
 source-bound policy index directly. The legacy review-token recipe streams the
 complete ordered witnesses, including retained unknown fields and literal values.
+Native preparation checkpoints inside witness indexing and canonical traversal,
+including skipped historical entries; yielding only after a draft is built would
+leave the cold index construction synchronous.
 The displayed history remains independently pageable. Saving another answer
 appends only its new resolution; it does not copy prior witnesses into the new
 draft. A single oversized resolution still requires the existing fragment view.
@@ -500,10 +503,23 @@ implementations with the transaction-bound synchronous policy. Native reads and 
 run at most 16 yielded work units before a real event-loop turn. These units include
 retained question/issue processing, source-scope evidence, report membership and
 receipt checks, and complete canonical review and selection-token inputs. A
-resolved promise alone is not a yield. Every asynchronous gap retains the exact
-connection SQL, registry and grounding stamp and checks the current owner and
-caller cancellation guard before resuming. A changed proof refuses the attempt;
-closing or aborting the generator releases its private policy scratch.
+resolved promise alone is not a yield. Every asynchronous gap retains a connection
+authority proof and checks the current owner and caller cancellation guard before
+resuming. A changed proof refuses the attempt; closing or aborting the generator
+releases its private policy scratch.
+
+Reader and source-attention caches can be populated by another read during those
+gaps. Their fixed synchronous TEMP statements receive neutral credits only after
+canonical table/index validation and restrictive SQLite authorization establish
+that they changed their owned disposable objects. Callbacks, dependency reads,
+awaits, failed or partial statements and transaction-bound writes receive no
+credit. Exact integer accounting preserves every other SQL change, external data
+version, main schema, registry and grounding generation, including real writes
+followed by rollback. Ordinary cache admission still uses the unadjusted SQL stamp;
+neutral maintenance cannot relabel a previously cached result as current. A fresh
+read checks its preparation proof through completion before retaining its final
+raw stamp. Borrowed immutable providers and multi-row feed reads keep their own
+preparation proof while later cache admission remains conservative.
 
 This cooperation does not cover every clinical lookup. The preexisting
 `activeMappingRules`, `latestRecordException` and saved-record `previous` helpers
@@ -521,6 +537,16 @@ complete cooperative traversal of the retained questions builds the private
 selection instead; a valid review gains no new preparation prerequisite. A
 malformed completed index is refused. The scratch rows are disposable and cannot
 supply an answer or create acceptance authority.
+
+Report-source preparation checkpoints retained references, group/version history,
+extension matching and complete membership hashing. Later duplicate-group
+precedence and the legacy canonical confirmation hash remain unchanged. Within
+one owned session, a memo retains only completed suggested-source hashes, with at
+most 32 entries and 256 KiB of encoded keys and digests. Exact authority changes
+or transaction entry discard that reuse; an interrupted hash is never cached.
+The source-hash, member-hash and reuse counters distinguish complete hashing from
+repeated selection. This avoids rehashing the same shared report for every record;
+it does not eliminate its cold history traversal.
 
 Cold file verification yields between 256 KiB hash chunks. The session retains
 verified physical identities for every source dependency and the selected
@@ -545,6 +571,15 @@ the result. These rows carry process-local integrity signatures and an expected
 count, so changed or missing disposable rows cannot certify current evidence.
 The identities are never refreshed to accept a replacement observed during a
 wait. Final checks still scale with the consumed artifact count.
+
+Grouped clinical projection owns a copy of every member's verified artifact proof
+before speculative writes begin. A later member can consume evidence attached by
+an earlier member only when that source already belongs to the verified union.
+Temporary consumption tracking is restored after preparation, so repeated
+preparation preserves the original sessions. The plan's signed physical proof
+survives disposable review-cache cleanup after a failed publication; replacement
+files, unknown consumed sources, closed sessions and changed logical authority
+still refuse reuse. Disposing the plan releases its proof storage.
 
 Original-grounding proofs also have a disposable semantic generation: publishing
 different facts, clearing them or evicting a scope invalidates held clinical
@@ -605,10 +640,13 @@ retention attempts. Confirmation and other mutations always rebuild current poli
 and verify their artifacts independently of the presentation memo.
 
 A live selected clinical scope also avoids repeated native v2 identity receipt
-header decoding and snapshot opening. Its private memo keeps at most 32 receipts
-and 256 KiB of encoded header/reference/key data, accounting for the reference
-captured by providers and fixed wrapper overhead. Each lookup authenticates the
-selected view and requires the exact host SQL/source/registry proof. Headers and
+header decoding and snapshot opening. Receipt headers and complete common scope
+providers share a private budget of at most 32 entries and 256 KiB of encoded
+header/reference/key data, accounting for references captured by providers and
+fixed wrapper overhead. Common providers are keyed by the entire encoded accepted
+scope reference; different receipt headers and supersession checks remain
+independent. Each lookup authenticates the selected view and requires the exact
+host authority proof. Headers and
 nested reference metadata are detached; complete collection providers have
 immutable counts and guarded traversal, including nested occurrence, issue and
 question proofs. Observed drift, transactions and scope close invalidate retained
@@ -630,11 +668,21 @@ later-version fallback remain unchanged. Work counters are attributed explicitly
 by both production scope hosts, including reads outside a global accounting
 scope.
 
-This memo optimizes repeated selectors over a small retained receipt set. The
-existing forward latest-receipt selectors still traverse the complete history.
-More than 32 receipts, aggregate budget pressure or a single oversized header
-fall back to reconstruction; this change makes no history-independent warm-cost
-claim. Legacy inline receipt readers keep their existing behavior.
+The forward latest-receipt selectors still traverse the complete history. Many
+receipts sharing one exact accepted scope can reuse that complete provider even
+as older headers leave the memo. Entry or byte-budget pressure and oversized
+values fall back to reconstruction; this makes no history-independent warm-cost
+claim. Separate counters report receipt-header reconstruction and common-scope
+opening/reuse. Native identity hosts enable this scope reuse independently of
+draft and membership caches. Legacy inline receipt readers keep their existing
+behavior.
+
+Native identity review prepares each proposal's required metadata and clinical
+session before acquiring its receipt selection. That preparation can publish
+real retained metadata, so an earlier selection is discarded and a fresh complete
+history is read after source, clinical, grounding and physical evidence checks.
+This does not extend an old proof across publication. A scope with no current
+occurrences still inspects its retained receipt history.
 
 Competing identity claims retain every report-group occurrence, including repeated
 public group IDs, with that occurrence's own latest version. Their canonical

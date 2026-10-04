@@ -16,6 +16,7 @@ import { canonicalLiteral } from './intake-format.ts';
 import { collectSelectedEvidencedIdentityWork } from './intake-identity-name-evidence.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
 import {
   beginNativeIdentityPreview,
   nativeIdentityPreviewCurrent,
@@ -92,7 +93,10 @@ import {
   type IdentityPolicyMember,
   type IdentityPolicyTarget,
 } from './intake-identity-policy.ts';
-import { retainSelectedIdentityGroundingWork } from './intake-identity-grounding.ts';
+import {
+  retainSelectedIdentityGroundingWork,
+  identityGroundingGeneration,
+} from './intake-identity-grounding.ts';
 import { selectedIdentityPeopleSnapshots } from './intake-identity-people.ts';
 import {
   selfSnapshot,
@@ -220,6 +224,21 @@ async function open(
     view,
     catalog,
     metadataBytes: 256 * 1024,
+    readIdentityReceiptScopeState: () => {
+      if (db.isTransaction) return undefined;
+      assertCurrent();
+      return reviewReadStamp(db);
+    },
+    readProofState: () => {
+      if (db.isTransaction) return undefined;
+      assertCurrent();
+      return reviewPreparationStamp(db);
+    },
+    readIdentityReceiptScopeProofState: () => {
+      if (db.isTransaction) return undefined;
+      assertCurrent();
+      return reviewPreparationStamp(db);
+    },
     identityReceiptWork: (metric) => withIntakeWork(db, 'warm', () => recordIntakeWork(metric)),
     packageEvidence: file.mime_type === 'application/zip' || !!plan?.hasMembers,
     readDraft: (record) =>
@@ -677,11 +696,12 @@ function runNativeIdentityWork<T>(context: Context, stored: Rows, work: Generato
     capture() {
       context.assertCurrent();
       stored.assertArtifacts();
-      const stamp = reviewReadStamp(db);
+      const stamp = reviewPreparationStamp(db);
       if (stamp === undefined) reject('Identity scope preparation requires current authority');
       return () => {
         context.assertCurrent();
-        if (reviewReadStamp(db) !== stamp) reject('Identity scope changed during preparation');
+        if (reviewPreparationStamp(db) !== stamp)
+          reject('Identity scope changed during preparation');
         stored.assertArtifacts();
       };
     },
@@ -697,7 +717,9 @@ async function build(
   const currentSelf = selfSnapshot(db),
     people = selectedIdentityPeopleSnapshots(db);
   const run = <T>(work: Generator<void, T, void>) => runNativeIdentityWork(context, stored, work);
-  const receipts = await run(scope.receiptsWork!());
+  let receipts: Iterable<IdentityPolicyReceipt> | undefined;
+  const currentReceipts = () =>
+    receipts || reject('Prepare the complete current identity receipt selection');
   let inspections = 0;
   const step = () =>
     ++inspections % 16 === 0
@@ -746,10 +768,20 @@ async function build(
     candidateVersionId: string,
   ) {
     if (!cached || cached.proposalId !== proposalId) {
+      // Prerequisite preparation may publish accepted derived catalogs. An older
+      // borrowed receipt proof is never rebased across those real SQL writes.
+      receipts = undefined;
       cached?.selected.session.close();
       cached = undefined;
+      const grounding = identityGroundingGeneration(db);
+      const assertPreparationCurrent = () => {
+        context.assertCurrent();
+        stored.assertArtifacts();
+        if (identityGroundingGeneration(db) !== grounding)
+          reject('Identity grounding changed during occurrence preparation');
+      };
       await prepareCollectionClinicalReviewDependencies(db, root, profileId, id, proposalId, {
-        assertRunning: context.assertCurrent,
+        assertRunning: assertPreparationCurrent,
       });
       const selected = await prepareCollectionClinicalReviewAsync(
         db,
@@ -757,17 +789,20 @@ async function build(
         profileId,
         id,
         proposalId,
-        { assertRunning: context.assertCurrent },
+        { assertRunning: assertPreparationCurrent },
       );
       if (selected.status !== 'ready')
         return reject(
           'Prepare this exact retained clinical occurrence before identity confirmation',
         );
       cached = { proposalId, selected };
-      context.assertCurrent();
+      assertPreparationCurrent();
       stored.retainArtifacts(
         collectionClinicalProjectionContext(selected.session).verifiedArtifacts(),
       );
+      // Acquire a new complete selection only after prerequisites and physical
+      // authority are verified. Previously borrowed providers stay invalid.
+      receipts = await run(scope.receiptsWork!());
     }
     const record = cached.selected.session.record(recordId, candidateId, candidateVersionId);
     if (!record) return reject('The current report occurrence differs from the displayed member');
@@ -899,7 +934,7 @@ async function build(
               const receipt = yield* repeatedIdentityQuestionReceiptWork({
                 issue,
                 group,
-                receipts,
+                receipts: currentReceipts(),
                 profileId,
                 intakeId: id,
                 sourceHash: context.file.sha256,
@@ -990,6 +1025,8 @@ async function build(
     cached?.selected.session.close();
   }
   stored.assertArtifacts();
+  // A report with no current occurrence still inspects all retained receipts.
+  if (!receipts) receipts = await run(scope.receiptsWork!());
   const dates = originalSubjectBirthDateEvidence(
     original.pageText,
     group.report!.subject!.text,
@@ -1051,7 +1088,7 @@ async function build(
         const issueId = occurrence.issueIds[0]!;
         if (
           yield* exactCurrentIdentityResolutionOperationIdWork({
-            receipts,
+            receipts: currentReceipts(),
             occurrences: [occurrence],
             receiptApplies,
             receiptAppliesWork,
@@ -1108,12 +1145,13 @@ async function build(
     {
       capture() {
         context.assertCurrent();
-        const stamp = reviewReadStamp(db);
+        const stamp = reviewPreparationStamp(db);
         if (stamp === undefined)
           reject('Identity scope preparation requires a current authority boundary');
         return () => {
           context.assertCurrent();
-          if (reviewReadStamp(db) !== stamp) reject('Identity scope changed during preparation');
+          if (reviewPreparationStamp(db) !== stamp)
+            reject('Identity scope changed during preparation');
           stored.assertArtifacts();
         };
       },
@@ -1228,7 +1266,7 @@ async function build(
     ? undefined
     : await run(
         exactCurrentIdentityResolutionOperationIdWork({
-          receipts,
+          receipts: currentReceipts(),
           occurrences: stored.sequence<Explicit>('explicit'),
           receiptApplies,
           receiptAppliesWork,
@@ -1242,7 +1280,7 @@ async function build(
     const repair = await run(
       (function* () {
         let last: IdentityPolicyReceipt | undefined;
-        for (const receipt of receipts) {
+        for (const receipt of currentReceipts()) {
           yield;
           if (
             !(yield* receiptAppliesWork(receipt)) ||
@@ -1328,7 +1366,7 @@ async function build(
       group,
       groupVersionId: context.groupVersionId,
       originalFingerprint: original.originalFingerprint,
-      receipts,
+      receipts: currentReceipts(),
       hasUnstructuredIdentityQuestion,
       explicitlyConfirmedOperationId,
       currentRefusal,
@@ -1337,7 +1375,7 @@ async function build(
   const confirmationCount = await run(
     (function* () {
       let count = 0;
-      for (const receipt of receipts) {
+      for (const receipt of currentReceipts()) {
         yield;
         if (receipt.scope.groupId === group.id) count++;
       }

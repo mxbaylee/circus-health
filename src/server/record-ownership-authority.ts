@@ -141,6 +141,12 @@ export function identityBeforeOwnershipHold(record: IntakeReviewRecord) {
 }
 export interface SelectedOwnershipReviewScope {
   readonly intakeVersion: number;
+  groupWork?(
+    id: string,
+  ): Generator<void, import('./intake-workflow.ts').WorkflowReviewGroup | undefined, void>;
+  currentVersionWork?(
+    group: import('./intake-workflow.ts').WorkflowReviewGroup,
+  ): Generator<void, string | null, void>;
   remainingWork?(
     groupId: string,
     selectedSources: ReadonlySet<string>,
@@ -246,7 +252,9 @@ function* ownershipIdentityBlockerSteps(
   for (const ref of groups) {
     yield;
     const group = selected
-      ? selected.group(ref.groupId)
+      ? selected.groupWork
+        ? yield* selected.groupWork(ref.groupId)
+        : selected.group(ref.groupId)
       : workflow?.reportGroups?.find((g) => g.id === ref.groupId);
     if (!group || (!workflow && !selected)) {
       yield 'The report boundary changed.';
@@ -479,7 +487,9 @@ export function* requireCorrectedOwnershipReviewWork(
     groupId: group?.id || null,
     groupVersionId: group
       ? selected
-        ? selected.currentVersion(group)
+        ? selected.currentVersionWork
+          ? yield* selected.currentVersionWork(group)
+          : selected.currentVersion(group)
         : (group as IntakeReportGroup).versions.at(-1)?.id || null
       : null,
     confirmationOperationId: authority.operationId,

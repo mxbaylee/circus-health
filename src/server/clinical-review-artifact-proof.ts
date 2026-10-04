@@ -41,6 +41,20 @@ export function createClinicalReviewArtifactProof(sql: DatabaseSync, table: stri
         }
       }
     },
+    /** Every source consumed after coupled speculative writes must already
+     * belong to the group's original verified proof, never a newer baseline. */
+    assertContains(ids: Iterable<string>) {
+      for (const id of ids) {
+        const row = previous.get(id);
+        if (
+          !row ||
+          typeof row.path !== 'string' ||
+          typeof row.identity !== 'string' ||
+          row.signature !== signature(id, row.path, row.identity)
+        )
+          throw changed();
+      }
+    },
     /** Restore only together with the caller's SQL savepoint rollback. */
     checkpoint() {
       const previousCount = count;

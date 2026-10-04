@@ -185,7 +185,17 @@ test(
     await inline.getByRole('button', { name: 'Close review', exact: true }).click();
     await inline.waitFor({ state: 'detached' });
 
+    // The encrypted publication has its own completion event; the short UI
+    // assertion below starts after the real save response, within this test's guard.
+    const accepted = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname === prefix + '/intakes/report-acceptance',
+      { timeout: 60000 },
+    );
     await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+    const acceptedResponse = await accepted;
+    assert.equal(acceptedResponse.status(), 200, await acceptedResponse.text());
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')

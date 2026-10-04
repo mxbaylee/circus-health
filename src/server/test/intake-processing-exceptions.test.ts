@@ -20,6 +20,7 @@ import { readVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
 import {
   setCollectionProcessingException,
   clearCollectionProcessingExceptions,
+  clearCollectionProcessingException,
 } from '../intake-processing-exceptions.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import {
@@ -114,6 +115,71 @@ test('native reading exceptions select sparse state atomically, replay, and clea
   );
   for (const name of ['materializationReads', 'sourceDTOHydrations', 'envelopeHydrations'] as const)
     assert.equal(intakeWorkCounters(db).warm[name], counters[name]);
+});
+
+test('scoped processing retry preserves another stalled unit and exact replay through cache loss', async (t) => {
+  const { db, root, profileId } = fixture(t);
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-scoped-retry.zip',
+    bytes: zipFixture([
+      { name: 'a.txt', data: 'Fictional A' },
+      { name: 'b.txt', data: 'Fictional B' },
+    ]),
+  });
+  const planned = await createPagedPackagePlan(db, root, profileId, source.id, {
+    version: source.version,
+    operationId: 'scoped-plan',
+  });
+  await prepareCollectionWorkflowReadiness(db, root, profileId, source.id, {
+    mappingVersion: planned.plan.pins.mappingVersion,
+  });
+  const initial = readPackagePlanScope(db, root, profileId, source.id)!,
+    unitIds = [0, 1].map(
+      (ordinal) => initial.unit(initial.inventory.member(ordinal)!.memberId)!.id,
+    );
+  for (const unitId of unitIds)
+    await setCollectionProcessingException(db, root, profileId, source.id, {
+      version: intakeSourceVersion(db, source.id).version,
+      operationId: 'stall:' + unitId,
+      unitId,
+      exception: { reason: 'processing_stalled', at: '2026-10-04T00:00:00Z' },
+    });
+  const version = intakeSourceVersion(db, source.id).version,
+    retry = { version, operationId: 'scoped-retry', unitId: unitIds[0]! };
+  await assert.rejects(
+    clearCollectionProcessingException(db, root, profileId, source.id, {
+      ...retry,
+      onCheckpoint() {
+        throw Error('fictional scoped cancellation');
+      },
+    }),
+    /fictional scoped cancellation/,
+  );
+  assert.equal(intakeSourceVersion(db, source.id).version, version);
+  for (const unitId of unitIds)
+    assert.ok(
+      readPackagePlanScope(db, root, profileId, source.id)!.unitById(unitId)!.processingException,
+    );
+  await clearCollectionProcessingException(db, root, profileId, source.id, retry);
+  clearIntakeStateCache(db);
+  const selected = readPackagePlanScope(db, root, profileId, source.id)!;
+  assert.equal(selected.unitById(unitIds[0]!)!.processingException, undefined);
+  assert.equal(selected.unitById(unitIds[1]!)!.processingException?.reason, 'processing_stalled');
+  for (const unitId of unitIds) assert.equal(selected.accountedKind(unitId), null);
+  assert.equal(nextPendingPagedPackageUnit(db, root, profileId, source.id)?.id, unitIds[0]);
+  await clearCollectionProcessingException(db, root, profileId, source.id, retry);
+  assert.equal(intakeSourceVersion(db, source.id).version, version + 1);
+  await assert.rejects(
+    clearCollectionProcessingException(db, root, profileId, source.id, {
+      ...retry,
+      unitId: unitIds[1]!,
+    }),
+    { code: 'OPERATION_CONFLICT' },
+  );
+  assert.ok(
+    readPackagePlanScope(db, root, profileId, source.id)!.unitById(unitIds[1]!)!
+      .processingException,
+  );
 });
 
 // Host-only preparation and atomic retry of 65 retained plans, then cache-loss

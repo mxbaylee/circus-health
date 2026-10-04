@@ -967,15 +967,32 @@ test(
   { timeout: 120000 },
   async (t) => {
     const f = await fixture(t, true, 1, false, undefined, undefined, true);
+    const hydrationBaseline = intakeWorkCounters(f.db).warm.envelopeHydrations;
     const initial = await f.review();
     const reference = initial.scopeReference!;
     assert.ok(reference);
+    // A receipt must reference accepted logical authority, rather than the
+    // disposable preview snapshot created by GET.
+    const accepted = await f.request('identity-scope', {
+      version: reference.intakeVersion,
+      operationId: 'fictional-before-superseded',
+      scope: reference,
+      outcome: 'this_is_me',
+      attestation: 'confirmed_displayed_identity_questions',
+    } satisfies IntakeIdentityConfirmation);
+    const current = openIntakeCollectionEnvelope(f.db, { id: f.original.id });
+    const workflow = current.child(current.child(current.root(), 'intake')!, 'workflow')!;
+    const receipt = readIntakeReviewValue<Record<string, unknown>>(
+      current,
+      current.childAt(workflow, 'identityConfirmations', 0)!,
+      256 * 1024,
+    );
     const operationIds = Array.from({ length: 70 }, (_, n) => 'fictional-superseded-' + n);
     const prepared = await prepareIntakeWorkflowCommand(
       f.db,
       { id: f.original.id },
       {
-        version: reference.intakeVersion,
+        version: accepted.version,
         operationId: 'fictional-superseded-receipt-history',
         request: { operationIds },
         createdAt: '2026-01-01T00:00:00Z',
@@ -985,12 +1002,7 @@ test(
               op: 'append' as const,
               record: workflow,
               field: 'identityConfirmations',
-              jsonText: JSON.stringify({
-                operationId,
-                scope: reference,
-                outcome: 'this_is_me',
-                at: '2026-01-01T00:00:00Z',
-              }),
+              jsonText: JSON.stringify({ ...receipt, operationId }),
             };
         },
       },
@@ -1000,7 +1012,7 @@ test(
       f.db,
       () => {
         selectedEnvelopeStore(f.db, { id: f.original.id }).collections.stage(prepared.prepared);
-        for (const supportOperationId of operationIds)
+        for (const supportOperationId of ['fictional-before-superseded', ...operationIds])
           f.db
             .prepare(
               "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES(?,'Identity receipt supersession','verified',?,?)",
@@ -1016,7 +1028,7 @@ test(
     clearNativeIdentityPreviews(f.db);
     const fresh = await f.review();
     assert.equal(fresh.confirmationCount, 0);
-    assert.equal(fresh.status, initial.status);
+    assert.ok(fresh.scopeReference);
     const scope = fresh.scopeReference!;
     const command: IntakeIdentityConfirmation = {
       version: scope.intakeVersion,
@@ -1032,6 +1044,6 @@ test(
     assert.equal(after.blocking, false);
     await f.request('identity-scope', command);
     assert.equal((await f.review()).confirmationCount, 1);
-    assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, 0);
+    assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, hydrationBaseline);
   },
 );

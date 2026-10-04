@@ -28,6 +28,12 @@ Model reading binds a fresh context to an unresolved plan unit before dispatch. 
 
 **Retry exceptions** reopens retained machine failures without erasing protected human-reviewed text. Human transcription can resolve the matching OCR-unavailable issue only after original/text review validation; it never claims OCR succeeded or resolves unrelated issues.
 
+Explicit **Resume** of a partial item reopens only the located processing stalls
+retained by that batch item. It preserves unrelated extraction or technical
+failures, other units' exceptions, prior proposals and cumulative usage. Each
+reopened unit uses a replayable command under the current profile and batch
+authorization; restarting the app alone does not grant this explicit retry.
+
 Source text uses partitioned immutable page/list storage instead of a total page/span/revision-byte ceiling. Decoder, raster and request limits remain. Full-revision editing still has memory costs proportional to document size. PDF inventory gets the page count separately and builds the index in 64-page worker chunks. Each chunk bounds both reference count and serialized reference bytes. Excess references are located as capacity exceptions while page text and later pages remain readable; long Unicode destinations cannot discard the whole inventory. Packets preserve those exact reference gaps. A source or capacity failure preserves its original and unresolved scope; it is not proof of complete clinical extraction. `SOURCE_TEXT_CHANGED` and active extraction races back off for the affected item; a true review conflict asks for source review. Locked durability waits for unlock, and a conflicted durable journal is reported as a durability problem.
 
 Legacy batch compatibility has one additional cost limit: older queued/running items with capture progress and no recorded model-pass baseline can run another billed model pass after upgrade. `review_ready` items can be hydrated safely; ambiguous active items cannot infer covered work from the count alone. Current-format completed passes persist the baseline. Legacy baseline migration is outside the owner's preproduction scope; this retained branch is not an old-format support promise. [CRS-140](../todo/CRS-140.md) retains current-format replay accounting and conservative handling of unknown outcomes without skipping unread evidence.

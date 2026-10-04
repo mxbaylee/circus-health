@@ -27,6 +27,8 @@ const hostTemplate = {
   reviewDraftHandoffs: 0,
   identityPolicyReceiptReconstructions: 0,
   identityPolicyReceiptCacheHits: 0,
+  identityPolicyScopeReconstructions: 0,
+  identityPolicyScopeCacheHits: 0,
   identityPolicyReceiptNamespaceReads: 0,
   identityPolicyReceiptNamespaceHits: 0,
   identityPolicyMembershipResolutions: 0,

@@ -1,5 +1,9 @@
 /** Disposable changed-source attention counts; originals and revision metadata remain authority. */
 import { setImmediate } from 'node:timers/promises';
+import {
+  execClinicalReviewMaintenance,
+  prepareClinicalReviewMaintenance,
+} from './clinical-review-maintenance.ts';
 import { HttpError, revision, type Database } from './database.ts';
 import { visibilityCondition, visibilitySQL } from './visibility.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
@@ -25,18 +29,29 @@ function prepareTables(db: Database) {
         )
         .get()!.n,
     ) === 9;
-  db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${rows}(source_id TEXT PRIMARY KEY,sections INTEGER NOT NULL);
-    CREATE TEMP TABLE IF NOT EXISTS ${dirty}(source_id TEXT PRIMARY KEY);
-    CREATE TEMP TABLE IF NOT EXISTS ${state}(singleton INTEGER PRIMARY KEY,profile_id TEXT NOT NULL,data_version INTEGER NOT NULL);`);
-  if (!complete) db.exec(`DELETE FROM temp.${state}`);
+  for (const sql of [
+    `CREATE TEMP TABLE IF NOT EXISTS ${rows}(source_id TEXT PRIMARY KEY,sections INTEGER NOT NULL)`,
+    `CREATE TEMP TABLE IF NOT EXISTS ${dirty}(source_id TEXT PRIMARY KEY)`,
+    `CREATE TEMP TABLE IF NOT EXISTS ${state}(singleton INTEGER PRIMARY KEY,profile_id TEXT NOT NULL,data_version INTEGER NOT NULL)`,
+  ])
+    execClinicalReviewMaintenance(db, 'attention', sql);
+  if (!complete) execClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${state}`);
   for (const action of ['INSERT', 'UPDATE', 'DELETE']) {
     const versions = action === 'UPDATE' ? ['old', 'new'] : [action === 'DELETE' ? 'old' : 'new'];
-    db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS source_attention_files_${action.toLowerCase()} AFTER ${action} ON main.source_files BEGIN
+    execClinicalReviewMaintenance(
+      db,
+      'attention',
+      `CREATE TEMP TRIGGER IF NOT EXISTS source_attention_files_${action.toLowerCase()} AFTER ${action} ON main.source_files BEGIN
       ${versions.map((v) => `INSERT INTO ${dirty} SELECT ${v}.id WHERE NOT EXISTS(SELECT 1 FROM ${dirty} WHERE source_id=${v}.id);`).join('\n')}
-      END;`);
-    db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS source_attention_meta_${action.toLowerCase()} AFTER ${action} ON main.app_meta BEGIN
+      END;`,
+    );
+    execClinicalReviewMaintenance(
+      db,
+      'attention',
+      `CREATE TEMP TRIGGER IF NOT EXISTS source_attention_meta_${action.toLowerCase()} AFTER ${action} ON main.app_meta BEGIN
       ${versions.map((v) => `INSERT INTO ${dirty} SELECT ${affected(v + '.key')} WHERE ${affected(v + '.key')} IS NOT NULL AND NOT EXISTS(SELECT 1 FROM ${dirty} WHERE source_id=${affected(v + '.key')});`).join('\n')}
-      END;`);
+      END;`,
+    );
   }
 }
 export async function readPreparedSourceAttention(
@@ -74,12 +89,18 @@ export async function readPreparedSourceAttention(
     selected.profile_id !== profileId ||
     selected.data_version !== selectedDataVersion
   ) {
-    db.exec(`DELETE FROM temp.${rows}; DELETE FROM temp.${dirty};
-      INSERT INTO temp.${dirty} SELECT id FROM source_files WHERE kind='intake_original';`);
-    db.prepare(`INSERT OR REPLACE INTO temp.${state} VALUES(1,?,?)`).run(
-      profileId,
-      selectedDataVersion,
+    execClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${rows}`);
+    execClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${dirty}`);
+    execClinicalReviewMaintenance(
+      db,
+      'attention',
+      `INSERT INTO temp.${dirty} SELECT id FROM source_files WHERE kind='intake_original'`,
     );
+    prepareClinicalReviewMaintenance(
+      db,
+      'attention',
+      `INSERT OR REPLACE INTO temp.${state} VALUES(1,?,?)`,
+    ).run(profileId, selectedDataVersion);
   }
   let processed = 0;
   for (;;) {
@@ -94,11 +115,22 @@ export async function readPreparedSourceAttention(
       const sections = sectionsFor(file);
       if (!Number.isSafeInteger(sections) || sections < 0)
         throw Error('Invalid source attention count');
-      db.prepare(
+      prepareClinicalReviewMaintenance(
+        db,
+        'attention',
         `INSERT INTO temp.${rows} VALUES(?,?) ON CONFLICT(source_id) DO UPDATE SET sections=excluded.sections`,
       ).run(id, sections);
-    } else db.prepare(`DELETE FROM temp.${rows} WHERE source_id=?`).run(id);
-    db.prepare(`DELETE FROM temp.${dirty} WHERE source_id=?`).run(id);
+    } else
+      prepareClinicalReviewMaintenance(
+        db,
+        'attention',
+        `DELETE FROM temp.${rows} WHERE source_id=?`,
+      ).run(id);
+    prepareClinicalReviewMaintenance(
+      db,
+      'attention',
+      `DELETE FROM temp.${dirty} WHERE source_id=?`,
+    ).run(id);
     withIntakeWork(db, 'warm', () => recordIntakeWork('sourceAttentionPreparedSources'));
     if (++processed % 32 === 0) await setImmediate();
   }

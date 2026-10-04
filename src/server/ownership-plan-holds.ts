@@ -1,5 +1,5 @@
 import { runClinicalReviewWork } from './clinical-review-work.ts';
-import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
 import { HttpError } from './database.ts';
 /** Complete selected-record report-default holds. Source fan-in stays in the owned SQL plan. */
 import type { Database } from './database.ts';
@@ -23,12 +23,12 @@ export async function ownershipPlanHolds(
     runClinicalReviewWork(work, {
       capture() {
         assertCurrent();
-        const stamp = reviewReadStamp(db);
+        const stamp = reviewPreparationStamp(db);
         if (stamp === undefined)
           throw Error('Ownership holds require outside-transaction preparation');
         return () => {
           assertCurrent();
-          if (reviewReadStamp(db) !== stamp)
+          if (reviewPreparationStamp(db) !== stamp)
             throw new HttpError(
               409,
               'OWNERSHIP_CHANGED',

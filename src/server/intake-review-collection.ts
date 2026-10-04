@@ -15,6 +15,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { canonicalLiteral, parseLiteralJSON } from './intake-format.ts';
 import {
   intakeEnvelopeRecordOrder,
+  intakeEnvelopeFieldAccess,
   type IntakeCollectionEnvelopeReader,
   type IntakeEnvelopeRecord,
 } from './intake-collection-envelope.ts';
@@ -60,6 +61,8 @@ type IdentityReceiptWork =
   | 'reviewDraftHandoffs'
   | 'identityPolicyReceiptReconstructions'
   | 'identityPolicyReceiptCacheHits'
+  | 'identityPolicyScopeReconstructions'
+  | 'identityPolicyScopeCacheHits'
   | 'identityPolicyReceiptNamespaceReads'
   | 'identityPolicyReceiptNamespaceHits'
   | 'identityPolicyMembershipResolutions'
@@ -163,6 +166,11 @@ export function collectionWorkflowReviewScope(input: {
   metadataBytes: number;
   /** A host-verified SQLite state stamp; omitted hosts perform every read. */
   readCacheState?: () => string | undefined;
+  /** In-flight provider authority, excluding only certified disposable maintenance. */
+  readProofState?: () => string | undefined;
+  /** Receipt snapshot accessors only; transaction-bound membership stays uncached. */
+  readIdentityReceiptScopeState?: () => string | undefined;
+  readIdentityReceiptScopeProofState?: () => string | undefined;
   identityReceiptWork?(metric: IdentityReceiptWork): void;
   packageEvidence: boolean;
   activeReceipt(receipt: IdentityPolicyReceipt): boolean;
@@ -590,9 +598,27 @@ export function collectionWorkflowReviewScope(input: {
     }
   >();
   let nativeReceiptState: string | undefined,
+    nativeReceiptProofState: string | undefined,
     nativeReceiptBytes = 0,
     receiptScopeClosed = false;
   let nativeReceiptEpoch = {};
+  const commonReceiptScopes = new Map<
+    string,
+    { collections: IdentityPolicyReceipt['scope']; bytes: number }
+  >();
+  let commonReceiptScopeBytes = 0,
+    commonReceiptScopeState: string | undefined,
+    commonReceiptScopeProofState: string | undefined,
+    commonReceiptScopeEpoch = {};
+  const clearCommonReceiptScopes = (invalidate = true) => {
+    if (invalidate) commonReceiptScopeEpoch = {};
+    commonReceiptScopes.clear();
+    commonReceiptScopeBytes = 0;
+    // Header entries can hold borrowed common accessors. Drop those aliases on
+    // authority invalidation, without changing membership/draft proof epochs.
+    nativeReceiptCache.clear();
+    nativeReceiptBytes = 0;
+  };
   let receiptLocators: readonly IntakeEnvelopeRecord[] | undefined;
   let receiptLocatorBytes = 0;
   const membershipCache = new Map<
@@ -605,8 +631,9 @@ export function collectionWorkflowReviewScope(input: {
     { revision: string | null | undefined; bytes: number }
   >();
   let proposalRevisionBytes = 0;
-  const clearNativeReceipts = () => {
-    nativeReceiptEpoch = {};
+  const clearNativeReceipts = (invalidate = true) => {
+    clearCommonReceiptScopes(invalidate);
+    if (invalidate) nativeReceiptEpoch = {};
     nativeReceiptCache.clear();
     nativeReceiptBytes = 0;
     receiptLocators = undefined;
@@ -626,13 +653,28 @@ export function collectionWorkflowReviewScope(input: {
       throw error;
     }
   };
+  const receiptProofState = () => {
+    if (receiptScopeClosed) throw Error('Selected native identity receipt scope closed');
+    try {
+      view.address(view.root());
+      return input.readProofState ? input.readProofState() : input.readCacheState?.();
+    } catch (error) {
+      clearNativeReceipts();
+      throw error;
+    }
+  };
   const currentReceiptState = () => {
+    const proof = receiptProofState();
+    if (proof !== nativeReceiptProofState) {
+      clearNativeReceipts();
+      nativeReceiptProofState = proof;
+    }
     const state = receiptState();
     if (state !== nativeReceiptState) {
-      clearNativeReceipts();
+      clearNativeReceipts(false);
       nativeReceiptState = state;
     }
-    return state;
+    return proof === undefined ? undefined : state;
   };
   const draftHandoff = selectedDraftHandoff(() => {
     const state = currentReceiptState();
@@ -641,7 +683,7 @@ export function collectionWorkflowReviewScope(input: {
   const receiptProofGuard = (state: string, epoch: object) => {
     if (receiptScopeClosed || epoch !== nativeReceiptEpoch)
       throw Error('Selected native identity receipt proof changed');
-    if (receiptState() !== state) {
+    if (receiptProofState() !== state) {
       clearNativeReceipts();
       throw Error('Selected native identity receipt proof changed');
     }
@@ -664,10 +706,8 @@ export function collectionWorkflowReviewScope(input: {
       scope: { ...header, ...entry.collections },
     } as IdentityPolicyReceipt;
   };
-  const guardedNativeCollections = (reference: IntakeIdentityScopeReference, state: string) => {
-    const source = nativeIdentityPolicyScope(catalog, reference),
-      epoch = nativeReceiptEpoch;
-    const guard = () => receiptProofGuard(state, epoch);
+  const guardedNativeCollections = (reference: IntakeIdentityScopeReference, guard: () => void) => {
+    const source = nativeIdentityPolicyScope(catalog, reference);
     const sequence = <T>(
       items: Iterable<T>,
       count: number,
@@ -746,6 +786,103 @@ export function collectionWorkflowReviewScope(input: {
     };
     return collections as unknown as IdentityPolicyReceipt['scope'];
   };
+  const currentCommonReceiptScopeProof = () => {
+    try {
+      if (receiptScopeClosed) throw Error('Selected native identity receipt scope closed');
+      view.address(view.root());
+      const proof = input.readIdentityReceiptScopeProofState
+        ? input.readIdentityReceiptScopeProofState()
+        : input.readProofState
+          ? input.readProofState()
+          : input.readIdentityReceiptScopeState
+            ? input.readIdentityReceiptScopeState()
+            : input.readCacheState?.();
+      if (proof !== commonReceiptScopeProofState) {
+        clearCommonReceiptScopes();
+        commonReceiptScopeProofState = proof;
+      }
+      return proof;
+    } catch (error) {
+      clearCommonReceiptScopes();
+      throw error;
+    }
+  };
+  const currentCommonReceiptScopeState = () => {
+    const proof = currentCommonReceiptScopeProof();
+    try {
+      const state = input.readIdentityReceiptScopeState
+        ? input.readIdentityReceiptScopeState()
+        : input.readCacheState?.();
+      if (state !== commonReceiptScopeState) {
+        clearCommonReceiptScopes(false);
+        commonReceiptScopeState = state;
+      }
+      return proof === undefined ? undefined : state;
+    } catch (error) {
+      clearCommonReceiptScopes();
+      throw error;
+    }
+  };
+  const trimReceiptCaches = () => {
+    while (
+      nativeReceiptCache.size + commonReceiptScopes.size > 32 ||
+      nativeReceiptBytes + commonReceiptScopeBytes > 256 * 1024
+    ) {
+      const header = nativeReceiptCache.keys().next();
+      if (!header.done) {
+        nativeReceiptBytes -= nativeReceiptCache.get(header.value)!.bytes;
+        nativeReceiptCache.delete(header.value);
+      } else {
+        const scope = commonReceiptScopes.keys().next().value!;
+        commonReceiptScopeBytes -= commonReceiptScopes.get(scope)!.bytes;
+        commonReceiptScopes.delete(scope);
+      }
+    }
+  };
+  const nativeReceiptCollections = (reference: IntakeIdentityScopeReference) => {
+    const state = currentCommonReceiptScopeState();
+    if (state === undefined) {
+      // No transaction or unproved host borrows a warm authority accessor.
+      clearCommonReceiptScopes();
+      receiptWork('identityPolicyScopeReconstructions');
+      return nativeIdentityPolicyScope(catalog, reference);
+    }
+    const key = JSON.stringify(reference),
+      epoch = commonReceiptScopeEpoch,
+      proof = commonReceiptScopeProofState;
+    const guard = () => {
+      if (
+        epoch !== commonReceiptScopeEpoch ||
+        currentCommonReceiptScopeProof() !== proof ||
+        epoch !== commonReceiptScopeEpoch
+      )
+        throw Error('Selected common identity scope proof changed');
+    };
+    const cached = commonReceiptScopes.get(key);
+    if (cached) {
+      guard();
+      commonReceiptScopes.delete(key);
+      commonReceiptScopes.set(key, cached);
+      receiptWork('identityPolicyScopeCacheHits');
+      return cached.collections;
+    }
+    receiptWork('identityPolicyScopeReconstructions');
+    const collections = guardedNativeCollections(reference, guard),
+      // Key text, reference captured by repeatable providers, and wrappers.
+      bytes = 2 * Buffer.byteLength(key) + 2048;
+    guard();
+    if (
+      epoch === commonReceiptScopeEpoch &&
+      currentCommonReceiptScopeState() === state &&
+      epoch === commonReceiptScopeEpoch &&
+      bytes <= 256 * 1024
+    ) {
+      commonReceiptScopes.set(key, { collections, bytes });
+      commonReceiptScopeBytes += bytes;
+      trimReceiptCaches();
+    }
+    return collections;
+  };
   const policyReceipt = (record: IntakeEnvelopeRecord): IdentityPolicyReceipt => {
     const state = currentReceiptState(),
       key = view.address(record);
@@ -760,22 +897,31 @@ export function collectionWorkflowReviewScope(input: {
     const receiptScope = view.child(record, 'scope');
     if (!receiptScope) throw Error('Missing retained identity scope');
     const native = value(receiptScope, 'format') === 'health-intake-identity-scope-v2';
+    // The selected receipt handle is authenticated before taking this bounded
+    // subtree. Resolve each field once within that receipt, preserving the same
+    // selected store guards and lexical values without repeated root ancestry.
+    const receiptView = native ? view.subtree(record) : undefined,
+      receiptRoot = receiptView?.root(),
+      receiptFields = receiptView && intakeEnvelopeFieldAccess(receiptView);
     const receiptValue = (name: string): unknown => {
       if (!native) return value(record, name);
-      const child = view.child(record, name);
-      if (child) return readIntakeReviewValue(view, child, metadataBytes);
-      if (!view.has(record, name)) return undefined;
+      const selected = receiptFields!.chunks(receiptRoot!, name);
+      if (!selected) return undefined;
       const pieces: string[] = [];
       let bytes = 0;
-      for (const piece of view.fieldChunks(record, name)) {
+      for (const piece of selected) {
         bytes += Buffer.byteLength(piece);
-        if (bytes > metadataBytes)
+        if (bytes > metadataBytes) {
+          // Preserve the prior exact inspection address on budget exhaustion.
+          // This ancestry resolution occurs only for an oversized field.
+          const child = view.child(record, name);
           throw new IntakeReviewFragmentRequired({
             format: 'health-intake-review-fragment-v1',
             logical: view.logical,
-            address: view.address(record),
-            field: name,
+            address: view.address(child || record),
+            ...(!child ? { field: name } : {}),
           });
+        }
         pieces.push(piece);
       }
       return parseLiteralJSON(pieces.join(''));
@@ -802,18 +948,23 @@ export function collectionWorkflowReviewScope(input: {
     }
     if (native) {
       const reference = JSON.parse(
-        JSON.stringify(read<IntakeIdentityScopeReference>(receiptScope)),
+        JSON.stringify(receiptValue('scope')),
       ) as IntakeIdentityScopeReference;
       receiptWork('identityPolicyReceiptReconstructions');
-      if (state === undefined)
+      if (state === undefined) {
+        const { format: _format, collection: _collection, ...scopeHeader } = reference;
         return {
           ...header,
-          scope: nativeIdentityPolicyScope(catalog, reference),
+          scope: {
+            ...scopeHeader,
+            ...nativeReceiptCollections(reference),
+          },
         } as IdentityPolicyReceipt;
+      }
       const entry = {
         header: JSON.stringify(header),
         reference: JSON.stringify(reference),
-        collections: guardedNativeCollections(reference, state),
+        collections: nativeReceiptCollections(reference),
         bytes: 0,
       };
       // Account both encoded reference copies (text and provider capture), key,
@@ -830,11 +981,7 @@ export function collectionWorkflowReviewScope(input: {
       ) {
         nativeReceiptCache.set(key, entry);
         nativeReceiptBytes += entry.bytes;
-        while (nativeReceiptCache.size > 32 || nativeReceiptBytes > 256 * 1024) {
-          const first = nativeReceiptCache.keys().next().value!;
-          nativeReceiptBytes -= nativeReceiptCache.get(first)!.bytes;
-          nativeReceiptCache.delete(first);
-        }
+        trimReceiptCaches();
       }
       return decodeNativeReceipt(entry);
     }
@@ -895,16 +1042,17 @@ export function collectionWorkflowReviewScope(input: {
   };
   function* receiptRecords(): Generator<IntakeEnvelopeRecord> {
     const state = currentReceiptState(),
-      epoch = nativeReceiptEpoch;
+      epoch = nativeReceiptEpoch,
+      proof = nativeReceiptProofState;
     if (state !== undefined && receiptLocators) {
       receiptWork('identityPolicyReceiptNamespaceHits');
       for (const record of receiptLocators) {
-        receiptProofGuard(state, epoch);
+        receiptProofGuard(proof!, epoch);
         // Authenticate each opaque address even when enumeration was retained.
         view.address(record);
         yield record;
       }
-      receiptProofGuard(state, epoch);
+      receiptProofGuard(proof!, epoch);
       return;
     }
     receiptWork('identityPolicyReceiptNamespaceReads');
@@ -991,14 +1139,15 @@ export function collectionWorkflowReviewScope(input: {
   };
   const selectedMembership = (group: WorkflowReviewGroup): SelectedIdentityMembership => {
     const state = currentReceiptState(),
-      epoch = nativeReceiptEpoch;
+      epoch = nativeReceiptEpoch,
+      proof = nativeReceiptProofState;
     // A bounded id selects the same first retained group; remaining header fields
     // have never participated in this membership resolution predicate.
     const key = group.id,
       keyBytes = Buffer.byteLength(key);
     const cached = state === undefined ? undefined : membershipCache.get(key);
     if (cached) {
-      receiptProofGuard(state!, epoch);
+      receiptProofGuard(proof!, epoch);
       membershipCache.delete(key);
       membershipCache.set(key, cached);
       receiptWork('identityPolicyMembershipResolutionHits');
@@ -1009,17 +1158,17 @@ export function collectionWorkflowReviewScope(input: {
     if (state === undefined) return source;
     const provider = Object.freeze({
       *retainsWork(prior: Parameters<typeof source.retains>[0]): Generator<void, boolean, void> {
-        receiptProofGuard(state, epoch);
+        receiptProofGuard(proof!, epoch);
         const result = source.retainsWork
           ? yield* source.retainsWork(prior)
           : source.retains(prior);
-        receiptProofGuard(state, epoch);
+        receiptProofGuard(proof!, epoch);
         return result;
       },
       retains(prior: Parameters<typeof source.retains>[0]) {
-        receiptProofGuard(state, epoch);
+        receiptProofGuard(proof!, epoch);
         const result = source.retains(prior);
-        receiptProofGuard(state, epoch);
+        receiptProofGuard(proof!, epoch);
         return result;
       },
     });
@@ -1068,7 +1217,7 @@ export function collectionWorkflowReviewScope(input: {
         const cached =
           state === undefined || !proposalId ? undefined : proposalRevisions.get(proposalId);
         if (cached) {
-          receiptProofGuard(state!, epoch);
+          receiptProofGuard(nativeReceiptProofState!, epoch);
           proposalRevisions.delete(proposalId!);
           proposalRevisions.set(proposalId!, cached);
           receiptWork('reviewProposalRevisionHits');
@@ -1365,7 +1514,7 @@ export function collectionWorkflowReviewScope(input: {
     *receiptsWork() {
       const sql = fallbackStore(),
         selection = ++fallbackSelection,
-        state = input.readCacheState?.();
+        state = receiptProofState();
       let ordinal = 0;
       for (const record of receiptRecords()) {
         yield;
@@ -1377,7 +1526,7 @@ export function collectionWorkflowReviewScope(input: {
       }
       return selectedSequence(function* () {
         fallbackStore();
-        if (state !== input.readCacheState?.()) throw Error('Selected identity receipts changed');
+        if (state !== receiptProofState()) throw Error('Selected identity receipts changed');
         for (const row of sql
           .prepare(
             `SELECT address FROM ${policyNamespace}active_receipts WHERE selection=? ORDER BY ordinal`,
@@ -1632,8 +1781,10 @@ export function collectionWorkflowReviewScope(input: {
           }
           return result;
         },
-        currentVersion: scope.currentVersion,
-        group: scope.identityGroup,
+        currentVersion: (group) => scope.currentVersion(group),
+        currentVersionWork: (group) => scope.currentVersionWork!(group),
+        group: (id) => scope.identityGroup(id),
+        groupWork: (id) => scope.identityGroupWork!(id),
         firstGroup(references) {
           return finishClinicalReviewWork(this.firstGroupWork!(references));
         },

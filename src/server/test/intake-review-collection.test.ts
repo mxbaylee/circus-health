@@ -45,7 +45,7 @@ import {
   intakeCandidateVersionId,
   intakeCandidateVersionIdForRevision,
 } from '../intake-workflow.ts';
-import { validateJSONL, canonicalLiteral } from '../intake-format.ts';
+import { validateJSONL, canonicalLiteral, parseLiteralJSON } from '../intake-format.ts';
 import { identityOriginalFingerprintForMember } from '../intake-identity-policy.ts';
 import type { IntakeReview, IntakeReviewRecord, IntakeReviewDraft } from '../../shared/intake.ts';
 
@@ -107,6 +107,7 @@ function review(): IntakeReview {
 async function fixture(
   t: test.TestContext,
   mutate?: (details: ReturnType<typeof detailsFor>) => void,
+  nativeReceipts?: unknown[],
 ) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-review-scope-'));
   const db = openDatabase(join(root, 'cache.sqlite'), 'fictional-profile');
@@ -119,7 +120,14 @@ async function fixture(
   const details = detailsFor();
   mutate?.(details);
   const initial = prepareInitialIntakeEnvelope({
-    intake: { version: 1, originalName: 'fictional.pdf', ...details },
+    intake: {
+      version: 1,
+      originalName: 'fictional.pdf',
+      ...details,
+      ...(nativeReceipts
+        ? { workflow: { ...details.workflow, identityConfirmations: nativeReceipts } }
+        : {}),
+    },
   });
   transaction(db, () => {
     db.prepare(
@@ -623,94 +631,149 @@ test('legacy ungrouped candidates keep exact virtual fallback versions and histo
   assert.ok(expected.records.every((record) => selectedReportGroups(record.reportGroups).length));
 });
 
-test('native fallback reference work yields during nonmatching history and preserves exact virtual hashes and tokens', async (t) => {
-  const { details, open } = await fixture(t, (details) => {
+test('ownership scope preserves bound group and version methods and dispatches cooperative fallback policy', async (t) => {
+  const { db, details, open } = await fixture(t, (details) => {
     details.workflow!.reportGroups = [];
-    const duplicate = structuredClone(details.workflow!.candidates[0]!);
-    for (let index = 0; index < 96; index++)
-      duplicate.versions[0]!.occurrences.push({
-        proposalId: 'fictional-historical',
-        recordId: 'fictional-absent:' + index,
-        batchId: null,
-        locator: 'page ' + (index + 2),
-      });
-    details.workflow!.candidates.push(duplicate);
-    for (let index = 0; index < 96; index++) {
-      const unrelated = structuredClone(details.workflow!.candidates[1]!);
-      unrelated.id = 'fictional-unrelated:' + index;
-      details.workflow!.candidates.push(unrelated);
-    }
   });
-  const { runClinicalReviewWork } = await import('../clinical-review-work.ts');
-  const { workflowReviewSelectedWork } = await import('../intake-workflow.ts');
+  const { ownershipIdentityBlockersWork } = await import('../record-ownership-authority.ts');
   const expected = workflowReview(file, details, review(), entries, self, identity);
-  const policySql = new DatabaseSync(':memory:');
-  t.after(() => policySql.isOpen && policySql.close());
-  const scope = open(128 * 1024, undefined, undefined, policySql);
-  let steps = 0,
-    observed = 0,
-    complete = false;
-  const wrapped = function* <T>(work: Generator<void, T, void>) {
-    try {
-      for (;;) {
-        const next = work.next();
-        if (next.done) return next.value;
-        steps++;
-        yield;
-      }
-    } finally {
-      work.return(undefined as never);
+  const record = expected.records[0]!;
+  const reference = [...selectedReportGroups(record.reportGroups)][0]!;
+  const scope = open().ownershipScope(() => undefined, 1);
+  const group = scope.group(reference.groupId)!;
+  assert.equal(group.basis, 'candidate_fallback');
+  assert.equal(scope.currentVersion(group), reference.groupVersionId);
+
+  const drain = <T>(work: Generator<void, T, void>) => {
+    let checkpoints = 0;
+    for (;;) {
+      const step = work.next();
+      if (step.done) return { value: step.value, checkpoints };
+      checkpoints++;
     }
   };
-  setImmediate(() => {
-    if (!complete) observed = steps;
-  });
-  const actual = await runClinicalReviewWork(
-    wrapped(workflowReviewSelectedWork(file, scope, review(), entries, self, identity)),
-    {
-      capture() {
-        return () => {};
+  const cooperative = open().ownershipScope(() => undefined, 1);
+  const groupResult = drain(cooperative.groupWork!(reference.groupId));
+  assert.deepEqual(groupResult.value, group);
+  assert.ok(groupResult.checkpoints > 0, 'cold fallback group preparation exposes checkpoints');
+  const versionResult = drain(open().ownershipScope(() => undefined, 1).currentVersionWork!(group));
+  assert.equal(versionResult.value, reference.groupVersionId);
+  assert.ok(versionResult.checkpoints > 0, 'cold fallback version preparation exposes checkpoints');
+
+  const expectedBlockers = [
+    ...ownershipIdentityBlockersWork(db, file.id, record, null, scope),
+  ].filter((value) => value !== undefined);
+  let groupCalls = 0;
+  const actualBlockers = [
+    ...ownershipIdentityBlockersWork(db, file.id, record, null, {
+      ...cooperative,
+      group() {
+        throw Error('Native ownership must use the cooperative group method');
       },
-    },
-  );
-  complete = true;
-  assert.ok(
-    observed > 0 && observed < 96,
-    'host turn ran before the unmatched candidate scan finished',
-  );
-  assert.deepEqual(actual, expected);
-  for (let index = 0; index < actual.records.length; index++)
-    assert.equal(
-      selectionAuthority(actual.records[index]),
-      selectionAuthority(expected.records[index]),
-    );
-  scope.close?.();
-  assert.ok(policySql.isOpen, 'closing one scope preserves the host-owned policy store');
-  const cancelled = open(128 * 1024, undefined, undefined, policySql);
-  const controller = new AbortController();
-  setImmediate(() => controller.abort(Error('fictional fallback cancellation')));
-  await assert.rejects(
-    runClinicalReviewWork(
-      workflowReviewSelectedWork(file, cancelled, review(), entries, self, identity),
+      *groupWork(id) {
+        groupCalls++;
+        return yield* cooperative.groupWork!(id);
+      },
+    }),
+  ].filter((value) => value !== undefined);
+  assert.deepEqual(actualBlockers, expectedBlockers);
+  assert.equal(groupCalls, 1);
+});
+
+// Publish 96 unrelated candidates and 96 historical occurrences before checking
+// full synchronous/cooperative parity, host progress and cancellation cleanup.
+test(
+  'native fallback reference work yields during nonmatching history and preserves exact virtual hashes and tokens',
+  { timeout: 120000 },
+  async (t) => {
+    const { details, open } = await fixture(t, (details) => {
+      details.workflow!.reportGroups = [];
+      const duplicate = structuredClone(details.workflow!.candidates[0]!);
+      for (let index = 0; index < 96; index++)
+        duplicate.versions[0]!.occurrences.push({
+          proposalId: 'fictional-historical',
+          recordId: 'fictional-absent:' + index,
+          batchId: null,
+          locator: 'page ' + (index + 2),
+        });
+      details.workflow!.candidates.push(duplicate);
+      for (let index = 0; index < 96; index++) {
+        const unrelated = structuredClone(details.workflow!.candidates[1]!);
+        unrelated.id = 'fictional-unrelated:' + index;
+        details.workflow!.candidates.push(unrelated);
+      }
+    });
+    const { runClinicalReviewWork } = await import('../clinical-review-work.ts');
+    const { workflowReviewSelectedWork } = await import('../intake-workflow.ts');
+    const expected = workflowReview(file, details, review(), entries, self, identity);
+    const policySql = new DatabaseSync(':memory:');
+    t.after(() => policySql.isOpen && policySql.close());
+    const scope = open(128 * 1024, undefined, undefined, policySql);
+    let steps = 0,
+      observed = 0,
+      complete = false;
+    const wrapped = function* <T>(work: Generator<void, T, void>) {
+      try {
+        for (;;) {
+          const next = work.next();
+          if (next.done) return next.value;
+          steps++;
+          yield;
+        }
+      } finally {
+        work.return(undefined as never);
+      }
+    };
+    setImmediate(() => {
+      if (!complete) observed = steps;
+    });
+    const actual = await runClinicalReviewWork(
+      wrapped(workflowReviewSelectedWork(file, scope, review(), entries, self, identity)),
       {
-        signal: controller.signal,
         capture() {
           return () => {};
         },
       },
-    ),
-    (error) =>
-      error === controller.signal.reason ||
-      (error instanceof Error &&
-        error.name === 'AbortError' &&
-        error.cause === controller.signal.reason),
-  );
-  cancelled.close?.();
-  assert.ok(policySql.isOpen, 'cancelled scope cleanup preserves the owner lifetime');
-  policySql.close();
-  scope.close?.();
-  cancelled.close?.();
-});
+    );
+    complete = true;
+    assert.ok(
+      observed > 0 && observed < 96,
+      'host turn ran before the unmatched candidate scan finished',
+    );
+    assert.deepEqual(actual, expected);
+    for (let index = 0; index < actual.records.length; index++)
+      assert.equal(
+        selectionAuthority(actual.records[index]),
+        selectionAuthority(expected.records[index]),
+      );
+    scope.close?.();
+    assert.ok(policySql.isOpen, 'closing one scope preserves the host-owned policy store');
+    const cancelled = open(128 * 1024, undefined, undefined, policySql);
+    const controller = new AbortController();
+    setImmediate(() => controller.abort(Error('fictional fallback cancellation')));
+    await assert.rejects(
+      runClinicalReviewWork(
+        workflowReviewSelectedWork(file, cancelled, review(), entries, self, identity),
+        {
+          signal: controller.signal,
+          capture() {
+            return () => {};
+          },
+        },
+      ),
+      (error) =>
+        error === controller.signal.reason ||
+        (error instanceof Error &&
+          error.name === 'AbortError' &&
+          error.cause === controller.signal.reason),
+    );
+    cancelled.close?.();
+    assert.ok(policySql.isOpen, 'cancelled scope cleanup preserves the owner lifetime');
+    policySql.close();
+    scope.close?.();
+    cancelled.close?.();
+  },
+);
 
 // A retained receipt larger than 256 KiB has 321 exact targets and complete historical policy parity; its work is not a display-page read.
 // This is a host-integration hang guard; correctness remains count/evidence based.
@@ -1116,9 +1179,9 @@ async function nativeReceiptMemoFixture(
   groupCount = 3,
   idBytes = 0,
   activeOverride?: (receipt: { operationId: string }) => boolean,
+  actualReceiptSchema = false,
 ) {
-  const f = await fixture(t),
-    token = 'd'.repeat(64);
+  const token = 'd'.repeat(64);
   const reference: IntakeIdentityScopeReference = {
     format: 'health-intake-identity-scope-v2',
     profileId: 'fictional-profile',
@@ -1143,6 +1206,24 @@ async function nativeReceiptMemoFixture(
       competingSubjects: 1,
     },
   };
+  const receipts = Array.from({ length: count }, (_, n) => ({
+    operationId: 'fictional-receipt-' + n,
+    outcome: 'this_is_me',
+    at: '2026-10-04',
+    identityAnswers: { birthDate: '1990-01-01', fictionalLexical: JSON.rawJSON('12.00') },
+    scope: reference,
+    ...(nameBytes
+      ? {
+          assignedPerson: {
+            noteId: 'fictional-person-note',
+            personId: 'fictional-family',
+            version: 1,
+            fullName: 'x'.repeat(nameBytes),
+          },
+        }
+      : {}),
+  }));
+  const f = await fixture(t, undefined, actualReceiptSchema ? receipts : undefined);
   const catalog = createReportSnapshotCatalog(f.db, file),
     writer = await catalog.fork();
   const ordinal = schemaOrdinal(0),
@@ -1221,23 +1302,7 @@ async function nativeReceiptMemoFixture(
   });
   transaction(f.db, () => collections.stage(prepared));
   f.db.exec('CREATE TABLE fictional_receipt_witness(value TEXT)');
-  const receipts = Array.from({ length: count }, (_, n) => ({
-    operationId: 'fictional-receipt-' + n,
-    outcome: 'this_is_me',
-    at: '2026-10-04',
-    identityAnswers: { birthDate: '1990-01-01', fictionalLexical: JSON.rawJSON('12.00') },
-    scope: reference,
-    ...(nameBytes
-      ? {
-          assignedPerson: {
-            noteId: 'fictional-person-note',
-            personId: 'fictional-family',
-            version: 1,
-            fullName: 'x'.repeat(nameBytes),
-          },
-        }
-      : {}),
-  }));
+
   const groups = Array.from({ length: groupCount }, (_, n) => ({
     id: (n ? 'fictional-policy-group-' + n : reference.groupId) + 'x'.repeat(idBytes),
     basis: 'report_anchor' as const,
@@ -1260,10 +1325,14 @@ async function nativeReceiptMemoFixture(
       catalog: ReturnType<typeof createReportSnapshotCatalog>,
     ) => ReturnType<typeof createReportSnapshotCatalog>,
     observe?: (view: ReturnType<typeof retainedEnvelopeReader>) => void,
+    nativeOuter = false,
+    proofState?: () => string | undefined,
   ) => {
-    const view = retainedEnvelopeReader({
-      intake: { workflow: { identityConfirmations: receipts, reportGroups: groups } },
-    });
+    const view = actualReceiptSchema
+      ? openIntakeCollectionEnvelope(f.db, file)
+      : retainedEnvelopeReader({
+          intake: { workflow: { identityConfirmations: receipts, reportGroups: groups } },
+        });
     observe?.(view);
     return collectionWorkflowReviewScope({
       view,
@@ -1271,7 +1340,10 @@ async function nativeReceiptMemoFixture(
         ? transform(createReportSnapshotCatalog(f.db, file))
         : createReportSnapshotCatalog(f.db, file),
       metadataBytes: 256 * 1024,
-      readCacheState: () => reviewReadStamp(f.db),
+      readCacheState: nativeOuter ? undefined : () => reviewReadStamp(f.db),
+      readIdentityReceiptScopeState: nativeOuter ? () => reviewReadStamp(f.db) : undefined,
+      readProofState: proofState,
+      readIdentityReceiptScopeProofState: nativeOuter ? proofState : undefined,
       identityReceiptWork: (metric) => withIntakeWork(f.db, 'warm', () => recordIntakeWork(metric)),
       packageEvidence: false,
       activeReceipt: (receipt) =>
@@ -1287,6 +1359,29 @@ async function nativeReceiptMemoFixture(
   return {
     ...f,
     open,
+    receipts,
+    reference,
+    async publishScopes(selected: IntakeIdentityScopeReference[]) {
+      const current = createReportSnapshotCatalog(f.db, file);
+      for (const referenceValue of selected) {
+        const writer = await current.fork(reference.collection.snapshotId);
+        await writer.putText(
+          '$scope',
+          (function* () {
+            yield JSON.stringify(referenceValue);
+          })(),
+        );
+        await current.publish(referenceValue.collection.snapshotId, writer);
+      }
+      const operationId = randomUUID();
+      const prepared = collections.prepare(collections.openView(), {
+        operationId,
+        requestDigest: createHash('sha256').update(operationId).digest('hex'),
+        domainVersion: collections.binding(collections.openView())!.logical.domainVersion,
+        changes: await current.finalChanges(),
+      });
+      transaction(f.db, () => collections.stage(prepared));
+    },
     scan,
     question,
     target,
@@ -1454,15 +1549,14 @@ test('native policy receipt memo does not seed a changed cold proof and refuses 
       return reader;
     },
   }));
-  const first = f.scan(scope),
-    before = intakeWorkCounters(f.db).warm;
-  assert.throws(() => Array.from(first[0]!.scope.targets), /proof changed/);
+  assert.throws(() => f.scan(scope), /proof changed/);
+  const before = intakeWorkCounters(f.db).warm;
   f.scan(scope);
   assert.equal(
     intakeWorkCounters(f.db).warm.identityPolicyReceiptReconstructions -
       before.identityPolicyReceiptReconstructions,
-    1,
-    'drifted first construction was not retained',
+    3,
+    'refused cold construction retained neither the first header nor a common provider',
   );
   f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('e'.repeat(64), file.id);
   try {
@@ -1787,4 +1881,496 @@ test('cooperative native receipt selection inspects superseded-only history and 
   );
   scope.close?.();
   assert.throws(() => Array.from(active), /closed/);
+});
+
+// Real immutable catalog cells, 71 independently decoded headers, one complete
+// common snapshot; the native outer scope keeps membership/draft caches disabled.
+test('native common receipt references retain one complete provider beyond 32 headers', async (t) => {
+  let visits = 0;
+  const f = await nativeReceiptMemoFixture(t, 71, 0, 1, 0, () => {
+    visits++;
+    return true;
+  });
+  f.receipts[35]!.outcome = 'unknown';
+  const scope = f.open(undefined, undefined, true);
+  t.after(() => scope.close?.());
+  const before = intakeWorkCounters(f.db).warm;
+  const first = f.scan(scope),
+    cold = intakeWorkCounters(f.db).warm;
+  assert.equal(first.length, 71);
+  assert.equal(
+    cold.identityPolicyReceiptReconstructions - before.identityPolicyReceiptReconstructions,
+    71,
+  );
+  assert.equal(
+    cold.identityPolicyScopeReconstructions - before.identityPolicyScopeReconstructions,
+    1,
+  );
+  assert.equal(cold.identityPolicyScopeCacheHits - before.identityPolicyScopeCacheHits, 70);
+  assert.equal(visits, 71);
+  assert.equal(first[35]!.outcome, 'unknown');
+  assert.equal(first[70]!.operationId, 'fictional-receipt-70');
+  first[0]!.scope.subject!.text = 'caller mutation';
+  assert.equal(Reflect.set(first[0]!.scope.targets, 'length', 999), false);
+  const repeated = f.scan(scope),
+    warm = intakeWorkCounters(f.db).warm;
+  assert.equal(visits, 142);
+  assert.equal(repeated[0]!.scope.subject!.text, f.reference.subject.text);
+  assert.equal(repeated[35]!.outcome, 'unknown');
+  assert.equal(
+    warm.identityPolicyReceiptReconstructions - cold.identityPolicyReceiptReconstructions,
+    71,
+  );
+  assert.equal(warm.identityPolicyScopeReconstructions, cold.identityPolicyScopeReconstructions);
+  assert.equal(warm.identityPolicyScopeCacheHits - cold.identityPolicyScopeCacheHits, 71);
+  assert.ok(
+    warm.collectionReadBytes - cold.collectionReadBytes <
+      cold.collectionReadBytes - before.collectionReadBytes,
+  );
+  const target = Array.from(first[0]!.scope.targets)[0]!;
+  scope.close?.();
+  assert.throws(() => Array.from(first[0]!.scope.targets), /changed|closed/);
+  assert.throws(() => Array.from(target.issueIds!), /changed|closed/);
+});
+
+test('receipt borrowed proof survives certified raw drift but rejects real rollback and transaction observation', async (t) => {
+  const { reviewPreparationStamp, execClinicalReviewMaintenance, runClinicalReviewMaintenance } =
+    await import('../clinical-review-maintenance.ts');
+  const f = await nativeReceiptMemoFixture(t);
+  const scope = f.open(undefined, undefined, false, () => reviewPreparationStamp(f.db));
+  t.after(() => scope.close?.());
+  const first = f.scan(scope)[0]!,
+    target = Array.from(first.scope.targets)[0]!,
+    member = Array.from(first.scope.membership)[0]!;
+  const selectedMembership = scope.membership({ ...f.groups[0]!, report: f.groups[0]!.report });
+  const work = scope.receiptsWork!();
+  let selected;
+  for (;;) {
+    const next = work.next();
+    if (next.done) {
+      selected = next.value;
+      break;
+    }
+  }
+  const authority = reviewPreparationStamp(f.db),
+    raw = reviewReadStamp(f.db),
+    before = intakeWorkCounters(f.db).warm;
+  execClinicalReviewMaintenance(
+    f.db,
+    'reader',
+    'CREATE TEMP TABLE IF NOT EXISTS __intake_reader_path(source TEXT,run TEXT,after TEXT,PRIMARY KEY(source,run,after))',
+  );
+  runClinicalReviewMaintenance(
+    f.db,
+    'reader',
+    'INSERT INTO __intake_reader_path VALUES(?,?,?)',
+    'fictional-neutral',
+    'run',
+    'one',
+  );
+  assert.notEqual(reviewReadStamp(f.db), raw);
+  assert.equal(reviewPreparationStamp(f.db), authority);
+  assert.equal(Array.from(target.issueIds!)[0], 'fictional-issue');
+  assert.equal(target.hasIssueId!('fictional-issue'), true);
+  assert.equal(Array.from(member.occurrences).length, 1);
+  assert.equal(Array.from(selected!).length, 3);
+  assert.equal(selectedMembership.retains(f.priorMembership), true);
+  f.scan(scope);
+  assert.ok(
+    intakeWorkCounters(f.db).warm.identityPolicyScopeReconstructions >
+      before.identityPolicyScopeReconstructions,
+  );
+  f.db.exec('SAVEPOINT fictional_common_scope');
+  f.db.prepare("INSERT INTO fictional_receipt_witness VALUES('foreign')").run();
+  f.db.exec('ROLLBACK TO fictional_common_scope; RELEASE fictional_common_scope');
+  runClinicalReviewMaintenance(
+    f.db,
+    'reader',
+    'UPDATE __intake_reader_path SET after=? WHERE source=?',
+    'two',
+    'fictional-neutral',
+  );
+  assert.notEqual(reviewPreparationStamp(f.db), authority);
+  assert.throws(() => Array.from(target.issueIds!), /changed/);
+  assert.throws(() => selectedMembership.retains(f.priorMembership), /changed/);
+  assert.throws(() => Array.from(selected!), /changed/);
+  const fresh = f.scan(scope)[0]!,
+    nextTarget = Array.from(fresh.scope.targets)[0]!;
+  f.db.exec('SAVEPOINT observe_common_transaction');
+  assert.equal(f.scan(scope).length, 3, 'transaction uses complete uncached readers');
+  f.db.exec('ROLLBACK TO observe_common_transaction; RELEASE observe_common_transaction');
+  assert.throws(() => nextTarget.hasIssueId!('fictional-issue'), /changed/);
+});
+
+test('native common receipt scope memo evicts complete distinct references at count and byte limits', async (t) => {
+  const f = await nativeReceiptMemoFixture(t, 33);
+  const references = Array.from({ length: 33 }, (_, n) => {
+    const scopeToken = createHash('sha256')
+      .update('fictional-distinct-' + n)
+      .digest('hex');
+    return {
+      ...structuredClone(f.reference),
+      scopeToken,
+      collection: { ...f.reference.collection, snapshotId: 'identity:' + scopeToken },
+    };
+  });
+  await f.publishScopes(references);
+  for (let n = 0; n < f.receipts.length; n++) f.receipts[n]!.scope = references[n]!;
+  const scope = f.open(undefined, undefined, true);
+  t.after(() => scope.close?.());
+  const first = f.scan(scope),
+    before = intakeWorkCounters(f.db).warm;
+  assert.equal(first.length, 33);
+  assert.equal(before.identityPolicyScopeReconstructions, 33);
+  assert.equal(f.scan(scope).length, 33);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyScopeReconstructions -
+      before.identityPolicyScopeReconstructions,
+    33,
+  );
+  assert.equal(
+    Array.from(first[0]!.scope.targets)[0]!.candidateId,
+    f.target.candidateId,
+    'ordinary LRU eviction does not revoke an unchanged borrowed provider',
+  );
+  scope.close?.();
+
+  const large = references.slice(0, 18).map((reference, n) => {
+    const scopeToken = createHash('sha256')
+      .update('fictional-large-reference-' + n)
+      .digest('hex');
+    return {
+      ...reference,
+      scopeToken,
+      subject: { ...reference.subject, text: 'x'.repeat(7800) },
+      collection: { ...reference.collection, snapshotId: 'identity:' + scopeToken },
+    };
+  });
+  const oversizedToken = createHash('sha256').update('fictional-oversized-reference').digest('hex');
+  const oversized = {
+    ...large[0]!,
+    scopeToken: oversizedToken,
+    subject: { ...large[0]!.subject, text: 'y'.repeat(140000) },
+    collection: { ...large[0]!.collection, snapshotId: 'identity:' + oversizedToken },
+  };
+  await f.publishScopes([...large, oversized]);
+  f.receipts.splice(18);
+  for (let n = 0; n < f.receipts.length; n++) f.receipts[n]!.scope = large[n]!;
+  const bytes = f.open(undefined, undefined, true);
+  t.after(() => bytes.close?.());
+  assert.equal(f.scan(bytes).length, 18);
+  const afterLarge = intakeWorkCounters(f.db).warm;
+  assert.equal(f.scan(bytes).length, 18);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyScopeReconstructions -
+      afterLarge.identityPolicyScopeReconstructions,
+    18,
+    'encoded references exceed the combined byte budget below 32 entries',
+  );
+  bytes.close?.();
+  f.receipts.splice(1);
+  f.receipts[0]!.scope = oversized;
+  const giant = f.open(undefined, undefined, true);
+  t.after(() => giant.close?.());
+  assert.equal(f.scan(giant).length, 1);
+  const afterGiant = intakeWorkCounters(f.db).warm;
+  assert.equal(f.scan(giant).length, 1);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyScopeReconstructions -
+      afterGiant.identityPolicyScopeReconstructions,
+    1,
+    'oversized reference is inspected completely and never retained',
+  );
+});
+
+test('native common receipt scope memo rejects changed references inactive corruption and cold drift', async (t) => {
+  const f = await nativeReceiptMemoFixture(t, 3);
+  const scope = f.open(undefined, undefined, true);
+  t.after(() => scope.close?.());
+  const borrowed = f.scan(scope)[0]!.scope;
+  scope.close?.();
+  f.receipts[1]!.scope = { ...structuredClone(f.reference), groupId: 'foreign-group' };
+  const changedReference = f.open(undefined, undefined, true);
+  t.after(() => changedReference.close?.());
+  assert.throws(
+    () => f.scan(changedReference),
+    /The retained identity scope is unavailable or changed/,
+    'same snapshot and token cannot bless a changed full reference',
+  );
+  changedReference.close?.();
+  f.receipts[1]!.scope = f.reference;
+  let changed = false;
+  using peer = new DatabaseSync(join(f.root, 'cache.sqlite'));
+  const drifting = f.open(
+    (catalog) => ({
+      ...catalog,
+      open(id) {
+        const reader = catalog.open(id);
+        if (!changed) {
+          changed = true;
+          peer
+            .prepare('INSERT INTO fictional_receipt_witness VALUES(?)')
+            .run('during common construction');
+        }
+        return reader;
+      },
+    }),
+    undefined,
+    true,
+  );
+  t.after(() => drifting.close?.());
+  assert.throws(() => f.scan(drifting), /proof changed/);
+  const failed = intakeWorkCounters(f.db).warm;
+  assert.equal(f.scan(drifting).length, 3);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyScopeReconstructions -
+      failed.identityPolicyScopeReconstructions,
+    1,
+    'failed cold construction cannot seed a subsequent hit',
+  );
+  assert.throws(() => Array.from(borrowed.targets), /changed|closed/);
+  drifting.close?.();
+  const inactive = await nativeReceiptMemoFixture(t, 1, 0, 1, 0, () => false);
+  inactive.receipts[0]!.scope = {
+    ...inactive.reference,
+    groupVersionId: 'changed-inactive-version',
+  };
+  const refused = inactive.open(undefined, undefined, true);
+  t.after(() => refused.close?.());
+  assert.throws(
+    () => inactive.scan(refused),
+    /The retained identity scope is unavailable or changed/,
+    'inactive malformed scopes remain validated before supersession filtering',
+  );
+});
+
+test('native common receipt provider rejects peer transaction callback refusal and changed source', async (t) => {
+  const { reviewPreparationStamp, execClinicalReviewMaintenance, runClinicalReviewMaintenance } =
+    await import('../clinical-review-maintenance.ts');
+  const f = await nativeReceiptMemoFixture(t);
+  let refused = false;
+  const scope = f.open(undefined, undefined, true, () => {
+    if (refused) throw Error('fictional authority callback refused');
+    return reviewPreparationStamp(f.db);
+  });
+  t.after(() => scope.close?.());
+  const first = f.scan(scope)[0]!,
+    target = Array.from(first.scope.targets)[0]!,
+    member = Array.from(first.scope.membership)[0]!,
+    question = Array.from(first.scope.questions!)[0]!;
+  const proof = reviewPreparationStamp(f.db);
+  execClinicalReviewMaintenance(
+    f.db,
+    'reader',
+    'CREATE TEMP TABLE IF NOT EXISTS __intake_reader_path(source TEXT,run TEXT,after TEXT,PRIMARY KEY(source,run,after))',
+  );
+  runClinicalReviewMaintenance(
+    f.db,
+    'reader',
+    'INSERT INTO __intake_reader_path VALUES(?,?,?)',
+    'fictional-native-neutral',
+    'run',
+    'one',
+  );
+  assert.equal(reviewPreparationStamp(f.db), proof);
+  assert.equal(Array.from(target.issueIds!)[0], 'fictional-issue');
+  assert.equal(Array.from(member.occurrences).length, 1);
+  assert.equal('matches' in question && question.matches(f.question), true);
+  const before = intakeWorkCounters(f.db).warm;
+  assert.equal(f.scan(scope).length, 3);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.identityPolicyScopeReconstructions -
+      before.identityPolicyScopeReconstructions,
+    1,
+  );
+  f.db.exec('BEGIN');
+  assert.throws(() => target.hasIssueId!('fictional-issue'), /proof changed/);
+  assert.equal(f.scan(scope).length, 3, 'native transaction uses complete uncached providers');
+  f.db.exec('ROLLBACK');
+  assert.throws(() => Array.from(member.occurrences), /proof changed/);
+  let current = Array.from(f.scan(scope)[0]!.scope.targets)[0]!;
+  using peer = new DatabaseSync(join(f.root, 'cache.sqlite'));
+  peer.prepare('INSERT INTO fictional_receipt_witness VALUES(?)').run('peer authority change');
+  assert.throws(() => current.hasIssueId!('fictional-issue'), /proof changed/);
+  current = Array.from(f.scan(scope)[0]!.scope.targets)[0]!;
+  refused = true;
+  assert.throws(() => Array.from(current.issueIds!), /fictional authority callback refused/);
+  refused = false;
+  assert.throws(
+    () => Array.from(current.issueIds!),
+    /proof changed/,
+    'refused callback cannot revive a captured provider',
+  );
+  current = Array.from(f.scan(scope)[0]!.scope.targets)[0]!;
+  f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('e'.repeat(64), file.id);
+  assert.throws(
+    () => Array.from(current.issueIds!),
+    /missing selected intake head|Stale|binding|source|proof changed/i,
+  );
+  assert.throws(
+    () => f.scan(scope),
+    /missing selected intake head|Stale|binding|source|proof changed/i,
+  );
+});
+
+// Actual accepted selected-schema cells/indexes, rather than the isolated lexical
+// map fixture, measure ancestry and field resolution for 71 complete receipts.
+// Publish 71 accepted schema receipts, then compare complete old and new reads.
+// The local measured setup+both passes takes52seconds before CI overhead.
+test(
+  'native receipt subtree field access preserves actual schema headers with fewer selected reads',
+  { timeout: 120000 },
+  async (t) => {
+    const { readIntakeReviewValue, intakeReviewChildren } =
+      await import('../intake-review-collection.ts');
+    const f = await nativeReceiptMemoFixture(t, 71, 0, 1, 0, undefined, true);
+    const view = openIntakeCollectionEnvelope(f.db, file),
+      intake = view.child(view.root(), 'intake')!,
+      workflow = view.child(intake, 'workflow')!;
+    const names = [
+      'operationId',
+      'at',
+      'outcome',
+      'attestation',
+      'identityAnswers',
+      'assignedPerson',
+      'knownNameAdded',
+      'confirmedPrintedName',
+      'selfUpdate',
+    ];
+    const read = (
+      record: import('../intake-collection-envelope.ts').IntakeEnvelopeRecord,
+      name: string,
+    ) => {
+      const child = view.child(record, name);
+      if (child) return readIntakeReviewValue(view, child, 256 * 1024);
+      if (!view.has(record, name)) return undefined;
+      return parseLiteralJSON(Array.from(view.fieldChunks(record, name)).join(''));
+    };
+    const before = intakeWorkCounters(f.db).warm;
+    const baseline = withIntakeWork(f.db, 'warm', () =>
+      Array.from(intakeReviewChildren(view, workflow, 'identityConfirmations'), (record) => {
+        const header: Record<string, unknown> = {};
+        for (const name of names) {
+          const value = read(record, name);
+          if (value !== undefined) header[name] = value;
+        }
+        const reference = readIntakeReviewValue(view, view.child(record, 'scope')!, 256 * 1024);
+        return { header, reference };
+      }),
+    );
+    const afterBaseline = intakeWorkCounters(f.db).warm;
+    const scope = f.open(undefined, undefined, true);
+    t.after(() => scope.close?.());
+    const actual = f.scan(scope),
+      after = intakeWorkCounters(f.db).warm;
+    assert.equal(actual.length, 71);
+    assert.deepEqual(
+      actual.map((receipt) => {
+        const { scope: _scope, ...header } = receipt;
+        return header;
+      }),
+      baseline.map((receipt) => receipt.header),
+    );
+    for (const receipt of actual) {
+      assert.equal(receipt.scope.scopeToken, f.reference.scopeToken);
+      assert.equal(receipt.scope.subject.text, f.reference.subject.text);
+      assert.equal(Array.from(receipt.scope.targets)[0]!.candidateId, f.target.candidateId);
+    }
+    const oldReads = afterBaseline.collectionReadBytes - before.collectionReadBytes,
+      newReads = after.collectionReadBytes - afterBaseline.collectionReadBytes;
+    t.diagnostic(
+      JSON.stringify({
+        oldReads,
+        newReads,
+        headers: 71,
+        scopeOpens:
+          after.identityPolicyScopeReconstructions -
+          afterBaseline.identityPolicyScopeReconstructions,
+        scopeHits: after.identityPolicyScopeCacheHits - afterBaseline.identityPolicyScopeCacheHits,
+      }),
+    );
+    assert.ok(
+      newReads < oldReads,
+      'per-receipt subtree resolves fields once without repeated intake ancestry',
+    );
+    assert.equal(
+      after.identityPolicyReceiptReconstructions -
+        afterBaseline.identityPolicyReceiptReconstructions,
+      71,
+    );
+  },
+);
+
+test('native receipt subtree preserves scalar structured fragment addresses and missing null lexical fields', async (t) => {
+  const structured = await nativeReceiptMemoFixture(t, 1, 256 * 1024 + 100);
+  let expected: import('../intake-review-collection.ts').IntakeReviewFragmentReference | undefined;
+  const selected = structured.open(
+    undefined,
+    (view) => {
+      const intake = view.child(view.root(), 'intake')!,
+        workflow = view.child(intake, 'workflow')!;
+      const receipt = view.children(workflow, 'identityConfirmations', {
+        items: 1,
+        bytes: 128 * 1024,
+      }).records[0]!;
+      const child = view.child(receipt, 'assignedPerson')!;
+      expected = {
+        format: 'health-intake-review-fragment-v1',
+        logical: view.logical,
+        address: view.address(child),
+      };
+    },
+    true,
+  );
+  t.after(() => selected.close?.());
+  assert.throws(
+    () => structured.scan(selected),
+    (error: unknown) => {
+      assert.ok(error instanceof IntakeReviewFragmentRequired);
+      assert.deepEqual(error.reference, expected);
+      return true;
+    },
+  );
+  const scalar = await nativeReceiptMemoFixture(t, 1);
+  Object.assign(scalar.receipts[0]!.identityAnswers, {
+    fictionalScalar: 'x'.repeat(256 * 1024 + 100),
+  });
+  const scalarSelected = scalar.open(
+    undefined,
+    (view) => {
+      const intake = view.child(view.root(), 'intake')!,
+        workflow = view.child(intake, 'workflow')!;
+      const receipt = view.children(workflow, 'identityConfirmations', {
+        items: 1,
+        bytes: 128 * 1024,
+      }).records[0]!;
+      assert.equal(view.child(receipt, 'identityAnswers'), undefined);
+      expected = {
+        format: 'health-intake-review-fragment-v1',
+        logical: view.logical,
+        address: view.address(receipt),
+        field: 'identityAnswers',
+      };
+    },
+    true,
+  );
+  t.after(() => scalarSelected.close?.());
+  assert.throws(
+    () => scalar.scan(scalarSelected),
+    (error: unknown) => {
+      assert.ok(error instanceof IntakeReviewFragmentRequired);
+      assert.deepEqual(error.reference, expected);
+      return true;
+    },
+  );
+  const ordinary = await nativeReceiptMemoFixture(t, 1);
+  Object.assign(ordinary.receipts[0]!, { attestation: null, knownNameAdded: '' });
+  const ordinarySelected = ordinary.open(undefined, undefined, true);
+  t.after(() => ordinarySelected.close?.());
+  const receipt = ordinary.scan(ordinarySelected)[0]!;
+  assert.equal(receipt.attestation, null);
+  assert.equal(receipt.knownNameAdded, '');
+  assert.equal(Object.hasOwn(receipt, 'selfUpdate'), false);
+  assert.ok(JSON.stringify(receipt.identityAnswers).includes('12.00'));
 });

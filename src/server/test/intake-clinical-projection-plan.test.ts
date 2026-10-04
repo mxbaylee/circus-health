@@ -32,6 +32,7 @@ import {
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { selectedEnvelopeStore } from '../intake-collection-envelope.ts';
 import { prepareIntakeLookupIndices } from '../intake-lookup-state.ts';
+import { collectionClinicalProjectionContext } from '../intake-review-collection-session.ts';
 async function fixture(t: test.TestContext, clinical = true, scoped = false) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-clinical-plan-')),
     profileId = 'fictional-profile';
@@ -171,6 +172,129 @@ test('projection read dependencies refuse changes even without a revision bump',
     db.prepare("SELECT count(*) AS n FROM documents WHERE id LIKE 'import:%'").get()!.n,
     0,
   );
+});
+
+test('projection copied group proof survives review cleanup and refuses replaced later evidence', async (t) => {
+  const { db, root, profileId, cleanup, intake } = await fixture(t, true, true);
+  await prepareIntakeLookupIndices(db);
+  const originalPath = profileOriginal(
+    root,
+    String(db.prepare('SELECT path FROM source_files WHERE id=?').get(intake.id)!.path),
+    profileId,
+  );
+  const source = JSON.parse(readFileSync(originalPath, 'utf8'));
+  source.payload.extra = 'Fictional later group member';
+  const second = uploadIntake(db, root, profileId, {
+    filename: 'later.jsonl',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from(JSON.stringify(source)),
+  });
+  await buildIntakeCollectionEnvelope(db, { id: second.id, sha256: second.sha256 });
+  await prepareCollectionReviewMembership(db, { id: second.id });
+  const members = [intake.id, second.id].map((id) => {
+    const selected = prepareCollectionClinicalReview(db, root, profileId, id);
+    if (selected.status !== 'ready') throw Error('Expected complete review');
+    return {
+      session: selected.session,
+      decisions: selected.session.review.records.map((record) => ({
+        recordId: record.id,
+        action: 'accept' as const,
+        mapping: record.mapping,
+      })),
+    };
+  });
+  const laterContext = collectionClinicalProjectionContext(members[1]!.session);
+  const consumed = laterContext.consumedArtifactIds.bind(laterContext);
+  laterContext.consumedArtifactIds = function* () {
+    yield* consumed();
+    yield 'fictional-unprepared-group-dependency';
+  };
+  assert.throws(() => prepareCollectionClinicalProjectionGroup(db, root, profileId, members), {
+    code: 'SOURCE_CHANGED',
+  });
+  laterContext.consumedArtifactIds = consumed;
+  const contexts = members.map((member) => collectionClinicalProjectionContext(member.session));
+  const checkpoints = contexts.map((context) => context.beginProjectionConsumption.bind(context));
+  const restored: number[] = [];
+  for (const [index, context] of contexts.entries())
+    context.beginProjectionConsumption = () => {
+      const restore = checkpoints[index]!();
+      return () => {
+        restore();
+        restored.push(index);
+        if (index === 1) throw Error('Fictional consumed source cleanup failure');
+      };
+    };
+  assert.throws(
+    () => prepareCollectionClinicalProjectionGroup(db, root, profileId, members),
+    /Fictional consumed source cleanup failure/,
+  );
+  assert.deepEqual(restored, [1, 0], 'all borrowed contexts restore even when one cleanup fails');
+  for (const [index, context] of contexts.entries())
+    context.beginProjectionConsumption = checkpoints[index]!;
+  const plan = prepareCollectionClinicalProjectionGroup(db, root, profileId, members);
+  cleanup.push(() => disposePreparedClinicalProjection(plan));
+  const repeated = prepareCollectionClinicalProjectionGroup(db, root, profileId, members);
+  cleanup.push(() => disposePreparedClinicalProjection(repeated));
+  assert.deepEqual(
+    preparedClinicalProjectionGroupResults(repeated),
+    preparedClinicalProjectionGroupResults(plan),
+  );
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        applyPreparedClinicalProjectionGroup(db, plan);
+        throw Error('Fictional coupled publication rollback');
+      }),
+    /Fictional coupled publication rollback/,
+  );
+  clearIntakeStateCache(db);
+  assert.equal(preparedClinicalProjectionGroupResults(plan)[0]!.clinical!.added, 1);
+  assert.equal(preparedClinicalProjectionGroupResults(plan)[1]!.clinical!.duplicates, 1);
+  const path = profileOriginal(
+    root,
+    String(db.prepare('SELECT path FROM source_files WHERE id=?').get(second.id)!.path),
+    profileId,
+  );
+  const original = readFileSync(path);
+  writeFileSync(path, Buffer.from(original.toString().replace('Fictional note', 'Different note')));
+  assert.throws(() => transaction(db, () => applyPreparedClinicalProjectionGroup(db, plan)), {
+    code: 'SOURCE_CHANGED',
+  });
+  assert.equal(db.prepare("SELECT count(*) n FROM documents WHERE id LIKE 'import:%'").get()!.n, 0);
+});
+
+test('projection copied proof does not outlive explicit session close or plan disposal', async (t) => {
+  const { db, root, profileId, session, decisions, cleanup } = await fixture(t);
+  const plan = prepareCollectionClinicalProjection(db, root, profileId, session, decisions);
+  cleanup.push(() => disposePreparedClinicalProjection(plan));
+  session.close();
+  assert.throws(() => preparedClinicalProjectionResult(plan), /Closed clinical review session/);
+  disposePreparedClinicalProjection(plan);
+  assert.throws(() => preparedClinicalProjectionResult(plan), /disposed clinical projection plan/);
+  assert.doesNotThrow(() => disposePreparedClinicalProjection(plan));
+});
+
+test('projection rejects a consumed source absent from the original verified proof', async (t) => {
+  const { db, root, profileId, session, decisions } = await fixture(t);
+  const context = collectionClinicalProjectionContext(session);
+  const consumed = context.consumedArtifactIds.bind(context);
+  // A late policy dependency cannot be authorized by merely naming a retained source.
+  context.consumedArtifactIds = function* () {
+    yield* consumed();
+    yield 'fictional-unprepared-source';
+  };
+  const capture = db.createSession();
+  try {
+    assert.throws(
+      () => prepareCollectionClinicalProjection(db, root, profileId, session, decisions),
+      { code: 'SOURCE_CHANGED' },
+    );
+    assert.equal(db.isTransaction, false);
+    assert.equal(capture.changeset().length, 0);
+  } finally {
+    capture.close();
+  }
 });
 
 test('projection survives certified auxiliary maintenance but refuses actor imitation', async (t) => {

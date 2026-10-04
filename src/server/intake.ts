@@ -38,7 +38,11 @@ import { observeIntakePairPreparation } from './intake-pair-preparation.ts';
 import type { IntakeReviewDraftTransition } from '../shared/intake-review-draft-transition.ts';
 import { intakePairScope, nativeDuplicateRecord } from './duplicate-review.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
-import { observeIntakeVersion, intakeVersionConflictFacts } from './import-version-diagnostics.ts';
+import {
+  observeIntakeVersion,
+  observeIntakeLogicalVersion,
+  intakeVersionConflictFacts,
+} from './import-version-diagnostics.ts';
 import {
   measureImportPhase,
   beginImportPhase,
@@ -3371,6 +3375,7 @@ async function mutateCollectionQuestion(
   return withVerifiedIntakeOriginalDescriptor(
     { db, root, profileId, id },
     async ({ assertRunning }) => {
+      const before = intakeSourceVersion(db, id);
       const mappingVersion = () =>
         workflowHash(
           activeMappingRules(
@@ -3489,7 +3494,7 @@ async function mutateCollectionQuestion(
           return [...planChanges, ...classifier.changes, ...changes];
         },
       });
-      if (!prepared.replayed)
+      if (!prepared.replayed) {
         intakeTransaction(
           db,
           () => {
@@ -3499,6 +3504,19 @@ async function mutateCollectionQuestion(
           },
           { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
         );
+        try {
+          const after = intakeSourceVersion(db, id);
+          observeIntakeLogicalVersion(
+            db,
+            id,
+            { version: before.version, logicalBinding: before.logicalBinding! },
+            { version: after.version, logicalBinding: after.logicalBinding! },
+            'question',
+          );
+        } catch {
+          /* Diagnostics do not change publication. */
+        }
+      }
       return {
         ...getIntakeRead(db, root, profileId, id),
         durability: flushIntake(db, root, profileId),

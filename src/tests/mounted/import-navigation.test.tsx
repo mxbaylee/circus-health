@@ -316,7 +316,16 @@ it('saves good selections through ImportPage, then requires a fresh approval for
           offeredSelfFields: {},
           conflicts: [],
         });
-      if (url.endsWith('/people')) return response([]);
+      if (url.endsWith('/record-ownership/people'))
+        return response([
+          {
+            noteId: 'person-note:fictional-parent',
+            personId: 'person:fictional-parent',
+            version: 1,
+            fullName: 'Fictional Parent',
+            relationship: 'Parent',
+          },
+        ]);
       if (url.includes('/record-owner?')) return response({ personId: 'patient' });
       if (url.endsWith('/intakes/report-acceptance') && init?.method === 'POST') {
         posts++;
@@ -346,7 +355,7 @@ it('saves good selections through ImportPage, then requires a fresh approval for
           operationId: `fictional-child-${posts}-${selection.recordId}`,
           label: selection.recordId.replace('record', 'marker'),
           kind: 'observation',
-          personId: 'patient',
+          personId: selection.recordId.endsWith('-1') ? 'person:fictional-parent' : 'patient',
           status: posts === 1 && selection.recordId.endsWith('-1') ? 'needs_review' : 'saved',
           message: 'Review the current record, then approve again.',
           ...(posts === 1 && selection.recordId.endsWith('-1')
@@ -404,6 +413,9 @@ it('saves good selections through ImportPage, then requires a fresh approval for
   await user.click(screen.getByRole('button', { name: 'Save 2 records' }));
   await waitFor(() => expect(posts).toBe(1));
   expect(await screen.findByText('1 saved, 1 needs review')).toBeVisible();
+  expect(
+    await screen.findByRole('link', { name: /Fictional Parent · Parent · needs review/ }),
+  ).toBeVisible();
   expect(
     screen
       .getAllByRole('status')

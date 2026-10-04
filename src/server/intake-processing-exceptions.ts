@@ -37,6 +37,7 @@ type Command = {
   onCheckpoint?: () => void | Promise<void>;
 } & (
   | { kind: 'set'; unitId: string; exception: { reason: 'processing_stalled'; at: string } }
+  | { kind: 'clear-unit'; unitId: string }
   | { kind: 'clear' }
 );
 export function setCollectionProcessingException(
@@ -56,6 +57,15 @@ export function clearCollectionProcessingExceptions(
   input: Omit<Extract<Command, { kind: 'clear' }>, 'kind'>,
 ) {
   return command(db, root, profileId, id, { ...input, kind: 'clear' });
+}
+export function clearCollectionProcessingException(
+  db: Database,
+  root: string,
+  profileId: string,
+  id: string,
+  input: Omit<Extract<Command, { kind: 'clear-unit' }>, 'kind'>,
+) {
+  return command(db, root, profileId, id, { ...input, kind: 'clear-unit' });
 }
 async function command(
   db: Database,
@@ -81,7 +91,10 @@ async function command(
     | undefined;
   if (!source) throw new HttpError(404, 'NOT_FOUND', 'Source intake not found');
   // These host commands preserve the historical workflowMutation receipt recipe.
-  const request = { operationId: input.operationId };
+  const request =
+    input.kind === 'clear-unit'
+      ? { operationId: input.operationId, kind: input.kind, unitId: input.unitId }
+      : { operationId: input.operationId };
   if (retainedIntakeWorkflowCommand(db, source, { operationId: input.operationId, request })) {
     flushIntake(db, root, profileId);
     return;
@@ -123,7 +136,7 @@ async function command(
         onCheckpoint: input.onCheckpoint,
       });
       const selected =
-        input.kind === 'set'
+        input.kind !== 'clear'
           ? readRetainedIntakeUnitScope(db, root, profileId, id, input.unitId)
           : undefined;
       if (
@@ -147,7 +160,7 @@ async function command(
         assertRunning,
         onCheckpoint: input.onCheckpoint,
         async *changes({ reader, intake }): AsyncGenerator<IntakeEnvelopeMutation> {
-          if (input.kind === 'set' && selected) {
+          if (input.kind !== 'clear' && selected) {
             const originalPlan =
               selected.format !== 'native'
                 ? selected.scope.record
@@ -173,14 +186,21 @@ async function command(
                 ? selected.unit.ordinal
                 : selected.scope.inventory.byUnit(input.unitId)!.ordinal;
             await catalog.checkpoint([
-              {
-                area: 'builds',
-                collection: exceptions,
-                op: 'put',
-                key: input.unitId,
-                value: JSON.stringify(input.exception),
-              },
-              selected.scope.accountedKind(input.unitId)
+              input.kind === 'set'
+                ? {
+                    area: 'builds',
+                    collection: exceptions,
+                    op: 'put',
+                    key: input.unitId,
+                    value: JSON.stringify(input.exception),
+                  }
+                : {
+                    area: 'builds',
+                    collection: exceptions,
+                    op: 'delete',
+                    key: input.unitId,
+                  },
+              input.kind === 'clear-unit' || selected.scope.accountedKind(input.unitId)
                 ? {
                     area: 'builds',
                     collection: readingSkipped,
@@ -195,13 +215,18 @@ async function command(
                     value: input.unitId,
                   },
             ]);
-            if (selected.format === 'retained')
-              yield {
-                op: 'set',
-                record: reader.resolve(selected.unit.reader.address(selected.unit.record)),
-                field: 'processingException',
-                jsonText: JSON.stringify(input.exception),
-              };
+            if (selected.format === 'retained') {
+              const record = reader.resolve(selected.unit.reader.address(selected.unit.record));
+              if (input.kind === 'set')
+                yield {
+                  op: 'set',
+                  record,
+                  field: 'processingException',
+                  jsonText: JSON.stringify(input.exception),
+                };
+              else if (reader.has(record, 'processingException'))
+                yield { op: 'delete', record, field: 'processingException' };
+            }
             await catalog.select(address, { exceptions, readingSkipped });
           } else {
             let after: string | undefined;

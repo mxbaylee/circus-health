@@ -29,6 +29,8 @@ import {
   type PreparedDuplicateEvidence,
 } from './duplicate-evidence-preparation.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
+import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
 
 declare const projectionBrand: unique symbol;
 export interface PreparedClinicalProjection {
@@ -48,6 +50,7 @@ interface State {
   closed: boolean;
   matchingEarlierRows: number[];
   stopObserving(): void;
+  closeArtifacts(): void;
   evidence?: PreparedDuplicateEvidence;
 }
 const plans = new WeakMap<PreparedClinicalProjection, State>();
@@ -61,7 +64,8 @@ function state(plan: PreparedClinicalProjection): State {
 const changed = () =>
   new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
 
-/** No awaits, filesystem writes, durability publication, or whole-table snapshots occur here. */
+/** Synchronous staging uses private disposable scratch, with no awaits,
+ * durable authority writes/publication, or whole-table snapshots. */
 export function prepareCollectionClinicalProjection(
   db: DatabaseSync,
   root: string,
@@ -312,160 +316,196 @@ function prepareProjectionGroup(
       blocks.reduce((n, block) => n + block.context.proposal.entries.length, 0),
     );
   });
-  const assertContextsCurrent = () => {
-    for (const { context } of blocks) context.assertCurrent();
-  };
-  const dataVersion = Number(db.prepare('PRAGMA data_version').get()!.data_version);
-  const results: (Result | undefined)[] = [];
-  let changes: Uint8Array;
-  const capture = db.createSession();
-  db.exec('SAVEPOINT clinical_projection_prepare');
-  try {
-    const insert = db.prepare(
-      'INSERT OR IGNORE INTO source_records(id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
-    );
-    const occurrenceAuthorityFinalizers: OccurrenceAuthorityFinalizer[] = [];
-    for (const { context, reviewed, decisions, acquisition, prevalidatedPairScopes } of blocks) {
-      for (const entry of context.proposal.entries) {
-        const retained = retainedClinicalSourceRecord(
-          entry,
-          context.proposal.inputFile.id,
-          context.proposal.file.id,
-          context.proposal.proposalId,
-          String(acquisition.provider_id),
-          String(acquisition.batch_id),
-        );
-        insert.run(
-          retained.id,
-          retained.sourceFileId,
-          retained.providerId,
-          retained.sourceKey,
-          retained.kind,
-          retained.label,
-          retained.raw,
-          retained.locator,
-          retained.extractionStatus,
-          retained.batchId,
-        );
+  const artifactScratch = disposableSqlite('circus-clinical-projection-artifacts-');
+  let retainedArtifacts = false;
+  const restoreConsumption: (() => void)[] = [];
+  const restoreConsumed = () => {
+    let failed = false;
+    let failure: unknown;
+    while (restoreConsumption.length) {
+      try {
+        restoreConsumption.pop()!();
+      } catch (error) {
+        if (!failed) failure = error;
+        failed = true;
       }
-      if (reviewed) {
-        context.selected.materializeSourceProviders();
-        const medicationsBefore = Number(
-          db.prepare('SELECT count(*) AS n FROM medications').get()!.n,
-        );
-        const clinical = projectClinicalReview(db, {
-          ...context.proposal,
-          review: context.review,
-          decisions: cloneLiteral(decisions),
-          root,
-          profileId,
-          selected: context.selected,
-          prevalidatedPairScopes,
-          occurrenceAuthorityFinalizers,
-        });
-        results.push({
-          ...clinical,
-          newMedications: Math.max(
-            0,
-            Number(db.prepare('SELECT count(*) AS n FROM medications').get()!.n) -
-              medicationsBefore,
-          ),
-        });
-      } else results.push(undefined);
     }
-    refreshOccurrenceAttachmentAuthorities(db, occurrenceAuthorityFinalizers);
-    changes = capture.changeset();
-    withIntakeWork(db, 'warm', () =>
-      recordIntakeWork('clinicalProjectionChangesetBytes', changes.byteLength),
-    );
-  } finally {
+    if (failed) throw failure;
+  };
+  try {
+    const artifacts = createClinicalReviewArtifactProof(artifactScratch.db, 'artifacts');
+    for (const { context } of blocks) artifacts.retain(context.verifiedArtifacts());
+    for (const { context } of blocks) restoreConsumption.push(context.beginProjectionConsumption());
+    const assertContextsCurrent = () => {
+      for (const { context } of blocks) context.assertAuthorityCurrent();
+      artifacts.assertCurrent();
+    };
+    assertContextsCurrent();
+    const dataVersion = Number(db.prepare('PRAGMA data_version').get()!.data_version);
+    const results: (Result | undefined)[] = [];
+    let changes: Uint8Array;
+    const capture = db.createSession();
+    db.exec('SAVEPOINT clinical_projection_prepare');
     try {
-      db.exec('ROLLBACK TO clinical_projection_prepare');
+      const insert = db.prepare(
+        'INSERT OR IGNORE INTO source_records(id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      );
+      const occurrenceAuthorityFinalizers: OccurrenceAuthorityFinalizer[] = [];
+      for (const { context, reviewed, decisions, acquisition, prevalidatedPairScopes } of blocks) {
+        for (const entry of context.proposal.entries) {
+          const retained = retainedClinicalSourceRecord(
+            entry,
+            context.proposal.inputFile.id,
+            context.proposal.file.id,
+            context.proposal.proposalId,
+            String(acquisition.provider_id),
+            String(acquisition.batch_id),
+          );
+          insert.run(
+            retained.id,
+            retained.sourceFileId,
+            retained.providerId,
+            retained.sourceKey,
+            retained.kind,
+            retained.label,
+            retained.raw,
+            retained.locator,
+            retained.extractionStatus,
+            retained.batchId,
+          );
+        }
+        if (reviewed) {
+          context.selected.materializeSourceProviders();
+          const medicationsBefore = Number(
+            db.prepare('SELECT count(*) AS n FROM medications').get()!.n,
+          );
+          const clinical = projectClinicalReview(db, {
+            ...context.proposal,
+            review: context.review,
+            decisions: cloneLiteral(decisions),
+            root,
+            profileId,
+            selected: context.selected,
+            prevalidatedPairScopes,
+            occurrenceAuthorityFinalizers,
+          });
+          results.push({
+            ...clinical,
+            newMedications: Math.max(
+              0,
+              Number(db.prepare('SELECT count(*) AS n FROM medications').get()!.n) -
+                medicationsBefore,
+            ),
+          });
+        } else results.push(undefined);
+      }
+      refreshOccurrenceAttachmentAuthorities(db, occurrenceAuthorityFinalizers);
+      changes = capture.changeset();
+      withIntakeWork(db, 'warm', () =>
+        recordIntakeWork('clinicalProjectionChangesetBytes', changes.byteLength),
+      );
     } finally {
       try {
-        db.exec('RELEASE clinical_projection_prepare');
+        db.exec('ROLLBACK TO clinical_projection_prepare');
       } finally {
-        capture.close();
+        try {
+          db.exec('RELEASE clinical_projection_prepare');
+        } finally {
+          capture.close();
+        }
       }
     }
-  }
-  assertContextsCurrent();
-  if (revision(db) !== beforeRevision) throw changed();
-  // Capture only subsequent application-row changes. Cache/schema preparation may
-  // touch private __ tables; it cannot authorize changes to clinical dependencies.
-  const guards: Session[] = [];
-  const tables: string[] = [];
-  try {
-    for (const row of db
-      .prepare(
-        "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB '__*' AND name NOT GLOB 'sqlite_*'",
-      )
-      .iterate()) {
-      tables.push(String(row.name));
-      guards.push(db.createSession({ table: String(row.name) }));
-    }
-  } catch (error) {
-    for (const guard of guards) guard.close();
-    throw error;
-  }
-  const plan = Object.freeze({
-    format: 'health-intake-clinical-projection-plan-v1',
-  }) as PreparedClinicalProjection;
-  let guardedRevision = beforeRevision,
-    invalidated = false;
-  const stopObserving = observeTransactionOutcome(db, (outcome) => {
-    if (!outcome.committed) return;
-    if (!outcome.intakeMaintenance || !outcome.succeeded || invalidated) {
-      invalidated = true;
-      return;
-    }
-    // Only the owning transaction verifier can mint this outcome witness. It
-    // proves exact auxiliary writes and unchanged source/logical/domain scope.
-    // Never forgive an ordinary policy write by excluding metadata namespaces.
-    invalidated = true;
+    for (const { context } of blocks) artifacts.assertContains(context.consumedArtifactIds());
     assertContextsCurrent();
-    if (
-      revision(db) !== guardedRevision + 1 ||
-      Number(db.prepare('PRAGMA data_version').get()!.data_version) !== dataVersion ||
-      guards.some((guard, index) => tables[index] !== 'app_meta' && guard.changeset().length !== 0)
-    )
-      return;
-    const index = tables.indexOf('app_meta');
-    if (index < 0) return;
-    guards[index]!.close();
-    guards[index] = db.createSession({ table: 'app_meta' });
-    guardedRevision = revision(db);
-    invalidated = false;
-  });
-  plans.set(plan, {
-    db,
-    results: structuredClone(results),
-    changes: changes!,
-    guards,
-    applied: false,
-    sessions: members.map((member) => member.session),
-    closed: false,
-    matchingEarlierRows: blocks.map((block) => block.matchingEarlierRows),
-    stopObserving,
-    evidence,
-    assertCurrent() {
+    // Restore every borrowed context before a plan can take ownership or escape.
+    restoreConsumed();
+    if (revision(db) !== beforeRevision) throw changed();
+    // Capture only subsequent application-row changes. Cache/schema preparation may
+    // touch private __ tables; it cannot authorize changes to clinical dependencies.
+    const guards: Session[] = [];
+    const tables: string[] = [];
+    try {
+      for (const row of db
+        .prepare(
+          "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB '__*' AND name NOT GLOB 'sqlite_*'",
+        )
+        .iterate()) {
+        tables.push(String(row.name));
+        guards.push(db.createSession({ table: String(row.name) }));
+      }
+    } catch (error) {
+      for (const guard of guards) guard.close();
+      throw error;
+    }
+    const plan = Object.freeze({
+      format: 'health-intake-clinical-projection-plan-v1',
+    }) as PreparedClinicalProjection;
+    let guardedRevision = beforeRevision,
+      invalidated = false;
+    const stopObserving = observeTransactionOutcome(db, (outcome) => {
+      if (!outcome.committed) return;
+      if (!outcome.intakeMaintenance || !outcome.succeeded || invalidated) {
+        invalidated = true;
+        return;
+      }
+      // Only the owning transaction verifier can mint this outcome witness. It
+      // proves exact auxiliary writes and unchanged source/logical/domain scope.
+      // Never forgive an ordinary policy write by excluding metadata namespaces.
+      invalidated = true;
       assertContextsCurrent();
-      evidence?.assertCurrent();
       if (
-        invalidated ||
-        revision(db) !== guardedRevision ||
+        revision(db) !== guardedRevision + 1 ||
         Number(db.prepare('PRAGMA data_version').get()!.data_version) !== dataVersion ||
-        guards.some((guard) => guard.changeset().length !== 0)
+        guards.some(
+          (guard, index) => tables[index] !== 'app_meta' && guard.changeset().length !== 0,
+        )
       )
-        throw changed();
-    },
-  });
-  let active = activePlans.get(db);
-  if (!active) activePlans.set(db, (active = new Set()));
-  while (active.size >= MAX_ACTIVE_PLANS)
-    disposePreparedClinicalProjection(active.values().next().value!);
-  active.add(plan);
-  return plan;
+        return;
+      const index = tables.indexOf('app_meta');
+      if (index < 0) return;
+      guards[index]!.close();
+      guards[index] = db.createSession({ table: 'app_meta' });
+      guardedRevision = revision(db);
+      invalidated = false;
+    });
+    plans.set(plan, {
+      db,
+      results: structuredClone(results),
+      changes: changes!,
+      guards,
+      applied: false,
+      sessions: members.map((member) => member.session),
+      closed: false,
+      matchingEarlierRows: blocks.map((block) => block.matchingEarlierRows),
+      stopObserving,
+      closeArtifacts: () => artifactScratch.close(),
+      evidence,
+      assertCurrent() {
+        assertContextsCurrent();
+        evidence?.assertCurrent();
+        if (
+          invalidated ||
+          revision(db) !== guardedRevision ||
+          Number(db.prepare('PRAGMA data_version').get()!.data_version) !== dataVersion ||
+          guards.some((guard) => guard.changeset().length !== 0)
+        )
+          throw changed();
+      },
+    });
+    let active = activePlans.get(db);
+    if (!active) activePlans.set(db, (active = new Set()));
+    while (active.size >= MAX_ACTIVE_PLANS)
+      disposePreparedClinicalProjection(active.values().next().value!);
+    active.add(plan);
+    retainedArtifacts = true;
+    return plan;
+  } finally {
+    try {
+      restoreConsumed();
+    } finally {
+      if (!retainedArtifacts) artifactScratch.close();
+    }
+  }
 }
 
 export function preparedClinicalProjectionMatchingRows(plan: PreparedClinicalProjection): number {
@@ -572,6 +612,7 @@ export function disposePreparedClinicalProjection(plan: PreparedClinicalProjecti
   for (const guard of value.guards) guard.close();
   value.stopObserving();
   value.evidence?.dispose();
+  value.closeArtifacts();
   value.closed = true;
   activePlans.get(value.db)?.delete(plan);
 }

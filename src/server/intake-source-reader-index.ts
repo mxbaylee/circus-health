@@ -2,6 +2,10 @@
  * remain authoritative; a new connection or unknown mutation prepares them again. */
 import { randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
+import {
+  execClinicalReviewMaintenance,
+  prepareClinicalReviewMaintenance,
+} from './clinical-review-maintenance.ts';
 import { HttpError, type Database } from './database.ts';
 import { assertIntakeOwner } from './intake.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
@@ -100,37 +104,48 @@ function ensure(db: Database) {
     if (!(error instanceof HttpError && error.code === 'READER_COVERAGE_PENDING')) throw error;
   }
   for (const table of ['meta', 'source'])
-    for (const event of events) db.exec(`DROP TRIGGER IF EXISTS temp.${P}${table}_${event}`);
-  for (const table of tables) db.exec(`DROP TABLE IF EXISTS temp.${P}${table}`);
-  db.exec(`
-    CREATE TEMP TABLE ${P}control(singleton INTEGER PRIMARY KEY,generation INTEGER NOT NULL);
-    INSERT INTO ${P}control VALUES(1,0);
-    CREATE TEMP TABLE ${P}sources(id TEXT PRIMARY KEY,logical TEXT NOT NULL,sourceHash TEXT NOT NULL,ready INTEGER NOT NULL,generation INTEGER NOT NULL,run TEXT NOT NULL);
-    CREATE TEMP TABLE ${P}plans(source TEXT,ordinal INTEGER,address TEXT,unitCount INTEGER,eligible INTEGER,summary TEXT,PRIMARY KEY(source,ordinal));
-    CREATE INDEX temp.${P}plan_address ON ${P}plans(source,address);
-    CREATE TEMP TABLE ${P}units(source TEXT,plan INTEGER,ordinal INTEGER,facts TEXT,proposal TEXT,stale INTEGER,PRIMARY KEY(source,plan,ordinal));
-    CREATE INDEX temp.${P}unit_proposal ON ${P}units(source,proposal);
-    CREATE TEMP TABLE ${P}tree(source TEXT,level INTEGER,slot INTEGER,value TEXT,PRIMARY KEY(source,level,slot));
-    CREATE TEMP TABLE ${P}excluded(source TEXT,plan INTEGER,level INTEGER,slot INTEGER,value INTEGER,PRIMARY KEY(source,plan,level,slot));
-    CREATE TEMP TABLE ${P}proposals(source TEXT,id TEXT,current INTEGER,PRIMARY KEY(source,id));
-    CREATE TEMP TABLE ${P}dependencies(key TEXT,source TEXT,proposal TEXT,PRIMARY KEY(key,source,proposal));
-    CREATE INDEX temp.${P}dependency_proposal ON ${P}dependencies(source,proposal);
-    CREATE TEMP TABLE ${P}dirty(key TEXT PRIMARY KEY);
-    CREATE TEMP TABLE ${P}dirty_proposals(source TEXT,proposal TEXT,PRIMARY KEY(source,proposal));
-    CREATE TEMP TABLE ${P}transitions(source TEXT,after TEXT,before TEXT,PRIMARY KEY(source,after));
-    CREATE TEMP TABLE ${P}effects(source TEXT,after TEXT,kind TEXT,key TEXT,value TEXT,PRIMARY KEY(source,after,kind,key));
-    CREATE TEMP TABLE ${P}path(source TEXT,run TEXT,after TEXT,PRIMARY KEY(source,run,after));
-  `);
+    for (const event of events)
+      execClinicalReviewMaintenance(
+        db,
+        'reader',
+        `DROP TRIGGER IF EXISTS temp.${P}${table}_${event}`,
+      );
+  for (const table of tables)
+    execClinicalReviewMaintenance(db, 'reader', `DROP TABLE IF EXISTS temp.${P}${table}`);
+  for (const sql of [
+    `CREATE TEMP TABLE ${P}control(singleton INTEGER PRIMARY KEY,generation INTEGER NOT NULL)`,
+    `INSERT INTO ${P}control VALUES(1,0)`,
+    `CREATE TEMP TABLE ${P}sources(id TEXT PRIMARY KEY,logical TEXT NOT NULL,sourceHash TEXT NOT NULL,ready INTEGER NOT NULL,generation INTEGER NOT NULL,run TEXT NOT NULL)`,
+    `CREATE TEMP TABLE ${P}plans(source TEXT,ordinal INTEGER,address TEXT,unitCount INTEGER,eligible INTEGER,summary TEXT,PRIMARY KEY(source,ordinal))`,
+    `CREATE INDEX temp.${P}plan_address ON ${P}plans(source,address)`,
+    `CREATE TEMP TABLE ${P}units(source TEXT,plan INTEGER,ordinal INTEGER,facts TEXT,proposal TEXT,stale INTEGER,PRIMARY KEY(source,plan,ordinal))`,
+    `CREATE INDEX temp.${P}unit_proposal ON ${P}units(source,proposal)`,
+    `CREATE TEMP TABLE ${P}tree(source TEXT,level INTEGER,slot INTEGER,value TEXT,PRIMARY KEY(source,level,slot))`,
+    `CREATE TEMP TABLE ${P}excluded(source TEXT,plan INTEGER,level INTEGER,slot INTEGER,value INTEGER,PRIMARY KEY(source,plan,level,slot))`,
+    `CREATE TEMP TABLE ${P}proposals(source TEXT,id TEXT,current INTEGER,PRIMARY KEY(source,id))`,
+    `CREATE TEMP TABLE ${P}dependencies(key TEXT,source TEXT,proposal TEXT,PRIMARY KEY(key,source,proposal))`,
+    `CREATE INDEX temp.${P}dependency_proposal ON ${P}dependencies(source,proposal)`,
+    `CREATE TEMP TABLE ${P}dirty(key TEXT PRIMARY KEY)`,
+    `CREATE TEMP TABLE ${P}dirty_proposals(source TEXT,proposal TEXT,PRIMARY KEY(source,proposal))`,
+    `CREATE TEMP TABLE ${P}transitions(source TEXT,after TEXT,before TEXT,PRIMARY KEY(source,after))`,
+    `CREATE TEMP TABLE ${P}effects(source TEXT,after TEXT,kind TEXT,key TEXT,value TEXT,PRIMARY KEY(source,after,kind,key))`,
+    `CREATE TEMP TABLE ${P}path(source TEXT,run TEXT,after TEXT,PRIMARY KEY(source,run,after))`,
+  ])
+    execClinicalReviewMaintenance(db, 'reader', sql);
   for (const event of events) {
     const row = event === 'delete' ? 'OLD' : 'NEW';
     const metaChanged =
       event === 'update'
         ? `(${watched('OLD')} OR ${watched('NEW')}) AND (OLD.key IS NOT NEW.key OR OLD.value IS NOT NEW.value)`
         : `(${watched(row)})`;
-    db.exec(
+    execClinicalReviewMaintenance(
+      db,
+      'reader',
       `CREATE TEMP TRIGGER ${P}meta_${event} AFTER ${event.toUpperCase()} ON main.app_meta WHEN ${metaChanged} BEGIN ${markDirty(`'meta:' || ${row}.key`)} ${event === 'update' ? markDirty("'meta:' || OLD.key") : ''} UPDATE ${P}control SET generation=generation+1; END`,
     );
-    db.exec(
+    execClinicalReviewMaintenance(
+      db,
+      'reader',
       `CREATE TEMP TRIGGER ${P}source_${event} AFTER ${event.toUpperCase()} ON main.source_files ${event === 'update' ? 'WHEN OLD.id IS NOT NEW.id OR OLD.sha256 IS NOT NEW.sha256 OR OLD.details_json IS NOT NEW.details_json OR OLD.kind IS NOT NEW.kind' : ''} BEGIN ${markDirty(`'source:' || ${row}.id`)} ${event === 'update' ? markDirty("'source:' || OLD.id") : ''} UPDATE ${P}control SET generation=generation+1; END`,
     );
   }
@@ -163,9 +178,14 @@ export function invalidateCollectionReaderRoleDependencies(
     }
     throw error;
   }
-  const put = db.prepare(`INSERT OR IGNORE INTO ${P}dirty VALUES(?)`);
+  const put = prepareClinicalReviewMaintenance(
+    db,
+    'reader',
+    `INSERT OR IGNORE INTO ${P}dirty VALUES(?)`,
+  );
   for (const member of members) put.run(roleKey(id, member));
-  if (members.length) db.exec(`UPDATE ${P}control SET generation=generation+1`);
+  if (members.length)
+    execClinicalReviewMaintenance(db, 'reader', `UPDATE ${P}control SET generation=generation+1`);
 }
 export interface ReaderCoverageEffects {
   planAddresses?: readonly string[];
@@ -198,13 +218,29 @@ export function recordCollectionReaderCoverageTransition(
   if (prior && prior.before !== before) {
     // A link-only command can return to an identical logical root. Ambiguous
     // auxiliary ancestry invalidates this cache rather than blocking the write.
-    db.prepare(`UPDATE ${P}sources SET ready=0 WHERE id=?`).run(source.id);
-    db.prepare(`DELETE FROM ${P}transitions WHERE source=?`).run(source.id);
-    db.prepare(`DELETE FROM ${P}effects WHERE source=?`).run(source.id);
+    prepareClinicalReviewMaintenance(db, 'reader', `UPDATE ${P}sources SET ready=0 WHERE id=?`).run(
+      source.id,
+    );
+    prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `DELETE FROM ${P}transitions WHERE source=?`,
+    ).run(source.id);
+    prepareClinicalReviewMaintenance(db, 'reader', `DELETE FROM ${P}effects WHERE source=?`).run(
+      source.id,
+    );
     return [];
   }
-  db.prepare(`INSERT OR IGNORE INTO ${P}transitions VALUES(?,?,?)`).run(source.id, after, before);
-  const put = db.prepare(`INSERT OR IGNORE INTO ${P}effects VALUES(?,?,?,?,?)`);
+  prepareClinicalReviewMaintenance(
+    db,
+    'reader',
+    `INSERT OR IGNORE INTO ${P}transitions VALUES(?,?,?)`,
+  ).run(source.id, after, before);
+  const put = prepareClinicalReviewMaintenance(
+    db,
+    'reader',
+    `INSERT OR IGNORE INTO ${P}effects VALUES(?,?,?,?,?)`,
+  );
   for (const address of effects.planAddresses ?? [])
     put.run(source.id, after, 'plan', address, address);
   for (const batch of effects.batches ?? [])
@@ -301,7 +337,9 @@ function operations(db: Database, source: string) {
         .get(source, plan, level, slot)?.value ?? 0,
     );
   const updateTree = (ordinal: number, delta: Counts, sign = 1) => {
-    const put = db.prepare(
+    const put = prepareClinicalReviewMaintenance(
+      db,
+      'reader',
       `INSERT INTO ${P}tree VALUES(?,?,?,?) ON CONFLICT(source,level,slot) DO UPDATE SET value=excluded.value`,
     );
     for (let level = 0; level <= ROOT_LEVEL; level++) {
@@ -310,7 +348,9 @@ function operations(db: Database, source: string) {
     }
   };
   const updateExcluded = (plan: PlanRow, ordinal: number, delta: number) => {
-    const put = db.prepare(
+    const put = prepareClinicalReviewMaintenance(
+      db,
+      'reader',
       `INSERT INTO ${P}excluded VALUES(?,?,?,?,?) ON CONFLICT(source,plan,level,slot) DO UPDATE SET value=excluded.value`,
     );
     for (
@@ -339,8 +379,16 @@ function operations(db: Database, source: string) {
   return { tree, excluded, updateTree, updateExcluded, plan, unit };
 }
 function registerDependencies(db: Database, source: string, proposalId: string) {
-  db.prepare(`DELETE FROM ${P}dependencies WHERE source=? AND proposal=?`).run(source, proposalId);
-  const insert = db.prepare(`INSERT OR IGNORE INTO ${P}dependencies VALUES(?,?,?)`),
+  prepareClinicalReviewMaintenance(
+    db,
+    'reader',
+    `DELETE FROM ${P}dependencies WHERE source=? AND proposal=?`,
+  ).run(source, proposalId);
+  const insert = prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `INSERT OR IGNORE INTO ${P}dependencies VALUES(?,?,?)`,
+    ),
     put = (key: string) => insert.run(key, source, proposalId);
   put('meta:intake_proposal_dependencies:v1:' + proposalId);
   const raw = db
@@ -389,10 +437,12 @@ function registerDependencies(db: Database, source: string, proposalId: string) 
 }
 function drainDirty(db: Database) {
   const keys = db.prepare(`SELECT key FROM ${P}dirty ORDER BY key LIMIT 64`).all();
-  const mark = db.prepare(
+  const mark = prepareClinicalReviewMaintenance(
+      db,
+      'reader',
       `INSERT OR IGNORE INTO ${P}dirty_proposals SELECT source,proposal FROM ${P}dependencies WHERE key=?`,
     ),
-    remove = db.prepare(`DELETE FROM ${P}dirty WHERE key=?`);
+    remove = prepareClinicalReviewMaintenance(db, 'reader', `DELETE FROM ${P}dirty WHERE key=?`);
   for (const row of keys) {
     mark.run(row.key);
     remove.run(row.key);
@@ -412,8 +462,10 @@ function clearSource(db: Database, id: string) {
     'effects',
     'path',
   ])
-    db.prepare(`DELETE FROM ${P}${table} WHERE source=?`).run(id);
-  db.prepare(`DELETE FROM ${P}sources WHERE id=?`).run(id);
+    prepareClinicalReviewMaintenance(db, 'reader', `DELETE FROM ${P}${table} WHERE source=?`).run(
+      id,
+    );
+  prepareClinicalReviewMaintenance(db, 'reader', `DELETE FROM ${P}sources WHERE id=?`).run(id);
 }
 /** Complete cold traversal is explicit. Warm work follows only closed command
  * effects and coalesced changed dependency keys. No pending row per implicit unit. */
@@ -487,7 +539,11 @@ export async function prepareCollectionReaderCoverage(
         selected = undefined;
         break;
       }
-      db.prepare(`INSERT INTO ${P}path VALUES(?,?,?)`).run(id, run, target);
+      prepareClinicalReviewMaintenance(db, 'reader', `INSERT INTO ${P}path VALUES(?,?,?)`).run(
+        id,
+        run,
+        target,
+      );
       target = previous;
       await checkpoint();
     }
@@ -496,14 +552,17 @@ export async function prepareCollectionReaderCoverage(
   assertCurrent();
   if (cold) {
     clearSource(db, id);
-    db.prepare(`INSERT INTO ${P}sources VALUES(?,?,?,0,?,?)`).run(
-      id,
-      logical,
-      sourceHash,
-      selectedGeneration,
-      run,
-    );
-  } else db.prepare(`UPDATE ${P}sources SET ready=0,run=? WHERE id=?`).run(run, id);
+    prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `INSERT INTO ${P}sources VALUES(?,?,?,0,?,?)`,
+    ).run(id, logical, sourceHash, selectedGeneration, run);
+  } else
+    prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `UPDATE ${P}sources SET ready=0,run=? WHERE id=?`,
+    ).run(run, id);
   initialized = true;
   const op = operations(db, id);
   const currentProposal = (proposalId: string) => {
@@ -515,7 +574,11 @@ export async function prepareCollectionReaderCoverage(
       recordIntakeWork('readerCoverageDependencyChecks'),
     );
     const current = collectionReaderProposalCurrent(db, id, view, proposalId);
-    db.prepare(`INSERT INTO ${P}proposals VALUES(?,?,?)`).run(id, proposalId, Number(current));
+    prepareClinicalReviewMaintenance(db, 'reader', `INSERT INTO ${P}proposals VALUES(?,?,?)`).run(
+      id,
+      proposalId,
+      Number(current),
+    );
     registerDependencies(db, id, proposalId);
     return current;
   };
@@ -540,22 +603,24 @@ export async function prepareCollectionReaderCoverage(
       before = contribution(prior, !!old?.stale),
       delta = plus(next, before, -1);
     const summary = validate(plus(JSON.parse(plan.summary), delta));
-    db.prepare(`UPDATE ${P}plans SET summary=? WHERE source=? AND ordinal=?`).run(
-      JSON.stringify(summary),
-      id,
-      ordinal,
-    );
+    prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `UPDATE ${P}plans SET summary=? WHERE source=? AND ordinal=?`,
+    ).run(JSON.stringify(summary), id, ordinal);
     if (fields.some((key) => delta[key]) && plan.eligible) op.updateTree(ordinal, delta);
     if (next.relevant !== before.relevant)
       op.updateExcluded(plan, unitOrdinal, before.relevant - next.relevant);
     if (facts.status === 'pending' && !facts.coverageKind)
-      db.prepare(`DELETE FROM ${P}units WHERE source=? AND plan=? AND ordinal=?`).run(
-        id,
-        ordinal,
-        unitOrdinal,
-      );
+      prepareClinicalReviewMaintenance(
+        db,
+        'reader',
+        `DELETE FROM ${P}units WHERE source=? AND plan=? AND ordinal=?`,
+      ).run(id, ordinal, unitOrdinal);
     else
-      db.prepare(
+      prepareClinicalReviewMaintenance(
+        db,
+        'reader',
         `INSERT INTO ${P}units VALUES(?,?,?,?,?,?) ON CONFLICT(source,plan,ordinal) DO UPDATE SET facts=excluded.facts,proposal=excluded.proposal,stale=excluded.stale`,
       ).run(id, ordinal, unitOrdinal, JSON.stringify(facts), proposal, Number(stale));
     if (
@@ -565,11 +630,16 @@ export async function prepareCollectionReaderCoverage(
         .prepare(`SELECT 1 FROM ${P}units WHERE source=? AND proposal=? LIMIT 1`)
         .get(id, old.proposal)
     ) {
-      db.prepare(`DELETE FROM ${P}proposals WHERE source=? AND id=?`).run(id, old.proposal);
-      db.prepare(`DELETE FROM ${P}dependencies WHERE source=? AND proposal=?`).run(
-        id,
-        old.proposal,
-      );
+      prepareClinicalReviewMaintenance(
+        db,
+        'reader',
+        `DELETE FROM ${P}proposals WHERE source=? AND id=?`,
+      ).run(id, old.proposal);
+      prepareClinicalReviewMaintenance(
+        db,
+        'reader',
+        `DELETE FROM ${P}dependencies WHERE source=? AND proposal=?`,
+      ).run(id, old.proposal);
     }
   };
   const preparePlan = async (address: string) => {
@@ -598,42 +668,51 @@ export async function prepareCollectionReaderCoverage(
             )
             .get(id, ordinal)?.proposal;
           if (typeof proposal !== 'string') break;
-          db.prepare(`DELETE FROM ${P}units WHERE source=? AND plan=? AND proposal=?`).run(
-            id,
-            ordinal,
-            proposal,
-          );
+          prepareClinicalReviewMaintenance(
+            db,
+            'reader',
+            `DELETE FROM ${P}units WHERE source=? AND plan=? AND proposal=?`,
+          ).run(id, ordinal, proposal);
           if (
             !db
               .prepare(`SELECT 1 FROM ${P}units WHERE source=? AND proposal=? LIMIT 1`)
               .get(id, proposal)
           ) {
-            db.prepare(`DELETE FROM ${P}proposals WHERE source=? AND id=?`).run(id, proposal);
-            db.prepare(`DELETE FROM ${P}dependencies WHERE source=? AND proposal=?`).run(
-              id,
-              proposal,
-            );
+            prepareClinicalReviewMaintenance(
+              db,
+              'reader',
+              `DELETE FROM ${P}proposals WHERE source=? AND id=?`,
+            ).run(id, proposal);
+            prepareClinicalReviewMaintenance(
+              db,
+              'reader',
+              `DELETE FROM ${P}dependencies WHERE source=? AND proposal=?`,
+            ).run(id, proposal);
           }
           await checkpoint();
         }
-        db.prepare(`DELETE FROM ${P}units WHERE source=? AND plan=?`).run(id, ordinal);
-        db.prepare(`DELETE FROM ${P}excluded WHERE source=? AND plan=?`).run(id, ordinal);
+        prepareClinicalReviewMaintenance(
+          db,
+          'reader',
+          `DELETE FROM ${P}units WHERE source=? AND plan=?`,
+        ).run(id, ordinal);
+        prepareClinicalReviewMaintenance(
+          db,
+          'reader',
+          `DELETE FROM ${P}excluded WHERE source=? AND plan=?`,
+        ).run(id, ordinal);
       }
-      db.prepare(`UPDATE ${P}plans SET eligible=?,summary=? WHERE source=? AND ordinal=?`).run(
-        eligible,
-        JSON.stringify(summary),
-        id,
-        ordinal,
-      );
+      prepareClinicalReviewMaintenance(
+        db,
+        'reader',
+        `UPDATE ${P}plans SET eligible=?,summary=? WHERE source=? AND ordinal=?`,
+      ).run(eligible, JSON.stringify(summary), id, ordinal);
     } else
-      db.prepare(`INSERT INTO ${P}plans VALUES(?,?,?,?,?,?)`).run(
-        id,
-        ordinal,
-        address,
-        plan.unitCount,
-        eligible,
-        JSON.stringify(summary),
-      );
+      prepareClinicalReviewMaintenance(
+        db,
+        'reader',
+        `INSERT INTO ${P}plans VALUES(?,?,?,?,?,?)`,
+      ).run(id, ordinal, address, plan.unitCount, eligible, JSON.stringify(summary));
     if (eligible) op.updateTree(ordinal, summary);
     if (!eligible) return;
     if (plan.format === 'retained') {
@@ -673,7 +752,11 @@ export async function prepareCollectionReaderCoverage(
             throw Error('Changed reader unit has no complete plan index');
           if (op.plan(ordinal)?.eligible) applyUnit(ordinal, unitOrdinal, plan.facts(unitOrdinal));
         } else
-          db.prepare(`INSERT OR IGNORE INTO ${P}dirty_proposals VALUES(?,?)`).run(id, effect.value);
+          prepareClinicalReviewMaintenance(
+            db,
+            'reader',
+            `INSERT OR IGNORE INTO ${P}dirty_proposals VALUES(?,?)`,
+          ).run(id, effect.value);
         await checkpoint();
       }
     }
@@ -688,11 +771,11 @@ export async function prepareCollectionReaderCoverage(
         withIntakeWork(db, 'warm', () => recordIntakeWork('readerCoverageDependencyChecks'));
         const current = collectionReaderProposalCurrent(db, id, view, dirty);
         registerDependencies(db, id, dirty);
-        db.prepare(`UPDATE ${P}proposals SET current=? WHERE source=? AND id=?`).run(
-          Number(current),
-          id,
-          dirty,
-        );
+        prepareClinicalReviewMaintenance(
+          db,
+          'reader',
+          `UPDATE ${P}proposals SET current=? WHERE source=? AND id=?`,
+        ).run(Number(current), id, dirty);
         for (const unit of db
           .prepare(
             `SELECT plan,ordinal,facts,proposal,stale FROM ${P}units WHERE source=? AND proposal=? ORDER BY plan,ordinal`,
@@ -702,20 +785,38 @@ export async function prepareCollectionReaderCoverage(
           await checkpoint();
         }
       }
-      db.prepare(`DELETE FROM ${P}dirty_proposals WHERE source=? AND proposal=?`).run(id, dirty);
+      prepareClinicalReviewMaintenance(
+        db,
+        'reader',
+        `DELETE FROM ${P}dirty_proposals WHERE source=? AND proposal=?`,
+      ).run(id, dirty);
       await checkpoint();
     }
     assertCurrent();
-    db.prepare(`UPDATE ${P}sources SET logical=?,ready=1,generation=? WHERE id=?`).run(
-      logical,
-      selectedGeneration,
+    prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `UPDATE ${P}sources SET logical=?,ready=1,generation=? WHERE id=?`,
+    ).run(logical, selectedGeneration, id);
+    prepareClinicalReviewMaintenance(db, 'reader', `DELETE FROM ${P}effects WHERE source=?`).run(
       id,
     );
-    db.prepare(`DELETE FROM ${P}effects WHERE source=?`).run(id);
-    db.prepare(`DELETE FROM ${P}transitions WHERE source=?`).run(id);
-    db.prepare(`DELETE FROM ${P}path WHERE source=? AND run=?`).run(id, run);
+    prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `DELETE FROM ${P}transitions WHERE source=?`,
+    ).run(id);
+    prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `DELETE FROM ${P}path WHERE source=? AND run=?`,
+    ).run(id, run);
   } catch (error) {
-    db.prepare(`UPDATE ${P}sources SET ready=0 WHERE id=? AND run=?`).run(id, run);
+    prepareClinicalReviewMaintenance(
+      db,
+      'reader',
+      `UPDATE ${P}sources SET ready=0 WHERE id=? AND run=?`,
+    ).run(id, run);
     throw error;
   }
 }

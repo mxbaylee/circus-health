@@ -4,6 +4,7 @@ import {
   type VerifiedClinicalArtifact,
 } from './intake-review-collection-session.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete native report summaries. Pages never become a clinical decision scope. */
 import { createHash, randomUUID } from 'node:crypto';
@@ -732,7 +733,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                 ) {
                   if (!prepared || proposal !== member.proposalId) {
                     if (prepared?.status === 'ready') prepared.session.close();
-                    const preparationStamp = reviewReadStamp(db);
+                    const preparationStamp = reviewPreparationStamp(db);
                     prepared = await prepareCollectionClinicalReviewAsync(
                       db,
                       root,
@@ -741,7 +742,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                       member.proposalId,
                       {
                         assertRunning: () => {
-                          if (reviewReadStamp(db) !== preparationStamp) throw changed();
+                          if (reviewPreparationStamp(db) !== preparationStamp) throw changed();
                         },
                         groundingDependency: (dependency) =>
                           retainGroundingDependency(source.id, dependency),
