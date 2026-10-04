@@ -3,8 +3,10 @@ import type { DatabaseSync } from 'node:sqlite';
 import { observeTransactionOutcome } from './database.ts';
 import {
   consumeSourceTextProjection,
+  prepareReadOnlySourceTextSearch,
   reconcileSourceTextProjection,
   sourceTextProjectionCounters,
+  sourceTextProjectionReadOnly,
 } from './source-text-projection.ts';
 import { createSourceDetailsLikeMatcher } from './source-details-like.ts';
 
@@ -167,7 +169,9 @@ export function createSourceDetailsSearch(
     }
     // Schema repair and initial authoritative reconstruction happen before the
     // outer SQL statement starts; warm reads need no source JSON hydration.
-    reconcileSourceTextProjection(db);
+    // Native conversion retains an original raw SQL witness. Its concurrent
+    // search consumes checked authority directly and defers disposable repair.
+    if (!prepareReadOnlySourceTextSearch(db)) reconcileSourceTextProjection(db);
     if (!registered.has(db)) {
       db.function(FUNCTION, (pathMatch, token, sourceId, pattern) => {
         const current = connections.get(db);
@@ -192,6 +196,7 @@ export function createSourceDetailsSearch(
             throw Error('Source details search pattern binding changed');
           // Validate the request even when the path already matches. An SQL OR
           // before the dispatcher would bypass token/profile invalidation.
+          sourceTextProjectionReadOnly(db);
           if (pathMatch === 1) return 1;
           const matcher = createSourceDetailsLikeMatcher(scope.pattern);
           current.counters.peakMatcherBytes = Math.max(

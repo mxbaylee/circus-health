@@ -29,6 +29,12 @@ import {
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { intakeSourcePinKey, writeIntakeSourcePin } from '../intake-source-pin.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { createSourceDetailsSearch } from '../source-details-search.ts';
+import {
+  holdReadOnlySourceTextProjection,
+  sourceTextProjectionReadOnly,
+  sourceTextProjectionCounters,
+} from '../source-text-projection.ts';
 
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 function fixture(
@@ -710,4 +716,266 @@ test('cold conversion and fixed warm edit count node and accepted journal writes
   assert.ok(rows[1]!.warmNodes <= rows[0]!.warmNodes * 2 + 8);
   assert.ok(rows[1]!.warmJournalBytes <= rows[0]!.warmJournalBytes * 2 + 16 * 1024);
   t.diagnostic(JSON.stringify(rows));
+});
+
+function exactSearch(db: Database, text: string | string[], query: string, limits = {}) {
+  const expected = (Array.isArray(text) ? text : [text]).reduce(
+    (sum, value) => sum + Number(db.prepare('SELECT ? LIKE ? n').get(value, '%' + query + '%')!.n),
+    0,
+  );
+  const plan = createSourceDetailsSearch(db, query, { limits });
+  try {
+    const actual = Number(
+      db
+        .prepare('SELECT count(*) n FROM source_files f WHERE ' + plan.predicate)
+        .get(...plan.parameters)!.n,
+    );
+    assert.equal(actual, expected);
+  } finally {
+    plan.dispose();
+  }
+}
+function rawSearchWitness(db: Database) {
+  return JSON.stringify([
+    db.prepare('SELECT total_changes() n').get(),
+    db.prepare('PRAGMA data_version').get(),
+    db.prepare('PRAGMA schema_version').get(),
+    db.prepare('PRAGMA temp.schema_version').get(),
+  ]);
+}
+
+test('conversion source search preserves exact text without projection SQL writes and releases its read scope', async (t) => {
+  for (const warm of [false, true]) {
+    const f = fixture(t, 3, 12000);
+    const otherText =
+      '{"duplicate":"retained neighbor","duplicate":"shown neighbor","escape":"\\u0041\\ud800","unicode":' +
+      JSON.stringify('b'.repeat(2500) + 'boundaryΩ😀 ending') +
+      '}';
+    transaction(f.db, () => {
+      f.db
+        .prepare(
+          'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+        )
+        .run(
+          'fictional-search-neighbor',
+          'fictional-neighbor.txt',
+          sha('fictional neighbor original'),
+          0,
+          'derived',
+          otherText,
+        );
+    });
+    const texts = [f.text, otherText];
+    if (warm) exactSearch(f.db, texts, 'same-public-id');
+    let inspected = 0;
+    const built = await buildIntakeCollectionEnvelope(f.db, f.source, {
+      onCheckpoint() {
+        if (inspected++ >= 2) return;
+        assert.equal(sourceTextProjectionReadOnly(f.db), true);
+        const before = rawSearchWitness(f.db);
+        const counters = structuredClone(sourceTextProjectionCounters(f.db));
+        for (const query of [
+          'same-public-id',
+          'fictional-resume.zip',
+          'absent fictional phrase',
+          'retained neighbor',
+          'shown neighbor',
+          '\\u0041',
+          '\\ud800',
+          'boundaryΩ😀',
+          'shown neighbor\",\"escape',
+        ])
+          exactSearch(f.db, texts, query);
+        assert.throws(
+          () => exactSearch(f.db, f.text, 'same-public-id', { maxReconstructedBytes: 1 }),
+          /limit/,
+        );
+        assert.equal(rawSearchWitness(f.db), before);
+        assert.equal(
+          sourceTextProjectionCounters(f.db).projectionWrites,
+          counters.projectionWrites,
+        );
+        assert.ok(sourceTextProjectionCounters(f.db).authorityBytes > counters.authorityBytes);
+        // A nested host read scope cannot release this active preparation's lease.
+        const release = holdReadOnlySourceTextProjection(f.db, () => {});
+        release();
+        release();
+        assert.equal(sourceTextProjectionReadOnly(f.db), true);
+      },
+    });
+    assert.ok(inspected >= 2);
+    assert.equal(built.sourceTextHash, sha(f.text));
+    assert.equal(sourceTextProjectionReadOnly(f.db), false);
+    const beforeRepair = rawSearchWitness(f.db);
+    exactSearch(f.db, texts, 'same-public-id');
+    assert.notEqual(rawSearchWitness(f.db), beforeRepair);
+    assert.equal([...iterateIntakeEnvelopeText(f.db, f.source)].join(''), f.text);
+  }
+  const cancelled = fixture(t, 3, 12000);
+  let checkpoint = false;
+  let heldPlan: ReturnType<typeof createSourceDetailsSearch> | undefined;
+  await assert.rejects(
+    () =>
+      buildIntakeCollectionEnvelope(cancelled.db, cancelled.source, {
+        onCheckpoint() {
+          checkpoint = true;
+          exactSearch(cancelled.db, cancelled.text, 'same-public-id');
+          heldPlan = createSourceDetailsSearch(cancelled.db, 'same-public-id');
+          throw Error('fictional search checkpoint cancellation');
+        },
+      }),
+    /fictional search checkpoint cancellation/,
+  );
+  assert.equal(checkpoint, true);
+  assert.equal(sourceTextProjectionReadOnly(cancelled.db), false);
+  assert.ok(heldPlan);
+  const beforePlanRepair = rawSearchWitness(cancelled.db);
+  try {
+    const expected = Number(
+      cancelled.db.prepare('SELECT ? LIKE ? n').get(cancelled.text, '%same-public-id%')!.n,
+    );
+    const actual = Number(
+      cancelled.db
+        .prepare('SELECT count(*) n FROM source_files f WHERE ' + heldPlan.predicate)
+        .get(...heldPlan.parameters)!.n,
+    );
+    assert.equal(actual, expected);
+    assert.notEqual(rawSearchWitness(cancelled.db), beforePlanRepair);
+  } finally {
+    heldPlan.dispose();
+  }
+  // A fresh production invocation verifies/replays the retained prefix normally.
+  await ensureNativeIntakeSchema(cancelled.db, cancelled.identity.profileId, cancelled.source.id);
+  assert.equal(
+    [...iterateIntakeEnvelopeText(cancelled.db, cancelled.source)].join(''),
+    cancelled.text,
+  );
+});
+
+test('conversion search does not credit unrelated SQL, TEMP or rolled-back writes', async (t) => {
+  for (const stimulus of ['local', 'temp', 'rollback', 'peer'] as const) {
+    const f = fixture(t, 3, 0);
+    f.db.exec('CREATE TEMP TABLE fictional_search_observer(id TEXT PRIMARY KEY)');
+    const peer =
+      stimulus === 'peer'
+        ? new DatabaseSync(String(f.db.prepare('PRAGMA database_list').get()!.file))
+        : undefined;
+    let injected = false;
+    let beforeInjection = '',
+      afterInjection = '';
+    let atInjection = { ...f.writes };
+    try {
+      await assert.rejects(
+        () =>
+          buildIntakeCollectionEnvelope(f.db, f.source, {
+            onCheckpoint() {
+              if (injected) return;
+              exactSearch(f.db, f.text, 'same-public-id');
+              beforeInjection = rawSearchWitness(f.db);
+              const target = peer ?? f.db;
+              if (stimulus === 'temp') {
+                target.exec(
+                  "INSERT INTO fictional_search_observer VALUES('fictional'); DELETE FROM fictional_search_observer",
+                );
+              } else if (stimulus === 'rollback') {
+                target.exec('SAVEPOINT fictional_search_rollback');
+                target.prepare('UPDATE source_files SET bytes=bytes+1 WHERE id=?').run(f.source.id);
+                target.exec(
+                  'ROLLBACK TO fictional_search_rollback; RELEASE fictional_search_rollback',
+                );
+              } else {
+                target.exec('BEGIN IMMEDIATE');
+                target.prepare('UPDATE source_files SET bytes=bytes+1 WHERE id=?').run(f.source.id);
+                target.prepare('UPDATE source_files SET bytes=bytes-1 WHERE id=?').run(f.source.id);
+                target.exec('COMMIT');
+              }
+              injected = true;
+              atInjection = { ...f.writes };
+              afterInjection = rawSearchWitness(f.db);
+            },
+          }),
+        /authority changed|source binding changed/,
+      );
+      assert.equal(injected, true);
+      assert.notEqual(afterInjection, beforeInjection);
+      assert.deepEqual(f.writes, atInjection);
+      assert.equal(sourceTextProjectionReadOnly(f.db), false);
+      assert.equal(
+        Number(f.db.prepare('SELECT bytes FROM source_files WHERE id=?').get(f.source.id)!.bytes),
+        23,
+      );
+      assert.equal(hasIntakeCollectionEnvelope(f.db, f.source), false);
+    } finally {
+      peer?.close();
+    }
+  }
+});
+
+test('conversion search refuses preexisting bad authority outside path matches and candidate filters without SQL mutation', async (t) => {
+  for (const warm of [false, true])
+    for (const fault of ['malformed', 'unsupported', 'missing'] as const) {
+      const f = fixture(t, 3, 0);
+      if (warm) exactSearch(f.db, f.text, 'same-public-id');
+      f.db.exec('PRAGMA ignore_check_constraints=ON');
+      transaction(f.db, () => {
+        f.db
+          .prepare(
+            'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+          )
+          .run(
+            'fictional-bad-search-neighbor',
+            'fictional-neighbor.txt',
+            sha('fictional bad neighbor original'),
+            0,
+            fault === 'missing' ? 'intake_original' : 'derived',
+            fault === 'missing'
+              ? prepareInitialIntakeEnvelope({
+                  intake: { version: 0, workflow: { format: 'health-intake-workflow-v1' } },
+                }).detailsJson
+              : fault === 'malformed'
+                ? '{'
+                : JSON.stringify({
+                    intake: { version: 0, workflow: { format: 'fictional-unsupported-workflow' } },
+                  }),
+          );
+      });
+      assert.equal(Number(f.db.prepare('SELECT count(*) n FROM __record_changed').get()!.n), 0);
+      let inspected = false;
+      const built = await buildIntakeCollectionEnvelope(f.db, f.source, {
+        onCheckpoint() {
+          if (inspected) return;
+          const before = rawSearchWitness(f.db);
+          const writes = { ...f.writes };
+          const projectionWrites = sourceTextProjectionCounters(f.db).projectionWrites;
+          // % matches every path. Candidate SQL selects only the valid converting
+          // source; upfront validation must still refuse its malformed neighbor.
+          assert.throws(() => {
+            const plan = createSourceDetailsSearch(f.db, '%');
+            try {
+              f.db
+                .prepare('SELECT count(*) n FROM source_files f WHERE f.id=? AND ' + plan.predicate)
+                .get(f.source.id, ...plan.parameters);
+            } finally {
+              plan.dispose();
+            }
+          }, /authority|corrupt|JSON|unsupported|workflow|missing|head/);
+          assert.equal(rawSearchWitness(f.db), before);
+          assert.deepEqual(f.writes, writes);
+          assert.equal(sourceTextProjectionCounters(f.db).projectionWrites, projectionWrites);
+          inspected = true;
+        },
+      });
+      assert.equal(inspected, true);
+      assert.equal(built.sourceTextHash, sha(f.text));
+      assert.equal(sourceTextProjectionReadOnly(f.db), false);
+      assert.equal([...iterateIntakeEnvelopeText(f.db, f.source)].join(''), f.text);
+      assert.equal(
+        Number(
+          f.db
+            .prepare('SELECT count(*) n FROM source_files WHERE id=?')
+            .get('fictional-bad-search-neighbor')!.n,
+        ),
+        1,
+      );
+    }
 });

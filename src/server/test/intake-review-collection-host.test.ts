@@ -1480,16 +1480,38 @@ test('signed native feed pages retain exact rows and refuse scratch, rollback, p
   db.exec('CREATE TEMP TABLE fictional_feed_stamp(n INTEGER)');
   await listIntakeImportFeedRead(db, root, profileId, options);
   assert.equal(intakeWorkCounters(db).warm.collectionQueueClinicalReviews, reviews + 1);
+  reviews = intakeWorkCounters(db).warm.collectionQueueClinicalReviews;
   db.exec('SAVEPOINT fictional_feed_rollback');
   try {
+    // A real rolled-back write changes the raw generation even when the final
+    // rows match. No cooperative review may enter the caller's transaction.
+    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
+      'fictional_feed_rollback_write',
+      'held',
+    );
     await assert.rejects(
       () => listIntakeImportFeedRead(db, root, profileId, options),
-      /Cooperative clinical review cannot hold a transaction/,
+      /Clinical operation cannot (?:enter|wait) inside a transaction/,
     );
     assert.equal(db.isTransaction, true, 'refusal leaves the caller-owned transaction intact');
+    assert.equal(
+      db.prepare('SELECT value FROM app_meta WHERE key=?').get('fictional_feed_rollback_write')!
+        .value,
+      'held',
+    );
+    assert.equal(
+      intakeWorkCounters(db).warm.collectionQueueClinicalReviews,
+      reviews,
+      'refused admission did not start a clinical review',
+    );
   } finally {
     db.exec('ROLLBACK TO fictional_feed_rollback;RELEASE fictional_feed_rollback');
   }
+  assert.equal(db.isTransaction, false);
+  assert.equal(
+    db.prepare('SELECT value FROM app_meta WHERE key=?').get('fictional_feed_rollback_write'),
+    undefined,
+  );
   reviews = intakeWorkCounters(db).warm.collectionQueueClinicalReviews;
   await listIntakeImportFeedRead(db, root, profileId, options);
   assert.equal(
@@ -1924,21 +1946,63 @@ test(
 );
 
 test('concurrent cold queue opens preserve the global four-queue bound', async (t) => {
-  const { db, root, profileId } = fixture(t);
+  // Distinct databases need distinct cache entries. Same-key callers on one DB
+  // are serialized and borrow leases on one existing queue.
+  const contexts = Array.from({ length: 6 }, () => fixture(t));
   const results = await Promise.allSettled(
-    Array.from({ length: 6 }, () => openCollectionReportQueue(db, root, profileId)),
+    contexts.map(async (context) => ({
+      context,
+      queue: await openCollectionReportQueue(context.db, context.root, context.profileId),
+    })),
   );
   const ready = results.filter((result) => result.status === 'fulfilled');
   const refused = results.filter((result) => result.status === 'rejected');
+  let reused: Awaited<ReturnType<typeof openCollectionReportQueue>>[] = [];
+  let replacement: Awaited<ReturnType<typeof openCollectionReportQueue>> | undefined;
   try {
     assert.equal(ready.length, 4);
     assert.equal(refused.length, 2);
     for (const result of refused) assert.equal(result.reason.code, 'REPORT_QUEUE_BUSY');
+    const first = ready[0]!.value;
+    const shared = await Promise.allSettled(
+      Array.from({ length: 6 }, () =>
+        openCollectionReportQueue(first.context.db, first.context.root, first.context.profileId),
+      ),
+    );
+    reused = shared.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+    assert.equal(
+      reused.length,
+      6,
+      'same-key leases reuse a queue even while all four entries are held',
+    );
+    for (const queue of reused) {
+      queue.assertCurrent();
+      queue.close();
+    }
+    for (const result of ready) result.value.queue.assertCurrent();
+
+    // Releasing one distinct owner permits exactly one formerly refused queue.
+    first.queue.close();
+    const waiting = contexts.filter((_context, index) => results[index]!.status === 'rejected');
+    replacement = await openCollectionReportQueue(
+      waiting[0]!.db,
+      waiting[0]!.root,
+      waiting[0]!.profileId,
+    );
+    replacement.assertCurrent();
+    for (const result of ready.slice(1)) result.value.queue.assertCurrent();
+    await assert.rejects(
+      () => openCollectionReportQueue(waiting[1]!.db, waiting[1]!.root, waiting[1]!.profileId),
+      { code: 'REPORT_QUEUE_BUSY' },
+    );
   } finally {
-    for (const result of ready) result.value.close();
+    for (const queue of reused) queue.close();
+    replacement?.close();
+    for (const result of ready) result.value.queue.close();
+    for (const { db } of contexts) clearCollectionReportQueues(db);
   }
-  clearCollectionReportQueues(db);
-  assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+  for (const { db } of contexts)
+    assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
 });
 
 test(

@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import type { Database } from './database.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
+import { holdReadOnlySourceTextProjection } from './source-text-projection.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
 import { selectedEnvelopeStore } from './intake-collection-envelope.ts';
 import { ENVELOPE_SCHEMA, schemaKey } from './intake-envelope-schema.ts';
@@ -154,6 +155,7 @@ export function prepareEnvelopeBuildResume(
         fail('progress changed during preparation');
       assertWitness();
     };
+    const releaseReadOnlySearch = holdReadOnlySourceTextProjection(db, assertCurrent);
     return {
       build,
       work,
@@ -239,7 +241,13 @@ export function prepareEnvelopeBuildResume(
         if (!prefixVerified || count < prefixCount) fail('prefix exceeds complete transcript');
         assertProgress();
       },
-      close: scratch.close,
+      close() {
+        try {
+          scratch.close();
+        } finally {
+          releaseReadOnlySearch();
+        }
+      },
     };
   } catch (error) {
     scratch.close();

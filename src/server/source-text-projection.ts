@@ -90,6 +90,31 @@ interface Connection {
   counters: SourceTextProjectionCounters;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
+// Preparation owners retain their original raw SQL witness. Search must not
+// repair this shared disposable cache across their asynchronous gaps.
+const readOnlyOwners = new WeakMap<DatabaseSync, Set<() => void>>();
+export function holdReadOnlySourceTextProjection(db: DatabaseSync, assertCurrent: () => void) {
+  assertCurrent();
+  let owners = readOnlyOwners.get(db);
+  if (!owners) readOnlyOwners.set(db, (owners = new Set()));
+  const owner = () => assertCurrent();
+  owners.add(owner);
+  const owned = owners;
+  let closed = false;
+  return () => {
+    if (closed) return;
+    closed = true;
+    owned.delete(owner);
+    if (!owned.size) readOnlyOwners.delete(db);
+  };
+}
+/** Selects a read path only; it grants no write permission or witness refresh. */
+export function sourceTextProjectionReadOnly(db: DatabaseSync): boolean {
+  const owners = readOnlyOwners.get(db);
+  if (!owners?.size) return false;
+  for (const assertCurrent of owners) assertCurrent();
+  return true;
+}
 const table = (name: Table) => PREFIX + name;
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
 // Corrupt BLOB keys have no JSON text representation. Hex-encode them only for
@@ -869,6 +894,85 @@ export function readSourceTextProjection(
   });
 }
 
+/** Read-only analogue of upfront dirty reconciliation. During preparation we
+ * cannot initialize or drain tracking rows, so validate the source inventory
+ * one identity at a time. These complete compatibility reads are counted. */
+export function prepareReadOnlySourceTextSearch(db: DatabaseSync): boolean {
+  if (!sourceTextProjectionReadOnly(db)) return false;
+  const connection = connectionFor(db);
+  if (recordDurabilityStatus(db)?.dirty) fail('accepted projection requires recovery');
+  for (const row of db
+    .prepare(
+      "SELECT CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB)) BETWEEN 1 AND 1024 THEN id END id FROM source_files ORDER BY id",
+    )
+    .iterate()) {
+    connection.counters.authorityReads++;
+    if (typeof row.id !== 'string') return fail('source identity exceeds binding bound');
+    const selected = authority(db, connection, row.id);
+    if (!selected) return fail('selected source text is unavailable');
+    if (
+      selected.logical_head === undefined &&
+      (selected.details_json as string).length > TEXT_PIECE_LIMITS.maxTextUtf16Units
+    )
+      fail('selected authority exceeds the text bound');
+  }
+  sourceTextProjectionReadOnly(db);
+  return true;
+}
+
+function consumeReadOnlySourceText(
+  db: DatabaseSync,
+  sourceId: string,
+  consume: (chunk: string) => void,
+): void {
+  const connection = connectionFor(db);
+  if (recordDurabilityStatus(db)?.dirty) fail('accepted projection requires recovery');
+  const profile = () =>
+    db
+      .prepare(
+        "SELECT CASE WHEN length(CAST(value AS BLOB))<=1024 THEN value END value FROM app_meta WHERE key='owner_profile_id'",
+      )
+      .get()?.value;
+  const owner = profile();
+  if (typeof owner !== 'string' || !owner) fail('profile binding');
+  const selected = authority(db, connection, sourceId);
+  if (!selected) return fail('selected source text is unavailable');
+  if (typeof selected.logical_head === 'string') {
+    for (const chunk of iterateIntakeEnvelopeText(
+      db,
+      selected as unknown as IntakeEnvelopeSource,
+    )) {
+      connection.counters.authorityReads++;
+      connection.counters.authorityBytes += Buffer.byteLength(chunk);
+      consume(chunk);
+    }
+  } else {
+    // Retained/raw compatibility remains explicitly bounded by authority().
+    // Consume UTF8-safe fragments through the same exact matcher as native text.
+    const text = selected.details_json as string;
+    if (text.length > TEXT_PIECE_LIMITS.maxTextUtf16Units)
+      fail('selected authority exceeds the text bound');
+    for (let at = 0; at < text.length;) {
+      let end = Math.min(at + 1024, text.length);
+      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+      consume(text.slice(at, end));
+      at = end;
+    }
+  }
+  const after = authority(db, connection, sourceId);
+  if (
+    profile() !== owner ||
+    !after ||
+    ['sha256', 'kind', 'details_json', 'authority_key', 'authority_head', 'logical_head'].some(
+      (key) => after[key] !== selected[key],
+    )
+  )
+    fail('selected source text binding changed');
+  // Final physical/source observations cannot adopt a changed-and-restored SQL
+  // witness. The original preparation owners still decide whether it is current.
+  sourceTextProjectionReadOnly(db);
+}
+
 /** Consume checked selected text in order without joining a query text operand.
  * Retained v3 uses its explicitly bounded compatibility snapshot; v4 uses the
  * selected authority's streamed logical export rather than a text-piece copy.
@@ -881,6 +985,7 @@ export function consumeSourceTextProjection(
 ): void {
   if (typeof sourceId !== 'string' || !sourceId || Buffer.byteLength(sourceId) > 1024)
     fail('source identity exceeds binding bound');
+  if (sourceTextProjectionReadOnly(db)) return consumeReadOnlySourceText(db, sourceId, consume);
   current(db, {}, (connection, profile) => {
     if (!db.prepare(`SELECT 1 FROM ${table('heads')} WHERE source_id=?`).get(sourceId)) {
       const selected = authority(db, connection, sourceId);
