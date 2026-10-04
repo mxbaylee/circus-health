@@ -4481,89 +4481,95 @@ test('fresh plan context starts at one captured current pin pair and stale conti
   f.assistant.cancel('cedar', f.chat.id);
 });
 
-test('fresh plan context rejects every malformed envelope before dispatch', async (t) => {
-  const cases: { name: string; args: Record<string, unknown> }[] = [
-    {
-      name: 'false flag',
-      args: { action: 'read', freshStart: false, section: 'units', offset: 0 },
-    },
-    { name: 'missing section', args: { action: 'read', freshStart: true, offset: 0 } },
-    {
-      name: 'unknown section',
-      args: { action: 'read', freshStart: true, section: 'fictional_unknown', offset: 0 },
-    },
-    {
-      name: 'nonzero offset',
-      args: { action: 'read', freshStart: true, section: 'units', offset: 1 },
-    },
-    {
-      name: 'intake pin',
-      args: { action: 'read', freshStart: true, section: 'units', version: 1 },
-    },
-    {
-      name: 'mapping pin',
-      args: { action: 'read', freshStart: true, section: 'units', mappingVersion: 'stale' },
-    },
-    {
-      name: 'create action',
-      args: { action: 'create', freshStart: true, section: 'units' },
-    },
-    {
-      name: 'read unit action',
-      args: { action: 'read_unit', freshStart: true, section: 'units' },
-    },
-    {
-      name: 'search action',
-      args: { action: 'search', freshStart: true, section: 'units' },
-    },
-    {
-      name: 'follow action',
-      args: { action: 'follow', freshStart: true, section: 'units' },
-    },
-    {
-      name: 'read unit field',
-      args: { action: 'read', freshStart: true, section: 'units', unitId: 'unit-1' },
-    },
-    {
-      name: 'create field',
-      args: { action: 'read', freshStart: true, section: 'units', replacePlanId: 'plan-1' },
-    },
-    {
-      name: 'search field',
-      args: { action: 'read', freshStart: true, section: 'units', query: 'fictional' },
-    },
-    {
-      name: 'follow field',
-      args: { action: 'read', freshStart: true, section: 'units', referenceId: 'reference-1' },
-    },
-    {
-      name: 'create sizing field',
-      args: { action: 'read', freshStart: true, section: 'units', unitSize: 100 },
-    },
-    {
-      name: 'create overlap field',
-      args: { action: 'read', freshStart: true, section: 'units', overlap: 10 },
-    },
-    {
-      name: 'unknown future field',
-      args: { action: 'read', freshStart: true, section: 'units', futureMode: true },
-    },
-  ];
+// Seventeen independent native conversion fixtures took about 46 seconds locally.
+// This is a coarse host integration hang guard; every malformed-envelope oracle remains exact.
+test(
+  'fresh plan context rejects every malformed envelope before dispatch',
+  { timeout: 120_000 },
+  async (t) => {
+    const cases: { name: string; args: Record<string, unknown> }[] = [
+      {
+        name: 'false flag',
+        args: { action: 'read', freshStart: false, section: 'units', offset: 0 },
+      },
+      { name: 'missing section', args: { action: 'read', freshStart: true, offset: 0 } },
+      {
+        name: 'unknown section',
+        args: { action: 'read', freshStart: true, section: 'fictional_unknown', offset: 0 },
+      },
+      {
+        name: 'nonzero offset',
+        args: { action: 'read', freshStart: true, section: 'units', offset: 1 },
+      },
+      {
+        name: 'intake pin',
+        args: { action: 'read', freshStart: true, section: 'units', version: 1 },
+      },
+      {
+        name: 'mapping pin',
+        args: { action: 'read', freshStart: true, section: 'units', mappingVersion: 'stale' },
+      },
+      {
+        name: 'create action',
+        args: { action: 'create', freshStart: true, section: 'units' },
+      },
+      {
+        name: 'read unit action',
+        args: { action: 'read_unit', freshStart: true, section: 'units' },
+      },
+      {
+        name: 'search action',
+        args: { action: 'search', freshStart: true, section: 'units' },
+      },
+      {
+        name: 'follow action',
+        args: { action: 'follow', freshStart: true, section: 'units' },
+      },
+      {
+        name: 'read unit field',
+        args: { action: 'read', freshStart: true, section: 'units', unitId: 'unit-1' },
+      },
+      {
+        name: 'create field',
+        args: { action: 'read', freshStart: true, section: 'units', replacePlanId: 'plan-1' },
+      },
+      {
+        name: 'search field',
+        args: { action: 'read', freshStart: true, section: 'units', query: 'fictional' },
+      },
+      {
+        name: 'follow field',
+        args: { action: 'read', freshStart: true, section: 'units', referenceId: 'reference-1' },
+      },
+      {
+        name: 'create sizing field',
+        args: { action: 'read', freshStart: true, section: 'units', unitSize: 100 },
+      },
+      {
+        name: 'create overlap field',
+        args: { action: 'read', freshStart: true, section: 'units', overlap: 10 },
+      },
+      {
+        name: 'unknown future field',
+        args: { action: 'read', freshStart: true, section: 'units', futureMode: true },
+      },
+    ];
 
-  for (const item of cases)
-    await t.test(item.name, async (child) => {
-      const f = await linkedFictionalPlanVersionConversion(child);
-      const before = intakeSourceVersion(f.db, f.item.id);
-      await assert.rejects(call(f.bridge, 'intake_plan', { id: f.item.id, ...item.args }), {
-        name: 'ModelToolValidationError',
-        code: 'MODEL_CONTEXT_FRESH_START',
+    for (const item of cases)
+      await t.test(item.name, async (child) => {
+        const f = await linkedFictionalPlanVersionConversion(child);
+        const before = intakeSourceVersion(f.db, f.item.id);
+        await assert.rejects(call(f.bridge, 'intake_plan', { id: f.item.id, ...item.args }), {
+          name: 'ModelToolValidationError',
+          code: 'MODEL_CONTEXT_FRESH_START',
+        });
+        assert.deepEqual(intakeSourceVersion(f.db, f.item.id), before);
+        assert.equal(f.chat.status, 'running');
+        assert.equal(f.bridge.closed, false);
+        f.assistant.cancel('cedar', f.chat.id);
       });
-      assert.deepEqual(intakeSourceVersion(f.db, f.item.id), before);
-      assert.equal(f.chat.status, 'running');
-      assert.equal(f.bridge.closed, false);
-      f.assistant.cancel('cedar', f.chat.id);
-    });
-});
+  },
+);
 
 // Four actual native conversion scenarios share this host integration hang guard.
 test(

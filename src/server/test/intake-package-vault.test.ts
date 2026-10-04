@@ -9,12 +9,12 @@ import {
   writeLargeStreamedZip,
 } from '../../tests/fixtures/large-streamed-zip.ts';
 import {
-  createIntakePlan,
+  createIntakePlanRead,
   getIntakeRead,
   uploadIntakeStream,
   verifyIntakeOriginal,
 } from '../intake.ts';
-import { indexIntakePackage, readIntakePackageMember } from '../intake-package.ts';
+import { inventoryIntakePackagePaged, readIntakePackageMember } from '../intake-package.ts';
 import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
 import { disposePdfEvidenceSessions } from '../intake-pdf-session.ts';
 import { newProfile, vaultFixture } from './helpers/vault-fixture.ts';
@@ -53,13 +53,23 @@ test('streamed large ZIP children and located failures recover from encrypted au
     createReadStream(zipPath, { highWaterMark: 64 * 1024 }) as unknown as IncomingMessage,
   );
   const context = () => ({ db: state.db, root: state.root, profileId, id: intake.id });
-  const index = await indexIntakePackage(context());
+  const inventory = await inventoryIntakePackagePaged({ ...context(), offset: 0, limit: 3 });
+  assert.equal(inventory.nextOffset, null, 'the three retained occurrences fit one native page');
+  const index = {
+    ...inventory,
+    members: inventory.members.map((member) => {
+      assert.ok('filename' in member, 'the short fictional member metadata is fully inline');
+      return member;
+    }),
+  };
   assert.deepEqual(
     index.members.map((m) => m.sourceHash),
     fixture.members.map((m) => m.sourceHash),
   );
   assert.ok(index.members.every((m) => m.bytes > 25 * 1024 * 1024));
-  await createIntakePlan(state.db, state.root, profileId, intake.id, { version: intake.version });
+  await createIntakePlanRead(state.db, state.root, profileId, intake.id, {
+    version: inventory.version,
+  });
   const childIds: string[] = [];
   for (const member of index.members.slice(0, 2)) {
     const result = await readIntakePackageMember({

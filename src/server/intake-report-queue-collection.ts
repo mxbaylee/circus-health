@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
@@ -410,194 +411,201 @@ export async function readCollectionIntakeReportRecords(
   } = {},
   queue?: Awaited<ReturnType<typeof openCollectionReportQueue>>,
 ): Promise<CollectionIntakeReportRecordPage> {
-  assertIntakeOwner(db, profileId);
-  const view = input.view || 'active',
-    limit = input.limit ?? 50,
-    byteBudget = input.bytes ?? 128 * 1024;
-  if (!Number.isSafeInteger(byteBudget) || byteBudget < 1024 || byteBudget > 256 * 1024)
-    throw new HttpError(
-      400,
-      'REPORT_QUEUE_WINDOW',
-      'Choose a report byte budget from 1024 to 262144',
-    );
-  if (
-    !['active', 'deferred', 'all'].includes(view) ||
-    !Number.isSafeInteger(limit) ||
-    limit < 1 ||
-    limit > 100
-  )
-    throw new HttpError(
-      400,
-      'REPORT_QUEUE_WINDOW',
-      'Choose an active, deferred or all report window from 1 to 100',
-    );
-  const source = db
-    .prepare(
-      "SELECT id,sha256,kind,details_json FROM source_files WHERE id=? AND kind='intake_original'",
-    )
-    .get(intakeId) as
-    { id: string; sha256: string; kind: string; details_json: string } | undefined;
-  if (!source) throw new HttpError(404, 'NOT_FOUND', 'Source intake not found');
-  if (!hasIntakeCollectionEnvelope(db, source))
-    throw new HttpError(
-      409,
-      'INTAKE_REVIEW_PENDING_MIGRATION',
-      'Prepare this retained intake for selected report review',
-    );
-  const binding = intakeSourceVersion(db, intakeId),
-    policy = clinicalReviewRevision(db),
-    query = JSON.stringify([
-      profileId,
-      intakeId,
-      binding.logicalBinding,
-      binding.version,
-      policy,
-      input.groupId || null,
-      view,
-    ]);
-  let after = '';
-  if (input.cursor) {
-    let cursor: unknown;
-    try {
-      cursor = JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8'));
-    } catch {
-      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-    }
-    if (
-      !Array.isArray(cursor) ||
-      cursor.length !== 2 ||
-      cursor[0] !== query ||
-      typeof cursor[1] !== 'string'
-    )
-      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-    after = cursor[1];
-  }
-  const records: CollectionIntakeReportRecordPage['records'] = [];
-  const window = queue?.recordMemberWindow(intakeId, {
-    groupId: input.groupId,
-    view,
-    after,
-    limit: limit + 1,
-  });
-  let totalRecords = window?.totalRecords ?? 0,
-    last = '',
-    remaining = false,
-    usedBytes = 0,
-    pageFull = false;
-  // Keep at most one complete bounded proposal review; never one full review per package member.
-  let cachedProposal: string | null | undefined,
-    cached: Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>> | undefined;
-  const physical = disposableSqlite('circus-report-record-proof-');
-  try {
-    const artifacts = createClinicalReviewArtifactProof(physical.db, 'clinical_artifacts');
-    for (const member of window
-      ? window.members()
-      : collectionReportQueueMembers(db, profileId, intakeId)) {
-      if (input.groupId && member.groupId !== input.groupId) continue;
-      if (view !== 'all' && member.state !== (view === 'active' ? 'pending' : 'deferred')) continue;
-      if (!window) totalRecords++;
-      const order =
-        member.groupOrder +
-        ':' +
-        String(member.groupOrdinal).padStart(12, '0') +
-        ':' +
-        String(member.memberOrder).padStart(12, '0') +
-        ':' +
-        JSON.stringify([member.candidateId, member.candidateVersionId]);
-      if (order <= after) continue;
-      if (pageFull || records.length >= limit) {
-        remaining = true;
-        continue;
-      }
-      if (!cached || cachedProposal !== member.proposalId) {
-        if (cached?.status === 'ready') cached.session.close();
-        cached = undefined;
-        cached = await prepareCollectionClinicalReviewAsync(
-          db,
-          root,
-          profileId,
-          intakeId,
-          member.proposalId,
-          { assertRunning: () => queue?.assertActive() },
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      assertIntakeOwner(db, profileId);
+      const view = input.view || 'active',
+        limit = input.limit ?? 50,
+        byteBudget = input.bytes ?? 128 * 1024;
+      if (!Number.isSafeInteger(byteBudget) || byteBudget < 1024 || byteBudget > 256 * 1024)
+        throw new HttpError(
+          400,
+          'REPORT_QUEUE_WINDOW',
+          'Choose a report byte budget from 1024 to 262144',
         );
-        cachedProposal = member.proposalId;
-      }
-      if (cached.status !== 'ready') throw new IntakeReviewFragmentRequired(cached.reference);
-      artifacts.retain(collectionClinicalProjectionContext(cached.session).verifiedArtifacts());
-      const record = cached.session.record(
-        member.recordId,
-        member.candidateId,
-        member.candidateVersionId,
-      );
-      if (!record)
+      if (
+        !['active', 'deferred', 'all'].includes(view) ||
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 100
+      )
+        throw new HttpError(
+          400,
+          'REPORT_QUEUE_WINDOW',
+          'Choose an active, deferred or all report window from 1 to 100',
+        );
+      const source = db
+        .prepare(
+          "SELECT id,sha256,kind,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+        )
+        .get(intakeId) as
+        { id: string; sha256: string; kind: string; details_json: string } | undefined;
+      if (!source) throw new HttpError(404, 'NOT_FOUND', 'Source intake not found');
+      if (!hasIntakeCollectionEnvelope(db, source))
         throw new HttpError(
           409,
-          'REPORT_REFERENCE_UNAVAILABLE',
-          'A report reference no longer matches its retained proposal; inspect the original',
+          'INTAKE_REVIEW_PENDING_MIGRATION',
+          'Prepare this retained intake for selected report review',
         );
-      const reviewed = reviewedIntakeQueueRecord(record, member.state),
-        selectable = reviewed.selectable;
-      const row = {
-        groupId: member.groupId,
-        proposalId: member.proposalId,
-        reviewToken: cached.session.review.reviewToken,
-        queueState: member.state,
-        selectable,
-      };
-      const expanded: CollectionIntakeReportRecordPage['records'][number] = {
-        ...row,
-        kind: 'record',
-        record: reviewed,
-      };
-      const cost = Buffer.byteLength(canonicalLiteral(expanded));
-      const item: CollectionIntakeReportRecordPage['records'][number] =
-        cost > byteBudget
-          ? {
-              ...row,
-              kind: 'record_reference',
-              selection: { recordId: record.id, candidateVersionId: record.candidateVersionId },
-              reference: {
-                format: 'health-intake-clinical-review-reference-v2',
-                reviewToken: cached.session.review.reviewToken,
-                section: 'records',
-                ordinal: cached.session.review.records.indexOf(record),
-                bytes: Buffer.byteLength(canonicalLiteral(record)),
-              },
-            }
-          : expanded;
-      const size = Buffer.byteLength(canonicalLiteral(item));
-      if (records.length && usedBytes + size > byteBudget) {
-        pageFull = true;
-        remaining = true;
-        continue;
+      const binding = intakeSourceVersion(db, intakeId),
+        policy = clinicalReviewRevision(db),
+        query = JSON.stringify([
+          profileId,
+          intakeId,
+          binding.logicalBinding,
+          binding.version,
+          policy,
+          input.groupId || null,
+          view,
+        ]);
+      let after = '';
+      if (input.cursor) {
+        let cursor: unknown;
+        try {
+          cursor = JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8'));
+        } catch {
+          throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+        }
+        if (
+          !Array.isArray(cursor) ||
+          cursor.length !== 2 ||
+          cursor[0] !== query ||
+          typeof cursor[1] !== 'string'
+        )
+          throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+        after = cursor[1];
       }
-      records.push(item);
-      usedBytes += size;
-      last = order;
-    }
-    artifacts.assertCurrent();
-    const current = intakeSourceVersion(db, intakeId);
-    queue?.assertCurrent();
-    if (
-      current.logicalBinding !== binding.logicalBinding ||
-      current.version !== binding.version ||
-      clinicalReviewRevision(db) !== policy
-    )
-      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-    return {
-      format: 'health-intake-report-record-page-v2',
-      scope: 'clinical_records',
-      intakeId,
-      version: binding.version,
-      view,
-      records,
-      totalRecords,
-      nextCursor: remaining
-        ? Buffer.from(JSON.stringify([query, last])).toString('base64url')
-        : null,
-    };
-  } finally {
-    if (cached?.status === 'ready') cached.session.close();
-    physical.close();
-  }
+      const records: CollectionIntakeReportRecordPage['records'] = [];
+      const window = queue?.recordMemberWindow(intakeId, {
+        groupId: input.groupId,
+        view,
+        after,
+        limit: limit + 1,
+      });
+      let totalRecords = window?.totalRecords ?? 0,
+        last = '',
+        remaining = false,
+        usedBytes = 0,
+        pageFull = false;
+      // Keep at most one complete bounded proposal review; never one full review per package member.
+      let cachedProposal: string | null | undefined,
+        cached: Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>> | undefined;
+      const physical = disposableSqlite('circus-report-record-proof-');
+      try {
+        const artifacts = createClinicalReviewArtifactProof(physical.db, 'clinical_artifacts');
+        for (const member of window
+          ? window.members()
+          : collectionReportQueueMembers(db, profileId, intakeId)) {
+          if (input.groupId && member.groupId !== input.groupId) continue;
+          if (view !== 'all' && member.state !== (view === 'active' ? 'pending' : 'deferred'))
+            continue;
+          if (!window) totalRecords++;
+          const order =
+            member.groupOrder +
+            ':' +
+            String(member.groupOrdinal).padStart(12, '0') +
+            ':' +
+            String(member.memberOrder).padStart(12, '0') +
+            ':' +
+            JSON.stringify([member.candidateId, member.candidateVersionId]);
+          if (order <= after) continue;
+          if (pageFull || records.length >= limit) {
+            remaining = true;
+            continue;
+          }
+          if (!cached || cachedProposal !== member.proposalId) {
+            if (cached?.status === 'ready') cached.session.close();
+            cached = undefined;
+            cached = await prepareCollectionClinicalReviewAsync(
+              db,
+              root,
+              profileId,
+              intakeId,
+              member.proposalId,
+              { assertRunning: () => queue?.assertActive() },
+            );
+            cachedProposal = member.proposalId;
+          }
+          if (cached.status !== 'ready') throw new IntakeReviewFragmentRequired(cached.reference);
+          artifacts.retain(collectionClinicalProjectionContext(cached.session).verifiedArtifacts());
+          const record = cached.session.record(
+            member.recordId,
+            member.candidateId,
+            member.candidateVersionId,
+          );
+          if (!record)
+            throw new HttpError(
+              409,
+              'REPORT_REFERENCE_UNAVAILABLE',
+              'A report reference no longer matches its retained proposal; inspect the original',
+            );
+          const reviewed = reviewedIntakeQueueRecord(record, member.state),
+            selectable = reviewed.selectable;
+          const row = {
+            groupId: member.groupId,
+            proposalId: member.proposalId,
+            reviewToken: cached.session.review.reviewToken,
+            queueState: member.state,
+            selectable,
+          };
+          const expanded: CollectionIntakeReportRecordPage['records'][number] = {
+            ...row,
+            kind: 'record',
+            record: reviewed,
+          };
+          const cost = Buffer.byteLength(canonicalLiteral(expanded));
+          const item: CollectionIntakeReportRecordPage['records'][number] =
+            cost > byteBudget
+              ? {
+                  ...row,
+                  kind: 'record_reference',
+                  selection: { recordId: record.id, candidateVersionId: record.candidateVersionId },
+                  reference: {
+                    format: 'health-intake-clinical-review-reference-v2',
+                    reviewToken: cached.session.review.reviewToken,
+                    section: 'records',
+                    ordinal: cached.session.review.records.indexOf(record),
+                    bytes: Buffer.byteLength(canonicalLiteral(record)),
+                  },
+                }
+              : expanded;
+          const size = Buffer.byteLength(canonicalLiteral(item));
+          if (records.length && usedBytes + size > byteBudget) {
+            pageFull = true;
+            remaining = true;
+            continue;
+          }
+          records.push(item);
+          usedBytes += size;
+          last = order;
+        }
+        artifacts.assertCurrent();
+        const current = intakeSourceVersion(db, intakeId);
+        queue?.assertCurrent();
+        if (
+          current.logicalBinding !== binding.logicalBinding ||
+          current.version !== binding.version ||
+          clinicalReviewRevision(db) !== policy
+        )
+          throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+        return {
+          format: 'health-intake-report-record-page-v2',
+          scope: 'clinical_records',
+          intakeId,
+          version: binding.version,
+          view,
+          records,
+          totalRecords,
+          nextCursor: remaining
+            ? Buffer.from(JSON.stringify([query, last])).toString('base64url')
+            : null,
+        };
+      } finally {
+        if (cached?.status === 'ready') cached.session.close();
+        physical.close();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }

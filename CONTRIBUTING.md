@@ -78,6 +78,11 @@ The retained-plan retry fixture uses 300 seconds to publish 65 plans, clear thei
 
 Browser journeys that need only HTTP access can run the actual server in a separate process so synchronous storage work cannot block the browser controller's event loop. The profile journey uses 180 seconds for four imports, relationship review, encrypted reopen and a second isolated profile. The draft journey also uses 180 seconds for consecutive corrections to two document shapes, restoration after encrypted SQLite cache deletion and resumed acceptance; its cache-rebuilding unlock request shares this whole-test guard. The two-upload batch journey uses 180 seconds for Stop/reload/Resume, two reviewed acceptances and recovery of a lost acknowledgement. The grounding journey uses 120 seconds for original checks before and after a real process restart, encrypted profile reopen and final acceptance. The exact clinical-destination journey uses 120 seconds for three reviewed destinations, their saved pages and DTOs, retained original bytes, and a final encrypted reload; its five-second Saved-link assertion remains unchanged. Browser action deadlines remain unchanged.
 
+After the first batch acceptance, the browser fixture observes the fresh pending
+feed request caused by Back to Import and requires its successful completion
+before checking the next card. An older record-scoped response cannot satisfy
+that barrier. The existing card deadline and whole-test guard still apply.
+
 The server suite includes the real encrypted 5,001-file/10,002-entry package qualification. It validates interrupted inventory, public upload/plan activation and reconstruction after deleting the encrypted SQLite cache; its explicit longer hang guard accommodates that complete integration. Server CI jobs allow 30 minutes including the other tests and setup. Work counts and exact recovered evidence determine correctness, not completion within a product latency target. Run this focused file when changing its authority or activation path; do not repeat it unchanged during unrelated UI iteration.
 
 Browser assertions wait for the state they inspect: a queue count or network response can arrive before the associated view renders. Use bounded locator waits and controlled response ordering. Chromium closes when a test is cancelled, and the runtime registers writer cleanup before browser launch.
@@ -98,6 +103,18 @@ The native repair-scope fixture uses 120 seconds for repeated complete policy
 preparations over 96 retained drafts, including cancellation, cross-source
 invalidation and scratch cleanup. Its complete host run measured about 36 seconds;
 the policy parity and refusal assertions establish correctness.
+
+The malformed-plan-envelope fixture uses 120 seconds for 17 independent native
+conversion setups followed by validation and unchanged-state checks. Its complete
+host run measured about 46 seconds; every malformed request must still be rejected
+before dispatch.
+
+The superseded identity-receipt fixture uses 300 seconds for publishing 70
+retained historical receipts, complete public review, fresh confirmation and exact
+replay. Its complete host run measured about 235 seconds; the original 120-second
+guard did not cover that sequence. Header visits, counted read bytes and exact
+confirmation/replay results remain the evidence. This guard is not a response-time
+target or a claim of constant history cost.
 
 Node suites run at most two files concurrently, and browser suites run one. These fixtures perform real PDF extraction, encryption and archive rebuilds; allowing concurrency to grow with the host CPU count can starve their bounded waits. HTTP upload tests should observe the automatically queued conversion rather than start a competing conversion immediately after upload. Large report fixtures establish each report-wide identity once; they retain representative row/version counts and full acceptance/rebuild assertions.
 

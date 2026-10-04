@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, HttpError } from '../database.ts';
 import { attachPersonalDurability } from '../portable.ts';
-import { ensureProfileDirectories } from '../profile-storage.ts';
+import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
 import {
   uploadIntake,
   getIntakeOriginal,
@@ -41,7 +41,11 @@ import { prepareIntakeEnvelopeMutation } from '../intake-envelope-mutation.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
 import { workflowHash } from '../intake-workflow.ts';
 import { createHash, randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { nativePacketReadingGaps } from '../packet-reading-gaps-native.ts';
+import { recordIntakePackageFailurePaged } from '../intake-package-failures.ts';
+import { inventoryIntakePackagePaged } from '../intake-package.ts';
+import type { IntakePackageInventoryPaged } from '../../shared/intake-package-paging.ts';
 import {
   prepareRetainedPlanAccess,
   readRetainedPlanScope,
@@ -201,6 +205,173 @@ test('selected package routes use authorized bounded pages and exact unit detail
     }),
     /changed/,
   );
+});
+
+test('package route first successful inventory retry uses the current plan after failure resolution', async (t) => {
+  const f = fixture(t, 3);
+  const plan = await createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+    version: f.intake.version,
+    operationId: 'fictional-retry-plan',
+  });
+  await recordIntakePackageFailurePaged(f.db, f.root, f.profileId, f.id, {
+    operationKey: 'inventory',
+    reasonCode: 'PACKAGE_CRC',
+    detail: 'Fictional retained inventory failure before source repair',
+  });
+  let response: unknown;
+  let status = 0;
+  const context = {
+    ...f,
+    resource: 'intakes',
+    method: 'GET',
+    action: 'package',
+    params: new URLSearchParams('limit=2'),
+    respond(value: unknown, _options: unknown, code = 200) {
+      response = value;
+      status = code;
+    },
+  } as unknown as Parameters<typeof handleIntakeRoute>[0];
+  const path = profileOriginal(
+    f.root,
+    String(f.db.prepare('SELECT path FROM source_files WHERE id=?').get(f.id)!.path),
+    f.profileId,
+  );
+  const original = readFileSync(path);
+  const damaged = Buffer.from(original);
+  damaged[0] = damaged[0]! ^ 1;
+  writeFileSync(path, damaged);
+  // Repaired bytes match the retained source again before retrying its inventory.
+  writeFileSync(path, original);
+  const failed = openIntakeCollectionEnvelope(f.db, { id: f.id });
+  assert.equal(
+    failed.info(failed.child(failed.child(failed.root(), 'intake')!, 'packageFailures')!).count,
+    1,
+  );
+  const before = intakeSourceVersion(f.db, f.id);
+  const stale = readPackagePlanScope(f.db, f.root, f.profileId, f.id)!;
+  const memberId = stale.inventory.member(0)!.memberId;
+  const expectedState = stale.memberState(memberId);
+
+  assert.equal(await handleIntakeRoute(context), true);
+  assert.equal(status, 200, 'the first successful retry needs no extra client refresh');
+  const page = response as IntakePackageInventoryPaged;
+  assert.equal(page.version, before.version + 1);
+  assert.equal(page.planId, plan.plan.id);
+  assert.equal(page.members.length, 2);
+  assert.equal(page.nextOffset, 2);
+  const first = page.members[0]!;
+  assert.ok('unitId' in first);
+  assert.deepEqual(
+    { unitId: first.unitId, status: first.status, coverage: first.coverage, role: first.role },
+    expectedState,
+  );
+  const current = readPackagePlanScope(f.db, f.root, f.profileId, f.id)!;
+  assert.equal(current.version, page.version);
+  assert.deepEqual(current.memberState(memberId), expectedState);
+  assert.throws(() => stale.memberState(memberId), { code: 'PLAN_CHANGED' });
+  await assert.rejects(inventoryIntakePackagePaged(f, stale), { code: 'PLAN_CHANGED' });
+  await handleIntakeRoute({
+    ...context,
+    action: 'package-failures',
+    params: new URLSearchParams(),
+  });
+  assert.deepEqual((response as { entries: unknown[] }).entries, []);
+});
+
+test('package metadata retry preserves stale reference refusal after inventory recovery', async (t) => {
+  const f = fixture(t, 1, () => 'fictional-' + 'x'.repeat(9000) + '.txt');
+  await createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+    version: f.intake.version,
+    operationId: 'fictional-metadata-retry-plan',
+  });
+  const page = await inventoryIntakePackagePaged(f, () =>
+    readPackagePlanScope(f.db, f.root, f.profileId, f.id),
+  );
+  const member = page.members[0]!;
+  assert.ok('metadata' in member);
+  await recordIntakePackageFailurePaged(f.db, f.root, f.profileId, f.id, {
+    operationKey: 'inventory',
+    reasonCode: 'PACKAGE_CRC',
+    detail: 'Fictional retained failure before metadata retry',
+  });
+  let response: unknown;
+  const context = {
+    ...f,
+    resource: 'intakes',
+    method: 'POST',
+    action: 'package-metadata',
+    req: { headers: { 'content-type': 'application/json' } },
+    params: new URLSearchParams(),
+    body: async () => Buffer.from(JSON.stringify({ reference: member.metadata })),
+    respond: (value: unknown) => {
+      response = value;
+    },
+  } as unknown as Parameters<typeof handleIntakeRoute>[0];
+  await assert.rejects(handleIntakeRoute(context), { code: 'PLAN_CHANGED' });
+  const readResponse = (): unknown => response;
+  assert.equal(readResponse(), undefined);
+  await assert.rejects(handleIntakeRoute(context), { code: 'PACKAGE_METADATA_CHANGED' });
+  assert.equal(readResponse(), undefined);
+  await handleIntakeRoute({ ...context, method: 'GET', action: 'package' });
+  const current = (response as IntakePackageInventoryPaged).members[0]!;
+  assert.ok('metadata' in current);
+  assert.ok(current.metadata.version > member.metadata.version);
+  assert.equal(
+    await handleIntakeRoute({
+      ...context,
+      body: async () => Buffer.from(JSON.stringify({ reference: current.metadata })),
+    }),
+    true,
+  );
+  assert.deepEqual((response as { reference: unknown }).reference, current.metadata);
+});
+
+test('deferred package scope is selected only after successful inventory and cancellation checks', async (t) => {
+  const f = fixture(t, 1);
+  let calls = 0;
+  const scope = () => {
+    calls++;
+    return readPackagePlanScope(f.db, f.root, f.profileId, f.id);
+  };
+  const originalExec = DatabaseSync.prototype.exec;
+  const failedSpool = t.mock.method(
+    DatabaseSync.prototype,
+    'exec',
+    function (this: DatabaseSync, sql: string) {
+      if (sql.includes('CREATE TABLE central'))
+        throw Object.assign(Error('Fictional package spool refusal'), { errcode: 13 });
+      return originalExec.call(this, sql);
+    },
+  );
+  try {
+    await assert.rejects(inventoryIntakePackagePaged(f, scope), {
+      status: 507,
+      code: 'PACKAGE_STORAGE_FULL',
+    });
+  } finally {
+    failedSpool.mock.restore();
+  }
+  assert.equal(calls, 0, 'failed durable inventory cannot select a success scope');
+  const before = intakeSourceVersion(f.db, f.id);
+  const cancellation = Error('Fictional package request cancellation');
+  await assert.rejects(
+    inventoryIntakePackagePaged(
+      {
+        ...f,
+        assertRunning() {
+          throw cancellation;
+        },
+      },
+      scope,
+    ),
+    (error) => error === cancellation,
+  );
+  assert.equal(calls, 0, 'cancelled inventory cannot select a success scope');
+  assert.equal(intakeSourceVersion(f.db, f.id).version, before.version);
+  const page = await inventoryIntakePackagePaged(f, scope);
+  assert.equal(page.version, before.version + 1);
+  assert.equal(page.members.length, 1);
+  assert.equal(calls, 1);
 });
 
 test('oversized unit metadata uses exact UTF8-safe bounded fragments with current source and version binding', async (t) => {

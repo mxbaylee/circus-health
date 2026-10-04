@@ -1,3 +1,5 @@
+import { currentClinicalOperation } from './clinical-operation.ts';
+import type { NativeIdentityReadOptions } from './intake-identity-native.ts';
 import {
   effectiveKnownNames,
   challengedKnownNames,
@@ -651,10 +653,15 @@ export async function getIntakeIdentityReview(
   profileId: string,
   id: string,
   groupId: string,
+  options: NativeIdentityReadOptions = {},
 ): Promise<IntakeIdentityReview> {
+  options.signal?.throwIfAborted();
   if (isNativeIdentitySource(db, profileId, id)) {
     const { getNativeIntakeIdentityReview } = await import('./intake-identity-native.ts');
-    return getNativeIntakeIdentityReview(db, root, profileId, id, groupId);
+    return getNativeIntakeIdentityReview(db, root, profileId, id, groupId, {
+      ...options,
+      operation: options.operation ?? currentClinicalOperation(db),
+    });
   }
   return measureImportPhase(
     'review_identity_grounding',

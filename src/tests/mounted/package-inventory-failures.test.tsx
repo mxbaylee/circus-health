@@ -74,6 +74,91 @@ beforeEach(() => {
   selectProfile(profile);
 });
 
+it('returns to actual variable member pages and resets navigation before a changed source or version loads', async () => {
+  const requests: string[] = [];
+  let delayed: ((response: Response) => void) | undefined;
+  let delayNext = false;
+  const pageResponse = (offset: number) =>
+    json({
+      format: 'health-intake-package-inventory-v2',
+      inventoryId: 'fictional-variable-inventory',
+      totalMembers: 100,
+      totalExpandedBytes: 200,
+      uniqueByteContents: 100,
+      members: Array.from({ length: offset === 80 ? 20 : 40 }, (_, index) => ({
+        ...member,
+        memberId: `member:${offset + index}`,
+        filename: `fictional-page-member-${offset + index}`,
+      })),
+      offset,
+      nextOffset: offset === 80 ? null : offset + 40,
+    });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      requests.push(path);
+      if (path.includes('/package?')) {
+        const offset = Number(new URL(path, 'http://fictional.local').searchParams.get('offset'));
+        if (delayNext && offset === 40) {
+          delayNext = false;
+          return new Promise<Response>((resolve) => {
+            delayed = resolve;
+          });
+        }
+        return pageResponse(offset);
+      }
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  const native = { ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2;
+  const view = render(<PackageInventory intake={native} />);
+  const user = userEvent.setup();
+  const next = () => screen.getByRole('button', { name: 'Next members' });
+  const previous = () => screen.getByRole('button', { name: 'Previous members' });
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  await user.click(next());
+  expect(await screen.findByText('41–80 of 100')).toBeVisible();
+  await user.click(next());
+  expect(await screen.findByText('81–100 of 100')).toBeVisible();
+  await user.click(previous());
+  expect(await screen.findByText('41–80 of 100')).toBeVisible();
+  await user.click(previous());
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  expect(previous()).toBeDisabled();
+  expect(
+    requests
+      .filter((path) => path.includes('/package?'))
+      .map((path) => Number(new URL(path, 'http://fictional.local').searchParams.get('offset'))),
+  ).toEqual([0, 40, 80, 40, 0]);
+
+  delayNext = true;
+  await user.click(next());
+  await waitFor(() => expect(delayed).toBeDefined());
+  view.rerender(<PackageInventory intake={{ ...native, version: 2 }} />);
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  expect(previous()).toBeDisabled();
+  await act(async () => {
+    delayed!(pageResponse(40));
+  });
+  expect(screen.queryByText('41–80 of 100')).not.toBeInTheDocument();
+  expect(requests.some((path) => path.includes('offset=40') && path.includes('version=2'))).toBe(
+    false,
+  );
+  await user.click(next());
+  expect(await screen.findByText('41–80 of 100')).toBeVisible();
+  view.rerender(
+    <PackageInventory intake={{ ...native, id: 'fictional-other-package', version: 2 }} />,
+  );
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  expect(previous()).toBeDisabled();
+  expect(requests.some((path) => path.includes('/fictional-other-package/package?offset=40'))).toBe(
+    false,
+  );
+});
+
 it('loads native processing issues as selected pages without fetching a complete intake', async () => {
   const requests: string[] = [];
   vi.stubGlobal(

@@ -376,6 +376,20 @@ bounded member metadata and addressed references; migrated legacy package plans
 prepare their source-bound compatibility indexes before these reads. Sources
 that still use legacy authority retain their original response contracts.
 
+Package inventory reads acquire their plan selection after successful inventory
+preparation and any retained failure resolution. Resolving a failure can advance
+the source's logical version; a plan selection captured before it remains stale
+and must not supply the returned member states. A failed or cancelled inventory
+preparation does not acquire a new plan selection.
+
+The package browser's Previous members action follows the actual visited page
+starts, since the response byte budget can produce fewer than 50 members. It
+retains only scalar navigation offsets in a linked history, with constant work
+to move forward or back; it never retains earlier member payloads. This voluntary
+navigation history grows with visited pages and resets on profile, source or
+version changes. The page payload bound does not imply constant total navigation
+history memory. Requests from an earlier version cannot replace the current page.
+
 Host-selected package evidence reads use a compact source header and literal
 window API. They do not construct an intake workflow to read a retained child.
 Source-text capture finishes before the returned pins are selected; retain-only
@@ -521,6 +535,32 @@ read checks its preparation proof through completion before retaining its final
 raw stamp. Borrowed immutable providers and multi-row feed reads keep their own
 preparation proof while later cache admission remains conservative.
 
+Participating clinical reads, identity preparation and mutation preflight acquire
+one exclusive operation slot per database before preparing dependencies or
+capturing a proof. The slot covers the complete feed window, record page or
+ownership preparation through its final checks and detached response. This keeps
+another participating request's real snapshot checkpoint outside that interval;
+it does not credit persistent writes as neutral or replace any authority check.
+Trusted nested calls pass an active owner explicitly and run sequentially. Stale
+owners, parallel children and admission inside a main-database transaction are
+refused. Detached children finish cleanup before the next operation enters.
+If cancellation rejects a newly prepared session, queue lease or plan before
+handoff, its producer disposes that result before admitting the next operation.
+Uncoordinated writes, including rolled-back writes, still invalidate held proofs.
+
+Native identity previews can share preparation across external callers. A
+disconnected HTTP response cancels only its subscriber; preparation stops when
+the last subscriber leaves. Cancellation is checked at cooperative boundaries
+and before snapshot publication. A nested identity lookup runs under its current
+owner rather than waiting on a shared request queued behind that owner. Ordinary
+request-body completion is not a disconnect. These operation slots are admission
+queues, not long-lived SQL transactions or a server-wide HTTP lock.
+
+Participating requests against the same database wait for one another, so a live
+large review can delay another clinical page. Cooperative yields still allow
+unrelated host and source-transport work to run. This coordination does not
+establish concurrent same-database clinical reads or a latency bound.
+
 This cooperation does not cover every clinical lookup. The preexisting
 `activeMappingRules`, `latestRecordException` and saved-record `previous` helpers
 still synchronously read, match or sort global decision catalogs and per-identity
@@ -580,6 +620,13 @@ preparation preserves the original sessions. The plan's signed physical proof
 survives disposable review-cache cleanup after a failed publication; replacement
 files, unknown consumed sources, closed sessions and changed logical authority
 still refuse reuse. Disposing the plan releases its proof storage.
+
+An ordinary failed-transaction cache reset closes cache-owned sessions while
+preserving independently caller-owned review scratch. A retry therefore checks
+the original logical and physical evidence rather than refreshing its baseline.
+Explicit cache teardown and database close still release all review scratch;
+callers must close the sessions they own. Retaining scratch does not make a
+changed source or a closed session reusable.
 
 Original-grounding proofs also have a disposable semantic generation: publishing
 different facts, clearing them or evicting a scope invalidates held clinical
@@ -676,6 +723,16 @@ claim. Separate counters report receipt-header reconstruction and common-scope
 opening/reuse. Native identity hosts enable this scope reuse independently of
 draft and membership caches. Legacy inline receipt readers keep their existing
 behavior.
+
+These memos do not eliminate repeated complete header scans. In the 2026-10-04
+fictional 70-retained-receipt confirmation/replay qualification, the full setup and
+public workflow reconstructed 1,653 headers and counted about 5.50 billion bytes
+of collection reads. Counted reads include repeated logical lookups and are not
+a measurement of physical disk traffic. Receipt-local field traversal reduced
+the selected 71-header comparison from about 176.86 million to 150.71 million
+counted bytes while preserving all headers. Complete confirmation and replay
+passed; these measurements establish neither constant history cost nor a host
+responsiveness guarantee. Cooperative host-work qualification remains separate.
 
 Native identity review prepares each proposal's required metadata and clinical
 session before acquiring its receipt selection. That preparation can publish

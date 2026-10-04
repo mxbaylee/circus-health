@@ -1,3 +1,9 @@
+import {
+  runExclusiveClinicalOperation,
+  currentClinicalOperation,
+  assertClinicalOperation,
+  type ClinicalOperation,
+} from './clinical-operation.ts';
 import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 import { runClinicalReviewWork } from './clinical-review-work.ts';
@@ -184,6 +190,7 @@ async function open(
   groupId: string,
   assertRunning?: () => void,
 ) {
+  assertRunning?.();
   const file = source(db, profileId, id),
     before = intakeSourceVersion(db, id),
     revision = clinicalReviewRevision(db);
@@ -219,7 +226,7 @@ async function open(
           sourceHash: scalar<string>(selected.view, selected.record, 'sourceHash')!,
         };
   };
-  const catalog = createReportSnapshotCatalog(db, file);
+  const catalog = createReportSnapshotCatalog(db, file, { assertRunning: assertCurrent });
   const scope = collectionWorkflowReviewScope({
     view,
     catalog,
@@ -245,7 +252,10 @@ async function open(
       readNativeReviewDraft(
         view,
         record,
-        createReportSnapshotCatalog(db, file, { catalog: 'review.snapshots' }),
+        createReportSnapshotCatalog(db, file, {
+          catalog: 'review.snapshots',
+          assertRunning: assertCurrent,
+        }),
         256 * 1024,
         { db, source: file },
       ),
@@ -253,7 +263,10 @@ async function open(
       readNativeReviewDraftWork(
         view,
         record,
-        createReportSnapshotCatalog(db, file, { catalog: 'review.snapshots' }),
+        createReportSnapshotCatalog(db, file, {
+          catalog: 'review.snapshots',
+          assertRunning: assertCurrent,
+        }),
         256 * 1024,
         { db, source: file },
       ),
@@ -1440,7 +1453,9 @@ async function pageReference(
     retained.binding === previewBinding(db, id)
   )
     return retained.reference;
-  const review = await getNativeIntakeIdentityReview(db, root, profileId, id, groupId);
+  const review = await getNativeIntakeIdentityReview(db, root, profileId, id, groupId, {
+    operation: currentClinicalOperation(db),
+  });
   return review.scopeReference || reject('The identity scope is unavailable');
 }
 async function writeSnapshot(
@@ -1816,89 +1831,144 @@ function detachIdentityPreview(value: IntakeIdentityReview): IntakeIdentityRevie
       : item,
   ) as IntakeIdentityReview;
 }
-const sourceLanes = new WeakMap<DatabaseSync, Map<string, Promise<unknown>>>();
-const previewFlights = new WeakMap<DatabaseSync, Map<string, Promise<IntakeIdentityReview>>>();
-function sourceLane<T>(db: DatabaseSync, id: string, work: () => Promise<T>): Promise<T> {
-  let lanes = sourceLanes.get(db);
-  if (!lanes) sourceLanes.set(db, (lanes = new Map()));
-  const previous = lanes.get(id),
-    next = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(work);
-  lanes.set(id, next);
-  void next
-    .finally(() => {
-      if (lanes!.get(id) === next) lanes!.delete(id);
-    })
-    .catch(() => undefined);
-  return next;
+export interface NativeIdentityReadOptions {
+  signal?: AbortSignal;
+  operation?: ClinicalOperation;
 }
-/** Shared snapshot publication captures fresh pins after an earlier source operation finishes. */
+type PreviewFlight = {
+  controller: AbortController;
+  subscribers: number;
+  settled: boolean;
+  promise: Promise<IntakeIdentityReview>;
+};
+const previewFlights = new WeakMap<DatabaseSync, Map<string, PreviewFlight>>();
+function subscribePreview(
+  flight: PreviewFlight,
+  signal?: AbortSignal,
+): Promise<IntakeIdentityReview> {
+  signal?.throwIfAborted();
+  flight.subscribers++;
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const release = () => {
+      if (done) return false;
+      done = true;
+      signal?.removeEventListener('abort', abort);
+      flight.subscribers--;
+      return true;
+    };
+    const abort = () => {
+      if (!release()) return;
+      reject(signal!.reason);
+      if (!flight.settled && flight.subscribers === 0) flight.controller.abort();
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    flight.promise.then(
+      (value) => {
+        if (!release()) return;
+        try {
+          resolve(detachIdentityPreview(value));
+        } catch (error) {
+          reject(error);
+        }
+      },
+      (error) => {
+        if (release()) reject(error);
+      },
+    );
+    if (signal?.aborted) abort();
+  });
+}
+/** Every preparation owns the database lane; coalesced cancellation belongs to subscribers. */
 export function getNativeIntakeIdentityReview(
   db: DatabaseSync,
   root: string,
   profileId: string,
   id: string,
   groupId: string,
+  options: NativeIdentityReadOptions = {},
 ): Promise<IntakeIdentityReview> {
-  try {
-    source(db, profileId, id);
-  } catch (error) {
-    clearNativeIdentityPreviews(db);
-    return Promise.reject(error);
-  }
+  const prepare = (signal: AbortSignal | undefined, parent?: ClinicalOperation) =>
+    runExclusiveClinicalOperation(
+      db,
+      async (operation) => {
+        const assertRunning = () => {
+          signal?.throwIfAborted();
+          assertClinicalOperation(db, operation);
+        };
+        assertRunning();
+        source(db, profileId, id);
+        const epoch = beginNativeIdentityPreview(db),
+          readKey = previewReadKey(db, root, profileId, id, groupId);
+        const cached = readNativeIdentityPreview(db, readKey);
+        if (cached) {
+          const context = await open(db, root, profileId, id, groupId, assertRunning);
+          try {
+            verifyPreviewArtifacts(context);
+            const value = detachIdentityPreview(cached.value);
+            verifyPreviewArtifacts(context);
+            if (
+              cached.stamp === reviewReadStamp(db) &&
+              readKey === previewReadKey(db, root, profileId, id, groupId) &&
+              nativeIdentityPreviewCurrent(db, epoch)
+            )
+              return value;
+          } catch (error) {
+            if (!signal?.aborted) clearNativeIdentityPreviews(db);
+            throw error;
+          } finally {
+            context.scope.close?.();
+          }
+          clearNativeIdentityPreviews(db);
+        }
+        let certificate: { key: string; stamp: string } | undefined;
+        const value = await getNativeIntakeIdentityReviewInner(
+          db,
+          root,
+          profileId,
+          id,
+          groupId,
+          assertRunning,
+          (key, stamp) => {
+            certificate = { key, stamp };
+          },
+        );
+        assertRunning();
+        if (certificate && nativeIdentityPreviewCurrent(db, epoch))
+          retainNativeIdentityPreview(db, certificate.key, certificate.stamp, value, epoch);
+        return value;
+      },
+      { signal, operation: parent },
+    );
+  // A held owner cannot wait on a foreign flight queued behind itself.
+  if (options.operation)
+    return prepare(options.signal, options.operation).then(detachIdentityPreview);
+  options.signal?.throwIfAborted();
   let flights = previewFlights.get(db);
   if (!flights) previewFlights.set(db, (flights = new Map()));
   const key = JSON.stringify([profileId, root, id, groupId]);
   const current = flights.get(key);
-  if (current) return current.then(detachIdentityPreview);
-  const next = sourceLane(db, id, async () => {
-    const epoch = beginNativeIdentityPreview(db),
-      readKey = previewReadKey(db, root, profileId, id, groupId);
-    const cached = readNativeIdentityPreview(db, readKey);
-    if (cached) {
-      const context = await open(db, root, profileId, id, groupId);
-      try {
-        verifyPreviewArtifacts(context);
-        const value = detachIdentityPreview(cached.value);
-        verifyPreviewArtifacts(context);
-        if (
-          cached.stamp === reviewReadStamp(db) &&
-          readKey === previewReadKey(db, root, profileId, id, groupId) &&
-          nativeIdentityPreviewCurrent(db, epoch)
-        )
-          return value;
-      } catch (error) {
-        clearNativeIdentityPreviews(db);
-        throw error;
-      } finally {
-        context.scope.close?.();
-      }
-      clearNativeIdentityPreviews(db);
-    }
-    let certificate: { key: string; stamp: string } | undefined;
-    const value = await getNativeIntakeIdentityReviewInner(
-      db,
-      root,
-      profileId,
-      id,
-      groupId,
-      (key, stamp) => {
-        certificate = { key, stamp };
-      },
-    );
-    if (certificate && nativeIdentityPreviewCurrent(db, epoch))
-      retainNativeIdentityPreview(db, certificate.key, certificate.stamp, value, epoch);
-    return value;
-  }).catch((error) => {
-    clearNativeIdentityPreviews(db);
-    throw error;
-  });
-  flights.set(key, next);
-  void next
-    .finally(() => {
-      if (flights!.get(key) === next) flights!.delete(key);
+  if (current && !current.controller.signal.aborted)
+    return subscribePreview(current, options.signal);
+  const flight: PreviewFlight = {
+    controller: new AbortController(),
+    subscribers: 0,
+    settled: false,
+    promise: undefined!,
+  };
+  flights.set(key, flight);
+  // Defer admission until the first subscriber has attached its lifetime.
+  flight.promise = Promise.resolve()
+    .then(() => prepare(flight.controller.signal))
+    .catch((error) => {
+      if (!flight.controller.signal.aborted) clearNativeIdentityPreviews(db);
+      throw error;
     })
-    .catch(() => undefined);
-  return next.then(detachIdentityPreview);
+    .finally(() => {
+      flight.settled = true;
+      if (flights!.get(key) === flight) flights!.delete(key);
+    });
+  return subscribePreview(flight, options.signal);
 }
 async function getNativeIntakeIdentityReviewInner(
   db: DatabaseSync,
@@ -1906,11 +1976,12 @@ async function getNativeIntakeIdentityReviewInner(
   profileId: string,
   id: string,
   groupId: string,
+  assertRunning: () => void,
   certified?: (key: string, stamp: string) => void,
 ): Promise<IntakeIdentityReview> {
   let context: Context;
   try {
-    context = await open(db, root, profileId, id, groupId);
+    context = await open(db, root, profileId, id, groupId, assertRunning);
   } catch (error) {
     if (!(error instanceof IntakeReviewFragmentRequired)) throw error;
     return {
@@ -1997,7 +2068,7 @@ async function getNativeIntakeIdentityReviewInner(
       const constructionStamp = reviewReadStamp(db),
         constructionKey = previewReadKey(db, root, profileId, id, groupId);
       context.scope.close?.();
-      context = await open(db, root, profileId, id, groupId);
+      context = await open(db, root, profileId, id, groupId, assertRunning);
       self = selfSnapshot(db);
       correctedPerson = correction();
       verifyPreviewArtifacts(context);
@@ -2012,6 +2083,7 @@ async function getNativeIntakeIdentityReviewInner(
       const changes = await catalog.finalChanges();
       const collections = selectedEnvelopeStore(db, context.file).collections,
         operationId = randomUUID();
+      assertRunning();
       if (changes.length)
         collections.commitMaintenance(
           collections.prepare(collections.openView(), {
@@ -2105,6 +2177,20 @@ export async function readNativeIdentityScopePage(
   groupId: string,
   input: { scopeToken: string; section: string; cursor?: string; limit?: number },
 ): Promise<IntakeIdentityScopePage> {
+  return runExclusiveClinicalOperation(
+    db,
+    async () => readNativeIdentityScopePageInner(db, root, profileId, id, groupId, input),
+    { operation: currentClinicalOperation(db) },
+  );
+}
+async function readNativeIdentityScopePageInner(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  groupId: string,
+  input: { scopeToken: string; section: string; cursor?: string; limit?: number },
+): Promise<IntakeIdentityScopePage> {
   const reference = await pageReference(db, root, profileId, id, groupId, input.scopeToken);
   if (!reference || reference.scopeToken !== input.scopeToken)
     reject('The identity scope changed; review its current pages');
@@ -2191,6 +2277,20 @@ export async function readNativeIdentityScopeFragment(
   groupId: string,
   input: { scopeToken: string; section: string; ordinal: number; offset?: number },
 ) {
+  return runExclusiveClinicalOperation(
+    db,
+    async () => readNativeIdentityScopeFragmentInner(db, root, profileId, id, groupId, input),
+    { operation: currentClinicalOperation(db) },
+  );
+}
+async function readNativeIdentityScopeFragmentInner(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  groupId: string,
+  input: { scopeToken: string; section: string; ordinal: number; offset?: number },
+) {
   const reference =
     (await pageReference(db, root, profileId, id, groupId, input.scopeToken)) ||
     reject('The identity scope is unavailable');
@@ -2259,8 +2359,10 @@ export function confirmNativeIntakeIdentityScope(
   input: IntakeIdentityConfirmation,
 ) {
   source(db, profileId, id);
-  return sourceLane(db, id, () =>
-    confirmNativeIntakeIdentityScopeInner(db, root, profileId, id, input),
+  return runExclusiveClinicalOperation(
+    db,
+    async () => confirmNativeIntakeIdentityScopeInner(db, root, profileId, id, input),
+    { operation: currentClinicalOperation(db) },
   );
 }
 async function confirmNativeIntakeIdentityScopeInner(
@@ -2288,7 +2390,11 @@ async function confirmNativeIntakeIdentityScopeInner(
     reject('Review the current complete native identity scope before confirming');
   return withVerifiedIntakeOriginalDescriptor(
     { db, root, profileId, id },
-    async ({ assertRunning }) => {
+    async ({ assertRunning: assertOriginal }) => {
+      const assertRunning = () => {
+        assertClinicalOperation(db);
+        assertOriginal();
+      };
       const context = await open(db, root, profileId, id, input.scope.groupId, assertRunning),
         stored = rows();
       try {

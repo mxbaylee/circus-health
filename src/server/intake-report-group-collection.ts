@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 import {
   collectionClinicalProjectionContext,
@@ -262,12 +263,18 @@ function collectionQueueBinding(db: DatabaseSync, profileId: string) {
 }
 /** Reuse an exact selected disposable join; no domain change is inferred from cache state. */
 export async function openCollectionReportQueue(db: DatabaseSync, root: string, profileId: string) {
-  try {
-    return await openCollectionReportQueueNow(db, root, profileId);
-  } catch (error) {
-    clearCollectionQueueReviews(db);
-    throw error;
-  }
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      try {
+        return await openCollectionReportQueueNow(db, root, profileId);
+      } catch (error) {
+        clearCollectionQueueReviews(db);
+        throw error;
+      }
+    },
+    { operation: currentClinicalOperation(db), onDiscardResult: (value) => value.close() },
+  );
 }
 async function openCollectionReportQueueNow(db: DatabaseSync, root: string, profileId: string) {
   if (!observedQueues.has(db)) {
@@ -349,38 +356,45 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
       assertRunning?: () => void,
       retainArtifacts?: (artifacts: Iterable<VerifiedClinicalArtifact>) => void,
     ) {
-      const assertLease = () => {
-        assertActive();
-        assertRunning?.();
-      };
-      assertLease();
-      try {
-        selected.queue.assertCurrent();
-        if (!verified.has(intakeId)) {
-          verifyIntakeOriginal(db, root, profileId, intakeId);
-          rememberVerified(intakeId);
-        }
-        if (member.proposalId && !verified.has(member.proposalId)) {
-          const file = db
-            .prepare('SELECT path,sha256,bytes FROM source_files WHERE id=?')
-            .get(member.proposalId) as { path: string; sha256: string; bytes: number } | undefined;
-          if (!file) throw changed();
-          verifyIntakeFileHash(profileOriginal(root, file.path, profileId), file);
-          rememberVerified(member.proposalId);
-        }
-      } catch (error) {
-        selected.queue.resetReview();
-        throw error;
-      }
-      const result = await selected.queue.reviewMember(
-        intakeId,
-        member,
-        assertLease,
-        retainArtifacts,
+      return runExclusiveClinicalOperation(
+        db,
+        async () => {
+          const assertLease = () => {
+            assertActive();
+            assertRunning?.();
+          };
+          assertLease();
+          try {
+            selected.queue.assertCurrent();
+            if (!verified.has(intakeId)) {
+              verifyIntakeOriginal(db, root, profileId, intakeId);
+              rememberVerified(intakeId);
+            }
+            if (member.proposalId && !verified.has(member.proposalId)) {
+              const file = db
+                .prepare('SELECT path,sha256,bytes FROM source_files WHERE id=?')
+                .get(member.proposalId) as
+                { path: string; sha256: string; bytes: number } | undefined;
+              if (!file) throw changed();
+              verifyIntakeFileHash(profileOriginal(root, file.path, profileId), file);
+              rememberVerified(member.proposalId);
+            }
+          } catch (error) {
+            selected.queue.resetReview();
+            throw error;
+          }
+          const result = await selected.queue.reviewMember(
+            intakeId,
+            member,
+            assertLease,
+            retainArtifacts,
+          );
+          assertLease();
+          selected.queue.assertCurrent();
+          return result;
+        },
+        { operation: currentClinicalOperation(db) },
       );
-      assertLease();
-      selected.queue.assertCurrent();
-      return result;
     },
     close(options: { retainReview?: boolean } = {}) {
       if (released) return;
@@ -1132,116 +1146,129 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       assertLease: () => void,
       retainArtifacts?: (artifacts: Iterable<VerifiedClinicalArtifact>) => void,
     ) {
-      const generation = reviewGeneration,
-        prior = reviewTail;
-      let release!: () => void;
-      reviewTail = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      pendingReviews++;
-      const assertRunning = () => {
-        assertLease();
-        if (closed || generation !== reviewGeneration) throw changed();
-      };
-      await prior;
-      try {
-        assertRunning();
-        assertCurrent();
-        const key = canonicalLiteral([intakeId, member.proposalId]),
-          stamp = reviewReadStamp(db),
-          requestRevision = revision(db),
-          sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
-        if (
-          !reviewCache ||
-          reviewKey !== key ||
-          stamp === undefined ||
-          stamp !== reviewObservedStamp ||
-          reviewCertificate?.requestRevision !== requestRevision ||
-          reviewCertificate?.sourcePin !== sourcePin ||
-          reviewCertificate?.queueBinding !== binding
-        ) {
-          closeReview();
-          withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueClinicalReviews'));
-          reviewCache = await prepareCollectionClinicalReviewAsync(
-            db,
-            root,
-            profileId,
-            intakeId,
-            member.proposalId,
-            {
-              assertRunning,
-              groundingDependency: (dependency) => retainGroundingDependency(intakeId, dependency),
-            },
-          );
-          assertRunning();
-          reviewKey = key;
-          reviewObservedStamp = reviewReadStamp(db);
-          reviewCertificate =
-            stamp !== undefined &&
-            stamp === reviewObservedStamp &&
-            requestRevision === revision(db) &&
-            sourcePin === canonicalLiteral(intakeSourceVersion(db, intakeId))
-              ? { stamp, requestRevision, sourcePin, queueBinding: binding }
-              : undefined;
-        }
-        assertRunning();
-        assertCurrent();
-        if (reviewCache.status !== 'ready')
-          throw new IntakeReviewFragmentRequired(reviewCache.reference);
-        // A queued lease may have waited after its initial file verification.
-        // Recheck every consumed physical identity before using a warm session.
-        const projection = collectionClinicalProjectionContext(reviewCache.session);
-        retainArtifacts?.(projection.verifiedArtifacts());
-        const record = reviewCache.session.record(
-          member.recordId,
-          member.candidateId,
-          member.candidateVersionId,
-        );
-        if (!record)
-          throw new HttpError(
-            409,
-            'REPORT_REFERENCE_UNAVAILABLE',
-            'A report reference no longer matches its retained proposal',
-          );
-        const reviewed = reviewedIntakeQueueRecord(record, member.state),
-          facts = reviewedMemberFacts(member, reviewed, true),
-          // Transport omits absent optional fields while retaining raw JSON numbers.
-          // canonicalLiteral also serves digest recipes that retain own undefined fields.
-          encoded = JSON.stringify(record),
-          detached = JSON.parse(encoded, (_key, value, context) =>
-            typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
-              ? JSON.rawJSON(context.source)
-              : value,
-          ) as typeof record;
-        withIntakeWork(db, 'warm', () => {
-          const bytes = Buffer.byteLength(encoded);
-          recordIntakeWork('serializationCalls');
-          recordIntakeWork('serializedBytes', bytes);
-          recordIntakeWork('jsonParseCalls');
-          recordIntakeWork('jsonParseBytes', bytes);
-        });
-        return {
-          certificate: reviewCertificate && { ...reviewCertificate },
-          version: reviewCache.session.review.version,
-          reviewToken: reviewCache.session.review.reviewToken,
-          recordBytes: Buffer.byteLength(encoded),
-          // Complete policy providers stay private. Transport contains their existing
-          // references; small policy facts are computed before detaching the row.
-          record: { ...detached, queueState: reviewed.queueState, selectable: reviewed.selectable },
-          facts,
-          ordinal: reviewCache.session.review.records.indexOf(record),
-        };
-      } catch (error) {
-        closeReview();
-        throw error;
-      } finally {
-        pendingReviews--;
-        if (!pendingReviews && discardReleasedReview) {
-          discardReleasedReview = false;
-          closeReview();
-        }
-        release();
-      }
+      return runExclusiveClinicalOperation(
+        db,
+        async () => {
+          const generation = reviewGeneration,
+            prior = reviewTail;
+          let release!: () => void;
+          reviewTail = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          pendingReviews++;
+          const assertRunning = () => {
+            assertLease();
+            if (closed || generation !== reviewGeneration) throw changed();
+          };
+          await prior;
+          try {
+            assertRunning();
+            assertCurrent();
+            const key = canonicalLiteral([intakeId, member.proposalId]),
+              stamp = reviewReadStamp(db),
+              requestRevision = revision(db),
+              sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
+            if (
+              !reviewCache ||
+              reviewKey !== key ||
+              stamp === undefined ||
+              stamp !== reviewObservedStamp ||
+              reviewCertificate?.requestRevision !== requestRevision ||
+              reviewCertificate?.sourcePin !== sourcePin ||
+              reviewCertificate?.queueBinding !== binding
+            ) {
+              closeReview();
+              withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueClinicalReviews'));
+              reviewCache = await prepareCollectionClinicalReviewAsync(
+                db,
+                root,
+                profileId,
+                intakeId,
+                member.proposalId,
+                {
+                  assertRunning,
+                  groundingDependency: (dependency) =>
+                    retainGroundingDependency(intakeId, dependency),
+                },
+              );
+              assertRunning();
+              reviewKey = key;
+              reviewObservedStamp = reviewReadStamp(db);
+              reviewCertificate =
+                stamp !== undefined &&
+                stamp === reviewObservedStamp &&
+                requestRevision === revision(db) &&
+                sourcePin === canonicalLiteral(intakeSourceVersion(db, intakeId))
+                  ? { stamp, requestRevision, sourcePin, queueBinding: binding }
+                  : undefined;
+            }
+            assertRunning();
+            assertCurrent();
+            if (reviewCache.status !== 'ready')
+              throw new IntakeReviewFragmentRequired(reviewCache.reference);
+            // A queued lease may have waited after its initial file verification.
+            // Recheck every consumed physical identity before using a warm session.
+            const projection = collectionClinicalProjectionContext(reviewCache.session);
+            retainArtifacts?.(projection.verifiedArtifacts());
+            const record = reviewCache.session.record(
+              member.recordId,
+              member.candidateId,
+              member.candidateVersionId,
+            );
+            if (!record)
+              throw new HttpError(
+                409,
+                'REPORT_REFERENCE_UNAVAILABLE',
+                'A report reference no longer matches its retained proposal',
+              );
+            const reviewed = reviewedIntakeQueueRecord(record, member.state),
+              facts = reviewedMemberFacts(member, reviewed, true),
+              // Transport omits absent optional fields while retaining raw JSON numbers.
+              // canonicalLiteral also serves digest recipes that retain own undefined fields.
+              encoded = JSON.stringify(record),
+              detached = JSON.parse(encoded, (_key, value, context) =>
+                typeof value === 'number' &&
+                context?.source &&
+                JSON.stringify(value) !== context.source
+                  ? JSON.rawJSON(context.source)
+                  : value,
+              ) as typeof record;
+            withIntakeWork(db, 'warm', () => {
+              const bytes = Buffer.byteLength(encoded);
+              recordIntakeWork('serializationCalls');
+              recordIntakeWork('serializedBytes', bytes);
+              recordIntakeWork('jsonParseCalls');
+              recordIntakeWork('jsonParseBytes', bytes);
+            });
+            return {
+              certificate: reviewCertificate && { ...reviewCertificate },
+              version: reviewCache.session.review.version,
+              reviewToken: reviewCache.session.review.reviewToken,
+              recordBytes: Buffer.byteLength(encoded),
+              // Complete policy providers stay private. Transport contains their existing
+              // references; small policy facts are computed before detaching the row.
+              record: {
+                ...detached,
+                queueState: reviewed.queueState,
+                selectable: reviewed.selectable,
+              },
+              facts,
+              ordinal: reviewCache.session.review.records.indexOf(record),
+            };
+          } catch (error) {
+            closeReview();
+            throw error;
+          } finally {
+            pendingReviews--;
+            if (!pendingReviews && discardReleasedReview) {
+              discardReleasedReview = false;
+              closeReview();
+            }
+            release();
+          }
+        },
+        { operation: currentClinicalOperation(db) },
+      );
     },
     *groups(
       view: IntakeReportQueueView = 'all',
@@ -1364,254 +1391,263 @@ export async function collectionReportGroupSummary(
   pointer: CollectionReportQueueGroupPointer & { intakeId: string },
   sourcePage?: { kind: 'current' | 'saved'; cursor?: string; limit?: number },
 ): Promise<CollectionReportGroupSummary> {
-  queue.assertCurrent();
-  const grounding = identityGroundingGeneration(db);
-  if (!sourcePage) {
-    const cached = queue.summary(pointer.intakeId, pointer.ordinal);
-    if (cached) return cached;
-  }
-  withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueSummaryBuilds'));
-  const { intakeId, groupId } = pointer,
-    source = { id: intakeId },
-    view = openIntakeCollectionEnvelope(db, source),
-    intake = view.child(view.root(), 'intake')!,
-    workflow = view.child(intake, 'workflow'),
-    group = pointer.address ? view.resolve(pointer.address) : undefined,
-    current = group && view.childAt(group, 'versions', view.childCount(group, 'versions') - 1),
-    filename = evidence(view, intake, 'originalName');
-  const tally = emptyCounts(),
-    dates = new Set<string | null>();
-  queue.beginSummary(intakeId, pointer.ordinal);
-  let fallbackTitle = '';
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      queue.assertCurrent();
+      const grounding = identityGroundingGeneration(db);
+      if (!sourcePage) {
+        const cached = queue.summary(pointer.intakeId, pointer.ordinal);
+        if (cached) return cached;
+      }
+      withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueSummaryBuilds'));
+      const { intakeId, groupId } = pointer,
+        source = { id: intakeId },
+        view = openIntakeCollectionEnvelope(db, source),
+        intake = view.child(view.root(), 'intake')!,
+        workflow = view.child(intake, 'workflow'),
+        group = pointer.address ? view.resolve(pointer.address) : undefined,
+        current = group && view.childAt(group, 'versions', view.childCount(group, 'versions') - 1),
+        filename = evidence(view, intake, 'originalName');
+      const tally = emptyCounts(),
+        dates = new Set<string | null>();
+      queue.beginSummary(intakeId, pointer.ordinal);
+      let fallbackTitle = '';
 
-  const coverageScratch = disposableSqlite('circus-report-coverage-'),
-    coverageDb = coverageScratch.db;
-  coverageDb.exec(
-    'CREATE TABLE sources(kind TEXT,source TEXT,count INTEGER,PRIMARY KEY(kind,source))',
-  );
-  let sourceReview: CollectionReportGroupSummary['sourceReview'] = null;
-  try {
-    const artifacts = createClinicalReviewArtifactProof(coverageDb, 'clinical_artifacts');
-    const report = group && view.child(group, 'report');
-    if (group && pointer.basis === 'report_anchor' && report && view.has(report, 'anchor')) {
-      const scope = await prepareNativeReportSourceReviewScope(db, source, {
-        profileId,
-        groupId,
-        view: 'all',
-      });
+      const coverageScratch = disposableSqlite('circus-report-coverage-'),
+        coverageDb = coverageScratch.db;
+      coverageDb.exec(
+        'CREATE TABLE sources(kind TEXT,source TEXT,count INTEGER,PRIMARY KEY(kind,source))',
+      );
+      let sourceReview: CollectionReportGroupSummary['sourceReview'] = null;
       try {
-        sourceReview = { intakeId, groupId, view: 'all', scopeToken: scope.scopeToken };
-        for (const entry of scope.entries()) {
-          const resolution = resolveNativeReportSource(db, source, {
-            candidateId: entry.candidateId,
-            candidateVersionId: entry.candidateVersionId,
-            references: () => [entry.sourceRef],
-            occurrence: {
-              proposalId: entry.proposalId,
-              recordId: entry.recordId,
-              batchId: entry.batchId,
-              locator: selectNativeReportSourceLocator(db, source, entry.occurrenceAddress),
-            },
+        const artifacts = createClinicalReviewArtifactProof(coverageDb, 'clinical_artifacts');
+        const report = group && view.child(group, 'report');
+        if (group && pointer.basis === 'report_anchor' && report && view.has(report, 'anchor')) {
+          const scope = await prepareNativeReportSourceReviewScope(db, source, {
+            profileId,
+            groupId,
+            view: 'all',
           });
-          coverageDb
-            .prepare(
-              'INSERT INTO sources VALUES(?,?,1) ON CONFLICT(kind,source) DO UPDATE SET count=count+1',
-            )
-            .run('current', resolution?.confirmation.source || '');
-        }
-        scope.assertCurrent();
-      } finally {
-        scope.close();
-      }
-    }
-    for (const member of queue.members(intakeId, pointer.ordinal)) {
-      if (member.state === 'kept_original') tally.keptOriginal++;
-      else tally[member.state]++;
-      const candidate =
-          workflow && view.find('candidate', workflow, member.candidateId, { match: 'last' }),
-        latest =
-          candidate &&
-          view.childAt(candidate, 'versions', view.childCount(candidate, 'versions') - 1),
-        isCurrent = latest && scalar(view, latest, 'id') === member.candidateVersionId;
-      if (
-        member.state !== 'pending' &&
-        member.state !== 'deferred' &&
-        !(pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
-      ) {
-        queue.cacheMemberFacts(intakeId, member, reviewedMemberFacts(member));
-        continue;
-      }
-      const { facts } = await queue.reviewMember(intakeId, member, undefined, artifacts.retain);
-      queue.cacheMemberFacts(intakeId, member, {
-        ...facts,
-        title: isCurrent && pointer.basis === 'candidate_fallback' ? facts.title : undefined,
-      });
-      if (pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
-        fallbackTitle = facts.title || '';
-      if (member.state !== 'pending' && member.state !== 'deferred') continue;
-      tally.blocked += facts.counts.blocked;
-      tally.questions += facts.counts.questions;
-      if (dates.size < 2) dates.add(facts.date ?? null);
-    }
-    for (const row of queue.saved(intakeId, pointer.ordinal))
-      coverageDb.prepare('INSERT INTO sources VALUES(?,?,?)').run('saved', row.source, row.count);
-    const coverage = (kind: 'current' | 'saved'): CollectionSourceCoverage => {
-      const limit = sourcePage?.kind === kind ? (sourcePage.limit ?? 20) : 20;
-      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
-        throw new HttpError(400, 'REPORT_QUEUE_WINDOW', 'Choose 1 to 100 source labels');
-      let after: string | undefined;
-      if (sourcePage?.kind === kind && sourcePage.cursor) {
-        let raw: unknown;
-        try {
-          raw = JSON.parse(Buffer.from(sourcePage.cursor, 'base64url').toString('utf8'));
-        } catch {
-          throw changed();
-        }
-        if (
-          !Array.isArray(raw) ||
-          raw.length !== 6 ||
-          raw[0] !== queue.binding ||
-          raw[1] !== intakeId ||
-          raw[2] !== groupId ||
-          raw[3] !== pointer.ordinal ||
-          raw[4] !== kind ||
-          typeof raw[5] !== 'string'
-        )
-          throw changed();
-        after = raw[5];
-      }
-      const row = coverageDb
-          .prepare(
-            "SELECT coalesce(sum(count),0) total,coalesce(sum(CASE WHEN source<>'' THEN count ELSE 0 END),0) covered,coalesce(sum(CASE WHEN source<>'' THEN 1 ELSE 0 END),0) sources FROM sources WHERE kind=?",
-          )
-          .get(kind)!,
-        total = Number(row.total),
-        covered = Number(row.covered),
-        sourceCount = Number(row.sources);
-      const items: { source: string; count: number }[] = [];
-      let remaining = 0;
-      for (const row of coverageDb
-        .prepare("SELECT source,count FROM sources WHERE kind=? AND source<>''")
-        .iterate(kind)) {
-        const source = String(row.source);
-        if (after !== undefined && source.localeCompare(after) <= 0) continue;
-        remaining++;
-        items.push({ source, count: Number(row.count) });
-        items.sort((a, b) => a.source.localeCompare(b.source));
-        if (items.length > limit) items.pop();
-      }
-      return {
-        total,
-        covered,
-        uncovered: total - covered,
-        status: !total
-          ? 'empty'
-          : !covered
-            ? 'uncovered'
-            : covered < total
-              ? 'partial'
-              : sourceCount === 1
-                ? 'single'
-                : 'mixed',
-        sourceCount,
-        bySource: {
-          items,
-          total: sourceCount,
-          nextCursor:
-            remaining > items.length
-              ? Buffer.from(
-                  canonicalLiteral([
-                    queue.binding,
-                    intakeId,
-                    groupId,
-                    pointer.ordinal,
-                    kind,
-                    items.at(-1)!.source,
-                  ]),
-                ).toString('base64url')
-              : null,
-        },
-      };
-    };
-    const sourceCoverage = { current: coverage('current'), saved: coverage('saved') },
-      effective =
-        sourceCoverage.current.status === 'single'
-          ? String(
+          try {
+            sourceReview = { intakeId, groupId, view: 'all', scopeToken: scope.scopeToken };
+            for (const entry of scope.entries()) {
+              const resolution = resolveNativeReportSource(db, source, {
+                candidateId: entry.candidateId,
+                candidateVersionId: entry.candidateVersionId,
+                references: () => [entry.sourceRef],
+                occurrence: {
+                  proposalId: entry.proposalId,
+                  recordId: entry.recordId,
+                  batchId: entry.batchId,
+                  locator: selectNativeReportSourceLocator(db, source, entry.occurrenceAddress),
+                },
+              });
               coverageDb
-                .prepare("SELECT source FROM sources WHERE kind='current' AND source<>''")
-                .get()!.source,
-            )
-          : sourceCoverage.current.status === 'empty' && sourceCoverage.saved.status === 'single'
-            ? String(
-                coverageDb
-                  .prepare("SELECT source FROM sources WHERE kind='saved' AND source<>''")
-                  .get()!.source,
-              )
-            : null,
-      metadata = view.child(intake, 'metadata'),
-      intakeSource = metadata ? evidence(view, metadata, 'source') : null,
-      issuer = group ? evidence(view, group, 'sourceSystem') : null;
-    const people = openCollectionPeopleRead(db, root, profileId, intakeId);
-    let firstPerson: ReturnType<typeof people.pointer>;
-    for (const pointer of people.pointers(groupId))
-      if (!firstPerson || pointer.order < firstPerson.order) firstPerson = pointer;
-    const memberId = group && scalar<string | null>(view, group, 'memberId'),
-      selected =
-        memberId && workflow && view.childCount(workflow, 'plans')
-          ? readRetainedPlanEvidence(db, profileId, intakeId).firstMember(memberId)
-          : undefined;
-    const member = memberId
-      ? {
-          memberId,
-          filename:
-            selected?.kind === 'retained'
-              ? evidence(selected.view, selected.record, 'filename')
-              : selected?.member.filename || null,
-          locator:
-            selected?.kind === 'retained'
-              ? evidence(selected.view, selected.record, 'locator')
-              : selected?.member.locator || null,
+                .prepare(
+                  'INSERT INTO sources VALUES(?,?,1) ON CONFLICT(kind,source) DO UPDATE SET count=count+1',
+                )
+                .run('current', resolution?.confirmation.source || '');
+            }
+            scope.assertCurrent();
+          } finally {
+            scope.close();
+          }
         }
-      : null;
-    queue.assertCurrent();
-    if (identityGroundingGeneration(db) !== grounding) throw changed();
-    artifacts.assertCurrent();
-    const summary: CollectionReportGroupSummary = {
-      format: 'health-intake-report-group-v2',
-      intakeId,
-      intakeVersion: intakeSourceVersion(db, intakeId).version,
-      groupId,
-      groupOrdinal: pointer.ordinal,
-      groupVersionId: current ? scalar<string>(view, current, 'id') || null : null,
-      basis: pointer.basis,
-      discoveryOrder: group ? (scalar<number>(view, group, 'discoveryOrder') ?? null) : null,
-      title:
-        pointer.basis === 'candidate_fallback'
-          ? fallbackTitle || (firstPerson ? people.person(firstPerson).title : '') || filename
-          : current
-            ? evidence(view, current, 'title')
-            : filename,
-      source: effective || intakeSource || issuer,
-      sourceScope: effective ? 'report' : intakeSource ? 'intake' : issuer ? 'issuer' : null,
-      date: dates.size === 1 ? [...dates][0]! : null,
-      original: {
-        filename,
-        contentUrl: '/api/sources/' + encodeURIComponent(intakeId) + '/content',
-        parentSourceFileId: scalar<string | null>(view, intake, 'parentSourceFileId') || null,
-      },
-      member,
-      report: group ? evidence(view, group, 'report') : null,
-      reportContext: current ? evidence(view, current, 'context') : null,
-      counts: tally,
-      peopleCounts: queue.peopleCounts(intakeId, groupId),
-      sourceCoverage,
-      sourceReview,
-      records: { intakeId, groupId },
-      people: { intakeId, groupId },
-    };
-    if (!sourcePage) queue.cacheSummary(summary);
-    return summary;
-  } finally {
-    coverageScratch.close();
-  }
+        for (const member of queue.members(intakeId, pointer.ordinal)) {
+          if (member.state === 'kept_original') tally.keptOriginal++;
+          else tally[member.state]++;
+          const candidate =
+              workflow && view.find('candidate', workflow, member.candidateId, { match: 'last' }),
+            latest =
+              candidate &&
+              view.childAt(candidate, 'versions', view.childCount(candidate, 'versions') - 1),
+            isCurrent = latest && scalar(view, latest, 'id') === member.candidateVersionId;
+          if (
+            member.state !== 'pending' &&
+            member.state !== 'deferred' &&
+            !(pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
+          ) {
+            queue.cacheMemberFacts(intakeId, member, reviewedMemberFacts(member));
+            continue;
+          }
+          const { facts } = await queue.reviewMember(intakeId, member, undefined, artifacts.retain);
+          queue.cacheMemberFacts(intakeId, member, {
+            ...facts,
+            title: isCurrent && pointer.basis === 'candidate_fallback' ? facts.title : undefined,
+          });
+          if (pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
+            fallbackTitle = facts.title || '';
+          if (member.state !== 'pending' && member.state !== 'deferred') continue;
+          tally.blocked += facts.counts.blocked;
+          tally.questions += facts.counts.questions;
+          if (dates.size < 2) dates.add(facts.date ?? null);
+        }
+        for (const row of queue.saved(intakeId, pointer.ordinal))
+          coverageDb
+            .prepare('INSERT INTO sources VALUES(?,?,?)')
+            .run('saved', row.source, row.count);
+        const coverage = (kind: 'current' | 'saved'): CollectionSourceCoverage => {
+          const limit = sourcePage?.kind === kind ? (sourcePage.limit ?? 20) : 20;
+          if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+            throw new HttpError(400, 'REPORT_QUEUE_WINDOW', 'Choose 1 to 100 source labels');
+          let after: string | undefined;
+          if (sourcePage?.kind === kind && sourcePage.cursor) {
+            let raw: unknown;
+            try {
+              raw = JSON.parse(Buffer.from(sourcePage.cursor, 'base64url').toString('utf8'));
+            } catch {
+              throw changed();
+            }
+            if (
+              !Array.isArray(raw) ||
+              raw.length !== 6 ||
+              raw[0] !== queue.binding ||
+              raw[1] !== intakeId ||
+              raw[2] !== groupId ||
+              raw[3] !== pointer.ordinal ||
+              raw[4] !== kind ||
+              typeof raw[5] !== 'string'
+            )
+              throw changed();
+            after = raw[5];
+          }
+          const row = coverageDb
+              .prepare(
+                "SELECT coalesce(sum(count),0) total,coalesce(sum(CASE WHEN source<>'' THEN count ELSE 0 END),0) covered,coalesce(sum(CASE WHEN source<>'' THEN 1 ELSE 0 END),0) sources FROM sources WHERE kind=?",
+              )
+              .get(kind)!,
+            total = Number(row.total),
+            covered = Number(row.covered),
+            sourceCount = Number(row.sources);
+          const items: { source: string; count: number }[] = [];
+          let remaining = 0;
+          for (const row of coverageDb
+            .prepare("SELECT source,count FROM sources WHERE kind=? AND source<>''")
+            .iterate(kind)) {
+            const source = String(row.source);
+            if (after !== undefined && source.localeCompare(after) <= 0) continue;
+            remaining++;
+            items.push({ source, count: Number(row.count) });
+            items.sort((a, b) => a.source.localeCompare(b.source));
+            if (items.length > limit) items.pop();
+          }
+          return {
+            total,
+            covered,
+            uncovered: total - covered,
+            status: !total
+              ? 'empty'
+              : !covered
+                ? 'uncovered'
+                : covered < total
+                  ? 'partial'
+                  : sourceCount === 1
+                    ? 'single'
+                    : 'mixed',
+            sourceCount,
+            bySource: {
+              items,
+              total: sourceCount,
+              nextCursor:
+                remaining > items.length
+                  ? Buffer.from(
+                      canonicalLiteral([
+                        queue.binding,
+                        intakeId,
+                        groupId,
+                        pointer.ordinal,
+                        kind,
+                        items.at(-1)!.source,
+                      ]),
+                    ).toString('base64url')
+                  : null,
+            },
+          };
+        };
+        const sourceCoverage = { current: coverage('current'), saved: coverage('saved') },
+          effective =
+            sourceCoverage.current.status === 'single'
+              ? String(
+                  coverageDb
+                    .prepare("SELECT source FROM sources WHERE kind='current' AND source<>''")
+                    .get()!.source,
+                )
+              : sourceCoverage.current.status === 'empty' &&
+                  sourceCoverage.saved.status === 'single'
+                ? String(
+                    coverageDb
+                      .prepare("SELECT source FROM sources WHERE kind='saved' AND source<>''")
+                      .get()!.source,
+                  )
+                : null,
+          metadata = view.child(intake, 'metadata'),
+          intakeSource = metadata ? evidence(view, metadata, 'source') : null,
+          issuer = group ? evidence(view, group, 'sourceSystem') : null;
+        const people = openCollectionPeopleRead(db, root, profileId, intakeId);
+        let firstPerson: ReturnType<typeof people.pointer>;
+        for (const pointer of people.pointers(groupId))
+          if (!firstPerson || pointer.order < firstPerson.order) firstPerson = pointer;
+        const memberId = group && scalar<string | null>(view, group, 'memberId'),
+          selected =
+            memberId && workflow && view.childCount(workflow, 'plans')
+              ? readRetainedPlanEvidence(db, profileId, intakeId).firstMember(memberId)
+              : undefined;
+        const member = memberId
+          ? {
+              memberId,
+              filename:
+                selected?.kind === 'retained'
+                  ? evidence(selected.view, selected.record, 'filename')
+                  : selected?.member.filename || null,
+              locator:
+                selected?.kind === 'retained'
+                  ? evidence(selected.view, selected.record, 'locator')
+                  : selected?.member.locator || null,
+            }
+          : null;
+        queue.assertCurrent();
+        if (identityGroundingGeneration(db) !== grounding) throw changed();
+        artifacts.assertCurrent();
+        const summary: CollectionReportGroupSummary = {
+          format: 'health-intake-report-group-v2',
+          intakeId,
+          intakeVersion: intakeSourceVersion(db, intakeId).version,
+          groupId,
+          groupOrdinal: pointer.ordinal,
+          groupVersionId: current ? scalar<string>(view, current, 'id') || null : null,
+          basis: pointer.basis,
+          discoveryOrder: group ? (scalar<number>(view, group, 'discoveryOrder') ?? null) : null,
+          title:
+            pointer.basis === 'candidate_fallback'
+              ? fallbackTitle || (firstPerson ? people.person(firstPerson).title : '') || filename
+              : current
+                ? evidence(view, current, 'title')
+                : filename,
+          source: effective || intakeSource || issuer,
+          sourceScope: effective ? 'report' : intakeSource ? 'intake' : issuer ? 'issuer' : null,
+          date: dates.size === 1 ? [...dates][0]! : null,
+          original: {
+            filename,
+            contentUrl: '/api/sources/' + encodeURIComponent(intakeId) + '/content',
+            parentSourceFileId: scalar<string | null>(view, intake, 'parentSourceFileId') || null,
+          },
+          member,
+          report: group ? evidence(view, group, 'report') : null,
+          reportContext: current ? evidence(view, current, 'context') : null,
+          counts: tally,
+          peopleCounts: queue.peopleCounts(intakeId, groupId),
+          sourceCoverage,
+          sourceReview,
+          records: { intakeId, groupId },
+          people: { intakeId, groupId },
+        };
+        if (!sourcePage) queue.cacheSummary(summary);
+        return summary;
+      } finally {
+        coverageScratch.close();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }

@@ -526,7 +526,32 @@ test(
       0,
       'a saved exact record has no repeat save action',
     );
-    await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
+    let navigationRequest: import('playwright').Request | undefined;
+    const observeNavigationRequest = (request: import('playwright').Request) => {
+      const selected = new URL(request.url());
+      if (
+        !navigationRequest &&
+        request.method() === 'GET' &&
+        selected.pathname === prefix + '/intakes/import-feed' &&
+        selected.searchParams.get('view') === 'active' &&
+        selected.searchParams.get('state') === 'pending' &&
+        !['groupId', 'intakeId', 'recordId'].some((key) => selected.searchParams.has(key))
+      )
+        navigationRequest = request;
+    };
+    page.on('request', observeNavigationRequest);
+    const navigatedFeed = fixtureBrowserResponse(
+      page,
+      (response) => response.request() === navigationRequest,
+    );
+    try {
+      await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
+      const response = await navigatedFeed;
+      assert.equal(response.status(), 200, await response.text());
+      assert.equal(await response.finished(), null);
+    } finally {
+      page.off('request', observeNavigationRequest);
+    }
     await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
     await openFullReview('Fictional second result');
     await page.getByRole('heading', { name: 'Fictional second result', exact: true }).waitFor();

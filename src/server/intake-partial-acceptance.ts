@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError, now } from './database.ts';
@@ -407,95 +408,101 @@ export async function acceptPartialSelectionAsync(
   request: IntakeReportAcceptanceRequest,
   fingerprint: string,
 ): Promise<IntakeReportAcceptanceResult> {
-  let preparedSources: Awaited<ReturnType<typeof prepareNativePartialReviews>> | undefined;
-  try {
-    if (hasNativeAcceptanceBlock(db, request)) {
-      const preparing = activeFor(db);
-      if (preparing.has(request.operationId))
-        throw new HttpError(
-          409,
-          'REPORT_ACCEPTANCE_IN_PROGRESS',
-          'This exact save is still processing. Check its receipt again.',
-        );
-      preparing.add(request.operationId);
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      let preparedSources: Awaited<ReturnType<typeof prepareNativePartialReviews>> | undefined;
       try {
-        const { prepareIntakeLookupIndices } = await import('./intake-lookup-projection.ts');
-        const { retainedReportAcceptance } = await import('./intake-state-access.ts');
-        await prepareIntakeLookupIndices(db);
-        if (retainedReportAcceptance(db, request.operationId))
-          throw new HttpError(
-            409,
-            'OPERATION_CONFLICT',
-            'Operation ID already belongs to a different acceptance mode.',
-          );
-        if (!read<Manifest>(db, request.operationId))
-          preparedSources = await prepareNativePartialReviews(db, root, profileId, request);
-      } finally {
-        preparing.delete(request.operationId);
-      }
-    }
-    const { manifest, replayed, reviews, noteVersions, identityStamps } =
-      initializePartialSelection(
-        db,
-        root,
-        profileId,
-        request,
-        fingerprint,
-        preparedSources?.sources,
-      );
-    if (replayed) return reconcileManifest(db, root, profileId, manifest);
-    const operations = activeFor(db);
-    operations.add(request.operationId);
-    try {
-      const steps = processManifestSteps(
-        db,
-        root,
-        profileId,
-        manifest,
-        false,
-        reviews,
-        noteVersions,
-        identityStamps,
-      );
-      let step = steps.next();
-      while (!step.done) {
-        try {
-          if (step.value) {
-            if (hasNativeAcceptanceBlock(db, step.value.request))
-              await applyNativeAcceptanceGroup(
-                db,
-                root,
-                profileId,
-                step.value.request,
-                step.value.fingerprint,
-                { retainResult: step.value.retainResult, reviewed: step.value.reviews },
+        if (hasNativeAcceptanceBlock(db, request)) {
+          const preparing = activeFor(db);
+          if (preparing.has(request.operationId))
+            throw new HttpError(
+              409,
+              'REPORT_ACCEPTANCE_IN_PROGRESS',
+              'This exact save is still processing. Check its receipt again.',
+            );
+          preparing.add(request.operationId);
+          try {
+            const { prepareIntakeLookupIndices } = await import('./intake-lookup-projection.ts');
+            const { retainedReportAcceptance } = await import('./intake-state-access.ts');
+            await prepareIntakeLookupIndices(db);
+            if (retainedReportAcceptance(db, request.operationId))
+              throw new HttpError(
+                409,
+                'OPERATION_CONFLICT',
+                'Operation ID already belongs to a different acceptance mode.',
               );
-            else
-              applyAcceptanceGroup(
-                db,
-                root,
-                profileId,
-                step.value.request,
-                step.value.fingerprint,
-                step.value.retainResult,
-                step.value.reviews,
-              );
-          } else {
-            await new Promise<void>((resolve) => setImmediate(resolve));
-            acceptanceOwner(db, profileId);
+            if (!read<Manifest>(db, request.operationId))
+              preparedSources = await prepareNativePartialReviews(db, root, profileId, request);
+          } finally {
+            preparing.delete(request.operationId);
           }
-          step = steps.next();
-        } catch (error) {
-          step = steps.throw(error);
         }
+        const { manifest, replayed, reviews, noteVersions, identityStamps } =
+          initializePartialSelection(
+            db,
+            root,
+            profileId,
+            request,
+            fingerprint,
+            preparedSources?.sources,
+          );
+        if (replayed) return reconcileManifest(db, root, profileId, manifest);
+        const operations = activeFor(db);
+        operations.add(request.operationId);
+        try {
+          const steps = processManifestSteps(
+            db,
+            root,
+            profileId,
+            manifest,
+            false,
+            reviews,
+            noteVersions,
+            identityStamps,
+          );
+          let step = steps.next();
+          while (!step.done) {
+            try {
+              if (step.value) {
+                if (hasNativeAcceptanceBlock(db, step.value.request))
+                  await applyNativeAcceptanceGroup(
+                    db,
+                    root,
+                    profileId,
+                    step.value.request,
+                    step.value.fingerprint,
+                    { retainResult: step.value.retainResult, reviewed: step.value.reviews },
+                  );
+                else
+                  applyAcceptanceGroup(
+                    db,
+                    root,
+                    profileId,
+                    step.value.request,
+                    step.value.fingerprint,
+                    step.value.retainResult,
+                    step.value.reviews,
+                  );
+              } else {
+                await new Promise<void>((resolve) => setImmediate(resolve));
+                acceptanceOwner(db, profileId);
+              }
+              step = steps.next();
+            } catch (error) {
+              step = steps.throw(error);
+            }
+          }
+          return step.value;
+        } finally {
+          operations.delete(request.operationId);
+        }
+      } finally {
+        preparedSources?.close();
       }
-      return step.value;
-    } finally {
-      operations.delete(request.operationId);
-    }
-  } finally {
-    preparedSources?.close();
-  }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export function getPartialAcceptance(
   db: DatabaseSync,

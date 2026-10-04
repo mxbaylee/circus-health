@@ -1,3 +1,4 @@
+import { intakeIdentityRequestLifetime } from './intake-identity-request.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { intakeSourceRoute } from './intake-source-routes.ts';
 import { listSourceAttentionRead } from './intake-source-text.ts';
@@ -22,7 +23,7 @@ import {
 import { getIntakeRelatedRecordsRead } from './intake-clinical-record-sections.ts';
 import { applyIntakePersonRead, saveIntakePersonDispositionRead } from './intake-people-native.ts';
 import type { DatabaseSync } from 'node:sqlite';
-import type { IncomingMessage } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { createAssistant } from './assistant.ts';
 import type { IntakeMetadataFragmentReference } from '../shared/intake-package-paging.ts';
 import { intakeFilenameDisplay, isIntakeSummary } from '../shared/intake-summary.ts';
@@ -36,6 +37,7 @@ interface IntakeRouteContext {
   method: string;
   params: URLSearchParams;
   req: IncomingMessage;
+  res?: ServerResponse;
   db: DatabaseSync;
   root: string;
   profileId: string;
@@ -70,6 +72,7 @@ export async function handleIntakeRoute({
   method,
   params,
   req,
+  res,
   db,
   root,
   profileId,
@@ -226,7 +229,9 @@ export async function handleIntakeRoute({
         await import('./intake-package-plan.ts');
       await preparePagedPackagePlanCompatibility(db, root, profileId, id);
       respond(
-        await inventoryIntakePackagePaged(context, readPackagePlanScope(db, root, profileId, id)),
+        await inventoryIntakePackagePaged(context, () =>
+          readPackagePlanScope(db, root, profileId, id),
+        ),
       );
     } else respond(await inventoryIntakePackage(context));
   } else if (method === 'GET' && id && action === 'navigate') {
@@ -274,9 +279,18 @@ export async function handleIntakeRoute({
     );
   } else if (method === 'GET' && id && action === 'identity-scope')
     respond(await getIntakeIdentityScope(db, root, profileId, id, params.get('groupId') || ''));
-  else if (method === 'GET' && id && action === 'identity-review')
-    respond(await getIntakeIdentityReview(db, root, profileId, id, params.get('groupId') || ''));
-  else if (method === 'GET' && id && action === 'report-source-review')
+  else if (method === 'GET' && id && action === 'identity-review') {
+    const lifetime = intakeIdentityRequestLifetime(req, res);
+    try {
+      respond(
+        await getIntakeIdentityReview(db, root, profileId, id, params.get('groupId') || '', {
+          signal: lifetime.signal,
+        }),
+      );
+    } finally {
+      lifetime.dispose();
+    }
+  } else if (method === 'GET' && id && action === 'report-source-review')
     respond(
       await intake.getIntakeReportSourceReviewRead(
         db,

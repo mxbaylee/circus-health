@@ -15,6 +15,7 @@ import {
   type IntakePackageFailurePage,
 } from '../../../shared/intake-summary';
 import { api, useResource } from '../../data/api';
+import { useProfile } from '../../data/profile';
 import { formatBytes } from '../../data/format';
 import { ResourceState } from '../../components/ResourceState';
 import { LoadingIndicator } from '../../components/LoadingIndicator';
@@ -67,11 +68,23 @@ type MemberRead = {
     note?: string;
   };
 };
+type PreviousMemberPage = { offset: number; previous: PreviousMemberPage | null };
 
 export function PackageInventory({ intake }: { intake: IntakeRead }) {
-  const [offset, setOffset] = useState(0);
+  const profile = useProfile();
+  const inventoryScope = JSON.stringify([profile?.id, intake.id, intake.version]);
+  const [navigation, setNavigation] = useState({
+    scope: inventoryScope,
+    offset: 0,
+    previous: null as PreviousMemberPage | null,
+  });
+  const currentNavigation =
+    navigation.scope === inventoryScope
+      ? navigation
+      : { scope: inventoryScope, offset: 0, previous: null };
+  const { offset, previous } = currentNavigation;
   const inventory = useResource<IntakePackageInventory | IntakePackageInventoryPaged>(
-    `/intakes/${encodeURIComponent(intake.id)}/package?offset=${offset}&limit=50`,
+    `/intakes/${encodeURIComponent(intake.id)}/package?offset=${offset}&limit=50&version=${encodeURIComponent(intake.version)}`,
   );
   const [selected, setSelected] = useState<PackageMember | null>(null);
   const [read, setRead] = useState<MemberRead | null>(null);
@@ -94,7 +107,9 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
     failurePage.reload();
   };
   useEffect(() => setFailureCursor(null), [intake.id, intake.version]);
-  useEffect(() => inventory.reload(), [intake.version]);
+  useEffect(() => {
+    setNavigation({ scope: inventoryScope, offset: 0, previous: null });
+  }, [inventoryScope]);
   useEffect(() => {
     if (!inventory.loading && !inventory.refreshing) refreshFailures();
   }, [inventory.loading, inventory.refreshing, inventory.data, inventory.error]);
@@ -251,8 +266,14 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
             <div className="intake-actions">
               <button
                 className="text-link"
-                disabled={!offset || busy}
-                onClick={() => setOffset(Math.max(0, offset - 50))}
+                disabled={!previous || busy || inventory.loading || !!inventory.refreshing}
+                onClick={() =>
+                  setNavigation({
+                    scope: inventoryScope,
+                    offset: previous!.offset,
+                    previous: previous!.previous,
+                  })
+                }
               >
                 Previous members
               </button>
@@ -262,8 +283,17 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
               </span>
               <button
                 className="text-link"
-                disabled={data.nextOffset === null || busy}
-                onClick={() => setOffset(data.nextOffset!)}
+                disabled={
+                  data.nextOffset === null || busy || inventory.loading || !!inventory.refreshing
+                }
+                onClick={() =>
+                  // Retain only visited starts: byte-bounded pages need not contain fifty members.
+                  setNavigation({
+                    scope: inventoryScope,
+                    offset: data.nextOffset!,
+                    previous: { offset, previous },
+                  })
+                }
               >
                 Next members
               </button>

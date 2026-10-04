@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Explicit preparation of the complete visible queue, followed by bounded read contracts. */
 import { setImmediate } from 'node:timers/promises';
@@ -97,27 +98,33 @@ export async function prepareCollectionQueueRead(
   profileId: string,
   options: { assertRunning?: () => void } = {},
 ) {
-  let active = preparingQueues.get(db);
-  if (!active) {
-    active = new Map();
-    preparingQueues.set(db, active);
-  }
-  const key = JSON.stringify([root, profileId]),
-    prior = active.get(key);
-  const operation = (async () => {
-    // Each caller rechecks its own authority and cancellation after any earlier preparation.
-    if (prior) await prior.catch(() => undefined);
-    await prepareCollectionQueueReadNow(db, root, profileId, options);
-  })();
-  active.set(key, operation);
-  try {
-    await operation;
-  } catch (error) {
-    clearCollectionQueueReviews(db);
-    throw error;
-  } finally {
-    if (active.get(key) === operation) active.delete(key);
-  }
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      let active = preparingQueues.get(db);
+      if (!active) {
+        active = new Map();
+        preparingQueues.set(db, active);
+      }
+      const key = JSON.stringify([root, profileId]),
+        prior = active.get(key);
+      const operation = (async () => {
+        // Each caller rechecks its own authority and cancellation after any earlier preparation.
+        if (prior) await prior.catch(() => undefined);
+        await prepareCollectionQueueReadNow(db, root, profileId, options);
+      })();
+      active.set(key, operation);
+      try {
+        await operation;
+      } catch (error) {
+        clearCollectionQueueReviews(db);
+        throw error;
+      } finally {
+        if (active.get(key) === operation) active.delete(key);
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 async function prepareCollectionQueueReadNow(
   db: DatabaseSync,
@@ -345,10 +352,16 @@ export async function listIntakeReportQueueRead(
   profileId: string,
   input: QueueInput = {},
 ) {
-  if (!hasNativeIntakeQueue(db, profileId))
-    return listIntakeReportQueue(db, root, profileId, input);
-  await prepareCollectionQueueRead(db, root, profileId);
-  return readCollectionReportQueuePage(db, root, profileId, nativeWindow(input));
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      if (!hasNativeIntakeQueue(db, profileId))
+        return listIntakeReportQueue(db, root, profileId, input);
+      await prepareCollectionQueueRead(db, root, profileId);
+      return readCollectionReportQueuePage(db, root, profileId, nativeWindow(input));
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function getIntakeReportQueueGroupRead(
   db: DatabaseSync,
@@ -357,10 +370,16 @@ export async function getIntakeReportQueueGroupRead(
   groupId: string,
   input: QueueInput = {},
 ) {
-  if (!hasNativeIntakeQueue(db, profileId))
-    return getIntakeReportQueueGroup(db, root, profileId, groupId, input);
-  await prepareCollectionQueueRead(db, root, profileId);
-  return readCollectionReportGroupDetail(db, root, profileId, groupId, nativeWindow(input));
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      if (!hasNativeIntakeQueue(db, profileId))
+        return getIntakeReportQueueGroup(db, root, profileId, groupId, input);
+      await prepareCollectionQueueRead(db, root, profileId);
+      return readCollectionReportGroupDetail(db, root, profileId, groupId, nativeWindow(input));
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function listIntakeImportFeedRead(
   db: DatabaseSync,
@@ -368,19 +387,26 @@ export async function listIntakeImportFeedRead(
   profileId: string,
   input: Parameters<typeof listIntakeImportFeed>[3] & { bytes?: unknown } = {},
 ) {
-  if (!hasNativeIntakeQueue(db, profileId)) return listIntakeImportFeed(db, root, profileId, input);
-  await prepareCollectionQueueRead(db, root, profileId);
-  return readCollectionImportFeed(db, root, profileId, {
-    ...nativeWindow(input),
-    q: input.q ?? undefined,
-    state: input.state as NonNullable<Parameters<typeof readCollectionImportFeed>[3]>['state'],
-    kind: input.kind as NonNullable<Parameters<typeof readCollectionImportFeed>[3]>['kind'],
-    edited: input.edited ?? undefined,
-    peopleCursor: input.peopleCursor ?? undefined,
-    groupId: input.groupId ?? undefined,
-    intakeId: input.intakeId ?? undefined,
-    recordId: input.recordId ?? undefined,
-  });
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      if (!hasNativeIntakeQueue(db, profileId))
+        return listIntakeImportFeed(db, root, profileId, input);
+      await prepareCollectionQueueRead(db, root, profileId);
+      return readCollectionImportFeed(db, root, profileId, {
+        ...nativeWindow(input),
+        q: input.q ?? undefined,
+        state: input.state as NonNullable<Parameters<typeof readCollectionImportFeed>[3]>['state'],
+        kind: input.kind as NonNullable<Parameters<typeof readCollectionImportFeed>[3]>['kind'],
+        edited: input.edited ?? undefined,
+        peopleCursor: input.peopleCursor ?? undefined,
+        groupId: input.groupId ?? undefined,
+        intakeId: input.intakeId ?? undefined,
+        recordId: input.recordId ?? undefined,
+      });
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function getIntakePeopleQueueRead(
   db: DatabaseSync,
@@ -395,21 +421,27 @@ export async function getIntakePeopleQueueRead(
     q?: string | null;
   } = {},
 ) {
-  if (input.view && !['active', 'deferred', 'all'].includes(input.view))
-    throw new HttpError(400, 'INTAKE_PERSON_WINDOW', 'Choose active, deferred or all People');
-  if (!hasNativeIntakeQueue(db, profileId))
-    return getIntakePeopleQueue(db, root, profileId, groupId, input);
-  await prepareCollectionQueueRead(db, root, profileId);
-  const detail = await readCollectionReportGroupDetail(db, root, profileId, groupId, {
-    intakeId: input.intakeId ?? undefined,
-    personId: input.personId ?? undefined,
-    view: (input.view || 'all') as import('../shared/intake.ts').IntakeReportQueueView,
-    limit: input.limit == null ? undefined : Number(input.limit),
-    bytes: input.bytes == null ? undefined : Number(input.bytes),
-    peopleCursor: input.cursor == null ? undefined : String(input.cursor),
-    peopleQuery: input.q ?? undefined,
-  });
-  return detail.people;
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      if (input.view && !['active', 'deferred', 'all'].includes(input.view))
+        throw new HttpError(400, 'INTAKE_PERSON_WINDOW', 'Choose active, deferred or all People');
+      if (!hasNativeIntakeQueue(db, profileId))
+        return getIntakePeopleQueue(db, root, profileId, groupId, input);
+      await prepareCollectionQueueRead(db, root, profileId);
+      const detail = await readCollectionReportGroupDetail(db, root, profileId, groupId, {
+        intakeId: input.intakeId ?? undefined,
+        personId: input.personId ?? undefined,
+        view: (input.view || 'all') as import('../shared/intake.ts').IntakeReportQueueView,
+        limit: input.limit == null ? undefined : Number(input.limit),
+        bytes: input.bytes == null ? undefined : Number(input.bytes),
+        peopleCursor: input.cursor == null ? undefined : String(input.cursor),
+        peopleQuery: input.q ?? undefined,
+      });
+      return detail.people;
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function readIntakeReportGroupFragment(
   db: DatabaseSync,
@@ -419,8 +451,14 @@ export async function readIntakeReportGroupFragment(
   offset?: number,
   bytes?: number,
 ) {
-  await prepareCollectionQueueRead(db, root, profileId);
-  return readCollectionReportGroupFragment(db, root, profileId, reference, offset, bytes);
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      await prepareCollectionQueueRead(db, root, profileId);
+      return readCollectionReportGroupFragment(db, root, profileId, reference, offset, bytes);
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function readIntakeReportSourceCoverage(
   db: DatabaseSync,
@@ -428,8 +466,14 @@ export async function readIntakeReportSourceCoverage(
   profileId: string,
   input: Parameters<typeof readCollectionReportSourceCoverage>[3],
 ) {
-  await prepareCollectionQueueRead(db, root, profileId);
-  return readCollectionReportSourceCoverage(db, root, profileId, input);
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      await prepareCollectionQueueRead(db, root, profileId);
+      return readCollectionReportSourceCoverage(db, root, profileId, input);
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function readIntakePeoplePage(
   db: DatabaseSync,
@@ -438,10 +482,16 @@ export async function readIntakePeoplePage(
   id: string,
   input: Parameters<typeof readCollectionPeoplePage>[4] = {},
 ) {
-  assertIntakeOwner(db, profileId);
-  await prepareIntakeSourceDependencyHeaders(db, id);
-  await prepareCollectionPeopleIndex(db, root, profileId, id);
-  return readCollectionPeoplePage(db, root, profileId, id, input);
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      assertIntakeOwner(db, profileId);
+      await prepareIntakeSourceDependencyHeaders(db, id);
+      await prepareCollectionPeopleIndex(db, root, profileId, id);
+      return readCollectionPeoplePage(db, root, profileId, id, input);
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function readIntakeReportRecords(
   db: DatabaseSync,
@@ -450,11 +500,17 @@ export async function readIntakeReportRecords(
   id: string,
   input: Parameters<typeof readCollectionIntakeReportRecords>[4] = {},
 ) {
-  await prepareCollectionQueueRead(db, root, profileId);
-  const queue = await openCollectionReportQueue(db, root, profileId);
-  try {
-    return await readCollectionIntakeReportRecords(db, root, profileId, id, input, queue);
-  } finally {
-    queue.close();
-  }
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      await prepareCollectionQueueRead(db, root, profileId);
+      const queue = await openCollectionReportQueue(db, root, profileId);
+      try {
+        return await readCollectionIntakeReportRecords(db, root, profileId, id, input, queue);
+      } finally {
+        queue.close();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }

@@ -111,10 +111,13 @@ function remember(cache: Cache, target: Map<string, CachedBasis>, key: string, v
   }
 }
 export function clearIntakeStateCache(db: Database): void {
+  clearIntakeCaches(db, true);
+}
+function clearIntakeCaches(db: Database, releaseReviewScratch: boolean): void {
   clearNativeIdentityPreviews(db);
   clearPreparedClinicalReviewRead(db);
   clearCollectionQueueReviews(db);
-  clearReviewIssueScratch(db);
+  if (releaseReviewScratch) clearReviewIssueScratch(db);
   clearIntakeCollectionCache(db);
   clearIntakeMaintenancePublications(db);
   clearIntakeLegacyBridgeProofs(db);
@@ -135,7 +138,10 @@ function cacheFor(db: Database): Cache {
     owned.dispose = observeTransactionOutcome(db, (outcome) => {
       try {
         if (!outcome.succeeded) {
-          clearIntakeStateCache(db);
+          // A rollback invalidates cached/prepared state, but does not own
+          // caller-held review sessions. Their original physical proofs must
+          // survive for a retry; their normal authority guards still run.
+          clearIntakeCaches(db, false);
           return;
         }
         if (outcome.token !== owned.token) return;

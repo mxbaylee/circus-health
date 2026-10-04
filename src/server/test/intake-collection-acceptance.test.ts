@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, transaction, HttpError } from '../database.ts';
@@ -11,6 +11,7 @@ import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { prepareCollectionReviewMembership } from '../intake-review-membership-index.ts';
 import { prepareClinicalSourceFingerprintIndex } from '../intake-clinical-source-index.ts';
+import { reviewIssueScratchCounts } from '../intake-review-issue-scratch.ts';
 import {
   openIntakeCollectionEnvelope,
   iterateIntakeEnvelopeText,
@@ -298,7 +299,7 @@ test('native acceptance preserves saved-answer and identity/source blockers', ()
   );
 });
 
-for (const extra of ['none', 'write', 'restored'] as const) {
+for (const extra of ['none', 'write', 'restored', 'changed-source'] as const) {
   test(`native acceptance composes actual clinical SQL and certifies only its owned writes: ${extra}`, async (t) => {
     const { ensureProfileDirectories } = await import('../profile-storage.ts'),
       { attachPersonalDurability } = await import('../portable.ts'),
@@ -366,6 +367,7 @@ for (const extra of ['none', 'write', 'restored'] as const) {
         action: 'accept' as const,
         mapping: record.mapping,
       }));
+    cleanup.push(() => session.close());
     let derivations = 0;
     const {
         captureNativeBatchRevalidationBasis,
@@ -444,7 +446,24 @@ for (const extra of ['none', 'write', 'restored'] as const) {
         .domainVersion,
       session.review.version,
     );
+    context.assertCurrent();
+    assert.equal(reviewIssueScratchCounts(db).databases, 1);
     prepared.dispose();
+    context.assertCurrent();
+    assert.equal(reviewIssueScratchCounts(db).databases, 1);
+    if (extra === 'changed-source') {
+      writeFileSync(
+        profileOriginal(root, String(original.path), profileId),
+        'Fictional replacement after rolled-back acceptance',
+      );
+      await assert.rejects(prepareNativeIntakeAcceptance(db, root, profileId, input), {
+        code: 'SOURCE_CHANGED',
+      });
+      assert.equal(db.prepare('SELECT count(*) AS n FROM documents').get()!.n, 0);
+      session.close();
+      assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+      return;
+    }
     prepared = await prepareNativeIntakeAcceptance(db, root, profileId, input);
     if (!prepared.prepared) throw Error('Unexpected replay after rollback');
     transaction(

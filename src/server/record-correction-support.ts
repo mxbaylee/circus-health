@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 /** Exact, bounded supporting-original preparation for direct clinical corrections. */
 import { setImmediate } from 'node:timers/promises';
 import { HttpError, revision, type Database } from './database.ts';
@@ -194,191 +195,201 @@ export async function prepareCorrectionSupportingEvidence(
   profileId: string,
   input: unknown,
 ): Promise<PreparedCorrectionSupportingEvidence> {
-  assertIntakeOwner(db, profileId);
-  const refs = correctionSupportingReferences(input),
-    dependencies = new Set<string>();
-  for (const ref of refs) {
-    const key = JSON.stringify([ref.intakeId, ref.proposalId]);
-    if (dependencies.has(key)) continue;
-    await prepareCollectionClinicalReviewDependencies(
-      db,
-      root,
-      profileId,
-      ref.intakeId,
-      ref.proposalId,
-    );
-    dependencies.add(key);
-  }
-  const initialRevision = revision(db),
-    assertions: (() => void)[] = [],
-    evidence: CorrectionSupportingEvidence[] = [];
-  const assertCurrent = () => {
-    assertIntakeOwner(db, profileId);
-    if (revision(db) !== initialRevision)
-      throw new HttpError(
-        409,
-        'CORRECTION_EVIDENCE_CHANGED',
-        'Records or evidence changed; review the supporting original again',
-      );
-    for (const assertion of assertions) assertion();
-  };
-  const sessions: Extract<
-    Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>>,
-    { status: 'ready' }
-  >['session'][] = [];
-  const dispose = () => {
-    for (const session of sessions) session.close();
-    sessions.length = 0;
-  };
-  try {
-    for (const ref of refs) {
-      assertCurrent();
-      const view = openIntakeCollectionEnvelope(db, { id: ref.intakeId }),
-        intake = view.child(view.root(), 'intake')!,
-        workflow = view.child(intake, 'workflow'),
-        candidate = workflow && view.find('candidate', workflow, ref.candidateId),
-        version =
-          candidate &&
-          view.childAt(candidate, 'versions', view.childCount(candidate, 'versions') - 1);
-      if (!version || field(view, version, 'id') !== ref.candidateVersionId)
-        throw new HttpError(
-          409,
-          'CORRECTION_EVIDENCE_CHANGED',
-          'Review the current incoming candidate before using its original',
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      assertIntakeOwner(db, profileId);
+      const refs = correctionSupportingReferences(input),
+        dependencies = new Set<string>();
+      for (const ref of refs) {
+        const key = JSON.stringify([ref.intakeId, ref.proposalId]);
+        if (dependencies.has(key)) continue;
+        await prepareCollectionClinicalReviewDependencies(
+          db,
+          root,
+          profileId,
+          ref.intakeId,
+          ref.proposalId,
         );
-      const selected = await prepareCollectionClinicalReviewAsync(
-        db,
-        root,
-        profileId,
-        ref.intakeId,
-        ref.proposalId,
-        { assertRunning: assertCurrent },
-      );
-      if (selected.status !== 'ready')
-        throw new HttpError(
-          409,
-          'CORRECTION_EVIDENCE',
-          'Prepare the complete selected clinical review before choosing supporting evidence',
-        );
-      sessions.push(selected.session);
-      const record = selected.session.record(ref.recordId, ref.candidateId, ref.candidateVersionId);
-      if (!record)
-        throw new HttpError(
-          409,
-          'CORRECTION_EVIDENCE_CHANGED',
-          'The supporting record does not belong to this exact proposal',
-        );
-      const sourceVersion = intakeSourceVersion(db, ref.intakeId),
-        contentUrl = `/api/sources/${encodeURIComponent(ref.originalSourceFileId)}/content`,
-        selectedEvidence = record.evidence.find((item) => item.contentUrl === contentUrl),
-        file = original(db, root, profileId, ref.originalSourceFileId),
-        membership = readCollectionReviewMembership(db, { id: ref.intakeId }, view),
-        catalog = createReportSnapshotCatalog(db, { id: ref.intakeId });
-      let memberId: string | undefined,
-        steps = 0;
-      // Preserve v1's first group with this candidate/version in any retained version,
-      // independently of which particular occurrence established the group.
-      group: for (const group of intakeReviewChildren(view, workflow, 'reportGroups')) {
-        const id = field<string>(view, group, 'memberId');
-        for (const reportVersion of intakeReviewChildren(view, group, 'versions')) {
-          if (++steps % 32 === 0) {
-            await setImmediate();
-            assertCurrent();
-          }
-          if (!id) continue;
-          const native =
-            field(view, reportVersion, 'format') === 'health-intake-report-group-version-v2';
-          const found = native
-            ? openReportMemberSnapshot(
-                catalog,
-                field<IntakeReportMembersReference>(view, reportVersion, 'members')!,
-              ).member(ref.candidateId, ref.candidateVersionId)
-            : membership.member(reportVersion, ref.candidateId, ref.candidateVersionId);
-          if (found) {
-            memberId = id;
-            break group;
-          }
-        }
+        dependencies.add(key);
       }
-      const planMember =
-        memberId && workflow && view.childCount(workflow, 'plans')
-          ? readRetainedPlanEvidence(db, profileId, ref.intakeId).firstMember(memberId)
-          : undefined;
-      const member = !planMember
-        ? undefined
-        : planMember.kind === 'inventory'
-          ? planMember.member
-          : {
-              memberId: field<string>(planMember.view, planMember.record, 'memberId')!,
-              locator: field<string>(planMember.view, planMember.record, 'locator')!,
-              sourceHash: field<string>(planMember.view, planMember.record, 'sourceHash')!,
-            };
-      const exactMember =
-        !!member &&
-        file.details?.parentSourceFileId === ref.intakeId &&
-        file.details.locator === member.locator &&
-        file.row.sha256 === member.sourceHash;
-      if (
-        (!selectedEvidence && !exactMember) ||
-        (await prepareSupportingSourceRoot(db, profileId, ref.originalSourceFileId)) !==
-          (await prepareSupportingSourceRoot(db, profileId, ref.intakeId))
-      )
-        throw new HttpError(
-          409,
-          'CORRECTION_EVIDENCE',
-          'The original is not evidence of this selected incoming occurrence',
-        );
-      if (
-        db.prepare('SELECT mime_type FROM source_files WHERE id=?').get(ref.intakeId)?.mime_type ===
-          'application/zip' &&
-        ref.originalSourceFileId === ref.intakeId
-      )
-        throw new HttpError(
-          409,
-          'CORRECTION_EVIDENCE',
-          'Choose the exact retained package member, not the outer delivery',
-        );
-      assertions.push(() => {
-        view.address(view.root());
-        collectionClinicalProjectionContext(selected.session);
-        const current = original(db, root, profileId, ref.originalSourceFileId);
-        if (JSON.stringify(current) !== JSON.stringify(file))
+      const initialRevision = revision(db),
+        assertions: (() => void)[] = [],
+        evidence: CorrectionSupportingEvidence[] = [];
+      const assertCurrent = () => {
+        assertIntakeOwner(db, profileId);
+        if (revision(db) !== initialRevision)
           throw new HttpError(
             409,
             'CORRECTION_EVIDENCE_CHANGED',
-            'The supporting original changed',
+            'Records or evidence changed; review the supporting original again',
           );
-      });
-      evidence.push({
-        ...ref,
-        intakeVersion: sourceVersion.version,
-        originalSourceHash: String(file.row.sha256),
-        filename: file.details?.originalName || String(file.row.path).split('/').at(-1)!,
-        contentUrl,
-        locator: exactMember ? member!.locator : selectedEvidence!.locator,
-        memberId: exactMember ? member!.memberId : null,
-        title: record.title,
-      });
-    }
-    assertCurrent();
-    const proof: PreparedCorrectionSupportingEvidence = Object.freeze({
-      kind: 'prepared-correction-support',
-      dispose() {
-        prepared.delete(proof);
+        for (const assertion of assertions) assertion();
+      };
+      const sessions: Extract<
+        Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>>,
+        { status: 'ready' }
+      >['session'][] = [];
+      const dispose = () => {
+        for (const session of sessions) session.close();
+        sessions.length = 0;
+      };
+      try {
+        for (const ref of refs) {
+          assertCurrent();
+          const view = openIntakeCollectionEnvelope(db, { id: ref.intakeId }),
+            intake = view.child(view.root(), 'intake')!,
+            workflow = view.child(intake, 'workflow'),
+            candidate = workflow && view.find('candidate', workflow, ref.candidateId),
+            version =
+              candidate &&
+              view.childAt(candidate, 'versions', view.childCount(candidate, 'versions') - 1);
+          if (!version || field(view, version, 'id') !== ref.candidateVersionId)
+            throw new HttpError(
+              409,
+              'CORRECTION_EVIDENCE_CHANGED',
+              'Review the current incoming candidate before using its original',
+            );
+          const selected = await prepareCollectionClinicalReviewAsync(
+            db,
+            root,
+            profileId,
+            ref.intakeId,
+            ref.proposalId,
+            { assertRunning: assertCurrent },
+          );
+          if (selected.status !== 'ready')
+            throw new HttpError(
+              409,
+              'CORRECTION_EVIDENCE',
+              'Prepare the complete selected clinical review before choosing supporting evidence',
+            );
+          sessions.push(selected.session);
+          const record = selected.session.record(
+            ref.recordId,
+            ref.candidateId,
+            ref.candidateVersionId,
+          );
+          if (!record)
+            throw new HttpError(
+              409,
+              'CORRECTION_EVIDENCE_CHANGED',
+              'The supporting record does not belong to this exact proposal',
+            );
+          const sourceVersion = intakeSourceVersion(db, ref.intakeId),
+            contentUrl = `/api/sources/${encodeURIComponent(ref.originalSourceFileId)}/content`,
+            selectedEvidence = record.evidence.find((item) => item.contentUrl === contentUrl),
+            file = original(db, root, profileId, ref.originalSourceFileId),
+            membership = readCollectionReviewMembership(db, { id: ref.intakeId }, view),
+            catalog = createReportSnapshotCatalog(db, { id: ref.intakeId });
+          let memberId: string | undefined,
+            steps = 0;
+          // Preserve v1's first group with this candidate/version in any retained version,
+          // independently of which particular occurrence established the group.
+          group: for (const group of intakeReviewChildren(view, workflow, 'reportGroups')) {
+            const id = field<string>(view, group, 'memberId');
+            for (const reportVersion of intakeReviewChildren(view, group, 'versions')) {
+              if (++steps % 32 === 0) {
+                await setImmediate();
+                assertCurrent();
+              }
+              if (!id) continue;
+              const native =
+                field(view, reportVersion, 'format') === 'health-intake-report-group-version-v2';
+              const found = native
+                ? openReportMemberSnapshot(
+                    catalog,
+                    field<IntakeReportMembersReference>(view, reportVersion, 'members')!,
+                  ).member(ref.candidateId, ref.candidateVersionId)
+                : membership.member(reportVersion, ref.candidateId, ref.candidateVersionId);
+              if (found) {
+                memberId = id;
+                break group;
+              }
+            }
+          }
+          const planMember =
+            memberId && workflow && view.childCount(workflow, 'plans')
+              ? readRetainedPlanEvidence(db, profileId, ref.intakeId).firstMember(memberId)
+              : undefined;
+          const member = !planMember
+            ? undefined
+            : planMember.kind === 'inventory'
+              ? planMember.member
+              : {
+                  memberId: field<string>(planMember.view, planMember.record, 'memberId')!,
+                  locator: field<string>(planMember.view, planMember.record, 'locator')!,
+                  sourceHash: field<string>(planMember.view, planMember.record, 'sourceHash')!,
+                };
+          const exactMember =
+            !!member &&
+            file.details?.parentSourceFileId === ref.intakeId &&
+            file.details.locator === member.locator &&
+            file.row.sha256 === member.sourceHash;
+          if (
+            (!selectedEvidence && !exactMember) ||
+            (await prepareSupportingSourceRoot(db, profileId, ref.originalSourceFileId)) !==
+              (await prepareSupportingSourceRoot(db, profileId, ref.intakeId))
+          )
+            throw new HttpError(
+              409,
+              'CORRECTION_EVIDENCE',
+              'The original is not evidence of this selected incoming occurrence',
+            );
+          if (
+            db.prepare('SELECT mime_type FROM source_files WHERE id=?').get(ref.intakeId)
+              ?.mime_type === 'application/zip' &&
+            ref.originalSourceFileId === ref.intakeId
+          )
+            throw new HttpError(
+              409,
+              'CORRECTION_EVIDENCE',
+              'Choose the exact retained package member, not the outer delivery',
+            );
+          assertions.push(() => {
+            view.address(view.root());
+            collectionClinicalProjectionContext(selected.session);
+            const current = original(db, root, profileId, ref.originalSourceFileId);
+            if (JSON.stringify(current) !== JSON.stringify(file))
+              throw new HttpError(
+                409,
+                'CORRECTION_EVIDENCE_CHANGED',
+                'The supporting original changed',
+              );
+          });
+          evidence.push({
+            ...ref,
+            intakeVersion: sourceVersion.version,
+            originalSourceHash: String(file.row.sha256),
+            filename: file.details?.originalName || String(file.row.path).split('/').at(-1)!,
+            contentUrl,
+            locator: exactMember ? member!.locator : selectedEvidence!.locator,
+            memberId: exactMember ? member!.memberId : null,
+            title: record.title,
+          });
+        }
+        assertCurrent();
+        const proof: PreparedCorrectionSupportingEvidence = Object.freeze({
+          kind: 'prepared-correction-support',
+          dispose() {
+            prepared.delete(proof);
+            dispose();
+          },
+        });
+        prepared.set(proof, {
+          db,
+          root,
+          profileId,
+          key: JSON.stringify(refs),
+          evidence,
+          assertCurrent,
+        });
+        return proof;
+      } catch (error) {
         dispose();
-      },
-    });
-    prepared.set(proof, {
-      db,
-      root,
-      profileId,
-      key: JSON.stringify(refs),
-      evidence,
-      assertCurrent,
-    });
-    return proof;
-  } catch (error) {
-    dispose();
-    throw error;
-  }
+        throw error;
+      }
+    },
+    { operation: currentClinicalOperation(db), onDiscardResult: (value) => value.dispose() },
+  );
 }

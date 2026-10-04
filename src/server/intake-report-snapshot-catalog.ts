@@ -11,6 +11,11 @@ import type {
 } from './intake-state-storage.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import { INTAKE_TREE_VALUE_BYTES } from './intake-state-tree.ts';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 
 /** Account for the storage wrapper as well as the unescaped text. */
 export function reportSnapshotInlineTextFits(text: string) {
@@ -95,6 +100,8 @@ export function createReportSnapshotCatalog(
   const names = new WeakMap<ReportSnapshotMapWriter, string>();
   const references = new WeakMap<ReportSnapshotMapReader, () => IntakeCollectionValue>();
   const assertCurrent = () => {
+    const operation = currentClinicalOperation(db);
+    if (operation) assertClinicalOperation(db, operation);
     options.assertRunning?.();
     const current = selectedEnvelopeStore(db, source);
     if (
@@ -108,24 +115,30 @@ export function createReportSnapshotCatalog(
       throw Error('Stale report snapshot source or logical state');
   };
   const checkpoint = async (changes: readonly IntakeCollectionChange[]) => {
-    assertCurrent();
-    if (!changes.length) return;
-    if (changes.length > 16) throw Error('Report checkpoint exceeds bounded change batch');
-    withIntakeWork(db, 'warm', () =>
-      recordIntakeWork('reportSnapshotCheckpointChanges', changes.length),
+    return runExclusiveClinicalOperation(
+      db,
+      async () => {
+        assertCurrent();
+        if (!changes.length) return;
+        if (changes.length > 16) throw Error('Report checkpoint exceeds bounded change batch');
+        withIntakeWork(db, 'warm', () =>
+          recordIntakeWork('reportSnapshotCheckpointChanges', changes.length),
+        );
+        const id = randomUUID();
+        collections.commitMaintenance(
+          collections.prepare(collections.openView(), {
+            operationId: id,
+            requestDigest: hash(id),
+            domainVersion: version,
+            changes,
+          }),
+        );
+        await options.onCheckpoint?.();
+        await setImmediate();
+        assertCurrent();
+      },
+      { operation: currentClinicalOperation(db) },
     );
-    const id = randomUUID();
-    collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId: id,
-        requestDigest: hash(id),
-        domainVersion: version,
-        changes,
-      }),
-    );
-    await options.onCheckpoint?.();
-    await setImmediate();
-    assertCurrent();
   };
   const init = async () => {
     if (initialized) return;

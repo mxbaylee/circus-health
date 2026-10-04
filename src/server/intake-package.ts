@@ -338,7 +338,7 @@ async function durablePackage(context: PackageContext) {
 /** Explicit paged-authority entrypoint; activated when all public consumers are ready. */
 export async function inventoryIntakePackagePaged(
   context: PackageContext,
-  scope?: PackagePlanScope,
+  scope?: PackagePlanScope | (() => PackagePlanScope | undefined),
 ): Promise<IntakePackageInventoryPaged> {
   const offset = context.offset ?? 0,
     limit = context.limit ?? 50;
@@ -351,11 +351,15 @@ export async function inventoryIntakePackagePaged(
   )
     throw new HttpError(400, 'PACKAGE_WINDOW', 'Read 1–50 members at a nonnegative integer offset');
   const inventory = await durablePackage(context);
+  context.assertRunning?.();
+  // Resolving a retained inventory failure publishes a new domain version.
+  // Live callers select their plan only after that legitimate transition.
+  const currentScope = typeof scope === 'function' ? scope() : scope;
   const members: IntakePackageInventoryPaged['members'] = [];
   const version = intakeSourceVersion(context.db, context.id).version;
   let bytes = 0;
   for (const member of inventory.range({ offset, limit })) {
-    const state = scope?.memberState(member.memberId);
+    const state = currentScope?.memberState(member.memberId);
     const value = {
       ...member,
       ...state,
@@ -396,7 +400,7 @@ export async function inventoryIntakePackagePaged(
     inventoryId: inventory.inventoryId,
     intakeId: context.id,
     version,
-    planId: scope?.planId ?? null,
+    planId: currentScope?.planId ?? null,
     sourceHash: inventory.binding.sourceHash,
     totalMembers: inventory.summary.members,
     totalExpandedBytes: inventory.summary.expandedBytes,

@@ -2893,24 +2893,20 @@ export function createAssistant({
       const packageTools = await import('./intake-package.ts');
       const selectedPackage = getIntakeRead(db, root, profileId, context.id);
       const nativePackage = isIntakeSummary(selectedPackage);
-      const packageScope =
+      const packagePlan =
         nativePackage &&
         selectedPackage.activePlan.state === 'exact' &&
         selectedPackage.activePlan.plan?.format === 'health-intake-package-plan-v2'
-          ? (await import('./intake-package-plan.ts')).readPackagePlanScope(
-              db,
-              root,
-              profileId,
-              context.id,
-            )
+          ? await import('./intake-package-plan.ts')
           : undefined;
+      const packageScope = () => packagePlan?.readPackagePlanScope(db, root, profileId, context.id);
       if (args.action === 'inventory')
         result = nativePackage
           ? await packageTools.inventoryIntakePackagePaged(context, packageScope)
           : await packageTools.inventoryIntakePackage(context);
       else if (args.action === 'read_member')
         result = nativePackage
-          ? await packageTools.readIntakePackageMemberPaged(context, packageScope)
+          ? await packageTools.readIntakePackageMemberPaged(context, packageScope())
           : await packageTools.readIntakePackageMember(context);
       else if (args.action === 'plan_roles') {
         const intake = await import('./intake.ts');

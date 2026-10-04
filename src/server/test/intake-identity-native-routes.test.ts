@@ -1,3 +1,6 @@
+import { setImmediate } from 'node:timers/promises';
+import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
+import { getNativeIntakeIdentityReview } from '../intake-identity-native.ts';
 import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -172,7 +175,7 @@ async function fixture(
     request(
       'identity-review?groupId=' + encodeURIComponent(groupId),
     ) as Promise<IntakeIdentityReview>;
-  return { root, profileId, db, original, proposed, groupId, app, request, review };
+  return { root, profileId, db, original, proposed, groupId, app, base, request, review };
 }
 
 // One native ordinary proposal, two retained duplicate occurrences, complete
@@ -961,10 +964,12 @@ test(
 );
 
 // Real native publication + public read/confirmation/replay with an entirely
-// superseded retained prefix; no model work. Host guard covers app and two builds.
+// superseded retained prefix; no model work. The complete 71-receipt fixture
+// measured 235s for publication, full public history scans, fresh confirmation
+// and exact replay. This host hang guard covers all those operations.
 test(
   'actual native identity handles superseded-only receipt history before fresh confirmation',
-  { timeout: 120000 },
+  { timeout: 300000 },
   async (t) => {
     const f = await fixture(t, true, 1, false, undefined, undefined, true);
     const hydrationBaseline = intakeWorkCounters(f.db).warm.envelopeHydrations;
@@ -1045,5 +1050,156 @@ test(
     await f.request('identity-scope', command);
     assert.equal((await f.review()).confirmationCount, 1);
     assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, hydrationBaseline);
+  },
+);
+
+// Real native preparation and HTTP disconnect; no fabricated policy or timer threshold.
+test(
+  'native preview cancellation preserves a live coalesced subscriber',
+  { timeout: 60000 },
+  async (t) => {
+    const f = await fixture(t, true, 1, false, undefined, undefined, true);
+    const before = intakeWorkCounters(f.db).warm.identityPreviewFullPreparations;
+    const controller = new AbortController();
+    const cancelled = getNativeIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.original.id,
+      f.groupId,
+      { signal: controller.signal },
+    );
+    const refused = assert.rejects(cancelled, { name: 'AbortError' });
+    const live = getNativeIntakeIdentityReview(f.db, f.root, f.profileId, f.original.id, f.groupId);
+    while (intakeWorkCounters(f.db).warm.identityPreviewFullPreparations === before) {
+      t.signal.throwIfAborted();
+      await setImmediate();
+    }
+    controller.abort();
+    await refused;
+    const value = await live;
+    assert.ok(value.scopeReference);
+    assert.equal(
+      intakeWorkCounters(f.db).warm.identityPreviewFullPreparations - before,
+      2,
+      'one shared cold preparation, including its required post-grounding rebuild',
+    );
+    value.scopeReference!.report.text = 'Caller mutation';
+    const next = await f.review();
+    assert.notEqual(next.scopeReference!.report.text, 'Caller mutation');
+    assert.deepEqual(reviewIssueScratchCounts(f.db), { databases: 0, scopes: 0, rows: 0 });
+  },
+);
+
+test(
+  'HTTP last-subscriber cancellation stops native staging before the next database reader',
+  { timeout: 60000 },
+  async (t) => {
+    const f = await fixture(t, true, 1, false, undefined, undefined, true);
+    const before = structuredClone(intakeWorkCounters(f.db).warm);
+    const controller = new AbortController();
+    const cancelled = fetch(f.base + 'identity-review?groupId=' + encodeURIComponent(f.groupId), {
+      signal: controller.signal,
+    });
+    const refused = assert.rejects(cancelled, { name: 'AbortError' });
+    while (
+      intakeWorkCounters(f.db).warm.identityPreviewFullPreparations -
+        before.identityPreviewFullPreparations <
+        2 ||
+      intakeWorkCounters(f.db).warm.reportSnapshotCheckpointChanges ===
+        before.reportSnapshotCheckpointChanges
+    ) {
+      t.signal.throwIfAborted();
+      await setImmediate();
+    }
+    controller.abort();
+    await refused;
+    // The queued owner enters only after abandoned preparation closes all its scopes.
+    await runExclusiveClinicalOperation(f.db, async () => undefined);
+    const stopped = intakeWorkCounters(f.db).warm.reportSnapshotCheckpointChanges;
+    for (let n = 0; n < 4; n++) await setImmediate();
+    assert.equal(intakeWorkCounters(f.db).warm.reportSnapshotCheckpointChanges, stopped);
+    assert.equal(nativeIdentityPreviewCounts(f.db).entries, 0);
+    assert.deepEqual(reviewIssueScratchCounts(f.db), { databases: 0, scopes: 0, rows: 0 });
+    const live = await f.review();
+    assert.ok(live.scopeReference, 'a later live request builds from retained authority');
+  },
+);
+
+test(
+  'native held operation bypasses a foreign queued preview flight',
+  { timeout: 60000 },
+  async (t) => {
+    const f = await fixture(t, true, 1, false, undefined, undefined, true);
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const held = runExclusiveClinicalOperation(f.db, async (operation) => {
+      enter();
+      await released;
+      return getNativeIntakeIdentityReview(f.db, f.root, f.profileId, f.original.id, f.groupId, {
+        operation,
+      });
+    });
+    await entered;
+    // This caller is outside the held owner's async context and must queue behind it.
+    const foreign = getNativeIntakeIdentityReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.original.id,
+      f.groupId,
+    );
+    release();
+    const first = await held,
+      second = await foreign;
+    assert.ok(first.scopeReference);
+    assert.deepEqual(first.scopeReference, second.scopeReference);
+    assert.deepEqual(reviewIssueScratchCounts(f.db), { databases: 0, scopes: 0, rows: 0 });
+  },
+);
+
+test(
+  'HTTP coalesced identity abort leaves its live response intact',
+  { timeout: 60000 },
+  async (t) => {
+    const f = await fixture(t, true, 1, false, undefined, undefined, true);
+    const before = intakeWorkCounters(f.db).warm.identityPreviewFullPreparations;
+    const controller = new AbortController();
+    const cancelled = fetch(f.base + 'identity-review?groupId=' + encodeURIComponent(f.groupId), {
+      signal: controller.signal,
+    });
+    const refused = assert.rejects(cancelled, { name: 'AbortError' });
+    let identityCompleted = false;
+    const live = fetch(f.base + 'identity-review?groupId=' + encodeURIComponent(f.groupId)).finally(
+      () => {
+        identityCompleted = true;
+      },
+    );
+    while (intakeWorkCounters(f.db).warm.identityPreviewFullPreparations === before) {
+      t.signal.throwIfAborted();
+      await setImmediate();
+    }
+    const notes = await fetch(
+      new URL(`/api/profiles/${encodeURIComponent(f.profileId)}/notes`, f.base),
+    );
+    assert.equal(notes.status, 200);
+    assert.ok(Array.isArray((await notes.json()).data));
+    assert.equal(
+      identityCompleted,
+      false,
+      'an unrelated same-database HTTP read completes while clinical preparation remains active',
+    );
+    controller.abort();
+    await refused;
+    const response = await live;
+    assert.equal(response.status, 200);
+    const value = await response.json();
+    assert.ok(value.data.scopeReference);
+    assert.equal(intakeWorkCounters(f.db).warm.identityPreviewFullPreparations - before, 2);
   },
 );

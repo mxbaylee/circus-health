@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { firstReportGroup } from '../shared/intake-report-group-links.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
@@ -277,140 +278,149 @@ export async function createManualSourceRecordRead(
   intakeId: string,
   input: ManualSourceRecordRequest,
 ): Promise<ManualSourceRecordResult> {
-  const current = getIntakeRead(db, root, profileId, intakeId);
-  if (!isIntakeSummary(current))
-    return createManualSourceRecord(db, root, profileId, intakeId, input);
-  const fingerprint = manualSourceFingerprint(input),
-    selectedInput = structuredClone(input);
-  const assertSelected = () => {
-    const selected = getIntakeRead(db, root, profileId, intakeId);
-    if (
-      !isIntakeSummary(selected) ||
-      selected.version !== current.version ||
-      selected.pins.logicalRoot !== current.pins.logicalRoot
-    )
-      throw new HttpError(
-        409,
-        'VERSION_CONFLICT',
-        'The source changed; reload before creating this draft',
-      );
-  };
-  await prepareRetainedPlanAccess(db, profileId, intakeId, { assertRunning: assertSelected });
-  const mappingVersion = () =>
-    workflowHash(
-      activeMappingRules(
-        db,
-        intakeSourceMetadata(db, intakeId).metadata?.sourceProviderId || current.providerId,
-      ),
-    );
-  const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, intakeId, {
-    mappingVersion: mappingVersion(),
-    currentMappingVersion: mappingVersion,
-    assertRunning: assertSelected,
-  });
-  if (ready.state !== 'ready')
-    throw new HttpError(
-      409,
-      'WORKFLOW_PREPARATION_REQUIRED',
-      'Prepare the selected source before creating a manual draft',
-    );
-  assertSelected();
-  const view = openIntakeCollectionEnvelope(db, { id: intakeId }),
-    prior = view.lookup('manual-source-operation-first', [selectedInput.operationId]);
-  const read = <T>(record: NonNullable<typeof prior>, key: string): T => {
-    const value = view.field(record, key, { bytes: 8192 });
-    if (value.kind !== 'value')
-      throw new HttpError(
-        409,
-        'MANUAL_SOURCE_RECORD',
-        'The retained manual draft needs selected evidence preparation',
-      );
-    return value.value as T;
-  };
-  let proposalId: string, saved: IntakeRead;
-  if (prior) {
-    const receipt = readSelectedManualSourceReceipt(view, prior);
-    if (receipt?.operationId !== selectedInput.operationId || receipt.fingerprint !== fingerprint)
-      throw new HttpError(
-        409,
-        'OPERATION_CONFLICT',
-        'This manual creation operation already records a different request',
-      );
-    proposalId = read<string>(prior, 'id');
-    saved = { ...current, durability: flushIntake(db, root, profileId) };
-  } else {
-    const prepared = prepareManualSourceRecordInput(
-      db,
-      root,
-      profileId,
-      intakeId,
-      current,
-      selectedInput,
-      fingerprint,
-    );
-    saved = await proposeConversionRead(
-      db,
-      root,
-      profileId,
-      intakeId,
-      {
-        version: current.version,
-        jsonlText: JSON.stringify(prepared.envelope),
-        summary: 'Record authored by you from retained source evidence',
-      },
-      { manualSourceRecord: prepared.receipt, assertRunning: prepared.assertCurrent },
-    );
-    const published = openIntakeCollectionEnvelope(db, { id: intakeId }),
-      selected = published.lookup('manual-source-operation-first', [selectedInput.operationId]),
-      identity = selected && published.field(selected, 'id', { bytes: 8192 });
-    if (!identity || identity.kind !== 'value' || typeof identity.value !== 'string')
-      throw new HttpError(
-        409,
-        'MANUAL_SOURCE_RECORD',
-        'The retained manual draft needs review recovery',
-      );
-    proposalId = identity.value;
-  }
-  await prepareCollectionClinicalReviewDependencies(db, root, profileId, intakeId, proposalId);
-  const reviewed = await prepareCollectionClinicalReviewAsync(
+  return runExclusiveClinicalOperation(
     db,
-    root,
-    profileId,
-    intakeId,
-    proposalId,
-  );
-  if (reviewed.status !== 'ready')
-    throw new HttpError(
-      409,
-      'MANUAL_SOURCE_RECORD',
-      'The retained manual draft needs selected review preparation',
-    );
-  try {
-    const record = reviewed.session.review.records[0],
-      groupId = firstReportGroup(record?.reportGroups)?.groupId;
-    if (!record || !groupId)
-      throw new HttpError(
-        409,
-        'MANUAL_SOURCE_RECORD',
-        'The retained manual draft needs review recovery',
+    async () => {
+      const current = getIntakeRead(db, root, profileId, intakeId);
+      if (!isIntakeSummary(current))
+        return createManualSourceRecord(db, root, profileId, intakeId, input);
+      const fingerprint = manualSourceFingerprint(input),
+        selectedInput = structuredClone(input);
+      const assertSelected = () => {
+        const selected = getIntakeRead(db, root, profileId, intakeId);
+        if (
+          !isIntakeSummary(selected) ||
+          selected.version !== current.version ||
+          selected.pins.logicalRoot !== current.pins.logicalRoot
+        )
+          throw new HttpError(
+            409,
+            'VERSION_CONFLICT',
+            'The source changed; reload before creating this draft',
+          );
+      };
+      await prepareRetainedPlanAccess(db, profileId, intakeId, { assertRunning: assertSelected });
+      const mappingVersion = () =>
+        workflowHash(
+          activeMappingRules(
+            db,
+            intakeSourceMetadata(db, intakeId).metadata?.sourceProviderId || current.providerId,
+          ),
+        );
+      const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, intakeId, {
+        mappingVersion: mappingVersion(),
+        currentMappingVersion: mappingVersion,
+        assertRunning: assertSelected,
+      });
+      if (ready.state !== 'ready')
+        throw new HttpError(
+          409,
+          'WORKFLOW_PREPARATION_REQUIRED',
+          'Prepare the selected source before creating a manual draft',
+        );
+      assertSelected();
+      const view = openIntakeCollectionEnvelope(db, { id: intakeId }),
+        prior = view.lookup('manual-source-operation-first', [selectedInput.operationId]);
+      const read = <T>(record: NonNullable<typeof prior>, key: string): T => {
+        const value = view.field(record, key, { bytes: 8192 });
+        if (value.kind !== 'value')
+          throw new HttpError(
+            409,
+            'MANUAL_SOURCE_RECORD',
+            'The retained manual draft needs selected evidence preparation',
+          );
+        return value.value as T;
+      };
+      let proposalId: string, saved: IntakeRead;
+      if (prior) {
+        const receipt = readSelectedManualSourceReceipt(view, prior);
+        if (
+          receipt?.operationId !== selectedInput.operationId ||
+          receipt.fingerprint !== fingerprint
+        )
+          throw new HttpError(
+            409,
+            'OPERATION_CONFLICT',
+            'This manual creation operation already records a different request',
+          );
+        proposalId = read<string>(prior, 'id');
+        saved = { ...current, durability: flushIntake(db, root, profileId) };
+      } else {
+        const prepared = prepareManualSourceRecordInput(
+          db,
+          root,
+          profileId,
+          intakeId,
+          current,
+          selectedInput,
+          fingerprint,
+        );
+        saved = await proposeConversionRead(
+          db,
+          root,
+          profileId,
+          intakeId,
+          {
+            version: current.version,
+            jsonlText: JSON.stringify(prepared.envelope),
+            summary: 'Record authored by you from retained source evidence',
+          },
+          { manualSourceRecord: prepared.receipt, assertRunning: prepared.assertCurrent },
+        );
+        const published = openIntakeCollectionEnvelope(db, { id: intakeId }),
+          selected = published.lookup('manual-source-operation-first', [selectedInput.operationId]),
+          identity = selected && published.field(selected, 'id', { bytes: 8192 });
+        if (!identity || identity.kind !== 'value' || typeof identity.value !== 'string')
+          throw new HttpError(
+            409,
+            'MANUAL_SOURCE_RECORD',
+            'The retained manual draft needs review recovery',
+          );
+        proposalId = identity.value;
+      }
+      await prepareCollectionClinicalReviewDependencies(db, root, profileId, intakeId, proposalId);
+      const reviewed = await prepareCollectionClinicalReviewAsync(
+        db,
+        root,
+        profileId,
+        intakeId,
+        proposalId,
       );
-    const params = new URLSearchParams({
-      intake: intakeId,
-      group: groupId,
-      proposal: proposalId,
-      record: record.id,
-    });
-    return {
-      intake: saved,
-      proposalId,
-      recordId: record.id,
-      groupId,
-      reviewUrl: `/import?${params}`,
-      replayed: !!prior,
-    };
-  } finally {
-    reviewed.session.close();
-  }
+      if (reviewed.status !== 'ready')
+        throw new HttpError(
+          409,
+          'MANUAL_SOURCE_RECORD',
+          'The retained manual draft needs selected review preparation',
+        );
+      try {
+        const record = reviewed.session.review.records[0],
+          groupId = firstReportGroup(record?.reportGroups)?.groupId;
+        if (!record || !groupId)
+          throw new HttpError(
+            409,
+            'MANUAL_SOURCE_RECORD',
+            'The retained manual draft needs review recovery',
+          );
+        const params = new URLSearchParams({
+          intake: intakeId,
+          group: groupId,
+          proposal: proposalId,
+          record: record.id,
+        });
+        return {
+          intake: saved,
+          proposalId,
+          recordId: record.id,
+          groupId,
+          reviewUrl: `/import?${params}`,
+          replayed: !!prior,
+        };
+      } finally {
+        reviewed.session.close();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 
 /** Profile-authorized route only. Model proposal input has no access to this host receipt. */

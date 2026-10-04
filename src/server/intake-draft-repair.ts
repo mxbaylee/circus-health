@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { selectedReportGroups } from './intake-selected-report-groups.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { HttpError } from './database.ts';
@@ -406,49 +407,65 @@ export async function prepareIntakeDraftRepairScope(
   value: unknown,
   options: { assertRunning?: () => void } = {},
 ): Promise<IntakeDraftRepairScope> {
-  const retained =
-    object(value) && value.format === 'intake-draft-repair-scope-v2'
-      ? retainedScope(profileId, value)
-      : undefined;
-  const chosen = retained
-    ? {
-        format: 'intake-draft-repair-selection-v1' as const,
-        intakeId: retained.intakeId,
-        groupId: retained.groupId,
-        rows: retained.rows.map((row) => ({
-          proposalId: row.proposalId,
-          recordId: row.recordId,
-          candidateVersionId: row.candidateVersionId,
-          fields: row.allowedFields,
-        })),
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      const retained =
+        object(value) && value.format === 'intake-draft-repair-scope-v2'
+          ? retainedScope(profileId, value)
+          : undefined;
+      const chosen = retained
+        ? {
+            format: 'intake-draft-repair-selection-v1' as const,
+            intakeId: retained.intakeId,
+            groupId: retained.groupId,
+            rows: retained.rows.map((row) => ({
+              proposalId: row.proposalId,
+              recordId: row.recordId,
+              candidateVersionId: row.candidateVersionId,
+              fields: row.allowedFields,
+            })),
+          }
+        : selection(value);
+      options.assertRunning?.();
+      if (isIntakeSummary(getIntakeRead(db, root, profileId, chosen.intakeId)))
+        for (const proposalId of new Set(chosen.rows.map((row) => row.proposalId))) {
+          await prepareCollectionClinicalReviewDependencies(
+            db,
+            root,
+            profileId,
+            chosen.intakeId,
+            proposalId,
+            options,
+          );
+          options.assertRunning?.();
+        }
+      if (retained) {
+        const original = verifyIntakeOriginal(db, root, profileId, retained.intakeId);
+        if (original.sourceHash !== retained.originalSha256)
+          throw new HttpError(
+            409,
+            'DRAFT_REPAIR_STALE',
+            'The retained original changed; ask again',
+          );
       }
-    : selection(value);
-  options.assertRunning?.();
-  if (isIntakeSummary(getIntakeRead(db, root, profileId, chosen.intakeId)))
-    for (const proposalId of new Set(chosen.rows.map((row) => row.proposalId))) {
-      await prepareCollectionClinicalReviewDependencies(
+      const refreshed = await resolveIntakeDraftRepairScopeAsync(
         db,
         root,
         profileId,
-        chosen.intakeId,
-        proposalId,
+        chosen,
         options,
       );
-      options.assertRunning?.();
-    }
-  if (retained) {
-    const original = verifyIntakeOriginal(db, root, profileId, retained.intakeId);
-    if (original.sourceHash !== retained.originalSha256)
-      throw new HttpError(409, 'DRAFT_REPAIR_STALE', 'The retained original changed; ask again');
-  }
-  const refreshed = await resolveIntakeDraftRepairScopeAsync(db, root, profileId, chosen, options);
-  if (retained && refreshed.scopeToken !== retained.scopeToken)
-    throw new HttpError(
-      409,
-      'DRAFT_REPAIR_STALE',
-      'Selected drafts or evidence changed; ask again',
-    );
-  return refreshed;
+      if (retained && refreshed.scopeToken !== retained.scopeToken)
+        throw new HttpError(
+          409,
+          'DRAFT_REPAIR_STALE',
+          'Selected drafts or evidence changed; ask again',
+        );
+      return refreshed;
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 
 type RepairEdit = {

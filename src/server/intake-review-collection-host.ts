@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { indexedReviewQuestions } from './intake-review-question-index.ts';
 import { finishClinicalReviewWork, runClinicalReviewWork } from './clinical-review-work.ts';
 import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
@@ -154,133 +155,147 @@ export async function prepareCollectionClinicalReviewDependencies(
   proposalId: string | null = null,
   options: { assertRunning?: () => void } = {},
 ): Promise<void> {
-  assertIntakeOwner(db, profileId);
-  await prepareIntakeSourceDependencyHeaders(db, intakeId, options);
-  const original = requiredFile(db, intakeId, true),
-    version = intakeSourceVersion(db, intakeId),
-    revision = clinicalReviewRevision(db),
-    view = openIntakeCollectionEnvelope(db, original),
-    intake = view.child(view.root(), 'intake')!;
-  const assertCurrent = () => {
-    options.assertRunning?.();
-    assertIntakeOwner(db, profileId);
-    const current = intakeSourceVersion(db, intakeId);
-    if (
-      current.version !== version.version ||
-      current.logicalBinding !== version.logicalBinding ||
-      clinicalReviewRevision(db) !== revision
-    )
-      throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
-  };
-  const verify = async (file: File) =>
-    runClinicalReviewWork(
-      verifyIntakeFileHashWork(profileOriginal(root, file.path, profileId), file),
-      {
-        capture() {
-          assertCurrent();
-          const stamp = reviewPreparationStamp(db);
-          if (stamp === undefined)
-            throw new HttpError(
-              409,
-              'INTAKE_REVIEW_CHANGED',
-              'Clinical verification cannot cross a transaction',
-            );
-          return () => {
-            assertCurrent();
-            if (reviewPreparationStamp(db) !== stamp)
-              throw new HttpError(
-                409,
-                'INTAKE_REVIEW_CHANGED',
-                'Review changed while verifying its original',
-              );
-          };
-        },
-      },
-    );
-  if (proposalId && !view.find('proposal', intake, proposalId))
-    throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
-  await verify(original);
-  const inputFile = proposalId ? requiredFile(db, proposalId) : original;
-  if (inputFile.bytes > MAX_INTAKE_BYTES)
-    throw new HttpError(413, 'CONVERSION_REQUIRED', 'Review a bounded JSONL conversion proposal');
-  const path = profileOriginal(root, inputFile.path, profileId);
-  await verify(inputFile);
-  const bytes = readFileSync(path);
-  if (
-    bytes.length !== inputFile.bytes ||
-    createHash('sha256').update(bytes).digest('hex') !== inputFile.sha256
-  )
-    throw new HttpError(409, 'SOURCE_CHANGED', 'Review source changed');
-  const validation = validateJSONL(bytes);
-  if (!validation.valid)
-    throw new HttpError(400, 'INVALID_JSONL', 'Convert the original before clinical review');
-  // A small cache removes nearby duplicate evidence without retaining a set
-  // proportional to the installation's accepted source history.
-  const prepared = new Set<string>();
-  let dependencyInspections = 0;
-  for (const id of clinicalSourceScopeDependencyIdsWork(db, original, validation.entries!)) {
-    if (++dependencyInspections % 16 === 0) {
-      await runClinicalReviewWork(
-        (function* () {
-          for (let n = 0; n < 16; n++) yield;
-        })(),
-        {
-          capture() {
-            assertCurrent();
-            const stamp = reviewPreparationStamp(db);
-            if (stamp === undefined)
-              throw Error('Clinical dependencies cannot cross a transaction');
-            return () => {
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      assertIntakeOwner(db, profileId);
+      await prepareIntakeSourceDependencyHeaders(db, intakeId, options);
+      const original = requiredFile(db, intakeId, true),
+        version = intakeSourceVersion(db, intakeId),
+        revision = clinicalReviewRevision(db),
+        view = openIntakeCollectionEnvelope(db, original),
+        intake = view.child(view.root(), 'intake')!;
+      const assertCurrent = () => {
+        options.assertRunning?.();
+        assertIntakeOwner(db, profileId);
+        const current = intakeSourceVersion(db, intakeId);
+        if (
+          current.version !== version.version ||
+          current.logicalBinding !== version.logicalBinding ||
+          clinicalReviewRevision(db) !== revision
+        )
+          throw new HttpError(
+            409,
+            'INTAKE_REVIEW_CHANGED',
+            'Refresh this selected clinical review',
+          );
+      };
+      const verify = async (file: File) =>
+        runClinicalReviewWork(
+          verifyIntakeFileHashWork(profileOriginal(root, file.path, profileId), file),
+          {
+            capture() {
               assertCurrent();
-              if (reviewPreparationStamp(db) !== stamp)
+              const stamp = reviewPreparationStamp(db);
+              if (stamp === undefined)
                 throw new HttpError(
                   409,
                   'INTAKE_REVIEW_CHANGED',
-                  'Review changed while preparing dependencies',
+                  'Clinical verification cannot cross a transaction',
                 );
-            };
+              return () => {
+                assertCurrent();
+                if (reviewPreparationStamp(db) !== stamp)
+                  throw new HttpError(
+                    409,
+                    'INTAKE_REVIEW_CHANGED',
+                    'Review changed while verifying its original',
+                  );
+              };
+            },
           },
-        },
-      );
-    }
-    if (id === undefined) continue;
-    assertCurrent();
-    if (prepared.has(id)) continue;
-    await prepareIntakeSourceDependencyHeaders(db, id, { assertRunning: assertCurrent });
-    const source = requiredFile(db, id, true),
-      selected = openIntakeCollectionEnvelope(db, source),
-      details = selected.child(selected.root(), 'intake')!,
-      workflow = selected.child(details, 'workflow');
-    if (workflow && selected.childCount(workflow, 'plans'))
-      await prepareRetainedPlanAccess(db, profileId, id, { assertRunning: assertCurrent });
-    const mappingVersion = () =>
-        workflowHash(
-          activeMappingRules(
-            db,
-            intakeSourceMetadata(db, id).metadata?.sourceProviderId || source.provider_id,
-          ),
-        ),
-      mapping = mappingVersion();
-    const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
-      mappingVersion: mapping,
-      currentMappingVersion: mappingVersion,
-      assertRunning: assertCurrent,
-    });
-    if (ready.state !== 'ready')
-      throw new HttpError(
-        409,
-        'WORKFLOW_PREPARATION_REQUIRED',
-        'Prepare complete selected clinical dependencies',
-      );
-    await prepareCollectionReviewMembership(db, source, { assertRunning: assertCurrent });
-    await prepareReviewQuestionState(db, source, { assertRunning: assertCurrent });
-    if (prepared.size >= 256) prepared.delete(prepared.values().next().value!);
-    prepared.add(id);
-  }
-  assertCurrent();
-  await verify(inputFile);
-  await prepareDuplicateEvidenceIndex(db, { assertRunning: assertCurrent });
-  await prepareOwnershipDecisionIndex(db, { assertRunning: assertCurrent });
+        );
+      if (proposalId && !view.find('proposal', intake, proposalId))
+        throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
+      await verify(original);
+      const inputFile = proposalId ? requiredFile(db, proposalId) : original;
+      if (inputFile.bytes > MAX_INTAKE_BYTES)
+        throw new HttpError(
+          413,
+          'CONVERSION_REQUIRED',
+          'Review a bounded JSONL conversion proposal',
+        );
+      const path = profileOriginal(root, inputFile.path, profileId);
+      await verify(inputFile);
+      const bytes = readFileSync(path);
+      if (
+        bytes.length !== inputFile.bytes ||
+        createHash('sha256').update(bytes).digest('hex') !== inputFile.sha256
+      )
+        throw new HttpError(409, 'SOURCE_CHANGED', 'Review source changed');
+      const validation = validateJSONL(bytes);
+      if (!validation.valid)
+        throw new HttpError(400, 'INVALID_JSONL', 'Convert the original before clinical review');
+      // A small cache removes nearby duplicate evidence without retaining a set
+      // proportional to the installation's accepted source history.
+      const prepared = new Set<string>();
+      let dependencyInspections = 0;
+      for (const id of clinicalSourceScopeDependencyIdsWork(db, original, validation.entries!)) {
+        if (++dependencyInspections % 16 === 0) {
+          await runClinicalReviewWork(
+            (function* () {
+              for (let n = 0; n < 16; n++) yield;
+            })(),
+            {
+              capture() {
+                assertCurrent();
+                const stamp = reviewPreparationStamp(db);
+                if (stamp === undefined)
+                  throw Error('Clinical dependencies cannot cross a transaction');
+                return () => {
+                  assertCurrent();
+                  if (reviewPreparationStamp(db) !== stamp)
+                    throw new HttpError(
+                      409,
+                      'INTAKE_REVIEW_CHANGED',
+                      'Review changed while preparing dependencies',
+                    );
+                };
+              },
+            },
+          );
+        }
+        if (id === undefined) continue;
+        assertCurrent();
+        if (prepared.has(id)) continue;
+        await prepareIntakeSourceDependencyHeaders(db, id, { assertRunning: assertCurrent });
+        const source = requiredFile(db, id, true),
+          selected = openIntakeCollectionEnvelope(db, source),
+          details = selected.child(selected.root(), 'intake')!,
+          workflow = selected.child(details, 'workflow');
+        if (workflow && selected.childCount(workflow, 'plans'))
+          await prepareRetainedPlanAccess(db, profileId, id, { assertRunning: assertCurrent });
+        const mappingVersion = () =>
+            workflowHash(
+              activeMappingRules(
+                db,
+                intakeSourceMetadata(db, id).metadata?.sourceProviderId || source.provider_id,
+              ),
+            ),
+          mapping = mappingVersion();
+        const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
+          mappingVersion: mapping,
+          currentMappingVersion: mappingVersion,
+          assertRunning: assertCurrent,
+        });
+        if (ready.state !== 'ready')
+          throw new HttpError(
+            409,
+            'WORKFLOW_PREPARATION_REQUIRED',
+            'Prepare complete selected clinical dependencies',
+          );
+        await prepareCollectionReviewMembership(db, source, { assertRunning: assertCurrent });
+        await prepareReviewQuestionState(db, source, { assertRunning: assertCurrent });
+        if (prepared.size >= 256) prepared.delete(prepared.values().next().value!);
+        prepared.add(id);
+      }
+      assertCurrent();
+      await verify(inputFile);
+      await prepareDuplicateEvidenceIndex(db, { assertRunning: assertCurrent });
+      await prepareOwnershipDecisionIndex(db, { assertRunning: assertCurrent });
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 /** Pending native migration/index state fails explicitly; this host never falls back to whole-workflow reads. */
 export function prepareCollectionClinicalReview(
@@ -291,35 +306,46 @@ export function prepareCollectionClinicalReview(
 export async function prepareCollectionClinicalReviewAsync(
   ...input: Parameters<typeof prepareCollectionClinicalReviewWork>
 ): Promise<CollectionClinicalReviewResult> {
-  const [db, , profileId] = input;
-  if (db.isTransaction) throw Error('Cooperative clinical review cannot hold a transaction');
-  input[5]?.assertRunning?.();
-  const result = await runClinicalReviewWork(prepareCollectionClinicalReviewWork(...input), {
-    signal: input[5]?.signal,
-    capture() {
+  return runExclusiveClinicalOperation(
+    input[0],
+    async () => {
+      const [db, , profileId] = input;
+      if (db.isTransaction) throw Error('Cooperative clinical review cannot hold a transaction');
       input[5]?.assertRunning?.();
-      assertIntakeOwner(db, profileId);
-      const stamp = reviewPreparationStamp(db);
-      if (stamp === undefined) throw Error('Clinical review authority is unavailable');
-      return () => {
+      const result = await runClinicalReviewWork(prepareCollectionClinicalReviewWork(...input), {
+        signal: input[5]?.signal,
+        capture() {
+          input[5]?.assertRunning?.();
+          assertIntakeOwner(db, profileId);
+          const stamp = reviewPreparationStamp(db);
+          if (stamp === undefined) throw Error('Clinical review authority is unavailable');
+          return () => {
+            input[5]?.assertRunning?.();
+            assertIntakeOwner(db, profileId);
+            if (reviewPreparationStamp(db) !== stamp)
+              throw new HttpError(
+                409,
+                'INTAKE_REVIEW_CHANGED',
+                'Review changed while preparing; refresh this review',
+              );
+          };
+        },
+      });
+      try {
         input[5]?.assertRunning?.();
-        assertIntakeOwner(db, profileId);
-        if (reviewPreparationStamp(db) !== stamp)
-          throw new HttpError(
-            409,
-            'INTAKE_REVIEW_CHANGED',
-            'Review changed while preparing; refresh this review',
-          );
-      };
+        return result;
+      } catch (error) {
+        if (result.status === 'ready') result.session.close();
+        throw error;
+      }
     },
-  });
-  try {
-    input[5]?.assertRunning?.();
-    return result;
-  } catch (error) {
-    if (result.status === 'ready') result.session.close();
-    throw error;
-  }
+    {
+      operation: currentClinicalOperation(input[0]),
+      onDiscardResult: (value) => {
+        if (value.status === 'ready') value.session.close();
+      },
+    },
+  );
 }
 function* prepareCollectionClinicalReviewWork(
   db: DatabaseSync,
@@ -1197,86 +1223,99 @@ export async function readPreparedCollectionClinicalReview(
   proposalId: string | null,
   input: ClinicalReadRequest,
 ): Promise<ClinicalReadResult<ClinicalReadValues[keyof ClinicalReadValues]>> {
-  const attempt = beginPreparedClinicalReviewRead(db);
-  let owned: ClinicalReadSession | undefined;
-  try {
-    if (db.isTransaction) discardPreparedClinicalReviewRead(db);
-    assertIntakeOwner(db, profileId);
-    await prepareCollectionClinicalReviewDependencies(db, root, profileId, intakeId, proposalId);
-    const key = canonicalLiteral([root, profileId, intakeId, proposalId]),
-      stamp = reviewReadStamp(db),
-      preparationStamp = reviewPreparationStamp(db),
-      requestRevision = revision(db),
-      sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
-    let cached = preparedClinicalReviewRead(db);
-    if (
-      cached &&
-      (stamp === undefined ||
-        cached.key !== key ||
-        cached.stamp !== stamp ||
-        cached.sourcePin !== sourcePin ||
-        cached.requestRevision !== requestRevision)
-    ) {
-      if (isPreparedClinicalReviewReadCurrent(db, attempt)) discardPreparedClinicalReviewRead(db);
-      cached = undefined;
-    }
-    if (!cached) {
-      withIntakeWork(db, 'warm', () => recordIntakeWork('collectionPublicClinicalReviews'));
-      const prepared = await prepareCollectionClinicalReviewAsync(
-        db,
-        root,
-        profileId,
-        intakeId,
-        proposalId,
-      );
-      if (prepared.status !== 'ready') return prepared;
-      owned = prepared.session;
-    }
-    const session = cached?.session || owned!;
-    collectionClinicalProjectionContext(session).assertCurrent();
-    const output =
-      input.kind === 'page'
-        ? session.page(input.section, input.options)
-        : input.kind === 'fragment'
-          ? session.fragment(input.reference, input.offset, input.bytes)
-          : session.selectedRecord(input.recordId, input.candidateVersionId, input.bytes);
-    // Detach only emitted bounded transport; no caller gets the private session or record aliases.
-    const value = JSON.parse(JSON.stringify(output), (_key, value, context) =>
-      typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
-        ? JSON.rawJSON(context.source)
-        : value,
-    ) as ClinicalReadValues[keyof ClinicalReadValues];
-    assertIntakeOwner(db, profileId);
-    if (
-      requestRevision !== revision(db) ||
-      sourcePin !== canonicalLiteral(intakeSourceVersion(db, intakeId)) ||
-      (preparationStamp !== undefined && preparationStamp !== reviewPreparationStamp(db))
-    )
-      throw new HttpError(
-        409,
-        'INTAKE_REVIEW_CHANGED',
-        'Review changed while reading; refresh this review',
-      );
-    const completedStamp = reviewReadStamp(db);
-    if (
-      completedStamp !== undefined &&
-      !cached &&
-      isPreparedClinicalReviewReadCurrent(db, attempt)
-    ) {
-      retainPreparedClinicalReviewRead(db, {
-        key,
-        stamp: completedStamp,
-        sourcePin,
-        requestRevision,
-        session,
-      });
-      owned = undefined;
-    }
-    return { status: 'ready', value };
-  } catch (error) {
-    if (isPreparedClinicalReviewReadCurrent(db, attempt)) discardPreparedClinicalReviewRead(db);
-    throw error;
-  } finally {
-    owned?.close();
-  }
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      const attempt = beginPreparedClinicalReviewRead(db);
+      let owned: ClinicalReadSession | undefined;
+      try {
+        if (db.isTransaction) discardPreparedClinicalReviewRead(db);
+        assertIntakeOwner(db, profileId);
+        await prepareCollectionClinicalReviewDependencies(
+          db,
+          root,
+          profileId,
+          intakeId,
+          proposalId,
+        );
+        const key = canonicalLiteral([root, profileId, intakeId, proposalId]),
+          stamp = reviewReadStamp(db),
+          preparationStamp = reviewPreparationStamp(db),
+          requestRevision = revision(db),
+          sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
+        let cached = preparedClinicalReviewRead(db);
+        if (
+          cached &&
+          (stamp === undefined ||
+            cached.key !== key ||
+            cached.stamp !== stamp ||
+            cached.sourcePin !== sourcePin ||
+            cached.requestRevision !== requestRevision)
+        ) {
+          if (isPreparedClinicalReviewReadCurrent(db, attempt))
+            discardPreparedClinicalReviewRead(db);
+          cached = undefined;
+        }
+        if (!cached) {
+          withIntakeWork(db, 'warm', () => recordIntakeWork('collectionPublicClinicalReviews'));
+          const prepared = await prepareCollectionClinicalReviewAsync(
+            db,
+            root,
+            profileId,
+            intakeId,
+            proposalId,
+          );
+          if (prepared.status !== 'ready') return prepared;
+          owned = prepared.session;
+        }
+        const session = cached?.session || owned!;
+        collectionClinicalProjectionContext(session).assertCurrent();
+        const output =
+          input.kind === 'page'
+            ? session.page(input.section, input.options)
+            : input.kind === 'fragment'
+              ? session.fragment(input.reference, input.offset, input.bytes)
+              : session.selectedRecord(input.recordId, input.candidateVersionId, input.bytes);
+        // Detach only emitted bounded transport; no caller gets the private session or record aliases.
+        const value = JSON.parse(JSON.stringify(output), (_key, value, context) =>
+          typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
+            ? JSON.rawJSON(context.source)
+            : value,
+        ) as ClinicalReadValues[keyof ClinicalReadValues];
+        assertIntakeOwner(db, profileId);
+        if (
+          requestRevision !== revision(db) ||
+          sourcePin !== canonicalLiteral(intakeSourceVersion(db, intakeId)) ||
+          (preparationStamp !== undefined && preparationStamp !== reviewPreparationStamp(db))
+        )
+          throw new HttpError(
+            409,
+            'INTAKE_REVIEW_CHANGED',
+            'Review changed while reading; refresh this review',
+          );
+        const completedStamp = reviewReadStamp(db);
+        if (
+          completedStamp !== undefined &&
+          !cached &&
+          isPreparedClinicalReviewReadCurrent(db, attempt)
+        ) {
+          retainPreparedClinicalReviewRead(db, {
+            key,
+            stamp: completedStamp,
+            sourcePin,
+            requestRevision,
+            session,
+          });
+          owned = undefined;
+        }
+        return { status: 'ready', value };
+      } catch (error) {
+        if (isPreparedClinicalReviewReadCurrent(db, attempt)) discardPreparedClinicalReviewRead(db);
+        throw error;
+      } finally {
+        owned?.close();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }

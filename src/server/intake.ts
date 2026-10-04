@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { latestReviewDraftResolution } from './intake-review-draft-selection.ts';
 import { cachedSourceContextVersions } from './intake-source-context-classification.ts';
 import {
@@ -1955,25 +1956,42 @@ export async function reviewIntakeRead(
     bytes?: number;
   } = {},
 ) {
-  owner(db, profileId);
-  if (!hasCollectionIntakeSchema(db, row(db, id)))
-    return reviewIntake(db, root, profileId, id, proposalId);
-  const { readPreparedCollectionClinicalReview } =
-    await import('./intake-review-collection-host.ts');
-  const result = await readPreparedCollectionClinicalReview(db, root, profileId, id, proposalId, {
-    kind: 'page',
-    section: options.section ?? 'records',
-    options: { cursor: options.cursor, items: options.items ?? 40, bytes: options.bytes ?? 65536 },
-  });
-  if (result.status === 'fragment_required')
-    return {
-      format: 'health-intake-clinical-review-pending-v2' as const,
-      intakeId: id,
-      proposalId,
-      reason: 'selected_evidence_requires_fragments' as const,
-      reference: result.reference,
-    };
-  return result.value;
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      owner(db, profileId);
+      if (!hasCollectionIntakeSchema(db, row(db, id)))
+        return reviewIntake(db, root, profileId, id, proposalId);
+      const { readPreparedCollectionClinicalReview } =
+        await import('./intake-review-collection-host.ts');
+      const result = await readPreparedCollectionClinicalReview(
+        db,
+        root,
+        profileId,
+        id,
+        proposalId,
+        {
+          kind: 'page',
+          section: options.section ?? 'records',
+          options: {
+            cursor: options.cursor,
+            items: options.items ?? 40,
+            bytes: options.bytes ?? 65536,
+          },
+        },
+      );
+      if (result.status === 'fragment_required')
+        return {
+          format: 'health-intake-clinical-review-pending-v2' as const,
+          intakeId: id,
+          proposalId,
+          reason: 'selected_evidence_requires_fragments' as const,
+          reference: result.reference,
+        };
+      return result.value;
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function readIntakeReviewFragment(
   db: DatabaseSync,
@@ -1987,35 +2005,44 @@ export async function readIntakeReviewFragment(
     bytes?: number;
   },
 ) {
-  owner(db, profileId);
-  if (!input.reference || input.reference.format !== 'health-intake-clinical-review-reference-v2')
-    throw new HttpError(
-      400,
-      'REVIEW_FRAGMENT',
-      'Use a reference from the current clinical review page',
-    );
-  const { readPreparedCollectionClinicalReview } =
-    await import('./intake-review-collection-host.ts');
-  const result = await readPreparedCollectionClinicalReview(
+  return runExclusiveClinicalOperation(
     db,
-    root,
-    profileId,
-    id,
-    input.proposalId ?? null,
-    {
-      kind: 'fragment',
-      reference: input.reference,
-      offset: input.offset ?? 0,
-      bytes: input.bytes ?? 32768,
+    async () => {
+      owner(db, profileId);
+      if (
+        !input.reference ||
+        input.reference.format !== 'health-intake-clinical-review-reference-v2'
+      )
+        throw new HttpError(
+          400,
+          'REVIEW_FRAGMENT',
+          'Use a reference from the current clinical review page',
+        );
+      const { readPreparedCollectionClinicalReview } =
+        await import('./intake-review-collection-host.ts');
+      const result = await readPreparedCollectionClinicalReview(
+        db,
+        root,
+        profileId,
+        id,
+        input.proposalId ?? null,
+        {
+          kind: 'fragment',
+          reference: input.reference,
+          offset: input.offset ?? 0,
+          bytes: input.bytes ?? 32768,
+        },
+      );
+      if (result.status !== 'ready')
+        throw new HttpError(
+          409,
+          'REVIEW_FRAGMENT',
+          'Prepare the selected clinical evidence before reading this fragment',
+        );
+      return result.value;
     },
+    { operation: currentClinicalOperation(db) },
   );
-  if (result.status !== 'ready')
-    throw new HttpError(
-      409,
-      'REVIEW_FRAGMENT',
-      'Prepare the selected clinical evidence before reading this fragment',
-    );
-  return result.value;
 }
 
 export async function readIntakeReviewRecord(
@@ -2030,55 +2057,65 @@ export async function readIntakeReviewRecord(
     bytes?: number;
   },
 ): Promise<import('../shared/intake-clinical-review.ts').IntakeClinicalRecordRead> {
-  owner(db, profileId);
-  const recordId = safeText(input.recordId, 'review record', 2000);
-  if (!recordId)
-    throw new HttpError(400, 'REVIEW_RECORD', 'Select an exact clinical review record');
-  if (hasCollectionIntakeSchema(db, row(db, id))) {
-    const { readPreparedCollectionClinicalReview } =
-      await import('./intake-review-collection-host.ts');
-    const result = await readPreparedCollectionClinicalReview(
-      db,
-      root,
-      profileId,
-      id,
-      input.proposalId ?? null,
-      {
-        kind: 'record',
-        recordId,
-        candidateVersionId: input.candidateVersionId,
-        bytes: input.bytes,
-      },
-    );
-    if (result.status !== 'ready')
-      throw new HttpError(
-        409,
-        'REVIEW_PREPARATION_REQUIRED',
-        'Prepare the selected clinical evidence before reading it',
-      );
-    return result.value;
-  }
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      owner(db, profileId);
+      const recordId = safeText(input.recordId, 'review record', 2000);
+      if (!recordId)
+        throw new HttpError(400, 'REVIEW_RECORD', 'Select an exact clinical review record');
+      if (hasCollectionIntakeSchema(db, row(db, id))) {
+        const { readPreparedCollectionClinicalReview } =
+          await import('./intake-review-collection-host.ts');
+        const result = await readPreparedCollectionClinicalReview(
+          db,
+          root,
+          profileId,
+          id,
+          input.proposalId ?? null,
+          {
+            kind: 'record',
+            recordId,
+            candidateVersionId: input.candidateVersionId,
+            bytes: input.bytes,
+          },
+        );
+        if (result.status !== 'ready')
+          throw new HttpError(
+            409,
+            'REVIEW_PREPARATION_REQUIRED',
+            'Prepare the selected clinical evidence before reading it',
+          );
+        return result.value;
+      }
 
-  const review = reviewIntake(db, root, profileId, id, input.proposalId ?? null);
-  const record = review.records.find((record) => record.id === recordId);
-  if (
-    !record ||
-    (input.candidateVersionId !== undefined &&
-      record.candidateVersionId !== input.candidateVersionId)
-  )
-    throw new HttpError(409, 'REVIEW_CHANGED', 'This record changed. Refresh the selected review');
-  return {
-    format: 'health-intake-clinical-record-v2',
-    context: {
-      intakeId: review.intakeId,
-      proposalId: review.proposalId,
-      version: review.version,
-      reviewToken: review.reviewToken,
-      sourceTextStale: review.sourceTextStale,
-      summary: review.summary,
+      const review = reviewIntake(db, root, profileId, id, input.proposalId ?? null);
+      const record = review.records.find((record) => record.id === recordId);
+      if (
+        !record ||
+        (input.candidateVersionId !== undefined &&
+          record.candidateVersionId !== input.candidateVersionId)
+      )
+        throw new HttpError(
+          409,
+          'REVIEW_CHANGED',
+          'This record changed. Refresh the selected review',
+        );
+      return {
+        format: 'health-intake-clinical-record-v2',
+        context: {
+          intakeId: review.intakeId,
+          proposalId: review.proposalId,
+          version: review.version,
+          reviewToken: review.reviewToken,
+          sourceTextStale: review.sourceTextStale,
+          summary: review.summary,
+        },
+        record: { kind: 'record', record },
+      };
     },
-    record: { kind: 'record', record },
-  };
+    { operation: currentClinicalOperation(db) },
+  );
 }
 /** Prepare one immutable original/workflow/identity context for several exact proposal reviews. */
 export function createIntakeReviewSession(
@@ -2392,236 +2429,249 @@ export async function importIntakeRead(
   input: ImportIntakeInput,
   options?: PersistenceOptions,
 ) {
-  owner(db, profileId);
-  const file = row(db, id);
-  if (!hasCollectionIntakeSchema(db, file))
-    return importIntake(db, root, profileId, id, input, options);
-  const view = openIntakeCollectionEnvelope(db, file),
-    intake = view.child(view.root(), 'intake')!,
-    selected = input.proposalId || null,
-    decisionFingerprint = hash(
-      canonicalLiteral({ proposalId: selected, decisions: input.decisions || [] }),
-    );
-  const scalar = (name: string): unknown => {
-    const value = view.field(intake, name, { bytes: 16384 });
-    if (value.kind === 'fragmented') throw Error('Invalid bounded acceptance header');
-    return value.kind === 'value' ? value.value : undefined;
-  };
-  const response = () => ({
-    ...getIntakeRead(db, root, profileId, id),
-    durability: flushIntake(db, root, profileId, options),
-  });
-  if (
-    view.child(intake, 'imported') &&
-    scalar('acceptedProposalId') === selected &&
-    (!input.reviewToken || input.reviewToken === scalar('lastReviewToken'))
-  ) {
-    if (
-      (input.reviewToken || input.decisions?.length) &&
-      scalar('lastDecisionFingerprint') !== decisionFingerprint
-    )
-      throw new HttpError(
-        409,
-        'OPERATION_CONFLICT',
-        'This accepted review belongs to different decisions; load a fresh review',
-      );
-    return response();
-  }
-  checkVersion(db, file, input.version);
-  const pairPreparation = observeIntakePairPreparation(db);
-  try {
-    for (const decision of input.decisions || [])
-      for (const comparison of decision.comparisons || [])
-        pairPreparation.capture(comparison.scope, input.version);
-    return await withVerifiedIntakeOriginalDescriptor(
-      { db, root, profileId, id },
-      async ({ assertRunning: assertSource }) => {
-        const assertRunning = () => {
-          assertSource();
-          pairPreparation.assertCurrent();
-        };
-        const { prepareRetainedPlanAccess, readRetainedPlanEvidence, prepareRetainedPlanDerived } =
-            await import('./intake-retained-plan.ts'),
-          { prepareCollectionWorkflowReadiness } = await import('./intake-workflow-readiness.ts'),
-          { prepareCollectionClinicalReviewAsync } =
-            await import('./intake-review-collection-host.ts'),
-          { collectionClinicalProjectionContext } =
-            await import('./intake-review-collection-session.ts'),
-          { prepareNativeIntakeAcceptance } = await import('./intake-collection-acceptance.ts'),
-          { prepareSourceContextClassificationDerived } =
-            await import('./intake-source-context-state.ts'),
-          { prepareWorkflowAcceptanceDerived } = await import('./intake-workflow-update.ts'),
-          { prepareIntakeLookupIndices, assertIntakeDiscoveryRevision } =
-            await import('./intake-lookup-projection.ts'),
-          { buildReportContextLookup } = await import('./intake-report-context.ts');
-        await prepareRetainedPlanAccess(db, profileId, id, { assertRunning });
-        const mappingVersion = () =>
-            workflowHash(
-              activeMappingRules(
-                db,
-                intakeSourceMetadata(db, id).metadata?.sourceProviderId || file.provider_id,
-              ),
-            ),
-          selectedMappingVersion = mappingVersion(),
-          ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
-            mappingVersion: selectedMappingVersion,
-            currentMappingVersion: mappingVersion,
-            assertRunning,
-          });
-        if (ready.state !== 'ready')
-          throw new HttpError(
-            409,
-            'WORKFLOW_PREPARATION_REQUIRED',
-            'Prepare the complete retained review before accepting records.',
-          );
-        const lookup = await prepareIntakeLookupIndices(db, { assertRunning });
-        const { prepareCollectionClinicalReviewDependencies } =
-          await import('./intake-review-collection-host.ts');
-        await prepareCollectionClinicalReviewDependencies(db, root, profileId, id, selected, {
-          assertRunning,
-        });
-        const session = await prepareCollectionClinicalReviewAsync(
-          db,
-          root,
-          profileId,
-          id,
-          selected,
-          {
-            assertRunning,
-          },
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      owner(db, profileId);
+      const file = row(db, id);
+      if (!hasCollectionIntakeSchema(db, file))
+        return importIntake(db, root, profileId, id, input, options);
+      const view = openIntakeCollectionEnvelope(db, file),
+        intake = view.child(view.root(), 'intake')!,
+        selected = input.proposalId || null,
+        decisionFingerprint = hash(
+          canonicalLiteral({ proposalId: selected, decisions: input.decisions || [] }),
         );
-        if (session.status !== 'ready')
+      const scalar = (name: string): unknown => {
+        const value = view.field(intake, name, { bytes: 16384 });
+        if (value.kind === 'fragmented') throw Error('Invalid bounded acceptance header');
+        return value.kind === 'value' ? value.value : undefined;
+      };
+      const response = () => ({
+        ...getIntakeRead(db, root, profileId, id),
+        durability: flushIntake(db, root, profileId, options),
+      });
+      if (
+        view.child(intake, 'imported') &&
+        scalar('acceptedProposalId') === selected &&
+        (!input.reviewToken || input.reviewToken === scalar('lastReviewToken'))
+      ) {
+        if (
+          (input.reviewToken || input.decisions?.length) &&
+          scalar('lastDecisionFingerprint') !== decisionFingerprint
+        )
           throw new HttpError(
             409,
-            'REVIEW_PREPARATION_REQUIRED',
-            'Prepare the selected clinical evidence before accepting records.',
+            'OPERATION_CONFLICT',
+            'This accepted review belongs to different decisions; load a fresh review',
           );
-        try {
-          const context = collectionClinicalProjectionContext(session.session),
-            reportEvidence = readRetainedPlanEvidence(db, profileId, id),
-            operationId = randomUUID(),
-            fingerprint = workflowHash(input);
-          let discoveryOrder = maximumReportDiscoveryOrder(db),
-            assertDerived: (() => void) | undefined;
-          const { prepareClinicalSourceFingerprintIndex } =
-            await import('./intake-clinical-source-index.ts');
-          await prepareClinicalSourceFingerprintIndex(db, { assertRunning });
-          const decisions = (input.decisions || []).map((decision) => ({
-            ...decision,
-            comparisons: decision.comparisons?.map((comparison) => {
-              if (comparison.scope?.format !== 'intake-pair-scope-v2') return comparison;
-              const record = session.session.record(decision.recordId);
-              const incoming = record?.comparisonReference;
-              const current =
-                incoming && record
-                  ? intakePairScope(
-                      db,
-                      { ...incoming, id: record.id, evidence: record.evidence },
-                      nativeDuplicateRecord(db, incoming.kind, comparison.otherRecordId),
-                      record.comparisonContextHash
-                        ? {
-                            intakeVersion: session.session.review.version,
-                            contextHash: record.comparisonContextHash,
-                          }
-                        : undefined,
-                    )
-                  : undefined;
-              return { ...comparison, scope: pairPreparation.refresh(comparison.scope, current) };
-            }),
-          }));
-          const prepared = await prepareNativeIntakeAcceptance(db, root, profileId, {
-            session: session.session,
-            expectedVersion: input.version,
-            reviewToken: input.reviewToken || undefined,
-            decisions,
-            requestDecisionFingerprint: decisionFingerprint,
-            operationId,
-            fingerprint,
-            reportEvidence: {
-              packageEvidence: reportEvidence.packageEvidence,
-              hasMember: reportEvidence.hasMember,
-              contextLookup: buildReportContextLookup(context.proposal.entries),
-            },
-            nextDiscoveryOrder: () => ++discoveryOrder,
-            assertRunning,
-            async prepareDerived(derived) {
-              const candidates = new Map(
-                derived.affected.candidateChanges.map((item) => [item.versionAddress, item]),
-              );
-              for (const item of derived.acceptance.candidateChanges)
-                if (candidates.get(item.versionAddress)?.kind !== 'append')
-                  candidates.set(item.versionAddress, item);
-              const affected = {
-                  ...derived.affected,
-                  candidateChanges: [...candidates.values()],
-                  questionAddresses: [
-                    ...new Set([
-                      ...derived.affected.questionAddresses,
-                      ...derived.acceptance.questionAddresses,
-                    ]),
-                  ],
-                },
-                plans = await prepareRetainedPlanDerived(db, profileId, id, {
-                  ...derived,
-                  impact: { kind: 'proposal' },
-                }),
-                classifier = await prepareSourceContextClassificationDerived(
-                  db,
-                  root,
-                  profileId,
-                  id,
-                  {
-                    ...derived,
-                    affected,
-                    impact: 'proposal',
-                    assertRunning,
-                  },
-                );
-              if (classifier.state !== 'ready')
-                throw Error('Acceptance classification changed during preparation');
-              assertDerived = classifier.assertPublicationCurrent;
-              const result = await prepareWorkflowAcceptanceDerived(db, file, {
-                ...derived,
-                affected,
+        return response();
+      }
+      checkVersion(db, file, input.version);
+      const pairPreparation = observeIntakePairPreparation(db);
+      try {
+        for (const decision of input.decisions || [])
+          for (const comparison of decision.comparisons || [])
+            pairPreparation.capture(comparison.scope, input.version);
+        return await withVerifiedIntakeOriginalDescriptor(
+          { db, root, profileId, id },
+          async ({ assertRunning: assertSource }) => {
+            const assertRunning = () => {
+              assertSource();
+              pairPreparation.assertCurrent();
+            };
+            const {
+                prepareRetainedPlanAccess,
+                readRetainedPlanEvidence,
+                prepareRetainedPlanDerived,
+              } = await import('./intake-retained-plan.ts'),
+              { prepareCollectionWorkflowReadiness } =
+                await import('./intake-workflow-readiness.ts'),
+              { prepareCollectionClinicalReviewAsync } =
+                await import('./intake-review-collection-host.ts'),
+              { collectionClinicalProjectionContext } =
+                await import('./intake-review-collection-session.ts'),
+              { prepareNativeIntakeAcceptance } = await import('./intake-collection-acceptance.ts'),
+              { prepareSourceContextClassificationDerived } =
+                await import('./intake-source-context-state.ts'),
+              { prepareWorkflowAcceptanceDerived } = await import('./intake-workflow-update.ts'),
+              { prepareIntakeLookupIndices, assertIntakeDiscoveryRevision } =
+                await import('./intake-lookup-projection.ts'),
+              { buildReportContextLookup } = await import('./intake-report-context.ts');
+            await prepareRetainedPlanAccess(db, profileId, id, { assertRunning });
+            const mappingVersion = () =>
+                workflowHash(
+                  activeMappingRules(
+                    db,
+                    intakeSourceMetadata(db, id).metadata?.sourceProviderId || file.provider_id,
+                  ),
+                ),
+              selectedMappingVersion = mappingVersion(),
+              ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
                 mappingVersion: selectedMappingVersion,
                 currentMappingVersion: mappingVersion,
-                isSourceContextVersion: classifier.isSourceContextVersion,
-                additionalVersionIds: classifier.additionalVersionIds,
-                assertRunning: () => {
-                  assertRunning();
-                  classifier.assertCurrent();
+                assertRunning,
+              });
+            if (ready.state !== 'ready')
+              throw new HttpError(
+                409,
+                'WORKFLOW_PREPARATION_REQUIRED',
+                'Prepare the complete retained review before accepting records.',
+              );
+            const lookup = await prepareIntakeLookupIndices(db, { assertRunning });
+            const { prepareCollectionClinicalReviewDependencies } =
+              await import('./intake-review-collection-host.ts');
+            await prepareCollectionClinicalReviewDependencies(db, root, profileId, id, selected, {
+              assertRunning,
+            });
+            const session = await prepareCollectionClinicalReviewAsync(
+              db,
+              root,
+              profileId,
+              id,
+              selected,
+              {
+                assertRunning,
+              },
+            );
+            if (session.status !== 'ready')
+              throw new HttpError(
+                409,
+                'REVIEW_PREPARATION_REQUIRED',
+                'Prepare the selected clinical evidence before accepting records.',
+              );
+            try {
+              const context = collectionClinicalProjectionContext(session.session),
+                reportEvidence = readRetainedPlanEvidence(db, profileId, id),
+                operationId = randomUUID(),
+                fingerprint = workflowHash(input);
+              let discoveryOrder = maximumReportDiscoveryOrder(db),
+                assertDerived: (() => void) | undefined;
+              const { prepareClinicalSourceFingerprintIndex } =
+                await import('./intake-clinical-source-index.ts');
+              await prepareClinicalSourceFingerprintIndex(db, { assertRunning });
+              const decisions = (input.decisions || []).map((decision) => ({
+                ...decision,
+                comparisons: decision.comparisons?.map((comparison) => {
+                  if (comparison.scope?.format !== 'intake-pair-scope-v2') return comparison;
+                  const record = session.session.record(decision.recordId);
+                  const incoming = record?.comparisonReference;
+                  const current =
+                    incoming && record
+                      ? intakePairScope(
+                          db,
+                          { ...incoming, id: record.id, evidence: record.evidence },
+                          nativeDuplicateRecord(db, incoming.kind, comparison.otherRecordId),
+                          record.comparisonContextHash
+                            ? {
+                                intakeVersion: session.session.review.version,
+                                contextHash: record.comparisonContextHash,
+                              }
+                            : undefined,
+                        )
+                      : undefined;
+                  return {
+                    ...comparison,
+                    scope: pairPreparation.refresh(comparison.scope, current),
+                  };
+                }),
+              }));
+              const prepared = await prepareNativeIntakeAcceptance(db, root, profileId, {
+                session: session.session,
+                expectedVersion: input.version,
+                reviewToken: input.reviewToken || undefined,
+                decisions,
+                requestDecisionFingerprint: decisionFingerprint,
+                operationId,
+                fingerprint,
+                reportEvidence: {
+                  packageEvidence: reportEvidence.packageEvidence,
+                  hasMember: reportEvidence.hasMember,
+                  contextLookup: buildReportContextLookup(context.proposal.entries),
+                },
+                nextDiscoveryOrder: () => ++discoveryOrder,
+                assertRunning,
+                async prepareDerived(derived) {
+                  const candidates = new Map(
+                    derived.affected.candidateChanges.map((item) => [item.versionAddress, item]),
+                  );
+                  for (const item of derived.acceptance.candidateChanges)
+                    if (candidates.get(item.versionAddress)?.kind !== 'append')
+                      candidates.set(item.versionAddress, item);
+                  const affected = {
+                      ...derived.affected,
+                      candidateChanges: [...candidates.values()],
+                      questionAddresses: [
+                        ...new Set([
+                          ...derived.affected.questionAddresses,
+                          ...derived.acceptance.questionAddresses,
+                        ]),
+                      ],
+                    },
+                    plans = await prepareRetainedPlanDerived(db, profileId, id, {
+                      ...derived,
+                      impact: { kind: 'proposal' },
+                    }),
+                    classifier = await prepareSourceContextClassificationDerived(
+                      db,
+                      root,
+                      profileId,
+                      id,
+                      {
+                        ...derived,
+                        affected,
+                        impact: 'proposal',
+                        assertRunning,
+                      },
+                    );
+                  if (classifier.state !== 'ready')
+                    throw Error('Acceptance classification changed during preparation');
+                  assertDerived = classifier.assertPublicationCurrent;
+                  const result = await prepareWorkflowAcceptanceDerived(db, file, {
+                    ...derived,
+                    affected,
+                    mappingVersion: selectedMappingVersion,
+                    currentMappingVersion: mappingVersion,
+                    isSourceContextVersion: classifier.isSourceContextVersion,
+                    additionalVersionIds: classifier.additionalVersionIds,
+                    assertRunning: () => {
+                      assertRunning();
+                      classifier.assertCurrent();
+                    },
+                  });
+                  return {
+                    changes: [...plans, ...classifier.changes, ...result.changes],
+                    needsReview: result.needsReview,
+                  };
                 },
               });
-              return {
-                changes: [...plans, ...classifier.changes, ...result.changes],
-                needsReview: result.needsReview,
-              };
-            },
-          });
-          if (!prepared.prepared) throw Error('Unexpected private acceptance replay');
-          try {
-            intakeTransaction(
-              db,
-              () => {
-                assertRunning();
-                assertDerived?.();
-                assertIntakeDiscoveryRevision(db, lookup.discoveryRevision);
-                prepared.apply();
-              },
-              { operationId, fingerprint },
-            );
-          } finally {
-            prepared.dispose();
-          }
-          return response();
-        } finally {
-          session.session.close();
-        }
-      },
-    );
-  } finally {
-    pairPreparation.dispose();
-  }
+              if (!prepared.prepared) throw Error('Unexpected private acceptance replay');
+              try {
+                intakeTransaction(
+                  db,
+                  () => {
+                    assertRunning();
+                    assertDerived?.();
+                    assertIntakeDiscoveryRevision(db, lookup.discoveryRevision);
+                    prepared.apply();
+                  },
+                  { operationId, fingerprint },
+                );
+              } finally {
+                prepared.dispose();
+              }
+              return response();
+            } finally {
+              session.session.close();
+            }
+          },
+        );
+      } finally {
+        pairPreparation.dispose();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 
 /** Prepare exact reviewed evidence without writing; callers apply inside one intake transaction. */
@@ -3864,36 +3914,42 @@ export async function getIntakeReportSourceReviewRead(
   view: string,
   options: { cursor?: string; sourceCursor?: string; evidenceCursor?: string; limit?: number } = {},
 ) {
-  owner(db, profileId);
-  const file = row(db, id);
-  if (!hasCollectionIntakeSchema(db, file))
-    return getIntakeReportSourceReview(db, root, profileId, id, groupId, view);
-  if (!['active', 'deferred', 'all'].includes(view))
-    throw new HttpError(400, 'REPORT_SOURCE_SCOPE', 'Choose active, deferred or all records');
-  const { readNativeReportSourceReview } = await import('./intake-report-source-review.ts'),
-    { prepareCollectionWorkflowReadiness } = await import('./intake-workflow-readiness.ts');
-  const mappingVersion = () =>
-    workflowHash(
-      activeMappingRules(
-        db,
-        intakeSourceMetadata(db, id).metadata?.sourceProviderId || file.provider_id,
-      ),
-    );
-  const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
-    mappingVersion: mappingVersion(),
-    currentMappingVersion: mappingVersion,
-  });
-  if (ready.state !== 'ready')
-    throw new HttpError(
-      409,
-      'WORKFLOW_PREPARATION_REQUIRED',
-      'Prepare the retained report evidence before reviewing its source.',
-    );
-  return readNativeReportSourceReview(db, root, profileId, file, {
-    groupId: safeText(groupId, 'report group ID', 2000),
-    view: view as IntakeReportQueueView,
-    ...options,
-  });
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      owner(db, profileId);
+      const file = row(db, id);
+      if (!hasCollectionIntakeSchema(db, file))
+        return getIntakeReportSourceReview(db, root, profileId, id, groupId, view);
+      if (!['active', 'deferred', 'all'].includes(view))
+        throw new HttpError(400, 'REPORT_SOURCE_SCOPE', 'Choose active, deferred or all records');
+      const { readNativeReportSourceReview } = await import('./intake-report-source-review.ts'),
+        { prepareCollectionWorkflowReadiness } = await import('./intake-workflow-readiness.ts');
+      const mappingVersion = () =>
+        workflowHash(
+          activeMappingRules(
+            db,
+            intakeSourceMetadata(db, id).metadata?.sourceProviderId || file.provider_id,
+          ),
+        );
+      const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
+        mappingVersion: mappingVersion(),
+        currentMappingVersion: mappingVersion,
+      });
+      if (ready.state !== 'ready')
+        throw new HttpError(
+          409,
+          'WORKFLOW_PREPARATION_REQUIRED',
+          'Prepare the retained report evidence before reviewing its source.',
+        );
+      return readNativeReportSourceReview(db, root, profileId, file, {
+        groupId: safeText(groupId, 'report group ID', 2000),
+        view: view as IntakeReportQueueView,
+        ...options,
+      });
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function readIntakeReportSourceFragment(
   db: DatabaseSync,
@@ -3904,9 +3960,16 @@ export async function readIntakeReportSourceFragment(
     limit?: number;
   },
 ) {
-  owner(db, profileId);
-  const { readNativeReportSourceScopeFragment } = await import('./intake-report-source-review.ts');
-  return readNativeReportSourceScopeFragment(db, profileId, row(db, id), input);
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      owner(db, profileId);
+      const { readNativeReportSourceScopeFragment } =
+        await import('./intake-report-source-review.ts');
+      return readNativeReportSourceScopeFragment(db, profileId, row(db, id), input);
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export function confirmIntakeReportSource(
   db: DatabaseSync,
@@ -4088,123 +4151,135 @@ export async function confirmIntakeReportSourceRead(
   id: string,
   input: ReportSourceUpdateInput,
 ) {
-  owner(db, profileId);
-  const file = row(db, id);
-  if (!hasCollectionIntakeSchema(db, file))
-    return confirmIntakeReportSource(db, root, profileId, id, input);
-  if (!input.operationId)
-    throw new HttpError(400, 'OPERATION_ID', 'A stable report source operation ID is required');
-  const { retainedIntakeWorkflowCommand } = await import('./intake-workflow-command.ts'),
-    { readNativeReportSourceReceipt } = await import('./intake-report-source-state.ts'),
-    { version: _version, ...request } = input;
-  const result = () => ({
-    format: 'health-intake-report-source-result-v2' as const,
-    intake: {
-      ...getIntakeRead(db, root, profileId, id),
-      durability: flushIntake(db, root, profileId),
-    },
-    confirmation: readNativeReportSourceReceipt(db, row(db, id), input.operationId!),
-  });
-  if (retainedIntakeWorkflowCommand(db, file, { operationId: input.operationId, request }))
-    return result();
-  checkVersion(db, file, input.version);
-  return withVerifiedIntakeOriginalDescriptor(
-    { db, root, profileId, id },
-    async ({ assertRunning }) => {
-      const { prepareNativeReportSourceCommand } =
-          await import('./intake-report-source-command.ts'),
-        { prepareCollectionWorkflowReadiness } = await import('./intake-workflow-readiness.ts'),
-        { prepareRetainedPlanDerived } = await import('./intake-retained-plan.ts'),
-        { prepareWorkflowCommandDerived } = await import('./intake-workflow-update.ts'),
-        { prepareSourceContextClassificationDerived } =
-          await import('./intake-source-context-state.ts');
-      const mappingVersion = () =>
-          workflowHash(
-            activeMappingRules(
-              db,
-              intakeSourceMetadata(db, id).metadata?.sourceProviderId || file.provider_id,
-            ),
-          ),
-        ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
-          mappingVersion: mappingVersion(),
-          currentMappingVersion: mappingVersion,
-          assertRunning,
-        });
-      if (ready.state !== 'ready')
-        throw new HttpError(
-          409,
-          'WORKFLOW_PREPARATION_REQUIRED',
-          'Prepare retained review evidence before confirming its source.',
-        );
-      let assertDerived: (() => void) | undefined;
-      const prepared = await prepareNativeReportSourceCommand(db, file, input, {
-        profileId,
-        createdAt: now(),
-        assertRunning,
-        needsReview: ready.counts.needsReview,
-        async prepareDerived(derived) {
-          const plans = await prepareRetainedPlanDerived(db, profileId, id, {
-              ...derived,
-              impact: { kind: 'link' },
-            }),
-            classifier = await prepareSourceContextClassificationDerived(db, root, profileId, id, {
-              ...derived,
-              impact: 'metadata',
-              affected: {
-                candidateChanges: [],
-                questionAddresses: [],
-                reportGroupAddresses: [],
-                proposalIds: [],
-              },
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      owner(db, profileId);
+      const file = row(db, id);
+      if (!hasCollectionIntakeSchema(db, file))
+        return confirmIntakeReportSource(db, root, profileId, id, input);
+      if (!input.operationId)
+        throw new HttpError(400, 'OPERATION_ID', 'A stable report source operation ID is required');
+      const { retainedIntakeWorkflowCommand } = await import('./intake-workflow-command.ts'),
+        { readNativeReportSourceReceipt } = await import('./intake-report-source-state.ts'),
+        { version: _version, ...request } = input;
+      const result = () => ({
+        format: 'health-intake-report-source-result-v2' as const,
+        intake: {
+          ...getIntakeRead(db, root, profileId, id),
+          durability: flushIntake(db, root, profileId),
+        },
+        confirmation: readNativeReportSourceReceipt(db, row(db, id), input.operationId!),
+      });
+      if (retainedIntakeWorkflowCommand(db, file, { operationId: input.operationId, request }))
+        return result();
+      checkVersion(db, file, input.version);
+      return withVerifiedIntakeOriginalDescriptor(
+        { db, root, profileId, id },
+        async ({ assertRunning }) => {
+          const { prepareNativeReportSourceCommand } =
+              await import('./intake-report-source-command.ts'),
+            { prepareCollectionWorkflowReadiness } = await import('./intake-workflow-readiness.ts'),
+            { prepareRetainedPlanDerived } = await import('./intake-retained-plan.ts'),
+            { prepareWorkflowCommandDerived } = await import('./intake-workflow-update.ts'),
+            { prepareSourceContextClassificationDerived } =
+              await import('./intake-source-context-state.ts');
+          const mappingVersion = () =>
+              workflowHash(
+                activeMappingRules(
+                  db,
+                  intakeSourceMetadata(db, id).metadata?.sourceProviderId || file.provider_id,
+                ),
+              ),
+            ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
+              mappingVersion: mappingVersion(),
+              currentMappingVersion: mappingVersion,
               assertRunning,
             });
-          if (classifier.state !== 'ready')
-            throw Error('Source classification changed during confirmation');
-          assertDerived = classifier.assertPublicationCurrent;
-          const changes = await prepareWorkflowCommandDerived(db, file, {
-            ...derived,
-            impact: 'metadata',
-            affected: {
-              candidateChanges: [],
-              questionAddresses: [],
-              reportGroupAddresses: [],
-              proposalIds: [],
-            },
-            mappingVersion: mappingVersion(),
-            currentMappingVersion: mappingVersion,
-            isSourceContextVersion: classifier.isSourceContextVersion,
-            assertRunning: () => {
-              assertRunning();
-              classifier.assertCurrent();
+          if (ready.state !== 'ready')
+            throw new HttpError(
+              409,
+              'WORKFLOW_PREPARATION_REQUIRED',
+              'Prepare retained review evidence before confirming its source.',
+            );
+          let assertDerived: (() => void) | undefined;
+          const prepared = await prepareNativeReportSourceCommand(db, file, input, {
+            profileId,
+            createdAt: now(),
+            assertRunning,
+            needsReview: ready.counts.needsReview,
+            async prepareDerived(derived) {
+              const plans = await prepareRetainedPlanDerived(db, profileId, id, {
+                  ...derived,
+                  impact: { kind: 'link' },
+                }),
+                classifier = await prepareSourceContextClassificationDerived(
+                  db,
+                  root,
+                  profileId,
+                  id,
+                  {
+                    ...derived,
+                    impact: 'metadata',
+                    affected: {
+                      candidateChanges: [],
+                      questionAddresses: [],
+                      reportGroupAddresses: [],
+                      proposalIds: [],
+                    },
+                    assertRunning,
+                  },
+                );
+              if (classifier.state !== 'ready')
+                throw Error('Source classification changed during confirmation');
+              assertDerived = classifier.assertPublicationCurrent;
+              const changes = await prepareWorkflowCommandDerived(db, file, {
+                ...derived,
+                impact: 'metadata',
+                affected: {
+                  candidateChanges: [],
+                  questionAddresses: [],
+                  reportGroupAddresses: [],
+                  proposalIds: [],
+                },
+                mappingVersion: mappingVersion(),
+                currentMappingVersion: mappingVersion,
+                isSourceContextVersion: classifier.isSourceContextVersion,
+                assertRunning: () => {
+                  assertRunning();
+                  classifier.assertCurrent();
+                },
+              });
+              return [...plans, ...classifier.changes, ...changes];
             },
           });
-          return [...plans, ...classifier.changes, ...changes];
+          if (!prepared.replayed)
+            intakeTransaction(
+              db,
+              () => {
+                prepared.assertCurrent();
+                assertDerived?.();
+                const current = provider(db, { newProviderName: input.source });
+                if (current.id !== prepared.provider.id || current.name !== prepared.provider.name)
+                  throw new HttpError(
+                    409,
+                    'SOURCE_CHANGED',
+                    'The selected source changed. Reload before confirming it.',
+                  );
+                if (current.create)
+                  db.prepare('INSERT INTO providers(id,name) VALUES(?,?)').run(
+                    current.id,
+                    current.name,
+                  );
+                selectedEnvelopeStore(db, file).collections.stage(prepared.prepared);
+              },
+              { operationId: prepared.publicationId, fingerprint: workflowHash(request) },
+            );
+          return result();
         },
-      });
-      if (!prepared.replayed)
-        intakeTransaction(
-          db,
-          () => {
-            prepared.assertCurrent();
-            assertDerived?.();
-            const current = provider(db, { newProviderName: input.source });
-            if (current.id !== prepared.provider.id || current.name !== prepared.provider.name)
-              throw new HttpError(
-                409,
-                'SOURCE_CHANGED',
-                'The selected source changed. Reload before confirming it.',
-              );
-            if (current.create)
-              db.prepare('INSERT INTO providers(id,name) VALUES(?,?)').run(
-                current.id,
-                current.name,
-              );
-            selectedEnvelopeStore(db, file).collections.stage(prepared.prepared);
-          },
-          { operationId: prepared.publicationId, fingerprint: workflowHash(request) },
-        );
-      return result();
+      );
     },
+    { operation: currentClinicalOperation(db) },
   );
 }
 function reviewedSource(
@@ -4633,409 +4708,424 @@ export async function saveIntakeReviewDraftRead(
   input: IntakeReviewDraftUpdate,
   options: { request?: unknown } = {},
 ) {
-  owner(db, profileId);
-  const file = row(db, id);
-  if (!hasCollectionIntakeSchema(db, file))
-    return saveIntakeReviewDraft(db, root, profileId, id, input);
-  if (!safeText(input.operationId, 'review operation ID', 200))
-    throw new HttpError(400, 'OPERATION_ID', 'A stable review operation ID is required');
-  const { version: _version, ...directRequest } = input;
-  const request = options.request ?? directRequest;
-  const { retainedIntakeWorkflowCommand, prepareIntakeWorkflowCommand } =
-    await import('./intake-workflow-command.ts');
-  const response = () => ({
-    ...getIntakeRead(db, root, profileId, id),
-    durability: flushIntake(db, root, profileId),
-  });
-  if (retainedIntakeWorkflowCommand(db, file, { operationId: input.operationId, request }))
-    return response();
-  checkVersion(db, file, input.version);
-  const pairEntryRevision = revision(db);
-  const pairPreparation = observeIntakePairPreparation(db);
-  try {
-    return await withVerifiedIntakeOriginalDescriptor(
-      { db, root, profileId, id },
-      async ({ assertRunning: assertSource }) => {
-        const assertRunning = () => {
-          assertSource();
-          pairPreparation.assertCurrent();
-        };
-        const { prepareCollectionWorkflowReadiness } =
-          await import('./intake-workflow-readiness.ts');
-        const {
-          prepareCollectionClinicalReviewAsync,
-          prepareCollectionClinicalReviewDependencies,
-        } = await import('./intake-review-collection-host.ts');
-        const { collectionClinicalProjectionContext } =
-          await import('./intake-review-collection-session.ts');
-        const { prepareNativeDraftHistory } = await import('./intake-review-draft-state.ts');
-        const { prepareWorkflowDraftDerived } = await import('./intake-workflow-update.ts');
-        const { prepareSourceContextClassificationDerived } =
-          await import('./intake-source-context-state.ts');
-        const { prepareRetainedPlanDerived } = await import('./intake-retained-plan.ts');
-        const {
-          prepareCollectionClinicalTerminalPairProjectionWithEvidence,
-          preparedClinicalEvidenceChanges,
-          applyPreparedClinicalProjection,
-          disposePreparedClinicalProjection,
-        } = await import('./intake-clinical-projection-plan.ts');
-        const mappingVersion = () =>
-          workflowHash(
-            activeMappingRules(
-              db,
-              intakeSourceMetadata(db, id).metadata?.sourceProviderId || file.provider_id,
-            ),
-          );
-        const selectedMappingVersion = mappingVersion();
-        const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
-          mappingVersion: selectedMappingVersion,
-          currentMappingVersion: mappingVersion,
-          assertRunning,
-        });
-        if (ready.state !== 'ready')
-          throw new HttpError(
-            409,
-            'WORKFLOW_PREPARATION_REQUIRED',
-            'Prepare this retained review before saving changes',
-          );
-        await prepareCollectionClinicalReviewDependencies(
-          db,
-          root,
-          profileId,
-          id,
-          input.proposalId || null,
-          { assertRunning },
-        );
-        const selected = await prepareCollectionClinicalReviewAsync(
-          db,
-          root,
-          profileId,
-          id,
-          input.proposalId || null,
-          { assertRunning },
-        );
-        if (selected.status !== 'ready')
-          throw new HttpError(
-            409,
-            'REVIEW_PREPARATION_REQUIRED',
-            'Prepare the complete selected evidence before saving changes',
-          );
-        try {
-          const context = collectionClinicalProjectionContext(selected.session);
-          const record = required(
-            selected.session.record(input.recordId),
-            'Review record does not belong to this proposal',
-          );
-          if (record.candidateVersionId !== input.candidateVersionId)
-            throw new HttpError(
-              409,
-              'CANDIDATE_VERSION_CONFLICT',
-              'Reload the current candidate before saving this review',
-            );
-          const view = openIntakeCollectionEnvelope(db, file),
-            intake = view.child(view.root(), 'intake')!,
-            workflow = view.child(intake, 'workflow')!;
-          const previous = view.lookup('draft-record-version-last', [
-            input.proposalId || '',
-            record.id,
-            record.candidateVersionId!,
-          ]);
-          const retainedComparison = (
-            comparison: NonNullable<IntakeReviewDecision['comparisons']>[number],
-          ) =>
-            record.draft?.decision?.comparisons?.some(
-              (retained) => canonicalLiteral(retained) === canonicalLiteral(comparison),
-            ) ?? false;
-          if (input.disposition === 'keep_original_only')
-            for (const comparison of input.decision?.comparisons || [])
-              if (!retainedComparison(comparison))
-                pairPreparation.capture(comparison.scope, input.version);
-          const calculated = calculateReviewDraft(
-            db,
-            id,
-            input,
-            record,
-            record.draft,
-            (questionId) => !!questionId && !!view.find('question', workflow, questionId),
-          );
-          const history = await prepareNativeDraftHistory(
-            db,
-            file,
-            view,
-            previous,
-            calculated.draft,
-            {
-              assertRunning,
-            },
-          );
-          const affected: import('./intake-collection-proposals.ts').NativeProposalAffected = {
-            candidateChanges: [],
-            questionAddresses: [],
-            reportGroupAddresses: [],
-            proposalIds: [],
-          };
-          const draftAddresses: string[] = [],
-            decisionAddresses: string[] = [];
-          const resolutionChanges: Array<{
-            candidateId: string | null;
-            candidateVersionId: string;
-            issueId: string;
-            resolutionAddress: string;
-          }> = [];
-          let needsReview: boolean | undefined, assertDerived: (() => void) | undefined;
-          const terminal = calculated.disposition === 'keep_original_only';
-          let comparisons = calculated.decision?.comparisons?.filter(
-            (comparison) =>
-              comparison.outcome !== 'unresolved' ||
-              (comparison.scope?.format === 'intake-pair-scope-v2' &&
-                comparison.scope.activeAttachment !== null),
-          );
-          let projection:
-            | Awaited<
-                ReturnType<typeof prepareCollectionClinicalTerminalPairProjectionWithEvidence>
-              >
-            | undefined;
-          if (terminal && comparisons?.length) {
-            if (calculated.decision?.action !== 'skip')
-              throw new HttpError(
-                400,
-                'IMPORT_REVIEW',
-                'Keeping original evidence can retain pair decisions but cannot accept a clinical record',
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      owner(db, profileId);
+      const file = row(db, id);
+      if (!hasCollectionIntakeSchema(db, file))
+        return saveIntakeReviewDraft(db, root, profileId, id, input);
+      if (!safeText(input.operationId, 'review operation ID', 200))
+        throw new HttpError(400, 'OPERATION_ID', 'A stable review operation ID is required');
+      const { version: _version, ...directRequest } = input;
+      const request = options.request ?? directRequest;
+      const { retainedIntakeWorkflowCommand, prepareIntakeWorkflowCommand } =
+        await import('./intake-workflow-command.ts');
+      const response = () => ({
+        ...getIntakeRead(db, root, profileId, id),
+        durability: flushIntake(db, root, profileId),
+      });
+      if (retainedIntakeWorkflowCommand(db, file, { operationId: input.operationId, request }))
+        return response();
+      checkVersion(db, file, input.version);
+      const pairEntryRevision = revision(db);
+      const pairPreparation = observeIntakePairPreparation(db);
+      try {
+        return await withVerifiedIntakeOriginalDescriptor(
+          { db, root, profileId, id },
+          async ({ assertRunning: assertSource }) => {
+            const assertRunning = () => {
+              assertSource();
+              pairPreparation.assertCurrent();
+            };
+            const { prepareCollectionWorkflowReadiness } =
+              await import('./intake-workflow-readiness.ts');
+            const {
+              prepareCollectionClinicalReviewAsync,
+              prepareCollectionClinicalReviewDependencies,
+            } = await import('./intake-review-collection-host.ts');
+            const { collectionClinicalProjectionContext } =
+              await import('./intake-review-collection-session.ts');
+            const { prepareNativeDraftHistory } = await import('./intake-review-draft-state.ts');
+            const { prepareWorkflowDraftDerived } = await import('./intake-workflow-update.ts');
+            const { prepareSourceContextClassificationDerived } =
+              await import('./intake-source-context-state.ts');
+            const { prepareRetainedPlanDerived } = await import('./intake-retained-plan.ts');
+            const {
+              prepareCollectionClinicalTerminalPairProjectionWithEvidence,
+              preparedClinicalEvidenceChanges,
+              applyPreparedClinicalProjection,
+              disposePreparedClinicalProjection,
+            } = await import('./intake-clinical-projection-plan.ts');
+            const mappingVersion = () =>
+              workflowHash(
+                activeMappingRules(
+                  db,
+                  intakeSourceMetadata(db, id).metadata?.sourceProviderId || file.provider_id,
+                ),
               );
-            const { prepareClinicalSourceFingerprintIndex } =
-              await import('./intake-clinical-source-index.ts');
-            await prepareClinicalSourceFingerprintIndex(db, { assertRunning });
-            comparisons = comparisons.map((comparison) => {
-              assertRunning();
-              if (comparison.scope?.format !== 'intake-pair-scope-v2') return comparison;
-              const incoming = record.comparisonReference;
-              const current = incoming
-                ? intakePairScope(
-                    db,
-                    { ...incoming, id: record.id, evidence: record.evidence },
-                    nativeDuplicateRecord(db, incoming.kind, comparison.otherRecordId),
-                    record.comparisonContextHash
-                      ? {
-                          intakeVersion: selected.session.review.version,
-                          contextHash: record.comparisonContextHash,
-                        }
-                      : undefined,
-                  )
-                : undefined;
-              if (!retainedComparison(comparison))
-                return { ...comparison, scope: pairPreparation.refresh(comparison.scope, current) };
-              if (
-                !current ||
-                canonicalLiteral(durableSelectionInputs(comparison.scope)) !==
-                  canonicalLiteral(durableSelectionInputs(current))
-              )
-                throw new HttpError(
-                  409,
-                  'DUPLICATE_SCOPE_CHANGED',
-                  'Compare the changed destination record again.',
-                );
-              return { ...comparison, scope: current };
+            const selectedMappingVersion = mappingVersion();
+            const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
+              mappingVersion: selectedMappingVersion,
+              currentMappingVersion: mappingVersion,
+              assertRunning,
             });
-            projection = await prepareCollectionClinicalTerminalPairProjectionWithEvidence(
+            if (ready.state !== 'ready')
+              throw new HttpError(
+                409,
+                'WORKFLOW_PREPARATION_REQUIRED',
+                'Prepare this retained review before saving changes',
+              );
+            await prepareCollectionClinicalReviewDependencies(
               db,
               root,
               profileId,
-              selected.session,
-              { ...calculated.decision, comparisons },
+              id,
+              input.proposalId || null,
+              { assertRunning },
             );
-          }
-          let draftTransition: IntakeReviewDraftTransition | undefined;
-          try {
-            const prepared = await prepareIntakeWorkflowCommand(db, file, {
-              version: input.version,
-              operationId: input.operationId,
-              request,
-              createdAt: calculated.draft.at,
-              additionalLogicalChanges: history.changes,
-              assertRunning() {
-                assertRunning();
-                context.assertCurrent();
-                history.assertCurrent();
-              },
-              ...(terminal
-                ? {
-                    derivedIntakeState: () => {
-                      if (needsReview === undefined) throw Error('Draft summary is not prepared');
-                      return needsReview
-                        ? ('needs_review' as const)
-                        : view.child(intake, 'imported')
-                          ? ('imported' as const)
-                          : ('kept_original' as const);
-                    },
-                  }
-                : {}),
-              *changes({ reader, workflow }) {
-                yield {
-                  op: 'append',
-                  record: workflow,
-                  field: 'reviewDrafts',
-                  jsonText: JSON.stringify(history.draft),
-                };
-                const saved = reader.childAt(
-                  workflow,
-                  'reviewDrafts',
-                  reader.childCount(workflow, 'reviewDrafts') - 1,
-                )!;
-                draftAddresses.push(reader.address(saved));
-                for (let ordinal = 0; ordinal < history.draft.resolutions.length; ordinal++)
-                  resolutionChanges.push({
-                    candidateId: record.candidateId!,
-                    candidateVersionId: record.candidateVersionId!,
-                    issueId: history.draft.resolutions[ordinal]!.issueId,
-                    resolutionAddress: reader.address(
-                      reader.childAt(saved, 'resolutions', ordinal)!,
-                    ),
-                  });
-                for (const { questionId, answer } of calculated.questionAnswers) {
-                  const question = reader.find('question', workflow, questionId)!;
-                  yield {
-                    op: 'append',
-                    record: question,
-                    field: 'answers',
-                    jsonText: JSON.stringify(answer),
-                  };
-                  yield { op: 'set', record: question, field: 'status', jsonText: '"answered"' };
-                  affected.questionAddresses.push(reader.address(question));
-                }
-                const candidate = reader.find('candidate', workflow, record.candidateId!);
-                const version =
-                  candidate && reader.find('version', candidate, record.candidateVersionId!);
-                if (version && candidate) {
-                  if (terminal)
-                    yield {
-                      op: 'set',
-                      record: version,
-                      field: 'status',
-                      jsonText: '"kept_original"',
-                    };
-                  affected.candidateChanges.push({
-                    candidateId: record.candidateId!,
-                    candidateVersionId: record.candidateVersionId!,
-                    candidateAddress: reader.address(candidate),
-                    versionAddress: reader.address(version),
-                    kind: 'update',
-                  });
-                }
-                if (terminal) {
-                  yield {
-                    op: 'append',
-                    record: workflow,
-                    field: 'decisions',
-                    jsonText: JSON.stringify({
-                      ...history.draft,
-                      action: 'keep_original_only',
-                      scope: 'record',
-                      evidence: record.evidence,
-                    }),
-                  };
-                  decisionAddresses.push(
-                    reader.address(
-                      reader.childAt(
-                        workflow,
-                        'decisions',
-                        reader.childCount(workflow, 'decisions') - 1,
-                      )!,
-                    ),
+            const selected = await prepareCollectionClinicalReviewAsync(
+              db,
+              root,
+              profileId,
+              id,
+              input.proposalId || null,
+              { assertRunning },
+            );
+            if (selected.status !== 'ready')
+              throw new HttpError(
+                409,
+                'REVIEW_PREPARATION_REQUIRED',
+                'Prepare the complete selected evidence before saving changes',
+              );
+            try {
+              const context = collectionClinicalProjectionContext(selected.session);
+              const record = required(
+                selected.session.record(input.recordId),
+                'Review record does not belong to this proposal',
+              );
+              if (record.candidateVersionId !== input.candidateVersionId)
+                throw new HttpError(
+                  409,
+                  'CANDIDATE_VERSION_CONFLICT',
+                  'Reload the current candidate before saving this review',
+                );
+              const view = openIntakeCollectionEnvelope(db, file),
+                intake = view.child(view.root(), 'intake')!,
+                workflow = view.child(intake, 'workflow')!;
+              const previous = view.lookup('draft-record-version-last', [
+                input.proposalId || '',
+                record.id,
+                record.candidateVersionId!,
+              ]);
+              const retainedComparison = (
+                comparison: NonNullable<IntakeReviewDecision['comparisons']>[number],
+              ) =>
+                record.draft?.decision?.comparisons?.some(
+                  (retained) => canonicalLiteral(retained) === canonicalLiteral(comparison),
+                ) ?? false;
+              if (input.disposition === 'keep_original_only')
+                for (const comparison of input.decision?.comparisons || [])
+                  if (!retainedComparison(comparison))
+                    pairPreparation.capture(comparison.scope, input.version);
+              const calculated = calculateReviewDraft(
+                db,
+                id,
+                input,
+                record,
+                record.draft,
+                (questionId) => !!questionId && !!view.find('question', workflow, questionId),
+              );
+              const history = await prepareNativeDraftHistory(
+                db,
+                file,
+                view,
+                previous,
+                calculated.draft,
+                {
+                  assertRunning,
+                },
+              );
+              const affected: import('./intake-collection-proposals.ts').NativeProposalAffected = {
+                candidateChanges: [],
+                questionAddresses: [],
+                reportGroupAddresses: [],
+                proposalIds: [],
+              };
+              const draftAddresses: string[] = [],
+                decisionAddresses: string[] = [];
+              const resolutionChanges: Array<{
+                candidateId: string | null;
+                candidateVersionId: string;
+                issueId: string;
+                resolutionAddress: string;
+              }> = [];
+              let needsReview: boolean | undefined, assertDerived: (() => void) | undefined;
+              const terminal = calculated.disposition === 'keep_original_only';
+              let comparisons = calculated.decision?.comparisons?.filter(
+                (comparison) =>
+                  comparison.outcome !== 'unresolved' ||
+                  (comparison.scope?.format === 'intake-pair-scope-v2' &&
+                    comparison.scope.activeAttachment !== null),
+              );
+              let projection:
+                | Awaited<
+                    ReturnType<typeof prepareCollectionClinicalTerminalPairProjectionWithEvidence>
+                  >
+                | undefined;
+              if (terminal && comparisons?.length) {
+                if (calculated.decision?.action !== 'skip')
+                  throw new HttpError(
+                    400,
+                    'IMPORT_REVIEW',
+                    'Keeping original evidence can retain pair decisions but cannot accept a clinical record',
                   );
-                }
-              },
-              async prepareDerived(derived) {
-                // State-only second pass reuses the same exact append effects.
-                const plans = await prepareRetainedPlanDerived(db, profileId, id, {
-                  ...derived,
-                  impact: { kind: 'proposal' },
+                const { prepareClinicalSourceFingerprintIndex } =
+                  await import('./intake-clinical-source-index.ts');
+                await prepareClinicalSourceFingerprintIndex(db, { assertRunning });
+                comparisons = comparisons.map((comparison) => {
+                  assertRunning();
+                  if (comparison.scope?.format !== 'intake-pair-scope-v2') return comparison;
+                  const incoming = record.comparisonReference;
+                  const current = incoming
+                    ? intakePairScope(
+                        db,
+                        { ...incoming, id: record.id, evidence: record.evidence },
+                        nativeDuplicateRecord(db, incoming.kind, comparison.otherRecordId),
+                        record.comparisonContextHash
+                          ? {
+                              intakeVersion: selected.session.review.version,
+                              contextHash: record.comparisonContextHash,
+                            }
+                          : undefined,
+                      )
+                    : undefined;
+                  if (!retainedComparison(comparison))
+                    return {
+                      ...comparison,
+                      scope: pairPreparation.refresh(comparison.scope, current),
+                    };
+                  if (
+                    !current ||
+                    canonicalLiteral(durableSelectionInputs(comparison.scope)) !==
+                      canonicalLiteral(durableSelectionInputs(current))
+                  )
+                    throw new HttpError(
+                      409,
+                      'DUPLICATE_SCOPE_CHANGED',
+                      'Compare the changed destination record again.',
+                    );
+                  return { ...comparison, scope: current };
                 });
-                const classifier = await prepareSourceContextClassificationDerived(
+                projection = await prepareCollectionClinicalTerminalPairProjectionWithEvidence(
                   db,
                   root,
                   profileId,
-                  id,
-                  { ...derived, affected, impact: 'proposal', assertRunning },
+                  selected.session,
+                  { ...calculated.decision, comparisons },
                 );
-                if (classifier.state !== 'ready')
-                  throw Error('Draft classification changed during preparation');
-                assertDerived = classifier.assertPublicationCurrent;
-                const result = await prepareWorkflowDraftDerived(db, file, {
-                  ...derived,
-                  affected,
-                  draftAddresses,
-                  decisionAddresses,
-                  resolutionChanges,
-                  mappingVersion: selectedMappingVersion,
-                  currentMappingVersion: mappingVersion,
-                  isSourceContextVersion: classifier.isSourceContextVersion,
-                  additionalVersionIds: classifier.additionalVersionIds,
+              }
+              let draftTransition: IntakeReviewDraftTransition | undefined;
+              try {
+                const prepared = await prepareIntakeWorkflowCommand(db, file, {
+                  version: input.version,
+                  operationId: input.operationId,
+                  request,
+                  createdAt: calculated.draft.at,
+                  additionalLogicalChanges: history.changes,
                   assertRunning() {
                     assertRunning();
-                    classifier.assertCurrent();
+                    context.assertCurrent();
+                    history.assertCurrent();
+                  },
+                  ...(terminal
+                    ? {
+                        derivedIntakeState: () => {
+                          if (needsReview === undefined)
+                            throw Error('Draft summary is not prepared');
+                          return needsReview
+                            ? ('needs_review' as const)
+                            : view.child(intake, 'imported')
+                              ? ('imported' as const)
+                              : ('kept_original' as const);
+                        },
+                      }
+                    : {}),
+                  *changes({ reader, workflow }) {
+                    yield {
+                      op: 'append',
+                      record: workflow,
+                      field: 'reviewDrafts',
+                      jsonText: JSON.stringify(history.draft),
+                    };
+                    const saved = reader.childAt(
+                      workflow,
+                      'reviewDrafts',
+                      reader.childCount(workflow, 'reviewDrafts') - 1,
+                    )!;
+                    draftAddresses.push(reader.address(saved));
+                    for (let ordinal = 0; ordinal < history.draft.resolutions.length; ordinal++)
+                      resolutionChanges.push({
+                        candidateId: record.candidateId!,
+                        candidateVersionId: record.candidateVersionId!,
+                        issueId: history.draft.resolutions[ordinal]!.issueId,
+                        resolutionAddress: reader.address(
+                          reader.childAt(saved, 'resolutions', ordinal)!,
+                        ),
+                      });
+                    for (const { questionId, answer } of calculated.questionAnswers) {
+                      const question = reader.find('question', workflow, questionId)!;
+                      yield {
+                        op: 'append',
+                        record: question,
+                        field: 'answers',
+                        jsonText: JSON.stringify(answer),
+                      };
+                      yield {
+                        op: 'set',
+                        record: question,
+                        field: 'status',
+                        jsonText: '"answered"',
+                      };
+                      affected.questionAddresses.push(reader.address(question));
+                    }
+                    const candidate = reader.find('candidate', workflow, record.candidateId!);
+                    const version =
+                      candidate && reader.find('version', candidate, record.candidateVersionId!);
+                    if (version && candidate) {
+                      if (terminal)
+                        yield {
+                          op: 'set',
+                          record: version,
+                          field: 'status',
+                          jsonText: '"kept_original"',
+                        };
+                      affected.candidateChanges.push({
+                        candidateId: record.candidateId!,
+                        candidateVersionId: record.candidateVersionId!,
+                        candidateAddress: reader.address(candidate),
+                        versionAddress: reader.address(version),
+                        kind: 'update',
+                      });
+                    }
+                    if (terminal) {
+                      yield {
+                        op: 'append',
+                        record: workflow,
+                        field: 'decisions',
+                        jsonText: JSON.stringify({
+                          ...history.draft,
+                          action: 'keep_original_only',
+                          scope: 'record',
+                          evidence: record.evidence,
+                        }),
+                      };
+                      decisionAddresses.push(
+                        reader.address(
+                          reader.childAt(
+                            workflow,
+                            'decisions',
+                            reader.childCount(workflow, 'decisions') - 1,
+                          )!,
+                        ),
+                      );
+                    }
+                  },
+                  async prepareDerived(derived) {
+                    // State-only second pass reuses the same exact append effects.
+                    const plans = await prepareRetainedPlanDerived(db, profileId, id, {
+                      ...derived,
+                      impact: { kind: 'proposal' },
+                    });
+                    const classifier = await prepareSourceContextClassificationDerived(
+                      db,
+                      root,
+                      profileId,
+                      id,
+                      { ...derived, affected, impact: 'proposal', assertRunning },
+                    );
+                    if (classifier.state !== 'ready')
+                      throw Error('Draft classification changed during preparation');
+                    assertDerived = classifier.assertPublicationCurrent;
+                    const result = await prepareWorkflowDraftDerived(db, file, {
+                      ...derived,
+                      affected,
+                      draftAddresses,
+                      decisionAddresses,
+                      resolutionChanges,
+                      mappingVersion: selectedMappingVersion,
+                      currentMappingVersion: mappingVersion,
+                      isSourceContextVersion: classifier.isSourceContextVersion,
+                      additionalVersionIds: classifier.additionalVersionIds,
+                      assertRunning() {
+                        assertRunning();
+                        classifier.assertCurrent();
+                      },
+                    });
+                    needsReview = result.needsReview;
+                    return [
+                      ...plans,
+                      ...classifier.changes,
+                      ...result.changes,
+                      ...(projection ? preparedClinicalEvidenceChanges(projection, id) : []),
+                    ];
                   },
                 });
-                needsReview = result.needsReview;
-                return [
-                  ...plans,
-                  ...classifier.changes,
-                  ...result.changes,
-                  ...(projection ? preparedClinicalEvidenceChanges(projection, id) : []),
-                ];
-              },
-            });
-            if (!prepared.replayed) {
-              let beforeCommit: number | undefined;
-              intakeTransaction(
-                db,
-                () => {
-                  assertRunning();
-                  beforeCommit = revision(db);
-                  prepared.assertCurrent();
-                  context.assertCurrent();
-                  history.assertCurrent();
-                  assertDerived?.();
-                  if (projection) applyPreparedClinicalProjection(db, projection);
-                  selectedEnvelopeStore(db, file).collections.stage(prepared.prepared);
-                },
-                { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
-              );
-              if (beforeCommit !== undefined && revision(db) === beforeCommit + 1)
-                draftTransition = {
-                  format: 'health-intake-own-draft-transition-v1',
-                  profileId,
-                  intakeId: id,
-                  proposalId: input.proposalId || null,
-                  recordId: record.id,
-                  candidateId: record.candidateId!,
-                  candidateVersionId: record.candidateVersionId!,
-                  operationId: input.operationId,
-                  fromVersion: input.version,
-                  toVersion: input.version + 1,
-                  fromRevision: pairEntryRevision,
-                  toRevision: beforeCommit + 1,
-                };
+                if (!prepared.replayed) {
+                  let beforeCommit: number | undefined;
+                  intakeTransaction(
+                    db,
+                    () => {
+                      assertRunning();
+                      beforeCommit = revision(db);
+                      prepared.assertCurrent();
+                      context.assertCurrent();
+                      history.assertCurrent();
+                      assertDerived?.();
+                      if (projection) applyPreparedClinicalProjection(db, projection);
+                      selectedEnvelopeStore(db, file).collections.stage(prepared.prepared);
+                    },
+                    { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
+                  );
+                  if (beforeCommit !== undefined && revision(db) === beforeCommit + 1)
+                    draftTransition = {
+                      format: 'health-intake-own-draft-transition-v1',
+                      profileId,
+                      intakeId: id,
+                      proposalId: input.proposalId || null,
+                      recordId: record.id,
+                      candidateId: record.candidateId!,
+                      candidateVersionId: record.candidateVersionId!,
+                      operationId: input.operationId,
+                      fromVersion: input.version,
+                      toVersion: input.version + 1,
+                      fromRevision: pairEntryRevision,
+                      toRevision: beforeCommit + 1,
+                    };
+                }
+              } finally {
+                if (projection) disposePreparedClinicalProjection(projection);
+              }
+              const result = response();
+              return {
+                ...result,
+                ...(draftTransition &&
+                result.version === draftTransition.toVersion &&
+                revision(db) === draftTransition.toRevision
+                  ? { reviewDraftTransition: draftTransition }
+                  : {}),
+              };
+            } finally {
+              selected.session.close();
             }
-          } finally {
-            if (projection) disposePreparedClinicalProjection(projection);
-          }
-          const result = response();
-          return {
-            ...result,
-            ...(draftTransition &&
-            result.version === draftTransition.toVersion &&
-            revision(db) === draftTransition.toRevision
-              ? { reviewDraftTransition: draftTransition }
-              : {}),
-          };
-        } finally {
-          selected.session.close();
-        }
-      },
-    );
-  } finally {
-    pairPreparation.dispose();
-  }
+          },
+        );
+      } finally {
+        pairPreparation.dispose();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 
 export function saveIntakeReviewDraft(

@@ -524,6 +524,7 @@ export function createApp({
           method,
           params,
           req,
+          res,
           db,
           root,
           profileId,

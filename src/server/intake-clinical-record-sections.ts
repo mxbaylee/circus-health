@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { selectedOwnershipBlockers } from './ownership-identity-values.ts';
 import { reviewIssueCollection } from './intake-review-issue-state.ts';
 import { reviewRecordIdentityWarnings } from './intake-review-identity-warnings.ts';
@@ -77,34 +78,40 @@ export async function openSelectedClinicalRecord(
   intakeId: string,
   input: ClinicalRecordSelection,
 ) {
-  validateSelection(input);
-  await prepareCollectionClinicalReviewDependencies(
+  return runExclusiveClinicalOperation(
     db,
-    root,
-    profileId,
-    intakeId,
-    input.proposalId,
+    async () => {
+      validateSelection(input);
+      await prepareCollectionClinicalReviewDependencies(
+        db,
+        root,
+        profileId,
+        intakeId,
+        input.proposalId,
+      );
+      const result = await prepareCollectionClinicalReviewAsync(
+        db,
+        root,
+        profileId,
+        intakeId,
+        input.proposalId,
+      );
+      if (result.status !== 'ready')
+        throw new HttpError(
+          409,
+          'REVIEW_PREPARATION_REQUIRED',
+          'Prepare the complete selected evidence before continuing',
+        );
+      const session = result.session,
+        record = session.record(input.recordId, undefined, input.candidateVersionId);
+      if (!record) {
+        session.close();
+        throw invalid();
+      }
+      return { session, record, review: session.review };
+    },
+    { operation: currentClinicalOperation(db), onDiscardResult: (value) => value.session.close() },
   );
-  const result = await prepareCollectionClinicalReviewAsync(
-    db,
-    root,
-    profileId,
-    intakeId,
-    input.proposalId,
-  );
-  if (result.status !== 'ready')
-    throw new HttpError(
-      409,
-      'REVIEW_PREPARATION_REQUIRED',
-      'Prepare the complete selected evidence before continuing',
-    );
-  const session = result.session,
-    record = session.record(input.recordId, undefined, input.candidateVersionId);
-  if (!record) {
-    session.close();
-    throw invalid();
-  }
-  return { session, record, review: session.review };
 }
 export function clinicalRecordOccurrence(
   review: IntakeReview,
@@ -392,115 +399,121 @@ export async function readClinicalRecordSection(
   intakeId: string,
   input: ClinicalRecordSectionRequest,
 ): Promise<ClinicalRecordSectionPage> {
-  const { session, review, record } = await openSelectedClinicalRecord(
+  return runExclusiveClinicalOperation(
     db,
-    root,
-    profileId,
-    intakeId,
-    input,
-  );
+    async () => {
+      const { session, review, record } = await openSelectedClinicalRecord(
+        db,
+        root,
+        profileId,
+        intakeId,
+        input,
+      );
 
-  try {
-    const limit = input.limit ?? 20,
-      budget = input.bytes ?? 65536;
-    if (
-      !Number.isSafeInteger(limit) ||
-      limit < 1 ||
-      limit > 20 ||
-      !Number.isSafeInteger(budget) ||
-      budget < 4096 ||
-      budget > 65536
-    )
-      throw new HttpError(400, 'REVIEW_WINDOW', 'Choose 1–20 items and 4096–65536 bytes');
-    const binding = fingerprint([
-      profileId,
-      intakeId,
-      review.reviewToken,
-      input.proposalId,
-      input.recordId,
-      input.candidateVersionId,
-      input.section,
-      input.comparisonSearch || null,
-    ]);
-    const discovered = comparisonSearch(db, record, input);
-    const all = sectionData(
-      db,
-      review,
-      record,
-      input.section,
-      discovered?.matches.map((match) => match.id),
-    );
-    let ordinal = 0;
-    if (input.cursor) {
       try {
-        const value = JSON.parse(Buffer.from(input.cursor, 'base64url').toString());
+        const limit = input.limit ?? 20,
+          budget = input.bytes ?? 65536;
         if (
-          value.binding !== binding ||
-          !Number.isSafeInteger(value.ordinal) ||
-          value.ordinal < 0 ||
-          value.ordinal >= all.length
+          !Number.isSafeInteger(limit) ||
+          limit < 1 ||
+          limit > 20 ||
+          !Number.isSafeInteger(budget) ||
+          budget < 4096 ||
+          budget > 65536
         )
-          throw invalid();
-        ordinal = value.ordinal;
-      } catch {
-        throw invalid();
-      }
-    }
-    const items: ClinicalRecordSectionPage['items'] = [];
-    let used = 0;
-    for (; ordinal < all.length && items.length < limit; ordinal++) {
-      const selected = all.at(ordinal)!,
-        value = selected.value,
-        control = selected.control,
-        size = Buffer.byteLength(canonicalLiteral(value));
-      const reference: ClinicalRecordSectionReference = {
-        format: 'health-clinical-record-section-reference-v1',
-        proposalId: input.proposalId,
-        recordId: record.id,
-        candidateVersionId: input.candidateVersionId,
-        reviewToken: review.reviewToken,
-        section: input.section,
-        ordinal,
-        bytes: size,
-        ...(input.comparisonSearch ? { comparisonSearch: input.comparisonSearch } : {}),
-      };
-      const inline = { ordinal, control, detail: { kind: 'value' as const, value } },
-        ref = { ordinal, control, detail: { kind: 'reference' as const, reference } };
-      const item = Buffer.byteLength(canonicalLiteral(inline)) <= budget - used ? inline : ref;
-      const bytes = Buffer.byteLength(canonicalLiteral(item));
-      if (items.length && used + bytes > budget) break;
-      if (bytes > budget)
-        throw new HttpError(
-          409,
-          'REVIEW_CONTROL_REQUIRED',
-          'The selected action controls require a larger review window',
+          throw new HttpError(400, 'REVIEW_WINDOW', 'Choose 1–20 items and 4096–65536 bytes');
+        const binding = fingerprint([
+          profileId,
+          intakeId,
+          review.reviewToken,
+          input.proposalId,
+          input.recordId,
+          input.candidateVersionId,
+          input.section,
+          input.comparisonSearch || null,
+        ]);
+        const discovered = comparisonSearch(db, record, input);
+        const all = sectionData(
+          db,
+          review,
+          record,
+          input.section,
+          discovered?.matches.map((match) => match.id),
         );
-      items.push(item);
-      used += bytes;
-    }
-    collectionClinicalProjectionContext(session).assertCurrent();
-    const { intakeId: id, proposalId, version, reviewToken, summary, sourceTextStale } = review;
-    return {
-      format: 'health-clinical-record-section-page-v1',
-      context: { intakeId: id, proposalId, version, reviewToken, summary, sourceTextStale },
-      selection: {
-        proposalId,
-        recordId: record.id,
-        candidateVersionId: input.candidateVersionId,
-        selectionReviewToken: record.selectionReviewToken,
-      },
-      section: input.section,
-      total: all.length,
-      items,
-      ...(discovered ? { discoveryPage: discovered.page } : {}),
-      nextCursor:
-        ordinal < all.length
-          ? Buffer.from(JSON.stringify({ binding, ordinal })).toString('base64url')
-          : null,
-    };
-  } finally {
-    session.close();
-  }
+        let ordinal = 0;
+        if (input.cursor) {
+          try {
+            const value = JSON.parse(Buffer.from(input.cursor, 'base64url').toString());
+            if (
+              value.binding !== binding ||
+              !Number.isSafeInteger(value.ordinal) ||
+              value.ordinal < 0 ||
+              value.ordinal >= all.length
+            )
+              throw invalid();
+            ordinal = value.ordinal;
+          } catch {
+            throw invalid();
+          }
+        }
+        const items: ClinicalRecordSectionPage['items'] = [];
+        let used = 0;
+        for (; ordinal < all.length && items.length < limit; ordinal++) {
+          const selected = all.at(ordinal)!,
+            value = selected.value,
+            control = selected.control,
+            size = Buffer.byteLength(canonicalLiteral(value));
+          const reference: ClinicalRecordSectionReference = {
+            format: 'health-clinical-record-section-reference-v1',
+            proposalId: input.proposalId,
+            recordId: record.id,
+            candidateVersionId: input.candidateVersionId,
+            reviewToken: review.reviewToken,
+            section: input.section,
+            ordinal,
+            bytes: size,
+            ...(input.comparisonSearch ? { comparisonSearch: input.comparisonSearch } : {}),
+          };
+          const inline = { ordinal, control, detail: { kind: 'value' as const, value } },
+            ref = { ordinal, control, detail: { kind: 'reference' as const, reference } };
+          const item = Buffer.byteLength(canonicalLiteral(inline)) <= budget - used ? inline : ref;
+          const bytes = Buffer.byteLength(canonicalLiteral(item));
+          if (items.length && used + bytes > budget) break;
+          if (bytes > budget)
+            throw new HttpError(
+              409,
+              'REVIEW_CONTROL_REQUIRED',
+              'The selected action controls require a larger review window',
+            );
+          items.push(item);
+          used += bytes;
+        }
+        collectionClinicalProjectionContext(session).assertCurrent();
+        const { intakeId: id, proposalId, version, reviewToken, summary, sourceTextStale } = review;
+        return {
+          format: 'health-clinical-record-section-page-v1',
+          context: { intakeId: id, proposalId, version, reviewToken, summary, sourceTextStale },
+          selection: {
+            proposalId,
+            recordId: record.id,
+            candidateVersionId: input.candidateVersionId,
+            selectionReviewToken: record.selectionReviewToken,
+          },
+          section: input.section,
+          total: all.length,
+          items,
+          ...(discovered ? { discoveryPage: discovered.page } : {}),
+          nextCursor:
+            ordinal < all.length
+              ? Buffer.from(JSON.stringify({ binding, ordinal })).toString('base64url')
+              : null,
+        };
+      } finally {
+        session.close();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function readClinicalRecordSectionFragment(
   db: DatabaseSync,
@@ -509,57 +522,63 @@ export async function readClinicalRecordSectionFragment(
   intakeId: string,
   input: { reference: ClinicalRecordSectionReference; offset?: number; bytes?: number },
 ) {
-  const { reference } = input,
-    offset = input.offset ?? 0,
-    bytes = input.bytes ?? 32768;
-  if (
-    !reference ||
-    reference.format !== 'health-clinical-record-section-reference-v1' ||
-    !Number.isSafeInteger(offset) ||
-    offset < 0 ||
-    !Number.isSafeInteger(bytes) ||
-    bytes < 1 ||
-    bytes > 65536
-  )
-    throw invalid();
-  const { session, record, review } = await openSelectedClinicalRecord(
+  return runExclusiveClinicalOperation(
     db,
-    root,
-    profileId,
-    intakeId,
-    reference,
-  );
+    async () => {
+      const { reference } = input,
+        offset = input.offset ?? 0,
+        bytes = input.bytes ?? 32768;
+      if (
+        !reference ||
+        reference.format !== 'health-clinical-record-section-reference-v1' ||
+        !Number.isSafeInteger(offset) ||
+        offset < 0 ||
+        !Number.isSafeInteger(bytes) ||
+        bytes < 1 ||
+        bytes > 65536
+      )
+        throw invalid();
+      const { session, record, review } = await openSelectedClinicalRecord(
+        db,
+        root,
+        profileId,
+        intakeId,
+        reference,
+      );
 
-  try {
-    if (reference.reviewToken !== review.reviewToken) throw invalid();
-    const discovered = comparisonSearch(db, record, reference);
-    const values = sectionData(
-      db,
-      review,
-      record,
-      reference.section,
-      discovered?.matches.map((match) => match.id),
-    );
-    if (
-      !Number.isSafeInteger(reference.ordinal) ||
-      reference.ordinal < 0 ||
-      reference.ordinal >= values.length
-    )
-      throw invalid();
-    const raw = Buffer.from(canonicalLiteral(values.at(reference.ordinal)!.value));
-    if (raw.length !== reference.bytes || offset > raw.length) throw invalid();
-    collectionClinicalProjectionContext(session).assertCurrent();
-    const end = Math.min(raw.length, offset + bytes);
-    return {
-      encoding: 'base64' as const,
-      data: raw.subarray(offset, end).toString('base64'),
-      totalBytes: raw.length,
-      complete: end === raw.length,
-      nextOffset: end === raw.length ? null : end,
-    };
-  } finally {
-    session.close();
-  }
+      try {
+        if (reference.reviewToken !== review.reviewToken) throw invalid();
+        const discovered = comparisonSearch(db, record, reference);
+        const values = sectionData(
+          db,
+          review,
+          record,
+          reference.section,
+          discovered?.matches.map((match) => match.id),
+        );
+        if (
+          !Number.isSafeInteger(reference.ordinal) ||
+          reference.ordinal < 0 ||
+          reference.ordinal >= values.length
+        )
+          throw invalid();
+        const raw = Buffer.from(canonicalLiteral(values.at(reference.ordinal)!.value));
+        if (raw.length !== reference.bytes || offset > raw.length) throw invalid();
+        collectionClinicalProjectionContext(session).assertCurrent();
+        const end = Math.min(raw.length, offset + bytes);
+        return {
+          encoding: 'base64' as const,
+          data: raw.subarray(offset, end).toString('base64'),
+          totalBytes: raw.length,
+          complete: end === raw.length,
+          nextOffset: end === raw.length ? null : end,
+        };
+      } finally {
+        session.close();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function applyClinicalRecordAction(
   db: DatabaseSync,
@@ -568,128 +587,142 @@ export async function applyClinicalRecordAction(
   intakeId: string,
   input: ClinicalRecordAction,
 ) {
-  if (
-    !input ||
-    typeof input !== 'object' ||
-    Array.isArray(input) ||
-    Object.keys(input).some(
-      (key) =>
-        ![
-          'proposalId',
-          'recordId',
-          'candidateVersionId',
-          'version',
-          'operationId',
-          'reviewToken',
-          'patch',
-          'pair',
-          'clearMissingPair',
-        ].includes(key),
-    ) ||
-    (input.patch !== undefined &&
-      (!input.patch ||
-        typeof input.patch !== 'object' ||
-        Array.isArray(input.patch) ||
-        Object.keys(input.patch).some(
-          (key) =>
-            !['mapping', 'resolutions', 'correctionReason', 'correctionPatch', 'answers'].includes(
-              key,
-            ),
-        )))
-  )
-    throw new HttpError(400, 'REVIEW_RECORD_ACTION', 'Supply a supported sparse record action');
-  assertIntakeOwner(db, profileId);
-  validateSelection(input);
-  if (
-    typeof input.operationId !== 'string' ||
-    !input.operationId.trim() ||
-    input.operationId.length > 200
-  )
-    throw new HttpError(400, 'OPERATION_ID', 'A stable review operation ID is required');
-  const request = { format: 'health-intake-clinical-record-action-v1', ...input };
-  if (
-    retainedIntakeWorkflowCommand(db, { id: intakeId }, { operationId: input.operationId, request })
-  )
-    return {
-      ...getIntakeRead(db, root, profileId, intakeId),
-      durability: flushIntake(db, root, profileId),
-    };
-  const { session, record, review } = await openSelectedClinicalRecord(
+  return runExclusiveClinicalOperation(
     db,
-    root,
-    profileId,
-    intakeId,
-    input,
-  );
-
-  try {
-    if (input.version !== review.version || input.reviewToken !== review.reviewToken)
-      throw invalid();
-    if (input.pair && input.clearMissingPair)
-      throw new HttpError(400, 'REVIEW_PAIR_ACTION', 'Choose one pair action');
-    let decision = record.draft?.decision;
-    if (input.pair || input.clearMissingPair) {
-      const id = input.pair?.otherRecordId || input.clearMissingPair!;
-      const selected = selectedClinicalPair(db, review, record, id);
-      const previous = decision?.comparisons || [];
-      const comparisons = previous.filter((choice) => choice.otherRecordId !== id);
-      if (input.pair) {
-        if (!selected?.scope || selected.scope.token !== input.pair.scopeToken) throw invalid();
-        const { scopeToken: _token, ...choice } = input.pair;
-        comparisons.push({ ...choice, scope: selected.scope });
-      } else {
-        const retained = previous.find((choice) => choice.otherRecordId === id);
-        if (
-          selected ||
-          !retained ||
-          (retained.scope?.format === 'intake-pair-scope-v2' && retained.scope.activeAttachment)
+    async () => {
+      if (
+        !input ||
+        typeof input !== 'object' ||
+        Array.isArray(input) ||
+        Object.keys(input).some(
+          (key) =>
+            ![
+              'proposalId',
+              'recordId',
+              'candidateVersionId',
+              'version',
+              'operationId',
+              'reviewToken',
+              'patch',
+              'pair',
+              'clearMissingPair',
+            ].includes(key),
+        ) ||
+        (input.patch !== undefined &&
+          (!input.patch ||
+            typeof input.patch !== 'object' ||
+            Array.isArray(input.patch) ||
+            Object.keys(input.patch).some(
+              (key) =>
+                ![
+                  'mapping',
+                  'resolutions',
+                  'correctionReason',
+                  'correctionPatch',
+                  'answers',
+                ].includes(key),
+            )))
+      )
+        throw new HttpError(400, 'REVIEW_RECORD_ACTION', 'Supply a supported sparse record action');
+      assertIntakeOwner(db, profileId);
+      validateSelection(input);
+      if (
+        typeof input.operationId !== 'string' ||
+        !input.operationId.trim() ||
+        input.operationId.length > 200
+      )
+        throw new HttpError(400, 'OPERATION_ID', 'A stable review operation ID is required');
+      const request = { format: 'health-intake-clinical-record-action-v1', ...input };
+      if (
+        retainedIntakeWorkflowCommand(
+          db,
+          { id: intakeId },
+          { operationId: input.operationId, request },
         )
-          throw new HttpError(
-            409,
-            'REVIEW_PAIR_PRESENT',
-            'Refresh and review this target before changing the retained relationship',
-          );
-      }
-      decision = {
-        ...decision,
-        recordId: record.id,
-        action: decision?.action || 'accept',
-        mapping: decision?.mapping || {},
-        comparisons,
-      };
-    }
-    collectionClinicalProjectionContext(session).assertCurrent();
-    const patch = input.patch?.correctionPatch
-      ? {
-          ...input.patch,
-          correctionPatch: Object.fromEntries(
-            Object.entries(input.patch.correctionPatch).filter(
-              ([field, value]) =>
-                canonicalLiteral(value) !==
-                canonicalLiteral(record.mapping[field as keyof IntakeClinicalMapping]),
-            ),
-          ),
+      )
+        return {
+          ...getIntakeRead(db, root, profileId, intakeId),
+          durability: flushIntake(db, root, profileId),
+        };
+      const { session, record, review } = await openSelectedClinicalRecord(
+        db,
+        root,
+        profileId,
+        intakeId,
+        input,
+      );
+
+      try {
+        if (input.version !== review.version || input.reviewToken !== review.reviewToken)
+          throw invalid();
+        if (input.pair && input.clearMissingPair)
+          throw new HttpError(400, 'REVIEW_PAIR_ACTION', 'Choose one pair action');
+        let decision = record.draft?.decision;
+        if (input.pair || input.clearMissingPair) {
+          const id = input.pair?.otherRecordId || input.clearMissingPair!;
+          const selected = selectedClinicalPair(db, review, record, id);
+          const previous = decision?.comparisons || [];
+          const comparisons = previous.filter((choice) => choice.otherRecordId !== id);
+          if (input.pair) {
+            if (!selected?.scope || selected.scope.token !== input.pair.scopeToken) throw invalid();
+            const { scopeToken: _token, ...choice } = input.pair;
+            comparisons.push({ ...choice, scope: selected.scope });
+          } else {
+            const retained = previous.find((choice) => choice.otherRecordId === id);
+            if (
+              selected ||
+              !retained ||
+              (retained.scope?.format === 'intake-pair-scope-v2' && retained.scope.activeAttachment)
+            )
+              throw new HttpError(
+                409,
+                'REVIEW_PAIR_PRESENT',
+                'Refresh and review this target before changing the retained relationship',
+              );
+          }
+          decision = {
+            ...decision,
+            recordId: record.id,
+            action: decision?.action || 'accept',
+            mapping: decision?.mapping || {},
+            comparisons,
+          };
         }
-      : input.patch;
-    return await saveIntakeReviewDraftRead(
-      db,
-      root,
-      profileId,
-      intakeId,
-      {
-        version: input.version,
-        operationId: input.operationId,
-        proposalId: input.proposalId,
-        recordId: input.recordId,
-        candidateVersionId: input.candidateVersionId,
-        ...patch,
-        ...(decision && (input.pair || input.clearMissingPair) ? { decision } : {}),
-      },
-      { request },
-    );
-  } finally {
-    session.close();
-  }
+        collectionClinicalProjectionContext(session).assertCurrent();
+        const patch = input.patch?.correctionPatch
+          ? {
+              ...input.patch,
+              correctionPatch: Object.fromEntries(
+                Object.entries(input.patch.correctionPatch).filter(
+                  ([field, value]) =>
+                    canonicalLiteral(value) !==
+                    canonicalLiteral(record.mapping[field as keyof IntakeClinicalMapping]),
+                ),
+              ),
+            }
+          : input.patch;
+        return await saveIntakeReviewDraftRead(
+          db,
+          root,
+          profileId,
+          intakeId,
+          {
+            version: input.version,
+            operationId: input.operationId,
+            proposalId: input.proposalId,
+            recordId: input.recordId,
+            candidateVersionId: input.candidateVersionId,
+            ...patch,
+            ...(decision && (input.pair || input.clearMissingPair) ? { decision } : {}),
+          },
+          { request },
+        );
+      } finally {
+        session.close();
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 
 /** Preserve the legacy route until this source activates native collection authority. */
@@ -700,32 +733,40 @@ export async function getIntakeRelatedRecordsRead(
   intakeId: string,
   input: IntakeRelatedRecordsRequest,
 ) {
-  assertIntakeOwner(db, profileId);
-  const source = db
-    .prepare("SELECT * FROM source_files WHERE id=? AND kind='intake_original'")
-    .get(intakeId);
-  if (!source) throw new HttpError(404, 'INTAKE_NOT_FOUND', 'Source intake not found');
-  if (!hasIntakeCollectionEnvelope(db, { id: intakeId }))
-    return getIntakeRelatedRecords(db, root, profileId, intakeId, input);
-  validateSelection(input);
-  if (visibilityState(db, 'source_file', intakeId).archived) throw invalid();
-  if (
-    Object.keys(input).some(
-      (key) =>
-        !['proposalId', 'recordId', 'candidateVersionId', 'query', 'cursor', 'limit'].includes(key),
-    )
-  )
-    throw new HttpError(
-      400,
-      'RELATED_RECORD_SEARCH',
-      'Supply the exact pending candidate and search',
-    );
-  return readClinicalRecordSection(db, root, profileId, intakeId, {
-    proposalId: input.proposalId,
-    recordId: input.recordId,
-    candidateVersionId: input.candidateVersionId,
-    section: 'comparisons',
-    limit: Math.min(input.limit ?? 20, 20),
-    comparisonSearch: { query: input.query, cursor: input.cursor, limit: input.limit ?? 20 },
-  });
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      assertIntakeOwner(db, profileId);
+      const source = db
+        .prepare("SELECT * FROM source_files WHERE id=? AND kind='intake_original'")
+        .get(intakeId);
+      if (!source) throw new HttpError(404, 'INTAKE_NOT_FOUND', 'Source intake not found');
+      if (!hasIntakeCollectionEnvelope(db, { id: intakeId }))
+        return getIntakeRelatedRecords(db, root, profileId, intakeId, input);
+      validateSelection(input);
+      if (visibilityState(db, 'source_file', intakeId).archived) throw invalid();
+      if (
+        Object.keys(input).some(
+          (key) =>
+            !['proposalId', 'recordId', 'candidateVersionId', 'query', 'cursor', 'limit'].includes(
+              key,
+            ),
+        )
+      )
+        throw new HttpError(
+          400,
+          'RELATED_RECORD_SEARCH',
+          'Supply the exact pending candidate and search',
+        );
+      return readClinicalRecordSection(db, root, profileId, intakeId, {
+        proposalId: input.proposalId,
+        recordId: input.recordId,
+        candidateVersionId: input.candidateVersionId,
+        section: 'comparisons',
+        limit: Math.min(input.limit ?? 20, 20),
+        comparisonSearch: { query: input.query, cursor: input.cursor, limit: input.limit ?? 20 },
+      });
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
