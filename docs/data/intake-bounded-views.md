@@ -625,6 +625,18 @@ including duplicates, separately from unique artifact verification and byte
 hashing. The file cache remains bounded at 256 entries; eviction requires
 authentication without making the resulting hash work synchronous.
 
+The complete fictional 257-proposal fixture verifies 449 historical and duplicate
+occurrences through the public membership API. Its controlled 2026-10-04 run
+passes exact warm-preview parity, unrelated HTTP progress inside verification,
+last-subscriber cancellation, scratch cleanup and refusal of an earlier file
+replaced with identical bytes. Warm verification reads and hashes 8,860,193
+payload bytes; its final physical-identity check performs no second payload hash.
+The complete fixture took about 412 seconds under its existing 450-second host
+hang guard. This is correctness evidence, not acceptable interaction timing or
+storage-cost qualification: native history preparation wrote about 600 MB of
+logical node data, and SQLite reached about 4.27 GB before normal cleanup.
+Logical node counters exclude database and recovery-storage overhead.
+
 Report and feed reads serialize use of a shared review session, detach the
 bounded response before releasing it, and close sessions replaced by another
 proposal. Reset and close invalidate waiting readers; releasing an unrelated

@@ -1540,7 +1540,16 @@ test(
           before.identityPreviewArtifactOccurrences <
           f.duplicateEnd,
       );
-      assert.deepEqual(await warm, f.stable);
+      // HTTP presentation adds the profile prefix; the internal verifier keeps
+      // its domain URL. Assert both exact routes and compare every other field.
+      const expectedWarm = structuredClone(f.stable);
+      assert.ok(expectedWarm.scopeReference);
+      assert.equal(
+        expectedWarm.scopeReference.original.contentUrl,
+        `/api/profiles/${encodeURIComponent(f.profileId)}/sources/${encodeURIComponent(f.original.id)}/content`,
+      );
+      expectedWarm.scopeReference.original.contentUrl = `/api/sources/${encodeURIComponent(f.original.id)}/content`;
+      assert.deepEqual(await warm, expectedWarm);
     } finally {
       await warm.catch(() => undefined);
     }
