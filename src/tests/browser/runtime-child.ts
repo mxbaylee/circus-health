@@ -31,6 +31,18 @@ process.on('message', async (message) => {
   if (message === 'close') {
     await runtime.close();
     process.disconnect();
+  } else if (
+    message &&
+    typeof message === 'object' &&
+    'type' in message &&
+    message.type === 'capture-diagnostics' &&
+    'id' in message &&
+    typeof message.id === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(message.id)
+  ) {
+    // Parent receipt, rather than an IPC acknowledgment, proves that earlier
+    // stderr bytes reached the controller. This test-only marker is stripped there.
+    process.stderr.write('\u001ecrs-browser-diagnostics:' + message.id + '\u001f');
   }
 });
 process.send!({ port: (runtime.server.address() as AddressInfo).port, pid: process.pid });
