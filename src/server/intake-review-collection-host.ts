@@ -27,7 +27,10 @@ import {
 } from './name-associations.ts';
 import { selectedIdentityPeopleSnapshots } from './intake-identity-people.ts';
 import { identityOriginalFingerprintForMember } from './intake-identity-policy.ts';
-import { selectedIdentityReviewGroundingLookups } from './intake-identity-grounding.ts';
+import {
+  selectedIdentityReviewGroundingLookups,
+  identityGroundingGeneration,
+} from './intake-identity-grounding.ts';
 import { copiedManualSourceRecordApplies } from './intake-manual-copy.ts';
 import { issueResolutionCurrent } from './intake-issue-dependencies.ts';
 import { profileOriginal } from './profile-storage.ts';
@@ -227,7 +230,7 @@ export function prepareCollectionClinicalReview(
   profileId: string,
   intakeId: string,
   proposalId: string | null = null,
-  options: { metadataBytes?: number } = {},
+  options: { metadataBytes?: number; groundingDependency?: (intakeId: string) => void } = {},
 ): CollectionClinicalReviewResult {
   assertIntakeOwner(db, profileId);
   const metadataBytes = options.metadataBytes ?? 256 * 1024;
@@ -240,14 +243,16 @@ export function prepareCollectionClinicalReview(
     );
   verifyIntakeOriginal(db, root, profileId, intakeId);
   const initialVersion = intakeSourceVersion(db, intakeId),
-    initialRevision = clinicalReviewRevision(db);
+    initialRevision = clinicalReviewRevision(db),
+    initialGrounding = identityGroundingGeneration(db);
   const assertCurrent = () => {
     assertIntakeOwner(db, profileId);
     const current = intakeSourceVersion(db, intakeId);
     if (
       current.logicalBinding !== initialVersion.logicalBinding ||
       current.version !== initialVersion.version ||
-      clinicalReviewRevision(db) !== initialRevision
+      clinicalReviewRevision(db) !== initialRevision ||
+      identityGroundingGeneration(db) !== initialGrounding
     )
       throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
   };
@@ -256,6 +261,7 @@ export function prepareCollectionClinicalReview(
   try {
     const opened = new Map<string, ReturnType<typeof open>>();
     function open(original: ClinicalScopeOriginal) {
+      options.groundingDependency?.(original.id);
       const retained = requiredFile(db, original.id, true);
       if (retained.sha256 !== original.sha256)
         throw new HttpError(409, 'SOURCE_CHANGED', 'The retained original changed');
@@ -272,14 +278,17 @@ export function prepareCollectionClinicalReview(
       );
       cacheStatement.setReadBigInts(true);
       let cacheGeneration: object | undefined,
+        cacheGrounding: object | undefined,
         cacheEpoch = 0;
       const readCacheState = () => {
         assertCurrent();
         view.address(view.root());
         if (db.isTransaction) return undefined;
-        const generation = intakeCollectionCacheGeneration(db);
-        if (generation !== cacheGeneration) {
+        const generation = intakeCollectionCacheGeneration(db),
+          grounding = identityGroundingGeneration(db);
+        if (generation !== cacheGeneration || grounding !== cacheGrounding) {
           cacheGeneration = generation;
+          cacheGrounding = grounding;
           cacheEpoch++;
         }
         const state = cacheStatement.get()!;

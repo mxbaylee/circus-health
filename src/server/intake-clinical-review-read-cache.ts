@@ -2,11 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { observeDatabaseClose } from './database.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
+import { identityGroundingGeneration } from './intake-identity-grounding.ts';
 import type { CollectionClinicalReviewSession } from './intake-review-collection-session.ts';
 const reviewReadStates = new WeakMap<
   DatabaseSync,
   {
     registry: object;
+    grounding: object;
     epoch: string;
     read: ReturnType<DatabaseSync['prepare']>;
     readTempSchema: ReturnType<DatabaseSync['prepare']>;
@@ -14,9 +16,10 @@ const reviewReadStates = new WeakMap<
 >();
 export function reviewReadStamp(db: DatabaseSync): string | undefined {
   if (!db.isOpen || db.isTransaction) return undefined;
-  const registry = intakeCollectionCacheGeneration(db);
+  const registry = intakeCollectionCacheGeneration(db),
+    grounding = identityGroundingGeneration(db);
   let state = reviewReadStates.get(db);
-  if (!state || state.registry !== registry) {
+  if (!state || state.registry !== registry || state.grounding !== grounding) {
     const read =
       state?.read ||
       db.prepare(
@@ -25,6 +28,7 @@ export function reviewReadStamp(db: DatabaseSync): string | undefined {
     read.setReadBigInts(true);
     state = {
       registry,
+      grounding,
       epoch: randomUUID(),
       read,
       readTempSchema: state?.readTempSchema || db.prepare('PRAGMA temp.schema_version'),

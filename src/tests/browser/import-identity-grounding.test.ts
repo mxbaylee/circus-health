@@ -12,7 +12,8 @@ import type {
   CollectionImportFeed,
   CollectionReportDetail,
 } from '../../shared/intake-clinical-pages.ts';
-import { fixtureApi, fixtureReportUrl } from './native-intake-fixture.ts';
+import { fixtureApi, fixtureReportUrl, fixtureBrowserResponse } from './native-intake-fixture.ts';
+import type { IntakeIdentityReview } from '../../shared/intake-identity.ts';
 
 function feedRecords(feed: CollectionImportFeed) {
   assert.equal(feed.format, 'health-intake-import-feed-v2');
@@ -286,6 +287,15 @@ test(
       await coldDetailLoaded;
       await route.continue();
     });
+    const directIdentityResponse = fixtureBrowserResponse(page, (response) => {
+      const requestUrl = new URL(response.url());
+      return (
+        response.request().method() === 'GET' &&
+        requestUrl.pathname ===
+          prefix + '/intakes/' + encodeURIComponent(directIntake.id) + '/identity-review' &&
+        requestUrl.searchParams.get('groupId') === directGroupId
+      );
+    });
     await page.goto(
       url +
         '/#/import?group=' +
@@ -293,8 +303,20 @@ test(
         '&intake=' +
         encodeURIComponent(directIntake.id),
     );
+    const directIdentity = await directIdentityResponse;
+    assert.equal(directIdentity.status(), 200, await directIdentity.text());
+    assert.equal(await directIdentity.finished(), null);
+    const checkedIdentity = (await directIdentity.json()).data as IntakeIdentityReview;
+    assert.equal(checkedIdentity.status, 'evidenced_match');
+    assert.equal(checkedIdentity.blocking, false);
+    const checkedScope = checkedIdentity.scopeReference || checkedIdentity.scope;
+    assert.equal(checkedScope?.intakeId, directIntake.id);
+    assert.equal(checkedScope?.groupId, directGroupId);
     const detailDeadline = Date.now() + 15000;
-    while (seenDetails.length < 2 && Date.now() < detailDeadline)
+    while (
+      (seenDetails.length < 2 || !detailRecords(seenDetails.at(-1)!)[0]?.selectable) &&
+      Date.now() < detailDeadline
+    )
       await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(
       seenDetails[0] && detailRecords(seenDetails[0])[0]?.identityReview?.blocking,
@@ -309,6 +331,8 @@ test(
     );
     assert.equal(seenDetails.length, 2, 'direct detail avoids refresh loops');
 
+    // Stop the old document rechecking an original before the cold-cache assertion.
+    await page.goto('about:blank');
     await runtime.close();
     runtime = await startBrowserRuntime(t, {
       ...runtimeOptions,
@@ -327,7 +351,6 @@ test(
     );
     const restartFeedOffset = seenFeeds.length;
     // Start one cold document so a hash navigation and reload cannot race feed requests.
-    await page.goto('about:blank');
     await page.goto(url + '/#/import');
     const restartDeadline = Date.now() + 15000;
     while (Date.now() < restartDeadline) {

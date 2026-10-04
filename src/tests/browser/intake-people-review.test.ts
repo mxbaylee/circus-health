@@ -1,4 +1,4 @@
-import { fixtureApi, fixtureReport } from './native-intake-fixture.ts';
+import { fixtureApi, fixtureReport, fixtureNativeReportReady } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
@@ -133,7 +133,23 @@ test('People-only report stays separate, opens original evidence, and saves by e
   await page.goto(
     `${url}/#/import?intake=${encodeURIComponent(intake.id)}&group=${encodeURIComponent(groupId)}`,
   );
-  await page.reload();
+  const browserReport = await fixtureNativeReportReady(
+    page,
+    prefix,
+    { intakeId: intake.id, groupId },
+    () => page.reload(),
+  );
+  assert.equal(browserReport.people.format, 'health-intake-people-page-v2');
+  assert.equal(browserReport.people.intakeId, intake.id);
+  assert.equal(browserReport.people.groupId, groupId);
+  assert.equal(browserReport.people.totalPeople, 2);
+  assert.equal(browserReport.people.nextCursor, null);
+  const rowan = browserReport.people.people.find(
+    (entry) => entry.kind === 'person' && entry.person.person.fullName === 'Rowan Finch',
+  );
+  assert.ok(rowan && rowan.kind === 'person');
+  assert.equal(rowan.person.state, 'pending');
+  assert.equal(!!rowan.person.selfMatch, false, 'this clinician can be added separately from Self');
   const people = page.getByRole('region', { name: 'People from this report' });
   await people.getByRole('tab', { name: /To review\s+2/ }).waitFor();
   assert.equal(
@@ -141,6 +157,7 @@ test('People-only report stays separate, opens original evidence, and saves by e
     0,
     'A People-only report does not invent clinical record links',
   );
+  await page.getByRole('button', { name: 'Back to Import', exact: true }).waitFor();
   assert.equal(await page.getByRole('button', { name: 'Back to Import', exact: true }).count(), 1);
 
   await people.getByRole('button', { name: /Rowan Finch/ }).click();
@@ -149,6 +166,7 @@ test('People-only report stays separate, opens original evidence, and saves by e
     .getByRole('region', { name: 'Original evidence' })
     .getByRole('link', { name: 'Open original' });
   assert.match((await original.getAttribute('href')) || '', /\/sources\/.+\/content/);
+  await page.getByRole('button', { name: 'Add as new person' }).waitFor();
   assert.equal(await page.getByRole('button', { name: 'Add as new person' }).count(), 1);
 
   const screenshots = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');

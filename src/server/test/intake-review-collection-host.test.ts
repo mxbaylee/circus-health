@@ -6,6 +6,12 @@ import { syncBuiltinESMExports } from 'node:module';
 import { intakeNamespace } from '../intake-state-evidence.ts';
 import { profileOriginal } from '../profile-storage.ts';
 import { canonicalLiteral } from '../intake-format.ts';
+import { reviewDraftResolutions } from '../intake-review-draft-selection.ts';
+import { prepareNativeDraftHistory, readNativeReviewDraft } from '../intake-review-draft-state.ts';
+import { createReportSnapshotCatalog } from '../intake-report-snapshot-catalog.ts';
+import { prepareIntakeWorkflowCommand } from '../intake-workflow-command.ts';
+import { canonicalReviewValueChunks } from '../intake-review-question-state.ts';
+import type { IntakeReviewDraft, IntakeReviewRecord } from '../../shared/intake.ts';
 import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import { readIntakeEnvelopeText } from '../intake-authority.ts';
 import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
@@ -24,7 +30,13 @@ import { prepareIntakeEnvelopeMutation } from '../intake-envelope-mutation.ts';
 import { collectionClinicalProjectionContext } from '../intake-review-collection-session.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
-import { uploadIntake, reviewIntake, importIntake, proposeConversionRead } from '../intake.ts';
+import {
+  uploadIntake,
+  reviewIntake,
+  importIntake,
+  proposeConversionRead,
+  intakeTransaction,
+} from '../intake.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { prepareCollectionReviewMembership } from '../intake-review-membership-index.ts';
 import { clearIntakeStateCache } from '../intake-state-storage.ts';
@@ -95,6 +107,137 @@ function fixture(t: test.TestContext) {
   });
   return { db, root, profileId };
 }
+// Real native proposal/catalog publication plus two complete review sessions
+// measured about 80s here. Counts establish scaling; this is a host hang guard.
+test(
+  'selected clinical draft handoff decodes once per complete record beyond 32 drafts',
+  { timeout: 120000 },
+  async (t) => {
+    const { db, root, profileId } = fixture(t);
+    const count = 33;
+    const source = uploadIntake(db, root, profileId, {
+      filename: 'fictional-draft-handoff.txt',
+      bytes: Buffer.from('Independently fictional original'),
+      newProviderName: 'Fictional clinic',
+    });
+    await buildIntakeCollectionEnvelope(db, { id: source.id });
+    await proposeConversionRead(db, root, profileId, source.id, {
+      version: source.version,
+      summary: 'Fictional selected draft proposal',
+      jsonlText: Array.from({ length: count }, (_, n) =>
+        JSON.stringify({
+          ...envelope('draft-' + n),
+          report: {
+            key: 'fictional-draft-report',
+            title: 'Fictional draft report',
+            anchor: { locator: 'page 1', text: 'Independently fictional original' },
+            subject: null,
+          },
+        }),
+      ).join('\n'),
+    });
+    const proposalId = String(
+      db
+        .prepare(
+          "SELECT id FROM source_files WHERE kind='intake_proposal' ORDER BY rowid DESC LIMIT 1",
+        )
+        .get()!.id,
+    );
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id, proposalId);
+    const initial = prepareCollectionClinicalReview(db, root, profileId, source.id, proposalId);
+    if (initial.status !== 'ready') throw Error('Expected initial selected review');
+    const view = openIntakeCollectionEnvelope(db, source),
+      catalog = createReportSnapshotCatalog(db, source, { catalog: 'review.snapshots' }),
+      drafts: IntakeReviewDraft[] = [];
+    for (const [n, record] of initial.session.review.records.entries()) {
+      const draft: IntakeReviewDraft = {
+        id: 'fictional-draft-' + n,
+        proposalId,
+        recordId: record.id,
+        candidateId: record.candidateId!,
+        candidateVersionId: record.candidateVersionId!,
+        mapping: { documentTitle: 'Reviewed fictional title ' + n },
+        resolutions: Array.from({ length: 3 }, (_, index) => ({
+          issueId: 'fictional-historical-' + index,
+          outcome: index === 2 ? 'this_is_me' : 'unknown',
+          at: '2026-01-01',
+        })),
+        disposition: 'pending',
+        at: '2026-01-01',
+      };
+      drafts.push(
+        (await prepareNativeDraftHistory(db, source, view, undefined, draft, { catalog })).draft,
+      );
+    }
+    const version = initial.session.review.version;
+    initial.session.close();
+    const prepared = await prepareIntakeWorkflowCommand(db, source, {
+      version,
+      operationId: 'fictional-draft-handoff-publication',
+      request: { count },
+      createdAt: '2026-01-01',
+      additionalLogicalChanges: await catalog.finalChanges(),
+      *changes({ workflow }) {
+        for (const draft of drafts)
+          yield {
+            op: 'append',
+            record: workflow,
+            field: 'reviewDrafts',
+            jsonText: JSON.stringify(draft),
+          };
+      },
+    });
+    if (prepared.replayed) throw Error('Unexpected fixture replay');
+    intakeTransaction(
+      db,
+      () => {
+        prepared.assertCurrent();
+        selectedEnvelopeStore(db, source).collections.stage(prepared.prepared);
+      },
+      { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
+    );
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id, proposalId);
+    const before = intakeWorkCounters(db).warm;
+    const ready = prepareCollectionClinicalReview(db, root, profileId, source.id, proposalId);
+    if (ready.status !== 'ready') throw Error('Expected complete selected clinical review');
+    const after = intakeWorkCounters(db).warm;
+    assert.equal(after.reviewDraftReconstructions - before.reviewDraftReconstructions, count);
+    assert.equal(after.reviewDraftHandoffs - before.reviewDraftHandoffs, count);
+    assert.equal(ready.session.review.records.length, count);
+    const freshView = openIntakeCollectionEnvelope(db, source),
+      freshCatalog = createReportSnapshotCatalog(db, source, { catalog: 'review.snapshots' });
+    for (let index = 0; index < count; index++) {
+      const record: IntakeReviewRecord = ready.session.review.records[index]!;
+      const selected = freshView.lookup('draft-record-version-last', [
+        proposalId,
+        record.id,
+        record.candidateVersionId!,
+      ])!;
+      const freshDraft = readNativeReviewDraft(freshView, selected, freshCatalog, 256 * 1024, {
+        db,
+        source,
+      });
+      assert.equal(record.mapping.documentTitle, drafts[index]!.mapping.documentTitle);
+      assert.deepEqual(record.draft?.mapping, drafts[index]!.mapping);
+      assert.deepEqual(
+        Array.from(reviewDraftResolutions(record.draft)),
+        Array.from(reviewDraftResolutions(freshDraft)),
+      );
+      assert.equal(
+        Array.from(canonicalReviewValueChunks(record.draft)).join(''),
+        Array.from(canonicalReviewValueChunks(freshDraft)).join(''),
+      );
+    }
+    const token = ready.session.review.reviewToken;
+    ready.session.close();
+    clearIntakeStateCache(db);
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id, proposalId);
+    const rebuilt = prepareCollectionClinicalReview(db, root, profileId, source.id, proposalId);
+    if (rebuilt.status !== 'ready') throw Error('Expected rebuilt selected clinical review');
+    assert.equal(rebuilt.session.review.reviewToken, token);
+    rebuilt.session.close();
+  },
+);
 test('native clinical host preserves complete legacy review and selection tokens through migration and cache loss', async (t) => {
   const { db, root, profileId } = fixture(t);
   const intake = uploadIntake(db, root, profileId, {

@@ -10,6 +10,7 @@ import { api, type ApiOptions } from './api';
 
 export interface SelectedClinicalReview {
   native: boolean;
+  revision?: number;
   context: IntakeClinicalReviewContext;
   record: IntakeClinicalRecordRead['record'];
 }
@@ -23,7 +24,7 @@ export async function readSelectedClinicalReview(
   const query = new URLSearchParams({ recordId, bytes: '65536' });
   if (proposalId) query.set('proposalId', proposalId);
   if (candidateVersionId) query.set('candidateVersionId', candidateVersionId);
-  const { data } = await api<IntakeClinicalReviewRead>(
+  const { data, meta } = await api<IntakeClinicalReviewRead>(
     `/intakes/${encodeURIComponent(intakeId)}/review-record?${query}`,
     options,
   );
@@ -41,7 +42,13 @@ export async function readSelectedClinicalReview(
       (candidateVersionId && selectedVersion !== candidateVersionId)
     )
       throw new Error('The server did not return this exact record version. Refresh its review.');
-    return { native: true, context: data.context, record: data.record };
+    const revision = meta?.revision;
+    return {
+      native: true,
+      ...(typeof revision === 'number' ? { revision } : {}),
+      context: data.context,
+      record: data.record,
+    };
   }
   if (isClinicalReviewPage(data))
     throw new Error('The server returned a display page instead of this exact record.');

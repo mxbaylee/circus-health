@@ -1,4 +1,5 @@
-import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { launchBrowser, newTestPage } from './harness.ts';
+import { startProcessRuntime } from './process-runtime.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import {
   fixtureApi,
@@ -14,36 +15,29 @@ import type {
 import type { IntakeReportAcceptanceResult } from '../../shared/intake.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { NoteHistoryEntry } from '../../shared/api.ts';
-import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
-const unavailableLiteLlm = () => ({
-  available: false,
-  backend: 'litellm',
-  model: 'fictional-browser-alias',
-  readiness: 'unavailable',
-  capabilities: { tools: null, images: null },
-});
-
 test(
   'real browser creates, edits, imports originals, locks and recovers encrypted profiles',
-  { timeout: 60000 },
+  // Four imports, retained relationship review, encrypted reopen and a second
+  // isolated profile form one host journey. Browser action deadlines stay at 5s.
+  { timeout: 180000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-'));
     const visuals = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
     mkdirSync(visuals, { recursive: true });
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startBrowserRuntime(t, {
+    const runtime = await startProcessRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
       host: '127.0.0.1',
-      assistantOptions: { availability: unavailableLiteLlm },
+      unavailableModelAlias: 'fictional-browser-alias',
     });
     const browser = await launchBrowser(t);
     t.after(async () => {
@@ -55,14 +49,15 @@ test(
     const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } }),
       errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
-    const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
+    const url = `http://127.0.0.1:${runtime.port}`;
     async function chooseFiles(file: { name: string; mimeType: string; buffer: Buffer }) {
       await page.locator('input[type=file]').waitFor();
       await page.waitForFunction(() => {
         const input = document.querySelector('input[type=file]');
         return input && !(input as HTMLInputElement).disabled;
       });
-      const uploaded = page.waitForResponse(
+      const uploaded = fixtureBrowserResponse(
+        page,
         (response) => response.request().method() === 'POST' && response.url().endsWith('/intakes'),
       );
       await page.locator('input[type=file]').setInputFiles(file);
@@ -533,7 +528,17 @@ test(
     await page.getByRole('button', { name: 'Choose profile', exact: true }).click();
     await page.getByRole('button', { name: /Fictional Browser Person.*Locked/ }).click();
     await page.getByLabel('Recovery key', { exact: true }).fill(recovery);
+    const reopened = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname === prefix + '/unlock',
+    );
     await page.getByRole('button', { name: 'Open profile', exact: true }).click();
+    const reopenedResponse = await reopened;
+    assert.equal(reopenedResponse.status(), 200, await reopenedResponse.text());
+    assert.equal(await reopenedResponse.finished(), null);
+    assert.equal((await reopenedResponse.json()).data.id, profile.id);
     await page
       .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
       .getByRole('button', { name: 'Add passkey', exact: true })

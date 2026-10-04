@@ -122,12 +122,22 @@ export function* workflowAcceptanceIndexContributions(
   for (let receiptOrdinal = 0; receiptOrdinal < newAddresses.length; receiptOrdinal++) {
     const current = receiptOrdinal === newAddresses.length - 1;
     const receipt = current ? imported : after.resolve(newAddresses[receiptOrdinal]!);
-    const clinical = after.child(receipt, 'clinical');
-    if (!clinical) throw Error('Accepted clinical receipt is unavailable');
-    const recordCount = after.childCount(clinical, 'records');
     const proposalId = read(current ? intake : receipt, 'acceptedProposalId');
     if (proposalId !== null && typeof proposalId !== 'string')
       throw Error('Invalid accepted proposal ID');
+    const clinical = after.child(receipt, 'clinical');
+    if (!clinical) {
+      // Source-only capture persists an explicit null review marker. A reviewed
+      // receipt must retain its clinical result, even when no records were accepted.
+      const reviewToken = read(
+        current ? intake : receipt,
+        current ? 'lastReviewToken' : 'reviewToken',
+      );
+      if (reviewToken !== null || after.has(receipt, 'clinical'))
+        throw Error('Accepted clinical receipt is unavailable');
+      continue;
+    }
+    const recordCount = after.childCount(clinical, 'records');
     const rank = current ? count : oldCount + Number(!!previous) + receiptOrdinal;
     for (let i = recordCount - 1; i >= 0; i--) {
       const record = after.childAt(clinical, 'records', i)!;

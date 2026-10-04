@@ -136,7 +136,7 @@ async function fixture(
   const open = (
     metadataBytes = 128 * 1024,
     observe?: (view: ReturnType<typeof openIntakeCollectionEnvelope>) => void,
-    readCacheState?: () => string,
+    readCacheState?: () => string | undefined,
   ) => {
     const view = openIntakeCollectionEnvelope(db, file);
     observe?.(view);
@@ -274,6 +274,56 @@ test('selected clinical engine matches legacy full proposal while joins remain o
   assert.equal(actual.records[0]!.draft?.id, 'latest');
   assert.equal(actual.records[0]!.identityReview?.blocking, true);
   assert.match(actual.records[0]!.identityReview!.message, /conflicting subject claims/);
+});
+
+test('selected draft handoff falls back after peer writes, transaction observation and scope close', async (t) => {
+  const { db, root, open } = await fixture(t, (details) => {
+    details.workflow!.reviewDrafts.push({
+      id: 'fictional-proof-draft',
+      proposalId,
+      recordId: `${proposalId}:line:1`,
+      candidateId: intakeCandidateId(file, entries[0]!),
+      candidateVersionId: intakeCandidateVersionId(details, proposalId, entries[0]!),
+      mapping: { documentTitle: 'Fictional reviewed title' },
+      resolutions: [],
+      disposition: 'pending',
+      at: '2026-01-01',
+    });
+  });
+  db.exec('CREATE TABLE fictional_draft_proof(value TEXT)');
+  using peer = new DatabaseSync(join(root, 'cache.sqlite'));
+  const scope = open(128 * 1024, undefined, () => reviewReadStamp(db));
+  const record = review().records[0]!,
+    version = scope.versionId(proposalId, entries[0]!);
+  const bind = () => {
+    const selected = scope.draft(proposalId, record.id, version);
+    scope.bindPreparedDraft!(record, selected);
+    return selected;
+  };
+  const consume = () => scope.preparedDraft!(proposalId, record, version);
+  const first = bind();
+  assert.equal(consume(), first);
+  assert.equal(consume(), undefined);
+  bind();
+  peer.prepare('INSERT INTO fictional_draft_proof VALUES(?)').run('peer mutation');
+  assert.equal(consume(), undefined, 'peer data_version invalidates handoff');
+  assert.equal(
+    scope.draft(proposalId, record.id, version)?.id,
+    first?.id,
+    'fresh indexed fallback',
+  );
+  bind();
+  db.exec('BEGIN');
+  try {
+    assert.equal(consume(), undefined, 'transaction state cannot consume previous proof');
+  } finally {
+    db.exec('ROLLBACK');
+  }
+  assert.equal(consume(), undefined, 'rollback cannot revive one-use capture');
+  bind();
+  scope.close!();
+  assert.equal(consume(), undefined, 'close releases all associations');
+  assert.throws(() => bind(), /closed/);
 });
 
 test('selected source joins retain first introduction and duplicate candidate/version semantics after cache loss', async (t) => {

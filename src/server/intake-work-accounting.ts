@@ -21,6 +21,8 @@ const primitiveTemplate = {
   metadataReadBytes: 0,
 };
 const hostTemplate = {
+  reviewDraftReconstructions: 0,
+  reviewDraftHandoffs: 0,
   identityPolicyReceiptReconstructions: 0,
   identityPolicyReceiptCacheHits: 0,
   identityPolicyReceiptNamespaceReads: 0,

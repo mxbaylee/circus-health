@@ -1,5 +1,6 @@
 import { launchBrowser, newTestPage } from './harness.ts';
 import { startProcessRuntime } from './process-runtime.ts';
+import { fixtureBrowserResponse, fixtureNativeFeedReady } from './native-intake-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -110,9 +111,32 @@ test(
       await route.abort('failed');
     });
     await page.goto(origin + '/#/import');
-    await page.reload();
+    const initialFeed = await fixtureNativeFeedReady(page, prefix, () => page.reload());
+    assert.equal(initialFeed.totalRecords, 2);
+    assert.equal(
+      initialFeed.records.filter(
+        (row) => row.detail.kind === 'record' && row.detail.record.selectable,
+      ).length,
+      2,
+      'both exact pending records are selectable after the native window is ready',
+    );
     await page.getByRole('checkbox', { name: 'Select all shown', exact: true }).check();
+    assert.equal(await page.getByRole('checkbox', { name: /Alpha marker/ }).isChecked(), true);
+    assert.equal(await page.getByRole('checkbox', { name: /Beta marker/ }).isChecked(), true);
+    const recoveredReply = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'GET' &&
+        new URL(response.url()).pathname ===
+          prefix + '/intakes/report-acceptance/' + originalOperation,
+    );
     await page.getByRole('button', { name: 'Save 2 records', exact: true }).click();
+    const recoveredResponse = await recoveredReply;
+    assert.equal(recoveredResponse.status(), 200, await recoveredResponse.text());
+    assert.equal(await recoveredResponse.finished(), null);
+    const recovered = (await recoveredResponse.json()).data as IntakeReportAcceptanceResult;
+    assert.equal(recovered.receipt.selectedCount, 2);
+    assert.equal(recovered.receipt.acceptedCount, 1);
     const outcomes = page.getByRole('region', { name: 'Save outcomes' });
     await outcomes.getByText('1 saved, 1 needs review', { exact: true }).waitFor();
     assert.equal(intercepted, 1);
@@ -132,6 +156,9 @@ test(
 
     const priorPid = runtime.pid;
     const port = runtime.port;
+    // Quiesce the old document before its server session disappears. The
+    // unchanged browser context retains the exact pending operation and cookies.
+    await page.goto('about:blank');
     await runtime.close();
     runtime = await startProcessRuntime(t, { ...runtimeOptions, port });
     assert.notEqual(runtime.pid, priorPid, 'all server memory belongs to a new process');
@@ -140,6 +167,7 @@ test(
       data: { recovery: setup.recovery },
     });
     assert.equal(unlocked.status(), 200, await unlocked.text());
+    assert.equal((await unlocked.json()).data.id, setup.profileId);
     const replay = await page.request.post(origin + prefix + '/intakes/report-acceptance', {
       headers: { Origin: origin },
       data: originalRequest,
@@ -156,12 +184,25 @@ test(
     );
     await page.unroute('**/intakes/report-acceptance');
     await page.goto(origin + '/#/import');
-    await page.reload();
+    const resumedFeed = await fixtureNativeFeedReady(page, prefix, () => page.reload());
+    assert.equal(resumedFeed.totalRecords, 1);
+    assert.equal(resumedFeed.records[0]?.detail.kind, 'record');
     const beta = page.getByRole('checkbox', { name: /Beta marker/ });
     await beta.focus();
     await page.keyboard.press('Space');
     assert.equal(await beta.isChecked(), true);
+    const freshReply = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname === prefix + '/intakes/report-acceptance',
+    );
     await page.getByRole('button', { name: 'Save 1 record', exact: true }).click();
+    const freshResponse = await freshReply;
+    assert.equal(freshResponse.status(), 200, await freshResponse.text());
+    assert.equal(await freshResponse.finished(), null);
+    const fresh = (await freshResponse.json()).data as IntakeReportAcceptanceResult;
+    assert.equal(fresh.receipt.acceptedCount, 1);
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByText('1 saved', { exact: true })

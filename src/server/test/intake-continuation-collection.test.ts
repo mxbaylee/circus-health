@@ -6,7 +6,12 @@ import { join } from 'node:path';
 import { openDatabase, clinicalReviewRevision } from '../database.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
-import { uploadIntake, createIntakePlan, workflowMutation } from '../intake.ts';
+import {
+  uploadIntake,
+  createIntakePlan,
+  workflowMutation,
+  retainIntakeChildren,
+} from '../intake.ts';
 import { fictionalModel } from './fictional-model.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import { createPagedPackagePlan, readPackagePlanScope } from '../intake-package-plan.ts';
@@ -20,7 +25,12 @@ import {
   readCollectionConversionWindow,
   deferCollectionConversionRead,
   acknowledgeCollectionConversionRead,
+  readCollectionConversionSessionTotals,
+  prepareManualCollectionDescendantRead,
 } from '../intake-continuation-collection.ts';
+import { readIntakeEnvelopeText } from '../intake-authority.ts';
+import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
+import { importLegacyReadingCheckpoint } from '../intake-reading-legacy.ts';
 import { conversionReadDetails } from '../intake-continuation.ts';
 import { clearIntakeStateCache } from '../intake-state-storage.ts';
 import { clearPackageSourceSession } from '../intake-package-session.ts';
@@ -37,6 +47,340 @@ import {
   clearCollectionProcessingExceptions,
 } from '../intake-processing-exceptions.ts';
 import { intakeSourceVersion } from '../intake-state-access.ts';
+
+test('concurrent reading publications merge exact session evidence and queued cancellation leaves no receipt', async (t) => {
+  fictionalModel(t);
+  const root = mkdtempSync(join(tmpdir(), 'fictional-concurrent-reading-')),
+    profileId = 'fictional';
+  const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId });
+  t.after(() => {
+    clearIntakeStateCache(db);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional.txt',
+    bytes: Buffer.from('Fictional reading source. '.repeat(600)),
+  });
+  await buildIntakeCollectionEnvelope(db, { id: source.id });
+  const planned = await createPagedDirectPlan(db, root, profileId, source.id, {
+    version: source.version,
+    operationId: 'concurrent-reading-plan',
+  });
+  const direct = readDirectPlanScope(db, profileId, source.id)!;
+  assert.ok(direct.unitCount >= 2);
+  const sessionId = 'concurrent';
+  await importLegacyReadingCheckpoint(db, root, profileId, source.id, sessionId, {
+    intakeId: source.id,
+    profileId,
+    sourceHash: source.sha256,
+    version: planned.version,
+    seen: [],
+    readScopes: [],
+    jsonRoots: [],
+    pending: [],
+    completedUnits: [],
+    accountedUnits: [],
+    turns: 0,
+    pagesProcessed: 0,
+    lastWindow: null,
+  });
+  const scopes = [0, 1].map((ordinal) =>
+    openCollectionConversion(db, root, profileId, source.id, {
+      sessionId,
+      unitId: direct.unitAt(ordinal)!.id,
+    })!,
+  );
+  const checkpoints = scopes.map(createCollectionCheckpoint);
+  const args = (index: number, offset = index * 12000) => ({
+    id: source.id,
+    unitId: scopes[index]!.unitId,
+    offset,
+  });
+  const result = (offset: number) => ({
+    original: { literal: 'Fictional window.', offset, nextOffset: null },
+  });
+  const entered = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  let held = false;
+  const first = recordCollectionConversionRead(
+    scopes[0]!,
+    checkpoints[0]!,
+    'health_intake_read',
+    args(0),
+    result(0),
+    {
+      async onCheckpoint() {
+        if (held) return;
+        held = true;
+        entered.resolve();
+        await resume.promise;
+      },
+    },
+  );
+  await entered.promise;
+  let stopped = false;
+  const cancelled = recordCollectionConversionRead(
+    scopes[1]!,
+    checkpoints[1]!,
+    'health_intake_read',
+    args(1),
+    result(12000),
+    {
+      assertRunning() {
+        if (stopped) throw Error('Queued reader stopped');
+      },
+    },
+  );
+  const cancelledProof = assert.rejects(cancelled, /Queued reader stopped/);
+  stopped = true;
+  resume.resolve();
+  assert.equal(await first, true);
+  await cancelledProof;
+  const totals = () => readCollectionConversionSessionTotals(db, profileId, source.id, sessionId);
+  assert.equal(totals().seen, 1);
+  assert.equal(totals().distinct, 1);
+  assert.equal(totals().pending, 0);
+  assert.deepEqual(
+    await Promise.all(
+      scopes.map((scope, index) =>
+        recordCollectionConversionRead(
+          scope,
+          checkpoints[index]!,
+          'health_intake_read',
+          args(index),
+          result(index * 12000),
+        ),
+      ),
+    ),
+    [false, true],
+    'a rejected queued operation releases the session and distinct unit contributions merge',
+  );
+  assert.equal(totals().seen, 2);
+  assert.equal(totals().distinct, 2);
+  const deferred = await deferCollectionConversionRead(
+    scopes[0]!,
+    checkpoints[0]!,
+    'health_intake_read',
+    args(0, 1),
+    result(1),
+  );
+  assert.ok(deferred);
+  assert.equal(totals().seen, 2);
+  assert.deepEqual(
+    await Promise.all([
+      acknowledgeCollectionConversionRead(scopes[0]!, checkpoints[0]!, deferred.key),
+      acknowledgeCollectionConversionRead(scopes[0]!, checkpoints[0]!, deferred.key),
+    ]),
+    [true, false],
+  );
+  assert.equal(totals().seen, 3);
+  assert.equal(totals().distinct, 3);
+  clearIntakeStateCache(db);
+  assert.equal(totals().seen, 3, 'quiescent evidence survives cache disposal');
+  assert.equal(totals().distinct, 3);
+});
+
+test('manual descendant reads require exact ancestry, original bytes and session without manufacturing parent coverage', async (t) => {
+  fictionalModel(t);
+  const root = mkdtempSync(join(tmpdir(), 'fictional-descendant-reading-')),
+    profileId = 'fictional';
+  const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId });
+  t.after(() => {
+    clearIntakeStateCache(db);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const parent = uploadIntake(db, root, profileId, {
+    filename: 'fictional.png',
+    bytes: Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aIYkAAAAASUVORK5CYII=',
+      'base64',
+    ),
+  });
+  const child = retainIntakeChildren(db, root, profileId, parent.id, [
+    {
+      filename: 'fictional-child.txt',
+      locator: 'fictional retained child',
+      bytes: Buffer.from('Independently fictional child source'),
+      derivative: false,
+    },
+  ])[0]!;
+  const unrelated = uploadIntake(db, root, profileId, {
+    filename: 'fictional-unrelated.txt',
+    bytes: Buffer.from('Separate fictional delivery'),
+  });
+  await buildIntakeCollectionEnvelope(db, { id: parent.id });
+  await createPagedDirectPlan(db, root, profileId, parent.id, {
+    version: intakeSourceVersion(db, parent.id).version,
+    operationId: 'manual-descendant-plan',
+  });
+  const scope = openCollectionConversion(db, root, profileId, parent.id, { sessionId: 'manual' })!,
+    checkpoint = createCollectionCheckpoint(scope),
+    args = { id: child.id },
+    result = {
+      original: { literal: 'Independently fictional child source', offset: 0, nextOffset: null },
+    };
+  const totals = () => readCollectionConversionSessionTotals(db, profileId, parent.id, 'manual');
+  await assert.rejects(
+    prepareManualCollectionDescendantRead(scope, unrelated.id),
+    /does not belong/,
+  );
+  const capability = await prepareManualCollectionDescendantRead(scope, child.id);
+  const other = openCollectionConversion(db, root, profileId, parent.id, {
+    sessionId: 'another-session',
+  })!;
+  await assert.rejects(
+    recordCollectionConversionRead(
+      other,
+      createCollectionCheckpoint(other),
+      'health_intake_read',
+      args,
+      result,
+      {
+        descendantRead: capability,
+      },
+    ),
+    /Foreign manual descendant/,
+  );
+  await assert.rejects(
+    recordCollectionConversionRead(
+      scope,
+      checkpoint,
+      'health_intake_read',
+      { ...args, unitId: 'unrelated-unit' },
+      result,
+      {
+        descendantRead: capability,
+      },
+    ),
+    /different occurrence/,
+  );
+  const original = JSON.parse(readIntakeEnvelopeText(db, { id: child.id })!);
+  const reparent = () =>
+    writeIntakeFixtureEnvelope(db, child.id, {
+      ...original,
+      intake: { ...original.intake, parentSourceFileId: unrelated.id },
+    });
+  reparent();
+  await assert.rejects(
+    recordCollectionConversionRead(scope, checkpoint, 'health_intake_read', args, result, {
+      descendantRead: capability,
+    }),
+    /does not belong/,
+  );
+  writeIntakeFixtureEnvelope(db, child.id, original);
+  let changed = false;
+  await assert.rejects(
+    recordCollectionConversionRead(scope, checkpoint, 'health_intake_read', args, result, {
+      descendantRead: capability,
+      onCheckpoint() {
+        if (!changed) {
+          changed = true;
+          reparent();
+        }
+      },
+    }),
+    /does not belong/,
+  );
+  assert.equal(changed, true);
+  writeIntakeFixtureEnvelope(db, child.id, original);
+  let stopped = false;
+  await assert.rejects(
+    recordCollectionConversionRead(scope, checkpoint, 'health_intake_read', args, result, {
+      descendantRead: capability,
+      assertRunning() {
+        if (stopped) throw Error('Manual descendant stopped');
+      },
+      onCheckpoint() {
+        stopped = true;
+      },
+    }),
+    /Manual descendant stopped/,
+  );
+  assert.equal(totals().seen, 0);
+  const deferred = await deferCollectionConversionRead(
+    scope,
+    checkpoint,
+    'health_intake_read',
+    args,
+    result,
+    {
+      descendantRead: capability,
+    },
+  );
+  assert.ok(deferred);
+  assert.equal(totals().seen, 0, 'a source route is not acknowledged reading');
+  clearIntakeStateCache(db);
+  const reopened = openCollectionConversion(db, root, profileId, parent.id, {
+    sessionId: 'manual',
+  })!;
+  assert.equal(await acknowledgeCollectionConversionRead(reopened, checkpoint, deferred.key), true);
+  assert.equal(totals().seen, 1);
+  assert.equal(totals().distinct, 1);
+  assert.throws(
+    () =>
+      assertCollectionConversionCoverage([reopened], {
+        planId: reopened.planId,
+        coverage: [{ unitId: reopened.unitId, kind: 'extracted', notes: 'Fictional child only' }],
+      }),
+    { code: 'CONVERSION_COVERAGE_PENDING' },
+  );
+  reparent();
+  await assert.rejects(
+    recordCollectionConversionRead(reopened, checkpoint, 'health_intake_read', args, result),
+    /does not belong/,
+  );
+  assert.equal(totals().seen, 1);
+  writeIntakeFixtureEnvelope(db, child.id, original);
+  const { updateIntakeMetadataRead } = await import('../intake.ts');
+  const beforeDomainChange = intakeSourceVersion(db, parent.id);
+  await updateIntakeMetadataRead(db, root, profileId, parent.id, {
+    version: beforeDomainChange.version,
+    operationId: 'fictional-parent-domain-change',
+    metadata: { careArea: 'Fictional changed care area' },
+  });
+  assert.notEqual(
+    intakeSourceVersion(db, parent.id).logicalBinding,
+    beforeDomainChange.logicalBinding,
+  );
+  const changedScope = openCollectionConversion(db, root, profileId, parent.id, {
+      sessionId: 'manual',
+    })!,
+    changedCheckpoint = createCollectionCheckpoint(changedScope);
+  await assert.rejects(
+    recordCollectionConversionRead(
+      changedScope,
+      changedCheckpoint,
+      'health_intake_read',
+      args,
+      result,
+      {
+        descendantRead: capability,
+      },
+    ),
+    /Foreign manual descendant/,
+  );
+  const changedCapability = await prepareManualCollectionDescendantRead(changedScope, child.id);
+  // Corrupt this disposable projection only after the publication/recovery
+  // oracles. Original evidence cannot be changed through an accepted write.
+  db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('f'.repeat(64), child.id);
+  await assert.rejects(
+    recordCollectionConversionRead(
+      changedScope,
+      changedCheckpoint,
+      'health_intake_read',
+      args,
+      result,
+      {
+        descendantRead: changedCapability,
+      },
+    ),
+    /source|authority|hash/i,
+  );
+});
 
 test('direct recipe plans provide exact workflow counts, model units and durable reading scope without expanded units', async (t) => {
   fictionalModel(t);

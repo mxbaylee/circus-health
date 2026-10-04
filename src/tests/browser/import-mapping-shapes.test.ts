@@ -7,12 +7,13 @@ import {
   fixtureNativeReportReady,
   fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
-import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { launchBrowser, newTestPage } from './harness.ts';
+import { startProcessRuntime } from './process-runtime.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
-import type { AddressInfo } from 'node:net';
+import type { CollectionReportDetail } from '../../shared/intake-clinical-pages.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
@@ -104,12 +105,11 @@ test(
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-mapping-shapes-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startBrowserRuntime(t, {
+    const runtime = await startProcessRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
       host: '127.0.0.1',
-      assistantOptions: { availability: () => ({ available: false }) },
     });
     let browser: Browser | undefined;
     t.after(async () => {
@@ -120,7 +120,7 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser);
-    const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
+    const url = `http://127.0.0.1:${runtime.port}`;
     await page.goto(url);
     const setup = await page.evaluate(async () => {
       const api = async (path: string, body?: unknown) => {
@@ -264,10 +264,65 @@ test(
           response.request().postDataJSON().candidateVersionId === recordScope.candidateVersionId &&
           response.request().postDataJSON().mapping?.documentDate === '2017-03-08',
       );
+      const choiceRead = fixtureBrowserResponse(page, async (response) => {
+        const selected = new URL(response.url());
+        if (
+          selected.pathname !== path + '/review-record' ||
+          selected.searchParams.get('recordId') !== recordScope.recordId ||
+          response.request().method() !== 'GET' ||
+          response.request().timing().startTime < choiceSince
+        )
+          return false;
+        if (!response.ok()) return true;
+        const read = (await response.json()).data;
+        return (
+          read.record.kind === 'record' &&
+          read.record.record.candidateVersionId === recordScope.candidateVersionId &&
+          read.record.record.mapping.documentDate === '2017-03-08'
+        );
+      });
       await choice.click();
       const choiceResponse = await choiceSaved;
       assert.equal(choiceResponse.status(), 200, await choiceResponse.text());
       assert.equal(await choiceResponse.finished(), null);
+      const refreshedChoice = await choiceRead;
+      assert.equal(refreshedChoice.status(), 200, await refreshedChoice.text());
+      assert.equal(await refreshedChoice.finished(), null);
+      if (clinical) {
+        // Both shape fixtures describe independent retained source occurrences.
+        // Review their relationship before accepting the second prescription.
+        const related = page.locator('details.intake-related-disclosure');
+        const summary = related.locator(':scope > summary');
+        await summary.waitFor();
+        if (!(await related.evaluate((element) => (element as HTMLDetailsElement).open)))
+          await summary.click();
+        const paired = page.getByRole('region', { name: 'Paired evidence review' });
+        assert.equal(await paired.count(), 1);
+        await paired.locator('summary').click();
+        await paired
+          .getByRole('group', { name: 'Relationship with this record', exact: true })
+          .getByRole('combobox')
+          .selectOption('distinct');
+        const reason =
+          'Independent fictional source record identifiers; retain both prescriptions.';
+        await paired.getByLabel('Reason for this relationship', { exact: true }).fill(reason);
+        const relationshipSaved = fixtureBrowserResponse(
+          page,
+          (response) =>
+            response.request().method() === 'POST' &&
+            new URL(response.url()).pathname === path + '/review-record-action',
+        );
+        await fixtureNativeRecordReady(page, prefix, recordScope, async () => {
+          await paired.getByRole('button', { name: 'Save this relationship', exact: true }).click();
+          const response = await relationshipSaved;
+          assert.equal(response.status(), 200, await response.text());
+          assert.equal(await response.finished(), null);
+          const command = response.request().postDataJSON();
+          assert.equal(command.recordId, recordScope.recordId);
+          assert.equal(command.pair.outcome, 'distinct');
+          assert.equal(command.pair.reason, reason);
+        });
+      }
       const accepted = fixtureBrowserResponse(
         page,
         (response) => response.url().endsWith('/intakes/report-acceptance') && response.ok(),
@@ -275,6 +330,7 @@ test(
       await page.getByRole('button', { name: 'Confirm and save record', exact: true }).click();
       const acceptedResponse = await accepted;
       const acceptedResult = (await acceptedResponse.json()).data;
+      assert.equal(acceptedResult.receipt.acceptedCount, 1);
       await page
         .getByText('This exact record was saved to your profile.', { exact: true })
         .waitFor();
@@ -390,18 +446,78 @@ test(
     assert.equal(initialQueue.records.length, 20);
     const queueReportUrl = await fixtureReportUrl(api, prefix, queueItem.id);
     const queueGroupId = new URLSearchParams(queueReportUrl.split('?')[1]).get('group')!;
+    const queueLinkSelector = '.import-detail-record-link:not([data-saved-record-id])';
+    async function assertQueuePage(detail: CollectionReportDetail) {
+      assert.equal(detail.records.totalRecords, 20, 'The complete report still has twenty records');
+      const expectedIds = detail.records.records.map((row) =>
+        row.kind === 'record' ? row.record.id : row.selection.recordId,
+      );
+      await page.waitForFunction(
+        ({ selector, expected }) => {
+          const ids = Array.from(document.querySelectorAll<HTMLAnchorElement>(selector), (link) =>
+            new URLSearchParams(new URL(link.href).hash.split('?')[1]).get('record'),
+          );
+          return JSON.stringify(ids) === JSON.stringify(expected);
+        },
+        { selector: queueLinkSelector, expected: expectedIds },
+        { timeout: 5000 },
+      );
+      assert.deepEqual(
+        await page
+          .locator(queueLinkSelector)
+          .evaluateAll((links) =>
+            links.map((link) =>
+              new URLSearchParams(new URL((link as HTMLAnchorElement).href).hash.split('?')[1]).get(
+                'record',
+              ),
+            ),
+          ),
+        expectedIds,
+        'Every displayed link selects the exact record in this bounded report page',
+      );
+      return expectedIds;
+    }
     async function openQueueRecord(index: number) {
       // A fresh document sees API-seeded records through one actual browser read.
       await page.goto('about:blank');
-      await fixtureNativeReportReady(
+      const firstPage = await fixtureNativeReportReady(
         page,
         prefix,
         { intakeId: queueItem.id, groupId: queueGroupId },
         () => page.goto(url + queueReportUrl),
       );
-      const links = page.locator('.import-detail-record-link:not([data-saved-record-id])');
-      await links.first().waitFor();
-      assert.equal(await links.count(), 20, 'The report keeps all twenty exact record links');
+      const firstIds = await assertQueuePage(firstPage);
+      if (index === 0) {
+        // The byte budget can split this report before the record-count limit.
+        // Traverse the real page controls to retain the complete twenty-link oracle.
+        const allIds = [...firstIds];
+        const cursors = new Set<string>();
+        let detail = firstPage;
+        while (detail.records.nextCursor) {
+          assert.ok(!cursors.has(detail.records.nextCursor), 'Report pagination never loops');
+          cursors.add(detail.records.nextCursor);
+          detail = await fixtureNativeReportReady(
+            page,
+            prefix,
+            { intakeId: queueItem.id, groupId: queueGroupId },
+            () => page.getByRole('button', { name: 'Next report records', exact: true }).click(),
+          );
+          allIds.push(...(await assertQueuePage(detail)));
+        }
+        assert.equal(new Set(allIds).size, 20, 'All twenty exact record links appear once');
+        assert.deepEqual(
+          allIds,
+          initialQueue.records.map((record) => record.id),
+          'Report pages retain every exact record link in order without gaps or duplicates',
+        );
+        if (cursors.size) {
+          await page.getByRole('button', { name: 'First report records', exact: true }).click();
+          await assertQueuePage(firstPage);
+        }
+      }
+      const targetId = initialQueue.records[index].id;
+      const targetIndex = firstIds.indexOf(targetId);
+      assert.ok(targetIndex >= 0, 'The selected review record is on the first bounded page');
       await fixtureNativeRecordReady(
         page,
         prefix,
@@ -411,7 +527,7 @@ test(
           recordId: initialQueue.records[index].id,
           candidateVersionId: initialQueue.records[index].candidateVersionId,
         },
-        () => links.nth(index).click(),
+        () => page.locator(queueLinkSelector).nth(targetIndex).click(),
       );
       await page.getByRole('region', { name: 'Review actions' }).waitFor();
     }

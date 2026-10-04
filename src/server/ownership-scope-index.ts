@@ -25,7 +25,12 @@ export function createOwnershipScopeIndex(
       const source = db
         .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
         .get(intakeId);
-      if (!source || !hasIntakeCollectionEnvelope(db, source as { id: string })) return;
+      if (
+        !source ||
+        source.kind !== 'intake_original' ||
+        !hasIntakeCollectionEnvelope(db, source as { id: string })
+      )
+        return;
       for (const member of ownershipIntakeScopeOccurrences(db, intakeId)) {
         if (member.latest)
           sql

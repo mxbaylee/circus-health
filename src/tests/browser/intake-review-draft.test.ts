@@ -8,11 +8,11 @@ import {
   fixtureNativeReportReady,
   fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
-import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { launchBrowser, newTestPage } from './harness.ts';
+import { startProcessRuntime } from './process-runtime.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
-import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
@@ -85,17 +85,18 @@ const envelope = (clinical: boolean) => ({
 
 test(
   'encrypted browser autosaves consecutive review choices with entire server mapping and restores drafts after cache loss',
-  { timeout: 60000 },
+  // Two complete autosave, encrypted cache-loss recovery and acceptance journeys.
+  // Host hang guard only; individual UI assertions keep their normal deadline.
+  { timeout: 180000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-review-draft-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startBrowserRuntime(t, {
+    const runtime = await startProcessRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
       host: '127.0.0.1',
-      assistantOptions: { availability: () => ({ available: false }) },
     });
     let browser: Browser | undefined;
     t.after(async () => {
@@ -106,7 +107,7 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser);
-    const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
+    const url = `http://127.0.0.1:${runtime.port}`;
     await page.goto(url);
     const setup = await page.evaluate(async () => {
       const api = async (path: string, body?: unknown) => {

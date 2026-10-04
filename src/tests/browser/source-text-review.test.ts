@@ -4,7 +4,9 @@ import {
   fixtureApi,
   fixtureAssertNoAccepted,
   fixtureBrowserResponse,
+  fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
+import type { ManualSourceRecordResult } from '../../shared/intake-manual-source-record.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -256,9 +258,36 @@ test(
     await manual
       .getByRole('textbox', { name: 'Literal source wording', exact: true })
       .fill('No fever; value 0.05 mg.');
+    const createdResponse = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          prefix + '/intakes/' + encodeURIComponent(intake.id) + '/source-records',
+    );
     await manual.getByRole('button', { name: 'Create review draft', exact: true }).click();
+    const created = await createdResponse;
+    assert.equal(created.status(), 200, await created.text());
+    assert.equal(await created.finished(), null);
+    const manualRecord = (await created.json()).data as ManualSourceRecordResult;
+    assert.equal(manualRecord.intake.id, intake.id);
+    assert.ok(manualRecord.proposalId && manualRecord.recordId && manualRecord.groupId);
     await fixtureAssertNoAccepted(api, prefix, intake.id);
-    await page.getByRole('link', { name: 'Review the new record', exact: true }).click();
+    const reviewNewRecord = page.getByRole('link', { name: 'Review the new record', exact: true });
+    assert.equal(await reviewNewRecord.getAttribute('href'), '#' + manualRecord.reviewUrl);
+    const selected = await fixtureNativeRecordReady(
+      page,
+      prefix,
+      {
+        intakeId: intake.id,
+        proposalId: manualRecord.proposalId,
+        recordId: manualRecord.recordId,
+      },
+      () => reviewNewRecord.click(),
+    );
+    assert.equal(selected.record.kind, 'record');
+    assert.ok(selected.record.kind === 'record');
+    assert.equal(selected.record.record.mapping.testLabel, 'Cookie Doe fictional measurement');
     const inline = page.locator('.import-record-accordion');
     await inline
       .getByRole('heading', { name: 'Cookie Doe fictional measurement', exact: true })

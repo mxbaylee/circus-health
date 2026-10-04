@@ -245,6 +245,8 @@ export interface BuildReviewInput {
   selected?: {
     sourceScopeProblem: (entry: IntakeEntry) => string | null;
     draft: (recordId: string) => IntakeReviewDraft | null;
+    /** Transfer the exact selected draft to the policy stage without changing wire records. */
+    retainDraft?: (record: ClinicalReviewRecord, draft: IntakeReviewDraft | null) => void;
     accepted: (recordId: string) => IntakeReviewDecision | undefined;
     reportContext: (
       envelopeId: string,
@@ -1047,6 +1049,7 @@ export function buildClinicalReview(
           { native: !!selected },
         ),
       );
+    selected?.retainDraft?.(result, draft ?? null);
     return result;
   });
   const summary = {

@@ -18,7 +18,7 @@ export interface ReviewDraftPairCommit {
   transition?: IntakeReviewDraftTransition;
 }
 
-function ownRevisionTransition(commit: ReviewDraftPairCommit, priorRevision: number) {
+export function ownRevisionTransition(commit: ReviewDraftPairCommit, priorRevision: number) {
   const transition = commit.transition;
   if (transition === undefined) return priorRevision + 1 === commit.revision;
   return (

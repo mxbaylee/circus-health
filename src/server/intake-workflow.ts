@@ -339,6 +339,15 @@ export interface WorkflowReviewScope {
   questions(candidateId: string, versionId: string): ReviewQuestionSelection;
   accepted(candidateId: string, versionId: string): boolean;
   draft(proposalId: string | null, recordId: string, versionId: string): IntakeReviewDraft | null;
+  bindPreparedDraft?(
+    record: Pick<IntakeReview['records'][number], 'id'>,
+    draft: IntakeReviewDraft | null,
+  ): void;
+  preparedDraft?(
+    proposalId: string | null,
+    record: IntakeReview['records'][number],
+    versionId: string,
+  ): IntakeReviewDraft | null | undefined;
   firstVersion(candidateId: string): string | undefined;
   keptOriginal(candidateId: string, versionId: string): boolean;
   group(reference: IntakeReviewGroupReference): WorkflowReviewGroup | undefined;
@@ -584,7 +593,11 @@ export function workflowReviewSelected<T extends IntakeReview>(
     bindReviewRecordQuestions(record, scope.questions(candidateId, versionId));
     record.reviewState =
       !record.projectionUpgrade && scope.accepted(candidateId, versionId) ? 'accepted' : 'pending';
-    record.draft = scope.draft(review.proposalId, record.id, versionId);
+    const preparedDraft = scope.preparedDraft?.(review.proposalId, record, versionId);
+    record.draft =
+      preparedDraft === undefined
+        ? scope.draft(review.proposalId, record.id, versionId)
+        : preparedDraft;
     // Legacy questions did not pin a version. An old identity answer is history,
     // not confirmation of a changed envelope. Keep the durable question intact.
     if (record.reviewState !== 'accepted' && scope.firstVersion(candidateId) !== versionId)

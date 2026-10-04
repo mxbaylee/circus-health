@@ -101,6 +101,7 @@ export function CollectionImportReview({
   onChanged,
   sourceProps,
   onUpload,
+  uploadUnavailable,
   busy,
   status,
   error: actionError,
@@ -115,6 +116,7 @@ export function CollectionImportReview({
   onChanged: () => void;
   sourceProps: SourceBrowserProps;
   onUpload: (files: File[]) => Promise<void>;
+  uploadUnavailable?: string;
   busy: boolean;
   status: string;
   error: string;
@@ -806,6 +808,8 @@ export function CollectionImportReview({
         )}
         actions={{
           busy: busy || mutationPending || authorityUnavailable,
+          uploadBusy: busy || mutationPending,
+          uploadUnavailable,
           onFiles: onUpload,
           onSave: save,
           onLater: (ids) => disposition(ids, 'later'),

@@ -3,6 +3,10 @@ import type { DatabaseSync } from 'node:sqlite';
 import { createHmac, randomBytes } from 'node:crypto';
 import { HttpError } from './database.ts';
 import {
+  identityGroundingGeneration,
+  identityGroundingReadStamp,
+} from './intake-identity-grounding.ts';
+import {
   openCollectionReportQueue,
   collectionReportGroupSummary,
 } from './intake-report-group-collection.ts';
@@ -89,6 +93,7 @@ type PreparedFeed = {
   key: string;
   binding: string;
   clinicalRevision: string;
+  grounding: object;
   busy: boolean;
   scratch: ReturnType<typeof disposableSqlite>;
   signingKey: Buffer;
@@ -373,6 +378,7 @@ export async function readCollectionImportFeed(
     );
   const activityPin = journalActivityBinding(root, profileId),
     queue = await openCollectionReportQueue(db, root, profileId),
+    grounding = identityGroundingGeneration(db),
     epoch = feedEpochs.get(db) || 0;
   let scratch = disposableSqlite('circus-import-feed-');
   let signingKey: Buffer = randomBytes(32);
@@ -381,7 +387,7 @@ export async function readCollectionImportFeed(
   let retained = false;
   let successfulRead = false;
   scratch.db.exec(
-    'CREATE TABLE sources(id TEXT PRIMARY KEY,pin TEXT,seen INTEGER,counts TEXT,peopleCounts TEXT,kindCounts TEXT,totalRecords INTEGER,totalPeopleGroups INTEGER);CREATE TABLE matches(intake TEXT,groupId TEXT,PRIMARY KEY(intake,groupId));CREATE TABLE records(ordering TEXT PRIMARY KEY,value TEXT,groupValue TEXT,intake TEXT,member TEXT,signature TEXT);CREATE INDEX recordIntake ON records(intake);CREATE TABLE people(ordering TEXT PRIMARY KEY,value TEXT,intake TEXT);CREATE INDEX peopleIntake ON people(intake);CREATE TABLE facts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,ordering TEXT,groupId TEXT,counts TEXT,kind TEXT,included INTEGER,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE INDEX factsGroup ON facts(intake,groupId,included);CREATE TABLE changedCandidates(id TEXT,version TEXT,PRIMARY KEY(id,version));CREATE TABLE changedGroups(ordinal INTEGER PRIMARY KEY);',
+    'CREATE TABLE sources(id TEXT PRIMARY KEY,pin TEXT,seen INTEGER,counts TEXT,peopleCounts TEXT,kindCounts TEXT,totalRecords INTEGER,totalPeopleGroups INTEGER,grounding TEXT);CREATE TABLE matches(intake TEXT,groupId TEXT,PRIMARY KEY(intake,groupId));CREATE TABLE records(ordering TEXT PRIMARY KEY,value TEXT,groupValue TEXT,intake TEXT,member TEXT,signature TEXT);CREATE INDEX recordIntake ON records(intake);CREATE TABLE people(ordering TEXT PRIMARY KEY,value TEXT,intake TEXT);CREATE INDEX peopleIntake ON people(intake);CREATE TABLE facts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,ordering TEXT,groupId TEXT,counts TEXT,kind TEXT,included INTEGER,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE INDEX factsGroup ON facts(intake,groupId,included);CREATE TABLE changedCandidates(id TEXT,version TEXT,PRIMARY KEY(id,version));CREATE TABLE changedGroups(ordinal INTEGER PRIMARY KEY);',
   );
   scratch.db.exec(
     'CREATE TABLE peopleMatches(intake TEXT,ordinal INTEGER,ordering TEXT,counts TEXT,visible INTEGER,PRIMARY KEY(intake,ordinal)) WITHOUT ROWID',
@@ -389,6 +395,7 @@ export async function readCollectionImportFeed(
   try {
     const binding = canonicalLiteral([
       queue.binding,
+      identityGroundingReadStamp(db),
       activityPin,
       view,
       query,
@@ -437,7 +444,7 @@ export async function readCollectionImportFeed(
       cached = [...preparedFeeds].find(
         (feed) => feed.db === db && feed.key === cacheKey && !feed.busy,
       );
-    if (cached && cached.binding === queue.binding) {
+    if (cached && cached.binding === queue.binding && cached.grounding === grounding) {
       cached.used = ++feedClock;
       readingFeed = cached;
       const result = feedWindow(db, root, profileId, queue, cached, {
@@ -676,8 +683,13 @@ export async function readCollectionImportFeed(
     };
     for (const source of queue.sources()) {
       const prior = scratch.db.prepare('SELECT * FROM sources WHERE id=?').get(source.id);
+      const sourceGrounding = queue.groundingStamp(source.id);
       scratch.db.prepare('UPDATE sources SET seen=1 WHERE id=?').run(source.id);
-      if (prior?.pin === source.pin && cached?.clinicalRevision === queue.clinicalRevision)
+      if (
+        prior?.pin === source.pin &&
+        prior.grounding === sourceGrounding &&
+        cached?.clinicalRevision === queue.clinicalRevision
+      )
         continue;
       withIntakeWork(db, 'warm', () => recordIntakeWork('collectionFeedRebuiltSources'));
       const old = prior
@@ -688,6 +700,7 @@ export async function readCollectionImportFeed(
           old?.logicalBinding &&
           current.logicalBinding &&
           cached?.clinicalRevision === queue.clinicalRevision &&
+          prior?.grounding === sourceGrounding &&
           canonicalLiteral(old.sourcePin) === canonicalLiteral(current.sourcePin)
             ? collectionQueueTransitionEffects(
                 db,
@@ -847,7 +860,7 @@ export async function readCollectionImportFeed(
           .run(source.id);
         scratch.db
           .prepare(
-            'UPDATE sources SET pin=?,counts=?,kindCounts=?,totalRecords=?,peopleCounts=?,totalPeopleGroups=? WHERE id=?',
+            'UPDATE sources SET pin=?,counts=?,kindCounts=?,totalRecords=?,peopleCounts=?,totalPeopleGroups=?,grounding=? WHERE id=?',
           )
           .run(
             source.pin,
@@ -856,6 +869,7 @@ export async function readCollectionImportFeed(
             totalRecords,
             JSON.stringify(peopleCounts),
             totalPeopleGroups,
+            queue.groundingStamp(source.id),
             source.id,
           );
         continue;
@@ -901,7 +915,7 @@ export async function readCollectionImportFeed(
         }
       }
       scratch.db
-        .prepare('INSERT OR REPLACE INTO sources VALUES(?,?,1,?,?,?,?,?)')
+        .prepare('INSERT OR REPLACE INTO sources VALUES(?,?,1,?,?,?,?,?,?)')
         .run(
           source.id,
           source.pin,
@@ -910,6 +924,7 @@ export async function readCollectionImportFeed(
           JSON.stringify(kindCounts),
           totalRecords,
           totalPeopleGroups,
+          queue.groundingStamp(source.id),
         );
     }
     for (const row of scratch.db.prepare('SELECT id FROM sources WHERE seen=0').iterate())
@@ -937,6 +952,12 @@ export async function readCollectionImportFeed(
       totalPeopleGroups += Number(row.totalPeopleGroups);
     }
     queue.assertCurrent();
+    if (identityGroundingGeneration(db) !== grounding)
+      throw new HttpError(
+        409,
+        'REPORT_QUEUE_CURSOR',
+        'Review changed while preparing; refresh this feed',
+      );
     if (journalActivityBinding(root, profileId) !== activityPin)
       throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Reading activity changed');
     if ((feedEpochs.get(db) || 0) !== epoch)
@@ -946,6 +967,7 @@ export async function readCollectionImportFeed(
       key: cacheKey,
       binding: queue.binding,
       clinicalRevision: queue.clinicalRevision,
+      grounding,
       busy: false,
       scratch,
       signingKey,

@@ -139,6 +139,9 @@ import {
   assertCollectionChildConversionCoverage,
   assertLegacyCollectionChildConversionCoverage,
   collectionConversionSourceUnit,
+  prepareManualCollectionDescendantRead,
+  createCollectionCheckpoint,
+  type CollectionDescendantRead,
 } from './intake-continuation-collection.ts';
 import {
   importNativeAttribution,
@@ -2245,6 +2248,8 @@ export function createAssistant({
     assertRunning();
     const db = dbFor(profileId),
       args = params.arguments;
+    let descendantRead: CollectionDescendantRead | undefined;
+    let descendantUnitId: string | undefined;
     if (state.beforeModelRequest && state.checkpoint?.activeUnitId) {
       const intake = conversionIntake(profileId, chat);
       const nativeUnit = isNativeAssistantConversion(intake)
@@ -3588,6 +3593,34 @@ export function createAssistant({
           profileId,
           stringArgument(args, 'id'),
         );
+        if (
+          !state.beforeModelRequest &&
+          isNativeAssistantCheckpoint(state.checkpoint) &&
+          args.id !== state.checkpoint.intakeId
+        ) {
+          const parent = conversionIntake(profileId, chat);
+          if (!isNativeAssistantConversion(parent))
+            throw new Error('The manual reading source changed');
+          const priorScope = nativeAssistantScope(parent, state.checkpoint.activeUnitId),
+            remembered =
+              priorScope && collectionConversionSourceUnit(priorScope, stringArgument(args, 'id')),
+            scope = remembered ? nativeAssistantScope(parent, remembered) : priorScope,
+            unit = scope && nativeAssistantUnit(parent, scope.unitId);
+          if (scope && unit && unit.kind !== 'package_member' && !unit.memberId) {
+            descendantUnitId = scope.unitId;
+            descendantRead = await prepareManualCollectionDescendantRead(
+              scope,
+              stringArgument(args, 'id'),
+              {
+                assertRunning() {
+                  assertRunning();
+                  if (dbFor(profileId) !== db || state.beforeModelRequest)
+                    throw new Error('The manual reading session changed');
+                },
+              },
+            );
+          }
+        }
         result = await readIntakeEvidence({
           pagedContext: isIntakeSummary(selectedEvidence),
           db,
@@ -3879,7 +3912,8 @@ export function createAssistant({
         // dispatch keeps its selected work-unit boundary.
         if (!state.beforeModelRequest) {
           let selectedUnit =
-            args.id === intake.id && typeof args.unitId === 'string' ? args.unitId : undefined;
+            descendantUnitId ??
+            (args.id === intake.id && typeof args.unitId === 'string' ? args.unitId : undefined);
           const observedChild =
             typeof args.id === 'string' && state.observedPackageMembers?.get(args.id);
           const priorScope = nativeAssistantScope(intake, state.checkpoint.activeUnitId);
@@ -3911,15 +3945,22 @@ export function createAssistant({
         }
         const scope = nativeAssistantScope(intake, state.checkpoint.activeUnitId);
         if (!scope) throw new Error('The selected reading ledger is unavailable');
-        await prepareLegacyCollectionReadingTargets(scope, { assertRunning });
+        // Another manual read can change the displayed unit while this receipt
+        // waits for its session publication. Its checked unit scope stays exact.
+        const readCheckpoint = createCollectionCheckpoint(scope);
+        const assertReadRunning = () => {
+          assertRunning();
+          if (dbFor(profileId) !== db) throw new Error('The reading database changed');
+        };
+        await prepareLegacyCollectionReadingTargets(scope, { assertRunning: assertReadRunning });
         if (params.deferReadConsumption === true) {
           const receipt = await deferCollectionConversionRead(
             scope,
-            state.checkpoint,
+            readCheckpoint,
             params.tool,
             args,
             result,
-            { assertRunning },
+            { assertRunning: assertReadRunning, descendantRead },
           );
           if (receipt)
             (state.unconsumedReads ||= new Map()).set(params.callId, {
@@ -3927,8 +3968,9 @@ export function createAssistant({
               unitId: scope.unitId,
             });
         } else
-          await recordCollectionConversionRead(scope, state.checkpoint, params.tool, args, result, {
-            assertRunning,
+          await recordCollectionConversionRead(scope, readCheckpoint, params.tool, args, result, {
+            assertRunning: assertReadRunning,
+            descendantRead,
           });
       } else if (!isNativeAssistantCheckpoint(state.checkpoint)) {
         if (params.deferReadConsumption === true) {
@@ -4225,12 +4267,59 @@ export function createAssistant({
           assertRunning();
           persist(profileId, chat, 'draft-repair-prepared');
         }
-        const initial = conversionIntake(profileId, chat);
-        if (isNativeAssistantConversion(initial) && !checkpoint) {
-          const assertRunning = () => {
-            if (active.get(profileId) !== state || state.generation !== generation)
-              throw new Error('Conversion stopped');
-          };
+        let initial = conversionIntake(profileId, chat);
+        const preparationDb = dbFor(profileId);
+        const assertPreparationRunning = () => {
+          state.assertAuthorized?.('publish');
+          if (
+            dbFor(profileId) !== preparationDb ||
+            active.get(profileId) !== state ||
+            state.generation !== generation
+          )
+            throw new Error('Conversion stopped');
+        };
+        if (initial && !isNativeAssistantConversion(initial)) {
+          // Prepare a retained conversion before its first model context. A later
+          // invalid proposal must not migrate its source beneath a legacy ledger.
+          const { ensureNativeIntakeSchema } = await import('./intake.ts');
+          await ensureNativeIntakeSchema(preparationDb, profileId, initial.id, {
+            assertRunning: assertPreparationRunning,
+          });
+          assertPreparationRunning();
+          initial = conversionIntake(profileId, chat);
+          if (!isNativeAssistantConversion(initial))
+            throw new Error('Selected conversion migration is unavailable');
+        }
+        if (
+          isNativeAssistantConversion(initial) &&
+          (!checkpoint || !isNativeAssistantCheckpoint(checkpoint))
+        ) {
+          const assertRunning = assertPreparationRunning;
+          if (initial.header.activePlan.state === 'pending') {
+            // A migrated nonempty plan history has no authoritative negative
+            // lookup until its complete index is prepared.
+            const selected = initial;
+            const ready = await prepareNativeAssistantConversion(selected, {
+              mappingVersion: modelMappingRuleContext(selected.db, selected.providerId)
+                .mappingRulesVersion,
+              currentMappingVersion: () =>
+                modelMappingRuleContext(selected.db, selected.providerId).mappingRulesVersion,
+              assertRunning,
+            });
+            assertRunning();
+            const refreshed = conversionIntake(profileId, chat);
+            if (
+              ready.state !== 'ready' ||
+              !isNativeAssistantConversion(refreshed) ||
+              refreshed.header.activePlan.state !== 'exact'
+            )
+              throw new HttpError(
+                409,
+                'WORKFLOW_PREPARATION_REQUIRED',
+                'Prepare the selected plan history before continuing conversion',
+              );
+            initial = refreshed;
+          }
           if (initial.header.activePlan.state === 'exact' && !initial.header.activePlan.plan) {
             const { createIntakePlanRead } = await import('./intake.ts');
             await createIntakePlanRead(initial.db, root, profileId, initial.id, {
@@ -4684,8 +4773,22 @@ export function createAssistant({
                     const scope = nativeAssistantScope(current, receipt.unitId);
                     if (!scope) throw new Error('Deferred evidence unit is unavailable');
                     changed =
-                      (await acknowledgeCollectionConversionRead(scope, checkpoint, receipt.key)) ||
-                      changed;
+                      (await acknowledgeCollectionConversionRead(
+                        scope,
+                        createCollectionCheckpoint(scope),
+                        receipt.key,
+                        {
+                          assertRunning() {
+                            state.assertAuthorized?.('publish');
+                            if (
+                              dbFor(profileId) !== current.db ||
+                              active.get(profileId) !== state ||
+                              state.generation !== generation
+                            )
+                              throw new Error('This response is no longer running');
+                          },
+                        },
+                      )) || changed;
                   } else if (!isNativeAssistantCheckpoint(checkpoint) && 'tool' in receipt)
                     changed =
                       recordConversionRead(

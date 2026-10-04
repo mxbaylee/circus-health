@@ -19,6 +19,7 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import { duplicateRecord } from '../duplicate-review.ts';
 import { createOwnershipPreviewStore } from '../ownership-preview-store.ts';
 import { prepareOwnershipMatchEvidence } from '../ownership-match-evidence.ts';
+import { createOwnershipScopeIndex } from '../ownership-scope-index.ts';
 
 test('source fan-in streams exact legacy order, contribution hashes and evidence without retaining complete joins', () => {
   const db = openDatabase(':memory:', 'fictional');
@@ -147,7 +148,7 @@ test('source fan-in streams exact legacy order, contribution hashes and evidence
   }
 });
 
-test('native destination evidence pins every carrier and original while storing the exact legacy display rows', () => {
+test('native destination evidence pins every carrier and original while storing the exact legacy display rows', async () => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-ownership-match-')),
     profileId = 'fictional',
     paths = ensureProfileDirectories(root, profileId),
@@ -158,12 +159,9 @@ test('native destination evidence pins every carrier and original while storing 
       const bytes = Buffer.from('Fictional ' + id),
         path = paths.relativeRoot + '/sources/' + id + '.txt';
       writeFileSync(join(root, path), bytes);
-      db.prepare('INSERT INTO source_files(id,path,sha256,bytes) VALUES(?,?,?,?)').run(
-        id,
-        path,
-        createHash('sha256').update(bytes).digest('hex'),
-        bytes.length,
-      );
+      db.prepare(
+        "INSERT INTO source_files(id,path,sha256,bytes,kind) VALUES(?,?,?,?,'source')",
+      ).run(id, path, createHash('sha256').update(bytes).digest('hex'), bytes.length);
     }
     const envelope = {
       format: 'health-record-v1',
@@ -182,6 +180,26 @@ test('native destination evidence pins every carrier and original while storing 
       JSON.stringify(envelope),
       JSON.stringify({ originalSourceFileId: 'original', locator: 'Source locator' }),
     );
+    db.prepare("UPDATE source_files SET details_json=? WHERE id='original'").run(
+      JSON.stringify({
+        intake: {
+          version: 0,
+          workflow: {
+            reportGroups: [
+              {
+                id: 'fictional-legacy-group',
+                versions: [
+                  {
+                    id: 'fictional-legacy-version',
+                    members: [{ occurrences: [{ recordId: 'source' }] }],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    );
     db.prepare(
       "INSERT INTO documents(id,source_record_id,title,extra_json) VALUES('saved','source','Fictional',?)",
     ).run(JSON.stringify({ import: { acceptedMapping: envelope.clinical } }));
@@ -193,8 +211,22 @@ test('native destination evidence pins every carrier and original while storing 
         'role-' + i,
         JSON.stringify({ locator: 'Fictional evidence ' + i, originalSourceFileId: 'original' }),
       );
+    const scopes = createOwnershipScopeIndex(db, scratch, () => {});
+    await scopes.prepare('original');
+    assert.deepEqual(
+      [...scopes.scopes('original', 'source')],
+      [{ id: 'fictional-legacy-group', subjectText: '' }],
+    );
     const store = createOwnershipPreviewStore(scratch, new Set(), '/evidence'),
-      result = prepareOwnershipMatchEvidence(db, root, profileId, 'document', 'saved', store.sink);
+      result = prepareOwnershipMatchEvidence(
+        db,
+        root,
+        profileId,
+        'document',
+        'saved',
+        store.sink,
+        scopes,
+      );
     assert.equal(result.reference.total, 257);
     const oracle = duplicateRecord(db, 'document', 'saved').evidence.map(
       ({ original, ...value }) => {
@@ -208,6 +240,12 @@ test('native destination evidence pins every carrier and original while storing 
       .map((row) => JSON.parse(String(row.value)));
     assert.deepEqual(rows, oracle);
     writeFileSync(join(paths.sources, 'carrier.txt'), 'Changed fictional carrier');
+    assert.throws(
+      () => prepareOwnershipMatchEvidence(db, root, profileId, 'document', 'saved', store.sink),
+      /changed|integrity|match|hash|size/i,
+    );
+    writeFileSync(join(paths.sources, 'carrier.txt'), 'Fictional carrier');
+    writeFileSync(join(paths.sources, 'original.txt'), 'Changed fictional original');
     assert.throws(
       () => prepareOwnershipMatchEvidence(db, root, profileId, 'document', 'saved', store.sink),
       /changed|integrity|match|hash|size/i,

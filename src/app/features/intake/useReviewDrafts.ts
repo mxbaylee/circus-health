@@ -128,6 +128,8 @@ export function useReviewDrafts(
   const queue = useRef(new Map<string, Work>());
   const pairCommits = useRef(new Map<string, ReviewDraftPairCommit>());
   const pairEpoch = useRef(0);
+  const mounted = useRef(true);
+  const editRevisions = useRef(new Map<string, number>());
   const active = useRef<Promise<boolean> | null>(null);
   const failedWork = useRef<{ key: string; work: Work } | null>(null);
   const epoch = useRef(0);
@@ -135,11 +137,20 @@ export function useReviewDrafts(
   const savedCallback = useRef(onSaved);
   savedCallback.current = onSaved;
   useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      pairEpoch.current++;
+      pairCommits.current.clear();
+    };
+  }, []);
+  useEffect(() => {
     epoch.current++;
     queue.current.clear();
     versions.current.clear();
     baselines.current.clear();
     pairCommits.current.clear();
+    editRevisions.current.clear();
     failedWork.current = null;
     draftsRef.current = {};
     setDrafts({});
@@ -193,17 +204,15 @@ export function useReviewDrafts(
         }
       : draft;
   }
-  function afterOwnSave(review: IntakeClinicalReviewContext, record: IntakeReviewRecord) {
+  function afterOwnSave(
+    review: IntakeClinicalReviewContext,
+    record: IntakeReviewRecord,
+    commit = pairCommits.current.get(draftKey(review, record)),
+  ) {
     const draft = current(review, record);
     return {
       ...draft,
-      decision: refreshPairScopesAfterOwnDraft(
-        profileId,
-        review,
-        record,
-        draft.decision,
-        pairCommits.current.get(draftKey(review, record)),
-      ),
+      decision: refreshPairScopesAfterOwnDraft(profileId, review, record, draft.decision, commit),
     };
   }
   async function flush(): Promise<boolean> {
@@ -310,6 +319,7 @@ export function useReviewDrafts(
     patch: Partial<LocalReviewDraft>,
   ) {
     const key = draftKey(review, record);
+    editRevisions.current.set(key, (editRevisions.current.get(key) || 0) + 1);
     const prior = current(review, record);
     const mappingChanged =
       patch.decision &&
@@ -366,6 +376,43 @@ export function useReviewDrafts(
         correctionReason: sendReason,
       },
     });
+  }
+  /** Only an explicit approval may change a retained skip into acceptance.
+   * The returned acknowledgement belongs to this exact queued write, once.
+   * A lost reply, remount, profile switch or newer edit grants no continuation. */
+  async function prepareAcceptance(
+    review: IntakeClinicalReviewContext,
+    record: IntakeReviewRecord,
+  ) {
+    const draft = current(review, record);
+    if (
+      !mounted.current ||
+      draft.disposition !== 'pending' ||
+      queue.current.size ||
+      active.current ||
+      failedWork.current
+    )
+      return null;
+    const generation = epoch.current;
+    const pairGeneration = pairEpoch.current;
+    const key = draftKey(review, record);
+    update(review, record, { decision: { ...draft.decision, action: 'accept' } });
+    const work = queue.current.get(key);
+    const editRevision = editRevisions.current.get(key);
+    if (!work || !(await flush())) return null;
+    const commit = pairCommits.current.get(key);
+    pairCommits.current.delete(key);
+    const isCurrent = () =>
+      mounted.current &&
+      epoch.current === generation &&
+      pairEpoch.current === pairGeneration &&
+      editRevisions.current.get(key) === editRevision &&
+      !queue.current.size &&
+      !active.current &&
+      !failedWork.current;
+    if (!isCurrent() || !commit || commit.request.operationId !== work.body.operationId)
+      return null;
+    return { commit, isCurrent };
   }
   useEffect(() => {
     if (!queue.current.size || paused.current) return;
@@ -484,6 +531,7 @@ export function useReviewDrafts(
     hydrateRecords,
     current,
     afterOwnSave,
+    prepareAcceptance,
     clearPairCommits: () => {
       pairEpoch.current++;
       pairCommits.current.clear();

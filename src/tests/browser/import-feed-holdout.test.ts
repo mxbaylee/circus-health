@@ -1,4 +1,5 @@
-import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { launchBrowser, newTestPage } from './harness.ts';
+import { startProcessRuntime } from './process-runtime.ts';
 import {
   fixtureBrowserResponse,
   fixtureNativeFeedReady,
@@ -7,7 +8,6 @@ import {
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { AddressInfo } from 'node:net';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -183,13 +183,12 @@ test(
     const root = mkdtempSync(resolve(tmpdir(), 'circus-import-feed-holdout-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startBrowserRuntime(t, {
+    const runtime = await startProcessRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       codeRoot: process.env.CRS_TEST_CODE_ROOT,
       port: 0,
       host: '127.0.0.1',
-      assistantOptions: { availability: () => ({ available: false }) },
     });
     let browser: Browser | undefined;
     t.after(async () => {
@@ -235,7 +234,7 @@ test(
       }
       if (viewport) await page.setViewportSize(viewport);
     }
-    const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
+    const url = `http://127.0.0.1:${runtime.port}`;
     await page.goto(url);
     const profileId = await page.evaluate(async () => {
       const post = async (path: string, body: unknown) => {
@@ -367,6 +366,15 @@ test(
       // Open one fresh document after fixture writes, without also preparing
       // the same report in the document immediately discarded by a reload.
       await page.goto('about:blank');
+      const identityReady = fixtureBrowserResponse(page, (response) => {
+        const selected = new URL(response.url());
+        return (
+          response.request().method() === 'GET' &&
+          selected.pathname ===
+            prefix + '/intakes/' + encodeURIComponent(intakeId) + '/identity-review' &&
+          selected.searchParams.get('groupId') === group.groupId
+        );
+      });
       const detail = await fixtureNativeReportReady(
         page,
         prefix,
@@ -380,6 +388,15 @@ test(
       assert.equal(detail.group.intakeId, intakeId);
       assert.equal(detail.group.groupId, group.groupId);
       assert.equal(detail.group.title, group.title);
+      // The first report page can precede the real retained-original identity
+      // check. Keep the UI deadline for rendering its completed response.
+      const identityResponse = await identityReady;
+      assert.equal(identityResponse.status(), 200, await identityResponse.text());
+      assert.equal(await identityResponse.finished(), null);
+      const identity = (await identityResponse.json()).data as IntakeIdentityReview;
+      const identityScope = identity.scopeReference || identity.scope;
+      assert.equal(identityScope?.intakeId, intakeId);
+      assert.equal(identityScope?.groupId, group.groupId);
       try {
         await page.getByRole('heading', { name: String(group.title), exact: true }).waitFor();
       } catch (cause) {

@@ -35,6 +35,8 @@ Exact-record detail recovery matches the intake, proposal and record across all 
 
 ## Drafts, source revisions and People
 
+The upload chooser and drop area wait for the installation's upload limits and any current review action. Both native and legacy review views explain an unavailable upload state; a failed limits request remains unavailable with a reload instruction. Loading upload limits does not block clinical record selection. The server still validates each upload independently.
+
 A correction reason is associated with the changed fields and values it explains. The browser sends `correctionPatch` with its reason, and the server verifies that association against the actual changes before journaling the before/after values. Coalesced unsent work may retain a displayed reason for its current patch; an unrelated later edit does not inherit it. A transport retry retains the exact patch, reason, version and operation ID. An acknowledged reason is cleared without discarding newer queued work or historical reasons.
 
 Source attention reconciles local save responses and resource refreshes by profile/intake scope and revision. A pristine editor follows the current source text. A dirty editor retains its text, displays the new revision for comparison and requires an explicit rebase or replacement before saving. Older responses cannot mask newer source state. Selection eligibility and remaining issue counts use the current revision, including while a local editor remains open.

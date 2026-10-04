@@ -213,6 +213,11 @@ export function ImportPage() {
   const [pagedFeedScope, setPagedFeedScope] = useState('');
   const [loadingMore, setLoadingMore] = useState(false);
   const limits = useResource<{ uploadBytes: number; extractionBytes: number }>('/intakes/limits');
+  const uploadUnavailable = limits.data
+    ? undefined
+    : limits.error
+      ? 'Uploads are unavailable. Reload the page to try again.'
+      : 'Getting ready to upload…';
   const batch = useIntakeBatch(profile?.id || '');
   const [people, setPeople] = useState<IntakePersonProposal[]>([]);
   const [peopleNext, setPeopleNext] = useState<Map<string, string>>(new Map());
@@ -2030,6 +2035,7 @@ export function ImportPage() {
         onChanged={feed.reload}
         sourceProps={sourceReviewProps}
         onUpload={upload}
+        uploadUnavailable={uploadUnavailable}
         busy={busy}
         status={uploadStatus || notice || operationStatus || ''}
         error={error || batch.error || feed.error?.message || ''}
@@ -2175,12 +2181,14 @@ export function ImportPage() {
         (!detailSelection.recordId ||
           detailSelection.personId ||
           searchParams.get('review') === 'full') ? (
-        <ImportDetailReview
-          selection={detailSelection}
-          onBack={closeDetail}
-          onChanged={feed.reload}
-          onUseSource={source}
-        />
+        feed.loading && !feed.data ? null : (
+          <ImportDetailReview
+            selection={detailSelection}
+            onBack={closeDetail}
+            onChanged={feed.reload}
+            onUseSource={source}
+          />
+        )
       ) : (
         <ImportReviewPresentation
           requestedRecordId={
@@ -2253,6 +2261,7 @@ export function ImportPage() {
           actions={{
             busy:
               busy || acceptance.busy || acceptance.recovering || !!acceptance.recoveryOperationId,
+            uploadUnavailable,
             onFiles: upload,
             onSave: save,
             onLater: (ids) => disposition(ids, 'later'),

@@ -49,8 +49,9 @@ function fixture(
   });
   let prerequisite = 'fictional-credential-1';
   let sends = 0,
-    elapsed = 0;
-  const currentTime = () => Date.now() + elapsed;
+    elapsed = 0,
+    fixedClock: number | null = null;
+  const currentTime = () => (fixedClock ?? Date.now()) + elapsed;
   const dispatchTimes: number[] = [];
   const reading: IntakeBatchReadingState = {
     status: 'paused',
@@ -134,6 +135,9 @@ function fixture(
     batch,
     dispatchTimes,
     now: currentTime,
+    freezeClock: () => {
+      fixedClock ??= Date.now();
+    },
     restoreConnection: () => {
       prerequisite = 'fictional-credential-2';
     },
@@ -311,7 +315,8 @@ test('create reports a stopped restart and reopens a completed item with unfinis
     },
   });
   f.reopenWith(completed);
-  const reopened = f.manager.create(f.profileId, {
+  // The public reprocessing route awaits the source-pinned native preparation.
+  const reopened = await f.manager.createPrepared(f.profileId, {
     operationId: 'fictional-reprocess-complete',
     intakeIds: [f.batch.items[0].intakeId],
   });
@@ -361,6 +366,7 @@ test('provider backoff grows with both equal-jitter extremes and reaches its cap
   for (const random of [0, 1]) {
     const f = fixture(t, false, undefined, random, 5_000);
     await waitFor(t, () => f.sends === 1);
+    f.freezeClock();
     for (let attempt = 1; attempt <= 9; attempt++) {
       const before = f.now();
       f.fail({
@@ -376,7 +382,7 @@ test('provider backoff grows with both equal-jitter extremes and reaches its cap
       const wait = f.manager.get(f.profileId, f.batch.id).items[0].providerWait!;
       const capped = Math.min(300_000, 5_000 * 2 ** Math.min(attempt - 1, 6));
       const expected = Math.round(capped * (0.5 + random / 2));
-      assert.ok(Math.abs(Date.parse(wait.retryAt!) - before - expected) < 100);
+      assert.equal(Date.parse(wait.retryAt!) - before, expected);
       f.advance(expected + 100);
       f.manager.wake(f.profileId);
       await waitFor(t, () => f.sends === attempt + 1);

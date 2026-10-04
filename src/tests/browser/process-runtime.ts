@@ -2,10 +2,16 @@ import { fork } from 'node:child_process';
 import { once } from 'node:events';
 import type { TestContext } from 'node:test';
 
-export async function startProcessRuntime(
-  t: TestContext,
-  options: { dataDirectory: string; runtimeDirectory: string; port: number; host: string },
-) {
+export type ProcessRuntimeOptions = {
+  dataDirectory: string;
+  runtimeDirectory: string;
+  codeRoot?: string;
+  port: number;
+  host: string;
+  unavailableModelAlias?: string;
+};
+
+export async function startProcessRuntime(t: TestContext, options: ProcessRuntimeOptions) {
   const child = fork(new URL('./runtime-child.ts', import.meta.url), [JSON.stringify(options)], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });

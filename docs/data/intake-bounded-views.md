@@ -150,10 +150,29 @@ source, session, plan and unit ledger reference. Seen windows, pending windows,
 read scopes, complete JSON ancestors and deferred acknowledgments live in
 authenticated auxiliary maps. No unloaded legacy checkpoint arrays are invented.
 One acknowledged read forks the affected ledger and selects its new state and
-session totals atomically. A cancelled preparation leaves the old selected state
+session totals atomically. Concurrent ledger publications for the same database,
+source and session are serialized, including imported target preparation and
+deferred acknowledgments. Source reads remain concurrent. Queue admission
+rechecks cancellation, authorization and the selected source/plan capability;
+the queue retains no idle session keys and does not certify changed evidence.
+A cancelled preparation leaves the old selected state
 intact; cache recovery follows the accepted auxiliary graph. Ledger writes do not
 advance the clinical version. Source or plan changes require reopening the unit
 capability under current pins.
+
+A manual conversation can read a retained descendant original directly without
+creating a child plan. Before source I/O, the host obtains an opaque capability
+for the issuing database, root, session, parent plan/unit, child original hash
+and complete retained ancestry. Publication rechecks that ancestry and the
+parent's exact logical/domain authority; source capture may advance the separate
+material-text pin without changing this original-byte authority. Each queued
+receipt still checks its current effective version and authorization. The pinned
+child route survives deferred acknowledgment and cache loss, and reuses its
+parent unit even after another unit is displayed. Child reads never count as
+parent reads or manufacture extraction coverage. Automatic dispatch and package
+member reads retain their existing unit and occurrence restrictions. Focused
+tests cover concurrent reads, Stop, foreign sessions, changed ancestry/originals
+and parent-domain changes, plus actual manual reading and retained plan history.
 
 Literal progress totals (retained candidate versions and submitted batches) bind
 to the complete logical workflow index. Source-text or mapping changes leave
@@ -262,8 +281,14 @@ populate the cache; rolled-back dependency repairs therefore cannot leave a
 positive interpretation witness. Returned results are detached from the cache.
 
 Assistant startup prepares native plan and reading capabilities before provider
-dispatch. Explicit unit/member reads in a manual conversation select that
-unit's ledger; automatic processing retains its dispatched unit boundary.
+dispatch, including retained conversions whose source still uses the legacy
+envelope. This preparation imports existing reading evidence before the first
+model context. A pending retained-plan index is prepared before deciding that
+no active plan exists; prior superseded plans remain unchanged when a current
+plan is created. A malformed proposal cannot change the checkpoint representation
+while returning its repairable validation error. Explicit unit/member reads in
+a manual conversation select that unit's ledger; automatic processing retains
+its dispatched unit boundary.
 Standalone proposals and extraction batches use the same native publication
 path and return a summary with selected-page links. Neither response fabricates
 legacy workflow collections.
@@ -407,6 +432,18 @@ The displayed history remains independently pageable. Saving another answer
 appends only its new resolution; it does not copy prior witnesses into the new
 draft. A single oversized resolution still requires the existing fragment view.
 
+Within one selected clinical review, the mapping stage transfers its complete
+draft to the policy stage through a one-use association with the actual record.
+Both the original read and consumption require the same exact selected-source,
+SQL, registry and grounding proof. A changed or unavailable proof uses the normal
+fresh indexed read. This preserves registered history and canonical providers;
+it neither clones their presentation references nor retains answers across
+sessions. The association is private, is removed on consumption, and is released
+when the scope closes. `reviewDraftReconstructions` counts actual selected draft
+decodes and `reviewDraftHandoffs` counts successful transfers. This avoids a second
+decode for a record even when the proposal contains more than 32 drafts; it does
+not eliminate the complete historical policy and token reads.
+
 An accumulated question list has an explicit complete selection reference when
 its inline representation exceeds the display budget. Policy iterates that
 selection; it does not substitute the first page or an empty list. Derived issues
@@ -423,6 +460,22 @@ session releases only its run; authority changes invalidate old generations,
 and missing scratch is refused instead of treated as no blockers. The issue
 row/read/write and peak-value counters distinguish this disposable policy work
 from durable writes. The derived issue collection is never recovery authority.
+
+Original-grounding proofs also have a disposable semantic generation: publishing
+different facts, clearing them or evicting a scope invalidates held clinical
+sessions and feed cursors even when SQLite has not changed. Repeating the same
+complete facts preserves this generation. Native proof iterables stage in
+unpublished scratch rows and stream their deduplicated, ordered fingerprint
+before replacing the prior complete scope. An identical nonempty publication can
+still write temporary SQL rows and invalidate SQL read stamps.
+
+Report summaries, member facts and feeds record the retained-source dependencies
+actually opened by clinical review in indexed scratch tables. They check those
+dependencies lazily and rebuild the affected source scope, including off-page
+dependencies, while reusing unchanged sources. Publishing a grounding proof does
+not eagerly traverse the installation. These certificates and indexes remain
+disposable; retained accepted identity evidence keeps its existing policy and
+does not become unreviewed solely because the original-grounding cache is cleared.
 
 The host can prepare clinical projection as an opaque changed-row plan. It runs
 the existing projector synchronously inside a SQLite savepoint, captures the

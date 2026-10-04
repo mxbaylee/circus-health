@@ -204,6 +204,10 @@ export interface ImportReviewModel {
 
 export interface ImportReviewActions {
   busy?: boolean;
+  /** A stale review window does not prevent retaining a new original. */
+  uploadBusy?: boolean;
+  /** Upload prerequisites can load independently from the review queue. */
+  uploadUnavailable?: string;
   onFiles?: (files: File[]) => void | Promise<void>;
   onSave?: (
     recordIds: string[],
@@ -737,8 +741,11 @@ export function ImportReviewPresentation({
     return Array.from(dataTransfer.types).includes('Files');
   }
 
+  const uploadUnavailable =
+    actions.uploadUnavailable ||
+    ((actions.uploadBusy ?? actions.busy) ? 'Please wait for the current action to finish.' : '');
   function submitFiles(files: File[]) {
-    if (files.length) void actions.onFiles?.(files);
+    if (!uploadUnavailable && files.length) void actions.onFiles?.(files);
   }
 
   return (
@@ -755,7 +762,7 @@ export function ImportReviewPresentation({
         className={`import-upload-card${fileDragActive ? ' is-dragging' : ''}`}
         aria-label="Upload reports"
         onDragEnter={(event) => {
-          if (!hasDraggedFiles(event.dataTransfer)) return;
+          if (!hasDraggedFiles(event.dataTransfer) || uploadUnavailable) return;
           event.preventDefault();
           dragDepth.current += 1;
           setFileDragActive(true);
@@ -763,6 +770,10 @@ export function ImportReviewPresentation({
         onDragOver={(event) => {
           if (!hasDraggedFiles(event.dataTransfer)) return;
           event.preventDefault();
+          if (uploadUnavailable) {
+            event.dataTransfer.dropEffect = 'none';
+            return;
+          }
           event.dataTransfer.dropEffect = 'copy';
           setFileDragActive(true);
         }}
@@ -783,6 +794,7 @@ export function ImportReviewPresentation({
           <input
             type="file"
             multiple
+            disabled={!!uploadUnavailable}
             accept=".pdf,.png,.jpg,.jpeg,.zip,.jsonl"
             onChange={(event) => {
               const files = [...(event.target.files || [])];
@@ -793,7 +805,9 @@ export function ImportReviewPresentation({
           <FileSearch aria-hidden="true" />
           <span>
             <strong>Drop reports here</strong>
-            <small>PDF, photos, ZIP or JSONL · up to 128 MB per file</small>
+            <small>
+              {uploadUnavailable || 'PDF, photos, ZIP or JSONL · up to 128 MB per file'}
+            </small>
           </span>
           <span className="button secondary">Browse files</span>
         </label>

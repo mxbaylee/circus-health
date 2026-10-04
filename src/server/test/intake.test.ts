@@ -35,6 +35,17 @@ import { validateJSONL, parseLiteralJSON, canonicalLiteral } from '../intake-for
 import { rebuildProfile } from '../portable.ts';
 import { createBackup, restoreBackup } from '../recovery.ts';
 import { createApp } from '../index.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
+import { selectedFixtureValue } from './helpers/selected-intake.ts';
+import {
+  memoryRecordAuthority,
+  registerRawIntakeFixture,
+} from './helpers/intake-authority-fixture.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
+import { createNativeAcceptanceEffects } from '../intake-collection-acceptance.ts';
+import { workflowAcceptanceIndexContributions } from '../intake-workflow-acceptance-index.ts';
+import { clearIntakeStateCache } from '../intake-state-storage.ts';
 const line = (
   id = 'test-one',
   payload = '{"value":1.000,"large":123456789012345678901,"date":"2026-09","literal":{"$health_archive_ref":"records:r1"}}',
@@ -312,9 +323,96 @@ test('HTTP intake upload, preview and import honor origin and profile scope', as
   });
   const importedBody = await response.json();
   assert.equal(response.status, 200, JSON.stringify(importedBody));
-  assert.equal(importedBody.data.imported.records, 1);
+  assert.ok(isIntakeSummary(importedBody.data));
+  assert.equal(importedBody.data.id, intake.id);
+  const imported = selectedFixtureValue<Record<string, unknown>>(f.db, intake.id, [
+    'intake',
+    'imported',
+  ]);
+  assert.equal(imported.records, 1);
+  assert.equal(Object.hasOwn(imported, 'clinical'), false);
+  assert.equal(
+    selectedFixtureValue(f.db, intake.id, ['intake', 'lastReviewToken']),
+    null,
+    'source-only capture retains its unreviewed receipt marker',
+  );
+  assert.deepEqual(
+    f.db
+      .prepare('SELECT raw_json FROM source_records WHERE source_file_id=?')
+      .all(intake.id)
+      .map((record) => record.raw_json),
+    [line()],
+  );
+  for (const table of ['observations', 'medications', 'procedures', 'documents'])
+    assert.equal(f.db.prepare(`SELECT count(*) AS count FROM ${table}`).get()!.count, 0);
   assert.equal((await (await fetch(base)).json()).meta.total, 1);
 });
+
+for (const invalid of [
+  'missing-review-marker',
+  'reviewed-receipt',
+  'scalar-clinical',
+  'dangling-clinical-effect',
+] as const)
+  test(`native source-only acceptance index refuses ${invalid}`, async (t) => {
+    const id = 'fictional-source-receipt';
+    const snapshots: ReturnType<typeof openIntakeCollectionEnvelope>[] = [];
+    for (const accepted of [false, true]) {
+      const db = openDatabase(':memory:', 'fictional-profile');
+      memoryRecordAuthority(db);
+      t.after(() => {
+        clearIntakeStateCache(db);
+        db.close();
+      });
+      registerRawIntakeFixture(
+        db,
+        id,
+        JSON.stringify({
+          intake: {
+            version: 1,
+            originalName: 'fictional.jsonl',
+            workflow: { decisions: [], identityConfirmations: [] },
+            importHistory: [],
+            ...(accepted
+              ? {
+                  acceptedProposalId: null,
+                  ...(invalid === 'missing-review-marker'
+                    ? {}
+                    : {
+                        lastReviewToken: invalid === 'reviewed-receipt' ? 'fictional-review' : null,
+                      }),
+                  imported: {
+                    records: 1,
+                    repeatedRows: 0,
+                    matchingEarlierRows: 0,
+                    at: '2026-01-01T00:00:00Z',
+                    fileId: id,
+                    ...(invalid === 'scalar-clinical' ? { clinical: null } : {}),
+                  },
+                }
+              : {}),
+          },
+        }),
+      );
+      await buildIntakeCollectionEnvelope(db, { id });
+      snapshots.push(openIntakeCollectionEnvelope(db, { id }));
+    }
+    const [before, after] = snapshots;
+    assert.ok(before && after);
+    const selected = after.child(after.root(), 'intake')!;
+    const receipt = after.child(selected, 'imported')!;
+    const effects = createNativeAcceptanceEffects();
+    effects.importedAddress = after.address(receipt);
+    effects.importedReceiptAddresses.push(effects.importedAddress);
+    if (invalid === 'dangling-clinical-effect')
+      effects.acceptedRecordAddresses.push(after.address(receipt));
+    assert.throws(
+      () => [...workflowAcceptanceIndexContributions(before, after, effects)],
+      invalid === 'dangling-clinical-effect'
+        ? /Accepted record effect scope is incomplete/
+        : /Accepted clinical receipt is unavailable/,
+    );
+  });
 
 test('an interrupted unpublished upload does not block retrying the same original', (t) => {
   const f = fixture(t),

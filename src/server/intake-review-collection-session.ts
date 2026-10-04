@@ -141,6 +141,7 @@ export function createCollectionClinicalReviewSession(input: {
           if (!entry) throw Error('Review record is not in the complete selected proposal');
           return scope.draft(proposal.proposalId, id, scope.versionId(proposal.proposalId, entry));
         },
+        retainDraft: scope.bindPreparedDraft,
         accepted: scope.latestAcceptedRecord,
       },
     });

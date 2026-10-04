@@ -7,7 +7,15 @@ import { resolve } from 'node:path';
 import { openDatabase } from '../database.ts';
 import { createApp } from '../index.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
-import { getIntake } from '../intake.ts';
+import { getIntakeRead } from '../intake.ts';
+import { isIntakeSummary, type IntakeRead } from '../../shared/intake-summary.ts';
+import {
+  isClinicalReviewPage,
+  type IntakeClinicalReviewRead,
+} from '../../shared/intake-clinical-review.ts';
+import type { Intake, IntakeProposal, IntakeReviewRecord } from '../../shared/intake.ts';
+import { selectedFixturePlan } from './helpers/selected-plan.ts';
+import { selectedFixtureValue } from './helpers/selected-intake.ts';
 import { fictionalModel } from './fictional-model.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import type { HealthTool, ProxyModelBridgeOptions } from '../proxy-model-bridge.ts';
@@ -91,7 +99,8 @@ async function waitFor<T>(read: () => Promise<T | null>, signal: AbortSignal): P
 
 test(
   'HTTP assistant conversion imports reviewed PDF evidence and survives loss of SQLite',
-  { timeout: 15000 },
+  // Full HTTP conversion/review, mapping edit and encrypted SQLite rebuild take ~49s locally.
+  { timeout: 120_000 },
   async (t) => {
     fictionalModel(t);
     const root = mkdtempSync(resolve(tmpdir(), 'health-import-workflow-')),
@@ -120,7 +129,7 @@ test(
       async turn(prompt: string) {
         const context = JSON.parse(prompt.slice(prompt.indexOf('{'))) as WorkflowPrompt;
         bridgeState.prompts.push(context);
-        callbacks.onEvent?.('turn/started', {
+        await callbacks.onEvent?.('turn/started', {
           turn: { id: `turn-${bridgeState.prompts.length}` },
         });
         if (context.intakeId) {
@@ -160,8 +169,8 @@ test(
             },
             coverage: { status: 'complete_response', notes: [] },
           };
-          const current = getIntake(db, root, profileId, context.intakeId);
-          const plan = current.workflow!.plans.find((entry) => entry.status === 'active')!;
+          const current = getIntakeRead(db, root, profileId, context.intakeId);
+          const plan = selectedFixturePlan(db, root, profileId, context.intakeId);
           assert.equal(plan.units.length, 1, 'The only PDF page forms one reading unit');
           await callbacks.onTool({
             tool: 'health_intake_batch',
@@ -198,14 +207,14 @@ test(
             callId: `call-${++callNumber}`,
           })) as MappingProposal;
         }
-        callbacks.onEvent?.('item/completed', {
+        await callbacks.onEvent?.('item/completed', {
           item: {
             id: `reply-${bridgeState.prompts.length}`,
             type: 'agentMessage',
             text: 'Synthetic workflow completed.',
           },
         });
-        callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+        await callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
       },
       async cancel() {},
       close() {},
@@ -307,22 +316,52 @@ test(
       'assistant proposal cannot create clinical rows',
     );
 
-    const converted = await request(`/intakes/${encodeURIComponent(uploaded.id)}`);
-    assert.equal(converted.proposals.length, 1);
-    const proposal = converted.proposals[0];
+    const converted = await request<IntakeRead>(`/intakes/${encodeURIComponent(uploaded.id)}`);
+    assert.ok(isIntakeSummary(converted));
+    assert.equal(converted.collections.proposals.total, 1);
+    const proposals = selectedFixtureValue<IntakeProposal[]>(db, uploaded.id, [
+      'intake',
+      'proposals',
+    ]);
+    assert.equal(proposals.length, 1);
+    const proposal = proposals[0];
     assert.ok(proposal);
     const proposalId = proposal.id;
-    let review = await request(
-      `/intakes/${encodeURIComponent(uploaded.id)}/review?proposalId=${encodeURIComponent(proposalId)}`,
-    );
-    assert.equal(review.summary.additions, 1);
+    const readReview = async () => {
+      const page = await request<IntakeClinicalReviewRead>(
+        `/intakes/${encodeURIComponent(uploaded.id)}/review?proposalId=${encodeURIComponent(proposalId)}&items=1&bytes=131072`,
+      );
+      assert.ok(isClinicalReviewPage(page));
+      assert.equal(page.total, 1);
+      assert.equal(page.items.length, 1);
+      assert.equal(
+        page.nextCursor,
+        null,
+        'the actual review page includes the entire fictional scope',
+      );
+      const item = page.items[0]!;
+      assert.equal(item.kind, 'value');
+      assert.ok(item.kind === 'value');
+      assert.ok(
+        item.value &&
+          typeof item.value === 'object' &&
+          'id' in item.value &&
+          'mapping' in item.value,
+      );
+      const record = item.value as IntakeReviewRecord;
+      assert.equal(record.issuesReference, undefined, 'all fictional policy issues are inline');
+      return { page, record };
+    };
+    let review = await readReview();
+    assert.equal(review.page.summary.additions, 1);
     assert.equal(
       db.prepare('SELECT count(*) n FROM observations').get()?.n,
       0,
       'review remains read-only',
     );
-    const reviewRecord = review.records[0];
+    const reviewRecord = review.record;
     assert.ok(reviewRecord);
+    assert.ok(reviewRecord.issues, 'the fictional review exposes its complete inline issues');
     const identity = reviewRecord.issues.find((issue) => issue.kind === 'identity');
     assert.ok(identity);
     assert.equal(identity.status, 'unresolved');
@@ -330,7 +369,7 @@ test(
       method: 'POST',
       headers,
       body: JSON.stringify({
-        version: review.version,
+        version: review.page.version,
         operationId: 'confirm-workflow-self',
         proposalId,
         recordId: reviewRecord.id,
@@ -340,25 +379,34 @@ test(
         ],
       }),
     });
-    review = await request(
-      `/intakes/${encodeURIComponent(uploaded.id)}/review?proposalId=${encodeURIComponent(proposalId)}`,
+    review = await readReview();
+    const decisions = [
+      {
+        recordId: review.record.id,
+        action: 'accept',
+        mapping: review.record.mapping,
+      },
+    ];
+    const imported = await request<IntakeRead>(
+      `/intakes/${encodeURIComponent(uploaded.id)}/import`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          version: review.page.version,
+          proposalId,
+          reviewToken: review.page.reviewToken,
+          decisions,
+        }),
+      },
     );
-    const decisions = review.records.map((record) => ({
-      recordId: record.id,
-      action: 'accept',
-      mapping: record.mapping,
-    }));
-    const imported = await request(`/intakes/${encodeURIComponent(uploaded.id)}/import`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        version: review.version,
-        proposalId,
-        reviewToken: review.reviewToken,
-        decisions,
-      }),
-    });
-    assert.equal(imported.imported.clinical.added, 1);
+    assert.ok(isIntakeSummary(imported));
+    assert.equal(imported.state, 'imported');
+    const importedReceipt = selectedFixtureValue<Intake['imported']>(db, uploaded.id, [
+      'intake',
+      'imported',
+    ]);
+    assert.equal(importedReceipt?.clinical?.added, 1);
 
     let observations = await request<ApiData[]>('/tests');
     assert.equal(observations.length, 1);

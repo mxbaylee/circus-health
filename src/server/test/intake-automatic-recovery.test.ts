@@ -32,9 +32,12 @@ import {
 import { getIntakeSourceText, publishIntakeSourceText } from '../intake-source-text.ts';
 import type { IntakeBatch } from '../../shared/intake-batch.ts';
 
-async function until(check: () => boolean, harnessTimeoutMs = 8000) {
-  const end = Date.now() + harnessTimeoutMs;
-  while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 5));
+async function until(t: TestContext, check: () => boolean) {
+  // Native admission publishes real preparation; the whole-test guard bounds a hang.
+  while (!check()) {
+    t.signal.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   assert.ok(check(), 'automatic recovery reached its durable checkpoint');
 }
 function fixture(
@@ -258,7 +261,7 @@ test(
   async (t) => {
     const f = fixture(t, 'model');
     const batch = f.manager.list(f.profileId)[0]!;
-    await until(() => f.manager.get(f.profileId, batch.id).status === 'complete', 60_000);
+    await until(t, () => f.manager.get(f.profileId, batch.id).status === 'complete');
     const result = f.manager.get(f.profileId, batch.id);
     assert.equal(result.reason, 'exceptions');
     const units = selectedFixturePlan(f.db, f.root, f.profileId, f.source.id).units;
@@ -281,7 +284,7 @@ test(
       ),
       false,
     );
-    await until(() => f.manager.get(f.profileId, batch.id).status === 'complete', 60_000);
+    await until(t, () => f.manager.get(f.profileId, batch.id).status === 'complete');
     assert.equal(f.manager.get(f.profileId, batch.id).items[0].exceptions!.length, units.length);
     for (const unit of units) assert.equal(f.units.filter((id) => id === unit.id).length, 6);
   },
@@ -298,7 +301,7 @@ test(
     const f = fixture(t, 'model', allowance, 1);
     const batch = f.manager.list(f.profileId)[0]!;
     // This synthetic bridge performs no inference; allow its durable host writes to finish.
-    await until(() => f.manager.get(f.profileId, batch.id).status === 'complete', 120_000);
+    await until(t, () => f.manager.get(f.profileId, batch.id).status === 'complete');
     const result = f.manager.get(f.profileId, batch.id);
     assert.equal(result.reason, 'exceptions');
     const units = selectedFixturePlan(f.db, f.root, f.profileId, f.source.id).units;
@@ -315,7 +318,10 @@ test(
 test('source revision races persist an item backoff and retry without review', async (t) => {
   const f = fixture(t, 'source-race');
   const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => f.manager.get(f.profileId, batch.id).items[0].reason === 'retrying_extraction');
+  await until(
+    t,
+    () => f.manager.get(f.profileId, batch.id).items[0].reason === 'retrying_extraction',
+  );
   const waiting = readIntakeBatch(f.root, f.profileId, batch.id).items[0];
   assert.equal(waiting.status, 'queued');
   assert.ok(waiting.retryAt);
@@ -323,6 +329,7 @@ test('source revision races persist an item backoff and retry without review', a
   f.tick(2_000);
   f.manager.wake(f.profileId);
   await until(
+    t,
     () => (f.manager.get(f.profileId, batch.id).items[0].sourceExtraction?.progress || 0) > 0,
   );
   f.manager.stop(f.profileId, batch.id);
@@ -335,11 +342,12 @@ test('non-default local source watchdog locates a stalled inventory after three 
     f.manager.wake(f.profileId);
     if (attempt < 3)
       await until(
+        t,
         () =>
           (f.manager.get(f.profileId, batch.id).items[0].sourceExtraction?.stalls || 0) >= attempt,
       );
   }
-  await until(() => !!f.manager.get(f.profileId, batch.id).items[0].exceptions?.length);
+  await until(t, () => !!f.manager.get(f.profileId, batch.id).items[0].exceptions?.length);
   const item = f.manager.get(f.profileId, batch.id).items[0];
   assert.equal(item.exceptions?.[0]?.reason, 'processing_stalled');
   assert.match(item.exceptions?.[0]?.locator || '', /inventory unavailable/);
@@ -348,7 +356,7 @@ test('non-default local source watchdog locates a stalled inventory after three 
 test('ordinary context slices continue beyond two boundaries without becoming an unsupported context', async (t) => {
   const f = fixture(t, 'slice');
   const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => f.manager.get(f.profileId, batch.id).status === 'complete', 60_000);
+  await until(t, () => f.manager.get(f.profileId, batch.id).status === 'complete');
   assert.ok(f.calls.length > 3, 'a bounded context yield is not a document-wide allowance');
   const result = f.manager.get(f.profileId, batch.id);
   assert.equal(result.reason, 'exceptions');
@@ -360,7 +368,7 @@ test('ordinary context slices continue beyond two boundaries without becoming an
 test('unknown replacement retains its predecessor, and superseded tools cannot publish after late success or Stop', async (t) => {
   const f = fixture(t, 'unknown');
   const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 2;
   });
@@ -493,7 +501,7 @@ test('batch journal changes are proportional to the edited state and replay the 
 
 test('three local failures isolate page two and preserve completed and later pages', async (t) => {
   const f = fixture(t, 'source');
-  await until(() => {
+  await until(t, () => {
     f.tick();
     const source = getIntakeSourceText(f.db, f.root, f.profileId, f.source.id);
     return source.status === 'available' && locateSourceExtractionProgress(source).page === 0;
@@ -567,9 +575,9 @@ test("finishing one batch preserves another batch's future wake without browser 
     },
   });
   try {
-    await until(() => manager.get(f.profileId, first.id).status === 'complete');
+    await until(t, () => manager.get(f.profileId, first.id).status === 'complete');
     schedulerNow += 1000;
-    await until(() => dispatched.includes(otherSource.id));
+    await until(t, () => dispatched.includes(otherSource.id));
     assert.equal(manager.get(f.profileId, first.id).status, 'complete');
     assert.deepEqual(dispatched, [f.source.id, otherSource.id]);
   } finally {
@@ -607,7 +615,7 @@ function pdf() {
 test('repeated initial-context rejection waits for a repaired prerequisite without clearing intent', async (t) => {
   const f = fixture(t, 'initial');
   const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.manager.get(f.profileId, batch.id).items[0].reason === 'provider_rejected';
   });
@@ -620,7 +628,7 @@ test('repeated initial-context rejection waits for a repaired prerequisite witho
   f.fixPrerequisite();
   f.tick(31000);
   f.manager.wake(f.profileId);
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 3;
   });
@@ -628,7 +636,7 @@ test('repeated initial-context rejection waits for a repaired prerequisite witho
 
 test('automatic PDF units after page one can read their exact unit and source passage', async (t) => {
   const f = fixture(t, 'pdf');
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 1;
   });
@@ -655,7 +663,7 @@ test('automatic PDF units after page one can read their exact unit and source pa
     exception: { reason: 'processing_stalled', at: new Date().toISOString() },
   });
   f.calls[0].onExit?.(new ModelContextLimitError('Fictional bounded slice ended', 'slice'));
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 2;
   });
@@ -688,7 +696,7 @@ test('automatic PDF units after page one can read their exact unit and source pa
 
 test('an automatic ZIP media member permits follow-up reads of its verified retained child', async (t) => {
   const f = fixture(t, 'zip');
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 1;
   });
@@ -782,7 +790,7 @@ test('one explicit Resume restores every previously automatic prerequisite wait'
 
 test('a model-correctable wrong-unit call retries automatically in a fresh scoped slice', async (t) => {
   const f = fixture(t, 'unknown');
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 2;
   });
@@ -800,7 +808,7 @@ test('a model-correctable wrong-unit call retries automatically in a fresh scope
       }),
     { code: 'INTAKE_WORK_UNIT_SCOPE' },
   );
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 3;
   });
@@ -818,7 +826,7 @@ test('a model-correctable wrong-unit call retries automatically in a fresh scope
 
 test('repeated local capacity interruptions preserve pending pages without spending the stall streak', async (t) => {
   const f = fixture(t, 'capacity');
-  await until(() => {
+  await until(t, () => {
     f.tick(1001);
     return f.calls.length > 0;
   });

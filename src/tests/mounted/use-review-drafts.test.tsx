@@ -408,3 +408,120 @@ it('preserves independently saved native pair choices through resolutions, mappi
   expect(requests).toHaveLength(2);
   expect(requests[1]).toEqual(requests[0]);
 });
+
+it.each(['unchanged', 'newer edit', 'scope clearing', 'unmount'] as const)(
+  'keeps retained relationships and invalidates changed explicit acceptance preparation (%s)',
+  async (change) => {
+    const paired = review(7, '42');
+    const exact = paired.records[0]!;
+    const pair: IntakePairDecision = {
+      otherRecordId: 'fictional-independent-record',
+      outcome: 'distinct',
+      reason: 'Independent fictional source occurrence.',
+    };
+    exact.draft = {
+      id: 'fictional-initial-skip',
+      proposalId: paired.proposalId,
+      recordId: exact.id,
+      candidateId: exact.candidateId!,
+      candidateVersionId: exact.candidateVersionId!,
+      mapping: exact.mapping,
+      disposition: 'pending',
+      at: '2026-10-04T00:00:00Z',
+      resolutions: [{ issueId: 'fictional-reviewed-question', outcome: 'acknowledged' }],
+      answers: { 'fictional-reviewed-question': 'Retain the original wording.' },
+      decision: { recordId: exact.id, action: 'skip', mapping: exact.mapping, comparisons: [pair] },
+    };
+    const requests: Record<string, any>[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input, init) => {
+        const command = JSON.parse(String(init?.body));
+        requests.push(command);
+        const ordinal = requests.length;
+        if (ordinal === 1) await gate;
+        return new Response(
+          JSON.stringify({
+            data: {
+              ...intake,
+              version: 7 + ordinal,
+              reviewDraftTransition: {
+                format: 'health-intake-own-draft-transition-v1',
+                profileId: profile.id,
+                intakeId: intake.id,
+                proposalId: paired.proposalId,
+                recordId: exact.id,
+                candidateId: exact.candidateId,
+                candidateVersionId: exact.candidateVersionId,
+                operationId: command.operationId,
+                fromVersion: 6 + ordinal,
+                toVersion: 7 + ordinal,
+                fromRevision: 40 + ordinal,
+                toRevision: 41 + ordinal,
+              },
+            },
+            meta: { revision: 41 + ordinal },
+          }),
+          { headers: { 'Content-Type': 'application/json' } },
+        );
+      }),
+    );
+    const view = renderHook(() =>
+      useReviewDrafts(profile.id, vi.fn(), { retainedComparisons: true }),
+    );
+    act(() => view.result.current.hydrate(paired));
+    let pending!: ReturnType<typeof view.result.current.prepareAcceptance>;
+    act(() => {
+      pending = view.result.current.prepareAcceptance(paired, exact);
+    });
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0].decision).toEqual({ ...exact.draft.decision, action: 'accept' });
+    expect(requests[0].resolutions).toEqual(exact.draft.resolutions);
+    expect(requests[0].answers).toEqual(exact.draft.answers);
+    expect(requests[0].decision.comparisons).toEqual([pair]);
+    if (change === 'newer edit')
+      act(() => {
+        const current = view.result.current.current(paired, exact);
+        view.result.current.update(paired, exact, {
+          decision: {
+            ...current.decision,
+            mapping: { ...current.decision.mapping, valueText: '99' },
+          },
+        });
+      });
+    let result: Awaited<typeof pending>;
+    await act(async () => {
+      release();
+      result = await pending;
+    });
+    if (change === 'newer edit') {
+      expect(result!).toBeNull();
+      expect(requests).toHaveLength(2);
+      expect(requests[1].mapping.valueText).toBe('99');
+      expect(requests[1].decision.comparisons).toEqual([pair]);
+    } else {
+      expect(result!.commit.request).toEqual(requests[0]);
+      expect(result!.isCurrent()).toBe(true);
+      if (change === 'scope clearing') {
+        act(() => view.result.current.clearPairCommits());
+      } else if (change === 'unmount') {
+        view.unmount();
+      } else
+        act(() => {
+          const current = view.result.current.current(paired, exact);
+          view.result.current.update(paired, exact, {
+            decision: {
+              ...current.decision,
+              mapping: { ...current.decision.mapping, valueText: '43' },
+            },
+          });
+        });
+      expect(result!.isCurrent()).toBe(false);
+    }
+    view.unmount();
+  },
+);

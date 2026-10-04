@@ -100,6 +100,7 @@ import {
 import { SourceTextReview } from '../intake/SourceTextReview';
 import { useReportAcceptance } from '../intake/useReportAcceptance';
 import { initialDraft, type LocalReviewDraft, useReviewDrafts } from '../intake/useReviewDrafts';
+import { ownRevisionTransition } from '../intake/review-draft-pair-scope';
 import { ImportSaveStatus } from './ImportSaveStatus';
 import { ImportRecordCorrection } from './ImportRecordCorrection';
 import { loadAcceptedRecordsForScope, SavedRecordDestinations } from './SavedRecordDestinations';
@@ -1878,7 +1879,7 @@ export function ImportRecordDetail({
       if (!(await flushPendingReview()))
         throw new Error('Save or discard unfinished review edits before accepting this record.');
       if (activeDetailScope.current !== scope || activeProfile.current !== profileId) return;
-      const selected = await readSelectedClinicalReview(
+      let selected = await readSelectedClinicalReview(
         intakeId,
         proposalId,
         exactRecord.id,
@@ -1886,15 +1887,15 @@ export function ImportRecordDetail({
         { operationId: diagnosticOperationId },
       );
       if (activeDetailScope.current !== scope || activeProfile.current !== profileId) return;
-      const fresh = selected.context;
-      const current = selected.record.kind === 'record' ? selected.record.record : undefined;
+      let fresh = selected.context;
+      let current = selected.record.kind === 'record' ? selected.record.record : undefined;
       if (
         !current?.candidateId ||
         !current.candidateVersionId ||
         current.selectionReviewToken !== exactRecord.selectionReviewToken
       )
         throw new Error('This exact record changed. Review the current proposal before saving.');
-      const currentDraft = drafts.afterOwnSave(fresh, current);
+      let currentDraft = drafts.afterOwnSave(fresh, current);
       if (
         currentDraft.disposition !== 'pending' ||
         (current.draft && current.draft.disposition !== 'pending')
@@ -1904,6 +1905,59 @@ export function ImportRecordDetail({
         throw new Error(
           'Review both exact record versions and their originals again before choosing this relationship.',
         );
+      if (selected.native && current.draft?.decision?.action === 'skip') {
+        // Correcting an unsupported mapping does not grant clinical acceptance.
+        // This explicit click publishes that intent through the existing queue;
+        // only its newly acknowledged, unchanged revision can continue the save.
+        const before = selected;
+        const approval = await drafts.prepareAcceptance(fresh, current);
+        if (activeDetailScope.current !== scope || activeProfile.current !== profileId) return;
+        if (!approval?.commit.transition)
+          throw new Error('Review the saved choices before confirming this record again.');
+        const refreshed = await readSelectedClinicalReview(
+          intakeId,
+          proposalId,
+          exactRecord.id,
+          exactRecord.candidateVersionId,
+          { operationId: diagnosticOperationId },
+        );
+        if (activeDetailScope.current !== scope || activeProfile.current !== profileId) return;
+        const next = refreshed.record.kind === 'record' ? refreshed.record.record : undefined;
+        const { commit } = approval;
+        if (
+          !approval.isCurrent() ||
+          !refreshed.native ||
+          !Number.isSafeInteger(before.revision) ||
+          !ownRevisionTransition(commit, before.revision!) ||
+          commit.profileId !== profileId ||
+          commit.intakeId !== intakeId ||
+          commit.request.proposalId !== proposalId ||
+          commit.request.recordId !== exactRecord.id ||
+          commit.candidateId !== exactRecord.candidateId ||
+          commit.request.candidateVersionId !== exactRecord.candidateVersionId ||
+          commit.request.version !== before.context.version ||
+          commit.version !== before.context.version + 1 ||
+          refreshed.revision !== commit.revision ||
+          refreshed.context.version !== commit.version ||
+          refreshed.context.sourceTextStale ||
+          !next?.selectionReviewToken ||
+          next.candidateId !== exactRecord.candidateId ||
+          next.draft?.id !== commit.request.operationId ||
+          next.draft.disposition !== 'pending' ||
+          next.draft.decision?.action !== 'accept'
+        )
+          throw new Error('This exact record changed. Review the current proposal before saving.');
+        selected = refreshed;
+        fresh = refreshed.context;
+        current = next;
+        currentDraft = drafts.afterOwnSave(fresh, current, commit);
+        if (comparisonDecisionsNeedReview(current, currentDraft.decision))
+          throw new Error(
+            'Review both exact record versions and their originals again before choosing this relationship.',
+          );
+      }
+      if (!current.candidateId || !current.candidateVersionId)
+        throw new Error('This exact record changed. Review the current proposal before saving.');
       const result = await acceptance.submit(
         {
           mode: 'partial-v1',

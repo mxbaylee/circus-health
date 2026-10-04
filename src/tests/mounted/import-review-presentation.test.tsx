@@ -354,6 +354,45 @@ it('highlights file drags and sends dropped files to the upload action', () => {
   expect(onFiles).toHaveBeenCalledWith([file]);
 });
 
+it('admits file selection and drops only after upload prerequisites and the current action settle', () => {
+  const onFiles = vi.fn();
+  const { container, rerender } = render(
+    <ImportReviewPresentation
+      model={model()}
+      actions={{ onFiles, uploadUnavailable: 'Getting ready to upload…' }}
+    />,
+  );
+  const input = container.querySelector('input[type=file]')!;
+  const dropzone = screen.getByText('Drop reports here').closest('.import-upload-card')!;
+  const file = new File(['fictional report'], 'fictional-report.pdf', { type: 'application/pdf' });
+  const dataTransfer = { files: [file], types: ['Files'], dropEffect: 'copy' };
+  expect(input).toBeDisabled();
+  expect(screen.getByText('Getting ready to upload…')).toBeVisible();
+  fireEvent.dragOver(dropzone, { dataTransfer });
+  expect(dataTransfer.dropEffect).toBe('none');
+  fireEvent.drop(dropzone, { dataTransfer });
+  fireEvent.change(input, { target: { files: [file] } });
+  expect(onFiles).not.toHaveBeenCalled();
+
+  rerender(<ImportReviewPresentation model={model()} actions={{ onFiles, busy: true }} />);
+  expect(input).toBeDisabled();
+  fireEvent.drop(dropzone, { dataTransfer });
+  expect(onFiles).not.toHaveBeenCalled();
+
+  rerender(
+    <ImportReviewPresentation
+      model={model()}
+      actions={{ onFiles, busy: true, uploadBusy: false }}
+    />,
+  );
+  expect(input).toBeEnabled();
+  fireEvent.change(input, { target: { files: [file] } });
+  expect(onFiles).toHaveBeenCalledExactlyOnceWith([file]);
+  fireEvent.drop(dropzone, { dataTransfer });
+  expect(onFiles).toHaveBeenCalledTimes(2);
+  expect(onFiles).toHaveBeenLastCalledWith([file]);
+});
+
 it('shows possible same-file overlap before saving without merging or blocking the result', () => {
   const onSave = vi.fn();
   const displayed: ImportReviewModel = {

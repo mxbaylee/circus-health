@@ -139,38 +139,48 @@ async function fixture(t: TestContext, family = false, fullName = 'Fictional chi
   };
 }
 
-test('native schema copy preserves real manual author receipt and source pins through selected authority rebuild', async (t) => {
-  const f = await fixture(t, true, '界'.repeat(90000));
-  await buildIntakeCollectionEnvelope(f.db, { id: f.original.id });
-  const sourceText = [...iterateIntakeEnvelopeText(f.db, { id: f.original.id })].join('');
-  const copy = await f.copy(),
-    target = f.databases.get(copy.id)!;
-  assert.equal([...iterateIntakeEnvelopeText(target, { id: f.original.id })].join(''), sourceText);
-  const receipt = f.manual.intake.proposals[0]!.manualSourceRecord!;
-  const scope = {
-    profileId: copy.id,
-    intakeId: f.original.id,
-    sourceHash: f.original.sha256,
-    proposalId: f.manual.proposalId,
-    proposalHash: String(
-      target.prepare('SELECT sha256 FROM source_files WHERE id=?').get(f.manual.proposalId)!.sha256,
-    ),
-  };
-  assert.equal(copiedManualSourceRecordApplies(target, scope, receipt), true);
-  assert.equal(receipt.profileId, f.source.id);
-  assert.equal(proofs(target).length, 1);
-  const replay = await createManualSourceRecordRead(
-    target,
-    f.root,
-    copy.id,
-    f.original.id,
-    f.request,
-  );
-  assert.equal(replay.replayed, true);
-  assert.equal(replay.proposalId, f.manual.proposalId);
-  assert.ok('format' in replay.intake);
-  assert.equal(proofs(target).length, 1);
-});
+// This host integration converts a 270KB retained Unicode author receipt, copies
+// and rebuilds selected authority, then replays the exact manual operation.
+test(
+  'native schema copy preserves real manual author receipt and source pins through selected authority rebuild',
+  { timeout: 90000 },
+  async (t) => {
+    const f = await fixture(t, true, '界'.repeat(90000));
+    await buildIntakeCollectionEnvelope(f.db, { id: f.original.id });
+    const sourceText = [...iterateIntakeEnvelopeText(f.db, { id: f.original.id })].join('');
+    const copy = await f.copy(),
+      target = f.databases.get(copy.id)!;
+    assert.equal(
+      [...iterateIntakeEnvelopeText(target, { id: f.original.id })].join(''),
+      sourceText,
+    );
+    const receipt = f.manual.intake.proposals[0]!.manualSourceRecord!;
+    const scope = {
+      profileId: copy.id,
+      intakeId: f.original.id,
+      sourceHash: f.original.sha256,
+      proposalId: f.manual.proposalId,
+      proposalHash: String(
+        target.prepare('SELECT sha256 FROM source_files WHERE id=?').get(f.manual.proposalId)!
+          .sha256,
+      ),
+    };
+    assert.equal(copiedManualSourceRecordApplies(target, scope, receipt), true);
+    assert.equal(receipt.profileId, f.source.id);
+    assert.equal(proofs(target).length, 1);
+    const replay = await createManualSourceRecordRead(
+      target,
+      f.root,
+      copy.id,
+      f.original.id,
+      f.request,
+    );
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.proposalId, f.manual.proposalId);
+    assert.ok('format' in replay.intake);
+    assert.equal(proofs(target).length, 1);
+  },
+);
 
 test('genuine contributor manual copy preserves exact receipt, review and replay and supports new acceptance and nested authorship', async (t) => {
   const f = await fixture(t);

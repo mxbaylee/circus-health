@@ -25,7 +25,12 @@ export function* ownershipIntakeScopes(
     .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
     .get(intakeId);
   if (!source) return;
-  if (!hasIntakeCollectionEnvelope(db, source as { id: string })) {
+  // Saved evidence can come from ordinary source imports as well as intake.
+  // Only intake originals have a selected intake authority to inspect.
+  if (
+    source.kind !== 'intake_original' ||
+    !hasIntakeCollectionEnvelope(db, source as { id: string })
+  ) {
     for (const group of readStoredIntakeDetails(db, intakeId)?.workflow?.reportGroups || []) {
       const versions = options.latestOnly ? group.versions.slice(-1) : group.versions;
       if (

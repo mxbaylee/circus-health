@@ -1,4 +1,5 @@
 import { selectedReportGroupLinks, selectedReportGroups } from './intake-selected-report-groups.ts';
+import { selectedDraftHandoff } from './intake-review-draft-handoff.ts';
 import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
 import { collectSelectedEvidencedIdentity } from './intake-identity-name-evidence.ts';
 import { recordIntakeWork } from './intake-work-accounting.ts';
@@ -47,6 +48,8 @@ type SelectedWorkflowReviewScope = Omit<WorkflowReviewScope, 'membership'> & {
   membership(group: WorkflowReviewGroup): SelectedIdentityMembership;
 };
 type IdentityReceiptWork =
+  | 'reviewDraftReconstructions'
+  | 'reviewDraftHandoffs'
   | 'identityPolicyReceiptReconstructions'
   | 'identityPolicyReceiptCacheHits'
   | 'identityPolicyReceiptNamespaceReads'
@@ -482,6 +485,10 @@ export function collectionWorkflowReviewScope(input: {
     }
     return state;
   };
+  const draftHandoff = selectedDraftHandoff(() => {
+    const state = currentReceiptState();
+    return state === undefined ? undefined : { state, epoch: nativeReceiptEpoch };
+  });
   const receiptProofGuard = (state: string, epoch: object) => {
     if (receiptScopeClosed || epoch !== nativeReceiptEpoch)
       throw Error('Selected native identity receipt proof changed');
@@ -861,6 +868,7 @@ export function collectionWorkflowReviewScope(input: {
   let questionInlineBytes = metadataBytes;
   const scope: SelectedWorkflowReviewScope = {
     close() {
+      draftHandoff.clear();
       receiptScopeClosed = true;
       clearNativeReceipts();
       input.close?.();
@@ -976,17 +984,26 @@ export function collectionWorkflowReviewScope(input: {
       return !!view.lookup('accepted-candidate-version', [JSON.stringify(candidateId), versionId]);
     },
     draft(proposalId, recordId, versionId) {
-      if (!workflow || view.childCount(workflow, 'reviewDrafts') === 0) return null;
-      const result = view.lookup('draft-record-version-last', [
-        proposalId || '',
-        recordId,
-        versionId,
-      ]);
-      if (!result) return null;
-      if (input.readDraft) return input.readDraft(result);
-      const draft = read<IntakeReviewDraft>(result);
-      if (draft.format === 'health-intake-review-draft-v2')
-        throw Error('Native review history requires its selected policy reader');
+      return draftHandoff.read(proposalId, recordId, versionId, () => {
+        if (!workflow || view.childCount(workflow, 'reviewDrafts') === 0) return null;
+        const result = view.lookup('draft-record-version-last', [
+          proposalId || '',
+          recordId,
+          versionId,
+        ]);
+        if (!result) return null;
+        receiptWork('reviewDraftReconstructions');
+        if (input.readDraft) return input.readDraft(result);
+        const draft = read<IntakeReviewDraft>(result);
+        if (draft.format === 'health-intake-review-draft-v2')
+          throw Error('Native review history requires its selected policy reader');
+        return draft;
+      });
+    },
+    bindPreparedDraft: draftHandoff.bind,
+    preparedDraft(proposalId, record, versionId) {
+      const draft = draftHandoff.consume(proposalId, record, versionId);
+      if (draft !== undefined) receiptWork('reviewDraftHandoffs');
       return draft;
     },
     firstVersion(candidateId) {

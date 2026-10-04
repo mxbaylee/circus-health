@@ -2,7 +2,10 @@ import {
   fixtureReview,
   fixtureReport,
   fixtureDestinations,
+  fixtureAssertNoAccepted,
   fixtureSourcePath,
+  fixtureBrowserResponse,
+  fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
@@ -63,7 +66,9 @@ function proposal(intakeId: string, label: string) {
 
 test(
   'encrypted browser reads two uploads sequentially and restores Stop, reload, Resume review',
-  { timeout: 60000 },
+  // Two real reading cycles, Stop/reload/Resume, and two encrypted acceptances
+  // include a lost acknowledgement and exact receipt recovery. UI waits stay 5s.
+  { timeout: 180000 },
   async (t) => {
     fictionalModel(t);
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-intake-batch-'));
@@ -103,7 +108,7 @@ test(
             async turn() {
               active.add(index);
               maxActive = Math.max(maxActive, active.size);
-              callbacks.onEvent!('turn/started', { turn: { id: `turn-${index}` } });
+              await callbacks.onEvent!('turn/started', { turn: { id: `turn-${index}` } });
             },
             async cancel() {},
             close() {
@@ -201,6 +206,27 @@ test(
       await exact.click();
       await page.getByRole('region', { name: 'Review actions' }).waitFor();
     }
+    async function confirmRecordIdentity() {
+      const params = new URLSearchParams(new URL(page.url()).hash.split('?')[1]);
+      const intakeId = params.get('intake');
+      const recordId = params.get('record');
+      assert.ok(intakeId && recordId);
+      const saved = fixtureBrowserResponse(
+        page,
+        (response) =>
+          response.request().method() === 'POST' &&
+          new URL(response.url()).pathname ===
+            prefix + '/intakes/' + encodeURIComponent(intakeId) + '/review-draft' &&
+          response.request().postDataJSON().recordId === recordId &&
+          response.request().postDataJSON().mapping?.subject === 'self',
+      );
+      await fixtureNativeRecordReady(page, prefix, { intakeId, recordId }, async () => {
+        await page.getByRole('button', { name: 'This is me', exact: true }).click();
+        const response = await saved;
+        assert.equal(response.status(), 200, await response.text());
+        assert.equal(await response.finished(), null);
+      });
+    }
 
     const conversionRequests = [];
     const importRequests = [];
@@ -216,7 +242,8 @@ test(
       const input = document.querySelector('.import-dropzone input[type="file"]');
       return input instanceof HTMLInputElement && !input.disabled;
     });
-    const created = page.waitForResponse(
+    const created = fixtureBrowserResponse(
+      page,
       async (response) =>
         response.request().method() === 'GET' &&
         response.url().endsWith('/intake-batches') &&
@@ -296,7 +323,7 @@ test(
       callId: 'fictional-first-proposal',
       ...{ threadId: 'fictional-thread-1', turnId: 'turn-1' },
     });
-    bridges[0].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
+    await bridges[0].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
 
     await waitFor(() => bridges.length === 2, 'second sequential model pass');
     assert.equal(active.size, 1);
@@ -353,7 +380,8 @@ test(
 
     await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
     await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
-    const stoppedResponse = page.waitForResponse(
+    const stoppedResponse = fixtureBrowserResponse(
+      page,
       (response) => response.url().endsWith('/stop') && response.ok(),
     );
     await page.getByRole('button', { name: 'Stop imports', exact: true }).click();
@@ -369,11 +397,7 @@ test(
     assert.equal(stoppedFirstReview.proposalId, firstBlock.proposalId);
     assert.equal(stoppedFirstReview.records.length, 1, 'Stop retains the exact first proposal');
     assert.equal(stopped.items[1].status, 'paused');
-    assert.equal(
-      (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).collections.importHistory
-        .total,
-      0,
-    );
+    await fixtureAssertNoAccepted(get, prefix, first.id);
     const second = await get(
       `${prefix}/intakes/${encodeURIComponent(initialBatch.items[1].intakeId)}`,
     );
@@ -394,7 +418,8 @@ test(
     await page.reload();
     await page.getByRole('button', { name: 'Resume imports', exact: true }).waitFor();
     assert.equal(importRequests.length, 0, 'reload does not accept retained proposals');
-    const resumedResponse = page.waitForResponse(
+    const resumedResponse = fixtureBrowserResponse(
+      page,
       (response) => response.url().endsWith('/resume') && response.ok(),
     );
     await page.getByRole('button', { name: 'Resume imports', exact: true }).click();
@@ -451,7 +476,7 @@ test(
       callId: 'fictional-second-proposal',
       ...{ threadId: 'fictional-thread-2', turnId: 'turn-3' },
     });
-    bridges[2].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
+    await bridges[2].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
     const currentSecond = await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`);
     assert.equal(
       currentSecond.collections.proposals.total,
@@ -475,26 +500,21 @@ test(
     assert.equal(maxActive, 1);
     assert.equal(conversionRequests.length, 0);
     assert.equal(importRequests.length, 0);
-    assert.equal(
-      (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).collections.importHistory
-        .total,
-      0,
-    );
-    assert.equal(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).collections
-        .importHistory.total,
-      0,
-    );
+    await fixtureAssertNoAccepted(get, prefix, first.id);
+    await fixtureAssertNoAccepted(get, prefix, resumedSecond.id);
 
-    const firstImport = page.waitForResponse(
+    const firstImport = fixtureBrowserResponse(
+      page,
       (response) =>
         (response.url().endsWith('/report-acceptance') || response.url().endsWith('/import')) &&
         response.ok(),
     );
-    await page.getByRole('button', { name: 'This is me', exact: true }).click();
+    await confirmRecordIdentity();
     await firstSaveAction.waitFor({ state: 'visible' });
     await firstSaveAction.click();
     const firstAcceptedResponse = await firstImport;
+    const firstAccepted = (await firstAcceptedResponse.json()).data;
+    assert.equal(firstAccepted.receipt.acceptedCount, 1);
     assert(
       firstAcceptedResponse.url().endsWith('/report-acceptance'),
       'Report save must use counted atomic acceptance: ' + firstAcceptedResponse.url(),
@@ -524,18 +544,16 @@ test(
       0,
       'missing printed identity does not invent a report-level confirmation',
     );
-    await page.getByRole('button', { name: 'This is me', exact: true }).click();
-    assert.notEqual(
-      (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).collections.importHistory
-        .total,
-      0,
+    await confirmRecordIdentity();
+    // The current native acceptance is retained separately from archived importHistory.
+    // Check its exact receipt and destination, not whether an older receipt exists.
+    assert.deepEqual(
+      (await get(`${prefix}/intakes/report-acceptance/${firstAccepted.receipt.operationId}`))
+        .receipt,
+      firstAccepted.receipt,
     );
-    assert.equal(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).collections
-        .importHistory.total,
-      0,
-      'moving to the next review does not accept it',
-    );
+    assert.equal((await fixtureDestinations(get, prefix, first.id)).length, 1);
+    await fixtureAssertNoAccepted(get, prefix, resumedSecond.id);
     let lostOperationId = '';
     await page.route('**/intakes/report-acceptance', async (route) => {
       lostOperationId = route.request().postDataJSON().operationId;
@@ -544,7 +562,8 @@ test(
       // The real server committed; the browser receives no acknowledgement.
       await route.abort('failed');
     });
-    const recoveredReceipt = page.waitForResponse(
+    const recoveredReceipt = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'GET' &&
         response.url().includes('/intakes/report-acceptance/') &&
@@ -557,11 +576,7 @@ test(
     await page.getByText('This exact record was saved to your profile.', { exact: true }).waitFor();
     await page.unroute('**/intakes/report-acceptance');
     assert.equal(importRequests.length, 2);
-    assert.notEqual(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).collections
-        .importHistory.total,
-      0,
-    );
+    assert.equal((await fixtureDestinations(get, prefix, resumedSecond.id)).length, 1);
     for (const [intakeId, label] of [
       [first.id, 'first'],
       [resumedSecond.id, 'second'],

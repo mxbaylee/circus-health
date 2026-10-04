@@ -241,6 +241,59 @@ beforeEach(() => {
   replaceProfiles([profile]);
   selectProfile(profile);
 });
+for (const succeeds of [true, false]) {
+  it(`keeps native uploads unavailable while limits load and handles their ${succeeds ? 'arrival' : 'failure'}`, async () => {
+    let releaseLimits!: (response: Response) => void;
+    const limits = new Promise<Response>((resolve) => {
+      releaseLimits = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input) => {
+        const url = new URL(String(input), 'https://fictional.invalid');
+        if (url.pathname.endsWith('/import-feed')) return json(feed([record('first')]));
+        if (url.pathname.endsWith('/intake-batches')) return json([]);
+        if (url.pathname.endsWith('/intakes/limits')) return limits;
+        if (url.pathname.includes('/report-queue/'))
+          return json({ format: 'health-intake-report-detail-v2', group: header('visible-group') });
+        if (url.pathname.endsWith('/identity-review')) return json(identity);
+        throw new Error('Unexpected ' + url);
+      }),
+    );
+    const { container } = render(
+      <MemoryRouter initialEntries={['/import']}>
+        <ImportPage />
+      </MemoryRouter>,
+    );
+    const selection = await screen.findByRole('checkbox', {
+      name: 'Select Fictional glucose first',
+    });
+    await waitFor(() => expect(selection).toBeEnabled());
+    const input = container.querySelector('input[type=file]')!;
+    expect(input).toBeDisabled();
+    expect(screen.getByText('Getting ready to upload…')).toBeVisible();
+    await act(async () => {
+      releaseLimits(
+        succeeds
+          ? json({ uploadBytes: 1024, extractionBytes: 1024 })
+          : new Response(
+              JSON.stringify({
+                error: { code: 'FICTIONAL_LIMITS_FAILURE', message: 'Unavailable' },
+              }),
+              { status: 503, headers: { 'Content-Type': 'application/json' } },
+            ),
+      );
+    });
+    if (succeeds) await waitFor(() => expect(input).toBeEnabled());
+    else {
+      expect(
+        await screen.findByText('Uploads are unavailable. Reload the page to try again.'),
+      ).toBeVisible();
+      expect(input).toBeDisabled();
+    }
+    expect(screen.queryByText('Getting ready to upload…')).not.toBeInTheDocument();
+  });
+}
 it('reuses inline correction and original dialogs for one visible page, preserving dirty navigation guards', async () => {
   const first = feed([record('first')]);
   const requests: string[] = [];
@@ -527,12 +580,14 @@ it('blocks stale later-window writes after a failed parent refresh and retries t
   expect(parentReads).toBe(2);
   expect(cursorReads).toBe(1);
   expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  expect(document.querySelector('input[type=file]')).toBeEnabled();
   fireEvent.click(screen.getByRole('button', { name: 'Later' }));
   await act(async () => {});
   expect(writes).toBe(1);
   fireEvent.click(screen.getByRole('button', { name: 'Refresh import review' }));
   await waitFor(() => expect(parentReads).toBe(3));
   expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled();
+  expect(document.querySelector('input[type=file]')).toBeEnabled();
   await act(async () => {
     releaseParent(json(first));
   });

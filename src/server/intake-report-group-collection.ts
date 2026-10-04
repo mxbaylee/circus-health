@@ -1,9 +1,13 @@
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete native report summaries. Pages never become a clinical decision scope. */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError, clinicalReviewRevision, revision, observeDatabaseClose } from './database.ts';
+import {
+  identityGroundingGeneration,
+  identityGroundingSourceStamp,
+} from './intake-identity-grounding.ts';
 import { assertIntakeOwner, verifyIntakeOriginal } from './intake.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
@@ -394,19 +398,58 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     ':' +
     JSON.stringify([member.candidateId, member.candidateVersionId]);
   const bindingNow = () => collectionQueueBinding(db, profileId);
+  let grounding = identityGroundingGeneration(db),
+    groundingEpoch = 0;
   cache.exec(
-    'CREATE TABLE summaries(intake TEXT,ordinal INTEGER,value TEXT,PRIMARY KEY(intake,ordinal))',
+    'CREATE TABLE groundingSources(intake TEXT PRIMARY KEY,stamp TEXT,epoch INTEGER);CREATE TABLE groundingDependencies(intake TEXT,dependency TEXT,stamp TEXT,PRIMARY KEY(intake,dependency)) WITHOUT ROWID',
+  );
+  const retainGroundingDependency = (intakeId: string, dependency: string) => {
+    cache
+      .prepare('INSERT OR IGNORE INTO groundingDependencies VALUES(?,?,?)')
+      .run(intakeId, dependency, identityGroundingSourceStamp(db, dependency));
+  };
+  const currentGroundingEpoch = (intakeId: string): string => {
+    const current = identityGroundingGeneration(db);
+    if (current !== grounding) {
+      grounding = current;
+      groundingEpoch++;
+    }
+    retainGroundingDependency(intakeId, intakeId);
+    const prior = cache
+      .prepare('SELECT stamp,epoch FROM groundingSources WHERE intake=?')
+      .get(intakeId);
+    if (prior?.epoch === groundingEpoch) return String(prior.stamp);
+    let changed = !prior;
+    for (const dependency of cache
+      .prepare('SELECT dependency,stamp FROM groundingDependencies WHERE intake=?')
+      .iterate(intakeId)) {
+      const stamp = identityGroundingSourceStamp(db, String(dependency.dependency));
+      if (stamp !== dependency.stamp) {
+        changed = true;
+        cache
+          .prepare('UPDATE groundingDependencies SET stamp=? WHERE intake=? AND dependency=?')
+          .run(stamp, intakeId, dependency.dependency);
+      }
+    }
+    const stamp = changed ? randomUUID() : String(prior!.stamp);
+    cache
+      .prepare('INSERT OR REPLACE INTO groundingSources VALUES(?,?,?)')
+      .run(intakeId, stamp, groundingEpoch);
+    return stamp;
+  };
+  cache.exec(
+    'CREATE TABLE summaries(intake TEXT,ordinal INTEGER,value TEXT,grounding INTEGER,PRIMARY KEY(intake,ordinal))',
   );
   cache.exec(
     'CREATE TABLE changedCandidates(id TEXT,version TEXT,PRIMARY KEY(id,version));CREATE TABLE changedGroups(sequence INTEGER PRIMARY KEY,value TEXT)',
   );
   cache.exec(
-    'CREATE TABLE memberFacts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,value TEXT,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE TABLE dates(intake TEXT,groupOrdinal INTEGER,date TEXT,count INTEGER,PRIMARY KEY(intake,groupOrdinal,date))',
+    'CREATE TABLE memberFacts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,value TEXT,grounding INTEGER,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE TABLE dates(intake TEXT,groupOrdinal INTEGER,date TEXT,count INTEGER,PRIMARY KEY(intake,groupOrdinal,date))',
   );
   const putFacts = (intakeId: string, member: CollectionReportQueueMember, facts: MemberFacts) => {
     const prior = cache
       .prepare(
-        'SELECT value FROM memberFacts WHERE intake=? AND groupOrdinal=? AND candidate=? AND version=?',
+        'SELECT value,grounding FROM memberFacts WHERE intake=? AND groupOrdinal=? AND candidate=? AND version=?',
       )
       .get(intakeId, member.groupOrdinal, member.candidateId, member.candidateVersionId);
     const old = prior ? (JSON.parse(String(prior.value)) as MemberFacts) : undefined;
@@ -424,15 +467,16 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       .prepare('DELETE FROM dates WHERE intake=? AND groupOrdinal=? AND count=0')
       .run(intakeId, member.groupOrdinal);
     cache
-      .prepare('INSERT OR REPLACE INTO memberFacts VALUES(?,?,?,?,?)')
+      .prepare('INSERT OR REPLACE INTO memberFacts VALUES(?,?,?,?,?,?)')
       .run(
         intakeId,
         member.groupOrdinal,
         member.candidateId,
         member.candidateVersionId,
         JSON.stringify(facts),
+        currentGroundingEpoch(intakeId),
       );
-    return old;
+    return prior?.grounding === currentGroundingEpoch(intakeId) ? old : undefined;
   };
   let binding = '',
     clinicalRevision = '';
@@ -646,8 +690,10 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                 changeMemberCount(source.id, JSON.parse(String(row.value)), -1);
                 if (member) changeMemberCount(source.id, member, 1);
                 const retained = cache
-                    .prepare('SELECT value FROM summaries WHERE intake=? AND ordinal=?')
-                    .get(source.id, row.groupOrdinal),
+                    .prepare(
+                      'SELECT value FROM summaries WHERE intake=? AND ordinal=? AND grounding=?',
+                    )
+                    .get(source.id, row.groupOrdinal, currentGroundingEpoch(source.id)),
                   oldMember = JSON.parse(String(row.value)) as CollectionReportQueueMember;
                 if (
                   member &&
@@ -663,6 +709,10 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                       profileId,
                       source.id,
                       member.proposalId,
+                      {
+                        groundingDependency: (dependency) =>
+                          retainGroundingDependency(source.id, dependency),
+                      },
                     );
                     proposal = member.proposalId;
                     withIntakeWork(db, 'warm', () =>
@@ -724,6 +774,8 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           'summaries',
           'memberFacts',
           'dates',
+          'groundingSources',
+          'groundingDependencies',
         ])
           cache.prepare(`DELETE FROM ${table} WHERE intake=?`).run(source.id);
         cache
@@ -875,6 +927,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       return clinicalRevision;
     },
     refresh,
+    groundingStamp: currentGroundingEpoch,
     *sources() {
       for (const row of cache.prepare('SELECT id,pin FROM sources ORDER BY id').iterate())
         yield { id: String(row.id), pin: String(row.pin) };
@@ -915,8 +968,8 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     },
     summary(intakeId: string, ordinal: number) {
       const row = cache
-        .prepare('SELECT value FROM summaries WHERE intake=? AND ordinal=?')
-        .get(intakeId, ordinal);
+        .prepare('SELECT value FROM summaries WHERE intake=? AND ordinal=? AND grounding=?')
+        .get(intakeId, ordinal, currentGroundingEpoch(intakeId));
       if (!row) return undefined;
       const value = JSON.parse(String(row.value)) as CollectionReportGroupSummary;
       value.intakeVersion = intakeSourceVersion(db, intakeId).version;
@@ -953,8 +1006,13 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     },
     cacheSummary(value: CollectionReportGroupSummary) {
       cache
-        .prepare('INSERT OR REPLACE INTO summaries VALUES(?,?,?)')
-        .run(value.intakeId, value.groupOrdinal, JSON.stringify(value));
+        .prepare('INSERT OR REPLACE INTO summaries VALUES(?,?,?,?)')
+        .run(
+          value.intakeId,
+          value.groupOrdinal,
+          JSON.stringify(value),
+          currentGroundingEpoch(value.intakeId),
+        );
     },
     cacheMemberFacts: putFacts,
     beginSummary(intakeId: string, ordinal: number) {
@@ -981,9 +1039,15 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     memberFacts(intakeId: string, member: CollectionReportQueueMember) {
       const row = cache
         .prepare(
-          'SELECT value FROM memberFacts WHERE intake=? AND groupOrdinal=? AND candidate=? AND version=?',
+          'SELECT value FROM memberFacts WHERE intake=? AND groupOrdinal=? AND candidate=? AND version=? AND grounding=?',
         )
-        .get(intakeId, member.groupOrdinal, member.candidateId, member.candidateVersionId);
+        .get(
+          intakeId,
+          member.groupOrdinal,
+          member.candidateId,
+          member.candidateVersionId,
+          currentGroundingEpoch(intakeId),
+        );
       return row ? (JSON.parse(String(row.value)) as MemberFacts) : undefined;
     },
     *membersByCandidate(intakeId: string, candidateId: string, version = '') {
@@ -1030,6 +1094,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           profileId,
           intakeId,
           member.proposalId,
+          { groundingDependency: (dependency) => retainGroundingDependency(intakeId, dependency) },
         );
         reviewKey = key;
         reviewObservedStamp = reviewReadStamp(db);
@@ -1205,6 +1270,7 @@ export async function collectionReportGroupSummary(
   sourcePage?: { kind: 'current' | 'saved'; cursor?: string; limit?: number },
 ): Promise<CollectionReportGroupSummary> {
   queue.assertCurrent();
+  const grounding = identityGroundingGeneration(db);
   if (!sourcePage) {
     const cached = queue.summary(pointer.intakeId, pointer.ordinal);
     if (cached) return cached;
@@ -1289,7 +1355,7 @@ export async function collectionReportGroupSummary(
       if (member.state !== 'pending' && member.state !== 'deferred') continue;
       tally.blocked += facts.counts.blocked;
       tally.questions += facts.counts.questions;
-      dates.add(facts.date ?? null);
+      if (dates.size < 2) dates.add(facts.date ?? null);
     }
     for (const row of queue.saved(intakeId, pointer.ordinal))
       coverageDb.prepare('INSERT INTO sources VALUES(?,?,?)').run('saved', row.source, row.count);
@@ -1412,6 +1478,7 @@ export async function collectionReportGroupSummary(
         }
       : null;
     queue.assertCurrent();
+    if (identityGroundingGeneration(db) !== grounding) throw changed();
     const summary: CollectionReportGroupSummary = {
       format: 'health-intake-report-group-v2',
       intakeId,

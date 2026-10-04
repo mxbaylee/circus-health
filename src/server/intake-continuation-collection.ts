@@ -19,6 +19,7 @@ import {
 import { openCollectionModelIntakeBackend } from './intake-model-collection-backend.ts';
 import { modelIntakeRecordReference } from './intake-model-context-v4.ts';
 import { intakeSourceVersion, intakeSourceMetadata } from './intake-state-access.ts';
+import { iterateIntakeSourceAncestry } from './intake-source-ancestry.ts';
 import {
   selectedEnvelopeStore,
   openIntakeCollectionEnvelope,
@@ -360,15 +361,53 @@ function legacyContext(scope: CollectionConversionScope) {
     },
   };
 }
+// Unit ledgers share their source/session totals and imported pending targets.
+// Serialize only their asynchronous publication; reading source bytes remains
+// independent. This queue grants no authority and retains no idle session keys.
+const readingUpdates = new WeakMap<Database, Map<string, Promise<void>>>();
+async function withReadingSession<T>(
+  scope: CollectionConversionScope,
+  options: { assertRunning?: () => void },
+  action: () => Promise<T>,
+): Promise<T> {
+  const { db } = owner(scope);
+  options.assertRunning?.();
+  let pending = readingUpdates.get(db);
+  if (!pending) readingUpdates.set(db, (pending = new Map()));
+  const key = JSON.stringify([scope.profileId, scope.intakeId, scope.sourceHash, scope.sessionId]);
+  const previous = pending.get(key);
+  let release!: () => void;
+  const tail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  pending.set(key, tail);
+  try {
+    await previous;
+    options.assertRunning?.();
+    owner(scope);
+    assertIntakeOwner(db, scope.profileId);
+    if (selectedEnvelopeStore(db, { id: scope.intakeId }).source.sha256 !== scope.sourceHash)
+      throw new Error('The reading source changed');
+    return await action();
+  } finally {
+    release();
+    if (pending.get(key) === tail) {
+      pending.delete(key);
+      if (!pending.size) readingUpdates.delete(db);
+    }
+  }
+}
 /** Explicit asynchronous preparation after selecting a changed plan. The reader
  * itself refuses missing target proof instead of guessing an empty history. */
 export function prepareLegacyCollectionReadingTargets(
   scope: CollectionConversionScope,
   options: { assertRunning?: () => void; onCheckpoint?: () => void | Promise<void> } = {},
 ) {
-  return prepareLegacyReadingTargets(
-    { ...legacyContext(scope), root: owner(scope).root, profileId: scope.profileId },
-    options,
+  return withReadingSession(scope, options, () =>
+    prepareLegacyReadingTargets(
+      { ...legacyContext(scope), root: owner(scope).root, profileId: scope.profileId },
+      options,
+    ),
   );
 }
 /** Selected source/session aggregate. An older header without pending accounting
@@ -598,6 +637,140 @@ function checkReadScope(scope: CollectionConversionScope, args: ReadArgs) {
   if (sourceHash !== unit.sourceHash) throw Error('Retained child source hash changed');
 }
 
+declare const descendantReadBrand: unique symbol;
+export interface CollectionDescendantRead {
+  readonly [descendantReadBrand]: true;
+}
+type DescendantEvidence = { sourceHash: string; ancestry: string };
+const descendantReads = new WeakMap<
+  CollectionDescendantRead,
+  {
+    db: Database;
+    root: string;
+    scope: string;
+    sourceId: string;
+    evidence: DescendantEvidence;
+  }
+>();
+const descendantBinding = (scope: CollectionConversionScope) => {
+  const logical = owner(scope).logical;
+  if (!logical) throw Error('Manual descendant reading requires selected logical authority');
+  // This is an original-byte capability. Source capture may advance the separate
+  // material-text pin, but domainVersion and the complete logical root must match.
+  return hash([binding(scope), logical]);
+};
+const descendantKey = (sourceId: string) => 'manual-source:' + hash(sourceId);
+async function inspectDescendant(
+  scope: CollectionConversionScope,
+  sourceId: string,
+  options: { assertRunning?: () => void },
+) {
+  const { db, plan, unit } = owner(scope);
+  descendantBinding(scope);
+  if (
+    sourceId === scope.intakeId ||
+    plan.kind === 'package' ||
+    unit.memberId ||
+    unit.kind === 'package_member'
+  )
+    throw Error('A manual descendant read cannot replace a package occurrence');
+  const readStamp = db.prepare(
+    'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS schema',
+  );
+  readStamp.setReadBigInts(true);
+  const stamp = () => {
+    if (db.isTransaction) throw Error('Prepare descendant reading outside a transaction');
+    const row = readStamp.get()!;
+    return `${row.changes}:${row.external}:${row.schema}`;
+  };
+  const before = stamp();
+  const assertCurrent = () => {
+    options.assertRunning?.();
+    owner(scope);
+    assertIntakeOwner(db, scope.profileId);
+    if (stamp() !== before) throw Error('Retained descendant evidence changed during preparation');
+  };
+  assertCurrent();
+  const sourceHash = db
+    .prepare("SELECT sha256 FROM source_files WHERE id=? AND kind='intake_original'")
+    .get(sourceId)?.sha256;
+  if (typeof sourceHash !== 'string') throw Error('Retained descendant source is unavailable');
+  const digest = createHash('sha256');
+  const walk = iterateIntakeSourceAncestry(db, scope.profileId, sourceId, {
+    stopAt: scope.intakeId,
+    assertRunning: assertCurrent,
+  });
+  let count = 0;
+  for (;;) {
+    const next = walk.next();
+    if (next.done) {
+      if (!next.value) throw Error('Read does not belong to this retained delivery');
+      break;
+    }
+    digest.update(JSON.stringify([next.value.id, next.value.parentId ?? null]));
+    if (++count % 64 === 0) {
+      await setImmediate();
+      assertCurrent();
+    }
+  }
+  assertCurrent();
+  return { evidence: { sourceHash, ancestry: digest.digest('hex') }, assertCurrent };
+}
+/** The manual host issues this before reading original bytes. It authorizes a
+ * pinned descendant source only; no read or extraction evidence is created. */
+export async function prepareManualCollectionDescendantRead(
+  scope: CollectionConversionScope,
+  sourceId: string,
+  options: { assertRunning?: () => void } = {},
+): Promise<CollectionDescendantRead> {
+  const checked = await inspectDescendant(scope, sourceId, options);
+  checked.assertCurrent();
+  const capability = Object.freeze({}) as CollectionDescendantRead;
+  descendantReads.set(capability, {
+    db: owner(scope).db,
+    root: owner(scope).root,
+    scope: descendantBinding(scope),
+    sourceId,
+    evidence: checked.evidence,
+  });
+  return capability;
+}
+async function checkedDescendant(
+  scope: CollectionConversionScope,
+  args: ReadArgs,
+  options: ReadingUpdateOptions,
+) {
+  const sourceId = args.id;
+  if (typeof sourceId !== 'string') throw Error('Reading source identity is unavailable');
+  let expected: DescendantEvidence | undefined;
+  if (options.descendantRead) {
+    const capability = descendantReads.get(options.descendantRead);
+    if (
+      !capability ||
+      capability.db !== owner(scope).db ||
+      capability.root !== owner(scope).root ||
+      capability.scope !== descendantBinding(scope) ||
+      capability.sourceId !== sourceId
+    )
+      throw Error('Foreign manual descendant reading capability');
+    expected = capability.evidence;
+  } else {
+    const raw = text(scope, collectionName(scope), descendantKey(sourceId));
+    if (raw !== undefined) expected = JSON.parse(raw) as DescendantEvidence;
+  }
+  if (!expected) return undefined;
+  if (args.memberId || (args.unitId && args.unitId !== scope.unitId))
+    throw Error('Manual descendant read belongs to a different occurrence');
+  const checked = await inspectDescendant(scope, sourceId, options);
+  checked.assertCurrent();
+  if (
+    checked.evidence.sourceHash !== expected.sourceHash ||
+    checked.evidence.ancestry !== expected.ancestry
+  )
+    throw Error('Retained descendant reading source changed');
+  return checked;
+}
+
 /** Only acknowledged provider-visible reads enter this ledger. Preparation is
  * forked and bounded; interruption leaves the prior selected receipt intact. */
 async function updateCollectionConversionRead(
@@ -606,7 +779,7 @@ async function updateCollectionConversionRead(
   tool: string,
   args: ReadArgs,
   result: unknown,
-  options: { assertRunning?: () => void; onCheckpoint?: () => void | Promise<void> } = {},
+  options: ReadingUpdateOptions = {},
   mode: 'acknowledge' | 'defer' = 'acknowledge',
 ): Promise<boolean> {
   checkCheckpoint(scope, checkpoint);
@@ -615,7 +788,8 @@ async function updateCollectionConversionRead(
   // Inventory selects discoverable units; it supplies no literal member read.
   // Native plans already retain complete unit order without enqueuing metadata.
   if (details.inventory) return false;
-  checkReadScope(scope, args);
+  const descendant = await checkedDescendant(scope, args, options);
+  if (!descendant) checkReadScope(scope, args);
   const { db } = owner(scope),
     collections = store(scope),
     selected = collectionName(scope),
@@ -676,6 +850,7 @@ async function updateCollectionConversionRead(
     intakeSourceVersion(db, scope.intakeId).rawVersion,
     { assertRunning: current, onCheckpoint: options.onCheckpoint },
   );
+  if (descendant) await writer.put(descendantKey(args.id!), JSON.stringify(descendant.evidence));
   const has = (key: string) =>
     writer.peek(key) !== undefined ||
     !!legacy?.has(key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1));
@@ -796,6 +971,11 @@ async function updateCollectionConversionRead(
           key: 'counts',
           value: JSON.stringify(totals),
         };
+    if (descendant) {
+      const checked = await checkedDescendant(scope, args, options);
+      if (!checked) throw Error('Retained descendant reading authority is unavailable');
+      checked.assertCurrent();
+    }
     commit([
       {
         area: 'builds',
@@ -859,7 +1039,7 @@ async function updateCollectionConversionRead(
   if (readable) {
     const childId = args.id !== scope.intakeId ? args.id : value.sourceFileId;
     if (typeof childId === 'string' && childId !== scope.intakeId) {
-      checkReadScope(scope, { id: childId });
+      if (!descendant) checkReadScope(scope, { id: childId });
       const sourceHash = db
         .prepare('SELECT sha256 FROM source_files WHERE id=?')
         .get(childId)?.sha256;
@@ -995,6 +1175,7 @@ async function updateCollectionConversionRead(
 type ReadingUpdateOptions = {
   assertRunning?: () => void;
   onCheckpoint?: () => void | Promise<void>;
+  descendantRead?: CollectionDescendantRead;
 };
 export function recordCollectionConversionRead(
   scope: CollectionConversionScope,
@@ -1004,7 +1185,9 @@ export function recordCollectionConversionRead(
   result: unknown,
   options: ReadingUpdateOptions = {},
 ) {
-  return updateCollectionConversionRead(scope, checkpoint, tool, args, result, options);
+  return withReadingSession(scope, options, () =>
+    updateCollectionConversionRead(scope, checkpoint, tool, args, result, options),
+  );
 }
 /** A host read is not counted until a valid provider response acknowledges it. */
 export async function deferCollectionConversionRead(
@@ -1019,11 +1202,13 @@ export async function deferCollectionConversionRead(
   if (!receipt) return null;
   if (Buffer.byteLength(JSON.stringify(receipt)) > 1024 * 1024)
     throw Error('Deferred read metadata exceeds the supported receipt budget');
-  await updateCollectionConversionRead(scope, checkpoint, tool, args, result, options, 'defer');
-  const key = windowKey({ tool, args: receipt.args });
-  return text(scope, collectionName(scope), 'deferred-priority:' + key) === undefined
-    ? null
-    : { format: 'health-intake-deferred-read-v2' as const, key };
+  return withReadingSession(scope, options, async () => {
+    await updateCollectionConversionRead(scope, checkpoint, tool, args, result, options, 'defer');
+    const key = windowKey({ tool, args: receipt.args });
+    return text(scope, collectionName(scope), 'deferred-priority:' + key) === undefined
+      ? null
+      : { format: 'health-intake-deferred-read-v2' as const, key };
+  });
 }
 export async function acknowledgeCollectionConversionRead(
   scope: CollectionConversionScope,
@@ -1032,31 +1217,33 @@ export async function acknowledgeCollectionConversionRead(
   options: ReadingUpdateOptions = {},
 ) {
   if (!/^[a-f0-9]{64}$/.test(key)) throw Error('Invalid deferred read reference');
-  const raw = text(scope, collectionName(scope), 'deferred:' + key, 1024 * 1024);
-  if (!raw) {
-    if (text(scope, collectionName(scope), 'seen:' + key) !== undefined) return false;
-    const window = readCollectionConversionWindow(scope, key);
-    if (
-      ancestors(window).some(
-        (pointer) =>
-          text(scope, collectionName(scope), 'supplied:' + ancestorKey(window, pointer)) !==
-          undefined,
+  return withReadingSession(scope, options, async () => {
+    const raw = text(scope, collectionName(scope), 'deferred:' + key, 1024 * 1024);
+    if (!raw) {
+      if (text(scope, collectionName(scope), 'seen:' + key) !== undefined) return false;
+      const window = readCollectionConversionWindow(scope, key);
+      if (
+        ancestors(window).some(
+          (pointer) =>
+            text(scope, collectionName(scope), 'supplied:' + ancestorKey(window, pointer)) !==
+            undefined,
+        )
       )
-    )
-      return false;
-    throw Error('Deferred read receipt is unavailable');
-  }
-  const receipt = JSON.parse(raw) as NonNullable<ReturnType<typeof conversionDeferredReceipt>>;
-  if (windowKey({ tool: receipt.tool, args: receipt.args }) !== key)
-    throw Error('Deferred reading receipt conflicts');
-  return updateCollectionConversionRead(
-    scope,
-    checkpoint,
-    receipt.tool,
-    receipt.args,
-    receipt.result,
-    options,
-  );
+        return false;
+      throw Error('Deferred read receipt is unavailable');
+    }
+    const receipt = JSON.parse(raw) as NonNullable<ReturnType<typeof conversionDeferredReceipt>>;
+    if (windowKey({ tool: receipt.tool, args: receipt.args }) !== key)
+      throw Error('Deferred reading receipt conflicts');
+    return updateCollectionConversionRead(
+      scope,
+      checkpoint,
+      receipt.tool,
+      receipt.args,
+      receipt.result,
+      options,
+    );
+  });
 }
 
 export function readCollectionConversionWindow(
@@ -1289,11 +1476,13 @@ export async function assertCollectionChildConversionCoverage(
     collections.collection(collections.openView(), 'builds', collection)?.root?.hash ?? '';
   const before = root(name),
     legacyBefore = legacy ? root(legacy.name) : '';
+  const descendantChecks: Array<() => void> = [];
   const check = () => {
     options.assertRunning?.();
     assertIntakeOwner(db, parent.profileId);
     owner(parent);
     for (const target of targets) owner(target);
+    for (const assertCurrent of descendantChecks) assertCurrent();
     if (root(name) !== before || (legacy && root(legacy.name) !== legacyBefore))
       throw new HttpError(
         409,
@@ -1340,7 +1529,11 @@ export async function assertCollectionChildConversionCoverage(
     profileId: parent.profileId,
     sessionId: parent.sessionId,
     check,
-    checkSource: (sourceId) => checkReadScope(parent, { id: sourceId }),
+    async checkSource(sourceId) {
+      const descendant = await checkedDescendant(parent, { id: sourceId }, options);
+      if (descendant) descendantChecks.push(descendant.assertCurrent);
+      else checkReadScope(parent, { id: sourceId });
+    },
     read,
     seen,
     pending,
