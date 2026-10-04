@@ -587,6 +587,8 @@ selection instead; a valid review gains no new preparation prerequisite. A
 malformed completed index is refused. The scratch rows are disposable and cannot
 supply an answer or create acceptance authority.
 
+The complete fictional 140-question qualification retains exact question ordering, tokens, late-blocker refusal, answer persistence, cache-loss recovery and final acceptance. Its 2026-10-04 controlled run passes that full oracle; it does not establish interactive performance. Through the matching pre-acceptance boundary, shared sections reduce repeated policy rows from 700 to 560 and warm collection-node reads from about 4.21 GB to 3.55 GB, while physical-head reads rise from 729,818 to 742,761. The complete run counts about 4.82 GB of warm node reads, 0.67 GB of reconstruction node reads and 1,031,782 physical-head reads. These logical counters are not physical disk traffic or a total-work reduction. The retained-record and larger-import qualifications remain separate.
+
 Report-source preparation checkpoints retained references, group/version history,
 extension matching and complete membership hashing. Later duplicate-group
 precedence and the legacy canonical confirmation hash remain unchanged. Within
