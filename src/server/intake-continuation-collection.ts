@@ -1,5 +1,10 @@
 /** Explicit collection-backed reading progress. It is not clinical coverage. */
 import { createHash, randomUUID } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
+import {
+  prepareReadingPendingIndex,
+  beginReadingPendingIndexUpdate,
+} from './intake-reading-pending-index.ts';
 import { HttpError, type Database } from './database.ts';
 import { assertIntakeOwner } from './intake.ts';
 import { readPackagePlanScope, readPackageUnitPage } from './intake-package-plan.ts';
@@ -33,6 +38,7 @@ import {
   conversionScopeKey as scopeKey,
   type ReadArgs,
   type ReadWindow,
+  type ConversionCheckpoint,
 } from './intake-continuation.ts';
 import type { IntakeExtractionCoverage } from '../shared/intake.ts';
 import {
@@ -323,6 +329,24 @@ export function openCollectionConversion(
 const collectionName = (scope: CollectionConversionScope) => 'reading.' + scope.ledgerId;
 const sessionName = (scope: CollectionConversionScope) =>
   'reading.session.' + hash([scope.sessionId, scope.intakeId, scope.sourceHash]);
+/** Point lookup for an acknowledged child, independent of the displayed unit. */
+export function collectionConversionSourceUnit(scope: CollectionConversionScope, sourceId: string) {
+  const { db } = owner(scope);
+  const raw = text(scope, sessionName(scope), 'sourceUnit:' + hash(sourceId));
+  if (!raw) return undefined;
+  const route = JSON.parse(raw) as { planId: string; unitId: string; sourceHash: string };
+  if (route.planId !== scope.planId) return undefined;
+  if (
+    db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(sourceId)?.sha256 !==
+    route.sourceHash
+  )
+    throw new HttpError(
+      409,
+      'CONVERSION_CHANGED',
+      'The child source differs from its acknowledged reading evidence',
+    );
+  return route.unitId;
+}
 function legacyContext(scope: CollectionConversionScope) {
   const value = owner(scope);
   return {
@@ -588,15 +612,33 @@ async function updateCollectionConversionRead(
   checkCheckpoint(scope, checkpoint);
   const details = conversionReadDetails(tool, args, result);
   if (!details) return false;
+  // Inventory selects discoverable units; it supplies no literal member read.
+  // Native plans already retain complete unit order without enqueuing metadata.
+  if (details.inventory) return false;
   checkReadScope(scope, args);
-  if (details.inventory) throw Error('Inventory metadata is not a selected unit reading receipt');
   const { db } = owner(scope),
     collections = store(scope),
     selected = collectionName(scope),
     before = state(scope),
     next = { ...before };
+  let sourceRoute: { key: string; value: string } | undefined;
   const oldRoot = collections.collection(collections.openView(), 'builds', selected)?.root?.hash;
-  const legacy = await prepareLegacyReadingUpdate(legacyContext(scope), options);
+  const oldLegacy = openLegacyReadingSession(legacyContext(scope));
+  const legacyRoot =
+    oldLegacy &&
+    collections.collection(collections.openView(), 'builds', oldLegacy.name)?.root?.hash;
+  const pendingIndex = beginReadingPendingIndexUpdate(
+    db,
+    scope.intakeId + ':' + selected,
+    oldRoot ?? '',
+  );
+  const legacyIndex =
+    oldLegacy &&
+    beginReadingPendingIndexUpdate(db, scope.intakeId + ':' + oldLegacy.name, legacyRoot ?? '');
+  const legacy = await prepareLegacyReadingUpdate(legacyContext(scope), {
+    ...options,
+    onPendingRemoved: (key) => legacyIndex?.change(key, null),
+  });
   const build = 'reading.build.' + randomUUID();
   const current = () => {
     options.assertRunning?.();
@@ -666,6 +708,7 @@ async function updateCollectionConversionRead(
     const key = windowKey(value),
       ordinal = writer.peek('pending:' + key);
     if (ordinal === undefined) return;
+    pendingIndex?.change(key, null);
     await writer.remove('pending:' + key);
     const id = groupId(value),
       local = group(id);
@@ -688,6 +731,7 @@ async function updateCollectionConversionRead(
     const value = descriptor(tool, args),
       key = windowKey(value);
     if (has('seen:' + key) || has('pending:' + key) || supplied(value)) return;
+    pendingIndex?.change(key, value);
     await window(value);
     const ordinal = schemaOrdinal(next.next++);
     await writer.put('pending:' + key, ordinal);
@@ -742,6 +786,7 @@ async function updateCollectionConversionRead(
       ].every((n) => Number.isSafeInteger(n) && n >= 0)
     )
       throw Error('Reading session count overflow');
+    if (legacy && sourceRoute) await legacy.sourceRoute(sourceRoute.key, sourceRoute.value);
     const sessionChange = legacy
       ? await legacy.finish(totals)
       : {
@@ -760,16 +805,43 @@ async function updateCollectionConversionRead(
         fromCollection: build,
       },
       sessionChange,
+      ...(!legacy && sourceRoute
+        ? [
+            {
+              area: 'builds' as const,
+              collection: sessionName(scope),
+              op: 'put' as const,
+              key: 'sourceUnit:' + sourceRoute.key,
+              value: sourceRoute.value,
+            },
+          ]
+        : []),
     ]);
+    const selectedRoot = collections.collection(collections.openView(), 'builds', selected)?.root
+      ?.hash;
+    pendingIndex?.finish(selectedRoot ?? '');
+    if (legacy && oldLegacy) {
+      const nextRoot = collections.collection(collections.openView(), 'builds', oldLegacy.name)
+        ?.root?.hash;
+      legacyIndex?.finish(nextRoot ?? '');
+    }
     checkpoint.version = scope.version;
     return fresh;
   };
   const { current: read, original, structure, readable, value } = details;
-  if (structure && supplied(read)) return false;
+  if (structure && supplied(read)) {
+    pendingIndex?.unchanged();
+    legacyIndex?.unchanged();
+    return false;
+  }
   const fresh = !has('seen:' + windowKey(read));
   if (mode === 'defer') {
     const key = windowKey(read);
-    if (!fresh || has('deferred-priority:' + key)) return false;
+    if (!fresh || has('deferred-priority:' + key)) {
+      pendingIndex?.unchanged();
+      legacyIndex?.unchanged();
+      return false;
+    }
     await enqueue(tool, read.args);
     const priority = schemaOrdinal(Number.MAX_SAFE_INTEGER - next.front++);
     await writer.put('deferred-priority:' + key, priority);
@@ -785,6 +857,19 @@ async function updateCollectionConversionRead(
   if (tool === 'health_intake_plan' && args.action === 'read_unit' && args.unitId === scope.unitId)
     await legacy?.readUnit();
   if (readable) {
+    const childId = args.id !== scope.intakeId ? args.id : value.sourceFileId;
+    if (typeof childId === 'string' && childId !== scope.intakeId) {
+      checkReadScope(scope, { id: childId });
+      const sourceHash = db
+        .prepare('SELECT sha256 FROM source_files WHERE id=?')
+        .get(childId)?.sha256;
+      if (typeof sourceHash !== 'string')
+        throw Error('Acknowledged child source hash is unavailable');
+      sourceRoute = {
+        key: hash(childId),
+        value: JSON.stringify({ planId: scope.planId, unitId: scope.unitId, sourceHash }),
+      };
+    }
     await legacy?.markRead(scopeKey([args.id, args.memberId || null, original.page || null]));
     if (args.memberId) await legacy?.markRead(scopeKey([args.id, args.memberId, null]));
     await writer.put(
@@ -1183,4 +1268,247 @@ export function assertCollectionConversionCoverage(
         'Read every remaining window in this member before claiming extracted coverage',
       );
   }
+}
+
+/** A child plan keeps its own source and unit authority. Its direct reads remain
+ * in the parent's conversation ledger, as they did in the legacy checkpoint. */
+export async function assertCollectionChildConversionCoverage(
+  parent: CollectionConversionScope,
+  targets: readonly CollectionConversionScope[],
+  input: { planId: string; coverage: readonly IntakeExtractionCoverage[] },
+  options: { assertRunning?: () => void } = {},
+) {
+  if (targets.length > 50 || input.coverage.length > 50)
+    throw Error('Oversized child reading coverage scope');
+  if (!input.coverage.some((item) => item.kind === 'extracted')) return;
+  const { db } = owner(parent),
+    collections = store(parent),
+    name = collectionName(parent),
+    legacy = openLegacyReadingSession(legacyContext(parent));
+  const root = (collection: string) =>
+    collections.collection(collections.openView(), 'builds', collection)?.root?.hash ?? '';
+  const before = root(name),
+    legacyBefore = legacy ? root(legacy.name) : '';
+  const check = () => {
+    options.assertRunning?.();
+    assertIntakeOwner(db, parent.profileId);
+    owner(parent);
+    for (const target of targets) owner(target);
+    if (root(name) !== before || (legacy && root(legacy.name) !== legacyBefore))
+      throw new HttpError(
+        409,
+        'CONVERSION_CHANGED',
+        'Reading evidence changed. Retry this exact coverage claim.',
+      );
+  };
+  const nativePending = await prepareReadingPendingIndex(
+    db,
+    parent.intakeId + ':' + name,
+    before,
+    function* () {
+      for (const entry of entries(parent, name, 'pending:')) {
+        const key = entry.key.slice('pending:'.length);
+        yield { key, window: readCollectionConversionWindow(parent, key) };
+      }
+    },
+    check,
+  );
+  const legacyPending =
+    legacy &&
+    (await prepareReadingPendingIndex(
+      db,
+      parent.intakeId + ':' + legacy.name,
+      legacyBefore,
+      function* () {
+        for (const entry of legacy.entries('legacy.pending:')) {
+          const key = entry.key.slice('legacy.pending:'.length).split(':')[0]!;
+          const window = legacy.window(key);
+          if (!window) throw Error('Imported pending child read is unavailable');
+          yield { key, window };
+        }
+      },
+      check,
+    ));
+  const pending = [nativePending, ...(legacyPending ? [legacyPending] : [])];
+  const seen = (key: string) => !!text(parent, name, 'seen:' + key) || !!legacy?.has('seen', key);
+  const read = (source: string, page: number | null) => {
+    const key = scopeKey([source, null, page]);
+    return !!text(parent, name, 'read:' + key) || !!legacy?.has('read', key);
+  };
+  await checkChildCoverageTargets(targets, input, {
+    parentId: parent.intakeId,
+    profileId: parent.profileId,
+    sessionId: parent.sessionId,
+    check,
+    checkSource: (sourceId) => checkReadScope(parent, { id: sourceId }),
+    read,
+    seen,
+    pending,
+  });
+}
+
+/** A retained legacy conversation may create a native plan only for its child.
+ * Read the real selected child units without reconstructing a legacy intake. */
+export async function assertLegacyCollectionChildConversionCoverage(
+  checkpoint: ConversionCheckpoint,
+  sessionId: string,
+  targets: readonly CollectionConversionScope[],
+  input: { planId: string; coverage: readonly IntakeExtractionCoverage[] },
+  options: { assertRunning?: () => void } = {},
+) {
+  if (!targets.length || !input.coverage.some((item) => item.kind === 'extracted')) return;
+  const { db } = owner(targets[0]!);
+  const root = intakeSourceVersion(db, checkpoint.intakeId);
+  const seenCount = checkpoint.seen.length,
+    pendingCount = checkpoint.pending.length,
+    readCount = checkpoint.readScopes.length,
+    last = checkpoint.lastWindow;
+  const check = () => {
+    options.assertRunning?.();
+    assertIntakeOwner(db, checkpoint.profileId);
+    const current = intakeSourceVersion(db, checkpoint.intakeId);
+    if (
+      current.logicalBinding !== root.logicalBinding ||
+      current.version !== root.version ||
+      checkpoint.seen.length !== seenCount ||
+      checkpoint.pending.length !== pendingCount ||
+      checkpoint.readScopes.length !== readCount ||
+      checkpoint.lastWindow !== last ||
+      db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(checkpoint.intakeId)?.sha256 !==
+        checkpoint.sourceHash
+    )
+      throw new HttpError(
+        409,
+        'CONVERSION_CHANGED',
+        'Reading evidence changed. Retry this exact coverage claim.',
+      );
+    for (const target of targets) owner(target);
+  };
+  const { checkIntakeSourceAncestry } = await import('./intake-source-ancestry.ts');
+  // The legacy checkpoint already owns its complete pending array. Index it
+  // once for this bounded claim; do not persist or promote completion IDs.
+  const pendingId = 'legacy-child:' + sessionId;
+  const binding = randomUUID();
+  const pending = await prepareReadingPendingIndex(
+    db,
+    pendingId,
+    binding,
+    function* () {
+      for (let ordinal = 0; ordinal < checkpoint.pending.length; ordinal++)
+        yield { key: String(ordinal), window: checkpoint.pending[ordinal]! };
+    },
+    check,
+  );
+  await checkChildCoverageTargets(targets, input, {
+    parentId: checkpoint.intakeId,
+    profileId: checkpoint.profileId,
+    sessionId,
+    check,
+    checkSource: async (sourceId) => {
+      if (
+        !(await checkIntakeSourceAncestry(db, checkpoint.profileId, sourceId, {
+          stopAt: checkpoint.intakeId,
+          assertRunning: check,
+        }))
+      )
+        throw new HttpError(
+          403,
+          'CONVERSION_SCOPE',
+          'Child evidence no longer belongs to this conversion',
+        );
+    },
+    read: (sourceId, page) => checkpoint.readScopes.includes(scopeKey([sourceId, null, page])),
+    seen: (key) => checkpoint.seen.includes(key),
+    pending: [pending],
+  });
+}
+
+async function checkChildCoverageTargets(
+  targets: readonly CollectionConversionScope[],
+  input: { planId: string; coverage: readonly IntakeExtractionCoverage[] },
+  evidence: {
+    parentId: string;
+    profileId: string;
+    sessionId: string;
+    check: () => void;
+    checkSource: (sourceId: string) => void | Promise<void>;
+    read: (sourceId: string, page: number | null) => boolean;
+    seen: (key: string) => boolean;
+    pending: readonly Awaited<ReturnType<typeof prepareReadingPendingIndex>>[];
+  },
+) {
+  if (targets.length > 50 || input.coverage.length > 50)
+    throw Error('Oversized child reading coverage scope');
+  const { check, read, seen, pending } = evidence;
+  const refuse = () => {
+    throw new HttpError(
+      409,
+      'CONVERSION_COVERAGE_PENDING',
+      'Read every remaining window in this child source before claiming extracted coverage',
+    );
+  };
+  for (const coverage of input.coverage) {
+    if (coverage.kind !== 'extracted') continue;
+    const target = targets.find(
+      (scope) => scope.planId === input.planId && scope.unitId === coverage.unitId,
+    );
+    if (!target || target.intakeId === evidence.parentId) refuse();
+    const selected = owner(target!),
+      { unit, pages } = selected,
+      sourceId = unit.sourceFileId || target!.intakeId;
+    if (
+      sourceId !== target!.intakeId ||
+      target!.profileId !== evidence.profileId ||
+      target!.sessionId !== evidence.sessionId
+    )
+      refuse();
+    // This proves the child still belongs to this exact retained member or
+    // addressed asset and that its bytes match the original read-source pin.
+    await evidence.checkSource(sourceId);
+    check();
+    if (unit.kind === 'pdf') {
+      if (!pages) refuse();
+      for (let ordinal = 0; ordinal < pages!.uniqueCount; ordinal++) {
+        check();
+        const page = pages!.uniquePageAt(ordinal)!;
+        if (!read(sourceId, page) || pending.some((index) => index.page(sourceId, page))) refuse();
+        if (ordinal % 32 === 31) await setImmediate();
+      }
+    } else {
+      if (['image', 'package_member'].includes(unit.kind) && !read(sourceId, null)) refuse();
+      if (pending.some((index) => index.unit(sourceId, unit.id))) refuse();
+      if (
+        ['text', 'html'].includes(unit.kind) &&
+        !seen(
+          windowKey(
+            descriptor('health_intake_plan', {
+              id: sourceId,
+              action: 'read_unit',
+              unitId: unit.id,
+            }),
+          ),
+        )
+      ) {
+        const end =
+          selected.plan.kind === 'direct'
+            ? selected.plan.scope.unitById(unit.id)?.end
+            : selected.retainedUnit &&
+              (() => {
+                const field = selected.retainedUnit!.reader.field(
+                  selected.retainedUnit!.record,
+                  'end',
+                  { bytes: 128 },
+                );
+                if (field.kind === 'missing') return undefined;
+                if (field.kind !== 'value' || typeof field.value !== 'number')
+                  throw Error('Child unit end is unavailable');
+                return field.value;
+              })();
+        // A parent member read is a different evidence scope. With no direct
+        // child read, an empty child pending index proves nothing about its tail.
+        if (!read(sourceId, null) || pending.some((index) => index.text(sourceId, end))) refuse();
+      }
+    }
+  }
+  check();
 }

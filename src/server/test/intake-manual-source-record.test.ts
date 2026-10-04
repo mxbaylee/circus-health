@@ -1,3 +1,4 @@
+import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
@@ -344,11 +345,9 @@ test(
     assert.equal(replay.proposalId, old.proposalId);
     assert.equal(replay.replayed, true);
     const assertNoPolicies = () => {
-      assert.equal(
-        f.db.prepare('SELECT count(*) n FROM intake_review_issue_policy_v2').get()!.n,
-        0,
-      );
-      assert.equal(f.db.prepare('SELECT count(*) n FROM intake_review_issue_scope').get()!.n, 0);
+      assert.equal(reviewIssueScratchCounts(f.db).databases, 0);
+      assert.equal(reviewIssueScratchCounts(f.db).rows, 0);
+      assert.equal(reviewIssueScratchCounts(f.db).scopes, 0);
     };
     assertNoPolicies();
     const before = { ...intakeWorkCounters(f.db).warm };
@@ -425,18 +424,21 @@ test(
       const fragment = page.items[0]!;
       assert.equal(fragment.kind, 'reference');
       if (fragment.kind !== 'reference') throw Error('Expected bounded review reference');
-      assertNoPolicies();
+      assert.equal(reviewIssueScratchCounts(f.db).databases, 1);
+      assert.ok(reviewIssueScratchCounts(f.db).scopes > 0);
       const data = await readIntakeReviewFragment(f.db, f.root, f.profileId, f.source.id, {
         proposalId: created.proposalId,
         reference: fragment.reference,
       });
       assert.equal(data.complete, true);
-      assertNoPolicies();
+      assert.equal(reviewIssueScratchCounts(f.db).databases, 1);
+      assert.ok(reviewIssueScratchCounts(f.db).scopes > 0);
       await readIntakeReviewRecord(f.db, f.root, f.profileId, f.source.id, {
         proposalId: created.proposalId,
         recordId: created.recordId,
       });
-      assertNoPolicies();
+      assert.equal(reviewIssueScratchCounts(f.db).databases, 1);
+      assert.ok(reviewIssueScratchCounts(f.db).scopes > 0);
       await assert.rejects(
         readIntakeReviewRecord(f.db, f.root, f.profileId, f.source.id, {
           proposalId: created.proposalId,

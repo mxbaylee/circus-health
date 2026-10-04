@@ -8,6 +8,7 @@ import { profileOriginal } from './profile-storage.ts';
 import {
   readPreparedCorrectionSupport,
   correctionSupportingReferences,
+  correctionSupportingSourceRoot,
   type PreparedCorrectionSupportingEvidence,
 } from './record-correction-support.ts';
 import { validClinicalFieldValue } from './optical-prescription.ts';
@@ -56,21 +57,6 @@ function retainedOriginal(db: Database, context: CorrectionEvidenceContext, sour
     intake?: { originalName?: string; parentSourceFileId?: string; locator?: string };
   };
   return { sha256: String(file.sha256), path: String(file.path), details };
-}
-
-function sourceRoot(db: Database, id: string): string {
-  const seen = new Set<string>();
-  while (!seen.has(id) && seen.size < 10) {
-    seen.add(id);
-    const row = db
-      .prepare(
-        "SELECT json_extract(details_json,'$.intake.parentSourceFileId') parent FROM source_files WHERE id=?",
-      )
-      .get(id);
-    if (!row?.parent) return id;
-    id = String(row.parent);
-  }
-  throw new HttpError(409, 'CORRECTION_EVIDENCE', 'Supporting source ancestry is invalid');
 }
 
 function supportingOriginals(
@@ -144,7 +130,8 @@ function supportingOriginals(
       file.sha256 === member.sourceHash;
     if (
       (!evidence && !exactMember) ||
-      sourceRoot(db, ref.originalSourceFileId) !== sourceRoot(db, ref.intakeId)
+      correctionSupportingSourceRoot(db, context.profileId, ref.originalSourceFileId) !==
+        correctionSupportingSourceRoot(db, context.profileId, ref.intakeId)
     )
       throw new HttpError(
         409,

@@ -71,7 +71,7 @@ test('fictional restore oracle uses public acceptance and preserves review, Stop
     keyring: 'circus-health-keyring-v1',
     manifest: 'circus-health-vault-head-v2',
     index: 'circus-health-vault-index-delta-v2',
-    history: 'health-record-versions-v1',
+    history: 'health-record-versions-v2',
     acceptedHistorySchema: LATEST_SCHEMA_VERSION,
     encryptedFraming: 'CIRCUS01',
     recoveryKit: 'circus-health-recovery-v1',

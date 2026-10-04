@@ -719,11 +719,16 @@ export function RecordOwnershipAction({
                       </li>
                     ))}
                 </ul>
-                {!!preview.reportHolds.length && (
+                {!!('reportHoldsIncluded' in preview
+                  ? preview.reportEvidence.reportHoldTotal
+                  : preview.reportHolds.length) && (
                   <p>
-                    Earlier person defaults for {preview.reportHolds.length} reports will require
-                    renewed identity review. Saved records outside this selection retain their
-                    owners.
+                    Earlier person defaults for{' '}
+                    {'reportHoldsIncluded' in preview
+                      ? preview.reportEvidence.reportHoldTotal
+                      : preview.reportHolds.length}{' '}
+                    reports will require renewed identity review. Saved records outside this
+                    selection retain their owners.
                   </p>
                 )}
                 <p>

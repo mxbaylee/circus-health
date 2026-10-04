@@ -94,9 +94,20 @@ export function identityScopePolicyCollections(
         for (let index = 0; index < reference.collection[section]; index++) {
           const key = section + ':' + schemaOrdinal(index),
             header = readIdentitySnapshotValue<
-              IdentityPolicyTarget & { hasIssueIds: boolean; issueCount: number }
+              IdentityPolicyTarget & {
+                hasIssueIds: boolean;
+                issueCount: number;
+                hasIssueLookup?: boolean;
+              }
             >(reader, 'targetHeader:' + key);
-          const { hasIssueIds, issueCount, ...target } = header;
+          const { hasIssueIds, issueCount, hasIssueLookup, ...target } = header;
+          if (hasIssueLookup)
+            Object.defineProperty(target, 'hasIssueId', {
+              value: (id: string) =>
+                reader.get(
+                  'targetLookup:' + key + ':' + createHash('sha256').update(id).digest('hex'),
+                ) === '1',
+            });
           if (hasIssueIds)
             target.issueIds = selectedSequence(function* () {
               for (let i = 0; i < issueCount; i++)

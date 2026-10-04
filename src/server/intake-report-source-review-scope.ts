@@ -24,6 +24,7 @@ import {
   type PreparedIntakeJsonCanonical,
 } from './intake-json-canonical.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
+import { prepareReportSourceRouting } from './intake-report-source-routing.ts';
 
 export interface NativeReportSourceScopeEntry {
   ordinal: number;
@@ -92,6 +93,11 @@ export async function prepareNativeReportSourceReviewScope(
     throw Error('Invalid source sort window');
   if (!['active', 'deferred', 'all'].includes(input.view))
     throw new HttpError(400, 'REPORT_SOURCE_SCOPE', 'Choose active, deferred or all records');
+  if (
+    db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==
+    input.profileId
+  )
+    throw new HttpError(409, 'REPORT_SOURCE_SCOPE', 'Refresh this report in its owning profile');
   const reader = openIntakeCollectionEnvelope(db, source),
     intake = reader.child(reader.root(), 'intake'),
     workflow = intake && reader.child(intake, 'workflow'),
@@ -191,7 +197,7 @@ export async function prepareNativeReportSourceReviewScope(
   };
   try {
     cache.exec(
-      'CREATE TABLE owners(candidate TEXT,version TEXT,groupId TEXT,PRIMARY KEY(candidate,version)) WITHOUT ROWID;CREATE TABLE introduced(candidate TEXT,version TEXT,identity TEXT,address TEXT,PRIMARY KEY(candidate,version,identity)) WITHOUT ROWID;CREATE TABLE drafts(identity TEXT PRIMARY KEY,disposition TEXT);CREATE TABLE authorities(address TEXT PRIMARY KEY,reference TEXT);CREATE TABLE entries(ordinal INTEGER PRIMARY KEY,identity TEXT UNIQUE,sortKey TEXT,metadata TEXT,rank INTEGER);CREATE TABLE chunks(entry INTEGER,ordinal INTEGER,text TEXT,PRIMARY KEY(entry,ordinal)) WITHOUT ROWID;CREATE TABLE evidence(version TEXT,ordinal INTEGER,text TEXT,PRIMARY KEY(version,ordinal)) WITHOUT ROWID;CREATE TABLE evidenceBounds(version TEXT PRIMARY KEY,start INTEGER,stop INTEGER);CREATE TABLE runs(level INTEGER,run INTEGER,ordinal INTEGER,entry INTEGER,sortKey TEXT,PRIMARY KEY(level,run,ordinal)) WITHOUT ROWID;',
+      'CREATE TABLE introduced(candidate TEXT,version TEXT,identity TEXT,address TEXT,PRIMARY KEY(candidate,version,identity)) WITHOUT ROWID;CREATE TABLE authorities(address TEXT PRIMARY KEY,reference TEXT);CREATE TABLE entries(ordinal INTEGER PRIMARY KEY,identity TEXT UNIQUE,sortKey TEXT,metadata TEXT,rank INTEGER);CREATE TABLE chunks(entry INTEGER,ordinal INTEGER,text TEXT,PRIMARY KEY(entry,ordinal)) WITHOUT ROWID;CREATE TABLE evidence(version TEXT,ordinal INTEGER,text TEXT,PRIMARY KEY(version,ordinal)) WITHOUT ROWID;CREATE TABLE evidenceBounds(version TEXT PRIMARY KEY,start INTEGER,stop INTEGER);CREATE TABLE runs(level INTEGER,run INTEGER,ordinal INTEGER,entry INTEGER,sortKey TEXT,PRIMARY KEY(level,run,ordinal)) WITHOUT ROWID;',
     );
     function* members(version: IntakeEnvelopeRecord) {
       if (nativeVersion(reader, version)) {
@@ -247,19 +253,42 @@ export async function prepareNativeReportSourceReviewScope(
         value(reader, occurrence, 'batchId') as string | null,
       ]).hash;
     };
-    const owner = statement(
-        'INSERT INTO owners VALUES(?,?,?) ON CONFLICT(candidate,version) DO UPDATE SET groupId=excluded.groupId',
-      ),
+    const routing = await prepareReportSourceRouting(db, {
+        sourceId: source.id,
+        binding: JSON.stringify([input.profileId, source.sha256, reader.logical]),
+        assertCurrent: check,
+        rows: function* () {
+          // Anchor ownership takes precedence even when an anchor precedes a fallback.
+          // Equal-basis writes preserve the legacy last-group/version/member winner.
+          for (const selectedGroup of children(reader, workflow, 'reportGroups')) {
+            check();
+            const basis = value(reader, selectedGroup, 'basis');
+            if (basis !== 'candidate_fallback' && basis !== 'report_anchor') continue;
+            const groupId = string(reader, selectedGroup, 'id');
+            for (const version of children(reader, selectedGroup, 'versions'))
+              for (const member of members(version))
+                yield {
+                  kind: 'owner',
+                  candidate: member.candidateId,
+                  version: member.candidateVersionId,
+                  groupId,
+                  basis: basis === 'report_anchor' ? 1 : 0,
+                };
+          }
+          for (const draft of children(reader, workflow, 'reviewDrafts'))
+            yield {
+              kind: 'draft',
+              identity: schemaKey(
+                value(reader, draft, 'candidateId'),
+                value(reader, draft, 'candidateVersionId'),
+                value(reader, draft, 'proposalId'),
+                value(reader, draft, 'recordId'),
+              ),
+              disposition: String(value(reader, draft, 'disposition') || ''),
+            };
+        },
+      }),
       introduced = statement('INSERT OR IGNORE INTO introduced VALUES(?,?,?,?)');
-    for (const basis of ['candidate_fallback', 'report_anchor'])
-      for (const selectedGroup of children(reader, workflow, 'reportGroups')) {
-        check();
-        if (value(reader, selectedGroup, 'basis') !== basis) continue;
-        const groupId = string(reader, selectedGroup, 'id');
-        for (const version of children(reader, selectedGroup, 'versions'))
-          for (const member of members(version))
-            owner.run(member.candidateId, member.candidateVersionId, groupId);
-      }
     for (const version of children(reader, group, 'versions'))
       for (const member of members(version))
         for (const identity of member.identities())
@@ -269,26 +298,10 @@ export async function prepareNativeReportSourceReviewScope(
             identity,
             reader.address(version),
           );
-    for (const draft of children(reader, workflow, 'reviewDrafts'))
-      statement(
-        'INSERT INTO drafts VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET disposition=excluded.disposition',
-      ).run(
-        schemaKey(
-          value(reader, draft, 'candidateId'),
-          value(reader, draft, 'candidateVersionId'),
-          value(reader, draft, 'proposalId'),
-          value(reader, draft, 'recordId'),
-        ),
-        String(value(reader, draft, 'disposition') || ''),
-      );
     let entryCount = 0;
     for (const member of members(current)) {
       check();
-      const ownerRow = statement('SELECT groupId FROM owners WHERE candidate=? AND version=?').get(
-        member.candidateId,
-        member.candidateVersionId,
-      );
-      if (ownerRow?.groupId !== input.groupId) continue;
+      if (routing.owner(member.candidateId, member.candidateVersionId) !== input.groupId) continue;
       const candidate = reader.find('candidate', workflow, member.candidateId, { match: 'last' }),
         version = candidate && reader.find('version', candidate, member.candidateVersionId);
       if (!candidate || !version) continue;
@@ -316,20 +329,17 @@ export async function prepareNativeReportSourceReviewScope(
       for (const occurrence of children(reader, version, 'occurrences')) {
         const proposalId = value(reader, occurrence, 'proposalId') as string | null,
           recordId = string(reader, occurrence, 'recordId'),
-          draft = statement('SELECT disposition FROM drafts WHERE identity=?').get(
+          disposition = routing.disposition(
             schemaKey(member.candidateId, member.candidateVersionId, proposalId, recordId),
           ),
-          state = draft?.disposition === 'review_later' ? 'deferred' : 'active';
+          state = disposition === 'review_later' ? 'deferred' : 'active';
         if (input.view !== 'all' && input.view !== state) continue;
-        const identity = schemaKey(
-          member.candidateId,
-          member.candidateVersionId,
-          occurrenceIdentity(occurrence),
-        );
+        const sourceIdentity = occurrenceIdentity(occurrence),
+          identity = schemaKey(member.candidateId, member.candidateVersionId, sourceIdentity);
         if (statement('SELECT 1 FROM entries WHERE identity=?').get(identity)) continue;
         const first = statement(
           'SELECT address FROM introduced WHERE candidate=? AND version=? AND identity=?',
-        ).get(member.candidateId, member.candidateVersionId, occurrenceIdentity(occurrence));
+        ).get(member.candidateId, member.candidateVersionId, sourceIdentity);
         if (!first) continue;
         let cachedAuthority = statement('SELECT reference FROM authorities WHERE address=?').get(
           String(first.address),

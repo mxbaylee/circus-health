@@ -4,6 +4,7 @@ import { HttpError, revision, type Database } from './database.ts';
 import { assertIntakeOwner } from './intake.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
+import { iterateIntakeSourceAncestry } from './intake-source-ancestry.ts';
 import { intakeSourceMetadata, intakeSourceVersion } from './intake-state-access.ts';
 import {
   openIntakeCollectionEnvelope,
@@ -110,22 +111,40 @@ function original(db: Database, root: string, profileId: string, id: string) {
         ).intake;
   return { row, details };
 }
-function ancestry(db: Database, id: string): string {
-  const seen = new Set<string>();
-  while (!seen.has(id) && seen.size < 10) {
-    seen.add(id);
-    const row = db.prepare('SELECT kind,details_json FROM source_files WHERE id=?').get(id);
-    if (!row)
-      throw new HttpError(409, 'CORRECTION_EVIDENCE', 'Supporting source ancestry is unavailable');
-    const parent =
-      row.kind === 'intake_original'
-        ? intakeSourceMetadata(db, id).parentSourceFileId
-        : (JSON.parse(String(row.details_json)) as { intake?: { parentSourceFileId?: string } })
-            .intake?.parentSourceFileId;
-    if (!parent) return id;
-    id = parent;
+function* supportingAncestry(db: Database, profileId: string, id: string) {
+  try {
+    yield* iterateIntakeSourceAncestry(db, profileId, id);
+  } catch (cause) {
+    if (cause instanceof HttpError && cause.status === 403) throw cause;
+    throw new HttpError(
+      409,
+      'CORRECTION_EVIDENCE',
+      'Supporting source ancestry is unavailable or invalid',
+    );
   }
-  throw new HttpError(409, 'CORRECTION_EVIDENCE', 'Supporting source ancestry is invalid');
+}
+/** Correction evidence has the same checked ancestry as explicit package inspection. */
+export function correctionSupportingSourceRoot(
+  db: Database,
+  profileId: string,
+  id: string,
+): string {
+  let root = id;
+  for (const source of supportingAncestry(db, profileId, id)) root = source.id;
+  return root;
+}
+async function prepareSupportingSourceRoot(
+  db: Database,
+  profileId: string,
+  id: string,
+): Promise<string> {
+  let root = id,
+    count = 0;
+  for (const source of supportingAncestry(db, profileId, id)) {
+    root = source.id;
+    if (++count % 64 === 0) await setImmediate();
+  }
+  return root;
 }
 /** The opaque host object never comes from an HTTP request or a display page. */
 export interface PreparedCorrectionSupportingEvidence {
@@ -300,7 +319,8 @@ export async function prepareCorrectionSupportingEvidence(
         file.row.sha256 === member.sourceHash;
       if (
         (!selectedEvidence && !exactMember) ||
-        ancestry(db, ref.originalSourceFileId) !== ancestry(db, ref.intakeId)
+        (await prepareSupportingSourceRoot(db, profileId, ref.originalSourceFileId)) !==
+          (await prepareSupportingSourceRoot(db, profileId, ref.intakeId))
       )
         throw new HttpError(
           409,

@@ -199,17 +199,20 @@ export function createCollectionClinicalReviewSession(input: {
           'This proposal uses earlier source text. Read the corrected source and create a new proposal before acceptance.',
       });
     for (const record of review.records)
-      record.selectionReviewToken = selectionAuthority({
-        profileId: input.profileId,
-        intakeId: proposal.file.id,
-        proposalId: proposal.proposalId,
-        originalHash: proposal.file.sha256,
-        proposalHash: proposal.inputFile.sha256,
-        sourceTextRevisionId: input.sourceText.revisionId,
-        sourceTextDependencyToken: input.sourceText.dependencyToken,
-        sourceTextStale: review.sourceTextStale || false,
-        record: { ...record, comparisons: undefined },
-      });
+      record.selectionReviewToken = selectionAuthority(
+        {
+          profileId: input.profileId,
+          intakeId: proposal.file.id,
+          proposalId: proposal.proposalId,
+          originalHash: proposal.file.sha256,
+          proposalHash: proposal.inputFile.sha256,
+          sourceTextRevisionId: input.sourceText.revisionId,
+          sourceTextDependencyToken: input.sourceText.dependencyToken,
+          sourceTextStale: review.sourceTextStale || false,
+          record,
+        },
+        { recordComparisonsUndefined: true },
+      );
     input.assertCurrent();
     const values = (section: Section): unknown[] => {
       if (!['records', 'sourceContext', 'coverageGaps'].includes(section))
@@ -305,6 +308,9 @@ export function createCollectionClinicalReviewSession(input: {
                   },
                   ...(record.identityReview?.ownershipBlockers
                     ? { ownershipBlockers: record.identityReview.ownershipBlockers }
+                    : {}),
+                  ...(record.identityReview?.warningsReference
+                    ? { identityWarnings: record.identityReview.warningsReference }
                     : {}),
                   ...(record.draft?.history ? { draftHistory: record.draft.history } : {}),
                   ...(!Array.isArray(groupLinks) ? { reportGroups: groupLinks } : {}),

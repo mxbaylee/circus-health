@@ -32,6 +32,7 @@ import {
   assessIdentityPolicy,
   confirmedPersonReceipt,
   collectEvidencedIdentity,
+  structuredEvidencedIdentity,
   isGenericNameConfirmation,
   competingIdentityBoundaries,
   identityBoundaryRepairApplies,
@@ -41,7 +42,8 @@ import {
   identityReceiptAppliesToCurrentBoundary,
   identityOriginalFingerprint,
   modelBirthDateWarnings,
-  type IdentityPolicyPersonSnapshot,
+  modelBirthDateWarningCandidates,
+  type IdentityPolicyPeople,
 } from './intake-identity-policy.ts';
 import type { IdentityGroundingLookup } from './intake-identity-grounding.ts';
 import type { ReportGroupContribution } from './intake-report-groups.ts';
@@ -319,6 +321,10 @@ export type WorkflowReviewGroup = import('./intake-identity-policy.ts').Identity
 export interface WorkflowReviewScope {
   close?(): void;
   issueSink?(record: IntakeReview['records'][number]): ReviewIssueCollection;
+  bindIdentityWarnings?(
+    record: IntakeReview['records'][number],
+    warnings: Iterable<import('../shared/intake-identity.ts').IntakeIdentityWarning>,
+  ): void;
   versionId(proposalId: string | null, entry: IntakeEntry): string;
   references(
     candidateId: string,
@@ -365,7 +371,7 @@ export interface WorkflowReviewScope {
 }
 export interface SelectedWorkflowIdentityContext {
   profileId: string;
-  people?: IdentityPolicyPersonSnapshot[];
+  people?: IdentityPolicyPeople;
   copiedManualSourceApplies?: NonNullable<
     Parameters<typeof workflowReview>[5]
   >['copiedManualSourceApplies'];
@@ -400,7 +406,7 @@ export function workflowReview<T extends IntakeReview>(
       receipts: IntakeWorkflow['identityConfirmations'],
     ) => IntakeWorkflow['identityConfirmations'];
     grounded: IdentityGroundingLookup;
-    people?: IdentityPolicyPersonSnapshot[];
+    people?: IdentityPolicyPeople;
     originalBirthDateEvidence?: (
       group: import('../shared/intake.ts').IntakeReportGroup,
     ) => import('./intake-evidence-dates.ts').BirthDateEvidence | undefined;
@@ -527,7 +533,7 @@ export function workflowReview<T extends IntakeReview>(
       };
       return {
         collected: collectEvidencedIdentity(issues(), group?.report?.subject?.text, original),
-        structured: collectEvidencedIdentity(issues()).evidence,
+        structured: structuredEvidencedIdentity(issues()),
       };
     },
   };
@@ -999,15 +1005,15 @@ export function workflowReviewSelected<T extends IntakeReview>(
               birthDate: self.birthDate,
             }
         : undefined;
+      const warningInput = {
+        issues: ownIdentityIssues,
+        originalBirthDate: evidence.birthDate,
+        unreadableBirthDate,
+        person: currentAssignedPerson,
+      };
+      const showWarnings = !assessment.blocking && (!group || originalBirthDates !== undefined);
       const warnings =
-        !assessment.blocking && (!group || originalBirthDates !== undefined)
-          ? modelBirthDateWarnings({
-              issues: ownIdentityIssues,
-              originalBirthDate: evidence.birthDate,
-              unreadableBirthDate,
-              person: currentAssignedPerson,
-            })
-          : [];
+        showWarnings && !scope.bindIdentityWarnings ? modelBirthDateWarnings(warningInput) : [];
       record.identityReview = {
         confidence: assessment.confidence,
         status: assessment.status,
@@ -1020,6 +1026,8 @@ export function workflowReviewSelected<T extends IntakeReview>(
           ? { assignedPerson: assessment.attribution.assignedPerson }
           : {}),
       };
+      if (showWarnings && scope.bindIdentityWarnings)
+        scope.bindIdentityWarnings(record, modelBirthDateWarningCandidates(warningInput));
       if (assessment.attribution) {
         record.identityAttribution = assessment.attribution;
         const otherPerson =

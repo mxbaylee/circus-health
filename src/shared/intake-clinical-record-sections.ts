@@ -18,7 +18,8 @@ export type ClinicalRecordSection =
   | 'mapping'
   | 'reportGroups'
   | 'questions'
-  | 'ownershipBlockers';
+  | 'ownershipBlockers'
+  | 'identityWarnings';
 export interface ClinicalRecordSelection {
   proposalId: string | null;
   recordId: string;
@@ -50,6 +51,7 @@ export type ClinicalRecordSectionControl =
       answerHistory?: import('./intake.ts').IntakeQuestion['answerHistory'];
     }
   | { kind: 'ownershipBlocker' }
+  | { kind: 'identityWarning' }
   | { kind: 'reportGroup'; groupId: string; groupVersionId: string }
   | {
       kind: 'issue';

@@ -6,6 +6,7 @@ import {
   hasPartialAcceptance,
 } from './intake-partial-acceptance.ts';
 import { durableSelectionInputs } from './intake-selection-authority.ts';
+import { prepareIntakeLookupIndices } from './intake-lookup-projection.ts';
 import {
   hasNativeAcceptanceBlock,
   applyNativeAcceptanceGroup,
@@ -164,6 +165,23 @@ export function getIntakeReportAcceptance(
   if (!saved)
     throw new HttpError(404, 'REPORT_ACCEPTANCE_NOT_FOUND', 'Acceptance operation not found');
   return { receipt: saved.receipt, replayed: true, durability: flushIntake(db, root, profileId) };
+}
+/** Reconstruct only receipt lookup authority before the public reconnect read. */
+export async function getIntakeReportAcceptanceRead(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  operationId: string,
+): Promise<IntakeReportAcceptanceResult> {
+  acceptanceOwner(db, profileId);
+  if (!uuid.test(operationId))
+    throw new HttpError(400, 'REPORT_ACCEPTANCE_INPUT', 'Supply the acceptance operation UUID');
+  const partial = getPartialAcceptance(db, root, profileId, operationId);
+  if (partial) return partial;
+  await prepareIntakeLookupIndices(db, {
+    assertRunning: () => acceptanceOwner(db, profileId),
+  });
+  return getIntakeReportAcceptance(db, root, profileId, operationId);
 }
 export function acceptIntakeReportSelection(
   db: DatabaseSync,

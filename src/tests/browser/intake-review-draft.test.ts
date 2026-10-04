@@ -1,3 +1,10 @@
+import type { IntakeClinicalMapping } from '../../shared/intake.ts';
+import {
+  fixtureReview,
+  fixtureProposalId,
+  fixtureReportUrl,
+  fixtureSourcePath,
+} from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
@@ -159,54 +166,58 @@ test(
         jsonlText: JSON.stringify(value),
       });
       const path = `${prefix}/intakes/${encodeURIComponent(item.id)}`;
-      const reviewPath = path + '/review?proposalId=' + encodeURIComponent(item.proposals[0].id);
-      const originalReview = await api(reviewPath);
-      await page.goto(url + '/#/import?intake=' + encodeURIComponent(item.id));
+      const proposalId = await fixtureProposalId(api, prefix, item.id);
+      const reviewPath = path + '/review?proposalId=' + encodeURIComponent(proposalId);
+      const originalReview = await fixtureReview(api, reviewPath);
+      await page.goto(url + (await fixtureReportUrl(api, prefix, item.id)));
       await page.reload();
-      await page.locator('.import-detail-record-link').first().click();
-      // No shared printed subject exists in this fixture. Its header review is
-      // informational; the explicit record-level identity answer stays separate.
+      await page.locator('.import-detail-record-link:not([data-saved-record-id])').first().click();
+      // The native report identity remains informational when no printed subject exists.
       await page
-        .getByRole('button', { name: 'Review person for this report', exact: true })
-        .click();
-      const personSidebar = page.getByRole('dialog', { name: 'Who is this report for?' });
-      await personSidebar
         .getByText('Identity is not printed clearly in this report.', { exact: true })
         .waitFor();
       assert.equal(
-        await personSidebar.getByRole('button', { name: 'This is me', exact: true }).count(),
+        await page.getByRole('region', { name: 'Report identity', exact: true }).count(),
         0,
+        'missing report identity does not invent a report-level confirmation; the record-level answer remains separate',
       );
-      await personSidebar.getByRole('button', { name: 'Close', exact: true }).click();
       await page.getByRole('button', { name: 'This is me', exact: true }).click();
       await page.getByRole('button', { name: 'Keep unconfirmed', exact: true }).click();
-      await page.getByRole('button', { name: 'Leave uncertain', exact: true }).click();
-      await page.waitForResponse(async (response) => {
-        if (!response.url().endsWith('/review-draft')) return false;
-        const body = await response.json();
-        assert(response.ok(), JSON.stringify(body));
-        return body.data.workflow.reviewDrafts.at(-1).resolutions.length === 4;
-      });
-      const deferred = page.waitForResponse(
-        async (response) =>
+      const choicesSaved = page.waitForResponse(
+        (response) =>
           response.url().endsWith('/review-draft') &&
-          (await response.json()).data?.workflow.reviewDrafts.at(-1).disposition === 'review_later',
+          response.ok() &&
+          response.request().postDataJSON().resolutions?.length === 4,
+      );
+      await page.getByRole('button', { name: 'Leave uncertain', exact: true }).click();
+      await choicesSaved;
+      const deferred = page.waitForResponse(
+        (response) =>
+          response.url().endsWith('/review-draft') &&
+          response.ok() &&
+          response.request().postDataJSON().disposition === 'review_later',
       );
       await page
         .locator('.intake-guided-actions')
         .getByRole('button', { name: 'Review later', exact: true })
         .click();
       await deferred;
-      const stored = await api(reviewPath);
-      assert.equal((await api(path)).imported, null, 'Autosave does not accept the record');
+      const stored = await fixtureReview(api, reviewPath);
+      assert.equal(
+        (await api(path)).collections.importHistory.total,
+        0,
+        'Autosave does not accept the record',
+      );
       assert.equal((await api(prefix + '/vision-prescriptions')).length, 0);
-      assert.equal(stored.records[0].draft.disposition, 'review_later');
+      assert.equal(stored.records[0].draft!.disposition, 'review_later');
       assert.equal(stored.records[0].mapping.subject, 'self');
       assert.equal(stored.records[0].mapping.date, '');
       assert.equal(stored.records[0].mapping.documentDate, '');
       assert.deepEqual(
-        stored.records[0].mapping.mappingOrigins,
-        originalReview.records[0].mapping.mappingOrigins,
+        (stored.records[0].mapping as IntakeClinicalMapping & { mappingOrigins?: unknown })
+          .mappingOrigins,
+        (originalReview.records[0].mapping as IntakeClinicalMapping & { mappingOrigins?: unknown })
+          .mappingOrigins,
       );
       assert.deepEqual(stored.records[0].mapping.assets, originalReview.records[0].mapping.assets);
       assert.deepEqual(
@@ -218,7 +229,8 @@ test(
       const sent = draftBodies.at(-1)!;
       assert.deepEqual(
         sent.mapping.mappingOrigins,
-        originalReview.records[0].mapping.mappingOrigins,
+        (originalReview.records[0].mapping as IntakeClinicalMapping & { mappingOrigins?: unknown })
+          .mappingOrigins,
       );
       assert.deepEqual(sent.mapping, sent.decision.mapping);
       assert.equal(sent.answers && typeof sent.answers, 'object');
@@ -243,7 +255,7 @@ test(
         force: true,
       });
       await api(prefix + '/unlock', { recovery: setup.recovery });
-      const rebuilt = await api(reviewPath);
+      const rebuilt = await fixtureReview(api, reviewPath);
       assert.deepEqual(rebuilt.records[0].draft, stored.records[0].draft);
       assert.deepEqual(rebuilt.records[0].mapping, stored.records[0].mapping);
       await page.reload();
@@ -263,9 +275,11 @@ test(
         assert.equal(prescriptions.length, 1);
         assert.deepEqual(prescriptions[0].opticalPrescription, optical);
       }
-      const original = await page.request.get(url + item.contentUrl);
+      const original = await page.request.get(url + fixtureSourcePath(prefix, item.contentUrl));
       assert.equal(await original.text(), 'Fictional retained original ' + clinical);
-      const proposal = await page.request.get(url + item.proposals[0].contentUrl);
+      const proposal = await page.request.get(
+        url + prefix + '/sources/' + encodeURIComponent(proposalId) + '/content',
+      );
       assert.deepEqual(JSON.parse(await proposal.text()), value);
     }
     assert.deepEqual(errors, []);

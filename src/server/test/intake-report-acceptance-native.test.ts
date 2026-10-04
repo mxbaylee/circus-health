@@ -1,3 +1,4 @@
+import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -198,8 +199,9 @@ test(
     };
     reviewed.session.close();
     const assertNoPolicies = () => {
-      assert.equal(db.prepare('SELECT count(*) n FROM intake_review_issue_policy_v2').get()!.n, 0);
-      assert.equal(db.prepare('SELECT count(*) n FROM intake_review_issue_scope').get()!.n, 0);
+      assert.equal(reviewIssueScratchCounts(db).databases, 0);
+      assert.equal(reviewIssueScratchCounts(db).rows, 0);
+      assert.equal(reviewIssueScratchCounts(db).scopes, 0);
     };
     assertNoPolicies();
     const before = { ...intakeWorkCounters(db).warm };

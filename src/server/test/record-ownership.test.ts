@@ -446,18 +446,18 @@ test('prior ownership correction never masks a new blocking identity assessment'
   assert.deepEqual(identityBeforeOwnershipHold(record), conflict);
 });
 
-function attachedReport(f: ReturnType<typeof fixture>) {
+function attachedReport(f: ReturnType<typeof fixture>, suffix = 'b') {
   const second = {
     ...f.envelope,
-    id: 'fictional-report-b',
+    id: 'fictional-report-' + suffix,
     provenance: {
       ...f.envelope.provenance,
-      sourceRecordId: 'fictional-report-b',
-      locator: 'Fictional report B',
+      sourceRecordId: 'fictional-report-' + suffix,
+      locator: 'Fictional report ' + suffix,
     },
   };
   const original = uploadIntake(f.db, f.root, f.profileId, {
-    filename: 'fictional-b.jsonl',
+    filename: 'fictional-' + suffix + '.jsonl',
     bytes: Buffer.from(JSON.stringify(second)),
     newProviderName: 'Fictional Clinic',
   });
@@ -2069,4 +2069,163 @@ test('a mixed-owner report previews both prior owners and moves only its reviewe
       if (!['extra_json', 'person_id'].includes(field))
         assert.deepEqual(after[field], value, field);
   }
+});
+
+test('native selected record pages all attached originals, refuses an off-page source race and retains complete authority through recovery', async (t) => {
+  const {
+    previewNativeRecordOwnership,
+    commitNativeRecordOwnership,
+    nativeOwnershipReportPlan,
+    clearNativeOwnershipPlans,
+  } = await import('../record-ownership-native.ts');
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+  const { ownershipReceiptReference, replayOwnershipReceiptReference } =
+    await import('../ownership-outcome-page.ts');
+  const { rebuildRecordDatabase, attachRecordDurability } = await import('../record-versions.ts');
+  const { ownershipIdentityIssueIncluded } = await import('../ownership-identity-snapshots.ts');
+  const journal = memoryJournal(),
+    f = fixture(t, 'observation', journal),
+    b = attachedReport(f),
+    c = attachedReport(f, 'c');
+  for (const original of [f.original, b.original, c.original])
+    await buildIntakeCollectionEnvelope(f.db, { id: original.id });
+  t.after(() => clearNativeOwnershipPlans(f.db));
+  const preview = await previewNativeRecordOwnership(f.db, f.root, f.profileId, f.request);
+  assert.ok('reportEvidence' in preview);
+  const plan = nativeOwnershipReportPlan(f.db, f.profileId, preview.reportEvidence.token),
+    record = plan.page('records').items[0]!;
+  assert.ok('mapping' in record);
+  assert.ok(!Array.isArray(record.contributions));
+  assert.equal(record.contributions.total, 3);
+  assert.equal(record.contributions.selectedTotal, 3);
+  const ids: string[] = [];
+  let after = -1;
+  for (;;) {
+    const page = plan.contributionPage(record.contributions.key, null, after, 1, 65536);
+    assert.equal(page.items.length, 1);
+    ids.push((page.items[0] as { sourceRecordId: string }).sourceRecordId);
+    if (page.complete) break;
+    after = Number(page.after);
+  }
+  assert.ok(ids.includes(b.sourceRecordId));
+  assert.ok(ids.includes(c.sourceRecordId));
+  await plan.prepareSourceSnapshots();
+  const oldHash = String(
+    f.db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(c.original.id)!.sha256,
+  );
+  fixtureTransaction(f.db, () =>
+    f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('f'.repeat(64), c.original.id),
+  );
+  await assert.rejects(
+    commitNativeRecordOwnership(f.db, f.root, f.profileId, {
+      operationId: randomUUID(),
+      request: preview.request,
+      version: preview.version,
+      scopeToken: preview.scopeToken,
+    }),
+  );
+  assert.equal(f.row().person_id, 'patient');
+  fixtureTransaction(f.db, () =>
+    f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run(oldHash, c.original.id),
+  );
+  const fresh = await previewNativeRecordOwnership(f.db, f.root, f.profileId, f.request),
+    operationId = randomUUID(),
+    command = {
+      operationId,
+      request: fresh.request,
+      version: fresh.version,
+      scopeToken: fresh.scopeToken,
+    };
+  const receipt = await commitNativeRecordOwnership(f.db, f.root, f.profileId, command);
+  assert.equal(receipt.moved, 1);
+  assert.equal(f.row().person_id, f.person.personId);
+  const sourceAuthorities = f.db
+    .prepare("SELECT coverage_json FROM manual_batches WHERE title='Record ownership source'")
+    .all()
+    .map((row) => JSON.parse(String(row.coverage_json)));
+  assert.equal(sourceAuthorities.length, 3);
+  assert.deepEqual(sourceAuthorities.map((row) => row.sourceRecordId).sort(), ids.sort());
+  assert.equal(replayOwnershipReceiptReference(f.db, f.profileId, command)?.replayed, true);
+  const restoredPath = join(f.root, 'ownership-restored.sqlite');
+  rebuildRecordDatabase(restoredPath, { profileId: f.profileId, storage: journal.storage });
+  const restored = openDatabase(restoredPath, f.profileId);
+  try {
+    attachRecordDurability(restored, { profileId: f.profileId, storage: journal.storage });
+    attachPersonalDurability(restored, {
+      root: f.root,
+      profileId: f.profileId,
+      recordStorage: journal.storage,
+    });
+    assert.equal(
+      restored.prepare('SELECT person_id FROM observations WHERE id=?').get(f.recordId)!.person_id,
+      f.person.personId,
+    );
+    assert.equal(ownershipReceiptReference(restored, f.profileId, operationId)?.moved, 1);
+    for (const row of sourceAuthorities)
+      assert.equal(
+        ownershipIdentityIssueIncluded(restored, row.identityIssues, 'unreviewed'),
+        false,
+      );
+  } finally {
+    restored.close();
+  }
+});
+
+test('native selected-record evidence pages complete report-default holds and publishes them without moving unselected records', async (t) => {
+  const {
+    previewNativeRecordOwnership,
+    commitNativeRecordOwnership,
+    nativeOwnershipReportPlan,
+    clearNativeOwnershipPlans,
+  } = await import('../record-ownership-native.ts');
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+  const f = fixture(t),
+    report = await confirmedReport(f, 'native-single-token-hold', 3, 2, 'R');
+  const recordId = String(
+      f.db
+        .prepare('SELECT id FROM observations WHERE source_record_id=?')
+        .get(report.review.records[0]!.id)!.id,
+    ),
+    otherId = String(
+      f.db
+        .prepare('SELECT id FROM observations WHERE source_record_id=?')
+        .get(report.review.records[1]!.id)!.id,
+    );
+  const request: OwnershipRequest = {
+    selection: { type: 'records', records: [{ kind: 'observation', recordId }] },
+    destination: { noteId: f.person.id, expectedVersion: f.person.version },
+  };
+  const oracle = f.preview(request);
+  assert.equal(oracle.reportHolds.length, 1);
+  await buildIntakeCollectionEnvelope(f.db, { id: report.original.id });
+  const preview = await previewNativeRecordOwnership(f.db, f.root, f.profileId, request);
+  assert.ok('reportEvidence' in preview);
+  assert.equal(preview.reportHoldsIncluded, false);
+  assert.equal('reportHolds' in preview, false);
+  assert.equal(preview.reportEvidence.reportHoldTotal, 1);
+  const plan = nativeOwnershipReportPlan(f.db, f.profileId, preview.reportEvidence.token),
+    page = plan.page('holds', -1, 1, 65536);
+  assert.deepEqual(page.items, oracle.reportHolds);
+  assert.equal(page.complete, true);
+  await commitNativeRecordOwnership(f.db, f.root, f.profileId, {
+    operationId: randomUUID(),
+    request: preview.request,
+    scopeToken: preview.scopeToken,
+    version: preview.version,
+  });
+  assert.equal(
+    f.db.prepare('SELECT person_id FROM observations WHERE id=?').get(recordId)!.person_id,
+    f.person.personId,
+  );
+  assert.equal(
+    f.db.prepare('SELECT person_id FROM observations WHERE id=?').get(otherId)!.person_id,
+    'patient',
+  );
+  assert.equal(
+    f.db
+      .prepare("SELECT COUNT(*) n FROM manual_batches WHERE title='Report ownership default hold'")
+      .get()!.n,
+    1,
+  );
+  clearNativeOwnershipPlans(f.db);
 });

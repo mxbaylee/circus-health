@@ -3,6 +3,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { ReferencedClinicalControls } from '../../app/features/intake/ReferencedClinicalControls';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
 import type { IntakeClinicalReviewContext } from '../../shared/intake-clinical-review';
+import type { IntakeEvidenceComparison } from '../../shared/intake';
 import type {
   ClinicalRecordAction,
   ClinicalRecordSection,
@@ -87,6 +88,68 @@ beforeEach(() => {
 async function open() {
   fireEvent.click(screen.getByRole('button', { name: 'Resolve questions or correct this record' }));
 }
+it('presents the selected native pair with original links and the exact saved correction target', async () => {
+  const comparison: IntakeEvidenceComparison = {
+    id: 'saved-record',
+    kind: 'observation',
+    title: 'Fictional saved beta',
+    date: '2026-02-04',
+    identity: 'fictional-person',
+    version: 'saved-version',
+    mapping: { kind: 'observation', valueText: '17.50', unit: 'mg/L', date: '2026-02-04' },
+    evidence: [
+      {
+        label: 'Saved page',
+        locator: 'Page 2',
+        contentUrl: '/api/sources/fictional-saved/content',
+      },
+    ],
+    previousDecision: null,
+  };
+  const corrected = vi.fn();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      json(page('comparisons', [{ ...pair, detail: { kind: 'value', value: { comparison } } }])),
+    ),
+  );
+  const mounted = render(
+    <ReferencedClinicalControls
+      context={context}
+      selection={selection}
+      initialSection="comparisons"
+      initiallyOpen
+      incoming={{
+        title: 'Fictional incoming alpha',
+        date: '2026-02-04',
+        mapping: comparison.mapping,
+        evidence: [
+          {
+            label: 'Incoming page',
+            locator: 'Page 1',
+            contentUrl: '/api/sources/fictional-incoming/content',
+          },
+        ],
+      }}
+      onRefresh={() => {}}
+      onPending={() => {}}
+      onCorrectSaved={corrected}
+    />,
+  );
+  fireEvent.click(await screen.findByText('Fictional saved beta · 2026-02-04'));
+  expect(screen.getByRole('heading', { name: 'Incoming record' })).toBeVisible();
+  expect(screen.getByRole('heading', { name: 'Previously accepted record' })).toBeVisible();
+  expect(screen.getByText('Fictional incoming alpha')).toBeVisible();
+  expect(screen.getAllByText(/17.50 · mg\/L/)).toHaveLength(2);
+  expect(mounted.container.querySelectorAll('.clinical-evidence-pair')).toHaveLength(1);
+  expect(mounted.container.querySelector('pre')).toBeNull();
+  const originals = screen.getAllByRole('link', { name: 'Open original' });
+  expect(originals).toHaveLength(2);
+  expect(originals.every((link) => link.getAttribute('target') === '_blank')).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: 'Correct this saved record' }));
+  expect(corrected).toHaveBeenCalledWith(comparison);
+  expect(screen.getByRole('button', { name: 'Save this relationship' })).toBeEnabled();
+});
 it('requires every giant issue evidence window before submitting its exact sparse decision', async () => {
   const bytes = new TextEncoder().encode('x'.repeat(32768) + 'last fictional window');
   const reference = {
@@ -153,6 +216,67 @@ it('requires every giant issue evidence window before submitting its exact spars
     patch: { resolutions: [{ issueId: 'question-1', outcome: 'confirmed' }] },
   });
   expect(writes[0]!.patch).not.toHaveProperty('mapping');
+});
+it('keeps a referenced pair in the shared evidence layout and requires all saved detail windows', async () => {
+  const bytes = new TextEncoder().encode(
+    'earlier fictional pair evidence '.repeat(1200) + 'last pair window',
+  );
+  const reference = {
+    format: 'health-clinical-record-section-reference-v1' as const,
+    recordId: selection.recordId,
+    candidateVersionId: selection.candidateVersionId,
+    proposalId: context.proposalId,
+    reviewToken: context.reviewToken,
+    section: 'comparisons' as const,
+    ordinal: 0,
+    bytes: bytes.length,
+  };
+  const offsets: number[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      if (String(input).endsWith('/review-record-section'))
+        return json(page('comparisons', [{ ...pair, detail: { kind: 'reference', reference } }]));
+      const { offset } = JSON.parse(String(init?.body));
+      offsets.push(offset);
+      const end = Math.min(offset + 32768, bytes.length);
+      return json({
+        encoding: 'base64',
+        data: Buffer.from(bytes.subarray(offset, end)).toString('base64'),
+        complete: end === bytes.length,
+        nextOffset: end === bytes.length ? null : end,
+      });
+    }),
+  );
+  const mounted = render(
+    <ReferencedClinicalControls
+      context={context}
+      selection={selection}
+      initialSection="comparisons"
+      initiallyOpen
+      incomingContent={<p>Exact incoming fragment viewer</p>}
+      onRefresh={() => {}}
+      onPending={() => {}}
+      onCorrectSaved={vi.fn()}
+    />,
+  );
+  fireEvent.click(await screen.findByText('Saved record with paged evidence'));
+  expect(screen.getByRole('heading', { name: 'Incoming record' })).toBeVisible();
+  expect(screen.getByRole('heading', { name: 'Previously accepted record' })).toBeVisible();
+  expect(screen.queryByRole('button', { name: 'Correct this saved record' })).toBeNull();
+  expect(screen.getByRole('button', { name: 'Save this relationship' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Open evidence' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Next evidence page' }));
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save this relationship' })).toBeEnabled(),
+  );
+  expect(offsets).toEqual([0, 32768]);
+  expect(mounted.container.querySelector('.clinical-evidence-pair pre')).toHaveTextContent(
+    'last pair window',
+  );
+  expect(
+    mounted.container.querySelector('.clinical-evidence-pair pre')!.textContent!.length,
+  ).toBeLessThanOrEqual(32768);
 });
 it('keeps an uncertain targeted date correction and retries the identical operation without losing aliases', async () => {
   const writes: ClinicalRecordAction[] = [];
@@ -474,7 +598,8 @@ it('opens the saved-original evidence reference even when the pair detail itself
                 label: 'Fictional retained original',
                 locator: 'Fictional page 2',
                 sourceRecordId: 'saved-record',
-                contentUrl: '/api/sources/fictional-saved-original/content',
+                contentUrl:
+                  '/api/profiles/fictional-section-editor/sources/fictional-saved-original/content',
               },
             },
           ],
@@ -520,7 +645,7 @@ it('opens the saved-original evidence reference even when the pair detail itself
   fireEvent.click(await screen.findByRole('button', { name: 'Related record 1' }));
   expect(await screen.findByRole('link', { name: 'Fictional retained original' })).toHaveAttribute(
     'href',
-    '/api/sources/fictional-saved-original/content',
+    '/api/profiles/fictional-section-editor/sources/fictional-saved-original/content',
   );
   expect(screen.getByRole('button', { name: 'Save this relationship' })).toBeDisabled();
 });
@@ -774,6 +899,56 @@ it('exposes all person-assignment requirements as read-only evidence rather than
   expect(screen.getByText(/Fictional printed names disagree/)).toBeVisible();
   expect(
     screen.getByText(/Reading it does not confirm a person or accept clinical records/),
+  ).toBeVisible();
+  expect(screen.queryByRole('button', { name: 'Confirm current reading' })).not.toBeInTheDocument();
+  expect(requests).toHaveLength(1);
+});
+
+it('exposes complete record-specific advisory identity warnings without a false inline completeness claim', async () => {
+  const requests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = String(input);
+      requests.push(url);
+      expect(url).toContain('/review-record-section');
+      const body = JSON.parse(String(init?.body));
+      expect(body.section).toBe('identityWarnings');
+      return json(
+        page(
+          'identityWarnings',
+          [
+            {
+              ordinal: 0,
+              control: { kind: 'identityWarning' },
+              detail: {
+                kind: 'value',
+                value: 'Fictional identity warning retained outside the inline page.',
+              },
+            },
+          ],
+          { total: 5000, nextCursor: 'next-requirement-window' },
+        ),
+      );
+    }),
+  );
+  render(
+    <ReferencedClinicalControls
+      context={context}
+      selection={selection}
+      initialSection="identityWarnings"
+      sections={['identityWarnings']}
+      triggerLabel="Inspect record identity warnings"
+      onRefresh={() => {}}
+      onPending={() => {}}
+    />,
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Inspect record identity warnings' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Identity warning 1' }));
+  expect(screen.getByText(/5,000 record identity warnings in this complete record/)).toBeVisible();
+  expect(screen.getByText(/Fictional identity warning retained/)).toBeVisible();
+  expect(
+    screen.getByText(/Reading it does not change person assignment or accept the record/),
   ).toBeVisible();
   expect(screen.queryByRole('button', { name: 'Confirm current reading' })).not.toBeInTheDocument();
   expect(requests).toHaveLength(1);

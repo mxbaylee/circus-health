@@ -108,6 +108,7 @@ interface PreparedData {
   legacyBridge?: IntakeLegacyBridgeProof;
 }
 interface Registry {
+  generation: object;
   pages: Map<string, { raw: string; node: IntakeTreeNode }>;
   views: Map<IntakeCollectionView, ViewData>;
   preparations: Map<PreparedIntakeCollectionMutation, PreparedData>;
@@ -119,6 +120,10 @@ interface Registry {
   >;
 }
 const registries = new WeakMap<Database, Registry>();
+/** Invalidates owner-handle reuse along with the existing disposable registry. */
+export function intakeCollectionCacheGeneration(db: Database): object {
+  return registryFor(db).generation;
+}
 export function clearIntakeCollectionCache(db: Database): void {
   const registry = registries.get(db);
   registry?.pages.clear();
@@ -132,6 +137,7 @@ function registryFor(db: Database): Registry {
   let value = registries.get(db);
   if (!value) {
     value = {
+      generation: Object.freeze({}),
       pages: new Map(),
       views: new Map(),
       preparations: new Map(),
@@ -275,26 +281,21 @@ export function createIntakeCollections(owner: {
   identity: IntakeStateIdentity;
   prefix: string;
   ready: () => void;
-  get: (key: string) => unknown;
+  get: (key: string, maxBytes?: number) => unknown;
   immutable: (key: string, value: string) => void;
   invalidate: () => void;
   legacyMaterialization: (head: Head) => IntakeStateMaterialization;
 }) {
   const { db, identity, prefix, ready, immutable } = owner;
   const headKey = prefix + 'head';
-  const readMetaBytes = db.prepare(
-    'SELECT length(CAST(value AS BLOB)) AS bytes FROM app_meta WHERE key=?',
+  const readGeneration = db.prepare(
+    'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS schema',
   );
+  readGeneration.setReadBigInts(true);
+  let validatedSelection:
+    { raw: unknown; generation: string; registry: Registry; value: ViewData } | undefined;
   let bridgeTransaction: object | undefined;
-  const get = (key: string) => {
-    const size = readMetaBytes.get(key)?.bytes;
-    if (
-      size !== undefined &&
-      (typeof size !== 'number' || size > (key === headKey ? HEAD_BYTES : 32 * 1024))
-    )
-      invalid('collection stored row bytes');
-    return owner.get(key);
-  };
+  const get = (key: string) => owner.get(key, key === headKey ? HEAD_BYTES : 32 * 1024);
   const run = <T>(fn: () => T): T =>
     withIntakeWork(db, 'warm', () => {
       try {
@@ -308,6 +309,25 @@ export function createIntakeCollections(owner: {
     });
   function selected(): ViewData {
     const raw = get(headKey);
+    const stamp = readGeneration.get()!,
+      generation = `${stamp.changes}:${stamp.external}:${stamp.schema}`,
+      registry = registryFor(db);
+    // total_changes does not advance on ROLLBACK. Never retain a selection
+    // authenticated inside a transaction: a savepoint rollback may restore
+    // different bytes without changing the head or the generation stamp.
+    const reusable = !db.isTransaction;
+    if (!reusable) validatedSelection = undefined;
+    // Root authentication is reusable only while this exact SQLite projection
+    // stays unchanged. Local writes (including rolled-back writes), external
+    // commits, schema changes and authority-cache invalidation all break it.
+    // Accessed tree pages still read and authenticate their current raw bytes.
+    if (
+      validatedSelection &&
+      validatedSelection.raw === raw &&
+      validatedSelection.generation === generation &&
+      validatedSelection.registry === registry
+    )
+      return validatedSelection.value;
     const head = parseIntakeCollectionHead(raw, identity);
     if (!head && db.prepare('SELECT 1 FROM app_meta WHERE key GLOB ? LIMIT 1').get(prefix + '*'))
       invalid('missing collection head');
@@ -316,7 +336,9 @@ export function createIntakeCollections(owner: {
       for (const root of [head.logical.root, head.receipts, head.history, head.builds])
         if (root) pages.load(root);
     }
-    return { prefix, raw: raw as string | undefined, head };
+    const value = { prefix, raw: raw as string | undefined, head };
+    if (reusable) validatedSelection = { raw, generation, registry, value };
+    return value;
   }
   function viewData(view: IntakeCollectionView): ViewData {
     const value = registryFor(db).views.get(view);

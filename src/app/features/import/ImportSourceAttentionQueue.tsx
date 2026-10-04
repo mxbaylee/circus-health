@@ -10,6 +10,7 @@ import './import-source-issues.css';
 
 export function ImportSourceAttentionQueue({
   onChanged,
+  guardNavigation = true,
   onPendingChange,
   onAttentionCount,
   attentionRefreshKey,
@@ -76,6 +77,7 @@ export function ImportSourceAttentionQueue({
       {resource.loading && !resource.data && <p role="status">Loading source sections…</p>}
       {queue?.items.map((item) => (
         <AttentionFile
+          guardNavigation={guardNavigation}
           key={item.intakeId}
           id={item.intakeId}
           onChanged={refresh}

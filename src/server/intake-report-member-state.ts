@@ -13,6 +13,7 @@ import type {
   ReportSnapshotMapReader,
   ReportSnapshotMapWriter,
 } from './intake-report-snapshot-catalog.ts';
+import { reportSnapshotInlineTextFits } from './intake-report-snapshot-catalog.ts';
 
 type Occurrence = IntakeReportGroupMember['occurrences'][number];
 const occurrenceHash = (raw: string) => createHash('sha256').update(raw).digest('hex');
@@ -392,24 +393,30 @@ export async function createReportMemberSnapshot(
     pieces: Iterable<string>,
     sourceIdentity: string,
     identity: { recordId: string | null; proposalId: string | null },
+    inline?: string,
   ) => {
     active();
     checked(store, member);
     if (!/^[a-f0-9]{64}$/.test(sourceIdentity)) throw Error('Invalid occurrence source identity');
-    const hash = createHash('sha256');
-    await store.putText(
-      'a:' + member.key + ':' + schemaOrdinal(member.occurrenceCount),
-      (function* () {
-        for (const piece of pieces) {
-          hash.update(piece);
-          yield piece;
-        }
-      })(),
-    );
+    const hash = createHash('sha256'),
+      occurrenceKey = 'a:' + member.key + ':' + schemaOrdinal(member.occurrenceCount),
+      inlineOccurrence = inline !== undefined && reportSnapshotInlineTextFits(inline);
+    if (inlineOccurrence) hash.update(inline);
+    else
+      await store.putText(
+        occurrenceKey,
+        (function* () {
+          for (const piece of pieces) {
+            hash.update(piece);
+            yield piece;
+          }
+        })(),
+      );
     const key = hash.digest('hex'),
       updated = { ...member, occurrenceCount: member.occurrenceCount + 1 },
       total = counts(store);
     await store.putMany([
+      ...(inlineOccurrence ? [{ key: occurrenceKey, value: inline! }] : []),
       { key: 'e:' + member.key + ':' + key, value: String(member.occurrenceCount) },
       { key: 'v:' + member.key + ':' + sourceIdentity, value: String(member.occurrenceCount) },
       {
@@ -452,22 +459,15 @@ export async function createReportMemberSnapshot(
         occurrenceCount: 0,
         sectionPresent: Object.hasOwn(member, 'section'),
       };
-      const prefix = options.canonicalPrefix ?? [
-        '{"candidateId":' +
+      const prefixText =
+          '{"candidateId":' +
           canonicalLiteral(member.candidateId) +
           ',"candidateVersionId":' +
           canonicalLiteral(member.candidateVersionId) +
           ',"occurrences":',
-      ];
-      const suffix = options.canonicalSuffix ?? [
-        (item.sectionPresent ? ',"section":' + canonicalLiteral(member.section) : '') + '}',
-      ];
-      await store.putText('p:' + key, prefix);
-      await store.putText('s:' + key, suffix);
-      await store.putText(
-        'section:' + key,
-        options.canonicalSection ?? [canonicalLiteral(member.section || null)],
-      );
+        suffixText =
+          (item.sectionPresent ? ',"section":' + canonicalLiteral(member.section) : '') + '}',
+        sectionText = canonicalLiteral(member.section || null);
       const entries = [
         { key: 'm:' + key, value: JSON.stringify(item) },
         { key: 'o:' + schemaOrdinal(ordinal), value: key },
@@ -478,6 +478,24 @@ export async function createReportMemberSnapshot(
           key: 'k:' + schemaKey(member.candidateId, member.candidateVersionId),
           value: key,
         });
+      // Ordinary bounded metadata and its member header share one checkpoint.
+      // Legacy lexical producers remain streamed, including oversized fields.
+      if (
+        options.canonicalPrefix === undefined &&
+        options.canonicalSuffix === undefined &&
+        options.canonicalSection === undefined &&
+        [prefixText, suffixText, sectionText].every(reportSnapshotInlineTextFits)
+      )
+        entries.push(
+          { key: 'p:' + key, value: prefixText },
+          { key: 's:' + key, value: suffixText },
+          { key: 'section:' + key, value: sectionText },
+        );
+      else {
+        await store.putText('p:' + key, options.canonicalPrefix ?? [prefixText]);
+        await store.putText('s:' + key, options.canonicalSuffix ?? [suffixText]);
+        await store.putText('section:' + key, options.canonicalSection ?? [sectionText]);
+      }
       await store.putMany(entries);
       return item;
     },
@@ -487,10 +505,16 @@ export async function createReportMemberSnapshot(
         raw = canonicalLiteral(value),
         entryKey = 'e:' + member.key + ':' + occurrenceHash(raw);
       if (text(store, entryKey) !== undefined && !options.retainDuplicate) return current;
-      return appendCanonicalOccurrence(member, [raw], sourceOccurrence(value), {
-        recordId: value.recordId ?? null,
-        proposalId: value.proposalId ?? null,
-      });
+      return appendCanonicalOccurrence(
+        member,
+        [raw],
+        sourceOccurrence(value),
+        {
+          recordId: value.recordId ?? null,
+          proposalId: value.proposalId ?? null,
+        },
+        raw,
+      );
     },
     async finish() {
       active();

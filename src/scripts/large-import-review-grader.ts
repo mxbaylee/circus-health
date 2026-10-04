@@ -5,12 +5,17 @@ import type {
   IntakeReportQueueGroup,
   IntakeReview,
   IntakeReviewRecord,
+  IntakeReportReference,
 } from '../shared/intake.ts';
 import type {
   IntakeIdentityPerson,
   IntakeIdentityReview,
   IntakeIdentityScope,
 } from '../shared/intake-identity.ts';
+import type {
+  CollectionReportGroupSummary,
+  CollectionIntakeReportRecordPage,
+} from '../shared/intake-clinical-pages.ts';
 import type { LargeImportAssertion, LargeImportOracle } from './large-import-fixture.ts';
 import { exactQualificationPage } from './provider-qualification-fixture.ts';
 
@@ -20,13 +25,39 @@ export interface LargeImportReviewAuthority {
   queue: IntakeReportQueueGroup;
   identity: IntakeIdentityReview;
 }
-export interface LargeImportReviewInput {
+/** Native qualification inspects the current group and every returned record page.
+ * It makes no claim about unloaded retained historical group versions. */
+export interface NativeLargeImportReviewAuthority {
+  format: 'qualification-native-report-v1';
+  inspectedScope?: IntakeIdentityScope;
+  group: CollectionReportGroupSummary;
+  records: CollectionIntakeReportRecordPage[];
+  sourceHash: string;
+  identity: IntakeIdentityReview;
+}
+interface InspectedReportAuthority {
+  id: string;
+  sourceFileId: string | null;
+  sourceHash: string | null;
+  memberId: string | null;
+  basis: string;
+  report: IntakeReportReference | undefined;
+  queue: Pick<
+    IntakeReportQueueGroup,
+    'groupId' | 'groupVersionId' | 'intakeId' | 'intakeVersion' | 'anchor'
+  > & { basis: string; member: { memberId: string } | null; original: { contentUrl: string } };
+  identity: IntakeIdentityReview;
+  latestVersionId: string | null;
+  memberships: Map<string, Set<string>>;
+  complete: boolean;
+}
+export interface LargeImportReviewInput<Authority = LargeImportReviewAuthority> {
   oracle: LargeImportOracle;
   stage: 'proposal' | 'review';
   originalId: string;
   people: Readonly<Record<string, IntakeIdentityPerson>>;
   reviews: readonly IntakeReview[];
-  authorities: readonly LargeImportReviewAuthority[];
+  authorities: readonly Authority[];
 }
 const blank = (value: unknown) =>
   value === undefined || value === null || value === '' || (Array.isArray(value) && !value.length);
@@ -107,7 +138,9 @@ export function largeImportFieldMismatches(
 }
 
 /** Pure fixture reconciliation, never acceptance authority or extraction/collection qualification. */
-export function gradeLargeImportReview(input: LargeImportReviewInput) {
+export function gradeLargeImportReview(
+  input: LargeImportReviewInput<LargeImportReviewAuthority | NativeLargeImportReviewAuthority>,
+) {
   const { oracle, originalId } = input;
   if (
     !['proposal', 'review'].includes(input.stage) ||
@@ -144,29 +177,31 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
   }
   if (Object.keys(input.people).some((key) => !oracle.people.some((person) => person.key === key)))
     authorityIssues.add('peopleBinding');
-  const byGroup = new Map<string, LargeImportReviewAuthority>();
+  const byGroup = new Map<string, InspectedReportAuthority>();
   const memberships = new Map<string, Set<string>>();
   const scopeMemberships = new Map<string, Set<string>>();
   const profileIds = new Set<string>();
-  for (const authority of input.authorities) {
-    const { retained, queue, identity } = authority;
-    if (byGroup.has(retained.id)) authorityIssues.add('duplicateAuthority');
-    else byGroup.set(retained.id, authority);
+  for (const source of input.authorities) {
+    const authority = inspectAuthority(source);
+    const { queue, identity } = authority;
+    if (byGroup.has(authority.id)) authorityIssues.add('duplicateAuthority');
+    else byGroup.set(authority.id, authority);
     if (
-      retained.id !== queue.groupId ||
-      retained.sourceFileId !== originalId ||
-      retained.basis !== 'report_anchor' ||
-      queue.basis !== retained.basis ||
-      (queue.member?.memberId ?? null) !== retained.memberId ||
-      !retained.report ||
-      retained.versions.at(-1)?.id !== queue.groupVersionId ||
+      !authority.complete ||
+      authority.id !== queue.groupId ||
+      authority.sourceFileId !== originalId ||
+      authority.basis !== 'report_anchor' ||
+      queue.basis !== authority.basis ||
+      (queue.member?.memberId ?? null) !== authority.memberId ||
+      !authority.report ||
+      authority.latestVersionId !== queue.groupVersionId ||
       (identity.scope &&
-        (identity.scope.groupId !== retained.id ||
+        (identity.scope.groupId !== authority.id ||
           identity.scope.groupVersionId !== queue.groupVersionId ||
           identity.scope.intakeId !== queue.intakeId ||
           identity.scope.intakeVersion !== queue.intakeVersion ||
-          identity.scope.memberId !== retained.memberId ||
-          identity.scope.sourceHash !== retained.sourceHash))
+          identity.scope.memberId !== authority.memberId ||
+          identity.scope.sourceHash !== authority.sourceHash))
     )
       authorityIssues.add('conflictingAuthority');
     if (identity.scope) {
@@ -182,25 +217,10 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
               member.candidateVersionId,
             ),
           );
-      scopeMemberships.set(retained.id, set);
+      scopeMemberships.set(authority.id, set);
     }
-    const seenVersions = new Set<string>();
-    for (const version of retained.versions) {
-      if (seenVersions.has(version.id)) authorityIssues.add('conflictingAuthority');
-      seenVersions.add(version.id);
-      const set = new Set<string>();
-      for (const member of version.members)
-        for (const occurrence of member.occurrences)
-          set.add(
-            occurrenceKey(
-              occurrence.proposalId,
-              occurrence.recordId,
-              member.candidateId,
-              member.candidateVersionId,
-            ),
-          );
-      memberships.set(JSON.stringify([retained.id, version.id]), set);
-    }
+    for (const [versionId, set] of authority.memberships)
+      memberships.set(JSON.stringify([authority.id, versionId]), set);
   }
   if (profileIds.size > 1) authorityIssues.add('conflictingAuthority');
   const expectedByLabel = new Map<string, LargeImportAssertion>();
@@ -292,18 +312,18 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
         !selfIdentity.blocking &&
         !selfIdentity.conflicts.length &&
         ['evidenced_match', 'prior_confirmation'].includes(selfIdentity.status) &&
-        selfScope.groupId === selfAuthority.retained.id &&
+        selfScope.groupId === selfAuthority.id &&
         selfScope.groupVersionId === selfAuthority.queue.groupVersionId &&
         selfScope.intakeId === review.intakeId &&
         selfScope.intakeVersion === review.version &&
-        selfScope.sourceHash === selfAuthority.retained.sourceHash &&
-        selfScope.memberId === selfAuthority.retained.memberId &&
-        selfScope.report.text === selfAuthority.retained.report?.anchor.text &&
-        selfScope.report.locator === selfAuthority.retained.report?.anchor.locator &&
-        selfScope.subject.text === selfAuthority.retained.report?.subject?.text &&
-        selfScope.subject.locator === selfAuthority.retained.report?.subject?.locator &&
+        selfScope.sourceHash === selfAuthority.sourceHash &&
+        selfScope.memberId === selfAuthority.memberId &&
+        selfScope.report.text === selfAuthority.report?.anchor.text &&
+        selfScope.report.locator === selfAuthority.report?.anchor.locator &&
+        selfScope.subject.text === selfAuthority.report?.subject?.text &&
+        selfScope.subject.locator === selfAuthority.report?.subject?.locator &&
         scopeMemberships
-          .get(selfAuthority.retained.id)
+          .get(selfAuthority.id)
           ?.has(
             occurrenceKey(
               review.proposalId,
@@ -313,7 +333,7 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
             ),
           ) &&
         memberships
-          .get(JSON.stringify([selfAuthority.retained.id, reportGroups[0]!.groupVersionId]))
+          .get(JSON.stringify([selfAuthority.id, reportGroups[0]!.groupVersionId]))
           ?.has(
             occurrenceKey(
               review.proposalId,
@@ -341,7 +361,7 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
           unresolved.add(expected.key);
           continue;
         }
-        const { retained, queue, identity } = authority;
+        const { queue, identity } = authority;
         const member = occurrenceKey(
           review.proposalId,
           record.id,
@@ -356,8 +376,8 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
             ?.has(member)
         )
           provenance.add('reportMembership');
-        const anchor = retained.report?.anchor;
-        const subject = retained.report?.subject;
+        const anchor = authority.report?.anchor;
+        const subject = authority.report?.subject;
         const anchorPage = anchor
           ? exactQualificationPage(
               { label: 'Original source', ...anchor, contentUrl: queue.original.contentUrl },
@@ -371,7 +391,7 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
             )
           : null;
         if (
-          retained.report?.key !== report.key ||
+          authority.report?.key !== report.key ||
           !anchor ||
           !printed(anchor.text, report.key) ||
           anchorPage === null ||
@@ -415,7 +435,7 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
             scopeSubjectPage === null ||
             scopeSubjectPage < report.firstPage ||
             scopeSubjectPage > report.lastPage ||
-            !scopeMemberships.get(retained.id)?.has(member)
+            !scopeMemberships.get(authority.id)?.has(member)
           )
             provenance.add('identityScope');
         }
@@ -498,6 +518,8 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
         if (!identity.scope) unresolved.add(expected.key);
       }
       if (
+        record.issuesReference ||
+        record.questionsReference ||
         (record.issues ?? []).some((issue) => issue.status === 'unresolved') ||
         (record.questions ?? []).some((question) => question.status === 'unanswered')
       )
@@ -565,5 +587,136 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
     unresolved: [...unresolved],
     unresolvedIssues: [...unresolvedIssues],
     mismatches,
+  };
+}
+
+function inspectedReport(value: unknown): IntakeReportReference | undefined {
+  const report = object(value),
+    anchor = object(report.anchor),
+    subject = report.subject === null ? null : object(report.subject);
+  if (
+    typeof report.key !== 'string' ||
+    typeof report.title !== 'string' ||
+    typeof anchor.text !== 'string' ||
+    typeof anchor.locator !== 'string' ||
+    (subject !== null && (typeof subject.text !== 'string' || typeof subject.locator !== 'string'))
+  )
+    return undefined;
+  return {
+    key: report.key,
+    title: report.title,
+    anchor: { text: anchor.text, locator: anchor.locator },
+    subject:
+      subject === null ? null : { text: String(subject.text), locator: String(subject.locator) },
+  };
+}
+function inspectAuthority(
+  input: LargeImportReviewAuthority | NativeLargeImportReviewAuthority,
+): InspectedReportAuthority {
+  const memberships = new Map<string, Set<string>>();
+  let complete = true;
+  if (!('format' in input)) {
+    const { retained, queue, identity } = input;
+    for (const version of retained.versions) {
+      if (memberships.has(version.id)) complete = false;
+      const members = new Set<string>();
+      for (const member of version.members)
+        for (const occurrence of member.occurrences)
+          members.add(
+            occurrenceKey(
+              occurrence.proposalId,
+              occurrence.recordId,
+              member.candidateId,
+              member.candidateVersionId,
+            ),
+          );
+      memberships.set(version.id, members);
+    }
+    return {
+      id: retained.id,
+      sourceFileId: retained.sourceFileId,
+      sourceHash: retained.sourceHash,
+      memberId: retained.memberId,
+      basis: retained.basis,
+      report: retained.report ?? undefined,
+      queue,
+      identity,
+      latestVersionId: retained.versions.at(-1)?.id ?? null,
+      memberships,
+      complete,
+    };
+  }
+  const { group } = input;
+  const identity = { ...input.identity, scope: input.inspectedScope ?? input.identity.scope };
+  const report = inspectedReport(group.report),
+    members = new Set<string>();
+  let count = 0;
+  const total = input.records[0]?.totalRecords;
+  for (const [index, page] of input.records.entries()) {
+    if (
+      page.intakeId !== group.intakeId ||
+      page.version !== group.intakeVersion ||
+      page.totalRecords !== total ||
+      page.view !== 'all' ||
+      index + 1 < input.records.length !== !!page.nextCursor
+    )
+      complete = false;
+    for (const entry of page.records) {
+      count++;
+      if (
+        entry.kind !== 'record' ||
+        entry.groupId !== group.groupId ||
+        !entry.record.candidateId ||
+        !entry.record.candidateVersionId
+      ) {
+        complete = false;
+        continue;
+      }
+      const refs = entry.record.reportGroups;
+      if (!Array.isArray(refs)) {
+        complete = false;
+        continue;
+      }
+      // Each public row proves only its actual introducing group-version link.
+      for (const reference of refs.filter((ref) => ref.groupId === group.groupId)) {
+        let selected = memberships.get(reference.groupVersionId);
+        if (!selected) {
+          selected = new Set();
+          memberships.set(reference.groupVersionId, selected);
+        }
+        const key = occurrenceKey(
+          entry.proposalId,
+          entry.record.id,
+          entry.record.candidateId,
+          entry.record.candidateVersionId,
+        );
+        if (members.has(key)) complete = false;
+        members.add(key);
+        selected.add(key);
+      }
+    }
+  }
+  if (count !== total || !report || group.groupVersionId === null) complete = false;
+  return {
+    id: group.groupId,
+    sourceFileId: group.intakeId,
+    sourceHash: input.sourceHash,
+    memberId: group.member?.memberId ?? null,
+    basis: group.basis,
+    report,
+    identity,
+    queue: {
+      groupId: group.groupId,
+      groupVersionId: group.groupVersionId ?? '',
+      intakeId: group.intakeId,
+      intakeVersion: group.intakeVersion,
+      basis: group.basis,
+      member: group.member,
+      original: group.original,
+      anchor: report?.anchor ?? null,
+    },
+    latestVersionId: group.groupVersionId,
+    memberships,
+    complete,
   };
 }

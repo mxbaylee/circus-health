@@ -15,6 +15,7 @@ import { createIntakeTree } from './intake-state-tree.ts';
 import {
   parseIntakeCollectionDescriptor,
   parseIntakeStoredValue,
+  intakeCollectionCacheGeneration,
 } from './intake-state-collections.ts';
 import {
   parseSchemaControl,
@@ -850,6 +851,13 @@ export function createSchemaEnvelopeReader(
   });
   return view;
 }
+const selectedStorageHandles = new WeakMap<
+  Database,
+  {
+    generation: object;
+    handles: Map<string, ReturnType<typeof createIntakeStateStorage>['collections']>;
+  }
+>();
 export function selectedEnvelopeStore(db: Database, input: IntakeEnvelopeSource) {
   const source = db
     .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
@@ -862,7 +870,18 @@ export function selectedEnvelopeStore(db: Database, input: IntakeEnvelopeSource)
     sourceHash: source.sha256 as string,
   });
   const binding = intakeEnvelopeAuthorityBinding(db, source),
-    collections = createIntakeStateStorage(db, identity).collections;
+    generation = intakeCollectionCacheGeneration(db),
+    key = JSON.stringify(identity);
+  let retained = selectedStorageHandles.get(db);
+  if (!retained || retained.generation !== generation) {
+    retained = { generation, handles: new Map() };
+    selectedStorageHandles.set(db, retained);
+  }
+  let collections = retained.handles.get(key);
+  if (collections) retained.handles.delete(key);
+  else collections = createIntakeStateStorage(db, identity).collections;
+  retained.handles.set(key, collections);
+  if (retained.handles.size > 32) retained.handles.delete(retained.handles.keys().next().value!);
   return { source, identity, binding, collections };
 }
 export function collectionCellReader(

@@ -24,6 +24,7 @@ import { compatibleIdentityBirthDates } from '../shared/self-identity.ts';
 import { competingIdentityBoundaries } from './intake-identity-policy.ts';
 import { identityOriginalBirthDateEvidenceLookup } from './intake-identity-grounding.ts';
 import { ownershipHash, latestOwnershipDecision } from './ownership-journal.ts';
+import { ownershipDecisionQueries } from './ownership-decision-index.ts';
 import { clinicalTables, type ClinicalKind } from './clinical-references.ts';
 
 export interface OwnershipSourceAuthority {
@@ -257,6 +258,9 @@ export function requireCorrectedOwnershipReview(
   workflow?: IntakeWorkflow,
   selected?: SelectedOwnershipReviewScope,
 ) {
+  // A complete current index can prove that there is no correction authority.
+  // Missing preparation supplies no absence answer; damaged/stale indexes refuse.
+  if (selected && ownershipDecisionQueries(db)?.hasAssignmentPolicy() === false) return;
   if (!selected && workflow === undefined && file)
     workflow = readStoredIntakeDetails(db, file.id)?.workflow;
   const source = ownershipSourceAuthority(db, identity);

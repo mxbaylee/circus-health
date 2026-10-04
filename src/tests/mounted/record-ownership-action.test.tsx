@@ -293,6 +293,7 @@ it('keeps report evidence paged and sends one clinical decision while earlier ch
     recordsIncluded: false,
     pendingIncluded: false,
     relationshipsIncluded: false,
+    reportHoldsIncluded: false,
     reportEvidence: {
       token: 'owned',
       digest: 'digest-' + chosen,
@@ -301,6 +302,7 @@ it('keeps report evidence paged and sends one clinical decision while earlier ch
       pendingTotal: 0,
       relationshipTotal: 0,
       recordBlockerTotal: 0,
+      reportHoldTotal: 0,
       url,
     },
     commitGroups: [{ id: 'one', atomic: true, recordTotal: 2, pendingCount: 0, url }],
@@ -828,6 +830,7 @@ it.each(['report', 'records'] as const)(
       recordsIncluded: false,
       pendingIncluded: false,
       relationshipsIncluded: false,
+      reportHoldsIncluded: false,
       reportEvidence: {
         token: 'blocked',
         digest: 'complete',
@@ -836,6 +839,7 @@ it.each(['report', 'records'] as const)(
         pendingTotal: 0,
         relationshipTotal: 0,
         recordBlockerTotal: 0,
+        reportHoldTotal: 0,
         url,
       },
       blockers: {

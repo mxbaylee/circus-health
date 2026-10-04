@@ -12,6 +12,7 @@ import type {
   IntakeReview,
 } from '../../shared/intake';
 import type { IntakeIdentityReview } from '../../shared/intake-identity';
+import type { CollectionReportDetail } from '../../shared/intake-clinical-pages';
 import {
   ImportDetailReview,
   ImportRecordDetail,
@@ -168,6 +169,217 @@ const identityReview: IntakeIdentityReview = {
     scopeToken: 'fictional-scope-token',
   },
 };
+
+it('waits for acknowledged identity grounding before refreshing readiness and retains a later referenced page', async () => {
+  selectProfile({ id: 'fictional-native-detail', name: 'Rowan', placebo: true });
+  const coverage = {
+    total: 1,
+    covered: 0,
+    uncovered: 1,
+    status: 'uncovered' as const,
+    sourceCount: 0,
+    bySource: { items: [], total: 0, nextCursor: null },
+  };
+  const detail: CollectionReportDetail = {
+    format: 'health-intake-report-detail-v2',
+    group: {
+      ...reportDetail.group,
+      format: 'health-intake-report-group-v2',
+      groupOrdinal: 0,
+      sourceScope: null,
+      report: null,
+      reportContext: null,
+      peopleCounts: { pending: 0, later: 0, excluded: 0, saved: 0 },
+      sourceCoverage: { current: coverage, saved: coverage },
+      sourceReview: null,
+      records: { intakeId: intake.id, groupId: reportDetail.group.groupId },
+      people: { intakeId: intake.id, groupId: reportDetail.group.groupId },
+    },
+    records: {
+      format: 'health-intake-report-record-page-v2',
+      intakeId: intake.id,
+      version: intake.version,
+      scope: 'clinical_records',
+      view: 'all',
+      records: [
+        {
+          kind: 'record',
+          groupId: reportDetail.group.groupId,
+          proposalId: block.proposalId,
+          reviewToken: block.reviewToken,
+          queueState: 'pending',
+          selectable: false,
+          record: {
+            ...record,
+            identityReview: {
+              status: identityReview.status,
+              blocking: identityReview.blocking,
+              message: identityReview.message,
+              evidencedIdentity: identityReview.evidencedIdentity,
+              conflicts: identityReview.conflicts,
+            },
+          },
+        },
+      ],
+      totalRecords: 2,
+      nextCursor: 'fictional-second-page',
+    },
+    people: {
+      format: 'health-intake-people-page-v2',
+      intakeId: intake.id,
+      groupId: reportDetail.group.groupId,
+      selectedPersonId: null,
+      people: [],
+      totalPeople: 0,
+      counts: { pending: 0, later: 0, excluded: 0, saved: 0 },
+      nextCursor: null,
+    },
+  };
+  let confirmed = false;
+  let grounded = false;
+  let finishGrounding: (() => void) | undefined;
+  let finishNextPage: (() => void) | undefined;
+  const reports: URL[] = [];
+  let identityReads = 0;
+  const changed = vi.fn();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.includes('/report-queue/')) {
+        reports.push(url);
+        if (url.searchParams.has('cursor'))
+          await new Promise<void>((resolve) => {
+            finishNextPage = resolve;
+          });
+        return response(
+          url.searchParams.has('cursor')
+            ? {
+                ...detail,
+                records: {
+                  ...detail.records,
+                  records: [
+                    {
+                      kind: 'record_reference',
+                      groupId: reportDetail.group.groupId,
+                      proposalId: block.proposalId,
+                      queueState: 'pending',
+                      selectable: true,
+                      reviewToken: 'referenced-record-token',
+                      selection: {
+                        recordId: 'fictional-next-record',
+                        candidateVersionId: 'fictional-next-v1',
+                      },
+                      reference: {
+                        format: 'health-intake-clinical-review-reference-v2',
+                        section: 'records',
+                        ordinal: 1,
+                        bytes: 70000,
+                        reviewToken: 'referenced-record-token',
+                      },
+                    },
+                  ],
+                  nextCursor: null,
+                },
+              }
+            : {
+                ...detail,
+                records: {
+                  ...detail.records,
+                  records: detail.records.records.map((row) =>
+                    row.kind === 'record'
+                      ? {
+                          ...row,
+                          selectable: grounded,
+                          record: {
+                            ...row.record,
+                            title: grounded
+                              ? 'Fictional grounded ready record'
+                              : 'Fictional blocked record',
+                            selectable: grounded,
+                            identityReview: { ...row.record.identityReview!, blocking: !grounded },
+                          },
+                        }
+                      : row,
+                  ),
+                },
+              },
+        );
+      }
+      if (url.pathname.endsWith('/identity-review')) {
+        identityReads += 1;
+        if (confirmed && !grounded)
+          await new Promise<void>((resolve) => {
+            finishGrounding = () => {
+              grounded = true;
+              resolve();
+            };
+          });
+        return response({
+          ...identityReview,
+          status: confirmed ? 'prior_confirmation' : 'confirmation_required',
+          blocking: !confirmed,
+          offeredSelfFields: {},
+          scope: {
+            ...identityReview.scope,
+            scopeToken: confirmed ? 'confirmed-scope' : 'initial-scope',
+          },
+        });
+      }
+      if (url.pathname.endsWith('/identity-scope') && init?.method === 'POST') {
+        confirmed = true;
+        return response(intake);
+      }
+      if (url.pathname.endsWith('/intakes/' + intake.id)) return response([]);
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <ImportDetailReview
+        selection={{ groupId: reportDetail.group.groupId, intakeId: intake.id }}
+        onBack={vi.fn()}
+        onChanged={changed}
+        onUseSource={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.click(await screen.findByRole('button', { name: 'This is me' }));
+  await waitFor(() => expect(finishGrounding).toBeDefined());
+  expect(reports).toHaveLength(1);
+  expect(changed).not.toHaveBeenCalled();
+  expect(
+    screen.getByRole('link', { name: 'Review exact record — Fictional blocked record' }),
+  ).toBeVisible();
+  await act(async () => finishGrounding!());
+  expect(await screen.findByText('This report already matches Self.')).toBeVisible();
+  expect(
+    await screen.findByRole('link', {
+      name: 'Review exact record — Fictional grounded ready record',
+    }),
+  ).toBeVisible();
+  expect(reports).toHaveLength(2);
+  expect(identityReads).toBe(2);
+  expect(changed).toHaveBeenCalledOnce();
+  expect(
+    reports.every(
+      (url) => url.searchParams.get('limit') === '40' && url.searchParams.get('bytes') === '65536',
+    ),
+  ).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: 'Next report records' }));
+  await waitFor(() => expect(finishNextPage).toBeDefined());
+  expect(screen.getByText('This report already matches Self.')).toBeVisible();
+  expect(screen.queryByRole('link', { name: /Review exact record/ })).toBeNull();
+  await act(async () => finishNextPage!());
+  await screen.findByRole('button', { name: 'First report records' });
+  expect(
+    await screen.findByRole('link', { name: 'Review exact record — Referenced clinical record' }),
+  ).toHaveAttribute('href', expect.stringContaining('fictional-next-record'));
+  await act(async () => {});
+  expect(reports).toHaveLength(3);
+  expect(identityReads).toBe(2);
+  expect(reports[2]!.searchParams.get('cursor')).toBe('fictional-second-page');
+});
 
 function response(data: unknown) {
   return new Response(JSON.stringify({ data, meta: { revision: 1 } }), {
@@ -2919,8 +3131,72 @@ it('uses exact section controls for native selected-record related discovery wit
     </MemoryRouter>,
   );
   fireEvent.click(await screen.findByText('Find possible related saved records'));
-  fireEvent.click(screen.getByRole('button', { name: 'Resolve questions or correct this record' }));
+  expect(screen.getByRole('region', { name: 'Paired evidence review' })).toBeVisible();
   expect(await screen.findByLabelText('Search related saved records')).toBeVisible();
   expect(screen.getByText('0 related records in this search result window.')).toBeVisible();
   expect(requests.some((url) => url.includes('/related-records'))).toBe(false);
+});
+it('keeps the selected record mounted and report retry actionable while an external report command is uncertain', async () => {
+  selectProfile({ id: 'fictional-external-pending', name: 'Fictional Reader', placebo: true });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/review-record?'))
+        return response({
+          format: 'health-intake-clinical-record-v2',
+          context: {
+            intakeId: intake.id,
+            proposalId: block.proposalId,
+            version: intake.version,
+            reviewToken: block.reviewToken,
+            summary: review.summary,
+            sourceTextStale: false,
+          },
+          record: { kind: 'record', record },
+        });
+      if (url.endsWith('/intakes/' + intake.id)) return response(intake);
+      if (url.includes('/test-types')) return response([]);
+      if (url.includes('/rules')) return response([]);
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  const back = vi.fn(),
+    retry = vi.fn();
+  const beforeClose = { current: null as (() => Promise<boolean>) | null };
+  const props = {
+    groupId: 'fictional-report',
+    block,
+    recordId: record.id,
+    identityPanel: <button onClick={retry}>Retry exact report command</button>,
+    identityRevision: 7,
+    sourcePanel: null,
+    commonIdentityIssueIds: new Set<string>(),
+    sourceError: '',
+    onBack: back,
+    onChanged: () => {},
+    onUseSource: () => {},
+    beforeCloseRef: beforeClose,
+  };
+  const mounted = render(
+    <MemoryRouter>
+      <ImportRecordDetail {...props} contextPending />
+    </MemoryRouter>,
+  );
+  await screen.findByRole('heading', { name: 'Ferritin' });
+  fireEvent.click(screen.getByRole('button', { name: 'Back to Import' }));
+  expect(back).not.toHaveBeenCalled();
+  expect(await beforeClose.current?.()).toBe(false);
+  const retryButton = screen.getByRole('button', { name: 'Retry exact report command' });
+  expect(retryButton).toBeEnabled();
+  fireEvent.click(retryButton);
+  expect(retry).toHaveBeenCalledOnce();
+  mounted.rerender(
+    <MemoryRouter>
+      <ImportRecordDetail {...props} contextPending={false} />
+    </MemoryRouter>,
+  );
+  await act(async () => {});
+  fireEvent.click(screen.getByRole('button', { name: 'Back to Import' }));
+  await waitFor(() => expect(back).toHaveBeenCalledOnce());
 });

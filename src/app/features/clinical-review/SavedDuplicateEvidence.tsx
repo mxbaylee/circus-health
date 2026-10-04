@@ -13,11 +13,29 @@ export function SavedDuplicateEvidence({
 }) {
   const profile = useProfile();
   return (
-    <SavedEvidenceReader key={JSON.stringify([profile?.id, reference])} reference={reference} />
+    <SavedEvidenceReader
+      key={JSON.stringify([profile?.id, reference])}
+      reference={reference}
+      profileId={profile?.id}
+    />
   );
 }
 const encodedBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
-function SavedEvidenceReader({ reference }: { reference: SavedDuplicateEvidenceReference }) {
+function originalUrl(value: unknown, profileId?: string): string | null {
+  if (!profileId || typeof value !== 'string') return null;
+  const prefix = `/api/profiles/${encodeURIComponent(profileId)}`;
+  const route = value.startsWith(prefix + '/') ? value.slice(prefix.length) : value.slice(4);
+  return value.startsWith('/api/') && /^\/sources\/[^/?#]+\/content$/.test(route)
+    ? prefix + route
+    : null;
+}
+function SavedEvidenceReader({
+  reference,
+  profileId,
+}: {
+  reference: SavedDuplicateEvidenceReference;
+  profileId?: string;
+}) {
   const [{ after, before }, setPosition] = useState({ after: '', before: 0 }),
     [page, setPage] = useState<SavedDuplicateEvidencePage | null>(null),
     [fragment, setFragment] = useState<string | null>(null),
@@ -59,7 +77,7 @@ function SavedEvidenceReader({ reference }: { reference: SavedDuplicateEvidenceR
                   encodedBytes(item.value) > 32768 ||
                   typeof item.value.label !== 'string' ||
                   typeof item.value.locator !== 'string' ||
-                  !/^\/api\/sources\/[^/?#]+\/content$/.test(item.value.contentUrl)
+                  !originalUrl(item.value.contentUrl, profileId)
                 : item.kind !== 'fragment' ||
                   !Number.isSafeInteger(item.bytes) ||
                   item.bytes <= 32768 ||
@@ -76,7 +94,7 @@ function SavedEvidenceReader({ reference }: { reference: SavedDuplicateEvidenceR
     return () => {
       request.abort();
     };
-  }, [reference.url, after, before]);
+  }, [reference.url, after, before, profileId]);
   return (
     <section aria-label="Saved original evidence">
       <p>{reference.count} retained evidence items, shown one page at a time.</p>
@@ -97,7 +115,11 @@ function SavedEvidenceReader({ reference }: { reference: SavedDuplicateEvidenceR
                   )
                 ) : (
                   <>
-                    <a href={item.value.contentUrl} target="_blank" rel="noreferrer">
+                    <a
+                      href={originalUrl(item.value.contentUrl, profileId)!}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
                       {item.value.label}
                     </a>{' '}
                     — {item.value.locator}

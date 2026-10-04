@@ -1,3 +1,9 @@
+import {
+  fixtureReview,
+  fixtureProposalId,
+  fixtureReportUrl,
+  fixtureSourcePath,
+} from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
@@ -202,36 +208,32 @@ test(
         jsonlText: JSON.stringify(value),
       });
       const path = `${prefix}/intakes/${encodeURIComponent(item.id)}`;
-      const reviewPath = path + '/review?proposalId=' + encodeURIComponent(item.proposals[0].id);
-      const originalReview = await api(reviewPath);
+      const proposalId = await fixtureProposalId(api, prefix, item.id);
+      const reviewPath = path + '/review?proposalId=' + encodeURIComponent(proposalId);
+      const originalReview = await fixtureReview(api, reviewPath);
       assert.deepEqual(originalReview.records[0].mapping.opticalPrescription, optical);
       assert.equal(
-        originalReview.records[0].issues.find(
+        originalReview.records[0].issues!.find(
           (issue: { kind: string }) => issue.kind === 'identity',
         )?.status,
         'unresolved',
         'The destination mapping does not replace explicit identity review',
       );
-      await page.goto(url + '/#/import?intake=' + encodeURIComponent(item.id));
+      await page.goto(url + (await fixtureReportUrl(api, prefix, item.id)));
       await page.reload();
       const exactLinks = page.locator('.import-detail-record-link:not([data-saved-record-id])');
       await exactLinks.first().waitFor();
       assert.equal(await exactLinks.count(), 1, 'The report keeps one exact optical record link');
       await exactLinks.first().click();
-      // No shared printed subject exists in this fixture. Its header review is
-      // informational; the explicit record-level identity answer stays separate.
+      // The native report identity remains informational when no printed subject exists.
       await page
-        .getByRole('button', { name: 'Review person for this report', exact: true })
-        .click();
-      const personSidebar = page.getByRole('dialog', { name: 'Who is this report for?' });
-      await personSidebar
         .getByText('Identity is not printed clearly in this report.', { exact: true })
         .waitFor();
       assert.equal(
-        await personSidebar.getByRole('button', { name: 'This is me', exact: true }).count(),
+        await page.getByRole('region', { name: 'Report identity', exact: true }).count(),
         0,
+        'missing report identity does not invent a report-level confirmation; the record-level answer remains separate',
       );
-      await personSidebar.getByRole('button', { name: 'Close', exact: true }).click();
       await page.getByRole('button', { name: 'This is me', exact: true }).waitFor();
       assert.equal(await page.getByRole('article').count(), 1);
       await capture(clinical ? 'proposed-review' : 'top-level-review');
@@ -253,7 +255,7 @@ test(
         await page.getByRole('button', { name: 'Confirm and save record', exact: true }).count(),
         0,
       );
-      const stored = await api(reviewPath);
+      const stored = await fixtureReview(api, reviewPath);
       assert.equal(stored.records[0].mapping.subject, 'self');
       assert.equal(stored.records[0].mapping.date, '2017-03-08');
       assert.equal(stored.records[0].mapping.documentDate, '2017-03-08');
@@ -285,9 +287,11 @@ test(
       await capture(clinical ? 'proposed-vision' : 'top-level-vision');
       await page.reload();
       await page.getByRole('article').waitFor();
-      const original = await page.request.get(url + item.contentUrl);
+      const original = await page.request.get(url + fixtureSourcePath(prefix, item.contentUrl));
       assert.equal(await original.text(), 'Fictional retained original ' + clinical);
-      const proposal = await page.request.get(url + item.proposals[0].contentUrl);
+      const proposal = await page.request.get(
+        url + prefix + '/sources/' + encodeURIComponent(proposalId) + '/content',
+      );
       assert.deepEqual(JSON.parse(await proposal.text()), value);
       await page.goto(url + '/#/import?intake=' + encodeURIComponent(item.id));
       await page.reload();
@@ -351,10 +355,10 @@ test(
     assert.equal(queued.status(), 201);
     const queueItem = await stopFixtureImport(page, url, prefix, (await queued.json()).data.id);
     const queuePath = `${prefix}/intakes/${encodeURIComponent(queueItem.id)}`;
-    const initialQueue = await api(queuePath + '/review');
+    const initialQueue = await fixtureReview(api, queuePath + '/review');
     assert.equal(initialQueue.records.length, 20);
     async function openQueueRecord(index: number) {
-      await page.goto(url + '/#/import?intake=' + encodeURIComponent(queueItem.id));
+      await page.goto(url + (await fixtureReportUrl(api, prefix, queueItem.id)));
       // API seeding bypasses the uploader's queue reload; reopen as a user would.
       await page.reload();
       const links = page.locator('.import-detail-record-link:not([data-saved-record-id])');
@@ -388,16 +392,16 @@ test(
       [initialQueue.records[0].id],
     );
     assert.equal(
-      (await api(queuePath + '/review')).records.filter(
-        (record: { reviewState: string }) => record.reviewState === 'accepted',
+      (await fixtureReview(api, queuePath + '/review')).records.filter(
+        (record: { reviewState?: string }) => record.reviewState === 'accepted',
       ).length,
       1,
     );
     const deferredSave = page.waitForResponse(
-      async (response) =>
+      (response) =>
         response.url().endsWith(queuePath + '/review-draft') &&
         response.ok() &&
-        (await response.json()).data.workflow.reviewDrafts.at(-1).disposition === 'review_later',
+        response.request().postDataJSON().disposition === 'review_later',
     );
     await page
       .locator('.intake-guided-actions')
@@ -410,7 +414,7 @@ test(
       async (response) =>
         response.url().endsWith(queuePath + '/review-draft') &&
         response.ok() &&
-        (await response.json()).data.workflow.reviewDrafts.at(-1).mapping.valueText === '18.5',
+        response.request().postDataJSON().mapping?.valueText === '18.5',
     );
     await page.getByLabel('Result', { exact: true }).fill('18.5');
     await edited;
@@ -439,14 +443,16 @@ test(
     assert.equal(await page.getByLabel('Result', { exact: true }).inputValue(), '18.5');
     await page.reload();
     assert.equal(await page.getByLabel('Result', { exact: true }).inputValue(), '18.5');
-    const resumedQueue = await api(queuePath + '/review');
+    const resumedQueue = await fixtureReview(api, queuePath + '/review');
     assert.equal(resumedQueue.records[0].reviewState, 'accepted');
-    assert.equal(resumedQueue.records[1].draft.disposition, 'review_later');
-    assert.equal(resumedQueue.records[2].draft.mapping.valueText, '18.5');
+    assert.equal(resumedQueue.records[1].draft!.disposition, 'review_later');
+    assert.equal(resumedQueue.records[2].draft!.mapping.valueText, '18.5');
     assert.equal(imports.length, 1, 'Reload and draft review never accept more records');
     assert.equal(await page.locator('.import-detail').count(), 1);
     await capture('guided-queue-resumed');
-    const queueOriginal = await page.request.get(url + queueItem.contentUrl);
+    const queueOriginal = await page.request.get(
+      url + fixtureSourcePath(prefix, queueItem.contentUrl),
+    );
     assert.deepEqual(await queueOriginal.body(), queueBytes);
     assert.deepEqual(errors, []);
   },

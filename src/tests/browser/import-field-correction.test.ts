@@ -1,5 +1,7 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
+import { fixtureDestinations, fixtureAssertNoAccepted } from './native-intake-fixture.ts';
+import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -231,7 +233,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         assert(
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
         );
-        assert.equal((await request(prefix + '/intakes/' + intake.id)).imported, null);
+        await fixtureAssertNoAccepted(request, prefix, intake.id);
         await page.getByRole('button', { name: 'Review', exact: true }).click();
         await inline.getByRole('textbox', { name: 'Result', exact: true }).waitFor();
         for (const label of ['Test name', 'Result', 'Unit', 'Date'])
@@ -263,7 +265,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         assert(
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
         );
-        assert.equal((await request(prefix + '/intakes/' + intake.id)).imported, null);
+        await fixtureAssertNoAccepted(request, prefix, intake.id);
         await page.getByRole('button', { name: 'Review', exact: true }).click();
         await inline.getByRole('textbox', { name: 'Unit', exact: true }).waitFor();
         for (const label of ['Test name', 'Result', 'Unit', 'Date'])
@@ -275,24 +277,28 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
       await page.reload();
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
-      assert.equal((await request(`${prefix}/intakes/${intake.id}`)).imported, null);
+      await fixtureAssertNoAccepted(request, prefix, intake.id);
       await page.waitForFunction(() =>
         [...document.querySelectorAll('button')].some(
           (button) => button.textContent?.trim() === 'Confirm & save' && !button.disabled,
         ),
       );
       if (!partial) {
-        const feed = await request(prefix + '/intakes/import-feed');
-        const selected = feed.blocks.find(
-          (block: { intakeId: string }) => block.intakeId === intake.id,
-        );
+        const feed = (await request(prefix + '/intakes/import-feed')) as CollectionImportFeed;
+        assert.equal(feed.format, 'health-intake-import-feed-v2');
+        const selected = feed.records.find((row) => row.intakeId === intake.id);
+        assert.ok(selected);
+        const recordId =
+          selected.detail.kind === 'record'
+            ? selected.detail.record.id
+            : selected.detail.selection.recordId;
         await page.goto(
           url +
             '/#/import?' +
             new URLSearchParams({
               intake: intake.id,
               group: selected.groupId,
-              record: selected.records[0].id,
+              record: recordId,
               proposal: selected.proposalId || 'original',
             }),
         );
@@ -329,8 +335,9 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         .getByRole('status')
         .getByText('1 saved', { exact: true })
         .waitFor();
-      const accepted = await request(prefix + '/intakes/' + intake.id);
-      const saved = accepted.imported.clinical.records[0];
+      const destinations = await fixtureDestinations(request, prefix, intake.id);
+      assert.equal(destinations.length, 1);
+      const saved = destinations[0]!;
       const observation = await request(prefix + '/tests/' + encodeURIComponent(saved.entityId));
       assert(
         observation.extra.import.corrections.some(

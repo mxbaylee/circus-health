@@ -51,6 +51,7 @@ import { ModelContextLimitError } from '../model-config.ts';
 import {
   uploadIntake,
   getIntake,
+  getIntakeRead,
   getIntakeOriginal,
   getRetainedIntakeOriginalReference,
   linkIntakeConversion,
@@ -70,6 +71,18 @@ import {
 import { uploadAsset } from '../assets.ts';
 import { vaultFixture, newProfile } from './helpers/vault-fixture.ts';
 import type { HealthTool } from '../proxy-model-bridge.ts';
+import { selectedFixturePlan } from './helpers/selected-plan.ts';
+import { readPackagePlanScope } from '../intake-package-plan.ts';
+import { decisionIndexCount } from '../intake-reading-state.ts';
+import { selectedEnvelopeStore } from '../intake-collection-envelope.ts';
+import type { IntakeSummaryV2, IntakeRead } from '../../shared/intake-summary.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
+import {
+  nativeAssistantConversion,
+  nativeAssistantResume,
+  isNativeAssistantCheckpoint,
+} from '../assistant-intake-native.ts';
+import { activeMappingRules } from '../clinical-import.ts';
 import type { Intake } from '../../shared/intake.ts';
 import type { ProposalSourceTextHandoff } from '../../shared/intake-source-text.ts';
 import { getIntakeIdentityScope, confirmIntakeIdentityScope } from '../intake-identity.ts';
@@ -96,6 +109,11 @@ interface PromptDto extends Record<string, unknown> {
     currentWindow: unknown;
     pendingReadWindows: RequiredArray<{ args: { offset?: number; page?: number } }>;
     nextReadWindows: RequiredArray<{ args: { offset?: number; page?: number } }>;
+    pendingWindows?: {
+      total: number;
+      complete: boolean;
+      items: { args: { page?: number; offset?: number } }[];
+    };
     freshTopLevelImageBootstrap?: { eligible: boolean; instructions: string };
   };
   identity: { name: string; displayName: string };
@@ -240,6 +258,27 @@ const workflowOperationIds = (intake: ReturnType<typeof getIntake>): string[] =>
     }
   ).operations.map((entry) => entry.id);
 
+const proposalCount = (...args: Parameters<typeof getIntakeRead>) => {
+  const value = getIntakeRead(...args);
+  return isIntakeSummary(value) ? value.collections.proposals.total : value.proposals.length;
+};
+const selectedPending = (f: ReturnType<typeof fixture>, id: string, chat: AssistantChat) => {
+  const header = getIntakeRead(f.db, f.root, 'cedar', id);
+  assert.ok(isIntakeSummary(header));
+  assert.ok(isNativeAssistantCheckpoint(chat.conversionCheckpoint));
+  const resume = nativeAssistantResume(
+    nativeAssistantConversion(f.db, f.root, 'cedar', chat.id, header),
+    chat.conversionCheckpoint,
+    createHash('sha256')
+      .update(JSON.stringify(activeMappingRules(f.db, header.providerId)))
+      .digest('hex'),
+  );
+  assert.ok(resume.pendingWindows.complete, 'fictional pending windows are completely selected');
+  return resume.pendingWindows.items.map((window) => {
+    assert.ok('args' in window);
+    return window;
+  });
+};
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 test('assistant package tools keep large inventory and JSON reads bounded and role proposals resumable', async (t) => {
   fictionalModel(t);
@@ -263,14 +302,17 @@ test('assistant package tools keep large inventory and JSON reads bounded and ro
   await tick();
   const bridge = bridges[0];
   assert.ok(bridge.tools.some((tool) => tool.name === 'health_intake_package'));
-  const plan = await call(bridge, 'intake_plan', {
+  const plan = await call<IntakeSummaryV2>(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
     version: item.version,
   });
-  assert.ok(plan.planId);
-  assert.equal(plan.totalMembers, 382);
-  assert.equal(plan.truncated, undefined);
+  assert.ok(
+    plan.activePlan.state === 'exact' &&
+      plan.activePlan.plan?.format === 'health-intake-package-plan-v2',
+  );
+  const planId = plan.activePlan.plan.id;
+  assert.equal(plan.activePlan.plan.unitCount, 382);
   const inventory = await call(bridge, 'intake_package', {
     id: item.id,
     action: 'inventory',
@@ -285,23 +327,36 @@ test('assistant package tools keep large inventory and JSON reads bounded and ro
     jsonPointer: '/items/0',
   });
   assert.match(read.structure.literal, /1\.000/);
-  const roles = await call(bridge, 'intake_package', {
-    id: item.id,
-    action: 'plan_roles',
-    version: getIntake(db, root, 'cedar', item.id).version,
-    planId: plan.planId,
-    operationId: 'fictional-roles',
-    roles: [
-      {
-        memberId,
-        role: 'unknown',
-        reason: 'Literal JSON source ID read; issuer remains unknown.',
-        coverage: 'pending',
-      },
-    ],
-  });
-  assert.equal(roles.roleProposalCount, 1);
-  assert.equal(roles.pendingWorkCount, 382);
+  const roles = await call<import('../../shared/intake-package-plan.ts').IntakePackagePlanResult>(
+    bridge,
+    'intake_package',
+    {
+      id: item.id,
+      action: 'plan_roles',
+      version: getIntakeRead(db, root, 'cedar', item.id).version,
+      planId: planId,
+      operationId: 'fictional-roles',
+      roles: [
+        {
+          memberId,
+          role: 'unknown',
+          reason: 'Literal JSON source ID read; issuer remains unknown.',
+          coverage: 'pending',
+        },
+      ],
+    },
+  );
+  assert.equal(roles.plan.unitCount, 382);
+  const roleScope = required(readPackagePlanScope(db, root, 'cedar', item.id));
+  assert.equal(roleScope.memberState(memberId)?.role?.role, 'unknown');
+  assert.equal(roleScope.memberState(memberId)?.role?.coverage, 'pending');
+  assert.equal(
+    decisionIndexCount(
+      selectedEnvelopeStore(db, { id: item.id }).collections,
+      roleScope.decisionIndex('accounted'),
+    ),
+    0,
+  );
   await assert.rejects(
     call(bridge, 'intake_package', {
       id: item.id,
@@ -310,11 +365,11 @@ test('assistant package tools keep large inventory and JSON reads bounded and ro
     }),
     (error: unknown) => hasCode(error, 'PACKAGE_MEMBER'),
   );
-  assert.equal(getIntake(db, root, 'cedar', item.id).proposals.length, 0);
-  const batch = await call(bridge, 'intake_batch', {
+  assert.equal(proposalCount(db, root, 'cedar', item.id), 0);
+  const batch = await call<IntakeSummaryV2>(bridge, 'intake_batch', {
     id: item.id,
     version: roles.version,
-    planId: roles.planId,
+    planId: roles.plan.id,
     operationId: 'fictional-batch',
     summary: 'One member read; remaining occurrences are pending.',
     jsonlText: JSON.stringify({
@@ -339,16 +394,36 @@ test('assistant package tools keep large inventory and JSON reads bounded and ro
       },
     ],
   });
-  assert.equal(batch.pendingWorkCount, 381);
-  assert.ok(batch.latestProposal.contentUrl);
-  assert.equal(batch.candidates.candidateCount, 0);
-  assert.equal(batch.candidates.versionCount, 0);
-  assert.equal(batch.candidates.occurrenceCount, 0);
-  assert.equal(batch.questions.count, 0);
-  assert.ok(batch.sections.some(({ section, count }) => section === 'candidates' && count === 0));
-  assert.match(batch.paging, /nextOffset/);
-  assert.equal(batch.truncated, undefined);
-  assert.equal(batch.version, getIntake(db, root, 'cedar', item.id).version);
+  assert.equal(batch.collections.proposals.total, 1);
+  assert.equal(batch.collections.candidates.total, 0);
+  assert.equal(batch.collections.questions.total, 0);
+  const savedScope = required(readPackagePlanScope(db, root, 'cedar', item.id));
+  assert.equal(
+    savedScope.plan.unitCount -
+      decisionIndexCount(
+        selectedEnvelopeStore(db, { id: item.id }).collections,
+        savedScope.decisionIndex('accounted'),
+      ),
+    381,
+  );
+  const candidates = await call<{
+    format: string;
+    logicalTotal: number;
+    complete: boolean;
+    items: unknown[];
+    nextCursor: string | null;
+  }>(bridge, 'intake_plan', {
+    id: item.id,
+    action: 'read',
+    section: 'candidates',
+    freshStart: true,
+  });
+  assert.equal(candidates.format, 'health-intake-model-context-v2');
+  assert.equal(candidates.logicalTotal, 0);
+  assert.equal(candidates.complete, true);
+  assert.deepEqual(candidates.items, []);
+  assert.equal(candidates.nextCursor, null);
+  assert.equal(batch.version, getIntakeRead(db, root, 'cedar', item.id).version);
   complete(bridge);
 });
 
@@ -480,11 +555,12 @@ test('linked ZIP conversion supplies multiple literal records per window and res
   let bridge = f.bridges[0];
   assert.equal(bridge.prompt.conversation.firstAcquaintance, false);
   assert.equal(bridge.prompt.conversation.firstAssistantResponse, false);
-  const plan = await call(bridge, 'intake_plan', {
+  const plan = await call<IntakeSummaryV2>(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
   });
+  assert.ok(plan.activePlan.state === 'exact' && plan.activePlan.plan);
   const inventory = await call(bridge, 'intake_package', { id: item.id, action: 'inventory' });
   const memberId = inventory.members[0].memberId;
   await call(bridge, 'intake_package', { id: item.id, action: 'read_member', memberId });
@@ -536,7 +612,7 @@ test('linked ZIP conversion supplies multiple literal records per window and res
   );
   await call(bridge, 'intake_propose', {
     id: item.id,
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
     jsonlText: rows.join('\n'),
     summary: 'Three fictional records from one literal window; coverage remains partial',
   });
@@ -553,7 +629,8 @@ test('linked ZIP conversion supplies multiple literal records per window and res
     'running',
     'a supplied window alone does not finish extraction accounting',
   );
-  await tick();
+  for (let n = 0; n < 500 && !f.bridges[1]?.prompt.conversion && chat.status === 'running'; n++)
+    await tick();
   assert.equal(bridge.closed, true);
   bridge = f.bridges[1];
   assert.ok(bridge);
@@ -566,8 +643,8 @@ test('linked ZIP conversion supplies multiple literal records per window and res
   assert.equal(required(chat.reading).pendingReadWindows, 0);
   await call(bridge, 'intake_batch', {
     id: item.id,
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
-    planId: plan.planId,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
+    planId: plan.activePlan.plan.id,
     operationId: 'fictional-final-coverage',
     jsonlText: rows.join('\n'),
     summary: 'All three fictional records retained',
@@ -608,7 +685,7 @@ test('linked ZIP conversion supplies multiple literal records per window and res
   assert.equal(required(chat.reading).reason, 'reading_exhausted');
   assert.equal(required(chat.reading).coverage, 'reading_progress_only');
   assert.equal(required(chat.runs).length, 1, 'continuations share the existing run budget');
-  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', item.id), 1);
   assert.equal(
     required(f.db.prepare('SELECT count(*) AS n FROM documents').get()).n,
     0,
@@ -728,14 +805,17 @@ test('a reading deadline retains the in-flight guarded tool result and blocks an
   assert.equal(chat.status, 'running');
   assert.equal(bridge.closed, false, 'the slice deadline does not abort an in-flight request');
 
-  const beforeVersion = getIntake(f.db, f.root, 'cedar', item.id).version;
+  const beforeVersion = getIntakeRead(f.db, f.root, 'cedar', item.id).version;
   const plan = await call(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
     version: beforeVersion,
   });
   assert.ok(plan.version > beforeVersion, 'the already-returned guarded tool applies exactly once');
-  assert.equal(required(getIntake(f.db, f.root, 'cedar', item.id).workflow).plans.length, 1);
+  assert.equal(
+    (getIntakeRead(f.db, f.root, 'cedar', item.id) as IntakeSummaryV2).collections.plans.total,
+    1,
+  );
 
   let boundaryError: unknown;
   try {
@@ -751,7 +831,10 @@ test('a reading deadline retains the in-flight guarded tool result and blocks an
   assert.equal(chat.error, null);
   assert.equal(bridge.closed, true);
   assert.equal(f.bridges.length, 1, 'the expired slice never creates a fresh model turn');
-  assert.equal(required(getIntake(f.db, f.root, 'cedar', item.id).workflow).plans.length, 1);
+  assert.equal(
+    (getIntakeRead(f.db, f.root, 'cedar', item.id) as IntakeSummaryV2).collections.plans.total,
+    1,
+  );
 });
 
 test('Stop remains immediate after a soft reading deadline', async (t) => {
@@ -1130,7 +1213,7 @@ test('a new provider request restores the truthful waiting phase without manufac
   const invalid = {
     id: f.item.id,
     sourceTextRevisionId: f.sourceTextRevisionId,
-    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
     jsonlText: JSON.stringify(fictionalOpticalPeopleEnvelope()),
     summary: 'Fictional rejected structure before another provider request',
   };
@@ -1193,9 +1276,9 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
   await call(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
   });
-  const plan = required(required(getIntake(f.db, f.root, 'cedar', item.id).workflow).plans[0]);
+  const plan = selectedFixturePlan(f.db, f.root, 'cedar', item.id);
   const row = (page: number) =>
     JSON.stringify({
       format: 'health-record-v1',
@@ -1221,21 +1304,23 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
   await call(bridge, 'intake_propose', {
     sourceTextRevisionId,
     id: item.id,
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
     jsonlText: row(1),
     summary: 'Fictional first page retained',
   });
   complete(bridge);
-  await tick();
-  bridge = f.bridges[1];
-  assert.equal(bridge.prompt.conversion.nextReadWindows[0].args.page, 2);
+  for (let n = 0; n < 500 && !f.bridges[1]?.prompt.conversion && chat.status === 'running'; n++)
+    await tick();
+  assert.equal(chat.status, 'running', chat.error ?? '');
+  bridge = required(f.bridges[1]);
+  assert.equal(bridge.prompt.conversion.pendingWindows?.items[0]?.args.page, 2);
   sourceTextRevisionId = (
     await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
   ).revisionId;
   const batch = () => ({
     sourceTextRevisionId,
     id: item.id,
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
     planId: plan.id,
     operationId: 'fictional-pages-covered',
     jsonlText: row(2),
@@ -1254,7 +1339,7 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
     });
   assert.equal(chat.status, 'running');
   assert.equal(required(chat.reading).reason, null);
-  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', item.id), 1);
   await call(bridge, 'intake_read', { id: item.id, page: 2 });
   sourceTextRevisionId = (
     await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
@@ -1299,14 +1384,14 @@ test('three consecutive premature coverage claims pause without publishing a pro
   await call(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
   });
-  const current = getIntake(f.db, f.root, 'cedar', item.id);
-  const plan = required(required(current.workflow).plans[0]);
+  const current = getIntakeRead(f.db, f.root, 'cedar', item.id);
+  const plan = selectedFixturePlan(f.db, f.root, 'cedar', current.id);
   await call(bridge, 'intake_read', { id: item.id, page: 1 });
   const batch = {
     id: item.id,
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
     planId: plan.id,
     operationId: 'fictional-repeated-premature-coverage',
     jsonlText: JSON.stringify({
@@ -1340,17 +1425,25 @@ test('three consecutive premature coverage claims pause without publishing a pro
     assert.equal(chat.status, attempt < 3 ? 'running' : 'idle');
   }
   assert.equal(required(chat.reading).reason, 'tool_error');
-  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 0);
-  assert.equal(required(legacyCheckpoint(chat.conversionCheckpoint).pending[0]).args.page, 2);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', item.id), 0);
+  assert.equal(required(selectedPending(f, item.id, chat)[0]).args.page, 2);
 });
 
-async function linkedPdfPackage(t: TestContext, pages: string[]) {
+async function linkedPdfPackage(t: TestContext, pages: string[], otherMember = false) {
   fictionalModel(t);
   const f = fixture(t);
   const pdf = resolve(f.root, 'fictional-member.pdf'),
     zip = resolve(f.root, 'fictional-pages.zip');
   writeFileSync(pdf, syntheticPdf(pages));
-  writeFileSync(zip, zipFixture([{ name: 'fictional-member.pdf', data: readFileSync(pdf) }]));
+  writeFileSync(
+    zip,
+    zipFixture([
+      { name: 'fictional-member.pdf', data: readFileSync(pdf) },
+      ...(otherMember
+        ? [{ name: 'fictional-other.txt', data: 'Other independently fictional source.' }]
+        : []),
+    ]),
+  );
   const item = uploadIntake(f.db, f.root, 'cedar', {
     filename: 'fictional-pages.zip',
     bytes: readFileSync(zip),
@@ -1363,10 +1456,10 @@ async function linkedPdfPackage(t: TestContext, pages: string[]) {
   });
   await tick();
   const bridge = f.bridges[0];
-  const plan = await call(bridge, 'intake_plan', {
+  const plan = await call<IntakeSummaryV2>(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
   });
   const inventory = await call(bridge, 'intake_package', { id: item.id, action: 'inventory' });
   const member = inventory.members[0];
@@ -1390,15 +1483,14 @@ async function linkedPdfPackage(t: TestContext, pages: string[]) {
     },
     coverage: { status: 'partial', notes: ['Fictional source evidence remains reviewable'] },
   });
-  return { ...f, item, chat, bridge, plan, member, first, jsonlText };
+  assert.ok(plan.activePlan.state === 'exact' && plan.activePlan.plan);
+  return { ...f, item, chat, bridge, planId: plan.activePlan.plan.id, member, first, jsonlText };
 }
 
 test('real package member page reads retain cursors, report rereads, and stop an unproductive loop', async (t) => {
   const f = await linkedPdfPackage(t, ['Fictional package page one', 'Fictional package page two']);
   const initialReads = f.chat.reading?.distinctReads || 0;
-  const pending = legacyCheckpoint(f.chat.conversionCheckpoint).pending.find(
-    (window) => window.args.page === 2,
-  );
+  const pending = selectedPending(f, f.item.id, f.chat).find((window) => window.args.page === 2);
   assert.equal(pending?.tool, 'health_intake_package');
   assert.equal(pending?.args.action, 'read_member');
   assert.equal(pending?.args.id, f.item.id);
@@ -1426,7 +1518,7 @@ test('real package member page reads retain cursors, report rereads, and stop an
     'only the new page adds distinct progress',
   );
   assert.equal(
-    legacyCheckpoint(f.chat.conversionCheckpoint).pending.some(
+    selectedPending(f, f.item.id, f.chat).some(
       (window) => window.args.page === 2 && window.args.memberId === f.member.memberId,
     ),
     false,
@@ -1440,16 +1532,20 @@ test('real package member page reads retain cursors, report rereads, and stop an
 });
 
 test('retained child batch coverage is checked against its own plan and cannot bypass unread PDF pages', async (t) => {
-  const f = await linkedPdfPackage(t, ['Fictional first page', 'Fictional unread second page']);
+  const f = await linkedPdfPackage(
+    t,
+    ['Fictional first page', 'Fictional unread second page'],
+    true,
+  );
   const childId = f.first.metadata.sourceFileId;
   assert.equal(f.first.metadata.original.nextPage, 2);
   await call(f.bridge, 'intake_plan', {
     id: childId,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', childId).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
   });
-  const child = getIntake(f.db, f.root, 'cedar', childId);
-  const childPlan = required(required(child.workflow).plans[0]);
+  const child = getIntakeRead(f.db, f.root, 'cedar', childId);
+  const childPlan = selectedFixturePlan(f.db, f.root, 'cedar', childId);
   assert.equal(required(childPlan.units[0]).pages?.length, 2);
   await assert.rejects(
     call(f.bridge, 'intake_batch', {
@@ -1469,28 +1565,253 @@ test('retained child batch coverage is checked against its own plan and cannot b
     }),
     { code: 'CONVERSION_COVERAGE_PENDING' },
   );
-  const after = getIntake(f.db, f.root, 'cedar', childId);
-  assert.equal(after.proposals.length, 0);
-  assert.equal(required(required(required(after.workflow).plans[0]).units[0]).status, 'pending');
+  assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 0);
+  assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', childId).units[0]!.status, 'pending');
   assert.equal(f.chat.status, 'running');
+  await f.bridge.callbacks.beforeRequest?.();
   assert.equal(required(f.chat.reading).reason, null);
   assert.ok(
-    legacyCheckpoint(f.chat.conversionCheckpoint).pending.some(
+    selectedPending(f, f.item.id, f.chat).some(
       (window) => window.args.memberId === f.member.memberId && window.args.page === 2,
     ),
   );
+  const childBatch = () => ({
+    id: childId,
+    version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
+    planId: childPlan.id,
+    operationId: 'fictional-actual-child-coverage',
+    jsonlText: f.jsonlText,
+    summary: 'Both exact child pages were read',
+    coverage: [
+      {
+        unitId: childPlan.units[0]!.id,
+        kind: 'extracted',
+        notes: 'Every page in the child plan was directly read',
+      },
+    ],
+  });
+  await call(f.bridge, 'intake_read', { id: childId, page: 1 });
+  await assert.rejects(call(f.bridge, 'intake_batch', childBatch()), {
+    code: 'CONVERSION_COVERAGE_PENDING',
+  });
+  assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 0);
+  const otherUnit = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units[1]!;
+  await call(f.bridge, 'intake_plan', { id: f.item.id, action: 'read_unit', unitId: otherUnit.id });
+  assert.ok(isNativeAssistantCheckpoint(f.chat.conversionCheckpoint));
+  assert.equal(f.chat.conversionCheckpoint.activeUnitId, otherUnit.id);
+  const { clearIntakeStateCache } = await import('../intake-state-storage.ts');
+  clearIntakeStateCache(f.db);
+  const { nativeAssistantScope } = await import('../assistant-intake-native.ts');
+  const { collectionConversionSourceUnit } = await import('../intake-continuation-collection.ts');
+  const parentHeader = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+  assert.ok(isIntakeSummary(parentHeader));
+  const unrelatedScope = nativeAssistantScope(
+    nativeAssistantConversion(f.db, f.root, 'cedar', f.chat.id, parentHeader),
+    otherUnit.id,
+  )!;
+  assert.equal(
+    collectionConversionSourceUnit(unrelatedScope, childId),
+    f.member.unitId,
+    'the acknowledged child selects its persisted parent ledger after cache loss and another displayed unit',
+  );
+  // The route is part of recovered authority, not only the live SQLite/cache.
+  exportCuration(f.db, f.root, 'cedar');
+  const recoveredRoot = resolve(f.root, 'recovered-child-reading');
+  rebuildProfile(f.root, 'cedar', recoveredRoot);
+  const recoveredDB = openDatabase(profilePaths(recoveredRoot, 'cedar').database, 'cedar');
+  attachPersonalDurability(recoveredDB, { root: recoveredRoot, profileId: 'cedar' });
+  try {
+    const recoveredHeader = getIntakeRead(recoveredDB, recoveredRoot, 'cedar', f.item.id);
+    assert.ok(isIntakeSummary(recoveredHeader));
+    const recoveredHost = nativeAssistantConversion(
+      recoveredDB,
+      recoveredRoot,
+      'cedar',
+      f.chat.id,
+      recoveredHeader,
+    );
+    const { prepareNativeAssistantConversion } = await import('../assistant-intake-native.ts');
+    await prepareNativeAssistantConversion(recoveredHost, {
+      mappingVersion: createHash('sha256')
+        .update(JSON.stringify(activeMappingRules(recoveredDB, recoveredHeader.providerId)))
+        .digest('hex'),
+    });
+    const recoveredScope = nativeAssistantScope(recoveredHost, otherUnit.id)!;
+    assert.equal(collectionConversionSourceUnit(recoveredScope, childId), f.member.unitId);
+  } finally {
+    recoveredDB.close();
+  }
+  await call(f.bridge, 'intake_read', { id: childId, page: 2 });
+  const currentChild = getIntakeRead(f.db, f.root, 'cedar', childId);
+  assert.ok(isIntakeSummary(currentChild));
+  const childScope = nativeAssistantScope(
+    nativeAssistantConversion(f.db, f.root, 'cedar', f.chat.id, currentChild),
+    childPlan.units[0]!.id,
+  )!;
+  const { assertCollectionChildConversionCoverage } =
+    await import('../intake-continuation-collection.ts');
+  await assert.rejects(
+    assertCollectionChildConversionCoverage(unrelatedScope, [childScope], {
+      planId: childPlan.id,
+      coverage: [
+        {
+          unitId: childPlan.units[0]!.id,
+          kind: 'extracted',
+          notes: 'Fictional wrong member ledger',
+        },
+      ],
+    }),
+    /Read does not belong to the retained package occurrence/,
+  );
+  const source = await call<{ revisionId: string }>(f.bridge, 'intake_source_text', {
+    id: childId,
+  });
+  await call(f.bridge, 'intake_batch', {
+    ...childBatch(),
+    sourceTextRevisionId: source.revisionId,
+  });
+  assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 1);
+  assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', childId).units[0]!.status, 'completed');
+  assert.equal(
+    selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units[0]!.status,
+    'pending',
+    'a child receipt does not invent parent member extraction coverage',
+  );
 });
+
+for (const parentNative of [false, true])
+  test(`a ${parentNative ? 'native' : 'legacy'} parent requires complete direct child text evidence for a native child plan`, async (t) => {
+    fictionalModel(t);
+    const f = fixture(t);
+    const literal = 'Fictional child text evidence and its retained tail. '.repeat(120);
+    const item = uploadIntake(f.db, f.root, 'cedar', {
+      filename: 'fictional-text-child.zip',
+      bytes: zipFixture([{ name: 'fictional-child.txt', data: literal }]),
+    });
+    const chat = f.assistant.create('cedar', { title: 'Fictional child text coverage' });
+    linkIntakeConversion(f.db, f.root, 'cedar', item.id, chat.id);
+    f.assistant.send('cedar', chat.id, {
+      message: 'Convert this supplied package',
+      context: { intakeId: item.id },
+    });
+    await tick();
+    const bridge = f.bridges[0];
+    if (parentNative)
+      await call(bridge, 'intake_plan', {
+        id: item.id,
+        action: 'create',
+        version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
+      });
+    const inventory = await call(bridge, 'intake_package', { id: item.id, action: 'inventory' });
+    const member = inventory.members[0];
+    const first = await call<{ sourceFileId: string; original: { nextOffset: number | null } }>(
+      bridge,
+      'intake_package',
+      {
+        id: item.id,
+        action: 'read_member',
+        memberId: member.memberId,
+        limit: 50,
+      },
+    );
+    const childId = first.sourceFileId;
+    assert.ok(first.original.nextOffset);
+    await call(bridge, 'intake_plan', {
+      id: childId,
+      action: 'create',
+      version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
+    });
+    assert.equal(
+      isNativeAssistantCheckpoint(chat.conversionCheckpoint),
+      parentNative,
+      'creating the child plan never fabricates a parent plan or resets its checkpoint',
+    );
+    const plan = selectedFixturePlan(f.db, f.root, 'cedar', childId);
+    assert.equal(plan.units.length, 1);
+    const jsonlText = JSON.stringify({
+      format: 'health-record-v1',
+      id: 'fictional-child-text',
+      kind: 'document',
+      payload: literal,
+      provenance: {
+        capturedVia: 'Fictional ZIP',
+        sourceSystem: null,
+        sourceRecordId: null,
+        evidenceClass: 'transcription',
+        locator: 'fictional-child.txt',
+      },
+      coverage: { status: 'partial', notes: ['Fictional child evidence remains reviewable'] },
+    });
+    const batch = () => ({
+      id: childId,
+      version: getIntakeRead(f.db, f.root, 'cedar', childId).version,
+      planId: plan.id,
+      operationId: 'fictional-child-text-coverage',
+      jsonlText,
+      summary: 'Fictional retained child text',
+      coverage: [
+        { unitId: plan.units[0]!.id, kind: 'extracted', notes: 'All selected text inspected' },
+      ],
+    });
+    await assert.rejects(
+      call(bridge, 'intake_batch', batch()),
+      { code: 'CONVERSION_COVERAGE_PENDING' },
+      'a parent-addressed pending tail and no direct child read cannot prove child completeness',
+    );
+    const read = await call<{ original: { nextOffset: number | null } }>(bridge, 'intake_read', {
+      id: childId,
+      limit: 512,
+    });
+    assert.ok(read.original.nextOffset);
+    await assert.rejects(
+      call(bridge, 'intake_batch', batch()),
+      { code: 'CONVERSION_COVERAGE_PENDING' },
+      'a direct child read must still exhaust its exact text tail',
+    );
+    await call(bridge, 'intake_plan', {
+      id: childId,
+      action: 'read_unit',
+      unitId: plan.units[0]!.id,
+    });
+    await assert.rejects(
+      call(bridge, 'intake_batch', {
+        ...batch(),
+        coverage: [
+          { unitId: 'fictional-foreign-unit', kind: 'extracted', notes: 'Fictional foreign unit' },
+        ],
+      }),
+      { code: 'CONVERSION_COVERAGE_PENDING' },
+    );
+    const source = await call<{ revisionId: string }>(bridge, 'intake_source_text', {
+      id: childId,
+    });
+    await call(bridge, 'intake_batch', { ...batch(), sourceTextRevisionId: source.revisionId });
+    assert.equal(proposalCount(f.db, f.root, 'cedar', childId), 1);
+    assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', childId).units[0]!.status, 'completed');
+    if (parentNative)
+      assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', item.id).units[0]!.status, 'pending');
+    else {
+      assert.ok(
+        chat.conversionCheckpoint && !isNativeAssistantCheckpoint(chat.conversionCheckpoint),
+      );
+      assert.ok(
+        chat.conversionCheckpoint.pending.some(
+          (window) => window.args.id === item.id && window.args.memberId === member.memberId,
+        ),
+      );
+    }
+  });
 
 test('a completely read single-page PDF member can receive reviewed extraction coverage without an unnecessary duplicate child read', async (t) => {
   const f = await linkedPdfPackage(t, ['Fictional complete single page']);
   assert.equal(f.first.metadata.original.page, 1);
   assert.equal(f.first.metadata.original.nextPage, null);
   assert.equal(f.first.metadata.original.nextOffset, null);
-  assert.equal(legacyCheckpoint(f.chat.conversionCheckpoint).pending.length, 0);
+  assert.equal(selectedPending(f, f.item.id, f.chat).length, 0);
   await call(f.bridge, 'intake_batch', {
     id: f.item.id,
-    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
-    planId: f.plan.planId,
+    version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
+    planId: f.planId,
     operationId: 'fictional-single-page-covered',
     jsonlText: f.jsonlText,
     summary: 'Fictional single page read and proposed',
@@ -1503,9 +1824,8 @@ test('a completely read single-page PDF member can receive reviewed extraction c
     ],
   });
   complete(f.bridge);
-  const after = getIntake(f.db, f.root, 'cedar', f.item.id);
-  assert.equal(after.proposals.length, 1);
-  assert.equal(required(required(required(after.workflow).plans[0]).units[0]).status, 'completed');
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);
+  assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units[0]!.status, 'completed');
   assert.equal(required(f.chat.reading).reason, 'reading_exhausted');
   assert.equal(required(f.db.prepare('SELECT count(*) AS n FROM documents').get()).n, 0);
 });
@@ -1926,7 +2246,7 @@ test('cancelled tools cannot act in a later retry or publish an in-flight intake
   });
   assistant.cancel('cedar', chat.id);
   await assert.rejects(pending, /no longer running/);
-  assert.equal(getIntake(db, root, 'cedar', original.id).proposals.length, 0);
+  assert.equal(proposalCount(db, root, 'cedar', original.id), 0);
   assert.equal(chat.operations.length, 0);
   assistant.retry('cedar', chat.id);
   await tick();
@@ -1940,13 +2260,13 @@ test('cancelled tools cannot act in a later retry or publish an in-flight intake
     /no longer running/,
   );
   assert.equal(chat.proposals.length, 0);
-  const converted = await call(bridges[1], 'intake_propose', {
+  const converted = await call<IntakeSummaryV2>(bridges[1], 'intake_propose', {
     id: original.id,
     version: original.version,
     jsonlText,
     summary: 'Letter conversion',
   });
-  assert.equal((converted.proposals as unknown as { count: number }).count, 1);
+  assert.equal(converted.collections.proposals.total, 1);
   assert.equal(chat.operations.length, 1);
   complete(bridges[1]);
 });
@@ -2121,7 +2441,7 @@ test('assistant PDF intake preserves visual pages, text offsets, and explicit im
   assert.equal('workflow' in read.metadata.intake, false);
   assert.equal('intake' in read.metadata.original, false);
   assert.match(read.metadata.caution, /visual derivative/);
-  assert.equal(getIntake(db, root, 'cedar', image.id).proposals.length, 0);
+  assert.equal(proposalCount(db, root, 'cedar', image.id), 0);
   complete(bridges[0]);
 });
 
@@ -2141,13 +2461,22 @@ test('default PDF units require every listed page and leave later targets resuma
   });
   await tick();
   const bridge = required(f.bridges[0]);
+  await bridge.callbacks.onEvent('model/requestStarted', { turnId: 'fictional-before-first-plan' });
+  await call(bridge, 'intake_read', { id: original.id, page: 1 });
+  const prior = structuredClone(legacyCheckpoint(chat.conversionCheckpoint));
+  assert.ok(prior.seen.length > 0);
   await call(bridge, 'intake_plan', {
     id: original.id,
     action: 'create',
-    version: original.version,
+    version: getIntakeRead(f.db, f.root, 'cedar', original.id).version,
   });
-  let item = getIntake(f.db, f.root, 'cedar', original.id);
-  const plan = required(item.workflow).plans[0]!;
+  assert.ok(isNativeAssistantCheckpoint(chat.conversionCheckpoint));
+  assert.equal(chat.conversionCheckpoint.turns, prior.turns);
+  assert.equal(chat.conversionCheckpoint.modelRequests, prior.modelRequests);
+  assert.equal(chat.reading?.readWindows, prior.seen.length);
+  assert.equal(selectedPending(f, original.id, chat)[0]?.args.page, 2);
+  let item = getIntakeRead(f.db, f.root, 'cedar', original.id);
+  const plan = selectedFixturePlan(f.db, f.root, 'cedar', item.id);
   assert.deepEqual(
     plan.units.map((unit) => unit.pages),
     [[1, 2], [3]],
@@ -2186,7 +2515,7 @@ test('default PDF units require every listed page and leave later targets resuma
   const batch = (unitIndex: number, operationId: string) => ({
     sourceTextRevisionId,
     id: item.id,
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
     planId: plan.id,
     operationId,
     summary: 'Exact fictional target pages retained without acceptance.',
@@ -2207,10 +2536,15 @@ test('default PDF units require every listed page and leave later targets resuma
   sourceTextRevisionId = (
     await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
   ).revisionId;
-  const firstSaved = await call(bridge, 'intake_batch', batch(0, 'fictional-target-one'));
-  assert.equal(firstSaved.pendingWorkCount, 1);
-  item = getIntake(f.db, f.root, 'cedar', item.id);
-  assert.equal(item.workflow!.plans[0]!.units[1]!.status, 'pending');
+  const firstSaved = await call<IntakeRead>(
+    bridge,
+    'intake_batch',
+    batch(0, 'fictional-target-one'),
+  );
+  assert.ok(isIntakeSummary(firstSaved));
+  assert.equal(chat.reading?.remainingUnits, 1);
+  item = getIntakeRead(f.db, f.root, 'cedar', item.id);
+  assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', item.id).units[1]!.status, 'pending');
 
   await call(bridge, 'intake_plan', {
     id: item.id,
@@ -2224,10 +2558,15 @@ test('default PDF units require every listed page and leave later targets resuma
   sourceTextRevisionId = (
     await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: item.id })
   ).revisionId;
-  const secondSaved = await call(bridge, 'intake_batch', batch(1, 'fictional-target-two'));
-  assert.equal(secondSaved.pendingWorkCount, 0);
-  item = getIntake(f.db, f.root, 'cedar', item.id);
-  assert.equal(item.workflow!.plans[0]!.units[1]!.status, 'completed');
+  const secondSaved = await call<IntakeRead>(
+    bridge,
+    'intake_batch',
+    batch(1, 'fictional-target-two'),
+  );
+  assert.ok(isIntakeSummary(secondSaved));
+  assert.equal(chat.reading?.remainingUnits, 0);
+  item = getIntakeRead(f.db, f.root, 'cedar', item.id);
+  assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', item.id).units[1]!.status, 'completed');
   complete(bridge);
 });
 
@@ -2300,7 +2639,7 @@ test('assistant accounts for one exact image only after a visual read and durabl
   request.sourceTextRevisionId = (
     await call<{ revisionId: string }>(bridge, 'intake_source_text', { id: image.id })
   ).revisionId;
-  request.version = getIntake(db, root, 'cedar', image.id).version;
+  request.version = getIntakeRead(db, root, 'cedar', image.id).version;
   const saved = await call(bridge, 'intake_batch', request);
   assert.equal(saved.pendingWorkCount, 0);
   let accounting = listIntakeReportQueue(db, root, 'cedar').activity.readingAccounting!;
@@ -2580,7 +2919,7 @@ test('automatic source capture shares publication while retaining each reader ca
     },
   });
   assert.equal(transitions.length, 1, 'completed capture leaves no repeated publication');
-  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).version, current.version);
+  assert.equal(getIntakeRead(f.db, f.root, 'cedar', item.id).version, current.version);
 
   const retry = uploadIntake(f.db, f.root, 'cedar', {
     filename: 'fictional-cancelled-capture.txt',
@@ -2597,7 +2936,7 @@ test('automatic source capture shares publication while retaining each reader ca
   retryCancelled = true;
   await assert.rejects(abandoned, /all readers cancelled/);
   await captureIntakeSourceTextForRead({ ...context, id: retry.id });
-  assert.ok(getIntake(f.db, f.root, 'cedar', retry.id).version > retry.version);
+  assert.ok(getIntakeRead(f.db, f.root, 'cedar', retry.id).version > retry.version);
 });
 
 test('retained image bootstrap requires the exact host create-plan receipt fingerprint', async (t) => {
@@ -2638,7 +2977,7 @@ test('fresh image bootstrap rejects stale versions and profile cancellation befo
   const concurrent = linkedFreshImage(t, fictionalPixel(), (reason, state) => {
     if (reason !== 'conversion-image-plan-prepared' || changedDuringPreparation) return;
     changedDuringPreparation = true;
-    const version = getIntake(state.db, state.root, 'cedar', state.item.id).version;
+    const version = getIntakeRead(state.db, state.root, 'cedar', state.item.id).version;
     updateIntakeMetadata(state.db, state.root, 'cedar', state.item.id, {
       version,
       operationId: 'fictional-change-during-visual-preparation',
@@ -2693,7 +3032,7 @@ test('fresh image bootstrap rejects stale versions and profile cancellation befo
 test('image bootstrap never replaces plan history or creates a plan for a child image', async (t) => {
   const active = linkedFreshImage(t);
   const created = await createIntakePlan(active.db, active.root, 'cedar', active.item.id, {
-    version: getIntake(active.db, active.root, 'cedar', active.item.id).version,
+    version: getIntakeRead(active.db, active.root, 'cedar', active.item.id).version,
   });
   await tick();
   const activeRead = await call(active.bridges[0], 'intake_read', { id: active.item.id });
@@ -2710,7 +3049,7 @@ test('image bootstrap never replaces plan history or creates a plan for a child 
 
   const superseded = linkedFreshImage(t);
   await createIntakePlan(superseded.db, superseded.root, 'cedar', superseded.item.id, {
-    version: getIntake(superseded.db, superseded.root, 'cedar', superseded.item.id).version,
+    version: getIntakeRead(superseded.db, superseded.root, 'cedar', superseded.item.id).version,
   });
   const details = JSON.parse(readIntakeEnvelopeText(superseded.db, { id: superseded.item.id })!);
   details.intake.workflow.plans[0].status = 'superseded';
@@ -3772,7 +4111,7 @@ test('fresh plan context starts at one captured current pin pair and stale conti
   const created = await call(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
   });
   const beforeRead = structuredClone(getIntake(f.db, f.root, 'cedar', f.item.id));
   const first = await call(f.bridge, 'intake_plan', {
@@ -3959,7 +4298,7 @@ test('fresh plan context malformed repair and repeated reads remain finitely bou
     await call(f.bridge, 'intake_plan', {
       id: f.item.id,
       action: 'create',
-      version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+      version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
     });
     const before = structuredClone(getIntake(f.db, f.root, 'cedar', f.item.id));
     const args = {
@@ -3993,7 +4332,7 @@ test('fresh plan context malformed repair and repeated reads remain finitely bou
     await call(f.bridge, 'intake_plan', {
       id: f.item.id,
       action: 'create',
-      version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+      version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
     });
     const args = {
       id: f.item.id,
@@ -4111,7 +4450,7 @@ test('plan create advertises and recovers its conditional current-version requir
   assert.equal(f.chat.status, 'running');
   assert.equal(f.bridge.closed, false);
   assert.equal(required(getIntake(f.db, f.root, 'cedar', f.item.id).workflow).plans.length, 0);
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).version, before.version);
+  assert.equal(getIntakeRead(f.db, f.root, 'cedar', f.item.id).version, before.version);
 
   await call(f.bridge, 'intake_plan', {
     id: f.item.id,
@@ -4137,7 +4476,7 @@ test('fresh conversion turns retain the mapping pin and reject it after mappings
   await call(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
   });
   const planned = getIntake(f.db, f.root, 'cedar', f.item.id);
   const plan = required(required(planned.workflow).plans.find((item) => item.status === 'active'));
@@ -4202,7 +4541,7 @@ test('three malformed plan-create versions exhaust only the finite validation bu
     );
     assert.equal(f.chat.status, index < 2 ? 'running' : 'idle');
     assert.equal(required(getIntake(f.db, f.root, 'cedar', f.item.id).workflow).plans.length, 0);
-    assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).version, before.version);
+    assert.equal(getIntakeRead(f.db, f.root, 'cedar', f.item.id).version, before.version);
   }
   assert.equal(f.bridge.closed, true);
   assert.equal(required(f.chat.reading).reason, 'tool_error');
@@ -4210,7 +4549,7 @@ test('three malformed plan-create versions exhaust only the finite validation bu
 
 test('a supplied stale numeric plan-create version remains terminal', async (t) => {
   const f = await linkedFictionalPlanVersionConversion(t);
-  const initialVersion = getIntake(f.db, f.root, 'cedar', f.item.id).version;
+  const initialVersion = getIntakeRead(f.db, f.root, 'cedar', f.item.id).version;
   await call(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'create',
@@ -4570,14 +4909,14 @@ test('explicit context and unreadable dispositions advance bounded accounting wi
   await call(f.bridges[0], 'intake_plan', {
     id: item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
   });
   const plan = required(required(getIntake(f.db, f.root, 'cedar', item.id).workflow).plans[0]);
   assert.equal(plan.units.length, 2);
   for (const [index, kind] of ['context', 'unreadable'].entries()) {
     await call(f.bridges[index], 'intake_batch', {
       id: item.id,
-      version: getIntake(f.db, f.root, 'cedar', item.id).version,
+      version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
       planId: plan.id,
       operationId: 'fictional-account-' + index,
       summary: 'Fictional scope disposition, not extraction verification',
@@ -4702,7 +5041,7 @@ async function linkedFictionalBatchConversion(
   await call(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
   });
   const planned = getIntake(f.db, f.root, 'cedar', item.id);
   const plan = required(
@@ -4717,7 +5056,7 @@ async function linkedFictionalBatchConversion(
   const batch = {
     id: item.id,
     ...(sourceTextRevisionId ? { sourceTextRevisionId } : {}),
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
     planId: plan.id,
     operationId: 'fictional-review-race-batch',
     jsonlText: JSON.stringify({
@@ -4853,13 +5192,13 @@ test('host source capture does not substitute for reading the new durable passag
     call(f.bridge, 'intake_propose', {
       id: f.item.id,
       sourceTextRevisionId: next.id,
-      version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+      version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
       summary: 'Fictional current proposal',
       jsonlText: f.batch.jsonlText,
     }),
     (error: unknown) => hasCode(error, 'SOURCE_TEXT_CHANGED'),
   );
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
 });
 
 for (const extension of ['txt', 'json'])
@@ -4986,7 +5325,7 @@ test('replaying a batch submission with the same operationId does not double cou
   const f = await linkedFictionalBatchConversion(t);
   await call(f.bridge, 'intake_batch', f.batch);
   assert.equal(required(f.chat.reading).proposalsProduced, 1);
-  const versionAfterFirstSubmit = getIntake(f.db, f.root, 'cedar', f.item.id).version;
+  const versionAfterFirstSubmit = getIntakeRead(f.db, f.root, 'cedar', f.item.id).version;
 
   // Same operationId, same fingerprint (the batch's own fields are unchanged) —
   // submitIntakeBatch short-circuits to the existing intake without creating a
@@ -5000,7 +5339,7 @@ test('replaying a batch submission with the same operationId does not double cou
     'a replayed batch operation must not be counted as a second proposal',
   );
   assert.equal(
-    getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
     versionAfterFirstSubmit,
     'the replay made no new change to the intake',
   );
@@ -5104,7 +5443,7 @@ async function eligibleCountedAcceptanceRace(
   beforeBasis?.(f);
   if (beforeBasis) review = reviewIntake(f.db, f.root, 'cedar', f.item.id, proposal.id);
   f.bridge.callbacks.onEvent('model/requestStarted', { turnId: 'fictional-delayed-batch' });
-  const preparedVersion = getIntake(f.db, f.root, 'cedar', f.item.id).version;
+  const preparedVersion = getIntakeRead(f.db, f.root, 'cedar', f.item.id).version;
   const secondBatch = {
     id: f.item.id,
     ...(f.batch.sourceTextRevisionId ? { sourceTextRevisionId: f.batch.sourceTextRevisionId } : {}),
@@ -5193,7 +5532,7 @@ test('a user review during model work requires a fresh plan before the same batc
   });
   assert.equal(f.chat.status, 'running');
   assert.equal(f.bridge.closed, false);
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
   assert.ok(
     workflowOperationIds(getIntake(f.db, f.root, 'cedar', f.item.id)).includes(
       'fictional-user-review-answer',
@@ -5214,7 +5553,7 @@ test('a user review during model work requires a fresh plan before the same batc
     offset: 0,
   });
   assert.equal(refreshed.contextStart?.kind, 'fresh_section_v1');
-  assert.equal(refreshed.version, getIntake(f.db, f.root, 'cedar', f.item.id).version);
+  assert.equal(refreshed.version, getIntakeRead(f.db, f.root, 'cedar', f.item.id).version);
   await call(f.bridge, 'intake_batch', { ...f.batch, version: refreshed.version });
 
   const retained = getIntake(f.db, f.root, 'cedar', f.item.id);
@@ -5339,7 +5678,7 @@ test('one host request retains an exact later-unit batch across disjoint counted
   );
   const modelRequestsBefore = required(required(f.chat.reading).modelRequests);
   f.bridge.callbacks.onEvent('model/requestStarted', { turnId: 'fictional-delayed-batch' });
-  const preparedVersion = getIntake(f.db, f.root, 'cedar', f.item.id).version;
+  const preparedVersion = getIntakeRead(f.db, f.root, 'cedar', f.item.id).version;
   const secondBatch = {
     id: f.item.id,
     ...(f.batch.sourceTextRevisionId ? { sourceTextRevisionId: f.batch.sourceTextRevisionId } : {}),
@@ -5451,7 +5790,7 @@ test('one host request retains an exact later-unit batch across disjoint counted
     assert.equal(hasCode(error, 'VERSION_CONFLICT'), true);
     return true;
   });
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);
   assert.ok(
     !workflowOperationIds(getIntake(f.db, f.root, 'cedar', f.item.id)).includes(
       overlappingBatch.operationId,
@@ -5621,7 +5960,7 @@ test('counted-acceptance revalidation fails closed across final host races', asy
           assert.throws(
             () =>
               askIntakeQuestion(db, race.root, 'cedar', race.item.id, {
-                version: getIntake(db, race.root, 'cedar', race.item.id).version,
+                version: getIntakeRead(db, race.root, 'cedar', race.item.id).version,
                 operationId: 'fictional-lost-ack-question',
                 key: 'fictional-lost-ack-question',
                 prompt: 'Fictional accepted question with missing acknowledgement',
@@ -5674,7 +6013,7 @@ test('counted-acceptance revalidation fails closed across final host races', asy
       assert.equal(hasCode(error, 'VERSION_CONFLICT'), true);
       return true;
     });
-    assert.equal(getIntake(race.db, race.root, 'cedar', race.item.id).proposals.length, 1);
+    assert.equal(proposalCount(race.db, race.root, 'cedar', race.item.id), 1);
   });
 
   await t.test('a newly occupied operation ID prevents the eligible retry', async (t) => {
@@ -5830,7 +6169,7 @@ test('four distinct durable batch cycles replenish only the local consecutive-st
     const refreshed = await call(f.bridge, 'intake_plan', {
       id: f.item.id,
       action: 'read',
-      version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+      version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
       mappingVersion: f.plan.pins.mappingVersion,
     });
     await call(f.bridge, 'intake_batch', { ...batch, version: refreshed.version });
@@ -5869,10 +6208,7 @@ test('configuration change and uncertain batch publication remain terminal witho
   });
   assert.equal(configured.chat.status, 'idle');
   assert.equal(required(configured.chat.reading).reason, 'tool_error');
-  assert.equal(
-    getIntake(configured.db, configured.root, 'cedar', configured.item.id).proposals.length,
-    0,
-  );
+  assert.equal(proposalCount(configured.db, configured.root, 'cedar', configured.item.id), 0);
 
   const storage = encryptedRecordStorage(t);
   const uncertain = await linkedFictionalBatchConversion(t, {}, undefined, storage);
@@ -5965,7 +6301,7 @@ test('stale batch repair is finite across successful reads and operation conflic
       const refreshed = await call(f.bridge, 'intake_plan', {
         id: f.item.id,
         action: 'read',
-        version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+        version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
         mappingVersion: f.plan.pins.mappingVersion,
       });
       await call(f.bridge, 'intake_batch', {
@@ -6112,7 +6448,7 @@ test('a malformed optical People envelope returns validation for repair without 
   const proposal = {
     id: f.item.id,
     sourceTextRevisionId: f.sourceTextRevisionId,
-    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
     jsonlText: JSON.stringify(fictionalOpticalPeopleEnvelope()),
     summary: 'Fictional optical mapping and clinician',
   };
@@ -6124,8 +6460,8 @@ test('a malformed optical People envelope returns validation for repair without 
   assert.equal(f.chat.status, 'running');
   assert.equal(f.bridge.closed, false);
   assert.equal(f.chat.error, null);
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).version, proposal.version);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
+  assert.equal(getIntakeRead(f.db, f.root, 'cedar', f.item.id).version, proposal.version);
   const repaired = { ...fictionalOpticalPeopleEnvelope(), kind: 'record' };
   await call(f.bridge, 'intake_propose', { ...proposal, jsonlText: JSON.stringify(repaired) });
   assert.equal(f.chat.status, 'running');
@@ -6150,7 +6486,7 @@ test('a malformed optical People envelope returns validation for repair without 
   assert.equal(f.chat.status, 'idle');
   assert.equal(required(f.chat.reading).reason, 'tool_error');
   assert.ok(f.chat.error);
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);
 });
 
 test('three invalid conversion proposals pause with a durable actionable error even with intervening reads', async (t) => {
@@ -6160,7 +6496,7 @@ test('three invalid conversion proposals pause with a durable actionable error e
       call(f.bridge, 'intake_propose', {
         id: f.item.id,
         sourceTextRevisionId: f.sourceTextRevisionId,
-        version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+        version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
         jsonlText: JSON.stringify(fictionalOpticalPeopleEnvelope()),
         summary: 'Fictional invalid structure',
       }),
@@ -6176,7 +6512,7 @@ test('three invalid conversion proposals pause with a durable actionable error e
     /Named People proposals require a report-scoped record envelope/,
   );
   assert.equal(readTestChat(f.root, 'cedar', f.chat.id).error, f.chat.error);
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
   assert.equal(required(f.db.prepare('SELECT count(*) n FROM source_records').get()).n, 0);
 });
 
@@ -6185,7 +6521,7 @@ test('successful pinned plan reads reset only the finite model-context refresh b
   const created = (await call(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
   })) as unknown as { version: number; mappingRules: { version: string } };
   const staleRead = () =>
     call(f.bridge, 'intake_plan', {
@@ -6238,7 +6574,7 @@ test('new retained candidates continue a partially read window but exact proposa
     return call(bridge, 'intake_propose', {
       sourceTextRevisionId,
       id: item.id,
-      version: getIntake(f.db, f.root, 'cedar', item.id).version,
+      version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
       summary: 'Fictional single result; more findings remain in this window',
       jsonlText: JSON.stringify({
         format: 'health-record-v1',
@@ -6314,7 +6650,7 @@ async function linkedJSONPointerFixture(t: TestContext) {
   await call(bridge, 'intake_plan', {
     id: item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
   });
   const inventory = await call(bridge, 'intake_package', { id: item.id, action: 'inventory' });
   const args = { id: item.id, action: 'read_member', memberId: inventory.members[0].memberId };
@@ -6331,7 +6667,7 @@ test('a missing JSON pointer can be corrected without ending conversion or weake
   assert.equal(f.chat.status, 'running');
   const corrected = await call(f.bridge, 'intake_package', { ...f.args, jsonPointer: '/items/0' });
   assert.match(corrected.structure.literal, /\+01\.20/);
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
   await assert.rejects(
     call(f.bridge, 'intake_package', {
       ...f.args,
@@ -6363,7 +6699,7 @@ test('plan creation exposes host indexing while the tool is pending, then restor
   const pending = call(f.bridge, 'intake_plan', {
     id: f.item.id,
     action: 'create',
-    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
   });
   assert.equal(required(f.chat.reading).phase, 'indexing_source');
   assert.equal(readTestChat(f.root, 'cedar', f.chat.id).reading?.phase, 'indexing_source');
@@ -6475,7 +6811,7 @@ test('throwing optional recovery diagnostics cannot fail a retained batch or byp
   };
   const f = await linkedFictionalBatchConversion(t, { diagnostics });
   await call(f.bridge, 'intake_batch', f.batch);
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);
   let stopped = false;
   for (let count = 0; count < 6; count++) {
     try {
@@ -6503,7 +6839,7 @@ test('missing source revision pin is repairable before publication and reading c
     return error instanceof ModelToolValidationError && error.code === 'SOURCE_TEXT_REQUIRED';
   });
   assert.equal(f.chat.status, 'running');
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
   const passage = await call<{ revisionId: string }>(f.bridge, 'intake_source_text', {
     id: f.item.id,
   });
@@ -6512,14 +6848,14 @@ test('missing source revision pin is repairable before publication and reading c
     proposalSourceText: ProposalSourceTextHandoff;
   }>(f.bridge, 'intake_batch', {
     ...f.batch,
-    version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+    version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
     sourceTextRevisionId: passage.revisionId,
   });
   assert.equal(retained.proposalSourceText.currentRevisionId, passage.revisionId);
   assert.equal(retained.proposalSourceText.sourceTextRevisionId, passage.revisionId);
   assert.equal(retained.proposalSourceText.readRequired, false);
   assert.equal(f.chat.status, 'running');
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);
   await call(f.bridge, 'intake_batch', {
     ...f.batch,
     operationId: 'cookie-second-batch',
@@ -6528,7 +6864,7 @@ test('missing source revision pin is repairable before publication and reading c
     jsonlText: JSON.stringify({ ...JSON.parse(f.batch.jsonlText), id: 'cookie-second-record' }),
   });
   assert.equal(f.chat.status, 'running');
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 2);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 2);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
 });
 
@@ -6544,7 +6880,7 @@ test('source revision preflight repair has a finite budget even with successful 
     );
     assert.equal(f.chat.status, attempt < 2 ? 'running' : 'idle');
   }
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
 });
 
 test('external text correction remains terminal even if the model supplies its new pin', async (t) => {
@@ -6576,14 +6912,14 @@ test('external text correction remains terminal even if the model supplies its n
   await assert.rejects(
     call(f.bridge, 'intake_batch', {
       ...f.batch,
-      version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+      version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
       sourceTextRevisionId: updated.revision!.id,
     }),
     (error: unknown) =>
       hasCode(error, 'SOURCE_TEXT_CHANGED') && !(error instanceof ModelToolValidationError),
   );
   assert.equal(f.chat.status, 'idle');
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
 });
 
 for (const exposure of ['create', 'read', 'question'] as const)
@@ -6608,7 +6944,7 @@ for (const exposure of ['create', 'read', 'question'] as const)
     // proves broad fallback without also exposing a create response to the model.
     if (exposure === 'read')
       await createIntakePlan(f.db, f.root, 'cedar', item.id, {
-        version: getIntake(f.db, f.root, 'cedar', item.id).version,
+        version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
       });
     f.assistant.create('cedar', { message: 'Review fictional bounded source evidence' });
     await tick();
@@ -6617,7 +6953,7 @@ for (const exposure of ['create', 'read', 'question'] as const)
       id: item.id,
       page: 1,
     });
-    const version = getIntake(f.db, f.root, 'cedar', item.id).version;
+    const version = getIntakeRead(f.db, f.root, 'cedar', item.id).version;
     if (exposure === 'question')
       await call(bridge, 'intake_question', {
         id: item.id,
@@ -6636,7 +6972,7 @@ for (const exposure of ['create', 'read', 'question'] as const)
       });
     await call(bridge, 'intake_propose', {
       id: item.id,
-      version: getIntake(f.db, f.root, 'cedar', item.id).version,
+      version: getIntakeRead(f.db, f.root, 'cedar', item.id).version,
       summary: 'Fictional context after an unmeasured response',
       sourceTextRevisionId: passage.revisionId,
       jsonlText: JSON.stringify({
@@ -6709,7 +7045,7 @@ test('a deferred model proposal survives an unrelated append but rejects a later
             arguments: { id: sourceId, page: 1 },
             callId: `fictional-deferred-read-${currentTurn}`,
           })) as { revisionId: string };
-          const version = getIntake(f.db, f.root, 'cedar', sourceId).version;
+          const version = getIntakeRead(f.db, f.root, 'cedar', sourceId).version;
           gates[currentTurn]!.signalObserved();
           await gates[currentTurn]!.released;
           try {
@@ -6781,7 +7117,7 @@ test('a deferred model proposal survives an unrelated append but rejects a later
   await gates[0]!.settled;
   const result = outcomes[0]!.result!;
   assert.equal(outcomes[0]!.error, undefined);
-  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', item.id), 1);
   assert.notEqual(result.proposalSourceText.currentRevisionId, beforeRevision);
   const proposal = getIntake(f.db, f.root, 'cedar', item.id).proposals[0]!;
   const dependency = JSON.parse(
@@ -6838,7 +7174,7 @@ test('a deferred model proposal survives an unrelated append but rejects a later
   gates[1]!.release();
   await gates[1]!.settled;
   assert.ok(hasCode(outcomes[1]!.error, 'SOURCE_TEXT_CHANGED'));
-  assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', item.id), 1);
 });
 
 test('a passage read cannot erase a human correction that arrived during a provider response', async (t) => {
@@ -6877,7 +7213,7 @@ test('a passage read cannot erase a human correction that arrived during a provi
     },
   );
   assert.equal(f.chat.status, 'idle');
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 0);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 0);
 });
 
 for (const resolvesCoverage of [false, true])
@@ -6907,7 +7243,7 @@ for (const resolvesCoverage of [false, true])
     if (resolvesCoverage) {
       await call(f.bridges[2]!, 'intake_batch', {
         ...f.batch,
-        version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
+        version: getIntakeRead(f.db, f.root, 'cedar', f.item.id).version,
         operationId: 'fictional-complete-coverage',
         coverage: [
           {
@@ -6987,7 +7323,7 @@ test('approving unchanged source text during conversion neither restarts reading
   assert.doesNotThrow(() => f.bridge.callbacks.beforeRequest?.());
   await call(f.bridge, 'intake_batch', f.batch);
   assert.equal(f.chat.status, 'running');
-  assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
+  assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);
 });
 
 test('native assistant package navigation uses explicit inventory-only evidence without workflow hydration', async (t) => {

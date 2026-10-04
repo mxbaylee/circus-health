@@ -33,7 +33,11 @@ import { canonicalLiteral } from '../intake-format.ts';
 import { workflowHash } from '../intake-workflow.ts';
 import type { IntakeWorkflow, IntakeReportSourceConfirmation } from '../../shared/intake.ts';
 
-async function fixture(t: { after(fn: () => void): void }, occurrenceCount = 2) {
+async function fixture(
+  t: { after(fn: () => void): void },
+  occurrenceCount = 2,
+  configure?: (workflow: IntakeWorkflow) => void,
+) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-source-command-')),
     db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
   memoryRecordAuthority(db);
@@ -120,6 +124,7 @@ async function fixture(t: { after(fn: () => void): void }, occurrenceCount = 2) 
       },
     ],
   } as unknown as IntakeWorkflow;
+  configure?.(workflow);
   const initial = prepareInitialIntakeEnvelope({ intake: { version: 1, workflow } });
   transaction(db, () => {
     db.prepare(
@@ -475,5 +480,167 @@ test(
     } finally {
       actual.close();
     }
+  },
+);
+
+test(
+  'source routing scans complete history once for all selected-root report scopes',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await fixture(t, 3, (workflow) => {
+      const first = workflow.reportGroups![0]!;
+      for (let index = 1; index <= 2; index++)
+        workflow.reportGroups!.push({ ...first, id: 'anchored-' + index });
+      // Later fallback must not steal an anchored member, including on a warm lookup.
+      workflow.reportGroups!.push({ ...first, id: 'last-fallback', basis: 'candidate_fallback' });
+      workflow.reviewDrafts!.push({
+        ...workflow.reviewDrafts![0]!,
+        id: 'latest-draft',
+        recordId: 'fictional-2',
+        disposition: 'review_later',
+      });
+    });
+    for (const group of f.workflow.reportGroups!.filter(
+      (group) => group.basis === 'report_anchor',
+    )) {
+      for (const view of ['active', 'deferred', 'all'] as const) {
+        const expected = intakeReportSourceReviewScope(
+          f.workflow,
+          f.identity.profileId,
+          f.source.id,
+          group.id,
+          view,
+        )!;
+        const actual = await prepareNativeReportSourceReviewScope(f.db, f.source, {
+          profileId: f.identity.profileId,
+          groupId: group.id,
+          view,
+        });
+        try {
+          assert.equal(actual.scopeToken, expected.scopeToken);
+          assert.equal(actual.entryCount, expected.entries.length);
+          assert.deepEqual(
+            [...actual.entries()].map((entry) =>
+              JSON.parse([...actual.entryPieces(entry)].join('')),
+            ),
+            expected.entries,
+          );
+        } finally {
+          actual.close();
+        }
+      }
+    }
+    const work = intakeWorkCounters(f.db).warm;
+    assert.equal(work.reportSourceScopeRoutingBuilds, 1);
+    assert.equal(work.reportSourceScopeRoutingReuses, 8);
+    assert.equal(
+      work.reportSourceScopeRoutingRows,
+      14,
+      'all 12 historical owner members and both drafts were read exactly once',
+    );
+    await assert.rejects(
+      () =>
+        prepareNativeReportSourceReviewScope(f.db, f.source, {
+          profileId: 'another-profile',
+          groupId: 'anchored-2',
+          view: 'all',
+        }),
+      /owning profile/,
+    );
+    // Damaged derived rows are never trusted as authoritative absence.
+    f.db.prepare('DELETE FROM __report_source_routing_owners WHERE source=?').run(f.source.id);
+    const rebuilt = await prepareNativeReportSourceReviewScope(f.db, f.source, {
+      profileId: f.identity.profileId,
+      groupId: 'anchored-2',
+      view: 'all',
+    });
+    try {
+      assert.equal(rebuilt.entryCount, 3);
+    } finally {
+      rebuilt.close();
+    }
+    assert.equal(intakeWorkCounters(f.db).warm.reportSourceScopeRoutingBuilds, 2);
+    f.db.exec('DROP TABLE __report_source_routing_owners');
+    const recovered = await prepareNativeReportSourceReviewScope(f.db, f.source, {
+      profileId: f.identity.profileId,
+      groupId: 'anchored-2',
+      view: 'all',
+    });
+    try {
+      assert.equal(recovered.entryCount, 3);
+    } finally {
+      recovered.close();
+    }
+    assert.equal(intakeWorkCounters(f.db).warm.reportSourceScopeRoutingBuilds, 3);
+  },
+);
+
+test(
+  'cancelled source routing cannot certify a partial owner index and selected-root changes rebuild',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await fixture(t, 3);
+    const input = { profileId: f.identity.profileId, groupId: f.group.id, view: 'all' as const };
+    await assert.rejects(
+      () =>
+        prepareNativeReportSourceReviewScope(f.db, f.source, input, {
+          assertRunning() {
+            if (intakeWorkCounters(f.db).warm.reportSourceScopeRoutingRows > 0)
+              throw Error('fictional cancellation');
+          },
+        }),
+      /fictional cancellation/,
+    );
+    assert.equal(intakeWorkCounters(f.db).warm.reportSourceScopeRoutingBuilds, 0);
+    const first = await prepareNativeReportSourceReviewScope(f.db, f.source, input);
+    const before = first.scopeToken;
+    const reader = openIntakeCollectionEnvelope(f.db, f.source),
+      workflow = reader.child(reader.child(reader.root(), 'intake')!, 'workflow')!;
+    const draft = {
+      ...f.workflow.reviewDrafts![0]!,
+      id: 'later',
+      recordId: 'fictional-0',
+      disposition: 'review_later' as const,
+    };
+    const mutation = await prepareIntakeEnvelopeMutation(f.db, f.source, {
+      reader,
+      operationId: randomUUID(),
+      requestDigest: 'e'.repeat(64),
+      domainVersion: 2,
+      changes: [
+        { op: 'append', record: workflow, field: 'reviewDrafts', jsonText: JSON.stringify(draft) },
+      ],
+    });
+    transaction(f.db, () =>
+      createIntakeStateStorage(f.db, f.identity).collections.stage(mutation.prepared!),
+    );
+    assert.throws(() => first.assertCurrent());
+    first.close();
+    f.workflow.reviewDrafts!.push(draft);
+    await buildVerifiedWorkflowSummary(f.db, f.source, {
+      mappingVersion: 'fictional',
+      isSourceContextVersion: () => false,
+    });
+    const refreshed = await prepareNativeReportSourceReviewScope(f.db, f.source, {
+      ...input,
+      view: 'deferred',
+    });
+    try {
+      assert.equal(refreshed.entryCount, 1);
+      assert.notEqual(refreshed.scopeToken, before);
+      assert.equal(
+        refreshed.scopeToken,
+        intakeReportSourceReviewScope(
+          f.workflow,
+          input.profileId,
+          f.source.id,
+          input.groupId,
+          'deferred',
+        )!.scopeToken,
+      );
+    } finally {
+      refreshed.close();
+    }
+    assert.equal(intakeWorkCounters(f.db).warm.reportSourceScopeRoutingBuilds, 2);
   },
 );

@@ -1,3 +1,4 @@
+import type { NativeAssistantSourceHeader } from './assistant-intake-header.ts';
 import { openIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Native assistant conversion state contains selected scopes and scalar ledger
  * references. It never represents unloaded workflow arrays as empty. */
@@ -42,11 +43,12 @@ export interface NativeAssistantConversion {
   root: string;
   profileId: string;
   sessionId: string;
-  header: IntakeSummaryV2;
+  header: IntakeSummaryV2 | NativeAssistantSourceHeader;
   id: string;
   sha256: string;
   version: number;
   providerId: string;
+  candidateCount: number;
   durability: IntakeSummaryV2['durability'];
 }
 export function isNativeAssistantCheckpoint(value: unknown): value is NativeAssistantCheckpoint {
@@ -70,8 +72,17 @@ export function nativeAssistantConversion(
   root: string,
   profileId: string,
   sessionId: string,
-  header: IntakeSummaryV2,
+  header: IntakeSummaryV2 | NativeAssistantSourceHeader,
 ): NativeAssistantConversion {
+  if (
+    header.format !== 'health-intake-summary-v2' &&
+    header.format !== 'health-intake-assistant-source-v1'
+  )
+    throw new HttpError(
+      409,
+      'CONVERSION_SOURCE_UNAVAILABLE',
+      'The conversion source is unavailable',
+    );
   return {
     format: 'health-intake-assistant-conversion-v2',
     db,
@@ -83,6 +94,10 @@ export function nativeAssistantConversion(
     sha256: header.sha256,
     version: header.version,
     providerId: header.providerId,
+    candidateCount:
+      header.format === 'health-intake-summary-v2'
+        ? header.collections.candidates.total
+        : header.candidateCount,
     durability: header.durability,
   };
 }
@@ -256,12 +271,22 @@ export function nativeAssistantReadingState(
   mappingVersion: string,
   reason: string | null = null,
 ): IntakeBatchReadingState {
+  return nativeAssistantReadingProgress(host, checkpoint, mappingVersion, reason).reading;
+}
+/** One synchronous projection supplies the continuation and progress counters.
+ * Callers must rebuild it after a write or an asynchronous boundary. */
+export function nativeAssistantReadingProgress(
+  host: NativeAssistantConversion,
+  checkpoint: NativeAssistantCheckpoint,
+  mappingVersion: string,
+  reason: string | null = null,
+) {
   const resume = nativeAssistantResume(host, checkpoint, mappingVersion),
     unit = nativeAssistantUnit(host),
     ready = resume.workflow.state === 'exact' && resume.readingFacts.state === 'exact',
     selectedReason = reason || (ready ? null : 'workflow_preparation_required'),
     timing = checkpoint.pageTiming?.turn === checkpoint.turns ? checkpoint.pageTiming : undefined;
-  return {
+  const reading: IntakeBatchReadingState = {
     workUnit: unit ? { id: unit.id, locator: unit.locator?.slice(0, 2000) || unit.id } : null,
     status: selectedReason ? 'paused' : 'running',
     reason: selectedReason,
@@ -295,6 +320,7 @@ export function nativeAssistantReadingState(
       intervalSamples: timing?.recentIntervalsMs.length ?? 0,
     },
   };
+  return { resume, reading };
 }
 export function assertNativeAssistantCoverage(
   host: NativeAssistantConversion,

@@ -1,13 +1,15 @@
 import { selectedReportGroupLinks, selectedReportGroups } from './intake-selected-report-groups.ts';
 import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
+import { collectSelectedEvidencedIdentity } from './intake-identity-name-evidence.ts';
 import { nativeIdentityPolicyScope } from './intake-identity-snapshot.ts';
 import type { IntakeIdentityScopeReference } from '../shared/intake-identity.ts';
 import type { ClinicalOriginalScope } from './clinical-source-scope.ts';
 import { createHash } from 'node:crypto';
 import { canonicalLiteral, parseLiteralJSON } from './intake-format.ts';
-import type {
-  IntakeCollectionEnvelopeReader,
-  IntakeEnvelopeRecord,
+import {
+  intakeEnvelopeRecordOrder,
+  type IntakeCollectionEnvelopeReader,
+  type IntakeEnvelopeRecord,
 } from './intake-collection-envelope.ts';
 import type { ReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
 import { openReportMemberSnapshot } from './intake-report-member-state.ts';
@@ -25,7 +27,7 @@ import type {
   IdentityPolicyMember,
 } from './intake-identity-policy.ts';
 import {
-  collectEvidencedIdentity,
+  structuredEvidencedIdentity,
   iterateCompetingIdentityBoundaries,
 } from './intake-identity-policy.ts';
 import {
@@ -100,6 +102,7 @@ const hashChunks = (chunks: Iterable<string>) => {
 export function collectionWorkflowReviewScope(input: {
   close?(): void;
   issueSink?: import('./intake-workflow.ts').WorkflowReviewScope['issueSink'];
+  bindIdentityWarnings?: import('./intake-workflow.ts').WorkflowReviewScope['bindIdentityWarnings'];
   questionState?: ReturnType<
     typeof import('./intake-review-question-state.ts').openReviewQuestionState
   >;
@@ -108,6 +111,8 @@ export function collectionWorkflowReviewScope(input: {
   view: IntakeCollectionEnvelopeReader;
   catalog: ReportSnapshotCatalog;
   metadataBytes: number;
+  /** A host-verified SQLite state stamp; omitted hosts perform every read. */
+  readCacheState?: () => string | undefined;
   packageEvidence: boolean;
   activeReceipt(receipt: IdentityPolicyReceipt): boolean;
   originalFingerprint(group: WorkflowReviewGroup): string;
@@ -192,14 +197,41 @@ export function collectionWorkflowReviewScope(input: {
   };
   const groupRecords = () => children(workflow, 'reportGroups');
   const groupRecord = (id: string) => workflow && view.find('reportGroup', workflow, id);
-  const groupHeader = (record: IntakeEnvelopeRecord): WorkflowReviewGroup => ({
-    id: value<string>(record, 'id')!,
-    basis: value<WorkflowReviewGroup['basis']>(record, 'basis')!,
-    sourceFileId: value<string>(record, 'sourceFileId')!,
-    sourceHash: value<string>(record, 'sourceHash')!,
-    memberId: value<string | null>(record, 'memberId')!,
-    report: value<WorkflowReviewGroup['report']>(record, 'report') ?? null,
-  });
+  const referenceCache = new Map<string, WorkflowReviewGroup | undefined>();
+  let referenceState: string | undefined;
+  const headerCache = new Map<string, WorkflowReviewGroup>();
+  let headerState: string | undefined;
+  const noCompetingBoundary = new Set<string>();
+  let competingState: string | undefined;
+  const groupHeader = (record: IntakeEnvelopeRecord): WorkflowReviewGroup => {
+    const address = view.address(record),
+      state = input.readCacheState?.();
+    if (state !== headerState) {
+      headerCache.clear();
+      headerState = state;
+    }
+    if (state !== undefined) {
+      const cached = headerCache.get(address);
+      if (cached) {
+        headerCache.delete(address);
+        headerCache.set(address, cached);
+        return cached;
+      }
+    }
+    const result: WorkflowReviewGroup = {
+      id: value<string>(record, 'id')!,
+      basis: value<WorkflowReviewGroup['basis']>(record, 'basis')!,
+      sourceFileId: value<string>(record, 'sourceFileId')!,
+      sourceHash: value<string>(record, 'sourceHash')!,
+      memberId: value<string | null>(record, 'memberId')!,
+      report: value<WorkflowReviewGroup['report']>(record, 'report') ?? null,
+    };
+    if (state !== undefined) {
+      if (headerCache.size >= 32) headerCache.delete(headerCache.keys().next().value!);
+      headerCache.set(address, result);
+    }
+    return result;
+  };
   const currentGroupVersion = (record: IntakeEnvelopeRecord) => {
     const count = view.childCount(record, 'versions');
     return count ? view.childAt(record, 'versions', count - 1) : undefined;
@@ -398,7 +430,11 @@ export function collectionWorkflowReviewScope(input: {
       'selfUpdate',
     ]) {
       const item = value(record, name);
-      if (item !== undefined) header[name] = item;
+      if (item !== undefined)
+        header[name] =
+          name === 'assignedPerson' || name === 'selfUpdate'
+            ? JSON.parse(JSON.stringify(item))
+            : item;
     }
     if (value(receiptScope, 'format') === 'health-intake-identity-scope-v2') {
       const reference = JSON.parse(
@@ -474,6 +510,7 @@ export function collectionWorkflowReviewScope(input: {
   const scope: WorkflowReviewScope = {
     close: input.close,
     issueSink: input.issueSink,
+    bindIdentityWarnings: input.bindIdentityWarnings,
     versionId(proposalId, entry) {
       const proposal = proposalId ? view.find('proposal', intake, proposalId) : undefined;
       const revision =
@@ -609,18 +646,38 @@ export function collectionWorkflowReviewScope(input: {
       return false;
     },
     group(reference) {
-      // Legacy .find includes the version predicate, so a later repeated group ID can qualify.
-      for (const record of groupRecords()) {
-        if (value(record, 'id') !== reference.groupId) continue;
-        for (const version of children(record, 'versions'))
-          if (value(version, 'id') === reference.groupVersionId) return groupHeader(record);
+      const state = input.readCacheState?.(),
+        key = JSON.stringify([reference.groupId, reference.groupVersionId]);
+      if (state !== referenceState) {
+        referenceCache.clear();
+        referenceState = state;
       }
-      for (const fallback of fallbackVersions(reference.groupId))
-        if (fallback.id === reference.groupVersionId) {
-          const existing = groupRecord(reference.groupId);
-          return existing ? groupHeader(existing) : fallbackHeader(reference.groupId);
+      if (state !== undefined && referenceCache.has(key)) {
+        const result = referenceCache.get(key);
+        referenceCache.delete(key);
+        referenceCache.set(key, result);
+        return result;
+      }
+      const resolve = (): WorkflowReviewGroup | undefined => {
+        // Legacy .find includes the version predicate, so a later repeated group ID can qualify.
+        for (const record of groupRecords()) {
+          if (value(record, 'id') !== reference.groupId) continue;
+          for (const version of children(record, 'versions'))
+            if (value(version, 'id') === reference.groupVersionId) return groupHeader(record);
         }
-      return undefined;
+        for (const fallback of fallbackVersions(reference.groupId))
+          if (fallback.id === reference.groupVersionId) {
+            const existing = groupRecord(reference.groupId);
+            return existing ? groupHeader(existing) : fallbackHeader(reference.groupId);
+          }
+        return undefined;
+      };
+      const result = resolve();
+      if (state !== undefined && state === input.readCacheState?.()) {
+        if (referenceCache.size >= 32) referenceCache.delete(referenceCache.keys().next().value!);
+        referenceCache.set(key, result);
+      }
+      return result;
     },
     identityGroup(id) {
       const record = groupRecord(id);
@@ -665,6 +722,13 @@ export function collectionWorkflowReviewScope(input: {
       return proposal && readSelectedManualSourceReceipt(view, proposal);
     },
     competingBoundaryUnrepaired(group, operationId, target) {
+      const state = input.readCacheState?.();
+      if (state !== competingState) {
+        noCompetingBoundary.clear();
+        competingState = state;
+      }
+      const boundaryKey = state === undefined ? undefined : hashChunks([canonicalLiteral(group)]);
+      if (boundaryKey && noCompetingBoundary.has(boundaryKey)) return false;
       const receipt = receipts.find((receipt) => receipt.operationId === operationId);
       const claims = receipt?.scope.competingSubjects;
       const headers = function* () {
@@ -691,7 +755,14 @@ export function collectionWorkflowReviewScope(input: {
         )
           return true;
       }
-      if (!count) return false;
+      if (!count) {
+        if (boundaryKey) {
+          if (noCompetingBoundary.size >= 32)
+            noCompetingBoundary.delete(noCompetingBoundary.values().next().value!);
+          noCompetingBoundary.add(boundaryKey);
+        }
+        return false;
+      }
       return (
         count !== claims!.length ||
         !(receipt!.scope.assignmentTargets || receipt!.scope.targets).some(
@@ -722,8 +793,8 @@ export function collectionWorkflowReviewScope(input: {
         }
       };
       return {
-        collected: collectEvidencedIdentity(issues(), group?.report?.subject?.text, original),
-        structured: collectEvidencedIdentity(issues()).evidence,
+        collected: collectSelectedEvidencedIdentity(issues, group?.report?.subject?.text, original),
+        structured: structuredEvidencedIdentity(issues()),
       };
     },
   };
@@ -811,14 +882,21 @@ export function collectionWorkflowReviewScope(input: {
         currentVersion: scope.currentVersion,
         group: scope.identityGroup,
         firstGroup(references) {
-          for (const record of groupRecords())
-            if (
-              selectedReportGroups(references).some(
-                (reference) => reference.groupId === value(record, 'id'),
-              )
-            )
-              return groupHeader(record);
-          return undefined;
+          let first: IntakeEnvelopeRecord | undefined,
+            ordinal = Infinity;
+          // References are the complete selected membership sequence. Resolve
+          // each public ID's first retained group, then preserve collection order
+          // even when duplicated IDs occur in a different reference order.
+          for (const reference of selectedReportGroups(references)) {
+            const record = groupRecord(reference.groupId);
+            if (!record) continue;
+            const position = intakeEnvelopeRecordOrder(view, record).at(-1)!;
+            if (position < ordinal) {
+              first = record;
+              ordinal = position;
+            }
+          }
+          return first ? groupHeader(first) : undefined;
         },
         confirmation(operationId) {
           for (const record of children(workflow, 'identityConfirmations'))

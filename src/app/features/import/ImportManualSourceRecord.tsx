@@ -15,6 +15,7 @@ import './import-manual-source-record.css';
 
 interface Props {
   intakeId: string;
+  guardNavigation?: boolean;
   page: number;
   onCreated?: (result: ManualSourceRecordResult) => void;
   onPendingChange?: (pending: boolean) => void;
@@ -33,6 +34,7 @@ export function ImportManualSourceRecord(props: Props) {
 
 function ManualSourceRecordForm({
   intakeId,
+  guardNavigation = true,
   page,
   profileId,
   onCreated,
@@ -286,7 +288,9 @@ function ManualSourceRecordForm({
     );
   return (
     <section className="import-manual-source-record" aria-label="Add record from source">
-      <ReviewNavigationGuard pending={() => latest.current.pending} flush={save} />
+      {guardNavigation && (
+        <ReviewNavigationGuard pending={() => latest.current.pending} flush={save} />
+      )}
       <h3>Add record from page {sourcePage}</h3>
       <p>This creates a review draft authored by you. Clinical acceptance is separate.</p>
       {loading && <p role="status">Loading current source and People…</p>}

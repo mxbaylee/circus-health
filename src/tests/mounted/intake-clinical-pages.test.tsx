@@ -422,9 +422,15 @@ it('keeps native feed totals complete while replacing the single displayed windo
   expect(await screen.findByText(/10,001 clinical records/)).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'Next records' }));
   await waitFor(() => expect(screen.queryByRole('button', { name: 'Next records' })).toBeNull());
-  expect(screen.getAllByRole('button', { name: 'Review exact record' })).toHaveLength(1);
+  expect(await screen.findByRole('link', { name: 'Review exact record' })).toHaveAttribute(
+    'href',
+    expect.stringContaining('record=second'),
+  );
+  expect(screen.getAllByRole('link', { name: 'Review exact record' })).toHaveLength(1);
   expect(screen.getByText(/Remaining reading work is still being checked/)).toBeVisible();
-  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(
+    fetch.mock.calls.filter(([input]) => String(input).includes('/import-feed?')),
+  ).toHaveLength(2);
 });
 
 it('accepts a referenced named person only after evidence pages and sends exact authority without copying person text', async () => {
@@ -643,9 +649,13 @@ for (const changedAuthority of [false, true])
     // Wait for the first pinned server page before selecting it.
     await act(async () => {});
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Fictional summary' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Save 1 selected records' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save 1 record' }));
     if (changedAuthority) {
-      expect(await screen.findByRole('alert')).toHaveTextContent('A selected record changed');
+      expect(
+        await screen.findByText(
+          'A selected record changed. Refresh the page and review it before saving.',
+        ),
+      ).toBeVisible();
       expect(writes).toHaveLength(0);
     } else {
       expect(

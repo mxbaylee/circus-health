@@ -545,6 +545,7 @@ export function ReviewIssue({
         {issue.locator}
         {issue.page ? ` · Page ${issue.page}` : ''}
       </p>
+      {issue.selfSuggestion?.fullName && <p>Suggested name: {issue.selfSuggestion.fullName}</p>}
       {issue.sourceSuggestion && (
         <p>
           Suggested source: {issue.sourceSuggestion}{' '}
@@ -566,6 +567,9 @@ export function ReviewIssue({
             {relatedIssues.map((item) => (
               <li key={item.id}>
                 {item.prompt}
+                {item.selfSuggestion?.fullName && (
+                  <span> · Suggested name: {item.selfSuggestion.fullName}</span>
+                )}
                 {item.resolution ? ` · Saved: ${item.resolution.outcome.replaceAll('_', ' ')}` : ''}
               </li>
             ))}

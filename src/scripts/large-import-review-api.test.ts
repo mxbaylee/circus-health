@@ -7,24 +7,31 @@ import { createHash } from 'node:crypto';
 import { createVaultApp } from '../server/vault-app.ts';
 import type { Note, Observation, Medication, Procedure } from '../shared/api.ts';
 import type {
-  Intake,
-  IntakeReview,
-  IntakeReportQueue,
   HealthRecordEnvelope,
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceResult,
 } from '../shared/intake.ts';
 import type {
   IntakeIdentityPerson,
-  IntakeIdentityReview,
   IntakeIdentityConfirmation,
 } from '../shared/intake-identity.ts';
+import type { IntakeRead } from '../shared/intake-summary.ts';
+import { isIntakeSummary } from '../shared/intake-summary.ts';
+import type {
+  CollectionReportDetail,
+  CollectionReportGroupSummary,
+} from '../shared/intake-clinical-pages.ts';
+import {
+  collectQualificationFeed,
+  readQualificationReview,
+  readQualificationIdentity,
+} from './qualification-intake-read.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
 import { writeFictionalPdf } from './fictional-pdf-writer.ts';
 import { createLargeImportOracle } from './large-import-fixture.ts';
 import {
   gradeLargeImportReview,
-  type LargeImportReviewAuthority,
+  type NativeLargeImportReviewAuthority,
 } from './large-import-review-grader.ts';
 import {
   gradeLargeImportAccepted,
@@ -158,7 +165,7 @@ test('independent small real upload/proposal/review snapshots remain a partial o
   });
   const originalBytes = readFileSync(path);
   const originalHash = createHash('sha256').update(originalBytes).digest('hex');
-  const uploaded = await request<Intake>(prefix + '/intakes', undefined, originalBytes);
+  const uploaded = await request<IntakeRead>(prefix + '/intakes', undefined, originalBytes);
   assert.equal(uploaded.sha256, originalHash);
   const batches = await request<IntakeBatch[]>(prefix + '/intake-batches');
   for (const batch of batches.filter((batch) =>
@@ -248,31 +255,78 @@ test('independent small real upload/proposal/review snapshots remain a partial o
       },
     },
   }));
-  const current = await request<Intake>(prefix + `/intakes/${uploaded.id}`);
-  const proposed = await request<Intake>(prefix + `/intakes/${uploaded.id}/proposals`, {
+  const current = await request<IntakeRead>(prefix + `/intakes/${uploaded.id}`);
+  const proposed = await request<IntakeRead>(prefix + `/intakes/${uploaded.id}/proposals`, {
     version: current.version,
     summary: 'Independent partial fictional proposals',
     jsonlText: envelopes.map((item) => JSON.stringify(item)).join('\n'),
   });
-  const proposalId = proposed.proposals.at(-1)!.id;
-  const review = await request<IntakeReview>(
+  const proposedFeed = await collectQualificationFeed(request, prefix);
+  const proposalIds = new Set(proposedFeed.blocks.map((block) => block.proposalId));
+  assert.equal(proposalIds.size, 1);
+  const proposalId = [...proposalIds][0];
+  assert.ok(proposalId);
+  assert.equal(proposed.id, uploaded.id);
+  const review = await readQualificationReview(
+    request,
     prefix + `/intakes/${uploaded.id}/review?proposalId=${encodeURIComponent(proposalId)}`,
   );
   assert.equal(review.records.length, 5);
-  const queue = await request<IntakeReportQueue>(
-    prefix + '/intakes/report-queue?view=all&limit=100',
-  );
-  const retained = await request<Intake>(prefix + `/intakes/${uploaded.id}`);
-  const authorities: LargeImportReviewAuthority[] = [];
-  for (const group of queue.groups)
-    authorities.push({
-      queue: group,
-      retained: retained.workflow!.reportGroups!.find((item) => item.id === group.groupId)!,
-      identity: await request<IntakeIdentityReview>(
+  async function authoritiesSnapshot(): Promise<NativeLargeImportReviewAuthority[]> {
+    const retained = await request<IntakeRead>(prefix + '/intakes/' + uploaded.id);
+    assert.ok(isIntakeSummary(retained));
+    const selected: NativeLargeImportReviewAuthority[] = [];
+    const queue = await request<{
+      format: 'health-intake-report-queue-page-v2';
+      groups: { kind: 'group'; group: CollectionReportGroupSummary }[];
+      nextCursor: string | null;
+    }>(prefix + '/intakes/report-queue?view=all&limit=100');
+    assert.equal(queue.format, 'health-intake-report-queue-page-v2');
+    assert.equal(queue.nextCursor, null);
+    for (const entry of queue.groups) {
+      assert.equal(entry.kind, 'group');
+      const group = entry.group;
+      const pages: CollectionReportDetail['records'][] = [];
+      let cursor: string | null = null;
+      const seen = new Set<string>();
+      do {
+        const detail: CollectionReportDetail = await request<CollectionReportDetail>(
+          prefix +
+            '/intakes/report-queue/' +
+            encodeURIComponent(group.groupId) +
+            '?view=all&limit=100&intakeId=' +
+            encodeURIComponent(uploaded.id) +
+            (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''),
+        );
+        assert.deepEqual(detail.group, group);
+        pages.push(detail.records);
+        cursor = detail.records.nextCursor;
+        if (cursor) {
+          assert.equal(seen.has(cursor), false);
+          seen.add(cursor);
+        }
+      } while (cursor);
+      const inspected = await readQualificationIdentity(
+        request,
         prefix +
-          `/intakes/${uploaded.id}/identity-review?groupId=${encodeURIComponent(group.groupId)}`,
-      ),
-    });
+          '/intakes/' +
+          uploaded.id +
+          '/identity-review?groupId=' +
+          encodeURIComponent(group.groupId),
+      );
+      selected.push({
+        format: 'qualification-native-report-v1',
+        group,
+        records: pages,
+        sourceHash: retained.sha256,
+        identity: inspected.review,
+        inspectedScope: inspected.inspectedScope,
+      });
+    }
+    return selected;
+  }
+  const authorities = await authoritiesSnapshot();
+  const retained = await request<IntakeRead>(prefix + '/intakes/' + uploaded.id);
   const savedPeople = await request<IntakeIdentityPerson[]>(prefix + '/record-ownership/people');
   const cedar = savedPeople.find((person) => person.personId === 'patient');
   const savedWillow = savedPeople.find((person) => person.personId === willow.personId);
@@ -295,29 +349,58 @@ test('independent small real upload/proposal/review snapshots remain a partial o
   assert.deepEqual(result.authorityIssues, []);
   assert.equal(result.passed, false);
   assert.equal(result.reviewReady, false);
+  for (const mutate of [
+    (item: NativeLargeImportReviewAuthority) => {
+      item.records[0]!.records.pop();
+    },
+    (item: NativeLargeImportReviewAuthority) => {
+      item.records[0]!.nextCursor = 'unfinished';
+    },
+    (item: NativeLargeImportReviewAuthority) => {
+      item.records[0]!.version++;
+    },
+    (item: NativeLargeImportReviewAuthority) => {
+      item.sourceHash = 'wrong-original';
+    },
+  ]) {
+    const incomplete = structuredClone(authorities);
+    mutate(incomplete[0]!);
+    const rejected = gradeLargeImportReview({
+      oracle: createLargeImportOracle(),
+      stage: 'proposal',
+      originalId: uploaded.id,
+      people: { 'fictional-cedar': cedar, 'fictional-willow': savedWillow },
+      reviews: [review],
+      authorities: incomplete,
+    });
+    assert.ok(rejected.authorityIssues.includes('conflictingAuthority'));
+    assert.equal(rejected.passed, false);
+  }
 
   const peopleBefore = await request<IntakeIdentityPerson[]>(prefix + '/record-ownership/people');
   const notesBefore = await Promise.all(
     peopleBefore.map((person) => request<Note>(prefix + `/notes/${person.noteId}`)),
   );
-  const workflowBefore = (await request<Intake>(prefix + `/intakes/${uploaded.id}`)).workflow;
+  const workflowBefore = await request<IntakeRead>(prefix + `/intakes/${uploaded.id}`);
   const identityPath = prefix + `/intakes/${uploaded.id}/identity-scope`;
   async function identity(groupId: string) {
-    const reading = await request<IntakeIdentityReview>(
-      prefix + `/intakes/${uploaded.id}/identity-review?groupId=${encodeURIComponent(groupId)}`,
+    return readQualificationIdentity(
+      request,
+      prefix +
+        '/intakes/' +
+        uploaded.id +
+        '/identity-review?groupId=' +
+        encodeURIComponent(groupId),
     );
-    assert.ok(reading.scope);
-    return reading;
   }
   function confirmation(
-    reading: IntakeIdentityReview,
+    reading: Awaited<ReturnType<typeof identity>>,
     operationId: string,
     person?: IntakeIdentityPerson,
   ): IntakeIdentityConfirmation {
-    assert.ok(reading.scope);
     return {
-      version: reading.scope.intakeVersion,
-      scope: reading.scope,
+      version: reading.confirmationScope.intakeVersion,
+      scope: reading.confirmationScope,
       operationId,
       outcome: person ? 'this_is_person' : 'this_is_me',
       printedName: person ? 'Fictional Willow Brook' : 'Fictional Cedar Vale',
@@ -328,17 +411,19 @@ test('independent small real upload/proposal/review snapshots remain a partial o
     };
   }
   const cedarGroup = authorities.find(
-    (authority) => authority.retained.report?.key === 'fictional-report-1',
+    (authority) =>
+      (authority.group.report as { key?: string } | null)?.key === 'fictional-report-1',
   )!;
   const willowGroup = authorities.find(
-    (authority) => authority.retained.report?.key === 'fictional-report-2',
+    (authority) =>
+      (authority.group.report as { key?: string } | null)?.key === 'fictional-report-2',
   )!;
   assert.ok(cedarGroup);
   assert.ok(willowGroup);
-  const cedarReading = await identity(cedarGroup.retained.id);
-  const willowReading = await identity(willowGroup.retained.id);
-  assert.equal(cedarReading.evidencedIdentity.fullName, 'Fictional Cedar Vale');
-  assert.equal(willowReading.evidencedIdentity.fullName, 'Fictional Willow Brook');
+  const cedarReading = await identity(cedarGroup.group.groupId);
+  const willowReading = await identity(willowGroup.group.groupId);
+  assert.equal(cedarReading.review.evidencedIdentity.fullName, 'Fictional Cedar Vale');
+  assert.equal(willowReading.review.evidencedIdentity.fullName, 'Fictional Willow Brook');
   await request(
     identityPath,
     confirmation(willowReading, 'wrong-self'),
@@ -365,10 +450,7 @@ test('independent small real upload/proposal/review snapshots remain a partial o
     subject: { ...alteredScope.scope.subject, text: subject2 },
   };
   await request(identityPath, alteredScope, undefined, 'IDENTITY_SCOPE');
-  assert.deepEqual(
-    (await request<Intake>(prefix + `/intakes/${uploaded.id}`)).workflow,
-    workflowBefore,
-  );
+  assert.deepEqual(await request<IntakeRead>(prefix + `/intakes/${uploaded.id}`), workflowBefore);
   assert.deepEqual(
     await Promise.all(
       peopleBefore.map((person) => request<Note>(prefix + `/notes/${person.noteId}`)),
@@ -376,12 +458,9 @@ test('independent small real upload/proposal/review snapshots remain a partial o
     notesBefore,
   );
 
-  const cedarInput = confirmation(await identity(cedarGroup.retained.id), 'confirm-cedar');
-  const cedarConfirmed = await request<Intake>(identityPath, cedarInput);
-  assert.deepEqual(
-    (await request<Intake>(identityPath, cedarInput)).workflow,
-    cedarConfirmed.workflow,
-  );
+  const cedarInput = confirmation(await identity(cedarGroup.group.groupId), 'confirm-cedar');
+  const cedarConfirmed = await request<IntakeRead>(identityPath, cedarInput);
+  assert.deepEqual(await request<IntakeRead>(identityPath, cedarInput), cedarConfirmed);
   // The first successful write invalidates the other displayed intake snapshot.
   await request(
     identityPath,
@@ -389,25 +468,20 @@ test('independent small real upload/proposal/review snapshots remain a partial o
     undefined,
     'VERSION_CONFLICT',
   );
-  const stillWillow = await identity(willowGroup.retained.id);
+  const stillWillow = await identity(willowGroup.group.groupId);
   // A different DOB from an earlier confirmed report on this same original
   // requires Willow's own explicit choice; Cedar's receipt cannot assign her.
-  assert.equal(stillWillow.assignedPerson, undefined);
-  assert.equal(stillWillow.blocking, true);
-  assert.equal(stillWillow.status, 'confirmation_required');
-  assert.equal(cedarConfirmed.workflow!.identityConfirmations!.length, 1);
-  assert.equal(
-    cedarConfirmed.workflow!.identityConfirmations![0]!.scope.groupId,
-    cedarGroup.retained.id,
-  );
+  assert.equal(stillWillow.review.assignedPerson, undefined);
+  assert.equal(stillWillow.review.blocking, true);
+  assert.equal(stillWillow.review.status, 'confirmation_required');
+  const confirmedCedarReview = await identity(cedarGroup.group.groupId);
+  assert.equal(confirmedCedarReview.review.confirmationCount, 1);
+  assert.equal(confirmedCedarReview.inspectedScope.groupId, cedarGroup.group.groupId);
   const currentPeople = await request<IntakeIdentityPerson[]>(prefix + '/record-ownership/people');
   const currentWillow = currentPeople.find((person) => person.personId === willow.personId)!;
   const willowInput = confirmation(stillWillow, 'confirm-willow', currentWillow);
-  const willowConfirmed = await request<Intake>(identityPath, willowInput);
-  assert.deepEqual(
-    (await request<Intake>(identityPath, willowInput)).workflow,
-    willowConfirmed.workflow,
-  );
+  const willowConfirmed = await request<IntakeRead>(identityPath, willowInput);
+  assert.deepEqual(await request<IntakeRead>(identityPath, willowInput), willowConfirmed);
   assert.deepEqual(
     await request<IntakeIdentityPerson[]>(prefix + '/record-ownership/people'),
     peopleBefore,
@@ -418,22 +492,21 @@ test('independent small real upload/proposal/review snapshots remain a partial o
     ),
     notesBefore,
   );
-  const finalIntake = await request<Intake>(prefix + `/intakes/${uploaded.id}`);
+  const finalIntake = await request<IntakeRead>(prefix + `/intakes/${uploaded.id}`);
   assert.equal(finalIntake.sha256, originalHash);
-  assert.deepEqual(finalIntake.workflow!.reportGroups, retained.workflow!.reportGroups);
-  for (const receipt of finalIntake.workflow!.identityConfirmations!) {
-    assert.equal(receipt.knownNameAdded, undefined);
-    assert.equal(receipt.scope.sourceHash, originalHash);
-    assert.equal(
-      receipt.scope.subject.text,
-      receipt.outcome === 'this_is_me' ? subject1 : subject2,
-    );
-    assert.equal(
-      receipt.confirmedPrintedName,
-      receipt.outcome === 'this_is_me' ? 'Fictional Cedar Vale' : 'Fictional Willow Brook',
-    );
+  assert.equal(finalIntake.id, retained.id);
+  for (const [groupId, printedName, subject] of [
+    [cedarGroup.group.groupId, 'Fictional Cedar Vale', subject1],
+    [willowGroup.group.groupId, 'Fictional Willow Brook', subject2],
+  ] as const) {
+    const confirmed = await identity(groupId);
+    assert.equal(confirmed.review.confirmationCount, 1);
+    assert.equal(confirmed.inspectedScope.sourceHash, originalHash);
+    assert.equal(confirmed.inspectedScope.subject.text, subject);
+    assert.equal(confirmed.review.evidencedIdentity.fullName, printedName);
   }
-  const finalReview = await request<IntakeReview>(
+  const finalReview = await readQualificationReview(
+    request,
     prefix + `/intakes/${uploaded.id}/review?proposalId=${encodeURIComponent(proposalId)}`,
   );
   for (const record of finalReview.records) {
@@ -453,16 +526,7 @@ test('independent small real upload/proposal/review snapshots remain a partial o
       record.mapping.testLabel === 'FXP151' ? willow.personId : undefined,
     );
   }
-  const finalQueue = await request<IntakeReportQueue>(
-    prefix + '/intakes/report-queue?view=all&limit=100',
-  );
-  const finalAuthorities: LargeImportReviewAuthority[] = [];
-  for (const group of finalQueue.groups)
-    finalAuthorities.push({
-      queue: group,
-      retained: finalIntake.workflow!.reportGroups!.find((item) => item.id === group.groupId)!,
-      identity: await identity(group.groupId),
-    });
+  const finalAuthorities = await authoritiesSnapshot();
   const finalGrade = gradeLargeImportReview({
     oracle: createLargeImportOracle(),
     stage: 'review',
@@ -481,7 +545,7 @@ test('independent small real upload/proposal/review snapshots remain a partial o
   assert.equal(finalGrade.reviewReady, false);
   assert.equal(finalGrade.passed, false);
   const originalResponse = await fetch(
-    base + finalAuthorities[0]!.identity.scope!.original.contentUrl,
+    base + finalAuthorities[0]!.inspectedScope!.original.contentUrl,
     { headers: { Cookie: cookie }, signal: t.signal },
   );
   assert.equal(originalResponse.ok, true);

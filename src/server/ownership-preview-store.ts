@@ -112,12 +112,14 @@ export function createOwnershipPreviewStore(
   sql: DatabaseSync,
   sources: ReadonlySet<string>,
   evidenceUrl: string,
+  sourceMode: 'all' | 'changed' = 'all',
 ) {
   sql.exec(`CREATE TABLE preview_records(ordinal INTEGER PRIMARY KEY,id TEXT,kind TEXT,value TEXT,blocked INTEGER,UNIQUE(id,kind));
     CREATE INDEX preview_record_ids ON preview_records(id);
     CREATE TABLE preview_pending(ordinal INTEGER PRIMARY KEY,value TEXT);
     CREATE TABLE preview_relationships(ordinal INTEGER PRIMARY KEY,id TEXT UNIQUE,value TEXT);
     CREATE TABLE owners(id TEXT PRIMARY KEY);
+    CREATE TABLE preview_selected_sources(id TEXT PRIMARY KEY);
     CREATE TABLE preview_contributions(record_key TEXT, ordinal INTEGER,source_id TEXT,value TEXT,selected INTEGER,PRIMARY KEY(record_key,ordinal),UNIQUE(record_key,source_id));
     CREATE TABLE preview_contribution_scopes(record_key TEXT,source_id TEXT,ordinal INTEGER,value TEXT,PRIMARY KEY(record_key,source_id,ordinal));`);
   let pinHash = createHash('sha256'),
@@ -151,21 +153,41 @@ export function createOwnershipPreviewStore(
       for (const id of ids()) callback.call(thisArg, id, id, owners);
     },
   };
+  const selectedIds = function* (): Generator<string, undefined> {
+    if (sourceMode === 'all') yield* sources;
+    else
+      for (const row of sql
+        .prepare('SELECT id FROM preview_selected_sources ORDER BY id')
+        .iterate())
+        yield String(row.id);
+    return undefined;
+  };
   const mutableSources: OwnershipMutableSet = {
-    ...sources,
     get size() {
-      return sources.size;
+      return sourceMode === 'all'
+        ? sources.size
+        : Number(sql.prepare('SELECT COUNT(*) n FROM preview_selected_sources').get()!.n);
     },
-    has: (id) => sources.has(id),
+    has: (id) =>
+      sourceMode === 'all'
+        ? sources.has(id)
+        : !!sql.prepare('SELECT 1 FROM preview_selected_sources WHERE id=?').get(id),
     add(id) {
       if (!sources.has(id))
         throw Error('Ownership record escaped its complete selected report scope');
+      if (sourceMode === 'changed')
+        sql.prepare('INSERT OR IGNORE INTO preview_selected_sources VALUES(?)').run(id);
     },
-    keys: () => sources.keys(),
-    values: () => sources.values(),
-    entries: () => sources.entries(),
-    [Symbol.iterator]: () => sources[Symbol.iterator](),
-    forEach: (callback, thisArg) => sources.forEach(callback, thisArg),
+    keys: selectedIds,
+    values: selectedIds,
+    *entries(): Generator<[string, string], undefined> {
+      for (const id of selectedIds()) yield [id, id];
+      return undefined;
+    },
+    [Symbol.iterator]: selectedIds,
+    forEach(callback, thisArg) {
+      for (const id of selectedIds()) callback.call(thisArg, id, id, mutableSources);
+    },
   };
   const relationships: OwnershipPreviewSink['relationships'] = {
     set(id, value) {
@@ -402,9 +424,12 @@ export function createOwnershipPreviewStore(
 }
 export type OwnershipCommitView = Omit<
   OwnershipPreview,
-  'records' | 'pending' | 'relationships'
+  'records' | 'pending' | 'relationships' | 'reportHolds'
 > & {
   blockerEvidence?: OwnershipBlockerReference;
+  reportHolds:
+    | OwnershipPreview['reportHolds']
+    | OwnershipStoredSequence<OwnershipPreview['reportHolds'][number]>;
   records: OwnershipPreview['records'] | OwnershipStoredSequence<OwnershipReportPreviewRecord>;
   pending:
     OwnershipPreview['pending'] | OwnershipStoredSequence<OwnershipPreview['pending'][number]>;

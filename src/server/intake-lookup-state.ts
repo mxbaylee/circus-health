@@ -84,7 +84,7 @@ export function readNativeIntakeLookupTarget(
   return view.lookup(index, key);
 }
 
-/** Explicit async cold preparation; never called by an interactive GET. */
+/** Explicit awaited maintenance boundary; warm callers reuse complete source-bound indexes. */
 export async function prepareIntakeLookupIndices(
   db: DatabaseSync,
   options: {

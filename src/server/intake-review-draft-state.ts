@@ -11,6 +11,7 @@ import { selectedEnvelopeStore } from './intake-collection-envelope.ts';
 import { schemaKey, schemaOrdinal } from './intake-envelope-schema.ts';
 import {
   createReportSnapshotCatalog,
+  reportSnapshotInlineTextFits,
   type ReportSnapshotCatalog,
   type ReportSnapshotMapReader,
   type ReportSnapshotMapWriter,
@@ -144,7 +145,7 @@ function value<T>(reader: ReportSnapshotMapReader, key: string, bytes: number): 
   return parseLiteralJSON(pieces.join('')) as T;
 }
 async function indexResolution(
-  writer: ReportSnapshotMapWriter,
+  writer: Pick<ReportSnapshotMapWriter, 'putMany'>,
   ordinal: number,
   resolution: Pick<IntakeIssueResolution, 'issueId' | 'outcome'>,
 ) {
@@ -156,6 +157,76 @@ async function indexResolution(
   if (resolution.outcome !== 'unknown') changes.push({ key: 'known:' + key, value: position });
   if (resolution.outcome === 'this_is_me') changes.push({ key: '$self', value: position });
   await writer.putMany(changes);
+}
+
+/** Small immutable entries share bounded checkpoints; large literal entries
+ * retain their streamed byte representation without a whole-value buffer. */
+function draftHistoryWriter(writer: ReportSnapshotMapWriter) {
+  let pending: Array<{ key: string; value: string }> = [],
+    bytes = 0;
+  const flush = async () => {
+    if (!pending.length) return;
+    await writer.putMany(pending);
+    pending = [];
+    bytes = 0;
+  };
+  const put = async (key: string, value: string) => {
+    const size = Buffer.byteLength(key) + Buffer.byteLength(value);
+    if (pending.length && (pending.length === 16 || bytes + size > 65536)) await flush();
+    pending.push({ key, value });
+    bytes += size;
+  };
+  return {
+    flush,
+    async putMany(entries: readonly { key: string; value: string }[]) {
+      for (const entry of entries) await put(entry.key, entry.value);
+    },
+    async putText(key: string, source: Iterable<string>) {
+      const iterator = source[Symbol.iterator](),
+        pieces: string[] = [];
+      let size = 0,
+        completed = false;
+      try {
+        while (true) {
+          const next = iterator.next();
+          if (next.done) {
+            completed = true;
+            const text = pieces.join('');
+            if (reportSnapshotInlineTextFits(text)) await put(key, text);
+            else {
+              await flush();
+              await writer.putText(key, pieces);
+            }
+            return;
+          }
+          size += Buffer.byteLength(next.value);
+          if (size <= 16384) {
+            pieces.push(next.value);
+            continue;
+          }
+          await flush();
+          await writer.putText(
+            key,
+            (function* () {
+              yield* pieces;
+              yield next.value;
+              while (true) {
+                const tail = iterator.next();
+                if (tail.done) {
+                  completed = true;
+                  return;
+                }
+                yield tail.value;
+              }
+            })(),
+          );
+          return;
+        }
+      } finally {
+        if (!completed) iterator.return?.();
+      }
+    },
+  };
 }
 
 export async function prepareNativeDraftHistory(
@@ -186,6 +257,7 @@ export async function prepareNativeDraftHistory(
     throw Error('Review history source binding changed');
   if (prior) checked(catalog, prior);
   const writer = await catalog.fork(prior?.snapshotId);
+  const entries = draftHistoryWriter(writer);
   let resolutions = prior?.resolutions ?? 0,
     corrections = prior?.corrections ?? 0;
   if (!prior) {
@@ -197,9 +269,12 @@ export async function prepareNativeDraftHistory(
         for (let ordinal = 0; ordinal < count; ordinal++) {
           options.assertRunning?.();
           const record = view.childAt(previous, section, ordinal)!;
-          await writer.putText(PREFIX[section] + schemaOrdinal(ordinal), view.recordChunks(record));
+          await entries.putText(
+            PREFIX[section] + schemaOrdinal(ordinal),
+            view.recordChunks(record),
+          );
           if (section === 'resolutions')
-            await indexResolution(writer, ordinal, {
+            await indexResolution(entries, ordinal, {
               issueId: scalar<string>(view, record, 'issueId')!,
               outcome: scalar<IntakeIssueResolution['outcome']>(view, record, 'outcome')!,
             });
@@ -218,11 +293,12 @@ export async function prepareNativeDraftHistory(
     (entry) => entry.operationId === draft.id,
   );
   for (const resolution of changedResolutions) {
-    await writer.putText('r:' + schemaOrdinal(resolutions), [JSON.stringify(resolution)]);
-    await indexResolution(writer, resolutions++, resolution);
+    await entries.putText('r:' + schemaOrdinal(resolutions), [JSON.stringify(resolution)]);
+    await indexResolution(entries, resolutions++, resolution);
   }
   for (const correction of changedCorrections)
-    await writer.putText('c:' + schemaOrdinal(corrections++), [JSON.stringify(correction)]);
+    await entries.putText('c:' + schemaOrdinal(corrections++), [JSON.stringify(correction)]);
+  await entries.flush();
   await writer.put('$counts', JSON.stringify([resolutions, corrections]));
   const snapshotId = 'draft:' + randomUUID();
   await catalog.publish(snapshotId, writer);

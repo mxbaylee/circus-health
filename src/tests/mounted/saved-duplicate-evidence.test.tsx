@@ -124,3 +124,41 @@ it('refuses a premature complete page even when its evidence reference matches',
   expect(await screen.findByRole('alert')).toHaveTextContent('exact bounded review');
   expect(screen.queryByText('First retained locator', { exact: false })).toBeNull();
 });
+
+it.each([
+  '/api/sources/fictional/content',
+  '/api/profiles/fictional-profile/sources/fictional/content',
+])('opens current-profile original evidence returned as %s', async (contentUrl) => {
+  calls.api.mockResolvedValue({
+    data: {
+      reference,
+      items: [{ ...value, value: { ...value.value, contentUrl } }],
+      complete: false,
+      after: 'first',
+    },
+  });
+  render(<SavedDuplicateEvidence reference={reference} />);
+  expect(await screen.findByRole('link', { name: 'Fictional original' })).toHaveAttribute(
+    'href',
+    '/api/profiles/fictional-profile/sources/fictional/content',
+  );
+});
+
+it.each([
+  '/api/profiles/foreign/sources/fictional/content',
+  '/api/profiles/fictional-profile-extra/sources/fictional/content',
+  '/api/profiles/fictional-profile/sources/fictional/content?download=1',
+  'https://fictional.invalid/api/sources/fictional/content',
+])('refuses an original URL outside the exact current-profile route: %s', async (contentUrl) => {
+  calls.api.mockResolvedValue({
+    data: {
+      reference,
+      items: [{ ...value, value: { ...value.value, contentUrl } }],
+      complete: false,
+      after: 'first',
+    },
+  });
+  render(<SavedDuplicateEvidence reference={reference} />);
+  expect(await screen.findByRole('alert')).toHaveTextContent('exact bounded review');
+  expect(screen.queryByRole('link', { name: 'Fictional original' })).toBeNull();
+});

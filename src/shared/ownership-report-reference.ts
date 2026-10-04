@@ -54,11 +54,12 @@ export interface OwnershipReportEvidenceReference {
   pendingTotal: number;
   relationshipTotal: number;
   recordBlockerTotal: number;
+  reportHoldTotal: number;
   url: string;
 }
 export type OwnershipReportPreviewReference = Omit<
   OwnershipPreview,
-  'names' | 'records' | 'pending' | 'relationships' | 'commitGroups' | 'blockers'
+  'names' | 'records' | 'pending' | 'relationships' | 'commitGroups' | 'blockers' | 'reportHolds'
 > & {
   blockers: string[] | OwnershipBlockerReference;
   namesIncluded: false;
@@ -66,6 +67,7 @@ export type OwnershipReportPreviewReference = Omit<
   recordsIncluded: false;
   pendingIncluded: false;
   relationshipsIncluded: false;
+  reportHoldsIncluded: false;
   reportEvidence: OwnershipReportEvidenceReference;
   commitGroups: {
     id: string;
@@ -81,6 +83,8 @@ export type OwnershipReportEvidencePage = OwnershipNameEvidencePage<
   | OwnershipPreview['relationships'][number]
 >;
 export type OwnershipReceiptReference = Omit<OwnershipReceipt, 'outcomes' | 'groups'> & {
+  /** Explicit record selection bounds this metadata to 1,000 selected records. */
+  groups?: OwnershipReceipt['groups'];
   outcomesIncluded: false;
   outcomeTotal: number;
   outcomeDigest: string;
@@ -89,7 +93,7 @@ export type OwnershipReceiptReference = Omit<OwnershipReceipt, 'outcomes' | 'gro
 
 export interface OwnershipReportItemReference {
   type: 'reference';
-  section: 'records' | 'pending' | 'relationships';
+  section: 'records' | 'pending' | 'relationships' | 'holds';
   ordinal: number;
   bytes: number;
   token: string;
@@ -99,6 +103,7 @@ export type OwnershipReportPageItem =
   | OwnershipReportPreviewRecord
   | import('./record-ownership.ts').OwnershipPreview['pending'][number]
   | import('./record-ownership.ts').OwnershipPreview['relationships'][number]
+  | import('./record-ownership.ts').OwnershipPreview['reportHolds'][number]
   | OwnershipReportItemReference;
 export interface OwnershipReportPage {
   items: OwnershipReportPageItem[];

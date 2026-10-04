@@ -1,3 +1,4 @@
+import { apiUrl } from '../../data/api';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ExternalLink, UserRound, UsersRound } from 'lucide-react';
 import type {
@@ -140,7 +141,7 @@ export function ReportPeopleReview<
           <div>
             <h4>Original evidence</h4>
             <a
-              href={focused.evidence[0]?.contentUrl || focused.source.contentUrl}
+              href={apiUrl(focused.evidence[0]?.contentUrl || focused.source.contentUrl)}
               target="_blank"
               rel="noreferrer"
             >

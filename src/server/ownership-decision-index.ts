@@ -4,13 +4,15 @@ import { HttpError, type Database } from './database.ts';
 const TABLE = '__ownership_decision_index',
   META = '__ownership_decision_index_state';
 const projection = (row: string) =>
-  `${row}.id,${row}.title,json_extract(${row}.coverage_json,'$.sourceRecordId'),json_extract(${row}.coverage_json,'$.revision'),json_extract(${row}.coverage_json,'$.duplicateDecision.occurrenceAttachment.incomingSourceRecordId'),json_extract(${row}.coverage_json,'$.duplicateDecision.sequence'),json_extract(${row}.coverage_json,'$.duplicateDecision.right.kind'),json_extract(${row}.coverage_json,'$.duplicateDecision.right.id'),CASE WHEN json_extract(${row}.coverage_json,'$.duplicateDecision.evidence.right.format')='health-duplicate-evidence-snapshot-v1' THEN json_extract(${row}.coverage_json,'$.duplicateDecision.evidence.right') END,json_extract(${row}.coverage_json,'$.duplicateDecision.right.identity'),json_extract(${row}.coverage_json,'$.duplicateDecision.right.sourceRecordId'),json_extract(${row}.coverage_json,'$.recordException.reclassification.recordId'),json_extract(${row}.coverage_json,'$.recordException.reclassification.fromKind'),json_extract(${row}.coverage_json,'$.recordException.reclassification.toKind'),json_extract(${row}.coverage_json,'$.recordException.sequence'),json_extract(${row}.coverage_json,'$.recordException.identityKey')`;
+  `${row}.id,${row}.title,json_extract(${row}.coverage_json,'$.sourceRecordId'),json_extract(${row}.coverage_json,'$.revision'),json_extract(${row}.coverage_json,'$.duplicateDecision.occurrenceAttachment.incomingSourceRecordId'),json_extract(${row}.coverage_json,'$.duplicateDecision.sequence'),json_extract(${row}.coverage_json,'$.duplicateDecision.right.kind'),json_extract(${row}.coverage_json,'$.duplicateDecision.right.id'),CASE WHEN json_extract(${row}.coverage_json,'$.duplicateDecision.evidence.right.format')='health-duplicate-evidence-snapshot-v1' THEN json_extract(${row}.coverage_json,'$.duplicateDecision.evidence.right') END,json_extract(${row}.coverage_json,'$.duplicateDecision.right.identity'),json_extract(${row}.coverage_json,'$.duplicateDecision.right.sourceRecordId'),json_extract(${row}.coverage_json,'$.recordException.reclassification.recordId'),json_extract(${row}.coverage_json,'$.recordException.reclassification.fromKind'),json_extract(${row}.coverage_json,'$.recordException.reclassification.toKind'),json_extract(${row}.coverage_json,'$.recordException.sequence'),json_extract(${row}.coverage_json,'$.recordException.identityKey'),json_extract(${row}.coverage_json,'$.operationId'),json_extract(${row}.coverage_json,'$.parentOperationId')`;
 const ddl = [
-  `CREATE TEMP TABLE ${TABLE}(id TEXT PRIMARY KEY,title TEXT,source_record_id,revision,transition_source_id,transition_sequence,duplicate_kind,duplicate_record_id,evidence_snapshot,duplicate_identity,duplicate_source_record_id,exception_record_id,exception_from_kind,exception_to_kind,exception_sequence,exception_identity)`,
+  `CREATE TEMP TABLE ${TABLE}(id TEXT PRIMARY KEY,title TEXT,source_record_id,revision,transition_source_id,transition_sequence,duplicate_kind,duplicate_record_id,evidence_snapshot,duplicate_identity,duplicate_source_record_id,exception_record_id,exception_from_kind,exception_to_kind,exception_sequence,exception_identity,operation_id,parent_operation_id)`,
   `CREATE INDEX temp.__ownership_decision_index_source ON ${TABLE}(title,source_record_id,revision DESC,id DESC)`,
   `CREATE INDEX temp.__ownership_decision_index_transition ON ${TABLE}(title,transition_source_id,transition_sequence,id)`,
   `CREATE INDEX temp.__ownership_decision_index_snapshot ON ${TABLE}(duplicate_kind,duplicate_record_id,transition_sequence DESC,id DESC) WHERE evidence_snapshot IS NOT NULL`,
   `CREATE INDEX temp.__ownership_decision_index_exception ON ${TABLE}(exception_record_id,exception_sequence DESC,id DESC) WHERE exception_record_id IS NOT NULL`,
+  `CREATE INDEX temp.__ownership_decision_index_operation ON ${TABLE}(title,operation_id,id)`,
+  `CREATE INDEX temp.__ownership_decision_index_parent ON ${TABLE}(title,parent_operation_id,id)`,
   `CREATE TEMP TABLE ${META}(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL)`,
   `CREATE TEMP TRIGGER __ownership_decision_index_insert AFTER INSERT ON main.manual_batches BEGIN UPDATE ${META} SET generation=generation+1; INSERT INTO ${TABLE} SELECT ${projection('NEW')}; END`,
   `CREATE TEMP TRIGGER __ownership_decision_index_delete AFTER DELETE ON main.manual_batches BEGIN UPDATE ${META} SET generation=generation+1; DELETE FROM ${TABLE} WHERE id=OLD.id; END`,
@@ -22,8 +24,11 @@ interface State {
   mainSchema: string;
   dataVersion: number;
   coldRows: number;
+  receiptReads: { planRows: number; eventRows: number; eventChecks: number };
+  policyPresence: { checks: number; empty: number };
 }
 const states = new WeakMap<Database, State>();
+const preparing = new WeakMap<Database, Promise<void>>();
 const version = (db: Database) => Number(db.prepare('PRAGMA data_version').get()!.data_version);
 const schema = (db: Database) =>
   JSON.stringify(
@@ -62,6 +67,27 @@ export async function prepareOwnershipDecisionIndex(
 ) {
   if (db.isTransaction)
     throw Error('Ownership decision indexing requires outside-transaction preparation');
+  const existing = preparing.get(db);
+  if (existing) {
+    options.assertRunning?.();
+    await existing;
+    options.assertRunning?.();
+    checked(db);
+    return;
+  }
+  const pending = prepareIndex(db, options);
+  preparing.set(db, pending);
+  try {
+    await pending;
+    options.assertRunning?.();
+    checked(db);
+  } finally {
+    if (preparing.get(db) === pending) preparing.delete(db);
+  }
+}
+async function prepareIndex(db: Database, options: { assertRunning?: () => void }) {
+  if (db.isTransaction)
+    throw Error('Ownership decision indexing requires outside-transaction preparation');
   try {
     checked(db);
     return;
@@ -75,6 +101,8 @@ export async function prepareOwnershipDecisionIndex(
     mainSchema: '',
     dataVersion: version(db),
     coldRows: 0,
+    receiptReads: { planRows: 0, eventRows: 0, eventChecks: 0 },
+    policyPresence: { checks: 0, empty: 0 },
   };
   states.set(db, state);
   for (const event of ['insert', 'delete', 'update'])
@@ -96,7 +124,9 @@ export async function prepareOwnershipDecisionIndex(
       throw unavailable();
   };
   try {
-    const insert = db.prepare('INSERT INTO ' + TABLE + ' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    const insert = db.prepare(
+      'INSERT INTO ' + TABLE + ' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    );
     for (const row of db
       .prepare('SELECT ' + projection('m') + ' FROM manual_batches m ORDER BY id')
       .iterate()) {
@@ -119,6 +149,47 @@ export function ownershipDecisionQueries(db: Database) {
   if (!states.has(db)) return undefined;
   checked(db);
   return {
+    hasAssignmentPolicy() {
+      const state = checked(db);
+      state.policyPresence.checks++;
+      const found = !!db
+        .prepare(
+          `SELECT 1 FROM ${TABLE} INDEXED BY __ownership_decision_index_source WHERE title IN ('Record ownership source','Report ownership default','Report ownership default hold') LIMIT 1`,
+        )
+        .get();
+      if (!found) state.policyPresence.empty++;
+      return found;
+    },
+    *receiptGroups(parentOperationId: string) {
+      const state = checked(db);
+      for (const row of db
+        .prepare(
+          `SELECT m.id,m.coverage_json FROM ${TABLE} i INDEXED BY __ownership_decision_index_parent JOIN main.manual_batches m ON m.id=i.id WHERE i.title='Ownership correction group' AND i.parent_operation_id=? ORDER BY i.id LIMIT 1001`,
+        )
+        .iterate(parentOperationId)) {
+        state.receiptReads.planRows++;
+        yield row;
+      }
+    },
+    *receiptEvents(operationId: string) {
+      const state = checked(db);
+      for (const row of db
+        .prepare(
+          `SELECT m.id,m.coverage_json FROM ${TABLE} i INDEXED BY __ownership_decision_index_operation JOIN main.manual_batches m ON m.id=i.id WHERE i.title='Record ownership event' AND i.operation_id=? ORDER BY i.id`,
+        )
+        .iterate(operationId)) {
+        state.receiptReads.eventRows++;
+        yield row;
+      }
+    },
+    hasReceiptEvents(operationId: string) {
+      checked(db).receiptReads.eventChecks++;
+      return !!db
+        .prepare(
+          `SELECT 1 FROM ${TABLE} WHERE title='Record ownership event' AND operation_id=? LIMIT 1`,
+        )
+        .get(operationId);
+    },
     latestDuplicateEvidenceSnapshot(kind: string, recordId: string) {
       checked(db);
       return db
@@ -167,4 +238,10 @@ export function ownershipDecisionIndexWork(db: Database) {
     coldRows: state.coldRows,
     changedRows: Number(db.prepare('SELECT generation FROM ' + META).get()!.generation),
   };
+}
+export function ownershipReceiptIndexWork(db: Database) {
+  return { ...checked(db).receiptReads };
+}
+export function ownershipPolicyIndexWork(db: Database) {
+  return { ...checked(db).policyPresence };
 }

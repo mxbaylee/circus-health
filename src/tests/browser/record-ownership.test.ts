@@ -1,3 +1,4 @@
+import { fixtureApi, fixtureReview, fixtureSourcePath } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -91,17 +92,19 @@ test(
         .join('\n');
       const intake = await request(prefix + '/intakes', undefined, original);
       const path = prefix + '/intakes/' + encodeURIComponent(intake.id);
-      const review = await request(path + '/review');
-      await request(path + '/import', {
-        version: review.version,
-        reviewToken: review.reviewToken,
-        decisions: review.records.map((r: { id: string }) => ({
-          recordId: r.id,
-          action: 'accept',
-          mapping: {},
-        })),
-      });
-      return { prefix, person, original, contentUrl: intake.contentUrl, intakeId: intake.id };
+      return { prefix, path, person, original, contentUrl: intake.contentUrl, intakeId: intake.id };
+    });
+    const api = fixtureApi(page, url);
+    const path = seed.path;
+    const review = await fixtureReview(api, path + '/review');
+    await api(path + '/import', {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: review.records.map((r: { id: string }) => ({
+        recordId: r.id,
+        action: 'accept',
+        mapping: {},
+      })),
     });
     await page.goto(url + '/#/tests');
     await page.reload();
@@ -117,7 +120,16 @@ test(
     });
     await dialog.getByLabel('Destination person').selectOption({ label: 'Robin Lane' });
     await dialog.getByRole('button', { name: 'Preview correction', exact: true }).click();
-    await dialog.getByRole('button', { name: 'Confirm person correction', exact: true }).waitFor();
+    try {
+      await dialog
+        .getByRole('button', { name: 'Confirm person correction', exact: true })
+        .waitFor();
+    } catch (cause) {
+      throw new Error(
+        'Native ownership preview did not offer confirmation: ' + (await dialog.innerText()),
+        { cause },
+      );
+    }
     assert.match(await dialog.innerText(), /2 saved records and 0 pending/);
     for (const viewport of [
       { width: 390, height: 844 },
@@ -161,7 +173,7 @@ test(
         prefix: seed.prefix,
         personId: seed.person.personId,
         operationId,
-        originalUrl: seed.contentUrl,
+        originalUrl: fixtureSourcePath(seed.prefix, seed.contentUrl),
       },
     );
     assert.equal(state.self.length, 0);

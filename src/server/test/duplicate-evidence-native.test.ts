@@ -439,232 +439,249 @@ test('native terminal pair composes its first saved-evidence snapshot with the i
 });
 
 for (const mode of ['atomic', 'partial-v1'] as const)
-  test(`compound native pair approval (${mode}) retains reviewed evidence, changed-row snapshots and recovery replay`, async (t) => {
-    const root = mkdtempSync(join(tmpdir(), 'fictional-native-duplicate-')),
-      profileId = 'fictional-profile',
-      db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-    attachPersonalDurability(db, { root, profileId });
-    t.after(() => {
-      clearIntakeStateCache(db);
-      db.close();
-      rmSync(root, { recursive: true, force: true });
-    });
-    const upload = (id: string) =>
-      uploadIntake(db, root, profileId, {
-        filename: id + '.jsonl',
-        newProviderName: 'Fictional clinic',
-        bytes: Buffer.from(JSON.stringify(envelope(id))),
+  // These fixtures retain 97 evidence rows, exercise concurrent/stale approvals,
+  // and reconstruct contributor authority before replay. The host hang budget
+  // covers real journal/filesystem work; exact outcomes and changed-row counts
+  // below remain the qualification, independently of elapsed time.
+  test(
+    `compound native pair approval (${mode}) retains reviewed evidence, changed-row snapshots and recovery replay`,
+    { timeout: 180000 },
+    async (t) => {
+      const root = mkdtempSync(join(tmpdir(), 'fictional-native-duplicate-')),
+        profileId = 'fictional-profile',
+        db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+      attachPersonalDurability(db, { root, profileId });
+      t.after(() => {
+        clearIntakeStateCache(db);
+        db.close();
+        rmSync(root, { recursive: true, force: true });
       });
-    const original = upload('saved');
-    const initial = reviewIntake(db, root, profileId, original.id);
-    importIntake(db, root, profileId, original.id, {
-      version: initial.version,
-      reviewToken: initial.reviewToken,
-      decisions: [{ recordId: initial.records[0]!.id, action: 'accept', mapping: {} }],
-    });
-    const targetId = String(db.prepare('SELECT id FROM documents').get()!.id),
-      firstEvidence = db.prepare('SELECT * FROM evidence WHERE entity_id=?').get(targetId)!;
-    transaction(db, () => {
-      for (let index = 0; index < 96; index++)
-        db.prepare(
-          'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES(?,?,?,?,?,?)',
-        ).run(
-          'fictional-retained-' + String(index).padStart(4, '0'),
-          'document',
-          targetId,
-          firstEvidence.source_record_id!,
-          'fictional_support_' + index,
-          firstEvidence.locator_json!,
-        );
-    });
-    const beforeEvidence = duplicateRecord(db, 'document', targetId).evidence,
-      beforeText = canonicalLiteral(beforeEvidence),
-      beforeDigest = createHash('sha256').update(beforeText).digest('hex');
-    assert.equal(beforeEvidence.length, 97);
-    assert.equal(hasIntakeCollectionEnvelope(db, { id: original.id }), false);
-
-    async function request(ids: string[]): Promise<IntakeReportAcceptanceRequest> {
-      const sources = ids.map(upload);
-      for (const source of sources)
-        await buildIntakeCollectionEnvelope(db, { id: source.id, sha256: source.sha256 });
-      for (const source of sources)
-        await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
-      return {
-        ...(mode === 'partial-v1' ? { mode } : {}),
-        operationId: randomUUID(),
-        blocks: sources.map((source) => {
-          const selected = prepareCollectionClinicalReview(db, root, profileId, source.id);
-          assert.equal(selected.status, 'ready');
-          if (selected.status !== 'ready') throw Error('Expected complete native review');
-          const review = selected.session.review,
-            record = review.records[0]!,
-            comparison = selectedClinicalPair(db, review, record, targetId);
-          assert.ok(comparison?.scope);
-          return {
-            intakeId: source.id,
-            proposalId: null,
-            intakeVersion: review.version,
-            reviewToken: review.reviewToken,
-            selections: [
-              {
-                recordId: record.id,
-                candidateId: record.candidateId!,
-                candidateVersionId: record.candidateVersionId!,
-                selectionReviewToken: record.selectionReviewToken!,
-                mapping: {},
-                comparisons: [
-                  {
-                    otherRecordId: targetId,
-                    scope: comparison.scope,
-                    outcome: 'same_event',
-                    occurrenceEvidence: 'attach',
-                    reason: 'Independent fictional export of the same reviewed visit.',
-                  },
-                ],
-              },
-            ],
-          };
-        }),
-      };
-    }
-    const decisions = (database: typeof db) =>
-      database
-        .prepare(
-          "SELECT json_extract(coverage_json,'$.duplicateDecision') AS value FROM manual_batches WHERE json_extract(coverage_json,'$.duplicateDecision.evidenceBasis')='reviewed-pre-projection-v1' ORDER BY json_extract(coverage_json,'$.duplicateDecision.sequence')",
-        )
-        .all()
-        .map(
-          (row) =>
-            JSON.parse(String(row.value)) as {
-              evidenceBasis: string;
-              evidence: { right: RetainedDuplicateEvidenceReference };
-              occurrenceAttachment: { status: string };
-            },
-        );
-    async function read(database: typeof db, ref: RetainedDuplicateEvidenceReference) {
-      const reader = await prepareRetainedDuplicateEvidenceSnapshot(database, ref);
-      try {
-        return [...reader.chunks()].join('');
-      } finally {
-        reader.close();
-      }
-    }
-    const compound = await request(['incoming-a', 'incoming-b']);
-    if (mode === 'atomic') {
-      const stale = structuredClone(compound);
-      stale.operationId = randomUUID();
-      for (const block of stale.blocks)
-        for (const selection of block.selections)
-          for (const comparison of selection.comparisons || []) {
-            const scope = comparison.scope;
-            if (scope?.format !== 'intake-pair-scope-v2') throw Error('Expected exact v2 scope');
-            scope.requestRevision--;
-            const { token: _token, ...payload } = scope;
-            scope.token = createHash('sha256').update(canonicalLiteral(payload)).digest('hex');
-          }
-      await assert.rejects(acceptIntakeReportSelectionAsync(db, root, profileId, stale), {
-        code: 'DUPLICATE_SCOPE_CHANGED',
-      });
-      assert.equal(decisions(db).length, 0);
-    }
-    const accepted = await acceptIntakeReportSelectionAsync(db, root, profileId, compound);
-    assert.equal(accepted.receipt.acceptedCount, 2);
-    assert.equal(db.prepare('SELECT count(*) AS n FROM documents').get()!.n, 1);
-    assert.equal(
-      db.prepare('SELECT count(*) AS n FROM evidence WHERE entity_id=?').get(targetId)!.n,
-      99,
-    );
-    const retained = decisions(db);
-    assert.equal(retained.length, 2);
-    assert.deepEqual(retained[0]!.evidence.right, retained[1]!.evidence.right);
-    const first = retained[0]!.evidence.right;
-    assert.equal(first.count, 97);
-    assert.equal(first.digest, beforeDigest);
-    assert.equal(
-      first.source.intakeId,
-      compound.blocks[0]!.intakeId,
-      'legacy target uses the first native incoming custodian',
-    );
-    assert.equal(await read(db, first), beforeText);
-    assert.ok(retained.every((item) => item.occurrenceAttachment.status === 'attached'));
-    const replay = await acceptIntakeReportSelectionAsync(db, root, profileId, compound);
-    assert.equal(replay.replayed, true);
-    assert.deepEqual(replay.receipt, accepted.receipt);
-    assert.equal(decisions(db).length, 2);
-    for (const block of compound.blocks) {
-      await prepareCollectionClinicalReviewDependencies(db, root, profileId, block.intakeId);
-      const reopened = prepareCollectionClinicalReview(db, root, profileId, block.intakeId);
-      if (reopened.status !== 'ready') throw Error('Expected accepted native source review');
-      const pair = selectedClinicalPair(
-        db,
-        reopened.session.review,
-        reopened.session.record(block.selections[0]!.recordId)!,
-        targetId,
-      );
-      assert.equal(pair?.previousDecision?.attachmentStatus, 'attached');
-      assert.equal(pair?.previousDecision?.scopeStatus, 'current');
-    }
-
-    const secondText = canonicalLiteral(duplicateRecord(db, 'document', targetId).evidence),
-      next = await request(['incoming-c']),
-      changedBefore = intakeWorkCounters(db).warm.duplicateSnapshotChangedRows;
-    const nextResult = await acceptIntakeReportSelectionAsync(db, root, profileId, next),
-      latest = decisions(db).at(-1)!.evidence.right;
-    assert.equal(intakeWorkCounters(db).warm.duplicateSnapshotChangedRows - changedBefore, 2);
-    assert.equal(latest.count, 99);
-    assert.equal(latest.source.intakeId, first.source.intakeId);
-    assert.equal(await read(db, latest), secondText);
-    assert.equal(await read(db, first), beforeText);
-    assert.equal(
-      db.prepare('SELECT count(*) AS n FROM evidence WHERE entity_id=?').get(targetId)!.n,
-      100,
-    );
-
-    const recoveredRoot = join(root, 'recovered'),
-      rebuilt = rebuildProfile(root, profileId, recoveredRoot),
-      recovered = openDatabase(rebuilt.database, profileId);
-    attachPersonalDurability(recovered, { root: recoveredRoot, profileId });
-    try {
-      assert.equal(await read(recovered, first), beforeText);
-      assert.equal(await read(recovered, latest), secondText);
-      assert.equal(
-        recovered.prepare('SELECT count(*) AS n FROM evidence WHERE entity_id=?').get(targetId)!.n,
-        100,
-      );
-      const replay = await acceptIntakeReportSelectionAsync(
-        recovered,
-        recoveredRoot,
-        profileId,
-        next,
-      );
-      assert.equal(replay.replayed, true);
-      assert.deepEqual(replay.receipt, nextResult.receipt);
-      assert.deepEqual(decisions(recovered), decisions(db));
-    } finally {
-      clearIntakeStateCache(recovered);
-      recovered.close();
-    }
-    if (mode === 'atomic') {
-      const racing = await request(['incoming-race']);
-      const mutation = new Promise<void>((resolve, reject) => {
-        setImmediate(() => {
-          try {
-            transaction(db, () => undefined, { actor: 'intake-envelope-build' });
-            resolve();
-          } catch (error) {
-            reject(error);
-          }
+      const upload = (id: string) =>
+        uploadIntake(db, root, profileId, {
+          filename: id + '.jsonl',
+          newProviderName: 'Fictional clinic',
+          bytes: Buffer.from(JSON.stringify(envelope(id))),
         });
+      const original = upload('saved');
+      const initial = reviewIntake(db, root, profileId, original.id);
+      importIntake(db, root, profileId, original.id, {
+        version: initial.version,
+        reviewToken: initial.reviewToken,
+        decisions: [{ recordId: initial.records[0]!.id, action: 'accept', mapping: {} }],
       });
-      await assert.rejects(
-        acceptIntakeReportSelectionAsync(db, root, profileId, racing),
-        (error: unknown) => error instanceof Error && /changed|Refresh/i.test(error.message),
+      const targetId = String(db.prepare('SELECT id FROM documents').get()!.id),
+        firstEvidence = db.prepare('SELECT * FROM evidence WHERE entity_id=?').get(targetId)!;
+      transaction(db, () => {
+        for (let index = 0; index < 96; index++)
+          db.prepare(
+            'INSERT INTO evidence(id,entity_type,entity_id,source_record_id,role,locator_json) VALUES(?,?,?,?,?,?)',
+          ).run(
+            'fictional-retained-' + String(index).padStart(4, '0'),
+            'document',
+            targetId,
+            firstEvidence.source_record_id!,
+            'fictional_support_' + index,
+            firstEvidence.locator_json!,
+          );
+      });
+      const beforeEvidence = duplicateRecord(db, 'document', targetId).evidence,
+        beforeText = canonicalLiteral(beforeEvidence),
+        beforeDigest = createHash('sha256').update(beforeText).digest('hex');
+      assert.equal(beforeEvidence.length, 97);
+      assert.equal(hasIntakeCollectionEnvelope(db, { id: original.id }), false);
+
+      async function request(ids: string[]): Promise<IntakeReportAcceptanceRequest> {
+        const sources = ids.map(upload);
+        for (const source of sources)
+          await buildIntakeCollectionEnvelope(db, { id: source.id, sha256: source.sha256 });
+        for (const source of sources)
+          await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+        return {
+          ...(mode === 'partial-v1' ? { mode } : {}),
+          operationId: randomUUID(),
+          blocks: sources.map((source) => {
+            const selected = prepareCollectionClinicalReview(db, root, profileId, source.id);
+            assert.equal(selected.status, 'ready');
+            if (selected.status !== 'ready') throw Error('Expected complete native review');
+            const review = selected.session.review,
+              record = review.records[0]!,
+              comparison = selectedClinicalPair(db, review, record, targetId);
+            assert.ok(comparison?.scope);
+            return {
+              intakeId: source.id,
+              proposalId: null,
+              intakeVersion: review.version,
+              reviewToken: review.reviewToken,
+              selections: [
+                {
+                  recordId: record.id,
+                  candidateId: record.candidateId!,
+                  candidateVersionId: record.candidateVersionId!,
+                  selectionReviewToken: record.selectionReviewToken!,
+                  mapping: {},
+                  comparisons: [
+                    {
+                      otherRecordId: targetId,
+                      scope: comparison.scope,
+                      outcome: 'same_event',
+                      occurrenceEvidence: 'attach',
+                      reason: 'Independent fictional export of the same reviewed visit.',
+                    },
+                  ],
+                },
+              ],
+            };
+          }),
+        };
+      }
+      const decisions = (database: typeof db) =>
+        database
+          .prepare(
+            "SELECT json_extract(coverage_json,'$.duplicateDecision') AS value FROM manual_batches WHERE json_extract(coverage_json,'$.duplicateDecision.evidenceBasis')='reviewed-pre-projection-v1' ORDER BY json_extract(coverage_json,'$.duplicateDecision.sequence')",
+          )
+          .all()
+          .map(
+            (row) =>
+              JSON.parse(String(row.value)) as {
+                evidenceBasis: string;
+                evidence: { right: RetainedDuplicateEvidenceReference };
+                occurrenceAttachment: { status: string };
+              },
+          );
+      async function read(database: typeof db, ref: RetainedDuplicateEvidenceReference) {
+        const reader = await prepareRetainedDuplicateEvidenceSnapshot(database, ref);
+        try {
+          return [...reader.chunks()].join('');
+        } finally {
+          reader.close();
+        }
+      }
+      const compound = await request(['incoming-a', 'incoming-b']);
+      if (mode === 'atomic') {
+        const unreviewed = structuredClone(compound);
+        unreviewed.operationId = randomUUID();
+        unreviewed.blocks[0]!.reviewToken = 'not-the-complete-reviewed-token';
+        const beforeUnreviewed = revision(db);
+        await assert.rejects(acceptIntakeReportSelectionAsync(db, root, profileId, unreviewed), {
+          code: 'REVIEW_CHANGED',
+        });
+        assert.equal(revision(db), beforeUnreviewed);
+        const stale = structuredClone(compound);
+        stale.operationId = randomUUID();
+        for (const block of stale.blocks)
+          for (const selection of block.selections)
+            for (const comparison of selection.comparisons || []) {
+              const scope = comparison.scope;
+              if (scope?.format !== 'intake-pair-scope-v2') throw Error('Expected exact v2 scope');
+              scope.requestRevision--;
+              const { token: _token, ...payload } = scope;
+              scope.token = createHash('sha256').update(canonicalLiteral(payload)).digest('hex');
+            }
+        await assert.rejects(acceptIntakeReportSelectionAsync(db, root, profileId, stale), {
+          code: 'DUPLICATE_SCOPE_CHANGED',
+        });
+        assert.equal(decisions(db).length, 0);
+      }
+      const accepted = await acceptIntakeReportSelectionAsync(db, root, profileId, compound);
+      assert.equal(accepted.receipt.acceptedCount, 2);
+      assert.equal(db.prepare('SELECT count(*) AS n FROM documents').get()!.n, 1);
+      assert.equal(
+        db.prepare('SELECT count(*) AS n FROM evidence WHERE entity_id=?').get(targetId)!.n,
+        99,
       );
-      await mutation;
-      assert.equal(decisions(db).length, 3);
+      const retained = decisions(db);
+      assert.equal(retained.length, 2);
+      assert.deepEqual(retained[0]!.evidence.right, retained[1]!.evidence.right);
+      const first = retained[0]!.evidence.right;
+      assert.equal(first.count, 97);
+      assert.equal(first.digest, beforeDigest);
+      assert.equal(
+        first.source.intakeId,
+        compound.blocks[0]!.intakeId,
+        'legacy target uses the first native incoming custodian',
+      );
+      assert.equal(await read(db, first), beforeText);
+      assert.ok(retained.every((item) => item.occurrenceAttachment.status === 'attached'));
+      const replay = await acceptIntakeReportSelectionAsync(db, root, profileId, compound);
+      assert.equal(replay.replayed, true);
+      assert.deepEqual(replay.receipt, accepted.receipt);
+      assert.equal(decisions(db).length, 2);
+      for (const block of compound.blocks) {
+        await prepareCollectionClinicalReviewDependencies(db, root, profileId, block.intakeId);
+        const reopened = prepareCollectionClinicalReview(db, root, profileId, block.intakeId);
+        if (reopened.status !== 'ready') throw Error('Expected accepted native source review');
+        const pair = selectedClinicalPair(
+          db,
+          reopened.session.review,
+          reopened.session.record(block.selections[0]!.recordId)!,
+          targetId,
+        );
+        assert.equal(pair?.previousDecision?.attachmentStatus, 'attached');
+        assert.equal(pair?.previousDecision?.scopeStatus, 'current');
+      }
+
+      const secondText = canonicalLiteral(duplicateRecord(db, 'document', targetId).evidence),
+        next = await request(['incoming-c']),
+        changedBefore = intakeWorkCounters(db).warm.duplicateSnapshotChangedRows;
+      const nextResult = await acceptIntakeReportSelectionAsync(db, root, profileId, next),
+        latest = decisions(db).at(-1)!.evidence.right;
+      assert.equal(intakeWorkCounters(db).warm.duplicateSnapshotChangedRows - changedBefore, 2);
+      assert.equal(latest.count, 99);
+      assert.equal(latest.source.intakeId, first.source.intakeId);
+      assert.equal(await read(db, latest), secondText);
+      assert.equal(await read(db, first), beforeText);
       assert.equal(
         db.prepare('SELECT count(*) AS n FROM evidence WHERE entity_id=?').get(targetId)!.n,
         100,
       );
-    }
-  });
+
+      const recoveredRoot = join(root, 'recovered'),
+        rebuilt = rebuildProfile(root, profileId, recoveredRoot),
+        recovered = openDatabase(rebuilt.database, profileId);
+      attachPersonalDurability(recovered, { root: recoveredRoot, profileId });
+      try {
+        assert.equal(await read(recovered, first), beforeText);
+        assert.equal(await read(recovered, latest), secondText);
+        assert.equal(
+          recovered.prepare('SELECT count(*) AS n FROM evidence WHERE entity_id=?').get(targetId)!
+            .n,
+          100,
+        );
+        const replay = await acceptIntakeReportSelectionAsync(
+          recovered,
+          recoveredRoot,
+          profileId,
+          next,
+        );
+        assert.equal(replay.replayed, true);
+        assert.deepEqual(replay.receipt, nextResult.receipt);
+        assert.deepEqual(decisions(recovered), decisions(db));
+      } finally {
+        clearIntakeStateCache(recovered);
+        recovered.close();
+      }
+      if (mode === 'atomic') {
+        const racing = await request(['incoming-race']);
+        const mutation = new Promise<void>((resolve, reject) => {
+          setImmediate(() => {
+            try {
+              transaction(db, () => undefined, { actor: 'intake-envelope-build' });
+              resolve();
+            } catch (error) {
+              reject(error);
+            }
+          });
+        });
+        await assert.rejects(
+          acceptIntakeReportSelectionAsync(db, root, profileId, racing),
+          (error: unknown) => error instanceof Error && /changed|Refresh/i.test(error.message),
+        );
+        await mutation;
+        assert.equal(decisions(db).length, 3);
+        assert.equal(
+          db.prepare('SELECT count(*) AS n FROM evidence WHERE entity_id=?').get(targetId)!.n,
+          100,
+        );
+      }
+    },
+  );

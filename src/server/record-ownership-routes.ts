@@ -15,7 +15,6 @@ import {
   nativeOwnershipBlockerStore,
   chooseNativeOwnershipName,
   nativeOwnershipReportPlan,
-  usesNativeOwnershipReportEvidence,
   chooseNativeOwnershipReport,
 } from './record-ownership-native.ts';
 import {
@@ -24,6 +23,7 @@ import {
   ownershipOutcomePage,
 } from './ownership-outcome-page.ts';
 import { publishedOwnershipNameSupportPage } from './ownership-name-support-page.ts';
+import { prepareOwnershipDecisionIndex } from './ownership-decision-index.ts';
 
 /** Mounted only after the existing unlocked-profile, session and origin checks. */
 export async function handleRecordOwnershipRoute(context: {
@@ -77,7 +77,7 @@ export async function handleRecordOwnershipRoute(context: {
   if (method === 'GET' && id === 'report-evidence' && action) {
     const url = new URL(req.url || '/', 'http://profile.invalid'),
       section = url.searchParams.get('section') || 'records';
-    if (!['records', 'pending', 'relationships'].includes(section))
+    if (!['records', 'pending', 'relationships', 'holds'].includes(section))
       throw new HttpError(400, 'OWNERSHIP_CURSOR', 'Invalid report evidence section');
     const plan = nativeOwnershipReportPlan(db, profileId, action);
     if (url.searchParams.has('contribution')) {
@@ -105,7 +105,7 @@ export async function handleRecordOwnershipRoute(context: {
     if (url.searchParams.has('ordinal'))
       respond(
         plan.fragment(
-          section as 'records' | 'pending' | 'relationships',
+          section as 'records' | 'pending' | 'relationships' | 'holds',
           Number(url.searchParams.get('ordinal')),
           Number(url.searchParams.get('offset') ?? '0'),
           Number(url.searchParams.get('bytes') ?? '65536'),
@@ -114,7 +114,7 @@ export async function handleRecordOwnershipRoute(context: {
     else
       respond(
         plan.page(
-          section as 'records' | 'pending' | 'relationships',
+          section as 'records' | 'pending' | 'relationships' | 'holds',
           Number(url.searchParams.get('after') ?? '-1'),
           Number(url.searchParams.get('limit') ?? '32'),
           Number(url.searchParams.get('bytes') ?? '65536'),
@@ -123,6 +123,7 @@ export async function handleRecordOwnershipRoute(context: {
     return true;
   }
   if (method === 'GET' && id === 'outcomes' && action) {
+    await prepareOwnershipDecisionIndex(db);
     const url = new URL(req.url || '/', 'http://profile.invalid');
     respond(
       ownershipOutcomePage(
@@ -136,6 +137,7 @@ export async function handleRecordOwnershipRoute(context: {
     return true;
   }
   if (method === 'GET' && id === 'name-supports' && action) {
+    await prepareOwnershipDecisionIndex(db);
     if (!ownershipReceiptReference(db, profileId, action))
       getRecordOwnershipReceipt(db, profileId, action);
     const url = new URL(req.url || '/', 'http://profile.invalid');
@@ -217,6 +219,7 @@ export async function handleRecordOwnershipRoute(context: {
     return true;
   }
   if (method === 'GET' && id && !action && id !== 'preview') {
+    await prepareOwnershipDecisionIndex(db);
     respond(
       ownershipReceiptReference(db, profileId, id) ?? getRecordOwnershipReceipt(db, profileId, id),
     );
@@ -235,6 +238,7 @@ export async function handleRecordOwnershipRoute(context: {
   }
   // Replays resolve before any original read; this also works after the source was archived.
   if (id !== 'preview' && input && typeof input === 'object' && 'operationId' in input) {
+    await prepareOwnershipDecisionIndex(db);
     const replay = replayOwnershipReceiptReference(db, profileId, input);
     if (replay) {
       respond(replay);
@@ -248,15 +252,15 @@ export async function handleRecordOwnershipRoute(context: {
       if (!(error instanceof HttpError) || error.code !== 'OWNERSHIP_NOT_FOUND') throw error;
     }
   }
-  const selectedInput = id === 'preview' ? input : (input as { request?: unknown })?.request;
-  if (!usesNativeOwnershipReportEvidence(db, selectedInput))
+  const native = usesNativeOwnershipEvidence(db);
+  if (!native)
     await prepareOwnershipEvidence(
       db,
       root,
       profileId,
       id === 'preview' ? input : (input as { request?: unknown })?.request,
     );
-  if (usesNativeOwnershipEvidence(db))
+  if (native)
     respond(
       id === 'preview'
         ? await previewNativeRecordOwnership(db, root, profileId, input)

@@ -34,8 +34,21 @@ interface Grounding {
   subject: boolean;
   nameQuestions: Pick<Set<string>, 'has'>;
   birthDates: BirthDateEvidence;
+  dispose?: () => void;
 }
 const grounded = new WeakMap<DatabaseSync, Map<string, Grounding>>();
+function discardGrounding(scopes: Map<string, Grounding>, key: string) {
+  const previous = scopes.get(key);
+  scopes.delete(key);
+  previous?.dispose?.();
+}
+/** Clear before profile lock or database close, including native SQL proof rows. */
+export function clearIdentityGrounding(db: DatabaseSync): void {
+  const scopes = grounded.get(db);
+  if (!scopes) return;
+  for (const key of scopes.keys()) discardGrounding(scopes, key);
+  grounded.delete(db);
+}
 const maxGroups = 256;
 const maxQuestions = 100;
 const boundaryKey = (boundary: Boundary, group: IntakeReportGroup) =>
@@ -92,7 +105,7 @@ export function retainIdentityGrounding(
   const key = originalDateKey(boundary, group);
   // Replace every proof and DOB fact atomically, including negative results.
   // Eviction must never leave a name proof without its DOB knowledge.
-  scopes.delete(key);
+  discardGrounding(scopes, key);
   scopes.set(key, {
     boundaryKey: boundaryKey(boundary, group),
     questions: proofs,
@@ -100,7 +113,7 @@ export function retainIdentityGrounding(
     nameQuestions,
     birthDates: structuredClone(birthDates),
   });
-  while (scopes.size > maxGroups) scopes.delete(scopes.keys().next().value!);
+  while (scopes.size > maxGroups) discardGrounding(scopes, scopes.keys().next().value!);
 }
 
 function proof(db: DatabaseSync, boundary: Boundary, group: IntakeReportGroup) {
@@ -199,6 +212,9 @@ export function retainSelectedIdentityGrounding(
     'CREATE TEMP TABLE IF NOT EXISTS intake_selected_identity_proofs(scope TEXT,kind TEXT,proof TEXT,PRIMARY KEY(scope,kind,proof)) WITHOUT ROWID',
   );
   const key = selectedOriginalDateKey(boundary, group);
+  let scopes = grounded.get(db);
+  if (!scopes) grounded.set(db, (scopes = new Map()));
+  discardGrounding(scopes, key);
   db.prepare('DELETE FROM intake_selected_identity_proofs WHERE scope=?').run(key);
   const add = db.prepare('INSERT OR IGNORE INTO intake_selected_identity_proofs VALUES(?,?,?)');
   for (const { issue, receipt } of questions) add.run(key, 'question', questionKey(issue, receipt));
@@ -212,20 +228,20 @@ export function retainSelectedIdentityGrounding(
         )
         .get(key, kind, proof),
   });
-  let scopes = grounded.get(db);
-  if (!scopes) grounded.set(db, (scopes = new Map()));
-  scopes.delete(key);
   scopes.set(key, {
     boundaryKey: boundary.boundaryFingerprint(group),
     questions: proofs('question'),
     subject: verifiedSubject,
     nameQuestions: proofs('name'),
     birthDates: structuredClone(birthDates),
+    dispose: () => {
+      if (db.isOpen)
+        db.prepare('DELETE FROM intake_selected_identity_proofs WHERE scope=?').run(key);
+    },
   });
   while (scopes.size > maxGroups) {
     const old = scopes.keys().next().value!;
-    scopes.delete(old);
-    db.prepare('DELETE FROM intake_selected_identity_proofs WHERE scope=?').run(old);
+    discardGrounding(scopes, old);
   }
 }
 /** Discard before writes/awaits. Exact source dates survive membership changes; question proofs do not. */

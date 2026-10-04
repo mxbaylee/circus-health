@@ -1,6 +1,17 @@
+import { revision } from './database.ts';
+import {
+  reviewReadStamp,
+  preparedClinicalReviewRead,
+  beginPreparedClinicalReviewRead,
+  isPreparedClinicalReviewReadCurrent,
+  discardPreparedClinicalReviewRead,
+  retainPreparedClinicalReviewRead,
+} from './intake-clinical-review-read-cache.ts';
 import { selectedReportGroups } from './intake-selected-report-groups.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
-import { reviewIssueFactory } from './intake-review-issue-state.ts';
+import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
+import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
+import { reviewIssueFactory, createReviewIssueScratch } from './intake-review-issue-state.ts';
 /** Native clinical host orchestration. Authorization and verified proposal bytes precede all policy reads. */
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -8,12 +19,13 @@ import type { DatabaseSync } from 'node:sqlite';
 import { assertIntakeOwner, verifyIntakeOriginal } from './intake.ts';
 import { HttpError, clinicalReviewRevision, safeText } from './database.ts';
 import { getNote } from './notes.ts';
+import { bindReviewIdentityWarnings } from './intake-review-identity-warnings.ts';
 import {
   effectiveKnownNames,
   challengedKnownNames,
   futureNameOwners,
 } from './name-associations.ts';
-import { identityPeopleSnapshots } from './intake-identity-people.ts';
+import { selectedIdentityPeopleSnapshots } from './intake-identity-people.ts';
 import { identityOriginalFingerprintForMember } from './intake-identity-policy.ts';
 import { selectedIdentityReviewGroundingLookups } from './intake-identity-grounding.ts';
 import { copiedManualSourceRecordApplies } from './intake-manual-copy.ts';
@@ -239,6 +251,8 @@ export function prepareCollectionClinicalReview(
     )
       throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
   };
+  const issueScratch = createReviewIssueScratch(db);
+  let retainedIssueScratch = false;
   try {
     const opened = new Map<string, ReturnType<typeof open>>();
     function open(original: ClinicalScopeOriginal) {
@@ -253,6 +267,70 @@ export function prepareCollectionClinicalReview(
         );
       const view = openIntakeCollectionEnvelope(db, retained),
         catalog = createReportSnapshotCatalog(db, retained);
+      const cacheStatement = db.prepare(
+        'SELECT total_changes() AS changes, (SELECT data_version FROM pragma_data_version) AS external, (SELECT schema_version FROM pragma_schema_version) AS schema',
+      );
+      cacheStatement.setReadBigInts(true);
+      let cacheGeneration: object | undefined,
+        cacheEpoch = 0;
+      const readCacheState = () => {
+        assertCurrent();
+        view.address(view.root());
+        if (db.isTransaction) return undefined;
+        const generation = intakeCollectionCacheGeneration(db);
+        if (generation !== cacheGeneration) {
+          cacheGeneration = generation;
+          cacheEpoch++;
+        }
+        const state = cacheStatement.get()!;
+        return `${cacheEpoch}:${state.changes}:${state.external}:${state.schema}`;
+      };
+      type SelectedSourceVersion = {
+        group: IntakeEnvelopeRecord;
+        version: IntakeEnvelopeRecord;
+        groupId: string;
+        versionId: string;
+      };
+      const uniqueVersions = new Map<string, SelectedSourceVersion | null>();
+      let uniqueVersionState: string | undefined;
+      const uniqueVersion = (groupId: string, versionId: string): SelectedSourceVersion | null => {
+        const state = readCacheState(),
+          key = JSON.stringify([groupId, versionId]);
+        if (state !== uniqueVersionState) {
+          uniqueVersions.clear();
+          uniqueVersionState = state;
+        }
+        if (state !== undefined && uniqueVersions.has(key)) {
+          const cached = uniqueVersions.get(key)!;
+          uniqueVersions.delete(key);
+          uniqueVersions.set(key, cached);
+          return cached;
+        }
+        withIntakeWork(db, 'warm', () => recordIntakeWork('collectionSuggestedSourceLookups'));
+        const workflow = view.child(view.child(view.root(), 'intake')!, 'workflow');
+        let result: SelectedSourceVersion | null = null;
+        if (workflow) {
+          const group = view.find('reportGroup', workflow, groupId),
+            lastGroup = view.find('reportGroup', workflow, groupId, { match: 'last' });
+          if (group && lastGroup && view.address(group) === view.address(lastGroup)) {
+            const version = view.find('version', group, versionId),
+              lastVersion = view.find('version', group, versionId, { match: 'last' });
+            if (
+              version &&
+              lastVersion &&
+              view.address(version) === view.address(lastVersion) &&
+              field<string>(view, version, 'format', metadataBytes) ===
+                'health-intake-report-group-version-v2'
+            )
+              result = { group, version, groupId, versionId };
+          }
+        }
+        if (state !== undefined) {
+          if (uniqueVersions.size >= 32) uniqueVersions.delete(uniqueVersions.keys().next().value!);
+          uniqueVersions.set(key, result);
+        }
+        return result;
+      };
       const intake = view.child(view.root(), 'intake');
       if (!intake) throw Error('Missing selected intake');
       const workflow = view.child(intake, 'workflow');
@@ -275,16 +353,22 @@ export function prepareCollectionClinicalReview(
       };
       const packageEvidence =
         retained.mime_type === 'application/zip' || !!planEvidence?.hasMembers;
-      const issueSink = reviewIssueFactory(db, {
-        sourceId: retained.id,
-        generation: workflowHash([view.logical, initialRevision]),
-        assertCurrent: () => {
-          assertCurrent();
-          view.address(view.root());
+      const issueSink = reviewIssueFactory(
+        db,
+        {
+          sourceId: retained.id,
+          generation: workflowHash([view.logical, initialRevision]),
+          assertCurrent: () => {
+            assertCurrent();
+            view.address(view.root());
+          },
         },
-      });
+        issueScratch.db,
+      );
       const scope = collectionWorkflowReviewScope({
         issueSink,
+        bindIdentityWarnings: (record, warnings) =>
+          bindReviewIdentityWarnings(issueSink, record, warnings),
         close: issueSink.dispose,
         questionState: openReviewQuestionState(db, retained, view),
         membershipIndex: readCollectionReviewMembership(db, retained, view),
@@ -299,6 +383,7 @@ export function prepareCollectionClinicalReview(
         view,
         catalog,
         metadataBytes,
+        readCacheState,
         packageEvidence,
         activeReceipt: (receipt) =>
           !db
@@ -349,7 +434,18 @@ export function prepareCollectionClinicalReview(
         subjectGrounded: grounding.subjectGrounded,
         questionGrounded: grounding.grounded,
       });
-      return { retained, view, catalog, intake, workflow, read, scope, grounding, sourceScope };
+      return {
+        retained,
+        view,
+        catalog,
+        intake,
+        workflow,
+        read,
+        scope,
+        grounding,
+        sourceScope,
+        uniqueVersion,
+      };
     }
     function validateProvider(id: string, name: string, materialize = false) {
       const existing = db.prepare('SELECT name FROM providers WHERE id=?').get(id);
@@ -510,117 +606,138 @@ export function prepareCollectionClinicalReview(
         })
       | null {
       const { view, read, workflow, catalog } = current;
-      const groupCount = workflow ? view.childCount(workflow, 'reportGroups') : 0;
-      for (let g = groupCount - 1; g >= 0; g--) {
-        const group = view.childAt(workflow!, 'reportGroups', g)!;
-        if (read(group, 'basis') !== 'report_anchor') continue;
-        const groupId = read<string>(group, 'id')!;
-        for (let v = view.childCount(group, 'versions') - 1; v >= 0; v--) {
-          const version = view.childAt(group, 'versions', v)!,
-            versionId = read<string>(version, 'id')!;
-          if (
-            !selectedReportGroups(record.reportGroups).some(
-              (ref) => ref.groupId === groupId && ref.groupVersionId === versionId,
-            ) ||
-            read(version, 'contextState') === 'mixed'
-          )
-            continue;
-          const context = read<IntakeReportContextReference>(version, 'context');
-          if (context?.status !== 'linked' || !context.sourceSuggestion?.value.trim()) continue;
-          const members =
-            read(version, 'format') === 'health-intake-report-group-version-v2'
-              ? openReportMemberSnapshot(
-                  catalog,
-                  read<IntakeReportMembersReference>(version, 'members')!,
-                )
-              : undefined;
-          const selected = members
-            ? members.member(record.candidateId!, record.candidateVersionId!)
-            : undefined;
-          const identities = function* () {
-            if (members)
-              for (let i = 0; i < members.reference.memberCount; i++) {
-                const member = members.memberAt(i)!;
-                yield {
-                  candidateId: member.candidateId,
-                  candidateVersionId: member.candidateVersionId,
-                };
-              }
-            else
-              for (const member of intakeReviewChildren(view, version, 'members'))
-                yield {
-                  candidateId: read<string>(member, 'candidateId')!,
-                  candidateVersionId: read<string>(member, 'candidateVersionId')!,
-                };
-          };
-          let present = !!selected;
-          if (!members)
-            for (const member of identities())
-              if (
-                member.candidateId === record.candidateId &&
-                member.candidateVersionId === record.candidateVersionId
-              ) {
-                present = true;
-                break;
-              }
-          if (!present) continue;
-          const name =
-            safeText(context.sourceSuggestion.value.trim(), 'source name', 200).trim() ||
-            'Unknown source';
-          const existing = db
-            .prepare('SELECT id,name FROM providers WHERE name=? COLLATE NOCASE')
-            .get(name);
-          const provider = existing
-            ? { id: String(existing.id), name: String(existing.name) }
-            : { id: 'source-' + digest(name.toLowerCase()).slice(0, 24), name };
-          const header = {
-            at: '',
-            basis: 'suggested_report_label' as const,
-            contextId: context.contextId,
-            groupId,
-            groupVersionId: versionId,
-            operationId:
-              'default-report-source:' +
-              workflowHash([
-                groupId,
-                versionId,
-                context.contextId,
-                context.sourceSuggestion.value.trim(),
-              ]),
-            source: provider.name,
-            sourceProviderId: provider.id,
-          };
-          if (providerId !== undefined && provider.id !== providerId) continue;
-          validateProvider(provider.id, provider.name);
-          const hash = createHash('sha256');
-          hash.update('{');
-          let comma = false;
-          for (const name of [...Object.keys(header), 'members'].sort()) {
-            if (comma) hash.update(',');
-            comma = true;
-            hash.update(JSON.stringify(name) + ':');
-            if (name === 'members') {
-              hash.update('[');
-              let comma = false;
-              for (const member of identities()) {
-                if (comma) hash.update(',');
-                comma = true;
-                hash.update(canonicalLiteral(member));
-              }
-              hash.update(']');
-            } else hash.update(canonicalLiteral(header[name as keyof typeof header]));
-          }
-          hash.update('}');
-          return {
-            confirmationHash: hash.digest('hex'),
-            confirmation: header,
-            coverage: { groupVersionId: versionId, contextId: context.contextId },
-          };
+      function* versions() {
+        const references = selectedReportGroups(record.reportGroups)[Symbol.iterator]();
+        let only: { groupId: string; groupVersionId: string } | undefined;
+        try {
+          const first = references.next();
+          if (!first.done && references.next().done) only = first.value;
+        } finally {
+          references.return?.();
         }
+        // New native records normally retain one report reference. Prove both
+        // IDs are unique before bypassing reverse historical precedence.
+        if (workflow && only) {
+          const selected = current.uniqueVersion(only.groupId, only.groupVersionId);
+          if (selected) {
+            if (read(selected.group, 'basis') === 'report_anchor') yield selected;
+            return;
+          }
+        }
+        const groupCount = workflow ? view.childCount(workflow, 'reportGroups') : 0;
+        for (let g = groupCount - 1; g >= 0; g--) {
+          const group = view.childAt(workflow!, 'reportGroups', g)!;
+          if (read(group, 'basis') !== 'report_anchor') continue;
+          const groupId = read<string>(group, 'id')!;
+          for (let v = view.childCount(group, 'versions') - 1; v >= 0; v--) {
+            const version = view.childAt(group, 'versions', v)!;
+            yield { group, version, groupId, versionId: read<string>(version, 'id')! };
+          }
+        }
+      }
+      for (const { version, groupId, versionId } of versions()) {
+        if (
+          !selectedReportGroups(record.reportGroups).some(
+            (ref) => ref.groupId === groupId && ref.groupVersionId === versionId,
+          ) ||
+          read(version, 'contextState') === 'mixed'
+        )
+          continue;
+        const context = read<IntakeReportContextReference>(version, 'context');
+        if (context?.status !== 'linked' || !context.sourceSuggestion?.value.trim()) continue;
+        const members =
+          read(version, 'format') === 'health-intake-report-group-version-v2'
+            ? openReportMemberSnapshot(
+                catalog,
+                read<IntakeReportMembersReference>(version, 'members')!,
+              )
+            : undefined;
+        const selected = members
+          ? members.member(record.candidateId!, record.candidateVersionId!)
+          : undefined;
+        const identities = function* () {
+          if (members)
+            for (let i = 0; i < members.reference.memberCount; i++) {
+              const member = members.memberAt(i)!;
+              yield {
+                candidateId: member.candidateId,
+                candidateVersionId: member.candidateVersionId,
+              };
+            }
+          else
+            for (const member of intakeReviewChildren(view, version, 'members'))
+              yield {
+                candidateId: read<string>(member, 'candidateId')!,
+                candidateVersionId: read<string>(member, 'candidateVersionId')!,
+              };
+        };
+        let present = !!selected;
+        if (!members)
+          for (const member of identities())
+            if (
+              member.candidateId === record.candidateId &&
+              member.candidateVersionId === record.candidateVersionId
+            ) {
+              present = true;
+              break;
+            }
+        if (!present) continue;
+        const name =
+          safeText(context.sourceSuggestion.value.trim(), 'source name', 200).trim() ||
+          'Unknown source';
+        const existing = db
+          .prepare('SELECT id,name FROM providers WHERE name=? COLLATE NOCASE')
+          .get(name);
+        const provider = existing
+          ? { id: String(existing.id), name: String(existing.name) }
+          : { id: 'source-' + digest(name.toLowerCase()).slice(0, 24), name };
+        const header = {
+          at: '',
+          basis: 'suggested_report_label' as const,
+          contextId: context.contextId,
+          groupId,
+          groupVersionId: versionId,
+          operationId:
+            'default-report-source:' +
+            workflowHash([
+              groupId,
+              versionId,
+              context.contextId,
+              context.sourceSuggestion.value.trim(),
+            ]),
+          source: provider.name,
+          sourceProviderId: provider.id,
+        };
+        if (providerId !== undefined && provider.id !== providerId) continue;
+        validateProvider(provider.id, provider.name);
+        const hash = createHash('sha256');
+        hash.update('{');
+        let comma = false;
+        for (const name of [...Object.keys(header), 'members'].sort()) {
+          if (comma) hash.update(',');
+          comma = true;
+          hash.update(JSON.stringify(name) + ':');
+          if (name === 'members') {
+            hash.update('[');
+            let comma = false;
+            for (const member of identities()) {
+              if (comma) hash.update(',');
+              comma = true;
+              hash.update(canonicalLiteral(member));
+            }
+            hash.update(']');
+          } else hash.update(canonicalLiteral(header[name as keyof typeof header]));
+        }
+        hash.update('}');
+        return {
+          confirmationHash: hash.digest('hex'),
+          confirmation: header,
+          coverage: { groupVersionId: versionId, contextId: context.contextId },
+        };
       }
       return null;
     }
-    return createCollectionClinicalReviewSession({
+    const result = createCollectionClinicalReviewSession({
       db,
       profileId,
       proposal: {
@@ -644,7 +761,7 @@ export function prepareCollectionClinicalReview(
       self,
       identity: {
         profileId,
-        people: identityPeopleSnapshots(db),
+        people: selectedIdentityPeopleSnapshots(db),
         ...grounding,
         resolutionCurrent: (resolution, mapping) => issueResolutionCurrent(db, resolution, mapping),
         copiedManualSourceApplies: (receipt, selectedProposal) =>
@@ -707,9 +824,151 @@ export function prepareCollectionClinicalReview(
       },
       assertCurrent,
     });
+    if (result.status === 'ready') {
+      const close = result.session.close;
+      result.session.close = () => {
+        try {
+          close();
+        } finally {
+          issueScratch.close();
+        }
+      };
+      retainedIssueScratch = true;
+    }
+    return result;
   } catch (error) {
     if (error instanceof IntakeReviewFragmentRequired)
       return { status: 'fragment_required', reference: error.reference };
     throw error;
+  } finally {
+    if (!retainedIssueScratch) issueScratch.close();
+  }
+}
+
+type ClinicalReadSession =
+  import('./intake-review-collection-session.ts').CollectionClinicalReviewSession;
+type ClinicalReadRequests = {
+  page: {
+    section: Parameters<ClinicalReadSession['page']>[0];
+    options: Parameters<ClinicalReadSession['page']>[1];
+  };
+  fragment: {
+    reference: Parameters<ClinicalReadSession['fragment']>[0];
+    offset: number;
+    bytes: number;
+  };
+  record: { recordId: string; candidateVersionId?: string; bytes?: number };
+};
+type ClinicalReadValues = {
+  page: ReturnType<ClinicalReadSession['page']>;
+  fragment: ReturnType<ClinicalReadSession['fragment']>;
+  record: ReturnType<ClinicalReadSession['selectedRecord']>;
+};
+type ClinicalReadRequest = {
+  [K in keyof ClinicalReadRequests]: { kind: K } & ClinicalReadRequests[K];
+}[keyof ClinicalReadRequests];
+type ClinicalReadResult<T> =
+  | { status: 'ready'; value: T }
+  | Extract<CollectionClinicalReviewResult, { status: 'fragment_required' }>;
+export function readPreparedCollectionClinicalReview(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  proposalId: string | null,
+  input: Extract<ClinicalReadRequest, { kind: 'page' }>,
+): Promise<ClinicalReadResult<ClinicalReadValues['page']>>;
+export function readPreparedCollectionClinicalReview(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  proposalId: string | null,
+  input: Extract<ClinicalReadRequest, { kind: 'fragment' }>,
+): Promise<ClinicalReadResult<ClinicalReadValues['fragment']>>;
+export function readPreparedCollectionClinicalReview(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  proposalId: string | null,
+  input: Extract<ClinicalReadRequest, { kind: 'record' }>,
+): Promise<ClinicalReadResult<ClinicalReadValues['record']>>;
+/** Read-only transport access: one exact, completed proposal review may serve successive windows. */
+export async function readPreparedCollectionClinicalReview(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  proposalId: string | null,
+  input: ClinicalReadRequest,
+): Promise<ClinicalReadResult<ClinicalReadValues[keyof ClinicalReadValues]>> {
+  const attempt = beginPreparedClinicalReviewRead(db);
+  let owned: ClinicalReadSession | undefined;
+  try {
+    if (db.isTransaction) discardPreparedClinicalReviewRead(db);
+    assertIntakeOwner(db, profileId);
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, intakeId, proposalId);
+    const key = canonicalLiteral([root, profileId, intakeId, proposalId]),
+      stamp = reviewReadStamp(db),
+      requestRevision = revision(db),
+      sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
+    let cached = preparedClinicalReviewRead(db);
+    if (
+      cached &&
+      (stamp === undefined ||
+        cached.key !== key ||
+        cached.stamp !== stamp ||
+        cached.sourcePin !== sourcePin ||
+        cached.requestRevision !== requestRevision)
+    ) {
+      if (isPreparedClinicalReviewReadCurrent(db, attempt)) discardPreparedClinicalReviewRead(db);
+      cached = undefined;
+    }
+    verifyIntakeOriginal(db, root, profileId, intakeId);
+    if (proposalId) {
+      const file = requiredFile(db, proposalId, false);
+      verifyIntakeFileHash(profileOriginal(root, file.path, profileId), file);
+    }
+    if (!cached) {
+      withIntakeWork(db, 'warm', () => recordIntakeWork('collectionPublicClinicalReviews'));
+      const prepared = prepareCollectionClinicalReview(db, root, profileId, intakeId, proposalId);
+      if (prepared.status !== 'ready') return prepared;
+      owned = prepared.session;
+    }
+    const session = cached?.session || owned!;
+    const output =
+      input.kind === 'page'
+        ? session.page(input.section, input.options)
+        : input.kind === 'fragment'
+          ? session.fragment(input.reference, input.offset, input.bytes)
+          : session.selectedRecord(input.recordId, input.candidateVersionId, input.bytes);
+    // Detach only emitted bounded transport; no caller gets the private session or record aliases.
+    const value = JSON.parse(canonicalLiteral(output), (_key, value, context) =>
+      typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
+        ? JSON.rawJSON(context.source)
+        : value,
+    ) as ClinicalReadValues[keyof ClinicalReadValues];
+    assertIntakeOwner(db, profileId);
+    if (
+      requestRevision !== revision(db) ||
+      sourcePin !== canonicalLiteral(intakeSourceVersion(db, intakeId)) ||
+      (stamp !== undefined && stamp !== reviewReadStamp(db))
+    )
+      throw new HttpError(
+        409,
+        'INTAKE_REVIEW_CHANGED',
+        'Review changed while reading; refresh this review',
+      );
+    if (stamp !== undefined && !cached && isPreparedClinicalReviewReadCurrent(db, attempt)) {
+      retainPreparedClinicalReviewRead(db, { key, stamp, sourcePin, requestRevision, session });
+      owned = undefined;
+    }
+    return { status: 'ready', value };
+  } catch (error) {
+    if (isPreparedClinicalReviewReadCurrent(db, attempt)) discardPreparedClinicalReviewRead(db);
+    throw error;
+  } finally {
+    owned?.close();
   }
 }

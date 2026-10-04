@@ -1,5 +1,6 @@
 import { selectedOwnershipBlockers } from './ownership-identity-values.ts';
 import { reviewIssueCollection } from './intake-review-issue-state.ts';
+import { reviewRecordIdentityWarnings } from './intake-review-identity-warnings.ts';
 import { reviewRecordQuestions, reviewQuestionCount } from './intake-review-question-selection.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { selectedReportGroups } from './intake-selected-report-groups.ts';
@@ -172,6 +173,18 @@ function sectionData(
   section: ClinicalRecordSectionRequest['section'],
   comparisonIds?: string[],
 ) {
+  if (section === 'identityWarnings') {
+    const warnings = reviewRecordIdentityWarnings(record);
+    return {
+      length: warnings.length,
+      at(ordinal: number) {
+        const warning = warnings.at(ordinal);
+        return warning
+          ? { value: warning, control: { kind: 'identityWarning' as const } }
+          : undefined;
+      },
+    };
+  }
   if (section === 'ownershipBlockers') {
     const reference = record.identityReview?.ownershipBlockers;
     return {

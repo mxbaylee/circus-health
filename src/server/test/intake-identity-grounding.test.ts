@@ -7,6 +7,8 @@ import {
   identitySubjectGroundingLookup,
   identityNameQuestionGroundingLookup,
   identityOriginalBirthDateEvidenceLookup,
+  retainSelectedIdentityGrounding,
+  clearIdentityGrounding,
 } from '../intake-identity-grounding.ts';
 import type { IntakeReportGroup } from '../../shared/intake.ts';
 
@@ -39,6 +41,42 @@ const boundary = {
   sourceHash: 'fictional-hash',
   workflow: { plans: [], reportGroups: [] },
 };
+
+test('mixed native and legacy grounding eviction disposes complete SQL proofs and lock clear', () => {
+  const db = new DatabaseSync(':memory:');
+  const selected = {
+    ...boundary,
+    originalFingerprint: (current: { id: string }) => current.id,
+    boundaryFingerprint: (current: { id: string }) => current.id,
+  };
+  const question = { prompt: 'Fictional exact question', textAnchor: 'Patient: Iris Meadow' };
+  const count = () =>
+    Number(db.prepare('SELECT count(*) n FROM intake_selected_identity_proofs').get()!.n);
+  try {
+    retainSelectedIdentityGrounding(
+      db,
+      selected,
+      group('native'),
+      [],
+      true,
+      (function* () {
+        for (let n = 0; n < 1000; n++) yield { ...question, prompt: question.prompt + n };
+      })(),
+    );
+    assert.equal(count(), 1000);
+    for (let n = 0; n < 256; n++)
+      retainIdentityGrounding(db, boundary, group('legacy-' + n), [], true);
+    assert.equal(count(), 0);
+    retainSelectedIdentityGrounding(db, selected, group('native-again'), [], true, [question]);
+    assert.equal(count(), 1);
+    clearIdentityGrounding(db);
+    assert.equal(count(), 0);
+    assert.equal(identitySubjectGroundingLookup(db, boundary)(group('legacy-255')), false);
+    clearIdentityGrounding(db);
+  } finally {
+    db.close();
+  }
+});
 
 test('new review snapshots recheck replaced proofs, membership, and database ownership', () => {
   const db = new DatabaseSync(':memory:');

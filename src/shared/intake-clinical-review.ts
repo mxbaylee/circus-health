@@ -40,6 +40,7 @@ export interface IntakeClinicalRecordRead {
         kind: 'reference';
         reference: IntakeClinicalReviewReference;
         ownershipBlockers?: import('./ownership-identity-values.ts').OwnershipIdentityBlockersReference;
+        identityWarnings?: NonNullable<IntakeReviewRecord['identityReview']>['warningsReference'];
         draftHistory?: NonNullable<IntakeReviewRecord['draft']>['history'];
         reportGroups?: import('./intake-report-group-links.ts').IntakeReviewGroupLinksReference;
         selection: {

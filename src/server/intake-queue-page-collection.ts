@@ -141,7 +141,12 @@ export async function readCollectionReportGroupDetail(
   root: string,
   profileId: string,
   groupId: string,
-  input: Options & { intakeId?: string; peopleCursor?: string; personId?: string } = {},
+  input: Options & {
+    intakeId?: string;
+    peopleCursor?: string;
+    personId?: string;
+    peopleQuery?: string;
+  } = {},
 ) {
   const queue = await openCollectionReportQueue(db, root, profileId);
   try {
@@ -169,6 +174,7 @@ export async function readCollectionReportGroupDetail(
       people = readCollectionPeoplePage(db, root, profileId, pointer.intakeId, {
         groupId,
         personId: input.personId,
+        q: input.peopleQuery,
         view: input.view,
         cursor: input.peopleCursor,
         limit: input.limit,

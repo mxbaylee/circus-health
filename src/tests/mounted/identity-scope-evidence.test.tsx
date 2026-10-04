@@ -284,3 +284,72 @@ it('opens an oversized retained identity field without treating its fragment as 
   ).toBeVisible();
   expect(requests.some((url) => url.endsWith('/identity-scope'))).toBe(false);
 });
+
+it('opens referenced advisory warnings as bounded evidence without treating the inline list as complete', async () => {
+  const scope = {
+    ...review.scopeReference!,
+    collection: { ...review.scopeReference!.collection, questions: 0 },
+  };
+  const visited: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.endsWith('/identity-review'))
+        return json({
+          ...review,
+          scopeReference: scope,
+          warnings: [],
+          warningsReference: {
+            format: 'health-intake-identity-warnings-v1',
+            scopeToken: scope.scopeToken,
+            snapshotId: scope.collection.snapshotId,
+            count: 2,
+          },
+        });
+      if (url.pathname.endsWith('/identity-scope-page')) {
+        const section = url.searchParams.get('section')!;
+        visited.push(section);
+        if (section === 'warnings')
+          return json({
+            format: 'health-intake-identity-scope-page-v2',
+            scopeToken: scope.scopeToken,
+            section,
+            total: 2,
+            items: [
+              {
+                kind: 'value',
+                value: { code: 'fictional-warning-one', message: 'First retained warning' },
+              },
+              {
+                kind: 'value',
+                value: { code: 'fictional-warning-two', message: 'Second retained warning' },
+              },
+            ],
+            nextCursor: null,
+          });
+        return json({
+          format: 'health-intake-identity-scope-page-v2',
+          scopeToken: scope.scopeToken,
+          section,
+          total: scope.collection.assignmentTargets,
+          items: [{ kind: 'value', value: { title: 'Fictional current target' } }],
+          nextCursor: 'next-target',
+        });
+      }
+      throw new Error(`Unexpected ${url}`);
+    }),
+  );
+  render(
+    <NativeIdentity intakeId="fictional-intake" groupId="fictional-group" onChanged={vi.fn()} />,
+  );
+  expect(await screen.findByText(/2 advisory warnings are available/)).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Inspect affected records and membership' }));
+  fireEvent.change(screen.getByRole('combobox', { name: 'Identity evidence section' }), {
+    target: { value: 'warnings' },
+  });
+  expect(await screen.findByText(/First retained warning/)).toBeVisible();
+  expect(screen.getByText(/Second retained warning/)).toBeVisible();
+  expect(visited).toContain('warnings');
+  expect(screen.getByRole('button', { name: 'This is me' })).toBeEnabled();
+});

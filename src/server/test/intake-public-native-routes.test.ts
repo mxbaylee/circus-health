@@ -16,8 +16,15 @@ import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { readIntakeEnvelopeMaterialized } from '../intake-authority.ts';
 import { buildVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
+import {
+  maximumIntakeDiscoveryOrder,
+  prepareIntakeLookupIndices,
+} from '../intake-lookup-projection.ts';
+import type { HealthRecordEnvelope } from '../../shared/intake.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import { createApp } from '../index.ts';
+import { randomUUID } from 'node:crypto';
 
 async function fixture(t: test.TestContext) {
   fictionalModel(t);
@@ -43,6 +50,20 @@ async function fixture(t: test.TestContext) {
     root,
     profileId,
     db,
+    async upload(filename: string, rows: HealthRecordEnvelope[]) {
+      const response = await fetch(base.slice(0, -1), {
+        method: 'POST',
+        headers: {
+          origin: 'http://127.0.0.1:5173',
+          'content-type': 'application/x-ndjson',
+          'x-filename': filename,
+        },
+        body: rows.map((row) => JSON.stringify(row)).join('\n') + '\n',
+      });
+      const result = await response.json();
+      assert.equal(response.status, 201, JSON.stringify(result));
+      return result.data;
+    },
     async request(id: string, action: string, input?: unknown, status = 200) {
       const response = await fetch(base + encodeURIComponent(id) + '/' + action, {
         ...(input === undefined
@@ -62,6 +83,84 @@ async function fixture(t: test.TestContext) {
     },
   };
 }
+
+test('successive public JSONL uploads prepare native discovery lookups and preserve mixed-source order', async (t) => {
+  const f = await fixture(t);
+  const entry = (id: string): HealthRecordEnvelope => ({
+    format: 'health-record-v1',
+    id,
+    kind: 'record',
+    payload: 'Fictional upload discovery report ' + id,
+    provenance: {
+      capturedVia: 'Fictional upload test',
+      sourceSystem: 'Fictional clinic',
+      sourceRecordId: id,
+      evidenceClass: 'provider_export',
+      locator: 'page 1',
+    },
+    coverage: { status: 'partial', notes: [] },
+    report: {
+      key: id,
+      title: 'Fictional report ' + id,
+      anchor: { locator: 'page 1 heading', text: 'Fictional report ' + id },
+      subject: null,
+    },
+    clinical: { kind: 'document', documentTitle: 'Fictional report ' + id },
+  });
+  const legacy = uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-legacy.jsonl',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from(JSON.stringify(entry('legacy')) + '\n'),
+  });
+  const prior = structuredClone(readIntakeEnvelopeMaterialized(f.db, { id: legacy.id }).value) as {
+    intake: { workflow: { reportGroups: { discoveryOrder: number }[] } };
+  };
+  prior.intake.workflow.reportGroups[0]!.discoveryOrder = 40;
+  writeIntakeFixtureEnvelope(f.db, legacy.id, prior);
+  assert.equal(maximumIntakeDiscoveryOrder(f.db), 40);
+
+  const orders = (id: string) => {
+    const view = openIntakeCollectionEnvelope(f.db, { id });
+    const workflow = view.child(view.child(view.root(), 'intake')!, 'workflow')!;
+    return Array.from({ length: view.childCount(workflow, 'reportGroups') }, (_, ordinal) => {
+      const field = view.field(view.childAt(workflow, 'reportGroups', ordinal)!, 'discoveryOrder');
+      assert.equal(field.kind, 'value');
+      return field.kind === 'value' ? field.value : undefined;
+    });
+  };
+  const clinical = await f.upload('fictional-clinical.jsonl', [entry('first'), entry('second')]);
+  assert.deepEqual(orders(clinical.id), [41, 42]);
+  // Schema publication deliberately does not claim a complete semantic index.
+  assert.throws(() => maximumIntakeDiscoveryOrder(f.db), /semantic indexes.*incomplete/);
+  const people: HealthRecordEnvelope = {
+    ...entry('people'),
+    payload: 'Fictional report people. Fictional Ellis is a clinician.',
+    clinical: undefined,
+    people: [
+      {
+        id: 'fictional-ellis',
+        fullName: 'Fictional Ellis',
+        role: 'clinician',
+        evidence: [{ textAnchor: 'Fictional Ellis is a clinician.', supports: ['fullName'] }],
+      },
+    ],
+  };
+  const second = await f.upload('fictional-people.jsonl', [people]);
+  assert.deepEqual(orders(second.id), [43]);
+  assert.deepEqual(orders(clinical.id), [41, 42]);
+  const preparation = await prepareIntakeLookupIndices(f.db);
+  assert.equal(preparation.prepared, 1, 'only the newly published native source needs preparation');
+  assert.equal(preparation.reused, 1, 'the preceding upload lookup remains current');
+  assert.equal(maximumIntakeDiscoveryOrder(f.db), 43);
+  const before = { ...intakeWorkCounters(f.db).warm };
+  const repeated = await f.upload('fictional-people.jsonl', [people]);
+  assert.equal(repeated.id, second.id);
+  assert.equal(repeated.repeatedUpload, true);
+  const after = intakeWorkCounters(f.db).warm;
+  assert.equal(after.collectionNodesWritten, before.collectionNodesWritten);
+  assert.equal(after.envelopeHydrations, before.envelopeHydrations);
+  assert.equal(after.sourceDTOHydrations, before.sourceDTOHydrations);
+});
 
 for (const native of [false, true])
   test(`public plan, package, member and literal endpoints retain ${native ? 'native bounded' : 'legacy'} contracts`, async (t) => {
@@ -229,4 +328,154 @@ test('public native navigation follows bounded cursors and preserves incomplete 
   await f.request(original.id, 'navigate?action=search&query=fictional&offset=1', undefined, 400);
   assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
   assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+});
+
+// Search must discover matching People outside the first report/page. Query-bound
+// cursors and exact disposition refresh prevent silently mixing searched scopes.
+test('native public People search filters complete groups and pages with current counts', async (t) => {
+  const f = await fixture(t);
+  const reports = [
+    ['Fictional Alder'],
+    ['Fictional Fern Sprig', 'Fictional Fern Meadow'],
+    ['Fictional Fern Vale'],
+  ];
+  const uploaded = await f.upload(
+    'fictional-named-people.jsonl',
+    reports.map((names, n): HealthRecordEnvelope => ({
+      format: 'health-record-v1',
+      id: 'fictional-people-search-' + n,
+      kind: 'record',
+      payload: ['Fictional directory ' + n, ...names.map((name) => name + ' is a clinician.')].join(
+        '\n',
+      ),
+      provenance: {
+        capturedVia: 'Fictional fixture',
+        sourceSystem: 'Fictional clinic',
+        sourceRecordId: 'directory-' + n,
+        evidenceClass: 'provider_export',
+        locator: 'page 1',
+      },
+      coverage: { status: 'complete_response', notes: [] },
+      report: {
+        key: 'directory-' + n,
+        title: 'Fictional directory ' + n,
+        anchor: { locator: 'page 1 heading', text: 'Fictional directory ' + n },
+        subject: null,
+      },
+      people: names.map((name, ordinal) => ({
+        id: 'person-' + ordinal,
+        fullName: name,
+        role: 'clinician',
+        evidence: [{ textAnchor: name + ' is a clinician.', supports: ['fullName'] }],
+      })),
+    })),
+  );
+  const before = { ...intakeWorkCounters(f.db).warm };
+  const feed = async (query: string, extra = '', status = 200) =>
+    (
+      await f.request(
+        'import-feed',
+        '?view=active&kind=person&limit=1&q=' + encodeURIComponent(query) + extra,
+        undefined,
+        status,
+      )
+    ).data;
+  const unfiltered = await feed('');
+  const found = await feed('  FERN  ');
+  assert.equal(found.kindCounts.person, 3);
+  assert.equal(found.people.counts.pending, 3);
+  assert.equal(found.people.totalGroups, 2);
+  assert.equal(found.people.groups.length, 1);
+  assert.notEqual(found.people.groups[0].groupId, unfiltered.people.groups[0].groupId);
+  assert.ok(found.people.nextCursor);
+  const nextGroup = await feed(
+    'fern',
+    '&peopleCursor=' + encodeURIComponent(found.people.nextCursor),
+  );
+  assert.equal(nextGroup.people.groups.length, 1);
+  assert.notEqual(nextGroup.people.groups[0].groupId, found.people.groups[0].groupId);
+  assert.equal(nextGroup.people.nextCursor, null);
+  await feed('alder', '&peopleCursor=' + encodeURIComponent(found.people.nextCursor), 409);
+  const group = found.people.groups[0];
+  const people = async (q: string, extra = '', status = 200) =>
+    (
+      await f.request(
+        'people',
+        encodeURIComponent(group.groupId) +
+          '?intakeId=' +
+          encodeURIComponent(uploaded.id) +
+          '&view=active&limit=1&q=' +
+          encodeURIComponent(q) +
+          extra,
+        undefined,
+        status,
+      )
+    ).data;
+  const first = await people('FERN');
+  assert.equal(first.totalPeople, 2);
+  assert.equal(first.counts.pending, 2);
+  assert.equal(first.people.length, 1);
+  assert.equal(first.people[0].kind, 'person');
+  assert.ok(first.nextCursor);
+  const second = await people('fern', '&cursor=' + encodeURIComponent(first.nextCursor));
+  assert.equal(second.people.length, 1);
+  assert.notEqual(first.people[0].person.id, second.people[0].person.id);
+  assert.equal(second.nextCursor, null);
+  await people('alder', '&cursor=' + encodeURIComponent(first.nextCursor), 409);
+  assert.equal((await people('no fictional match')).totalPeople, 0);
+  assert.equal((await people('professional')).totalPeople, 2, 'tags remain searchable');
+  assert.equal(
+    (await people('fictional-named-people.jsonl')).totalPeople,
+    2,
+    'the retained filename remains searchable',
+  );
+  const selected = first.people[0].person;
+  await f.request('people-disposition', '', {
+    operationId: randomUUID(),
+    intakeId: uploaded.id,
+    intakeVersion: selected.intakeVersion,
+    proposalId: selected.id,
+    proposalVersion: selected.version,
+    state: 'later',
+  });
+  const changed = await feed('fern');
+  assert.equal(changed.kindCounts.person, 2);
+  assert.equal(changed.people.counts.pending, 2);
+  assert.equal(changed.people.counts.later, 1);
+  assert.equal(changed.people.totalGroups, 2);
+  const changedPeople = await people('fern');
+  assert.equal(changedPeople.totalPeople, 1);
+  assert.equal(changedPeople.counts.later, 1);
+  assert.notEqual(changedPeople.people[0].person.id, selected.id);
+  await people('fern', '&cursor=' + encodeURIComponent(first.nextCursor), 409);
+  const lastInGroup = changedPeople.people[0].person;
+  await f.request('people-disposition', '', {
+    operationId: randomUUID(),
+    intakeId: uploaded.id,
+    intakeVersion: lastInGroup.intakeVersion,
+    proposalId: lastInGroup.id,
+    proposalVersion: lastInGroup.version,
+    state: 'later',
+  });
+  const remaining = await feed('fern');
+  assert.equal(remaining.kindCounts.person, 1);
+  assert.equal(remaining.people.counts.later, 2);
+  assert.equal(
+    remaining.people.totalGroups,
+    1,
+    'a group leaves discovery when its last match leaves this view',
+  );
+  assert.notEqual(remaining.people.groups[0].groupId, group.groupId);
+  assert.equal((await people('fern')).totalPeople, 0);
+  const allNames = await feed('');
+  assert.equal(allNames.kindCounts.person, 2);
+  assert.equal(allNames.people.counts.pending, 2);
+  assert.equal(allNames.people.counts.later, 2);
+  assert.equal(
+    allNames.people.totalGroups,
+    2,
+    'the unmatched Alder report remains in the unfiltered view',
+  );
+  assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
 });

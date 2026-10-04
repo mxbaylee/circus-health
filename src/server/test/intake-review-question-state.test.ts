@@ -31,6 +31,7 @@ import {
 } from '../intake-evidence-fragment.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { canonicalLiteral, parseLiteralJSON } from '../intake-format.ts';
+import { selectionAuthority } from '../intake-selection-authority.ts';
 import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
 import {
   openReviewQuestionState,
@@ -100,6 +101,18 @@ test('selected question witnesses and streamed history preserve raw numeric spel
     assert.equal(selected.answers.length, 1);
     assert.match(canonicalLiteral(selected.answers), /13\.00/);
     assert.equal([...state.canonicalRecords(selected)].join(''), canonicalLiteral(question));
+    assert.equal(selectionAuthority({ question: selected }), selectionAuthority({ question }));
+    assert.notEqual(
+      selectionAuthority({ question: selected }),
+      selectionAuthority({
+        question: {
+          ...question,
+          answers: question.answers.map((answer, n) =>
+            n ? answer : { ...answer, answer: 'Fictional changed historical answer' },
+          ),
+        },
+      }),
+    );
   } finally {
     clearIntakeStateCache(db);
     db.close();

@@ -9,6 +9,7 @@ import { prepareCollectionClinicalReview } from './intake-review-collection-host
 import type { CollectionClinicalReviewSession } from './intake-review-collection-session.ts';
 import {
   ownershipSourceSnapshotHas,
+  assertOwnershipSourceSnapshot,
   type OwnershipSourceSnapshotReference,
   createOwnershipSourceSnapshotPreparation,
 } from './ownership-source-snapshots.ts';
@@ -38,6 +39,7 @@ export async function prepareOwnershipIdentityIssueSnapshot(
     sourceRecordIds: values,
     movingSourceRecordIds: () => [],
   });
+  await factory.finishMaintenance();
   return { format: 'health-ownership-identity-issues-v1', snapshot: snapshot.remaining } as const;
 }
 
@@ -45,7 +47,12 @@ export async function prepareOwnershipIdentitySnapshots(
   db: Database,
   sql: Database,
   input: {
-    sources: Iterable<{ intakeId: string; recordId: string; identity?: string }>;
+    sources: Iterable<{
+      intakeId: string;
+      recordId: string;
+      identity?: string;
+      reportMember?: boolean;
+    }>;
     record(
       intakeId: string,
       recordId: string,
@@ -58,12 +65,10 @@ export async function prepareOwnershipIdentitySnapshots(
     'CREATE TABLE IF NOT EXISTS ownership_identity_snapshots(intake TEXT,record TEXT,value TEXT,PRIMARY KEY(intake,record)); CREATE TABLE IF NOT EXISTS ownership_identity_union(value TEXT PRIMARY KEY); DELETE FROM ownership_identity_snapshots; DELETE FROM ownership_identity_union;',
   );
   for (const source of input.sources) {
-    if (
-      sql
-        .prepare('SELECT 1 FROM ownership_identity_snapshots WHERE intake=? AND record=?')
-        .get(source.intakeId, source.recordId)
-    )
-      continue;
+    const prepared = !!sql
+      .prepare('SELECT 1 FROM ownership_identity_snapshots WHERE intake=? AND record=?')
+      .get(source.intakeId, source.recordId);
+    if (prepared && !source.reportMember) continue;
     const record = input.record(source.intakeId, source.recordId);
     if (!record) throw Error('Ownership identity source is no longer reviewable');
     const previous = source.identity
@@ -78,15 +83,17 @@ export async function prepareOwnershipIdentitySnapshots(
         }
       }
     };
-    const reference = await prepareOwnershipIdentityIssueSnapshot(
-      input.factory(source.intakeId),
-      values,
-      previous,
-    );
-    sql
-      .prepare('INSERT INTO ownership_identity_snapshots VALUES(?,?,?)')
-      .run(source.intakeId, source.recordId, JSON.stringify(reference));
-    if (input.report)
+    if (!prepared) {
+      const reference = await prepareOwnershipIdentityIssueSnapshot(
+        input.factory(source.intakeId),
+        values,
+        previous,
+      );
+      sql
+        .prepare('INSERT INTO ownership_identity_snapshots VALUES(?,?,?)')
+        .run(source.intakeId, source.recordId, JSON.stringify(reference));
+    }
+    if (input.report && source.reportMember && source.intakeId === input.report.intakeId)
       for (const value of values())
         sql.prepare('INSERT OR IGNORE INTO ownership_identity_union VALUES(?)').run(value);
   }
@@ -118,6 +125,16 @@ export async function prepareOwnershipIdentitySnapshots(
         throw Error('Ownership identity snapshot was not prepared for this exact occurrence');
       return JSON.parse(String(value));
     },
+    assertCurrent() {
+      for (const row of sql
+        .prepare('SELECT value FROM ownership_identity_snapshots ORDER BY intake,record')
+        .iterate())
+        assertOwnershipSourceSnapshot(
+          db,
+          (JSON.parse(String(row.value)) as OwnershipIdentityIssuesReference).snapshot,
+        );
+      if (report) assertOwnershipSourceSnapshot(db, report.snapshot);
+    },
     forReport() {
       if (!report) throw Error('No prepared report identity snapshot');
       return report;
@@ -133,10 +150,6 @@ export async function prepareStandaloneOwnershipIdentitySnapshots(
   records: Iterable<{ kind: import('./clinical-references.ts').ClinicalKind; recordId: string }>,
 ) {
   const scratch = disposableSqlite('circus-ownership-identity-plan-');
-  const factories = new Map<string, ReturnType<typeof createOwnershipSourceSnapshotPreparation>>();
-  const stages: Awaited<
-    ReturnType<ReturnType<typeof createOwnershipSourceSnapshotPreparation>['finish']>
-  >[] = [];
   let selected: CollectionClinicalReviewSession | undefined,
     key = '';
   const basis = clinicalReviewRevision(db),
@@ -151,16 +164,11 @@ export async function prepareStandaloneOwnershipIdentitySnapshots(
             yield { intakeId: c.intakeId, recordId: c.sourceRecordId, identity: c.identity };
       })(),
       factory(intakeId) {
-        let result = factories.get(intakeId);
-        if (!result) {
-          result = createOwnershipSourceSnapshotPreparation(
-            db,
-            { id: intakeId },
-            { assertRunning: assertCurrent },
-          );
-          factories.set(intakeId, result);
-        }
-        return result;
+        return createOwnershipSourceSnapshotPreparation(
+          db,
+          { id: intakeId },
+          { assertRunning: assertCurrent },
+        );
       },
       record(intakeId, recordId) {
         const proposal = recordId.replace(/:line:\d+$/, ''),
@@ -184,22 +192,19 @@ export async function prepareStandaloneOwnershipIdentitySnapshots(
     });
     selected?.close();
     selected = undefined;
-    for (const factory of factories.values()) stages.push(await factory.finish());
     return {
       ...values,
       assertCurrent,
       stage() {
-        for (const stage of stages) stage.assertCurrent();
-        for (const stage of stages) stage.apply();
+        assertCurrent();
+        values.assertCurrent();
       },
       close() {
-        for (const stage of stages) stage.dispose();
         scratch.close();
       },
     };
   } catch (error) {
     selected?.close();
-    for (const stage of stages) stage.dispose();
     scratch.close();
     throw error;
   }

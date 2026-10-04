@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type {
   IntakeClinicalMapping,
   IntakeIssueResolution,
   IntakePairDecision,
   IntakeEvidenceComparison,
+  IntakeReviewRecord,
 } from '../../../shared/intake';
 import type {
   IntakeClinicalRecordRead,
@@ -25,6 +26,9 @@ import { OpticalPrescriptionEditor } from '../../components/OpticalPrescriptionE
 import { mappingFields } from '../import/import-correction-fields';
 import { SavedDuplicateEvidence } from '../clinical-review/SavedDuplicateEvidence';
 import type { SavedDuplicateEvidenceReference } from '../../../shared/saved-duplicate-evidence';
+import { ClinicalEvidencePair } from '../clinical-review/ClinicalEvidencePair';
+
+type IncomingEvidence = Pick<IntakeReviewRecord, 'title' | 'date' | 'mapping' | 'evidence'>;
 
 type ReferenceRecord = Extract<IntakeClinicalRecordRead['record'], { kind: 'reference' }>;
 type Item = ClinicalRecordSectionPage['items'][number];
@@ -37,6 +41,7 @@ const labels: Record<ClinicalRecordSection, string> = {
   mapping: 'Clinical fields',
   reportGroups: 'Linked reports',
   ownershipBlockers: 'Person assignment requirements',
+  identityWarnings: 'Record identity warnings',
 };
 const fieldLabel = (field: string) =>
   Object.values(mappingFields)
@@ -56,9 +61,13 @@ export function ReferencedClinicalControls({
   triggerLabel = 'Resolve questions or correct this record',
   disabled = false,
   guardNavigation = true,
+  externalPending = false,
   onRefresh,
   onPending,
   onCorrectSaved,
+  initiallyOpen = false,
+  incoming,
+  incomingContent,
 }: {
   context: IntakeClinicalReviewContext;
   selection: ReferenceRecord['selection'];
@@ -67,9 +76,13 @@ export function ReferencedClinicalControls({
   triggerLabel?: string;
   disabled?: boolean;
   guardNavigation?: boolean;
+  externalPending?: boolean;
   onRefresh: () => void;
   onPending: (pending: boolean) => void;
   onCorrectSaved?: (comparison: IntakeEvidenceComparison) => void;
+  initiallyOpen?: boolean;
+  incoming?: IncomingEvidence;
+  incomingContent?: ReactNode;
 }) {
   const profile = useProfile();
   const scope = JSON.stringify([
@@ -81,7 +94,7 @@ export function ReferencedClinicalControls({
   ]);
   const active = useRef(scope);
   active.current = scope;
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(initiallyOpen);
   const [section, setSection] = useState<ClinicalRecordSection>(initialSection);
   const [cursor, setCursor] = useState<string>();
   const [queryInput, setQueryInput] = useState('');
@@ -197,7 +210,9 @@ export function ReferencedClinicalControls({
                         ? 'reportGroup'
                         : section === 'ownershipBlockers'
                           ? 'ownershipBlocker'
-                          : 'pair') ||
+                          : section === 'identityWarnings'
+                            ? 'identityWarning'
+                            : 'pair') ||
               !Number.isSafeInteger(item.ordinal) ||
               item.ordinal < 0 ||
               item.ordinal >= data.total ||
@@ -217,6 +232,13 @@ export function ReferencedClinicalControls({
             'These controls no longer match the exact record. Refresh the review before making a choice.',
           );
         setPageState({ key, data });
+        if (
+          (incoming || incomingContent) &&
+          (section === 'comparisons' || section === 'comparisonDrafts')
+        )
+          setSelected((current) =>
+            data.items.some((item) => item.ordinal === current) ? current : data.items[0]?.ordinal,
+          );
         // A successful write/409 holds controls until this exact server read
         // validates the current authority. Merely receiving new props is not
         // enough, and unresolved writes keep this effect paused.
@@ -306,7 +328,11 @@ export function ReferencedClinicalControls({
   return (
     <section aria-label="Exact record controls" className="intake-processing-details">
       {guardNavigation && (
-        <ReviewNavigationGuard anyLocationChange pending={() => held} flush={async () => !held} />
+        <ReviewNavigationGuard
+          anyLocationChange
+          pending={() => held || externalPending}
+          flush={async () => !held && !externalPending}
+        />
       )}
       <button
         type="button"
@@ -442,9 +468,11 @@ export function ReferencedClinicalControls({
                           ? `Related record ${entry.ordinal + 1}`
                           : entry.control.kind === 'ownershipBlocker'
                             ? `Person requirement ${entry.ordinal + 1}`
-                            : entry.control.kind === 'reportGroup'
-                              ? `Linked report ${entry.ordinal + 1}`
-                              : fieldLabel(entry.control.field)}
+                            : entry.control.kind === 'identityWarning'
+                              ? `Identity warning ${entry.ordinal + 1}`
+                              : entry.control.kind === 'reportGroup'
+                                ? `Linked report ${entry.ordinal + 1}`
+                                : fieldLabel(entry.control.field)}
                   </button>
                 ))}
               </div>
@@ -465,6 +493,8 @@ export function ReferencedClinicalControls({
                   onSave={save}
                   onRefresh={refresh}
                   onCorrectSaved={!dirty ? onCorrectSaved : undefined}
+                  incoming={incoming}
+                  incomingContent={incomingContent}
                 />
               )}
               {page.data.nextCursor && (
@@ -523,6 +553,8 @@ function SelectedControl({
   onSave,
   onRefresh,
   onCorrectSaved,
+  incoming,
+  incomingContent,
 }: {
   item: Item;
   intakeId: string;
@@ -531,6 +563,8 @@ function SelectedControl({
   onSave: (change: Change) => void;
   onRefresh: () => void;
   onCorrectSaved?: (comparison: IntakeEvidenceComparison) => void;
+  incoming?: IncomingEvidence;
+  incomingContent?: ReactNode;
 }) {
   const [inspected, setInspected] = useState(item.detail.kind === 'value');
   const blocked = disabled || !inspected;
@@ -545,21 +579,59 @@ function SelectedControl({
   const savedEvidence:
     IntakeEvidenceComparison['evidence'] | SavedDuplicateEvidenceReference | undefined =
     item.control.kind === 'pair' ? item.control.savedEvidence || comparison?.evidence : undefined;
-  return (
-    <article aria-label="Selected record question or field">
-      {item.detail.kind === 'value' ? (
-        <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
-          {JSON.stringify(item.detail.value, null, 2)}
-        </pre>
-      ) : (
-        <ClinicalEvidenceWindow
-          endpoint={`/intakes/${encodeURIComponent(intakeId)}/review-record-section-fragment`}
-          reference={item.detail.reference}
-          onRefresh={onRefresh}
-          onInspected={setInspected}
+  const paired = item.control.kind === 'pair' && (incoming || incomingContent);
+  const detail =
+    item.detail.kind === 'value' ? (
+      <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+        {JSON.stringify(item.detail.value, null, 2)}
+      </pre>
+    ) : (
+      <ClinicalEvidenceWindow
+        endpoint={`/intakes/${encodeURIComponent(intakeId)}/review-record-section-fragment`}
+        reference={item.detail.reference}
+        onRefresh={onRefresh}
+        onInspected={setInspected}
+      />
+    );
+  const content = (
+    <>
+      {paired ? (
+        <ClinicalEvidencePair
+          {...(incoming ? { incoming } : { incomingContent })}
+          {...(comparison
+            ? { saved: comparison, onCorrectSaved }
+            : {
+                savedContent: (
+                  <>
+                    {detail}
+                    {savedEvidence && !Array.isArray(savedEvidence) && (
+                      <SavedDuplicateEvidence reference={savedEvidence} />
+                    )}
+                  </>
+                ),
+              })}
+          disabled={blocked}
         />
+      ) : (
+        detail
       )}
       {!inspected && <p>Read every page of this selected evidence before choosing an outcome.</p>}
+      {paired && comparison?.previousDecision && (
+        <p>
+          Saved decision:{' '}
+          {
+            {
+              distinct: 'Separate measurement',
+              same_event: 'Another source for the same measurement',
+              changed_version: 'Different version — keep both records',
+              unresolved: 'Not sure yet',
+            }[comparison.previousDecision.outcome]
+          }
+          . {comparison.previousDecision.reason}
+          {comparison.previousDecision.scopeStatus !== 'current' &&
+            ' The displayed record version has changed, so review this pair again.'}
+        </p>
+      )}
       {item.control.kind === 'issue' && (
         <QuestionAnswerHistory
           intakeId={intakeId}
@@ -567,10 +639,10 @@ function SelectedControl({
           onRefresh={onRefresh}
         />
       )}
-      {savedEvidence && !Array.isArray(savedEvidence) && (
+      {!paired && savedEvidence && !Array.isArray(savedEvidence) && (
         <SavedDuplicateEvidence reference={savedEvidence} />
       )}
-      {comparison && onCorrectSaved && (
+      {!paired && comparison && onCorrectSaved && (
         <button
           type="button"
           className="button secondary"
@@ -606,6 +678,11 @@ function SelectedControl({
           onDirty={onDirty}
           onSave={onSave}
         />
+      ) : item.control.kind === 'identityWarning' ? (
+        <p>
+          This advisory warning belongs to the complete identity review for this exact record.
+          Reading it does not change person assignment or accept the record.
+        </p>
       ) : item.control.kind === 'ownershipBlocker' ? (
         <p>
           Resolve this requirement in the person review for this report. Reading it does not confirm
@@ -616,6 +693,22 @@ function SelectedControl({
           This retained report link belongs to the selected record. Group: {item.control.groupId};
           version: {item.control.groupVersionId}.
         </p>
+      )}
+    </>
+  );
+  return (
+    <article aria-label="Selected record question or field">
+      {paired ? (
+        <details>
+          <summary>
+            {comparison
+              ? `${comparison.title} · ${comparison.date || 'Unknown date'}`
+              : 'Saved record with paged evidence'}
+          </summary>
+          {content}
+        </details>
+      ) : (
+        content
       )}
     </article>
   );

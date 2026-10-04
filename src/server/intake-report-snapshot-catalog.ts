@@ -10,6 +10,15 @@ import type {
   IntakeCollectionValue,
 } from './intake-state-storage.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
+import { INTAKE_TREE_VALUE_BYTES } from './intake-state-tree.ts';
+
+/** Account for the storage wrapper as well as the unescaped text. */
+export function reportSnapshotInlineTextFits(text: string) {
+  return (
+    Buffer.byteLength(text) <= INTAKE_TREE_VALUE_BYTES &&
+    Buffer.byteLength(JSON.stringify({ kind: 'inline', text })) <= INTAKE_TREE_VALUE_BYTES
+  );
+}
 
 export const REPORT_SNAPSHOT_CATALOG = 'report.snapshots';
 export interface ReportSnapshotPage {
@@ -289,11 +298,13 @@ export function createReportSnapshotCatalog(
         const blob = 'report.text.' + randomUUID();
         let pending: IntakeCollectionChange[] = [],
           any = false,
+          wroteBlob = false,
           carry = '',
           piecesSinceCheck = 0;
         const flush = async () => {
           if (pending.length) {
             await checkpoint(pending);
+            wroteBlob = true;
             pending = [];
           }
         };
@@ -336,6 +347,23 @@ export function createReportSnapshotCatalog(
             bytes: Buffer.from(carry),
           });
           any = true;
+        }
+        // Tiny values need no separate byte collection or attachment checkpoint.
+        // Reuse the already bounded UTF-8 leaves, preserving the streamed codec's
+        // exact text semantics and keeping large values on its existing path.
+        if (!wroteBlob) {
+          const leaves = pending.map((change) => {
+            if (change.op !== 'appendBytes') throw Error('Invalid pending snapshot text');
+            return change.bytes;
+          });
+          const size = leaves.reduce((total, leaf) => total + leaf.byteLength, 0);
+          if (size <= 16384) {
+            const text = Buffer.concat(leaves).toString('utf8');
+            if (reportSnapshotInlineTextFits(text)) {
+              await result.put(key, text);
+              return;
+            }
+          }
         }
         await flush();
         if (!any) {

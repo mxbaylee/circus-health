@@ -1026,6 +1026,11 @@ export async function uploadIntakeStream(
   return (receiveIntakeUpload as unknown as ReceiveIntakeUpload)(
     req,
     async (staged) => {
+      // Discovery order spans all retained originals. A preceding upload may
+      // have its native schema ready before its semantic lookup indexes; build
+      // those explicitly outside the synchronous publication transaction.
+      const { prepareIntakeLookupIndices } = await import('./intake-lookup-state.ts');
+      await prepareIntakeLookupIndices(db, { assertRunning: options?.assertRunning });
       const retained = publishIntake(db, root, profileId, input, staged, options, (id) => ({ id }));
       await ensureNativeIntakeSchema(db, profileId, retained.id, options);
       return {
@@ -1939,10 +1944,13 @@ export async function reviewIntakeRead(
   owner(db, profileId);
   if (!hasCollectionIntakeSchema(db, row(db, id)))
     return reviewIntake(db, root, profileId, id, proposalId);
-  const { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
+  const { readPreparedCollectionClinicalReview } =
     await import('./intake-review-collection-host.ts');
-  await prepareCollectionClinicalReviewDependencies(db, root, profileId, id, proposalId);
-  const result = prepareCollectionClinicalReview(db, root, profileId, id, proposalId);
+  const result = await readPreparedCollectionClinicalReview(db, root, profileId, id, proposalId, {
+    kind: 'page',
+    section: options.section ?? 'records',
+    options: { cursor: options.cursor, items: options.items ?? 40, bytes: options.bytes ?? 65536 },
+  });
   if (result.status === 'fragment_required')
     return {
       format: 'health-intake-clinical-review-pending-v2' as const,
@@ -1951,15 +1959,7 @@ export async function reviewIntakeRead(
       reason: 'selected_evidence_requires_fragments' as const,
       reference: result.reference,
     };
-  try {
-    return result.session.page(options.section ?? 'records', {
-      cursor: options.cursor,
-      items: options.items ?? 40,
-      bytes: options.bytes ?? 65536,
-    });
-  } finally {
-    result.session.close();
-  }
+  return result.value;
 }
 export async function readIntakeReviewFragment(
   db: DatabaseSync,
@@ -1980,27 +1980,28 @@ export async function readIntakeReviewFragment(
       'REVIEW_FRAGMENT',
       'Use a reference from the current clinical review page',
     );
-  const { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
+  const { readPreparedCollectionClinicalReview } =
     await import('./intake-review-collection-host.ts');
-  await prepareCollectionClinicalReviewDependencies(
+  const result = await readPreparedCollectionClinicalReview(
     db,
     root,
     profileId,
     id,
     input.proposalId ?? null,
+    {
+      kind: 'fragment',
+      reference: input.reference,
+      offset: input.offset ?? 0,
+      bytes: input.bytes ?? 32768,
+    },
   );
-  const result = prepareCollectionClinicalReview(db, root, profileId, id, input.proposalId ?? null);
   if (result.status !== 'ready')
     throw new HttpError(
       409,
       'REVIEW_FRAGMENT',
       'Prepare the selected clinical evidence before reading this fragment',
     );
-  try {
-    return result.session.fragment(input.reference, input.offset ?? 0, input.bytes ?? 32768);
-  } finally {
-    result.session.close();
-  }
+  return result.value;
 }
 
 export async function readIntakeReviewRecord(
@@ -2020,21 +2021,20 @@ export async function readIntakeReviewRecord(
   if (!recordId)
     throw new HttpError(400, 'REVIEW_RECORD', 'Select an exact clinical review record');
   if (hasCollectionIntakeSchema(db, row(db, id))) {
-    const { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
+    const { readPreparedCollectionClinicalReview } =
       await import('./intake-review-collection-host.ts');
-    await prepareCollectionClinicalReviewDependencies(
+    const result = await readPreparedCollectionClinicalReview(
       db,
       root,
       profileId,
       id,
       input.proposalId ?? null,
-    );
-    const result = prepareCollectionClinicalReview(
-      db,
-      root,
-      profileId,
-      id,
-      input.proposalId ?? null,
+      {
+        kind: 'record',
+        recordId,
+        candidateVersionId: input.candidateVersionId,
+        bytes: input.bytes,
+      },
     );
     if (result.status !== 'ready')
       throw new HttpError(
@@ -2042,12 +2042,9 @@ export async function readIntakeReviewRecord(
         'REVIEW_PREPARATION_REQUIRED',
         'Prepare the selected clinical evidence before reading it',
       );
-    try {
-      return result.session.selectedRecord(recordId, input.candidateVersionId, input.bytes);
-    } finally {
-      result.session.close();
-    }
+    return result.value;
   }
+
   const review = reviewIntake(db, root, profileId, id, input.proposalId ?? null);
   const record = review.records.find((record) => record.id === recordId);
   if (
@@ -2255,26 +2252,30 @@ function reviewIntakePrepared(
       });
   }
   for (const record of review.records)
-    record.selectionReviewToken = selectionAuthority({
-      profileId,
-      intakeId: id,
-      proposalId,
-      originalHash: file.sha256,
-      proposalHash: inputFile.sha256,
-      sourceTextRevisionId:
-        proposalId && proposalDependenciesCurrent(db, proposalId) !== null
-          ? d.proposals.find((proposal) => proposal.id === proposalId)?.sourceTextRevisionId || null
-          : d.sourceTextRevisionId || null,
-      sourceTextDependencyToken:
-        proposalId && proposalDependenciesCurrent(db, proposalId) !== null
-          ? d.proposals.find((proposal) => proposal.id === proposalId)?.sourceTextDependencyToken ||
-            null
-          : d.sourceTextDependencyToken || null,
-      sourceTextStale: review.sourceTextStale || false,
-      // Discovery suggestions are not approvals. Exact chosen comparison scopes are
-      // independently validated inside acceptance; duplicate classification remains pinned.
-      record: { ...record, comparisons: undefined },
-    });
+    record.selectionReviewToken = selectionAuthority(
+      {
+        profileId,
+        intakeId: id,
+        proposalId,
+        originalHash: file.sha256,
+        proposalHash: inputFile.sha256,
+        sourceTextRevisionId:
+          proposalId && proposalDependenciesCurrent(db, proposalId) !== null
+            ? d.proposals.find((proposal) => proposal.id === proposalId)?.sourceTextRevisionId ||
+              null
+            : d.sourceTextRevisionId || null,
+        sourceTextDependencyToken:
+          proposalId && proposalDependenciesCurrent(db, proposalId) !== null
+            ? d.proposals.find((proposal) => proposal.id === proposalId)
+                ?.sourceTextDependencyToken || null
+            : d.sourceTextDependencyToken || null,
+        sourceTextStale: review.sourceTextStale || false,
+        // Discovery suggestions are not approvals. Exact chosen comparison scopes are
+        // independently validated inside acceptance; duplicate classification remains pinned.
+        record,
+      },
+      { recordComparisonsUndefined: true },
+    );
   return review;
 }
 

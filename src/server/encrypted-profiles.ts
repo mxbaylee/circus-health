@@ -4,6 +4,7 @@ import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
+import { clearIdentityGrounding } from './intake-identity-grounding.ts';
 import { clearPackageSourceSession } from './intake-package-session.ts';
 import {
   prepareManualSourceCopy,
@@ -667,6 +668,7 @@ export function createEncryptedProfiles({
             if (db) {
               clearPackageSourceSession(db);
               clearIntakeStateCache(db);
+              clearIdentityGrounding(db);
               clearIntakeLookupCache(db);
               clearSourceContextClassificationCache(db);
               clearSourceTextProjectionCache(db);
@@ -711,6 +713,7 @@ export function createEncryptedProfiles({
         }
         clearPackageSourceSession(db);
         clearIntakeStateCache(db);
+        clearIdentityGrounding(db);
         clearIntakeLookupCache(db);
         clearSourceContextClassificationCache(db);
         clearSourceTextProjectionCache(db);
@@ -793,6 +796,7 @@ export function createEncryptedProfiles({
       const db = state.db;
       cleanup(() => clearPackageSourceSession(db));
       cleanup(() => clearIntakeStateCache(db));
+      cleanup(() => clearIdentityGrounding(db));
       cleanup(() => clearIntakeLookupCache(db));
       cleanup(() => clearSourceContextClassificationCache(db));
       cleanup(() => clearSourceTextProjectionCache(db));
@@ -1020,6 +1024,7 @@ export function createEncryptedProfiles({
     } finally {
       clearPackageSourceSession(state.db);
       clearIntakeStateCache(state.db);
+      clearIdentityGrounding(state.db);
       clearIntakeLookupCache(state.db);
       clearSourceContextClassificationCache(state.db);
       clearSourceTextProjectionCache(state.db);

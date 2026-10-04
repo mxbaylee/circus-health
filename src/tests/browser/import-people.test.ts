@@ -1,3 +1,4 @@
+import { fixtureApi, fixtureReport } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
@@ -157,15 +158,22 @@ test(
     assert(upload.ok(), await upload.text());
     const intake = (await upload.json()).data;
     const reportQueue = await api<{
-      groups: Array<{
-        groupId: string;
-        counts: { pending: number };
-        peopleCounts: { pending: number };
-      }>;
+      format: string;
+      groups: (
+        | { kind: 'group'; group: { groupId: string } }
+        | { kind: 'reference'; reference: { groupId: string } }
+      )[];
     }>(page, url, prefix + '/intakes/report-queue');
-    assert.equal(reportQueue.groups[0]?.counts.pending, 0);
-    assert.equal(reportQueue.groups[0]?.peopleCounts.pending, 2);
-    const groupId = reportQueue.groups[0]!.groupId;
+    assert.equal(reportQueue.format, 'health-intake-report-queue-page-v2');
+    const selectedGroup = reportQueue.groups[0];
+    assert(selectedGroup, 'People-only report remains in the native queue');
+    const groupId =
+      selectedGroup.kind === 'group'
+        ? selectedGroup.group.groupId
+        : selectedGroup.reference.groupId;
+    const selectedReport = await fixtureReport(fixtureApi(page, url), prefix, groupId, intake.id);
+    assert.equal(selectedReport.group.counts.pending, 0);
+    assert.equal(selectedReport.group.peopleCounts.pending, 2);
 
     const clinical = async () =>
       Promise.all(
@@ -191,7 +199,15 @@ test(
     const originalHref = await originalLink.getAttribute('href');
     assert(originalHref, 'the evidence link addresses the retained original');
     const downloaded = await page.request.get(url + originalHref);
-    assert(downloaded.ok());
+    assert(
+      downloaded.ok(),
+      'Retained original link ' +
+        originalHref +
+        ' returned ' +
+        downloaded.status() +
+        ': ' +
+        (await downloaded.text()),
+    );
     assert.deepEqual(await downloaded.body(), original);
 
     let exactApplyBody: string | null = null;

@@ -19,6 +19,8 @@ export function ReferencedClinicalRecord({
   onBack,
   onPendingChange,
   authorityUnavailable = false,
+  contextPending = false,
+  guardNavigation = true,
 }: {
   context: IntakeClinicalReviewContext;
   record: Extract<IntakeClinicalRecordRead['record'], { kind: 'reference' }>;
@@ -27,6 +29,8 @@ export function ReferencedClinicalRecord({
   onBack: () => void;
   onPendingChange?: (pending: boolean) => void;
   authorityUnavailable?: boolean;
+  contextPending?: boolean;
+  guardNavigation?: boolean;
 }) {
   const profile = useProfile();
   const scope = JSON.stringify([
@@ -75,6 +79,7 @@ export function ReferencedClinicalRecord({
   });
   const disabled =
     authorityUnavailable ||
+    contextPending ||
     busy ||
     controlsPending ||
     !inspected ||
@@ -144,7 +149,7 @@ export function ReferencedClinicalRecord({
       <button
         type="button"
         className="text-link"
-        disabled={busy || controlsPending}
+        disabled={busy || controlsPending || contextPending}
         onClick={onBack}
       >
         Back to Import
@@ -158,6 +163,13 @@ export function ReferencedClinicalRecord({
         <p>
           {record.ownershipBlockers.count.toLocaleString()} person assignment requirements remain.
           Select Person assignment requirements in the record controls to inspect the complete
+          retained evidence.
+        </p>
+      )}
+      {record.identityWarnings && (
+        <p>
+          {record.identityWarnings.count.toLocaleString()} advisory identity warnings belong to this
+          record. Select Record identity warnings in the record controls to inspect the complete
           retained evidence.
         </p>
       )}
@@ -185,9 +197,19 @@ export function ReferencedClinicalRecord({
       />
       <ReviewDraftHistory history={record.draftHistory} />
       <ReferencedClinicalControls
-        disabled={authorityUnavailable}
+        disabled={authorityUnavailable || contextPending}
+        externalPending={contextPending}
+        guardNavigation={guardNavigation}
         context={context}
         selection={record.selection}
+        incomingContent={
+          <ClinicalReviewReference
+            intakeId={context.intakeId}
+            proposalId={context.proposalId}
+            reference={record.reference}
+            onRefresh={onRefresh}
+          />
+        }
         onRefresh={onRefresh}
         onPending={(pending) => {
           setControlsPending(pending);

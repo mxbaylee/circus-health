@@ -12,6 +12,7 @@ import { clearPreparedCollectionQueues } from './intake-queue-native.ts';
 import { clearCollectionReportQueues } from './intake-report-group-collection.ts';
 import { clearCollectionImportFeeds } from './intake-import-feed-collection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
+import { clearIdentityGrounding } from './intake-identity-grounding.ts';
 import { clearPackageSourceSession } from './intake-package-session.ts';
 import { sourceAssertionOwnership } from './source-assertion-ownership.ts';
 import { handleRecordOwnershipRoute } from './record-ownership-routes.ts';
@@ -1088,6 +1089,7 @@ export function createApp({
         cleanup(() => diagnostics.clear(profileId));
         cleanup(() => clearPackageSourceSession(db));
         cleanup(() => clearIntakeStateCache(db));
+        cleanup(() => clearIdentityGrounding(db));
         cleanup(() => clearIntakeLookupCache(db));
         cleanup(() => clearNativeOwnershipPlans(db));
         cleanup(() => clearPreparedClinicalProjections(db));

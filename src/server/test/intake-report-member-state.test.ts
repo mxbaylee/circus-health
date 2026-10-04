@@ -15,6 +15,7 @@ import {
   openReportMemberSnapshot,
 } from '../intake-report-member-state.ts';
 import { canonicalLiteral } from '../intake-format.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-report-snapshot-')),
     identity = {
@@ -51,6 +52,34 @@ function fixture(t: test.TestContext) {
   });
   return { db, identity, source: { id: identity.intakeId, sha256: identity.sourceHash } };
 }
+test('snapshot text keeps tiny values inline and streams escaped or oversized encoded values', async (t) => {
+  const { db, source } = fixture(t);
+  await buildIntakeCollectionEnvelope(db, source);
+  const catalog = createReportSnapshotCatalog(db, source),
+    writer = await catalog.fork();
+  const before = intakeWorkCounters(db).warm.reportSnapshotCheckpointChanges;
+  await writer.putText('tiny', ['fictional ', 'small value']);
+  assert.equal(writer.get('tiny'), 'fictional small value');
+  assert.equal(
+    intakeWorkCounters(db).warm.reportSnapshotCheckpointChanges - before,
+    1,
+    'one inline value avoids a byte collection and attachment checkpoint',
+  );
+  for (const [name, value] of [
+    ['escaped', '\\'.repeat(5000)],
+    ['wrapper-limit', 'x'.repeat(8192)],
+    ['unicode', '🌿'.repeat(5000)],
+  ]) {
+    await writer.putText(
+      name!,
+      (function* () {
+        for (let at = 0; at < value!.length; at += 17) yield value!.slice(at, at + 17);
+      })(),
+    );
+    assert.equal(typeof writer.get(name!), 'object');
+    assert.equal([...writer.chunks(name!)].join(''), value);
+  }
+});
 test('report snapshots share old members, keep exact hash grammar and select all catalog changes atomically', async (t) => {
   const { db, source, identity } = fixture(t);
   await buildIntakeCollectionEnvelope(db, source);
@@ -63,8 +92,15 @@ test('report snapshots share old members, keep exact hash grammar and select all
     batchId: null,
     locator: 'page 🌿',
   };
+  const collections = createIntakeStateStorage(db, identity).collections,
+    sequenceBefore = collections.binding(collections.openView())!.storageSequence;
   let member = await first.include({ candidateId: 'candidate', candidateVersionId: 'version' });
   member = await first.occurrence(member, occurrence);
+  assert.equal(
+    collections.binding(collections.openView())!.storageSequence - sequenceBefore,
+    2,
+    'bounded member metadata and occurrence metadata each publish one checkpoint',
+  );
   const ref1 = await first.finish();
   const second = await createReportMemberSnapshot(catalog, 'second', ref1);
   const extra = { ...occurrence, unknown: 'retained' };

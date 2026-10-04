@@ -10,13 +10,18 @@ import { type Browser, type Request } from 'playwright';
 import type { Medication, Note, Observation, Procedure } from '../../shared/api.ts';
 import type {
   HealthRecordEnvelope,
-  Intake,
-  IntakeImportFeed,
+  IntakeReviewRecord,
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceResult,
-  IntakeReview,
 } from '../../shared/intake.ts';
-import type { IntakePeopleQueue, IntakePersonApplyRequest } from '../../shared/intake-people.ts';
+import type { IntakePersonApplyRequest } from '../../shared/intake-people.ts';
+import type { IntakeSummaryV2 } from '../../shared/intake-summary.ts';
+import type {
+  CollectionImportFeed,
+  CollectionPeoplePage,
+  CollectionReportDetail,
+} from '../../shared/intake-clinical-pages.ts';
+import type { IntakeClinicalReviewPage } from '../../shared/intake-clinical-review.ts';
 import type { SourceAttentionQueue } from '../../shared/intake-source-text.ts';
 import type {
   IntakeIdentityConfirmation,
@@ -190,6 +195,9 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
+    page.on('pageerror', (error) =>
+      console.error('Fictional holdout browser error:', error.message),
+    );
     async function captureControls(stage: string) {
       if (!process.env.CRS_TEST_SCREENSHOTS) return;
       mkdirSync(process.env.CRS_TEST_SCREENSHOTS, { recursive: true });
@@ -250,11 +258,19 @@ test(
     });
     const prefix = `/api/profiles/${profileId}`;
     async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+      const started = Date.now();
       const response = await page.request.fetch(url + prefix + path, {
         method,
         headers: method === 'GET' ? undefined : { Origin: url },
         data: body,
       });
+      if (process.env.CRS_TEST_DIAGNOSTICS)
+        console.error(
+          'Fixture request',
+          path.split('?')[0],
+          Date.now() - started,
+          response.status(),
+        );
       const json = await response.json();
       assert.ok(response.ok(), JSON.stringify(json));
       return json.data as T;
@@ -266,7 +282,7 @@ test(
         data: bytes,
       });
       assert.equal(response.status(), 201, await response.text());
-      return { intake: (await response.json()).data as Intake, bytes };
+      return { intake: (await response.json()).data as IntakeSummaryV2, bytes };
     }
     async function readIdentityTargets(scope: IntakeIdentityConfirmation['scope']) {
       if (!('format' in scope)) return scope.targets;
@@ -299,7 +315,76 @@ test(
     const clinical = await upload(clinicalRows, 'fictional-linden-clinical.jsonl');
     const people = await upload([peopleOnly], 'fictional-linden-people.jsonl');
     const selfBefore = await request<Note>('/notes/person-note%3Aself');
-    const readFeed = () => request<IntakeImportFeed>('/intakes/import-feed?view=all');
+    const readFeed = () =>
+      request<CollectionImportFeed>('/intakes/import-feed?view=all&limit=40&bytes=65536');
+    const feedRecords = (feed: CollectionImportFeed) => {
+      assert.equal(
+        feed.nextCursor,
+        null,
+        'the controlled five-record fixture fits one bounded page',
+      );
+      return feed.records.map((row) => {
+        assert.equal(row.detail.kind, 'record');
+        if (row.detail.kind !== 'record') throw new Error('Unexpected fictional record reference');
+        return row.detail.record;
+      });
+    };
+    async function readReview(intakeId: string) {
+      const page = await request<IntakeClinicalReviewPage>(
+        `/intakes/${encodeURIComponent(intakeId)}/review?limit=40&bytes=65536`,
+      );
+      assert.equal(page.format, 'health-intake-clinical-review-page-v2');
+      assert.equal(
+        page.nextCursor,
+        null,
+        'controlled review fixture fits one complete bounded page',
+      );
+      const records = page.items.map((item) => {
+        assert.equal(item.kind, 'value');
+        if (item.kind !== 'value') throw new Error('Unexpected fictional record reference');
+        return item.value as IntakeReviewRecord;
+      });
+      assert.equal(records.length, page.total);
+      return { version: page.version, records };
+    }
+    async function groupFor(intakeId: string, title?: string) {
+      const feed = await readFeed();
+      for (const ref of feed.groups.filter((group) => group.intakeId === intakeId)) {
+        const detail = await request<CollectionReportDetail>(
+          `/intakes/report-queue/${encodeURIComponent(ref.groupId)}?intakeId=${encodeURIComponent(intakeId)}&view=all&limit=40&bytes=65536`,
+        );
+        if (!title || detail.group.title === title) return detail.group;
+      }
+      throw new Error('Missing exact fictional report ' + title);
+    }
+    async function openReport(intakeId: string, title?: string) {
+      const group = await groupFor(intakeId, title);
+      await page.goto(
+        url + '/#/import?' + new URLSearchParams({ intake: intakeId, group: group.groupId }),
+      );
+      await page.reload();
+      try {
+        await page.getByRole('heading', { name: String(group.title), exact: true }).waitFor();
+      } catch (cause) {
+        throw new Error(`Exact report did not open: ${await page.locator('body').innerText()}`, {
+          cause,
+        });
+      }
+      return group;
+    }
+    async function readPeople() {
+      const result = await request<CollectionPeoplePage>(
+        `/intakes/people/${encodeURIComponent(initial.people.groups[0]!.groupId)}?intakeId=${encodeURIComponent(people.intake.id)}&view=all&limit=40&bytes=65536`,
+      );
+      assert.equal(result.nextCursor, null);
+      const values = result.people.map((item) => {
+        assert.equal(item.kind, 'person');
+        if (item.kind !== 'person') throw new Error('Unexpected fictional Person reference');
+        return item.person;
+      });
+      assert.equal(values.length, result.totalPeople);
+      return { people: values };
+    }
     const initial = await readFeed();
     assert.equal(initial.counts.pending, 5);
     assert.equal(initial.counts.blocked, 5, 'every printed-subject clinical row awaits review');
@@ -308,7 +393,7 @@ test(
       11,
       'five identity prompts, five saved-name conflicts, and one uncertain reading',
     );
-    const initialClinicalRecords = initial.blocks.flatMap((block) => block.records);
+    const initialClinicalRecords = feedRecords(initial);
     assert.equal(initialClinicalRecords.length, 5);
     assert.equal(
       initialClinicalRecords.filter((record) => record.selectable).length,
@@ -338,39 +423,14 @@ test(
     assert.equal(initial.groups.length, 2, 'two clinical reports share one retained original');
     assert.equal(initial.people.groups.length, 1, 'People-only report has independent discovery');
 
-    await page.goto(url + '/#/import');
-    await page.reload();
-    const laboratoryReport = page.getByRole('region', {
-      name: /Fictional Linden laboratory report/,
-    });
-    await laboratoryReport.getByRole('button', { name: /Review person for/ }).waitFor();
+    const laboratoryGroup = await openReport(
+      clinical.intake.id,
+      'Fictional Linden laboratory report',
+    );
+    const identityPanel = page.getByRole('region', { name: 'Report identity', exact: true });
+    await identityPanel.getByText(/This report identifies “Fictional Sol Linden”/).waitFor();
     await captureControls('import-person-pending');
-    await laboratoryReport.getByRole('button', { name: /Review person for/ }).click();
-    await page
-      .getByRole('dialog')
-      .getByText('The report identifies “Fictional Sol Linden”.', { exact: true })
-      .waitFor();
     await captureControls('import-person-sidebar');
-    if (process.env.CRS_TEST_SCREENSHOTS) {
-      await page.getByRole('dialog').getByRole('button', { name: 'Source', exact: true }).click();
-      await captureControls('import-source-sidebar');
-      await page.getByRole('dialog').getByRole('button', { name: 'Person', exact: true }).click();
-      await page
-        .getByRole('dialog')
-        .getByRole('link', { name: 'Review retained report evidence' })
-        .click();
-      await page
-        .getByRole('button', { name: 'Review person for this report', exact: true })
-        .click();
-      await page
-        .getByRole('dialog')
-        .getByRole('combobox', { name: 'Person for this report' })
-        .waitFor();
-      await captureControls('import-direct-person-sidebar');
-      await page.goto(url + '/#/import');
-      await page.reload();
-      await laboratoryReport.getByRole('button', { name: /Review person for/ }).click();
-    }
     const initialIdentityPosts: IntakeIdentityConfirmation[] = [];
     const captureInitialIdentity = (request: Request) => {
       if (request.method() === 'POST' && request.url().endsWith('/identity-scope'))
@@ -378,7 +438,7 @@ test(
     };
     page.on('request', captureInitialIdentity);
     const initialLaboratoryScope = await request<IntakeIdentityConfirmation['scope']>(
-      `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(initial.groups.find((group) => group.title === 'Fictional Linden laboratory report')!.groupId)}`,
+      `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(laboratoryGroup.groupId)}`,
     );
     const initialLaboratoryTargets = await readIdentityTargets(initialLaboratoryScope);
     const initialIdentityResponse = page.waitForResponse(
@@ -386,20 +446,17 @@ test(
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
     await page
-      .getByRole('dialog')
+      .getByRole('region', { name: 'Report identity', exact: true })
       .getByLabel('Name printed on this report')
       .fill('Fictional Sol Linden');
-    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
+    await identityPanel.getByRole('button', { name: 'This is me', exact: true }).click();
     const initialIdentity = await initialIdentityResponse;
     assert.equal(initialIdentity.status(), 200, await initialIdentity.text());
     const initialIdentityRequest = initialIdentity
       .request()
       .postDataJSON() as IntakeIdentityConfirmation;
     assert.equal(initialIdentityRequest.attestation, 'confirmed_displayed_identity_questions');
-    assert.equal(
-      initialIdentityRequest.scope.groupId,
-      initial.groups.find((group) => group.title === 'Fictional Linden laboratory report')!.groupId,
-    );
+    assert.equal(initialIdentityRequest.scope.groupId, laboratoryGroup.groupId);
     assert.deepEqual(
       initialIdentityRequest.scope,
       initialLaboratoryScope,
@@ -413,24 +470,20 @@ test(
     // one unambiguous original patient header, so each report needs its own choice.
     const laboratoryReady = await readFeed();
     assert.equal(laboratoryReady.counts.blocked, 4);
-    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    const visitGroup = await openReport(clinical.intake.id, 'Fictional Linden visit report');
     await page
-      .getByRole('region', { name: /Fictional Linden visit report/ })
-      .getByRole('button', { name: /Review person for/ })
-      .click();
-    await page
-      .getByRole('dialog')
+      .getByRole('region', { name: 'Report identity', exact: true })
       .getByLabel('Name printed on this report')
       .fill('Fictional Sol Linden');
     const initialVisitScope = await request<IntakeIdentityConfirmation['scope']>(
-      `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(initial.groups.find((group) => group.title === 'Fictional Linden visit report')!.groupId)}`,
+      `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(visitGroup.groupId)}`,
     );
     const initialVisitTargets = await readIdentityTargets(initialVisitScope);
     const visitIdentityResponse = page.waitForResponse(
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
-    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
+    await identityPanel.getByRole('button', { name: 'This is me', exact: true }).click();
     const visitIdentity = await visitIdentityResponse;
     assert.equal(visitIdentity.status(), 200, await visitIdentity.text());
     const identityReady = await until(
@@ -445,10 +498,7 @@ test(
       'each report confirmation records exactly one identity operation',
     );
     assert.deepEqual(initialIdentityPosts[0], initialIdentityRequest);
-    assert.equal(
-      initialIdentityPosts[1]!.scope.groupId,
-      initial.groups.find((group) => group.title === 'Fictional Linden visit report')!.groupId,
-    );
+    assert.equal(initialIdentityPosts[1]!.scope.groupId, visitGroup.groupId);
     assert.deepEqual(initialIdentityPosts[1]!.scope, initialVisitScope);
     assert.equal(initialVisitTargets.length, 3);
     assert.equal(identityReady.counts.pending, 5);
@@ -459,7 +509,7 @@ test(
     assert.equal(selfAfterIdentity.person.birthDate, selfBefore.person.birthDate);
     assert.deepEqual(selfAfterIdentity.person.knownNames, ['Fictional Sol Linden']);
     assert.equal(selfAfterIdentity.person.sourceKnownNames?.[0]?.name, 'Fictional Sol Linden');
-    const identityReadyRecords = identityReady.blocks.flatMap((block) => block.records);
+    const identityReadyRecords = feedRecords(identityReady);
     assert.equal(identityReadyRecords.filter((record) => record.selectable).length, 4);
     const stillBlocked = identityReadyRecords.filter((record) => !record.selectable);
     assert.equal(stillBlocked.length, 1);
@@ -480,6 +530,7 @@ test(
       ),
       'both reports retain their explicit printed-person confirmations',
     );
+    await page.goto(url + '/#/import');
     await page.reload();
     const sourceAttention = await request<SourceAttentionQueue>('/intakes/source-attention');
     assert.equal(
@@ -492,9 +543,6 @@ test(
       [clinical.intake.id, people.intake.id].sort(),
     );
     // Source inspection remains separate from the five clinical and two People rows.
-    await page.getByRole('tab', { name: /^All\s*9$/ }).waitFor();
-    await page.getByRole('tab', { name: /^Needs attention\s*2$/ }).waitFor();
-    await page.getByRole('tab', { name: /^People\s*2$/ }).waitFor();
     await captureControls('import-person-confirmed');
     await until(
       () => page.locator('.import-record').count(),
@@ -511,12 +559,12 @@ test(
     assert.equal(deferred.counts.pending, 0);
     assert.equal(deferred.counts.blocked, 1);
     assert.equal(
-      (await request<IntakeImportFeed>('/intakes/import-feed?view=all&edited=true')).totalRecords,
+      (await request<CollectionImportFeed>('/intakes/import-feed?view=all&edited=true'))
+        .totalRecords,
       0,
       'Later snapshots are not manual clinical edits',
     );
-    await page.getByRole('combobox', { name: 'Review status' }).selectOption('later');
-    await page.getByRole('tab', { name: /^All\s*7$/ }).waitFor();
+    await page.getByRole('combobox', { name: 'Review view' }).selectOption('deferred');
     await until(
       () => page.locator('.import-record').count(),
       (count) => count === 7,
@@ -552,7 +600,7 @@ test(
       } else await route.fulfill({ response });
     });
     await page.getByLabel('Select all shown', { exact: true }).check();
-    await page.getByRole('button', { name: 'Save 4 records', exact: true }).click();
+    await page.getByRole('button', { name: 'Save 4 selected records', exact: true }).click();
     const clinicalSaved = await until(
       readFeed,
       (value) => value.counts.accepted === 4,
@@ -603,9 +651,7 @@ test(
     await page
       .getByText('The second fictional Person changed before saving.', { exact: true })
       .waitFor();
-    const savedAfterFailure = await request<IntakePeopleQueue>(
-      `/intakes/people/${encodeURIComponent(initial.people.groups[0]!.groupId)}`,
-    );
+    const savedAfterFailure = await readPeople();
     const firstSavedPerson = savedAfterFailure.people.find((person) => person.state === 'saved')!;
     assert.ok(firstSavedPerson.saved, 'the first successful Apply has a durable destination');
     const justSavedPeople = page.getByRole('region', { name: 'Just saved People' });
@@ -626,9 +672,7 @@ test(
       firstSavedPerson.saved.resultUrl,
       'the first confirmed destination remains available after retrying the second Person',
     );
-    const savedPeople = await request<IntakePeopleQueue>(
-      `/intakes/people/${encodeURIComponent(initial.people.groups[0]!.groupId)}`,
-    );
+    const savedPeople = await readPeople();
     assert.equal(peopleApplyRequests.length, 3, 'only the failed Person is retried');
     for (const person of savedPeople.people)
       assert.equal(
@@ -639,10 +683,9 @@ test(
           : 'the definite failed Person is the only retried proposal',
       );
     await page.unroute(peopleApplyPattern);
-    await page.getByRole('combobox', { name: 'Review status' }).selectOption('saved');
-    await page.getByRole('tab', { name: /^People\s*2$/ }).click();
+    await page.getByRole('combobox', { name: 'Review view' }).selectOption('all');
     await until(
-      () => page.locator('.import-record-destination').count(),
+      () => page.locator('.import-record-destination [data-saved-person-id]').count(),
       (count) => count === 2,
       'both durable saved Person row destinations',
     );
@@ -724,9 +767,7 @@ test(
     assert.equal(vision[0]!.opticalPrescription.eyes[0]!.sph?.valueText, '-00.75');
     assert.equal(vision[0]!.opticalPrescription.eyes[0]!.baseCurve?.valueText, '08.60');
     assert.equal(vision[0]!.opticalPrescription.expiresDateText, '6 November 2027');
-    const peopleQueue = await request<IntakePeopleQueue>(
-      `/intakes/people/${encodeURIComponent(initial.people.groups[0]!.groupId)}`,
-    );
+    const peopleQueue = await readPeople();
     assert.equal(peopleQueue.people.length, 2);
     for (const person of peopleQueue.people) {
       assert.ok(person.saved);
@@ -765,18 +806,14 @@ test(
       unit: 'arb',
     });
     const matchedOriginal = await upload([identityRow], 'fictional-linden-alias-match.jsonl');
-    const matchedGroup = matchedOriginal.intake.workflow!.reportGroups![0]!;
+    const matchedGroup = await groupFor(matchedOriginal.intake.id);
     const matchedIdentity = await request<IntakeIdentityReview>(
-      `/intakes/${encodeURIComponent(matchedOriginal.intake.id)}/identity-review?groupId=${encodeURIComponent(matchedGroup.id)}`,
+      `/intakes/${encodeURIComponent(matchedOriginal.intake.id)}/identity-review?groupId=${encodeURIComponent(matchedGroup.groupId)}`,
     );
     assert.equal(matchedIdentity.status, 'confirmation_required');
     assert.equal(matchedIdentity.blocking, true);
     assert.equal(matchedIdentity.evidencedIdentity.fullName, undefined);
-    assert.equal(
-      (await request<Intake>(`/intakes/${encodeURIComponent(matchedOriginal.intake.id)}`)).workflow
-        ?.identityConfirmations?.length || 0,
-      0,
-    );
+    assert.equal(matchedIdentity.confirmationCount, 0);
     // Neither a remembered spelling nor a new alias can replace original
     // patient grounding; this report also requires an explicit choice.
     identityRow.report!.subject!.text = 'Fictional Sol Birch';
@@ -785,30 +822,15 @@ test(
       'Fictional Sol Birch',
     );
     const identity = await upload([identityRow], 'fictional-linden-identity.jsonl');
-    await page.goto(url + '/#/import');
-    await page.reload();
-    const staleIdentityReport = page
-      .getByRole('region', {
-        name: /Fictional Linden identity holdout/,
-      })
-      .filter({ hasText: 'New Import Source: fictional-linden-identity.jsonl' });
-    await staleIdentityReport.getByRole('button', { name: /Review person for/ }).click();
-    await page
-      .getByRole('dialog')
-      .getByText('The report identifies “Fictional Sol Birch”.', { exact: true })
-      .waitFor();
-    await page
-      .getByRole('dialog')
-      .getByLabel('Name printed on this report')
-      .fill('Fictional Sol Birch');
-    const identityFeed = await request<IntakeImportFeed>('/intakes/import-feed');
+    await openReport(identity.intake.id);
+    await identityPanel.getByText(/This report identifies “Fictional Sol Birch”/).waitFor();
+    await identityPanel.getByLabel('Name printed on this report').fill('Fictional Sol Birch');
+    const identityFeed = await request<CollectionImportFeed>('/intakes/import-feed');
     const group = identityFeed.groups.find((item) => item.intakeId === identity.intake.id)!;
-    const displayedScope = await request<IntakeIdentityScope>(
+    const displayedScope = await request<IntakeIdentityConfirmation['scope']>(
       `/intakes/${encodeURIComponent(identity.intake.id)}/identity-scope?groupId=${encodeURIComponent(group.groupId)}`,
     );
-    const review = await request<IntakeReview>(
-      `/intakes/${encodeURIComponent(identity.intake.id)}/review`,
-    );
+    const review = await readReview(identity.intake.id);
     await request(`/intakes/${encodeURIComponent(identity.intake.id)}/review-draft`, 'POST', {
       version: review.version,
       operationId: 'fictional-stale-displayed-scope',
@@ -836,14 +858,14 @@ test(
         response.status() === 200,
     );
     page.on('request', captureIdentity);
-    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
+    await identityPanel.getByRole('button', { name: 'This is me', exact: true }).click();
     const firstIdentity = await firstIdentityResponse;
     assert.equal(firstIdentity.status(), 409, await firstIdentity.text());
     assert.equal((await firstIdentity.json()).error.code, 'VERSION_CONFLICT');
     const confirmedIdentity = await confirmedIdentityResponse;
     assert.equal(confirmedIdentity.status(), 200, await confirmedIdentity.text());
     await until(
-      () => request<IntakeReview>(`/intakes/${encodeURIComponent(identity.intake.id)}/review`),
+      () => readReview(identity.intake.id),
       (value) => value.records[0]!.mapping.subject === 'self',
       'one explicit action confirmed after exact freshness validation',
     );
@@ -874,10 +896,10 @@ test(
       version: freshVersion,
       scope: identityPosts[1]!.scope,
     });
-    const confirmedIntake = await request<Intake>(
-      `/intakes/${encodeURIComponent(identity.intake.id)}`,
+    const confirmedReview = await request<IntakeIdentityReview>(
+      `/intakes/${encodeURIComponent(identity.intake.id)}/identity-review?groupId=${encodeURIComponent(group.groupId)}`,
     );
-    assert.equal(confirmedIntake.workflow?.identityConfirmations?.length, 1);
+    assert.equal(confirmedReview.confirmationCount, 1);
     assert.equal(
       (await readFeed()).counts.accepted,
       4,
@@ -899,11 +921,15 @@ test(
       ],
     }));
     const questionsOriginal = await upload(questionRows, 'fictional-explicit-subject.jsonl');
-    await page.reload();
-    await page
-      .getByRole('region', { name: /Fictional explicit subject report/ })
-      .getByRole('button', { name: /Review person for/ })
-      .click();
+    const questionsGroup = await openReport(questionsOriginal.intake.id);
+    const questionScope = await request<IntakeIdentityConfirmation['scope']>(
+      `/intakes/${encodeURIComponent(questionsOriginal.intake.id)}/identity-scope?groupId=${encodeURIComponent(questionsGroup.groupId)}`,
+    );
+    const questionTargets = await readIdentityTargets(questionScope);
+    const questionEvidence = await request<IntakeIdentityScopePage>(
+      `/intakes/${encodeURIComponent(questionsOriginal.intake.id)}/identity-scope-page?${new URLSearchParams({ groupId: questionsGroup.groupId, scopeToken: questionScope.scopeToken, section: 'questions', limit: '20' })}`,
+    );
+    assert.equal(questionEvidence.nextCursor, null);
     await page.getByText(questionPrompt, { exact: true }).waitFor();
     assert.equal(
       await page.getByText(questionPrompt, { exact: true }).count(),
@@ -912,7 +938,7 @@ test(
     );
     await page.getByText(questionAnchor, { exact: true }).waitFor();
     await page
-      .getByRole('dialog')
+      .getByRole('region', { name: 'Report identity', exact: true })
       .getByLabel('Name printed on this report')
       .fill('Fictional Sol Linden');
     const questionResponse = page.waitForResponse(
@@ -922,19 +948,21 @@ test(
     await page.getByRole('button', { name: 'This is me', exact: true }).click();
     const confirmedQuestions = await questionResponse;
     assert.equal(confirmedQuestions.status(), 200, await confirmedQuestions.text());
-    const questionRequest = confirmedQuestions.request().postDataJSON() as {
-      scope: IntakeIdentityScope;
-      attestation: string;
-    };
+    const questionRequest = confirmedQuestions
+      .request()
+      .postDataJSON() as IntakeIdentityConfirmation;
     assert.equal(questionRequest.attestation, 'confirmed_displayed_identity_questions');
-    assert.deepEqual(questionRequest.scope.questions, [
-      { prompt: questionPrompt, textAnchor: questionAnchor },
-    ]);
-    assert.equal(questionRequest.scope.targets.length, 2);
-    assert.ok(questionRequest.scope.targets.every((target) => target.issueIds?.length === 2));
-    const questionsReview = await request<IntakeReview>(
-      `/intakes/${encodeURIComponent(questionsOriginal.intake.id)}/review`,
+    assert.deepEqual(questionRequest.scope, questionScope);
+    assert.deepEqual(
+      questionEvidence.items.map((item) => {
+        assert.equal(item.kind, 'value');
+        return item.kind === 'value' ? item.value : null;
+      }),
+      [{ prompt: questionPrompt, textAnchor: questionAnchor }],
     );
+    assert.equal(questionTargets.length, 2);
+    assert.ok(questionTargets.every((target) => target.issueIds?.length === 2));
+    const questionsReview = await readReview(questionsOriginal.intake.id);
     assert.ok(questionsReview.records.every((record) => record.mapping.subject === 'self'));
     assert.ok(
       questionsReview.records.every((record) =>
@@ -961,25 +989,11 @@ test(
     anonymous.payload =
       'Fictional anonymous report. A measurement of 17.20 arb. No printed patient.';
     const anonymousOriginal = await upload([anonymous], 'fictional-anonymous.jsonl');
-    await page.reload();
-    const anonymousCard = page.getByRole('region', { name: /Fictional anonymous report/ });
-    await anonymousCard.getByRole('button', { name: /Review person for/ }).click();
-    await page
-      .getByRole('dialog')
-      .getByText('Identity is not printed clearly in this report.', { exact: true })
-      .waitFor();
-    await page
-      .getByRole('dialog')
-      .getByRole('link', { name: 'Review retained report evidence' })
-      .click();
-    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
+    await openReport(anonymousOriginal.intake.id);
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
-    await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
-    const anonymousReview = await request<IntakeReview>(
-      `/intakes/${encodeURIComponent(anonymousOriginal.intake.id)}/review`,
-    );
+    const anonymousReview = await readReview(anonymousOriginal.intake.id);
     const anonymousRecordLink = page.locator('.import-detail-record-link').filter({
       hasText: 'Fictional anonymous measurement',
     });
@@ -996,13 +1010,12 @@ test(
     );
     await page.getByRole('button', { name: 'This is me', exact: true }).click();
     await until(
-      () =>
-        request<IntakeReview>(`/intakes/${encodeURIComponent(anonymousOriginal.intake.id)}/review`),
+      () => readReview(anonymousOriginal.intake.id),
       (value) => value.records[0]!.mapping.subject === 'self',
       'individual identity decision is retained',
     );
     await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
-    await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Import', exact: true }).waitFor();
     assert.ok(page.url().endsWith('/import'), 'secondary review returns to the new inbox');
     assert.equal((await readFeed()).counts.accepted, 4, 'returning does not accept the result');
   },

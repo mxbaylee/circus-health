@@ -10,8 +10,11 @@ import type { AddressInfo } from 'node:net';
 import { startRuntime } from '../runtime.ts';
 import type { createEncryptedProfiles } from '../encrypted-profiles.ts';
 import type { getObservation } from '../queries.ts';
-import type { Intake, IntakeReview, HealthRecordEnvelope } from '../../shared/intake.ts';
-import type { IntakeRelatedRecordsResult } from '../../shared/clinical-review.ts';
+import type { HealthRecordEnvelope } from '../../shared/intake.ts';
+import type { IntakeRead, IntakeAcceptedDestinations } from '../../shared/intake-summary.ts';
+import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
+import { readQualificationReview } from '../../scripts/qualification-intake-read.ts';
+import type { ClinicalRecordSectionPage } from '../../shared/intake-clinical-record-sections.ts';
 import type {
   RecordCorrectionPreview,
   RecordCorrectionApplyResult,
@@ -118,6 +121,34 @@ test('encrypted runtime authorizes related discovery and reviewed corrections wi
   );
   assert.equal(verified.status, 201);
   const prefix = `/api/profiles/${verified.data.id}`;
+  const read = async <T>(path: string): Promise<T> => {
+    const result = await request<T>(path, { method: 'GET' });
+    assert.equal(result.status, 200, result.text);
+    return result.data;
+  };
+  const acceptedDestinations = async (intakeId: string) => {
+    const feed = await read<CollectionImportFeed>(
+      prefix +
+        '/intakes/import-feed?' +
+        new URLSearchParams({ view: 'all', state: 'accepted', intakeId }),
+    );
+    assert.equal(feed.format, 'health-intake-import-feed-v2');
+    assert.equal(feed.nextCursor, null, 'the single-record fixture must be completely inspected');
+    assert.equal(feed.records.length, feed.totalRecords);
+    const destinations: IntakeAcceptedDestinations['records'] = [];
+    for (const item of feed.records) {
+      const recordId =
+        item.detail.kind === 'record' ? item.detail.record.id : item.detail.selection.recordId;
+      const params = new URLSearchParams({ groupId: item.groupId, recordId });
+      if (item.proposalId) params.set('proposalId', item.proposalId);
+      const selected = await read<IntakeAcceptedDestinations>(
+        prefix + '/intakes/' + encodeURIComponent(intakeId) + '/accepted-destinations?' + params,
+      );
+      assert.equal(selected.format, 'health-intake-accepted-destinations-v1');
+      destinations.push(...selected.records);
+    }
+    return destinations;
+  };
   const envelope = (id: string): HealthRecordEnvelope => ({
     format: 'health-record-v1',
     id,
@@ -141,10 +172,10 @@ test('encrypted runtime authorizes related discovery and reviewed corrections wi
     },
   });
   const originalText = JSON.stringify(envelope('first'));
-  const uploaded = await request<Intake>(`${prefix}/intakes`, { raw: originalText });
+  const uploaded = await request<IntakeRead>(`${prefix}/intakes`, { raw: originalText });
   assert.equal(uploaded.status, 201);
   const intakePath = `${prefix}/intakes/${encodeURIComponent(uploaded.data.id)}`;
-  const review = (await request<IntakeReview>(intakePath + '/review', { method: 'GET' })).data;
+  const review = await readQualificationReview(read, intakePath + '/review');
   const accepted = await request(intakePath + '/import', {
     body: {
       version: review.version,
@@ -154,21 +185,29 @@ test('encrypted runtime authorizes related discovery and reviewed corrections wi
   });
   assert.equal(accepted.status, 200);
   const incoming = (
-    await request<Intake>(`${prefix}/intakes`, { raw: JSON.stringify(envelope('second')) })
+    await request<IntakeRead>(`${prefix}/intakes`, { raw: JSON.stringify(envelope('second')) })
   ).data;
   const incomingPath = `${prefix}/intakes/${encodeURIComponent(incoming.id)}`;
-  const pending = (await request<IntakeReview>(incomingPath + '/review', { method: 'GET' })).data;
+  const pending = await readQualificationReview(read, incomingPath + '/review');
   const search = {
     proposalId: null,
     recordId: pending.records[0]!.id,
     candidateVersionId: pending.records[0]!.candidateVersionId!,
   };
-  const discovered = await request<IntakeRelatedRecordsResult>(incomingPath + '/related-records', {
+  const discovered = await request<ClinicalRecordSectionPage>(incomingPath + '/related-records', {
     body: search,
   });
   assert.equal(discovered.status, 200);
-  assert.equal(discovered.data.comparisons.length, 1);
-  const recordId = discovered.data.comparisons[0]!.id;
+  assert.equal(discovered.data.format, 'health-clinical-record-section-page-v1');
+  assert.equal(discovered.data.section, 'comparisons');
+  assert.equal(discovered.data.total, 1);
+  assert.equal(discovered.data.items.length, 1);
+  assert.equal(discovered.data.nextCursor, null);
+  const comparison = discovered.data.items[0]!.control;
+  assert.equal(comparison.kind, 'pair');
+  if (comparison.kind !== 'pair') throw Error('Expected an exact saved comparison');
+  assert.equal(comparison.targetAvailable, true);
+  const recordId = comparison.otherRecordId;
   const correctionPath = prefix + '/clinical-review/';
   const measurementPath =
     correctionPath + 'measurement?kind=observation&recordId=' + encodeURIComponent(recordId);
@@ -280,7 +319,7 @@ test('encrypted runtime authorizes related discovery and reviewed corrections wi
   assert.equal(staleConverted.data[0]!.points[0]!.valueText, '14.00');
   assert.equal(staleConverted.data[0]!.points[0]!.measurement!.conversion, null);
   assert.equal(staleConverted.data[0]!.points[0]!.measurement!.status, 'stale_semantics');
-  assert.equal((await request<Intake>(incomingPath, { method: 'GET' })).data.imported, null);
+  assert.deepEqual(await acceptedDestinations(incoming.id), []);
   assert.equal((await request(uploaded.data.contentUrl, { method: 'GET' })).text, originalText);
   for (const [path, body] of [
     [incomingPath + '/related-records', search],
@@ -292,8 +331,7 @@ test('encrypted runtime authorizes related discovery and reviewed corrections wi
     assert.equal((await request(path, { body, anonymous: true })).status, 423);
     assert.equal((await request(path, { body, origin: 'https://foreign.example' })).status, 403);
   }
-  const finalReview = (await request<IntakeReview>(incomingPath + '/review', { method: 'GET' }))
-    .data;
+  const finalReview = await readQualificationReview(read, incomingPath + '/review');
   assert.equal(
     (
       await request(incomingPath + '/import', {
@@ -306,8 +344,9 @@ test('encrypted runtime authorizes related discovery and reviewed corrections wi
     ).status,
     200,
   );
-  const secondRecord = (await request<Intake>(incomingPath, { method: 'GET' })).data.imported!
-    .clinical!.records![0]!;
+  const savedIncoming = await acceptedDestinations(incoming.id);
+  assert.equal(savedIncoming.length, 1);
+  const secondRecord = savedIncoming[0]!;
   const relationshipPath = prefix + '/clinical-relationships';
   const pairPath =
     relationshipPath +

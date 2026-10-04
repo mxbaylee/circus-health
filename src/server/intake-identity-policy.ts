@@ -38,7 +38,14 @@ import type {
 /** Read policy needs complete repeatable collections, not materialized receipt histories. */
 export type IdentityPolicyTarget = Omit<IntakeIdentityScope['targets'][number], 'issueIds'> & {
   issueIds?: Iterable<string>;
+  /** Complete immutable selected issue index; omitted from canonical evidence. */
+  hasIssueId?: (id: string) => boolean;
 };
+export function identityTargetHasIssue(target: IdentityPolicyTarget, issueId: string): boolean {
+  return target.hasIssueId
+    ? target.hasIssueId(issueId)
+    : selectedSequence(target.issueIds || [target.issueId]).some((id) => id === issueId);
+}
 export type IdentityPolicyTargets =
   IdentityPolicyTarget[] | (SelectedSequence<IdentityPolicyTarget> & { readonly length: number });
 export type IdentityPolicyMember = Omit<
@@ -59,6 +66,8 @@ export type IdentityPolicyReceipt = Omit<IntakeIdentityReceipt, 'scope' | 'draft
 export type IdentityGroundingReceipt = Pick<IdentityPolicyReceipt, 'operationId'> & {
   scope: Pick<IntakeIdentityScope, 'scopeToken' | 'profileId'>;
 };
+export type IdentityPolicyPeople =
+  IdentityPolicyPersonSnapshot[] | SelectedSequence<IdentityPolicyPersonSnapshot>;
 export interface IdentityPolicyPersonSnapshot extends IntakeIdentityPerson {
   knownNames: string[];
   challengedNames?: string[];
@@ -204,23 +213,42 @@ export function modelBirthDateWarnings({
   const savedBirthDate = clean(person?.birthDate);
   if (originalBirthDate || unreadableBirthDate || !savedBirthDate || !person) return [];
   const warnings: IntakeIdentityWarning[] = [];
+  for (const warning of modelBirthDateWarningCandidates({
+    issues,
+    originalBirthDate,
+    unreadableBirthDate,
+    person,
+  })) {
+    if (!warnings.some((prior) => prior.modelBirthDate === warning.modelBirthDate))
+      warnings.push(warning);
+  }
+  return warnings;
+}
+
+/** Complete warning candidates; the selected policy sink deduplicates on disk. */
+export function* modelBirthDateWarningCandidates({
+  issues,
+  originalBirthDate,
+  unreadableBirthDate,
+  person,
+}: Parameters<typeof modelBirthDateWarnings>[0]): Generator<IntakeIdentityWarning> {
+  const savedBirthDate = clean(person?.birthDate);
+  if (originalBirthDate || unreadableBirthDate || !savedBirthDate || !person) return;
   for (const issue of issues) {
     const modelBirthDate = clean(issue.selfSuggestion?.birthDate);
     if (
       !modelBirthDate ||
       !validModelBirthDate(modelBirthDate) ||
-      compatibleBirthDates(modelBirthDate, savedBirthDate) ||
-      warnings.some((warning) => warning.modelBirthDate === modelBirthDate)
+      compatibleBirthDates(modelBirthDate, savedBirthDate)
     )
       continue;
-    warnings.push({
+    yield {
       kind: 'model_birth_date_mismatch',
       modelBirthDate,
       savedBirthDate,
       personName: person.fullName,
-    });
+    };
   }
-  return warnings;
 }
 
 export function identityOriginalFingerprint(
@@ -328,7 +356,7 @@ export function isGenericNameConfirmation(
   issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor' | 'field' | 'questionId' | 'resolution'>,
   subjectText: string | undefined,
   self: IntakeIdentitySelfSnapshot,
-  people: IdentityPolicyPersonSnapshot[],
+  people: Iterable<IdentityPolicyPersonSnapshot>,
 ): boolean {
   if (issue.field !== 'subject' || issue.resolution || !issue.textAnchor) return false;
   const name = printedIdentityName(subjectText);
@@ -370,10 +398,10 @@ export function isGenericNameConfirmation(
   // DOBs still need interpretation and cannot take this permissive path.
   const alternatives = numericDateReadings(rawDate, !labelledAnchorDate && !!bannerDate);
   if (!alternatives.length) return false;
-  const owners = [
-    { fullName: self.fullName, knownNames: self.knownNames, birthDate: self.birthDate },
-    ...people,
-  ];
+  const owners = selectedSequence(function* () {
+    yield { fullName: self.fullName, knownNames: self.knownNames, birthDate: self.birthDate };
+    yield* people;
+  });
   const matching = owners.filter((owner) =>
     [owner.fullName, ...savedKnownNames(owner.knownNames)].some(
       (saved) => saved && canonicalIdentityName(saved) === canonicalIdentityName(name),
@@ -384,12 +412,32 @@ export function isGenericNameConfirmation(
   // readings fit the saved person; one compatible reading leaves that match
   // unchanged. Labelled DOB ambiguity still requires its own review.
   return (
-    matching.length === 1 &&
-    (!matching[0]!.birthDate ||
+    matching.at(0) !== undefined &&
+    matching.at(1) === undefined &&
+    (!matching.at(0)!.birthDate ||
       (labelledAnchorDate
-        ? alternatives.every((date) => compatibleBirthDates(date, matching[0]!.birthDate!))
-        : alternatives.some((date) => compatibleBirthDates(date, matching[0]!.birthDate!))))
+        ? alternatives.every((date) => compatibleBirthDates(date, matching.at(0)!.birthDate!))
+        : alternatives.some((date) => compatibleBirthDates(date, matching.at(0)!.birthDate!))))
   );
+}
+
+/** Structured hints contribute a name only when every distinct reading agrees. */
+export function structuredEvidencedIdentity(
+  issues: Iterable<Pick<IntakeReviewIssue, 'selfSuggestion'>>,
+): IntakeEvidencedIdentity {
+  let firstName: string | undefined;
+  let firstCanonical: string | undefined;
+  let ambiguous = false;
+  for (const issue of issues) {
+    const name = clean(issue.selfSuggestion?.fullName);
+    if (!name || printedIdentityName(name) !== name) continue;
+    const canonical = canonicalIdentityName(name);
+    if (firstName === undefined) {
+      firstName = name;
+      firstCanonical = canonical;
+    } else if (canonical !== firstCanonical) ambiguous = true;
+  }
+  return firstName && !ambiguous ? { fullName: firstName } : {};
 }
 
 export function collectEvidencedIdentity(
@@ -660,7 +708,7 @@ export function confirmedPersonReceipt<T extends IdentityPolicyReceipt>({
     return (
       !!target &&
       selectedSequence(requiredIssueIds).every((issueId) =>
-        selectedSequence(target.issueIds || [target.issueId]).some((id) => id === issueId),
+        identityTargetHasIssue(target, issueId),
       ) &&
       selectedSequence(target.issueIds || [target.issueId]).every((issueId) => {
         const answer = latestResolution
@@ -703,10 +751,7 @@ export function exactCurrentIdentityResolutionOperationId<T extends IdentityPoli
               item.proposalId === occurrence.proposalId &&
               item.recordId === occurrence.recordId,
           );
-          return (
-            !!target &&
-            selectedSequence(target.issueIds || [target.issueId]).some((id) => id === issueId)
-          );
+          return !!target && identityTargetHasIssue(target, issueId);
         }) ?? -1;
       if (receiptIndex < 0) return undefined;
       if (receiptIndex > latestReceiptIndex) {
@@ -784,7 +829,7 @@ export function assessIdentityPolicy({
   bannerBirthDates = [],
 }: {
   self: IntakeIdentitySelfSnapshot;
-  people?: IdentityPolicyPersonSnapshot[];
+  people?: Iterable<IdentityPolicyPersonSnapshot>;
   evidence: IntakeEvidencedIdentity;
   evidenceConflicts?: IntakeIdentityConflict[];
   group: IdentityBoundaryHeader | null;
@@ -828,41 +873,45 @@ export function assessIdentityPolicy({
     selfName,
     ...savedKnownNames(self.knownNames).filter(safeSourceIdentityName),
   ].filter((name): name is string => !!name);
-  const owners = [
-    {
-      personId: 'patient',
-      names: selfNames,
-      birthDate: selfBirthDate,
-      person: undefined as IdentityPolicyPersonSnapshot | undefined,
-    },
-    ...people
-      .filter((person) => person.personId !== 'patient')
-      .map((person) => ({
-        personId: person.personId,
-        names: [person.fullName, ...person.knownNames.filter(safeSourceIdentityName)].filter(
-          Boolean,
-        ),
-        birthDate: clean(person.birthDate),
-        person,
-      })),
-  ];
+  const selfOwner = {
+    personId: 'patient',
+    names: selfNames,
+    birthDate: selfBirthDate,
+    person: undefined as IdentityPolicyPersonSnapshot | undefined,
+  };
+  const owners = selectedSequence(function* () {
+    yield selfOwner;
+    for (const person of people)
+      if (person.personId !== 'patient')
+        yield {
+          personId: person.personId,
+          names: [person.fullName, ...person.knownNames.filter(safeSourceIdentityName)].filter(
+            Boolean,
+          ),
+          birthDate: clean(person.birthDate),
+          person,
+        };
+  });
   const exactOwners = fullName
     ? owners.filter((owner) =>
         owner.names.some((name) => canonicalIdentityName(name) === canonicalIdentityName(fullName)),
       )
-    : [];
+    : selectedSequence([]);
   const futureOwner = fullName
     ? self.futureNameOwners?.find(
         (decision) => canonicalIdentityName(decision.name) === canonicalIdentityName(fullName),
       )?.personId
     : undefined;
-  const distinctOwners = [
-    ...new Map(
-      exactOwners
-        .filter((owner) => !futureOwner || owner.personId === futureOwner)
-        .map((owner) => [owner.personId, owner]),
-    ).values(),
-  ];
+  let uniqueOwner: typeof selfOwner | undefined,
+    ownerMatchCount: 0 | 1 | 2 = 0;
+  for (const owner of exactOwners) {
+    if (futureOwner && owner.personId !== futureOwner) continue;
+    if (!uniqueOwner) {
+      uniqueOwner = owner;
+      ownerMatchCount = 1;
+    } else if (uniqueOwner.personId === owner.personId) uniqueOwner = owner;
+    else ownerMatchCount = 2; // Two means ambiguity, never a displayed completeness count.
+  }
   const generationalName = (name: string): { base: string; suffix: string | null } => {
     const printed = name.normalize('NFKC').trim();
     const surnameFirst = printed.match(/^([^,]+),\s*(.+?)\s+(jr\.?|sr\.?|ii|iii|iv)\.?$/iu);
@@ -877,10 +926,10 @@ export function assessIdentityPolicy({
   const suffixAmbiguity =
     !!printedName &&
     !printedName.suffix &&
-    distinctOwners.length === 1 &&
+    ownerMatchCount === 1 &&
     owners.some(
       (owner) =>
-        owner.personId !== distinctOwners[0]!.personId &&
+        owner.personId !== uniqueOwner!.personId &&
         owner.names.some((name) => {
           const saved = generationalName(name);
           return !!saved.suffix && saved.base === printedName.base;
@@ -888,13 +937,16 @@ export function assessIdentityPolicy({
     );
   const challengedName =
     !!fullName &&
-    [self, ...people].some((owner) =>
+    selectedSequence(function* () {
+      yield self;
+      yield* people;
+    }).some((owner) =>
       owner.challengedNames?.some(
         (name) => canonicalIdentityName(name) === canonicalIdentityName(fullName),
       ),
     );
-  const matchedOwner = distinctOwners.length === 1 ? distinctOwners[0] : undefined;
-  const bannerIncompatibleWith = (owner: (typeof owners)[number] | undefined): boolean =>
+  const matchedOwner = ownerMatchCount === 1 ? uniqueOwner : undefined;
+  const bannerIncompatibleWith = (owner: typeof selfOwner | undefined): boolean =>
     !!owner?.birthDate &&
     bannerBirthDates.some(
       (readings) => !readings.some((date) => compatibleBirthDates(date, owner.birthDate!)),
@@ -988,7 +1040,7 @@ export function assessIdentityPolicy({
   if (
     latestPersonChoice?.outcome === 'this_is_person' &&
     !ownPersonReceipt &&
-    distinctOwners.length < 2 &&
+    ownerMatchCount < 2 &&
     matchedOwner?.personId !== latestPersonChoice.assignedPerson?.personId
   )
     return {
@@ -1001,7 +1053,7 @@ export function assessIdentityPolicy({
   if (
     latestPersonChoice?.outcome === 'this_is_me' &&
     !ownSelfReceipt &&
-    distinctOwners.length < 2 &&
+    ownerMatchCount < 2 &&
     matchedOwner?.personId !== 'patient'
   )
     return {
@@ -1020,9 +1072,9 @@ export function assessIdentityPolicy({
     candidate?.outcome === 'this_is_me' &&
     ((candidate.scope.groupId === group?.id && candidate.scope.groupVersionId === groupVersionId) ||
       (!unreadableBirthDate &&
-        distinctOwners.length <= 1 &&
+        ownerMatchCount <= 1 &&
         !suffixAmbiguity &&
-        !bannerIncompatibleWith(owners[0])));
+        !bannerIncompatibleWith(selfOwner)));
   const receipt =
     latestPersonChoice?.outcome === 'this_is_me' &&
     (!borrowedSelfReceipt || reusableSelfReceipt(latestPersonChoice))
@@ -1140,7 +1192,7 @@ export function assessIdentityPolicy({
       },
     };
   if (ownPersonReceipt) {
-    const assigned = people.find(
+    const assigned = selectedSequence(people).find(
       (person) =>
         person.personId === ownPersonReceipt.assignedPerson?.personId &&
         person.noteId === ownPersonReceipt.assignedPerson?.noteId,
@@ -1204,7 +1256,7 @@ export function assessIdentityPolicy({
       message:
         'This printed name could belong to people whose saved names differ only by a generational suffix. Choose who this report belongs to.',
     };
-  if (distinctOwners.length > 1)
+  if (ownerMatchCount > 1)
     return {
       ...common,
       confidence: 'none',
@@ -1357,7 +1409,7 @@ export function identityBoundaryRepairApplies(
           prior.proposalId === target.proposalId &&
           prior.recordId === target.recordId &&
           selectedSequence(target.issueIds || [target.issueId]).every((issueId) =>
-            selectedSequence(prior.issueIds || [prior.issueId]).some((id) => id === issueId),
+            identityTargetHasIssue(prior, issueId),
           ),
       ),
     )

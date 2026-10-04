@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -275,6 +276,9 @@ test('private exclusive outputs preserve conflicts and remove only this call par
   const repository = join(root, 'git-checkout');
   mkdirSync(repository);
   mkdirSync(join(repository, '.git'));
+  chmodSync(join(repository, '.git'), 0o555);
+  assert.doesNotThrow(() => assertFictionalOutputPath(join(repository, 'fixture.pdf')));
+  chmodSync(join(repository, '.git'), 0o755);
   assert.throws(
     () => writeLargeImportFixture(join(repository, 'fixture.pdf'), oraclePath),
     /outside Git/,

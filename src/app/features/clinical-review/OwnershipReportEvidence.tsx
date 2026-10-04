@@ -19,7 +19,9 @@ export function OwnershipReportEvidence({
   renderRecord: (record: OwnershipReportPreviewRecord) => ReactNode;
   renderRelationship: (relationship: OwnershipPreview['relationships'][number]) => ReactNode;
 }) {
-  const [section, setSection] = useState<'records' | 'pending' | 'relationships'>('records'),
+  const [section, setSection] = useState<'records' | 'pending' | 'relationships' | 'holds'>(
+      'records',
+    ),
     [after, setAfter] = useState('-1'),
     [page, setPage] = useState<OwnershipReportPage | null>(null),
     [error, setError] = useState('');
@@ -43,8 +45,8 @@ export function OwnershipReportEvidence({
   return (
     <section aria-label="Complete report evidence">
       <p>
-        This complete report correction saves as one atomic group: {reference.recordTotal} saved
-        records and {reference.pendingTotal} pending records. Evidence is shown one page at a time.
+        This correction includes {reference.recordTotal} saved records and {reference.pendingTotal}{' '}
+        pending records. Evidence is shown one page at a time.
       </p>
       <label>
         Report evidence{' '}
@@ -59,6 +61,9 @@ export function OwnershipReportEvidence({
           <option value="records">Saved records ({reference.recordTotal})</option>
           <option value="pending">Pending members ({reference.pendingTotal})</option>
           <option value="relationships">Relationships ({reference.relationshipTotal})</option>
+          <option value="holds">
+            Report defaults requiring review ({reference.reportHoldTotal})
+          </option>
         </select>
       </label>
       {error && <p role="alert">{error}</p>}
@@ -71,6 +76,13 @@ export function OwnershipReportEvidence({
           {page.items.map((item, index) => {
             if ('type' in item && item.type === 'reference')
               return <ReportFragment key={item.ordinal} reference={item} disabled={disabled} />;
+            if ('defaultOperationId' in item)
+              return (
+                <p key={item.defaultOperationId}>
+                  Report {item.groupId}: the earlier person default will require renewed identity
+                  review. Other saved records retain their current owners.
+                </p>
+              );
             if ('mapping' in item)
               return <div key={item.kind + item.recordId}>{renderRecord(item)}</div>;
             if ('decisionId' in item)

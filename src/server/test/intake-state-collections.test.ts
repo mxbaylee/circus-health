@@ -4,6 +4,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { openDatabase, transaction, clinicalReviewRevision, type Database } from '../database.ts';
 import {
   attachRecordDurability,
@@ -147,6 +148,155 @@ test('v4 selected maps, sequences and byte chunks survive accepted-journal rebui
   assert.equal(work.warm.envelopeHydrations, 0);
   assert.equal(work.warm.materializationReads, 0);
   assert.equal(work.warm.evidenceReplayVersions, 0);
+});
+
+test('unchanged collection reads authenticate selected roots once per SQLite state', (t) => {
+  const { db, identity } = fixture(t),
+    store = createIntakeStateStorage(db, identity).collections;
+  mutate(
+    db,
+    store,
+    [{ area: 'logical', collection: 'small', op: 'put', key: 'key', value: 'fictional' }],
+    1,
+  );
+  const operationId = randomUUID();
+  store.commitMaintenance(
+    store.prepare(store.openView(), {
+      operationId,
+      requestDigest: digest(operationId),
+      domainVersion: 1,
+      changes: [{ area: 'builds', collection: 'small', op: 'put', key: 'key', value: 'auxiliary' }],
+    }),
+  );
+  const view = store.openView();
+  assert.equal(store.get(view, 'logical', 'small', 'key'), 'fictional');
+  const before = { ...intakeWorkCounters(db).warm };
+  for (let index = 0; index < 32; index++)
+    assert.equal(store.get(view, 'logical', 'small', 'key'), 'fictional');
+  const after = intakeWorkCounters(db).warm;
+  assert.equal(
+    after.collectionNodeReads - before.collectionNodeReads,
+    64,
+    'each point read authenticates its directory and value page without unrelated root rereads',
+  );
+  t.diagnostic(
+    JSON.stringify({
+      nodeReads: after.collectionNodeReads - before.collectionNodeReads,
+      readBytes: after.collectionReadBytes - before.collectionReadBytes,
+      hashedBytes: after.hashedBytes - before.hashedBytes,
+    }),
+  );
+});
+
+test('selected root memo refuses local, external and rolled-back corruption without explicit cache clearing', (t) => {
+  const { db, identity } = fixture(t),
+    store = createIntakeStateStorage(db, identity).collections;
+  mutate(
+    db,
+    store,
+    [{ area: 'logical', collection: 'small', op: 'put', key: 'key', value: 'first' }],
+    1,
+  );
+  const prefix = intakeNamespace(identity),
+    firstHead = String(
+      db.prepare('SELECT value FROM app_meta WHERE key=?').get(prefix + 'head')!.value,
+    );
+  mutate(
+    db,
+    store,
+    [{ area: 'logical', collection: 'small', op: 'put', key: 'key', value: 'second' }],
+    2,
+  );
+  const operationId = randomUUID();
+  store.commitMaintenance(
+    store.prepare(store.openView(), {
+      operationId,
+      requestDigest: digest(operationId),
+      domainVersion: 2,
+      changes: [{ area: 'builds', collection: 'small', op: 'put', key: 'key', value: 'auxiliary' }],
+    }),
+  );
+  const selected = store.binding(store.openView())!,
+    read = () => store.get(store.openView(), 'logical', 'small', 'key'),
+    change = db.prepare('UPDATE app_meta SET value=? WHERE key=?');
+  assert.equal(read(), 'second');
+  for (const root of [
+    selected.logical.root,
+    selected.builds,
+    selected.history,
+    selected.receipts,
+  ]) {
+    assert.ok(root);
+    db.exec('SAVEPOINT fictional_corrupt_root');
+    try {
+      change.run('{}', prefix + 'node:' + root.hash);
+      assert.throws(
+        read,
+        /schema|tree|collection/,
+        'even an unrelated selected root is revalidated after a write',
+      );
+    } finally {
+      db.exec('ROLLBACK TO fictional_corrupt_root; RELEASE fictional_corrupt_root');
+    }
+    assert.equal(read(), 'second');
+  }
+  db.exec('SAVEPOINT fictional_head_aba');
+  try {
+    change.run(firstHead, prefix + 'head');
+    assert.equal(read(), 'first');
+  } finally {
+    db.exec('ROLLBACK TO fictional_head_aba; RELEASE fictional_head_aba');
+  }
+  assert.equal(read(), 'second', 'rollback restores the exact selected head');
+  db.exec('SAVEPOINT fictional_owner');
+  try {
+    change.run('other-profile', 'owner_profile_id');
+    assert.throws(read, /owner/);
+  } finally {
+    db.exec('ROLLBACK TO fictional_owner; RELEASE fictional_owner');
+  }
+  assert.equal(read(), 'second');
+  const peer = new DatabaseSync(String(db.prepare('PRAGMA database_list').get()!.file)),
+    key = prefix + 'node:' + selected.receipts!.hash,
+    original = String(db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)!.value);
+  try {
+    peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run('{}', key);
+    assert.throws(read, /schema|tree|collection/, 'external corruption changes data_version');
+    peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run(original, key);
+    assert.equal(read(), 'second');
+    for (const oversized of ['f'.repeat(32769), '🌿'.repeat(9000)]) {
+      if (oversized.startsWith('🌿')) assert.ok(oversized.length < 32768);
+      peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run(oversized, key);
+      assert.throws(read, /collection stored row bytes/, 'the atomic bound measures UTF-8 bytes');
+      peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run(original, key);
+      assert.equal(read(), 'second');
+    }
+  } finally {
+    peer.close();
+  }
+  change.run('{}', key);
+  db.exec('SAVEPOINT fictional_temporary_root_repair');
+  try {
+    change.run(original, key);
+    assert.equal(read(), 'second', 'temporary valid bytes may be read inside the savepoint');
+    const changes = db.prepare('SELECT total_changes() AS count').get()!.count;
+    db.exec('ROLLBACK TO fictional_temporary_root_repair; RELEASE fictional_temporary_root_repair');
+    assert.equal(db.prepare('SELECT total_changes() AS count').get()!.count, changes);
+    assert.throws(
+      read,
+      /schema|tree|collection/,
+      'rollback must not reuse transaction-authenticated roots',
+    );
+  } finally {
+    if (db.isTransaction)
+      db.exec(
+        'ROLLBACK TO fictional_temporary_root_repair; RELEASE fictional_temporary_root_repair',
+      );
+    change.run(original, key);
+  }
+  assert.equal(read(), 'second');
+  const reopened = createIntakeStateStorage(db, identity).collections;
+  assert.equal(reopened.get(reopened.openView(), 'logical', 'small', 'key'), 'second');
 });
 
 test('selected incomplete chunks publish without clinical invalidation and promote atomically as large values', (t) => {

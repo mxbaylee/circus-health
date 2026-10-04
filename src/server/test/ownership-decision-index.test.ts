@@ -57,6 +57,20 @@ test('native ownership decision joins remain indexed across warm writes, rollbac
     assert.throws(() => ownershipDecisionQueries(db), /Prepare complete accepted/);
     await prepareOwnershipDecisionIndex(db);
     const selected = ownershipDecisionQueries(db)!;
+    assert.equal(selected.hasAssignmentPolicy(), false);
+    const presencePlan = db
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM __ownership_decision_index INDEXED BY __ownership_decision_index_source WHERE title IN ('Record ownership source','Report ownership default','Report ownership default hold') LIMIT 1",
+      )
+      .all();
+    assert.ok(
+      presencePlan.some((row) =>
+        String(row.detail).includes(
+          'SEARCH __ownership_decision_index USING COVERING INDEX __ownership_decision_index_source',
+        ),
+      ),
+    );
+    assert.ok(presencePlan.every((row) => !String(row.detail).startsWith('SCAN')));
     assert.deepEqual(
       JSON.parse(String(selected.accepted('selected')!.coverage_json)),
       latestOwnershipDecision(db, 'Accepted clinical contribution', 'sourceRecordId', 'selected'),
@@ -101,6 +115,87 @@ test('native ownership decision joins remain indexed across warm writes, rollbac
       JSON.parse(String(ownershipDecisionQueries(db)!.accepted('selected')!.coverage_json))
         .revision,
       4,
+    );
+    const routing = ownershipDecisionQueries(db)!;
+    insert.run(
+      'selected-plan',
+      'Ownership correction group',
+      '{"parentOperationId":"parent","groupId":"fictional"}',
+    );
+    insert.run(
+      'selected-event',
+      'Record ownership event',
+      '{"operationId":"child","recordId":"fictional"}',
+    );
+    assert.deepEqual(
+      Array.from(routing.receiptGroups('parent'), (row) => row.id),
+      ['selected-plan'],
+    );
+    assert.deepEqual(
+      Array.from(routing.receiptEvents('child'), (row) => row.id),
+      ['selected-event'],
+    );
+    assert.equal(routing.hasReceiptEvents('child'), true);
+    assert.equal(routing.hasReceiptEvents('unrelated'), false);
+    for (const [field, title, scope, index] of [
+      [
+        'parent_operation_id',
+        'Ownership correction group',
+        'parent',
+        '__ownership_decision_index_parent',
+      ],
+      ['operation_id', 'Record ownership event', 'child', '__ownership_decision_index_operation'],
+    ]) {
+      const query = db
+        .prepare(
+          `EXPLAIN QUERY PLAN SELECT m.id,m.coverage_json FROM __ownership_decision_index i INDEXED BY ${index} JOIN main.manual_batches m ON m.id=i.id WHERE i.title=? AND i.${field}=? ORDER BY i.id`,
+        )
+        .all(title!, scope!);
+      assert.ok(
+        query.some((row) => String(row.detail).includes(`SEARCH i USING COVERING INDEX ${index}`)),
+      );
+      assert.ok(query.some((row) => /SEARCH m USING INDEX.*\(id=\?\)/.test(String(row.detail))));
+      assert.ok(query.every((row) => !String(row.detail).startsWith('SCAN')));
+    }
+    db.exec('BEGIN');
+    db.prepare(
+      "UPDATE manual_batches SET coverage_json=json_set(coverage_json,'$.operationId','changed') WHERE id='selected-event'",
+    ).run();
+    assert.equal(routing.hasReceiptEvents('child'), false);
+    assert.equal(routing.hasReceiptEvents('changed'), true);
+    db.prepare("DELETE FROM manual_batches WHERE id='selected-plan'").run();
+    assert.deepEqual([...routing.receiptGroups('parent')], []);
+    db.exec('ROLLBACK');
+    assert.equal(routing.hasReceiptEvents('child'), true);
+    assert.equal(routing.hasReceiptEvents('changed'), false);
+    assert.deepEqual(
+      Array.from(routing.receiptGroups('parent'), (row) => row.id),
+      ['selected-plan'],
+    );
+    db.exec('DROP TRIGGER temp.__ownership_decision_index_update');
+    let waiterChecks = 0;
+    const firstPreparation = prepareOwnershipDecisionIndex(db);
+    await assert.rejects(
+      prepareOwnershipDecisionIndex(db, {
+        assertRunning() {
+          throw Error('Fictional waiting caller cancelled');
+        },
+      }),
+      /waiting caller cancelled/,
+    );
+    await Promise.all([
+      firstPreparation,
+      prepareOwnershipDecisionIndex(db, {
+        assertRunning() {
+          waiterChecks++;
+        },
+      }),
+    ]);
+    assert.equal(waiterChecks, 2);
+    assert.equal(ownershipDecisionIndexWork(db).coldRows, 2055);
+    assert.deepEqual(
+      Array.from(ownershipDecisionQueries(db)!.receiptGroups('parent'), (row) => row.id),
+      ['selected-plan'],
     );
   } finally {
     db.close();

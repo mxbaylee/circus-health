@@ -9,6 +9,7 @@ import { canonicalLiteral } from './intake-format.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import {
   createReportSnapshotCatalog,
+  reportSnapshotInlineTextFits,
   type ReportSnapshotCatalog,
   type ReportSnapshotMapReader,
   type ReportSnapshotMapWriter,
@@ -166,7 +167,7 @@ export function createDuplicateEvidenceSnapshotPreparation(
           }
         };
         const put = async (key: string, value: string) => {
-          if (Buffer.byteLength(value) > 4096) {
+          if (!reportSnapshotInlineTextFits(value)) {
             await flush();
             await (await writable()).putText(key, [value]);
           } else {

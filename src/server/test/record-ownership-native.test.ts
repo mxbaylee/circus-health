@@ -8,17 +8,17 @@ import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { uploadIntake, reviewIntake, importIntake } from '../intake.ts';
-import { createNote } from '../notes.ts';
+import { createNote, getNote } from '../notes.ts';
 import {
   prepareOwnershipEvidence,
   previewRecordOwnership,
-  commitRecordOwnership,
   getRecordOwnershipReceipt,
 } from '../record-ownership.ts';
 import {
   previewNativeRecordOwnership,
   commitNativeRecordOwnership,
   nativeOwnershipNamePlan,
+  nativeOwnershipReportPlan,
   clearNativeOwnershipPlans,
   chooseNativeOwnershipName,
   chooseNativeOwnershipReport,
@@ -111,8 +111,16 @@ test('native records-selected ownership previews and commits a complete large na
   const preview = await previewNativeRecordOwnership(db, root, profileId, request);
   assert.equal(preview.namesIncluded, false);
   assert.equal('names' in preview, false);
-  assert.ok('records' in preview);
-  assert.deepEqual(preview.records, oracle.records);
+  assert.ok('reportEvidence' in preview);
+  const recordPlan = nativeOwnershipReportPlan(db, profileId, preview.reportEvidence.token),
+    page = recordPlan.page('records');
+  assert.equal(page.total, oracle.records.length);
+  assert.equal(page.items.length, 1);
+  const shown = page.items[0]!;
+  assert.ok('mapping' in shown);
+  assert.deepEqual(shown.mapping, oracle.records[0]!.mapping);
+  assert.ok(!Array.isArray(shown.contributions));
+  assert.equal(shown.contributions.total, oracle.records[0]!.contributions.length);
   assert.deepEqual(preview.blockers, oracle.blockers);
   const plan = nativeOwnershipNamePlan(db, profileId, preview.nameEvidence.token);
   assert.equal(plan.reference.targetTotal, 96);
@@ -159,9 +167,32 @@ test('native records-selected ownership previews and commits a complete large na
     db.prepare('SELECT person_id FROM observations WHERE id=?').get(record.id)!.person_id,
     destination.personId,
   );
-  assert.equal(commitRecordOwnership(db, root, profileId, command).replayed, true);
+  const { replayOwnershipReceiptReference } = await import('../ownership-outcome-page.ts');
+  assert.equal(replayOwnershipReceiptReference(db, profileId, command)?.replayed, true);
   assert.equal(intakeWorkCounters(db).warm.envelopeHydrations, before.warm.envelopeHydrations);
   assert.equal(intakeWorkCounters(db).warm.materializationReads, before.warm.materializationReads);
+  const noOpPreview = await previewNativeRecordOwnership(db, root, profileId, {
+    ...request,
+    destination: { noteId: destination.id, expectedVersion: getNote(db, destination.id).version },
+  });
+  assert.equal(noOpPreview.nameEvidence.total, 0);
+  const snapshotChanges = () => {
+      const counters = intakeWorkCounters(db);
+      return (
+        counters.warm.ownershipSnapshotChangedIds +
+        counters.reconstruction.ownershipSnapshotChangedIds
+      );
+    },
+    beforeNoOp = snapshotChanges();
+  const noOp = await commitNativeRecordOwnership(db, root, profileId, {
+    operationId: randomUUID(),
+    request: noOpPreview.request,
+    scopeToken: noOpPreview.scopeToken,
+    version: noOpPreview.version,
+  });
+  assert.equal(noOp.moved, 0);
+  assert.equal(noOp.unchanged, 1);
+  assert.equal(snapshotChanges(), beforeNoOp);
   assert.throws(
     () => nativeOwnershipNamePlan(db, 'another-profile', preview.nameEvidence.token),
     /current ownership evidence/,
@@ -405,7 +436,6 @@ test('native whole-report preview pages exact clinical and pending scope and pub
 });
 
 test('native selected-record ownership keeps every off-page identity requirement and refuses the complete blocked scope', async (t) => {
-  const { nativeOwnershipBlockerStore } = await import('../record-ownership-native.ts');
   const root = mkdtempSync(join(tmpdir(), 'fictional-ownership-identity-questions-')),
     profileId = 'fictional',
     db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
@@ -476,17 +506,19 @@ test('native selected-record ownership keeps every off-page identity requirement
   };
   await prepareOwnershipEvidence(db, root, profileId, request);
   const preview = await previewNativeRecordOwnership(db, root, profileId, request);
-  if (!('records' in preview)) throw Error('Expected selected record preview');
-  const blockers = preview.records[0]!.blockers;
+  if (!('reportEvidence' in preview)) throw Error('Expected complete record evidence');
+  const plan = nativeOwnershipReportPlan(db, profileId, preview.reportEvidence.token),
+    selected = plan.page('records').items[0]!;
+  if (!('mapping' in selected)) throw Error('Expected bounded clinical header');
+  const blockers = selected.blockers;
   assert.equal(Array.isArray(blockers), false);
   if (Array.isArray(blockers)) throw Error('Expected complete blocker reference');
   assert.equal(blockers.count, 66);
   const token = new URL(blockers.url, 'http://fictional').pathname.split('/').at(-1)!,
-    plan = nativeOwnershipBlockerStore(db, profileId, token),
-    first = plan.page(blockers.key, -1, 3, 4096);
+    first = plan.contributionPage(blockers.key, null, -1, 3, 4096);
   assert.equal(first.total, 66);
   assert.equal(first.items.length, 3);
-  const last = plan.page(blockers.key, 63, 3, 8192);
+  const last = plan.contributionPage(blockers.key, null, 63, 3, 8192);
   assert.equal(last.items.length, 2);
   assert.match(String(last.items[0]), /64/);
   await assert.rejects(
@@ -502,5 +534,8 @@ test('native selected-record ownership keeps every off-page identity requirement
     db.prepare('SELECT person_id FROM observations WHERE id=?').get(row.id)!.person_id,
     'patient',
   );
-  assert.throws(() => nativeOwnershipBlockerStore(db, 'other-profile', token), /Refresh/);
+  assert.throws(
+    () => nativeOwnershipReportPlan(db, 'other-profile', token),
+    /current report evidence/,
+  );
 });

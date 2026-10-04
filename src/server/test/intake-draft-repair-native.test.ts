@@ -1,3 +1,4 @@
+import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import { firstReportGroup } from '../../shared/intake-report-group-links.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -143,8 +144,9 @@ test('native repair composes ordered fields and records in one version with exac
   const result = await saveIntakeDraftRepairRead(db, root, profileId, source.id, input);
   assert.equal(result.version, input.version + 1);
   const assertNoPolicies = () => {
-    assert.equal(db.prepare('SELECT count(*) n FROM intake_review_issue_policy_v2').get()!.n, 0);
-    assert.equal(db.prepare('SELECT count(*) n FROM intake_review_issue_scope').get()!.n, 0);
+    assert.equal(reviewIssueScratchCounts(db).databases, 0);
+    assert.equal(reviewIssueScratchCounts(db).rows, 0);
+    assert.equal(reviewIssueScratchCounts(db).scopes, 0);
   };
   assertNoPolicies();
   const read = () => {

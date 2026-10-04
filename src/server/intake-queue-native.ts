@@ -386,6 +386,7 @@ export async function getIntakePeopleQueueRead(
     bytes?: unknown;
     personId?: string | null;
     view?: string | null;
+    q?: string | null;
   } = {},
 ) {
   if (input.view && !['active', 'deferred', 'all'].includes(input.view))
@@ -400,6 +401,7 @@ export async function getIntakePeopleQueueRead(
     limit: input.limit == null ? undefined : Number(input.limit),
     bytes: input.bytes == null ? undefined : Number(input.bytes),
     peopleCursor: input.cursor == null ? undefined : String(input.cursor),
+    peopleQuery: input.q ?? undefined,
   });
   return detail.people;
 }

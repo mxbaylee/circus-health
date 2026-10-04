@@ -286,8 +286,12 @@ export function ImportDetailReview({
   onUseSource,
   embedded = false,
   beforeCloseRef,
+  guardNavigation = true,
+  externalPending = false,
 }: {
   embedded?: boolean;
+  guardNavigation?: boolean;
+  externalPending?: boolean;
   beforeCloseRef?: RefObject<(() => Promise<boolean>) | null>;
   selection: ImportDetailSelection;
   onBack: () => void;
@@ -315,7 +319,7 @@ export function ImportDetailReview({
   const identityMounted = useRef(true);
   const restoringIdentityRef = useRef(false);
   const rawDetail = useResource<IntakeReportQueueDetail | CollectionReportDetail>(
-    `/intakes/report-queue/${encodeURIComponent(selection.groupId)}?view=all&limit=100${selection.intakeId ? `&intakeId=${encodeURIComponent(selection.intakeId)}` : ''}`,
+    `/intakes/report-queue/${encodeURIComponent(selection.groupId)}?view=all&limit=40&bytes=65536${selection.intakeId ? `&intakeId=${encodeURIComponent(selection.intakeId)}` : ''}${selection.personId ? `&personId=${encodeURIComponent(selection.personId)}` : ''}`,
     'review_open',
   );
   const nativeDetail = isCollectionReportDetail(rawDetail.data) ? rawDetail.data : undefined;
@@ -324,10 +328,12 @@ export function ImportDetailReview({
     data: isCollectionReportDetail(rawDetail.data) ? null : rawDetail.data,
   };
   const sourceReview = useResource<IntakeReportSourceReview>(
-    `/intakes/${encodeURIComponent(selection.intakeId || '')}/report-source-review?groupId=${encodeURIComponent(selection.groupId)}&view=all`,
+    detail.data
+      ? `/intakes/${encodeURIComponent(selection.intakeId || '')}/report-source-review?groupId=${encodeURIComponent(selection.groupId)}&view=all`
+      : null,
   );
   const people = useResource<IntakePeopleQueue>(
-    `/intakes/people/${encodeURIComponent(selection.groupId)}?limit=100`,
+    detail.data ? `/intakes/people/${encodeURIComponent(selection.groupId)}?limit=100` : null,
   );
   const [pagedPeople, setPagedPeople] = useState<IntakePeopleQueue | null>(null);
   const [pagedDetail, setPagedDetail] = useState<IntakeReportQueueDetail | null>(null);
@@ -1103,13 +1109,13 @@ export function ImportDetailReview({
     return (
       <CollectionReportReview
         parentError={rawDetail.error?.message}
+        guardNavigation={guardNavigation}
+        externalPending={externalPending}
         initial={nativeDetail}
+        firstPage={rawDetail}
         selection={selection}
         onBack={onBack}
-        onChanged={() => {
-          rawDetail.reload();
-          onChanged();
-        }}
+        onChanged={onChanged}
         onUseSource={onUseSource}
         embedded={embedded}
         beforeCloseRef={beforeCloseRef}
@@ -1136,6 +1142,8 @@ export function ImportDetailReview({
     return (
       <ImportRecordDetail
         embedded={embedded}
+        guardNavigation={guardNavigation}
+        contextPending={externalPending}
         beforeCloseRef={beforeCloseRef}
         groupId={selection.groupId}
         block={exact.block}
@@ -1332,6 +1340,8 @@ function GuardedReviewContext({ blocked, children }: { blocked: boolean; childre
 
 export function ImportRecordDetail({
   embedded = false,
+  contextPending = false,
+  guardNavigation = true,
   beforeCloseRef,
   groupId,
   block,
@@ -1349,6 +1359,8 @@ export function ImportRecordDetail({
   onUseSource,
 }: {
   embedded?: boolean;
+  contextPending?: boolean;
+  guardNavigation?: boolean;
   beforeCloseRef?: RefObject<(() => Promise<boolean>) | null>;
   groupId: string;
   block: Pick<IntakeReportQueueBlock, 'intakeId' | 'proposalId'>;
@@ -1553,6 +1565,7 @@ export function ImportRecordDetail({
   // Otherwise an answer/autosave acknowledgement races its resource refresh.
   const canSave =
     !authorityUnavailable &&
+    !contextPending &&
     !selectedControlsPending &&
     !review.loading &&
     !drafts.pending() &&
@@ -1572,7 +1585,7 @@ export function ImportRecordDetail({
     action: (operationId: string) => Promise<void>,
     kind: ClientOperationSummary['kind'] = 'review_action',
   ) {
-    if (busy || authorityUnavailable) return;
+    if (busy || authorityUnavailable || contextPending) return;
     const operation = beginClientOperation(kind, { selected: 1, actions: 1 });
     const started = performance.now();
     let outcome: ClientOperationSummary['outcome'] = 'completed';
@@ -1820,6 +1833,10 @@ export function ImportRecordDetail({
   const metadataPending = () =>
     metadataDirty || !!metadataOperation.current || !!metadataConflict || metadataBusy;
   async function flushPendingReview() {
+    if (contextPending) {
+      setError('Retry the pending report identity or source choice before leaving.');
+      return false;
+    }
     if (selectedControlsPending) {
       setError('Save, retry or discard the selected record choice before leaving.');
       return false;
@@ -1991,6 +2008,8 @@ export function ImportRecordDetail({
           onBack={onBack}
           onPendingChange={setSelectedControlsPending}
           authorityUnavailable={authorityUnavailable}
+          contextPending={contextPending}
+          guardNavigation={guardNavigation}
         />
         <ClinicalReviewSections intakeId={block.intakeId} proposalId={block.proposalId} />
       </>
@@ -2056,10 +2075,34 @@ export function ImportRecordDetail({
       />
     </section>
   ) : null;
+  const identityWarningScope = record.identityReview?.warningsReference ? (
+    <section aria-label="Complete record identity warnings">
+      <p>
+        {record.identityReview.warningsReference.count.toLocaleString()} advisory warnings belong to
+        this record. Inspect the complete retained warning evidence.
+      </p>
+      <ReferencedClinicalControls
+        guardNavigation={false}
+        context={review.selected!.context}
+        selection={{
+          recordId: record.id,
+          candidateVersionId: record.candidateVersionId,
+          selectionReviewToken: record.selectionReviewToken,
+        }}
+        initialSection="identityWarnings"
+        sections={['identityWarnings']}
+        triggerLabel="Inspect record identity warnings"
+        disabled={contextBlocked || busy || drafts.saving || acceptance.busy || acceptanceBlocked}
+        onPending={() => {}}
+        onRefresh={review.reload}
+      />
+    </section>
+  ) : null;
   const relatedReview = (
     <>
       {linkedReportScope}
       {ownershipBlockerScope}
+      {identityWarningScope}
       <ImportRelatedRecordEditor
         nativeControls={
           review.selected?.native && review.selected.record.kind === 'record'
@@ -2073,7 +2116,16 @@ export function ImportRecordDetail({
                     selectionReviewToken: record.selectionReviewToken,
                   }}
                   initialSection="comparisons"
+                  sections={['comparisons', 'comparisonDrafts']}
+                  initiallyOpen
+                  incoming={{
+                    title: record.title,
+                    date: record.date,
+                    mapping: decision.mapping,
+                    evidence: record.evidence,
+                  }}
                   disabled={
+                    contextPending ||
                     authorityUnavailable ||
                     busy ||
                     drafts.pending() ||
@@ -2096,6 +2148,7 @@ export function ImportRecordDetail({
         record={record}
         decision={decision}
         busy={
+          contextPending ||
           busy ||
           drafts.saving ||
           acceptance.busy ||
@@ -2166,11 +2219,18 @@ export function ImportRecordDetail({
     return (
       <section className="import-detail is-embedded is-focused-correction">
         {refreshNotice}
-        <ReviewNavigationGuard
-          anyLocationChange
-          pending={() => selectedControlsPending || correctionPending.current || drafts.pending()}
-          flush={flushPendingReview}
-        />
+        {guardNavigation && (
+          <ReviewNavigationGuard
+            anyLocationChange
+            pending={() =>
+              contextPending ||
+              selectedControlsPending ||
+              correctionPending.current ||
+              drafts.pending()
+            }
+            flush={flushPendingReview}
+          />
+        )}
         <a className="text-link" href={`#${detailUrl(groupId, block, record)}`}>
           Open full review <ArrowRight size={15} aria-hidden="true" />
         </a>
@@ -2230,6 +2290,7 @@ export function ImportRecordDetail({
           mapping={decision.mapping}
           fields={fields}
           disabled={
+            contextPending ||
             authorityUnavailable ||
             selectedControlsPending ||
             busy ||
@@ -2244,7 +2305,7 @@ export function ImportRecordDetail({
           }}
           onClose={onBack}
           onUpdate={async (patch, correctionReason) => {
-            if (authorityUnavailable) return false;
+            if (authorityUnavailable || contextPending) return false;
             const resolutions = (record.issues || [])
               .filter(
                 (issue) =>
@@ -2292,13 +2353,19 @@ export function ImportRecordDetail({
       aria-label={`Review ${reviewRecordTitle(record)}`}
     >
       {refreshNotice}
-      <ReviewNavigationGuard
-        anyLocationChange
-        pending={() =>
-          selectedControlsPending || drafts.pending() || metadataPending() || sourceTextPending
-        }
-        flush={flushPendingReview}
-      />
+      {guardNavigation && (
+        <ReviewNavigationGuard
+          anyLocationChange
+          pending={() =>
+            contextPending ||
+            selectedControlsPending ||
+            drafts.pending() ||
+            metadataPending() ||
+            sourceTextPending
+          }
+          flush={flushPendingReview}
+        />
+      )}
       <button
         type="button"
         className="text-link import-detail-back"
@@ -2472,6 +2539,7 @@ export function ImportRecordDetail({
             options={[intake.data]}
             suggestions={metadataSuggestions}
             busy={
+              contextPending ||
               authorityUnavailable ||
               metadataBusy ||
               !!metadataOperation.current ||
@@ -2489,6 +2557,7 @@ export function ImportRecordDetail({
           draft={draft}
           commonIdentityIssueIds={commonIdentityIssueIds}
           busy={
+            contextPending ||
             authorityUnavailable ||
             selectedControlsPending ||
             busy ||
@@ -2616,7 +2685,9 @@ function ImportRelatedRecordEditor({
             : 'Find possible related saved records'}
         </summary>
         {nativeControls ? (
-          nativeControls(setCorrectionTarget)
+          <section className="clinical-related-review" aria-label="Paired evidence review">
+            {nativeControls(setCorrectionTarget)}
+          </section>
         ) : (
           <RelatedRecordReview
             record={record}

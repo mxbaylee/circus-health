@@ -461,6 +461,11 @@ export interface IntakeReviewRecord {
     evidencedIdentity: IntakeEvidencedIdentity;
     conflicts: IntakeIdentityConflict[];
     warnings?: IntakeIdentityWarning[];
+    warningsReference?: {
+      format: 'health-intake-review-identity-warnings-v1';
+      count: number;
+      token: string;
+    };
   };
   /** Derived identity policy for this exact candidate version; it never accepts the record. */
   identityAttribution?: IntakeClinicalIdentityAttribution;

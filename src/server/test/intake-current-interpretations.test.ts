@@ -11,6 +11,7 @@ import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { prepareCurrentIntakeInterpretations } from '../intake-current-interpretations.ts';
 import { writeIntakeSourcePin } from '../intake-source-pin.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { clearIntakeCollectionCache } from '../intake-state-collections.ts';
 test('selected interpretation existence preserves old fallback and rechecks changed dependency evidence without ID arrays', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-interpretations-')),
     profile = 'fictional',
@@ -52,6 +53,12 @@ test('selected interpretation existence preserves old fallback and rechecks chan
   assert.equal(actual.hasCurrentProposal, true);
   assert.equal(actual.proposalTotal, 1);
   assert.equal('proposalIds' in actual, false);
+  actual.hasCurrentProposal = false;
+  assert.equal(
+    (await prepareCurrentIntakeInterpretations(db, profile, source.id)).hasCurrentProposal,
+    true,
+    'Caller mutation must not rewrite the cached result',
+  );
   await prepareCurrentIntakeInterpretations(db, profile, source.id, {
     onProposal() {
       throw Error('Warm scan');
@@ -83,6 +90,77 @@ test('selected interpretation existence preserves old fallback and rechecks chan
     (await prepareCurrentIntakeInterpretations(db, profile, source.id)).hasCurrentProposal,
     false,
   );
+  const dependencyKey = 'intake_proposal_dependencies:v1:' + proposed.proposals[0]!.id,
+    validDependency = JSON.stringify({ format: 'intake-proposal-dependencies-v1', sources: [] });
+  db.exec('SAVEPOINT fictional_temporary_repair');
+  db.prepare('UPDATE app_meta SET value=? WHERE key=?').run(validDependency, dependencyKey);
+  assert.equal(
+    (await prepareCurrentIntakeInterpretations(db, profile, source.id)).hasCurrentProposal,
+    true,
+  );
+  const beforeRollback = db.prepare('SELECT total_changes() AS count').get()!.count;
+  db.exec('ROLLBACK TO fictional_temporary_repair; RELEASE fictional_temporary_repair');
+  assert.equal(db.prepare('SELECT total_changes() AS count').get()!.count, beforeRollback);
+  assert.equal(
+    (await prepareCurrentIntakeInterpretations(db, profile, source.id)).hasCurrentProposal,
+    false,
+    'Rolled-back dependency repair cannot supply a current proposal',
+  );
+
+  const peer = openDatabase(ensureProfileDirectories(root, profile).database, profile);
+  try {
+    const ownChanges = db.prepare('SELECT total_changes() AS count').get()!.count;
+    peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run(validDependency, dependencyKey);
+    assert.equal(db.prepare('SELECT total_changes() AS count').get()!.count, ownChanges);
+    assert.equal(
+      (await prepareCurrentIntakeInterpretations(db, profile, source.id)).hasCurrentProposal,
+      true,
+      'Peer repair invalidates a cached negative',
+    );
+    peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run('invalid', dependencyKey);
+    assert.equal(
+      (await prepareCurrentIntakeInterpretations(db, profile, source.id)).hasCurrentProposal,
+      false,
+      'Peer dependency change invalidates a cached positive',
+    );
+  } finally {
+    peer.close();
+  }
+  async function assertRescanned() {
+    let visited = 0;
+    assert.equal(
+      (
+        await prepareCurrentIntakeInterpretations(db, profile, source.id, {
+          onProposal() {
+            visited++;
+          },
+        })
+      ).hasCurrentProposal,
+      false,
+    );
+    assert.equal(visited, 1, 'Changed projection requires fresh negative evidence');
+  }
+  const beforeSchema = db.prepare('SELECT total_changes() AS count').get()!.count;
+  db.exec('CREATE TABLE fictional_interpretation_schema_probe (id TEXT)');
+  assert.equal(db.prepare('SELECT total_changes() AS count').get()!.count, beforeSchema);
+  await assertRescanned();
+  clearIntakeCollectionCache(db);
+  await assertRescanned();
+  db.exec('SAVEPOINT fictional_unchanged_transaction');
+  await assertRescanned();
+  await assertRescanned();
+  db.exec('RELEASE fictional_unchanged_transaction');
+  await assertRescanned();
+  db.exec('SAVEPOINT fictional_changed_source');
+  db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('0'.repeat(64), source.id);
+  await assert.rejects(prepareCurrentIntakeInterpretations(db, profile, source.id));
+  db.exec('ROLLBACK TO fictional_changed_source; RELEASE fictional_changed_source');
+  await assertRescanned();
+  db.exec('SAVEPOINT fictional_changed_owner');
+  db.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run('foreign');
+  await assert.rejects(prepareCurrentIntakeInterpretations(db, profile, source.id));
+  db.exec('ROLLBACK TO fictional_changed_owner; RELEASE fictional_changed_owner');
+  await assertRescanned();
   assert.equal(intakeWorkCounters(db).warm.envelopeHydrations, before.envelopeHydrations);
   await assert.rejects(prepareCurrentIntakeInterpretations(db, 'foreign', source.id));
 });

@@ -1,4 +1,10 @@
+import { readNativeAssistantSourceHeader } from '../assistant-intake-header.ts';
+import { nativeAssistantConversion } from '../assistant-intake-native.ts';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
+import { intakeNamespace } from '../intake-state-evidence.ts';
+import { createIntakeTree } from '../intake-state-tree.ts';
+import { schemaKey } from '../intake-envelope-schema.ts';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,6 +17,8 @@ import {
   createIntakePlanRead,
   createIntakePlan,
   workflowMutation,
+  getIntakeRead,
+  updateIntakeMetadataRead,
 } from '../intake.ts';
 import { fictionalModel } from './fictional-model.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
@@ -18,6 +26,7 @@ import {
   createPagedDirectPlan,
   prepareDirectPlanAccess,
   readDirectPlanScope,
+  readDirectPlanHeader,
 } from '../intake-direct-plan.ts';
 import { extractionUnits, type EvidenceIndex } from '../intake-plan.ts';
 import { workflowHash } from '../intake-workflow.ts';
@@ -332,4 +341,211 @@ test('snapshot namespaces reject foreign writers without selecting unfinished in
   assert.equal(plans.open('wrong-owner'), undefined);
   assert.equal(reports.open('wrong-owner'), undefined);
   assert.equal(intakeSourceVersion(f.db, f.id).logicalBinding, before.logicalBinding);
+});
+
+test('direct plan headers reuse bounded immutable context and reject changed, external and rolled-back authority', async (t) => {
+  const f = await fixture(t, 'fictional-cache.txt', 'Independently fictional small source.');
+  const planned = await createPagedDirectPlan(f.db, f.root, f.profileId, f.id, {
+    version: f.intake.version,
+    operationId: 'fictional-header-cache',
+  });
+  assert.ok('plan' in planned);
+  const read = () => readDirectPlanHeader(f.db, f.profileId, f.id)!;
+  clearIntakeStateCache(f.db);
+  let before = intakeWorkCounters(f.db).warm.collectionNodeReads;
+  const first = read();
+  const coldReads = intakeWorkCounters(f.db).warm.collectionNodeReads - before;
+  before = intakeWorkCounters(f.db).warm.collectionNodeReads;
+  assert.deepEqual(read(), first);
+  const warmReads = intakeWorkCounters(f.db).warm.collectionNodeReads - before;
+  assert.ok(
+    warmReads < coldReads / 4,
+    'an unchanged header does not decode all scalar fields again',
+  );
+  t.diagnostic(JSON.stringify({ coldReads, warmReads }));
+  assert.throws(() => {
+    first.pins.mappingVersion = 'fictional-poisoned-pin';
+  }, TypeError);
+  const scope = readDirectPlanScope(f.db, f.profileId, f.id)!;
+  assert.throws(() => {
+    scope.plan.unitCount = 999;
+  }, TypeError);
+  assert.throws(() => Object.assign(scope.reader.logical, { domainVersion: -1 }), TypeError);
+  assert.throws(
+    () => Object.assign(scope.reader, { field: scope.reader.field.bind(scope.reader) }),
+    TypeError,
+  );
+  assert.equal(read().pins.mappingVersion, planned.plan.pins.mappingVersion);
+  clearIntakeStateCache(f.db);
+  before = intakeWorkCounters(f.db).warm.collectionNodeReads;
+  assert.deepEqual(read(), first);
+  assert.ok(
+    intakeWorkCounters(f.db).warm.collectionNodeReads - before > warmReads * 4,
+    'cache invalidation rebuilds the decoded context from authority',
+  );
+  const { identity, collections } = selectedEnvelopeStore(f.db, { id: f.id });
+  const view = collections.openView();
+  const currentScope = readDirectPlanScope(f.db, f.profileId, f.id)!;
+  const targetRaw = collections.get(
+    view,
+    'logical',
+    'envelope.data',
+    'f:' + currentScope.reader.address(currentScope.record) + ':' + schemaKey('unitCount'),
+  );
+  assert.equal(typeof targetRaw, 'string');
+  const target = JSON.parse(String(targetRaw));
+  assert.equal(target.type, 'cell');
+  const cell = 'c:' + target.id;
+  let key = '';
+  const tree = createIntakeTree(
+    identity,
+    (hash) => {
+      const rowKey = intakeNamespace(identity) + 'node:' + hash;
+      const raw = f.db.prepare('SELECT value FROM app_meta WHERE key=?').get(rowKey)?.value;
+      assert.equal(typeof raw, 'string');
+      if (JSON.parse(String(raw)).key === cell) key = rowKey;
+      return raw;
+    },
+    new Map(),
+  );
+  const data = collections.collection(view, 'logical', 'envelope.data')!;
+  assert.ok(tree.get(data.root, cell));
+  assert.ok(key, 'the selected plan scalar has an actual authenticated storage node');
+  const original = String(f.db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)!.value);
+  const change = f.db.prepare('UPDATE app_meta SET value=? WHERE key=?');
+  change.run('{}', key);
+  assert.equal(
+    currentScope.reader.childCount(currentScope.record, 'batches'),
+    0,
+    'the warm header accessor does not visit this decoded plan-value node',
+  );
+  assert.throws(
+    read,
+    /schema|tree|collection/,
+    'local scalar corruption invalidates the decoded header',
+  );
+  change.run(original, key);
+  assert.deepEqual(read(), first);
+  const peer = new DatabaseSync(String(f.db.prepare('PRAGMA database_list').get()!.file));
+  try {
+    peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run('{}', key);
+    assert.throws(read, /schema|tree|collection/, 'external changes invalidate the decoded header');
+    peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run(original, key);
+    assert.deepEqual(read(), first);
+  } finally {
+    peer.close();
+  }
+  change.run('{}', key);
+  f.db.exec('SAVEPOINT fictional_direct_header_repair');
+  try {
+    change.run(original, key);
+    assert.deepEqual(read(), first, 'a transaction can inspect temporarily repaired authority');
+    const changes = f.db.prepare('SELECT total_changes() AS count').get()!.count;
+    f.db.exec('ROLLBACK TO fictional_direct_header_repair; RELEASE fictional_direct_header_repair');
+    assert.equal(f.db.prepare('SELECT total_changes() AS count').get()!.count, changes);
+    assert.throws(
+      read,
+      /schema|tree|collection/,
+      'a rolled-back repair cannot seed the header cache',
+    );
+  } finally {
+    if (f.db.isTransaction)
+      f.db.exec(
+        'ROLLBACK TO fictional_direct_header_repair; RELEASE fictional_direct_header_repair',
+      );
+    change.run(original, key);
+  }
+  assert.deepEqual(read(), first);
+  f.db.exec('SAVEPOINT fictional_direct_source');
+  try {
+    f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('f'.repeat(64), f.id);
+    assert.throws(read, /source|collection|envelope|identity|head/i);
+  } finally {
+    f.db.exec('ROLLBACK TO fictional_direct_source; RELEASE fictional_direct_source');
+  }
+  assert.deepEqual(read(), first);
+  f.db.exec('SAVEPOINT fictional_direct_owner');
+  try {
+    change.run('fictional-other-profile', 'owner_profile_id');
+    assert.throws(read, /profile|owner/i);
+  } finally {
+    f.db.exec('ROLLBACK TO fictional_direct_owner; RELEASE fictional_direct_owner');
+  }
+  assert.deepEqual(read(), first);
+});
+
+test('internal assistant source headers preserve selected facts without constructing public collection summaries', async (t) => {
+  const f = await fixture(t, 'fictional-assistant-header.txt', 'Independently fictional source.');
+  const planned = await createPagedDirectPlan(f.db, f.root, f.profileId, f.id, {
+    version: f.intake.version,
+    operationId: 'fictional-assistant-header',
+  });
+  assert.ok('plan' in planned);
+  const read = () => readNativeAssistantSourceHeader(f.db, f.root, f.profileId, f.id)!;
+  const summary = getIntakeRead(f.db, f.root, f.profileId, f.id);
+  assert.ok(isIntakeSummary(summary));
+  const header = read();
+  assert.equal(header.format, 'health-intake-assistant-source-v1');
+  assert.equal('collections' in header, false);
+  for (const key of [
+    'id',
+    'sha256',
+    'version',
+    'providerId',
+    'activePlan',
+    'durability',
+    'filename',
+  ] as const)
+    assert.deepEqual(header[key], summary[key]);
+  assert.equal(header.candidateCount, summary.collections.candidates.total);
+  assert.equal(
+    nativeAssistantConversion(f.db, f.root, f.profileId, 'fictional-session', header)
+      .candidateCount,
+    summary.collections.candidates.total,
+  );
+  assert.throws(
+    () =>
+      Reflect.apply(nativeAssistantConversion, undefined, [
+        f.db,
+        f.root,
+        f.profileId,
+        'fictional-session',
+        { ...header, format: 'fictional-unknown-source' },
+      ]),
+    { code: 'CONVERSION_SOURCE_UNAVAILABLE' },
+  );
+  let before = intakeWorkCounters(f.db).warm.collectionNodeReads;
+  getIntakeRead(f.db, f.root, f.profileId, f.id);
+  const publicReads = intakeWorkCounters(f.db).warm.collectionNodeReads - before;
+  before = intakeWorkCounters(f.db).warm.collectionNodeReads;
+  read();
+  const internalReads = intakeWorkCounters(f.db).warm.collectionNodeReads - before;
+  assert.ok(
+    internalReads < publicReads / 3,
+    'internal model events read only their actual source, plan and candidate-count fields',
+  );
+  t.diagnostic(JSON.stringify({ publicReads, internalReads }));
+  const changed = await updateIntakeMetadataRead(f.db, f.root, f.profileId, f.id, {
+    version: header.version,
+    operationId: 'fictional-header-metadata',
+    metadata: { source: 'Fictional corrected provider' },
+  });
+  assert.ok(isIntakeSummary(changed));
+  assert.equal(read().version, changed.version);
+  assert.equal(read().providerId, changed.providerId);
+  assert.deepEqual(read().activePlan, changed.activePlan);
+  assert.throws(
+    () => readNativeAssistantSourceHeader(f.db, f.root, 'fictional-foreign-profile', f.id),
+    { code: 'PROFILE_BOUNDARY' },
+  );
+  f.db.exec('SAVEPOINT fictional_assistant_source_change');
+  try {
+    f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('0'.repeat(64), f.id);
+    assert.throws(read, /source|collection|envelope|identity|head/i);
+  } finally {
+    f.db.exec(
+      'ROLLBACK TO fictional_assistant_source_change; RELEASE fictional_assistant_source_change',
+    );
+  }
+  assert.equal(read().version, changed.version);
 });

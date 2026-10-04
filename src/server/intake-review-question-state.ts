@@ -33,9 +33,18 @@ const name = (logical: unknown) => 'review.questions.' + workflowHash(logical);
 const pending = () =>
   new HttpError(409, 'QUESTION_HISTORY_PENDING', 'Prepare current question history before review');
 const proof = Symbol('selected-question-policy');
-const canonicalValues = new WeakMap<object, () => Iterable<string>>();
+export interface ReviewCanonicalOptions {
+  fieldValue?: (object: object, key: string) => { value: unknown } | undefined;
+}
+const canonicalValues = new WeakMap<
+  object,
+  (options?: ReviewCanonicalOptions) => Iterable<string>
+>();
 /** Host-only complete selected values can retain the exact legacy token recipe. */
-export function registerReviewCanonicalValue(value: object, chunks: () => Iterable<string>) {
+export function registerReviewCanonicalValue(
+  value: object,
+  chunks: (options?: ReviewCanonicalOptions) => Iterable<string>,
+) {
   canonicalValues.set(value, chunks);
 }
 interface QuestionPolicy {
@@ -295,11 +304,14 @@ export function openReviewQuestionState(
   };
 }
 
-export function* canonicalReviewValueChunks(value: unknown): Generator<string> {
+export function* canonicalReviewValueChunks(
+  value: unknown,
+  options: ReviewCanonicalOptions = {},
+): Generator<string> {
   const selectedChunks =
     value && typeof value === 'object' ? canonicalValues.get(value) : undefined;
   if (selectedChunks) {
-    yield* selectedChunks();
+    yield* selectedChunks(options);
     return;
   }
   if (JSON.isRawJSON(value) || !value || typeof value !== 'object') {
@@ -310,7 +322,7 @@ export function* canonicalReviewValueChunks(value: unknown): Generator<string> {
     yield '[';
     for (let n = 0; n < value.length; n++) {
       if (n) yield ',';
-      if (value[n] !== undefined) yield* canonicalReviewValueChunks(value[n]);
+      if (value[n] !== undefined) yield* canonicalReviewValueChunks(value[n], options);
     }
     yield ']';
     return;
@@ -333,7 +345,11 @@ export function* canonicalReviewValueChunks(value: unknown): Generator<string> {
         question.answers.at(-1) === selected.selectedAnswer
       )
         yield* selected.answers();
-      else yield* canonicalReviewValueChunks(key === 'answers' ? question.answers : header[key]);
+      else
+        yield* canonicalReviewValueChunks(
+          key === 'answers' ? question.answers : header[key],
+          options,
+        );
     }
     yield '}';
     return;
@@ -344,7 +360,11 @@ export function* canonicalReviewValueChunks(value: unknown): Generator<string> {
     if (!first) yield ',';
     first = false;
     yield JSON.stringify(key) + ':';
-    yield* canonicalReviewValueChunks((value as Record<string, unknown>)[key]);
+    const override = options.fieldValue?.(value, key);
+    yield* canonicalReviewValueChunks(
+      override ? override.value : (value as Record<string, unknown>)[key],
+      options,
+    );
   }
   yield '}';
 }

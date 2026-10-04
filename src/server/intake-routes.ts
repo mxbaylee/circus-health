@@ -3,7 +3,7 @@ import { intakeSourceRoute } from './intake-source-routes.ts';
 import { listSourceAttentionRead } from './intake-source-text.ts';
 import {
   acceptIntakeReportSelectionAsync,
-  getIntakeReportAcceptance,
+  getIntakeReportAcceptanceRead,
 } from './intake-report-acceptance.ts';
 import { HttpError } from './database.ts';
 import * as intake from './intake.ts';
@@ -96,7 +96,7 @@ export async function handleIntakeRoute({
   )
     respond(await intakeSourceRoute({ db, root, profileId, id, action, params }));
   else if (method === 'GET' && id === 'report-acceptance' && action)
-    respond(getIntakeReportAcceptance(db, root, profileId, action));
+    respond(await getIntakeReportAcceptanceRead(db, root, profileId, action));
   else if (method === 'GET' && id === 'people' && action)
     respond(
       await getIntakePeopleQueueRead(db, root, profileId, action, {
@@ -106,6 +106,7 @@ export async function handleIntakeRoute({
         intakeId: params.get('intakeId') || undefined,
         bytes: params.get('bytes'),
         personId: params.get('personId') || undefined,
+        q: params.get('q') || undefined,
       }),
     );
   else if (method === 'GET' && id === 'import-feed' && !action)

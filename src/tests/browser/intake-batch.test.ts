@@ -1,3 +1,9 @@
+import {
+  fixtureReview,
+  fixtureReport,
+  fixtureDestinations,
+  fixtureSourcePath,
+} from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AppOptions } from '../../server/index.ts';
@@ -189,8 +195,7 @@ test(
     async function openFullReview(label: string) {
       const record = page.locator('.import-record').filter({ hasText: label }).first();
       await record.waitFor();
-      await record.getByRole('button', { name: `More actions for ${label}`, exact: true }).click();
-      await record.getByRole('link', { name: 'Open full review' }).click();
+      await record.getByRole('button', { name: 'Review exact record', exact: true }).click();
       await page.getByRole('region', { name: 'Review actions' }).waitFor();
     }
 
@@ -245,12 +250,26 @@ test(
       arguments: { id: first.id },
       callId: 'fictional-first-source-text',
     })) as { revisionId: string };
-    const firstPlan = first.workflow.plans.find(
-      (plan: { status: string }) => plan.status === 'active',
-    );
+    assert.equal(first.format, 'health-intake-summary-v2');
+    const firstPlan = first.activePlan.plan;
+    assert.equal(firstPlan.status, 'active');
+    const firstUnits = (await bridges[0].callbacks.onTool!({
+      tool: 'health_intake_plan',
+      arguments: { id: first.id, action: 'read', section: 'units', freshStart: true },
+      callId: 'fictional-first-units',
+    })) as {
+      format: string;
+      items: { value: { id: string } }[];
+      logicalTotal: number;
+      complete: boolean;
+    };
+    assert.equal(firstUnits.format, 'health-intake-model-context-v2');
+    assert.equal(firstUnits.logicalTotal, 1);
+    assert.equal(firstUnits.complete, true);
+    const firstUnitId = firstUnits.items[0]!.value.id;
     await bridges[0].callbacks.onTool!({
       tool: 'health_intake_plan',
-      arguments: { id: first.id, action: 'read_unit', unitId: firstPlan.units[0].id },
+      arguments: { id: first.id, action: 'read_unit', unitId: firstUnitId },
       callId: 'fictional-first-read',
     });
     await bridges[0].callbacks.onTool!({
@@ -262,7 +281,7 @@ test(
         operationId: 'fictional-first-batch',
         coverage: [
           {
-            unitId: firstPlan.units[0].id,
+            unitId: firstUnitId,
             kind: 'extracted',
             notes: 'The supplied fictional section was fully read.',
           },
@@ -281,11 +300,14 @@ test(
     assert.equal(maxActive, 1, 'the profile never runs parallel model jobs');
     await page.locator('.import-reading').getByText('Moxie is reading 1 file').waitFor();
     const firstFeed = await get(`${prefix}/intakes/import-feed?view=all`);
-    const firstGroup = firstFeed.groups.find(
-      (group: { title: string }) => group.title === 'Fictional first report',
+    const firstPointer = firstFeed.groups.find(
+      (group: { intakeId: string }) => group.intakeId === first.id,
     );
+    assert(firstPointer);
+    const firstGroup = (await fixtureReport(get, prefix, firstPointer.groupId, first.id)).group;
+    assert.equal(firstGroup.title, 'Fictional first report');
     assert(firstGroup, 'the first retained report is represented in the Import feed');
-    const firstBlock = firstFeed.blocks.find(
+    const firstBlock = firstFeed.records.find(
       (block: { groupId: string; intakeId: string }) =>
         block.groupId === firstGroup.groupId && block.intakeId === first.id,
     );
@@ -295,11 +317,12 @@ test(
     );
     assert.equal(firstIdentity.status, 'missing_warning');
     assert.equal(firstIdentity.blocking, false);
-    const firstReview = await get(
+    const firstReview = await fixtureReview(
+      get,
       `${prefix}/intakes/${encodeURIComponent(first.id)}/review?proposalId=${encodeURIComponent(firstBlock.proposalId)}`,
     );
     assert(
-      firstReview.records[0].issues.some(
+      firstReview.records[0].issues!.some(
         (issue: { kind: string; status: string }) =>
           issue.kind === 'identity' && issue.status === 'unresolved',
       ),
@@ -313,28 +336,20 @@ test(
     });
     assert.equal(await firstSaveAction.count(), 1);
     assert.equal(await firstSaveAction.isDisabled(), false);
-    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
     assert.equal(
-      await page
-        .locator('.import-identity-question.is-warning')
-        .getByRole('button', { name: 'This is me', exact: true })
-        .count(),
+      await page.getByRole('region', { name: 'Report identity', exact: true }).count(),
       0,
-      'the warning does not claim that report identity was confirmed',
+      'missing printed identity does not invent a report-level confirmation',
     );
-    await page
-      .getByRole('dialog', { name: 'Who is this report for?' })
-      .getByRole('button', { name: 'Close', exact: true })
-      .click();
     assert.equal(await page.getByRole('button', { name: 'This is me', exact: true }).count(), 1);
     assert.equal(importRequests.length, 0, 'the first partial proposal remains review-only');
     await capture('batch-reading-partial-review');
 
     await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
-    await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Import', exact: true }).waitFor();
     const stoppedResponse = page.waitForResponse(
       (response) => response.url().endsWith('/stop') && response.ok(),
     );
@@ -344,7 +359,11 @@ test(
     assert.equal(stopped.items[0].status, 'review_ready');
     assert.equal(stopped.items[0].proposalIds.length, 1);
     assert.equal(stopped.items[1].status, 'paused');
-    assert.equal((await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).imported, null);
+    assert.equal(
+      (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).collections.importHistory
+        .total,
+      0,
+    );
     const second = await get(
       `${prefix}/intakes/${encodeURIComponent(initialBatch.items[1].intakeId)}`,
     );
@@ -353,8 +372,10 @@ test(
       'needs_review',
       'source capture remains available before clinical proposals',
     );
-    assert.equal(second.proposals.length, 0);
-    const secondOriginal = await page.request.get(url + second.contentUrl);
+    assert.equal(second.collections.proposals.total, 0);
+    const secondOriginal = await page.request.get(
+      url + fixtureSourcePath(prefix, second.contentUrl),
+    );
     assert.equal(
       await secondOriginal.text(),
       'Fictional second result 18 ng/mL; unread appendix retained.',
@@ -377,12 +398,26 @@ test(
       arguments: { id: resumedSecond.id },
       callId: 'fictional-second-source-text',
     })) as { revisionId: string };
-    const secondPlan = resumedSecond.workflow.plans.find(
-      (plan: { status: string }) => plan.status === 'active',
-    );
+    assert.equal(resumedSecond.format, 'health-intake-summary-v2');
+    const secondPlan = resumedSecond.activePlan.plan;
+    assert.equal(secondPlan.status, 'active');
+    const secondUnits = (await bridges[2].callbacks.onTool!({
+      tool: 'health_intake_plan',
+      arguments: { id: resumedSecond.id, action: 'read', section: 'units', freshStart: true },
+      callId: 'fictional-second-units',
+    })) as {
+      format: string;
+      items: { value: { id: string } }[];
+      logicalTotal: number;
+      complete: boolean;
+    };
+    assert.equal(secondUnits.format, 'health-intake-model-context-v2');
+    assert.equal(secondUnits.logicalTotal, 1);
+    assert.equal(secondUnits.complete, true);
+    const secondUnitId = secondUnits.items[0]!.value.id;
     await bridges[2].callbacks.onTool!({
       tool: 'health_intake_plan',
-      arguments: { id: resumedSecond.id, action: 'read_unit', unitId: secondPlan.units[0].id },
+      arguments: { id: resumedSecond.id, action: 'read_unit', unitId: secondUnitId },
       callId: 'fictional-second-read',
     });
     await bridges[2].callbacks.onTool!({
@@ -394,7 +429,7 @@ test(
         operationId: 'fictional-second-batch',
         coverage: [
           {
-            unitId: secondPlan.units[0].id,
+            unitId: secondUnitId,
             kind: 'extracted',
             notes: 'The supplied fictional section was fully read.',
           },
@@ -409,7 +444,7 @@ test(
     bridges[2].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
     const currentSecond = await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`);
     assert.equal(
-      currentSecond.proposals.length,
+      currentSecond.collections.proposals.total,
       1,
       JSON.stringify({
         currentSecond,
@@ -417,11 +452,11 @@ test(
       }),
     );
     const firstReport = page
-      .locator('.import-report')
-      .filter({ hasText: 'Fictional first report' });
+      .locator('.import-record')
+      .filter({ hasText: 'Fictional first result' });
     const secondReport = page
-      .locator('.import-report')
-      .filter({ hasText: 'Fictional second report' });
+      .locator('.import-record')
+      .filter({ hasText: 'Fictional second result' });
     await firstReport.waitFor();
     await secondReport.waitFor();
     await capture('batch-review-queue');
@@ -430,10 +465,15 @@ test(
     assert.equal(maxActive, 1);
     assert.equal(conversionRequests.length, 0);
     assert.equal(importRequests.length, 0);
-    assert.equal((await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).imported, null);
     assert.equal(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).imported,
-      null,
+      (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).collections.importHistory
+        .total,
+      0,
+    );
+    assert.equal(
+      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).collections
+        .importHistory.total,
+      0,
     );
 
     const firstImport = page.waitForResponse(
@@ -466,22 +506,24 @@ test(
     });
     await secondSaveAction.waitFor();
     assert.equal(await secondSaveAction.isDisabled(), false);
-    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
-    await page
-      .getByRole('dialog', { name: 'Who is this report for?' })
-      .getByRole('button', { name: 'Close', exact: true })
-      .click();
+    assert.equal(
+      await page.getByRole('region', { name: 'Report identity', exact: true }).count(),
+      0,
+      'missing printed identity does not invent a report-level confirmation',
+    );
     await page.getByRole('button', { name: 'This is me', exact: true }).click();
     assert.notEqual(
-      (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).imported,
-      null,
+      (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).collections.importHistory
+        .total,
+      0,
     );
     assert.equal(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).imported,
-      null,
+      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).collections
+        .importHistory.total,
+      0,
       'moving to the next review does not accept it',
     );
     let lostOperationId = '';
@@ -506,16 +548,18 @@ test(
     await page.unroute('**/intakes/report-acceptance');
     assert.equal(importRequests.length, 2);
     assert.notEqual(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).imported,
-      null,
+      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).collections
+        .importHistory.total,
+      0,
     );
     for (const [intakeId, label] of [
       [first.id, 'first'],
       [resumedSecond.id, 'second'],
     ]) {
       const accepted = await get(`${prefix}/intakes/${encodeURIComponent(intakeId)}`);
-      assert.equal(accepted.imported.clinical.records.length, 1);
-      const target = accepted.imported.clinical.records[0];
+      const destinations = await fixtureDestinations(get, prefix, intakeId);
+      assert.equal(destinations.length, 1);
+      const target = destinations[0]!;
       assert.equal(target.kind, 'observation');
       const result = await get(`${prefix}/tests/${encodeURIComponent(target.entityId)}`);
       assert.equal(result.label, `Fictional ${label} result`);
@@ -523,7 +567,7 @@ test(
       assert.equal(result.unit, 'ng/mL');
       assert.equal(result.date, '2026-09-01');
       assert(result.evidence.length > 0);
-      const original = await page.request.get(url + accepted.contentUrl);
+      const original = await page.request.get(url + fixtureSourcePath(prefix, accepted.contentUrl));
       assert.equal(
         await original.text(),
         `Fictional ${label} result 18 ng/mL; unread appendix retained.`,

@@ -1,5 +1,6 @@
 /** Complete filters and counts with bounded native feed rows and referenced group evidence. */
 import type { DatabaseSync } from 'node:sqlite';
+import { createHmac, randomBytes } from 'node:crypto';
 import { HttpError } from './database.ts';
 import {
   openCollectionReportQueue,
@@ -7,7 +8,10 @@ import {
 } from './intake-report-group-collection.ts';
 import type { CollectionReportGroupReference } from './intake-queue-page-collection.ts';
 import { readCollectionQueueActivity } from './intake-queue-activity-collection.ts';
-import { openCollectionPeopleRead } from './intake-people-collection.ts';
+import {
+  openCollectionPeopleRead,
+  collectionPersonMatchesQuery,
+} from './intake-people-collection.ts';
 import { feedKind } from './intake-report-queue.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { intakeFeedTextMatcher } from './intake-feed-match.ts';
@@ -35,6 +39,7 @@ import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import { collectionQueueTransitionEffects } from './intake-queue-transitions.ts';
 import type { intakeSourceVersion } from './intake-state-access.ts';
 import type { CollectionReportGroupSummary } from './intake-report-group-collection.ts';
+import type { CollectionReviewRowCertificate } from './intake-report-group-collection.ts';
 import type { CollectionReportQueueGroupPointer } from './intake-report-queue-collection.ts';
 
 const kinds: IntakeImportFeedKind[] = [
@@ -86,6 +91,7 @@ type PreparedFeed = {
   clinicalRevision: string;
   busy: boolean;
   scratch: ReturnType<typeof disposableSqlite>;
+  signingKey: Buffer;
   counts: IntakeReportQueueCounts;
   peopleCounts: { pending: number; later: number; excluded: number; saved: number };
   kindCounts: Record<IntakeImportFeedKind, number>;
@@ -94,12 +100,50 @@ type PreparedFeed = {
   totalGroups: number;
   used: number;
 };
+type CachedFeedMember = {
+  member: CollectionReportQueueMember;
+  certificate?: CollectionReviewRowCertificate;
+};
+// Keep source numeric spelling on the wire while retaining ordinary host
+// counters/ordinals as numbers. This is a disposable transport snapshot.
+function cachedFeedRecord(text: string): CollectionFeedRecord {
+  return JSON.parse(text, (_key, value, context) =>
+    typeof value === 'number' &&
+    context.source !== undefined &&
+    JSON.stringify(value) !== context.source
+      ? JSON.rawJSON(context.source)
+      : value,
+  ) as CollectionFeedRecord;
+}
 const preparedFeeds = new Set<PreparedFeed>(),
   feedEpochs = new WeakMap<DatabaseSync, number>();
 let feedClock = 0;
 function disposeFeed(feed: PreparedFeed) {
   preparedFeeds.delete(feed);
   feed.scratch.close();
+  feed.signingKey.fill(0);
+}
+function feedRowSignature(
+  db: DatabaseSync,
+  key: Buffer,
+  ordering: string,
+  value: string,
+  group: string,
+  intake: string,
+  member: string,
+) {
+  const mac = createHmac('sha256', key);
+  let bytes = 0;
+  for (const field of [ordering, value, group, intake, member]) {
+    const prefix = String(Buffer.byteLength(field)) + ':';
+    bytes += Buffer.byteLength(prefix) + Buffer.byteLength(field);
+    mac.update(prefix).update(field);
+  }
+  withIntakeWork(db, 'warm', () => {
+    recordIntakeWork('collectionFeedRowCertificateHashes');
+    recordIntakeWork('collectionFeedRowCertificateBytes', bytes);
+  });
+  return mac.digest('hex');
 }
 export function clearCollectionImportFeeds(db: DatabaseSync) {
   feedEpochs.set(db, (feedEpochs.get(db) || 0) + 1);
@@ -123,7 +167,11 @@ function feedWindow(
   const records: CollectionFeedRecord[] = [],
     groups = new Map<string, CollectionReportGroupReference>(),
     peopleGroups: CollectionReportGroupReference[] = [],
-    verified = new Set<string>();
+    verified = new Set<string>(),
+    certificates: Array<{
+      intakeId: string;
+      certificate: NonNullable<CachedFeedMember['certificate']>;
+    }> = [];
   let used = 0,
     more = false,
     peopleMore = false,
@@ -131,7 +179,7 @@ function feedWindow(
     peopleLast = '';
   for (const row of feed.scratch.db
     .prepare(
-      'SELECT ordering,value,groupValue,member FROM records WHERE ordering>? ORDER BY ordering LIMIT ?',
+      'SELECT ordering,value,groupValue,intake,member,signature FROM records WHERE ordering>? ORDER BY ordering LIMIT ?',
     )
     .iterate(input.after, input.limit + 1)) {
     const value = String(row.value);
@@ -139,30 +187,46 @@ function feedWindow(
       more = true;
       break;
     }
-    const record = JSON.parse(value) as CollectionFeedRecord;
-    const fresh = queue.reviewMember(
-      record.intakeId,
-      JSON.parse(String(row.member)) as CollectionReportQueueMember,
-    );
-    record.intakeVersion = fresh.session.review.version;
-    record.reviewToken = fresh.session.review.reviewToken;
-    if (record.detail.kind === 'record')
-      record.detail.record = {
-        ...fresh.record,
-        feedKind: record.feedKind,
-        feedKey: record.feedKey,
-        feedOrder: record.feedOrder,
-        manuallyEdited: record.manuallyEdited,
-      };
-    else
-      record.detail.reference = {
-        ...record.detail.reference,
-        reviewToken: record.reviewToken,
-        ordinal: fresh.ordinal,
-        bytes: Buffer.byteLength(canonicalLiteral(fresh.session.review.records[fresh.ordinal])),
-      };
+    if (
+      row.signature !==
+      feedRowSignature(
+        db,
+        feed.signingKey,
+        String(row.ordering),
+        value,
+        String(row.groupValue),
+        String(row.intake),
+        String(row.member),
+      )
+    ) {
+      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Cached review changed; refresh this feed');
+    }
+    const record = cachedFeedRecord(value),
+      cached = JSON.parse(String(row.member)) as CachedFeedMember;
+    let fresh: ReturnType<typeof queue.reviewMember> | undefined;
+    if (!queue.currentReviewCertificate(record.intakeId, cached.certificate)) {
+      fresh = queue.reviewMember(record.intakeId, cached.member);
+      record.intakeVersion = fresh.session.review.version;
+      record.reviewToken = fresh.session.review.reviewToken;
+      if (record.detail.kind === 'record')
+        record.detail.record = {
+          ...fresh.record,
+          feedKind: record.feedKind,
+          feedKey: record.feedKey,
+          feedOrder: record.feedOrder,
+          manuallyEdited: record.manuallyEdited,
+        };
+      else
+        record.detail.reference = {
+          ...record.detail.reference,
+          reviewToken: record.reviewToken,
+          ordinal: fresh.ordinal,
+          bytes: Buffer.byteLength(canonicalLiteral(fresh.session.review.records[fresh.ordinal])),
+        };
+    }
     let size = Buffer.byteLength(canonicalLiteral(record));
     if (size > input.budget && record.detail.kind === 'record') {
+      fresh ??= queue.reviewMember(record.intakeId, cached.member);
       record.detail = {
         kind: 'reference',
         selection: {
@@ -178,6 +242,29 @@ function feedWindow(
         },
       };
       size = Buffer.byteLength(canonicalLiteral(record));
+    }
+    if (fresh) {
+      const updated = canonicalLiteral(record),
+        member = JSON.stringify({
+          member: cached.member,
+          certificate: fresh.certificate,
+        } satisfies CachedFeedMember);
+      feed.scratch.db
+        .prepare('UPDATE records SET value=?,member=?,signature=? WHERE ordering=?')
+        .run(
+          updated,
+          member,
+          feedRowSignature(
+            db,
+            feed.signingKey,
+            String(row.ordering),
+            updated,
+            String(row.groupValue),
+            String(row.intake),
+            member,
+          ),
+          row.ordering,
+        );
     }
     if (records.length && used + size > input.budget) {
       more = true;
@@ -196,6 +283,8 @@ function feedWindow(
       verifyIntakeFileHash(profileOriginal(root, source.path, profileId), source);
       verified.add(record.proposalId);
     }
+    const certificate = fresh ? fresh.certificate : cached.certificate;
+    if (certificate) certificates.push({ intakeId: record.intakeId, certificate });
     records.push(record);
     used += size;
     last = String(row.ordering);
@@ -223,7 +312,15 @@ function feedWindow(
     peopleGroups.push(group);
     peopleLast = String(row.ordering);
   }
+  const activity = readCollectionQueueActivity(db, root, profileId, queue);
   queue.assertCurrent();
+  for (const { intakeId, certificate } of certificates)
+    if (!queue.currentReviewCertificate(intakeId, certificate))
+      throw new HttpError(
+        409,
+        'REPORT_QUEUE_CURSOR',
+        'Review changed while reading; refresh this feed',
+      );
   return {
     format: 'health-intake-import-feed-v2' as const,
     view: input.view,
@@ -242,7 +339,7 @@ function feedWindow(
       counts: { ...feed.peopleCounts },
       nextCursor: peopleMore ? input.cursor('people', peopleLast) : null,
     },
-    activity: readCollectionQueueActivity(db, root, profileId, queue),
+    activity,
   };
 }
 export async function readCollectionImportFeed(
@@ -278,10 +375,15 @@ export async function readCollectionImportFeed(
     queue = await openCollectionReportQueue(db, root, profileId),
     epoch = feedEpochs.get(db) || 0;
   let scratch = disposableSqlite('circus-import-feed-');
+  let signingKey: Buffer = randomBytes(32);
+  let readingFeed: PreparedFeed | undefined;
   let reused: PreparedFeed | undefined;
   let retained = false;
   scratch.db.exec(
-    'CREATE TABLE sources(id TEXT PRIMARY KEY,pin TEXT,seen INTEGER,counts TEXT,peopleCounts TEXT,kindCounts TEXT,totalRecords INTEGER,totalPeopleGroups INTEGER);CREATE TABLE matches(intake TEXT,groupId TEXT,PRIMARY KEY(intake,groupId));CREATE TABLE records(ordering TEXT PRIMARY KEY,value TEXT,groupValue TEXT,intake TEXT,member TEXT);CREATE INDEX recordIntake ON records(intake);CREATE TABLE people(ordering TEXT PRIMARY KEY,value TEXT,intake TEXT);CREATE INDEX peopleIntake ON people(intake);CREATE TABLE facts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,ordering TEXT,groupId TEXT,counts TEXT,kind TEXT,included INTEGER,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE INDEX factsCandidate ON facts(intake,candidate,version);CREATE INDEX factsGroup ON facts(intake,groupId,included);CREATE TABLE changedCandidates(id TEXT,version TEXT,PRIMARY KEY(id,version));CREATE TABLE changedGroups(ordinal INTEGER PRIMARY KEY);',
+    'CREATE TABLE sources(id TEXT PRIMARY KEY,pin TEXT,seen INTEGER,counts TEXT,peopleCounts TEXT,kindCounts TEXT,totalRecords INTEGER,totalPeopleGroups INTEGER);CREATE TABLE matches(intake TEXT,groupId TEXT,PRIMARY KEY(intake,groupId));CREATE TABLE records(ordering TEXT PRIMARY KEY,value TEXT,groupValue TEXT,intake TEXT,member TEXT,signature TEXT);CREATE INDEX recordIntake ON records(intake);CREATE TABLE people(ordering TEXT PRIMARY KEY,value TEXT,intake TEXT);CREATE INDEX peopleIntake ON people(intake);CREATE TABLE facts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,ordering TEXT,groupId TEXT,counts TEXT,kind TEXT,included INTEGER,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE INDEX factsGroup ON facts(intake,groupId,included);CREATE TABLE changedCandidates(id TEXT,version TEXT,PRIMARY KEY(id,version));CREATE TABLE changedGroups(ordinal INTEGER PRIMARY KEY);',
+  );
+  scratch.db.exec(
+    'CREATE TABLE peopleMatches(intake TEXT,ordinal INTEGER,ordering TEXT,counts TEXT,visible INTEGER,PRIMARY KEY(intake,ordinal)) WITHOUT ROWID',
   );
   try {
     const binding = canonicalLiteral([
@@ -336,6 +438,7 @@ export async function readCollectionImportFeed(
       );
     if (cached && cached.binding === queue.binding) {
       cached.used = ++feedClock;
+      readingFeed = cached;
       return feedWindow(db, root, profileId, queue, cached, {
         view,
         limit,
@@ -348,6 +451,8 @@ export async function readCollectionImportFeed(
     if (cached) {
       scratch.close();
       scratch = cached.scratch;
+      signingKey.fill(0);
+      signingKey = cached.signingKey;
       reused = cached;
       retained = true;
       cached.busy = true;
@@ -369,6 +474,42 @@ export async function readCollectionImportFeed(
       >;
     let totalRecords = 0,
       totalPeopleGroups = 0;
+    const forgetPeopleMatch = (intakeId: string, ordinal: number) => {
+      const old = scratch.db
+        .prepare('SELECT * FROM peopleMatches WHERE intake=? AND ordinal=?')
+        .get(intakeId, ordinal);
+      if (!old) return;
+      const previous = JSON.parse(String(old.counts)) as typeof peopleCounts;
+      for (const state of Object.keys(peopleCounts) as (keyof typeof peopleCounts)[])
+        peopleCounts[state] -= previous[state];
+      kindCounts.person -= Number(old.visible);
+      scratch.db.prepare('DELETE FROM people WHERE ordering=?').run(old.ordering);
+      scratch.db
+        .prepare('DELETE FROM peopleMatches WHERE intake=? AND ordinal=?')
+        .run(intakeId, ordinal);
+    };
+    const visitPeople = (
+      pointer: CollectionReportQueueGroupPointer & { intakeId: string },
+      ordering: string,
+    ) => {
+      const matching = { pending: 0, later: 0, excluded: 0, saved: 0 },
+        people = openCollectionPeopleRead(db, root, profileId, pointer.intakeId);
+      let visible = 0;
+      for (const person of people.pointers(pointer.groupId)) {
+        if (query && !collectionPersonMatchesQuery(db, people.person(person), query)) continue;
+        const state = people.state(person);
+        matching[state]++;
+        if (view === 'all' || state === (view === 'active' ? 'pending' : 'later')) visible++;
+      }
+      for (const state of Object.keys(peopleCounts) as (keyof typeof peopleCounts)[])
+        peopleCounts[state] += matching[state];
+      kindCounts.person += visible;
+      if (query)
+        scratch.db
+          .prepare('INSERT INTO peopleMatches VALUES(?,?,?,?,?)')
+          .run(pointer.intakeId, pointer.ordinal, ordering, JSON.stringify(matching), visible);
+      return visible;
+    };
     const visitMember = (
       pointer: CollectionReportQueueGroupPointer & { intakeId: string },
       summary: CollectionReportGroupSummary,
@@ -395,7 +536,12 @@ export async function readCollectionImportFeed(
           (input.state && input.state !== member.state)
         )
           return;
-        const { session, record: raw, ordinal } = queue.reviewMember(pointer.intakeId, member),
+        const {
+            session,
+            record: raw,
+            ordinal,
+            certificate,
+          } = queue.reviewMember(pointer.intakeId, member),
           kind = feedKind(raw);
         if (
           (input.recordId && raw.id !== input.recordId) ||
@@ -486,14 +632,26 @@ export async function readCollectionImportFeed(
               },
             },
           };
+        const encoded = canonicalLiteral(row),
+          groupEncoded = canonicalLiteral(groupReference),
+          memberEncoded = JSON.stringify({ member, certificate } satisfies CachedFeedMember);
         scratch.db
-          .prepare('INSERT INTO records VALUES(?,?,?,?,?)')
+          .prepare('INSERT INTO records VALUES(?,?,?,?,?,?)')
           .run(
             order,
-            canonicalLiteral(row),
-            canonicalLiteral(groupReference),
+            encoded,
+            groupEncoded,
             pointer.intakeId,
-            JSON.stringify(member),
+            memberEncoded,
+            feedRowSignature(
+              db,
+              signingKey,
+              order,
+              encoded,
+              groupEncoded,
+              pointer.intakeId,
+              memberEncoded,
+            ),
           );
       } finally {
         scratch.db
@@ -581,6 +739,7 @@ export async function readCollectionImportFeed(
         for (const changedGroup of scratch.db
           .prepare('SELECT ordinal FROM changedGroups')
           .iterate()) {
+          if (peopleChanged && query) forgetPeopleMatch(source.id, Number(changedGroup.ordinal));
           const pointer = queue.groupPointer(source.id, Number(changedGroup.ordinal));
           if (
             !pointer ||
@@ -604,9 +763,11 @@ export async function readCollectionImportFeed(
               bytes: Buffer.byteLength(canonicalLiteral(summary)),
             },
             visible =
-              view === 'all'
-                ? Object.values(summary.peopleCounts).reduce((a, b) => a + b, 0)
-                : summary.peopleCounts[view === 'active' ? 'pending' : 'later'];
+              query && peopleChanged
+                ? visitPeople(pointer, order)
+                : view === 'all'
+                  ? Object.values(summary.peopleCounts).reduce((a, b) => a + b, 0)
+                  : summary.peopleCounts[view === 'active' ? 'pending' : 'later'];
           if (!peopleChanged) continue;
           scratch.db.prepare('DELETE FROM people WHERE ordering=?').run(order);
           if (visible)
@@ -615,16 +776,18 @@ export async function readCollectionImportFeed(
               .run(order, canonicalLiteral(reference), source.id);
         }
         if (peopleChanged) {
-          Object.assign(
-            peopleCounts,
-            !input.intakeId || input.intakeId === source.id
-              ? queue.allPeopleCounts(source.id, input.groupId)
-              : { pending: 0, later: 0, excluded: 0, saved: 0 },
-          );
-          kindCounts.person =
-            view === 'all'
-              ? Object.values(peopleCounts).reduce((a, b) => a + b, 0)
-              : peopleCounts[view === 'active' ? 'pending' : 'later'];
+          if (!query) {
+            Object.assign(
+              peopleCounts,
+              !input.intakeId || input.intakeId === source.id
+                ? queue.allPeopleCounts(source.id, input.groupId)
+                : { pending: 0, later: 0, excluded: 0, saved: 0 },
+            );
+            kindCounts.person =
+              view === 'all'
+                ? Object.values(peopleCounts).reduce((a, b) => a + b, 0)
+                : peopleCounts[view === 'active' ? 'pending' : 'later'];
+          }
           totalPeopleGroups = Number(
             scratch.db.prepare('SELECT count(*) n FROM people WHERE intake=?').get(source.id)!.n,
           );
@@ -692,7 +855,7 @@ export async function readCollectionImportFeed(
           );
         continue;
       }
-      for (const table of ['records', 'people', 'matches', 'facts'])
+      for (const table of ['records', 'people', 'matches', 'facts', 'peopleMatches'])
         scratch.db.prepare(`DELETE FROM ${table} WHERE intake=?`).run(source.id);
       for (const key of Object.keys(counts) as (keyof typeof counts)[]) counts[key] = 0;
       for (const key of Object.keys(peopleCounts) as (keyof typeof peopleCounts)[])
@@ -721,15 +884,7 @@ export async function readCollectionImportFeed(
             ordinal: pointer.ordinal,
             bytes: Buffer.byteLength(canonicalLiteral(summary)),
           };
-        let visiblePeople = 0;
-        const people = openCollectionPeopleRead(db, root, profileId, pointer.intakeId);
-        for (const person of people.pointers(pointer.groupId)) {
-          const state = people.state(person);
-          peopleCounts[state]++;
-          if (view === 'all' || state === (view === 'active' ? 'pending' : 'later'))
-            visiblePeople++;
-        }
-        kindCounts.person += visiblePeople;
+        const visiblePeople = visitPeople(pointer, groupOrder);
         if (visiblePeople) {
           totalPeopleGroups++;
           scratch.db
@@ -753,7 +908,7 @@ export async function readCollectionImportFeed(
         );
     }
     for (const row of scratch.db.prepare('SELECT id FROM sources WHERE seen=0').iterate())
-      for (const table of ['records', 'people', 'matches', 'facts'])
+      for (const table of ['records', 'people', 'matches', 'facts', 'peopleMatches'])
         scratch.db.prepare(`DELETE FROM ${table} WHERE intake=?`).run(row.id);
     scratch.db.exec('DELETE FROM sources WHERE seen=0');
     for (const key of Object.keys(counts) as (keyof typeof counts)[]) counts[key] = 0;
@@ -788,6 +943,7 @@ export async function readCollectionImportFeed(
       clinicalRevision: queue.clinicalRevision,
       busy: false,
       scratch,
+      signingKey,
       counts,
       kindCounts,
       peopleCounts,
@@ -814,6 +970,7 @@ export async function readCollectionImportFeed(
     }
     preparedFeeds.add(feed);
     retained = true;
+    readingFeed = feed;
     return feedWindow(db, root, profileId, queue, feed, {
       view,
       limit,
@@ -823,6 +980,7 @@ export async function readCollectionImportFeed(
       cursor,
     });
   } catch (error) {
+    if (readingFeed) disposeFeed(readingFeed);
     try {
       scratch.db.exec('ROLLBACK');
     } catch {
@@ -832,6 +990,9 @@ export async function readCollectionImportFeed(
   } finally {
     if (reused) reused.busy = false;
     queue.close();
-    if (!retained) scratch.close();
+    if (!retained) {
+      scratch.close();
+      signingKey.fill(0);
+    }
   }
 }

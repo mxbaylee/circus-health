@@ -12,6 +12,7 @@ import {
 import { proposalDependenciesCurrent } from './intake-proposal-dependencies.ts';
 import { readIntakeSourcePin } from './intake-source-pin.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
+import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 interface Result {
   original: boolean;
   originalValid: boolean;
@@ -20,11 +21,25 @@ interface Result {
 }
 interface Cached {
   binding: string;
-  changes: number;
+  stamp: string;
+  generation: object;
   proposalId?: string;
   result: Result;
 }
 const caches = new WeakMap<Database, Map<string, Cached>>();
+const stampQueries = new WeakMap<Database, ReturnType<Database['prepare']>>();
+function stamp(db: Database) {
+  let query = stampQueries.get(db);
+  if (!query) {
+    query = db.prepare(
+      'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS schema',
+    );
+    query.setReadBigInts(true);
+    stampQueries.set(db, query);
+  }
+  const value = query.get()!;
+  return `${value.changes}:${value.external}:${value.schema}`;
+}
 function field<T>(
   view: IntakeCollectionEnvelopeReader,
   record: IntakeEnvelopeRecord,
@@ -44,13 +59,18 @@ export async function prepareCurrentIntakeInterpretations(
 ): Promise<Result> {
   assertIntakeOwner(db, profileId);
   options.assertRunning?.();
+  // A rolled-back temporary repair may leave total_changes unchanged. Do not
+  // retain or reuse transaction-local positive or negative evidence.
+  const transaction = db.isTransaction;
+  if (transaction) caches.delete(db);
+  const initialStamp = stamp(db),
+    generation = intakeCollectionCacheGeneration(db);
   const view = openIntakeCollectionEnvelope(db, { id }),
     intake = view.child(view.root(), 'intake');
   if (!intake) throw Error('Selected intake metadata unavailable');
   const pin = readIntakeSourcePin(db, id),
     version = intakeSourceVersion(db, id).version,
-    binding = JSON.stringify([view.logical, version, pin]),
-    changes = Number(db.prepare('SELECT total_changes() AS count').get()!.count);
+    binding = JSON.stringify([profileId, view.logical, version, pin]);
   const current = () => {
     assertIntakeOwner(db, profileId);
     options.assertRunning?.();
@@ -58,7 +78,9 @@ export async function prepareCurrentIntakeInterpretations(
     if (
       intakeSourceVersion(db, id).version !== version ||
       JSON.stringify(readIntakeSourcePin(db, id)) !== JSON.stringify(pin) ||
-      Number(db.prepare('SELECT total_changes() AS count').get()!.count) !== changes
+      stamp(db) !== initialStamp ||
+      db.isTransaction !== transaction ||
+      intakeCollectionCacheGeneration(db) !== generation
     )
       throw Error('Interpretation selection changed during preparation');
   };
@@ -67,7 +89,7 @@ export async function prepareCurrentIntakeInterpretations(
     cache = new Map();
     caches.set(db, cache);
   }
-  const previous = cache.get(id);
+  const previous = transaction ? undefined : cache.get(id);
   const selectedRevision = pin
       ? pin.revisionId
       : (field<string | null>(view, intake, 'sourceTextRevisionId') ?? null),
@@ -93,9 +115,13 @@ export async function prepareCurrentIntakeInterpretations(
     hasCurrentProposal: false,
     proposalTotal: view.childCount(intake, 'proposals'),
   };
-  if (previous?.binding === binding && previous.changes === changes) {
+  if (
+    previous?.binding === binding &&
+    previous.stamp === initialStamp &&
+    previous.generation === generation
+  ) {
     current();
-    return previous.result;
+    return { ...previous.result };
   }
   let proposalId: string | undefined;
   if (previous?.proposalId) {
@@ -122,7 +148,15 @@ export async function prepareCurrentIntakeInterpretations(
   }
   current();
   result.hasCurrentProposal = proposalId !== undefined;
-  if (cache.size >= 8 && !cache.has(id)) cache.delete(cache.keys().next().value!);
-  cache.set(id, { binding, changes, proposalId, result });
+  if (!transaction) {
+    if (cache.size >= 8 && !cache.has(id)) cache.delete(cache.keys().next().value!);
+    cache.set(id, {
+      binding,
+      stamp: initialStamp,
+      generation,
+      proposalId,
+      result: { ...result },
+    });
+  }
   return result;
 }

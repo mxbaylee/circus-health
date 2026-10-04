@@ -21,6 +21,14 @@ export interface IntakeIdentityConflict {
   field: 'fullName' | 'birthDate';
   selfValue: string | null;
   evidencedValue: string;
+  /** Bounded conflict presentation; exact names remain in the record identity questions. */
+  evidencedValueReference?: {
+    format: 'health-intake-name-conflict-v1';
+    names: number;
+    bytes: number;
+    sha256: string;
+    evidence: 'record_identity_questions';
+  };
   reason: 'self_mismatch' | 'evidence_disagreement';
 }
 

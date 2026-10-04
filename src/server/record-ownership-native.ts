@@ -1,12 +1,5 @@
-import { iterateOwnershipStreamContributions } from './ownership-contribution-stream.ts';
-import { prepareCollectionClinicalReviewDependencies } from './intake-review-collection-host.ts';
-import {
-  createOwnershipBlockerStore,
-  bindOwnershipBlockerStore,
-  type OwnershipBlockerStore,
-} from './ownership-blocker-store.ts';
+import { type OwnershipBlockerStore } from './ownership-blocker-store.ts';
 import type { OwnershipBlockerReference } from '../shared/ownership-report-reference.ts';
-import { prepareStandaloneOwnershipIdentitySnapshots } from './ownership-identity-snapshots.ts';
 import { ownershipBlockerCount } from './ownership-preview-store.ts';
 import {
   prepareOwnershipReportPlan,
@@ -18,24 +11,12 @@ import type { Database } from './database.ts';
 import { HttpError } from './database.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { ownershipRequest, object, text, invalid } from './record-ownership-input.ts';
-import {
-  previewRecordOwnership,
-  commitRecordOwnershipPlannedUnit,
-  getRecordOwnershipReceipt,
-} from './record-ownership.ts';
-import { prepareOwnershipNamePlan, type PreparedOwnershipNamePlan } from './ownership-name-plan.ts';
+import { previewRecordOwnership, commitRecordOwnershipPlannedUnit } from './record-ownership.ts';
+import { type PreparedOwnershipNamePlan } from './ownership-name-plan.ts';
 import { getNote } from './notes.ts';
-import {
-  ownershipGroupRequest,
-  childOwnershipOperation,
-  ownershipPlans,
-} from './ownership-groups.ts';
+import { childOwnershipOperation, ownershipPlans } from './ownership-groups.ts';
 import { ownershipHash } from './ownership-journal.ts';
-import type {
-  OwnershipCommit,
-  OwnershipRequest,
-  OwnershipPreview,
-} from '../shared/record-ownership.ts';
+import type { OwnershipCommit, OwnershipPreview } from '../shared/record-ownership.ts';
 import type { OwnershipPreviewReference } from '../shared/ownership-name-reference.ts';
 
 const selectedPlans = new WeakMap<
@@ -93,102 +74,34 @@ async function prepare(
   root: string,
   profileId: string,
   input: unknown,
-  options: { onCheckpoint?: (stage: string) => void } = {},
+  options: {
+    onCheckpoint?: (stage: string) => void;
+    approvedRelationshipDecisions?: () => Iterable<
+      NonNullable<
+        import('../shared/record-ownership.ts').OwnershipRequest['relationshipDecisions']
+      >[number]
+    >;
+  } = {},
 ) {
   const epoch = planEpochs.get(db) ?? 0;
   const selectedRequest = ownershipRequest(input);
-  if (
-    selectedRequest.selection.type === 'report' &&
-    usesNativeOwnershipReportEvidence(db, selectedRequest)
-  ) {
-    const report = await prepareOwnershipReportPlan(db, root, profileId, selectedRequest, {
-      ...options,
-      assertRunning() {
-        if ((planEpochs.get(db) ?? 0) !== epoch)
-          throw new HttpError(
-            401,
-            'PROFILE_LOCKED',
-            'Unlock this profile and prepare the report evidence',
-          );
-      },
-    });
-    return { preview: report.finalize(), plan: report.plan, report };
-  }
-  if (selectedRequest.selection.type === 'records') {
-    for (const record of selectedRequest.selection.records)
-      for (const source of iterateOwnershipStreamContributions(db, record.kind, record.recordId)) {
-        if (hasIntakeCollectionEnvelope(db, { id: source.intakeId })) continue;
-        const proposal = source.sourceRecordId.replace(/:line:\d+$/, '');
-        await prepareCollectionClinicalReviewDependencies(
-          db,
-          root,
-          profileId,
-          source.intakeId,
-          proposal === source.intakeId ? null : proposal,
-          {
-            assertRunning() {
-              if ((planEpochs.get(db) ?? 0) !== epoch)
-                throw new HttpError(
-                  401,
-                  'PROFILE_LOCKED',
-                  'Unlock this profile and prepare the current ownership evidence',
-                );
-            },
-          },
+  const report = await prepareOwnershipReportPlan(db, root, profileId, selectedRequest, {
+    ...options,
+    assertRunning() {
+      if ((planEpochs.get(db) ?? 0) !== epoch)
+        throw new HttpError(
+          401,
+          'PROFILE_LOCKED',
+          'Unlock this profile and prepare the current ownership evidence',
         );
-      }
-  }
-  const blockers = createOwnershipBlockerStore(profileId);
-  try {
-    let context:
-      | { sources: ReadonlySet<string>; owners: ReadonlySet<string>; request: OwnershipRequest }
-      | undefined;
-    previewRecordOwnership(db, root, profileId, input, {
-      blockerStore: blockers,
-      captureNameScopes(sources, owners, request) {
-        context = { sources, owners, request };
-      },
-    });
-    if (!context) throw Error('Ownership selected name scope is unavailable');
-    const plan = await prepareOwnershipNamePlan(
-      db,
-      profileId,
-      context.sources,
-      context.owners,
-      context.request,
-      {
-        assertRunning() {
-          if ((planEpochs.get(db) ?? 0) !== epoch)
-            throw new HttpError(
-              401,
-              'PROFILE_LOCKED',
-              'Unlock this profile and prepare the current ownership evidence',
-            );
-        },
-      },
-    );
-    const close = plan.close;
-    plan.close = () => {
-      close();
-      blockers.close();
-    };
-    blockers.setGuard(plan.assertCurrent);
-    bindOwnershipBlockerStore(plan, blockers);
-    try {
-      const preview = previewRecordOwnership(db, root, profileId, context.request, {
-        blockerStore: blockers,
-        namePlan: plan,
-      });
-      plan.assertCurrent();
-      return { preview, plan, blockers };
-    } catch (error) {
-      plan.close();
-      throw error;
-    }
-  } catch (error) {
-    blockers.close();
-    throw error;
-  }
+    },
+  });
+  return {
+    preview: report.finalize(),
+    plan: report.plan,
+    report,
+    blockers: undefined as OwnershipBlockerStore | undefined,
+  };
 }
 export async function previewNativeRecordOwnership(
   db: Database,
@@ -335,108 +248,60 @@ async function commitNativeOwnershipOwned(
     );
   selected.plan.assertCurrent();
   const request = ownershipRequest(supplied.request);
-  if (selected.report) {
-    if (ownershipHash(request) !== ownershipHash(selected.plan.request))
-      throw new HttpError(409, 'OWNERSHIP_CHANGED', 'Review the selected report before saving');
-    const preview = selected.report.finalize();
-    if (preview.scopeToken !== supplied.scopeToken || preview.version !== supplied.version)
-      throw new HttpError(
-        409,
-        'OWNERSHIP_CHANGED',
-        'Review the current report evidence before saving',
-      );
-    await selected.report.prepareSourceSnapshots();
-    commitRecordOwnershipPlannedUnit(
-      db,
-      root,
-      profileId,
-      input,
-      selected.plan,
-      undefined,
-      selected.report,
-    );
-    const receipt = ownershipReceiptReference(db, profileId, supplied.operationId);
-    if (!receipt)
-      throw Error('Accepted report correction is missing its durable outcome reference');
-    return { ...receipt, replayed: false };
-  }
-  const preview = previewRecordOwnership(db, root, profileId, request, {
-    namePlan: selected.plan,
-    blockerStore: selected.blockers,
-  });
+  const report = selected.report;
+  if (!report) throw Error('Native ownership requires its complete selected plan');
+  if (ownershipHash(request) !== ownershipHash(selected.plan.request))
+    throw new HttpError(409, 'OWNERSHIP_CHANGED', 'Review the selected correction before saving');
+  const preview = report.finalize();
   if (preview.scopeToken !== supplied.scopeToken || preview.version !== supplied.version)
-    throw new HttpError(409, 'OWNERSHIP_CHANGED', 'Review the current selection before saving');
-  if (ownershipBlockerCount(preview) || preview.records.some((r) => ownershipBlockerCount(r) > 0))
-    throw new HttpError(409, 'OWNERSHIP_REVIEW', 'Resolve every displayed decision before saving');
-  if (preview.commitGroups.length <= 1) {
-    const identity = await prepareStandaloneOwnershipIdentitySnapshots(
-      db,
-      root,
-      profileId,
-      preview.records,
+    throw new HttpError(
+      409,
+      'OWNERSHIP_CHANGED',
+      'Review the current ownership evidence before saving',
     );
-    try {
-      return commitRecordOwnershipPlannedUnit(
-        db,
-        root,
-        profileId,
-        input,
-        selected.plan,
-        undefined,
-        undefined,
-        identity,
-      );
-    } finally {
-      identity.close();
-    }
+  if (ownershipBlockerCount(preview) || report.reference.recordBlockerTotal)
+    throw new HttpError(409, 'OWNERSHIP_REVIEW', 'Resolve every displayed decision before saving');
+  const published = () => {
+    const receipt = ownershipReceiptReference(db, profileId, supplied.operationId);
+    if (!receipt) throw Error('Accepted correction is missing its durable outcome reference');
+    return { ...receipt, replayed: false };
+  };
+  if (preview.commitGroups.length <= 1) {
+    await report.prepareSourceSnapshots();
+    commitRecordOwnershipPlannedUnit(db, root, profileId, input, selected.plan, undefined, report);
+    return published();
   }
-  const fingerprint = ownershipHash({ ...supplied, request });
-  const approvedChoices = selected.plan.approvedChoices();
+  const fingerprint = ownershipHash({ ...supplied, request }),
+    approvedChoices = selected.plan.approvedChoices();
   let destination = request.destination;
   for (const group of preview.commitGroups) {
-    let childPlan: PreparedOwnershipNamePlan | undefined;
+    let child: PreparedOwnershipReportPlan | undefined;
     try {
       if ('noteId' in destination)
         destination = { ...destination, expectedVersion: getNote(db, destination.noteId).version };
-      const childRequest = { ...ownershipGroupRequest(request, group, preview), destination };
-      // The complete parent's streamed name grouping already joined all selected
-      // contributions of an effect. Child preparation runs outside its transaction.
-      const prepared = await prepare(db, root, profileId, childRequest);
-      childPlan = prepared.plan;
-      for (const choice of request.nameDecisions || [])
-        if (childPlan.has(choice.key)) childPlan.choose(choice.key, choice.outcome);
-      for (const choice of approvedChoices())
-        if (childPlan.has(choice.key)) childPlan.choose(choice.key, choice.outcome);
-      prepared.preview = previewRecordOwnership(db, root, profileId, childPlan.request, {
-        namePlan: childPlan,
-        blockerStore: prepared.blockers,
+      const childRequest = { ...report.requestForGroup(group), destination };
+      const prepared = await prepare(db, root, profileId, childRequest, {
+        approvedRelationshipDecisions: () => report.relationshipChoicesForGroup(group),
       });
-      const identity = await prepareStandaloneOwnershipIdentitySnapshots(
+      child = prepared.report;
+      for (const choice of approvedChoices())
+        if (child.plan.has(choice.key)) child.plan.choose(choice.key, choice.outcome);
+      const current = child.finalize();
+      await child.prepareSourceSnapshots();
+      const receipt = commitRecordOwnershipPlannedUnit(
         db,
         root,
         profileId,
-        prepared.preview.records,
+        {
+          operationId: childOwnershipOperation(supplied.operationId, group.id),
+          request: current.request,
+          scopeToken: current.scopeToken,
+          version: current.version,
+        },
+        child.plan,
+        { operationId: supplied.operationId, fingerprint, groups: preview.commitGroups },
+        child,
       );
-      let receipt: ReturnType<typeof commitRecordOwnershipPlannedUnit>;
-      try {
-        receipt = commitRecordOwnershipPlannedUnit(
-          db,
-          root,
-          profileId,
-          {
-            operationId: childOwnershipOperation(supplied.operationId, group.id),
-            request: prepared.preview.request,
-            scopeToken: prepared.preview.scopeToken,
-            version: prepared.preview.version,
-          },
-          childPlan,
-          { operationId: supplied.operationId, fingerprint, groups: preview.commitGroups },
-          undefined,
-          identity,
-        );
-      } finally {
-        identity.close();
-      }
       if ('newPerson' in destination) {
         const note = db
           .prepare("SELECT id FROM notes WHERE kind='person' AND person_id=?")
@@ -449,12 +314,12 @@ async function commitNativeOwnershipOwned(
       }
     } catch (error) {
       if (!ownershipPlans(db, supplied.operationId).length) throw error;
-      return { ...getRecordOwnershipReceipt(db, profileId, supplied.operationId), replayed: false };
+      return published();
     } finally {
-      childPlan?.close();
+      child?.close();
     }
   }
-  return { ...getRecordOwnershipReceipt(db, profileId, supplied.operationId), replayed: false };
+  return published();
 }
 
 export function nativeOwnershipReportPlan(db: Database, profileId: string, token: string) {

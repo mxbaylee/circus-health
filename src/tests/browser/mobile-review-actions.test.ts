@@ -1,5 +1,6 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
+import { fixtureApi, fixtureReview, fixtureReportUrl } from './native-intake-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
@@ -85,6 +86,7 @@ test('Import detail keeps a readable record and reachable explicit actions on mo
     return profile.id as string;
   });
   const prefix = `/api/profiles/${profileId}`;
+  const api = fixtureApi(page, url);
   const saved = await page.request.post(url + prefix + '/intakes', {
     headers: {
       Origin: url,
@@ -97,12 +99,10 @@ test('Import detail keeps a readable record and reachable explicit actions on mo
   });
   assert.equal(saved.status(), 201);
   const savedIntake = await stopFixtureImport(page, url, prefix, (await saved.json()).data.id);
-  const savedReviewResponse = await page.request.get(
-    url + prefix + `/intakes/${encodeURIComponent(savedIntake.id)}/review`,
-    { headers: { Origin: url } },
+  const savedReview = await fixtureReview(
+    api,
+    prefix + `/intakes/${encodeURIComponent(savedIntake.id)}/review`,
   );
-  assert(savedReviewResponse.ok(), await savedReviewResponse.text());
-  const savedReview = (await savedReviewResponse.json()).data;
   const savedImport = await page.request.post(
     url + prefix + `/intakes/${encodeURIComponent(savedIntake.id)}/import`,
     {
@@ -144,7 +144,7 @@ test('Import detail keeps a readable record and reachable explicit actions on mo
   const selected = await createReview('fictional-cedar-report', 'Fictional Cedar Clinic report');
   await createReview('fictional-maple-report', 'Fictional Maple Clinic report');
 
-  await page.goto(`${url}/#/import?intake=${encodeURIComponent(selected.id)}`);
+  await page.goto(url + (await fixtureReportUrl(api, prefix, selected.id)));
   await page.reload();
   await page.locator('.import-detail-record-link').first().click();
   await page.getByRole('heading', { name: 'Glucose' }).waitFor();

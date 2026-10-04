@@ -1,3 +1,9 @@
+import {
+  fixtureReview,
+  fixtureProposalId,
+  fixtureReportUrl,
+  fixtureSourcePath,
+} from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
@@ -146,25 +152,79 @@ test(
         ],
       }),
     });
-    const proposalId = intake.proposals.at(-1)!.id;
-    const review = await request(
+    const proposalId = await fixtureProposalId(
+      (path: string, body?: unknown) => request(path, body === undefined ? 'GET' : 'POST', body),
+      prefix,
+      intake.id,
+    );
+    const review = await fixtureReview(
+      (path: string, body?: unknown) => request(path, body === undefined ? 'GET' : 'POST', body),
       `${prefix}/intakes/${encodeURIComponent(intake.id)}/review?proposalId=${encodeURIComponent(proposalId)}`,
     );
     assert.deepEqual(
-      review.records[0].issues.find(
+      review.records[0].issues!.find(
         (issue: { prompt: string }) => issue.prompt === 'Does the printed identity belong to you?',
-      ).selfSuggestion,
+      )!.selfSuggestion,
       { fullName: 'Fictional Source Rowan', birthDate: '1990-03-12' },
     );
 
-    await page.goto(
-      url +
-        '/#/import?intake=' +
-        encodeURIComponent(intake.id) +
-        '&proposal=' +
-        encodeURIComponent(proposalId),
+    const reportUrl = await fixtureReportUrl(
+      (path: string, body?: unknown) => request(path, body === undefined ? 'GET' : 'POST', body),
+      prefix,
+      intake.id,
     );
+    const identity = page.getByRole('region', { name: 'Report identity', exact: true });
+    // Cold native preparation belongs to the overall test hang guard. Assert
+    // controls promptly after the browser's actual identity read has completed.
+    const readIdentity = async () => {
+      const since = Date.now();
+      const response = await page.waitForResponse(
+        (candidate) =>
+          candidate.request().method() === 'GET' &&
+          candidate.request().timing().startTime >= since &&
+          new URL(candidate.url()).pathname ===
+            `${prefix}/intakes/${encodeURIComponent(intake.id)}/identity-review`,
+        { timeout: 0 },
+      );
+      assert.equal(response.status(), 200);
+      assert.equal(await response.finished(), null);
+      return (await response.json()).data;
+    };
+    const readReport = async () => {
+      const since = Date.now();
+      const response = await page.waitForResponse(
+        (candidate) => {
+          const selected = new URL(candidate.url());
+          return (
+            candidate.request().method() === 'GET' &&
+            candidate.request().timing().startTime >= since &&
+            selected.pathname.startsWith(`${prefix}/intakes/report-queue/`) &&
+            selected.searchParams.get('intakeId') === intake.id
+          );
+        },
+        { timeout: 0 },
+      );
+      assert.equal(response.status(), 200);
+      assert.equal(await response.finished(), null);
+    };
+    const identityReady = async () => {
+      await page
+        .getByRole('status')
+        .filter({ hasText: 'Checking retained identity evidence…' })
+        .waitFor({ state: 'hidden', timeout: 0 });
+    };
+    const waitForConfirmedIdentity = () =>
+      identity.getByText('This report already matches Self.', { exact: true }).waitFor();
+    await page.goto(url + reportUrl);
+    const initialIdentity = readIdentity();
     await page.reload();
+    await initialIdentity;
+    await identityReady();
+    const confirm = identity.getByRole('button', {
+      name: 'This is me and add selected details',
+      exact: true,
+    });
+    await confirm.waitFor();
     let identityPosts = 0;
     page.on('request', (candidate) => {
       if (candidate.method() === 'POST' && candidate.url().endsWith('/identity-scope'))
@@ -179,54 +239,42 @@ test(
         response.request().method() === 'POST' &&
         response.ok(),
     );
-    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
-    await page
-      .getByRole('dialog', { name: 'Who is this report for?' })
-      .getByRole('button', { name: 'This is me and add selected details', exact: true })
-      .click();
+    const refreshedIdentity = readIdentity();
+    const refreshedReport = readReport();
+    await confirm.click();
     const submitted = (await identityRequest).postDataJSON();
     await updated;
     assert.equal(submitted.selfUpdate.expectedVersion, initialSelf.version);
-    assert.deepEqual(submitted.selfUpdate.fields, {
-      birthDate: '1990-03-12',
-    });
-    await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
+    assert.deepEqual(submitted.selfUpdate.fields, { birthDate: '1990-03-12' });
+    const confirmed = await refreshedIdentity;
+    assert.equal(confirmed.status, 'prior_confirmation');
+    assert.equal(confirmed.blocking, false);
+    assert.equal(confirmed.confirmationCount, 1);
+    await refreshedReport;
+    await identityReady();
+    await waitForConfirmedIdentity();
+    const reloadedIdentity = readIdentity();
+    await page.reload();
+    await reloadedIdentity;
+    await identityReady();
+    await waitForConfirmedIdentity();
     assert.equal(
-      await page.getByRole('dialog').count(),
+      await identity.getByRole('button', { name: /This is me|Self details/ }).count(),
       0,
-      'successful person review closes the sidebar and returns to Import',
+      'the refreshed report has no second confirmation control after the name was retained and the selected birth date was filled',
     );
-    await page.goto(
-      url +
-        '/#/import?intake=' +
-        encodeURIComponent(intake.id) +
-        '&proposal=' +
-        encodeURIComponent(proposalId),
-    );
-    await page.getByRole('button', { name: 'Change person for this report', exact: true }).click();
-    await page.getByText('This report already matches Self.', { exact: true }).waitFor();
-    assert.equal(
-      await page.getByRole('button', { name: /This is me|Self details/ }).count(),
-      0,
-      'the refreshed detail has no second confirmation control after the name was retained and the selected birth date was filled',
-    );
-
-    const originalUrl =
-      url + prefix + intake.contentUrl.slice(intake.contentUrl.startsWith('/api/') ? 4 : 0);
-    await page.goto(originalUrl);
+    await page.goto(url + fixtureSourcePath(prefix, intake.contentUrl));
+    const returnedIdentity = readIdentity();
     await page.goBack({ waitUntil: 'domcontentloaded' });
-    await page.getByRole('button', { name: 'Change person for this report', exact: true }).click();
-    await page.getByText('This report already matches Self.', { exact: true }).waitFor();
+    await returnedIdentity;
+    await identityReady();
+    await waitForConfirmedIdentity();
     assert.equal(
-      await page.getByRole('button', { name: /This is me|Self details/ }).count(),
+      await identity.getByRole('button', { name: /This is me|Self details/ }).count(),
       0,
       'same-tab retained-original Back does not restore a stale confirmation control',
     );
-    await page
-      .getByRole('dialog', { name: 'Who is this report for?' })
-      .getByRole('button', { name: 'Done', exact: true })
-      .click();
-    await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
+    await identity.getByRole('button', { name: 'Done', exact: true }).click();
     assert.equal(
       identityPosts,
       1,

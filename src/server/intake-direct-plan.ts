@@ -39,6 +39,7 @@ import {
   type IntakeDecisionIndex,
 } from './intake-reading-state.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
+import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 import type { IntakeExtractionCoverage, IntakeExtractionUnit } from '../shared/intake.ts';
 import type {
   IntakeDirectPlanV2,
@@ -359,7 +360,98 @@ async function prepareRecipe(
   await writer.flush();
   return { name, count: ordinal };
 }
+type DirectContext = NonNullable<ReturnType<typeof readContext>>;
+const directContexts = new WeakMap<
+  Database,
+  {
+    stamp: string;
+    generation: object;
+    values: Map<string, DirectContext>;
+  }
+>();
+const directContextStamps = new WeakMap<Database, ReturnType<Database['prepare']>>();
+function contextStamp(db: Database) {
+  let query = directContextStamps.get(db);
+  if (!query) {
+    query = db.prepare(
+      'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS schema',
+    );
+    query.setReadBigInts(true);
+    directContextStamps.set(db, query);
+  }
+  const stamp = query.get()!;
+  return `${stamp.changes}:${stamp.external}:${stamp.schema}`;
+}
+function freezeHeader(value: unknown) {
+  const pending = [value];
+  while (pending.length) {
+    const next = pending.pop();
+    if (!next || typeof next !== 'object' || Object.isFrozen(next)) continue;
+    pending.push(...Object.values(next));
+    Object.freeze(next);
+  }
+}
+/** Bounded decoded plan headers are reusable only in the exact unchanged SQL
+ * projection. Transaction-local reads never populate or reuse this cache:
+ * rolling back a temporary repair need not advance total_changes(). */
 function context(
+  db: Database,
+  profileId: string,
+  id: string,
+  options: { planId?: string; recordAddress?: string } = {},
+) {
+  if (db.isTransaction) {
+    directContexts.delete(db);
+    return readContext(db, profileId, id, options);
+  }
+  const stamp = contextStamp(db),
+    generation = intakeCollectionCacheGeneration(db),
+    file = source(db, profileId, id),
+    key = JSON.stringify([profileId, id, options.planId ?? null, options.recordAddress ?? null]);
+  let cache = directContexts.get(db);
+  if (!cache || cache.stamp !== stamp || cache.generation !== generation) {
+    cache = { stamp, generation, values: new Map() };
+    directContexts.set(db, cache);
+  }
+  const cached = cache.values.get(key);
+  if (
+    cached &&
+    Object.keys(file).every(
+      (name) => file[name as keyof typeof file] === cached.file[name as keyof typeof file],
+    ) &&
+    !db.isTransaction &&
+    contextStamp(db) === stamp &&
+    intakeCollectionCacheGeneration(db) === generation
+  ) {
+    cache.values.delete(key);
+    cache.values.set(key, cached);
+    return cached;
+  }
+  const value = readContext(db, profileId, id, options);
+  if (
+    value &&
+    !db.isTransaction &&
+    contextStamp(db) === stamp &&
+    intakeCollectionCacheGeneration(db) === generation
+  ) {
+    freezeHeader(value.file);
+    freezeHeader(value.plan);
+    freezeHeader(value.reader.logical);
+    Object.freeze(value.reader);
+    Object.freeze(value.index);
+    const remember = (address: string) => {
+      if (Buffer.byteLength(address) > 4096) return;
+      cache.values.set(address, value);
+      while (cache.values.size > 32) cache.values.delete(cache.values.keys().next().value!);
+    };
+    remember(key);
+    // An exact retained address is unambiguous even when historical plan IDs
+    // repeat. Do not alias an arbitrary plan-ID lookup to another occurrence.
+    remember(JSON.stringify([profileId, id, null, value.reader.address(value.record)]));
+  }
+  return value;
+}
+function readContext(
   db: Database,
   profileId: string,
   id: string,

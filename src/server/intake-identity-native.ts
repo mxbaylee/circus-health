@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError, clinicalReviewRevision, now, json } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
+import { collectSelectedEvidencedIdentity } from './intake-identity-name-evidence.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import {
   assertIntakeOwner,
@@ -49,6 +50,7 @@ import {
   identitySnapshotScopeMatches,
 } from './intake-identity-snapshot.ts';
 import { schemaOrdinal } from './intake-envelope-schema.ts';
+import { INTAKE_TREE_VALUE_BYTES } from './intake-state-tree.ts';
 import {
   assessIdentityPolicy,
   collectEvidencedIdentity,
@@ -58,6 +60,7 @@ import {
   identityReceiptAppliesToCurrentBoundary,
   identityOriginalFingerprintForMember,
   identityPersonFingerprint,
+  identityTargetHasIssue,
   isGenericNameConfirmation,
   iterateCompetingIdentityBoundaries,
   type IdentityPolicyReceipt,
@@ -65,7 +68,7 @@ import {
   type IdentityPolicyTarget,
 } from './intake-identity-policy.ts';
 import { retainSelectedIdentityGrounding } from './intake-identity-grounding.ts';
-import { identityPeopleSnapshots } from './intake-identity-people.ts';
+import { selectedIdentityPeopleSnapshots } from './intake-identity-people.ts';
 import {
   selfSnapshot,
   applyIdentityConfirmationPeople,
@@ -81,6 +84,7 @@ import {
 import { readPdfIdentityPageText } from './intake-pdf-session.ts';
 import { latestReviewDraftResolution } from './intake-review-draft-selection.ts';
 import { reviewRecordIssues } from './intake-review-issue-state.ts';
+import { reviewRecordIdentityWarnings } from './intake-review-identity-warnings.ts';
 import {
   canonicalReviewValueChunks,
   registerReviewCanonicalValue,
@@ -400,10 +404,15 @@ async function evidence(context: Context) {
 function rows() {
   const scratch = disposableSqlite('fictional-identity-scope-');
   scratch.db.exec(
-    'CREATE TABLE pieces(section TEXT,key TEXT,ordinal INTEGER,value TEXT,PRIMARY KEY(section,key,ordinal));CREATE TABLE rows(section TEXT NOT NULL,key TEXT NOT NULL,ordinal INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(section,key));CREATE INDEX ordered ON rows(section,ordinal);',
+    `CREATE TABLE pieces(section TEXT,key TEXT,ordinal INTEGER,value TEXT,PRIMARY KEY(section,key,ordinal));
+    CREATE TABLE counts(section TEXT PRIMARY KEY,count INTEGER NOT NULL);
+    CREATE TABLE rows(section TEXT NOT NULL,key TEXT NOT NULL,ordinal INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(section,key));
+    CREATE INDEX ordered ON rows(section,ordinal);
+    CREATE TRIGGER inserted AFTER INSERT ON rows BEGIN INSERT INTO counts VALUES(NEW.section,1) ON CONFLICT(section) DO UPDATE SET count=count+1; END;
+    CREATE TRIGGER removed AFTER DELETE ON rows BEGIN UPDATE counts SET count=count-1 WHERE section=OLD.section; END;`,
   );
   const count = (section: string) =>
-    Number(scratch.db.prepare('SELECT count(*) n FROM rows WHERE section=?').get(section)!.n);
+    Number(scratch.db.prepare('SELECT count FROM counts WHERE section=?').get(section)?.count || 0);
   const get = <T>(section: string, key: string) => {
     const row = scratch.db
       .prepare('SELECT value FROM rows WHERE section=? AND key=?')
@@ -530,7 +539,7 @@ async function build(
 ) {
   const { db, root, profileId, id, view, workflow, group, scope } = context;
   const currentSelf = selfSnapshot(db),
-    people = identityPeopleSnapshots(db);
+    people = selectedIdentityPeopleSnapshots(db);
   for (const question of intakeReviewChildren(view, workflow, 'questions'))
     if (
       !scalar(view, question, 'candidateId') &&
@@ -604,7 +613,7 @@ async function build(
         else if (person?.personId !== assignedPerson?.personId) consistentAssignment = false;
         occurrenceCount++;
         allEvidenced &&= record.identityReview?.status === 'evidenced_match';
-        for (const warning of record.identityReview?.warnings || [])
+        for (const warning of reviewRecordIdentityWarnings(record))
           stored.put(
             'warnings',
             canonicalLiteral([
@@ -950,7 +959,7 @@ async function build(
                 prior.proposalId === target.proposalId &&
                 prior.recordId === target.recordId &&
                 selectedSequence(target.issueIds || [target.issueId]).every((issueId) =>
-                  selectedSequence(prior.issueIds || [prior.issueId]).some((id) => id === issueId),
+                  identityTargetHasIssue(prior, issueId),
                 ),
             ),
           ),
@@ -1069,6 +1078,14 @@ async function writeSnapshot(
     pendingBytes = 0;
   };
   const put = async (key: string, value: string) => {
+    if (
+      Buffer.byteLength(value) > INTAKE_TREE_VALUE_BYTES ||
+      Buffer.byteLength(JSON.stringify({ kind: 'inline', text: value })) > INTAKE_TREE_VALUE_BYTES
+    ) {
+      await flush();
+      await writer.putText(key, [value]);
+      return;
+    }
     const cost = Buffer.byteLength(key) + Buffer.byteLength(value);
     if (pending.length && (pending.length === 16 || pendingBytes + cost > 64 * 1024)) await flush();
     pending.push({ key, value });
@@ -1086,7 +1103,7 @@ async function writeSnapshot(
       }
       bytes += Buffer.byteLength(next.value);
       prefix.push(next.value);
-      if (bytes > 16 * 1024) {
+      if (bytes > INTAKE_TREE_VALUE_BYTES) {
         await flush();
         await writer.putText(
           key,
@@ -1118,14 +1135,35 @@ async function writeSnapshot(
           { issueIds, ...header } = target;
         const targetKey = section + ':' + schemaOrdinal(index);
         let count = 0;
-        if (issueIds)
-          for (const issueId of issueIds)
+        if (issueIds) {
+          for (const issueId of issueIds) {
             await put(
               'targetIssue:' + targetKey + ':' + schemaOrdinal(count++),
               JSON.stringify(issueId),
             );
+            await put(
+              'targetLookup:' +
+                targetKey +
+                ':' +
+                createHash('sha256').update(issueId).digest('hex'),
+              '1',
+            );
+          }
+        } else
+          await put(
+            'targetLookup:' +
+              targetKey +
+              ':' +
+              createHash('sha256').update(target.issueId).digest('hex'),
+            '1',
+          );
         await putText('targetHeader:' + targetKey, [
-          JSON.stringify({ ...header, hasIssueIds: !!issueIds, issueCount: count }),
+          JSON.stringify({
+            ...header,
+            hasIssueIds: !!issueIds,
+            issueCount: count,
+            hasIssueLookup: true,
+          }),
         ]);
       }
       if (section === 'questions') {
@@ -1242,8 +1280,8 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
   } finally {
     cached?.session.close();
   }
-  const collected = collectEvidencedIdentity(
-    stored.sequence<IntakeReviewIssue>('initialIssues'),
+  const collected = collectSelectedEvidencedIdentity(
+    () => stored.sequence<IntakeReviewIssue>('initialIssues'),
     context.group.report?.subject?.text,
   );
   const hasIdentityContext = !!(
@@ -1295,7 +1333,47 @@ function peoplePreview(db: DatabaseSync) {
     peopleTruncated: rows.length > 100,
   };
 }
-export async function getNativeIntakeIdentityReview(
+const sourceLanes = new WeakMap<DatabaseSync, Map<string, Promise<unknown>>>();
+const previewFlights = new WeakMap<DatabaseSync, Map<string, Promise<IntakeIdentityReview>>>();
+function sourceLane<T>(db: DatabaseSync, id: string, work: () => Promise<T>): Promise<T> {
+  let lanes = sourceLanes.get(db);
+  if (!lanes) sourceLanes.set(db, (lanes = new Map()));
+  const previous = lanes.get(id),
+    next = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(work);
+  lanes.set(id, next);
+  void next
+    .finally(() => {
+      if (lanes!.get(id) === next) lanes!.delete(id);
+    })
+    .catch(() => undefined);
+  return next;
+}
+/** Shared snapshot publication captures fresh pins after an earlier source operation finishes. */
+export function getNativeIntakeIdentityReview(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  groupId: string,
+): Promise<IntakeIdentityReview> {
+  source(db, profileId, id);
+  let flights = previewFlights.get(db);
+  if (!flights) previewFlights.set(db, (flights = new Map()));
+  const key = JSON.stringify([profileId, root, id, groupId]);
+  const current = flights.get(key);
+  if (current) return current;
+  const next = sourceLane(db, id, () =>
+    getNativeIntakeIdentityReviewInner(db, root, profileId, id, groupId),
+  );
+  flights.set(key, next);
+  void next
+    .finally(() => {
+      if (flights!.get(key) === next) flights!.delete(key);
+    })
+    .catch(() => undefined);
+  return next;
+}
+async function getNativeIntakeIdentityReviewInner(
   db: DatabaseSync,
   root: string,
   profileId: string,
@@ -1344,7 +1422,7 @@ export async function getNativeIntakeIdentityReview(
       const initial = await collectGroupIdentity(context, stored);
       const assessment = assessIdentityPolicy({
         self,
-        people: identityPeopleSnapshots(db),
+        people: selectedIdentityPeopleSnapshots(db),
         nameEvidenceGrounded: false,
         evidence: initial.evidence,
         evidenceConflicts: initial.conflicts,
@@ -1616,7 +1694,19 @@ export async function readNativeIdentityScopeFragment(
     nextOffset: complete ? null : offset + used,
   };
 }
-export async function confirmNativeIntakeIdentityScope(
+export function confirmNativeIntakeIdentityScope(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  input: IntakeIdentityConfirmation,
+) {
+  source(db, profileId, id);
+  return sourceLane(db, id, () =>
+    confirmNativeIntakeIdentityScopeInner(db, root, profileId, id, input),
+  );
+}
+async function confirmNativeIntakeIdentityScopeInner(
   db: DatabaseSync,
   root: string,
   profileId: string,
@@ -1764,7 +1854,7 @@ export async function confirmNativeIntakeIdentityScope(
         }
         await writeSnapshot(context, built, stored, catalog);
         const draftSnapshotId =
-          built.display.collection.snapshotId + ':drafts:' + input.operationId;
+          built.display.collection.snapshotId + ':drafts:' + hash(input.operationId);
         const draftWriter = await catalog.fork();
         await draftWriter.put('$format', 'health-intake-identity-drafts-v1');
         let draftOrdinal = 0;

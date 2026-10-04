@@ -1,3 +1,6 @@
+import { ownershipPlanGroups } from './ownership-plan-groups.ts';
+import { ownershipPlanHolds } from './ownership-plan-holds.ts';
+import { prepareOwnershipRecordsSelection } from './ownership-records-selection.ts';
 import { prepareOwnershipIdentitySnapshots } from './ownership-identity-snapshots.ts';
 /** Owned complete report preview. Its scratch rows are views, never durable authority. */
 import { createOwnershipScopeIndex } from './ownership-scope-index.ts';
@@ -13,7 +16,7 @@ import {
 } from './intake-review-collection-host.ts';
 import type { IntakeReview } from '../shared/intake.ts';
 import type { SelectedOwnershipReviewScope } from './record-ownership-authority.ts';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import {
   HttpError,
@@ -40,6 +43,7 @@ import { ownershipClinicalHeader } from './ownership-clinical-header.ts';
 import { prepareOwnershipDecisionIndex } from './ownership-decision-index.ts';
 import {
   createOwnershipSourceSnapshotPreparation,
+  assertOwnershipSourceSnapshot,
   type OwnershipSourceSnapshotReference,
 } from './ownership-source-snapshots.ts';
 import { ownershipRequest, object } from './record-ownership-input.ts';
@@ -53,49 +57,71 @@ export async function prepareOwnershipReportPlan(
   root: string,
   profileId: string,
   request: OwnershipRequest,
-  options: { assertRunning?: () => void; onCheckpoint?: (stage: string) => void } = {},
+  options: {
+    assertRunning?: () => void;
+    onCheckpoint?: (stage: string) => void;
+    approvedRelationshipDecisions?: () => Iterable<
+      NonNullable<OwnershipRequest['relationshipDecisions']>[number]
+    >;
+  } = {},
 ) {
   request = structuredClone(request);
   const submittedDecisions = request.decisions ?? [],
-    submittedRelationships = request.relationshipDecisions ?? [];
+    submittedRelationshipValues = request.relationshipDecisions ?? [],
+    submittedRelationships =
+      options.approvedRelationshipDecisions ?? (() => submittedRelationshipValues);
   request = { ...request, decisions: [], relationshipDecisions: [] };
-  if (request.selection.type !== 'report')
-    throw Error('Report action requires its complete selection');
-  const intakeId = request.selection.intakeId,
-    metadata = intakeSourceMetadata(db, intakeId).metadata;
-  const mappingVersion = () =>
-    workflowHash(
-      activeMappingRules(
-        db,
-        metadata?.sourceProviderId ||
-          String(
-            db.prepare('SELECT provider_id FROM source_files WHERE id=?').get(intakeId)!
-              .provider_id,
-          ),
-      ),
-    );
-  options.onCheckpoint?.('readiness-start');
+  const report = request.selection.type === 'report' ? request.selection : null;
   await prepareOwnershipDecisionIndex(db, options);
-  const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, intakeId, {
-    mappingVersion: mappingVersion(),
-    currentMappingVersion: mappingVersion,
-    assertRunning: options.assertRunning,
-  });
-  if (ready.state !== 'ready')
-    throw new HttpError(
-      409,
-      'OWNERSHIP_REVIEW_PENDING',
-      'Complete report clinical evidence is still being prepared',
+  if (report) {
+    await prepareCollectionClinicalReviewDependencies(
+      db,
+      root,
+      profileId,
+      report.intakeId,
+      null,
+      options,
     );
-  options.onCheckpoint?.('readiness-complete');
-  await prepareCollectionReviewMembership(db, { id: intakeId }, options);
+    const intakeId = report.intakeId,
+      metadata = intakeSourceMetadata(db, intakeId).metadata;
+    const mappingVersion = () =>
+      workflowHash(
+        activeMappingRules(
+          db,
+          metadata?.sourceProviderId ||
+            String(
+              db.prepare('SELECT provider_id FROM source_files WHERE id=?').get(intakeId)!
+                .provider_id,
+            ),
+        ),
+      );
+    options.onCheckpoint?.('readiness-start');
+    const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, intakeId, {
+      mappingVersion: mappingVersion(),
+      currentMappingVersion: mappingVersion,
+      assertRunning: options.assertRunning,
+    });
+    if (ready.state !== 'ready')
+      throw new HttpError(
+        409,
+        'OWNERSHIP_REVIEW_PENDING',
+        'Complete report clinical evidence is still being prepared',
+      );
+    options.onCheckpoint?.('readiness-complete');
+    await prepareCollectionReviewMembership(db, { id: intakeId }, options);
+  }
+  const prepareSelection = () =>
+    report
+      ? prepareOwnershipReportSelection(db, profileId, request, options)
+      : prepareOwnershipRecordsSelection(db, profileId, request, options);
+  const intakeId = report?.intakeId;
   const token = randomUUID(),
     evidenceUrl =
       '/api/profiles/' +
       encodeURIComponent(profileId) +
       '/record-ownership/report-evidence/' +
       token;
-  let selection = await prepareOwnershipReportSelection(db, profileId, request, options);
+  let selection = await prepareSelection();
   // Upgrade only exact participating legacy originals before selecting the final
   // preview frontier. This is a counted cold conversion, never a legacy DTO fallback.
   const selectedClinical = clinicalReviewRevision(db),
@@ -131,33 +157,35 @@ export async function prepareOwnershipReportPlan(
             'OWNERSHIP_CHANGED',
             'Clinical evidence changed while preparing its exact sources',
           );
-        selection.view.address(selection.view.root());
+        if (selection.view) selection.view.address(selection.view.root());
       }
-    for (const pending of selection.pending()) await prepareDependency(intakeId, pending.recordId);
+    for (const pending of selection.pending()) await prepareDependency(intakeId!, pending.recordId);
     if (clinicalReviewRevision(db) !== selectedClinical)
       throw new HttpError(
         409,
         'OWNERSHIP_CHANGED',
         'Clinical evidence changed while preparing its exact sources',
       );
-    selection.view.address(selection.view.root());
+    if (selection.view) selection.view.address(selection.view.root());
     if (intakeDiscoveryRevision(db) !== selectedFrontier) {
       selection.close();
-      selection = await prepareOwnershipReportSelection(db, profileId, request, options);
+      selection = await prepareSelection();
     } else selection.assertCurrent();
   } catch (error) {
     selection.close();
     throw error;
   }
-  const store = createOwnershipPreviewStore(selection.sql, selection.sources, evidenceUrl);
+  const store = createOwnershipPreviewStore(
+    selection.sql,
+    selection.sources,
+    evidenceUrl,
+    report ? 'all' : 'changed',
+  );
   options.onCheckpoint?.('selection-complete');
   const scopes = createOwnershipScopeIndex(db, selection.sql, selection.assertCurrent);
   selection.sql.exec(
     'CREATE TABLE record_choices(id TEXT PRIMARY KEY,value TEXT); CREATE TABLE relationship_choices(id TEXT PRIMARY KEY); CREATE TABLE ownership_lineage(record_key TEXT PRIMARY KEY,moving TEXT,remaining TEXT); CREATE TABLE contribution_values(record_key TEXT,ordinal INTEGER,value TEXT,PRIMARY KEY(record_key,ordinal));',
   );
-  const snapshotStages: Awaited<
-    ReturnType<ReturnType<typeof createOwnershipSourceSnapshotPreparation>['finish']>
-  >[] = [];
   let snapshotPrepared = false;
   let identitySnapshots: Awaited<ReturnType<typeof prepareOwnershipIdentitySnapshots>> | undefined;
   for (const choice of submittedDecisions)
@@ -166,7 +194,7 @@ export async function prepareOwnershipReportPlan(
         'INSERT INTO record_choices VALUES(?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',
       )
       .run(choice.recordId, JSON.stringify(choice));
-  for (const choice of submittedRelationships)
+  for (const choice of submittedRelationships())
     selection.sql
       .prepare('INSERT OR IGNORE INTO relationship_choices VALUES(?)')
       .run(choice.decisionId);
@@ -179,7 +207,13 @@ export async function prepareOwnershipReportPlan(
   const relationshipDecision = (id: string) =>
     !!selection.sql.prepare('SELECT 1 FROM relationship_choices WHERE id=?').get(id);
   let retainedReview:
-    | { key: string; review: IntakeReview; ownership: SelectedOwnershipReviewScope; close(): void }
+    | {
+        key: string;
+        review: IntakeReview;
+        ownership: SelectedOwnershipReviewScope;
+        record(id: string): import('../shared/intake.ts').IntakeReviewRecord | undefined;
+        close(): void;
+      }
     | undefined;
   const reviewSource = (intakeId: string, sourceId: string) => {
     const proposal = sourceId.replace(/:line:\d+$/, ''),
@@ -203,6 +237,7 @@ export async function prepareOwnershipReportPlan(
         key,
         review: ready.session.review,
         ownership: ready.session.ownership,
+        record: (id: string) => ready.session.record(id),
         close: () => ready.session.close(),
       };
     }
@@ -210,7 +245,7 @@ export async function prepareOwnershipReportPlan(
   };
   let plan: Awaited<ReturnType<typeof prepareOwnershipNamePlan>> | undefined;
   try {
-    await scopes.prepare(selection.reference.intakeId);
+    if (intakeId) await scopes.prepare(intakeId);
     options.onCheckpoint?.('index-complete');
     const reportSelection = (
       refs: import('../shared/record-ownership.ts').OwnershipRecordReference[],
@@ -285,7 +320,7 @@ export async function prepareOwnershipReportPlan(
     for (const choice of submittedDecisions)
       if (!store.sink.hasRecord(choice.recordId))
         blockers.push('A matching decision is outside this selection.');
-    for (const choice of submittedRelationships)
+    for (const choice of submittedRelationships())
       if (!store.sink.relationships.has(choice.decisionId))
         blockers.push('A relationship decision is outside this selection.');
     for (const pending of selection.pending()) {
@@ -312,6 +347,13 @@ export async function prepareOwnershipReportPlan(
       { ...options, ownedReportScopes: true, scopes },
     );
     options.onCheckpoint?.('names-complete');
+    let holds = ownershipPlanHolds(
+      db,
+      selection.sql,
+      report ? [] : store.records,
+      selection.sources,
+      (intakeId, sourceId) => reviewSource(intakeId, sourceId).ownership,
+    );
     const finalize = () => {
       selection.assertCurrent();
       plan!.assertCurrent();
@@ -322,6 +364,31 @@ export async function prepareOwnershipReportPlan(
       const bucket = store.sink.blockerBucket('header', false);
       for (const blocker of blockers.values()) bucket.push(blocker);
       Object.assign(header, { blockerEvidence: bucket.reference() });
+      holds = ownershipPlanHolds(
+        db,
+        selection.sql,
+        report ? [] : store.records,
+        selection.sources,
+        (intakeId, sourceId) => reviewSource(intakeId, sourceId).ownership,
+      );
+      if (!report) {
+        const decisions = [
+          ...selection.sql.prepare('SELECT value FROM record_choices ORDER BY id').iterate(),
+        ].map((row) => JSON.parse(String(row.value)));
+        header.commitGroups = ownershipPlanGroups(
+          selection.sql,
+          store.records,
+          { ...request, decisions },
+          plan!.groupSourceEffects(),
+        );
+      }
+      const holdHash = createHash('sha256');
+      for (const hold of holds) holdHash.update(JSON.stringify(hold));
+      header.scopeToken = ownershipHash([
+        header.scopeToken,
+        header.commitGroups,
+        holdHash.digest('hex'),
+      ]);
       return header;
     };
     let header = finalize();
@@ -333,6 +400,7 @@ export async function prepareOwnershipReportPlan(
       pendingTotal: store.pending.length,
       relationshipTotal: store.relationships.length,
       recordBlockerTotal: store.recordBlockerTotal,
+      reportHoldTotal: holds.length,
       url: evidenceUrl,
     };
     let stageToken: ReturnType<typeof currentTransactionToken>;
@@ -340,6 +408,7 @@ export async function prepareOwnershipReportPlan(
       header = finalize();
       reference.digest = ownershipHash([selection.reference, store.sink.digest]);
       reference.recordBlockerTotal = store.recordBlockerTotal;
+      reference.reportHoldTotal = holds.length;
       return header;
     };
     return {
@@ -365,100 +434,83 @@ export async function prepareOwnershipReportPlan(
       },
       async prepareSourceSnapshots() {
         if (snapshotPrepared) {
-          for (const stage of snapshotStages) stage.assertCurrent();
+          this.stageSourceSnapshots();
           return;
         }
         selection.assertCurrent();
         plan!.assertCurrent();
+        if (
+          'personId' in header.destination &&
+          store.records.every((item) => item.action === 'unchanged') &&
+          store.pending.every(
+            (item) =>
+              item.personId ===
+              ('personId' in header.destination ? header.destination.personId : null),
+          )
+        )
+          return;
         selection.sql.exec('DELETE FROM ownership_lineage');
-        const factories = new Map<
-          string,
-          ReturnType<typeof createOwnershipSourceSnapshotPreparation>
-        >();
-        try {
-          for (const item of store.records) {
-            if (item.action === 'unchanged' || !item.splitReviewRequired) continue;
-            const clinical = ownershipClinicalHeader(db, item.kind, item.recordId),
-              audit = clinical.extra.import.ownershipReview as
-                { sourceRecordIdsReference?: OwnershipSourceSnapshotReference } | undefined,
-              previous = audit?.sourceRecordIdsReference,
-              custodian = previous?.source.intakeId ?? intakeId;
-            let factory = factories.get(custodian);
-            if (!factory) {
-              factory = createOwnershipSourceSnapshotPreparation(
-                db,
-                { id: custodian },
-                {
-                  assertRunning: () => {
-                    selection.assertCurrent();
-                    plan!.assertCurrent();
-                  },
-                },
-              );
-              factories.set(custodian, factory);
-            }
-            const key = ownershipHash([item.kind, item.recordId]);
-            const ids = function* (selected?: boolean) {
-              for (const row of selection.sql
-                .prepare(
-                  'SELECT source_id FROM preview_contributions WHERE record_key=?' +
-                    (selected === undefined ? '' : ' AND selected=?') +
-                    ' ORDER BY ordinal',
-                )
-                .iterate(...(selected === undefined ? [key] : [key, Number(selected)])))
-                yield String(row.source_id);
-            };
-            const snapshots = await factory.prepareSplit({
-              previous,
-              sourceRecordIds: () => ids(),
-              movingSourceRecordIds: () => ids(true),
-            });
-            selection.sql
-              .prepare('INSERT INTO ownership_lineage VALUES(?,?,?)')
-              .run(key, JSON.stringify(snapshots.moving), JSON.stringify(snapshots.remaining));
-          }
-          const factoryFor = (id: string) => {
-            let factory = factories.get(id);
-            if (!factory) {
-              factory = createOwnershipSourceSnapshotPreparation(
-                db,
-                { id },
-                {
-                  assertRunning: () => {
-                    selection.assertCurrent();
-                    plan!.assertCurrent();
-                  },
-                },
-              );
-              factories.set(id, factory);
-            }
-            return factory;
+        const factoryFor = (id: string) =>
+          createOwnershipSourceSnapshotPreparation(
+            db,
+            { id },
+            {
+              assertRunning: () => {
+                selection.assertCurrent();
+                plan!.assertCurrent();
+              },
+            },
+          );
+        for (const item of store.records) {
+          if (item.action === 'unchanged' || !item.splitReviewRequired) continue;
+          const clinical = ownershipClinicalHeader(db, item.kind, item.recordId),
+            audit = clinical.extra.import.ownershipReview as
+              { sourceRecordIdsReference?: OwnershipSourceSnapshotReference } | undefined,
+            previous = audit?.sourceRecordIdsReference,
+            custodian = previous?.source.intakeId ?? intakeId;
+          if (!custodian)
+            throw Error('A selected whole record cannot require a contribution split');
+          const factory = factoryFor(custodian),
+            key = ownershipHash([item.kind, item.recordId]);
+          const ids = function* (selected?: boolean) {
+            for (const row of selection.sql
+              .prepare(
+                'SELECT source_id FROM preview_contributions WHERE record_key=?' +
+                  (selected === undefined ? '' : ' AND selected=?') +
+                  ' ORDER BY ordinal',
+              )
+              .iterate(...(selected === undefined ? [key] : [key, Number(selected)])))
+              yield String(row.source_id);
           };
-          identitySnapshots = await prepareOwnershipIdentitySnapshots(db, selection.sql, {
-            factory: factoryFor,
-            record: (intakeId, recordId) =>
-              reviewSource(intakeId, recordId).review.records.find(
-                (record) => record.id === recordId,
-              ),
-            report: { intakeId, groupId: selection.reference.groupId },
-            sources: (function* () {
-              for (const item of store.records)
+          const snapshots = await factory.prepareSplit({
+            previous,
+            sourceRecordIds: () => ids(),
+            movingSourceRecordIds: () => ids(true),
+          });
+          await factory.finishMaintenance();
+          selection.sql
+            .prepare('INSERT INTO ownership_lineage VALUES(?,?,?)')
+            .run(key, JSON.stringify(snapshots.moving), JSON.stringify(snapshots.remaining));
+        }
+        identitySnapshots = await prepareOwnershipIdentitySnapshots(db, selection.sql, {
+          factory: factoryFor,
+          record: (intakeId, recordId) => reviewSource(intakeId, recordId).record(recordId),
+          ...(report ? { report: { intakeId: report.intakeId, groupId: report.groupId } } : {}),
+          sources: (function* () {
+            for (const item of store.records)
+              if (item.action !== 'unchanged')
                 for (const c of iterateOwnershipStreamContributions(db, item.kind, item.recordId, {
                   scopes: scopes.contributionValues.bind(scopes),
                 }))
                   yield { intakeId: c.intakeId, recordId: c.sourceRecordId, identity: c.identity };
-              for (const recordId of selection.occurrences()) yield { intakeId, recordId };
-            })(),
-          });
-          for (const factory of factories.values()) snapshotStages.push(await factory.finish());
-          selection.assertCurrent();
-          plan!.assertCurrent();
-          snapshotPrepared = true;
-        } catch (error) {
-          for (const stage of snapshotStages) stage.dispose();
-          snapshotStages.length = 0;
-          throw error;
-        }
+            for (const recordId of selection.occurrences())
+              yield { intakeId: intakeId!, recordId, reportMember: true };
+          })(),
+        });
+        selection.assertCurrent();
+        plan!.assertCurrent();
+        snapshotPrepared = true;
+        this.stageSourceSnapshots();
       },
       identityIssues(intakeId: string, recordId: string) {
         if (!identitySnapshots) throw Error('Identity authority preparation required');
@@ -483,14 +535,57 @@ export async function prepareOwnershipReportPlan(
       stageSourceSnapshots() {
         if (!snapshotPrepared)
           throw Error('Ownership source snapshots require completed preparation');
-        for (const stage of snapshotStages) stage.assertCurrent();
-        for (const stage of snapshotStages) stage.apply();
+        selection.assertCurrent();
+        plan!.assertCurrent();
+        for (const row of selection.sql
+          .prepare('SELECT moving,remaining FROM ownership_lineage ORDER BY record_key')
+          .iterate()) {
+          assertOwnershipSourceSnapshot(db, JSON.parse(String(row.moving)));
+          assertOwnershipSourceSnapshot(db, JSON.parse(String(row.remaining)));
+        }
+        identitySnapshots!.assertCurrent();
       },
       reference,
       boundary: selection.boundary,
       occurrences: selection.occurrences,
       assertCurrent: selection.assertCurrent,
       finalize: refresh,
+      requestForGroup(group: OwnershipPreview['commitGroups'][number]): OwnershipRequest {
+        // The approved parent can be read after an earlier independent child commits.
+        // Each child reselects and checks its own current clinical authority.
+        if (request.selection.type !== 'records')
+          throw Error('A report is one indivisible ownership group');
+        const ids = new Set(group.recordIds),
+          decisions: NonNullable<OwnershipRequest['decisions']> = [];
+        for (const id of ids) {
+          const choice = decision(id);
+          if (choice) decisions.push(choice);
+        }
+        return {
+          ...request,
+          selection: {
+            type: 'records',
+            records: request.selection.records.filter((record) => ids.has(record.recordId)),
+          },
+          decisions,
+          relationshipDecisions: [],
+          nameDecisions: [],
+        };
+      },
+      *relationshipChoicesForGroup(group: OwnershipPreview['commitGroups'][number]) {
+        const ids = new Set(group.recordIds);
+        for (const row of selection.sql
+          .prepare(
+            'SELECT r.id,r.value FROM preview_relationships r JOIN relationship_choices c ON c.id=r.id ORDER BY r.ordinal',
+          )
+          .iterate()) {
+          const relation = JSON.parse(
+            String(row.value),
+          ) as OwnershipPreview['relationships'][number];
+          if (ids.has(relation.recordId) || ids.has(relation.otherRecordId))
+            yield { decisionId: String(row.id), action: 'withdraw' as const };
+        }
+      },
       *choices() {
         selection.assertCurrent();
         for (const row of selection.sql
@@ -612,6 +707,7 @@ export async function prepareOwnershipReportPlan(
           records: store.records,
           pending: store.pending,
           relationships: store.relationships,
+          reportHolds: holds,
         };
       },
       publicPreview(): OwnershipReportPreviewReference {
@@ -623,6 +719,7 @@ export async function prepareOwnershipReportPlan(
           relationships,
           commitGroups,
           blockers: legacyBlockers,
+          reportHolds,
           ...rest
         } = header;
         const blockerEvidence = (header as OwnershipCommitView).blockerEvidence;
@@ -631,6 +728,7 @@ export async function prepareOwnershipReportPlan(
         void pending;
         void names;
         void relationships;
+        void reportHolds;
         return {
           ...rest,
           blockers: blockerEvidence ? store.sink.blockerBucket('header', false).presentation() : [],
@@ -639,16 +737,15 @@ export async function prepareOwnershipReportPlan(
           recordsIncluded: false,
           pendingIncluded: false,
           relationshipsIncluded: false,
+          reportHoldsIncluded: false,
           reportEvidence: reference,
-          commitGroups: [
-            {
-              id: commitGroups[0]!.id,
-              atomic: true,
-              recordTotal: reference.recordTotal,
-              pendingCount: reference.pendingTotal,
-              url: reference.url,
-            },
-          ],
+          commitGroups: commitGroups.map((group) => ({
+            id: group.id,
+            atomic: true,
+            recordTotal: report ? reference.recordTotal : group.recordIds.length,
+            pendingCount: group.pendingCount,
+            url: reference.url,
+          })),
         };
       },
       contributionPage(key: string, source: string | null, after = -1, limit = 16, bytes = 65536) {
@@ -768,7 +865,7 @@ export async function prepareOwnershipReportPlan(
         };
       },
       fragment(
-        section: 'records' | 'pending' | 'relationships',
+        section: 'records' | 'pending' | 'relationships' | 'holds',
         ordinal: number,
         offset: number,
         bytes = 65536,
@@ -776,7 +873,7 @@ export async function prepareOwnershipReportPlan(
         selection.assertCurrent();
         plan!.assertCurrent();
         if (
-          !['records', 'pending', 'relationships'].includes(section) ||
+          !['records', 'pending', 'relationships', 'holds'].includes(section) ||
           !Number.isSafeInteger(ordinal) ||
           ordinal < 0 ||
           !Number.isSafeInteger(offset) ||
@@ -809,7 +906,7 @@ export async function prepareOwnershipReportPlan(
         };
       },
       page(
-        section: 'records' | 'pending' | 'relationships',
+        section: 'records' | 'pending' | 'relationships' | 'holds',
         after = -1,
         limit = 32,
         bytes = 65536,
@@ -833,7 +930,9 @@ export async function prepareOwnershipReportPlan(
               ? reference.recordTotal
               : section === 'pending'
                 ? reference.pendingTotal
-                : reference.relationshipTotal;
+                : section === 'relationships'
+                  ? reference.relationshipTotal
+                  : reference.reportHoldTotal;
         const rows = selection.sql
             .prepare(
               'SELECT ordinal,length(CAST(value AS BLOB)) bytes FROM ' +
@@ -874,7 +973,6 @@ export async function prepareOwnershipReportPlan(
       },
       close() {
         retainedReview?.close();
-        for (const stage of snapshotStages) stage.dispose();
         plan!.close();
         selection.close();
       },

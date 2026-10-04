@@ -7,6 +7,7 @@ import type {
 } from '../shared/record-ownership.ts';
 import { appendOwnershipDecision, ownershipHash } from './ownership-journal.ts';
 import { json, type Database } from './database.ts';
+import { ownershipDecisionQueries } from './ownership-decision-index.ts';
 export function ownershipCommitGroups(
   preview: Pick<OwnershipPreview, 'records' | 'pending' | 'relationships'> & {
     names: Iterable<Pick<OwnershipNameEffect, 'personId' | 'affectedSourceIds'>>;
@@ -131,12 +132,16 @@ export function retainOwnershipPlan(
     );
 }
 export function ownershipPlans(db: Database, operationId: string): OwnershipGroupPlan[] {
-  return db
-    .prepare(
-      "SELECT coverage_json FROM manual_batches WHERE title='Ownership correction group' AND json_extract(coverage_json,'$.parentOperationId')=? ORDER BY id",
-    )
-    .all(operationId)
-    .map((r) => json(r.coverage_json) as OwnershipGroupPlan);
+  const indexed = ownershipDecisionQueries(db);
+  const rows = indexed
+    ? Array.from(indexed.receiptGroups(operationId))
+    : db
+        .prepare(
+          "SELECT coverage_json FROM manual_batches WHERE title='Ownership correction group' AND json_extract(coverage_json,'$.parentOperationId')=? ORDER BY id LIMIT 1001",
+        )
+        .all(operationId);
+  if (rows.length > 1000) throw Error('Accepted ownership group selection exceeds its bound');
+  return rows.map((r) => json(r.coverage_json) as OwnershipGroupPlan);
 }
 export function ownershipGroupRequest(
   request: OwnershipRequest,

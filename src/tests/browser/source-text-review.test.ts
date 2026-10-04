@@ -1,5 +1,6 @@
 import { launchBrowser, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
+import { fixtureApi, fixtureAssertNoAccepted } from './native-intake-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -62,6 +63,7 @@ test(
       return profile.id as string;
     });
     const prefix = `/api/profiles/${profileId}`;
+    const api = fixtureApi(page, url);
     const original =
       'Fictional administrative wording.\nNo fever; value 0.05 mg.\nRepeated source footer.';
     const upload = await page.request.post(url + prefix + '/intakes', {
@@ -119,8 +121,11 @@ test(
     const corrected = await get(`/intakes/${encodeURIComponent(intake.id)}/source-text`);
     assert.notEqual(corrected.revision.id, initial.revision.id);
     assert.equal(corrected.revision.parentRevisionId, initial.revision.id);
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).proposals.length, 0);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
+    assert.equal(
+      (await get(`/intakes/${encodeURIComponent(intake.id)}`)).collections.proposals.total,
+      0,
+    );
     await page.getByRole('button', { name: 'Source text revision history', exact: true }).click();
     await page.getByText(/Historical revision/).waitFor();
     assert.equal(
@@ -166,7 +171,7 @@ test(
       ),
       'source review does not restart the stopped upload job',
     );
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
     // A real non-square image exercises browser layout/rotation. OCR availability is
     // not asserted here; the retained pixel view and explicit exceptions suffice.
     const canvas = createCanvas(360, 180);
@@ -237,13 +242,13 @@ test(
       .getByRole('textbox', { name: 'Literal source wording', exact: true })
       .fill('No fever; value 0.05 mg.');
     await manual.getByRole('button', { name: 'Create review draft', exact: true }).click();
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
     await page.getByRole('link', { name: 'Review the new record', exact: true }).click();
     const inline = page.locator('.import-record-accordion');
     await inline
       .getByRole('heading', { name: 'Cookie Doe fictional measurement', exact: true })
       .waitFor();
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
     const screenshots = process.env.CRS_SCREENSHOTS_DIR;
     if (screenshots) {
       mkdirSync(screenshots, { recursive: true });
@@ -375,7 +380,7 @@ test(
     );
     const afterApproval = await get('/intakes/' + encodeURIComponent(intake.id));
     assert.equal(afterApproval.version, beforeApproval.version);
-    assert.equal(afterApproval.imported, null);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
     assert.equal(
       (await get('/intake-batches')).filter(
         (batch: { status: string }) => batch.status === 'running',

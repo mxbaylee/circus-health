@@ -2,6 +2,7 @@ import { copyOwnershipHoldMessage } from './ownership-identity-values.ts';
 import { createHash } from 'node:crypto';
 import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
 import { isSelectedReportGroups } from './intake-selected-report-groups.ts';
+import { canonicalSelectionChunks } from './intake-selection-canonical.ts';
 
 /** Only v2 pair transport pins may advance without another human review. */
 export function durableSelectionInputs(value: unknown): unknown {
@@ -27,8 +28,22 @@ export function durableSelectionInputs(value: unknown): unknown {
   copyOwnershipHoldMessage(object, result);
   return result;
 }
-export const selectionAuthority = (value: unknown): string => {
+export const selectionAuthority = (
+  value: unknown,
+  options: { recordComparisonsUndefined?: boolean } = {},
+): string => {
   const hash = createHash('sha256');
-  for (const chunk of canonicalReviewValueChunks(durableSelectionInputs(value))) hash.update(chunk);
+  const record =
+    value && typeof value === 'object' ? (value as { record?: unknown }).record : undefined;
+  const chunks = canonicalReviewValueChunks(
+    value,
+    options.recordComparisonsUndefined
+      ? {
+          fieldValue: (object, key) =>
+            object === record && key === 'comparisons' ? { value: undefined } : undefined,
+        }
+      : {},
+  );
+  for (const chunk of canonicalSelectionChunks(chunks)) hash.update(chunk);
   return hash.digest('hex');
 };

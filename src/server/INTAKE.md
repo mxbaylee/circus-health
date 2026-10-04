@@ -211,7 +211,7 @@ Read caches never authorize acceptance. Returned selected rows refresh their rev
 
 The response includes group headers, exact proposal `blocks`, matching totals, pre-kind `kindCounts`, global clinical state `counts`, `nextCursor` and reading `activity`. Records add durable `feedKey`, stable `feedOrder`, `feedKind` and `manuallyEdited` to the existing review fields. The manual-edit marker compares clinical values against the undrafted mapped proposal; merely saving an unchanged full draft or choosing Review later does not set it. Identity/source confirmation and automatic reusable-rule application are distinct from a manual clinical edit. Cursors bind profile, view and filters; they are navigation state, never write authorization. Completing earlier rows does not shift later cursor results. A changed candidate version has a different key.
 
-People discovery is independent: `people.groups`, `people.counts`, `people.totalGroups` and `people.nextCursor` expose at most the same limit of group headers, including People-only imports. Pass `peopleCursor` to continue that window; use the existing scoped People APIs for records and reviewed add/update/disposition operations. Clinical search, state and edited filters do not filter this metadata window. `kindCounts.person` follows the selected view; clinical kind counts follow view/state/search/edited before kind. Clients must not present the independent People counts as filtered clinical results.
+People discovery is independent: `people.groups`, `people.counts`, `people.totalGroups` and `people.nextCursor` expose at most the same limit of group headers, including People-only imports. Pass `peopleCursor` to continue that window; use the existing scoped People APIs for records and reviewed add/update/disposition operations. Clinical state and edited filters do not filter this metadata window. Native feeds apply `q` to retained People names, display titles, relationships, tags and original/member filenames; `GET /intakes/people/:groupId` accepts the same query. Search scans complete selected evidence in bounded steps, including referenced filenames, so matches outside the displayed page remain discoverable. Both windows bind their cursors to normalized search text and current authority, and People counts describe that searched scope before the view filter. Warm group changes replace only their searched People counts. `kindCounts.person` follows the selected view and native People search; clinical kind counts follow view/state/search/edited before kind. Legacy inline feeds retain their prior unfiltered People metadata window. Clients must not present the independent People counts as filtered clinical results.
 
 Checkbox selection and save eligibility are distinct. Blocked pending records can be selected for Review later; only exact current eligible records can be accepted. Before counted acceptance, coalesce selected rows from different report headers that share `[intakeId,proposalId]` into one proposal block. Flush drafts, re-read current exact snapshots, and preserve uncertain operation requests/receipts. Never substitute a newer candidate version for an earlier selection.
 
@@ -236,6 +236,20 @@ The result is `IntakeReportAcceptanceResult`: `{receipt,replayed,durability}`. I
 The request fingerprint and receipt are appended to the first selected source's curation-owned `workflow.reportAcceptances`. Subsequent metadata, proposals and ordinary imports preserve them. The operation ID/fingerprint/result also accompanies the existing durable transaction journal. This is application-owned metadata; model envelopes cannot replace it. Backup/rebuild retains the original receipt independently of the source's latest accepted proposal.
 
 `GET /intakes/report-acceptance/:operationId` retrieves that receipt after reconnect. Repeating POST with the same operation ID and exact request returns the original receipt without accepting again, even after later operations. Reusing the ID for a changed request returns `OPERATION_CONFLICT`. A lost reply is not evidence of failure: retain the request and first query or replay its operation; never refresh mappings/tokens under an uncertain operation ID. After a definite stale/validation rejection, review again and use a new operation ID for the new selection.
+
+Native selection tokens stream complete retained questions and answer history,
+issues, identity warnings, report links and draft resolution witnesses. Their
+presentation references and counts cannot substitute for that content. A
+same-count change outside the displayed page requires fresh review. Token
+construction preserves the inline legacy recipe and literal numeric spelling;
+it removes only the established ephemeral review and v2 pair transport pins.
+Comparison discovery is excluded before its provider is read. Refresh pending
+reviews after an update that corrects this derived-token calculation; retained
+completed operation receipts still replay their original result.
+
+The native reconnect read explicitly awaits source-bound receipt lookup preparation when a later intake mutation or disposable-cache loss invalidated it. Warm reads reuse complete indexes. Preparation yields between bounded checkpoints and rechecks profile ownership; it does not reconstruct complete workflow summaries or resume clinical writes. Fresh atomic approval verifies the complete review at request entry, then may refresh generated pair transport pins only across host-certified auxiliary publications. Ordinary intervening writes still require a fresh review.
+
+Selection tokens consume complete canonical policy providers, including referenced question answers, draft resolutions, issues, warnings and ownership messages. Presentation counts or previews cannot replace those commitments. Only the established ephemeral pair transport fields and discovery-only comparison presentation are omitted; a same-count change to off-page policy evidence requires a new selected review.
 
 Durability is reported separately and must be honored. A failure after publishing a durable commit may throw without a success response; it does not justify rerunning clinical writes. If the working cache trails accepted durable history, POST and GET return `REPORT_ACCEPTANCE_RECOVERY_REQUIRED` until the profile is reopened/recovered, rather than falsely reporting the receipt absent. After recovery the receipt resolves the outcome. A nonconflicted cache without that operation returns `REPORT_ACCEPTANCE_NOT_FOUND`. That legacy receipt is never rewritten as partial success. Profile lock closes the working database and prevents acceptance until authorized unlock.
 
@@ -272,6 +286,55 @@ Persisted source identities are centralized in `intake-source-identity.ts` as tw
 `GET /intakes/:id/identity-review?groupId=...` returns a bounded, profile-scoped `IntakeIdentityReview`. Its status is `evidenced_match`, `prior_confirmation`, `confirmation_required`, `missing_warning` or `conflict`; `blocking` and `message` are authoritative. It includes the current versioned Self name/DOB snapshot, supported evidenced identity, exact values offered for blank Self fields, conflicts, and a confirmation scope when an explicit action is available. `GET .../identity-scope` retains the legacy scope response shape for callers that already know they need that action.
 
 An `IntakeIdentityScope` includes the exact original/report/printed-subject claims, original or retained-member link, PDF page where available, `verificationMode`, supported name/DOB evidence and person/original fingerprints, immutable group version and full historical membership, and the exact pending candidate-version/proposal/record/issue targets. `assignmentTargets` also exposes pending records that already auto-match Self, so the user can deliberately assign them to a family Person; accepted records are excluded. `selfVersion` pins the displayed Self identity. The maximum is 1000 historical members and 1000 target occurrences. Targets count draft occurrences; distinct candidate/version pairs count clinical results. Historical accepted or superseded members are shown in the snapshot but never receive a new draft.
+
+Those array limits apply to the retained legacy handler. Native collection
+identity routes return `scope:null` and an explicit
+`scopeReference.format:"health-intake-identity-scope-v2"`. Its `collection`
+identifies the immutable selected snapshot and complete membership, target,
+assignment-target, question and competing-subject counts. No partially populated
+legacy scope is returned. `GET .../identity-scope` returns this reference for a
+native intake. `GET .../identity-scope-page?groupId=...&scopeToken=...&section=...`
+reads 1–100 items with a version-bound cursor and a bounded response byte budget.
+Items are explicit values or exact large-item references;
+`GET .../identity-scope-fragment` uses the same pins plus `section`, `ordinal` and
+byte `offset` to return at most 32 KiB. A complete-question attestation requires
+displaying all question pages and fragments. `confirmationCount` counts the
+complete selected report receipt history. Advisory warnings remain complete
+inline only when bounded; otherwise `warningsReference` identifies their full
+count and the same readers with `section=warnings`.
+
+Selected-record DOB advisories likewise retain a complete repeatable policy
+sequence. When its inline presentation budget is exceeded,
+`identityReview.warningsReference.format:"health-intake-review-identity-warnings-v1"`
+provides its exact count and token; the record section reader exposes
+`section=identityWarnings`, including exact fragment references for large items.
+The review token still hashes the full legacy warning array, including warnings
+outside the displayed page. Saved Person matching traverses every active Person
+through a repeatable SQL provider and retains only the scalar unique owner or
+ambiguity state; the bounded Person chooser cannot hide an off-page collision.
+
+Native commands retain `health-intake-identity-receipt-v2`: the original
+attestation, outcome and optional person/Self-field results, exact scope
+reference, and a `draftCollection` reference whose immutable snapshot contains
+all new draft IDs. The scope snapshot retains exact legacy canonical collection
+bytes; its token uses the same ordered scope recipe rather than substituting a
+storage tree hash. Receipt-policy adapters traverse complete membership and
+issue/resolution witnesses, including large question equality proofs, without
+materializing the collections. The scope, draft snapshots, drafts, human receipt
+and People changes select in one ordinary transaction. Auxiliary preparation
+cannot select a partial decision. Derived review state remains visibly pending
+until complete bounded preparation finishes; exact operation replay returns the
+retained result without repeating Person or Self updates.
+
+A single oversized clinical scalar returns `scopeFragmentReference` and a
+located pending conflict instead of a scope, with exact retained bytes available
+through the collection fragment reader. Common confirmation remains unavailable
+for that scalar; this is the separate clinical text-byte boundary. Aggregate
+membership, issue counts and alternative-subject questions have no corresponding
+identity count or cumulative byte refusal. Existing legacy receipts continue to
+use their original policy adapter. Earlier readers do not understand native
+collection authority or compact v2 identity receipts and must refuse it rather
+than interpret an unloaded collection as empty.
 
 Before confirmation the client must show the subject as a claim, the report boundary and the number of affected distinct results, with the exact targets and original/page available to inspect. `literal_text_match` means only that both literal quotes occur in retained text; it does not verify identity. `human_reviewed_original` denotes an image or PDF page without extractable text; it never pretends a text verifier read the printed name. A direct “This is me” action confirms the displayed report's subject; it must not claim that every original or result has already been reviewed.
 

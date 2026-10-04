@@ -66,10 +66,12 @@ async function publish(
 test('duplicate evidence snapshots retain exact binary order, giant IDs, composed selection and unchanged replay', async (t) => {
   const { db, source, authority } = await fixture(t),
     rows = ordered(
-      ['fictional-a', 'fictional-' + 'x'.repeat(1500), '\ue000', '😀'].map((id) => ({
-        id,
-        value: value(id),
-      })),
+      ['\u0001'.repeat(1800), 'fictional-a', 'fictional-' + 'x'.repeat(1500), '\ue000', '😀'].map(
+        (id) => ({
+          id,
+          value: value(id),
+        }),
+      ),
     ),
     expected = canonicalLiteral(rows.map((row) => row.value)),
     first = createDuplicateEvidenceSnapshotPreparation(db, source),

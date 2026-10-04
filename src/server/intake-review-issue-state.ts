@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Database } from './database.ts';
+export {
+  createReviewIssueScratch,
+  reviewIssueScratchCounts,
+} from './intake-review-issue-scratch.ts';
 import type { IntakeReviewIssue, IntakeReviewRecord } from '../shared/intake.ts';
 import type { IntakeReviewIssuesReference } from '../shared/intake-review-issues.ts';
 import { canonicalLiteral, parseLiteralJSON } from './intake-format.ts';
@@ -8,20 +12,21 @@ import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
 import { registerReviewRecordField } from './intake-review-selected-record.ts';
 import { recordIntakeWork, recordIntakePeak, withIntakeWork } from './intake-work-accounting.ts';
 
-export interface ReviewIssueCollection extends Iterable<IntakeReviewIssue> {
+export interface ReviewPolicyValueCollection<T extends { id: string }> extends Iterable<T> {
   readonly length: number;
-  at(ordinal: number): IntakeReviewIssue | undefined;
-  find(predicate: (issue: IntakeReviewIssue) => unknown): IntakeReviewIssue | undefined;
-  some(predicate: (issue: IntakeReviewIssue) => unknown): boolean;
-  push(issue: IntakeReviewIssue): number;
-  findId?(id: string): IntakeReviewIssue | undefined;
+  at(ordinal: number): T | undefined;
+  find(predicate: (issue: T) => unknown): T | undefined;
+  some(predicate: (issue: T) => unknown): boolean;
+  push(issue: T): number;
+  findId?(id: string): T | undefined;
   markQuestionReset?(id: string): void;
   questionWasReset?(id: string): boolean;
 }
+export type ReviewIssueCollection = ReviewPolicyValueCollection<IntakeReviewIssue>;
 const providers = new WeakMap<IntakeReviewIssuesReference, ReviewIssueCollection>();
-const references = new WeakMap<ReviewIssueCollection, IntakeReviewIssuesReference>();
+const references = new WeakMap<object, IntakeReviewIssuesReference>();
 
-const encodeIssue = (issue: IntakeReviewIssue, reset = false) =>
+const encodeIssue = (issue: { id: string }, reset = false) =>
   JSON.stringify({
     json: JSON.stringify(issue),
     reset,
@@ -30,33 +35,32 @@ const encodeIssue = (issue: IntakeReviewIssue, reset = false) =>
     ),
   });
 
-/** Connection-local derived policy. No journal or recovery authority is written. */
+/** Disposable derived policy. Host reviews supply their own private scratch connection. */
 export function reviewIssueFactory(
   db: Database,
   input: { sourceId: string; generation: string; assertCurrent(): void },
+  storage: Database = db,
 ) {
-  const retainedTable = !!db
+  const retainedTable = !!storage
     .prepare(
       "SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='intake_review_issue_policy_v2'",
     )
     .get();
-  db.exec(
+  storage.exec(
     `CREATE TEMP TABLE IF NOT EXISTS intake_review_issue_policy_v2(scope TEXT NOT NULL,run TEXT NOT NULL,source TEXT NOT NULL,generation TEXT NOT NULL,ordinal INTEGER NOT NULL,id TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(scope,ordinal),UNIQUE(scope,id)) WITHOUT ROWID`,
   );
-  db.exec(`CREATE TEMP TABLE IF NOT EXISTS intake_review_issue_scope(scope TEXT PRIMARY KEY,run TEXT NOT NULL,source TEXT NOT NULL,generation TEXT NOT NULL,count INTEGER NOT NULL) WITHOUT ROWID;
+  storage.exec(`CREATE TEMP TABLE IF NOT EXISTS intake_review_issue_scope(scope TEXT PRIMARY KEY,run TEXT NOT NULL,source TEXT NOT NULL,generation TEXT NOT NULL,count INTEGER NOT NULL) WITHOUT ROWID;
     CREATE TEMP TRIGGER IF NOT EXISTS intake_review_issue_insert AFTER INSERT ON intake_review_issue_policy_v2 BEGIN UPDATE intake_review_issue_scope SET count=count+1 WHERE scope=NEW.scope; END;
     CREATE TEMP TRIGGER IF NOT EXISTS intake_review_issue_delete AFTER DELETE ON intake_review_issue_policy_v2 BEGIN UPDATE intake_review_issue_scope SET count=count-1 WHERE scope=OLD.scope; END;`);
-  if (!retainedTable) db.exec('DELETE FROM intake_review_issue_scope');
+  if (!retainedTable) storage.exec('DELETE FROM intake_review_issue_scope');
   input.assertCurrent();
   // Source generations are made from the same authority/dependency pins used by assertCurrent.
-  db.prepare('DELETE FROM intake_review_issue_policy_v2 WHERE source=? AND generation<>?').run(
-    input.sourceId,
-    input.generation,
-  );
-  db.prepare('DELETE FROM intake_review_issue_scope WHERE source=? AND generation<>?').run(
-    input.sourceId,
-    input.generation,
-  );
+  storage
+    .prepare('DELETE FROM intake_review_issue_policy_v2 WHERE source=? AND generation<>?')
+    .run(input.sourceId, input.generation);
+  storage
+    .prepare('DELETE FROM intake_review_issue_scope WHERE source=? AND generation<>?')
+    .run(input.sourceId, input.generation);
   const run = randomUUID();
   let active = true;
   const originalCheck = input.assertCurrent;
@@ -67,9 +71,9 @@ export function reviewIssueFactory(
       originalCheck();
     },
   };
-  const create = (
+  const create = <T extends { id: string } = IntakeReviewIssue>(
     record: Pick<IntakeReviewRecord, 'id' | 'candidateVersionId'>,
-  ): ReviewIssueCollection => {
+  ): ReviewPolicyValueCollection<T> => {
     input.assertCurrent();
     const scope = createHash('sha256')
       .update(
@@ -88,15 +92,12 @@ export function reviewIssueFactory(
       count: 0,
       token: '',
     };
-    db.prepare('INSERT INTO intake_review_issue_scope VALUES(?,?,?,?,0)').run(
-      scope,
-      run,
-      input.sourceId,
-      input.generation,
-    );
+    storage
+      .prepare('INSERT INTO intake_review_issue_scope VALUES(?,?,?,?,0)')
+      .run(scope, run, input.sourceId, input.generation);
     const check = () => {
       input.assertCurrent();
-      const count = db
+      const count = storage
         .prepare('SELECT count FROM intake_review_issue_scope WHERE scope=?')
         .get(scope)?.count;
       if (count !== ref.count)
@@ -113,7 +114,7 @@ export function reviewIssueFactory(
         undefined: string[];
         reset?: boolean;
       };
-      const value = parseLiteralJSON(stored.json) as unknown as IntakeReviewIssue;
+      const value = parseLiteralJSON(stored.json) as unknown as T;
       for (const key of stored.undefined)
         Object.defineProperty(value, key, {
           value: undefined,
@@ -126,9 +127,9 @@ export function reviewIssueFactory(
           check();
           Reflect.set(target, key, item);
           const text = encodeIssue(target, stored.reset);
-          db.prepare(
-            'UPDATE intake_review_issue_policy_v2 SET value=? WHERE scope=? AND ordinal=?',
-          ).run(text, scope, row.ordinal);
+          storage
+            .prepare('UPDATE intake_review_issue_policy_v2 SET value=? WHERE scope=? AND ordinal=?')
+            .run(text, scope, row.ordinal);
           withIntakeWork(db, 'warm', () =>
             recordIntakeWork('reviewIssuePolicyWrittenBytes', Buffer.byteLength(text)),
           );
@@ -137,16 +138,16 @@ export function reviewIssueFactory(
         deleteProperty(target, key) {
           check();
           Reflect.deleteProperty(target, key);
-          db.prepare(
-            'UPDATE intake_review_issue_policy_v2 SET value=? WHERE scope=? AND ordinal=?',
-          ).run(encodeIssue(target, stored.reset), scope, row.ordinal);
+          storage
+            .prepare('UPDATE intake_review_issue_policy_v2 SET value=? WHERE scope=? AND ordinal=?')
+            .run(encodeIssue(target, stored.reset), scope, row.ordinal);
           return true;
         },
       });
     };
     const values = function* () {
       check();
-      const statement = db.prepare(
+      const statement = storage.prepare(
         'SELECT ordinal,value FROM intake_review_issue_policy_v2 WHERE scope=? ORDER BY ordinal',
       );
       let count = 0;
@@ -159,7 +160,7 @@ export function reviewIssueFactory(
         throw Error('Issue policy scratch lost; prepare the current review again');
     };
     const seq = selectedSequence(values);
-    const sink: ReviewIssueCollection = {
+    const sink: ReviewPolicyValueCollection<T> = {
       [Symbol.iterator]: values,
       get length() {
         check();
@@ -169,7 +170,7 @@ export function reviewIssueFactory(
         check();
         if (ordinal < 0) ordinal += ref.count;
         return read(
-          db
+          storage
             .prepare(
               'SELECT ordinal,value FROM intake_review_issue_policy_v2 WHERE scope=? AND ordinal=?',
             )
@@ -180,13 +181,15 @@ export function reviewIssueFactory(
       some: (predicate) => seq.some(predicate),
       markQuestionReset(id) {
         check();
-        db.prepare(
-          "UPDATE intake_review_issue_policy_v2 SET value=json_set(value,'$.reset',1) WHERE scope=? AND id=?",
-        ).run(scope, id);
+        storage
+          .prepare(
+            "UPDATE intake_review_issue_policy_v2 SET value=json_set(value,'$.reset',1) WHERE scope=? AND id=?",
+          )
+          .run(scope, id);
       },
       questionWasReset(id) {
         check();
-        return !!db
+        return !!storage
           .prepare(
             "SELECT json_extract(value,'$.reset') AS reset FROM intake_review_issue_policy_v2 WHERE scope=? AND id=?",
           )
@@ -195,7 +198,7 @@ export function reviewIssueFactory(
       findId(id) {
         check();
         return read(
-          db
+          storage
             .prepare(
               'SELECT ordinal,value FROM intake_review_issue_policy_v2 WHERE scope=? AND id=?',
             )
@@ -206,15 +209,9 @@ export function reviewIssueFactory(
         check();
         const value = encodeIssue(issue),
           ordinal = ref.count;
-        db.prepare('INSERT INTO intake_review_issue_policy_v2 VALUES(?,?,?,?,?,?,?)').run(
-          scope,
-          run,
-          input.sourceId,
-          input.generation,
-          ordinal,
-          issue.id,
-          value,
-        );
+        storage
+          .prepare('INSERT INTO intake_review_issue_policy_v2 VALUES(?,?,?,?,?,?,?)')
+          .run(scope, run, input.sourceId, input.generation, ordinal, issue.id, value);
         withIntakeWork(db, 'warm', () => {
           recordIntakeWork('reviewIssuePolicyRows', 1);
           recordIntakeWork('reviewIssuePolicyWrittenBytes', Buffer.byteLength(value));
@@ -223,7 +220,9 @@ export function reviewIssueFactory(
         return ref.count;
       },
     };
-    providers.set(ref, sink);
+    // Issue references use this map only for the default issue specialization;
+    // other typed policy rows are exposed by their own explicit read contracts.
+    providers.set(ref, sink as unknown as ReviewIssueCollection);
     references.set(sink, ref);
     return sink;
   };
@@ -232,23 +231,23 @@ export function reviewIssueFactory(
       if (active) {
         active = false;
         if (
-          db.isOpen &&
-          db
+          storage.isOpen &&
+          storage
             .prepare(
               "SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='intake_review_issue_policy_v2'",
             )
             .get()
         )
-          db.prepare('DELETE FROM intake_review_issue_policy_v2 WHERE run=?').run(run);
+          storage.prepare('DELETE FROM intake_review_issue_policy_v2 WHERE run=?').run(run);
         if (
-          db.isOpen &&
-          db
+          storage.isOpen &&
+          storage
             .prepare(
               "SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='intake_review_issue_scope'",
             )
             .get()
         )
-          db.prepare('DELETE FROM intake_review_issue_scope WHERE run=?').run(run);
+          storage.prepare('DELETE FROM intake_review_issue_scope WHERE run=?').run(run);
       }
     },
   });

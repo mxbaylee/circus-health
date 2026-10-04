@@ -35,6 +35,8 @@ import {
   selectedIntakePersonState,
 } from './intake-people.ts';
 import { workflowHash } from './intake-workflow.ts';
+import { intakeFeedTextMatcher } from './intake-feed-match.ts';
+import { hashSourceScalar } from './intake-report-source-resolution-index.ts';
 import {
   prepareIntakeJsonCanonical,
   intakeJsonCanonicalWorkObserver,
@@ -137,6 +139,42 @@ export type CollectionPersonProposal = Omit<IntakePersonProposal, 'source'> & {
     member: { memberId: string; filename: Text | null; locator: Text | null } | null;
   };
 };
+/** Shared complete search for discovery and a selected People page; references are not absence. */
+export function collectionPersonMatchesQuery(
+  db: DatabaseSync,
+  person: CollectionPersonProposal,
+  query: string,
+) {
+  if (!query) return true;
+  const matcher = intakeFeedTextMatcher(query);
+  let separated = false;
+  for (const value of [
+    person.person.fullName,
+    person.title,
+    person.person.relationship,
+    ...person.person.tags,
+    person.source.filename,
+    person.source.member?.filename,
+  ]) {
+    if (!value) continue;
+    if (separated) matcher.push(' ');
+    separated = true;
+    if (typeof value === 'string') matcher.push(value);
+    else {
+      const reader = openIntakeCollectionEnvelope(db, { id: person.intakeId });
+      if (canonicalLiteral(reader.logical) !== canonicalLiteral(value.logical))
+        throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
+      const record = reader.resolve(value.address);
+      hashSourceScalar(
+        db,
+        value.field ? reader.fieldChunks(record, value.field) : reader.recordChunks(record),
+        [],
+        (unit) => matcher.push(unit),
+      );
+    }
+  }
+  return matcher.finish();
+}
 function file(db: DatabaseSync, id: string): File {
   const row = db
     .prepare('SELECT id,kind,sha256,path,bytes,details_json FROM source_files WHERE id=?')
@@ -256,18 +294,21 @@ export function readCollectionPeoplePage(
     limit?: number;
     bytes?: number;
     view?: IntakeReportQueueView;
+    q?: string;
   } = {},
 ): CollectionPeoplePage {
   const reader = openCollectionPeopleRead(db, root, profileId, intakeId),
     limit = input.limit ?? 50,
-    budget = input.bytes ?? 128 * 1024;
+    budget = input.bytes ?? 128 * 1024,
+    query = (input.q || '').trim().toLowerCase();
   if (
     !Number.isSafeInteger(limit) ||
     limit < 1 ||
     limit > 100 ||
     !Number.isSafeInteger(budget) ||
     budget < 1024 ||
-    budget > 256 * 1024
+    budget > 256 * 1024 ||
+    query.length > 300
   )
     throw new HttpError(
       400,
@@ -281,6 +322,7 @@ export function readCollectionPeoplePage(
     input.groupId || null,
     input.view || 'all',
     input.personId || null,
+    query,
   ]);
   if (input.personId !== undefined && (typeof input.personId !== 'string' || !input.personId))
     throw new HttpError(400, 'INTAKE_PERSON_INPUT', 'Choose a retained Person proposal');
@@ -309,6 +351,8 @@ export function readCollectionPeoplePage(
     full = false,
     more = false;
   for (const pointer of reader.pointers(input.groupId)) {
+    let person = query ? reader.person(pointer) : undefined;
+    if (person && !collectionPersonMatchesQuery(db, person, query)) continue;
     const state = reader.state(pointer);
     counts[state]++;
     if (
@@ -324,8 +368,8 @@ export function readCollectionPeoplePage(
       more = true;
       continue;
     }
-    const person = reader.person(pointer),
-      size = Buffer.byteLength(canonicalLiteral(person));
+    person ??= reader.person(pointer);
+    const size = Buffer.byteLength(canonicalLiteral(person));
     const item: CollectionPeoplePage['people'][number] =
       size > budget
         ? {

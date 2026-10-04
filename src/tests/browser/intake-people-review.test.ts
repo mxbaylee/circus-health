@@ -1,3 +1,4 @@
+import { fixtureApi, fixtureReport } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
@@ -121,9 +122,13 @@ test('People-only report stays separate, opens original evidence, and saves by e
   const reportQueueResponse = await page.request.get(url + prefix + '/intakes/report-queue');
   assert(reportQueueResponse.ok(), await reportQueueResponse.text());
   const reportQueue = (await reportQueueResponse.json()).data;
-  assert.equal(reportQueue.groups[0].peopleCounts.pending, 2);
-  assert.equal(reportQueue.groups[0].counts.pending, 0);
-  const groupId = reportQueue.groups[0].groupId;
+  const selectedGroup = reportQueue.groups[0];
+  assert(selectedGroup, 'People-only report remains in the native queue');
+  const groupId =
+    selectedGroup.kind === 'group' ? selectedGroup.group.groupId : selectedGroup.reference.groupId;
+  const selectedReport = await fixtureReport(fixtureApi(page, url), prefix, groupId, intake.id);
+  assert.equal(selectedReport.group.peopleCounts.pending, 2);
+  assert.equal(selectedReport.group.counts.pending, 0);
 
   await page.goto(
     `${url}/#/import?intake=${encodeURIComponent(intake.id)}&group=${encodeURIComponent(groupId)}`,

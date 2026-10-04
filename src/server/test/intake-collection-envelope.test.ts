@@ -18,6 +18,7 @@ import {
   projectIntakeEnvelopeMetadata,
   intakeEnvelopeRecordOrder,
   intakeEnvelopePropertyOrder,
+  selectedEnvelopeStore,
 } from '../intake-collection-envelope.ts';
 import { schemaKey } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
@@ -29,10 +30,10 @@ function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
       sourceHash: 'c'.repeat(64),
     },
     db = openDatabase(join(root, 'cache.sqlite'), identity.profileId);
-  memoryRecordAuthority(db);
+  const authority = memoryRecordAuthority(db);
   t.after(() => {
     clearIntakeStateCache(db);
-    db.close();
+    if (db.isOpen) db.close();
     rmSync(root, { recursive: true, force: true });
   });
   const initial = prepareInitialIntakeEnvelope(input);
@@ -51,10 +52,64 @@ function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
   });
   return {
     db,
+    authority,
+    path: join(root, 'cache.sqlite'),
     identity,
     source: { id: identity.intakeId, kind: 'intake_original', sha256: identity.sourceHash },
   };
 }
+
+test('selected storage handles reuse only current profile/source bindings and expire on cache disposal', async (t) => {
+  const { db, source, identity, authority, path } = fixture(t, { intake: { version: 1 } });
+  await buildIntakeCollectionEnvelope(db, source);
+  const first = selectedEnvelopeStore(db, source).collections,
+    before = intakeWorkCounters(db).primitive.handlesCreated;
+  for (let index = 0; index < 32; index++)
+    assert.equal(selectedEnvelopeStore(db, source).collections, first);
+  assert.equal(intakeWorkCounters(db).primitive.handlesCreated, before);
+  clearIntakeStateCache(db);
+  const next = selectedEnvelopeStore(db, source).collections;
+  assert.notEqual(next, first);
+  assert.equal(next.binding(next.openView())!.identity.sourceHash, identity.sourceHash);
+  for (const [sql, parameter, selected] of [
+    ['UPDATE source_files SET sha256=? WHERE id=?', 'd'.repeat(64), source],
+    [
+      'UPDATE source_files SET id=? WHERE id=?',
+      'fictional-other-source',
+      { id: 'fictional-other-source' },
+    ],
+  ] as const) {
+    db.exec('SAVEPOINT fictional_rebinding');
+    try {
+      db.prepare(sql).run(parameter, source.id);
+      assert.throws(() => selectedEnvelopeStore(db, selected), /missing|binding|source/);
+    } finally {
+      db.exec('ROLLBACK TO fictional_rebinding; RELEASE fictional_rebinding');
+    }
+    assert.equal(selectedEnvelopeStore(db, source).identity.sourceHash, identity.sourceHash);
+  }
+  db.exec('SAVEPOINT fictional_rebinding');
+  try {
+    db.prepare(
+      "UPDATE app_meta SET value='fictional-other-profile' WHERE key='owner_profile_id'",
+    ).run();
+    assert.throws(() => selectedEnvelopeStore(db, source), /missing|binding|owner/);
+  } finally {
+    db.exec('ROLLBACK TO fictional_rebinding; RELEASE fictional_rebinding');
+  }
+  db.close();
+  assert.throws(() => selectedEnvelopeStore(db, source), /not open|closed/);
+  const reopened = openDatabase(path, identity.profileId);
+  try {
+    authority.attach(reopened);
+    const selected = selectedEnvelopeStore(reopened, source).collections;
+    assert.notEqual(selected, next);
+    assert.equal(selected.binding(selected.openView())!.identity.sourceHash, identity.sourceHash);
+  } finally {
+    clearIntakeStateCache(reopened);
+    reopened.close();
+  }
+});
 for (const raw of [false, true])
   test(`schema migration preserves exact ${raw ? 'raw duplicate' : 'normalized unknown'} bytes and paged known scopes`, async (t) => {
     const input = {

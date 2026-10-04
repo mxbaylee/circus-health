@@ -124,13 +124,19 @@ async function fixture(
     isSourceContextVersion: () => false,
   });
   await prepareCollectionReviewMembership(db, file);
-  const open = (metadataBytes = 128 * 1024) => {
+  const open = (
+    metadataBytes = 128 * 1024,
+    observe?: (view: ReturnType<typeof openIntakeCollectionEnvelope>) => void,
+    readCacheState?: () => string,
+  ) => {
     const view = openIntakeCollectionEnvelope(db, file);
+    observe?.(view);
     return collectionWorkflowReviewScope({
       view,
       membershipIndex: readCollectionReviewMembership(db, file, view),
       catalog: createReportSnapshotCatalog(db, file),
       metadataBytes,
+      readCacheState,
       packageEvidence: false,
       activeReceipt: () => true,
       originalFingerprint: (group) =>
@@ -162,6 +168,71 @@ const identity = {
   subjectGrounded: () => true,
   originalBirthDateEvidence: () => ({ dates: [], unreadable: false }),
 };
+
+test('selected report headers reuse authenticated fields only within the supplied current state', async (t) => {
+  const { db, open } = await fixture(t);
+  const statement = db.prepare('SELECT total_changes() AS changes');
+  let reads = 0,
+    pages = 0;
+  const scope = open(
+    128 * 1024,
+    (view) => {
+      const field = view.field.bind(view);
+      view.field = (...args) => {
+        reads++;
+        return field(...args);
+      };
+      const children = view.children.bind(view);
+      view.children = (...args) => {
+        pages++;
+        return children(...args);
+      };
+    },
+    () => String(statement.get()!.changes),
+  );
+  const group = scope.groupRecords()[Symbol.iterator]().next().value!;
+  const before = reads,
+    first = scope.groupHeader(group),
+    hydrated = reads - before;
+  assert.ok(hydrated > 0);
+  for (let index = 0; index < 32; index++) assert.deepEqual(scope.groupHeader(group), first);
+  assert.equal(reads - before, hydrated);
+  db.prepare(
+    "INSERT INTO providers(id,name) VALUES('fictional-header-cache','Fictional header cache')",
+  ).run();
+  assert.deepEqual(scope.groupHeader(group), first);
+  assert.equal(reads - before, 2 * hydrated);
+  const target = {
+    candidateId: 'fictional-candidate',
+    candidateVersionId: 'fictional-version',
+    proposalId,
+    recordId: 'fictional-record',
+    title: 'Fictional',
+    issueId: 'identity',
+  };
+  const reference = { groupId: first.id, groupVersionId: scope.currentVersion(first)! };
+  const beforeReference = pages;
+  assert.deepEqual(scope.group(reference), first);
+  const referencePages = pages - beforeReference;
+  assert.ok(referencePages > 0);
+  for (let index = 0; index < 32; index++) assert.deepEqual(scope.group(reference), first);
+  assert.equal(pages - beforeReference, referencePages);
+  const beforeBoundary = pages;
+  assert.equal(scope.competingBoundaryUnrepaired(first, undefined, target), false);
+  const boundaryPages = pages - beforeBoundary;
+  assert.ok(boundaryPages > 0);
+  for (let index = 0; index < 32; index++)
+    assert.equal(scope.competingBoundaryUnrepaired(first, undefined, target), false);
+  assert.equal(pages - beforeBoundary, boundaryPages);
+  db.prepare(
+    "UPDATE providers SET name='Fictional changed header cache' WHERE id='fictional-header-cache'",
+  ).run();
+  assert.equal(scope.competingBoundaryUnrepaired(first, undefined, target), false);
+  assert.equal(pages - beforeBoundary, 2 * boundaryPages);
+  const changedReference = pages;
+  assert.deepEqual(scope.group(reference), first);
+  assert.equal(pages - changedReference, referencePages);
+});
 
 test('selected clinical engine matches legacy full proposal while joins remain off-page and historical', async (t) => {
   const { details, open } = await fixture(t, (details) => {
@@ -406,7 +477,7 @@ test('large natural identity receipts retain complete lazy target and historical
 });
 
 test('selected report links exceed display budget without losing off-page identity or legacy commitments', async (t) => {
-  const { details, open } = await fixture(t, (details) => {
+  const { db, details, open } = await fixture(t, (details) => {
     const group = details.workflow!.reportGroups![0]!;
     for (let index = 0; index < 12; index++) {
       const copy = structuredClone(group);
@@ -415,7 +486,8 @@ test('selected report links exceed display budget without losing off-page identi
       details.workflow!.reportGroups!.push(copy);
     }
   });
-  const scope = open(1024),
+  const state = db.prepare('SELECT total_changes() AS changes');
+  const scope = open(1024, undefined, () => String(state.get()!.changes)),
     entry = entries[0]!,
     candidateId = intakeCandidateId(file, entry),
     versionId = intakeCandidateVersionId(details, proposalId, entry),
@@ -446,5 +518,178 @@ test('selected report links exceed display budget without losing off-page identi
       }),
     ].join(''),
     JSON.stringify({ groups: [...selectedReportGroups(links)], raw: { rawJSON: '1.0' } }),
+  );
+});
+
+test('native ownership policy skips membership work only with complete current empty authority and preserves off-page holds', async (t) => {
+  const { prepareOwnershipDecisionIndex, ownershipPolicyIndexWork } =
+    await import('../ownership-decision-index.ts');
+  const { requireCorrectedOwnershipReview } = await import('../record-ownership-authority.ts');
+  const { db, details, open } = await fixture(t, (details) => {
+    const selected = details.workflow!.reportGroups![0]!;
+    details.workflow!.reportGroups = [
+      ...Array.from({ length: 64 }, (_, i) => ({
+        ...structuredClone(selected),
+        id: 'unrelated-' + i,
+        versions: [],
+      })),
+      selected,
+    ];
+  });
+  let idReads = 0;
+  const scope = open(undefined, (view) => {
+    const field = view.field;
+    view.field = (record, name, options) => {
+      if (record.kind === 'reportGroup' && name === 'id') idReads++;
+      return field(record, name, options);
+    };
+  });
+  const ownership = scope.ownershipScope!(() => undefined, 1),
+    entry = entries[0]!,
+    references = scope.references(
+      intakeCandidateId(file, entry),
+      intakeCandidateVersionId(details, proposalId, entry),
+      `${proposalId}:line:1`,
+      proposalId,
+    );
+  const record = { ...review().records[0]!, reportGroups: references },
+    identity = 'fictional-native-identity';
+  const compare = () => {
+    const legacy = structuredClone(record),
+      actual = structuredClone(record);
+    requireCorrectedOwnershipReview(db, legacy, identity, file, details.workflow);
+    requireCorrectedOwnershipReview(db, actual, identity, file, undefined, ownership);
+    assert.deepEqual(actual, legacy);
+    return actual;
+  };
+  compare();
+  assert.equal(idReads, 2, 'unprepared index retains the complete authoritative policy path');
+  await prepareOwnershipDecisionIndex(db);
+  idReads = 0;
+  for (let i = 0; i < 12; i++) compare();
+  assert.equal(
+    idReads,
+    0,
+    'complete current empty policy does not read any group header or membership',
+  );
+  assert.deepEqual(ownershipPolicyIndexWork(db), { checks: 12, empty: 12 });
+  const selected = details.workflow!.reportGroups!.at(-1)!;
+  const insert = db.prepare(
+    "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES(?,?,'verified','2026-01-01',?)",
+  );
+  db.exec('BEGIN');
+  insert.run(
+    'held-report',
+    'Report ownership default hold',
+    JSON.stringify({
+      groupId: selected.id,
+      intakeId: file.id,
+      defaultOperationId: 'former',
+      operationId: 'hold',
+      intakeVersion: 1,
+      revision: 1,
+    }),
+  );
+  const held = compare();
+  assert.equal(held.identityReview?.blocking, true);
+  assert.match(held.identityReview!.message, /earlier report assignment/);
+  assert.equal(
+    idReads,
+    2,
+    'off-page relevant group validates one point identity and reads one header instead of scanning 65 group IDs',
+  );
+  db.exec('ROLLBACK');
+  idReads = 0;
+  compare();
+  assert.equal(idReads, 0, 'rollback restores the exact empty authority proof');
+  insert.run(
+    'source-correction',
+    'Record ownership source',
+    JSON.stringify({ identity, sourceHash: 'wrong', revision: 2 }),
+  );
+  assert.match(compare().identityReview!.message, /boundary changed/);
+  db.prepare(
+    "UPDATE manual_batches SET title='Record ownership event' WHERE id='source-correction'",
+  ).run();
+  idReads = 0;
+  compare();
+  assert.equal(idReads, 0);
+  insert.run(
+    'report-default',
+    'Report ownership default',
+    JSON.stringify({ groupId: selected.id, intakeId: file.id, boundary: 'wrong', revision: 3 }),
+  );
+  assert.match(compare().identityReview!.message, /boundary changed/);
+  db.prepare("DELETE FROM manual_batches WHERE id='report-default'").run();
+  idReads = 0;
+  compare();
+  assert.equal(idReads, 0);
+  db.exec('DROP TRIGGER temp.__ownership_decision_index_update');
+  assert.throws(() => compare(), /Prepare complete accepted ownership evidence/);
+  await prepareOwnershipDecisionIndex(db);
+  idReads = 0;
+  compare();
+  assert.equal(idReads, 0);
+});
+
+test('ownership first-group point lookup preserves retained collection order and duplicate IDs', async (t) => {
+  const { open, details } = await fixture(t, (details) => {
+    const original = details.workflow!.reportGroups![0]!;
+    details.workflow!.reportGroups = [
+      {
+        ...structuredClone(original),
+        id: 'duplicate',
+        report: { ...original.report!, title: 'First duplicate' },
+      },
+      { ...structuredClone(original), id: 'middle' },
+      ...Array.from({ length: 32 }, (_, i) => ({
+        ...structuredClone(original),
+        id: 'unrelated-' + i,
+        versions: [],
+      })),
+      {
+        ...structuredClone(original),
+        id: 'duplicate',
+        report: { ...original.report!, title: 'Last duplicate' },
+      },
+    ];
+  });
+  let reads = 0;
+  const scope = open(undefined, (view) => {
+      const field = view.field;
+      view.field = (record, name, options) => {
+        if (record.kind === 'reportGroup' && name === 'id') reads++;
+        return field(record, name, options);
+      };
+    }),
+    ownership = scope.ownershipScope!(() => undefined, 1),
+    references = [
+      { groupId: 'missing', groupVersionId: 'missing' },
+      { groupId: 'middle', groupVersionId: 'version' },
+      { groupId: 'duplicate', groupVersionId: 'version' },
+    ];
+  const expected = details.workflow!.reportGroups!.find((group) =>
+    references.some((ref) => ref.groupId === group.id),
+  )!;
+  const selected = ownership.firstGroup(references);
+  assert.equal(selected?.id, expected.id);
+  assert.equal(selected?.report?.title, expected.report?.title);
+  assert.equal(reads, 3);
+  const { selectedReportGroupLinks } = await import('../intake-selected-report-groups.ts');
+  const linked = selectedReportGroupLinks(
+    () => references,
+    {
+      candidateId: 'fictional',
+      candidateVersionId: 'fictional-version',
+      recordId: 'fictional-record',
+      proposalId: null,
+    },
+    1,
+  );
+  assert.equal(Array.isArray(linked), false);
+  assert.equal(ownership.firstGroup(linked)?.report?.title, expected.report?.title);
+  assert.equal(
+    ownership.firstGroup([{ groupId: 'synthetic-fallback', groupVersionId: 'version' }]),
+    undefined,
   );
 });

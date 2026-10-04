@@ -1,3 +1,4 @@
+import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -7,13 +8,14 @@ import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
-import { uploadIntake, proposeConversion, getIntake } from '../intake.ts';
+import { uploadIntake, proposeConversion, proposeConversionRead, getIntake } from '../intake.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { getNote, saveNote } from '../notes.ts';
 import { createApp } from '../index.ts';
 import { fictionalModel } from './fictional-model.ts';
+import { readQualificationReview } from '../../scripts/qualification-intake-read.ts';
 import type { HealthRecordEnvelope } from '../../shared/intake.ts';
 import type {
   IntakeIdentityConfirmation,
@@ -70,6 +72,7 @@ async function fixture(
   explicit = false,
   recordAt = (n: number) => envelope('fictional-' + n, explicit && n === count - 1),
   originalText = `${heading}\n${subject}\nDOB: ${birthDate}\nFictional result`,
+  nativeProposal = false,
 ) {
   fictionalModel(t);
   const root = mkdtempSync(join(tmpdir(), 'fictional-native-identity-http-')),
@@ -81,13 +84,30 @@ async function fixture(
     bytes: Buffer.from(originalText),
     newProviderName: 'Invented Clinic',
   });
-  const proposed = proposeConversion(db, root, profileId, original.id, {
-    version: original.version,
-    summary: 'Independently fictional proposal',
-    jsonlText: Array.from({ length: count }, (_, n) => JSON.stringify(recordAt(n))).join('\n'),
-  });
-  const groupId = getIntake(db, root, profileId, original.id).workflow!.reportGroups![0]!.id;
-  if (native) await buildIntakeCollectionEnvelope(db, { id: original.id });
+  if (nativeProposal) await buildIntakeCollectionEnvelope(db, { id: original.id });
+  const proposed = await (nativeProposal ? proposeConversionRead : proposeConversion)(
+    db,
+    root,
+    profileId,
+    original.id,
+    {
+      version: original.version,
+      summary: 'Independently fictional proposal',
+      jsonlText: Array.from({ length: count }, (_, n) => JSON.stringify(recordAt(n))).join('\n'),
+    },
+  );
+  const groupId = nativeProposal
+    ? (() => {
+        const view = openIntakeCollectionEnvelope(db, { id: original.id }),
+          intake = view.child(view.root(), 'intake')!,
+          workflow = view.child(intake, 'workflow')!,
+          group = view.childAt(workflow, 'reportGroups', 0)!,
+          field = view.field(group, 'id');
+        assert.equal(field.kind, 'value');
+        return (field as { kind: 'value'; value: string }).value;
+      })()
+    : getIntake(db, root, profileId, original.id).workflow!.reportGroups![0]!.id;
+  if (native && !nativeProposal) await buildIntakeCollectionEnvelope(db, { id: original.id });
   const app = createApp({
     root,
     databases: new Map([[profileId, db]]),
@@ -124,173 +144,275 @@ async function fixture(
   return { root, profileId, db, original, proposed, groupId, app, request, review };
 }
 for (const native of [false, true])
-  test(`actual HTTP common identity preserves ${native ? 'native reference' : 'legacy'} membership and atomic Self updates`, async (t) => {
-    const f = await fixture(t, native),
-      before = { ...intakeWorkCounters(f.db).warm };
-    const review = await f.review(),
-      scope = review.scopeReference || review.scope;
-    assert.ok(scope);
-    assert.equal(review.status, 'confirmation_required');
-    assert.deepEqual(review.offeredSelfFields, { fullName: 'Fictional Iris Meadow', birthDate });
-    if (native) {
-      assert.equal(review.scope, null);
-      assert.ok(review.scopeReference);
-      assert.equal(review.scopeReference.collection.membership, 3);
-      assert.equal(review.scopeReference.collection.assignmentTargets, 3);
-      assert.equal('targets' in scope, false);
-      const temporaryCounts = () => {
-        const counts: number[] = [];
-        for (const name of ['intake_review_issue_policy_v2', 'intake_review_issue_scope']) {
-          const exists = f.db
-            .prepare("SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name=?")
-            .get(name);
-          counts.push(exists ? Number(f.db.prepare('SELECT count(*) n FROM ' + name).get()!.n) : 0);
-        }
-        return counts;
-      };
-      const baseline = temporaryCounts();
-      const sourceReview = await f.request(
-        `report-source-review?groupId=${encodeURIComponent(f.groupId)}&view=all&limit=2`,
+  // Real accepted authority selection, source review and checkpoint preparation
+  // need a host-fixture hang budget; scaling is checked by work counts below.
+  test(
+    `actual HTTP common identity preserves ${native ? 'native reference' : 'legacy'} membership and atomic Self updates`,
+    { timeout: 120000 },
+    async (t) => {
+      const f = await fixture(t, native),
+        before = { ...intakeWorkCounters(f.db).warm };
+      const previews = await Promise.all(
+        native ? [f.review(), f.review(), f.review()] : [f.review()],
       );
-      assert.equal(sourceReview.targets.total, 3);
-      assert.equal(sourceReview.targets.items.length, 2);
-      assert.ok(sourceReview.targets.nextCursor);
+      const review = previews[0]!,
+        scope = review.scopeReference || review.scope;
+      if (native) {
+        assert.ok(
+          previews.every(
+            (value) => value.scopeReference!.scopeToken === review.scopeReference!.scopeToken,
+          ),
+        );
+      }
+      assert.ok(scope);
+      assert.equal(review.status, 'confirmation_required');
+      assert.deepEqual(review.offeredSelfFields, { fullName: 'Fictional Iris Meadow', birthDate });
+      if (native) {
+        assert.equal(review.scope, null);
+        assert.ok(review.scopeReference);
+        assert.equal(review.scopeReference.collection.membership, 3);
+        assert.equal(review.scopeReference.collection.assignmentTargets, 3);
+        assert.equal('targets' in scope, false);
+        const temporaryCounts = () => reviewIssueScratchCounts(f.db);
+        const baseline = temporaryCounts();
+        const sourceReview = await f.request(
+          `report-source-review?groupId=${encodeURIComponent(f.groupId)}&view=all&limit=2`,
+        );
+        assert.equal(sourceReview.targets.total, 3);
+        assert.equal(sourceReview.targets.items.length, 2);
+        assert.ok(sourceReview.targets.nextCursor);
+        await f.request(
+          `report-source-review?groupId=${encodeURIComponent(f.groupId)}&view=all&limit=2&cursor=invalid`,
+          undefined,
+          409,
+        );
+        assert.deepEqual(temporaryCounts(), baseline);
+        const page = await f.request(
+          `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=assignmentTargets&limit=2`,
+        );
+        assert.equal(page.items.length, 2);
+        assert.equal(page.total, 3);
+        assert.ok(page.nextCursor);
+        const last = await f.request(
+          `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=assignmentTargets&limit=2&cursor=${encodeURIComponent(page.nextCursor)}`,
+        );
+        assert.equal(last.items.length, 1);
+        assert.equal(last.nextCursor, null);
+        assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+        assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+      } else assert.equal(review.scope!.assignmentTargets!.length, 3);
+      const input: IntakeIdentityConfirmation = {
+        version: scope.intakeVersion,
+        operationId: 'fictional-native-identity-confirm',
+        scope,
+        outcome: 'this_is_me',
+        attestation: 'confirmed_displayed_report_subject',
+        selfUpdate: { expectedVersion: review.self.version, fields: review.offeredSelfFields },
+      };
       await f.request(
-        `report-source-review?groupId=${encodeURIComponent(f.groupId)}&view=all&limit=2&cursor=invalid`,
-        undefined,
+        'identity-scope',
+        { ...input, selfUpdate: { ...input.selfUpdate, expectedVersion: review.self.version + 1 } },
         409,
       );
-      assert.deepEqual(temporaryCounts(), baseline);
-      const page = await f.request(
-        `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=assignmentTargets&limit=2`,
+      assert.equal(getNote(f.db, 'person-note:self').version, review.self.version);
+      await f.request(
+        'identity-scope',
+        { ...input, scope: { ...scope, profileId: 'fictional-other-profile' } },
+        409,
       );
-      assert.equal(page.items.length, 2);
-      assert.equal(page.total, 3);
-      assert.ok(page.nextCursor);
-      const last = await f.request(
-        `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=assignmentTargets&limit=2&cursor=${encodeURIComponent(page.nextCursor)}`,
-      );
-      assert.equal(last.items.length, 1);
-      assert.equal(last.nextCursor, null);
-      assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
-      assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
-    } else assert.equal(review.scope!.assignmentTargets!.length, 3);
+      const saved = await f.request('identity-scope', input);
+      assert.equal(saved.version, input.version + 1);
+      assert.equal(getNote(f.db, 'person-note:self').person.fullName, 'Fictional Iris Meadow');
+      assert.equal(getNote(f.db, 'person-note:self').person.birthDate, birthDate);
+      const selfVersion = getNote(f.db, 'person-note:self').version;
+      const replayed = await f.request('identity-scope', input);
+      assert.equal(replayed.version, saved.version);
+      assert.equal(getNote(f.db, 'person-note:self').version, selfVersion);
+      await f.request('identity-scope', { ...input, printedName: 'Fictional altered' }, 409);
+      const after = await f.review();
+      assert.equal(after.status, 'prior_confirmation');
+      assert.equal(after.blocking, false);
+      if (native) {
+        const view = openIntakeCollectionEnvelope(f.db, { id: f.original.id }),
+          intake = view.child(view.root(), 'intake')!,
+          workflow = view.child(intake, 'workflow')!;
+        assert.equal(view.childCount(workflow, 'identityConfirmations'), 1);
+        assert.equal(view.childCount(workflow, 'reviewDrafts'), 3);
+        assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+      }
+    },
+  );
+// This fixture exports real contributor authority and reconstructs a fresh cache;
+// encrypted-profile recovery is qualified by the separate runtime/archive fixtures.
+test(
+  'native identity pages include off-page explicit questions and preserve stale and recovery checks',
+  { timeout: 180000 },
+  async (t) => {
+    const f = await fixture(t, true, 3, true),
+      beforeWork = intakeWorkCounters(f.db),
+      review = await f.review(),
+      scope = review.scopeReference!;
+    assert.ok(scope);
+    assert.equal(scope.collection.assignmentTargets, 3);
+    assert.equal(scope.collection.questions, 1);
+    const questions = await f.request(
+      `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=questions&limit=1`,
+    );
+    assert.match(questions.items[0].value.prompt, /guardian/);
     const input: IntakeIdentityConfirmation = {
       version: scope.intakeVersion,
-      operationId: 'fictional-native-identity-confirm',
+      operationId: 'fictional-offpage-confirm',
       scope,
       outcome: 'this_is_me',
-      attestation: 'confirmed_displayed_report_subject',
-      selfUpdate: { expectedVersion: review.self.version, fields: review.offeredSelfFields },
+      attestation: 'confirmed_displayed_identity_questions',
     };
-    const saved = await f.request('identity-scope', input);
-    assert.equal(saved.version, input.version + 1);
-    assert.equal(getNote(f.db, 'person-note:self').person.fullName, 'Fictional Iris Meadow');
-    assert.equal(getNote(f.db, 'person-note:self').person.birthDate, birthDate);
-    const selfVersion = getNote(f.db, 'person-note:self').version;
-    const replayed = await f.request('identity-scope', input);
-    assert.equal(replayed.version, saved.version);
-    assert.equal(getNote(f.db, 'person-note:self').version, selfVersion);
-    await f.request('identity-scope', { ...input, printedName: 'Fictional altered' }, 409);
+    await f.request(
+      'identity-scope',
+      { ...input, attestation: 'confirmed_displayed_report_subject' },
+      400,
+    );
+    const currentSelf = getNote(f.db, 'person-note:self');
+    saveNote(f.db, currentSelf.id, {
+      version: currentSelf.version,
+      person: { ...currentSelf.person, birthDate: '1980-01-01' },
+    });
+    await f.request('identity-scope', input, 409);
+    const conflicting = await f.review();
+    assert.equal(conflicting.selfBirthDateConflict, true);
+    assert.equal(conflicting.blocking, true);
+    const restoredSelf = getNote(f.db, currentSelf.id);
+    saveNote(f.db, restoredSelf.id, {
+      version: restoredSelf.version,
+      person: { ...restoredSelf.person, birthDate: '' },
+    });
+    const fresh = await f.review(),
+      freshScope = fresh.scopeReference!;
+    const valid = { ...input, version: freshScope.intakeVersion, scope: freshScope };
+    await f.request('identity-scope', valid);
+    const backup = await createBackup(f.db, f.root, f.profileId),
+      target = join(f.root, 'recovered');
+    const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
+      recovered = openDatabase(rebuilt.database, f.profileId);
+    attachPersonalDurability(recovered, {
+      root: target,
+      profileId: f.profileId,
+      initialize: false,
+    });
+    try {
+      const { getIntakeIdentityReview, confirmIntakeIdentityScope } =
+        await import('../intake-identity.ts');
+      const result = await getIntakeIdentityReview(
+        recovered,
+        target,
+        f.profileId,
+        f.original.id,
+        f.groupId,
+      );
+      assert.equal(result.status, 'prior_confirmation');
+      assert.equal(result.blocking, false);
+      assert.equal(result.scopeReference!.collection.assignmentTargets, 3);
+      const replayed = await confirmIntakeIdentityScope(
+        recovered,
+        target,
+        f.profileId,
+        f.original.id,
+        valid,
+      );
+      assert.equal(replayed.version, freshScope.intakeVersion + 1);
+      assert.equal(intakeWorkCounters(recovered).warm.envelopeHydrations, 0);
+      assert.equal(
+        intakeWorkCounters(f.db).warm.envelopeHydrations,
+        beforeWork.warm.envelopeHydrations,
+      );
+      t.diagnostic(
+        JSON.stringify({
+          original: intakeWorkCounters(f.db),
+          recovered: intakeWorkCounters(recovered),
+        }),
+      );
+    } finally {
+      recovered.close();
+    }
+  },
+);
+
+test(
+  'native public identity creates one Family Person atomically and replays the assignment',
+  { timeout: 120000 },
+  async (t) => {
+    const f = await fixture(t, true, 1);
+    const review = await f.review(),
+      scope = review.scopeReference!;
+    const before = Number(
+      f.db.prepare("SELECT count(*) n FROM notes WHERE kind='person'").get()!.n,
+    );
+    const input: IntakeIdentityConfirmation = {
+      version: scope.intakeVersion,
+      operationId: 'fictional-family-create-confirm',
+      scope,
+      outcome: 'this_is_person',
+      attestation: 'confirmed_displayed_report_subject',
+      personSelection: {
+        newPerson: { fullName: 'Fictional Iris Meadow', relationship: 'relative' },
+      },
+    };
+    await f.request('identity-scope', input);
+    assert.equal(
+      Number(f.db.prepare("SELECT count(*) n FROM notes WHERE kind='person'").get()!.n),
+      before + 1,
+    );
     const after = await f.review();
     assert.equal(after.status, 'prior_confirmation');
     assert.equal(after.blocking, false);
-    if (native) {
-      const view = openIntakeCollectionEnvelope(f.db, { id: f.original.id }),
-        intake = view.child(view.root(), 'intake')!,
-        workflow = view.child(intake, 'workflow')!;
-      assert.equal(view.childCount(workflow, 'identityConfirmations'), 1);
-      assert.equal(view.childCount(workflow, 'reviewDrafts'), 3);
-      assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
-    }
-  });
-test('native identity pages include off-page explicit questions and preserve stale and recovery checks', async (t) => {
-  const f = await fixture(t, true, 7, true),
-    review = await f.review(),
-    scope = review.scopeReference!;
-  assert.ok(scope);
-  assert.equal(scope.collection.assignmentTargets, 7);
-  assert.equal(scope.collection.questions, 1);
-  const questions = await f.request(
-    `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=questions&limit=1`,
-  );
-  assert.match(questions.items[0].value.prompt, /guardian/);
-  const input: IntakeIdentityConfirmation = {
-    version: scope.intakeVersion,
-    operationId: 'fictional-offpage-confirm',
-    scope,
-    outcome: 'this_is_me',
-    attestation: 'confirmed_displayed_identity_questions',
-  };
-  await f.request(
-    'identity-scope',
-    { ...input, attestation: 'confirmed_displayed_report_subject' },
-    400,
-  );
-  const currentSelf = getNote(f.db, 'person-note:self');
-  saveNote(f.db, currentSelf.id, {
-    version: currentSelf.version,
-    person: { ...currentSelf.person, birthDate: '1980-01-01' },
-  });
-  await f.request('identity-scope', input, 409);
-  const conflicting = await f.review();
-  assert.equal(conflicting.selfBirthDateConflict, true);
-  assert.equal(conflicting.blocking, true);
-  const restoredSelf = getNote(f.db, currentSelf.id);
-  saveNote(f.db, restoredSelf.id, {
-    version: restoredSelf.version,
-    person: { ...restoredSelf.person, birthDate: '' },
-  });
-  const fresh = await f.review(),
-    freshScope = fresh.scopeReference!;
-  const valid = { ...input, version: freshScope.intakeVersion, scope: freshScope };
-  await f.request('identity-scope', valid);
-  const backup = await createBackup(f.db, f.root, f.profileId),
-    target = join(f.root, 'recovered');
-  const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
-    recovered = openDatabase(rebuilt.database, f.profileId);
-  attachPersonalDurability(recovered, { root: target, profileId: f.profileId, initialize: false });
-  try {
-    const { getIntakeIdentityReview, confirmIntakeIdentityScope } =
-      await import('../intake-identity.ts');
-    const result = await getIntakeIdentityReview(
-      recovered,
-      target,
+    assert.notEqual(after.assignedPerson!.personId, 'patient');
+    assert.equal(after.assignedPerson!.fullName, 'Fictional Iris Meadow');
+    const assignedNote = getNote(f.db, after.assignedPerson!.noteId);
+    assert.deepEqual(after.assignedPerson, {
+      noteId: assignedNote.id,
+      personId: assignedNote.personId!,
+      version: assignedNote.version,
+      fullName: 'Fictional Iris Meadow',
+    });
+    const { getIntakeIdentityReview } = await import('../intake-identity.ts');
+    const direct = await getIntakeIdentityReview(
+      f.db,
+      f.root,
       f.profileId,
       f.original.id,
       f.groupId,
     );
-    assert.equal(result.status, 'prior_confirmation');
-    assert.equal(result.blocking, false);
-    assert.equal(result.scopeReference!.collection.assignmentTargets, 7);
-    const replayed = await confirmIntakeIdentityScope(
-      recovered,
-      target,
-      f.profileId,
-      f.original.id,
-      valid,
+    assert.deepEqual(direct.assignedPerson, after.assignedPerson);
+    await f.request('identity-scope', input);
+    assert.equal(
+      Number(f.db.prepare("SELECT count(*) n FROM notes WHERE kind='person'").get()!.n),
+      before + 1,
     );
-    assert.equal(replayed.version, freshScope.intakeVersion + 1);
-  } finally {
-    recovered.close();
-  }
-});
+  },
+);
 
 test('native common identity preserves a complete giant competing-subject question through confirmation', async (t) => {
   const otherSubjects = Array.from(
     { length: 70 },
     (_, n) => `Patient: Fictional alternative ${n} ` + 'z'.repeat(3900),
   );
-  const f = await fixture(t, true, otherSubjects.length + 1, false, (n) => {
-    const record = envelope('fictional-competing-' + n);
-    if (n)
-      record.report = {
-        ...record.report!,
-        key: 'claim-' + n,
-        subject: { locator: 'page 1 patient', text: otherSubjects[n - 1]! },
-      };
-    return record;
-  });
+  const f = await fixture(
+    t,
+    true,
+    otherSubjects.length + 1,
+    false,
+    (n) => {
+      const record = envelope('fictional-competing-' + n);
+      if (n)
+        record.report = {
+          ...record.report!,
+          key: 'claim-' + n,
+          subject: { locator: 'page 1 patient', text: otherSubjects[n - 1]! },
+        };
+      return record;
+    },
+    undefined,
+    true,
+  );
   const review = await f.review(),
     scope = review.scopeReference!;
   assert.equal(review.confirmationCount, 0);
@@ -347,92 +469,206 @@ test('native common identity preserves a complete giant competing-subject questi
   await f.request('identity-scope', input);
 });
 
-test('native identity confirmations retain all per-record issue witnesses beyond the inline metadata budget', async (t) => {
-  const issueCount = 180;
-  const f = await fixture(t, true, 1, false, () => {
-    const record = envelope('fictional-many-questions');
-    record.reviewIssues = Array.from({ length: issueCount }, (_, n) => ({
-      kind: 'identity' as const,
-      field: 'subject',
-      prompt: `Confirm patient uncertainty ${n}: ` + 'x'.repeat(1600),
-      textAnchor: subject,
-    }));
-    return record;
-  });
-  const review = await f.review(),
-    scope = review.scopeReference!;
-  assert.equal(scope.collection.questions, issueCount);
-  const targets = await f.request(
-    `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=assignmentTargets&limit=1`,
-  );
-  assert.equal(targets.items[0].kind, 'value');
-  assert.equal(targets.items[0].value.issueIds.length, issueCount + 1);
-  let cursor: string | null = null,
-    seen = 0;
-  do {
-    const page = await f.request(
-      `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=questions&limit=50${cursor ? '&cursor=' + encodeURIComponent(cursor) : ''}`,
+// This durable fixture confirms >256 KiB of independent witnesses, reconstructs
+// current policy and retries the exact durable operation. The hang guard covers
+// those host writes; complete counts and zero whole hydrations qualify behavior.
+test(
+  'native identity confirmations retain all per-record issue witnesses beyond the inline metadata budget',
+  { timeout: 180000 },
+  async (t) => {
+    const issueCount = 70;
+    const f = await fixture(t, true, 1, false, () => {
+      const record = envelope('fictional-many-questions');
+      record.reviewIssues = Array.from({ length: issueCount }, (_, n) => ({
+        kind: 'identity' as const,
+        field: 'subject',
+        prompt: `Confirm patient uncertainty ${n}: ` + 'x'.repeat(3900),
+        textAnchor: subject,
+      }));
+      return record;
+    });
+    const before = { ...intakeWorkCounters(f.db).warm };
+    const review = await f.review(),
+      scope = review.scopeReference!;
+    assert.equal(scope.collection.questions, issueCount);
+    const targets = await f.request(
+      `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=assignmentTargets&limit=1`,
     );
-    seen += page.items.length;
-    cursor = page.nextCursor;
-  } while (cursor);
-  assert.equal(seen, issueCount);
-  const input: IntakeIdentityConfirmation = {
-    version: scope.intakeVersion,
-    operationId: 'fictional-many-witnesses-confirm',
-    scope,
-    outcome: 'this_is_me',
-    attestation: 'confirmed_displayed_identity_questions',
-  };
-  await f.request('identity-scope', input);
-  const after = await f.review();
-  assert.equal(after.status, 'prior_confirmation');
-  assert.equal(after.blocking, false);
-  assert.equal(after.scopeReference!.collection.targets, 0);
-  await f.request('identity-scope', input);
-});
+    assert.equal(targets.items[0].kind, 'value');
+    assert.equal(targets.items[0].value.issueIds.length, issueCount + 1);
+    let cursor: string | null = null,
+      seen = 0;
+    do {
+      const page = await f.request(
+        `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${scope.scopeToken}&section=questions&limit=50${cursor ? '&cursor=' + encodeURIComponent(cursor) : ''}`,
+      );
+      seen += page.items.length;
+      cursor = page.nextCursor;
+    } while (cursor);
+    assert.equal(seen, issueCount);
+    const input: IntakeIdentityConfirmation = {
+      version: scope.intakeVersion,
+      operationId: 'fictional-many-witnesses-confirm',
+      scope,
+      outcome: 'this_is_me',
+      attestation: 'confirmed_displayed_identity_questions',
+    };
+    await f.request('identity-scope', input);
+    const after = await f.review();
+    assert.equal(after.status, 'prior_confirmation');
+    assert.equal(after.blocking, false);
+    assert.equal(after.scopeReference!.collection.targets, 0);
+    await f.request('identity-scope', input);
+    assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+    assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+  },
+);
 
-test('native identity exposes complete deduplicated advisory warnings and aggregate assigned status', async (t) => {
-  const f = await fixture(
-    t,
-    true,
-    3,
-    false,
-    (n) => {
-      const record = envelope('fictional-warning-' + n),
-        date = n === 2 ? '1972-01-01' : '1971-01-01';
-      const textAnchor = subject + ' DOB: ' + date;
-      record.payload = { text: textAnchor };
-      record.reviewIssues = [
-        {
+test(
+  'public absent-subject identity preserves all name claims behind a bounded conflict summary',
+  { timeout: 180000 },
+  async (t) => {
+    const count = 48;
+    const claimedName = (n: number) =>
+      'Fictional X' +
+      String.fromCharCode(65 + Math.floor(n / 26)) +
+      String.fromCharCode(97 + (n % 26)) +
+      ' ' +
+      'Meadow'.repeat(28);
+    const f = await fixture(
+      t,
+      true,
+      1,
+      false,
+      (n) => {
+        const record = envelope('fictional-unbounded-names-' + n);
+        delete record.report;
+        record.payload = {
+          literal: '12.00',
+          nameReadings: Array.from({ length: count }, (_, offset) => claimedName(offset)),
+        };
+        // The complete claims, not the record count, trigger this boundary:
+        // 48 individually small name claims exceed the inline conflict budget.
+        record.reviewIssues = Array.from({ length: count }, (_, offset) => ({
           kind: 'identity',
           field: 'subject',
-          prompt: 'Does this report belong to you?',
-          textAnchor,
-          selfSuggestion: { fullName: 'Fictional Iris Meadow', birthDate: date },
-        },
-      ];
-      return record;
-    },
-    `${heading}\n${subject}\nFictional result`,
-  );
-  const self = getNote(f.db, 'person-note:self');
-  saveNote(f.db, self.id, {
-    version: self.version,
-    person: { ...self.person, fullName: 'Fictional Iris Meadow', birthDate },
-  });
-  const review = await f.review();
-  assert.equal(review.status, 'evidenced_match');
-  assert.equal(review.blocking, false);
-  assert.equal(review.assignedPerson!.personId, 'patient');
-  assert.deepEqual(review.warnings!.map((warning) => warning.modelBirthDate).sort(), [
-    '1971-01-01',
-    '1972-01-01',
-  ]);
-  const page = await f.request(
-    `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${review.scopeReference!.scopeToken}&section=warnings&limit=1`,
-  );
-  assert.equal(page.total, 2);
-  assert.equal(page.items.length, 1);
-  assert.ok(page.nextCursor);
-});
+          prompt: `Who does this record belong to? Reading ${offset}`,
+          textAnchor: claimedName(offset),
+          selfSuggestion: { fullName: claimedName(offset) },
+        }));
+        return record;
+      },
+      heading +
+        '\nFictional records without a printed patient boundary.\n' +
+        Array.from({ length: count }, (_, n) => claimedName(n)).join('\n'),
+      true,
+    );
+    const before = { ...intakeWorkCounters(f.db).warm };
+    const result = await f.review();
+    assert.equal(result.scope, null);
+    assert.equal(result.scopeReference, undefined);
+    assert.equal(result.blocking, true);
+    assert.equal(result.evidencedIdentity.fullName, undefined);
+    const conflict = result.conflicts.find((value) => value.field === 'fullName');
+    assert.equal(conflict?.evidencedValueReference?.names, count);
+    assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8192);
+    const detail = await f.request(
+      `../report-queue/${encodeURIComponent(f.groupId)}?intakeId=${encodeURIComponent(f.original.id)}&view=all`,
+    );
+    assert.ok(detail.records.records[0]?.proposalId);
+    const full = await readQualificationReview(
+      f.request,
+      'review?proposalId=' + encodeURIComponent(detail.records.records[0].proposalId),
+    );
+    const inspected = new Set<string>();
+    for (const record of full.records) {
+      let cursor: string | null = null;
+      do {
+        const page = await f.request('review-record-section', {
+          proposalId: full.proposalId,
+          recordId: record.id,
+          candidateVersionId: record.candidateVersionId,
+          section: 'issues',
+          limit: 17,
+          bytes: 65536,
+          cursor,
+        });
+        for (const item of page.items) {
+          let value = item.detail.value;
+          if (item.detail.kind === 'reference') {
+            assert.ok(item.detail.reference.bytes < 128 * 1024);
+            const parts: Buffer[] = [];
+            let offset = 0;
+            for (;;) {
+              const fragment = await f.request('review-record-section-fragment', {
+                reference: item.detail.reference,
+                offset,
+                bytes: 32768,
+              });
+              parts.push(Buffer.from(fragment.data, 'base64'));
+              if (fragment.complete) break;
+              assert.ok(fragment.nextOffset > offset);
+              offset = fragment.nextOffset;
+            }
+            value = JSON.parse(Buffer.concat(parts).toString('utf8'));
+          }
+          if (value.selfSuggestion?.fullName) inspected.add(value.selfSuggestion.fullName);
+        }
+        cursor = page.nextCursor;
+      } while (cursor);
+    }
+    assert.deepEqual(inspected, new Set(Array.from({ length: count }, (_, n) => claimedName(n))));
+    assert.equal(getNote(f.db, 'person-note:self').person.fullName || '', '');
+    assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+    assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+  },
+);
+
+test(
+  'native identity exposes complete deduplicated advisory warnings',
+  { timeout: 120000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      true,
+      3,
+      false,
+      (n) => {
+        const record = envelope('fictional-warning-' + n),
+          date = n === 2 ? '1972-01-01' : '1971-01-01';
+        const textAnchor = subject + ' DOB: ' + date;
+        record.payload = { text: textAnchor };
+        record.reviewIssues = [
+          {
+            kind: 'identity',
+            field: 'subject',
+            prompt: 'Does this report belong to you?',
+            textAnchor,
+            selfSuggestion: { fullName: 'Fictional Iris Meadow', birthDate: date },
+          },
+        ];
+        return record;
+      },
+      `${heading}\n${subject}\nFictional result`,
+    );
+    const self = getNote(f.db, 'person-note:self');
+    saveNote(f.db, self.id, {
+      version: self.version,
+      person: { ...self.person, fullName: 'Fictional Iris Meadow', birthDate },
+    });
+    const review = await f.review();
+    assert.equal(review.status, 'evidenced_match');
+    assert.equal(review.blocking, false);
+    assert.equal(review.assignedPerson, undefined);
+    assert.deepEqual(review.warnings!.map((warning) => warning.modelBirthDate).sort(), [
+      '1971-01-01',
+      '1972-01-01',
+    ]);
+    const page = await f.request(
+      `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${review.scopeReference!.scopeToken}&section=warnings&limit=1`,
+    );
+    assert.equal(page.total, 2);
+    assert.equal(page.items.length, 1);
+    assert.ok(page.nextCursor);
+  },
+);

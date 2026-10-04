@@ -205,6 +205,14 @@ export function createOwnershipSourceSnapshotPreparation(
       }
       return { moving: await publish(moving, phase), remaining: await publish(current, phase) };
     },
+    async finishMaintenance() {
+      const prepared = await this.finish();
+      try {
+        prepared.publishMaintenance();
+      } finally {
+        prepared.dispose();
+      }
+    },
     async finish() {
       if (finished) throw Error('Ownership source snapshot preparation already finished');
       finished = true;
@@ -224,6 +232,11 @@ export function createOwnershipSourceSnapshotPreparation(
           if (disposed) throw Error('Disposed ownership source snapshots');
           assertCurrent();
           collections.stage(prepared);
+        },
+        publishMaintenance() {
+          if (disposed) throw Error('Disposed ownership source snapshots');
+          assertCurrent();
+          collections.commitMaintenance(prepared);
         },
         dispose() {
           if (disposed) return;
@@ -286,4 +299,12 @@ export function ownershipSourceSnapshotHas(
     { catalog: 'ownership.snapshots', catalogArea: 'builds' },
   );
   return open(catalog, reference).get(key(id)) === id;
+}
+
+/** Validate the exact immutable receipt target against its current authenticated source/catalog. */
+export function assertOwnershipSourceSnapshot(
+  db: Database,
+  reference: OwnershipSourceSnapshotReference,
+) {
+  readOwnershipSourceSnapshot(db, reference, { limit: 1, bytes: 65536 });
 }

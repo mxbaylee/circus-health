@@ -482,7 +482,11 @@ export async function importLegacyReadingCheckpoint(
  * only that map and the selected native unit ledger at final publication. */
 export async function prepareLegacyReadingUpdate(
   context: Context,
-  options: { assertRunning?: () => void; onCheckpoint?: () => void | Promise<void> } = {},
+  options: {
+    assertRunning?: () => void;
+    onCheckpoint?: () => void | Promise<void>;
+    onPendingRemoved?: (key: string) => void;
+  } = {},
 ) {
   const old = openLegacyReadingSession(context);
   if (!old) return undefined;
@@ -548,6 +552,7 @@ export async function prepareLegacyReadingUpdate(
   };
   const removeWindow = async (key: string) => {
     if (!count('legacy.pendingCount:' + key)) return;
+    options.onPendingRemoved?.(key);
     await writer.flush();
     for (const item of read.entries('legacy.targets:' + key + ':'))
       await removeTarget(item.key, item.value);
@@ -595,6 +600,9 @@ export async function prepareLegacyReadingUpdate(
       await writer.flush();
     },
     readPageRank: read.readPageRank,
+    async sourceRoute(key: string, value: string) {
+      await writer.put('sourceUnit:' + key, value);
+    },
     async markJSON(key: string) {
       await writer.put('legacy.json:' + key, '1');
     },

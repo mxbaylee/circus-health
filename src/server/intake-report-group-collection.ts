@@ -1,8 +1,9 @@
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete native report summaries. Pages never become a clinical decision scope. */
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError, clinicalReviewRevision } from './database.ts';
+import { HttpError, clinicalReviewRevision, revision } from './database.ts';
 import { assertIntakeOwner } from './intake.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -203,6 +204,12 @@ type QueueCache = {
   used: number;
   closed: boolean;
 };
+export interface CollectionReviewRowCertificate {
+  stamp: string;
+  requestRevision: number;
+  sourcePin: string;
+  queueBinding: string;
+}
 const queueCaches = new Set<QueueCache>(),
   queueEpochs = new WeakMap<DatabaseSync, number>();
 let queueClock = 0;
@@ -793,7 +800,9 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     if (bindingNow() !== binding) throw changed();
   };
   let reviewCache: ReturnType<typeof prepareCollectionClinicalReview> | undefined,
-    reviewKey = '';
+    reviewKey = '',
+    reviewObservedStamp: string | undefined,
+    reviewCertificate: CollectionReviewRowCertificate | undefined;
   return {
     get binding() {
       return binding;
@@ -807,6 +816,18 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         yield { id: String(row.id), pin: String(row.pin) };
     },
     assertCurrent,
+    currentReviewCertificate(
+      intakeId: string,
+      certificate: CollectionReviewRowCertificate | undefined,
+    ) {
+      const currentStamp = reviewReadStamp(db);
+      if (!certificate || certificate.stamp !== currentStamp) return false;
+      return (
+        certificate.queueBinding === binding &&
+        certificate.requestRevision === revision(db) &&
+        certificate.sourcePin === canonicalLiteral(intakeSourceVersion(db, intakeId))
+      );
+    },
     close() {
       if (reviewCache?.status === 'ready') reviewCache.session.close();
       reviewCache = undefined;
@@ -912,9 +933,17 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         };
     },
     reviewMember(intakeId: string, member: CollectionReportQueueMember) {
-      const key = canonicalLiteral([intakeId, member.proposalId]);
-      if (!reviewCache || reviewKey !== key) {
+      const key = canonicalLiteral([intakeId, member.proposalId]),
+        stamp = reviewReadStamp(db);
+      if (
+        !reviewCache ||
+        reviewKey !== key ||
+        stamp === undefined ||
+        stamp !== reviewObservedStamp
+      ) {
         if (reviewCache?.status === 'ready') reviewCache.session.close();
+        const requestRevision = revision(db),
+          sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
         withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueClinicalReviews'));
         reviewCache = prepareCollectionClinicalReview(
           db,
@@ -924,6 +953,14 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           member.proposalId,
         );
         reviewKey = key;
+        reviewObservedStamp = reviewReadStamp(db);
+        reviewCertificate =
+          stamp !== undefined &&
+          stamp === reviewObservedStamp &&
+          requestRevision === revision(db) &&
+          sourcePin === canonicalLiteral(intakeSourceVersion(db, intakeId))
+            ? { stamp, requestRevision, sourcePin, queueBinding: binding }
+            : undefined;
       }
       if (reviewCache.status !== 'ready')
         throw new IntakeReviewFragmentRequired(reviewCache.reference);
@@ -939,6 +976,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           'A report reference no longer matches its retained proposal',
         );
       return {
+        certificate: reviewCertificate,
         session: reviewCache.session,
         record: reviewedIntakeQueueRecord(record, member.state),
         ordinal: reviewCache.session.review.records.indexOf(record),
@@ -1083,47 +1121,7 @@ export async function collectionReportGroupSummary(
     dates = new Set<string | null>();
   queue.beginSummary(intakeId, pointer.ordinal);
   let fallbackTitle = '';
-  for (const member of queue.members(intakeId, pointer.ordinal)) {
-    if (member.state === 'kept_original') tally.keptOriginal++;
-    else tally[member.state]++;
-    const candidate =
-        workflow && view.find('candidate', workflow, member.candidateId, { match: 'last' }),
-      latest =
-        candidate &&
-        view.childAt(candidate, 'versions', view.childCount(candidate, 'versions') - 1),
-      isCurrent = latest && scalar(view, latest, 'id') === member.candidateVersionId;
-    if (
-      member.state !== 'pending' &&
-      member.state !== 'deferred' &&
-      !(pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
-    ) {
-      queue.cacheMemberFacts(intakeId, member, reviewedMemberFacts(member));
-      continue;
-    }
-    const { record } = queue.reviewMember(intakeId, member);
-    queue.cacheMemberFacts(
-      intakeId,
-      member,
-      reviewedMemberFacts(member, record, !!isCurrent && pointer.basis === 'candidate_fallback'),
-    );
-    if (pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
-      fallbackTitle = clinicalMappingLabel(record.mapping).trim();
-    if (member.state !== 'pending' && member.state !== 'deferred') continue;
-    if (!record.selectable) tally.blocked++;
-    tally.questions += reviewRecordIssues(record).filter(
-      (issue) => issue.kind !== 'information' && issue.status !== 'resolved',
-    ).length;
-    const date = record.mapping.documentDate || record.mapping.date;
-    dates.add(
-      typeof date === 'string' &&
-        /^\d{4}(?:-\d{2}(?:-\d{2})?)?$/.test(date) &&
-        !reviewRecordIssues(record).some(
-          (issue) => issue.kind === 'date' && issue.status !== 'resolved',
-        )
-        ? date
-        : null,
-    );
-  }
+
   const coverageScratch = disposableSqlite('circus-report-coverage-'),
     coverageDb = coverageScratch.db;
   coverageDb.exec(
@@ -1162,6 +1160,47 @@ export async function collectionReportGroupSummary(
       } finally {
         scope.close();
       }
+    }
+    for (const member of queue.members(intakeId, pointer.ordinal)) {
+      if (member.state === 'kept_original') tally.keptOriginal++;
+      else tally[member.state]++;
+      const candidate =
+          workflow && view.find('candidate', workflow, member.candidateId, { match: 'last' }),
+        latest =
+          candidate &&
+          view.childAt(candidate, 'versions', view.childCount(candidate, 'versions') - 1),
+        isCurrent = latest && scalar(view, latest, 'id') === member.candidateVersionId;
+      if (
+        member.state !== 'pending' &&
+        member.state !== 'deferred' &&
+        !(pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
+      ) {
+        queue.cacheMemberFacts(intakeId, member, reviewedMemberFacts(member));
+        continue;
+      }
+      const { record } = queue.reviewMember(intakeId, member);
+      queue.cacheMemberFacts(
+        intakeId,
+        member,
+        reviewedMemberFacts(member, record, !!isCurrent && pointer.basis === 'candidate_fallback'),
+      );
+      if (pointer.basis === 'candidate_fallback' && !fallbackTitle && isCurrent)
+        fallbackTitle = clinicalMappingLabel(record.mapping).trim();
+      if (member.state !== 'pending' && member.state !== 'deferred') continue;
+      if (!record.selectable) tally.blocked++;
+      tally.questions += reviewRecordIssues(record).filter(
+        (issue) => issue.kind !== 'information' && issue.status !== 'resolved',
+      ).length;
+      const date = record.mapping.documentDate || record.mapping.date;
+      dates.add(
+        typeof date === 'string' &&
+          /^\d{4}(?:-\d{2}(?:-\d{2})?)?$/.test(date) &&
+          !reviewRecordIssues(record).some(
+            (issue) => issue.kind === 'date' && issue.status !== 'resolved',
+          )
+          ? date
+          : null,
+      );
     }
     for (const row of queue.saved(intakeId, pointer.ordinal))
       coverageDb.prepare('INSERT INTO sources VALUES(?,?,?)').run('saved', row.source, row.count);

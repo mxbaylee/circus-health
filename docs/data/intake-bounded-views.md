@@ -153,8 +153,31 @@ intact; cache recovery follows the accepted auxiliary graph. Ledger writes do no
 advance the clinical version. Source or plan changes require reopening the unit
 capability under current pins.
 
+Manual child-source batches select the child's actual plan and source pins while
+checking acknowledged reads in the parent's conversation ledger. Child PDF
+pages and pending windows are checked separately from the package-member
+coverage; a child receipt does not complete its parent. A disposable pending
+window index supports exact source/page, unit and text-range checks. Its cold
+preparation yields in bounded batches, and acknowledged reads update only their
+changed windows. Cache loss rebuilds from native and imported legacy ledgers;
+an interrupted preparation cannot establish an empty scope. Package inventory
+metadata does not count as a literal member read.
+Acknowledged child reads also retain a source-hash-bound pointer to their parent
+unit in the session map, so switching units or rebuilding the cache does not
+substitute another unit's reading evidence.
+A legacy parent conversation can also open a native child plan: coverage uses
+that actual child's selected units against the retained legacy read checkpoint,
+without synthesizing a parent plan or treating old completion IDs as evidence.
+Child text and HTML coverage require an acknowledged direct child read or the
+exact selected child-unit read, with its required continuation windows exhausted.
+An unread child does not become complete just because only its parent member has
+pending windows. Cold pending-index cleanup and rebuilding both yield in bounded
+batches; an interrupted or superseded preparation cannot publish a partial index.
+
 Resuming a migrated chat explicitly imports its retained checkpoint before the
-provider starts. The import preserves seen and read-scope hashes, complete JSON
+provider starts. Creating a native plan during an already running legacy turn
+uses the same import before another read or completion; usage and progress
+callbacks then share the native checkpoint. The import preserves seen and read-scope hashes, complete JSON
 scope evidence, supplied JSON descriptors, pending windows, ordering and scalar
 model counters. Old completed/accounted unit IDs remain historical metadata;
 they do not create extraction coverage. A complete cold routing pass assigns
@@ -188,6 +211,13 @@ grant from the acknowledged parent evidence.
 
 Direct-source recipe plans participate in the same exact workflow counts,
 ordinal model unit pages, per-unit ledgers, and batch scopes as package recipes.
+Their bounded decoded plan headers use at most 32 cached lookup keys per database.
+Reuse requires the exact source and owner, unchanged SQLite change/data/schema
+versions before and after reading, and the same disposable collection-cache
+generation. Cache loss or any projection change rebuilds the header; reads inside
+transactions neither reuse nor populate it, so a rolled-back temporary repair
+cannot establish authority. Cached headers and exposed reader objects are frozen;
+accessed collection pages continue through their existing authority checks.
 Their fixed unit metadata carries a direct-source reference; shared headings and
 the original source index remain explicit scopes. The selected direct plan
 pointer avoids scanning historical plan headers on ordinary reads. Cold recipe
@@ -197,6 +227,22 @@ Mapping policy values can use external fragment cursors within the version 2
 model context protocol. These cursors bind the same source, logical, and mapping
 pins as record cursors, and resolve through the selected policy provider rather
 than asserting authority over an envelope record.
+
+Internal assistant events use an explicit selected source header containing
+source/version pins, bounded filename, provider, active plan, candidate count and
+durability. They do not reconstruct public collection-summary counts on each
+model event, and the smaller header does not represent omitted collections as
+empty. The public source summary remains a separate projection.
+Within one synchronous model-event callback, continuation and progress decisions
+share one complete reading projection. A write or asynchronous boundary requires
+a fresh projection; repeated scalar checks do not reopen the same reading scope.
+
+The coordinator's current-interpretation check retains at most eight scalar
+results per database, without materializing proposal IDs. Reuse requires the
+same owner, source/version pins, collection-cache generation and SQLite
+change/data/schema versions. Transactions discard prior results and never
+populate the cache; rolled-back dependency repairs therefore cannot leave a
+positive interpretation witness. Returned results are detached from the cache.
 
 Assistant startup prepares native plan and reading capabilities before provider
 dispatch. Explicit unit/member reads in a manual conversation select that

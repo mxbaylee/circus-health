@@ -16,7 +16,7 @@ export function registerReviewRecordField(
   let selected = fields.get(record);
   if (!selected) fields.set(record, (selected = new Map()));
   selected.set(field, { transport, chunks });
-  registerReviewCanonicalValue(record, function* () {
+  registerReviewCanonicalValue(record, function* (options = {}) {
     const current = fields.get(record)!,
       hidden = new Set([...current.values()].map((value) => value.transport));
     yield '{';
@@ -27,9 +27,14 @@ export function registerReviewRecordField(
       if (!first) yield ',';
       first = false;
       yield JSON.stringify(key) + ':';
+      const override = options.fieldValue?.(record, key);
+      if (override) {
+        yield* canonicalReviewValueChunks(override.value, options);
+        continue;
+      }
       const selected = current.get(key);
       if (selected) yield* selected.chunks();
-      else yield* canonicalReviewValueChunks((record as Record<string, unknown>)[key]);
+      else yield* canonicalReviewValueChunks((record as Record<string, unknown>)[key], options);
     }
     yield '}';
   });

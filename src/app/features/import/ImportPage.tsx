@@ -1,3 +1,5 @@
+import { hostGroundedIdentity, identityGroundingRefreshKey } from './identity-grounding';
+import { recordLabel, recordValue, recordSaveBlockReason } from './import-feed-presentation';
 import { readSelectedClinicalReview } from '../../data/intake-clinical-review';
 import { firstReportGroup } from '../../../shared/intake-report-group-links';
 import { isIntakeSummary, type IntakeRead } from '../../../shared/intake-summary';
@@ -140,73 +142,6 @@ const feedKind: Partial<Record<ImportReviewKind, IntakeImportFeedRecord['feedKin
   Documents: 'history',
   People: 'person',
 };
-
-function recordLabel(record: IntakeImportFeedRecord) {
-  return (
-    record.mapping.testLabel ||
-    record.mapping.medicationName ||
-    record.mapping.procedureLabel ||
-    record.mapping.documentTitle ||
-    record.mapping.label ||
-    record.title
-  );
-}
-
-function recordValue(record: IntakeImportFeedRecord) {
-  const mapping = initialDraft(record).decision.mapping;
-  if (record.feedKind === 'prescription')
-    return { value: mapping.doseText || mapping.status || 'Prescription', unit: mapping.frequency };
-  if (record.feedKind === 'procedure')
-    return { value: mapping.status || mapping.eventKind || 'Procedure', unit: '' };
-  if (record.feedKind === 'history' || record.feedKind === 'unsupported') {
-    const literal = (mapping.text || mapping.status || record.title).replace(/\s+/g, ' ').trim();
-    return { value: literal.length > 120 ? `${literal.slice(0, 117)}…` : literal, unit: '' };
-  }
-  if (record.feedKind === 'vision' && mapping.opticalPrescription) {
-    const eyes = mapping.opticalPrescription.eyes.map((eye) => {
-      const side =
-        eye.sideText ||
-        (eye.side === 'right'
-          ? 'OD'
-          : eye.side === 'left'
-            ? 'OS'
-            : eye.side === 'both'
-              ? 'OU'
-              : 'Eye');
-      const values = [
-        eye.sph && `SPH ${eye.sph.valueText}${eye.sph.unit ? ` ${eye.sph.unit}` : ''}`,
-        eye.cyl && `CYL ${eye.cyl.valueText}${eye.cyl.unit ? ` ${eye.cyl.unit}` : ''}`,
-        eye.axis && `AXIS ${eye.axis.valueText}${eye.axis.unit ? ` ${eye.axis.unit}` : ''}`,
-        eye.add && `ADD ${eye.add.valueText}${eye.add.unit ? ` ${eye.add.unit}` : ''}`,
-      ].filter(Boolean);
-      return `${side} ${values.join(' ')}`.trim();
-    });
-    const literal = eyes.filter(Boolean).join(' · ');
-    return { value: literal || 'Vision prescription', unit: '' };
-  }
-  return { value: mapping.valueText || 'Value to review', unit: mapping.unit };
-}
-
-function recordSaveBlockReason(record: IntakeImportFeedRecord): string | undefined {
-  if (record.selectable || (record.queueState !== 'pending' && record.queueState !== 'deferred'))
-    return undefined;
-  if (hasUnreviewedPairChoices(record))
-    return 'Review the possible record matches before saving this record.';
-  if (record.identityReview?.blocking)
-    return record.identityReview.message || 'Review the report identity before saving this record.';
-  const issue = record.issues?.find(
-    (candidate) => candidate.blocking && candidate.status !== 'resolved',
-  );
-  if (issue?.kind === 'identity') return 'Review the report identity before saving this record.';
-  if (issue?.kind === 'date') return 'Resolve the date question before saving this record.';
-  if (issue?.kind === 'uncertain_reading')
-    return 'Resolve the uncertain reading before saving this record.';
-  if (issue?.kind === 'information')
-    return 'Answer the required review question before saving this record.';
-  if (record.classification === 'unsupported')
-    return 'This item is kept with its original and cannot be saved as a structured record.';
-  return 'Open the full review to resolve what is blocking this record.';
-}
 
 function detailUrl(
   group: IntakeReportQueueGroup,
@@ -440,16 +375,15 @@ export function ImportPage() {
           identityReviewLoads.current.set(group.groupId, { ...load, pending: false });
           recordIdentityReviewDiagnostic(review);
           setIdentityReviews((reviews) => new Map(reviews).set(group.groupId, review));
-          const groundingRefreshKey = JSON.stringify([
+          const groundingRefreshKey = identityGroundingRefreshKey(
             signature,
-            review.scope?.scopeToken,
+            review,
             data.blocks
               .filter((block) => block.groupId === group.groupId)
               .map((block) => block.reviewToken),
-          ]);
+          );
           if (
-            ['prior_confirmation', 'evidenced_match'].includes(review.status) &&
-            !review.blocking &&
+            hostGroundedIdentity(review) &&
             identityGroundingRefreshes.current.get(group.groupId) !== groundingRefreshKey &&
             data.blocks.some(
               (block) =>
@@ -1006,7 +940,16 @@ export function ImportPage() {
             ? data.people.counts.saved
             : data.people.counts.excluded
       : 0;
-    const activeFiles = (data?.activity.runningFiles || 0) + (data?.activity.queuedFiles || 0);
+    const nativeActivity = isCollectionImportFeed(feed.data) ? feed.data.activity : undefined;
+    const activity = nativeActivity || data?.activity;
+    const activeFiles = Math.max(
+      (activity?.runningFiles || 0) + (activity?.queuedFiles || 0),
+      batch.batch?.status === 'running'
+        ? batch.batch.items.filter((item) =>
+            ['queued', 'running', 'starting'].includes(item.status),
+          ).length
+        : 0,
+    );
     const pausedItem = batch.batch?.items.find(hasPausedIntakeReading);
     const currentItem =
       batch.batch?.items.find((item) => ['running', 'starting'].includes(item.status)) ||
@@ -1217,6 +1160,7 @@ export function ImportPage() {
     batch.batch,
     batch.busy,
     displayedFeed,
+    feed.data,
     filters,
     identityReviews,
     identityReviewErrors,

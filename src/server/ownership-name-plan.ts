@@ -529,6 +529,21 @@ export async function prepareOwnershipNamePlan(
             yield { key: String(row.key), outcome: row.outcome as OwnershipNameEffect['decision'] };
         };
       },
+      *groupSourceEffects() {
+        assertCurrent();
+        for (const row of sql.prepare('SELECT key,person_id FROM effects ORDER BY key').iterate()) {
+          const key = String(row.key);
+          yield {
+            personId: String(row.person_id),
+            sourceRecordIds: (function* () {
+              for (const value of sql
+                .prepare('SELECT record_id FROM affected WHERE effect=? ORDER BY ordinal')
+                .iterate(key))
+                yield String(value.record_id);
+            })(),
+          };
+        }
+      },
       *groupEffects() {
         assertCurrent();
         for (const row of sql.prepare('SELECT * FROM effects ORDER BY key').iterate()) {

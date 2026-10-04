@@ -5,16 +5,10 @@ import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createVaultApp } from '../server/vault-app.ts';
-import {
-  askIntakeQuestion,
-  getIntake,
-  getRetainedIntakeOriginalReference,
-  proposeConversion,
-  reviewIntake,
-} from '../server/intake.ts';
+import { getRetainedIntakeOriginalReference } from '../server/intake.ts';
 import type { IntakeIdentityReview } from '../shared/intake-identity.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
-import type { HealthRecordEnvelope, Intake, IntakeImportFeed } from '../shared/intake.ts';
+import type { HealthRecordEnvelope } from '../shared/intake.ts';
 import {
   qualificationAnswers,
   qualificationBirthDate,
@@ -24,6 +18,8 @@ import {
   writeProviderQualificationPdf,
 } from './provider-qualification-fixture.ts';
 import { readPdfIdentityPageText } from '../server/intake-pdf-session.ts';
+import type { IntakeRead } from '../shared/intake-summary.ts';
+import { collectQualificationFeed, readQualificationReview } from './qualification-intake-read.ts';
 import { performQualificationAcceptance } from './provider-qualification-acceptance.ts';
 
 test(
@@ -90,7 +86,7 @@ test(
     const prefix = `/api/profiles/${profile.id}`;
     const path = join(root, 'fictional.pdf');
     const fixture = writeProviderQualificationPdf(path);
-    const uploaded = await request<Intake>(prefix + '/intakes', undefined, readFileSync(path));
+    const uploaded = await request<IntakeRead>(prefix + '/intakes', undefined, readFileSync(path));
     // This fixture supplies its own proposals. Revoke automatic processing before
     // inspecting evidence so a background capture cannot change their source pin.
     const batches = await request<IntakeBatch[]>(prefix + '/intake-batches');
@@ -179,26 +175,26 @@ test(
         },
       },
     }));
-    const proposed = proposeConversion(state.db, state.root, profile.id, uploaded.id, {
-      version: getIntake(state.db, state.root, profile.id, uploaded.id).version,
+    await request<IntakeRead>(prefix + '/intakes/' + uploaded.id + '/proposals', {
+      version: (await request<IntakeRead>(prefix + '/intakes/' + uploaded.id)).version,
       jsonlText: proposals.map((item) => JSON.stringify(item)).join('\n'),
       summary: 'Independently fictional test proposals',
     });
-    // Real unresolved identity questions exercise the confirmation path even
-    // when the host independently matches a printed name and DOB to saved Self.
-    const review = reviewIntake(
-      state.db,
-      state.root,
-      profile.id,
-      uploaded.id,
-      proposed.proposals.at(-1)!.id,
+    const proposedFeed = await collectQualificationFeed(request, prefix);
+    const proposalIds = new Set(proposedFeed.blocks.map((block) => block.proposalId));
+    assert.equal(proposalIds.size, 1);
+    const proposalId = [...proposalIds][0];
+    assert.ok(proposalId);
+    const review = await readQualificationReview(
+      request,
+      prefix + '/intakes/' + uploaded.id + '/review?proposalId=' + encodeURIComponent(proposalId),
     );
     for (const record of review.records.filter((record) =>
       record.mapping.testLabel?.endsWith('R01'),
     )) {
-      askIntakeQuestion(state.db, state.root, profile.id, uploaded.id, {
-        version: getIntake(state.db, state.root, profile.id, uploaded.id).version,
-        key: `fictional-identity-${record.id}`,
+      await request(prefix + '/intakes/' + uploaded.id + '/questions', {
+        version: (await request<IntakeRead>(prefix + '/intakes/' + uploaded.id)).version,
+        key: 'fictional-identity-' + record.id,
         prompt: 'Confirm the fictional patient printed on this page belongs to you.',
         candidateId: record.candidateId,
         candidateVersionId: record.candidateVersionId,
@@ -206,13 +202,7 @@ test(
         locator: record.evidence[0]!.locator,
       });
     }
-    async function collectFeed(prefix: string) {
-      const feed = await request<IntakeImportFeed>(
-        prefix + '/intakes/import-feed?view=all&limit=100',
-      );
-      assert.equal(feed.nextCursor, null);
-      return { feed, blocks: feed.blocks };
-    }
+    const collectFeed = (prefix: string) => collectQualificationFeed(request, prefix);
     async function originalHash(prefix: string, originalId: string) {
       const response = await fetch(
         base + prefix + `/sources/${encodeURIComponent(originalId)}/content`,
@@ -271,10 +261,9 @@ test(
         review.self.fullName = 'Different Selected Person';
       },
       (review: IntakeIdentityReview) => {
-        review.scope!.sourceHash = 'different-original';
-      },
-      (review: IntakeIdentityReview) => {
-        review.scope!.targets[0]!.candidateVersionId = 'different-version';
+        const scope = review.scope || review.scopeReference;
+        assert.ok(scope);
+        scope.sourceHash = 'different-original';
       },
     ]) {
       await assert.rejects(
@@ -283,7 +272,10 @@ test(
           request: async <T>(path: string, input?: unknown): Promise<T> => {
             const result = await request<T>(path, input);
             if (path.includes('/identity-review?')) {
-              assert.ok((result as IntakeIdentityReview).scope, JSON.stringify(result));
+              assert.ok(
+                (result as IntakeIdentityReview).scope ||
+                  (result as IntakeIdentityReview).scopeReference,
+              );
               mutate(result as IntakeIdentityReview);
             }
             return result;
@@ -292,6 +284,32 @@ test(
         /exact fictional patient and original/,
       );
     }
+    await assert.rejects(
+      performQualificationAcceptance({
+        ...options,
+        request: async <T>(path: string, input?: unknown): Promise<T> => {
+          const result = await request<T>(path, input);
+          if (
+            path.includes('/identity-scope-page?') &&
+            new URLSearchParams(path.split('?')[1]).get('section') === 'targets'
+          ) {
+            const page = result as import('../shared/intake-identity.ts').IntakeIdentityScopePage;
+            const first = page.items[0];
+            assert.equal(first?.kind, 'value');
+            if (first?.kind === 'value') {
+              assert.ok(
+                first.value &&
+                  typeof first.value === 'object' &&
+                  'candidateVersionId' in first.value,
+              );
+              first.value.candidateVersionId = 'different-version';
+            }
+          }
+          return result;
+        },
+      }),
+      /exact fictional patient and original/,
+    );
     await assert.rejects(
       performQualificationAcceptance({
         ...options,

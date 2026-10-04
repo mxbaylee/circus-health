@@ -73,16 +73,45 @@ export async function applyNativeAcceptanceGroup(
 ): Promise<IntakeReportAcceptanceResult> {
   assertIntakeOwner(db, profileId);
   const pairPreparation = observeIntakePairPreparation(db);
+  const reviewedAtEntry = new Set<IntakeReportAcceptanceRequest['blocks'][number]>();
   try {
     // Fresh requests must be current at entry; retained/partial choices have
     // their separate exact-selection proof below.
     if (!options.retainResult)
-      for (const block of selected.blocks)
+      for (const block of selected.blocks) {
         for (const selection of block.selections) {
           if (selection.useRetainedDecision) continue;
           for (const comparison of selection.comparisons || [])
             pairPreparation.capture(comparison.scope, block.intakeVersion);
         }
+        // A complete review includes generated pair transport pins even when
+        // no comparison choice is submitted. Verify the exact human-reviewed
+        // token before our own auxiliary publications can advance those pins.
+        // The observer below permits only certified, domain-invisible writes;
+        // an ordinary write (including one imitating a maintenance actor)
+        // invalidates this proof before any refreshed token can be used.
+        if (!hasIntakeCollectionEnvelope(db, { id: block.intakeId })) continue;
+        const entry = prepareCollectionClinicalReview(
+          db,
+          root,
+          profileId,
+          block.intakeId,
+          block.proposalId,
+        );
+        if (entry.status !== 'ready') continue;
+        try {
+          pairPreparation.assertCurrent();
+          if (entry.session.review.reviewToken !== block.reviewToken)
+            throw new HttpError(
+              409,
+              'REVIEW_CHANGED',
+              'Refresh the complete selected review before approving its choices',
+            );
+          reviewedAtEntry.add(block);
+        } finally {
+          entry.session.close();
+        }
+      }
   } catch (error) {
     pairPreparation.dispose();
     throw error;
@@ -221,7 +250,11 @@ export async function applyNativeAcceptanceGroup(
             'SELECTION_REVIEW_CHANGED',
             'This record or its source/person dependencies changed. Review this exact record again.',
           );
-        if (selection.useRetainedDecision && block.reviewToken !== session.review.reviewToken)
+        if (
+          selection.useRetainedDecision &&
+          !reviewedAtEntry.has(block) &&
+          block.reviewToken !== session.review.reviewToken
+        )
           throw new HttpError(
             409,
             'REVIEW_CHANGED',
@@ -232,7 +265,10 @@ export async function applyNativeAcceptanceGroup(
       return {
         session,
         expectedVersion: options.retainResult ? version.version : block.intakeVersion,
-        reviewToken: options.retainResult ? session.review.reviewToken : block.reviewToken,
+        reviewToken:
+          options.retainResult || reviewedAtEntry.has(block)
+            ? session.review.reviewToken
+            : block.reviewToken,
         decisions: block.selections.map((selection) => {
           const record = session.record(selection.recordId)!;
           if (

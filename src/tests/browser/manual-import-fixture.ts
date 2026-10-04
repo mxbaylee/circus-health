@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import type { Page } from 'playwright';
-import type { Intake } from '../../shared/intake.ts';
+import type { IntakeSummaryV2 } from '../../shared/intake-summary.ts';
 
 /** Manual-review journeys own their seeded proposals. Stop the automatically queued
  * reader before seeding, then use the retained version after any admitted capture. */
@@ -9,7 +9,7 @@ export async function stopFixtureImport(
   url: string,
   prefix: string,
   id: string,
-): Promise<Intake> {
+): Promise<IntakeSummaryV2> {
   const response = await page.request.get(url + prefix + '/intake-batches');
   assert.ok(response.ok());
   const { data } = await response.json();

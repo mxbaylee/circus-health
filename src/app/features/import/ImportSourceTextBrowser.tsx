@@ -15,6 +15,7 @@ import { ImportSourceAttentionQueue } from './ImportSourceAttentionQueue';
 
 export interface SourceBrowserProps {
   onChanged: () => void;
+  guardNavigation?: boolean;
   attentionRows?: boolean;
   onAttentionCount?: (count: number) => void;
   attentionRefreshKey?: unknown;
@@ -43,6 +44,7 @@ function ImportedSourceSections({
   onManualCreated,
   intakeId,
   onPendingChange,
+  guardNavigation = true,
 }: SourceBrowserProps) {
   const profile = useProfile();
   const alive = useRef(true);
@@ -226,6 +228,7 @@ function ImportedSourceSections({
         <SourceReportSection
           key={intake.id}
           intake={intake}
+          guardNavigation={guardNavigation}
           compact={!!intakeId}
           expanded={selected?.id === intake.id}
           pending={pending}
@@ -309,6 +312,7 @@ function issueState(issue: Issue): string {
 
 function SourceReportSection({
   intake,
+  guardNavigation,
   compact,
   expanded,
   pending,
@@ -321,6 +325,7 @@ function SourceReportSection({
   children,
 }: {
   intake: IntakeHeader;
+  guardNavigation?: boolean;
   compact?: boolean;
   expanded: boolean;
   pending: boolean;
@@ -382,6 +387,7 @@ function SourceReportSection({
       ) : (
         <fieldset className="import-source-manual" disabled={textPending || reading}>
           <ImportManualSourceRecord
+            guardNavigation={guardNavigation}
             intakeId={intake.id}
             page={editorPage}
             onPendingChange={setManualPending}
@@ -394,6 +400,7 @@ function SourceReportSection({
         </fieldset>
       )}
       <SourceTextReview
+        guardNavigation={guardNavigation}
         key={`${intake.id}:${selection.issueId || selection.readerId || 'original'}:${selection.page}`}
         intakeId={intake.id}
         embedded

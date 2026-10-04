@@ -167,7 +167,10 @@ it.each([true, false])(
             manuallyEdited: false,
             issues: [],
             identityReview: {
-              ...identity,
+              message: identity.message,
+              evidencedIdentity: identity.evidencedIdentity,
+              conflicts: identity.conflicts,
+              warnings: identity.warnings,
               status: ready ? 'prior_confirmation' : 'confirmation_required',
               blocking: !ready,
             },
@@ -2157,7 +2160,14 @@ it('keeps report B banner review visible and saving blocked beside confirmed rep
     selectable: !identity(id).blocking,
     manuallyEdited: false,
     issues: [],
-    identityReview: identity(id),
+    identityReview: {
+      status: identity(id).status,
+      blocking: identity(id).blocking,
+      message: identity(id).message,
+      evidencedIdentity: identity(id).evidencedIdentity,
+      conflicts: identity(id).conflicts,
+      warnings: identity(id).warnings,
+    },
   });
   vi.stubGlobal(
     'fetch',

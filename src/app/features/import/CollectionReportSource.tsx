@@ -12,13 +12,17 @@ export function CollectionReportSource({
   intakeId,
   groupId,
   onChanged,
+  initiallyOpen = false,
+  onPending,
 }: {
   intakeId: string;
   groupId: string;
   onChanged: () => void;
+  initiallyOpen?: boolean;
+  onPending?: (pending: boolean) => void;
 }) {
   const profile = useProfile();
-  const [open, setOpen] = useState(false),
+  const [open, setOpen] = useState(initiallyOpen),
     [source, setSource] = useState('');
   const [cursor, setCursor] = useState<string>(),
     [evidenceCursor, setEvidenceCursor] = useState<string>(),
@@ -54,23 +58,28 @@ export function CollectionReportSource({
     setEvidenceCursor(undefined);
     resource.reload();
   };
+  const pendingListener = useRef(onPending);
+  pendingListener.current = onPending;
+  useEffect(() => {
+    pendingListener.current?.(busy || !!request.current);
+  }, [busy, error, scope]);
+  useEffect(() => () => pendingListener.current?.(false), []);
   const data = resource.data;
   async function save() {
     if (busy || !data || resource.refreshing || !source.trim()) return;
     const key = JSON.stringify([data.scopeToken, source.trim()]);
-    const body =
-      request.current?.key === key
-        ? request.current.body
-        : {
-            version: data.intakeVersion,
-            operationId: crypto.randomUUID(),
-            groupId: data.groupId,
-            groupVersionId: data.groupVersionId,
-            contextId: data.groupVersionId,
-            source: source.trim(),
-            scopeToken: data.scopeToken,
-            view: data.view,
-          };
+    const body = request.current
+      ? request.current.body
+      : {
+          version: data.intakeVersion,
+          operationId: crypto.randomUUID(),
+          groupId: data.groupId,
+          groupVersionId: data.groupVersionId,
+          contextId: data.groupVersionId,
+          source: source.trim(),
+          scopeToken: data.scopeToken,
+          view: data.view,
+        };
     request.current = { key, body };
     setBusy(true);
     setError('');
@@ -86,7 +95,12 @@ export function CollectionReportSource({
       onChanged();
     } catch (cause) {
       if (current.current !== scope) return;
-      if (cause instanceof ApiError && cause.status >= 400 && cause.status < 500) {
+      if (
+        cause instanceof ApiError &&
+        cause.status >= 400 &&
+        cause.status < 500 &&
+        ![408, 429].includes(cause.status)
+      ) {
         request.current = undefined;
         refresh();
       }
@@ -100,7 +114,7 @@ export function CollectionReportSource({
     }
   }
   return (
-    <details onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <details open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>Source label for this report</summary>
       {open && (
         <>
@@ -197,7 +211,7 @@ export function CollectionReportSource({
                 <input
                   value={source}
                   maxLength={200}
-                  disabled={busy}
+                  disabled={busy || !!request.current}
                   onChange={(event) => setSource(event.target.value)}
                 />
               </label>
