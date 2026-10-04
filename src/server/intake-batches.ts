@@ -1,3 +1,7 @@
+import {
+  setCollectionProcessingException,
+  clearCollectionProcessingExceptions,
+} from './intake-processing-exceptions.ts';
 import { randomUUID } from 'node:crypto';
 import { modelRecoveryKey } from './model-bridge.ts';
 import { INTAKE_PDF_BOUNDS } from './intake-files.ts';
@@ -9,10 +13,11 @@ import {
 } from './import-diagnostics.ts';
 import { HttpError, required } from './database.ts';
 import {
-  getIntake,
-  linkIntakeConversion,
+  getIntakeRead as getIntake,
+  intakeConversionChatId,
+  linkIntakeConversionRead,
   currentIntakeInterpretations,
-  createIntakePlan,
+  createIntakePlanRead,
   workflowMutation,
 } from './intake.ts';
 import { isRetainOnlyIntake } from './intake-source-policy.ts';
@@ -40,7 +45,19 @@ import {
   assertCurrentIntakeBatch,
 } from './intake-batch-journal.ts';
 import type { DatabaseSync } from 'node:sqlite';
-import type { Intake } from '../shared/intake.ts';
+import {
+  isIntakeSummary,
+  intakeFilenameDisplay,
+  type IntakeRead as Intake,
+} from '../shared/intake-summary.ts';
+import { prepareCurrentIntakeInterpretations } from './intake-current-interpretations.ts';
+import {
+  nativeAssistantConversion,
+  nativeAssistantUnit,
+  prepareNativeAssistantConversion,
+} from './assistant-intake-native.ts';
+import { activeMappingRules } from './clinical-import.ts';
+import { workflowHash } from './intake-workflow.ts';
 import { hasPausedIntakeReading } from '../shared/intake-batch.ts';
 import {
   beginReadingSlice,
@@ -126,11 +143,15 @@ interface BatchManagerOptions {
 export interface IntakeBatchManager {
   wake(profileId: string): void;
   create(profileId: string, input: Partial<CreateIntakeBatchInput> | null): IntakeBatch;
+  createPrepared(
+    profileId: string,
+    input: Partial<CreateIntakeBatchInput> | null,
+  ): Promise<IntakeBatch>;
   list(profileId: string): IntakeBatch[];
   get(profileId: string, id: string): IntakeBatch;
   stop(profileId: string, batchId: string): IntakeBatch;
   resume(profileId: string, batchId: string): IntakeBatch;
-  retryExceptions(profileId: string, batchId: string): IntakeBatch;
+  retryExceptions(profileId: string, batchId: string): Promise<IntakeBatch>;
   close(reason?: string): void;
   isBusy(profileId: string): boolean;
 }
@@ -688,6 +709,34 @@ export function createIntakeBatchManager({
     timers.set(profileId, { timer, batchId, at });
   }
 
+  function retainProposalState(item: IntakeBatchItem, intake: Intake | null) {
+    if (!intake) return;
+    if (isIntakeSummary(intake))
+      item.proposalState = {
+        format: 'health-intake-proposal-summary-v2',
+        total: intake.collections.proposals.total,
+        href: intake.links.review,
+      };
+    else {
+      delete item.proposalState;
+      item.proposalIds = intake.proposals.map((p) => p.id);
+    }
+  }
+  const hasActivePlan = (intake: Intake) =>
+    isIntakeSummary(intake)
+      ? intake.activePlan.state === 'exact' && !!intake.activePlan.plan
+      : intake.workflow?.plans.some((p) => p.status === 'active');
+  async function interpretationsFor(profileId: string, intake: Intake) {
+    if (isIntakeSummary(intake))
+      return prepareCurrentIntakeInterpretations(dbFor(profileId), profileId, intake.id);
+    const current = currentIntakeInterpretations(dbFor(profileId), profileId, intake.id);
+    return {
+      original: current.original,
+      originalValid: !!intake.validation?.valid,
+      hasCurrentProposal: current.proposalIds.length > 0,
+      proposalTotal: intake.proposals.length,
+    };
+  }
   function finishItem(
     profileId: string,
     batch: IntakeBatch,
@@ -718,7 +767,7 @@ export function createIntakeBatchManager({
     item.status = status;
     item.reason = reason;
     item.endedAt = now();
-    item.proposalIds = intake?.proposals?.map((proposal) => proposal.id) || item.proposalIds;
+    retainProposalState(item, intake);
     item.reading = chat?.reading ? cloneIntakeBatch(chat.reading) : item.reading;
     batch.currentIndex = Math.min(batch.items.length, batch.currentIndex + 1);
     save(profileId, batch, `item-${status}`);
@@ -901,7 +950,7 @@ export function createIntakeBatchManager({
   }
 
   function startMessage(intake: Intake): string {
-    return `Convert the selected delivery ${intake.filename} (${intake.id}) from ${intake.provider} into a reviewable health-record-v1 proposal. Read all its pages or members using host tools, including selected-page PDFs or rendered page images and extracted embedded files where present. Use the original page references in metadata; each supplied PDF contains only its selected original page. Preserve originals, exact values, subject identity, locators and uncertainty. Propose separate clinical mappings for observed labs, medications, procedures and documents. Do not accept/import. Report any unreviewed pages/assets as coverage gaps.`;
+    return `Convert the selected delivery ${intakeFilenameDisplay(intake)} (${intake.id}) from ${intake.provider} into a reviewable health-record-v1 proposal. Read all its pages or members using host tools, including selected-page PDFs or rendered page images and extracted embedded files where present. Use the original page references in metadata; each supplied PDF contains only its selected original page. Preserve originals, exact values, subject identity, locators and uncertainty. Propose separate clinical mappings for observed labs, medications, procedures and documents. Do not accept/import. Report any unreviewed pages/assets as coverage gaps.`;
   }
 
   async function captureSourceStep(
@@ -1133,9 +1182,10 @@ export function createIntakeBatchManager({
     }
 
     let linkedChat: AssistantChat | null = null;
-    if (intake.conversionChatId) {
+    const conversionChatId = intakeConversionChatId(db, profileId, intake.id);
+    if (conversionChatId) {
       try {
-        linkedChat = assistant.get(profileId, intake.conversionChatId);
+        linkedChat = assistant.get(profileId, conversionChatId);
       } catch (error: unknown) {
         if (!(error instanceof HttpError) || error.code !== 'CHAT_NOT_FOUND') throw error;
       }
@@ -1176,10 +1226,11 @@ export function createIntakeBatchManager({
       schedule(profileId, batch.id);
       return;
     }
-    const interpretations = currentIntakeInterpretations(db, profileId, item.intakeId);
+    const interpretations = await interpretationsFor(profileId, intake);
     const staleInterpretation =
-      !interpretations.proposalIds.length &&
-      ((!interpretations.original && !!intake.validation?.valid) || intake.proposals.length > 0);
+      !interpretations.hasCurrentProposal &&
+      ((!interpretations.original && interpretations.originalValid) ||
+        interpretations.proposalTotal > 0);
     const retry =
       retryItems.delete(key(profileId, `${batch.id}/${item.intakeId}`)) ||
       (item.automaticRun === true && !!item.chatId) ||
@@ -1218,7 +1269,7 @@ export function createIntakeBatchManager({
         return;
       }
     }
-    const current = currentIntakeInterpretations(db, profileId, item.intakeId);
+    const current = await interpretationsFor(profileId, intake);
     if (
       recordDurabilityStatus(db) &&
       sourceTextExtractionPending(getIntakeSourceText(db, root, profileId, item.intakeId))
@@ -1226,7 +1277,7 @@ export function createIntakeBatchManager({
       await drainRecordlessSource(profileId, batch, item, expected, linkedChat);
       return;
     }
-    if (intake.state === 'ready' && intake.validation?.valid && current.original) {
+    if (intake.state === 'ready' && current.originalValid && current.original) {
       finishItem(profileId, batch, item, 'review_ready', 'prepared_jsonl', intake, linkedChat);
       schedule(profileId, batch.id);
       return;
@@ -1240,7 +1291,7 @@ export function createIntakeBatchManager({
     if (
       !item.forceModelResume &&
       !capturedThisBatch &&
-      current.proposalIds.length &&
+      current.hasCurrentProposal &&
       (!retry || completedProposalPass)
     ) {
       finishItem(profileId, batch, item, 'review_ready', 'already_reviewable', intake, linkedChat);
@@ -1294,8 +1345,8 @@ export function createIntakeBatchManager({
       return;
     }
 
-    if (recordDurabilityStatus(db) && !intake.workflow?.plans.some((p) => p.status === 'active')) {
-      intake = await createIntakePlan(db, root, profileId, intake.id, {
+    if (recordDurabilityStatus(db) && !hasActivePlan(intake)) {
+      intake = await createIntakePlanRead(db, root, profileId, intake.id, {
         version: intake.version,
         assertRunning: () => {
           if (!live(profileId, expected) || !authorized(profileId, item.intakeId, 'publish'))
@@ -1303,8 +1354,36 @@ export function createIntakeBatchManager({
         },
       });
     }
-    const plan = intake.workflow?.plans.find((p) => p.status === 'active');
-    const unit = plan ? nextPendingReadingUnit(plan) : undefined;
+    if (isIntakeSummary(intake)) {
+      const mappingVersion = workflowHash(
+        activeMappingRules(db, intake.metadata?.sourceProviderId || intake.providerId),
+      );
+      const ready = await prepareNativeAssistantConversion(
+        nativeAssistantConversion(db, root, profileId, item.chatId || batch.id, intake),
+        {
+          mappingVersion,
+          assertRunning: () => {
+            if (!live(profileId, expected)) throw Error('Import processing stopped');
+          },
+        },
+      );
+      if (ready.state !== 'ready')
+        throw new HttpError(
+          409,
+          'WORKFLOW_PREPARATION_REQUIRED',
+          'Prepare the selected reading workflow before dispatch',
+        );
+    }
+    const plan = !isIntakeSummary(intake)
+      ? intake.workflow?.plans.find((p) => p.status === 'active')
+      : undefined;
+    const unit = isIntakeSummary(intake)
+      ? nativeAssistantUnit(
+          nativeAssistantConversion(db, root, profileId, item.chatId || batch.id, intake),
+        )
+      : plan
+        ? nextPendingReadingUnit(plan)
+        : undefined;
     if (unit && item.stalls?.unitId !== unit.id)
       item.stalls = { unitId: unit.id, locator: unit.locator || unit.id, attempts: 0 };
     beginReadingSlice(item, now(), readingLimits);
@@ -1342,13 +1421,13 @@ export function createIntakeBatchManager({
     try {
       if (!chat) {
         chat = assistant.create(profileId, {
-          title: `Convert ${intake.filename}`,
+          title: `Convert ${intakeFilenameDisplay(intake)}`,
           context: {
             route: `/import?intake=${encodeURIComponent(intake.id)}`,
             intakeId: intake.id,
           },
         });
-        linkIntakeConversion(db, root, profileId, intake.id, chat.id);
+        await linkIntakeConversionRead(db, root, profileId, intake.id, chat.id);
         item.chatId = chat.id;
         save(profileId, batch, 'conversion-linked');
         chat = assistant.send(
@@ -1411,6 +1490,7 @@ export function createIntakeBatchManager({
     item.chatId = chat!.id;
     delete item.forceModelResume;
     item.status = 'running';
+    retainProposalState(item, intake);
     save(profileId, batch, 'conversion-running');
     schedule(profileId, batch.id, pollMs);
   }
@@ -1448,7 +1528,7 @@ export function createIntakeBatchManager({
       return;
     }
     if (!live(profileId, expected)) return;
-    const intake = getIntake(dbFor(profileId), root, profileId, item.intakeId) as Intake;
+    const intake = getIntake(dbFor(profileId), root, profileId, item.intakeId);
     const responsesBefore = item.reading?.usableModelResponses || 0;
     const madeProgress = finishReadingSlice(item, chat.reading || item.reading, now());
     item.reading = chat.reading ? cloneIntakeBatch(chat.reading) : item.reading;
@@ -1521,26 +1601,50 @@ export function createIntakeBatchManager({
             reason: 'processing_stalled' as const,
           };
           itemExceptions(item).push(exception);
-          workflowMutation(
-            dbFor(profileId),
-            root,
-            profileId,
-            intake.id,
-            {
+          if (isIntakeSummary(intake))
+            await setCollectionProcessingException(dbFor(profileId), root, profileId, intake.id, {
               version: intake.version,
               operationId:
                 'stall:' + batch.id + ':' + scope.unitId + ':' + (item.exceptionEpoch || 0),
-            },
-            (workflow) => {
-              const unit = workflow.plans
+              unitId: scope.unitId,
+              exception: { reason: 'processing_stalled', at: now() },
+              assertRunning: () => {
+                if (!live(profileId, expected) || !authorized(profileId, intake.id, 'publish'))
+                  throw Error('Import processing stopped');
+              },
+            });
+          else
+            workflowMutation(
+              dbFor(profileId),
+              root,
+              profileId,
+              intake.id,
+              {
+                version: intake.version,
+                operationId:
+                  'stall:' + batch.id + ':' + scope.unitId + ':' + (item.exceptionEpoch || 0),
+              },
+              (workflow) => {
+                const unit = workflow.plans
+                  .find((p) => p.status === 'active')
+                  ?.units.find((u) => u.id === scope.unitId);
+                if (unit) unit.processingException = { reason: 'processing_stalled', at: now() };
+              },
+            );
+          const latest = getIntake(dbFor(profileId), root, profileId, intake.id);
+          const remaining = isIntakeSummary(latest)
+            ? !!nativeAssistantUnit(
+                nativeAssistantConversion(
+                  dbFor(profileId),
+                  root,
+                  profileId,
+                  item.chatId || batch.id,
+                  latest,
+                ),
+              )
+            : latest.workflow?.plans
                 .find((p) => p.status === 'active')
-                ?.units.find((u) => u.id === scope.unitId);
-              if (unit) unit.processingException = { reason: 'processing_stalled', at: now() };
-            },
-          );
-          const remaining = getIntake(dbFor(profileId), root, profileId, intake.id)
-            .workflow?.plans.find((p) => p.status === 'active')
-            ?.units.some((u) => !u.processingException && u.status !== 'completed');
+                ?.units.some((u) => !u.processingException && u.status !== 'completed');
           if (!remaining) {
             finishItem(profileId, batch, item, 'review_ready', 'processing_stalled', intake, chat);
             schedule(profileId, batch.id);
@@ -1550,7 +1654,7 @@ export function createIntakeBatchManager({
       }
       item.status = 'queued';
       item.reason = 'continuing';
-      item.proposalIds = intake.proposals.map((proposal) => proposal.id);
+      retainProposalState(item, intake);
       item.retryAt = new Date(clock().getTime() + continuationDelayMs).toISOString();
       retryItems.add(key(profileId, batch.id + '/' + item.intakeId));
       save(profileId, batch, 'productive-slice-continued');
@@ -1558,7 +1662,7 @@ export function createIntakeBatchManager({
       schedule(profileId, batch.id);
       return;
     }
-    item.proposalIds = intake.proposals.map((proposal) => proposal.id);
+    retainProposalState(item, intake);
     // A retained cumulative step count is not evidence of new source capture on
     // the next process run. Record that this completed pass covered those steps.
     if (chat.status === 'idle' && item.sourceExtraction)
@@ -1568,14 +1672,14 @@ export function createIntakeBatchManager({
       // Do not forgive preceding unproductive model requests in this slice.
       if (retainProviderWait(profileId, batch, item, chat)) return;
     }
-    if (
-      currentIntakeInterpretations(dbFor(profileId), profileId, item.intakeId).proposalIds.length
-    ) {
+    if ((await interpretationsFor(profileId, intake)).hasCurrentProposal) {
       finishItem(
         profileId,
         batch,
         item,
-        intake.workflow?.plans.length &&
+        (isIntakeSummary(intake)
+          ? intake.collections.plans.total
+          : intake.workflow?.plans.length) &&
           (item.reading?.remainingUnits || item.reading?.pendingReadWindows)
           ? 'paused'
           : 'review_ready',
@@ -1669,7 +1773,82 @@ export function createIntakeBatchManager({
     await beginItem(profileId, batch, item, expected);
   }
 
-  function create(profileId: string, input: Partial<CreateIntakeBatchInput> | null): IntakeBatch {
+  type InterpretationSelection = {
+    result: Awaited<ReturnType<typeof prepareCurrentIntakeInterpretations>>;
+    assertCurrent: () => void;
+  };
+  async function createPrepared(
+    profileId: string,
+    input: Partial<CreateIntakeBatchInput> | null,
+  ): Promise<IntakeBatch> {
+    const db = dbFor(profileId);
+    retryPublication(profileId);
+    loadProfile(profileId);
+    assertProfileCurrent(profileId);
+    if (!Array.isArray(input?.intakeIds) || !input.intakeIds.length || input.intakeIds.length > 100)
+      return create(profileId, input);
+    const prepared = new Map<string, InterpretationSelection>();
+    const expected = generation(profileId),
+      { readIntakeSourcePin } = await import('./intake-source-pin.ts');
+    for (const id of input.intakeIds) {
+      if (typeof id !== 'string' || !id) return create(profileId, input);
+      const selected = getIntake(db, root, profileId, id);
+      if (!isIntakeSummary(selected)) continue;
+      const result = await prepareCurrentIntakeInterpretations(db, profileId, id, {
+        assertRunning: () => {
+          if (!live(profileId, expected) || !authorized(profileId, id, 'publish'))
+            throw Error('Import preparation stopped');
+        },
+      });
+      const pin = JSON.stringify(readIntakeSourcePin(db, id)),
+        changes = Number(db.prepare('SELECT total_changes() AS count').get()!.count);
+      prepared.set(id, {
+        result,
+        assertCurrent() {
+          if (!live(profileId, expected) || !authorized(profileId, id, 'publish'))
+            throw Error('Import preparation stopped');
+          const current = getIntake(db, root, profileId, id);
+          if (
+            !isIntakeSummary(current) ||
+            current.version !== selected.version ||
+            current.pins.logicalRoot !== selected.pins.logicalRoot ||
+            JSON.stringify(readIntakeSourcePin(db, id)) !== pin ||
+            Number(db.prepare('SELECT total_changes() AS count').get()!.count) !== changes
+          )
+            throw new HttpError(
+              409,
+              'INTAKE_BATCH_PREPARATION_REQUIRED',
+              'The selected interpretation changed; prepare again',
+            );
+        },
+      });
+    }
+    for (const value of prepared.values()) value.assertCurrent();
+    return create(profileId, input, prepared);
+  }
+  function create(
+    profileId: string,
+    input: Partial<CreateIntakeBatchInput> | null,
+    prepared?: Map<string, InterpretationSelection>,
+  ): IntakeBatch {
+    const selectionInterpretation = (id: string) => {
+      const db = dbFor(profileId),
+        selected = getIntake(db, root, profileId, id);
+      if (isIntakeSummary(selected)) {
+        const ready = prepared?.get(id);
+        if (!ready)
+          throw new HttpError(
+            409,
+            'INTAKE_BATCH_PREPARATION_REQUIRED',
+            'Prepare current native interpretations before reprocessing',
+          );
+        ready.assertCurrent();
+        return ready.result;
+      }
+      const old = currentIntakeInterpretations(db, profileId, id);
+      return { original: old.original, hasCurrentProposal: old.proposalIds.length > 0 };
+    };
+
     dbFor(profileId);
     retryPublication(profileId);
     loadProfile(profileId);
@@ -1736,9 +1915,9 @@ export function createIntakeBatchManager({
         batch.items.some((item) => {
           if (!intakeIds.includes(item.intakeId)) return false;
           if (item.status !== 'review_ready') return batch.status === 'stopped';
-          const interpretation = currentIntakeInterpretations(db, profileId, item.intakeId);
+          const interpretation = selectionInterpretation(item.intakeId);
           return (
-            (!interpretation.original && !interpretation.proposalIds.length) ||
+            (!interpretation.original && !interpretation.hasCurrentProposal) ||
             sourceTextExtractionPending(getIntakeSourceText(db, root, profileId, item.intakeId))
           );
         }),
@@ -1770,10 +1949,10 @@ export function createIntakeBatchManager({
         const db = dbFor(profileId);
         const affected = retained.items.filter((item) => {
           if (!intakeIds.includes(item.intakeId) || item.status !== 'review_ready') return false;
-          const interpretation = currentIntakeInterpretations(db, profileId, item.intakeId);
+          const interpretation = selectionInterpretation(item.intakeId);
           const text = getIntakeSourceText(db, root, profileId, item.intakeId);
           return (
-            (!interpretation.original && !interpretation.proposalIds.length) ||
+            (!interpretation.original && !interpretation.hasCurrentProposal) ||
             sourceTextExtractionPending(text)
           );
         });
@@ -1829,15 +2008,11 @@ export function createIntakeBatchManager({
           );
         for (const item of retained.items) {
           if (!intakeIds.includes(item.intakeId) || item.status !== 'review_ready') continue;
-          const interpretation = currentIntakeInterpretations(
-            dbFor(profileId),
-            profileId,
-            item.intakeId,
-          );
+          const interpretation = selectionInterpretation(item.intakeId);
           const pending = sourceTextExtractionPending(
             getIntakeSourceText(dbFor(profileId), root, profileId, item.intakeId),
           );
-          if ((interpretation.proposalIds.length || interpretation.original) && !pending) continue;
+          if ((interpretation.hasCurrentProposal || interpretation.original) && !pending) continue;
           item.status = 'paused';
           item.reason = 'stopped';
           item.resumeAutomaticRun = true;
@@ -1872,13 +2047,22 @@ export function createIntakeBatchManager({
       return {
         intakeId: intake.id,
         sourceHash: intake.sha256,
-        filename: intake.filename,
+        filename: intakeFilenameDisplay(intake),
         mimeType: intake.mimeType,
         automaticRun: true,
         status: 'queued',
         reason: null,
         chatId: null,
         proposalIds: [],
+        ...(isIntakeSummary(intake)
+          ? {
+              proposalState: {
+                format: 'health-intake-proposal-summary-v2' as const,
+                total: intake.collections.proposals.total,
+                href: intake.links.review,
+              },
+            }
+          : {}),
         reading: null,
         startedAt: null,
         endedAt: null,
@@ -2060,7 +2244,7 @@ export function createIntakeBatchManager({
     return publicBatch(batch);
   }
 
-  function retryExceptions(profileId: string, batchId: string): IntakeBatch {
+  async function retryExceptions(profileId: string, batchId: string): Promise<IntakeBatch> {
     const batch = get(profileId, batchId);
     const db = dbFor(profileId);
     for (const item of batch.items) {
@@ -2069,17 +2253,27 @@ export function createIntakeBatchManager({
         throw new HttpError(403, 'PROFILE_SCOPE', 'Unlock this profile before retrying imports');
       retrySourceExceptions(db, root, profileId, item.intakeId);
       const intake = getIntake(db, root, profileId, item.intakeId);
-      workflowMutation(
-        db,
-        root,
-        profileId,
-        item.intakeId,
-        { version: intake.version, operationId: randomUUID() },
-        (workflow) => {
-          for (const plan of workflow.plans.filter((plan) => plan.status === 'active'))
-            for (const unit of plan.units) delete unit.processingException;
-        },
-      );
+      if (isIntakeSummary(intake))
+        await clearCollectionProcessingExceptions(db, root, profileId, item.intakeId, {
+          version: intake.version,
+          operationId: randomUUID(),
+          assertRunning: () => {
+            if (!authorized(profileId, item.intakeId, 'publish'))
+              throw Error('Import processing authorization ended');
+          },
+        });
+      else
+        workflowMutation(
+          db,
+          root,
+          profileId,
+          item.intakeId,
+          { version: intake.version, operationId: randomUUID() },
+          (workflow) => {
+            for (const plan of workflow.plans.filter((plan) => plan.status === 'active'))
+              for (const unit of plan.units) delete unit.processingException;
+          },
+        );
       item.exceptionEpoch = (item.exceptionEpoch || 0) + 1;
       item.exceptions = [];
       item.stalls = undefined;
@@ -2173,6 +2367,7 @@ export function createIntakeBatchManager({
   return {
     wake,
     create,
+    createPrepared,
     list,
     get: (profileId: string, id: string) => publicBatch(get(profileId, id)),
     stop,

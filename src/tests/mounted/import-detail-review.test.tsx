@@ -12,7 +12,10 @@ import type {
   IntakeReview,
 } from '../../shared/intake';
 import type { IntakeIdentityReview } from '../../shared/intake-identity';
-import { ImportDetailReview } from '../../app/features/import/ImportDetailReview';
+import {
+  ImportDetailReview,
+  ImportRecordDetail,
+} from '../../app/features/import/ImportDetailReview';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
 
 vi.mock('../../app/components/SourceDialog', () => ({
@@ -560,7 +563,7 @@ it.each(['review_later', 'keep_original_only'] as const)(
             totalPeople: 0,
             peopleNextCursor: null,
           });
-        if (url.includes('/intakes/fictional-intake/review?'))
+        if (url.includes('/intakes/fictional-intake/review-record?'))
           return response({ ...review, records: [savedDraft()] });
         if (url.endsWith('/intakes/fictional-intake/review-draft')) {
           currentDisposition = JSON.parse(String(init?.body)).disposition;
@@ -2838,4 +2841,86 @@ it('recovers the exact second saved sibling from a partial bulk receipt before r
   expect(screen.queryByRole('button', { name: 'Confirm and save record' })).toBeNull();
   expect(screen.queryByText('This record needs review before saving.')).toBeNull();
   expect(acceptancePosts).toBe(0);
+});
+
+it('uses exact section controls for native selected-record related discovery without a legacy full-review request', async () => {
+  selectProfile({ id: 'fictional-native-related', name: 'Rowan', placebo: true });
+  const selected = { ...record, selectionReviewToken: 'selected-native-token' };
+  const nativeContext = {
+    intakeId: intake.id,
+    proposalId: block.proposalId,
+    version: intake.version,
+    reviewToken: block.reviewToken,
+    summary: review.summary,
+    sourceTextStale: false,
+  };
+  const requests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.includes('/review-record?'))
+        return response({
+          format: 'health-intake-clinical-record-v2',
+          context: nativeContext,
+          record: { kind: 'record', record: selected },
+        });
+      if (url.endsWith(`/intakes/${intake.id}`)) return response(intake);
+      if (url.endsWith('/review-record-section')) {
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          recordId: record.id,
+          candidateVersionId: record.candidateVersionId,
+          section: 'comparisons',
+          comparisonSearch: { query: '', limit: 20 },
+        });
+        return response({
+          format: 'health-clinical-record-section-page-v1',
+          context: nativeContext,
+          selection: {
+            proposalId: block.proposalId,
+            recordId: record.id,
+            candidateVersionId: record.candidateVersionId,
+            selectionReviewToken: selected.selectionReviewToken,
+          },
+          section: 'comparisons',
+          items: [],
+          total: 0,
+          nextCursor: null,
+          discoveryPage: {
+            query: '',
+            limit: 20,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+            truncated: false,
+            maximumResults: 200,
+          },
+        });
+      }
+      throw new Error(`Unexpected native selected request ${url}`);
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <ImportRecordDetail
+        groupId="fictional-report"
+        block={block}
+        recordId={record.id}
+        identityPanel={null}
+        identityRevision={0}
+        sourcePanel={null}
+        commonIdentityIssueIds={new Set()}
+        sourceError=""
+        onBack={() => {}}
+        onChanged={() => {}}
+        onUseSource={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.click(await screen.findByText('Find possible related saved records'));
+  fireEvent.click(screen.getByRole('button', { name: 'Resolve questions or correct this record' }));
+  expect(await screen.findByLabelText('Search related saved records')).toBeVisible();
+  expect(screen.getByText('0 related records in this search result window.')).toBeVisible();
+  expect(requests.some((url) => url.includes('/related-records'))).toBe(false);
 });

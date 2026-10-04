@@ -30,6 +30,7 @@ type Reply =
 interface HarnessOptions {
   config?: ProxyConfig;
   beforeRequest?: ProxyModelBridgeOptions['beforeRequest'];
+  onEvent?: ProxyModelBridgeOptions['onEvent'];
   retryDelay?: ProxyModelBridgeOptions['retryDelay'];
   onTool?: (request: ToolRequest) => unknown | Promise<unknown>;
   resolveHost?: ProxyModelBridgeOptions['resolveHost'];
@@ -535,7 +536,10 @@ function harness(replies: Reply[], options: HarnessOptions = {}): BridgeHarness 
       calls.push(value);
       return options.onTool ? options.onTool(value) : { record: 'fictional only' };
     },
-    onEvent: (method, params) => events.push({ method, params }),
+    onEvent: (method, params) => {
+      events.push({ method, params });
+      return options.onEvent?.(method, params);
+    },
     onExit: (error) => errors.push(error.message),
     onDiagnostic: (diagnostic) => diagnostics.push(JSON.parse(diagnostic)),
     resolveHost: options.resolveHost,
@@ -2982,4 +2986,91 @@ test('provider context rejection distinguishes initial admission from a producti
       bridge.close();
     }
   }
+});
+
+test('async host admission and request-start publication finish before the provider is called', async () => {
+  const gate = Promise.withResolvers<void>(),
+    admission = Promise.withResolvers<void>(),
+    publicationGate = Promise.withResolvers<void>(),
+    publication = Promise.withResolvers<void>();
+  const f = harness([answer], {
+    async beforeRequest() {
+      admission.resolve();
+      await gate.promise;
+    },
+    async onEvent(method) {
+      if (method === 'model/requestStarted') {
+        publication.resolve();
+        await publicationGate.promise;
+      }
+    },
+  });
+  const running = run(f);
+  await admission.promise;
+  assert.equal(f.requests.length, 0);
+  assert.equal(
+    f.events.some((e) => e.method === 'model/requestStarted'),
+    false,
+  );
+  gate.resolve();
+  await publication.promise;
+  assert.equal(f.requests.length, 0);
+  publicationGate.resolve();
+  await running;
+  assert.equal(f.requests.length, 1);
+  assert.deepEqual(f.errors, []);
+});
+
+test('async evidence acknowledgment finishes before the next guarded tool or terminal completion', async () => {
+  const gate = Promise.withResolvers<void>(),
+    started = Promise.withResolvers<void>();
+  let acknowledged = false;
+  const second = structuredClone(toolCall);
+  second.choices[0]!.message.tool_calls[0]!.id = 'call-2';
+  const f = harness([toolCall, second, answer], {
+    async onEvent(method) {
+      if (method === 'model/toolResultsConsumed' && !acknowledged) {
+        started.resolve();
+        await gate.promise;
+        acknowledged = true;
+      }
+    },
+    onTool(request) {
+      if (request.callId === 'call-2') assert.equal(acknowledged, true);
+      return { fictional: true };
+    },
+  });
+  const running = run(f);
+  await started.promise;
+  assert.equal(f.calls.length, 1);
+  assert.equal(
+    f.events.some((e) => e.method === 'turn/completed'),
+    false,
+  );
+  gate.resolve();
+  await running;
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.events.filter((e) => e.method === 'turn/completed').length, 1);
+  assert.deepEqual(f.errors, []);
+});
+
+test('rejected async evidence acknowledgment prevents follow-on writes and a false completed turn', async () => {
+  const second = structuredClone(toolCall);
+  second.choices[0]!.message.tool_calls[0]!.id = 'call-2';
+  const f = harness([toolCall, second, answer], {
+    async onEvent(method) {
+      if (method === 'model/toolResultsConsumed') {
+        await Promise.resolve();
+        throw new Error('fictional durable acknowledgment failed');
+      }
+    },
+  });
+  await run(f);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.requests.length, 2);
+  assert.equal(
+    f.events.some((e) => e.method === 'turn/completed'),
+    false,
+  );
+  assert.equal(f.errors.length, 1);
 });

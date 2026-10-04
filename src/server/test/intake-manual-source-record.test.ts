@@ -18,6 +18,7 @@ import {
 import { intakeSourceRoute } from '../intake-source-routes.ts';
 import { getIntakeSourceText, reviewIntakeSourceText } from '../intake-source-text.ts';
 import { createManualSourceRecord } from '../intake-manual-source-record.ts';
+import { createManualSourceRecordRead } from '../intake-manual-source-record.ts';
 import { createNote, getNote } from '../notes.ts';
 import { setVisibility } from '../visibility.ts';
 import type { ManualSourceRecordRequest } from '../../shared/intake-manual-source-record.ts';
@@ -311,4 +312,224 @@ test('a model envelope cannot forge the manual ownership receipt', async (t) => 
   const review = reviewIntake(f.db, f.root, f.profileId, f.source.id, proposal.id);
   assert.notEqual(review.records[0]!.identityAttribution?.basis, 'explicit_manual_source_record');
   assert.equal(review.records[0]!.identityReview?.blocking, true);
+});
+
+test(
+  'native manual source creation uses selected history, exact replay and ordinary reviewed acceptance after cache loss',
+  { timeout: 120000 },
+  async (t) => {
+    const f = await fixture(t),
+      { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts'),
+      { clearIntakeStateCache } = await import('../intake-state-storage.ts'),
+      { intakeWorkCounters } = await import('../intake-work-accounting.ts'),
+      {
+        getIntakeRead,
+        importIntakeRead,
+        reviewIntakeRead,
+        readIntakeReviewRecord,
+        readIntakeReviewFragment,
+      } = await import('../intake.ts'),
+      { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
+        await import('../intake-review-collection-host.ts');
+    // The old manual operation remains replayable after the schema changes.
+    const old = f.create();
+    await buildIntakeCollectionEnvelope(f.db, { id: f.source.id });
+    const replay = await createManualSourceRecordRead(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      f.request,
+    );
+    assert.equal(replay.proposalId, old.proposalId);
+    assert.equal(replay.replayed, true);
+    const assertNoPolicies = () => {
+      assert.equal(
+        f.db.prepare('SELECT count(*) n FROM intake_review_issue_policy_v2').get()!.n,
+        0,
+      );
+      assert.equal(f.db.prepare('SELECT count(*) n FROM intake_review_issue_scope').get()!.n, 0);
+    };
+    assertNoPolicies();
+    const before = { ...intakeWorkCounters(f.db).warm };
+    const preview = (await intakeSourceRoute({
+      db: f.db,
+      root: f.root,
+      profileId: f.profileId,
+      id: f.source.id,
+      action: 'source-preview',
+      params: new URLSearchParams({ page: '1', revisionId: f.revision.id }),
+    })) as { text: string; nextOffset: number | null };
+    assert.equal(preview.text, f.bytes.toString('utf8'));
+    assert.equal(preview.nextOffset, null);
+    assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+    assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+    const request = {
+      ...f.request,
+      operationId: randomUUID(),
+      version: replay.intake.version,
+      literalText: 'Fictional later reading 7.25 units',
+      clinical: { ...f.request.clinical, valueText: '7.25' },
+    };
+    const created = (await intakeSourceRoute({
+      db: f.db,
+      root: f.root,
+      profileId: f.profileId,
+      id: f.source.id,
+      action: 'source-records',
+      params: new URLSearchParams(),
+      input: request,
+    })) as Awaited<ReturnType<typeof createManualSourceRecordRead>>;
+    assert.ok('format' in created.intake);
+    assert.equal(created.intake.collections.proposals.total, 2);
+    assert.equal(f.db.prepare('SELECT COUNT(*) n FROM observations').get()!.n, 0);
+    assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+    assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+    clearIntakeStateCache(f.db);
+    const resumed = await createManualSourceRecordRead(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      request,
+    );
+    assert.equal(resumed.replayed, true);
+    assert.equal(resumed.proposalId, created.proposalId);
+    await assert.rejects(
+      createManualSourceRecordRead(f.db, f.root, f.profileId, f.source.id, {
+        ...request,
+        literalText: 'Changed fictional text',
+      }),
+      { code: 'OPERATION_CONFLICT' },
+    );
+    assertNoPolicies();
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const repeated = await createManualSourceRecordRead(
+        f.db,
+        f.root,
+        f.profileId,
+        f.source.id,
+        request,
+      );
+      assert.equal(repeated.replayed, true);
+      assertNoPolicies();
+      const page = await reviewIntakeRead(
+        f.db,
+        f.root,
+        f.profileId,
+        f.source.id,
+        created.proposalId,
+        { items: 1, bytes: 1024 },
+      );
+      assert.ok('items' in page);
+      const fragment = page.items[0]!;
+      assert.equal(fragment.kind, 'reference');
+      if (fragment.kind !== 'reference') throw Error('Expected bounded review reference');
+      assertNoPolicies();
+      const data = await readIntakeReviewFragment(f.db, f.root, f.profileId, f.source.id, {
+        proposalId: created.proposalId,
+        reference: fragment.reference,
+      });
+      assert.equal(data.complete, true);
+      assertNoPolicies();
+      await readIntakeReviewRecord(f.db, f.root, f.profileId, f.source.id, {
+        proposalId: created.proposalId,
+        recordId: created.recordId,
+      });
+      assertNoPolicies();
+      await assert.rejects(
+        readIntakeReviewRecord(f.db, f.root, f.profileId, f.source.id, {
+          proposalId: created.proposalId,
+          recordId: created.recordId + ':wrong',
+        }),
+      );
+      assertNoPolicies();
+      await assert.rejects(
+        reviewIntakeRead(f.db, f.root, f.profileId, f.source.id, created.proposalId, { items: 0 }),
+        { code: 'REVIEW_WINDOW' },
+      );
+      assertNoPolicies();
+      await assert.rejects(
+        readIntakeReviewFragment(f.db, f.root, f.profileId, f.source.id, {
+          proposalId: created.proposalId,
+          reference: { ...fragment.reference, reviewToken: 'stale' },
+        }),
+        { code: 'REVIEW_FRAGMENT' },
+      );
+      assertNoPolicies();
+    }
+    await prepareCollectionClinicalReviewDependencies(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      created.proposalId,
+    );
+    const review = prepareCollectionClinicalReview(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      created.proposalId,
+    );
+    assert.equal(review.status, 'ready');
+    if (review.status !== 'ready') throw Error('Expected selected manual review');
+    assert.equal(
+      review.session.review.records[0]!.identityAttribution?.basis,
+      'explicit_manual_source_record',
+    );
+    await importIntakeRead(f.db, f.root, f.profileId, f.source.id, {
+      version: review.session.review.version,
+      proposalId: created.proposalId,
+      reviewToken: review.session.review.reviewToken,
+      decisions: [{ recordId: created.recordId, action: 'accept', mapping: {} }],
+    });
+    review.session.close();
+    assertNoPolicies();
+    assert.equal(f.db.prepare('SELECT value_text FROM observations').get()!.value_text, '7.25');
+    const selected = getIntakeRead(f.db, f.root, f.profileId, f.source.id);
+    assert.ok('format' in selected);
+    assert.equal(selected.collections.proposals.total, 2);
+  },
+);
+
+test('native manual operation replay preserves the first historical duplicate and refuses later fingerprints', async (t) => {
+  const f = await fixture(t),
+    { readIntakeEnvelopeText } = await import('../intake-authority.ts'),
+    { writeIntakeFixtureEnvelope } = await import('./helpers/intake-authority-fixture.ts'),
+    { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts'),
+    { clearIntakeStateCache } = await import('../intake-state-storage.ts');
+  const first = f.create(),
+    secondInput = {
+      ...f.request,
+      version: first.intake.version,
+      operationId: randomUUID(),
+      literalText: 'Fictional second historical text',
+    },
+    second = f.create(secondInput),
+    retained = JSON.parse(readIntakeEnvelopeText(f.db, { id: f.source.id }));
+  const duplicate = retained.intake.proposals.find(
+    (proposal: { id: string }) => proposal.id === second.proposalId,
+  );
+  assert.ok(duplicate);
+  duplicate.manualSourceRecord.operationId = f.request.operationId;
+  writeIntakeFixtureEnvelope(f.db, f.source.id, retained);
+  clearIntakeStateCache(f.db);
+  await buildIntakeCollectionEnvelope(f.db, { id: f.source.id });
+  const replay = await createManualSourceRecordRead(
+    f.db,
+    f.root,
+    f.profileId,
+    f.source.id,
+    f.request,
+  );
+  assert.equal(replay.proposalId, first.proposalId);
+  assert.equal(replay.replayed, true);
+  await assert.rejects(
+    createManualSourceRecordRead(f.db, f.root, f.profileId, f.source.id, {
+      ...secondInput,
+      operationId: f.request.operationId,
+    }),
+    { code: 'OPERATION_CONFLICT' },
+  );
 });

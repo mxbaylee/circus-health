@@ -21,7 +21,11 @@ import { createNote, getNote, saveNote } from '../notes.ts';
 import { startRuntime } from '../runtime.ts';
 import { acquireStorageLock } from '../storage-lock.ts';
 import { decryptObject, encryptObject, recoveryEntropy, unwrapKey } from '../vault-crypto.ts';
-import { queryRecordHistory, type RecordObjectReference } from '../record-versions.ts';
+import {
+  queryRecordHistory,
+  iterateRecordCommitSegments,
+  type RecordObjectReference,
+} from '../record-versions.ts';
 import { createTestRuntimeDirectory } from './runtime-fixture.ts';
 import { newProfile } from './helpers/vault-fixture.ts';
 
@@ -235,6 +239,22 @@ test('candidate unlock refuses future key, encrypted index and accepted-history 
           if (kind.startsWith('record-commit')) commit.format = 'health-record-versions-v999';
           else if (kind.startsWith('record-schema')) commit.schemaVersion = 999999;
           else {
+            commit.segments = [
+              ...iterateRecordCommitSegments(
+                {
+                  read: (name) =>
+                    read('vault/versions/' + name.slice(8) + '.enc', 'record:' + name),
+                  writeImmutable() {
+                    throw Error('read-only fixture');
+                  },
+                  publishHead() {
+                    throw Error('read-only fixture');
+                  },
+                },
+                commit,
+              ),
+            ];
+            commit.format = 'health-record-versions-v1';
             const segment = commit.segments[0];
             const name = `vault/versions/${segment.name.slice(8)}.enc`;
             const lines = read(name, `record:${segment.name}`).toString().trimEnd().split('\n');

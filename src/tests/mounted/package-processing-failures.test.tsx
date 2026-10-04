@@ -56,3 +56,35 @@ it('keeps an unknown inventory scope at the retained original and prevents retry
   expect(screen.getByText(/remaining members are unknown/)).toBeVisible();
   expect(screen.queryByText(/Member ordinal/)).not.toBeInTheDocument();
 });
+
+it('uses the checked total for a selected page and keeps exact retry targets while more issues remain', async () => {
+  const next = vi.fn(),
+    retry = vi.fn();
+  render(
+    <PackageProcessingFailures
+      busy={false}
+      onRetry={retry}
+      onNext={next}
+      page={{
+        format: 'health-intake-package-failure-page-v1',
+        intakeId: failure.sourceFileId,
+        pins: {
+          sourceHash: failure.sourceHash,
+          logicalRoot: 'fictional-root',
+          domainVersion: 1,
+          version: 1,
+        },
+        total: 10001,
+        entries: [{ key: 'selected', failure }],
+        complete: false,
+        nextCursor: 'selected-next',
+      }}
+    />,
+  );
+  expect(screen.getByText(/10001 unfinished operations/)).toBeVisible();
+  expect(screen.getByText('Showing 1 of 10001')).toBeVisible();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Next unfinished operations' }));
+  expect(next).toHaveBeenCalledOnce();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Retry member' }));
+  expect(retry).toHaveBeenCalledWith(failure);
+});

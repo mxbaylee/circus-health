@@ -1,3 +1,4 @@
+import { selectedReportGroups } from '../intake-selected-report-groups.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -289,7 +290,7 @@ async function accept(f: Fixture, blocks: IntakeReportAcceptanceBlock[]) {
       // Do not repeat original grounding and every proposal review for rows
       // whose current identity policy is already satisfied.
       if (record.identityReview?.blocking)
-        for (const group of record.reportGroups || [])
+        for (const group of selectedReportGroups(record.reportGroups))
           groupKeys.add(JSON.stringify([block.intakeId, group.groupId]));
     }
   }

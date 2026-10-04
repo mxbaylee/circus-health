@@ -1643,3 +1643,37 @@ test('idempotent Stop and Resume reject a stale cached head before reporting suc
   assert.equal(readIntakeBatch(f.root, profileId, batch.id).status, 'stopped');
   assert.equal(f.manager.resume(profileId, batch.id).status, 'running');
 });
+
+test('automatic coordinator dispatches a selected native direct plan with explicit proposal state and scalar reading checkpoint', async (t) => {
+  const f = setup(t),
+    source = uploadIntake(f.db, f.root, profileId, {
+      filename: 'fictional-native-coordinator.txt',
+      bytes: Buffer.from('Fictional native coordinator source.'),
+    });
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts'),
+    { createIntakePlanRead, getIntakeRead } = await import('../intake.ts');
+  await buildIntakeCollectionEnvelope(f.db, { id: source.id });
+  const planned = await createIntakePlanRead(f.db, f.root, profileId, source.id, {
+    version: source.version,
+    operationId: 'native-coordinator-plan',
+  });
+  assert.ok('format' in planned);
+  const batch = f.manager.create(profileId, {
+    operationId: 'native-coordinator-batch',
+    intakeIds: [source.id],
+  });
+  const until = Date.now() + 30000;
+  while (!f.bridges[0]?.started && Date.now() < until)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  const current = f.manager.get(profileId, batch.id);
+  assert.equal(current.items[0]!.status, 'running', JSON.stringify(current.items[0]));
+  assert.ok(f.bridges[0]?.started);
+  assert.equal(current.items[0]!.proposalState?.format, 'health-intake-proposal-summary-v2');
+  assert.equal(current.items[0]!.proposalState?.total, 0);
+  const chat = f.assistant.get(profileId, current.items[0]!.chatId!);
+  assert.ok(chat.conversionCheckpoint && 'format' in chat.conversionCheckpoint);
+  assert.equal(chat.conversionCheckpoint.format, 'health-intake-conversion-checkpoint-v2');
+  assert.equal('seen' in chat.conversionCheckpoint, false);
+  assert.ok('format' in getIntakeRead(f.db, f.root, profileId, source.id));
+  f.manager.stop(profileId, batch.id);
+});

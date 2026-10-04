@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { Note } from '../../../shared/api';
-import type { Intake } from '../../../shared/intake';
+import type { IntakeHeader } from '../../../shared/intake-summary';
 import type { SourceTextIssueList } from '../../../shared/intake-source-text';
 import type {
   ManualSourceRecordRequest,
@@ -41,7 +41,7 @@ function ManualSourceRecordForm({
   const [open, setOpen] = useState(false);
   const [sourcePage, setSourcePage] = useState(page);
   const [snapshot, setSnapshot] = useState<{
-    intake: Intake;
+    intake: IntakeHeader;
     revisionId: string;
     self: Note;
   } | null>(null);
@@ -139,7 +139,7 @@ function ManualSourceRecordForm({
     setError('');
     try {
       const [intake, source, self, choices] = await Promise.all([
-        api<Intake>(`${endpoint}/intakes/${encodeURIComponent(intakeId)}`),
+        api<IntakeHeader>(`${endpoint}/intakes/${encodeURIComponent(intakeId)}`),
         api<SourceTextIssueList>(
           `${endpoint}/intakes/${encodeURIComponent(intakeId)}/source-issues?limit=1`,
         ),

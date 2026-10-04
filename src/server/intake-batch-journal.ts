@@ -18,7 +18,13 @@ import {
 import { dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { HttpError } from './database.ts';
+import {
+  clearJournalActivityIndex,
+  forgetJournalActivityScope,
+  publishedJournalActivity,
+} from './journal-activity-index.ts';
 import { profilePaths } from './profile-storage.ts';
+import { portableWork } from './portable-work.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
 import type { ChatChange } from './chat-journal-codec.ts';
 import { flockExclusiveNonblocking, flockUnlock } from '../shared/flock.ts';
@@ -214,11 +220,13 @@ function readBytes(file: string, head = false, stagedTwin?: string): Buffer {
       const size = readSync(fd, bytes, offset, bytes.length - offset, null);
       if (!size) invalid();
       count(head ? 'headReadBytes' : 'eventReadBytes', size);
+      portableWork('journalReadBytes', size);
       offset += size;
     }
     const extra = readSync(fd, Buffer.alloc(1), 0, 1, null);
     if (extra) {
       count(head ? 'headReadBytes' : 'eventReadBytes', extra);
+      portableWork('journalReadBytes', extra);
       invalid();
     }
     count(head ? 'headReads' : 'eventReads');
@@ -512,11 +520,14 @@ function remember(batch: IntakeBatch, basis: Basis): void {
   scopes.set(basis.scope, references);
 }
 export function forgetIntakeBatchJournal(batch: object): void {
+  const prior = bases.get(batch);
+  if (prior) forgetJournalActivityScope(prior.scope);
   bases.delete(batch);
   const tracker = batchMutations(batch);
   if (tracker) tracker.valid = false;
 }
 export function clearIntakeBatchJournalCache(root: string, profileId?: string): void {
+  clearJournalActivityIndex(root, profileId);
   const selected = profileId ? resolve(profilePaths(root, profileId).root) : null;
   for (const [scope, references] of scopes) {
     if (selected ? scope !== selected : !scope.startsWith(resolve(root) + '/')) continue;
@@ -744,7 +755,9 @@ export function writeIntakeBatch(
       directoryStat: fingerprint(path),
       orphans: [],
     });
+    publishedJournalActivity(root, profileId, 'batch', batch.id);
   } catch (error) {
+    clearJournalActivityIndex(root, profileId);
     forgetIntakeBatchJournal(batch);
     if (event && existsSync(event)) {
       try {
@@ -773,34 +786,53 @@ export function copyIntakeBatchJournals(
   root: string,
   profileId: string,
   targetRoot: string,
+  { onFile }: { onFile?: (path: string) => void } = {},
 ): string[] {
-  const copied: string[] = [];
-  for (const batch of listIntakeBatches(root, profileId)) {
-    const path = directory(root, profileId, batch.id),
-      head = readHead(path, profileId, batch.id);
-    const save = (name: string, bytes: Buffer) => {
-      const relative = `${profilePaths(root, profileId).relativeRoot}/intake-batches/${batch.id}/events/${name}`;
-      const target = resolve(targetRoot, relative);
-      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
-      if (realpathSync(dirname(target)) !== dirname(target)) invalid();
-      writeFileSync(target, bytes, { flag: 'wx', mode: 0o600 });
-      copied.push(relative);
-      if (name !== 'current') {
-        count('copiedEvents');
-        count('copiedEventBytes', bytes.length);
-        count('copyValidationReads');
-        count('copyValidationReadBytes', bytes.length);
+  const copied: string[] = [],
+    base = join(profilePaths(root, profileId).root, 'intake-batches');
+  if (!existsSync(base)) return copied;
+  if (realpathSync(base) !== base) invalid();
+  const iterator = opendirSync(base);
+  try {
+    for (let entry = iterator.readSync(); entry; entry = iterator.readSync()) {
+      count('directoryEntries');
+      if (!UUID.test(entry.name)) continue;
+      const id = entry.name;
+      let path: string;
+      try {
+        path = directory(root, profileId, id);
+      } catch (error) {
+        if (error instanceof HttpError && error.code === 'INTAKE_BATCH_NOT_FOUND') continue;
+        throw error;
       }
-    };
-    cold(path, profileId, batch.id, head, save);
-    if (head) save('current', Buffer.from(JSON.stringify(head)));
-    notifyPublication(
-      resolve(profilePaths(targetRoot, profileId).root),
-      batch.id,
-      copied
-        .filter((name) => name.includes('/' + batch.id + '/events/'))
-        .map((name) => name.slice(name.lastIndexOf('/') + 1)),
-    );
+      const head = readHead(path, profileId, id),
+        names: string[] = [];
+      const save = (name: string, bytes: Buffer) => {
+        const relative = `${profilePaths(root, profileId).relativeRoot}/intake-batches/${id}/events/${name}`;
+        const target = resolve(targetRoot, relative);
+        mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+        if (realpathSync(dirname(target)) !== dirname(target)) invalid();
+        portableWork('outputBytes', bytes.length);
+        portableWork('maxOutputChunkBytes', bytes.length, true);
+        writeFileSync(target, bytes, { flag: 'wx', mode: 0o600 });
+        if (onFile) onFile(relative);
+        else copied.push(relative);
+        names.push(name);
+        if (name !== 'current') {
+          count('copiedEvents');
+          count('copiedEventBytes', bytes.length);
+          count('copyValidationReads');
+          count('copyValidationReadBytes', bytes.length);
+        }
+      };
+      // Cold validation reconstructs only this journal and keeps its existing
+      // per-journal budget. Never register every batch in the warm cache.
+      if (!cold(path, profileId, id, head, save)) continue;
+      if (head) save('current', Buffer.from(JSON.stringify(head)));
+      notifyPublication(resolve(profilePaths(targetRoot, profileId).root), id, names);
+    }
+    return copied;
+  } finally {
+    iterator.closeSync();
   }
-  return copied;
 }

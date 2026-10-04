@@ -3,11 +3,14 @@ import type {
   OwnershipPreview,
   OwnershipRequest,
   OwnershipReceipt,
+  OwnershipNameEffect,
 } from '../shared/record-ownership.ts';
 import { appendOwnershipDecision, ownershipHash } from './ownership-journal.ts';
 import { json, type Database } from './database.ts';
 export function ownershipCommitGroups(
-  preview: Pick<OwnershipPreview, 'records' | 'pending' | 'names' | 'relationships'>,
+  preview: Pick<OwnershipPreview, 'records' | 'pending' | 'relationships'> & {
+    names: Iterable<Pick<OwnershipNameEffect, 'personId' | 'affectedSourceIds'>>;
+  },
   request: OwnershipRequest,
 ): OwnershipPreview['commitGroups'] {
   if (request.selection.type === 'report')

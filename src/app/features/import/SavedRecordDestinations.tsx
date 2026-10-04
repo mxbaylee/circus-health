@@ -1,8 +1,13 @@
-import { useResource, queryString } from '../../data/api';
+import { api, useResource, queryString } from '../../data/api';
 import { clinicalPersonQuery } from '../../../shared/person-scope';
 import { Check, ExternalLink } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { Intake, IntakeAcceptedRecord } from '../../../shared/intake';
+import {
+  isIntakeSummary,
+  type IntakeRead,
+  type IntakeAcceptedDestinations,
+} from '../../../shared/intake-summary';
 
 export type SavedPersonDestination = {
   proposalId: string;
@@ -81,6 +86,36 @@ export function acceptedRecordsForScope(intake: Intake, scope: AcceptedRecordSco
       accepted.push(record);
     }
   return accepted;
+}
+
+/** Never interpret unloaded receipt history as evidence that no record was saved. */
+export async function loadAcceptedRecordsForScope(
+  intakeId: string,
+  scope: AcceptedRecordScope,
+  selected?: IntakeRead,
+) {
+  const intake =
+    selected ?? (await api<IntakeRead>(`/intakes/${encodeURIComponent(intakeId)}`)).data;
+  if (!isIntakeSummary(intake)) return acceptedRecordsForScope(intake, scope);
+  const recordIds = [...new Set(scope.recordIds)];
+  if (recordIds.length > 100) throw new Error('Choose at most 100 saved records at a time.');
+  if (!recordIds.length) return [];
+  const query = new URLSearchParams({ groupId: scope.groupId });
+  if (scope.proposalId !== null) query.set('proposalId', scope.proposalId);
+  for (const id of recordIds) query.append('recordId', id);
+  const result = (
+    await api<IntakeAcceptedDestinations>(
+      `/intakes/${encodeURIComponent(intakeId)}/accepted-destinations?${query}`,
+    )
+  ).data;
+  if (
+    result.intakeId !== intakeId ||
+    result.version !== intake.version ||
+    result.groupId !== scope.groupId ||
+    result.proposalId !== scope.proposalId
+  )
+    throw new Error('Saved record links did not match the selected report.');
+  return result.records;
 }
 
 function displayTitle(record: IntakeAcceptedRecord, fallback: string) {

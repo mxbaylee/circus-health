@@ -22,6 +22,7 @@ import type {
   IntakeIdentityConfirmation,
   IntakeIdentityReview,
   IntakeIdentityScope,
+  IntakeIdentityScopePage,
 } from '../../shared/intake-identity.ts';
 import type { VisionPrescriptionRecord } from '../../shared/vision.ts';
 
@@ -267,6 +268,34 @@ test(
       assert.equal(response.status(), 201, await response.text());
       return { intake: (await response.json()).data as Intake, bytes };
     }
+    async function readIdentityTargets(scope: IntakeIdentityConfirmation['scope']) {
+      if (!('format' in scope)) return scope.targets;
+      const targets: IntakeIdentityScope['targets'] = [];
+      let cursor: string | null = null;
+      do {
+        const query = new URLSearchParams({
+          groupId: scope.groupId,
+          scopeToken: scope.scopeToken,
+          section: 'targets',
+          limit: '20',
+        });
+        if (cursor) query.set('cursor', cursor);
+        const page = await request<IntakeIdentityScopePage>(
+          `/intakes/${encodeURIComponent(scope.intakeId)}/identity-scope-page?${query}`,
+        );
+        assert.equal(page.scopeToken, scope.scopeToken);
+        assert.equal(page.total, scope.collection.targets);
+        for (const item of page.items) {
+          assert.equal(item.kind, 'value', 'controlled fictional targets fit a bounded page');
+          if (item.kind === 'value')
+            targets.push(item.value as IntakeIdentityScope['targets'][number]);
+        }
+        assert.notEqual(page.nextCursor, cursor || undefined, 'identity target pages advance');
+        cursor = page.nextCursor;
+      } while (cursor);
+      assert.equal(targets.length, scope.collection.targets);
+      return targets;
+    }
     const clinical = await upload(clinicalRows, 'fictional-linden-clinical.jsonl');
     const people = await upload([peopleOnly], 'fictional-linden-people.jsonl');
     const selfBefore = await request<Note>('/notes/person-note%3Aself');
@@ -348,6 +377,10 @@ test(
         initialIdentityPosts.push(request.postDataJSON() as IntakeIdentityConfirmation);
     };
     page.on('request', captureInitialIdentity);
+    const initialLaboratoryScope = await request<IntakeIdentityConfirmation['scope']>(
+      `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(initial.groups.find((group) => group.title === 'Fictional Linden laboratory report')!.groupId)}`,
+    );
+    const initialLaboratoryTargets = await readIdentityTargets(initialLaboratoryScope);
     const initialIdentityResponse = page.waitForResponse(
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
@@ -367,7 +400,12 @@ test(
       initialIdentityRequest.scope.groupId,
       initial.groups.find((group) => group.title === 'Fictional Linden laboratory report')!.groupId,
     );
-    assert.deepEqual(initialIdentityRequest.scope.targets.map((target) => target.title).sort(), [
+    assert.deepEqual(
+      initialIdentityRequest.scope,
+      initialLaboratoryScope,
+      'confirmation binds the exact displayed target scope',
+    );
+    assert.deepEqual(initialLaboratoryTargets.map((target) => target.title).sort(), [
       'Fictional Linden copper',
       'Fictional Linden unclear result',
     ]);
@@ -384,6 +422,10 @@ test(
       .getByRole('dialog')
       .getByLabel('Name printed on this report')
       .fill('Fictional Sol Linden');
+    const initialVisitScope = await request<IntakeIdentityConfirmation['scope']>(
+      `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(initial.groups.find((group) => group.title === 'Fictional Linden visit report')!.groupId)}`,
+    );
+    const initialVisitTargets = await readIdentityTargets(initialVisitScope);
     const visitIdentityResponse = page.waitForResponse(
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
@@ -407,7 +449,8 @@ test(
       initialIdentityPosts[1]!.scope.groupId,
       initial.groups.find((group) => group.title === 'Fictional Linden visit report')!.groupId,
     );
-    assert.equal(initialIdentityPosts[1]!.scope.targets.length, 3);
+    assert.deepEqual(initialIdentityPosts[1]!.scope, initialVisitScope);
+    assert.equal(initialVisitTargets.length, 3);
     assert.equal(identityReady.counts.pending, 5);
     assert.equal(identityReady.counts.accepted, 0, 'identity confirmation does not accept records');
     assert.equal(identityReady.counts.questions, 1);

@@ -10,6 +10,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { currentTransactionToken } from './database.ts';
 import {
   initializeIntakeEnvelope,
+  intakeEnvelopeAuthorityBinding,
   prepareInitialIntakeEnvelope,
   readIntakeEnvelope,
   readIntakeEnvelopeMaterialized,
@@ -33,6 +34,7 @@ import type { IntakeIdentityReceipt } from '../shared/intake-identity.ts';
 import type { intakeWorkflow } from './intake-workflow.ts';
 import {
   parseIntakeSourcePin,
+  readIntakeSourcePin,
   withIntakeSourcePin,
   withoutIntakeSourcePin,
 } from './intake-source-pin.ts';
@@ -83,6 +85,58 @@ interface DetailsRow {
   kind?: string;
   details_json?: string | null;
   source_pin?: unknown;
+}
+export type IntakeSourceMetadata = Pick<
+  IntakeDetails,
+  | 'originalName'
+  | 'acquisition'
+  | 'metadata'
+  | 'receivedMimeType'
+  | 'createdAt'
+  | 'parentSourceFileId'
+  | 'locator'
+  | 'derivative'
+  | 'sourceTextRevisionId'
+>;
+
+/** A checked compact source header, independent of inventory/workflow size.
+ * Current authority and source identity are still checked on every call. The
+ * compact raw representation retains JSON's existing last-member semantics. */
+export function intakeSourceMetadata(db: DatabaseSync, id: string): IntakeSourceMetadata {
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+    )
+    .get(id);
+  if (!source) throw Error('Source intake not found');
+  intakeEnvelopeAuthorityBinding(
+    db,
+    source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1],
+  );
+  const value = JSON.parse(source.details_json as string) as { intake: IntakeSourceMetadata };
+  return value.intake;
+}
+
+/** Public stale-tab version without hydrating a selected V4 workflow. The
+ * separate source-text pin retains its existing additive version semantics. */
+export function intakeSourceVersion(db: DatabaseSync, id: string) {
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+    )
+    .get(id);
+  if (!source) throw Error('Source intake not found');
+  const selected = source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1];
+  const binding = intakeEnvelopeAuthorityBinding(db, selected);
+  const rawVersion =
+    binding.logicalHead === undefined
+      ? requireStoredIntakeDetails(db, selected).version
+      : (JSON.parse(binding.head!) as { logical: { domainVersion: number } }).logical.domainVersion;
+  const sourcePin = readIntakeSourcePin(db, id);
+  const version = rawVersion + (sourcePin?.version ?? 0);
+  if (!Number.isSafeInteger(rawVersion) || rawVersion < 0 || !Number.isSafeInteger(version))
+    throw Error('Intake version is invalid');
+  return { rawVersion, version, sourcePin, logicalBinding: binding.logicalHead };
 }
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);

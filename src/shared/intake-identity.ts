@@ -66,12 +66,23 @@ export interface IntakeIdentityReview {
   challengedName?: string;
   correctedPerson?: { personId: string; fullName: string };
   scope: IntakeIdentityScope | null;
+  scopeReference?: IntakeIdentityScopeReference;
+  scopeFragmentReference?: import('./intake-clinical-pages.ts').IntakeReviewFragmentReference;
+  /** Complete selected receipt count for this report; history remains retained authority. */
+  confirmationCount?: number;
   evidencedIdentity: IntakeEvidencedIdentity;
   self: IntakeIdentitySelfSnapshot;
   /** Exact evidence values that may be selected only while the Self fields stay blank. */
   offeredSelfFields: Pick<IntakeEvidencedIdentity, 'fullName' | 'birthDate'>;
   conflicts: IntakeIdentityConflict[];
   warnings?: IntakeIdentityWarning[];
+  /** Explicit complete advisory collection when warnings do not fit the inline view. */
+  warningsReference?: {
+    format: 'health-intake-identity-warnings-v1';
+    scopeToken: string;
+    snapshotId: string;
+    count: number;
+  };
 }
 
 export interface IntakeIdentityAnswers {
@@ -122,6 +133,44 @@ export interface IntakeIdentityScope {
   scopeToken: string;
 }
 
+/** Complete selected scope; arrays are read through bounded pages, never inferred from a preview. */
+export interface IntakeIdentityScopeReference extends Omit<
+  IntakeIdentityScope,
+  'membership' | 'targets' | 'assignmentTargets' | 'questions' | 'competingSubjects'
+> {
+  format: 'health-intake-identity-scope-v2';
+  collection: {
+    snapshotId: string;
+    membership: number;
+    targets: number;
+    assignmentTargets: number;
+    questions: number;
+    competingSubjects: number;
+  };
+}
+export type IntakeIdentityScopeSection =
+  'membership' | 'targets' | 'assignmentTargets' | 'questions' | 'competingSubjects' | 'warnings';
+export interface IntakeIdentityScopePage {
+  format: 'health-intake-identity-scope-page-v2';
+  scopeToken: string;
+  section: IntakeIdentityScopeSection;
+  total: number;
+  items: (
+    | { kind: 'value'; value: unknown }
+    | {
+        kind: 'reference';
+        reference: {
+          format: 'health-intake-identity-item-v2';
+          scopeToken: string;
+          section: IntakeIdentityScopeSection;
+          ordinal: number;
+          bytes: number;
+        };
+      }
+  )[];
+  nextCursor: string | null;
+}
+
 /** Records what the person actually confirmed; neither choice accepts clinical results. */
 export type IntakeIdentityAttestation =
   | 'reviewed_original_and_membership'
@@ -131,7 +180,7 @@ export type IntakeIdentityAttestation =
 export interface IntakeIdentityConfirmation {
   version: number;
   operationId: string;
-  scope: IntakeIdentityScope;
+  scope: IntakeIdentityScope | IntakeIdentityScopeReference;
   outcome: 'this_is_me' | 'this_is_person';
   attestation: IntakeIdentityAttestation;
   identityAnswers?: IntakeIdentityAnswers;

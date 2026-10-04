@@ -20,8 +20,12 @@ import {
 import { resolve, dirname } from 'node:path';
 import { openDatabase, HttpError, transaction, type Database } from './database.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
-import { stageIntakeStateCopy } from './intake-state-bootstrap.ts';
-import { prepareManualSourceCopy, stageManualSourceCopy } from './intake-manual-copy.ts';
+import { stageIntakeStateCopy, disposeIntakeStateCopyPlan } from './intake-state-bootstrap.ts';
+import {
+  prepareManualSourceCopy,
+  stageManualSourceCopy,
+  disposeManualSourceCopyPlan,
+} from './intake-manual-copy.ts';
 import {
   preparePortableIntakeCopy,
   assertPortableCopyCoherence,
@@ -51,10 +55,9 @@ import {
   attachPersonalDurability,
   flushPersonal,
   writePortableSources,
-  loadPortable,
+  openPortableRows,
   durableWrite,
   syncDirectory,
-  type CompleteLoadedPortable,
 } from './portable.ts';
 import { registerProfileDisplayGuard, selfIdentity, getNote, saveNote } from './notes.ts';
 export interface ProfileRegistryEntry {
@@ -308,8 +311,14 @@ export function createProfileLifecycle({
       flushPersonal(active);
       return { ...profileInfo(active, entry), operationId: operation.operationId };
     }
-    if (!entry) verifyCopyHeads(operation, loadPortable(root, id) as CompleteLoadedPortable, root);
-    else if (!operation.published || entry.placebo)
+    if (!entry) {
+      const portable = openPortableRows(root, id);
+      try {
+        verifyCopyHeads(operation, portable, root);
+      } finally {
+        portable.close();
+      }
+    } else if (!operation.published || entry.placebo)
       throw new HttpError(409, 'PROFILE_COPY_OPERATION', 'Private copy registry binding conflicts');
     operation = { ...operation, published: true };
     writeCopyOperation(root, operation);
@@ -321,7 +330,7 @@ export function createProfileLifecycle({
       if (!existsSync(location)) rebuildContributorDatabase(location, root, id);
       recovered = openDatabase(location, id);
       attachPersonalDurability(recovered, { root, profileId: id, initialize: false });
-      assertPortableCopyCoherence(recovered, root, id);
+      assertPortableCopyCoherence(recovered, root, id)?.close();
       const identity = selfIdentity(recovered);
       if (!entry && identity.name !== operation.name)
         throw new HttpError(
@@ -433,55 +442,61 @@ export function createProfileLifecycle({
             sourceId,
             id,
           );
-          const manualPlan = prepareManualSourceCopy(databases.get(sourceId)!, root, sourceId, id);
-          checkpoint(operation, stage, 'validated');
-          transaction(copy, () => {
-            copy.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
-            const before = `data/profiles/${sourceId}/`,
-              after = `data/profiles/${id}/`;
-            for (const [table, column] of [
-              ['source_files', 'path'],
-              ['assets', 'stored_path'],
-            ])
+          let manualPlan: ReturnType<typeof prepareManualSourceCopy> | undefined;
+          try {
+            manualPlan = prepareManualSourceCopy(databases.get(sourceId)!, root, sourceId, id);
+            checkpoint(operation, stage, 'validated');
+            transaction(copy, () => {
+              copy.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
+              const before = `data/profiles/${sourceId}/`,
+                after = `data/profiles/${id}/`;
+              for (const [table, column] of [
+                ['source_files', 'path'],
+                ['assets', 'stored_path'],
+              ])
+                copy
+                  .prepare(
+                    `UPDATE ${table} SET ${column}=? || substr(${column},?) WHERE substr(${column},1,?)=?`,
+                  )
+                  .run(after, before.length + 1, before.length, before);
+              rebindCopiedIntakeSourceText(copy, sourceId, id);
+              for (const row of copy
+                .prepare(
+                  "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
+                )
+                .all())
+                copy.exec(`DROP TABLE IF EXISTS "${String(row.name).replaceAll('"', '""')}"`);
+              const publication = {
+                profileId: id,
+                readSelectedHead: () => {
+                  for (const base of [stage, root]) {
+                    if (hasContributorAuthority(base, id))
+                      throw Error(
+                        'Copy target already has selected record authority: ' +
+                          contributorAuthorityPath(base, id),
+                      );
+                    for (const kind of ['personal', 'curation'] as const) {
+                      const head = resolve(profilePaths(base, id)[kind], 'current.json');
+                      if (existsSync(head)) return readFileSync(head);
+                    }
+                  }
+                  return null;
+                },
+              };
+              stageIntakeStateCopy(copy, plan, publication);
+              stageManualSourceCopy(copy, manualPlan!, publication);
+              rebindCopyReceipts(copy, sourceId, id);
               copy
                 .prepare(
-                  `UPDATE ${table} SET ${column}=? || substr(${column},?) WHERE substr(${column},1,?)=?`,
+                  "DELETE FROM app_meta WHERE key IN ('personal_dirty','personal_persisted_revision','personal_last_error','personal_conflict','curation_revision')",
                 )
-                .run(after, before.length + 1, before.length, before);
-            rebindCopiedIntakeSourceText(copy, sourceId, id);
-            for (const row of copy
-              .prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
-              )
-              .all())
-              copy.exec(`DROP TABLE IF EXISTS "${String(row.name).replaceAll('"', '""')}"`);
-            const publication = {
-              profileId: id,
-              readSelectedHead: () => {
-                for (const base of [stage, root]) {
-                  if (hasContributorAuthority(base, id))
-                    throw Error(
-                      'Copy target already has selected record authority: ' +
-                        contributorAuthorityPath(base, id),
-                    );
-                  for (const kind of ['personal', 'curation'] as const) {
-                    const head = resolve(profilePaths(base, id)[kind], 'current.json');
-                    if (existsSync(head)) return readFileSync(head);
-                  }
-                }
-                return null;
-              },
-            };
-            stageIntakeStateCopy(copy, plan, publication);
-            stageManualSourceCopy(copy, manualPlan, publication);
-            rebindCopyReceipts(copy, sourceId, id);
-            copy
-              .prepare(
-                "DELETE FROM app_meta WHERE key IN ('personal_dirty','personal_persisted_revision','personal_last_error','personal_conflict','curation_revision')",
-              )
-              .run();
-          });
-          checkpoint(operation, stage, 'staged');
+                .run();
+            });
+            checkpoint(operation, stage, 'staged');
+          } finally {
+            if (manualPlan) disposeManualSourceCopyPlan(manualPlan);
+            disposeIntakeStateCopyPlan(plan);
+          }
         } finally {
           copy.close();
         }
@@ -509,7 +524,7 @@ export function createProfileLifecycle({
       attachPersonalDurability(db, { root: stage, profileId: id, initialize: true });
       // One-time portable copy/export artifact. Subsequent runtime writes select
       // only the record journal and never refresh these complete snapshots.
-      writePortableSources(db, stage, id, stage);
+      writePortableSources(db, stage, id, stage, { onFile: () => {} });
       if (operation) {
         mkdirSync(resolve(paths.root, 'mappings'), { recursive: true });
         durableWrite(
@@ -534,10 +549,14 @@ export function createProfileLifecycle({
       checkpoint(operation, stage, 'exported');
       assertContributorCopyCoherence(db, stage, id);
       const acceptedHead = selectedContributorHead(stage, id);
-      const portable = loadPortable(stage, id) as CompleteLoadedPortable;
-      if (operation) {
-        operation = selectCopyHeads(operation, portable, stage);
-        writeCopyOperation(root, operation);
+      const portable = openPortableRows(stage, id);
+      try {
+        if (operation) {
+          operation = selectCopyHeads(operation, portable, stage);
+          writeCopyOperation(root, operation);
+        }
+      } finally {
+        portable.close();
       }
       const createdIdentity = selfIdentity(db);
       db.close();

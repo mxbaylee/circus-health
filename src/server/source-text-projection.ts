@@ -11,6 +11,7 @@ import {
   readIntakeEnvelopeMaterialized,
   type IntakeEnvelopeSource,
 } from './intake-authority.ts';
+import { iterateIntakeEnvelopeText } from './intake-collection-envelope.ts';
 import {
   createTextPiecePlan,
   reconstructTextPieces,
@@ -424,6 +425,9 @@ function retained(
     const result = reconstructTextPieces(snapshot);
     addMetrics(connection.counters.engine, result.metrics);
     const selected = { row, snapshot, text: result.text };
+    // The compatibility engine materializes one bounded v3 value. Never retain
+    // one such value per source across a large source-list traversal.
+    connection.snapshots.clear();
     connection.snapshots.set(id, selected);
     return selected;
   } catch (error) {
@@ -453,6 +457,13 @@ function authority(db: DatabaseSync, connection: Connection, id: string): Row | 
   const binding = intakeEnvelopeAuthorityBinding(db, selected);
   source.authority_key = binding.key;
   source.authority_head = binding.head;
+  // V4 text already belongs to the checked logical tree. Keeping a second rope
+  // would copy that authority and hide a complete traversal in ordinary writes.
+  if (binding.logicalHead !== undefined) {
+    source.logical_head = binding.logicalHead;
+    connection.counters.authorityBytes += Buffer.byteLength(source.details_json as string);
+    return source;
+  }
   if (source.kind === 'intake_original') {
     const materialized = readIntakeEnvelopeMaterialized(db, selected);
     source.details_json = materialized.text;
@@ -620,6 +631,15 @@ function reconcile(
   connection.counters.reconciledSources++;
   if (!source) {
     removeSource(db, connection, id, obsolete);
+    return;
+  }
+  if (typeof source.logical_head === 'string') {
+    // Conversion removes a prior compatibility rope once. Subsequent logical or
+    // auxiliary changes touch no content rows; query-time export is explicit.
+    if (db.prepare(`SELECT 1 FROM ${table('heads')} WHERE source_id=?`).get(id))
+      removeSource(db, connection, id, obsolete);
+    db.prepare(`DELETE FROM temp.${AUTHORITIES} WHERE source_id=?`).run(id);
+    db.prepare(`INSERT INTO temp.${AUTHORITIES} VALUES(?,?)`).run(source.authority_key!, id);
     return;
   }
   const raw = source.details_json as string;
@@ -834,12 +854,64 @@ export function readSourceTextProjection(
     fail('source identity exceeds binding bound');
   return current(db, options, (connection, profile) => {
     const selected = retained(db, connection, sourceId, profile, true);
-    if (!selected) return fail('selected source is missing');
+    if (!selected) {
+      const source = authority(db, connection, sourceId);
+      if (typeof source?.logical_head === 'string')
+        return fail('native intake text requires ordered stream consumption');
+      return fail('selected source is missing');
+    }
     if (options.limits) {
       const result = reconstructTextPieces(selected.snapshot, { limits: options.limits });
       addMetrics(connection.counters.engine, result.metrics);
       return result.text;
     }
     return selected.text;
+  });
+}
+
+/** Consume checked selected text in order without joining a query text operand.
+ * Retained v3 uses its explicitly bounded compatibility snapshot; v4 uses the
+ * selected authority's streamed logical export rather than a text-piece copy.
+ * Always finish traversal: a match before corrupt/missing evidence is incomplete.
+ */
+export function consumeSourceTextProjection(
+  db: DatabaseSync,
+  sourceId: string,
+  consume: (chunk: string) => void,
+): void {
+  if (typeof sourceId !== 'string' || !sourceId || Buffer.byteLength(sourceId) > 1024)
+    fail('source identity exceeds binding bound');
+  current(db, {}, (connection, profile) => {
+    if (!db.prepare(`SELECT 1 FROM ${table('heads')} WHERE source_id=?`).get(sourceId)) {
+      const selected = authority(db, connection, sourceId);
+      if (!selected || typeof selected.logical_head !== 'string')
+        return fail('selected source text is unavailable');
+      for (const chunk of iterateIntakeEnvelopeText(
+        db,
+        selected as unknown as IntakeEnvelopeSource,
+      )) {
+        connection.counters.authorityReads++;
+        connection.counters.authorityBytes += Buffer.byteLength(chunk);
+        consume(chunk);
+      }
+      // A consumer cannot turn a traversal bound to one logical source into a
+      // successful result for a different selected source during consumption.
+      const after = authority(db, connection, sourceId);
+      if (
+        !after ||
+        after.sha256 !== selected.sha256 ||
+        after.logical_head !== selected.logical_head
+      )
+        return fail('selected source text binding changed');
+      return;
+    }
+    const selected = retained(db, connection, sourceId, profile, true);
+    if (!selected) return fail('selected source is missing');
+    let id = selected.snapshot.head.first;
+    while (id !== null) {
+      const piece = selected.snapshot.occurrences.get(id)!;
+      consume(selected.snapshot.contents.get(piece.contentId)!.text.slice(piece.start, piece.end));
+      id = selected.snapshot.links.get(id)!.next;
+    }
   });
 }

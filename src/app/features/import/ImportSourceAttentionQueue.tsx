@@ -1,5 +1,7 @@
+import { intakeFilenameDisplay } from '../../../shared/intake-summary';
+import { IntakeFilenameDetails } from '../intake/IntakeFilenameDetails';
 import { useEffect, useRef, useState } from 'react';
-import type { Intake } from '../../../shared/intake';
+import type { IntakeHeader } from '../../../shared/intake-summary';
 import type { SourceAttentionQueue } from '../../../shared/intake-source-text';
 import { api, useResource } from '../../data/api';
 import { SourceAttentionReview } from './SourceAttentionReview';
@@ -53,7 +55,7 @@ export function ImportSourceAttentionQueue({
       if (seen.has(id) || seen.size >= 100)
         throw new Error('Refresh the source package before reading.');
       seen.add(id);
-      const result = await api<Intake>('/intakes/' + encodeURIComponent(id));
+      const result = await api<IntakeHeader>('/intakes/' + encodeURIComponent(id));
       if (!result.data.parentSourceFileId) {
         await onRead(id);
         return;
@@ -116,7 +118,7 @@ function AttentionFile({
   id,
   ...props
 }: Omit<React.ComponentProps<typeof SourceAttentionReview>, 'intake'> & { id: string }) {
-  const resource = useResource<Intake>('/intakes/' + encodeURIComponent(id));
+  const resource = useResource<IntakeHeader>('/intakes/' + encodeURIComponent(id));
   const [remaining, setRemaining] = useState<number | null>(null);
   return (
     <article className="import-report import-source-report" hidden={remaining === 0}>
@@ -124,7 +126,10 @@ function AttentionFile({
       {resource.data && (
         <>
           <header className="import-report-title">
-            <h3>{resource.data.filename}</h3>
+            <h3>{intakeFilenameDisplay(resource.data)}</h3>
+            {resource.data.filenameReference && (
+              <IntakeFilenameDetails reference={resource.data.filenameReference} />
+            )}
           </header>
           <SourceAttentionReview
             {...props}

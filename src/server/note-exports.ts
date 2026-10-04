@@ -1,4 +1,13 @@
-import { readStoredIntakeDetails } from './intake-state-access.ts';
+import { readStoredIntakeDetails, intakeSourceMetadata } from './intake-state-access.ts';
+import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
+import { PacketOutputBudget, packetOutputLimit } from './packet-output-budget.ts';
+import {
+  iterateNativePacketReadingGaps,
+  type PacketReadingGap,
+} from './packet-reading-gaps-native.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
+import { packetSourcesReachFile } from './packet-source-membership.ts';
+import { packetSourceAncestry } from './packet-source-ancestry.ts';
 import { sourceAssertionBoundary, sourceAssertionOwnership } from './source-assertion-ownership.ts';
 import { recordOwner } from './record-owner.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
@@ -18,7 +27,7 @@ import { dateNumber } from '../app/data/format.ts';
 import { documentPersonId, observation } from './queries.ts';
 import { getNote, attachments } from './notes.ts';
 import type { NoteDTO } from './notes.ts';
-import { packetReportReview, type PacketReportReview } from './packet-report-review.ts';
+import { iteratePacketReportReview, type PacketReportReview } from './packet-report-review.ts';
 import type { IntakeExtractionPlan } from '../shared/intake.ts';
 import { accountedUnitKind } from './intake-unit-accounting.ts';
 import { readFile } from 'node:fs/promises';
@@ -574,113 +583,127 @@ function record(
 function packetOriginalMember(db: Database, personId: string, id: string): boolean {
   // This targeted read is used by a single preference write. Do not build or
   // materialize the person's complete packet merely to change one flag.
-  const pending = [id],
-    seen = new Set<string>();
-  while (pending.length) {
-    const file = pending.pop()!;
-    if (seen.has(file)) continue;
-    seen.add(file);
-    if (seen.size > 100000)
-      throw new HttpError(400, 'EXPORT_TOO_LARGE', 'Source ancestry exceeds the packet limit.');
-    const linked = db
-      .prepare(
-        "SELECT 1 FROM note_links l JOIN notes n ON n.id=l.note_id WHERE l.target_type='source' AND l.target_id=? AND n.kind<>'person' AND COALESCE(json_extract(n.profile_json,'$.recordOwnerPersonId'),'patient')=? LIMIT 1",
-      )
-      .get(file, personId);
-    if (linked) return true;
-    for (const attached of db
-      .prepare(
-        'SELECT at.owner_type,at.owner_id FROM attachments at JOIN assets a ON a.id=at.asset_id WHERE a.source_file_id=?',
-      )
-      .iterate(file)) {
-      if (recordOwner(db, String(attached.owner_type), String(attached.owner_id)) === personId)
-        return true;
-    }
-    const sources = db
-      .prepare(
-        "SELECT id FROM source_records WHERE source_file_id=? OR json_extract(locator_json,'$.originalSourceFileId')=?",
-      )
-      .iterate(file, file);
-    for (const source of sources) {
-      const sourceId = String(source.id);
-      if (sourceAssertionOwnership(db, sourceId).ownerPersonId === personId) return true;
-      for (const [kind, table] of [
-        ['observation', 'observations'],
-        ['medication', 'medications'],
-        ['procedure', 'procedures'],
-        ['document', 'documents'],
-        ['note', 'notes'],
-      ] as const) {
-        const owner =
-          kind === 'document'
-            ? "COALESCE(json_extract(r.extra_json,'$.import.personId'),'patient')"
-            : kind === 'note'
-              ? "COALESCE(json_extract(r.profile_json,'$.recordOwnerPersonId'),'patient')"
-              : 'r.person_id';
-        if (
-          db
-            .prepare(
-              `SELECT 1 FROM ${table} r WHERE ${owner}=? ${kind === 'note' ? "AND r.kind<>'person'" : ''} AND (r.source_record_id=? OR EXISTS(SELECT 1 FROM evidence e WHERE e.entity_type=? AND e.entity_id=r.id AND e.source_record_id=?)) LIMIT 1`,
-            )
-            .get(personId, sourceId, kind, sourceId)
+  const scratch = disposableSqlite('circus-packet-descendants-');
+  try {
+    scratch.db.exec('CREATE TABLE files(id TEXT PRIMARY KEY,seen INTEGER NOT NULL DEFAULT 0)');
+    const enqueue = scratch.db.prepare('INSERT OR IGNORE INTO files(id) VALUES(?)');
+    enqueue.run(id);
+    for (;;) {
+      const next = scratch.db
+        .prepare('SELECT id FROM files WHERE seen=0 ORDER BY id LIMIT 1')
+        .get();
+      if (!next) break;
+      const file = String(next.id);
+      scratch.db.prepare('UPDATE files SET seen=1 WHERE id=?').run(file);
+      const linked = db
+        .prepare(
+          "SELECT 1 FROM note_links l JOIN notes n ON n.id=l.note_id WHERE l.target_type='source' AND l.target_id=? AND n.kind<>'person' AND COALESCE(json_extract(n.profile_json,'$.recordOwnerPersonId'),'patient')=? LIMIT 1",
         )
+        .get(file, personId);
+      if (linked) return true;
+      for (const attached of db
+        .prepare(
+          'SELECT at.owner_type,at.owner_id FROM attachments at JOIN assets a ON a.id=at.asset_id WHERE a.source_file_id=?',
+        )
+        .iterate(file)) {
+        if (recordOwner(db, String(attached.owner_type), String(attached.owner_id)) === personId)
           return true;
       }
+      const sources = db
+        .prepare(
+          "SELECT id FROM source_records WHERE source_file_id=? OR json_extract(locator_json,'$.originalSourceFileId')=?",
+        )
+        .iterate(file, file);
+      for (const source of sources) {
+        const sourceId = String(source.id);
+        if (sourceAssertionOwnership(db, sourceId).ownerPersonId === personId) return true;
+        for (const [kind, table] of [
+          ['observation', 'observations'],
+          ['medication', 'medications'],
+          ['procedure', 'procedures'],
+          ['document', 'documents'],
+          ['note', 'notes'],
+        ] as const) {
+          const owner =
+            kind === 'document'
+              ? "COALESCE(json_extract(r.extra_json,'$.import.personId'),'patient')"
+              : kind === 'note'
+                ? "COALESCE(json_extract(r.profile_json,'$.recordOwnerPersonId'),'patient')"
+                : 'r.person_id';
+          if (
+            db
+              .prepare(
+                `SELECT 1 FROM ${table} r WHERE ${owner}=? ${kind === 'note' ? "AND r.kind<>'person'" : ''} AND (r.source_record_id=? OR EXISTS(SELECT 1 FROM evidence e WHERE e.entity_type=? AND e.entity_id=r.id AND e.source_record_id=?)) LIMIT 1`,
+              )
+              .get(personId, sourceId, kind, sourceId)
+          )
+            return true;
+        }
+      }
+      for (const child of db
+        .prepare(
+          "SELECT id FROM source_files WHERE json_extract(details_json,'$.originalSourceFileId')=? OR json_extract(details_json,'$.intake.parentSourceFileId')=?",
+        )
+        .iterate(file, file))
+        enqueue.run(String(child.id));
     }
-    for (const child of db
-      .prepare(
-        "SELECT id FROM source_files WHERE json_extract(details_json,'$.originalSourceFileId')=? OR json_extract(details_json,'$.intake.parentSourceFileId')=?",
-      )
-      .iterate(file, file))
-      pending.push(String(child.id));
+  } finally {
+    scratch.close();
   }
   // A factored context may be reachable only through a retained reference. Use
   // scoped identities for that uncommon proof; do not load clinical/note bodies.
-  const sources = new Set<string>(),
-    assets = new Set<string>();
-  for (const [kind, table] of [
-    ['observation', 'observations'],
-    ['medication', 'medications'],
-    ['procedure', 'procedures'],
-    ['document', 'documents'],
-    ['note', 'notes'],
-  ] as const) {
-    const owner =
-      kind === 'document'
-        ? "COALESCE(json_extract(r.extra_json,'$.import.personId'),'patient')"
-        : kind === 'note'
-          ? "COALESCE(json_extract(r.profile_json,'$.recordOwnerPersonId'),'patient')"
-          : 'r.person_id';
-    const where = `${owner}=? ${kind === 'note' ? "AND r.kind<>'person'" : ''}`;
+  function* sources() {
+    for (const [kind, table] of [
+      ['observation', 'observations'],
+      ['medication', 'medications'],
+      ['procedure', 'procedures'],
+      ['document', 'documents'],
+      ['note', 'notes'],
+    ] as const) {
+      const owner =
+        kind === 'document'
+          ? "COALESCE(json_extract(r.extra_json,'$.import.personId'),'patient')"
+          : kind === 'note'
+            ? "COALESCE(json_extract(r.profile_json,'$.recordOwnerPersonId'),'patient')"
+            : 'r.person_id';
+      const where = `${owner}=? ${kind === 'note' ? "AND r.kind<>'person'" : ''}`;
+      for (const row of db
+        .prepare(
+          `SELECT r.source_record_id source FROM ${table} r WHERE ${where} UNION SELECT e.source_record_id source FROM evidence e JOIN ${table} r ON r.id=e.entity_id AND e.entity_type=? WHERE ${where}`,
+        )
+        .iterate(personId, kind, personId))
+        if (row.source) yield String(row.source);
+    }
     for (const row of db
       .prepare(
-        `SELECT r.source_record_id source FROM ${table} r WHERE ${where} UNION SELECT e.source_record_id source FROM evidence e JOIN ${table} r ON r.id=e.entity_id AND e.entity_type=? WHERE ${where}`,
+        `SELECT sr.id FROM source_records sr WHERE ${assertionBoundary.singleOwner} AND EXISTS(SELECT 1 FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject' AND e.entity_id=?)`,
       )
-      .iterate(personId, kind, personId))
-      if (row.source) sources.add(String(row.source));
-    for (const row of db
-      .prepare(
-        `SELECT at.asset_id FROM attachments at JOIN ${table} r ON r.id=at.owner_id AND at.owner_type=? WHERE ${where}`,
-      )
-      .iterate(kind, personId))
-      assets.add(String(row.asset_id));
+      .iterate(personId))
+      yield String(row.id);
   }
-  for (const row of db
-    .prepare(
-      `SELECT sr.id FROM source_records sr WHERE ${assertionBoundary.singleOwner} AND EXISTS(SELECT 1 FROM evidence e WHERE e.source_record_id=sr.id AND e.entity_type='person' AND e.role='report_subject' AND e.entity_id=?)`,
-    )
-    .iterate(personId))
-    sources.add(String(row.id));
-  return packetDependencies(db, {
-    key: 'membership',
-    type: 'membership',
-    id: 'membership',
-    title: '',
-    date: null,
-    row: {},
-    citations: [...sources].map((id) => ({ id })),
-    attachments: [...assets].map((assetId) => ({ assetId })),
-  }).files.has(id);
+  function* files() {
+    for (const [kind, table] of [
+      ['observation', 'observations'],
+      ['medication', 'medications'],
+      ['procedure', 'procedures'],
+      ['document', 'documents'],
+      ['note', 'notes'],
+    ] as const) {
+      const owner =
+        kind === 'document'
+          ? "COALESCE(json_extract(r.extra_json,'$.import.personId'),'patient')"
+          : kind === 'note'
+            ? "COALESCE(json_extract(r.profile_json,'$.recordOwnerPersonId'),'patient')"
+            : 'r.person_id';
+      for (const row of db
+        .prepare(
+          `SELECT a.source_file_id FROM attachments at JOIN assets a ON a.id=at.asset_id JOIN ${table} r ON r.id=at.owner_id AND at.owner_type=? WHERE ${owner}=? ${kind === 'note' ? "AND r.kind<>'person'" : ''}`,
+        )
+        .iterate(kind, personId))
+        if (row.source_file_id) yield String(row.source_file_id);
+    }
+  }
+  return packetSourcesReachFile(db, id, sources(), files());
 }
 
 function packetItems(
@@ -1053,74 +1076,77 @@ function patientInformation(db: Database, personId = 'patient'): PatientInformat
 }
 function includedReadingGaps(
   db: Database,
-  records: ExportRecord[],
-): NoteExportSnapshot['readingGaps'] {
-  const citations = new Set(
-    records.flatMap((record) => record.citations.map((citation) => citation.id)),
-  );
-  const sourceFiles = new Set(
-    records.filter((record) => record.type === 'source_file').map((record) => record.id),
-  );
-  for (const id of citations) {
-    const row = db.prepare('SELECT source_file_id FROM source_records WHERE id=?').get(id) as
-      { source_file_id?: string } | undefined;
-    if (row?.source_file_id) sourceFiles.add(row.source_file_id);
+  records: Iterable<ExportRecord>,
+  budget: PacketOutputBudget,
+  retain: boolean,
+) {
+  function* sourceFiles() {
+    for (const record of records) {
+      if (record.type === 'source_file') yield record.id;
+      for (const citation of record.citations) {
+        const row = db
+          .prepare('SELECT source_file_id FROM source_records WHERE id=?')
+          .get(citation.id);
+        if (row?.source_file_id) yield String(row.source_file_id);
+      }
+    }
   }
-  const result: NoteExportSnapshot['readingGaps'] = [];
-  const visited = new Set<string>();
-  const pending = [...sourceFiles].sort();
-  while (pending.length) {
-    const sourceId = pending.shift()!;
-    if (visited.has(sourceId)) continue;
-    visited.add(sourceId);
-    const row = db.prepare('SELECT details_json FROM source_files WHERE id=?').get(sourceId);
-    if (!row) continue;
-    const metadata = parsedRecord(row.details_json);
-    // Accepted conversions cite a proposal; source/package children can also
-    // point at a parent original. Follow retained pointers without guessing paths.
-    if (typeof metadata.originalSourceFileId === 'string')
-      pending.push(metadata.originalSourceFileId);
-    const details = readStoredIntakeDetails(db, sourceId);
-    if (!details) continue;
-    if (typeof details.parentSourceFileId === 'string') pending.push(details.parentSourceFileId);
-    const workflow = details.workflow as { plans?: IntakeExtractionPlan[] } | undefined;
-    const plan = workflow?.plans?.find((entry) => entry.status === 'active');
-    const gaps =
-      plan?.units?.flatMap((unit) => {
+  const items: NoteExportSnapshot['readingGaps'] = [];
+  let incomplete = false;
+  for (const source of packetSourceAncestry(db, sourceFiles())) {
+    const sourceId = source.id,
+      native =
+        source.kind === 'intake_original' && hasIntakeCollectionEnvelope(db, { id: sourceId }),
+      details = native ? undefined : readStoredIntakeDetails(db, sourceId);
+    if (!native && !details) continue;
+    function* legacy(): Generator<PacketReadingGap> {
+      const plan = (
+        details?.workflow as { plans?: IntakeExtractionPlan[] } | undefined
+      )?.plans?.find((entry) => entry.status === 'active');
+      for (const unit of plan?.units || []) {
         const kind = accountedUnitKind(
-          { ...plan, batches: plan.batches || [] },
+          { ...plan!, batches: plan!.batches || [] },
           { ...unit, attempts: unit.attempts || [] },
         );
-        if (!unit.processingException && kind && kind !== 'unreadable') return [];
-        return [
-          {
+        if (unit.processingException || !kind || kind === 'unreadable')
+          yield {
             locator: unit.locator || unit.id,
             reason:
               unit.processingException?.reason ||
               (kind === 'unreadable' ? 'unreadable' : 'not yet read'),
-          },
-        ];
-      }) || [];
-    if (!plan || !plan.units?.length)
-      gaps.push({
-        locator: 'Retained original',
-        reason: 'reading has not established page coverage',
-      });
-    for (const reference of plan?.index?.references || [])
-      if (reference.status === 'capacity_exception')
-        gaps.push({
-          locator: reference.locator,
-          reason: `capacity exception: ${reference.note || 'references were not indexed'}`,
-        });
-    if (gaps.length)
-      result.push({
-        sourceFileId: sourceId,
-        filename: String(details.originalName || sourceId),
-        gaps,
-      });
+          };
+      }
+      if (!plan?.units?.length)
+        yield { locator: 'Retained original', reason: 'reading has not established page coverage' };
+      for (const reference of plan?.index?.references || [])
+        if (reference.status === 'capacity_exception')
+          yield {
+            locator: reference.locator,
+            reason: 'capacity exception: ' + (reference.note || 'references were not indexed'),
+          };
+    }
+    let selected: NoteExportSnapshot['readingGaps'][number] | undefined;
+    for (const gap of native ? iterateNativePacketReadingGaps(db, sourceId) : legacy()) {
+      incomplete = true;
+      if (!retain) continue;
+      if (!selected) {
+        selected = {
+          sourceFileId: sourceId,
+          filename: String(
+            (native ? intakeSourceMetadata(db, sourceId).originalName : details?.originalName) ||
+              sourceId,
+          ),
+          gaps: [],
+        };
+        budget.add(selected, items.length ? 1 : 0);
+        items.push(selected);
+      }
+      budget.add(gap, selected.gaps.length ? 1 : 0);
+      selected.gaps.push(gap);
+    }
   }
-  result.sort((a, b) => a.sourceFileId.localeCompare(b.sourceFileId));
-  return result;
+  items.sort((a, b) => a.sourceFileId.localeCompare(b.sourceFileId));
+  return { items, incomplete };
 }
 
 /** Only these normalized fields are shared while a packet withholds records. */
@@ -1737,21 +1763,16 @@ export function exportSnapshot(
     source_file: 6,
   };
   const rank = (type: ExportRecordType): number => ranks[type] ?? 7;
-  const reportReview = packetReportReview(
-    db,
-    [main, ...records.values()].flatMap((item) => item.citations.map((citation) => citation.id)),
-  );
-  const readingGaps = includedReadingGaps(db, [main, ...records.values()]);
+  const reportReview: PacketReportReview[] = [];
+  const readingGaps: NoteExportSnapshot['readingGaps'] = [];
   const payload = {
     ...(plan.active || input.packetSelection !== undefined || plan.preferences.length
       ? {
           selective: plan.active,
           patientRequestedWithholding: requestedWithholding,
           unredactedMaterialsIncluded,
-          sourceReviewIncomplete: reportReview.some(
-            (report) => report.savedCount < report.totalCount,
-          ),
-          sourceReadingIncomplete: readingGaps.length > 0,
+          sourceReviewIncomplete: false,
+          sourceReadingIncomplete: false,
           packetReview: plan.review,
           packetInspection,
           packetPrivate: { ...plan.finish(), approval: input.packetApproval || null },
@@ -1780,12 +1801,30 @@ export function exportSnapshot(
     },
     selection: plan.active ? [...plan.selected].sort() : selected,
   };
-  if (JSON.stringify(payload).length > (input.mode === 'provider' ? 64_000_000 : 8_000_000))
-    throw new HttpError(
-      400,
-      'EXPORT_TOO_LARGE',
-      'Selected text is too large for a single export. Narrow the selection.',
-    );
+  // The fixed transport budget bounds resident output before any report or
+  // pending-member disclosure is appended. Selective packets retain only the
+  // generic truth while still traversing the complete authoritative scope.
+  const budget = new PacketOutputBudget(packetOutputLimit(input.mode === 'provider'));
+  budget.add(payload);
+  function* includedSources() {
+    for (const item of [main, ...records.values()])
+      for (const citation of item.citations) yield citation.id;
+  }
+  let reviewIncomplete = false;
+  for (const report of iteratePacketReportReview(db, includedSources())) {
+    reviewIncomplete ||= report.savedCount < report.totalCount;
+    if (!plan.active) {
+      budget.add(report, reportReview.length ? 1 : 0);
+      reportReview.push(report);
+    }
+  }
+  reportReview.sort(
+    (a, b) => a.intakeId.localeCompare(b.intakeId) || a.groupId.localeCompare(b.groupId),
+  );
+  const reading = includedReadingGaps(db, [main, ...records.values()], budget, !plan.active);
+  for (const source of reading.items) readingGaps.push(source);
+  if ('sourceReviewIncomplete' in payload) payload.sourceReviewIncomplete = reviewIncomplete;
+  if ('sourceReadingIncomplete' in payload) payload.sourceReadingIncomplete = reading.incomplete;
   return { ...payload, generatedAt: now, fingerprint: hash(payload) };
 }
 

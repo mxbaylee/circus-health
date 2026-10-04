@@ -13,6 +13,7 @@ import {
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { backup } from 'node:sqlite';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability, rebuildProfile, writePortableSources } from '../portable.ts';
@@ -21,7 +22,12 @@ import {
   openContributorRecordStorage,
   contributorAuthorityPath,
 } from '../contributor-record-storage.ts';
-import { rebuildContributorDatabase } from '../contributor-durability.ts';
+import {
+  rebuildContributorDatabase,
+  assertContributorCopyCoherence,
+  copyContributorAuthority,
+  selectedContributorHead,
+} from '../contributor-durability.ts';
 import { createBackup, restoreBackup } from '../recovery.ts';
 import { rebuildStartup } from '../startup-rebuild.ts';
 import { readProfileRegistry } from '../profile-registry.ts';
@@ -342,4 +348,40 @@ test('selected authority refuses an unindexed existing cache without resetting i
   } finally {
     reopened.close();
   }
+});
+
+test('contributor copy compares exact streamed row multisets and publishes authority paths to a bounded sink', async (t) => {
+  const { root, db } = fixture(t);
+  const insert = db.prepare('INSERT INTO app_meta VALUES(?,?)');
+  for (let ordinal = 0; ordinal < 1024; ordinal++)
+    insert.run('fictional:retained:' + ordinal, 'opaque-' + 'x'.repeat(256));
+  insert.run('fictional:astral', '𐀀');
+  insert.run('fictional:bmp', '\ue000');
+  attachPersonalDurability(db, { root, profileId: 'cedar' });
+  const backupPath = resolve(root, 'copy.sqlite');
+  await backup(db, backupPath);
+  const copied = openDatabase(backupPath, 'cedar');
+  try {
+    assertContributorCopyCoherence(db, root, 'cedar', copied);
+    copied
+      .prepare("UPDATE app_meta SET value=? WHERE key='fictional:retained:1023'")
+      .run('unpublished change');
+    assert.throws(
+      () => assertContributorCopyCoherence(db, root, 'cedar', copied),
+      /conflicts with selected record authority/,
+    );
+  } finally {
+    copied.close();
+  }
+  const target = resolve(root, 'authority-copy');
+  let files = 0;
+  const collected = copyContributorAuthority(root, 'cedar', target, {
+    onFile(path) {
+      files++;
+      assert.equal(existsSync(resolve(target, path)), true);
+    },
+  });
+  assert.equal(collected.length, 0);
+  assert.ok(files > 3);
+  assert.equal(selectedContributorHead(target, 'cedar'), selectedContributorHead(root, 'cedar'));
 });

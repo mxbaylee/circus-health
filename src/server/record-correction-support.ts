@@ -1,0 +1,363 @@
+/** Exact, bounded supporting-original preparation for direct clinical corrections. */
+import { setImmediate } from 'node:timers/promises';
+import { HttpError, revision, type Database } from './database.ts';
+import { assertIntakeOwner } from './intake.ts';
+import { verifyIntakeFileHash } from './intake-files.ts';
+import { profileOriginal } from './profile-storage.ts';
+import { intakeSourceMetadata, intakeSourceVersion } from './intake-state-access.ts';
+import {
+  openIntakeCollectionEnvelope,
+  type IntakeCollectionEnvelopeReader,
+  type IntakeEnvelopeRecord,
+} from './intake-collection-envelope.ts';
+import { intakeReviewChildren, readIntakeReviewValue } from './intake-review-collection.ts';
+import {
+  prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewDependencies,
+} from './intake-review-collection-host.ts';
+import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
+import { readCollectionReviewMembership } from './intake-review-membership-index.ts';
+import { readRetainedPlanEvidence } from './intake-retained-plan.ts';
+import { createReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
+import { openReportMemberSnapshot } from './intake-report-member-state.ts';
+import type { IntakeReportMembersReference } from '../shared/intake-report-version.ts';
+import type {
+  CorrectionSupportingEvidence,
+  CorrectionSupportingReference,
+} from '../shared/record-correction.ts';
+
+const keys = [
+  'intakeId',
+  'proposalId',
+  'recordId',
+  'candidateId',
+  'candidateVersionId',
+  'originalSourceFileId',
+] as const;
+export function correctionSupportingReferences(input: unknown): CorrectionSupportingReference[] {
+  if (input === undefined) return [];
+  if (!Array.isArray(input) || input.length > 8)
+    throw new HttpError(
+      400,
+      'CORRECTION_EVIDENCE',
+      'Choose at most eight scoped supporting originals',
+    );
+  const seen = new Set<string>();
+  return input.map((value) => {
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      Object.keys(value).some((key) => !keys.includes(key as (typeof keys)[number])) ||
+      keys.some((key) =>
+        key === 'proposalId' && value[key] === null
+          ? false
+          : typeof value[key] !== 'string' || !value[key] || value[key].length > 500,
+      )
+    )
+      throw new HttpError(
+        400,
+        'CORRECTION_EVIDENCE',
+        'Supply the exact incoming candidate, proposal and original reference',
+      );
+    const key = JSON.stringify(keys.map((key) => value[key]));
+    if (seen.has(key))
+      throw new HttpError(400, 'CORRECTION_EVIDENCE', 'Choose each supporting occurrence once');
+    seen.add(key);
+    return Object.fromEntries(
+      keys.map((key) => [key, value[key]]),
+    ) as unknown as CorrectionSupportingReference;
+  });
+}
+
+function field<T>(
+  view: IntakeCollectionEnvelopeReader,
+  record: IntakeEnvelopeRecord,
+  key: string,
+): T | undefined {
+  const child = view.child(record, key);
+  if (child) return readIntakeReviewValue<T>(view, child, 16 * 1024);
+  const value = view.field(record, key, { bytes: 16 * 1024 });
+  if (value.kind === 'fragmented')
+    throw new HttpError(
+      409,
+      'CORRECTION_EVIDENCE',
+      'Supporting evidence identity needs bounded metadata',
+    );
+  return value.kind === 'value' ? (value.value as T) : undefined;
+}
+function original(db: Database, root: string, profileId: string, id: string) {
+  const row = db
+    .prepare('SELECT id,kind,path,sha256,bytes,details_json FROM source_files WHERE id=?')
+    .get(id);
+  if (!row)
+    throw new HttpError(
+      404,
+      'CORRECTION_EVIDENCE',
+      'Supporting original is not retained in this profile',
+    );
+  verifyIntakeFileHash(profileOriginal(root, row.path, profileId), {
+    sha256: String(row.sha256),
+    bytes: Number(row.bytes),
+  });
+  const details =
+    row.kind === 'intake_original'
+      ? intakeSourceMetadata(db, id)
+      : (
+          JSON.parse(String(row.details_json)) as {
+            intake?: { originalName?: string; parentSourceFileId?: string; locator?: string };
+          }
+        ).intake;
+  return { row, details };
+}
+function ancestry(db: Database, id: string): string {
+  const seen = new Set<string>();
+  while (!seen.has(id) && seen.size < 10) {
+    seen.add(id);
+    const row = db.prepare('SELECT kind,details_json FROM source_files WHERE id=?').get(id);
+    if (!row)
+      throw new HttpError(409, 'CORRECTION_EVIDENCE', 'Supporting source ancestry is unavailable');
+    const parent =
+      row.kind === 'intake_original'
+        ? intakeSourceMetadata(db, id).parentSourceFileId
+        : (JSON.parse(String(row.details_json)) as { intake?: { parentSourceFileId?: string } })
+            .intake?.parentSourceFileId;
+    if (!parent) return id;
+    id = parent;
+  }
+  throw new HttpError(409, 'CORRECTION_EVIDENCE', 'Supporting source ancestry is invalid');
+}
+/** The opaque host object never comes from an HTTP request or a display page. */
+export interface PreparedCorrectionSupportingEvidence {
+  readonly kind: 'prepared-correction-support';
+  /** Release selected issue policies after the preview or correction consumes this proof. */
+  dispose(): void;
+}
+const prepared = new WeakMap<
+  PreparedCorrectionSupportingEvidence,
+  {
+    db: Database;
+    root: string;
+    profileId: string;
+    key: string;
+    evidence: CorrectionSupportingEvidence[];
+    assertCurrent(): void;
+  }
+>();
+export function readPreparedCorrectionSupport(
+  proof: PreparedCorrectionSupportingEvidence,
+  db: Database,
+  root: string,
+  profileId: string,
+  input: unknown,
+): CorrectionSupportingEvidence[] {
+  const selected = prepared.get(proof);
+  if (
+    !selected ||
+    selected.db !== db ||
+    selected.root !== root ||
+    selected.profileId !== profileId ||
+    selected.key !== JSON.stringify(correctionSupportingReferences(input))
+  )
+    throw new HttpError(
+      409,
+      'CORRECTION_EVIDENCE_CHANGED',
+      'Prepare this exact supporting evidence again',
+    );
+  selected.assertCurrent();
+  return selected.evidence.map((value) => ({ ...value }));
+}
+
+/** Expensive cold dependency work and complete group traversal happen before the clinical transaction. */
+export async function prepareCorrectionSupportingEvidence(
+  db: Database,
+  root: string,
+  profileId: string,
+  input: unknown,
+): Promise<PreparedCorrectionSupportingEvidence> {
+  assertIntakeOwner(db, profileId);
+  const refs = correctionSupportingReferences(input),
+    dependencies = new Set<string>();
+  for (const ref of refs) {
+    const key = JSON.stringify([ref.intakeId, ref.proposalId]);
+    if (dependencies.has(key)) continue;
+    await prepareCollectionClinicalReviewDependencies(
+      db,
+      root,
+      profileId,
+      ref.intakeId,
+      ref.proposalId,
+    );
+    dependencies.add(key);
+  }
+  const initialRevision = revision(db),
+    assertions: (() => void)[] = [],
+    evidence: CorrectionSupportingEvidence[] = [];
+  const assertCurrent = () => {
+    assertIntakeOwner(db, profileId);
+    if (revision(db) !== initialRevision)
+      throw new HttpError(
+        409,
+        'CORRECTION_EVIDENCE_CHANGED',
+        'Records or evidence changed; review the supporting original again',
+      );
+    for (const assertion of assertions) assertion();
+  };
+  const sessions: Extract<
+    ReturnType<typeof prepareCollectionClinicalReview>,
+    { status: 'ready' }
+  >['session'][] = [];
+  const dispose = () => {
+    for (const session of sessions) session.close();
+    sessions.length = 0;
+  };
+  try {
+    for (const ref of refs) {
+      assertCurrent();
+      const view = openIntakeCollectionEnvelope(db, { id: ref.intakeId }),
+        intake = view.child(view.root(), 'intake')!,
+        workflow = view.child(intake, 'workflow'),
+        candidate = workflow && view.find('candidate', workflow, ref.candidateId),
+        version =
+          candidate &&
+          view.childAt(candidate, 'versions', view.childCount(candidate, 'versions') - 1);
+      if (!version || field(view, version, 'id') !== ref.candidateVersionId)
+        throw new HttpError(
+          409,
+          'CORRECTION_EVIDENCE_CHANGED',
+          'Review the current incoming candidate before using its original',
+        );
+      const selected = prepareCollectionClinicalReview(
+        db,
+        root,
+        profileId,
+        ref.intakeId,
+        ref.proposalId,
+      );
+      if (selected.status !== 'ready')
+        throw new HttpError(
+          409,
+          'CORRECTION_EVIDENCE',
+          'Prepare the complete selected clinical review before choosing supporting evidence',
+        );
+      sessions.push(selected.session);
+      const record = selected.session.record(ref.recordId, ref.candidateId, ref.candidateVersionId);
+      if (!record)
+        throw new HttpError(
+          409,
+          'CORRECTION_EVIDENCE_CHANGED',
+          'The supporting record does not belong to this exact proposal',
+        );
+      const sourceVersion = intakeSourceVersion(db, ref.intakeId),
+        contentUrl = `/api/sources/${encodeURIComponent(ref.originalSourceFileId)}/content`,
+        selectedEvidence = record.evidence.find((item) => item.contentUrl === contentUrl),
+        file = original(db, root, profileId, ref.originalSourceFileId),
+        membership = readCollectionReviewMembership(db, { id: ref.intakeId }, view),
+        catalog = createReportSnapshotCatalog(db, { id: ref.intakeId });
+      let memberId: string | undefined,
+        steps = 0;
+      // Preserve v1's first group with this candidate/version in any retained version,
+      // independently of which particular occurrence established the group.
+      group: for (const group of intakeReviewChildren(view, workflow, 'reportGroups')) {
+        const id = field<string>(view, group, 'memberId');
+        for (const reportVersion of intakeReviewChildren(view, group, 'versions')) {
+          if (++steps % 32 === 0) {
+            await setImmediate();
+            assertCurrent();
+          }
+          if (!id) continue;
+          const native =
+            field(view, reportVersion, 'format') === 'health-intake-report-group-version-v2';
+          const found = native
+            ? openReportMemberSnapshot(
+                catalog,
+                field<IntakeReportMembersReference>(view, reportVersion, 'members')!,
+              ).member(ref.candidateId, ref.candidateVersionId)
+            : membership.member(reportVersion, ref.candidateId, ref.candidateVersionId);
+          if (found) {
+            memberId = id;
+            break group;
+          }
+        }
+      }
+      const planMember =
+        memberId && workflow && view.childCount(workflow, 'plans')
+          ? readRetainedPlanEvidence(db, profileId, ref.intakeId).firstMember(memberId)
+          : undefined;
+      const member = !planMember
+        ? undefined
+        : planMember.kind === 'inventory'
+          ? planMember.member
+          : {
+              memberId: field<string>(planMember.view, planMember.record, 'memberId')!,
+              locator: field<string>(planMember.view, planMember.record, 'locator')!,
+              sourceHash: field<string>(planMember.view, planMember.record, 'sourceHash')!,
+            };
+      const exactMember =
+        !!member &&
+        file.details?.parentSourceFileId === ref.intakeId &&
+        file.details.locator === member.locator &&
+        file.row.sha256 === member.sourceHash;
+      if (
+        (!selectedEvidence && !exactMember) ||
+        ancestry(db, ref.originalSourceFileId) !== ancestry(db, ref.intakeId)
+      )
+        throw new HttpError(
+          409,
+          'CORRECTION_EVIDENCE',
+          'The original is not evidence of this selected incoming occurrence',
+        );
+      if (
+        db.prepare('SELECT mime_type FROM source_files WHERE id=?').get(ref.intakeId)?.mime_type ===
+          'application/zip' &&
+        ref.originalSourceFileId === ref.intakeId
+      )
+        throw new HttpError(
+          409,
+          'CORRECTION_EVIDENCE',
+          'Choose the exact retained package member, not the outer delivery',
+        );
+      assertions.push(() => {
+        view.address(view.root());
+        collectionClinicalProjectionContext(selected.session);
+        const current = original(db, root, profileId, ref.originalSourceFileId);
+        if (JSON.stringify(current) !== JSON.stringify(file))
+          throw new HttpError(
+            409,
+            'CORRECTION_EVIDENCE_CHANGED',
+            'The supporting original changed',
+          );
+      });
+      evidence.push({
+        ...ref,
+        intakeVersion: sourceVersion.version,
+        originalSourceHash: String(file.row.sha256),
+        filename: file.details?.originalName || String(file.row.path).split('/').at(-1)!,
+        contentUrl,
+        locator: exactMember ? member!.locator : selectedEvidence!.locator,
+        memberId: exactMember ? member!.memberId : null,
+        title: record.title,
+      });
+    }
+    assertCurrent();
+    const proof: PreparedCorrectionSupportingEvidence = Object.freeze({
+      kind: 'prepared-correction-support',
+      dispose() {
+        prepared.delete(proof);
+        dispose();
+      },
+    });
+    prepared.set(proof, {
+      db,
+      root,
+      profileId,
+      key: JSON.stringify(refs),
+      evidence,
+      assertCurrent,
+    });
+    return proof;
+  } catch (error) {
+    dispose();
+    throw error;
+  }
+}

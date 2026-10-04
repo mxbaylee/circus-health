@@ -2,12 +2,13 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { observeTransactionOutcome } from './database.ts';
 import {
-  readSourceTextProjection,
+  consumeSourceTextProjection,
   reconcileSourceTextProjection,
   sourceTextProjectionCounters,
 } from './source-text-projection.ts';
+import { createSourceDetailsLikeMatcher } from './source-details-like.ts';
 
-const FUNCTION = '__source_details_search_text';
+const FUNCTION = '__source_details_search_match';
 
 export interface SourceDetailsSearchLimits {
   maxEvaluations: number;
@@ -15,19 +16,20 @@ export interface SourceDetailsSearchLimits {
   maxReconstructedBytes: number;
 }
 export const SOURCE_DETAILS_SEARCH_LIMITS: Readonly<SourceDetailsSearchLimits> = Object.freeze({
-  maxEvaluations: 100_000,
-  maxReconstructedUtf16Units: 268_435_456,
-  maxReconstructedBytes: 536_870_912,
+  maxEvaluations: Number.MAX_SAFE_INTEGER,
+  maxReconstructedUtf16Units: Number.MAX_SAFE_INTEGER,
+  maxReconstructedBytes: Number.MAX_SAFE_INTEGER,
 });
 
-/** These counters measure query consumption separately from projection maintenance.
- * A candidate is reconstructed again for the page query; no reconstructed strings
- * are cached across candidates, statements, requests, sessions or profiles. */
+/** Query consumption is separate from projection maintenance. Legacy
+ * reconstruction counters remain zero: matching consumes bounded fragments.
+ * No source text is cached across candidates or count/page statements here. */
 export interface SourceDetailsSearchCounters {
   requests: number;
   completedRequests: number;
   failedRequests: number;
   activeRequests: number;
+  /** Candidate callbacks across count/page statements, including path matches. */
   evaluations: number;
   reconstructions: number;
   reconstructedUtf16Units: number;
@@ -44,10 +46,15 @@ export interface SourceDetailsSearchCounters {
   /** Physical source_files.details_json bytes; original rows are compact metadata.
    * Full original DTO hydration/serialization is counted by intakeWorkCounters. */
   dtoDetailsBytes: number;
+  streamedFragments: number;
+  streamedUtf16Units: number;
+  streamedBytes: number;
+  peakMatcherBytes: number;
 }
 interface Scope {
   token: string;
   profile: string;
+  pattern: string;
   failed: boolean;
   evaluating: boolean;
   evaluations: number;
@@ -86,6 +93,10 @@ function connectionFor(db: DatabaseSync): Connection {
       queryAuthorityBytes: 0,
       dtoRows: 0,
       dtoDetailsBytes: 0,
+      streamedFragments: 0,
+      streamedUtf16Units: 0,
+      streamedBytes: 0,
+      peakMatcherBytes: 0,
     },
   };
   connections.set(db, connection);
@@ -103,6 +114,7 @@ export function clearSourceDetailsSearchCache(db: DatabaseSync): void {
   if (connection?.active) {
     connection.active.unobserve();
     connection.active.profile = '';
+    connection.active.pattern = '';
     connection.active = undefined;
     connection.counters.activeRequests = 0;
     connection.counters.failedRequests++;
@@ -127,10 +139,10 @@ export function recordSourceDetailsSearchDTORead(db: DatabaseSync, raw: unknown)
   if (typeof raw === 'string') connection.counters.dtoDetailsBytes += Buffer.byteLength(raw);
 }
 
-/** Keep SQLite itself responsible for LIKE, including wildcards, case, Unicode
- * and embedded NUL behavior. Only its text operand changes. The projection's
- * selected profile/source/hash/head and transactional dirty tracking establish
- * freshness on every reconstruction, without parsing operational intake views. */
+/** SQLite evaluates path LIKE; the checked ordered source stream uses the same
+ * default LIKE grammar and TEXT transport semantics. Query work has no corpus
+ * size product limit. Optional diagnostic limits fail the entire request.
+ */
 export function createSourceDetailsSearch(
   db: DatabaseSync,
   query: string,
@@ -157,7 +169,7 @@ export function createSourceDetailsSearch(
     // outer SQL statement starts; warm reads need no source JSON hydration.
     reconcileSourceTextProjection(db);
     if (!registered.has(db)) {
-      db.function(FUNCTION, (token, sourceId) => {
+      db.function(FUNCTION, (pathMatch, token, sourceId, pattern) => {
         const current = connections.get(db);
         const scope = current?.active;
         if (!scope || token !== scope.token)
@@ -176,6 +188,16 @@ export function createSourceDetailsSearch(
           )
             throw Error('Source details search profile binding changed');
           if (typeof sourceId !== 'string') throw Error('Invalid source search identity');
+          if (pattern !== scope.pattern)
+            throw Error('Source details search pattern binding changed');
+          // Validate the request even when the path already matches. An SQL OR
+          // before the dispatcher would bypass token/profile invalidation.
+          if (pathMatch === 1) return 1;
+          const matcher = createSourceDetailsLikeMatcher(scope.pattern);
+          current.counters.peakMatcherBytes = Math.max(
+            current.counters.peakMatcherBytes,
+            matcher.retainedBytes,
+          );
           const before = sourceTextProjectionCounters(db);
           const reads = {
             rows: before.projectionRowsRead,
@@ -183,9 +205,22 @@ export function createSourceDetailsSearch(
             authorityReads: before.authorityReads,
             authorityBytes: before.authorityBytes,
           };
-          let text: string;
           try {
-            text = readSourceTextProjection(db, sourceId);
+            consumeSourceTextProjection(db, sourceId, (text) => {
+              const size = Buffer.byteLength(text);
+              current.counters.streamedFragments++;
+              current.counters.streamedUtf16Units += text.length;
+              current.counters.streamedBytes += size;
+              current.counters.peakTextBytes = Math.max(current.counters.peakTextBytes, size);
+              scope.units += text.length;
+              scope.bytes += size;
+              if (
+                scope.units > scope.limits.maxReconstructedUtf16Units ||
+                scope.bytes > scope.limits.maxReconstructedBytes
+              )
+                throw Error('Source details search reconstruction limit exceeded');
+              matcher.write(text);
+            });
           } finally {
             const after = sourceTextProjectionCounters(db);
             current.counters.queryProjectionRowsRead += after.projectionRowsRead - reads.rows;
@@ -193,19 +228,7 @@ export function createSourceDetailsSearch(
             current.counters.queryAuthorityReads += after.authorityReads - reads.authorityReads;
             current.counters.queryAuthorityBytes += after.authorityBytes - reads.authorityBytes;
           }
-          const size = Buffer.byteLength(text);
-          current.counters.reconstructions++;
-          current.counters.reconstructedUtf16Units += text.length;
-          current.counters.reconstructedBytes += size;
-          current.counters.peakTextBytes = Math.max(current.counters.peakTextBytes, size);
-          scope.units += text.length;
-          scope.bytes += size;
-          if (
-            scope.units > scope.limits.maxReconstructedUtf16Units ||
-            scope.bytes > scope.limits.maxReconstructedBytes
-          )
-            throw Error('Source details search reconstruction limit exceeded');
-          return text;
+          return matcher.finish() ? 1 : 0;
         } catch (error) {
           scope.failed = true;
           throw error;
@@ -224,6 +247,9 @@ export function createSourceDetailsSearch(
     profile: db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()!
       .value as string,
     failed: false,
+    // Node's SQLite TEXT binding replaces lone UTF-16 surrogates before the
+    // dispatcher sees the parameter. Bind the scope to that same exact operand.
+    pattern: Buffer.from(`%${query}%`, 'utf8').toString('utf8'),
     evaluating: false,
     evaluations: 0,
     units: 0,
@@ -236,12 +262,13 @@ export function createSourceDetailsSearch(
   scope.unobserve = observeTransactionOutcome(db, () => clearSourceDetailsSearchCache(db));
   return {
     joins: '',
-    predicate: `(f.path LIKE ? OR ${FUNCTION}(?,f.id) LIKE ?)`,
+    predicate: `${FUNCTION}(f.path LIKE ?,?,f.id,?)=1`,
     parameters: [`%${query}%`, scope.token, `%${query}%`],
     dispose(error?: unknown) {
       if (connection.active !== scope) return;
       scope.unobserve();
       scope.profile = '';
+      scope.pattern = '';
       connection.active = undefined;
       connection.counters.activeRequests = 0;
       if (scope.failed || error !== undefined) connection.counters.failedRequests++;

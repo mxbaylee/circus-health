@@ -21,6 +21,88 @@ const primitiveTemplate = {
   metadataReadBytes: 0,
 };
 const hostTemplate = {
+  reviewIssuePolicyRows: 0,
+  reviewIssuePolicyWrittenBytes: 0,
+  reviewIssuePolicyReadBytes: 0,
+  reviewIssuePolicyPeakValueBytes: 0,
+  sourceAttentionPreparedSources: 0,
+  sourceAttentionReturnedSources: 0,
+  reviewQuestionTokenBytes: 0,
+  collectionQueuePreparedSources: 0,
+  collectionQueueMemberRows: 0,
+  collectionQueueReceiptRecords: 0,
+  collectionQueueClinicalReviews: 0,
+  collectionQueueSummaryBuilds: 0,
+  collectionFeedRebuiltSources: 0,
+  collectionFeedReviewedRecords: 0,
+  duplicateSnapshotComparedRows: 0,
+  duplicateSnapshotChangedRows: 0,
+  duplicateSnapshotHashedBytes: 0,
+  duplicateSnapshotYields: 0,
+  duplicateSnapshotSortedRows: 0,
+  duplicateSnapshotScratchWrittenBytes: 0,
+  duplicateSnapshotScratchReadBytes: 0,
+  duplicateEvidenceHashedRows: 0,
+  duplicateEvidenceRawHashedRows: 0,
+  duplicateEvidenceHashedBytes: 0,
+  duplicateEvidenceYields: 0,
+  readerCoverageColdUnits: 0,
+  readerCoverageChangedUnits: 0,
+  readerCoverageDependencyChecks: 0,
+  ownershipSnapshotHashedBytes: 0,
+  ownershipSnapshotChangedIds: 0,
+  ownershipSnapshotComparedIds: 0,
+  ownershipSnapshotYields: 0,
+  collectionEvidenceFragmentInputBytes: 0,
+  collectionEvidenceFragmentScratchWrittenBytes: 0,
+  collectionEvidenceFragmentReadBytes: 0,
+  collectionEvidenceFragmentPeakBufferBytes: 0,
+  schemaCertificationChunks: 0,
+  schemaCertificationYields: 0,
+  schemaCertificationHashedBytes: 0,
+  schemaUpgradeInputUnits: 0,
+  schemaUpgradeScratchReadBytes: 0,
+  schemaUpgradeScratchWrittenBytes: 0,
+  schemaUpgradeNodes: 0,
+  schemaUpgradeSqliteCalls: 0,
+  schemaUpgradePeakBufferBytes: 0,
+  clinicalProjectionEarlierRows: 0,
+  clinicalProjectionEarlierRawBytes: 0,
+  clinicalProjectionEarlierCanonicalBytes: 0,
+  clinicalProjectionRetainedEntries: 0,
+  clinicalProjectionChangesetBytes: 0,
+  clinicalReviewMembershipRecords: 0,
+  clinicalCanonicalIndexColdRows: 0,
+  clinicalCanonicalIndexColdBytes: 0,
+  clinicalCanonicalIndexChangedRows: 0,
+  clinicalCanonicalIndexChangedBytes: 0,
+  clinicalCanonicalIndexLookups: 0,
+  reportSourceScopeMembers: 0,
+  reportSourceScopeOccurrences: 0,
+  reportSourceScopeSortComparisons: 0,
+  reportSourceScopeScratchReadBytes: 0,
+  reportSourceScopeScratchWrittenBytes: 0,
+  jsonCanonicalInputCodeUnits: 0,
+  jsonCanonicalSqliteCalls: 0,
+  jsonCanonicalScratchReadBytes: 0,
+  jsonCanonicalScratchWrittenBytes: 0,
+  jsonCanonicalOutputBytes: 0,
+  jsonCanonicalYields: 0,
+  jsonCanonicalPeakBufferBytes: 0,
+  jsonCanonicalPeakChunkBytes: 0,
+  proposalEntriesProcessed: 0,
+  reportMemberHashBytes: 0,
+  reportMemberHashItems: 0,
+  reportSnapshotCheckpointChanges: 0,
+  packagePlanUnitIds: 0,
+  packagePlanHashBytes: 0,
+  collectionNodeReads: 0,
+  collectionReadBytes: 0,
+  collectionPreparedBytes: 0,
+  collectionPeakPreparedBytes: 0,
+  collectionNodesWritten: 0,
+  collectionWrittenBytes: 0,
+  collectionItemsRead: 0,
   normalizeCalls: 0,
   normalizeValidationNodes: 0,
   normalizeCloneNodes: 0,
@@ -66,6 +148,9 @@ const hostTemplate = {
   rawNormalizations: 0,
   sourceDTOHydrations: 0,
   sourceDTOEnvelopeBytes: 0,
+  retainedPlanHeaders: 0,
+  retainedPlanUnits: 0,
+  retainedPlanCoverageReceipts: 0,
 };
 export type IntakeHostWork = typeof hostTemplate;
 export type IntakeWorkPhase = 'warm' | 'reconstruction';
@@ -115,6 +200,19 @@ export function withIntakeWork<T>(db: DatabaseSync, phase: IntakeWorkPhase, run:
 }
 export function recordIntakeWork(metric: keyof IntakeHostWork, amount = 1): void {
   if (active) active.counters[metric] += amount;
+}
+/** High-water logical encoded bytes, distinct from cumulative work and RSS. */
+export function recordIntakePeak(
+  metric:
+    | 'collectionPeakPreparedBytes'
+    | 'jsonCanonicalPeakBufferBytes'
+    | 'jsonCanonicalPeakChunkBytes'
+    | 'schemaUpgradePeakBufferBytes'
+    | 'reviewIssuePolicyPeakValueBytes'
+    | 'collectionEvidenceFragmentPeakBufferBytes',
+  amount: number,
+): void {
+  if (active) active.counters[metric] = Math.max(active.counters[metric], amount);
 }
 /** Charge a known existing serialization, never serialize solely for accounting. */
 export function recordIntakeSerialization(text: string): string {

@@ -365,101 +365,115 @@ test('failed PDF inventory exposes a durable file exception, never an invented p
   assert.deepEqual(await read(f.rebuild()), response);
 });
 
-test('reader coverage remains separately visible for context-only zero-record proposals and uses version-pinned pagination', async (t) => {
-  fictionalModel(t);
-  const f = fixture(t),
-    { db, root, profileId, id } = f.context;
-  await runIntakeSourceExtractionOperation(f.context);
-  const original = getIntake(db, root, profileId, id);
-  const planned = await createIntakePlan(db, root, profileId, id, { version: original.version });
-  const plan = planned.workflow!.plans[0];
-  const jsonlText = JSON.stringify({
-    format: 'health-record-v1',
-    id: 'fictional-context',
-    kind: 'context',
-    payload: { text: 'Fictional unrecognized administrative section.' },
-    provenance: {
-      capturedVia: 'Fictional reader',
-      sourceSystem: null,
-      sourceRecordId: null,
-      evidenceClass: 'transcription',
-      locator: 'source section 1',
-    },
-    coverage: { status: 'partial', notes: ['Unrecognized writing requires a person.'] },
-  });
-  const proposed = submitIntakeBatch(db, root, profileId, id, {
-    version: planned.version,
-    planId: plan.id,
-    operationId: 'fictional-coverage-observation',
-    jsonlText,
-    summary: 'Fictional source only',
-    coverage: [
-      {
-        unitId: plan.units[0].id,
-        kind: 'unreadable',
-        notes: 'Fictional unreadable area. '.repeat(100),
-      },
-    ],
-  });
-  assert.equal(reviewIntake(db, root, profileId, id, proposed.proposals[0].id).records.length, 0);
-  const request = (params: string) =>
-    intakeSourceRoute({
-      db,
-      root,
-      profileId,
-      id,
-      action: 'source-issues',
-      params: new URLSearchParams(params),
-    });
-  const first = (await request('readerLimit=1')) as SourceTextIssueList;
-  assert.equal(first.status, 'available');
-  assert.ok(first.summary);
-  assert.ok(first.readerCoverage!.summary.units > 1);
-  assert.equal(first.readerCoverage!.summary.unreadable, 1);
-  assert.equal(first.readerCoverage!.entries[0].coverageKind, 'unreadable');
-  assert.equal(first.readerCoverage!.entries[0].notes.length, 1200);
-  assert.equal(first.readerCoverage!.entries[0].notesTruncated, true);
-  assert.equal(first.readerCoverage!.nextOffset, 1);
-  await assert.rejects(request('readerOffset=1'), { code: 'VERSION_CONFLICT' });
-  const next = (await request(
-    `readerOffset=1&readerLimit=1&readerVersion=${first.readerCoverage!.intakeVersion}`,
-  )) as SourceTextIssueList;
-  assert.equal(next.readerCoverage!.entries[0].status, 'pending');
-  await assert.rejects(request('readerVersion=0'), { code: 'VERSION_CONFLICT' });
-  const source = getIntakeSourceText(db, root, profileId, id).revision!;
-  reviewIntakeSourceText(
-    db,
-    root,
-    profileId,
-    id,
-    {
-      operationId: randomUUID(),
-      expectedRevisionId: source.id,
-      sourceHash: source.sourceHash,
-      scope: { page: 1 },
-      action: 'correct',
-      spans: [
-        {
-          id: 'human-corrected',
-          text: 'Fictional corrected section.',
-          region: { page: 1 },
-          provenance: 'human',
+for (const native of [false, true])
+  test(
+    `${native ? 'native' : 'legacy'} reader coverage remains separately visible for context-only zero-record proposals and uses version-pinned pagination`,
+    { timeout: 120000 },
+    async (t) => {
+      fictionalModel(t);
+      const f = fixture(t),
+        { db, root, profileId, id } = f.context;
+      await runIntakeSourceExtractionOperation(f.context);
+      const original = getIntake(db, root, profileId, id);
+      const planned = await createIntakePlan(db, root, profileId, id, {
+        version: original.version,
+      });
+      const plan = planned.workflow!.plans[0];
+      const jsonlText = JSON.stringify({
+        format: 'health-record-v1',
+        id: 'fictional-context',
+        kind: 'context',
+        payload: { text: 'Fictional unrecognized administrative section.' },
+        provenance: {
+          capturedVia: 'Fictional reader',
+          sourceSystem: null,
+          sourceRecordId: null,
+          evidenceClass: 'transcription',
+          locator: 'source section 1',
         },
-      ],
+        coverage: { status: 'partial', notes: ['Unrecognized writing requires a person.'] },
+      });
+      const proposed = submitIntakeBatch(db, root, profileId, id, {
+        version: planned.version,
+        planId: plan.id,
+        operationId: 'fictional-coverage-observation',
+        jsonlText,
+        summary: 'Fictional source only',
+        coverage: [
+          {
+            unitId: plan.units[0].id,
+            kind: 'unreadable',
+            notes: 'Fictional unreadable area. '.repeat(100),
+          },
+        ],
+      });
+      assert.equal(
+        reviewIntake(db, root, profileId, id, proposed.proposals[0].id).records.length,
+        0,
+      );
+      if (native) {
+        const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+        await buildIntakeCollectionEnvelope(db, { id });
+      }
+      const request = (params: string) =>
+        intakeSourceRoute({
+          db,
+          root,
+          profileId,
+          id,
+          action: 'source-issues',
+          params: new URLSearchParams(params),
+        });
+      const first = (await request('readerLimit=1')) as SourceTextIssueList;
+      assert.equal(first.status, 'available');
+      assert.ok(first.summary);
+      assert.ok(first.readerCoverage!.summary.units > 1);
+      assert.equal(first.readerCoverage!.summary.unreadable, 1);
+      assert.equal(first.readerCoverage!.entries[0].coverageKind, 'unreadable');
+      assert.equal(first.readerCoverage!.entries[0].notes.length, 1200);
+      assert.equal(first.readerCoverage!.entries[0].notesTruncated, true);
+      assert.equal(first.readerCoverage!.nextOffset, 1);
+      await assert.rejects(request('readerOffset=1'), { code: 'VERSION_CONFLICT' });
+      const next = (await request(
+        `readerOffset=1&readerLimit=1&readerVersion=${first.readerCoverage!.intakeVersion}`,
+      )) as SourceTextIssueList;
+      assert.equal(next.readerCoverage!.entries[0].status, 'pending');
+      await assert.rejects(request('readerVersion=0'), { code: 'VERSION_CONFLICT' });
+      const source = getIntakeSourceText(db, root, profileId, id).revision!;
+      reviewIntakeSourceText(
+        db,
+        root,
+        profileId,
+        id,
+        {
+          operationId: randomUUID(),
+          expectedRevisionId: source.id,
+          sourceHash: source.sourceHash,
+          scope: { page: 1 },
+          action: 'correct',
+          spans: [
+            {
+              id: 'human-corrected',
+              text: 'Fictional corrected section.',
+              region: { page: 1 },
+              provenance: 'human',
+            },
+          ],
+        },
+        'fictional-owner',
+      );
+      const corrected = (await request('readerLimit=1')) as SourceTextIssueList;
+      assert.equal(corrected.readerCoverage!.entries[0].stale, true);
+      assert.equal(corrected.readerCoverage!.summary.unreadable, 0);
+      assert.equal(corrected.readerCoverage!.summary.stale, 1);
+      assert.equal(
+        corrected.readerCoverage!.entries[0].notes,
+        first.readerCoverage!.entries[0].notes,
+        'earlier findings stay inspectable, explicitly stale',
+      );
+      await assert.rejects(
+        request(`readerOffset=1&readerVersion=${first.readerCoverage!.intakeVersion}`),
+        { code: 'VERSION_CONFLICT' },
+      );
     },
-    'fictional-owner',
   );
-  const corrected = (await request('readerLimit=1')) as SourceTextIssueList;
-  assert.equal(corrected.readerCoverage!.entries[0].stale, true);
-  assert.equal(corrected.readerCoverage!.summary.unreadable, 0);
-  assert.equal(corrected.readerCoverage!.summary.stale, 1);
-  assert.equal(
-    corrected.readerCoverage!.entries[0].notes,
-    first.readerCoverage!.entries[0].notes,
-    'earlier findings stay inspectable, explicitly stale',
-  );
-  await assert.rejects(
-    request(`readerOffset=1&readerVersion=${first.readerCoverage!.intakeVersion}`),
-    { code: 'VERSION_CONFLICT' },
-  );
-});

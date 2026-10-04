@@ -597,13 +597,18 @@ test('an unversioned legacy identity answer cannot unblock changed evidence or e
     resolutions: [{ issueId: questionId, outcome: 'unknown' }],
   });
   const initialIdentity = await getIntakeIdentityReview(f.db, f.root, f.profileId, item.id, id);
-  item = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, item.id, {
+  const identityConfirmed = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, item.id, {
     version: initialIdentity.scope!.intakeVersion,
     operationId: 'confirm-initial-current-identity',
     scope: initialIdentity.scope!,
     outcome: 'this_is_me',
     attestation: 'confirmed_displayed_identity_questions',
   });
+  assert.ok(
+    'validation' in identityConfirmed,
+    'The direct legacy fixture retains its full intake contract',
+  );
+  item = identityConfirmed;
   review = intake.reviewIntake(f.db, f.root, f.profileId, item.id);
   item = intake.importIntake(f.db, f.root, f.profileId, item.id, {
     version: item.version,

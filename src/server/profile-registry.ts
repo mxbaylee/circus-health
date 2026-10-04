@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync, lstatSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { validProfileId, profileDefinition } from './profiles.ts';
-import { durableWrite, syncDirectory, publishedPersonalLineage } from './portable.ts';
+import { durableWrite, syncDirectory, publishedPersonalHeaders } from './portable.ts';
 import { hasContributorAuthority } from './contributor-record-storage.ts';
 import { verifyContributorProfileAuthority } from './contributor-durability.ts';
 import {
@@ -79,9 +79,13 @@ export function readProfileRegistry(root: string) {
           throw Error('Multiple durable archives claim the same profile');
         verifyContributorProfileAuthority(root, id);
       } else if (!existsSync(database) && !profiles.some((profile) => profile.id === id)) {
-        const current = publishedPersonalLineage(root, id).next();
-        if (current.done)
-          throw Error('Profile has no verified owner metadata; recover its registry explicitly');
+        const lineage = publishedPersonalHeaders(root, id);
+        try {
+          if (lineage.next().done)
+            throw Error('Profile has no verified owner metadata; recover its registry explicitly');
+        } finally {
+          lineage.return(undefined);
+        }
       }
       if (!profiles.some((profile) => profile.id === id))
         profiles.push({ id, placebo: profileDefinition(id).placebo });

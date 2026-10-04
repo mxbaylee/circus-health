@@ -12,6 +12,22 @@ import {
   readIntakeEnvelopeMaterialized,
   type IntakeEnvelopeSource,
 } from './intake-authority.ts';
+import {
+  hasIntakeCollectionEnvelope,
+  openIntakeCollectionEnvelope,
+  type IntakeCollectionEnvelopeReader,
+  type IntakeEnvelopeRecord,
+} from './intake-collection-envelope.ts';
+import {
+  boundedIntakeLookupText,
+  INTAKE_LOOKUP_SCOPE_BYTES,
+} from './intake-lookup-contributions.ts';
+import { readNativeIntakeLookupTarget } from './intake-lookup-state.ts';
+export {
+  prepareIntakeLookupIndices,
+  intakeDiscoveryRevision,
+  assertIntakeDiscoveryRevision,
+} from './intake-lookup-state.ts';
 
 const PREFIX = '__record_intake_lookup_';
 const VERSION = 2;
@@ -321,6 +337,45 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
   }
   const selected = source as unknown as IntakeEnvelopeSource;
   const binding = intakeEnvelopeAuthorityBinding(db, selected);
+  if (binding.logicalHead !== undefined && hasIntakeCollectionEnvelope(db, selected)) {
+    // Native semantic roots are independently checked by their point consumers.
+    // Reconciliation records the logical binding only; it never derives an
+    // index from the workflow or rewrites text on auxiliary head changes.
+    connection.counters.authorityBytes += Buffer.byteLength(JSON.stringify(source));
+    const prior = db.prepare(`SELECT * FROM ${table('sources')} WHERE source_id=?`).get(id);
+    if (prior?.identity_first !== -1) {
+      for (const name of ['acceptances', 'identities'] as const) {
+        while (true) {
+          const row = db
+            .prepare(`SELECT hash FROM ${table(name)} WHERE source_id=? LIMIT 1`)
+            .get(id);
+          if (!row) break;
+          db.prepare(`DELETE FROM ${table(name)} WHERE source_id=? AND hash=?`).run(id, row.hash!);
+          prune(db, connection, new Set([String(row.hash)]));
+          countWrite(connection, { id, hash: row.hash, deleted: true });
+        }
+      }
+      db.prepare(`DELETE FROM ${table('groups')} WHERE source_id=?`).run(id);
+    }
+    if (
+      !prior ||
+      prior.source_order !== source.source_order ||
+      prior.kind !== source.kind ||
+      prior.authority_key !== binding.key ||
+      prior.authority_head !== binding.logicalHead ||
+      prior.identity_first !== -1
+    ) {
+      db.prepare(
+        `INSERT INTO ${table('sources')} VALUES(?,?,?,?,?,-1) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind,authority_key=excluded.authority_key,authority_head=excluded.authority_head,identity_first=-1`,
+      ).run(id, source.source_order!, source.kind!, binding.key, binding.logicalHead);
+      countWrite(connection, { id, logicalHead: binding.logicalHead });
+    }
+    db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
+    if (binding.key !== null)
+      db.prepare('INSERT INTO temp.__intake_lookup_authorities VALUES(?,?)').run(binding.key, id);
+    db.prepare('DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?').run(id);
+    return obsolete;
+  }
   const material =
     source.kind === 'intake_original' ? readIntakeEnvelopeMaterialized(db, selected) : undefined;
   const raw = material?.text ?? String(source.details_json);
@@ -434,6 +489,9 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     if (!hash) {
       connection.counters.hashedPayloadBytes += Buffer.byteLength(text);
       hash = digest(text);
+      // Only one legacy payload memo survives. Native readers retain no receipt
+      // payloads, and a corpus-wide memo is unnecessary for correctness.
+      connection.hashes.clear();
       connection.hashes.set(text, hash);
     }
     retainedHere.add(hash);
@@ -578,13 +636,13 @@ function current(db: DatabaseSync): Connection {
   if (binding?.profile_id !== profile) initialize(db, connection, profile);
   db.exec('SAVEPOINT __intake_lookup_reconcile');
   try {
-    const obsolete = new Set<string>();
-    for (const row of db
-      .prepare('SELECT source_id FROM temp.__intake_lookup_dirty ORDER BY source_id')
-      .all()) {
-      for (const hash of reconcile(db, connection, String(row.source_id))) obsolete.add(hash);
+    while (true) {
+      const row = db
+        .prepare('SELECT source_id FROM temp.__intake_lookup_dirty ORDER BY source_id LIMIT 1')
+        .get();
+      if (!row) break;
+      prune(db, connection, reconcile(db, connection, String(row.source_id)));
     }
-    prune(db, connection, obsolete);
     db.exec('RELEASE __intake_lookup_reconcile');
   } catch (error) {
     try {
@@ -610,33 +668,191 @@ export function reconcileActiveIntakeLookup(db: DatabaseSync): void {
 }
 export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
   current(db);
-  return Number(db.prepare(`SELECT MAX(discovery_order) n FROM ${table('groups')}`).get()!.n || 0);
+  let maximum = db
+    .prepare(
+      `SELECT MAX(g.discovery_order) n FROM ${table('groups')} g JOIN ${table('sources')} s ON s.source_id=g.source_id WHERE s.identity_first IS NULL OR s.identity_first<>-1`,
+    )
+    .get()!.n;
+  for (const source of nativeSources(db)) {
+    const view = nativeReader(db, source);
+    const group = readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
+    if (!group) continue;
+    const text = boundedIntakeLookupText(view.fieldChunks(group, 'discoveryOrder'));
+    const value = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n").get(text)!.n;
+    if (value !== null && (maximum === null || Number(value) > Number(maximum))) maximum = value;
+  }
+  return Number(maximum || 0);
 }
 export function retainedIntakeAcceptance(db: DatabaseSync, operationId: string): unknown {
+  const reference = retainedIntakeAcceptanceReference(db, operationId);
+  if (!reference) return null;
+  return reference.mode === 'legacy'
+    ? reference.value
+    : JSON.parse(boundedIntakeLookupText(reference.view.recordChunks(reference.record)));
+}
+/** Point-selected receipt capability for consumers that cannot hydrate its targets. */
+export function retainedIntakeAcceptanceReference(
+  db: DatabaseSync,
+  operationId: string,
+): IntakeLookupReceiptReference | null {
   current(db);
   const row = db
     .prepare(
-      `SELECT p.payload FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id WHERE a.operation_id=? ORDER BY s.source_order LIMIT 1`,
+      `SELECT p.payload,s.source_id,s.source_order FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id WHERE a.operation_id=? AND (s.identity_first IS NULL OR s.identity_first<>-1) ORDER BY s.source_order LIMIT 1`,
     )
     .get(operationId);
-  return row ? JSON.parse(String(row.payload)) : null;
+  let selected: IntakeLookupReceiptReference | null = row
+    ? { mode: 'legacy', sourceId: String(row.source_id), value: JSON.parse(String(row.payload)) }
+    : null;
+  let order = row ? Number(row.source_order) : Infinity;
+  const nativeOperation = Buffer.from(operationId, 'utf8').toString('hex').toUpperCase();
+  for (const source of nativeSources(db)) {
+    const view = nativeReader(db, source);
+    const record = readNativeIntakeLookupTarget(
+      db,
+      source,
+      view,
+      'lookup-acceptance-operation-first',
+      [nativeOperation],
+    );
+    if (record && Number(source.source_order) < order) {
+      selected = { mode: 'native', sourceId: String(source.id), view, record };
+      order = Number(source.source_order);
+    }
+  }
+  return selected;
+}
+type NativeSource = IntakeEnvelopeSource & { source_order: number; authority_head: string };
+function* nativeSources(db: DatabaseSync): Generator<NativeSource> {
+  for (const source of db
+    .prepare(
+      `SELECT f.id,f.kind,f.sha256,f.details_json,f.rowid source_order,s.authority_head,s.identity_first FROM source_files f LEFT JOIN ${table('sources')} s ON s.source_id=f.id WHERE f.kind='intake_original' ORDER BY f.rowid`,
+    )
+    .iterate()) {
+    const selected = source as unknown as NativeSource;
+    const binding = intakeEnvelopeAuthorityBinding(db, selected);
+    if (!hasIntakeCollectionEnvelope(db, selected)) continue;
+    if (source.identity_first !== -1 || source.authority_head !== binding.logicalHead)
+      return fail('native source projection binding is unavailable');
+    yield selected;
+  }
+}
+function nativeReader(db: DatabaseSync, source: NativeSource): IntakeCollectionEnvelopeReader {
+  if (intakeEnvelopeAuthorityBinding(db, source).logicalHead !== source.authority_head)
+    return fail('native logical binding changed');
+  const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
+  // The legacy adapter validated the JS-last operational contribution shapes
+  // before issuing SQL-first extraction. Keep that independent validation;
+  // it reads three descriptors and never visits the collection contents.
+  const operational = view.subtree(view.root(), { fieldSelection: 'last' });
+  const intake = operational.child(operational.root(), 'intake');
+  if (!intake) return fail('original metadata is unavailable');
+  const workflow = operational.child(intake, 'workflow');
+  if (!workflow) {
+    if (operational.has(intake, 'workflow')) return fail('malformed workflow');
+    return view;
+  }
+  for (const name of ['reportGroups', 'reportAcceptances', 'identityConfirmations']) {
+    const collection = operational.child(workflow, name);
+    if (collection) {
+      if (operational.info(collection).shape !== 'array')
+        return fail('malformed contribution array');
+    } else {
+      const value = operational.field(workflow, name, { bytes: INTAKE_LOOKUP_SCOPE_BYTES });
+      if (value.kind !== 'missing' && !(value.kind === 'value' && value.value == null))
+        return fail('malformed contribution array');
+    }
+  }
+  return view;
+}
+export type IntakeLookupReceiptReference =
+  | { mode: 'legacy'; sourceId: string; value: unknown }
+  | {
+      mode: 'native';
+      sourceId: string;
+      view: IntakeCollectionEnvelopeReader;
+      record: IntakeEnvelopeRecord;
+    };
+export type IntakeIdentityReference = IntakeLookupReceiptReference;
+/** Ordered checked references. No global receipt array or native payload cache. */
+export function* iterateIntakeIdentityReferences(
+  db: DatabaseSync,
+): Generator<IntakeIdentityReference> {
+  current(db);
+  for (const source of db
+    .prepare(
+      `SELECT f.id source_id,f.kind,f.sha256,f.details_json,f.rowid source_order,s.authority_head,s.identity_first FROM source_files f LEFT JOIN ${table('sources')} s ON s.source_id=f.id ORDER BY f.rowid`,
+    )
+    .iterate()) {
+    const selected = { ...source, id: String(source.source_id) } as unknown as NativeSource;
+    const logicalHead = intakeEnvelopeAuthorityBinding(db, selected).logicalHead;
+    if (logicalHead !== undefined && hasIntakeCollectionEnvelope(db, selected)) {
+      if (source.identity_first !== -1 || source.authority_head !== logicalHead)
+        return fail('native source projection binding is unavailable');
+      const view = nativeReader(db, selected);
+      // Completeness is required even for an empty selected receipt collection.
+      readNativeIntakeLookupTarget(db, selected, view, 'lookup-discovery-maximum', []);
+      const intake = view.child(view.root(), 'intake');
+      const workflow = intake && view.child(intake, 'workflow');
+      const total = workflow ? view.childCount(workflow, 'identityConfirmations') : 0;
+      for (let ordinal = 0; ordinal < total; ordinal++) {
+        const record = readNativeIntakeLookupTarget(db, selected, view, 'lookup-identity-order', [
+          String(ordinal),
+        ]);
+        if (!record) return fail('native identity index occurrence missing');
+        yield { mode: 'native', sourceId: String(source.source_id), view, record };
+      }
+      view.address(view.root());
+    } else {
+      // Legacy chain traversal is bounded in retained reader memory; validate
+      // cardinality rather than retaining all links to detect cycles/orphans.
+      const total = Number(
+        db
+          .prepare(`SELECT COUNT(*) n FROM ${table('identities')} WHERE source_id=?`)
+          .get(source.source_id!)!.n,
+      );
+      let next = source.identity_first;
+      for (let ordinal = 0; ordinal < total; ordinal++) {
+        if (!Number.isSafeInteger(next)) return fail('invalid identity occurrence chain');
+        const row = db
+          .prepare(
+            `SELECT i.next,p.payload FROM ${table('identities')} i LEFT JOIN ${table('payloads')} p ON p.hash=i.hash WHERE i.source_id=? AND i.id=?`,
+          )
+          .get(source.source_id!, next!);
+        if (!row || typeof row.payload !== 'string')
+          return fail('invalid identity occurrence chain');
+        yield { mode: 'legacy', sourceId: String(source.source_id), value: json(row.payload) };
+        next = row.next;
+      }
+      if (next !== null) return fail('invalid identity occurrence chain');
+    }
+  }
+}
+/** Explicit small-scope compatibility decode. Large native receipts use refs. */
+export function readIntakeIdentityReference(reference: IntakeIdentityReference): unknown {
+  if (reference.mode === 'legacy') return reference.value;
+  const value = JSON.parse(boundedIntakeLookupText(reference.view.recordChunks(reference.record)));
+  // json_each transports booleans as INTEGER and strings as unquoted TEXT;
+  // the historical json() consumer then parses that transported value again.
+  return reference.view.info(reference.record).shape === 'scalar'
+    ? json(typeof value === 'boolean' ? Number(value) : value)
+    : value;
 }
 export function indexedIntakeIdentityConfirmations(db: DatabaseSync): unknown[] {
   current(db);
-  const sources = db
-    .prepare(`SELECT source_id,identity_first FROM ${table('sources')} ORDER BY source_order`)
-    .all();
+  const native = !!db
+    .prepare(`SELECT 1 FROM ${table('sources')} WHERE identity_first=-1 LIMIT 1`)
+    .get();
   const values: unknown[] = [];
-  for (const source of sources) {
-    const rows = db
-      .prepare(
-        `SELECT i.id,i.next,i.hash,p.payload FROM ${table('identities')} i LEFT JOIN ${table('payloads')} p ON p.hash=i.hash WHERE i.source_id=?`,
-      )
-      .all(source.source_id!);
-    const ordered = identityOrder(rows, source.identity_first);
-    if (!ordered || ordered.some((row) => typeof row.payload !== 'string'))
-      return fail('invalid identity occurrence chain');
-    for (const row of ordered) values.push(json(row.payload));
+  let bytes = 2;
+  for (const reference of iterateIntakeIdentityReferences(db)) {
+    const value = readIntakeIdentityReference(reference);
+    if (native) {
+      bytes += Buffer.byteLength(JSON.stringify(value)) + 1;
+      if (bytes > INTAKE_LOOKUP_SCOPE_BYTES)
+        return fail('identity ledger requires addressed consumption');
+    }
+    values.push(value);
   }
   return values;
 }

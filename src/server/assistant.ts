@@ -1,4 +1,5 @@
 import { readStoredIntakeDetails } from './intake-state-access.ts';
+import { isIntakeSummary } from '../shared/intake-summary.ts';
 import {
   assistantPersonScope,
   scopeAssistantQuery,
@@ -16,6 +17,7 @@ import type { AssistantContext } from './assistant-context.ts';
 import {
   resolveIntakeDraftRepairContext,
   revalidateIntakeDraftRepairScope,
+  prepareIntakeDraftRepairScope,
 } from './intake-draft-repair.ts';
 import type { IntakeBatchReadingState } from '../shared/intake-batch.ts';
 import {
@@ -85,22 +87,70 @@ import { exportCuration, personalDurabilityStatus } from './portable.ts';
 import type { IntakeReportAcceptanceReceipt, IntakeReportGroup } from '../shared/intake.ts';
 import { clinicalRedirect } from './clinical-references.ts';
 import { clinicalRecordHistory } from './clinical-history.ts';
-import { getIntake, getRetainedIntakeOriginalReference, verifyIntakeOriginal } from './intake.ts';
+import {
+  getIntake,
+  getIntakeRead,
+  intakeConversionChatId,
+  getRetainedIntakeOriginalReference,
+  verifyIntakeOriginal,
+} from './intake.ts';
 import { canonicalLiteral, validateJSONL } from './intake-format.ts';
 import { intakeCandidateId, workflowHash } from './intake-workflow.ts';
 import {
-  conversionCheckpoint,
-  intakeUnitSourcePages,
+  conversionCheckpoint as legacyConversionCheckpoint,
   recordConversionRead,
   deferConversionRead,
-  conversionResumeContext,
-  conversionReadingState,
+  conversionResumeContext as legacyConversionResumeContext,
+  conversionReadingState as legacyConversionReadingState,
   recordConversionPageTiming,
   conversionReadKey,
   assertConversionCoverage,
   isFreshTopLevelImageConversion,
 } from './intake-continuation.ts';
-import type { ConversionCheckpoint, IntakeWithWorkflow } from './intake-continuation.ts';
+import type {
+  ConversionCheckpoint as LegacyConversionCheckpoint,
+  IntakeWithWorkflow,
+} from './intake-continuation.ts';
+import {
+  nativeAssistantConversion,
+  isNativeAssistantConversion,
+  isNativeAssistantCheckpoint,
+  nativeAssistantCheckpoint,
+  nativeAssistantReadingState,
+  nativeAssistantResume,
+  nativeAssistantBatchProgress,
+  nativeAssistantScope,
+  nativeAssistantUnit,
+  assertNativeAssistantCoverage,
+  prepareNativeAssistantConversion,
+  recordNativeAssistantPageTiming,
+  type NativeAssistantCheckpoint,
+  type NativeAssistantConversion,
+} from './assistant-intake-native.ts';
+import {
+  recordCollectionConversionRead,
+  deferCollectionConversionRead,
+  acknowledgeCollectionConversionRead,
+  collectionConversionLedgerBinding,
+  prepareLegacyCollectionReadingTargets,
+} from './intake-continuation-collection.ts';
+import {
+  importNativeAttribution,
+  readNativeAttributionMetadata,
+  recordNativeAttributionRead,
+  acknowledgeNativeAttributionRead,
+  startNativeAttributionRequest,
+  finishNativeAttributionRequest,
+} from './assistant-intake-attribution.ts';
+import {
+  captureNativeBatchRevalidationBasis,
+  disposeNativeBatchRevalidationBasis,
+  proveNativeAcceptanceOnlyTransition,
+  assertNativeAcceptanceOnlyTransition,
+  type NativeBatchRevalidationBasis,
+} from './intake-collection-acceptance.ts';
+type ConversionCheckpoint = LegacyConversionCheckpoint | NativeAssistantCheckpoint;
+type ConversionIntake = IntakeWithWorkflow | NativeAssistantConversion;
 import { MODEL_INTAKE_SECTIONS, type ModelIntakeSection } from './intake-model-context.ts';
 
 const INSTRUCTIONS = readFileSync(new URL('./assistant-instructions.md', import.meta.url), 'utf8');
@@ -494,6 +544,7 @@ interface ActiveState {
   finish?: (status: ChatStatus, error?: string | null, readingReason?: string | null) => void;
   seenBeforeTurn?: number;
   candidatesBeforeTurn?: number;
+  accountedBeforeTurn?: number;
   /** One same-run attempt to reconcile read-but-unaccounted evidence before pausing. */
   coverageReconciliationUsed?: boolean;
   coverageReconciliationPending?: boolean;
@@ -511,9 +562,23 @@ interface ActiveState {
   repeatedReads?: Map<string, { progress: string; count: number; ordinal: number }>;
   attributionCalls?: Map<string, { scopeKey: string; acknowledged: boolean }>;
   attributionRequests?: Map<string, string[]>;
-  unconsumedReads?: Map<string, NonNullable<ReturnType<typeof deferConversionRead>>>;
+  unconsumedReads?: Map<
+    string,
+    | NonNullable<ReturnType<typeof deferConversionRead>>
+    | { format: 'health-intake-deferred-read-v2'; key: string; unitId: string }
+  >;
   modelRequestOrdinal?: number;
   batchRevalidationBasis?: BatchRevalidationBasis;
+  nativeBatchRevalidationBasis?: Omit<
+    BatchRevalidationBasis,
+    'intake' | 'rawIntake' | 'revision' | 'persistedRevision' | 'sequence' | 'unitSources'
+  > & {
+    intakeId: string;
+    version: number;
+    sourceHash: string;
+    ledger: string;
+    proof: NativeBatchRevalidationBasis;
+  };
   readingDeadlineReached?: boolean;
   readingDeadlineAt?: number;
   beforeModelRequest?: (reading: IntakeBatchReadingState) => boolean;
@@ -584,6 +649,17 @@ const exactJSON = (left: unknown, right: unknown): boolean =>
   JSON.stringify(left) === JSON.stringify(right);
 
 function batchCheckpointBasis(checkpoint: ConversionCheckpoint): string {
+  if (isNativeAssistantCheckpoint(checkpoint))
+    return JSON.stringify({
+      format: checkpoint.format,
+      intakeId: checkpoint.intakeId,
+      sourceHash: checkpoint.sourceHash,
+      sessionId: checkpoint.sessionId,
+      planId: checkpoint.planId,
+      inventoryId: checkpoint.inventoryId,
+      unitId: checkpoint.activeUnitId,
+      ledgerId: checkpoint.ledgerId,
+    });
   return JSON.stringify({
     intakeId: checkpoint.intakeId,
     sourceHash: checkpoint.sourceHash,
@@ -1055,6 +1131,10 @@ export interface AssistantActionExtensions {
   ) => unknown | Promise<unknown>;
   reconcile?: (proposal: AssistantProposal, context: AssistantApplyContext) => UnknownRecord | null;
   apply?: (proposal: AssistantProposal, context: AssistantApplyContext) => UnknownRecord | null;
+  applyAsync?: (
+    proposal: AssistantProposal,
+    context: AssistantApplyContext,
+  ) => Promise<UnknownRecord | null>;
 }
 interface AssistantModelBridge {
   start(
@@ -1104,7 +1184,7 @@ interface AssistantService {
     profileId: string,
     intakes: { conversionChatId: string | null }[],
   ): {
-    chats: { conversionCheckpoint: ConversionCheckpoint }[];
+    chats: { conversionCheckpoint: unknown }[];
     omittedChats: number;
     unavailableChats: number;
     readBytes: number;
@@ -1125,6 +1205,7 @@ interface AssistantService {
   ): boolean;
   cancel(profileId: string, id: string): AssistantChat;
   apply(profileId: string, id: string, proposalId: string): AssistantChat;
+  applyRead(profileId: string, id: string, proposalId: string): Promise<AssistantChat>;
   isBusy(profileId: string): boolean;
   startIntakeConversion(
     profileId: string,
@@ -1375,13 +1456,14 @@ export const HEALTH_TOOLS = [
   ),
   tool(
     'intake_plan',
-    'Read or create a durable delivery-wide extraction plan, read a literal work unit, search indexed source sections, or follow an indexed reference within supplied evidence. Action create requires the exact current conversion.version; never omit, guess or reuse a stale version. To begin or restart one context section at offset 0, use read with freshStart true, name the section, and omit both version pins; discard every previously assembled context page under different returned pins. Every continuation read requires the returned exact version and mappingVersion. Plan reads return structured pages: choose plan, units, candidates, occurrences, report_scopes, questions, question_answers, proposals, decisions, batches, operations, acceptances, mapping_rules, missing_assets, or package_failures and follow nextOffset until complete; never combine pages across pins, reassemble explicitly marked JSON chunks, and use read_unit for one exact unit. Equal clinical keys never prove one event: compare distinct occurrence locators, report scope and prior explicit question outcomes. Revalidate version, plan pins, batch receipts and retained decisions before retrying. After a configuration change, ask the user before passing the active replacePlanId to replace a plan. PDF units name their sourceFileId and neighboring pages for intake_read. Search/follow never fetch missing or remote evidence. No acceptance.',
+    'Read or create a durable delivery-wide extraction plan, read a literal work unit, search indexed source sections, or follow an indexed reference within supplied evidence. Action create requires the exact current conversion.version; never omit, guess or reuse a stale version. To begin or restart one context section at offset 0, use read with freshStart true, name the section, and omit both version pins; discard every previously assembled context page under different returned pins. Every continuation read requires the returned exact version and mappingVersion. Plan reads return structured pages: choose plan, units, candidates, occurrences, report_scopes, questions, question_answers, proposals, decisions, batches, operations, acceptances, mapping_rules, missing_assets, or package_failures and follow nextOffset until complete; never combine pages across pins, reassemble explicitly marked JSON chunks, and use read_unit for one exact unit. Equal clinical keys never prove one event: compare distinct occurrence locators, report scope and prior explicit question outcomes. Revalidate version, plan pins, batch receipts and retained decisions before retrying. After a configuration change, ask the user before passing the active replacePlanId to replace a plan. PDF units name their sourceFileId and neighboring pages for intake_read. Native search returns nextCursor; pass it as cursor without a legacy offset until complete. A partial search page does not establish absence. Search/follow never fetch missing or remote evidence. No acceptance.',
     {
       id: str(),
       action: { enum: ['read', 'create', 'read_unit', 'search', 'follow'] },
       freshStart: { type: 'boolean' },
       version: { type: 'integer', minimum: 1 },
       mappingVersion: str(),
+      cursor: str(64000),
       replacePlanId: str(),
       unitId: str(),
       query: str(500),
@@ -1749,6 +1831,11 @@ export function createAssistant({
   const key = (profileId: string, id: string) => `${profileId}/${id}`;
   const dbFor = (profileId: string): Database =>
     required(databases.get(profileId), 'Profile not found');
+  const nativeRepair = (profileId: string, value: unknown) =>
+    object(value) &&
+    typeof value.intakeId === 'string' &&
+    isIntakeSummary(getIntakeRead(dbFor(profileId), root, profileId, value.intakeId));
+  const repairApplications = new Map<string, Promise<AssistantChat>>();
   const resolvedContext = (profileId: string, input: unknown): AssistantContext =>
     resolveIntakeDraftRepairContext(
       dbFor(profileId),
@@ -1756,14 +1843,90 @@ export function createAssistant({
       profileId,
       normalizeAssistantContext(input) as Record<string, unknown>,
     );
-  const conversionIntake = (profileId: string, chat: AssistantChat): IntakeWithWorkflow | null => {
+  const conversionIntake = (profileId: string, chat: AssistantChat): ConversionIntake | null => {
     if (!chat.context?.intakeId) return null;
     const db = dbFor(profileId);
-    const intakeDetails = readStoredIntakeDetails(db, chat.context.intakeId);
-    if (intakeDetails?.conversionChatId !== chat.id) return null;
-    const intake = getIntake(db, root, profileId, chat.context.intakeId);
+    if (
+      !db
+        .prepare("SELECT 1 FROM source_files WHERE id=? AND kind='intake_original'")
+        .get(chat.context.intakeId)
+    )
+      return null;
+    if (intakeConversionChatId(db, profileId, chat.context.intakeId) !== chat.id) return null;
+    const intake = getIntakeRead(db, root, profileId, chat.context.intakeId);
+    if (isIntakeSummary(intake))
+      return nativeAssistantConversion(db, root, profileId, chat.id, intake);
     return intake.workflow ? intakeWithWorkflow(intake) : null;
   };
+  const conversionCheckpoint = (
+    chat: AssistantChat,
+    intake: ConversionIntake,
+    profileId: string,
+  ): ConversionCheckpoint | null => {
+    if (isNativeAssistantConversion(intake)) {
+      const prior = chat.conversionCheckpoint;
+      if (prior && !isNativeAssistantCheckpoint(prior))
+        throw new HttpError(
+          409,
+          'CONVERSION_CHECKPOINT_PREPARATION_REQUIRED',
+          'Prepare the retained reading checkpoint before continuing this migrated conversion',
+        );
+      const checkpoint = nativeAssistantCheckpoint(intake, prior);
+      if (checkpoint) chat.conversionCheckpoint = checkpoint;
+      return checkpoint ?? null;
+    }
+    if (isNativeAssistantCheckpoint(chat.conversionCheckpoint))
+      throw new HttpError(
+        409,
+        'CONVERSION_CHANGED',
+        'This native reading checkpoint requires its selected collection evidence',
+      );
+    const legacy = { conversionCheckpoint: chat.conversionCheckpoint };
+    const checkpoint = legacyConversionCheckpoint(legacy, intake, profileId);
+    chat.conversionCheckpoint = checkpoint;
+    return checkpoint;
+  };
+  const conversionReadingState = (
+    checkpoint: ConversionCheckpoint,
+    intake: ConversionIntake,
+    reason: string | null = null,
+  ): IntakeBatchReadingState => {
+    if (isNativeAssistantCheckpoint(checkpoint) && isNativeAssistantConversion(intake))
+      return nativeAssistantReadingState(
+        intake,
+        checkpoint,
+        modelMappingRuleContext(intake.db, intake.providerId).mappingRulesVersion,
+        reason,
+      );
+    if (isNativeAssistantCheckpoint(checkpoint) || isNativeAssistantConversion(intake))
+      throw Error('Conversion checkpoint representation changed');
+    return legacyConversionReadingState(checkpoint, intake, reason);
+  };
+  const conversionResumeContext = (checkpoint: ConversionCheckpoint, intake: ConversionIntake) => {
+    if (isNativeAssistantCheckpoint(checkpoint) && isNativeAssistantConversion(intake)) {
+      const resume = nativeAssistantResume(
+        intake,
+        checkpoint,
+        modelMappingRuleContext(intake.db, intake.providerId).mappingRulesVersion,
+      );
+      return {
+        ...resume,
+        pendingUnits: resume.reading.remainingUnits,
+        pendingReadWindows: resume.reading.pendingReadWindows,
+      };
+    }
+    if (isNativeAssistantCheckpoint(checkpoint) || isNativeAssistantConversion(intake))
+      throw Error('Conversion checkpoint representation changed');
+    return legacyConversionResumeContext(checkpoint, intake);
+  };
+  const candidateCount = (intake: ConversionIntake) =>
+    isNativeAssistantConversion(intake)
+      ? intake.header.collections.candidates.total
+      : intake.workflow.candidates.length;
+  const readingCount = (checkpoint: ConversionCheckpoint, intake: ConversionIntake) =>
+    isNativeAssistantCheckpoint(checkpoint)
+      ? (conversionReadingState(checkpoint, intake).readWindows ?? 0)
+      : checkpoint.seen.length;
   function persist(profileId: string, chat: AssistantChat, reason: string): void {
     chat.updatedAt = clock().toISOString();
     const started = performance.now();
@@ -2013,17 +2176,33 @@ export function createAssistant({
       args = params.arguments;
     if (state.beforeModelRequest && state.checkpoint?.activeUnitId) {
       const intake = conversionIntake(profileId, chat);
-      const unit = intake?.workflow.plans
-        .find((plan) => plan.status === 'active')
-        ?.units.find((unit) => unit.id === state.checkpoint!.activeUnitId);
+      const nativeUnit = isNativeAssistantConversion(intake)
+        ? nativeAssistantUnit(intake, state.checkpoint.activeUnitId)
+        : undefined;
+      const unit =
+        nativeUnit ||
+        (intake && !isNativeAssistantConversion(intake)
+          ? intake.workflow.plans
+              .find((plan) => plan.status === 'active')
+              ?.units.find((unit) => unit.id === state.checkpoint!.activeUnitId)
+          : undefined);
       if (!unit || unit.processingException)
         throw new HttpError(
           409,
           'INTAKE_WORK_UNIT_CHANGED',
           'The dispatched source unit is no longer eligible.',
         );
+      const pages =
+        nativeUnit?.pageScope ||
+        ('pages' in unit && unit.pages
+          ? {
+              count: unit.pages.length,
+              first: unit.pages[0],
+              includes: (n: number) => unit.pages!.includes(n),
+            }
+          : undefined);
       if (params.tool === 'health_intake_read') {
-        if (unit.pages && args.page === undefined) args.page = unit.pages[0];
+        if (pages && args.page === undefined) args.page = pages.first;
         if (unit.start !== undefined) {
           args.offset ??= unit.start;
           args.limit = Math.min(
@@ -2032,16 +2211,25 @@ export function createAssistant({
           );
         }
       }
-      const sourcePages = intakeUnitSourcePages(unit);
+      const sourcePageFirst =
+        pages?.first ?? (unit.start !== undefined ? Math.floor(unit.start / 24000) + 1 : 1);
+      const sourcePageLast =
+        unit.start !== undefined
+          ? Math.max(sourcePageFirst!, Math.ceil((unit.end || unit.start + 1) / 24000))
+          : 1;
+      const sourcePageIncludes = (page: number) =>
+        pages
+          ? pages.includes(page)
+          : Number.isSafeInteger(page) && page >= sourcePageFirst! && page <= sourcePageLast;
       if (params.tool === 'health_intake_source_text' && args.page === undefined)
-        args.page = sourcePages[0];
+        args.page = sourcePageFirst;
       if (
         params.tool === 'health_intake_propose' ||
         (params.tool === 'health_intake_plan' &&
           !['read', 'read_unit'].includes(String(args.action))) ||
         (params.tool === 'health_intake_source_text' &&
           ((args.action && args.action !== 'passage') ||
-            (!unit.memberId && !sourcePages.includes(Number(args.page)))))
+            (!unit.memberId && !sourcePageIncludes(Number(args.page)))))
       )
         throw new HttpError(
           409,
@@ -2065,8 +2253,8 @@ export function createAssistant({
         (read &&
           ((args.unitId && args.unitId !== unit.id) ||
             (params.tool !== 'health_intake_plan' &&
-              unit.pages &&
-              !unit.pages.includes(Number(args.page || 1))) ||
+              pages &&
+              !pages.includes(Number(args.page || 1))) ||
             (params.tool === 'health_intake_package' &&
               unit.memberId &&
               args.memberId !== unit.memberId) ||
@@ -2108,7 +2296,7 @@ export function createAssistant({
       const rootId = state.checkpoint?.intakeId || sourceId;
       const versions = state.observedIntakeVersions || (state.observedIntakeVersions = new Map());
       if (versions.has(rootId)) return;
-      const current = getIntake(db, root, profileId, rootId);
+      const current = getIntakeRead(db, root, profileId, rootId);
       versions.set(rootId, {
         version: current.version,
         pinVersion: readIntakeSourcePin(db, rootId)?.version || 0,
@@ -2159,7 +2347,7 @@ export function createAssistant({
     const observedHashesCurrent = () => observedSourceHashesCurrent(db, state);
     const sourceHashesCurrent = (intakeId: string) => measuredSourceCurrent(db, state, intakeId);
     const versionForUnchangedEvidence = (intakeId: string, requested: number) => {
-      const current = getIntake(db, root, profileId, intakeId);
+      const current = getIntakeRead(db, root, profileId, intakeId);
       if (current.version === requested) return requested;
       const observed = state.observedIntakeVersions?.get(intakeId);
       const pinVersion = readIntakeSourcePin(db, intakeId)?.version || 0;
@@ -2207,11 +2395,13 @@ export function createAssistant({
     const readKey = state.checkpoint ? conversionReadKey(params.tool, args) : null;
     const readIntake = readKey ? conversionIntake(profileId, chat) : null;
     const readProgress =
-      state.checkpoint && readKey
+      state.checkpoint && readKey && readIntake
         ? JSON.stringify([
-            state.checkpoint.seen.length,
-            readIntake?.workflow.candidates.length || 0,
-            readIntake ? accountedIntakeUnitIds(readIntake).sort() : [],
+            readingCount(state.checkpoint, readIntake),
+            candidateCount(readIntake),
+            isNativeAssistantConversion(readIntake)
+              ? (conversionReadingState(state.checkpoint, readIntake).accountedUnits ?? 0)
+              : accountedIntakeUnitIds(readIntake).length,
           ])
         : null;
     if (state.checkpoint) {
@@ -2240,32 +2430,51 @@ export function createAssistant({
       return { updated: true };
     }
     if (state.checkpoint && params.tool.startsWith('health_intake_')) {
-      let sourceId: string | undefined = optionalStringArgument(args, 'id');
-      const seen = new Set<string>();
-      while (sourceId && sourceId !== state.checkpoint.intakeId && !seen.has(sourceId)) {
-        seen.add(sourceId);
-        sourceId = readStoredIntakeDetails(db, sourceId)?.parentSourceFileId || undefined;
-      }
-      if (sourceId !== state.checkpoint.intakeId)
+      const sourceId = optionalStringArgument(args, 'id');
+      const { checkIntakeSourceAncestry } = await import('./intake-source-ancestry.ts');
+      if (
+        !sourceId ||
+        !(await checkIntakeSourceAncestry(db, profileId, sourceId, {
+          stopAt: state.checkpoint.intakeId,
+          assertRunning,
+        }))
+      )
         throw new HttpError(
           403,
           'CONVERSION_SCOPE',
           'Use only this conversion’s retained delivery and child evidence',
         );
-      if (params.tool === 'health_intake_batch')
-        assertConversionCoverage(
-          state.checkpoint,
-          intakeWithWorkflow(getIntake(db, root, profileId, stringArgument(args, 'id'))),
-          {
-            planId: stringArgument(args, 'planId'),
-            coverage: intakeCoverageArgument(args),
-          },
-        );
+      if (params.tool === 'health_intake_batch') {
+        const selected = conversionIntake(profileId, chat);
+        if (
+          selected &&
+          isNativeAssistantConversion(selected) &&
+          isNativeAssistantCheckpoint(state.checkpoint)
+        )
+          assertNativeAssistantCoverage(
+            selected,
+            state.checkpoint,
+            { planId: stringArgument(args, 'planId'), coverage: intakeCoverageArgument(args) },
+            !!state.beforeModelRequest,
+          );
+        else {
+          if (isNativeAssistantCheckpoint(state.checkpoint))
+            throw Error('Native conversion selection changed');
+          assertConversionCoverage(
+            state.checkpoint,
+            intakeWithWorkflow(getIntake(db, root, profileId, stringArgument(args, 'id'))),
+            {
+              planId: stringArgument(args, 'planId'),
+              coverage: intakeCoverageArgument(args),
+            },
+          );
+        }
+      }
     }
     if (
       params.tool.startsWith('health_intake_') &&
       typeof args.id === 'string' &&
-      isRetainOnlyIntake(getIntake(db, root, profileId, args.id))
+      isRetainOnlyIntake(getIntakeRead(db, root, profileId, args.id))
     )
       throw new HttpError(
         409,
@@ -2541,27 +2750,58 @@ export function createAssistant({
         onSourceTextCaptured,
       };
       const packageTools = await import('./intake-package.ts');
-      if (args.action === 'inventory') result = await packageTools.inventoryIntakePackage(context);
+      const selectedPackage = getIntakeRead(db, root, profileId, context.id);
+      const nativePackage = isIntakeSummary(selectedPackage);
+      const packageScope =
+        nativePackage &&
+        selectedPackage.activePlan.state === 'exact' &&
+        selectedPackage.activePlan.plan?.format === 'health-intake-package-plan-v2'
+          ? (await import('./intake-package-plan.ts')).readPackagePlanScope(
+              db,
+              root,
+              profileId,
+              context.id,
+            )
+          : undefined;
+      if (args.action === 'inventory')
+        result = nativePackage
+          ? await packageTools.inventoryIntakePackagePaged(context, packageScope)
+          : await packageTools.inventoryIntakePackage(context);
       else if (args.action === 'read_member')
-        result = await packageTools.readIntakePackageMember(context);
+        result = nativePackage
+          ? await packageTools.readIntakePackageMemberPaged(context, packageScope)
+          : await packageTools.readIntakePackageMember(context);
       else if (args.action === 'plan_roles') {
         const intake = await import('./intake.ts');
-        result = await intake.saveIntakePackagePlan(
-          db,
-          root,
-          profileId,
-          stringArgument(args, 'id'),
-          {
+        const selected = intake.getIntakeRead(db, root, profileId, stringArgument(args, 'id'));
+        if (isIntakeSummary(selected)) {
+          const { saveIntakePackageRolesRead } = await import('./intake-package-plan.ts');
+          result = await saveIntakePackageRolesRead(db, root, profileId, selected.id, {
             operationId: stringArgument(args, 'operationId'),
             planId: stringArgument(args, 'planId'),
             roles: packageRolesArgument(args),
             version: numberArgument(args, 'version'),
-          },
-        );
-        result = packageTools.boundedPackagePlan(
-          result,
-          modelMappingRuleContext(db, result.providerId),
-        );
+            assertRunning,
+          });
+          result = { ...result, durability: intake.flushIntake(db, root, profileId) };
+        } else {
+          result = await intake.saveIntakePackagePlan(
+            db,
+            root,
+            profileId,
+            stringArgument(args, 'id'),
+            {
+              operationId: stringArgument(args, 'operationId'),
+              planId: stringArgument(args, 'planId'),
+              roles: packageRolesArgument(args),
+              version: numberArgument(args, 'version'),
+            },
+          );
+          result = packageTools.boundedPackagePlan(
+            result,
+            modelMappingRuleContext(db, result.providerId),
+          );
+        }
       } else throw new Error('Unsupported package discovery operation');
       if (args.action === 'read_member' && object(result)) {
         const memberResult = result as UnknownRecord;
@@ -2612,21 +2852,30 @@ export function createAssistant({
       const freshPlanRead =
         params.tool === 'health_intake_plan' ? intakePlanFreshStartArgument(args) : false;
       if (params.tool === 'health_intake_question') {
-        result = intake.askIntakeQuestion(db, root, profileId, stringArgument(args, 'id'), {
-          key: stringArgument(args, 'key'),
-          prompt: stringArgument(args, 'prompt', 10000),
-          locator: stringArgument(args, 'locator', 10000),
-          version: numberArgument(args, 'version'),
-          operationId: optionalStringArgument(args, 'operationId'),
-          candidateId: optionalStringArgument(args, 'candidateId'),
-          candidateVersionId: optionalStringArgument(args, 'candidateVersionId'),
-          field: optionalStringArgument(args, 'field'),
-        });
-        const { boundedPackagePlan } = await import('./intake-package.ts');
-        result = boundedPackagePlan(result, {
-          ...modelMappingRuleContext(db, result.providerId),
-          section: 'questions',
-        });
+        const changed = await intake.askIntakeQuestionRead(
+          db,
+          root,
+          profileId,
+          stringArgument(args, 'id'),
+          {
+            key: stringArgument(args, 'key'),
+            prompt: stringArgument(args, 'prompt', 10000),
+            locator: stringArgument(args, 'locator', 10000),
+            version: numberArgument(args, 'version'),
+            operationId: optionalStringArgument(args, 'operationId'),
+            candidateId: optionalStringArgument(args, 'candidateId'),
+            candidateVersionId: optionalStringArgument(args, 'candidateVersionId'),
+            field: optionalStringArgument(args, 'field'),
+          },
+        );
+        if (isIntakeSummary(changed)) result = changed;
+        else {
+          const { boundedPackagePlan } = await import('./intake-package.ts');
+          result = boundedPackagePlan(changed, {
+            ...modelMappingRuleContext(db, changed.providerId),
+            section: 'questions',
+          });
+        }
       } else if (params.tool === 'health_intake_batch') {
         const intakeId = stringArgument(args, 'id');
         const batchInput = {
@@ -2638,195 +2887,348 @@ export function createAssistant({
           summary: stringArgument(args, 'summary', 10000),
           runId: chat.id,
         };
+        const nativeBatch = isIntakeSummary(intake.getIntakeRead(db, root, profileId, intakeId));
         try {
-          result = intake.submitIntakeBatch(
-            db,
-            root,
-            profileId,
-            intakeId,
-            batchInput,
-            measuredSources(),
-          );
+          result = nativeBatch
+            ? await intake.submitPagedIntakeBatch(
+                db,
+                root,
+                profileId,
+                intakeId,
+                batchInput,
+                measuredSources(),
+                { assertRunning },
+              )
+            : intake.submitIntakeBatch(
+                db,
+                root,
+                profileId,
+                intakeId,
+                batchInput,
+                measuredSources(),
+              );
         } catch (error) {
-          if (
-            !(error instanceof HttpError) ||
-            error.status !== 409 ||
-            error.code !== 'VERSION_CONFLICT'
-          )
-            throw error;
-          const currentDurability = personalDurabilityStatus(db);
-          if (
-            currentDurability.dirty ||
-            currentDurability.conflicted ||
-            currentDurability.lastError
-          )
-            throw error;
-          const basis = state.batchRevalidationBasis;
-          const current = conversionIntake(profileId, chat);
-          const currentRawIntake = current
-            ? (readStoredIntakeDetails(db, current.id) as unknown as UnknownRecord | undefined)
-            : undefined;
-          const mappingVersion = current
-            ? modelMappingRuleContext(db, current.providerId).mappingRulesVersion
-            : null;
-          if (
-            !basis ||
-            !current ||
-            basis.profileId !== profileId ||
-            basis.chatId !== chat.id ||
-            basis.runId !== state.run.id ||
-            basis.generation !== generation ||
-            basis.database !== db ||
-            databases.get(profileId) !== db ||
-            basis.model !== (state.run.model || null) ||
-            basis.backend !== (state.run.backend || null) ||
-            basis.reasoningEffort !== (state.run.reasoningEffort || null) ||
-            state.modelRequestOrdinal !== basis.requestOrdinal ||
-            basis.instructionVersion !== INSTRUCTION_VERSION ||
-            basis.mappingRulesVersion !== mappingVersion ||
-            basis.intake.id !== intakeId ||
-            basis.intake.version !== batchInput.version ||
-            !state.checkpoint ||
-            basis.checkpoint !== batchCheckpointBasis(state.checkpoint) ||
-            !currentRawIntake ||
-            !exactDisjointCountedAcceptance(
-              db,
-              basis,
-              basis.intake,
-              current,
-              currentRawIntake,
-              batchInput.jsonlText,
+          // The native acceptance-transition capability is supplied by the
+          // clinical participant; never substitute whole-DTO comparison here.
+          if (nativeBatch) {
+            if (!(error instanceof HttpError) || error.code !== 'VERSION_CONFLICT') throw error;
+            const basis = state.nativeBatchRevalidationBasis,
+              current = conversionIntake(profileId, chat),
+              checkpoint = state.checkpoint;
+            const matches = () =>
+              basis &&
+              isNativeAssistantConversion(current) &&
+              isNativeAssistantCheckpoint(checkpoint) &&
+              basis.profileId === profileId &&
+              basis.chatId === chat.id &&
+              basis.runId === state.run.id &&
+              basis.generation === generation &&
+              basis.database === db &&
+              databases.get(profileId) === db &&
+              basis.model === (state.run.model || null) &&
+              basis.backend === (state.run.backend || null) &&
+              basis.reasoningEffort === (state.run.reasoningEffort || null) &&
+              basis.instructionVersion === INSTRUCTION_VERSION &&
+              basis.requestOrdinal === state.modelRequestOrdinal &&
+              basis.intakeId === intakeId &&
+              basis.version === batchInput.version &&
+              basis.sourceHash === current.sha256 &&
+              basis.checkpoint === batchCheckpointBasis(checkpoint) &&
+              basis.mappingRulesVersion ===
+                modelMappingRuleContext(db, current.providerId).mappingRulesVersion;
+            if (
+              !matches() ||
+              !basis ||
+              !isNativeAssistantConversion(current) ||
+              !isNativeAssistantCheckpoint(checkpoint)
             )
-          )
-            throw error;
-          assertRunning();
-          beforeBatchRevalidationRetry?.({
-            db,
-            profileId,
-            intakeId,
-            batchInput: structuredClone(batchInput),
-          });
-          // A published head can survive SQL rollback. Preserve the public CAS
-          // refusal before attempting to hydrate a now-stale intake projection.
-          const retryDurability = personalDurabilityStatus(db);
-          if (retryDurability.dirty || retryDurability.conflicted || retryDurability.lastError)
-            throw error;
-          const retryCurrent = conversionIntake(profileId, chat);
-          const retryRawIntake = retryCurrent
-            ? (readStoredIntakeDetails(db, retryCurrent.id) as unknown as UnknownRecord | undefined)
-            : undefined;
-          if (
-            databases.get(profileId) !== db ||
-            state.batchRevalidationBasis !== basis ||
-            state.modelRequestOrdinal !== basis.requestOrdinal ||
-            !retryCurrent ||
-            !retryRawIntake ||
-            !exactDisjointCountedAcceptance(
+              throw error;
+            const ledger = nativeAssistantScope(current, checkpoint.activeUnitId);
+            if (!ledger || collectionConversionLedgerBinding(ledger) !== basis.ledger) throw error;
+            const parsed = validateJSONL(Buffer.from(batchInput.jsonlText));
+            if (!parsed.valid || !parsed.entries) throw error;
+            const proof = proveNativeAcceptanceOnlyTransition(db, basis.proof, {
+              entries: parsed.entries,
+            });
+            if (!proof) throw error;
+            assertRunning();
+            beforeBatchRevalidationRetry?.({
               db,
-              basis,
-              basis.intake,
-              retryCurrent,
-              retryRawIntake,
-              batchInput.jsonlText,
-            ) ||
-            basis.mappingRulesVersion !==
-              modelMappingRuleContext(db, retryCurrent.providerId).mappingRulesVersion
-          )
-            throw error;
-          const activePlan = retryCurrent.workflow.plans.find(
-            (candidate) => candidate.id === batchInput.planId && candidate.status === 'active',
-          );
-          if (
-            !activePlan ||
-            !verifyBatchCoveredSources(
+              profileId,
+              intakeId,
+              batchInput: structuredClone(batchInput),
+            });
+            if (!matches() || state.nativeBatchRevalidationBasis !== basis) throw error;
+            assertNativeAcceptanceOnlyTransition(proof);
+            assertNativeAssistantCoverage(
+              current,
+              checkpoint,
+              batchInput,
+              !!state.beforeModelRequest,
+            );
+            for (const coverage of batchInput.coverage) {
+              const unit = nativeAssistantUnit(current, coverage.unitId);
+              if (!unit) throw error;
+              const sourceId =
+                unit.kind === 'package_member' ? current.id : unit.sourceFileId || current.id;
+              const original = verifyIntakeOriginal(db, root, profileId, sourceId);
+              if (
+                original.sourceHash !==
+                (unit.kind === 'package_member'
+                  ? current.sha256
+                  : unit.sourceHash || current.sha256)
+              )
+                throw error;
+            }
+            assertRunning();
+            assertNativeAcceptanceOnlyTransition(proof);
+            state.nativeBatchRevalidationBasis = undefined;
+            disposeNativeBatchRevalidationBasis(basis.proof);
+            result = await intake.submitPagedIntakeBatch(
               db,
               root,
               profileId,
-              basis,
-              retryCurrent,
-              activePlan,
-              batchInput.coverage,
+              intakeId,
+              { ...batchInput, version: current.version },
+              measuredSources(),
+              { assertRunning },
+            );
+          } else {
+            if (
+              !(error instanceof HttpError) ||
+              error.status !== 409 ||
+              error.code !== 'VERSION_CONFLICT'
             )
-          )
-            throw error;
-          assertRunning();
-          state.batchRevalidationBasis = undefined;
-          result = intake.submitIntakeBatch(
-            db,
-            root,
-            profileId,
-            intakeId,
-            {
-              ...batchInput,
-              version: retryCurrent.version,
-            },
-            measuredSources(),
-          );
+              throw error;
+            const currentDurability = personalDurabilityStatus(db);
+            if (
+              currentDurability.dirty ||
+              currentDurability.conflicted ||
+              currentDurability.lastError
+            )
+              throw error;
+            const basis = state.batchRevalidationBasis;
+            const current = conversionIntake(profileId, chat);
+            const currentRawIntake =
+              current && !isNativeAssistantConversion(current)
+                ? (readStoredIntakeDetails(db, current.id) as unknown as UnknownRecord | undefined)
+                : undefined;
+            const mappingVersion = current
+              ? modelMappingRuleContext(db, current.providerId).mappingRulesVersion
+              : null;
+            if (
+              !basis ||
+              !current ||
+              isNativeAssistantConversion(current) ||
+              basis.profileId !== profileId ||
+              basis.chatId !== chat.id ||
+              basis.runId !== state.run.id ||
+              basis.generation !== generation ||
+              basis.database !== db ||
+              databases.get(profileId) !== db ||
+              basis.model !== (state.run.model || null) ||
+              basis.backend !== (state.run.backend || null) ||
+              basis.reasoningEffort !== (state.run.reasoningEffort || null) ||
+              state.modelRequestOrdinal !== basis.requestOrdinal ||
+              basis.instructionVersion !== INSTRUCTION_VERSION ||
+              basis.mappingRulesVersion !== mappingVersion ||
+              basis.intake.id !== intakeId ||
+              basis.intake.version !== batchInput.version ||
+              !state.checkpoint ||
+              basis.checkpoint !== batchCheckpointBasis(state.checkpoint) ||
+              !currentRawIntake ||
+              !exactDisjointCountedAcceptance(
+                db,
+                basis,
+                basis.intake,
+                current,
+                currentRawIntake,
+                batchInput.jsonlText,
+              )
+            )
+              throw error;
+            assertRunning();
+            beforeBatchRevalidationRetry?.({
+              db,
+              profileId,
+              intakeId,
+              batchInput: structuredClone(batchInput),
+            });
+            // A published head can survive SQL rollback. Preserve the public CAS
+            // refusal before attempting to hydrate a now-stale intake projection.
+            const retryDurability = personalDurabilityStatus(db);
+            if (retryDurability.dirty || retryDurability.conflicted || retryDurability.lastError)
+              throw error;
+            const retryCurrent = conversionIntake(profileId, chat);
+            const retryRawIntake =
+              retryCurrent && !isNativeAssistantConversion(retryCurrent)
+                ? (readStoredIntakeDetails(db, retryCurrent.id) as unknown as
+                    UnknownRecord | undefined)
+                : undefined;
+            if (
+              databases.get(profileId) !== db ||
+              state.batchRevalidationBasis !== basis ||
+              state.modelRequestOrdinal !== basis.requestOrdinal ||
+              !retryCurrent ||
+              isNativeAssistantConversion(retryCurrent) ||
+              !retryRawIntake ||
+              !exactDisjointCountedAcceptance(
+                db,
+                basis,
+                basis.intake,
+                retryCurrent,
+                retryRawIntake,
+                batchInput.jsonlText,
+              ) ||
+              basis.mappingRulesVersion !==
+                modelMappingRuleContext(db, retryCurrent.providerId).mappingRulesVersion
+            )
+              throw error;
+            const activePlan = retryCurrent.workflow.plans.find(
+              (candidate) => candidate.id === batchInput.planId && candidate.status === 'active',
+            );
+            if (
+              !activePlan ||
+              !verifyBatchCoveredSources(
+                db,
+                root,
+                profileId,
+                basis,
+                retryCurrent,
+                activePlan,
+                batchInput.coverage,
+              )
+            )
+              throw error;
+            assertRunning();
+            state.batchRevalidationBasis = undefined;
+            result = intake.submitIntakeBatch(
+              db,
+              root,
+              profileId,
+              intakeId,
+              {
+                ...batchInput,
+                version: retryCurrent.version,
+              },
+              measuredSources(),
+            );
+          }
         }
         // proposalsProduced is derived in conversionReadingState() from
         // plan.batches.length, not tracked here — see intake-continuation.ts.
-        const { boundedPackagePlan } = await import('./intake-package.ts');
-        result = boundedPackagePlan(result, modelMappingRuleContext(db, result.providerId));
+        if (!nativeBatch) {
+          const { boundedPackagePlan } = await import('./intake-package.ts');
+          if (!isIntakeSummary(result))
+            result = boundedPackagePlan(result, modelMappingRuleContext(db, result.providerId));
+        }
       } else if (args.action === 'read') {
         const { boundedPackagePlan } = await import('./intake-package.ts');
         assertRunning();
-        const currentIntake = intake.getIntake(db, root, profileId, stringArgument(args, 'id'));
+        const currentIntake = intake.getIntakeRead(db, root, profileId, stringArgument(args, 'id'));
         const mappingContext = modelMappingRuleContext(db, currentIntake.providerId);
-        if (
-          !freshPlanRead &&
-          (optionalNumberArgument(args, 'version') !== currentIntake.version ||
-            optionalStringArgument(args, 'mappingVersion') !== mappingContext.mappingRulesVersion)
-        )
-          throw new HttpError(
-            409,
-            'MODEL_CONTEXT_CHANGED',
-            `This model context changed. Discard every previously assembled model-context page and partial section under different pins. Begin the section again with freshStart true at offset 0 and omit both pins; the current values are version ${currentIntake.version} and mappingVersion ${mappingContext.mappingRulesVersion}. Never combine pages or reuse a batch across pins.`,
+        if (isIntakeSummary(currentIntake)) {
+          const { prepareCollectionModelContext } = await import('./intake-model-collection.ts');
+          const { prepareIntakeMappingSection } = await import('./intake-model-mapping.ts');
+          const mappingSection = await prepareIntakeMappingSection(
+            db,
+            mappingContext.mappingRules,
+            mappingContext.mappingRulesVersion,
+            { assertCurrent: assertRunning },
           );
-        const section = optionalStringArgument(args, 'section') as ModelIntakeSection | undefined;
-        const context = boundedPackagePlan(currentIntake, {
-          ...mappingContext,
-          section,
-          offset: optionalNumberArgument(args, 'offset'),
-        });
-        result = freshPlanRead
-          ? {
-              ...context,
-              contextStart: {
-                kind: 'fresh_section_v1',
+          const section = (optionalStringArgument(args, 'section') || 'plan') as ModelIntakeSection;
+          const request = freshPlanRead
+            ? {
+                format: 'health-intake-model-context-request-v2' as const,
                 section,
-                offset: 0,
-                version: currentIntake.version,
-                mappingVersion: mappingContext.mappingRulesVersion,
-                sourceHash: currentIntake.sha256,
-                instruction:
-                  'Discard every previously assembled model-context page and partial section whose intake version or mapping version differs from these pins. Never combine any section or page across pins or reuse a batch assembled under older pins. Use these exact pins for every continuation page and later write; begin a new freshStart at offset 0 if either pin changes.',
-              },
-            }
-          : context;
+                freshStart: true as const,
+              }
+            : {
+                format: 'health-intake-model-context-request-v2' as const,
+                section,
+                cursor: stringArgument(args, 'cursor', 64000),
+                version: numberArgument(args, 'version'),
+                mappingVersion: stringArgument(args, 'mappingVersion'),
+              };
+          result = await prepareCollectionModelContext(
+            db,
+            root,
+            profileId,
+            currentIntake.id,
+            request,
+            {
+              mappingVersion: mappingContext.mappingRulesVersion,
+              mappingSection,
+              currentMappingVersion: () =>
+                modelMappingRuleContext(db, currentIntake.providerId).mappingRulesVersion,
+              assertRunning,
+            },
+          );
+        } else {
+          if (
+            !freshPlanRead &&
+            (optionalNumberArgument(args, 'version') !== currentIntake.version ||
+              optionalStringArgument(args, 'mappingVersion') !== mappingContext.mappingRulesVersion)
+          )
+            throw new HttpError(
+              409,
+              'MODEL_CONTEXT_CHANGED',
+              `This model context changed. Discard every previously assembled model-context page and partial section under different pins. Begin the section again with freshStart true at offset 0 and omit both pins; the current values are version ${currentIntake.version} and mappingVersion ${mappingContext.mappingRulesVersion}. Never combine pages or reuse a batch across pins.`,
+            );
+          const section = optionalStringArgument(args, 'section') as ModelIntakeSection | undefined;
+          const context = boundedPackagePlan(currentIntake, {
+            ...mappingContext,
+            section,
+            offset: optionalNumberArgument(args, 'offset'),
+          });
+          result = freshPlanRead
+            ? {
+                ...context,
+                contextStart: {
+                  kind: 'fresh_section_v1',
+                  section,
+                  offset: 0,
+                  version: currentIntake.version,
+                  mappingVersion: mappingContext.mappingRulesVersion,
+                  sourceHash: currentIntake.sha256,
+                  instruction:
+                    'Discard every previously assembled model-context page and partial section whose intake version or mapping version differs from these pins. Never combine any section or page across pins or reuse a batch assembled under older pins. Use these exact pins for every continuation page and later write; begin a new freshStart at offset 0 if either pin changes.',
+                },
+              }
+            : context;
+        }
       } else if (args.action === 'read_unit') {
-        result = intake.readIntakeUnit(
+        const { readIntakeUnitRead } = await import('./intake-unit-read.ts');
+        result = await readIntakeUnitRead(
           db,
           root,
           profileId,
           stringArgument(args, 'id'),
           stringArgument(args, 'unitId'),
-          {
-            offset: optionalNumberArgument(args, 'offset'),
-          },
+          { offset: optionalNumberArgument(args, 'offset'), assertRunning },
         );
-        const selected = intake.getIntake(db, root, profileId, stringArgument(args, 'id'));
-        const unit = selected.workflow?.plans
-          .flatMap((plan) => plan.units)
-          .find((candidate) => candidate.id === args.unitId);
-        const sourceId = unit?.sourceFileId || selected.id;
-        if (sourceId !== selected.id && !state.observedPackageMembers?.has(sourceId))
+        const selected = intake.getIntakeRead(db, root, profileId, stringArgument(args, 'id'));
+        if (isIntakeSummary(selected)) {
+          const host = nativeAssistantConversion(db, root, profileId, chat.id, selected),
+            unit = nativeAssistantUnit(host, stringArgument(args, 'unitId')),
+            sourceId = unit?.sourceFileId || selected.id;
+          // Literal unit windows may cover a subrange rather than complete source pages.
+          // Preserve the broad source pin until a page-aware evidence read proves coverage.
           (state.unknownSourceCoverage ||= new Set()).add(sourceId);
-        else observeSourcePages(sourceId, unit?.pages || []);
+        } else {
+          const unit = selected.workflow?.plans
+              .flatMap((plan) => plan.units)
+              .find((candidate) => candidate.id === args.unitId),
+            sourceId = unit?.sourceFileId || selected.id;
+          if (sourceId !== selected.id && !state.observedPackageMembers?.has(sourceId))
+            (state.unknownSourceCoverage ||= new Set()).add(sourceId);
+          else observeSourcePages(sourceId, unit?.pages || []);
+        }
       } else if (args.action === 'create') {
         result = await measureImportPhase(
           'source_indexing',
           () =>
-            intake.createIntakePlan(db, root, profileId, stringArgument(args, 'id'), {
+            intake.createIntakePlanRead(db, root, profileId, stringArgument(args, 'id'), {
               version: intakePlanCreateVersionArgument(args),
               operationId: optionalStringArgument(args, 'operationId'),
               planId: optionalStringArgument(args, 'planId'),
@@ -2839,8 +3241,28 @@ export function createAssistant({
           { profileId, importId: stringArgument(args, 'id'), runId: state.run.id },
           diagnostics,
         );
+        if (
+          isIntakeSummary(result) &&
+          isNativeAssistantCheckpoint(state.checkpoint) &&
+          state.checkpoint.intakeId === result.id
+        ) {
+          const selected = nativeAssistantConversion(db, root, profileId, chat.id, result);
+          const ready = await prepareNativeAssistantConversion(selected, {
+            mappingVersion: modelMappingRuleContext(db, selected.providerId).mappingRulesVersion,
+            currentMappingVersion: () =>
+              modelMappingRuleContext(db, selected.providerId).mappingRulesVersion,
+            assertRunning,
+          });
+          if (ready.state !== 'ready')
+            throw new Error('Created plan reading preparation is unavailable');
+          const scope = nativeAssistantScope(selected);
+          if (scope) await prepareLegacyCollectionReadingTargets(scope, { assertRunning });
+          nativeAssistantCheckpoint(selected, state.checkpoint, { nextUnit: true });
+          chat.reading = conversionReadingState(state.checkpoint, selected);
+        }
         const { boundedPackagePlan } = await import('./intake-package.ts');
-        result = boundedPackagePlan(result, modelMappingRuleContext(db, result.providerId));
+        if (!isIntakeSummary(result))
+          result = boundedPackagePlan(result, modelMappingRuleContext(db, result.providerId));
       } else if (args.action === 'search' || args.action === 'follow') {
         const { navigateIntakeEvidence } = await import('./intake-evidence.ts');
         result = await navigateIntakeEvidence({
@@ -2852,6 +3274,10 @@ export function createAssistant({
           query: optionalStringArgument(args, 'query'),
           referenceId: optionalStringArgument(args, 'referenceId'),
           offset: optionalNumberArgument(args, 'offset'),
+          navigationCursor: optionalStringArgument(args, 'cursor'),
+          pagedContext: isIntakeSummary(
+            getIntakeRead(db, root, profileId, stringArgument(args, 'id')),
+          ),
           assertRunning,
         });
         // Search also exposes absence across the index; followed references can
@@ -2968,7 +3394,11 @@ export function createAssistant({
         let hostPreparedImagePlan = false;
         if (state.checkpoint && args.id === state.checkpoint.intakeId) {
           const current = conversionIntake(profileId, chat);
-          const freshImage = current && isFreshTopLevelImageConversion(state.checkpoint, current);
+          const freshImage =
+            current &&
+            !isNativeAssistantConversion(current) &&
+            !isNativeAssistantCheckpoint(state.checkpoint) &&
+            isFreshTopLevelImageConversion(state.checkpoint, current);
           if (freshImage && current.workflow.plans.length === 0) {
             assertRunning();
             const prepared = intakeWithWorkflow(
@@ -3022,7 +3452,14 @@ export function createAssistant({
           }
         }
         const { readIntakeEvidence } = await import('./intake-evidence.ts');
+        const selectedEvidence = intake.getIntakeRead(
+          db,
+          root,
+          profileId,
+          stringArgument(args, 'id'),
+        );
         result = await readIntakeEvidence({
+          pagedContext: isIntakeSummary(selectedEvidence),
           db,
           root,
           profileId,
@@ -3035,7 +3472,12 @@ export function createAssistant({
           assertRunning,
           onSourceTextCaptured,
         });
-        const evidenceIntake = intake.getIntake(db, root, profileId, stringArgument(args, 'id'));
+        const evidenceIntake = intake.getIntakeRead(
+          db,
+          root,
+          profileId,
+          stringArgument(args, 'id'),
+        );
         if (evidenceIntake.mimeType !== 'application/zip') {
           const text = (await import('./intake-source-text.ts')).getIntakeSourceText(
             db,
@@ -3061,7 +3503,10 @@ export function createAssistant({
         assertRunning();
         if (state.checkpoint && args.id === state.checkpoint.intakeId) {
           const current = conversionIntake(profileId, chat);
-          const activePlan = current?.workflow.plans.find((plan) => plan.status === 'active');
+          const activePlan =
+            current && !isNativeAssistantConversion(current)
+              ? current.workflow.plans.find((plan) => plan.status === 'active')
+              : undefined;
           const resultObject: UnknownRecord = object(result) ? result : {};
           const resultMetadata = object(resultObject.metadata) ? resultObject.metadata : null;
           const resultIntake =
@@ -3070,7 +3515,7 @@ export function createAssistant({
             resultMetadata && object(resultMetadata.mappingRules)
               ? resultMetadata.mappingRules
               : null;
-          if (hostPreparedImagePlan) {
+          if (hostPreparedImagePlan && current && !isNativeAssistantConversion(current)) {
             if (
               current?.parentSourceFileId !== null ||
               activePlan?.index.kind !== 'image' ||
@@ -3128,7 +3573,7 @@ export function createAssistant({
           }
         }
       } else {
-        result = intake.proposeConversion(
+        const proposed = await intake.proposeConversionRead(
           db,
           root,
           profileId,
@@ -3151,7 +3596,9 @@ export function createAssistant({
           { observedSourcePages: measuredSources() },
         );
         const { boundedPackagePlan } = await import('./intake-package.ts');
-        result = boundedPackagePlan(result, modelMappingRuleContext(db, result.providerId));
+        result = isIntakeSummary(proposed)
+          ? proposed
+          : boundedPackagePlan(proposed, modelMappingRuleContext(db, proposed.providerId));
       }
     } else if (
       extensionTools.some((item) => item.name === params.tool) &&
@@ -3188,8 +3635,26 @@ export function createAssistant({
         // Diagnostic counts survive automatic slices, explicit continues and journal
         // recovery. They never share/reset the no-progress safety counter below.
         try {
-          const { priorReads, scopeKey } = recordAttributionRead(
-            state.checkpoint,
+          const attributionHost = conversionIntake(profileId, chat);
+          const native =
+            isNativeAssistantCheckpoint(state.checkpoint) &&
+            isNativeAssistantConversion(attributionHost);
+          const { priorReads, scopeKey } = (
+            native
+              ? (...args: Parameters<typeof recordAttributionRead>) =>
+                  recordNativeAttributionRead(
+                    attributionHost,
+                    state.checkpoint as NativeAssistantCheckpoint,
+                    ...(args.slice(1) as [
+                      string,
+                      ReturnType<typeof attributionReadScope>,
+                      unknown,
+                      number,
+                    ]),
+                  )
+              : recordAttributionRead
+          )(
+            state.checkpoint as LegacyConversionCheckpoint,
             readKey,
             attributionReadScope(params.tool, args, result),
             object(result) && object(result.hostTimings)
@@ -3198,8 +3663,10 @@ export function createAssistant({
             performance.now() - toolStartedAt,
           );
           if (scopeKey && attributionReadScope(params.tool, args, result)?.page != null)
-            recordConversionPageTiming(
-              state.checkpoint,
+            (isNativeAssistantCheckpoint(state.checkpoint)
+              ? recordNativeAssistantPageTiming
+              : recordConversionPageTiming)(
+              state.checkpoint as NativeAssistantCheckpoint & LegacyConversionCheckpoint,
               clock().toISOString(),
               performance.now() - toolStartedAt,
             );
@@ -3210,7 +3677,13 @@ export function createAssistant({
               acknowledged: false,
             });
             if (params.deferReadConsumption !== true) {
-              acknowledgeAttributionRead(state.checkpoint, scopeKey);
+              if (
+                isNativeAssistantCheckpoint(state.checkpoint) &&
+                isNativeAssistantConversion(attributionHost)
+              )
+                acknowledgeNativeAttributionRead(attributionHost, state.checkpoint, scopeKey);
+              else if (!isNativeAssistantCheckpoint(state.checkpoint))
+                acknowledgeAttributionRead(state.checkpoint, scopeKey);
               state.attributionCalls.get(attributionCallId)!.acknowledged = true;
             }
           }
@@ -3233,7 +3706,7 @@ export function createAssistant({
         let readFacts: Record<string, string | number | boolean | null> = {};
         try {
           const location = attributionReadScope(params.tool, args, result);
-          const progressCounts = JSON.parse(readProgress) as [number, number, unknown[]];
+          const progressCounts = JSON.parse(readProgress) as [number, number, number];
           readFacts = {
             recoveryAction:
               params.tool === 'health_intake_plan' && args.action === 'read'
@@ -3248,7 +3721,7 @@ export function createAssistant({
             repeatedWindowLimit: 3,
             baselineReadWindows: progressCounts[0],
             baselineCandidates: progressCounts[1],
-            baselineAccountedUnits: progressCounts[2].length,
+            baselineAccountedUnits: progressCounts[2],
             progressChanged: !!repeated && repeated.progress !== readProgress,
             freshContextStart: args.freshStart === true,
             currentVersion: readIntake?.version ?? null,
@@ -3270,10 +3743,53 @@ export function createAssistant({
       const intake = conversionIntake(profileId, chat);
       if (!intake) throw new Error('This conversion is no longer linked to the selected delivery');
       conversionCheckpoint(chat, intake, profileId);
-      if (params.deferReadConsumption === true) {
-        const receipt = deferConversionRead(state.checkpoint, params.tool, args, result);
-        if (receipt) (state.unconsumedReads ||= new Map()).set(params.callId, receipt);
-      } else recordConversionRead(state.checkpoint, params.tool, args, result);
+      if (isNativeAssistantConversion(intake) && isNativeAssistantCheckpoint(state.checkpoint)) {
+        // A manual conversation may explicitly read another retained unit in
+        // the same request. Give that read its own addressed ledger; automatic
+        // dispatch keeps its selected work-unit boundary.
+        if (!state.beforeModelRequest) {
+          let selectedUnit = typeof args.unitId === 'string' ? args.unitId : undefined;
+          if (
+            params.tool === 'health_intake_package' &&
+            args.action === 'read_member' &&
+            typeof args.memberId === 'string'
+          ) {
+            const { readPackagePlanScope } = await import('./intake-package-plan.ts'),
+              { readRetainedPlanScope } = await import('./intake-retained-plan.ts');
+            selectedUnit =
+              readPackagePlanScope(db, root, profileId, intake.id)?.unit(args.memberId)?.id ??
+              readRetainedPlanScope(db, profileId, intake.id)?.unitByMemberId(args.memberId)?.id;
+          }
+          if (selectedUnit)
+            nativeAssistantCheckpoint(intake, state.checkpoint, { unitId: selectedUnit });
+        }
+        const scope = nativeAssistantScope(intake, state.checkpoint.activeUnitId);
+        if (!scope) throw new Error('The selected reading ledger is unavailable');
+        await prepareLegacyCollectionReadingTargets(scope, { assertRunning });
+        if (params.deferReadConsumption === true) {
+          const receipt = await deferCollectionConversionRead(
+            scope,
+            state.checkpoint,
+            params.tool,
+            args,
+            result,
+            { assertRunning },
+          );
+          if (receipt)
+            (state.unconsumedReads ||= new Map()).set(params.callId, {
+              ...receipt,
+              unitId: scope.unitId,
+            });
+        } else
+          await recordCollectionConversionRead(scope, state.checkpoint, params.tool, args, result, {
+            assertRunning,
+          });
+      } else if (!isNativeAssistantCheckpoint(state.checkpoint)) {
+        if (params.deferReadConsumption === true) {
+          const receipt = deferConversionRead(state.checkpoint, params.tool, args, result);
+          if (receipt) (state.unconsumedReads ||= new Map()).set(params.callId, receipt);
+        } else recordConversionRead(state.checkpoint, params.tool, args, result);
+      } else throw new Error('Reading checkpoint authority changed');
       state.checkpoint.version = intake.version;
       chat.reading = conversionReadingState(state.checkpoint, intake);
     }
@@ -3334,7 +3850,7 @@ export function createAssistant({
       );
       persist(profileId, chat, 'conversion-model-recovery-authorized');
     }
-    if (chat.context?.intakeRepair)
+    if (chat.context?.intakeRepair && !nativeRepair(profileId, chat.context.intakeRepair))
       chat.context.intakeRepair = revalidateIntakeDraftRepairScope(
         dbFor(profileId),
         root,
@@ -3346,12 +3862,17 @@ export function createAssistant({
     const firstResponse =
       !chat.runs?.length && !chat.messages.some((message) => message.role === 'assistant');
     const intake = conversionIntake(profileId, chat);
-    const checkpoint = intake ? conversionCheckpoint(chat, intake, profileId) : null;
+    // Native scopes may require asynchronous maintenance before they can be read.
+    let checkpoint: ConversionCheckpoint | null = isNativeAssistantConversion(intake)
+      ? null
+      : intake
+        ? conversionCheckpoint(chat, intake, profileId)
+        : null;
     if (checkpoint && options.beforeModelRequest) {
       checkpoint.activeUnitId = conversionReadingState(checkpoint, intake!).workUnit?.id;
     }
     const firstAcquaintance =
-      !checkpoint &&
+      !intake &&
       firstResponse &&
       !journalChats(profileId).some(
         (prior) =>
@@ -3420,6 +3941,10 @@ export function createAssistant({
       if (state.timer) clearTimeout(state.timer);
       if (state.streamPersistTimer) clearTimeout(state.streamPersistTimer);
       active.delete(profileId);
+      if (state.nativeBatchRevalidationBasis) {
+        disposeNativeBatchRevalidationBasis(state.nativeBatchRevalidationBasis.proof);
+        state.nativeBatchRevalidationBasis = undefined;
+      }
       if (checkpoint && readingReason === 'context_limit') {
         checkpoint.contextTier = 1;
         checkpoint.initialContextFailures = (checkpoint.initialContextFailures || 0) + 1;
@@ -3538,13 +4063,127 @@ export function createAssistant({
           finish('idle', null, 'time_limit');
           return;
         }
+        if (chat.context?.intakeRepair && nativeRepair(profileId, chat.context.intakeRepair)) {
+          const assertRunning = () => {
+            dbFor(profileId);
+            if (active.get(profileId) !== state || state.generation !== generation)
+              throw new Error('Draft repair stopped');
+          };
+          chat.context.intakeRepair = await prepareIntakeDraftRepairScope(
+            dbFor(profileId),
+            root,
+            profileId,
+            chat.context.intakeRepair,
+            { assertRunning },
+          );
+          assertRunning();
+          persist(profileId, chat, 'draft-repair-prepared');
+        }
+        const initial = conversionIntake(profileId, chat);
+        if (isNativeAssistantConversion(initial) && !checkpoint) {
+          const assertRunning = () => {
+            if (active.get(profileId) !== state || state.generation !== generation)
+              throw new Error('Conversion stopped');
+          };
+          if (initial.header.activePlan.state === 'exact' && !initial.header.activePlan.plan) {
+            const { createIntakePlanRead } = await import('./intake.ts');
+            await createIntakePlanRead(initial.db, root, profileId, initial.id, {
+              version: initial.version,
+              operationId: 'assistant-plan:' + chat.id,
+              assertRunning,
+            });
+          }
+          const current = conversionIntake(profileId, chat);
+          if (!isNativeAssistantConversion(current))
+            throw new Error('Selected native conversion changed');
+          const ready = await prepareNativeAssistantConversion(current, {
+            mappingVersion: modelMappingRuleContext(current.db, current.providerId)
+              .mappingRulesVersion,
+            currentMappingVersion: () =>
+              modelMappingRuleContext(current.db, current.providerId).mappingRulesVersion,
+            assertRunning,
+          });
+          if (ready.state !== 'ready')
+            throw new HttpError(
+              409,
+              'WORKFLOW_PREPARATION_REQUIRED',
+              'Prepare the selected workflow before continuing conversion',
+            );
+          assertRunning();
+          const previous = chat.conversionCheckpoint;
+          if (previous && !isNativeAssistantCheckpoint(previous)) {
+            const { importLegacyReadingCheckpoint } = await import('./intake-reading-legacy.ts');
+            await importLegacyReadingCheckpoint(
+              current.db,
+              root,
+              profileId,
+              current.id,
+              chat.id,
+              previous,
+              { assertRunning },
+            );
+            const imported = nativeAssistantCheckpoint(current);
+            if (!imported) throw new Error('Imported reading checkpoint has no selected plan');
+            Object.assign(imported, {
+              turns: previous.turns,
+              modelRequests: previous.modelRequests,
+              measuredModelTokens: previous.measuredModelTokens,
+              modelUsageIncomplete: previous.modelUsageIncomplete,
+              unmeasuredRequests: previous.unmeasuredRequests,
+              usableModelResponses: previous.usableModelResponses,
+              contextTier: previous.contextTier,
+              initialContextFailures: previous.initialContextFailures,
+              pageTiming: previous.pageTiming,
+            });
+            await importNativeAttribution(current, imported, previous, { assertRunning });
+            assertRunning();
+            chat.conversionCheckpoint = imported;
+          }
+          const preparedScope = nativeAssistantScope(current);
+          if (preparedScope)
+            await prepareLegacyCollectionReadingTargets(preparedScope, { assertRunning });
+          checkpoint = conversionCheckpoint(chat, current, profileId);
+          if (!checkpoint || !isNativeAssistantCheckpoint(checkpoint))
+            throw new HttpError(
+              409,
+              'CONVERSION_CHECKPOINT_PREPARATION_REQUIRED',
+              'Prepare the selected reading checkpoint before continuing conversion',
+            );
+          nativeAssistantCheckpoint(current, checkpoint, { nextUnit: true });
+          state.checkpoint = checkpoint;
+          state.readingDeadlineAt ??= monotonicNow() + READING_SLICE_MS;
+          diagnosticContext.importId = current.id;
+          state.diagnosticScope ??= diagnostics.startActive(profileId, diagnosticContext);
+        }
         if (checkpoint) {
-          state.seenBeforeTurn = checkpoint.seen.length;
           state.usageBeforeTurn = measuredUsage(runRecord.usage);
           const current = conversionIntake(profileId, chat);
           if (!current)
             throw new Error('This conversion is no longer linked to the selected delivery');
-          state.candidatesBeforeTurn = current.workflow.candidates.length;
+          if (isNativeAssistantConversion(current)) {
+            const mapping = modelMappingRuleContext(
+              dbFor(profileId),
+              current.providerId,
+            ).mappingRulesVersion;
+            const ready = await prepareNativeAssistantConversion(current, {
+              mappingVersion: mapping,
+              currentMappingVersion: () =>
+                modelMappingRuleContext(dbFor(profileId), current.providerId).mappingRulesVersion,
+              assertRunning: () => {
+                if (active.get(profileId) !== state || state.generation !== generation)
+                  throw new Error('Conversion stopped');
+              },
+            });
+            if (ready.state !== 'ready')
+              throw new HttpError(
+                409,
+                'WORKFLOW_PREPARATION_REQUIRED',
+                'Prepare the selected workflow before continuing conversion',
+              );
+          }
+          state.seenBeforeTurn = readingCount(checkpoint, current);
+          state.candidatesBeforeTurn = candidateCount(current);
+          state.accountedBeforeTurn = conversionReadingState(checkpoint, current).accountedUnits;
           conversionCheckpoint(chat, current, profileId);
           checkpoint.turns++;
           chat.reading = conversionReadingState(checkpoint, current);
@@ -3576,52 +4215,108 @@ export function createAssistant({
           diagnostics,
           diagnosticContext,
           beforeRequest: () => {
-            state.assertAuthorized?.('dispatch');
-            if (
-              !state.unknownSourceCoverage?.size &&
-              state.observedSourceHashes?.size &&
-              !observedSourceHashesCurrent(dbFor(profileId), state)
-            )
-              throw new ModelError(
-                'Source text changed during this response; reread observed evidence in a fresh response before continuing.',
-              );
-            for (const [sourceId, revisionId] of new Map([
-              ...(state.sourceTextReads || []),
-              ...(state.sourceTextCapturePins || []),
-            ]))
+            const guard = () => {
+              state.assertAuthorized?.('dispatch');
               if (
-                currentIntakeSourceTextRevisionId(dbFor(profileId), profileId, sourceId) !==
-                  revisionId &&
-                !measuredSourceCurrent(dbFor(profileId), state, sourceId)
+                !state.unknownSourceCoverage?.size &&
+                state.observedSourceHashes?.size &&
+                !observedSourceHashesCurrent(dbFor(profileId), state)
               )
                 throw new ModelError(
-                  'Source text changed during this response. Completed work is retained; reread the current text in a fresh response before continuing.',
+                  'Source text changed during this response; reread observed evidence in a fresh response before continuing.',
                 );
-            if (readingDeadlineReached())
-              throw new ReadingDeadlineError(
-                'The bounded reading slice reached its time limit before another model request. Productive work is retained.',
-              );
-            if (
-              checkpoint?.activeUnitId &&
-              chat.reading?.workUnit?.id &&
-              checkpoint.activeUnitId !== chat.reading.workUnit.id
-            )
-              throw new ReadingDeadlineError(
-                'The current unit reached a checkpoint; continue with the next queued unit in a fresh context.',
-              );
-            if (checkpoint && state.beforeModelRequest?.(chat.reading!))
-              throw new ReadingJobLimitError(
-                'A reading safety guard was reached before another model request. Completed work and cumulative usage are retained.',
-              );
+              for (const [sourceId, revisionId] of new Map([
+                ...(state.sourceTextReads || []),
+                ...(state.sourceTextCapturePins || []),
+              ]))
+                if (
+                  currentIntakeSourceTextRevisionId(dbFor(profileId), profileId, sourceId) !==
+                    revisionId &&
+                  !measuredSourceCurrent(dbFor(profileId), state, sourceId)
+                )
+                  throw new ModelError(
+                    'Source text changed during this response. Completed work is retained; reread the current text in a fresh response before continuing.',
+                  );
+              if (readingDeadlineReached())
+                throw new ReadingDeadlineError(
+                  'The bounded reading slice reached its time limit before another model request. Productive work is retained.',
+                );
+              if (
+                checkpoint?.activeUnitId &&
+                chat.reading?.workUnit?.id &&
+                checkpoint.activeUnitId !== chat.reading.workUnit.id
+              )
+                throw new ReadingDeadlineError(
+                  'The current unit reached a checkpoint; continue with the next queued unit in a fresh context.',
+                );
+              if (checkpoint && state.beforeModelRequest?.(chat.reading!))
+                throw new ReadingJobLimitError(
+                  'A reading safety guard was reached before another model request. Completed work and cumulative usage are retained.',
+                );
+            };
+            if (!isNativeAssistantCheckpoint(checkpoint)) return guard();
+            return (async () => {
+              if (isNativeAssistantCheckpoint(checkpoint)) {
+                const current = conversionIntake(profileId, chat);
+                if (!isNativeAssistantConversion(current))
+                  throw Error('Native conversion source changed');
+                const mappingVersion = modelMappingRuleContext(
+                  dbFor(profileId),
+                  current.providerId,
+                ).mappingRulesVersion;
+                const ready = await prepareNativeAssistantConversion(current, {
+                  mappingVersion,
+                  currentMappingVersion: () =>
+                    modelMappingRuleContext(dbFor(profileId), current.providerId)
+                      .mappingRulesVersion,
+                  assertRunning: () => {
+                    state.assertAuthorized?.('dispatch');
+                    if (active.get(profileId) !== state || state.generation !== generation)
+                      throw Error('This response is no longer running');
+                  },
+                });
+                if (ready.state !== 'ready')
+                  throw new HttpError(
+                    409,
+                    'WORKFLOW_PREPARATION_REQUIRED',
+                    'Prepare complete selected workflow facts before another model request',
+                  );
+                chat.reading = conversionReadingState(checkpoint, current);
+              }
+              guard();
+            })();
           },
           onTool: (params) => {
-            const readsBefore = checkpoint?.seen.length || 0;
+            let beforeIntake: ConversionIntake | null = null;
+            if (checkpoint && active.get(profileId) === state && state.generation === generation) {
+              try {
+                beforeIntake = conversionIntake(profileId, chat);
+              } catch {
+                /* The guarded tool path owns error classification. */
+              }
+            }
+            const readsBefore =
+              checkpoint && beforeIntake ? readingCount(checkpoint, beforeIntake) : 0;
+            const nativeProgressBefore =
+              isNativeAssistantConversion(beforeIntake) &&
+              isNativeAssistantCheckpoint(checkpoint) &&
+              params.tool === 'health_intake_batch'
+                ? nativeAssistantBatchProgress(
+                    beforeIntake,
+                    checkpoint,
+                    params.arguments.operationId,
+                    modelMappingRuleContext(dbFor(profileId), beforeIntake.providerId)
+                      .mappingRulesVersion,
+                  )
+                : undefined;
             const batchProgressBefore =
               checkpoint &&
               active.get(profileId) === state &&
               state.generation === generation &&
               params.tool === 'health_intake_batch'
-                ? durableBatchProgress(conversionIntake(profileId, chat))
+                ? isNativeAssistantConversion(beforeIntake)
+                  ? null
+                  : durableBatchProgress(beforeIntake)
                 : null;
             return callTool(profileId, chat, params, state, generation)
               .then((result) => {
@@ -3632,6 +4327,17 @@ export function createAssistant({
                   params.tool === 'health_intake_batch'
                     ? conversionIntake(profileId, chat)
                     : null;
+                const nativeProgressAfter =
+                  isNativeAssistantConversion(batchCurrent) &&
+                  isNativeAssistantCheckpoint(checkpoint)
+                    ? nativeAssistantBatchProgress(
+                        batchCurrent,
+                        checkpoint,
+                        params.arguments.operationId,
+                        modelMappingRuleContext(dbFor(profileId), batchCurrent.providerId)
+                          .mappingRulesVersion,
+                      )
+                    : undefined;
                 if (batchCurrent?.durability?.pending)
                   throw new HttpError(
                     503,
@@ -3643,11 +4349,18 @@ export function createAssistant({
                   active.get(profileId) === state &&
                   state.generation === generation &&
                   params.tool === 'health_intake_batch' &&
-                  advancedDurableBatchProgress(
-                    batchProgressBefore,
-                    batchCurrent,
-                    params.arguments.operationId,
-                  )
+                  ((nativeProgressBefore &&
+                    nativeProgressAfter &&
+                    !nativeProgressBefore.recorded &&
+                    nativeProgressAfter.recorded &&
+                    (nativeProgressAfter.versions > nativeProgressBefore.versions ||
+                      nativeProgressAfter.accounted > nativeProgressBefore.accounted)) ||
+                    (!isNativeAssistantConversion(batchCurrent) &&
+                      advancedDurableBatchProgress(
+                        batchProgressBefore,
+                        batchCurrent,
+                        params.arguments.operationId,
+                      )))
                 )
                 // Reads, questions, new operation IDs and no-op/inspected
                 // batches cannot replenish this consecutive-stale budget.
@@ -3658,10 +4371,11 @@ export function createAssistant({
                       recoveryAction: 'batch_progress',
                       toolName: params.tool,
                       currentVersion: batchCurrent?.version ?? null,
-                      candidates: batchCurrent?.workflow.candidates.length || 0,
-                      accountedUnits: batchCurrent
-                        ? accountedIntakeUnitIds(batchCurrent).length
-                        : 0,
+                      candidates: batchCurrent ? candidateCount(batchCurrent) : 0,
+                      accountedUnits:
+                        batchCurrent && !isNativeAssistantConversion(batchCurrent)
+                          ? accountedIntakeUnitIds(batchCurrent).length
+                          : 0,
                     });
                   } catch {
                     /* Optional recovery diagnostics cannot alter model/tool outcomes. */
@@ -3678,7 +4392,7 @@ export function createAssistant({
                 if (
                   checkpoint &&
                   state.generation === generation &&
-                  checkpoint.seen.length > readsBefore
+                  (chat.reading?.readWindows || 0) > readsBefore
                 )
                   state.recoverableCoverageErrors = 0;
                 if (checkpoint && state.generation === generation)
@@ -3686,7 +4400,7 @@ export function createAssistant({
                     toolName: params.tool,
                     turns: checkpoint.turns,
                     readyRecords: chat.reading?.readyRecords || 0,
-                    readWindows: checkpoint.seen.length,
+                    readWindows: chat.reading?.readWindows || 0,
                     accountedUnits: chat.reading?.accountedUnits || 0,
                     remainingUnits: chat.reading?.remainingUnits || 0,
                     pendingReadWindows: chat.reading?.pendingReadWindows || 0,
@@ -3819,7 +4533,7 @@ export function createAssistant({
                       )
                     : finish('failed', error.message);
           },
-          onEvent: (method, params) => {
+          onEvent: async (method, params) => {
             if (active.get(profileId) !== state || state.generation !== generation) {
               if (
                 method === 'model/requestFinished' &&
@@ -3846,15 +4560,42 @@ export function createAssistant({
                 Array.isArray(params.callIds)
               ) {
                 const beforeConsumption = batchCheckpointBasis(checkpoint);
+                const nativeBasis = state.nativeBatchRevalidationBasis;
+                const beforeHost = conversionIntake(profileId, chat);
+                const beforeScope =
+                  isNativeAssistantConversion(beforeHost) && isNativeAssistantCheckpoint(checkpoint)
+                    ? nativeAssistantScope(beforeHost, checkpoint.activeUnitId)
+                    : undefined;
+                const beforeLedger = beforeScope
+                  ? collectionConversionLedgerBinding(beforeScope)
+                  : undefined;
                 const basis = state.batchRevalidationBasis;
                 let changed = false;
                 for (const callId of params.callIds) {
                   if (typeof callId !== 'string') continue;
                   const receipt = state.unconsumedReads?.get(callId);
                   if (!receipt) continue;
-                  changed =
-                    recordConversionRead(checkpoint, receipt.tool, receipt.args, receipt.result) ||
-                    changed;
+                  if ('format' in receipt && receipt.format === 'health-intake-deferred-read-v2') {
+                    const current = conversionIntake(profileId, chat);
+                    if (
+                      !isNativeAssistantConversion(current) ||
+                      !isNativeAssistantCheckpoint(checkpoint)
+                    )
+                      throw new Error('Deferred evidence authority changed');
+                    const scope = nativeAssistantScope(current, receipt.unitId);
+                    if (!scope) throw new Error('Deferred evidence unit is unavailable');
+                    changed =
+                      (await acknowledgeCollectionConversionRead(scope, checkpoint, receipt.key)) ||
+                      changed;
+                  } else if (!isNativeAssistantCheckpoint(checkpoint) && 'tool' in receipt)
+                    changed =
+                      recordConversionRead(
+                        checkpoint,
+                        receipt.tool,
+                        receipt.args,
+                        receipt.result,
+                      ) || changed;
+                  else throw new Error('Deferred evidence checkpoint changed');
                   state.unconsumedReads!.delete(callId);
                 }
                 if (changed) {
@@ -3871,6 +4612,21 @@ export function createAssistant({
                     basis.checkpoint = batchCheckpointBasis(checkpoint);
                   const current = conversionIntake(profileId, chat);
                   if (!current) throw new Error('The linked conversion changed');
+                  if (
+                    nativeBasis &&
+                    isNativeAssistantConversion(current) &&
+                    isNativeAssistantCheckpoint(checkpoint) &&
+                    nativeBasis.generation === generation &&
+                    nativeBasis.requestOrdinal === state.modelRequestOrdinal &&
+                    nativeBasis.checkpoint === beforeConsumption &&
+                    nativeBasis.ledger === beforeLedger
+                  ) {
+                    const scope = nativeAssistantScope(current, checkpoint.activeUnitId);
+                    if (scope) {
+                      nativeBasis.ledger = collectionConversionLedgerBinding(scope);
+                      nativeBasis.checkpoint = batchCheckpointBasis(checkpoint);
+                    }
+                  }
                   chat.reading = conversionReadingState(checkpoint, current);
                   state.recoverableCoverageErrors = 0;
                   persist(profileId, chat, 'evidence-consumed');
@@ -3906,7 +4662,11 @@ export function createAssistant({
                     const attribution =
                       typeof id === 'string' ? state.attributionCalls?.get(id) : null;
                     if (attribution && !attribution.acknowledged) {
-                      acknowledgeAttributionRead(checkpoint, attribution.scopeKey);
+                      if (isNativeAssistantCheckpoint(checkpoint)) {
+                        const host = conversionIntake(profileId, chat);
+                        if (isNativeAssistantConversion(host))
+                          acknowledgeNativeAttributionRead(host, checkpoint, attribution.scopeKey);
+                      } else acknowledgeAttributionRead(checkpoint, attribution.scopeKey);
                       attribution.acknowledged = true;
                     }
                   }
@@ -3939,10 +4699,18 @@ export function createAssistant({
                 try {
                   const scopes = state.attributionRequests?.get(params.requestId);
                   if (scopes) {
-                    finishAttributionRequest(checkpoint, scopes, {
-                      failed: params.failed === true,
-                      usage: params.usage,
-                    });
+                    if (isNativeAssistantCheckpoint(checkpoint)) {
+                      const host = conversionIntake(profileId, chat);
+                      if (isNativeAssistantConversion(host))
+                        await finishNativeAttributionRequest(host, checkpoint, scopes, {
+                          failed: params.failed === true,
+                          usage: params.usage,
+                        });
+                    } else
+                      finishAttributionRequest(checkpoint, scopes, {
+                        failed: params.failed === true,
+                        usage: params.usage,
+                      });
                     state.attributionRequests!.delete(params.requestId);
                   }
                 } catch {
@@ -3986,7 +4754,12 @@ export function createAssistant({
                       ? [state.attributionCalls.get(callId)!.scopeKey]
                       : [],
                   );
-                  const scopes = startAttributionRequest(checkpoint, scopeKeys);
+                  const scopes =
+                    isNativeAssistantCheckpoint(checkpoint) && isNativeAssistantConversion(scoped)
+                      ? await startNativeAttributionRequest(scoped, checkpoint, scopeKeys)
+                      : !isNativeAssistantCheckpoint(checkpoint)
+                        ? startAttributionRequest(checkpoint, scopeKeys)
+                        : [];
                   if (typeof params.requestId === 'string')
                     (state.attributionRequests ||= new Map()).set(params.requestId, scopes);
                 } catch {
@@ -3998,16 +4771,58 @@ export function createAssistant({
                 const durability = personalDurabilityStatus(dbFor(profileId)) as ReturnType<
                   typeof personalDurabilityStatus
                 > & { sequence?: number };
-                const rawIntake = basisIntake
-                  ? (readStoredIntakeDetails(dbFor(profileId), basisIntake.id) as unknown as
-                      UnknownRecord | undefined)
-                  : undefined;
-                const unitSources = basisIntake
-                  ? batchUnitSourceBasis(dbFor(profileId), root, profileId, basisIntake)
-                  : null;
+                const rawIntake =
+                  basisIntake && !isNativeAssistantConversion(basisIntake)
+                    ? (readStoredIntakeDetails(dbFor(profileId), basisIntake.id) as unknown as
+                        UnknownRecord | undefined)
+                    : undefined;
+                const unitSources =
+                  basisIntake && !isNativeAssistantConversion(basisIntake)
+                    ? batchUnitSourceBasis(dbFor(profileId), root, profileId, basisIntake)
+                    : null;
                 state.modelRequestOrdinal = (state.modelRequestOrdinal || 0) + 1;
+                if (state.nativeBatchRevalidationBasis) {
+                  disposeNativeBatchRevalidationBasis(state.nativeBatchRevalidationBasis.proof);
+                  state.nativeBatchRevalidationBasis = undefined;
+                }
+                if (
+                  isNativeAssistantConversion(basisIntake) &&
+                  isNativeAssistantCheckpoint(checkpoint) &&
+                  !durability.dirty &&
+                  !durability.conflicted &&
+                  !durability.lastError &&
+                  !basisIntake.durability.pending
+                ) {
+                  const scope = nativeAssistantScope(basisIntake, checkpoint.activeUnitId);
+                  if (scope)
+                    state.nativeBatchRevalidationBasis = {
+                      profileId,
+                      chatId: chat.id,
+                      runId: state.run.id,
+                      generation,
+                      requestOrdinal: state.modelRequestOrdinal,
+                      database: dbFor(profileId),
+                      model: state.run.model || null,
+                      backend: state.run.backend || null,
+                      reasoningEffort: state.run.reasoningEffort || null,
+                      instructionVersion: INSTRUCTION_VERSION,
+                      mappingRulesVersion: modelMappingRuleContext(
+                        dbFor(profileId),
+                        basisIntake.providerId,
+                      ).mappingRulesVersion,
+                      checkpoint: batchCheckpointBasis(checkpoint),
+                      intakeId: basisIntake.id,
+                      version: basisIntake.version,
+                      sourceHash: basisIntake.sha256,
+                      ledger: collectionConversionLedgerBinding(scope),
+                      proof: captureNativeBatchRevalidationBasis(dbFor(profileId), {
+                        id: basisIntake.id,
+                      }),
+                    };
+                }
                 state.batchRevalidationBasis =
                   basisIntake &&
+                  !isNativeAssistantConversion(basisIntake) &&
                   unitSources &&
                   !basisIntake.durability.pending &&
                   rawIntake &&
@@ -4168,26 +4983,43 @@ export function createAssistant({
                   if (!current) throw new Error('The linked conversion changed');
                   conversionCheckpoint(chat, current, profileId);
                   const resume = conversionResumeContext(checkpoint, current);
-                  const accounted = accountedIntakeUnitIds(current);
-                  checkpoint.completedUnits ||= [];
-                  checkpoint.accountedUnits ||= [...checkpoint.completedUnits];
+                  const accounted = !isNativeAssistantConversion(current)
+                    ? accountedIntakeUnitIds(current)
+                    : [];
+                  const nativeState =
+                    isNativeAssistantConversion(current) && isNativeAssistantCheckpoint(checkpoint)
+                      ? conversionReadingState(checkpoint, current)
+                      : undefined;
+                  const legacyAccounted = !isNativeAssistantCheckpoint(checkpoint)
+                    ? checkpoint.accountedUnits || checkpoint.completedUnits || []
+                    : [];
                   const progress =
-                    checkpoint.seen.length > (state.seenBeforeTurn ?? 0) ||
-                    current.workflow.candidates.length > (state.candidatesBeforeTurn ?? 0) ||
-                    accounted.some((id: string) => !checkpoint.accountedUnits!.includes(id));
-                  checkpoint.accountedUnits = [
-                    ...new Set([...checkpoint.accountedUnits, ...accounted]),
-                  ];
-                  checkpoint.completedUnits = [
-                    ...new Set([
-                      ...checkpoint.completedUnits,
-                      ...current.workflow.plans.flatMap((plan) =>
-                        plan.units
-                          .filter((unit) => accountedUnitKind(plan, unit) === 'extracted')
-                          .map((unit) => unit.id),
-                      ),
-                    ]),
-                  ];
+                    readingCount(checkpoint, current) > (state.seenBeforeTurn ?? 0) ||
+                    candidateCount(current) > (state.candidatesBeforeTurn ?? 0) ||
+                    (nativeState
+                      ? (nativeState.accountedUnits || 0) > (state.accountedBeforeTurn || 0)
+                      : !isNativeAssistantCheckpoint(checkpoint) &&
+                        accounted.some((id) => !legacyAccounted.includes(id)));
+                  if (
+                    !isNativeAssistantCheckpoint(checkpoint) &&
+                    !isNativeAssistantConversion(current)
+                  ) {
+                    checkpoint.completedUnits ||= [];
+                    checkpoint.accountedUnits ||= [...checkpoint.completedUnits];
+                    checkpoint.accountedUnits = [
+                      ...new Set([...checkpoint.accountedUnits, ...accounted]),
+                    ];
+                    checkpoint.completedUnits = [
+                      ...new Set([
+                        ...checkpoint.completedUnits,
+                        ...current.workflow.plans.flatMap((plan) =>
+                          plan.units
+                            .filter((unit) => accountedUnitKind(plan, unit) === 'extracted')
+                            .map((unit) => unit.id),
+                        ),
+                      ]),
+                    ];
+                  }
                   if (readingDeadlineReached()) {
                     finish('idle', null, 'time_limit');
                     return;
@@ -4197,8 +5029,8 @@ export function createAssistant({
                     !state.coverageReconciliationUsed &&
                     resume.pendingReadWindows === 0 &&
                     resume.pendingUnits > 0 &&
-                    checkpoint.seen.length > 0 &&
-                    current.workflow.candidates.length > 0;
+                    readingCount(checkpoint, current) > 0 &&
+                    candidateCount(current) > 0;
                   if (reconcileCoverage) {
                     state.coverageReconciliationUsed = true;
                     state.coverageReconciliationPending = true;
@@ -4206,7 +5038,7 @@ export function createAssistant({
                       recoveryAction: 'reconcile_coverage',
                       pendingReadWindows: resume.pendingReadWindows,
                       remainingUnits: resume.pendingUnits,
-                      readyRecords: current.workflow.candidates.length,
+                      readyRecords: candidateCount(current),
                     });
                   }
                   if (
@@ -4232,7 +5064,8 @@ export function createAssistant({
                       null,
                       !resume.pendingReadWindows &&
                         !resume.pendingUnits &&
-                        (checkpoint.seen.length > 0 || accounted.length > 0)
+                        (readingCount(checkpoint, current) > 0 ||
+                          (nativeState?.accountedUnits || accounted.length) > 0)
                         ? 'reading_exhausted'
                         : 'no_progress',
                     );
@@ -4258,6 +5091,7 @@ export function createAssistant({
                 );
             } catch (error) {
               finish('failed', 'The conversation could not be saved: ' + errorMessage(error));
+              if (isNativeAssistantCheckpoint(checkpoint)) throw error;
             }
           },
         });
@@ -4307,10 +5141,14 @@ export function createAssistant({
                   checkpoint,
                   required(conversionIntake(profileId, chat), 'Source missing'),
                 ),
-                retainedCandidates: [],
-                proposalIds: [],
-                currentWindow: null,
-                nextReadWindows: [],
+                ...(isNativeAssistantCheckpoint(checkpoint)
+                  ? {}
+                  : {
+                      retainedCandidates: [],
+                      proposalIds: [],
+                      currentWindow: null,
+                      nextReadWindows: [],
+                    }),
                 instructions:
                   'Read the dispatched unit using the scoped host tools and supporting source-text pages. Publish only with health_intake_batch and this unit coverage. Retained candidate versions and receipts are available through paginated plan reads. Never accept/import.',
               },
@@ -4438,7 +5276,7 @@ export function createAssistant({
           intakes.flatMap((intake) => (intake.conversionChatId ? [intake.conversionChatId] : [])),
         ),
       ];
-      const chats: { conversionCheckpoint: ConversionCheckpoint }[] = [];
+      const chats: { conversionCheckpoint: unknown }[] = [];
       let unavailableChats = 0;
       let omittedChats = Math.max(0, ids.length - 100),
         readBytes = 0;
@@ -4459,10 +5297,32 @@ export function createAssistant({
                 readBytes += bytes;
               },
             });
-          if (object(chat) && object(chat.conversionCheckpoint))
-            chats.push({
-              conversionCheckpoint: chat.conversionCheckpoint as unknown as ConversionCheckpoint,
-            });
+          if (object(chat) && object(chat.conversionCheckpoint)) {
+            const checkpoint = chat.conversionCheckpoint;
+            if (isNativeAssistantCheckpoint(checkpoint)) {
+              const selected = getIntakeRead(
+                dbFor(profileId),
+                root,
+                profileId,
+                checkpoint.intakeId,
+              );
+              if (!isIntakeSummary(selected))
+                throw Error('Native attribution selection unavailable');
+              const host = nativeAssistantConversion(
+                dbFor(profileId),
+                root,
+                profileId,
+                id,
+                selected,
+              );
+              chats.push({
+                conversionCheckpoint: {
+                  ...checkpoint,
+                  attribution: readNativeAttributionMetadata(host, { ...checkpoint }),
+                },
+              });
+            } else chats.push({ conversionCheckpoint: checkpoint });
+          }
         } catch (error) {
           if (error instanceof HttpError && error.code === 'CHAT_READ_LIMIT') omittedChats++;
           else unavailableChats++;
@@ -4544,12 +5404,14 @@ export function createAssistant({
       const context = chat.context?.intakeRepair
         ? {
             ...requestedContext,
-            intakeRepair: revalidateIntakeDraftRepairScope(
-              dbFor(profileId),
-              root,
-              profileId,
-              chat.context.intakeRepair,
-            ),
+            intakeRepair: nativeRepair(profileId, chat.context.intakeRepair)
+              ? chat.context.intakeRepair
+              : revalidateIntakeDraftRepairScope(
+                  dbFor(profileId),
+                  root,
+                  profileId,
+                  chat.context.intakeRepair,
+                ),
           }
         : requestedContext;
       if (
@@ -4599,6 +5461,65 @@ export function createAssistant({
         state.finish?.('cancelled');
       }
       return chat;
+    },
+    async applyRead(profileId, id, proposalId) {
+      const chat = get(profileId, id),
+        proposal = required(
+          chat.proposals.find((item) => item.id === proposalId),
+          'Proposal not found',
+        );
+      if (
+        proposal.kind !== 'intake_draft_repair' ||
+        !nativeRepair(profileId, chat.context?.intakeRepair)
+      )
+        return service.apply(profileId, id, proposalId);
+      if (!actionExtensions.applyAsync || !actionExtensions.reconcile)
+        throw new HttpError(
+          500,
+          'PROPOSAL_KIND',
+          'Selected draft repairs require asynchronous preparation and durable reconciliation',
+        );
+      const applicationKey = JSON.stringify([profileId, id, proposalId]);
+      const pending = repairApplications.get(applicationKey);
+      if (pending) return pending;
+      const apply = async () => {
+        const db = dbFor(profileId);
+        reconcileActions(profileId, chat);
+        if (proposal.status === 'applied') return chat;
+        try {
+          const result = await actionExtensions.applyAsync!(proposal, {
+            profileId,
+            chat,
+            db,
+            root,
+          });
+          dbFor(profileId);
+          if (!result || result.applied !== true)
+            throw new HttpError(
+              409,
+              'PROPOSAL_NOT_APPLIED',
+              'The reviewed proposal was not applied',
+            );
+          if (typeof result.resultUrl === 'string') proposal.resultUrl = result.resultUrl;
+          proposal.status = 'applied';
+          proposal.error = null;
+          proposal.durability = personalDurabilityStatus(db);
+          persist(profileId, chat, 'proposal-applied');
+          return chat;
+        } catch (error) {
+          proposal.error = errorMessage(error);
+          proposal.status = 'failed';
+          persist(profileId, chat, 'proposal-failed');
+          throw error;
+        }
+      };
+      const result = apply();
+      repairApplications.set(applicationKey, result);
+      try {
+        return await result;
+      } finally {
+        repairApplications.delete(applicationKey);
+      }
     },
     apply(profileId, id, proposalId) {
       const chat = get(profileId, id),

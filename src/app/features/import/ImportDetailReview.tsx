@@ -1,3 +1,21 @@
+import { readSelectedClinicalReview } from '../../data/intake-clinical-review';
+import { useSelectedClinicalReview } from '../intake/useSelectedClinicalReview';
+import { ClinicalReviewSections } from '../intake/ClinicalReviewPages';
+import { ReferencedClinicalRecord } from '../intake/ReferencedClinicalRecord';
+import { ReferencedClinicalControls } from '../intake/ReferencedClinicalControls';
+import { ReviewDraftHistory } from '../intake/ReviewDraftHistory';
+import { QuestionAnswerHistory } from '../intake/QuestionAnswerHistory';
+import { CollectionReportReview } from './CollectionImportReview';
+import {
+  isCollectionReportDetail,
+  type CollectionReportDetail,
+} from '../../../shared/intake-clinical-pages';
+import {
+  intakeFilenameDisplay,
+  isIntakePackageHeader,
+  type IntakeRead,
+  type IntakeHeader,
+} from '../../../shared/intake-summary';
 import { RecordOwnershipAction } from '../clinical-review/RecordOwnershipAction';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { FutureNameChoice } from './ImportFutureNameChoice';
@@ -27,7 +45,6 @@ import type {
   IntakeReportQueueDetail,
   IntakeReportQueueRecord,
   IntakeReportSourceReview,
-  IntakeReview,
   IntakeReviewDecision,
   IntakeReviewRecord,
 } from '../../../shared/intake';
@@ -81,12 +98,11 @@ import {
   reviewRecordTitle,
 } from '../intake/ReviewWorkspace';
 import { SourceTextReview } from '../intake/SourceTextReview';
-import { SourceContextNotes } from '../intake/SourceContextNotes';
 import { useReportAcceptance } from '../intake/useReportAcceptance';
 import { initialDraft, type LocalReviewDraft, useReviewDrafts } from '../intake/useReviewDrafts';
 import { ImportSaveStatus } from './ImportSaveStatus';
 import { ImportRecordCorrection } from './ImportRecordCorrection';
-import { acceptedRecordsForScope, SavedRecordDestinations } from './SavedRecordDestinations';
+import { loadAcceptedRecordsForScope, SavedRecordDestinations } from './SavedRecordDestinations';
 import '../intake/intake.css';
 import '../intake/intake-guided.css';
 
@@ -101,7 +117,7 @@ export interface ImportDetailSelection {
 const errorMessage = (cause: unknown) =>
   cause instanceof Error ? cause.message : 'Unable to complete this import review action.';
 
-const visibleMetadata = (intake: Intake): IntakeMetadata => ({
+const visibleMetadata = (intake: IntakeHeader): IntakeMetadata => ({
   source: intake.metadata ? intake.metadata.source : intake.provider || null,
   careArea: intake.metadata?.careArea ?? null,
   documentType: intake.metadata?.documentType ?? null,
@@ -158,7 +174,7 @@ function MappingSummary({ mapping }: { mapping: IntakeClinicalMapping }) {
   );
 }
 
-function DraftSummary({ draft }: { draft: LocalReviewDraft }) {
+export function DraftSummary({ draft }: { draft: LocalReviewDraft }) {
   return (
     <div>
       <p>
@@ -174,8 +190,18 @@ function DraftSummary({ draft }: { draft: LocalReviewDraft }) {
               .join(' · ')
           : 'None'}
       </p>
+      {draft.resolutionsReference && (
+        <>
+          <p>
+            {draft.resolutionsReference.count.toLocaleString()} saved question decisions remain
+            referenced in this draft. The entries below show only decisions edited in this open
+            review.
+          </p>
+          <ReviewDraftHistory history={draft.history} />
+        </>
+      )}
       <p>
-        Issue resolutions:{' '}
+        {draft.resolutionsReference ? 'Decisions shown in this review' : 'Issue resolutions'}:{' '}
         {draft.resolutions.length
           ? draft.resolutions
               .map((resolution) => `${resolution.issueId}: ${resolution.outcome}`)
@@ -216,7 +242,7 @@ function reusableRule(
   };
 }
 
-function originalSourceFileId(record: IntakeReviewRecord, intake: Intake) {
+function originalSourceFileId(record: IntakeReviewRecord, intake: IntakeHeader) {
   for (const evidence of record.evidence) {
     const match = evidence.contentUrl?.match(/\/api\/sources\/([^/?#]+)\/content(?:[?#]|$)/);
     if (match)
@@ -226,7 +252,7 @@ function originalSourceFileId(record: IntakeReviewRecord, intake: Intake) {
         // Fall through to the guarded intake fallback.
       }
   }
-  return /zip/i.test(intake.mimeType) || /\.zip$/i.test(intake.filename) ? null : intake.id;
+  return isIntakePackageHeader(intake) ? null : intake.id;
 }
 
 function recordKey(block: IntakeReportQueueBlock, record: IntakeReportQueueRecord) {
@@ -288,10 +314,15 @@ export function ImportDetailReview({
   const identityGeneration = useRef(0);
   const identityMounted = useRef(true);
   const restoringIdentityRef = useRef(false);
-  const detail = useResource<IntakeReportQueueDetail>(
-    `/intakes/report-queue/${encodeURIComponent(selection.groupId)}?view=all&limit=100`,
+  const rawDetail = useResource<IntakeReportQueueDetail | CollectionReportDetail>(
+    `/intakes/report-queue/${encodeURIComponent(selection.groupId)}?view=all&limit=100${selection.intakeId ? `&intakeId=${encodeURIComponent(selection.intakeId)}` : ''}`,
     'review_open',
   );
+  const nativeDetail = isCollectionReportDetail(rawDetail.data) ? rawDetail.data : undefined;
+  const detail = {
+    ...rawDetail,
+    data: isCollectionReportDetail(rawDetail.data) ? null : rawDetail.data,
+  };
   const sourceReview = useResource<IntakeReportSourceReview>(
     `/intakes/${encodeURIComponent(selection.intakeId || '')}/report-source-review?groupId=${encodeURIComponent(selection.groupId)}&view=all`,
   );
@@ -380,21 +411,29 @@ export function ImportDetailReview({
     void Promise.all(
       [...new Set(acceptedBlocks.map((block) => block.intakeId))].map(
         async (intakeId) =>
-          [intakeId, (await api<Intake>(`/intakes/${encodeURIComponent(intakeId)}`)).data] as const,
+          [
+            intakeId,
+            (await api<IntakeRead>(`/intakes/${encodeURIComponent(intakeId)}`)).data,
+          ] as const,
       ),
     )
-      .then((intakes) => {
+      .then(async (intakes) => {
         if (cancelled) return;
         const byIntake = new Map(intakes);
         const next = new Map<string, IntakeAcceptedRecord>();
         for (const block of current.blocks) {
           const intake = byIntake.get(block.intakeId);
           if (!intake) continue;
-          const accepted = acceptedRecordsForScope(intake, {
-            groupId: current.group.groupId,
-            proposalId: block.proposalId,
-            recordIds: block.records.map((record) => record.id),
-          });
+          const accepted = await loadAcceptedRecordsForScope(
+            intake.id,
+            {
+              groupId: current.group.groupId,
+              proposalId: block.proposalId,
+              recordIds: block.records.map((record) => record.id),
+            },
+            intake,
+          );
+          if (cancelled) return;
           for (const record of block.records) {
             const destination = accepted.find((item) => item.recordId === record.id);
             if (destination) next.set(recordKey(block, record), destination);
@@ -1016,6 +1055,7 @@ export function ImportDetailReview({
               <Dialog.Close
                 className="icon-button"
                 aria-label="Close"
+                data-review-context-dismiss
                 disabled={identityBusy || sourceBusy}
               >
                 <X size={18} />
@@ -1059,9 +1099,25 @@ export function ImportDetailReview({
         .flatMap((target) => [target.issueId, ...(target.issueIds || [])]) || [],
     );
 
+  if (nativeDetail)
+    return (
+      <CollectionReportReview
+        parentError={rawDetail.error?.message}
+        initial={nativeDetail}
+        selection={selection}
+        onBack={onBack}
+        onChanged={() => {
+          rawDetail.reload();
+          onChanged();
+        }}
+        onUseSource={onUseSource}
+        embedded={embedded}
+        beforeCloseRef={beforeCloseRef}
+      />
+    );
   if (detail.loading && !detail.data)
     return <LoadingIndicator label="Opening exact import review…" layout="centered" />;
-  if (detail.error)
+  if (detail.error && (!detail.data || !selection.recordId))
     return (
       <section className="import-detail-state" role="alert">
         <p>{detail.error.message}</p>
@@ -1084,6 +1140,8 @@ export function ImportDetailReview({
         groupId={selection.groupId}
         block={exact.block}
         recordId={exact.record.id}
+        contextError={detail.error?.message}
+        onRetryContext={detail.reload}
         savedDestination={savedDestinations.get(recordKey(exact.block, exact.record))}
         identityPanel={identityPanel}
         identityRevision={identityRevision}
@@ -1225,9 +1283,8 @@ export function ImportDetailReview({
 }
 
 function ImportFileDetails({ intakeId }: { intakeId: string }) {
-  const intake = useResource<Intake>(`/intakes/${encodeURIComponent(intakeId)}`);
-  if (!intake.data || !(/zip/i.test(intake.data.mimeType) || /\.zip$/i.test(intake.data.filename)))
-    return null;
+  const intake = useResource<IntakeRead>(`/intakes/${encodeURIComponent(intakeId)}`);
+  if (!intake.data || !isIntakePackageHeader(intake.data)) return null;
   return (
     <details className="intake-processing-details">
       <summary>Package and original file details</summary>
@@ -1236,7 +1293,44 @@ function ImportFileDetails({ intakeId }: { intakeId: string }) {
   );
 }
 
-function ImportRecordDetail({
+/** Keep shared context mounted while a selected draft is pending, including portal event paths. */
+function GuardedReviewContext({ blocked, children }: { blocked: boolean; children: ReactNode }) {
+  if (!children) return null;
+  return (
+    <fieldset
+      disabled={blocked}
+      inert={blocked}
+      style={{ border: 0, margin: 0, padding: 0 }}
+      onClickCapture={(event) => {
+        if (
+          blocked &&
+          !(
+            event.target instanceof Element && event.target.closest('[data-review-context-dismiss]')
+          )
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      }}
+      onKeyDownCapture={(event) => {
+        if (
+          blocked &&
+          event.key !== 'Escape' &&
+          !(
+            event.target instanceof Element && event.target.closest('[data-review-context-dismiss]')
+          )
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      }}
+    >
+      {children}
+    </fieldset>
+  );
+}
+
+export function ImportRecordDetail({
   embedded = false,
   beforeCloseRef,
   groupId,
@@ -1248,6 +1342,8 @@ function ImportRecordDetail({
   sourcePanel,
   commonIdentityIssueIds,
   sourceError,
+  contextError,
+  onRetryContext,
   onBack,
   onChanged,
   onUseSource,
@@ -1263,6 +1359,8 @@ function ImportRecordDetail({
   sourcePanel: ReactNode;
   commonIdentityIssueIds: Set<string>;
   sourceError: string;
+  contextError?: string;
+  onRetryContext?: () => void;
   onBack: () => void;
   onChanged: () => void;
   onUseSource: (groupId: string, source: string) => void;
@@ -1279,13 +1377,15 @@ function ImportRecordDetail({
   activeDetailScope.current = detailScope;
   const activeProfile = useRef(profile?.id);
   activeProfile.current = profile?.id;
-  const proposalQuery = block.proposalId
-    ? `?proposalId=${encodeURIComponent(block.proposalId)}`
-    : '';
-  const intake = useResource<Intake>(`/intakes/${encodeURIComponent(block.intakeId)}`);
-  const review = useResource<IntakeReview>(
-    `/intakes/${encodeURIComponent(block.intakeId)}/review${proposalQuery}`,
-  );
+  const intake = useResource<IntakeRead>(`/intakes/${encodeURIComponent(block.intakeId)}`);
+  const review = useSelectedClinicalReview(block.intakeId, block.proposalId, recordId);
+  const authorityUnavailable =
+    review.loading ||
+    !!review.error ||
+    intake.loading ||
+    !!intake.refreshing ||
+    !!intake.error ||
+    !!contextError;
   const drafts = useReviewDrafts(profile?.id || '', () => {
     review.reload();
     intake.reload();
@@ -1295,6 +1395,7 @@ function ImportRecordDetail({
     scope: string;
     record: IntakeReportAcceptanceReceipt['receipts'][number]['records'][number];
   }>();
+  const [selectedControlsPending, setSelectedControlsPending] = useState(false);
   const recentDestination =
     recentAcceptance?.scope === detailScope ? recentAcceptance.record : undefined;
   const acceptance = useReportAcceptance(profile?.id || '', (result) => {
@@ -1360,8 +1461,8 @@ function ImportRecordDetail({
   }, [detailScope]);
 
   useEffect(() => {
-    if (review.data) drafts.hydrate(review.data);
-  }, [review.data]);
+    if (review.data && review.record) drafts.hydrateRecords(review.data, [review.record]);
+  }, [review.data, review.record]);
   useEffect(() => {
     if (identityRevision > 0) review.reload();
   }, [identityRevision]);
@@ -1375,7 +1476,7 @@ function ImportRecordDetail({
     return () => window.removeEventListener('beforeunload', warn);
   }, []);
 
-  const record = review.data?.records.find((item) => item.id === recordId);
+  const record = review.record;
   const draft = record && review.data ? drafts.current(review.data, record) : null;
   const decision = draft?.decision;
   const blocked =
@@ -1401,13 +1502,31 @@ function ImportRecordDetail({
       recentDestination.candidateVersionId === record?.candidateVersionId
     );
   const finalized = accepted || record?.reviewState === 'kept_original';
-  const durableDestination = intake.data
-    ? acceptedRecordsForScope(intake.data, {
-        groupId,
-        proposalId: block.proposalId,
-        recordIds: [recordId],
-      })[0]
-    : undefined;
+  const [durableDestination, setDurableDestination] = useState<IntakeAcceptedRecord>();
+  const [destinationError, setDestinationError] = useState('');
+  useEffect(() => {
+    let cancelled = false;
+    setDurableDestination(undefined);
+    setDestinationError('');
+    if (!intake.data || !accepted) return;
+    void loadAcceptedRecordsForScope(
+      block.intakeId,
+      { groupId, proposalId: block.proposalId, recordIds: [recordId] },
+      intake.data,
+    )
+      .then((records) => {
+        if (!cancelled) setDurableDestination(records[0]);
+      })
+      .catch(() => {
+        if (!cancelled)
+          setDestinationError(
+            'Saved record links could not load. Your saved records are unchanged.',
+          );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [intake.data, accepted, block.intakeId, block.proposalId, groupId, recordId]);
   const destination = recentDestination || savedDestination || durableDestination;
   const metadataSuggestions = useMemo<IntakeMetadataSuggestions>(() => {
     const collected = {
@@ -1416,7 +1535,7 @@ function ImportRecordDetail({
       documentType: new Set<string>(),
       topics: new Set<string>(),
     };
-    for (const item of review.data?.records || [])
+    for (const item of record ? [record] : [])
       for (const issue of item.issues || []) {
         const suggestion = issue.metadataSuggestion;
         if (!suggestion) continue;
@@ -1433,6 +1552,9 @@ function ImportRecordDetail({
   // Approval must use the review the person can see after their own write.
   // Otherwise an answer/autosave acknowledgement races its resource refresh.
   const canSave =
+    !authorityUnavailable &&
+    !selectedControlsPending &&
+    !review.loading &&
     !drafts.pending() &&
     !drafts.error &&
     !!review.data &&
@@ -1450,7 +1572,7 @@ function ImportRecordDetail({
     action: (operationId: string) => Promise<void>,
     kind: ClientOperationSummary['kind'] = 'review_action',
   ) {
-    if (busy) return;
+    if (busy || authorityUnavailable) return;
     const operation = beginClientOperation(kind, { selected: 1, actions: 1 });
     const started = performance.now();
     let outcome: ClientOperationSummary['outcome'] = 'completed';
@@ -1605,7 +1727,7 @@ function ImportRecordDetail({
   }
 
   async function saveMetadata(metadata: IntakeMetadata) {
-    if (!profile?.id || !intake.data || metadataBusy) return false;
+    if (authorityUnavailable || !profile?.id || !intake.data || metadataBusy) return false;
     const scope = detailScope;
     const profileId = profile.id;
     const intakeId = block.intakeId;
@@ -1643,7 +1765,14 @@ function ImportRecordDetail({
 
   async function applyReviewedMetadata() {
     const comparison = metadataConflict;
-    if (!comparison || !profile?.id || metadataBusy || metadataOperation.current) return;
+    if (
+      authorityUnavailable ||
+      !comparison ||
+      !profile?.id ||
+      metadataBusy ||
+      metadataOperation.current
+    )
+      return;
     const scope = detailScope;
     const profileId = profile.id;
     const intakeId = block.intakeId;
@@ -1691,6 +1820,10 @@ function ImportRecordDetail({
   const metadataPending = () =>
     metadataDirty || !!metadataOperation.current || !!metadataConflict || metadataBusy;
   async function flushPendingReview() {
+    if (selectedControlsPending) {
+      setError('Save, retry or discard the selected record choice before leaving.');
+      return false;
+    }
     if (correctionPending.current) {
       setError('Update the correction, or use Close review inside the editor to discard it.');
       return false;
@@ -1724,17 +1857,16 @@ function ImportRecordDetail({
       if (!(await flushPendingReview()))
         throw new Error('Save or discard unfinished review edits before accepting this record.');
       if (activeDetailScope.current !== scope || activeProfile.current !== profileId) return;
-      const fresh = (
-        await api<IntakeReview>(
-          `/api/profiles/${encodeURIComponent(profileId)}/intakes/${encodeURIComponent(intakeId)}/review${proposalId ? `?proposalId=${encodeURIComponent(proposalId)}` : ''}`,
-          { operationId: diagnosticOperationId },
-        )
-      ).data;
-      if (activeDetailScope.current !== scope || activeProfile.current !== profileId) return;
-      const current = fresh.records.find(
-        (item) =>
-          item.id === exactRecord.id && item.candidateVersionId === exactRecord.candidateVersionId,
+      const selected = await readSelectedClinicalReview(
+        intakeId,
+        proposalId,
+        exactRecord.id,
+        exactRecord.candidateVersionId,
+        { operationId: diagnosticOperationId },
       );
+      if (activeDetailScope.current !== scope || activeProfile.current !== profileId) return;
+      const fresh = selected.context;
+      const current = selected.record.kind === 'record' ? selected.record.record : undefined;
       if (
         !current?.candidateId ||
         !current.candidateVersionId ||
@@ -1786,7 +1918,45 @@ function ImportRecordDetail({
 
   if ((review.loading && !review.data) || (intake.loading && !intake.data))
     return <LoadingIndicator label="Opening record fields and evidence…" layout="centered" />;
-  if (review.error || intake.error)
+  const refreshError = review.error?.message || intake.error?.message || contextError;
+  const refreshNotice =
+    (review.selected || intake.data) && authorityUnavailable ? (
+      <section className="import-detail-state" role={refreshError ? 'alert' : 'status'}>
+        <p>{refreshError || 'Refreshing this record’s current review…'}</p>
+        {refreshError && (
+          <>
+            <p>
+              Your open review is retained. Refresh it before making a new choice. An unconfirmed
+              save can still retry its exact request.
+            </p>
+            <button
+              className="button secondary"
+              type="button"
+              onClick={() => {
+                review.reload();
+                intake.reload();
+                onRetryContext?.();
+              }}
+            >
+              Retry exact record
+            </button>
+          </>
+        )}
+      </section>
+    ) : null;
+  const contextBlocked =
+    authorityUnavailable ||
+    selectedControlsPending ||
+    drafts.pending() ||
+    fieldCorrectionDirty ||
+    sourceTextPending;
+  const identityContextPanel = (
+    <GuardedReviewContext blocked={contextBlocked}>{identityPanel}</GuardedReviewContext>
+  );
+  const sourceContextPanel = (
+    <GuardedReviewContext blocked={contextBlocked}>{sourcePanel}</GuardedReviewContext>
+  );
+  if ((review.error && !review.selected) || (intake.error && !intake.data))
     return (
       <section className="import-detail-state" role="alert">
         <p>{review.error?.message || intake.error?.message}</p>
@@ -1796,6 +1966,7 @@ function ImportRecordDetail({
           onClick={() => {
             review.reload();
             intake.reload();
+            onRetryContext?.();
           }}
         >
           Retry exact record
@@ -1804,6 +1975,25 @@ function ImportRecordDetail({
           Back to Import
         </button>
       </section>
+    );
+  if (review.selected?.record.kind === 'reference')
+    return (
+      <>
+        {refreshNotice}
+        {identityContextPanel}
+        {sourceContextPanel}
+        <ReferencedClinicalRecord
+          key={`${review.selected.record.selection.recordId}:${review.selected.record.selection.candidateVersionId}`}
+          context={review.selected.context}
+          record={review.selected.record}
+          onRefresh={review.reload}
+          onChanged={onChanged}
+          onBack={onBack}
+          onPendingChange={setSelectedControlsPending}
+          authorityUnavailable={authorityUnavailable}
+        />
+        <ClinicalReviewSections intakeId={block.intakeId} proposalId={block.proposalId} />
+      </>
     );
   if (!review.data || !intake.data || !record || !draft || !decision)
     return (
@@ -1817,85 +2007,174 @@ function ImportRecordDetail({
       </section>
     );
 
+  const linkedReportScope =
+    record.reportGroups && !Array.isArray(record.reportGroups) ? (
+      <section aria-label="Complete linked reports">
+        <p>
+          {record.reportGroups.count.toLocaleString()} retained report links belong to this record.
+          The first link identifies a starting report; open the complete list to inspect every
+          association.
+        </p>
+        <ReferencedClinicalControls
+          guardNavigation={false}
+          context={review.selected!.context}
+          selection={{
+            recordId: record.id,
+            candidateVersionId: record.candidateVersionId,
+            selectionReviewToken: record.selectionReviewToken,
+          }}
+          initialSection="reportGroups"
+          sections={['reportGroups']}
+          triggerLabel="Inspect linked reports"
+          disabled={contextBlocked || busy || drafts.saving || acceptance.busy || acceptanceBlocked}
+          onPending={() => {}}
+          onRefresh={review.reload}
+        />
+      </section>
+    ) : null;
+  const ownershipBlockerScope = record.identityReview?.ownershipBlockers ? (
+    <section aria-label="Complete person assignment requirements">
+      <p>
+        {record.identityReview.ownershipBlockers.count.toLocaleString()} person assignment
+        requirements remain. Open their retained evidence before resolving the person review for
+        this report.
+      </p>
+      <ReferencedClinicalControls
+        guardNavigation={false}
+        context={review.selected!.context}
+        selection={{
+          recordId: record.id,
+          candidateVersionId: record.candidateVersionId,
+          selectionReviewToken: record.selectionReviewToken,
+        }}
+        initialSection="ownershipBlockers"
+        sections={['ownershipBlockers']}
+        triggerLabel="Inspect person assignment requirements"
+        disabled={contextBlocked || busy || drafts.saving || acceptance.busy || acceptanceBlocked}
+        onPending={() => {}}
+        onRefresh={review.reload}
+      />
+    </section>
+  ) : null;
   const relatedReview = (
-    <ImportRelatedRecordEditor
-      record={record}
-      decision={decision}
-      busy={
-        busy ||
-        drafts.saving ||
-        acceptance.busy ||
-        acceptanceBlocked ||
-        !!drafts.comparison ||
-        fieldCorrectionDirty
-      }
-      onChange={(next) => drafts.update(review.data!, record, { decision: next })}
-      onDiscoverRelated={(search) =>
-        api<IntakeRelatedRecordsResult>(
-          `/intakes/${encodeURIComponent(block.intakeId)}/related-records`,
-          {
-            method: 'POST',
-            body: JSON.stringify({
-              proposalId: block.proposalId,
-              recordId: record.id,
-              candidateVersionId: record.candidateVersionId,
-              ...search,
-            }),
-          },
-        ).then(({ data }) => data)
-      }
-      correctionSupporting={
-        record.candidateId && record.candidateVersionId && originalSourceFileId(record, intake.data)
-          ? {
-              reference: {
-                intakeId: intake.data.id,
-                proposalId: review.data.proposalId,
+    <>
+      {linkedReportScope}
+      {ownershipBlockerScope}
+      <ImportRelatedRecordEditor
+        nativeControls={
+          review.selected?.native && review.selected.record.kind === 'record'
+            ? (onCorrectSaved) => (
+                <ReferencedClinicalControls
+                  guardNavigation={false}
+                  context={review.selected!.context}
+                  selection={{
+                    recordId: record.id,
+                    candidateVersionId: record.candidateVersionId,
+                    selectionReviewToken: record.selectionReviewToken,
+                  }}
+                  initialSection="comparisons"
+                  disabled={
+                    authorityUnavailable ||
+                    busy ||
+                    drafts.pending() ||
+                    drafts.saving ||
+                    acceptance.busy ||
+                    acceptanceBlocked ||
+                    fieldCorrectionDirty
+                  }
+                  onPending={setSelectedControlsPending}
+                  onRefresh={() => {
+                    review.reload();
+                    intake.reload();
+                    onChanged();
+                  }}
+                  onCorrectSaved={onCorrectSaved}
+                />
+              )
+            : undefined
+        }
+        record={record}
+        decision={decision}
+        busy={
+          busy ||
+          drafts.saving ||
+          acceptance.busy ||
+          acceptanceBlocked ||
+          !!drafts.comparison ||
+          fieldCorrectionDirty
+        }
+        onChange={(next) => drafts.update(review.data!, record, { decision: next })}
+        onDiscoverRelated={(search) =>
+          api<IntakeRelatedRecordsResult>(
+            `/intakes/${encodeURIComponent(block.intakeId)}/related-records`,
+            {
+              method: 'POST',
+              body: JSON.stringify({
+                proposalId: block.proposalId,
                 recordId: record.id,
-                candidateId: record.candidateId,
                 candidateVersionId: record.candidateVersionId,
-                originalSourceFileId: originalSourceFileId(record, intake.data)!,
-              },
-              label: record.title,
-              locator:
-                record.evidence.map((entry) => entry.locator).join(' · ') || 'Original intake',
-              contentUrl:
-                record.evidence.find((entry) => entry.contentUrl)?.contentUrl ||
-                intake.data.contentUrl,
-            }
-          : undefined
-      }
-      previewCorrection={(request) =>
-        api<RecordCorrectionPreview>('/clinical-review/correction-preview', {
-          method: 'POST',
-          body: JSON.stringify(request),
-        }).then(({ data }) => data)
-      }
-      applyCorrection={(request) =>
-        api<RecordCorrectionApplyResult>('/clinical-review/correction-apply', {
-          method: 'POST',
-          body: JSON.stringify(request),
-        }).then(({ data }) => data)
-      }
-      onCorrectionApplied={() => {
-        review.reload();
-        intake.reload();
-        onChanged();
-      }}
-    />
+                ...search,
+              }),
+            },
+          ).then(({ data }) => data)
+        }
+        correctionSupporting={
+          record.candidateId &&
+          record.candidateVersionId &&
+          originalSourceFileId(record, intake.data)
+            ? {
+                reference: {
+                  intakeId: intake.data.id,
+                  proposalId: review.data.proposalId,
+                  recordId: record.id,
+                  candidateId: record.candidateId,
+                  candidateVersionId: record.candidateVersionId,
+                  originalSourceFileId: originalSourceFileId(record, intake.data)!,
+                },
+                label: record.title,
+                locator:
+                  record.evidence.map((entry) => entry.locator).join(' · ') || 'Original intake',
+                contentUrl:
+                  record.evidence.find((entry) => entry.contentUrl)?.contentUrl ||
+                  intake.data.contentUrl,
+              }
+            : undefined
+        }
+        previewCorrection={(request) =>
+          api<RecordCorrectionPreview>('/clinical-review/correction-preview', {
+            method: 'POST',
+            body: JSON.stringify(request),
+          }).then(({ data }) => data)
+        }
+        applyCorrection={(request) =>
+          api<RecordCorrectionApplyResult>('/clinical-review/correction-apply', {
+            method: 'POST',
+            body: JSON.stringify(request),
+          }).then(({ data }) => data)
+        }
+        onCorrectionApplied={() => {
+          review.reload();
+          intake.reload();
+          onChanged();
+        }}
+      />
+    </>
   );
 
   if (embedded && !finalized) {
     const fields = recordCorrectionFields(decision.mapping.kind || record.kind, record.issues);
     return (
       <section className="import-detail is-embedded is-focused-correction">
+        {refreshNotice}
         <ReviewNavigationGuard
           anyLocationChange
-          pending={() => correctionPending.current || drafts.pending()}
+          pending={() => selectedControlsPending || correctionPending.current || drafts.pending()}
           flush={flushPendingReview}
         />
         <a className="text-link" href={`#${detailUrl(groupId, block, record)}`}>
           Open full review <ArrowRight size={15} aria-hidden="true" />
         </a>
+        <ReviewDraftHistory history={record.draft?.history} />
         {(error || drafts.error) && (
           <div className="import-error" role="alert">
             {error || drafts.error}
@@ -1951,7 +2230,13 @@ function ImportRecordDetail({
           mapping={decision.mapping}
           fields={fields}
           disabled={
-            busy || drafts.saving || acceptanceBlocked || !!drafts.error || !!drafts.comparison
+            authorityUnavailable ||
+            selectedControlsPending ||
+            busy ||
+            drafts.saving ||
+            acceptanceBlocked ||
+            !!drafts.error ||
+            !!drafts.comparison
           }
           onDirtyChange={(dirty) => {
             correctionPending.current = dirty;
@@ -1959,6 +2244,7 @@ function ImportRecordDetail({
           }}
           onClose={onBack}
           onUpdate={async (patch, correctionReason) => {
+            if (authorityUnavailable) return false;
             const resolutions = (record.issues || [])
               .filter(
                 (issue) =>
@@ -2005,9 +2291,12 @@ function ImportRecordDetail({
       className={`import-detail${embedded ? ' is-embedded' : ''}`}
       aria-label={`Review ${reviewRecordTitle(record)}`}
     >
+      {refreshNotice}
       <ReviewNavigationGuard
         anyLocationChange
-        pending={() => drafts.pending() || metadataPending() || sourceTextPending}
+        pending={() =>
+          selectedControlsPending || drafts.pending() || metadataPending() || sourceTextPending
+        }
         flush={flushPendingReview}
       />
       <button
@@ -2069,16 +2358,18 @@ function ImportRecordDetail({
           <p className="eyebrow">{embedded ? 'REVIEW ORIGINAL & RECORD' : 'EXACT RECORD REVIEW'}</p>
           <h2>{reviewRecordTitle(record, decision.mapping)}</h2>
           <p>
-            {intake.data.filename} · {record.date || 'Date not given'}
+            {intakeFilenameDisplay(intake.data)} · {record.date || 'Date not given'}
           </p>
         </div>
       </header>
       <SavedRecordDestinations
         records={destination ? [destination] : []}
         label="Saved destination"
+        error={destinationError}
+        onRetry={intake.reload}
       />
-      {identityPanel}
-      {sourcePanel}
+      {identityContextPanel}
+      {sourceContextPanel}
       {drafts.comparison && (
         <section aria-label="Review draft conflict" className="import-page-notice">
           <h3>Review newer saved changes</h3>
@@ -2180,18 +2471,31 @@ function ImportRecordDetail({
             intake={intake.data}
             options={[intake.data]}
             suggestions={metadataSuggestions}
-            busy={metadataBusy || !!metadataOperation.current || !!metadataConflict}
+            busy={
+              authorityUnavailable ||
+              metadataBusy ||
+              !!metadataOperation.current ||
+              !!metadataConflict
+            }
             onSave={saveMetadata}
             onDirtyChange={setMetadataDirty}
           />
         </details>
         <StandaloneRecordEditor
+          intakeId={block.intakeId}
+          onRefresh={review.reload}
           record={record}
           decision={decision}
           draft={draft}
           commonIdentityIssueIds={commonIdentityIssueIds}
           busy={
-            busy || drafts.saving || acceptance.busy || acceptanceBlocked || !!drafts.comparison
+            authorityUnavailable ||
+            selectedControlsPending ||
+            busy ||
+            drafts.saving ||
+            acceptance.busy ||
+            acceptanceBlocked ||
+            !!drafts.comparison
           }
           onChange={(next) => drafts.update(review.data!, record, { decision: next })}
           onDraft={(patch) => drafts.update(review.data!, record, patch)}
@@ -2200,21 +2504,8 @@ function ImportRecordDetail({
           relatedReview={relatedReview}
           onReviewLater={() => void disposition('review_later')}
         />
-        {!!(review.data.sourceContext?.length || review.data.coverageGaps.length) && (
-          <details className="intake-reading-notes">
-            <summary>Transcription notes and coverage</summary>
-            <SourceContextNotes items={review.data.sourceContext || []} />
-            {!!review.data.coverageGaps.length && (
-              <ul>
-                {review.data.coverageGaps.map((gap) => (
-                  <li key={gap.id}>
-                    {gap.label}: {gap.detail}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </details>
-        )}
+        <ClinicalReviewSections intakeId={block.intakeId} proposalId={block.proposalId} />
+        <ReviewDraftHistory history={record.draft?.history} />
         <section className="intake-accept intake-guided-actions" aria-label="Review actions">
           <p role="status">
             {drafts.saving
@@ -2279,7 +2570,7 @@ function ImportRecordDetail({
           )}
         </section>
       </ReviewLayout>
-      {(/zip/i.test(intake.data.mimeType) || /\.zip$/i.test(intake.data.filename)) && (
+      {isIntakePackageHeader(intake.data) && (
         <details className="intake-processing-details">
           <summary>Package and original file details</summary>
           <PackageInventory intake={intake.data} />
@@ -2299,6 +2590,7 @@ function ImportRelatedRecordEditor({
   previewCorrection,
   applyCorrection,
   onCorrectionApplied,
+  nativeControls,
 }: {
   record: IntakeReviewRecord;
   decision: IntakeReviewDecision;
@@ -2309,6 +2601,7 @@ function ImportRelatedRecordEditor({
   previewCorrection: (request: RecordCorrectionRequest) => Promise<RecordCorrectionPreview>;
   applyCorrection: (request: RecordCorrectionApplyRequest) => Promise<RecordCorrectionApplyResult>;
   onCorrectionApplied: (result: RecordCorrectionApplyResult) => void | Promise<void>;
+  nativeControls?: (onCorrectSaved: (record: IntakeEvidenceComparison) => void) => ReactNode;
 }) {
   const [correctionTarget, setCorrectionTarget] = useState<IntakeEvidenceComparison | null>(null);
   return (
@@ -2322,14 +2615,18 @@ function ImportRelatedRecordEditor({
             ? `Review ${record.comparisons.length} possible related saved ${record.comparisons.length === 1 ? 'record' : 'records'}`
             : 'Find possible related saved records'}
         </summary>
-        <RelatedRecordReview
-          record={record}
-          decision={decision}
-          onChange={onChange}
-          onDiscover={onDiscoverRelated}
-          onCorrectSaved={(other) => setCorrectionTarget(other)}
-          disabled={busy}
-        />
+        {nativeControls ? (
+          nativeControls(setCorrectionTarget)
+        ) : (
+          <RelatedRecordReview
+            record={record}
+            decision={decision}
+            onChange={onChange}
+            onDiscover={onDiscoverRelated}
+            onCorrectSaved={(other) => setCorrectionTarget(other)}
+            disabled={busy}
+          />
+        )}
       </details>
       {correctionTarget &&
         ['observation', 'medication', 'procedure', 'document'].includes(correctionTarget.kind) && (
@@ -2354,6 +2651,8 @@ function ImportRelatedRecordEditor({
 }
 
 function StandaloneRecordEditor({
+  intakeId,
+  onRefresh,
   record,
   decision,
   draft,
@@ -2366,6 +2665,8 @@ function StandaloneRecordEditor({
   onReviewLater,
   relatedReview,
 }: {
+  intakeId: string;
+  onRefresh: () => void;
   record: IntakeReviewRecord;
   decision: IntakeReviewDecision;
   draft: LocalReviewDraft;
@@ -2463,12 +2764,31 @@ function StandaloneRecordEditor({
         .map((question) => (
           <StandaloneQuestion
             key={question.id}
+            intakeId={intakeId}
+            onRefresh={onRefresh}
             question={question}
             answer={draft.answers[question.id] ?? question.answers.at(-1)?.answer ?? ''}
             busy={busy}
             onChange={(answer) => onDraft({ answers: { ...draft.answers, [question.id]: answer } })}
             onSave={(answer) => onAnswer(question.id, answer)}
           />
+        ))}
+      {record.questions
+        ?.filter(
+          (question) =>
+            question.answerHistory &&
+            (question.field === 'duplicate' ||
+              record.issues?.some((issue) => issue.questionId === question.id)),
+        )
+        .map((question) => (
+          <section key={`history:${question.id}`}>
+            <p>{question.prompt}</p>
+            <QuestionAnswerHistory
+              intakeId={intakeId}
+              history={question.answerHistory}
+              onRefresh={onRefresh}
+            />
+          </section>
         ))}
       {relatedReview}
       {decision.mapping.opticalPrescription && (
@@ -2642,13 +2962,17 @@ function StandaloneRecordEditor({
   );
 }
 
-function StandaloneQuestion({
+export function StandaloneQuestion({
+  intakeId,
+  onRefresh,
   question,
   answer,
   busy,
   onChange,
   onSave,
 }: {
+  intakeId: string;
+  onRefresh: () => void;
   question: NonNullable<IntakeReviewRecord['questions']>[number];
   answer: string;
   busy: boolean;
@@ -2680,8 +3004,16 @@ function StandaloneQuestion({
         <small>Answer saved; clinical acceptance remains separate.</small>
       )}
       {question.answers.map((saved) => (
-        <p key={saved.id}>Saved answer: {saved.answer}</p>
+        <p key={saved.id}>
+          {question.answerScope === 'latest' ? 'Latest saved answer' : 'Saved answer'}:{' '}
+          {saved.answer}
+        </p>
       ))}
+      <QuestionAnswerHistory
+        intakeId={intakeId}
+        history={question.answerHistory}
+        onRefresh={onRefresh}
+      />
     </section>
   );
 }

@@ -6,6 +6,19 @@ import {
   type Database,
 } from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
+import { clearIntakeCollectionCache, createIntakeCollections } from './intake-state-collections.ts';
+import { clearIntakeMaintenancePublications } from './intake-state-maintenance.ts';
+import { clearIntakeLegacyBridgeProofs } from './intake-state-migration.ts';
+export type {
+  IntakeCollectionView,
+  PreparedIntakeCollectionMutation,
+  IntakeCollectionArea,
+  IntakeCollectionChange,
+  IntakeCollectionMutation,
+  IntakeCollectionDescriptor,
+  IntakeByteValue,
+  IntakeCollectionValue,
+} from './intake-state-collections.ts';
 import {
   createIntakePrimitiveCounters,
   recordIntakeWork,
@@ -41,6 +54,7 @@ import {
   type Limits,
   type IntakeStateIdentity,
   type IntakeStateResult,
+  type Head,
 } from './intake-state-evidence.ts';
 export type { IntakeStateIdentity, IntakeStateResult } from './intake-state-evidence.ts';
 export interface IntakePreparedMaterialization {
@@ -71,22 +85,44 @@ const preparations = new WeakMap<PreparedIntakeState, Preparation>();
 interface Cache {
   committed: Map<string, CachedBasis>;
   candidates: Map<string, CachedBasis>;
+  prepared: Map<PreparedIntakeState, Preparation>;
   token?: object;
   dispose: () => void;
 }
 const caches = new WeakMap<Database, Cache>();
+/** Legacy materializations share the connection lifecycle with v4 pages. Large
+ * v3 values remain readable, but are not retained as an unbounded warm cache. */
+function remember(cache: Cache, target: Map<string, CachedBasis>, key: string, value: CachedBasis) {
+  target.delete(key);
+  if (value.semanticBytes > 16 * 1024 * 1024) return;
+  target.set(key, value);
+  const retainedBytes = () =>
+    [...cache.committed.values(), ...cache.candidates.values()].reduce(
+      (sum, entry) => sum + entry.semanticBytes,
+      0,
+    );
+  while (cache.committed.size + cache.candidates.size > 64 || retainedBytes() > 32 * 1024 * 1024) {
+    const oldest = cache.committed.size ? cache.committed : cache.candidates;
+    oldest.delete(oldest.keys().next().value!);
+  }
+}
 export function clearIntakeStateCache(db: Database): void {
+  clearIntakeCollectionCache(db);
+  clearIntakeMaintenancePublications(db);
+  clearIntakeLegacyBridgeProofs(db);
   const cache = caches.get(db);
   if (!cache) return;
   cache.committed.clear();
   cache.candidates.clear();
+  for (const prepared of cache.prepared.keys()) preparations.delete(prepared);
+  cache.prepared.clear();
   cache.dispose();
   caches.delete(db);
 }
 function cacheFor(db: Database): Cache {
   let cache = caches.get(db);
   if (!cache) {
-    cache = { committed: new Map(), candidates: new Map(), dispose: () => {} };
+    cache = { committed: new Map(), candidates: new Map(), prepared: new Map(), dispose: () => {} };
     const owned = cache;
     owned.dispose = observeTransactionOutcome(db, (outcome) => {
       try {
@@ -96,7 +132,8 @@ function cacheFor(db: Database): Cache {
         }
         if (outcome.token !== owned.token) return;
         if (outcome.succeeded) {
-          for (const [key, candidate] of owned.candidates) owned.committed.set(key, candidate);
+          for (const [key, candidate] of owned.candidates)
+            remember(owned, owned.committed, key, candidate);
           owned.candidates.clear();
           owned.token = undefined;
         } else clearIntakeStateCache(db);
@@ -124,8 +161,11 @@ export function createIntakeStateStorage(
   const headKey = `${prefix}head`;
   let closed = false;
   const { counters, count } = createIntakePrimitiveCounters(db);
+  const readMeta = db.prepare('SELECT value FROM app_meta WHERE key=?'),
+    readSource = db.prepare('SELECT sha256,kind FROM source_files WHERE id=?'),
+    insertMeta = db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)');
   const get = (key: string) => {
-    const value = db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
+    const value = readMeta.get(key)?.value;
     count('metadataReads');
     if (typeof value === 'string') count('metadataReadBytes', Buffer.byteLength(value));
     return value;
@@ -136,9 +176,7 @@ export function createIntakeStateStorage(
       invalid('closed');
     }
     if (get('owner_profile_id') !== identity.profileId) invalid('database owner');
-    const source = db
-      .prepare('SELECT sha256,kind FROM source_files WHERE id=?')
-      .get(identity.intakeId);
+    const source = readSource.get(identity.intakeId);
     if (!source || source.sha256 !== identity.sourceHash || source.kind !== 'intake_original')
       invalid('original source');
     const durability = recordDurabilityStatus(db);
@@ -146,6 +184,9 @@ export function createIntakeStateStorage(
       clearIntakeStateCache(db);
       invalid('accepted authority requires configured current projection');
     }
+    // V4 also uses the existing outcome observer, including cache/preparation
+    // invalidation after rollback or uncertain durable publication.
+    cacheFor(db);
   }
   function immutable(key: string, serialized: string) {
     const old = get(key);
@@ -153,7 +194,7 @@ export function createIntakeStateStorage(
       if (old !== serialized) invalid('immutable collision');
       return;
     }
-    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(key, serialized);
+    insertMeta.run(key, serialized);
   }
   function cachedBasis(basis: Basis, selectedHead: string): CachedBasis {
     freezeValidatedIntakeJson(basis.value);
@@ -204,8 +245,8 @@ export function createIntakeStateStorage(
     );
     if (token) {
       cache.token = token;
-      cache.candidates.set(prefix, result);
-    } else cache.committed.set(prefix, result);
+      remember(cache, cache.candidates, prefix, result);
+    } else remember(cache, cache.committed, prefix, result);
     return result;
   }
   function normalized(next: unknown): IntakePreparedMaterialization {
@@ -215,6 +256,20 @@ export function createIntakeStateStorage(
     count('normalizedStateBytes', semanticBytes);
     freezeValidatedIntakeJson(value);
     return Object.freeze({ value, serialized, fingerprint: digest(serialized), semanticBytes });
+  }
+  function legacyMaterialization(head: Head): IntakeStateMaterialization {
+    ready();
+    const raw = JSON.stringify(head),
+      cache = cacheFor(db),
+      key = prefix + 'legacy';
+    const prior = cache.committed.get(key) ?? cache.committed.get(prefix);
+    if (prior?.materialization.selectedHead === raw) return prior.materialization;
+    const reconstructed = withIntakeWork(db, 'reconstruction', () =>
+      reconstructIntakeEvidence(identity, caps, head, get),
+    );
+    const result = cachedBasis(reconstructed, raw);
+    remember(cache, cache.committed, key, result);
+    return result.materialization;
   }
   function inspected(prepared: PreparedIntakeState): IntakePreparedMaterialization {
     ready();
@@ -292,7 +347,9 @@ export function createIntakeStateStorage(
     ).run(headKey, serializedHead);
     const cache = cacheFor(db);
     cache.token = token;
-    cache.candidates.set(
+    remember(
+      cache,
+      cache.candidates,
       prefix,
       cachedBasis(
         {
@@ -308,6 +365,16 @@ export function createIntakeStateStorage(
     return result;
   }
   return {
+    collections: createIntakeCollections({
+      db,
+      identity,
+      prefix,
+      ready,
+      get,
+      immutable,
+      legacyMaterialization,
+      invalidate: () => clearIntakeStateCache(db),
+    }),
     counters,
     prepare(next: unknown): PreparedIntakeState {
       return withIntakeWork(db, 'warm', () => {
@@ -322,6 +389,23 @@ export function createIntakeStateStorage(
             cache: cacheFor(db),
             materialization,
           });
+          const cache = cacheFor(db);
+          cache.prepared.set(prepared, preparations.get(prepared)!);
+          // An explicitly prepared legacy value can still use its existing
+          // per-value v3 budget; do not retain other preparations alongside it.
+          while (
+            cache.prepared.size > 1 &&
+            (cache.prepared.size > 8 ||
+              [...cache.prepared.values()].reduce(
+                (sum, entry) => sum + entry.materialization.semanticBytes,
+                0,
+              ) >
+                32 * 1024 * 1024)
+          ) {
+            const oldest = cache.prepared.keys().next().value!;
+            cache.prepared.delete(oldest);
+            preparations.delete(oldest);
+          }
           return prepared;
         } catch (error) {
           if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);

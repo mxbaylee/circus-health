@@ -5,6 +5,12 @@ import { fileURLToPath } from 'node:url';
 import { profilePaths } from './profile-storage.ts';
 import { profileDefinition, validProfileId } from './profiles.ts';
 import { readDatabaseOwner } from './profile-ownership.ts';
+import {
+  beginIntakeMaintenancePublication,
+  finishIntakeMaintenancePublication,
+  verifyIntakeMaintenancePublication,
+  type IntakeMaintenancePublication,
+} from './intake-state-maintenance.ts';
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const LATEST_SCHEMA_VERSION = 7;
 export type Database = DatabaseSync;
@@ -92,6 +98,12 @@ export function openDatabase(path?: string | null, profileId?: string): Database
           'utf8',
         ),
       );
+    // Disposable lookup only: retained accepted decisions remain authoritative.
+    // It is recreated with the cache and does not change the journal schema.
+    db.exec(`CREATE INDEX IF NOT EXISTS manual_batches_native_correction_source
+      ON manual_batches(json_extract(coverage_json,'$.sourceRecordId'),id)
+      WHERE title='Accepted clinical contribution'
+        AND json_type(coverage_json,'$.reviewDraftHistory')='object'`);
     db.exec('COMMIT');
     inTransaction = false;
     return db;
@@ -132,6 +144,7 @@ export interface TransactionOperation {
   operationId?: unknown;
   fingerprint?: unknown;
   expectedRevision?: unknown;
+  intakeMaintenance?: IntakeMaintenancePublication;
   [key: string]: unknown;
 }
 
@@ -165,7 +178,14 @@ export function hasTransactionDurability(db: DatabaseSync): boolean {
   return durabilityHooks.has(db);
 }
 /** Memory-only observers; accepted-record durability hooks retain their ordering. */
-export type TransactionOutcome = { token: object; committed: boolean; succeeded: boolean };
+export type TransactionOutcome = {
+  token: object;
+  committed: boolean;
+  succeeded: boolean;
+  /** Set only by the transaction owner after exact maintenance verification,
+   * successful commit, durable flush and participant cleanup. */
+  intakeMaintenance?: true;
+};
 const transactionTokens = new WeakMap<DatabaseSync, object>();
 const transactionFailures = new WeakMap<DatabaseSync, unknown>();
 /** A failed staged storage write must abort its outer transaction even if caught. */
@@ -174,6 +194,19 @@ export function rejectCurrentTransaction(db: DatabaseSync, error: unknown): void
   transactionFailures.set(db, error);
 }
 const outcomeObservers = new WeakMap<DatabaseSync, Set<(outcome: TransactionOutcome) => void>>();
+const beforePublicationObservers = new WeakMap<DatabaseSync, Set<(token: object) => void>>();
+/** Read-only witnesses inspect the complete caller write set before owner
+ * revision/durability bookkeeping. Observer failure can only suppress its own
+ * optimization; it cannot alter the transaction acknowledgement. */
+export function observeTransactionBeforePublication(
+  db: DatabaseSync,
+  observer: (token: object) => void,
+): () => void {
+  let observers = beforePublicationObservers.get(db);
+  if (!observers) beforePublicationObservers.set(db, (observers = new Set()));
+  observers.add(observer);
+  return () => observers.delete(observer);
+}
 export function currentTransactionToken(db: DatabaseSync): object | undefined {
   return transactionTokens.get(db);
 }
@@ -194,13 +227,20 @@ export function transaction<T>(
   db.exec('BEGIN IMMEDIATE');
   let committed = false;
   let succeeded = false;
+  let verifiedIntakeMaintenance = false;
   const token = {};
   transactionTokens.set(db, token);
   const hooks = durabilityHooks.get(db);
   let captured;
   try {
+    if (operation.intakeMaintenance) {
+      if (!hooks?.capture) throw Error('Intake maintenance requires accepted-row capture');
+      beginIntakeMaintenancePublication(db, operation.intakeMaintenance, token, operation);
+    }
     const retry = hooks?.begin?.(operation);
     if (retry?.replayed) {
+      if (operation.intakeMaintenance)
+        throw Error('Intake maintenance replay must be resolved before preparation');
       db.exec('COMMIT');
       committed = true;
       succeeded = true;
@@ -209,10 +249,21 @@ export function transaction<T>(
     captured = hooks?.capture?.();
     const result = fn();
     if (transactionFailures.has(db)) throw transactionFailures.get(db);
+    if (operation.intakeMaintenance) {
+      verifyIntakeMaintenancePublication(db, operation.intakeMaintenance, token, result);
+      verifiedIntakeMaintenance = true;
+    }
+    for (const observer of beforePublicationObservers.get(db) ?? []) {
+      try {
+        observer(token);
+      } catch {
+        /* memory-only witnesses must remain ineligible after a failed check */
+      }
+    }
     db.prepare(
       "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
     ).run();
-    if (operation.actor !== 'source-text')
+    if (operation.actor !== 'source-text' && !operation.intakeMaintenance)
       db.exec(
         "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='clinical_review_revision'",
       );
@@ -232,6 +283,8 @@ export function transaction<T>(
     if (!committed) db.exec('ROLLBACK');
     throw error;
   } finally {
+    if (operation.intakeMaintenance)
+      finishIntakeMaintenancePublication(operation.intakeMaintenance, token);
     transactionTokens.delete(db);
     transactionFailures.delete(db);
     // Read at completion: observers can register while fn stages its first value.
@@ -245,7 +298,14 @@ export function transaction<T>(
         // A disposable-cache observer cannot change a durable acknowledgement
         // or suppress cleanup by another observer.
         try {
-          observer({ token, committed, succeeded });
+          observer({
+            token,
+            committed,
+            succeeded,
+            ...(verifiedIntakeMaintenance && committed && succeeded
+              ? { intakeMaintenance: true as const }
+              : {}),
+          });
         } catch {
           /* memory only */
         }

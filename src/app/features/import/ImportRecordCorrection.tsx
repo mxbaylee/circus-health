@@ -1,5 +1,6 @@
+import type { IntakeHeader } from '../../../shared/intake-summary';
 import { useEffect, useId, useRef, useState } from 'react';
-import type { Intake, IntakeClinicalMapping, IntakeReviewRecord } from '../../../shared/intake';
+import type { IntakeClinicalMapping, IntakeReviewRecord } from '../../../shared/intake';
 import { SourcePreview } from '../../components/SourceDialog';
 import { intakeEvidencePage, intakeOriginal, reviewRecordTitle } from '../intake/ReviewWorkspace';
 
@@ -22,7 +23,7 @@ export function ImportRecordCorrection({
   onClose,
   onDirtyChange,
 }: {
-  intake: Intake;
+  intake: IntakeHeader;
   record: IntakeReviewRecord;
   mapping: IntakeClinicalMapping;
   fields: CorrectionField[];

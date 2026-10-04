@@ -1,3 +1,4 @@
+import type { ConversionCheckpoint as LegacyConversionCheckpoint } from '../intake-continuation.ts';
 import { readIntakeEnvelopeText } from '../intake-authority.ts';
 import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
 import { ModelToolValidationError } from '../model-tool-validation.ts';
@@ -657,7 +658,7 @@ test('conversion pauses on repeated reads and retains checkpoints across resume 
     42,
     'cumulative turns never double-count token totals',
   );
-  const saved = structuredClone(required(chat.conversionCheckpoint));
+  const saved = structuredClone(legacyCheckpoint(chat.conversionCheckpoint));
   f.assistant.send('cedar', chat.id, {
     message: 'Resume reading the retained evidence',
     context: { intakeId: item.id },
@@ -1340,7 +1341,7 @@ test('three consecutive premature coverage claims pause without publishing a pro
   }
   assert.equal(required(chat.reading).reason, 'tool_error');
   assert.equal(getIntake(f.db, f.root, 'cedar', item.id).proposals.length, 0);
-  assert.equal(required(required(chat.conversionCheckpoint).pending[0]).args.page, 2);
+  assert.equal(required(legacyCheckpoint(chat.conversionCheckpoint).pending[0]).args.page, 2);
 });
 
 async function linkedPdfPackage(t: TestContext, pages: string[]) {
@@ -1395,7 +1396,7 @@ async function linkedPdfPackage(t: TestContext, pages: string[]) {
 test('real package member page reads retain cursors, report rereads, and stop an unproductive loop', async (t) => {
   const f = await linkedPdfPackage(t, ['Fictional package page one', 'Fictional package page two']);
   const initialReads = f.chat.reading?.distinctReads || 0;
-  const pending = required(f.chat.conversionCheckpoint).pending.find(
+  const pending = legacyCheckpoint(f.chat.conversionCheckpoint).pending.find(
     (window) => window.args.page === 2,
   );
   assert.equal(pending?.tool, 'health_intake_package');
@@ -1425,7 +1426,7 @@ test('real package member page reads retain cursors, report rereads, and stop an
     'only the new page adds distinct progress',
   );
   assert.equal(
-    required(f.chat.conversionCheckpoint).pending.some(
+    legacyCheckpoint(f.chat.conversionCheckpoint).pending.some(
       (window) => window.args.page === 2 && window.args.memberId === f.member.memberId,
     ),
     false,
@@ -1474,7 +1475,7 @@ test('retained child batch coverage is checked against its own plan and cannot b
   assert.equal(f.chat.status, 'running');
   assert.equal(required(f.chat.reading).reason, null);
   assert.ok(
-    required(f.chat.conversionCheckpoint).pending.some(
+    legacyCheckpoint(f.chat.conversionCheckpoint).pending.some(
       (window) => window.args.memberId === f.member.memberId && window.args.page === 2,
     ),
   );
@@ -1485,7 +1486,7 @@ test('a completely read single-page PDF member can receive reviewed extraction c
   assert.equal(f.first.metadata.original.page, 1);
   assert.equal(f.first.metadata.original.nextPage, null);
   assert.equal(f.first.metadata.original.nextOffset, null);
-  assert.equal(required(f.chat.conversionCheckpoint).pending.length, 0);
+  assert.equal(legacyCheckpoint(f.chat.conversionCheckpoint).pending.length, 0);
   await call(f.bridge, 'intake_batch', {
     id: f.item.id,
     version: getIntake(f.db, f.root, 'cedar', f.item.id).version,
@@ -1564,7 +1565,7 @@ test('encrypted cache loss retains conversion cursors for explicit resume and en
   });
   await tick();
   await call(bridges[0], 'intake_read', { id: item.id });
-  const checkpoint = structuredClone(required(chat.conversionCheckpoint));
+  const checkpoint = structuredClone(legacyCheckpoint(chat.conversionCheckpoint));
   assert.ok(checkpoint.pending.length);
   assistant.close();
   vault.manager.lock(profile.id);
@@ -1587,7 +1588,7 @@ test('encrypted cache loss retains conversion cursors for explicit resume and en
     code: 'CONVERSION_SCOPE',
   });
   assert.equal(required(restored.reading).reason, 'tool_error');
-  assert.deepEqual(required(restored.conversionCheckpoint).seen, checkpoint.seen);
+  assert.deepEqual(legacyCheckpoint(restored.conversionCheckpoint).seen, checkpoint.seen);
   assert.equal(required(state.db.prepare('SELECT count(*) AS n FROM documents').get()).n, 0);
 });
 
@@ -2489,7 +2490,7 @@ test('failed fresh image decoding leaves one durable pending plan and a retry ne
   assert.equal(required(after.workflow).plans.length, 1);
   assert.equal(required(required(after.workflow).plans[0]).units[0]?.status, 'pending');
   assert.equal(after.proposals.length, 0);
-  assert.equal(required(f.chat.conversionCheckpoint).seen.length, 0);
+  assert.equal(legacyCheckpoint(f.chat.conversionCheckpoint).seen.length, 0);
 
   const retry = linkedFreshImage(t);
   await tick();
@@ -2661,7 +2662,7 @@ test('fresh image bootstrap rejects stale versions and profile cancellation befo
     required(required(afterConcurrentChange.workflow).plans[0]).units[0]?.status,
     'pending',
   );
-  assert.equal(required(concurrent.chat.conversionCheckpoint).seen.length, 0);
+  assert.equal(legacyCheckpoint(concurrent.chat.conversionCheckpoint).seen.length, 0);
 
   const cancelled = linkedFreshImage(t);
   await tick();
@@ -2686,7 +2687,7 @@ test('fresh image bootstrap rejects stale versions and profile cancellation befo
   const afterProfileClose = getIntake(locked.db, locked.root, 'cedar', locked.item.id);
   assert.equal(required(afterProfileClose.workflow).plans.length, 1);
   assert.equal(required(required(afterProfileClose.workflow).plans[0]).units[0]?.status, 'pending');
-  assert.equal(required(locked.chat.conversionCheckpoint).seen.length, 0);
+  assert.equal(legacyCheckpoint(locked.chat.conversionCheckpoint).seen.length, 0);
 });
 
 test('image bootstrap never replaces plan history or creates a plan for a child image', async (t) => {
@@ -4611,7 +4612,7 @@ test('explicit context and unreadable dispositions advance bounded accounting wi
   assert.equal(required(chat.reading).remainingUnits, 0);
   const saved = getIntake(f.db, f.root, 'cedar', item.id);
   assert.ok(saved.workflow!.plans[0]!.units.every((unit) => unit.status === 'partial'));
-  assert.equal(required(chat.conversionCheckpoint).completedUnits.length, 0);
+  assert.equal(legacyCheckpoint(chat.conversionCheckpoint).completedUnits.length, 0);
   assert.equal(saved.workflow!.decisions.length, 0);
 });
 
@@ -5323,16 +5324,18 @@ test('one host request retains an exact later-unit batch across disjoint counted
   });
   const firstReview = reviewIntake(f.db, f.root, 'cedar', f.item.id, firstProposal.id);
 
-  const seenBeforeDeferredRead = f.chat.conversionCheckpoint!.seen.length;
+  const seenBeforeDeferredRead = legacyCheckpoint(f.chat.conversionCheckpoint).seen.length;
   await f.bridge.callbacks.onTool({
     tool: 'health_intake_plan',
     arguments: { id: f.item.id, action: 'read_unit', unitId: plan.units[1]!.id },
     callId: 'fictional-deferred-later-unit',
     deferReadConsumption: true,
   });
-  assert.equal(f.chat.conversionCheckpoint!.seen.length, seenBeforeDeferredRead);
+  assert.equal(legacyCheckpoint(f.chat.conversionCheckpoint).seen.length, seenBeforeDeferredRead);
   assert.ok(
-    f.chat.conversionCheckpoint!.pending.some((window) => window.args.unitId === plan.units[1]!.id),
+    legacyCheckpoint(f.chat.conversionCheckpoint).pending.some(
+      (window) => window.args.unitId === plan.units[1]!.id,
+    ),
   );
   const modelRequestsBefore = required(required(f.chat.reading).modelRequests);
   f.bridge.callbacks.onEvent('model/requestStarted', { turnId: 'fictional-delayed-batch' });
@@ -5432,9 +5435,9 @@ test('one host request retains an exact later-unit batch across disjoint counted
   f.bridge.callbacks.onEvent('model/toolResultsConsumed', {
     callIds: ['fictional-deferred-later-unit'],
   });
-  assert.ok(f.chat.conversionCheckpoint!.seen.length > seenBeforeDeferredRead);
+  assert.ok(legacyCheckpoint(f.chat.conversionCheckpoint).seen.length > seenBeforeDeferredRead);
   assert.ok(
-    !f.chat.conversionCheckpoint!.pending.some(
+    !legacyCheckpoint(f.chat.conversionCheckpoint).pending.some(
       (window) => window.args.unitId === plan.units[1]!.id,
     ),
   );
@@ -6986,3 +6989,409 @@ test('approving unchanged source text during conversion neither restarts reading
   assert.equal(f.chat.status, 'running');
   assert.equal(getIntake(f.db, f.root, 'cedar', f.item.id).proposals.length, 1);
 });
+
+test('native assistant package navigation uses explicit inventory-only evidence without workflow hydration', async (t) => {
+  fictionalModel(t);
+  const f = fixture(t),
+    { createPagedPackagePlan } = await import('../intake-package-plan.ts'),
+    { intakeWorkCounters } = await import('../intake-work-accounting.ts');
+  const source = uploadIntake(f.db, f.root, 'cedar', {
+    filename: 'fictional-navigation.zip',
+    bytes: zipFixture([{ name: 'fictional.txt', data: 'Fictional original text.' }]),
+  });
+  await createPagedPackagePlan(f.db, f.root, 'cedar', source.id, {
+    version: source.version,
+    operationId: 'fictional-native-navigation',
+  });
+  const chat = f.assistant.create('cedar', { message: 'Inspect the fictional delivery.' });
+  await tick();
+  const before = { ...intakeWorkCounters(f.db).warm };
+  for (const action of ['search', 'follow']) {
+    const result = await call(f.bridges[0], 'intake_plan', {
+      id: source.id,
+      action,
+      ...(action === 'search' ? { query: 'fictional' } : { referenceId: 'fictional-reference' }),
+    });
+    assert.equal(result.format, 'health-intake-navigation-v2');
+    assert.equal(result.state, 'inventory_only');
+    assert.equal(result.searched, false);
+    assert.equal(result.followed, false);
+  }
+  assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+  f.assistant.cancel('cedar', chat.id);
+});
+
+test('native package assistant dispatch retains scalar checkpoints and acknowledges deferred ledger reads before continuing', async (t) => {
+  fictionalModel(t);
+  const f = fixture(t),
+    { createPagedPackagePlan, readPackagePlanScope } = await import('../intake-package-plan.ts'),
+    { linkIntakeConversionRead, getIntakeRead, flushIntake } = await import('../intake.ts'),
+    { intakeWorkCounters } = await import('../intake-work-accounting.ts');
+  const source = uploadIntake(f.db, f.root, 'cedar', {
+    filename: 'fictional-native.zip',
+    bytes: zipFixture([
+      { name: 'first.txt', data: 'Fictional native literal source.' },
+      { name: 'second.txt', data: 'Another fictional source.' },
+    ]),
+  });
+  await createPagedPackagePlan(f.db, f.root, 'cedar', source.id, {
+    version: source.version,
+    operationId: 'native-plan',
+  });
+  flushIntake(f.db, f.root, 'cedar');
+  const chat = f.assistant.create('cedar', { title: 'Fictional native conversion' });
+  await linkIntakeConversionRead(f.db, f.root, 'cedar', source.id, chat.id);
+  f.assistant.send('cedar', chat.id, {
+    message: 'Read the selected native unit',
+    context: { route: '/sources', intakeId: source.id },
+  });
+  for (let i = 0; i < 200 && !f.bridges[0]; i++) await tick();
+  const bridge = required(f.bridges[0]);
+  for (let i = 0; i < 200 && !bridge.prompt.conversion; i++) await tick();
+  assert.equal(chat.status, 'running', chat.error || '');
+  const checkpoint = chat.conversionCheckpoint;
+  assert.ok(checkpoint && 'format' in checkpoint);
+  assert.equal(checkpoint.format, 'health-intake-conversion-checkpoint-v2');
+  assert.equal('seen' in checkpoint, false);
+  assert.equal('pending' in checkpoint, false);
+  const plan = required(readPackagePlanScope(f.db, f.root, 'cedar', source.id)),
+    member = required(plan.inventory.member(0));
+  const result = await bridge.callbacks.onTool({
+    tool: 'health_intake_package',
+    arguments: { id: source.id, action: 'read_member', memberId: member.memberId },
+    callId: 'native-deferred',
+    deferReadConsumption: true,
+  });
+  assert.ok(result);
+  assert.equal(chat.reading?.distinctReads, 0);
+  await bridge.callbacks.onEvent('model/toolResultsConsumed', { callIds: ['native-deferred'] });
+  assert.equal(chat.reading?.distinctReads, 1);
+  await bridge.callbacks.onEvent('model/toolResultsConsumed', { callIds: ['native-deferred'] });
+  assert.equal(chat.reading?.distinctReads, 1);
+  const before = { ...intakeWorkCounters(f.db).warm };
+  await bridge.callbacks.onTool({
+    tool: 'health_intake_package',
+    arguments: { id: source.id, action: 'read_member', memberId: member.memberId, offset: 1 },
+    callId: 'native-second',
+    deferReadConsumption: true,
+  });
+  await bridge.callbacks.onEvent('model/toolResultsConsumed', { callIds: ['native-second'] });
+  assert.equal(chat.reading?.distinctReads, 2);
+  assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+  assert.ok('format' in getIntakeRead(f.db, f.root, 'cedar', source.id));
+  f.assistant.cancel('cedar', chat.id);
+});
+
+function legacyCheckpoint(value: unknown): LegacyConversionCheckpoint {
+  assert.ok(
+    value && typeof value === 'object' && !('format' in value),
+    'Expected an actual legacy checkpoint',
+  );
+  return value as LegacyConversionCheckpoint;
+}
+
+test('native direct conversion prepares its first plan before provider dispatch without a legacy checkpoint', async (t) => {
+  fictionalModel(t);
+  const f = fixture(t),
+    source = uploadIntake(f.db, f.root, 'cedar', {
+      filename: 'fictional-direct.txt',
+      bytes: Buffer.from('Fictional direct conversion evidence.'),
+    });
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts'),
+    { linkIntakeConversionRead, getIntakeRead } = await import('../intake.ts');
+  const row = f.db
+    .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
+    .get(source.id)!;
+  await buildIntakeCollectionEnvelope(f.db, row as never);
+  const chat = f.assistant.create('cedar', { title: 'Fictional direct conversion' });
+  await linkIntakeConversionRead(f.db, f.root, 'cedar', source.id, chat.id);
+  f.assistant.send('cedar', chat.id, {
+    message: 'Read this direct source',
+    context: { intakeId: source.id },
+  });
+  for (let n = 0; n < 300 && !f.bridges[0] && chat.status === 'running'; n++) await tick();
+  assert.equal(chat.status, 'running', chat.error ?? '');
+  const bridge = required(f.bridges[0]);
+  for (let n = 0; n < 300 && !bridge.prompt.conversion && chat.status === 'running'; n++)
+    await tick();
+  assert.ok(chat.conversionCheckpoint && 'format' in chat.conversionCheckpoint);
+  assert.equal(chat.conversionCheckpoint.format, 'health-intake-conversion-checkpoint-v2');
+  assert.ok('format' in getIntakeRead(f.db, f.root, 'cedar', source.id));
+  assert.equal('seen' in chat.conversionCheckpoint, false);
+  assert.ok(bridge.prompt.conversion);
+  const { readDirectPlanScope } = await import('../intake-direct-plan.ts'),
+    selected = required(readDirectPlanScope(f.db, 'cedar', source.id));
+  await call(bridge, 'intake_plan', {
+    id: source.id,
+    action: 'read_unit',
+    unitId: selected.unitAt(0)!.id,
+  });
+  const proposed = await call(bridge, 'intake_propose', {
+    id: source.id,
+    version: getIntakeRead(f.db, f.root, 'cedar', source.id).version,
+    jsonlText: JSON.stringify({
+      format: 'health-record-v1',
+      id: 'fictional-native-propose',
+      kind: 'document',
+      payload: { text: 'Fictional direct conversion evidence.' },
+      provenance: {
+        capturedVia: 'Fictional export',
+        sourceSystem: 'Fictional source',
+        sourceRecordId: 'fictional-native-propose',
+        evidenceClass: 'provider_export',
+        locator: 'fictional text',
+      },
+      coverage: { status: 'partial', notes: [] },
+    }),
+    summary: 'Fictional direct manual proposal',
+  });
+  assert.equal(proposed.format, 'health-intake-summary-v2');
+  const retained = getIntakeRead(f.db, f.root, 'cedar', source.id);
+  assert.ok('format' in retained);
+  assert.equal(retained.collections.proposals.total, 1);
+  f.assistant.cancel('cedar', chat.id);
+});
+
+for (const finalRace of ['unchanged', 'unrelated_write'] as const)
+  test(
+    `native assistant retains an exact delayed batch only across one disjoint public counted acceptance: ${finalRace}`,
+    { timeout: 120000 },
+    async (t) => {
+      fictionalModel(t);
+      const retries: unknown[] = [],
+        f = fixture(t, {
+          beforeBatchRevalidationRetry: ({ db, batchInput }) => {
+            retries.push(structuredClone(batchInput));
+            if (finalRace === 'unrelated_write')
+              transaction(db, () =>
+                db
+                  .prepare('INSERT INTO app_meta(key,value) VALUES(?,?)')
+                  .run('fictional:unrelated-final-race', 'changed'),
+              );
+          },
+        }),
+        { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts'),
+        { createIntakePlanRead, getIntakeRead, linkIntakeConversionRead } =
+          await import('../intake.ts'),
+        { readDirectPlanScope } = await import('../intake-direct-plan.ts'),
+        { prepareCollectionReviewMembership } =
+          await import('../intake-review-membership-index.ts'),
+        { prepareCollectionClinicalReview } = await import('../intake-review-collection-host.ts'),
+        { acceptIntakeReportSelectionAsync } = await import('../intake-report-acceptance.ts'),
+        { iterateIntakeEnvelopeText } = await import('../intake-collection-envelope.ts');
+      const source = uploadIntake(f.db, f.root, 'cedar', {
+        filename: 'fictional-native-acceptance-race.txt',
+        bytes: Buffer.from(
+          'Fictional first report. ' +
+            'first source evidence '.repeat(1500) +
+            '\nFictional second report. ' +
+            'second source evidence '.repeat(1500),
+        ),
+      });
+      await buildIntakeCollectionEnvelope(f.db, { id: source.id });
+      await createIntakePlanRead(f.db, f.root, 'cedar', source.id, {
+        version: source.version,
+        operationId: 'fictional-native-race-plan',
+      });
+      const plan = required(readDirectPlanScope(f.db, 'cedar', source.id)),
+        firstUnit = required(plan.unitAt(0)),
+        secondUnit = required(plan.unitAt(1));
+      const chat = f.assistant.create('cedar', { title: 'Fictional native delayed approval' });
+      await linkIntakeConversionRead(f.db, f.root, 'cedar', source.id, chat.id);
+      f.assistant.send('cedar', chat.id, {
+        message: 'Read the fictional source',
+        context: { intakeId: source.id },
+      });
+      for (let n = 0; n < 300 && !f.bridges[0]?.prompt.conversion && chat.status === 'running'; n++)
+        await tick();
+      assert.equal(chat.status, 'running', chat.error ?? '');
+      const bridge = required(f.bridges[0]);
+      const line = (id: string, locator: string) =>
+        JSON.stringify({
+          format: 'health-record-v1',
+          id,
+          kind: 'document',
+          payload: { text: 'Fictional ' + id },
+          provenance: {
+            capturedVia: 'Fictional export',
+            sourceSystem: 'Fictional source',
+            sourceRecordId: id,
+            evidenceClass: 'provider_export',
+            locator,
+          },
+          coverage: { status: 'complete_response', notes: [] },
+          clinical: {
+            kind: 'document',
+            subject: 'self',
+            documentTitle: 'Fictional ' + id,
+            date: '2026-01-01',
+          },
+        });
+      await call(bridge, 'intake_plan', {
+        id: source.id,
+        action: 'read_unit',
+        unitId: firstUnit.id,
+      });
+      await call(bridge, 'intake_batch', {
+        id: source.id,
+        planId: plan.planId,
+        version: getIntakeRead(f.db, f.root, 'cedar', source.id).version,
+        operationId: 'fictional-native-first-batch',
+        jsonlText: line('first', firstUnit.locator),
+        summary: 'Fictional first report',
+        coverage: [
+          { unitId: firstUnit.id, kind: 'extracted', notes: 'Fictional literal retained' },
+        ],
+      });
+      const current = getIntakeRead(f.db, f.root, 'cedar', source.id);
+      assert.ok('format' in current && current.collections.proposals.total === 1);
+      const proposalId = JSON.parse(
+        [...iterateIntakeEnvelopeText(f.db, { id: source.id })].join(''),
+      ).intake.proposals[0].id as string;
+      const readsBefore = chat.reading!.distinctReads!;
+      await bridge.callbacks.onTool({
+        tool: 'health_intake_plan',
+        arguments: { id: source.id, action: 'read_unit', unitId: secondUnit.id },
+        callId: 'fictional-native-delayed-read',
+        deferReadConsumption: true,
+      });
+      assert.equal(chat.reading!.distinctReads, readsBefore);
+      await prepareCollectionReviewMembership(f.db, { id: source.id });
+      const session = prepareCollectionClinicalReview(f.db, f.root, 'cedar', source.id, proposalId);
+      assert.equal(session.status, 'ready');
+      if (session.status !== 'ready') throw Error('Expected selected review');
+      const review = session.session.review;
+      await bridge.callbacks.onEvent('model/requestStarted', {
+        turnId: 'fictional-native-delayed',
+      });
+      const delayed = {
+        id: source.id,
+        planId: plan.planId,
+        version: getIntakeRead(f.db, f.root, 'cedar', source.id).version,
+        operationId: 'fictional-native-second-batch',
+        jsonlText: line('second', secondUnit.locator),
+        summary: 'Fictional second report',
+        coverage: [
+          { unitId: secondUnit.id, kind: 'extracted', notes: 'Fictional literal retained' },
+        ],
+      };
+      await acceptIntakeReportSelectionAsync(f.db, f.root, 'cedar', {
+        operationId: randomUUID(),
+        blocks: [
+          {
+            intakeId: source.id,
+            intakeVersion: review.version,
+            proposalId,
+            reviewToken: review.reviewToken,
+            selections: review.records.map((record) => ({
+              recordId: record.id,
+              candidateId: record.candidateId!,
+              candidateVersionId: record.candidateVersionId!,
+              mapping: record.mapping,
+            })),
+          },
+        ],
+      });
+      await bridge.callbacks.onEvent('model/toolResultsConsumed', {
+        callIds: ['fictional-native-delayed-read'],
+      });
+      assert.equal(chat.reading!.distinctReads, readsBefore + 1);
+      if (finalRace === 'unrelated_write')
+        await assert.rejects(call(bridge, 'intake_batch', delayed), (error: unknown) =>
+          hasCode(error, 'VERSION_CONFLICT'),
+        );
+      else await call(bridge, 'intake_batch', delayed);
+      const { id: _transportId, ...submitted } = delayed;
+      assert.deepEqual(retries, [{ ...submitted, runId: chat.id }]);
+      const retained = JSON.parse(
+        [...iterateIntakeEnvelopeText(f.db, { id: source.id })].join(''),
+      ).intake;
+      assert.equal(retained.proposals.length, finalRace === 'unrelated_write' ? 1 : 2);
+      assert.equal(retained.workflow.candidates[0].versions[0].status, 'accepted');
+      if (finalRace === 'unchanged')
+        assert.equal(retained.workflow.candidates[1].versions[0].status, 'pending');
+      assert.equal(retained.workflow.reportAcceptances.length, 1);
+      assert.equal(f.bridges.length, 1);
+      if (finalRace === 'unchanged') await call(bridge, 'intake_batch', delayed);
+      assert.equal(retries.length, 1);
+      f.assistant.cancel('cedar', chat.id);
+    },
+  );
+
+test(
+  'a migrated assistant chat imports retained reading progress before native provider dispatch',
+  { timeout: 120000 },
+  async (t) => {
+    const f = await linkedFictionalBatchConversion(t),
+      { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts'),
+      { nativeAssistantConversion, isNativeAssistantCheckpoint } =
+        await import('../assistant-intake-native.ts'),
+      { readNativeAttributionMetadata } = await import('../assistant-intake-attribution.ts'),
+      { getIntakeRead } = await import('../intake.ts');
+    await f.bridge.callbacks.onTool({
+      tool: 'health_intake_plan',
+      arguments: { id: f.item.id, action: 'read_unit', unitId: f.plan.units[0]!.id },
+      callId: 'fictional-legacy-pending',
+      deferReadConsumption: true,
+    });
+    await f.bridge.callbacks.onEvent('model/requestStarted', {
+      turnId: 'fictional-before-migration',
+    });
+    const previous = structuredClone(legacyCheckpoint(f.chat.conversionCheckpoint));
+    assert.ok(previous.seen.length > 0);
+    f.assistant.cancel('cedar', f.chat.id);
+    await buildIntakeCollectionEnvelope(f.db, { id: f.item.id });
+    f.assistant.send('cedar', f.chat.id, {
+      message: 'Continue the retained fictional source',
+      context: { intakeId: f.item.id },
+    });
+    for (let n = 0; n < 500 && !f.bridges[1]?.prompt.conversion && f.chat.status === 'running'; n++)
+      await tick();
+    assert.equal(f.chat.status, 'running', f.chat.error ?? '');
+    assert.ok(f.bridges[1]?.prompt.conversion);
+    const checkpoint = f.chat.conversionCheckpoint;
+    assert.ok(isNativeAssistantCheckpoint(checkpoint));
+    assert.equal('seen' in checkpoint, false);
+    assert.equal('pending' in checkpoint, false);
+    assert.equal(checkpoint.turns, previous.turns + 1);
+    assert.equal(checkpoint.modelRequests, previous.modelRequests);
+    assert.equal(f.chat.reading?.readWindows, previous.seen.length);
+    assert.equal(
+      f.chat.reading?.distinctReads,
+      previous.distinctReads ?? previous.pagesProcessed ?? 0,
+    );
+    const header = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
+    assert.ok('format' in header);
+    const host = nativeAssistantConversion(f.db, f.root, 'cedar', f.chat.id, header),
+      attribution = readNativeAttributionMetadata(host, checkpoint);
+    assert.deepEqual(attribution.totals, previous.attribution?.totals);
+    assert.deepEqual(attribution.scopes, previous.attribution?.scopes);
+    assert.ok(header.activePlan.state === 'exact' && header.activePlan.plan);
+    // Text windows intentionally ignore row/page-size options. A different
+    // fictional model pin makes this an actual replacement plan occurrence.
+    const previousModel = process.env.CRS_AI_MODEL;
+    process.env.CRS_AI_MODEL = 'fictional-replacement-model';
+    try {
+      await call(f.bridges[1], 'intake_plan', {
+        id: f.item.id,
+        action: 'create',
+        version: header.version,
+        replacePlanId: header.activePlan.plan.id,
+        operationId: 'fictional-migrated-new-plan',
+      });
+    } finally {
+      if (previousModel === undefined) delete process.env.CRS_AI_MODEL;
+      else process.env.CRS_AI_MODEL = previousModel;
+    }
+    assert.equal(f.chat.reading?.readWindows, previous.seen.length);
+    assert.equal(
+      f.chat.reading?.distinctReads,
+      previous.distinctReads ?? previous.pagesProcessed ?? 0,
+    );
+    assert.equal(f.chat.reading?.pendingReadWindows, previous.pending.length);
+    assert.notEqual(checkpoint.planId, header.activePlan.plan.id);
+    f.assistant.cancel('cedar', f.chat.id);
+  },
+);

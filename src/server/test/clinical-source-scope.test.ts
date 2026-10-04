@@ -1,3 +1,4 @@
+import { selectedReportGroups } from '../intake-selected-report-groups.ts';
 import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
 import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
 import { readIntakeEnvelopeText } from '../intake-authority.ts';
@@ -92,7 +93,9 @@ async function accept(f: Fixture, id: string, mapping: Record<string, string> = 
 }
 async function prepare(f: Fixture, id: string) {
   let review = reviewIntake(f.db, f.root, f.profile, id);
-  for (const group of review.records.flatMap((record) => record.reportGroups || [])) {
+  for (const group of review.records.flatMap((record) => [
+    ...selectedReportGroups(record.reportGroups),
+  ])) {
     const state = await getIntakeIdentityReview(f.db, f.root, f.profile, id, group.groupId);
     if (state.blocking && state.scope) {
       await confirmIntakeIdentityScope(f.db, f.root, f.profile, id, {

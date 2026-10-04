@@ -14,6 +14,8 @@ import type {
   IntakeReviewRecord,
 } from '../../../shared/intake';
 import './clinical-review.css';
+import type { SavedDuplicateEvidenceReference } from '../../../shared/saved-duplicate-evidence';
+import { SavedDuplicateEvidence } from './SavedDuplicateEvidence';
 
 const reasonLabels: Record<RelatedRecordReason, string> = {
   same_code: 'Same clinical code',
@@ -126,7 +128,7 @@ function EvidenceSide({
   label: string;
   date: string | null;
   mapping: IntakeClinicalMapping;
-  evidence: IntakeReviewRecord['evidence'];
+  evidence: IntakeReviewRecord['evidence'] | SavedDuplicateEvidenceReference;
   onCorrect?: () => void;
   disabled?: boolean;
 }) {
@@ -138,7 +140,9 @@ function EvidenceSide({
         {date || 'Unknown date'}
         {facts(mapping) ? ` · ${facts(mapping)}` : ''}
       </p>
-      {evidence.length ? (
+      {!Array.isArray(evidence) ? (
+        <SavedDuplicateEvidence reference={evidence} />
+      ) : evidence.length ? (
         evidence.map((item, index) => (
           <p key={`${item.locator}-${index}`}>
             {item.label}: {item.locator}

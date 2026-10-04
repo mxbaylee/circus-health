@@ -12,8 +12,19 @@ import { ImportPage } from '../../app/features/import/ImportPage';
 import { selectProfile } from '../../app/data/profile';
 
 vi.mock('../../app/features/import/ImportDetailReview', () => ({
-  ImportDetailReview: ({ onBack }: { onBack: () => void }) => (
-    <section aria-label="Exact selected report">
+  ImportDetailReview: ({
+    onBack,
+    selection,
+  }: {
+    onBack: () => void;
+    selection: { groupId: string; recordId?: string; proposalId?: string | null };
+  }) => (
+    <section
+      aria-label="Exact selected report"
+      data-group-id={selection.groupId}
+      data-record-id={selection.recordId}
+      data-proposal-id={selection.proposalId ?? 'original'}
+    >
       <button onClick={onBack}>Back to overview</button>
     </section>
   ),
@@ -2203,4 +2214,102 @@ it('keeps report B banner review visible and saving blocked beside confirmed rep
   expect(
     within(refreshedB.closest('article')!).getByRole('button', { name: 'Confirm & save' }),
   ).toBeEnabled();
+});
+
+it('resolves a native historical record link through exact authority and forwards its first retained report', async () => {
+  selectProfile({ id: 'fictional-native-deep-link', name: 'Fictional Reader', placebo: true });
+  const nativeFeed = {
+    format: 'health-intake-import-feed-v2',
+    view: 'active',
+    records: [],
+    totalRecords: 0,
+    totalGroups: 0,
+    nextCursor: null,
+    counts,
+    kindCounts: feed.kindCounts,
+    groups: [],
+    people: feed.people,
+    activity: {
+      ...feed.activity,
+      format: 'activity',
+      binding: 'pinned',
+      remainingUnits: { state: 'exact', value: 0 },
+      readingAccounting: { state: 'referenced', scope: 'full', binding: 'pinned' },
+    },
+  };
+  const requests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.includes('/intakes/import-feed?')) return response(nativeFeed);
+      if (url.endsWith('/intakes/limits'))
+        return response({ uploadBytes: 1024, extractionBytes: 1024 });
+      if (url.endsWith('/intake-batches')) return response([]);
+      if (url.endsWith('/intakes/fictional-intake'))
+        return response({
+          format: 'health-intake-summary-v2',
+          id: 'fictional-intake',
+          links: { reports: '/intakes/import-feed?intakeId=fictional-intake' },
+        });
+      if (url.includes('/review-record?'))
+        return response({
+          format: 'health-intake-clinical-record-v2',
+          context: {
+            intakeId: 'fictional-intake',
+            proposalId: 'fictional-proposal',
+            version: 7,
+            reviewToken: 'review-7',
+            summary: { additions: 1, duplicates: 0, unsupported: 0, uncertain: 0 },
+            sourceTextStale: false,
+          },
+          record: {
+            kind: 'reference',
+            reference: {
+              format: 'health-intake-clinical-review-reference-v2',
+              reviewToken: 'review-7',
+              section: 'records',
+              ordinal: 0,
+              bytes: 90000,
+            },
+            selection: { recordId: 'fictional-record', candidateVersionId: 'version-1' },
+            policy: {
+              canAcceptUnchanged: true,
+              blockingIssueCount: 0,
+              unreviewedPairChoices: false,
+              classification: 'addition',
+              kind: 'document',
+            },
+            reportGroups: {
+              format: 'health-intake-report-group-links-v1',
+              count: 200,
+              first: { groupId: 'fictional-exact-group', groupVersionId: 'group-1' },
+              selection: {
+                recordId: 'fictional-record',
+                candidateId: 'candidate-1',
+                candidateVersionId: 'version-1',
+                proposalId: 'fictional-proposal',
+              },
+            },
+          },
+        });
+      throw new Error(`Unexpected request ${url}`);
+    }),
+  );
+  render(
+    <RouterProvider
+      router={createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
+        initialEntries: [
+          '/import?intake=fictional-intake&proposal=fictional-proposal&record=fictional-record',
+        ],
+      })}
+    />,
+  );
+  const selected = await screen.findByRole('region', { name: 'Exact selected report' });
+  expect(selected).toHaveAttribute('data-group-id', 'fictional-exact-group');
+  expect(selected).toHaveAttribute('data-record-id', 'fictional-record');
+  expect(selected).toHaveAttribute('data-proposal-id', 'fictional-proposal');
+  expect(requests.filter((url) => url.includes('/review-record?'))).toHaveLength(1);
+  expect(requests.some((url) => url.includes('/review?'))).toBe(false);
 });

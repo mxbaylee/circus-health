@@ -1,4 +1,6 @@
 import { readStoredIntakeDetails } from './intake-state-access.ts';
+import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
+import { readSelectedPackageRoleHash } from './intake-package-plan.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
@@ -46,6 +48,20 @@ export function packageMemberRoleHash(
   rootIntakeId: string,
   memberId: string,
 ): string | null {
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+    )
+    .get(rootIntakeId) as
+    { id: string; kind: string; sha256: string; details_json: string } | undefined;
+  if (!source) return null;
+  if (hasIntakeCollectionEnvelope(db, source)) {
+    const profileId = db
+      .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
+      .get()?.value;
+    if (typeof profileId !== 'string') throw Error('Missing package role owner');
+    return readSelectedPackageRoleHash(db, profileId, rootIntakeId, memberId);
+  }
   const details = readStoredIntakeDetails(db, rootIntakeId, { originalOnly: true });
   const role = details?.workflow?.plans
     ?.find((plan) => plan.status === 'active')

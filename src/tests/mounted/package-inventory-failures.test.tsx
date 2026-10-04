@@ -2,6 +2,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { Intake, IntakePackageFailure, IntakePackageMember } from '../../shared/intake';
+import type { IntakeSummaryV2 } from '../../shared/intake-summary';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
 import { PackageInventory } from '../../app/features/intake/PackageInventory';
 
@@ -71,6 +72,123 @@ const inventory = (members = [member]) =>
 beforeEach(() => {
   replaceProfiles([profile]);
   selectProfile(profile);
+});
+
+it('loads native processing issues as selected pages without fetching a complete intake', async () => {
+  const requests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      requests.push(path);
+      if (path.includes('/package?')) return inventory();
+      if (path.includes('/package-failures?'))
+        return json({
+          format: 'health-intake-package-failure-page-v1',
+          intakeId: intake.id,
+          pins: {
+            sourceHash: 'b'.repeat(64),
+            logicalRoot: 'fictional-root',
+            domainVersion: 1,
+            version: 1,
+          },
+          entries: [{ key: 'exact', failure: failure('exact', 'read_member') }],
+          total: 10001,
+          complete: false,
+          nextCursor: 'fictional-next',
+        });
+      throw Error('Unexpected complete intake request: ' + path);
+    }),
+  );
+  render(
+    <PackageInventory
+      intake={{ ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2}
+    />,
+  );
+  expect(await screen.findByText(/10001 unfinished operations/)).toBeVisible();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Next unfinished operations' }));
+  await waitFor(() =>
+    expect(requests.some((path) => path.includes('cursor=fictional-next'))).toBe(true),
+  );
+  expect(requests.some((path) => path.endsWith('/intakes/' + intake.id))).toBe(false);
+});
+
+it('keeps oversized member details in selected fragments and never uses the shortened name as identity', async () => {
+  const reference = {
+    format: 'health-intake-metadata-reference-v1',
+    kind: 'package_member',
+    intakeId: intake.id,
+    inventoryId: 'fictional-inventory',
+    memberId: member.memberId,
+    ordinal: member.ordinal,
+    sourceHash: 'b'.repeat(64),
+    version: 1,
+    metadataHash: 'c'.repeat(64),
+    bytes: 100,
+  };
+  const requests: Record<string, unknown>[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+      const path = String(input);
+      if (path.includes('/package?'))
+        return json({
+          format: 'health-intake-package-inventory-v2',
+          inventoryId: reference.inventoryId,
+          totalMembers: 1,
+          totalExpandedBytes: 2,
+          uniqueByteContents: 1,
+          members: [
+            {
+              format: 'health-intake-package-member-reference-v1',
+              memberId: member.memberId,
+              ordinal: 17,
+              filenamePreview: 'fictional-long-name',
+              filenameTruncated: true,
+              metadata: reference,
+            },
+          ],
+          offset: 0,
+          nextOffset: null,
+        });
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      if (path.endsWith('/package-metadata')) {
+        const body = JSON.parse(String(options.body));
+        requests.push(body);
+        return json({
+          format: 'health-intake-metadata-fragment-v1',
+          reference,
+          text: body.offset === 0 ? 'first retained section' : 'second retained section',
+          offset: body.offset,
+          nextOffset: body.offset === 0 ? 50 : null,
+          totalBytes: 100,
+          complete: body.offset !== 0,
+        });
+      }
+      if (path.endsWith('/package-member')) {
+        requests.push(JSON.parse(String(options.body)));
+        return json({ member });
+      }
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  render(
+    <PackageInventory
+      intake={{ ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2}
+    />,
+  );
+  expect(await screen.findByText('File name shortened for display')).toBeVisible();
+  await userEvent.setup().click(screen.getByText('Full retained file details'));
+  expect(await screen.findByText('first retained section')).toBeVisible();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Next part of file details' }));
+  expect(await screen.findByText('second retained section')).toBeVisible();
+  expect(screen.queryByText('first retained section')).not.toBeInTheDocument();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'fictional-long-name…' }));
+  await waitFor(() =>
+    expect(requests.some((body) => body.memberId === member.memberId)).toBe(true),
+  );
+  expect(requests.some((body) => body.memberId === 'fictional-long-name')).toBe(false);
 });
 
 it.each(['read_member', 'read_structure'] as const)(

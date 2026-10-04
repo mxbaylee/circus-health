@@ -503,6 +503,69 @@ function attachedReport(f: ReturnType<typeof fixture>) {
     },
   };
 }
+test('native report split publishes portable exact source snapshots with the clinical correction and replays without copying memberships', async (t) => {
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+  const {
+    previewNativeRecordOwnership,
+    commitNativeRecordOwnership,
+    nativeOwnershipReportPlan,
+    clearNativeOwnershipPlans,
+  } = await import('../record-ownership-native.ts');
+  const { readOwnershipSourceSnapshot } = await import('../ownership-source-snapshots.ts');
+  const { ownershipReceiptReference, replayOwnershipReceiptReference } =
+    await import('../ownership-outcome-page.ts');
+  const f = fixture(t, 'document'),
+    b = attachedReport(f),
+    first = f.preview({ ...f.request, selection: b.selection });
+  const request: OwnershipRequest = {
+    ...first.request,
+    decisions: [
+      {
+        recordId: f.recordId,
+        action: 'keep_both',
+        reviewedSplit: true,
+        splitMapping: first.records[0]!.mapping,
+        remainingMapping: first.records[0]!.remainingMapping,
+      },
+    ],
+  };
+  const expected = first.records[0]!.contributions;
+  await buildIntakeCollectionEnvelope(f.db, { id: b.original.id });
+  t.after(() => clearNativeOwnershipPlans(f.db));
+  const preview = await previewNativeRecordOwnership(f.db, f.root, f.profileId, request);
+  assert.ok('reportEvidence' in preview);
+  const plan = nativeOwnershipReportPlan(f.db, f.profileId, preview.reportEvidence.token);
+  assert.equal(preview.reportEvidence.recordBlockerTotal, 0);
+  const page = plan.page('records');
+  assert.equal(page.items.length, 1);
+  const operationId = randomUUID(),
+    command = {
+      operationId,
+      request: preview.request,
+      scopeToken: preview.scopeToken,
+      version: preview.version,
+    };
+  const receipt = await commitNativeRecordOwnership(f.db, f.root, f.profileId, command);
+  assert.equal(receipt.moved, 1);
+  for (const row of f.db.prepare('SELECT id,extra_json FROM documents ORDER BY id').iterate()) {
+    const extra = JSON.parse(String(row.extra_json)),
+      reference = extra.import.ownershipReview.sourceRecordIdsReference;
+    assert.equal(extra.import.ownershipReview.sourceRecordIds, undefined);
+    assert.equal(reference.format, 'health-ownership-source-snapshot-v1');
+    const members = readOwnershipSourceSnapshot(f.db, reference);
+    assert.equal(members.complete, true);
+    assert.deepEqual(
+      members.sourceRecordIds,
+      expected
+        .filter((c) => (String(row.id) === f.recordId ? !c.selected : c.selected))
+        .map((c) => c.sourceRecordId),
+    );
+  }
+  assert.deepEqual(replayOwnershipReceiptReference(f.db, f.profileId, command), {
+    ...ownershipReceiptReference(f.db, f.profileId, operationId),
+    replayed: true,
+  });
+});
 for (const kind of Object.keys(clinicalTables) as ClinicalKind[])
   test(`${kind}: report B splits only its accepted contribution; replay and reimport retain B's corrected destination`, (t) => {
     const f = fixture(t, kind),
@@ -1107,7 +1170,8 @@ test('later new anchored identity questions invalidate a standing report assignm
 });
 
 test('large report correction stages bounded journal objects and exposes no ownership or names before atomic publication', async (t) => {
-  const { attachRecordDurability } = await import('../record-versions.ts');
+  const { attachRecordDurability, iterateRecordCommitSegments } =
+    await import('../record-versions.ts');
   const journal = memoryJournal(),
     f = fixture(t, 'observation', journal),
     report = await confirmedReport(f, 'large', 60);
@@ -1139,8 +1203,9 @@ test('large report correction stages bounded journal objects and exposes no owne
   assert.equal(commit.result.moved, 60);
   assert.equal(commit.result.outcomes, undefined);
   assert.ok(JSON.stringify(commit.result).length < 1024);
-  assert.ok(commit.segments.length > 1);
-  assert.ok(commit.segments.every((s: { bytes: number }) => s.bytes <= 4096));
+  const segments = [...iterateRecordCommitSegments(journal.storage, commit)];
+  assert.ok(segments.length > 1);
+  assert.ok(segments.every((s) => s.bytes <= 4096));
   const writes = [...journal.objects].filter(([key]) => !beforeObjects.has(key));
   assert.ok(writes.length > 1);
 });

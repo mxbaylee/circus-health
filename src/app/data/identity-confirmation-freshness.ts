@@ -3,6 +3,7 @@ import type {
   IntakeIdentityConfirmation,
   IntakeIdentityReview,
   IntakeIdentityScope,
+  IntakeIdentityScopeReference,
 } from '../../shared/intake-identity';
 
 export type IdentityConfirmationFreshnessOutcome =
@@ -43,9 +44,7 @@ function sortedJsonValue(value: unknown): unknown {
 
 const canonical = (value: unknown): string => JSON.stringify(sortedJsonValue(value));
 
-function withoutGlobalVersion(
-  scope: IntakeIdentityScope,
-): Omit<IntakeIdentityScope, 'intakeVersion' | 'scopeToken'> {
+function withoutGlobalVersion(scope: IntakeIdentityScope | IntakeIdentityScopeReference) {
   const { intakeVersion: _intakeVersion, scopeToken: _scopeToken, ...boundary } = scope;
   return boundary;
 }
@@ -59,10 +58,16 @@ export function sameDisplayedIdentityReview(
   displayed: IntakeIdentityReview,
   fresh: IntakeIdentityReview,
 ): boolean {
-  if (!displayed.scope || !fresh.scope) return false;
+  const shownScope = displayed.scopeReference || displayed.scope;
+  const freshScope = fresh.scopeReference || fresh.scope;
+  if (!shownScope || !freshScope) return false;
   return (
-    canonical({ ...displayed, scope: withoutGlobalVersion(displayed.scope) }) ===
-    canonical({ ...fresh, scope: withoutGlobalVersion(fresh.scope) })
+    canonical({
+      ...displayed,
+      scope: withoutGlobalVersion(shownScope),
+      scopeReference: undefined,
+    }) ===
+    canonical({ ...fresh, scope: withoutGlobalVersion(freshScope), scopeReference: undefined })
   );
 }
 
@@ -125,8 +130,8 @@ export async function confirmIdentityWithFreshness({
 
   const retry = structuredClone({
     ...original,
-    version: fresh.scope!.intakeVersion,
-    scope: fresh.scope!,
+    version: (fresh.scopeReference || fresh.scope)!.intakeVersion,
+    scope: (fresh.scopeReference || fresh.scope)!,
   });
   if (!isContextCurrent()) return { status: 'context_changed' };
   retainRequest(retry);

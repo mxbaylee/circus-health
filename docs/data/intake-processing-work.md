@@ -14,6 +14,8 @@ The access adapter obtains the selected envelope and stored intake from one mate
 
 ## Derived lookup and text reuse
 
+Native collection envelopes use [checked point lookup indexes and addressed receipt readers](intake-lookup-projection.md), with explicit pending reads when their logical completeness binding is stale. Their [source search](source-details-search.md) streams checked JSON fragments directly and retains no text projection. The materialization, lookup payload and text snapshot reuse described below concerns the supported v3 compatibility path.
+
 The lookup projection stores what its consumers need: a maximum discovery value per source, the first acceptance payload for each operation within each source, and a linked sequence of identity occurrences. Equal identity payloads retain separate occurrences and observable order. Front insertion or movement changes affected references instead of renumbering every later item. Across sources, first-acceptance and identity ordering continue to follow source insertion order. Raw SQL extraction and scalar conversion semantics remain unchanged.
 
 This is disposable lookup format 2. An earlier or damaged cache is rebuilt from supported selected authority; originals and accepted records are unchanged. Missing, cyclic or extra identity references cannot silently supply a shortened result. Dirty-source tracking reconciles changed authority while reusing verified unchanged payloads. Transaction failure, reconstruction, schema initialization, unmanaged transactions and profile closure discard disposable payload memos so failed work cannot certify a later retry.

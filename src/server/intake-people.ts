@@ -39,7 +39,7 @@ import { profileOriginal } from './profile-storage.ts';
 import { readIntakeSourcePin, withIntakeSourcePin } from './intake-source-pin.ts';
 
 type UnknownRecord = Record<string, unknown>;
-interface SourceFileRow {
+export interface IntakePersonSourceFileRow {
   id: string;
   provider_id: string;
   path: string;
@@ -49,6 +49,7 @@ interface SourceFileRow {
   batch_id: string | null;
   details_json: string;
 }
+type SourceFileRow = IntakePersonSourceFileRow;
 interface PersonalImportReceipt {
   profileId: string;
   proposalId: string;
@@ -64,8 +65,11 @@ interface PersonalImportReceipt {
   sourceRecordId: string;
   appliedAt: string;
 }
-interface ResolvedProposal {
-  dto: IntakePersonProposal;
+export type SelectedIntakePersonProposal = Omit<IntakePersonProposal, 'source'> & {
+  source: Pick<IntakePersonProposal['source'], 'sourceRecordId'>;
+};
+interface ResolvedProposal<T extends SelectedIntakePersonProposal = IntakePersonProposal> {
+  dto: T;
   entry: IntakeEntry;
   rawProposal: IntakePersonEnvelopeProposal;
   original: SourceFileRow;
@@ -159,7 +163,7 @@ function exactMatches(
     .prepare(
       "SELECT id FROM notes WHERE kind='person' AND person_id<>'patient' ORDER BY updated_at DESC,id",
     )
-    .all() as unknown as { id: string }[]) {
+    .iterate() as Iterable<{ id: string }>) {
     const note = getNote(db, row.id);
     const candidate = personMatchName(note);
     if (normalizedName(candidate) !== wanted) continue;
@@ -277,6 +281,115 @@ function memberReference(
   };
 }
 
+/** Shared exact People decision and display logic; source metadata is supplied separately. */
+export function intakePersonProposalIdentity(
+  originalId: string,
+  candidateId: string,
+  candidateVersionId: string,
+  rawProposal: IntakePersonEnvelopeProposal,
+) {
+  return {
+    id: `intake-person:${hash([originalId, candidateId, candidateVersionId, rawProposal.id])}`,
+    version: `intake-person-version:${hash([candidateVersionId, rawProposal])}`,
+  };
+}
+export function selectedIntakePersonState(
+  db: DatabaseSync,
+  id: string,
+  version: string,
+  draftState: (id: string, version: string) => IntakePersonProposalState,
+): IntakePersonProposalState {
+  return parsedReceipt(db, id) ? 'saved' : draftState(id, version);
+}
+export function intakePersonReviewCore(
+  db: DatabaseSync,
+  input: {
+    original: { id: string };
+    intakeVersion: number;
+    proposalId: string | null;
+    recordId: string;
+    entry: IntakeEntry;
+    rawProposal: IntakePersonEnvelopeProposal;
+    group: Pick<IntakeReportGroup, 'id' | 'memberId'>;
+    groupVersionId: string;
+    candidateId: string;
+    candidateVersionId: string;
+    draftState(id: string, version: string): IntakePersonProposalState;
+  },
+): Omit<IntakePersonProposal, 'source'> {
+  const {
+    original,
+    proposalId,
+    recordId,
+    entry,
+    rawProposal,
+    group,
+    groupVersionId,
+    candidateId,
+    candidateVersionId,
+  } = input;
+  // Repeated delivery of the exact candidate is one review item even when
+  // it has another retained occurrence in a later conversion proposal.
+  const { id, version } = intakePersonProposalIdentity(
+    original.id,
+    candidateId,
+    candidateVersionId,
+    rawProposal,
+  );
+  if (entry.value.report?.memberId !== undefined && entry.value.report.memberId !== group.memberId)
+    throw new HttpError(
+      409,
+      'INTAKE_PERSON_SCOPE',
+      'Named Person evidence no longer matches its retained report member',
+    );
+  const proposedFields = Object.fromEntries(
+    ['fullName', 'relationship', 'phone', 'email', 'schedulingUrl', 'medicalHistory']
+      .filter((key) => typeof rawProposal[key as keyof IntakePersonEnvelopeProposal] === 'string')
+      .map((key) => [key, rawProposal[key as keyof IntakePersonEnvelopeProposal]]),
+  ) as IntakePersonProposal['person'];
+  proposedFields.tags = [rawProposal.role === 'clinician' ? 'Professional' : 'Family'];
+  const matching = exactMatches(db, rawProposal.fullName);
+  const selfMatch = canonicalSelfMatch(db, rawProposal.fullName);
+  const dto: Omit<IntakePersonProposal, 'source'> = {
+    id,
+    version,
+    state: selectedIntakePersonState(db, id, version, input.draftState),
+    intakeId: original.id,
+    intakeVersion: input.intakeVersion,
+    proposalId,
+    envelopeRecordId: recordId,
+    envelopeId: entry.value.id,
+    groupId: group.id,
+    groupVersionId,
+    title: intakePersonDisplayTitle(rawProposal),
+    person: proposedFields,
+    uncertainties: [...new Set(rawProposal.uncertainties || [])],
+    evidence: rawProposal.evidence.map((item) => ({
+      label: 'Named person in original source',
+      locator: item.locator || entry.value.provenance.locator,
+      contentUrl: `/api/sources/${encodeURIComponent(original.id)}/content`,
+      textAnchor: item.textAnchor,
+      supports: item.supports,
+      ...(item.memberId ? { memberId: item.memberId } : {}),
+      ...(item.page ? { page: item.page } : {}),
+    })),
+    matches: matching.matches,
+    matchCount: matching.matchCount,
+    matchesTruncated: matching.matchCount > matching.matches.length,
+    ...(selfMatch
+      ? {
+          selfMatch: {
+            reason:
+              'This name matches Self. Keep it as source evidence instead of creating another Person.',
+          },
+        }
+      : {}),
+    ...(savedReference(db, id) ? { saved: savedReference(db, id) } : {}),
+  };
+
+  return dto;
+}
+
 function collectForOriginal(
   db: DatabaseSync,
   root: string,
@@ -296,78 +409,31 @@ function collectForOriginal(
       const groups = groupsForRecord(intake.workflow, proposalId, recordId);
       for (const rawProposal of validatedIntakePeople(entry.value)) {
         for (const { group, groupVersionId, candidateId, candidateVersionId } of groups) {
-          // Repeated delivery of the exact candidate is one review item even when
-          // it has another retained occurrence in a later conversion proposal.
-          const id = `intake-person:${hash([
-            original.id,
+          const core = intakePersonReviewCore(db, {
+            original,
+            proposalId,
+            recordId,
+            entry,
+            rawProposal,
+            group,
+            groupVersionId,
             candidateId,
             candidateVersionId,
-            rawProposal.id,
-          ])}`;
-          const version = `intake-person-version:${hash([candidateVersionId, rawProposal])}`;
-          if (
-            entry.value.report?.memberId !== undefined &&
-            entry.value.report.memberId !== group.memberId
-          )
-            throw new HttpError(
-              409,
-              'INTAKE_PERSON_SCOPE',
-              'Named Person evidence no longer matches its retained report member',
-            );
-          const proposedFields = Object.fromEntries(
-            ['fullName', 'relationship', 'phone', 'email', 'schedulingUrl', 'medicalHistory']
-              .filter(
-                (key) => typeof rawProposal[key as keyof IntakePersonEnvelopeProposal] === 'string',
-              )
-              .map((key) => [key, rawProposal[key as keyof IntakePersonEnvelopeProposal]]),
-          ) as IntakePersonProposal['person'];
-          proposedFields.tags = [rawProposal.role === 'clinician' ? 'Professional' : 'Family'];
-          const matching = exactMatches(db, rawProposal.fullName);
-          const selfMatch = canonicalSelfMatch(db, rawProposal.fullName);
-          const dto: IntakePersonProposal = {
-            id,
-            version,
-            state: personState(db, intake, id, version),
-            intakeId: original.id,
             intakeVersion: withIntakeSourcePin(intake, readIntakeSourcePin(db, original.id))
               .version,
-            proposalId,
-            envelopeRecordId: recordId,
-            envelopeId: entry.value.id,
-            groupId: group.id,
-            groupVersionId,
-            title: intakePersonDisplayTitle(rawProposal),
-            person: proposedFields,
-            uncertainties: [...new Set(rawProposal.uncertainties || [])],
-            evidence: rawProposal.evidence.map((item) => ({
-              label: 'Named person in original source',
-              locator: item.locator || entry.value.provenance.locator,
-              contentUrl: `/api/sources/${encodeURIComponent(original.id)}/content`,
-              textAnchor: item.textAnchor,
-              supports: item.supports,
-              ...(item.memberId ? { memberId: item.memberId } : {}),
-              ...(item.page ? { page: item.page } : {}),
-            })),
+            draftState: (id, version) => personState(db, intake, id, version),
+          });
+          const id = core.id;
+          const dto: IntakePersonProposal = {
+            ...core,
             source: {
               sourceRecordId: recordId,
               filename: intake.originalName,
-              contentUrl: `/api/sources/${encodeURIComponent(original.id)}/content`,
+              contentUrl: '/api/sources/' + encodeURIComponent(original.id) + '/content',
               originalSourceFileId: original.id,
               originalSha256: original.sha256,
               member: memberReference(intake.workflow, group.memberId),
             },
-            matches: matching.matches,
-            matchCount: matching.matchCount,
-            matchesTruncated: matching.matchCount > matching.matches.length,
-            ...(selfMatch
-              ? {
-                  selfMatch: {
-                    reason:
-                      'This name matches Self. Keep it as source evidence instead of creating another Person.',
-                  },
-                }
-              : {}),
-            ...(savedReference(db, id) ? { saved: savedReference(db, id) } : {}),
           };
           if (!result.has(id))
             result.set(id, { dto, entry, rawProposal, original, inputFile: verified.inputFile });
@@ -499,7 +565,7 @@ export function saveIntakePersonDisposition(
 function receipt(
   db: DatabaseSync,
   profileId: string,
-  proposal: ResolvedProposal,
+  proposal: ResolvedProposal<SelectedIntakePersonProposal>,
   input: IntakePersonApplyRequest,
 ): PersonalImportReceipt | null {
   const saved = parsedReceipt(db, proposal.dto.id);
@@ -524,14 +590,17 @@ function appendHistory(existing: unknown, incoming: string | undefined): string 
   return existing.includes(incoming) ? existing : `${existing}\n\n${incoming}`;
 }
 
-function reviewedPersonContent(proposal: IntakePersonProposal): string[] {
+function reviewedPersonContent(proposal: SelectedIntakePersonProposal): string[] {
   return [
     ...proposal.evidence.map((item) => item.textAnchor),
     ...proposal.uncertainties.map((item) => `Uncertainty: ${item}`),
   ];
 }
 
-function appendReviewedPersonContent(existing: unknown, proposal: IntakePersonProposal): string {
+function appendReviewedPersonContent(
+  existing: unknown,
+  proposal: SelectedIntakePersonProposal,
+): string {
   return reviewedPersonContent(proposal).reduce(
     (content, item) => appendHistory(content, item),
     typeof existing === 'string' ? existing : '',
@@ -553,7 +622,10 @@ function mergedPerson(
   return merged;
 }
 
-function publishSourceRecord(db: DatabaseSync, proposal: ResolvedProposal): void {
+function publishSourceRecord(
+  db: DatabaseSync,
+  proposal: ResolvedProposal<SelectedIntakePersonProposal>,
+): void {
   const existing = db
     .prepare('SELECT * FROM source_records WHERE id=?')
     .get(proposal.dto.source.sourceRecordId) as UnknownRecord | undefined;
@@ -589,7 +661,7 @@ function publishSourceRecord(db: DatabaseSync, proposal: ResolvedProposal): void
 
 function appliedResult(
   db: DatabaseSync,
-  proposal: ResolvedProposal,
+  proposal: ResolvedProposal<SelectedIntakePersonProposal>,
   value: PersonalImportReceipt,
   replayed: boolean,
 ): IntakePersonApplyResult {
@@ -619,7 +691,32 @@ export function applyIntakePerson(
   owner(db, profileId);
   if (!/^[0-9a-f-]{36}$/iu.test(input.operationId))
     throw new HttpError(400, 'INTAKE_PERSON_INPUT', 'Supply an Apply operation UUID');
-  const proposal = findProposal(db, root, profileId, input.intakeId, input.proposalId);
+  return applySelectedIntakePerson(
+    db,
+    root,
+    profileId,
+    input,
+    findProposal(db, root, profileId, input.intakeId, input.proposalId),
+  );
+}
+
+/** Common Personal write policy for an exact source-verified selected proposal. */
+export function applySelectedIntakePerson(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  input: IntakePersonApplyRequest,
+  proposal: ResolvedProposal<SelectedIntakePersonProposal>,
+): IntakePersonApplyResult {
+  owner(db, profileId);
+  if (proposal.dto.id !== input.proposalId || proposal.original.id !== input.intakeId)
+    throw new HttpError(
+      409,
+      'INTAKE_PERSON_SOURCE',
+      'Selected People evidence does not match this request',
+    );
+  if (!/^[0-9a-f-]{36}$/iu.test(input.operationId))
+    throw new HttpError(400, 'INTAKE_PERSON_INPUT', 'Supply an Apply operation UUID');
   if (proposal.dto.version !== input.proposalVersion)
     throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Reload this named Person proposal');
   const prior = receipt(db, profileId, proposal, input);

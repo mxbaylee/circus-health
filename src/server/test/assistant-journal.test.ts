@@ -8,6 +8,7 @@ import { join, basename } from 'node:path';
 import {
   readChat,
   listChats,
+  countChats,
   writeChat,
   copyAssistantJournals,
   clearChatJournalCache,
@@ -422,4 +423,33 @@ test('cumulative decode work refuses a warm append before it becomes unrecoverab
   const target = join(f.root, 'work-limit-backup');
   copyAssistantJournals(f.root, f.profileId, target);
   assert.deepEqual(readChat(target, f.profileId, f.chat.id), restored);
+});
+
+test('archive sinks and startup chat counts validate one journal at a time', (t) => {
+  const f = fixture(t),
+    target = join(f.root, 'streamed-chats');
+  const ids: string[] = [];
+  for (let ordinal = 0; ordinal < 4; ordinal++) {
+    const chat = { ...f.chat, id: randomUUID(), title: 'Fictional ' + ordinal };
+    writeChat(f.root, f.profileId, chat, 'initial');
+    chat.title += ' updated';
+    writeChat(f.root, f.profileId, chat, 'progress');
+    ids.push(chat.id);
+  }
+  assert.equal(countChats(f.root, f.profileId), 4);
+  let files = 0;
+  const collected = copyAssistantJournals(f.root, f.profileId, target, {
+    onFile(path) {
+      files++;
+      assert.equal(fs.existsSync(join(target, path)), true);
+    },
+  });
+  assert.equal(collected.length, 0);
+  assert.equal(files, 12);
+  assert.equal(countChats(target, f.profileId), 4);
+  for (const id of ids)
+    assert.deepEqual(readChat(target, f.profileId, id), readChat(f.root, f.profileId, id));
+  const corrupt = join(profilePaths(target, f.profileId).root, 'chats', ids[3]!, 'events');
+  fs.writeFileSync(join(corrupt, names(corrupt)[0]!), 'corrupt');
+  assert.throws(() => countChats(target, f.profileId), /journal|checksum|JSON/i);
 });

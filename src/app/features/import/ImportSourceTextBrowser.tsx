@@ -1,5 +1,7 @@
+import { intakeFilenameDisplay } from '../../../shared/intake-summary';
+import { IntakeFilenameDetails } from '../intake/IntakeFilenameDetails';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Intake } from '../../../shared/intake';
+import type { IntakeHeader } from '../../../shared/intake-summary';
 import type { ManualSourceRecordResult } from '../../../shared/intake-manual-source-record';
 import type { SourceTextIssueList } from '../../../shared/intake-source-text';
 import { isRetainOnlyIntake } from '../../../shared/intake-source-policy';
@@ -50,7 +52,7 @@ function ImportedSourceSections({
   const [readingError, setReadingError] = useState('');
   const [offset, setOffset] = useState(0);
   const [members, setMembers] = useState(false);
-  const [selected, setSelected] = useState<Intake | null>(null);
+  const [selected, setSelected] = useState<IntakeHeader | null>(null);
   const [pendingSources, setPendingSources] = useState<Set<string>>(() => new Set());
   const pending = pendingSources.size > 0;
   const setSourcePending = useCallback((id: string, value: boolean) => {
@@ -74,7 +76,7 @@ function ImportedSourceSections({
     },
     [],
   );
-  const resource = useResource<Intake[] | Intake>(
+  const resource = useResource<IntakeHeader[] | IntakeHeader>(
     intakeId
       ? `/intakes/${encodeURIComponent(intakeId)}`
       : `/intakes?rootOnly=${!members}&limit=30&offset=${offset}`,
@@ -113,14 +115,14 @@ function ImportedSourceSections({
       // belong to their original delivery and must not start a second, competing job.
       let id = source.id;
       const seen = new Set<string>();
-      let root: Intake;
+      let root: IntakeHeader;
       while (true) {
         if (seen.has(id) || seen.size >= 100)
           throw new Error(
             'The source package ancestry could not be resolved. Refresh imported files.',
           );
         seen.add(id);
-        const result = await api<Intake>(
+        const result = await api<IntakeHeader>(
           '/api/profiles/' + encodeURIComponent(profile.id) + '/intakes/' + encodeURIComponent(id),
         );
         if (!alive.current) return;
@@ -139,7 +141,7 @@ function ImportedSourceSections({
       if (alive.current) {
         setReadingNotice(
           'Clinical reading queued for ' +
-            root.filename +
+            intakeFilenameDisplay(root) +
             '. Review the resulting proposals before saving records.',
         );
         onChanged();
@@ -156,7 +158,7 @@ function ImportedSourceSections({
       if (alive.current) setReading(false);
     }
   }
-  const change = (next: Intake | null) => {
+  const change = (next: IntakeHeader | null) => {
     if (readingLock.current) return;
     if (pending) {
       setNotice('Save or discard the current source review draft before opening another file.');
@@ -318,7 +320,7 @@ function SourceReportSection({
   onManualCreated,
   children,
 }: {
-  intake: Intake;
+  intake: IntakeHeader;
   compact?: boolean;
   expanded: boolean;
   pending: boolean;
@@ -486,18 +488,21 @@ function SourceReportSection({
   return (
     <article
       className={`import-report import-source-report${compact ? ' is-embedded' : ''}`}
-      aria-label={`Original ${intake.filename}`}
+      aria-label={`Original ${intakeFilenameDisplay(intake)}`}
     >
       {!compact && (
         <header className="import-report-title">
-          <h3>{intake.filename}</h3>
+          <h3>{intakeFilenameDisplay(intake)}</h3>
+          {intake.filenameReference && (
+            <IntakeFilenameDetails reference={intake.filenameReference} />
+          )}
         </header>
       )}
       <div className="import-source-report-summary">
         <button
           type="button"
           className="text-link"
-          aria-label={intake.filename}
+          aria-label={intakeFilenameDisplay(intake)}
           aria-expanded={expanded}
           disabled={reading}
           onClick={onToggle}

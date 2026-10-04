@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { applyIntakeChanges, serializeIntakeJson, type IntakeJson } from './intake-state-codec.ts';
 import type { ChatDecodeBudget } from './chat-journal-codec.ts';
 import { recordIntakeSerialization, recordIntakeWork } from './intake-work-accounting.ts';
+import { intakeTreeRef, type IntakeTreeRoot } from './intake-state-tree.ts';
 export const FORMAT = 'health-intake-state-v3';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HASH = /^[0-9a-f]{64}$/;
@@ -26,6 +27,61 @@ export interface IntakeStateResult {
   version: number;
   operationId: string;
   changed: boolean;
+}
+export const COLLECTION_FORMAT = 'health-intake-state-v4';
+export interface IntakeCollectionHead {
+  format: typeof COLLECTION_FORMAT;
+  identity: IntakeStateIdentity;
+  storageSequence: number;
+  logical: { root: IntakeTreeRoot; domainVersion: number };
+  receipts: IntakeTreeRoot;
+  history: IntakeTreeRoot;
+  builds: IntakeTreeRoot;
+}
+export interface IntakeCollectionResult {
+  format: 'health-intake-state-result-v4';
+  intakeId: string;
+  operationId: string;
+  storageSequence: number;
+  logical: IntakeCollectionHead['logical'];
+  changed: boolean;
+}
+export function parseIntakeCollectionHead(
+  raw: unknown,
+  identity: IntakeStateIdentity,
+): IntakeCollectionHead | undefined {
+  if (raw === undefined) return undefined;
+  const value = decode(raw, HEAD_BYTES);
+  exact(value, [
+    'format',
+    'identity',
+    'storageSequence',
+    'logical',
+    'receipts',
+    'history',
+    'builds',
+  ]);
+  if (
+    value.format !== COLLECTION_FORMAT ||
+    JSON.stringify(validateIntakeIdentity(value.identity as IntakeStateIdentity)) !==
+      JSON.stringify(identity)
+  )
+    invalid('collection head format/identity');
+  integer(value.storageSequence, 1);
+  exact(value.logical, ['root', 'domainVersion']);
+  integer(value.logical.domainVersion);
+  intakeTreeRef(value.logical.root);
+  intakeTreeRef(value.receipts);
+  intakeTreeRef(value.history);
+  intakeTreeRef(value.builds);
+  if (
+    !value.receipts ||
+    !value.history ||
+    value.receipts.count !== value.storageSequence ||
+    value.history.count !== value.storageSequence
+  )
+    invalid('collection head evidence count');
+  return value as unknown as IntakeCollectionHead;
 }
 export type Limits = typeof DEFAULT_LIMITS;
 export type Usage = Limits;

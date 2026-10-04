@@ -236,6 +236,10 @@ export async function performQualificationAcceptance({
         .flatMap((candidateBlock) => candidateBlock.records)
         .find((candidate) => candidate.candidateVersionId === initialRecord.candidateVersionId);
       check(record, 'Qualification candidate disappeared during identity review.');
+      check(
+        Array.isArray(record.reportGroups),
+        'Qualification requires fully inspected inline report membership; a paged reference is not proof.',
+      );
       const unresolved = (record.issues ?? []).filter(
         (issue) => issue.blocking && issue.status === 'unresolved',
       );

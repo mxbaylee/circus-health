@@ -1,3 +1,4 @@
+import type { ConversionCheckpoint as LegacyConversionCheckpoint } from '../intake-continuation.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -194,13 +195,13 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
     assert.equal(hostReads, 1);
     assert.equal(requests, ['time', 'transcript'].includes(boundary) ? 1 : 2);
     assert.equal(chat.reading?.readWindows, 0, 'host completion is not provider consumption');
-    assert.equal(chat.conversionCheckpoint!.pending.length, 1);
-    assert.equal(chat.conversionCheckpoint!.pending[0]!.args.id, source.id);
+    assert.equal(legacyCheckpoint(chat.conversionCheckpoint).pending.length, 1);
+    assert.equal(legacyCheckpoint(chat.conversionCheckpoint).pending[0]!.args.id, source.id);
     const current = getIntake(db, root, profileId, source.id);
     assert.throws(
       () =>
         assertConversionCoverage(
-          chat.conversionCheckpoint!,
+          legacyCheckpoint(chat.conversionCheckpoint),
           { ...current, workflow: current.workflow! },
           { planId: plan.id, coverage },
         ),
@@ -210,7 +211,7 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
     assert.deepEqual(retained.conversionCheckpoint, chat.conversionCheckpoint);
     assert.ok(!JSON.stringify(retained.conversionCheckpoint).includes('FICTIONAL SOURCE SENTINEL'));
     assert.equal(current.proposals.length, 0);
-    const beforeAttribution = chat.conversionCheckpoint!.attribution!;
+    const beforeAttribution = legacyCheckpoint(chat.conversionCheckpoint).attribution!;
     const beforeScope = Object.values(beforeAttribution.scopes)[0]!;
     assert.equal(beforeScope.hostReads, 1);
     assert.equal(beforeScope.acknowledgedReads, 0);
@@ -227,7 +228,7 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
     assert.equal(chat.reading?.reason, 'reading_exhausted');
     assert.equal(getIntake(db, root, profileId, source.id).proposals.length, 1);
     assert.equal(db.prepare('SELECT count(*) AS n FROM documents').get()?.n, 0);
-    const attribution = chat.conversionCheckpoint!.attribution!;
+    const attribution = legacyCheckpoint(chat.conversionCheckpoint).attribution!;
     const scope = Object.values(attribution.scopes)[0]!;
     assert.equal(scope.hostReads, 2, 'host read tally does not reset across explicit continues');
     assert.equal(scope.acknowledgedReads, 1);
@@ -249,3 +250,11 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
     assert.equal(metadata.unavailableChats, 0);
     assert.ok(!JSON.stringify(metadata).includes('FICTIONAL SOURCE SENTINEL'));
   });
+
+function legacyCheckpoint(value: unknown): LegacyConversionCheckpoint {
+  assert.ok(
+    value && typeof value === 'object' && !('format' in value),
+    'Expected an actual legacy checkpoint',
+  );
+  return value as LegacyConversionCheckpoint;
+}

@@ -153,7 +153,7 @@ test(
       assert.equal(counters.streamHashBytes, counters.streamReadBytes);
       assert.equal(counters.inspectionBufferBytes, 3 * 256 * 1024);
       assert.equal(counters.streamReadBytes, 3 * member.bytes);
-      const original = await readIntakeEvidence({
+      const original: Awaited<ReturnType<typeof readIntakeEvidence>> = await readIntakeEvidence({
         db,
         root,
         profileId,

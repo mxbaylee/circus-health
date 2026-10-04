@@ -8,7 +8,11 @@ import type {
   SourceTextEvidence,
   SourceTextIssue,
 } from '../shared/intake-source-text.ts';
-import { getIntakeOriginal, getRetainedIntakeOriginalReference, readIntake } from './intake.ts';
+import {
+  getIntakeOriginal,
+  getRetainedIntakeOriginalReference,
+  readIntakeLiteralWindow,
+} from './intake.ts';
 import { pdfPageCountEvidence, readPdfEvidencePage } from './intake-pdf-session.ts';
 import { getIntakeSourceText, publishIntakeSourceText } from './intake-source-text.ts';
 import { composeSourceReadings } from './intake-source-ocr.ts';
@@ -230,7 +234,7 @@ async function extractSourceStep({
     let pages = 1;
     if (pdf) pages = await pdfPageCountEvidence({ ...original, profileId }, assertRunning);
     else if (!image) {
-      const window = readIntake(db, root, profileId, id, { limit: TEXT_WINDOW });
+      const window = readIntakeLiteralWindow(db, root, profileId, id, { limit: TEXT_WINDOW });
       pages = Math.max(1, Math.ceil((window.totalCharacters || 0) / TEXT_WINDOW));
     }
     publish({
@@ -324,7 +328,7 @@ async function extractSourceStep({
         publish(replacePage(evidence, page, partial));
       }
     } else {
-      const window = readIntake(db, root, profileId, id, {
+      const window = readIntakeLiteralWindow(db, root, profileId, id, {
         offset: (page - 1) * TEXT_WINDOW,
         limit: TEXT_WINDOW,
       });

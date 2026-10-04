@@ -70,7 +70,7 @@ it('requires another comparison when the saved draft changes before a conflict c
           return json({ code: 'VERSION_CONFLICT', message: 'Review changed.' }, 409);
         return json({ ...intake, version: 10 });
       }
-      if (url.includes('/review?proposalId=')) {
+      if (url.includes('/review-record?')) {
         reads += 1;
         return json(reads === 1 ? review(8, '44') : review(9, '45'));
       }
@@ -117,7 +117,7 @@ it('does not install a stale saved draft when choosing the current fields', asyn
         writes += 1;
         return json({ code: 'VERSION_CONFLICT', message: 'Review changed.' }, 409);
       }
-      if (url.includes('/review?proposalId=')) {
+      if (url.includes('/review-record?')) {
         reads += 1;
         return json(reads === 1 ? review(8, '44') : review(9, '45'));
       }
@@ -255,3 +255,72 @@ it.each(['answers', 'resolutions', 'disposition'] as const)(
     );
   },
 );
+
+it('retains referenced resolution history while coalescing only changed decisions and retrying exact sparse writes', async () => {
+  const initial = review(7, '42'),
+    row = initial.records[0]!;
+  row.draft = {
+    id: 'fictional-large-draft',
+    format: 'health-intake-review-draft-v2',
+    proposalId: initial.proposalId,
+    recordId: row.id,
+    candidateId: row.candidateId!,
+    candidateVersionId: row.candidateVersionId!,
+    mapping: {},
+    resolutions: [],
+    resolutionsReference: { format: 'health-intake-review-draft-resolutions-v1', count: 4000 },
+    history: {
+      format: 'health-intake-review-draft-history-v1',
+      intakeId: intake.id,
+      sourceHash: 'fictional-source',
+      snapshotId: 'retained-history',
+      resolutions: 9000,
+      corrections: 4,
+    },
+    answers: { old: 'Retained earlier answer' },
+    disposition: 'pending',
+    at: '2026-10-04T00:00:00Z',
+  };
+  const requests: Record<string, unknown>[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_input, options) => {
+      requests.push(JSON.parse(String(options?.body)));
+      if (requests.length === 2) throw new TypeError('Fictional uncertain sparse save');
+      return json({ ...intake, version: 7 + requests.length });
+    }),
+  );
+  const view = renderHook(() => useReviewDrafts(profile.id, vi.fn()));
+  act(() => {
+    view.result.current.hydrate(initial);
+    view.result.current.update(initial, row, {
+      resolutions: [{ issueId: 'first-new-question', outcome: 'acknowledged' }],
+    });
+    const first = view.result.current.current(initial, row);
+    view.result.current.update(initial, row, {
+      resolutions: [...first.resolutions, { issueId: 'second-new-question', outcome: 'confirmed' }],
+      answers: { ...first.answers, new: 'New fictional reading' },
+    });
+  });
+  await act(() => view.result.current.flush());
+  expect(requests[0]!.resolutions).toEqual([
+    { issueId: 'first-new-question', outcome: 'acknowledged' },
+    { issueId: 'second-new-question', outcome: 'confirmed' },
+  ]);
+  expect(requests[0]!.answers).toEqual({ new: 'New fictional reading' });
+  expect(requests[0]).not.toHaveProperty('history');
+  expect(requests[0]).not.toHaveProperty('resolutionsReference');
+  act(() => {
+    const current = view.result.current.current(initial, row);
+    view.result.current.update(initial, row, {
+      resolutions: [...current.resolutions, { issueId: 'third-new-question', outcome: 'unknown' }],
+    });
+  });
+  await act(() => view.result.current.flush());
+  expect(requests[1]!.resolutions).toEqual([{ issueId: 'third-new-question', outcome: 'unknown' }]);
+  expect(requests[1]!.answers).toEqual({});
+  await act(() => view.result.current.retry());
+  expect(requests[2]).toEqual(requests[1]);
+  expect(view.result.current.current(initial, row).history).toEqual(row.draft.history);
+  expect(view.result.current.current(initial, row).resolutionsReference?.count).toBe(4000);
+});

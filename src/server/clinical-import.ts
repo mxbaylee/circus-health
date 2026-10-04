@@ -1,5 +1,8 @@
+import { canonicalReportGroupContextChunks } from './intake-selected-report-groups.ts';
 import { storedIntakeDetails } from './intake-state-access.ts';
 import { retainAcceptedContribution } from './ownership-contributions.ts';
+import { checkedAcceptedReviewDraftHistory } from './intake-review-draft-state.ts';
+import { clinicalTables } from './clinical-references.ts';
 import {
   requireCorrectedOwnershipReview,
   correctedOccurrence,
@@ -13,6 +16,9 @@ import { appendImportedMedicationDefault } from './medication-preferences.ts';
 import { opticalPrescriptionProblem, validClinicalFieldValue } from './optical-prescription.ts';
 import {
   buildIntakeRelatedReview,
+  nativeDuplicateRecord,
+  streamingDuplicateRecord,
+  duplicateRecordHeader,
   duplicateRecord,
   intakePairDraftStatus,
   intakePairPreviousDecision,
@@ -220,12 +226,12 @@ interface ClinicalEvidenceComparison extends Omit<IntakeEvidenceComparison, 'kin
   sourceRecordId: string;
 }
 
-interface ClinicalReview extends Omit<IntakeReview, 'records'> {
+export interface ClinicalReview extends Omit<IntakeReview, 'records'> {
   records: ClinicalReviewRecord[];
   sourceContext: IntakeSourceContext[];
 }
 
-interface BuildReviewInput {
+export interface BuildReviewInput {
   file: SourceFileRow;
   inputFile: InputFileRow;
   entries: IntakeEntry[];
@@ -235,9 +241,50 @@ interface BuildReviewInput {
   reviewTokenVersion?: number;
   drafts?: IntakeReviewDraft[];
   acceptedDecisions?: IntakeReviewDecision[];
+  /** Required together on selected collection paths; neither accessor materializes an envelope. */
+  selected?: {
+    sourceScopeProblem: (entry: IntakeEntry) => string | null;
+    draft: (recordId: string) => IntakeReviewDraft | null;
+    accepted: (recordId: string) => IntakeReviewDecision | undefined;
+    reportContext: (
+      envelopeId: string,
+      proposalId: string | null,
+    ) => IntakeSourceContext['reportContext'] | undefined;
+  };
 }
 
-interface ProjectReviewInput {
+export interface SelectedClinicalProjectionScope {
+  duplicateEvidence?(
+    kind: ClinicalKind,
+    id: string,
+  ): import('../shared/saved-duplicate-evidence.ts').RetainedDuplicateEvidenceReference;
+  /** Materialize every checked retained report source provider in the synchronous projection scope. */
+  materializeSourceProviders(): void;
+  /** Construct a fresh complete collision policy for precisely the mutating proposal entries. */
+  sourceScope(entries: IntakeEntry[]): (entry: IntakeEntry) => string | null;
+  pairSource: SelectedClinicalReportSource;
+  reportSource(
+    record: Parameters<SelectedClinicalReportSource>[0],
+    proposalId: string | null,
+  ): {
+    confirmation: Pick<
+      IntakeReportSourceConfirmation,
+      'basis' | 'source' | 'sourceProviderId' | 'groupId' | 'operationId'
+    >;
+    coverage: {
+      groupVersionId: string;
+      contextId: string;
+      extensionId?: string;
+      coverageEntryId?: string;
+    };
+  } | null;
+  providerAuthorized(
+    record: Parameters<SelectedClinicalReportSource>[0],
+    proposalId: string | null,
+    providerId: string,
+  ): boolean;
+}
+export interface ProjectReviewInput {
   file: SourceFileRow;
   inputFile: InputFileRow;
   entries: IntakeEntry[];
@@ -247,6 +294,7 @@ interface ProjectReviewInput {
   profileId: string;
   prevalidatedPairScopes?: Set<string>;
   occurrenceAuthorityFinalizers?: OccurrenceAuthorityFinalizer[];
+  selected?: SelectedClinicalProjectionScope;
 }
 
 interface MappingRule {
@@ -561,6 +609,7 @@ export function refreshClinicalIdentityPolicy(
   file: SourceFileRow,
   record: IntakeReviewRecord,
   workflow?: IntakeWorkflow,
+  selected?: import('./record-ownership-authority.ts').SelectedOwnershipReviewScope,
 ): void {
   const internal = record as IntakeReviewRecord & {
     problem?: string | null;
@@ -570,7 +619,7 @@ export function refreshClinicalIdentityPolicy(
   const clinicalIdentity = (record as IntakeReviewRecord & { ownershipIdentity?: string })
     .ownershipIdentity;
   if (clinicalIdentity)
-    requireCorrectedOwnershipReview(db, record, clinicalIdentity, file, workflow);
+    requireCorrectedOwnershipReview(db, record, clinicalIdentity, file, workflow, selected);
   const assigned = record.identityAttribution?.assignedPerson;
   if (record.mapping.personId) {
     const person = db
@@ -719,10 +768,12 @@ export function buildClinicalReview(
     reviewTokenVersion,
     drafts = [],
     acceptedDecisions = [],
+    selected,
   }: BuildReviewInput,
 ): ClinicalReview {
   const rules = activeMappingRules(db, file.provider_id);
-  const sourceScopeProblem = clinicalSourceScopeCheck(db, file, entries, inputFile.id);
+  const sourceScopeProblem =
+    selected?.sourceScopeProblem ?? clinicalSourceScopeCheck(db, file, entries, inputFile.id);
   const local = new Map<string, PriorRecord>(),
     localIdentity = new Map<string, PriorRecord>();
   const contextOnly = (entry: IntakeEntry): boolean => {
@@ -739,10 +790,15 @@ export function buildClinicalReview(
       ? null
       : latestRecordException(db, identity(entry, file), original);
     if (exception) Object.assign(mapping, { kind: original.kind, ...exception.set });
-    const draft = drafts.find((item) => item.recordId === `${inputFile.id}:line:${entry.line}`);
-    const accepted = acceptedDecisions.findLast(
-      (item) => item.action === 'accept' && item.recordId === `${inputFile.id}:line:${entry.line}`,
-    );
+    const draft = selected
+      ? selected.draft(`${inputFile.id}:line:${entry.line}`)
+      : drafts.find((item) => item.recordId === `${inputFile.id}:line:${entry.line}`);
+    const accepted = selected
+      ? selected.accepted(`${inputFile.id}:line:${entry.line}`)
+      : acceptedDecisions.findLast(
+          (item) =>
+            item.action === 'accept' && item.recordId === `${inputFile.id}:line:${entry.line}`,
+        );
     Object.assign(
       mapping,
       accepted?.mapping || {},
@@ -756,6 +812,7 @@ export function buildClinicalReview(
     .filter((item) => !item.contextOnly)
     .map((item) => item.entry);
   const retainedGroups = (() => {
+    if (selected) return [];
     const workflow = parsedObject(storedIntakeDetails(db, file)?.workflow);
     return Array.isArray(workflow.reportGroups)
       ? (workflow.reportGroups as IntakeReportGroup[])
@@ -765,15 +822,17 @@ export function buildClinicalReview(
     .filter((item) => item.contextOnly)
     .map(({ entry }) => {
       const value = entry.value;
-      const reportContext = retainedGroups
-        .flatMap((group) => group.versions)
-        .findLast(
-          (groupVersion) =>
-            groupVersion.context?.envelopeId === value.id &&
-            groupVersion.members.some((member) =>
-              member.occurrences.some((occurrence) => occurrence.proposalId === proposalId),
-            ),
-        )?.context;
+      const reportContext = selected
+        ? selected.reportContext(value.id, proposalId)
+        : retainedGroups
+            .flatMap((group) => group.versions)
+            .findLast(
+              (groupVersion) =>
+                groupVersion.context?.envelopeId === value.id &&
+                groupVersion.members.some((member) =>
+                  member.occurrences.some((occurrence) => occurrence.proposalId === proposalId),
+                ),
+            )?.context;
       return {
         id: `${inputFile.id}:line:${entry.line}`,
         envelopeId: value.id,
@@ -826,11 +885,15 @@ export function buildClinicalReview(
     const beforeExceptionMapping = { ...mapping };
     Object.assign(mapping, exception ? { kind: original.kind, ...exception.set } : {});
     const undraftedMapping = { ...mapping },
-      draft = drafts.find((d) => d.recordId === `${inputFile.id}:line:${entry.line}`),
-      accepted = acceptedDecisions.findLast(
-        (item) =>
-          item.action === 'accept' && item.recordId === `${inputFile.id}:line:${entry.line}`,
-      );
+      draft = selected
+        ? selected.draft(`${inputFile.id}:line:${entry.line}`)
+        : drafts.find((d) => d.recordId === `${inputFile.id}:line:${entry.line}`),
+      accepted = selected
+        ? selected.accepted(`${inputFile.id}:line:${entry.line}`)
+        : acceptedDecisions.findLast(
+            (item) =>
+              item.action === 'accept' && item.recordId === `${inputFile.id}:line:${entry.line}`,
+          );
     Object.assign(
       mapping,
       sourceContextEnvelope(entry.value) ? accepted?.mapping || {} : {},
@@ -979,6 +1042,9 @@ export function buildClinicalReview(
           },
           mapping as IntakeClinicalMapping,
           draft?.decision?.comparisons,
+          {},
+          undefined,
+          { native: !!selected },
         ),
       );
     return result;
@@ -1026,18 +1092,19 @@ function occurrenceContext(
   review: ClinicalReview,
   record: ClinicalReviewRecord,
   confirmationHashes: Map<IntakeReportSourceConfirmation, string>,
+  selectedReportSource?: SelectedClinicalReportSource,
 ): IntakeOccurrenceContext {
   const acquisition = db
     .prepare('SELECT provider_id,sha256,bytes FROM source_files WHERE id=?')
     .get(file.id) as { provider_id: string; sha256: string; bytes: number } | undefined;
   if (!acquisition)
     throw new HttpError(409, 'SOURCE_CHANGED', 'The retained intake source is unavailable');
-  const reportSource = intakeReportSourceForMember(
-    file.reportSourceConfirmations,
-    record.reportGroups,
-    record,
-    { proposalId: review.proposalId, recordId: record.id },
-  );
+  const reportSource = selectedReportSource
+    ? null
+    : intakeReportSourceForMember(file.reportSourceConfirmations, record.reportGroups, record, {
+        proposalId: review.proposalId,
+        recordId: record.id,
+      });
   // Hash the entire immutable confirmation once per synchronous pass. Every
   // field remains pinned, without serializing all report members for every row.
   let confirmationHash: string | undefined;
@@ -1060,15 +1127,17 @@ function occurrenceContext(
     identityAttribution: record.identityAttribution || null,
     identityReview: record.identityReview || null,
     reportGroups: record.reportGroups || [],
-    reviewedReportSource: reportSource
-      ? {
-          confirmationHash,
-          groupVersionId: reportSource.coverage.groupVersionId,
-          contextId: reportSource.coverage.contextId,
-          extensionId: reportSource.coverage.extensionId || null,
-          coverageEntryId: reportSource.coverage.coverageEntryId || null,
-        }
-      : null,
+    reviewedReportSource: selectedReportSource
+      ? selectedReportSource(record, review.proposalId)
+      : reportSource
+        ? {
+            confirmationHash,
+            groupVersionId: reportSource.coverage.groupVersionId,
+            contextId: reportSource.coverage.contextId,
+            extensionId: reportSource.coverage.extensionId || null,
+            coverageEntryId: reportSource.coverage.coverageEntryId || null,
+          }
+        : null,
     evidence: record.evidence,
   };
   return {
@@ -1077,7 +1146,11 @@ function occurrenceContext(
     proposalId: review.proposalId,
     candidateId: record.candidateId || '',
     candidateVersionId: record.candidateVersionId || '',
-    contextHash: hash(canonical(context)),
+    contextHash: (() => {
+      const hash = createHash('sha256');
+      for (const chunk of canonicalReportGroupContextChunks(context)) hash.update(chunk);
+      return hash.digest('hex');
+    })(),
     locator: entry.value.provenance.locator,
     originalSourceFileId: file.id,
   };
@@ -1141,6 +1214,7 @@ function verifyRetainedClinicalSourceRecord(
   entry: IntakeEntry,
   review: ClinicalReview,
   record: ClinicalReviewRecord,
+  selected?: SelectedClinicalProjectionScope,
 ): void {
   const acquisition = db.prepare('SELECT provider_id FROM source_files WHERE id=?').get(file.id) as
     { provider_id: string } | undefined;
@@ -1170,9 +1244,12 @@ function verifyRetainedClinicalSourceRecord(
     retained.locator_json !== expected.locator ||
     retained.batch_id !== expected.batchId ||
     !['retained_unprojected', 'projected_reviewed'].includes(String(retained.extraction_status)) ||
-    !authorizedIncomingProviderIds(acquisition.provider_id, file, review, record).has(
-      String(retained.provider_id),
-    )
+    !(selected
+      ? retained.provider_id === acquisition.provider_id ||
+        selected.providerAuthorized(record, review.proposalId, String(retained.provider_id))
+      : authorizedIncomingProviderIds(acquisition.provider_id, file, review, record).has(
+          String(retained.provider_id),
+        ))
   )
     throw new HttpError(
       409,
@@ -1182,12 +1259,24 @@ function verifyRetainedClinicalSourceRecord(
 }
 
 /** Finalize v2 scopes only after candidate/report and identity policy enrichment. */
+/** The same exact commitment fields used by v1 pair authority, resolved from complete selected source coverage. */
+export type SelectedClinicalReportSource = (
+  record: Pick<IntakeReviewRecord, 'id' | 'candidateId' | 'candidateVersionId' | 'reportGroups'>,
+  proposalId: string | null,
+) => {
+  confirmationHash: string;
+  groupVersionId: string;
+  contextId: string;
+  extensionId: string | null;
+  coverageEntryId: string | null;
+} | null;
 export function finalizeClinicalPairScopes(
   db: DatabaseSync,
   file: SourceFileRow,
   inputFile: InputFileRow,
   entries: IntakeEntry[],
   review: ClinicalReview,
+  selectedReportSource?: SelectedClinicalReportSource,
 ): void {
   const confirmationHashes = new Map<IntakeReportSourceConfirmation, string>();
   const entriesByRecordId = new Map(
@@ -1205,15 +1294,24 @@ export function finalizeClinicalPairScopes(
       review,
       record,
       confirmationHashes,
+      selectedReportSource,
     );
     record.comparisonContextHash = occurrence.contextHash;
+    // Identity/report enrichment may change the effective mapping after initial
+    // discovery. Scope the version that final acceptance actually validates.
+    record.comparisonReference = {
+      ...record.comparisonReference,
+      version: clinicalVersion(record.mapping),
+    };
     const incoming = {
       ...record.comparisonReference,
       id: record.id,
       evidence: record.evidence,
     };
     for (const comparison of record.comparisons) {
-      const candidate = duplicateRecord(db, record.kind, comparison.id);
+      const candidate = selectedReportSource
+        ? nativeDuplicateRecord(db, record.kind, comparison.id)
+        : duplicateRecord(db, record.kind, comparison.id);
       comparison.scope = intakePairScope(db, incoming, candidate, occurrence);
       comparison.previousDecision = intakePairPreviousDecision(
         db,
@@ -1229,11 +1327,12 @@ export function finalizeClinicalPairScopes(
           (decision) => decision.otherRecordId === comparison.id,
         ),
         occurrence,
+        !!selectedReportSource,
       );
     }
     record.comparisonDrafts = (record.draft?.decision?.comparisons || []).map((decision) => ({
       otherRecordId: decision.otherRecordId,
-      status: intakePairDraftStatus(db, incoming, decision, occurrence),
+      status: intakePairDraftStatus(db, incoming, decision, occurrence, !!selectedReportSource),
     }));
   }
 }
@@ -1449,13 +1548,16 @@ export function assertClinicalSourceScopes(
   inputFile: InputFileRow,
   entries: IntakeEntry[],
   decisions: IntakeReviewDecision[],
+  complete?: SelectedClinicalProjectionScope,
 ): void {
   const selected = new Map(decisions.map((decision) => [decision.recordId, decision]));
   const mutatingEntries = entries.filter((entry) => {
     const decision = selected.get(`${inputFile.id}:line:${entry.line}`);
     return decision?.action === 'accept' || !!decision?.comparisons?.length;
   });
-  const scopeProblem = clinicalSourceScopeCheck(db, file, mutatingEntries, inputFile.id);
+  const scopeProblem = complete
+    ? complete.sourceScope(mutatingEntries)
+    : clinicalSourceScopeCheck(db, file, mutatingEntries, inputFile.id);
   for (const entry of mutatingEntries) {
     const problem = scopeProblem(entry);
     if (problem) throw new HttpError(409, 'CLINICAL_SOURCE_SCOPE_COLLISION', problem);
@@ -1469,10 +1571,11 @@ export function validateClinicalPairScopes(
   entries: IntakeEntry[],
   review: ClinicalReview,
   decisions: IntakeReviewDecision[],
+  complete?: SelectedClinicalProjectionScope,
 ): Set<string> {
   const confirmationHashes = new Map<IntakeReportSourceConfirmation, string>();
   const selected = new Map(decisions.map((decision) => [decision.recordId, decision]));
-  assertClinicalSourceScopes(db, file, inputFile, entries, decisions);
+  assertClinicalSourceScopes(db, file, inputFile, entries, decisions, complete);
   const entriesByRecordId = new Map(
     entries.map((entry) => [`${inputFile.id}:line:${entry.line}`, entry]),
   );
@@ -1489,6 +1592,7 @@ export function validateClinicalPairScopes(
       review,
       record,
       confirmationHashes,
+      complete?.pairSource,
     );
     const incoming = {
       id: record.id,
@@ -1507,7 +1611,9 @@ export function validateClinicalPairScopes(
         'Attach one incoming occurrence to at most one reviewed saved record',
       );
     for (const comparison of comparisons) {
-      const target = duplicateRecord(db, record.kind, comparison.otherRecordId);
+      const target = complete
+        ? nativeDuplicateRecord(db, record.kind, comparison.otherRecordId)
+        : duplicateRecord(db, record.kind, comparison.otherRecordId);
       requireIntakePairScope(
         db,
         incoming,
@@ -1533,6 +1639,7 @@ export function projectClinicalReview(
     profileId,
     prevalidatedPairScopes,
     occurrenceAuthorityFinalizers: compoundOccurrenceFinalizers,
+    selected: complete,
   }: ProjectReviewInput,
 ): ProjectionResults {
   const confirmationHashes = new Map<IntakeReportSourceConfirmation, string>();
@@ -1558,14 +1665,14 @@ export function projectClinicalReview(
   // A coordinator may have prepared multiple blocks against one unchanged
   // snapshot. Recheck against earlier blocks in this transaction even when
   // paired-evidence scopes were already prevalidated.
-  assertClinicalSourceScopes(db, file, inputFile, entries, decisions || []);
+  assertClinicalSourceScopes(db, file, inputFile, entries, decisions || [], complete);
   // INSERT OR IGNORE materialization is not authority. Prove every existing
   // deterministic row before any provider, relationship, evidence, workflow,
   // or accepted clinical write in this compound projection.
   for (const record of review.records) {
     const entry = entriesByRecordId.get(record.id);
     if (!entry) throw new Error('Clinical review entry is missing from its retained proposal');
-    verifyRetainedClinicalSourceRecord(db, file, inputFile, entry, review, record);
+    verifyRetainedClinicalSourceRecord(db, file, inputFile, entry, review, record, complete);
   }
   prevalidatedPairScopes ||= validateClinicalPairScopes(
     db,
@@ -1574,18 +1681,19 @@ export function projectClinicalReview(
     entries,
     review,
     decisions || [],
+    complete,
   );
   const verifiedComparisonOriginals = new Set<string>();
   const occurrenceAuthorityFinalizers: OccurrenceAuthorityFinalizer[] = [];
   for (const record of review.records) {
     const entry = entriesByRecordId.get(record.id);
     if (!entry) throw new Error('Clinical review entry is missing from its retained proposal');
-    const reportSourceResolution = intakeReportSourceForMember(
-      file.reportSourceConfirmations,
-      record.reportGroups,
-      record,
-      { proposalId: review.proposalId, recordId: record.id },
-    );
+    const reportSourceResolution = complete
+      ? complete.reportSource(record, review.proposalId)
+      : intakeReportSourceForMember(file.reportSourceConfirmations, record.reportGroups, record, {
+          proposalId: review.proposalId,
+          recordId: record.id,
+        });
     const reportSource = reportSourceResolution?.confirmation;
     const reviewedReportSource = reportSourceResolution
       ? {
@@ -1667,6 +1775,7 @@ export function projectClinicalReview(
       review,
       record,
       confirmationHashes,
+      complete?.pairSource,
     );
     const saveComparisons = (mapping: ClinicalMapping, entityId = record.id): void => {
       for (const comparison of [...recordComparisons].sort(
@@ -1675,7 +1784,16 @@ export function projectClinicalReview(
           Number(right.occurrenceEvidence === 'attach'),
       )) {
         // A scoped result from any search page is valid; the default page is not an allowlist.
-        const target = duplicateRecord(db, mapping.kind, comparison.otherRecordId);
+        const target = complete
+          ? streamingDuplicateRecord(db, mapping.kind, comparison.otherRecordId)
+          : duplicateRecord(db, mapping.kind, comparison.otherRecordId);
+        const reviewedSavedEvidence = complete?.duplicateEvidence?.(target.kind, target.id);
+        if (complete && !reviewedSavedEvidence)
+          throw new HttpError(
+            409,
+            'DUPLICATE_EVIDENCE_PENDING',
+            'Prepare exact saved evidence before accepting this relationship',
+          );
         const targetTable = {
           observation: 'observations',
           medication: 'medications',
@@ -1739,6 +1857,7 @@ export function projectClinicalReview(
             scope: comparison.scope,
             occurrence: scopedOccurrence,
             prevalidated: true,
+            reviewedSavedEvidence,
           },
         );
         if (savedDecision.occurrenceAttachment && scopedOccurrence)
@@ -1783,6 +1902,24 @@ export function projectClinicalReview(
     }
     const problem = checkClinicalMapping(mapping) || assetProblem(db, file, mapping);
     if (problem) throw new HttpError(400, 'IMPORT_MAPPING', problem);
+    const selectedDraftHistory = record.draft
+        ? checkedAcceptedReviewDraftHistory(db, file, record.draft, {
+            proposalId: review.proposalId,
+            recordId: record.id,
+            candidateId: record.candidateId!,
+            candidateVersionId: record.candidateVersionId!,
+          })
+        : undefined,
+      reviewDraftHistory = selectedDraftHistory?.corrections ? selectedDraftHistory : undefined,
+      correctionHistorySource = { format: 'health-accepted-contribution-corrections-v1' as const },
+      correctionAudit = reviewDraftHistory
+        ? {
+            reviewDraftHistory,
+            reviewDraftId: record.draft!.id,
+            proposalId: review.proposalId,
+            candidateId: record.candidateId!,
+          }
+        : {};
     const marked = markedComparisons[0];
     if (marked) {
       if (decision.rememberRule)
@@ -1791,7 +1928,7 @@ export function projectClinicalReview(
           'MAPPING_RULE',
           'An occurrence attachment cannot also create a reusable clinical mapping rule',
         );
-      const target = duplicateRecord(db, mapping.kind, marked.otherRecordId);
+      const target = duplicateRecordHeader(db, mapping.kind, marked.otherRecordId);
       if (target.kind !== mapping.kind)
         throw new HttpError(
           409,
@@ -1819,7 +1956,22 @@ export function projectClinicalReview(
         mapping: mapping as IntakeClinicalMapping,
         intakeId: file.id,
         candidateVersionId: record.candidateVersionId || null,
+        ...correctionAudit,
       });
+      if (reviewDraftHistory) {
+        // Register the audit marker before the compound operation finalizes its
+        // owned occurrence authority against the exact resulting target row.
+        const table = clinicalTables[target.kind],
+          row = db.prepare(`SELECT extra_json FROM ${table} WHERE id=?`).get(target.id)!,
+          extra = parsedObject(row.extra_json),
+          imported = parsedObject(extra.import);
+        imported.correctionHistorySource = correctionHistorySource;
+        extra.import = imported;
+        db.prepare(`UPDATE ${table} SET extra_json=? WHERE id=?`).run(
+          JSON.stringify(extra),
+          target.id,
+        );
+      }
       results.duplicates++;
       results.records.push({
         recordId: record.id,
@@ -1895,7 +2047,12 @@ export function projectClinicalReview(
     if (found?.exact) {
       entityId = found.id;
       entityKind = found.kind;
-      if (recordException || reviewedReportSource || record.identityAttribution) {
+      if (
+        recordException ||
+        reviewedReportSource ||
+        record.identityAttribution ||
+        reviewDraftHistory
+      ) {
         const table = {
             observation: 'observations',
             medication: 'medications',
@@ -1963,7 +2120,11 @@ export function projectClinicalReview(
             outcome: sourceOutcome,
           };
         }
-        if (record.draft?.corrections?.length) {
+        if (reviewDraftHistory) imported.correctionHistorySource = correctionHistorySource;
+        else if (
+          record.draft?.format !== 'health-intake-review-draft-v2' &&
+          record.draft?.corrections?.length
+        ) {
           const prior = Array.isArray(imported.corrections) ? imported.corrections : [];
           imported.corrections = [
             ...prior,
@@ -1992,7 +2153,12 @@ export function projectClinicalReview(
           acceptedMapping: mapping,
           personId: mapping.personId || 'patient',
           originalMapping: mappingFrom(entry),
-          ...(record.draft?.corrections?.length ? { corrections: record.draft.corrections } : {}),
+          ...(reviewDraftHistory
+            ? { correctionHistorySource }
+            : record.draft?.format !== 'health-intake-review-draft-v2' &&
+                record.draft?.corrections?.length
+              ? { corrections: record.draft.corrections }
+              : {}),
           recordException,
           manuallyEdited:
             record.manuallyEdited ||
@@ -2064,6 +2230,7 @@ export function projectClinicalReview(
       mapping: mapping as IntakeClinicalMapping,
       intakeId: file.id,
       candidateVersionId: record.candidateVersionId || null,
+      ...correctionAudit,
     });
     saveComparisons(mapping, entityId);
     results.records.push({

@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   fstatSync,
   mkdtempSync,
@@ -22,6 +22,8 @@ import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
 import {
   getIntake,
+  getIntakeEvidenceHeader,
+  readIntakeLiteralWindow,
   isUnpublishedIntakeChildError,
   intakeDurability,
   uploadIntake,
@@ -32,6 +34,11 @@ import {
 import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
 import { recordPublicationFixture } from './helpers/accepted-record-fixture.ts';
 import type { RecordStorage } from '../record-versions.ts';
+import { clearIntakeStateCache } from '../intake-state-storage.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import { publishIntakeSourceText } from '../intake-source-text.ts';
+import { readIntakeSourcePin } from '../intake-source-pin.ts';
 
 const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 function fixture(t: TestContext, recordStorage?: RecordStorage) {
@@ -113,6 +120,8 @@ test('streamed child above 25 MiB uses bounded verification, exact occurrence id
   assert.deepEqual(readdirSync(join(f.root, '.intake-child-staging')), []);
   const before = intakeDurability(f.db),
     retryWork = createIntakeFileWorkCounters();
+  clearIntakeStateCache(f.db);
+  const metadataBefore = intakeWorkCounters(f.db);
   const retry = await withIntakeFileWork(retryWork, () =>
     withStagedIntakeChild(f, input, async () =>
       assert.fail('retry must reuse verified occurrence'),
@@ -122,6 +131,94 @@ test('streamed child above 25 MiB uses bounded verification, exact occurrence id
   assert.deepEqual(intakeDurability(f.db), before);
   assert.equal(retryWork.publications, 0);
   assert.equal(retryWork.writes, 0);
+  const metadataAfter = intakeWorkCounters(f.db);
+  assert.equal(metadataAfter.warm.envelopeHydrations, metadataBefore.warm.envelopeHydrations);
+  assert.equal(
+    metadataAfter.primitive.coldReconstructions,
+    metadataBefore.primitive.coldReconstructions,
+  );
+});
+
+test('compact evidence headers and literal windows read legacy and native originals without workflow hydration', async (t) => {
+  const f = fixture(t),
+    bytes = Buffer.from('Fictional 🌿 source text with a later page'),
+    input = { ...member(bytes, 'zip:fictional.txt'), filename: 'fictional.txt' };
+  const child = await withStagedIntakeChild(f, input, async ({ outputFd }) => {
+    writeSync(outputFd, bytes);
+  });
+  for (const selected of [false, true]) {
+    if (selected) {
+      const source = f.db
+        .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
+        .get(child.id)!;
+      await buildIntakeCollectionEnvelope(f.db, source as never);
+    }
+    clearIntakeStateCache(f.db);
+    const before = intakeWorkCounters(f.db),
+      header = getIntakeEvidenceHeader(f.db, f.root, f.profileId, child.id),
+      window = readIntakeLiteralWindow(f.db, f.root, f.profileId, child.id, {
+        offset: 4,
+        limit: 13,
+      });
+    assert.equal(header.filename, input.filename);
+    assert.equal(header.version, selected ? 1 : null);
+    assert.equal(header.workflowState, selected ? 'selected' : 'pending_migration');
+    assert.equal(window.text, bytes.toString().slice(4, 17));
+    assert.equal(window.nextOffset, 17);
+    assert.equal('intake' in window, false);
+    const after = intakeWorkCounters(f.db);
+    assert.equal(after.warm.envelopeHydrations, before.warm.envelopeHydrations);
+    assert.equal(after.primitive.coldReconstructions, before.primitive.coldReconstructions);
+    assert.throws(
+      () => getIntakeEvidenceHeader(f.db, f.root, 'another-profile', child.id),
+      (error: unknown) => error instanceof HttpError && error.status === 403,
+    );
+    assert.throws(
+      () => readIntakeLiteralWindow(f.db, f.root, 'another-profile', child.id),
+      (error: unknown) => error instanceof HttpError && error.status === 403,
+    );
+  }
+});
+
+test('native child source-text publication updates parent pins without loading either workflow', async (t) => {
+  const f = fixture(t),
+    bytes = Buffer.from('Fictional retained child text'),
+    input = { ...member(bytes, 'zip:fictional.txt'), filename: 'fictional.txt' };
+  const child = await withStagedIntakeChild(f, input, async ({ outputFd }) => {
+    writeSync(outputFd, bytes);
+  });
+  for (const id of [f.parentId, child.id]) {
+    const source = f.db
+      .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
+      .get(id)!;
+    await buildIntakeCollectionEnvelope(f.db, source as never);
+  }
+  clearIntakeStateCache(f.db);
+  const before = intakeWorkCounters(f.db);
+  const result = publishIntakeSourceText(f.db, f.root, f.profileId, child.id, {
+    operationId: randomUUID(),
+    sourceHash: input.sourceHash,
+    expectedRevisionId: null,
+    evidence: {
+      adapter: { name: 'fictional-literal', version: '1' },
+      pages: [{ page: 1, disposition: 'extracted', inspected: false }],
+      spans: [
+        { id: 'fictional-span', text: bytes.toString(), region: { page: 1 }, provenance: 'native' },
+      ],
+      relations: [],
+      issues: [],
+    },
+  });
+  assert.ok(result.revision);
+  assert.equal(readIntakeSourcePin(f.db, child.id)!.revisionId, result.revision.id);
+  assert.equal(readIntakeSourcePin(f.db, f.parentId)!.revisionId, null);
+  assert.equal(readIntakeSourcePin(f.db, child.id)!.version, 1);
+  assert.equal(readIntakeSourcePin(f.db, f.parentId)!.version, 1);
+  assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.warm.envelopeHydrations);
+  assert.equal(
+    intakeWorkCounters(f.db).primitive.coldReconstructions,
+    before.primitive.coldReconstructions,
+  );
 });
 
 test('same bytes at distinct locators survive durable rebuild as distinct children', async (t) => {
@@ -320,7 +417,7 @@ test('writer lifecycle assertion detects owner closure while a stage remains ope
     }),
     (error: unknown) => {
       assert.equal(isUnpublishedIntakeChildError(error), false);
-      return /not open/i.test(String(error));
+      return error instanceof HttpError && error.code === 'PROFILE_LOCKED';
     },
   );
   assert.equal(assertions, 1);

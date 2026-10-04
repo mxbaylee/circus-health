@@ -1,8 +1,8 @@
+import type { IntakeHeader } from '../../../shared/intake-summary';
 import { useContext, useEffect, useId, useRef, useState } from 'react';
 import { UNSAFE_DataRouterContext, useBlocker } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import type {
-  Intake,
   IntakeClinicalMapping,
   IntakeIssueResolution,
   IntakeMetadata,
@@ -22,12 +22,12 @@ export interface IntakeMetadataSuggestions {
   topics: string[];
 }
 
-export function intakeOriginal(intake: Intake): SourceFile {
+export function intakeOriginal(intake: IntakeHeader): SourceFile {
   return {
     id: intake.id,
     providerId: intake.providerId,
     provider: intake.provider,
-    path: intake.filename,
+    path: intake.filename ?? intake.contentUrl,
     sha256: intake.sha256,
     bytes: intake.bytes,
     mimeType: intake.mimeType,
@@ -39,7 +39,7 @@ export function intakeOriginal(intake: Intake): SourceFile {
 }
 
 export function intakeEvidencePage(
-  intake: Intake,
+  intake: IntakeHeader,
   evidence: IntakeEvidenceLocator[],
 ): number | undefined {
   const sameOriginal = (url?: string) => {
@@ -79,7 +79,7 @@ export function ReviewLayout({
   evidence = [],
   sideBySide = false,
 }: {
-  intake: Intake;
+  intake: IntakeHeader;
   children: ReactNode;
   evidence?: IntakeEvidenceLocator[];
   sideBySide?: boolean;
@@ -188,8 +188,8 @@ export function IntakeMetadataEditor({
   onSave,
   onDirtyChange,
 }: {
-  intake: Intake;
-  options: Intake[];
+  intake: IntakeHeader;
+  options: IntakeHeader[];
   suggestions?: IntakeMetadataSuggestions;
   busy: boolean;
   onSave: (metadata: IntakeMetadata) => Promise<boolean>;
@@ -238,6 +238,12 @@ export function IntakeMetadataEditor({
             .map((value) => ({ field, value })),
       )
     : [];
+  if (intake.metadataState === 'unloaded')
+    return (
+      <p role="status">
+        File labels have not loaded completely. Refresh the file before editing its labels.
+      </p>
+    );
   return (
     <section className="intake-metadata" aria-label="File details">
       <p className="helper-text">

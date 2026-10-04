@@ -1,4 +1,6 @@
+import { latestSelfReviewDraftResolution } from './intake-review-draft-selection.ts';
 import { labelledBirthDates, supportedDateValues } from './intake-evidence-dates.ts';
+import type { ReviewIssueCollection } from './intake-review-issue-state.ts';
 import { createHash } from 'node:crypto';
 import { HttpError } from './database.ts';
 import { clinicalFields, clinicalMappingEnvelope, datePrecision } from './clinical-import.ts';
@@ -318,14 +320,17 @@ export function resolutionFields(
 export function reviewIssues(
   record: ReviewRecordInput,
   entry: IntakeEntry,
-  questions: IntakeQuestion[] = [],
+  questions: Iterable<IntakeQuestion> & {
+    some(predicate: (question: IntakeQuestion) => boolean): boolean;
+  } = [],
   metadataScope: SuggestionEvidenceScope = {
     packageEvidence: false,
     reportScoped: false,
     memberId: null,
   },
-): IntakeReviewIssue[] {
-  const issues: IntakeReviewIssue[] = [];
+  sink?: ReviewIssueCollection,
+): ReviewIssueCollection {
+  const issues: ReviewIssueCollection = sink || [];
   const add = (
     prompt: unknown,
     kind: IssueKind,
@@ -338,7 +343,8 @@ export function reviewIssues(
       kind === 'date' && !dateFields.includes(field || '') ? 'information' : kind;
     const writableField = writableKind === 'information' && kind === 'date' ? null : field;
     const id = question?.id || 'issue:' + hash([record.candidateVersionId, writableKind, key]);
-    if (issues.some((i) => i.id === id)) return issues.find((i) => i.id === id) || null;
+    const retained = issues.findId ? issues.findId(id) : issues.find((issue) => issue.id === id);
+    if (retained) return retained;
     issues.push({
       id,
       kind: writableKind,
@@ -358,9 +364,7 @@ export function reviewIssues(
     ...(Array.isArray(value.reviewIssues) ? value.reviewIssues : []),
     ...(Array.isArray(clinical.reviewIssues) ? clinical.reviewIssues : []),
   ] as ReviewIssueSource[];
-  const retainedSelfConfirmation = record.draft?.resolutions?.findLast(
-    (resolution) => resolution.outcome === 'this_is_me',
-  );
+  const retainedSelfConfirmation = latestSelfReviewDraftResolution(record.draft);
   if (
     original.subject !== 'self' ||
     (record.identityConfirmationRequired &&

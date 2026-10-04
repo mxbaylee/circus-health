@@ -2,10 +2,12 @@ import {
   parseRecordJson,
   stringifyRecordJson,
   recordVersionWork,
+  recordVersionWorkMaximum,
   recordVersionColumns,
   withRecordVersionWorkPhase,
 } from './record-version-work.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
 // Logical record journal. All storage callbacks operate on plaintext bytes in
 // memory; the profile vault must authenticate/encrypt durable objects and own
 // the single-writer lock. This module never writes a plaintext journal to disk.
@@ -53,8 +55,7 @@ export interface DurableRecordVersion {
   previousVersion: string | null;
 }
 
-export interface RecordCommit {
-  format: 'health-record-versions-v1';
+interface RecordCommitHeader {
   profileId: string;
   schemaVersion: number;
   sequence: number;
@@ -64,8 +65,31 @@ export interface RecordCommit {
   fingerprint: unknown;
   result: unknown;
   recordedAt: string;
-  segments: RecordObjectReference[];
   records: number;
+}
+export interface RecordCommitV1 extends RecordCommitHeader {
+  format: 'health-record-versions-v1';
+  segments: RecordObjectReference[];
+}
+export interface RecordSegmentIndex {
+  format: 'health-record-segment-index-v1';
+  head: RecordObjectReference | null;
+  count: number;
+}
+export interface RecordCommitV2 extends RecordCommitHeader {
+  format: 'health-record-versions-v2';
+  segments: RecordSegmentIndex;
+}
+export type RecordCommit = RecordCommitV1 | RecordCommitV2;
+interface RecordSegmentPage {
+  format: 'health-record-segment-page-v1';
+  profileId: string;
+  schemaVersion: number;
+  sequence: number;
+  operationId: string;
+  previous: RecordObjectReference | null;
+  firstSegment: number;
+  segments: RecordObjectReference[];
 }
 
 interface TableSchema {
@@ -151,6 +175,9 @@ export interface RecordHistoryResult {
 }
 
 const FORMAT = 'health-record-versions-v1';
+const COMMIT_FORMAT = 'health-record-versions-v2';
+const SEGMENT_REFERENCE_WINDOW = 64;
+const SEGMENT_PAGE_BYTES = 32768;
 const PROJECTION = 2;
 const LIMIT = 256 * 1024;
 const q = (s: string): string => '"' + s.replaceAll('"', '""') + '"';
@@ -320,12 +347,14 @@ function readCommit(
   const commit = parseRecordJson(readObject(storage, ref) as unknown as string) as RecordCommit;
   recordVersionWork('commitValidations');
   if (
-    commit.format !== FORMAT ||
+    (commit.format !== FORMAT && commit.format !== COMMIT_FORMAT) ||
     commit.profileId !== profileId ||
     commit.schemaVersion !== schemaVersion ||
     !Number.isSafeInteger(commit.sequence) ||
     commit.sequence < 1 ||
-    !Array.isArray(commit.segments) ||
+    (commit.format === FORMAT
+      ? !Array.isArray(commit.segments)
+      : !segmentIndexValid(commit.segments)) ||
     !Number.isSafeInteger(commit.records) ||
     commit.records < 0 ||
     !Number.isSafeInteger(commit.revision) ||
@@ -337,6 +366,83 @@ function readCommit(
     fail('unsupported or wrong-profile commit');
   if (commit.previous !== null && !refValid(commit.previous)) fail('invalid commit ancestry');
   return commit;
+}
+
+function segmentIndexValid(value: unknown): value is RecordSegmentIndex {
+  if (!value || typeof value !== 'object') return false;
+  const index = value as RecordSegmentIndex;
+  return (
+    Object.keys(index).sort().join(',') === 'count,format,head' &&
+    index.format === 'health-record-segment-index-v1' &&
+    Number.isSafeInteger(index.count) &&
+    index.count >= 0 &&
+    (index.count === 0 ? index.head === null : refValid(index.head))
+  );
+}
+/** Authenticated forward order over bounded immutable manifest pages. Legacy commits retain their old per-object decoder boundary. */
+export function* iterateRecordCommitSegments(
+  storage: RecordStorage,
+  commit: RecordCommit,
+): Generator<RecordObjectReference> {
+  if (commit.format === FORMAT) {
+    for (const ref of commit.segments) {
+      if (!refValid(ref)) fail('invalid segment reference');
+      yield ref;
+    }
+    return;
+  }
+  if (commit.format !== COMMIT_FORMAT || !segmentIndexValid(commit.segments))
+    fail('unsupported segment index');
+  const scratch = disposableSqlite('circus-record-segments-');
+  try {
+    scratch.db.exec('CREATE TABLE segments(ordinal INTEGER PRIMARY KEY,reference TEXT NOT NULL)');
+    const insert = scratch.db.prepare('INSERT INTO segments VALUES(?,?)');
+    let ref = commit.segments.head,
+      expected = commit.segments.count;
+    while (ref) {
+      if (!refValid(ref) || ref.bytes > SEGMENT_PAGE_BYTES) fail('invalid segment page reference');
+      const page = parseRecordJson<RecordSegmentPage>(
+        readObject(storage, ref) as unknown as string,
+      );
+      recordVersionWork('segmentIndexPagesRead');
+      if (
+        !page ||
+        Object.keys(page).sort().join(',') !==
+          'firstSegment,format,operationId,previous,profileId,schemaVersion,segments,sequence' ||
+        page.format !== 'health-record-segment-page-v1' ||
+        page.profileId !== commit.profileId ||
+        page.schemaVersion !== commit.schemaVersion ||
+        page.sequence !== commit.sequence ||
+        page.operationId !== commit.operationId ||
+        !Number.isSafeInteger(page.firstSegment) ||
+        page.firstSegment < 0 ||
+        !Array.isArray(page.segments) ||
+        !page.segments.length ||
+        page.segments.length > SEGMENT_REFERENCE_WINDOW ||
+        page.firstSegment + page.segments.length !== expected ||
+        (page.firstSegment === 0 ? page.previous !== null : !refValid(page.previous))
+      )
+        fail('invalid segment page binding, order or count');
+      recordVersionWorkMaximum('maxSegmentReferencesBuffered', page.segments.length);
+      for (let ordinal = 0; ordinal < page.segments.length; ordinal++) {
+        const segment = page.segments[ordinal];
+        if (!refValid(segment)) fail('invalid segment reference');
+        insert.run(page.firstSegment + ordinal, JSON.stringify(segment));
+        recordVersionWork('segmentReferencesSpooled');
+      }
+      expected = page.firstSegment;
+      ref = page.previous;
+    }
+    if (expected !== 0) fail('incomplete segment index');
+    for (const row of scratch.db
+      .prepare('SELECT reference FROM segments ORDER BY ordinal')
+      .iterate()) {
+      recordVersionWork('segmentReferencesReplayed');
+      yield JSON.parse(String(row.reference)) as RecordObjectReference;
+    }
+  } finally {
+    scratch.close();
+  }
 }
 
 /** Read the selected authoritative envelope even when the disposable cache is current. */
@@ -354,20 +460,53 @@ function committedSince(
   profileId: string,
   schemaVersion: number,
   stop: RecordObjectReference | null = null,
-): { head: RecordObjectReference | null; transactions: IndexedTransaction[] } {
-  const head = readHead(storage),
-    result: IndexedTransaction[] = [],
-    seen = new Set<string>();
-  let ref: RecordObjectReference | null = head;
-  while (!eq(ref, stop)) {
-    if (!ref || seen.has(ref.name)) fail('missing ancestry or cyclic commits');
-    seen.add((ref as RecordObjectReference).name);
-    const commit = readCommit(storage, ref as RecordObjectReference, profileId, schemaVersion);
-    const versions = readSegmentVersions(storage, commit);
-    result.push({ ref, commit, versions } as IndexedTransaction);
-    ref = commit.previous;
+): {
+  head: RecordObjectReference | null;
+  transactions: Iterable<IndexedTransaction>;
+  length: number;
+  close(): void;
+} {
+  const head = readHead(storage);
+  // Only authenticated references enter this private ordering/cycle index.
+  // Payloads always come from the selected journal again during replay.
+  const scratch = disposableSqlite('circus-record-ancestry-');
+  try {
+    scratch.db.exec(
+      'CREATE TABLE ancestry (ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, reference TEXT NOT NULL)',
+    );
+    const insert = scratch.db.prepare('INSERT INTO ancestry VALUES(?,?,?)');
+    const seen = scratch.db.prepare('SELECT 1 FROM ancestry WHERE name=?');
+    let ref = head,
+      length = 0;
+    while (!eq(ref, stop)) {
+      if (!ref || seen.get(ref.name)) fail('missing ancestry or cyclic commits');
+      const selected = ref as RecordObjectReference;
+      const commit = readCommit(storage, selected, profileId, schemaVersion);
+      insert.run(length++, selected.name, JSON.stringify(selected));
+      recordVersionWork('ancestryReferencesSpooled');
+      ref = commit.previous;
+    }
+    return {
+      head,
+      length,
+      close: scratch.close,
+      transactions: {
+        *[Symbol.iterator]() {
+          for (const row of scratch.db
+            .prepare('SELECT reference FROM ancestry ORDER BY ordinal DESC')
+            .iterate()) {
+            const ref = JSON.parse(String(row.reference)) as RecordObjectReference;
+            recordVersionWork('ancestryReferencesReplayed');
+            const commit = readCommit(storage, ref, profileId, schemaVersion);
+            yield { ref, commit, versions: readSegmentVersions(storage, commit) };
+          }
+        },
+      },
+    };
+  } catch (error) {
+    scratch.close();
+    throw error;
   }
-  return { head, transactions: result.reverse() };
 }
 /** Reiterable bounded reader: keep at most a segment plus one logical record in memory. */
 function readSegmentVersions(
@@ -378,7 +517,7 @@ function readSegmentVersions(
     *[Symbol.iterator]() {
       let pending: Buffer = Buffer.alloc(0),
         count = 0;
-      for (const ref of commit.segments) {
+      for (const ref of iterateRecordCommitSegments(storage, commit)) {
         const bytes = readObject(storage, ref);
         let offset = 0;
         for (let end = bytes.indexOf(10, offset); end !== -1; end = bytes.indexOf(10, offset)) {
@@ -429,22 +568,46 @@ function values(contents: unknown): Map<string, string | undefined> {
     }
   return found;
 }
+const currentStatements = new WeakMap<Database, ReturnType<Database['prepare']>>();
 function current(db: Database, entity: string, id: string): CurrentVersionRow | undefined {
-  return db
-    .prepare(
+  let statement = currentStatements.get(db);
+  if (!statement) {
+    statement = db.prepare(
       'SELECT v.* FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
-    )
-    .get(entity, id) as CurrentVersionRow | undefined;
+    );
+    currentStatements.set(db, statement);
+  }
+  return statement.get(entity, id) as CurrentVersionRow | undefined;
 }
 function identity(table: TableSchema, row: Record<string, unknown>): string {
   return stringifyRecordJson(table.pk.map((key) => row[key]));
+}
+function versionIdentityIndex() {
+  const scratch = disposableSqlite('circus-record-identities-');
+  try {
+    scratch.db.exec('CREATE TABLE identities(value TEXT PRIMARY KEY)');
+  } catch (error) {
+    scratch.close();
+    throw error;
+  }
+  const contains = scratch.db.prepare('SELECT 1 FROM identities WHERE value=?'),
+    insert = scratch.db.prepare('INSERT INTO identities VALUES(?)');
+  return {
+    close: scratch.close,
+    has(value: string) {
+      return !!contains.get(value);
+    },
+    add(value: string) {
+      insert.run(value);
+    },
+  };
 }
 function validateVersion(
   db: Database,
   config: RecordConfig,
   commit: RecordCommit,
   version: DurableRecordVersion,
-  identities: Set<string>,
+  identities: { has(value: string): boolean; add(value: string): void },
 ): CurrentVersionRow | undefined {
   recordVersionWork('versionValidations');
   const table = config.schema.find((table) => table.name === version.entity);
@@ -501,44 +664,51 @@ function indexTransaction(
   }
   if (indexed && commit.revision !== revision(db))
     fail('projection revision differs from committed transaction');
-  const identities = new Set<string>();
-  for (const version of versions) {
-    recordVersionWork('indexedVersionAttempts');
-    const previous = validateVersion(db, config, commit, version, identities);
-    const before = values(
-        previous && !previous.deleted ? parseRecordJson(previous.contents_json) : null,
-      ),
-      after = values(version.deleted ? null : version.contents);
-    const { contents, ...metadata } = version;
-    db.prepare('INSERT INTO __record_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(
-      version.versionId,
-      config.profileId,
-      version.entity,
-      version.recordId,
-      version.sequence,
-      version.recordedAt,
-      version.previousVersion,
-      version.operationId,
-      Number(version.deleted),
-      stringifyRecordJson(contents),
-      stringifyRecordJson(metadata),
-    );
-    db.prepare(
+  const identities = versionIdentityIndex(),
+    insertVersion = db.prepare('INSERT INTO __record_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)'),
+    selectVersion = db.prepare(
       'INSERT INTO __record_current VALUES(?,?,?) ON CONFLICT(entity,record_id) DO UPDATE SET version_id=excluded.version_id',
-    ).run(version.entity, version.recordId, version.versionId);
-    for (const field of new Set([...before.keys(), ...after.keys()]))
-      if (before.get(field) !== after.get(field))
-        db.prepare('INSERT INTO __record_fields VALUES(?,?,?,?,?,?,?,?,?)').run(
-          version.versionId,
-          config.profileId,
-          version.entity,
-          version.recordId,
-          field,
-          version.sequence,
-          previous?.version_id ?? null,
-          Number(before.has(field)),
-          Number(after.has(field)),
-        );
+    ),
+    insertField = db.prepare('INSERT INTO __record_fields VALUES(?,?,?,?,?,?,?,?,?)');
+  try {
+    for (const version of versions) {
+      recordVersionWork('indexedVersionAttempts');
+      const previous = validateVersion(db, config, commit, version, identities);
+      const before = values(
+          previous && !previous.deleted ? parseRecordJson(previous.contents_json) : null,
+        ),
+        after = values(version.deleted ? null : version.contents);
+      const { contents, ...metadata } = version;
+      insertVersion.run(
+        version.versionId,
+        config.profileId,
+        version.entity,
+        version.recordId,
+        version.sequence,
+        version.recordedAt,
+        version.previousVersion,
+        version.operationId,
+        Number(version.deleted),
+        stringifyRecordJson(contents),
+        stringifyRecordJson(metadata),
+      );
+      selectVersion.run(version.entity, version.recordId, version.versionId);
+      for (const field of new Set([...before.keys(), ...after.keys()]))
+        if (before.get(field) !== after.get(field))
+          insertField.run(
+            version.versionId,
+            config.profileId,
+            version.entity,
+            version.recordId,
+            field,
+            version.sequence,
+            previous?.version_id ?? null,
+            Number(before.has(field)),
+            Number(after.has(field)),
+          );
+    }
+  } finally {
+    identities.close();
   }
   db.prepare('INSERT INTO __record_transactions VALUES(?,?,?,?,?)').run(
     commit.operationId,
@@ -625,11 +795,36 @@ function publish(
     recordedAt = new Date().toISOString();
   const operationId = (operation.operationId ?? randomUUID()) as string;
   let count = 0;
-  const segments: RecordObjectReference[] = [];
+  let page: RecordObjectReference[] = [],
+    segmentCount = 0,
+    segmentHead: RecordObjectReference | null = null;
+  const flushPage = () => {
+    if (!page.length) return;
+    const value: RecordSegmentPage = {
+      format: 'health-record-segment-page-v1',
+      profileId: config.profileId,
+      schemaVersion: config.schemaVersion,
+      sequence,
+      operationId,
+      previous: segmentHead,
+      firstSegment: segmentCount - page.length,
+      segments: page,
+    };
+    const bytes = encode(value);
+    if (bytes.length > SEGMENT_PAGE_BYTES) fail('segment page exceeds controlled format');
+    segmentHead = writeObject(config.storage, bytes);
+    recordVersionWork('segmentIndexPagesWritten');
+    page = [];
+  };
   let chunks: Buffer[] = [],
     size = 0;
   const flush = (): void => {
-    if (size) segments.push(writeObject(config.storage, Buffer.concat(chunks)));
+    if (size) {
+      page.push(writeObject(config.storage, Buffer.concat(chunks)));
+      segmentCount++;
+      recordVersionWorkMaximum('maxSegmentReferencesBuffered', page.length);
+      if (page.length === SEGMENT_REFERENCE_WINDOW) flushPage();
+    }
     chunks = [];
     size = 0;
   };
@@ -659,8 +854,9 @@ function publish(
     }
   }
   flush();
-  const commit: RecordCommit = {
-    format: FORMAT,
+  flushPage();
+  const commit: RecordCommitV2 = {
+    format: COMMIT_FORMAT,
     profileId: config.profileId,
     schemaVersion: config.schemaVersion,
     sequence,
@@ -670,7 +866,7 @@ function publish(
     fingerprint: operation.fingerprint ?? null,
     result: result ?? null,
     recordedAt,
-    segments,
+    segments: { format: 'health-record-segment-index-v1', head: segmentHead, count: segmentCount },
     records: count,
   };
   const ref = writeObject(config.storage, encode(commit));
@@ -746,7 +942,7 @@ function verifyTargets(db: Database): void {
     ['evidence', 'entity_type', 'entity_id'],
     ['visibility_events', 'target_type', 'target_id'],
   ]) {
-    for (const row of db.prepare(`SELECT * FROM ${q(table)}`).all())
+    for (const row of db.prepare(`SELECT * FROM ${q(table)}`).iterate())
       if (!exists(row[typeKey], row[idKey]))
         fail('rebuilt polymorphic relationship target is missing');
   }
@@ -787,49 +983,58 @@ function catchUpRecords(
     )
       fail('cached projection sequence or revision is inconsistent');
   }
-  const { head, transactions } = committedSince(
+  const ancestry = committedSince(
     config.storage,
     config.profileId,
     config.schemaVersion,
     indexed ? parseRecordJson<RecordObjectReference>(indexed.head_json) : null,
   );
-  if (!transactions.length) return head;
-  const triggers = db
-    .prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger'")
-    .all() as Array<SqliteRow & { name: string; sql: string }>;
-  db.exec('PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE');
+  const { head, transactions } = ancestry;
   try {
-    for (const trigger of triggers) db.exec(`DROP TRIGGER ${q(trigger.name)}`);
-    if (!indexed && empty)
-      for (const table of config.schema) db.exec(`DELETE FROM ${q(table.name)}`);
-    for (const tx of transactions) {
-      const identities = new Set<string>();
-      for (const version of tx.versions)
-        validateVersion(db, config, tx.commit, version, identities);
-      if (config.verifyReferences)
-        for (const version of tx.versions) config.verifyReferences([version]);
-      applyVersions(db, config, tx.versions);
-      indexTransaction(db, config, tx);
-      if (revision(db) !== tx.commit.revision) fail('committed revision record is missing');
+    if (!ancestry.length) return head;
+    const triggers = db
+      .prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger'")
+      .all() as Array<SqliteRow & { name: string; sql: string }>;
+    db.exec('PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE');
+    try {
+      for (const trigger of triggers) db.exec(`DROP TRIGGER ${q(trigger.name)}`);
+      if (!indexed && empty)
+        for (const table of config.schema) db.exec(`DELETE FROM ${q(table.name)}`);
+      for (const tx of transactions) {
+        const identities = versionIdentityIndex();
+        try {
+          for (const version of tx.versions)
+            validateVersion(db, config, tx.commit, version, identities);
+        } finally {
+          identities.close();
+        }
+        if (config.verifyReferences)
+          for (const version of tx.versions) config.verifyReferences([version]);
+        applyVersions(db, config, tx.versions);
+        indexTransaction(db, config, tx);
+        if (revision(db) !== tx.commit.revision) fail('committed revision record is missing');
+      }
+      for (const trigger of triggers) db.exec(trigger.sql);
+      if (
+        meta(db, 'owner_profile_id') !== config.profileId ||
+        databaseSchemaVersion(db) !== config.schemaVersion ||
+        db.prepare('PRAGMA foreign_key_check').get()
+      )
+        fail('rebuilt ownership, schema or foreign-key integrity failed');
+      verifyTargets(db);
+      if (db.prepare('PRAGMA integrity_check').get()!.integrity_check !== 'ok')
+        fail('rebuilt SQLite integrity failed');
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    } finally {
+      db.exec('PRAGMA foreign_keys=ON');
     }
-    for (const trigger of triggers) db.exec(trigger.sql);
-    if (
-      meta(db, 'owner_profile_id') !== config.profileId ||
-      databaseSchemaVersion(db) !== config.schemaVersion ||
-      db.prepare('PRAGMA foreign_key_check').all().length
-    )
-      fail('rebuilt ownership, schema or foreign-key integrity failed');
-    verifyTargets(db);
-    if (db.prepare('PRAGMA integrity_check').get()!.integrity_check !== 'ok')
-      fail('rebuilt SQLite integrity failed');
-    db.exec('COMMIT');
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
+    return head;
   } finally {
-    db.exec('PRAGMA foreign_keys=ON');
+    ancestry.close();
   }
-  return head;
 }
 
 /** Attach while the profile is unlocked and exclusively owned by one writer.

@@ -14,6 +14,13 @@ const empty = () => ({
   headReadCalls: 0,
   headReadBytes: 0,
   commitValidations: 0,
+  ancestryReferencesSpooled: 0,
+  ancestryReferencesReplayed: 0,
+  segmentIndexPagesRead: 0,
+  segmentIndexPagesWritten: 0,
+  segmentReferencesSpooled: 0,
+  segmentReferencesReplayed: 0,
+  maxSegmentReferencesBuffered: 0,
   versionValidations: 0,
   indexedVersionValidations: 0,
   validatedColumns: 0,
@@ -72,4 +79,13 @@ export function parseRecordJson<T = unknown>(text: string): T {
 export function recordVersionColumns<T extends string[]>(columns: T): T {
   recordVersionWork('validatedColumns', columns.length);
   return columns;
+}
+
+export function recordVersionWorkMaximum(metric: keyof Metrics, amount: number): void {
+  const current = scope.getStore();
+  if (current)
+    current.counters[current.phase][metric] = Math.max(
+      current.counters[current.phase][metric],
+      amount,
+    );
 }

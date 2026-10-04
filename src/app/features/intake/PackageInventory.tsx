@@ -1,16 +1,32 @@
+import type {
+  IntakePackageInventoryPaged,
+  IntakePackageMemberReference,
+} from '../../../shared/intake-package-paging';
+import { PackageMemberDetails } from './PackageMemberDetails';
 import { useEffect, useState } from 'react';
 import type {
-  Intake,
   IntakePackageFailure,
   IntakePackageInventory,
   IntakePackageMember,
 } from '../../../shared/intake';
+import {
+  isIntakeSummary,
+  type IntakeRead,
+  type IntakePackageFailurePage,
+} from '../../../shared/intake-summary';
 import { api, useResource } from '../../data/api';
 import { formatBytes } from '../../data/format';
 import { ResourceState } from '../../components/ResourceState';
 import { LoadingIndicator } from '../../components/LoadingIndicator';
 import { PackageProcessingFailures } from './PackageProcessingFailures';
 
+type PackageMember = IntakePackageMember | IntakePackageMemberReference;
+const isMemberReference = (member: PackageMember): member is IntakePackageMemberReference =>
+  'format' in member && member.format === 'health-intake-package-member-reference-v1';
+const memberName = (member: PackageMember) =>
+  isMemberReference(member)
+    ? member.filenamePreview + (member.filenameTruncated ? '…' : '')
+    : member.filename;
 type Structure = {
   jsonPointer: string;
   type: string;
@@ -27,7 +43,7 @@ type Structure = {
   nextJSONOffset: number | null;
 };
 type MemberRead = {
-  member: IntakePackageMember;
+  member: PackageMember;
   contentUrl?: string;
   sourceFileId?: string;
   literal?: string;
@@ -45,30 +61,45 @@ type MemberRead = {
     note?: string;
   };
   metadata?: {
-    member: IntakePackageMember;
+    member: PackageMember;
     contentUrl?: string;
     original?: MemberRead['original'];
     note?: string;
   };
 };
 
-export function PackageInventory({ intake }: { intake: Intake }) {
+export function PackageInventory({ intake }: { intake: IntakeRead }) {
   const [offset, setOffset] = useState(0);
-  const inventory = useResource<IntakePackageInventory>(
+  const inventory = useResource<IntakePackageInventory | IntakePackageInventoryPaged>(
     `/intakes/${encodeURIComponent(intake.id)}/package?offset=${offset}&limit=50`,
   );
-  const [selected, setSelected] = useState<IntakePackageMember | null>(null);
+  const [selected, setSelected] = useState<PackageMember | null>(null);
   const [read, setRead] = useState<MemberRead | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState<string[]>([]);
-  const failureState = useResource<Intake>(`/intakes/${encodeURIComponent(intake.id)}`);
+  const [failureCursor, setFailureCursor] = useState<string | null>(null);
+  const paged = isIntakeSummary(intake);
+  const failureState = useResource<IntakeRead>(
+    paged ? null : `/intakes/${encodeURIComponent(intake.id)}`,
+  );
+  const failurePage = useResource<IntakePackageFailurePage>(
+    paged
+      ? `/intakes/${encodeURIComponent(intake.id)}/package-failures?limit=25${failureCursor ? `&cursor=${encodeURIComponent(failureCursor)}` : ''}`
+      : null,
+  );
+  const refreshFailures = () => {
+    setFailureCursor(null);
+    failureState.reload();
+    failurePage.reload();
+  };
+  useEffect(() => setFailureCursor(null), [intake.id, intake.version]);
   useEffect(() => inventory.reload(), [intake.version]);
   useEffect(() => {
-    if (!inventory.loading && !inventory.refreshing) failureState.reload();
+    if (!inventory.loading && !inventory.refreshing) refreshFailures();
   }, [inventory.loading, inventory.refreshing, inventory.data, inventory.error]);
   async function inspect(
-    member: IntakePackageMember,
+    member: PackageMember,
     window: { jsonPointer?: string; jsonOffset?: number; offset?: number; page?: number } = {},
   ) {
     setBusy(true);
@@ -87,7 +118,7 @@ export function PackageInventory({ intake }: { intake: Intake }) {
       setError(error instanceof Error ? error.message : 'This member could not be inspected.');
     } finally {
       setBusy(false);
-      failureState.reload();
+      refreshFailures();
     }
   }
   async function retryFailure(failure: IntakePackageFailure) {
@@ -122,7 +153,7 @@ export function PackageInventory({ intake }: { intake: Intake }) {
       setError(error instanceof Error ? error.message : 'This operation could not finish.');
     } finally {
       setBusy(false);
-      failureState.reload();
+      refreshFailures();
     }
   }
   return (
@@ -131,8 +162,28 @@ export function PackageInventory({ intake }: { intake: Intake }) {
       <a className="text-link" href={intake.contentUrl} target="_blank" rel="noreferrer">
         Open original: {intake.filename}
       </a>
+      {failurePage.error && (
+        <p role="alert">
+          {failurePage.error.message}{' '}
+          <button className="text-link" onClick={refreshFailures}>
+            Reload processing issues
+          </button>
+        </p>
+      )}
+      {paged && !failurePage.data && !failurePage.error && (
+        <p role="status">Checking unfinished operations…</p>
+      )}
       <PackageProcessingFailures
-        failures={failureState.data ? failureState.data.packageFailures : intake.packageFailures}
+        failures={
+          failureState.data && !isIntakeSummary(failureState.data)
+            ? failureState.data.packageFailures
+            : !paged
+              ? intake.packageFailures
+              : undefined
+        }
+        page={failurePage.data ?? undefined}
+        onFirst={failureCursor ? () => setFailureCursor(null) : undefined}
+        onNext={() => setFailureCursor(failurePage.data?.nextCursor ?? null)}
         busy={busy || inventory.loading || !!inventory.refreshing}
         onRetry={(failure) => void retryFailure(failure)}
       />
@@ -158,28 +209,41 @@ export function PackageInventory({ intake }: { intake: Intake }) {
                       void inspect(member);
                     }}
                   >
-                    {member.filename || 'Unnamed member'}
+                    {memberName(member) || 'Unnamed member'}
                   </button>
-                  <span>
-                    {formatBytes(member.bytes)} · {member.role?.role || 'Role unknown'} ·{' '}
-                    {member.coverage?.kind || member.status || 'Not read'}
-                  </span>
-                  {member.duplicateOf && (
-                    <small>
-                      Same bytes as another occurrence; both original locations remain retained.
-                    </small>
-                  )}
-                  {member.role && (
-                    <details>
-                      <summary>Role and references</summary>
-                      <p>{member.role.reason}</p>
-                      <p>
-                        {member.role.referenceCount} references ·{' '}
-                        {member.role.missingReferenceCount} not supplied
-                        {!!member.role.ambiguousReferenceCount &&
-                          ` · ${member.role.ambiguousReferenceCount} ambiguous`}
-                      </p>
-                    </details>
+                  {isMemberReference(member) ? (
+                    <>
+                      <span>
+                        {member.filenameTruncated
+                          ? 'File name shortened for display'
+                          : 'File details available below'}
+                      </span>
+                      <PackageMemberDetails reference={member.metadata} />
+                    </>
+                  ) : (
+                    <>
+                      <span>
+                        {formatBytes(member.bytes)} · {member.role?.role || 'Role unknown'} ·{' '}
+                        {member.coverage?.kind || member.status || 'Not read'}
+                      </span>
+                      {member.duplicateOf && (
+                        <small>
+                          Same bytes as another occurrence; both original locations remain retained.
+                        </small>
+                      )}
+                      {member.role && (
+                        <details>
+                          <summary>Role and references</summary>
+                          <p>{member.role.reason}</p>
+                          <p>
+                            {member.role.referenceCount} references ·{' '}
+                            {member.role.missingReferenceCount} not supplied
+                            {!!member.role.ambiguousReferenceCount &&
+                              ` · ${member.role.ambiguousReferenceCount} ambiguous`}
+                          </p>
+                        </details>
+                      )}
+                    </>
                   )}
                 </li>
               ))}
@@ -220,8 +284,12 @@ export function PackageInventory({ intake }: { intake: Intake }) {
       )}
       {read && selected?.memberId === read.member.memberId && (
         <section className="intake-member-reading" aria-label="Selected package member">
-          <h4>{read.member.filename}</h4>
-          <p className="helper-text">{read.member.locator}</p>
+          <h4>{memberName(read.member)}</h4>
+          {isMemberReference(read.member) ? (
+            <PackageMemberDetails reference={read.member.metadata} />
+          ) : (
+            <p className="helper-text">{read.member.locator}</p>
+          )}
           {read.contentUrl && (
             <a className="text-link" href={read.contentUrl} target="_blank" rel="noreferrer">
               Open retained member
@@ -307,7 +375,7 @@ export function PackageInventory({ intake }: { intake: Intake }) {
             <img
               className="intake-member-image"
               src={read.imageContent}
-              alt={`${read.member.filename}${read.original?.page ? `, page ${read.original.page}` : ''}`}
+              alt={`${memberName(read.member)}${read.original?.page ? `, page ${read.original.page}` : ''}`}
             />
           )}
           {read.original?.text && <div className="intake-readable-text">{read.original.text}</div>}

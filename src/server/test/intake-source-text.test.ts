@@ -1,3 +1,4 @@
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
@@ -24,6 +25,7 @@ import {
 import {
   getIntakeSourceText,
   listSourceAttention,
+  listSourceAttentionRead,
   getIntakeSourceIssues,
   getIntakeSourceTextPassage,
   getIntakeSourceTextReviewHistory,
@@ -1095,6 +1097,31 @@ test('unchanged text approval preserves clinical pins and receipts through rebui
   );
 });
 
+test('native interpretation reads legacy material revision metadata without a separate pin', async (t) => {
+  const f = fixture(t),
+    initial = publish(f);
+  const { writeIntakeDetails } = await import('../intake-state-access.ts');
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+  const { intakeSourceTextInterpretationRevisionId } = await import('../intake-source-text.ts');
+  const file = f.db.prepare('SELECT * FROM source_files WHERE id=?').get(intakeId)!;
+  transaction(f.db, () => {
+    const details = JSON.parse(readIntakeEnvelopeText(f.db, { id: intakeId })!).intake;
+    writeIntakeDetails(
+      f.db,
+      { ...file, id: intakeId },
+      { ...details, sourceTextRevisionId: initial.id },
+    );
+    f.db.prepare('DELETE FROM app_meta WHERE key=?').run(`intake_source_pin:v1:${intakeId}`);
+  });
+  await buildIntakeCollectionEnvelope(f.db, { id: intakeId, sha256: f.sourceHash });
+  assert.equal(readIntakeSourcePin(f.db, intakeId), null);
+  assert.equal(intakeSourceTextInterpretationRevisionId(f.db, profileId, intakeId), initial.id);
+  assert.equal(
+    intakeSourceTextInterpretationRevisionId(f.rebuild(), profileId, intakeId),
+    initial.id,
+  );
+});
+
 test('measured page dependencies survive unrelated correction and rebuild, but follow cross-page headers', (t) => {
   const f = fixture(t);
   const independent = evidence();
@@ -1280,7 +1307,7 @@ test('attention queue counts sections rather than flags and removes completed or
   assert.throws(() => listSourceAttention(f.db, 'another-profile'), code('PROFILE_SCOPE'));
 });
 
-test('attention totals include later files while pages omit completed files', (t) => {
+test('attention totals include later files while pages omit completed files', async (t) => {
   const f = fixture(t);
   const ev = evidence();
   ev.issues = [
@@ -1327,6 +1354,34 @@ test('attention totals include later files while pages omit completed files', (t
   assert.equal(last.sections, 31);
   assert.equal(last.items.length, 1);
   assert.equal(last.nextOffset, null);
+  const before = intakeWorkCounters(f.db).warm.sourceAttentionPreparedSources;
+  assert.deepEqual(await listSourceAttentionRead(f.db, profileId), first);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceAttentionPreparedSources - before, 31);
+  const warm = intakeWorkCounters(f.db).warm.sourceAttentionPreparedSources;
+  assert.deepEqual(await listSourceAttentionRead(f.db, profileId, 30), last);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceAttentionPreparedSources, warm);
+  const current = getIntakeSourceText(f.db, f.root, profileId, intakeId).revision!;
+  review(f, current);
+  const updated = await listSourceAttentionRead(f.db, profileId);
+  assert.equal(updated.total, 30);
+  assert.equal(updated.sections, 30);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceAttentionPreparedSources - warm, 1);
+  assert.deepEqual(updated, listSourceAttention(f.db, profileId));
+  // Tracking and cached totals share rollback; a failed mutation cannot hide a source.
+  assert.throws(
+    () =>
+      transaction(f.db, () => {
+        f.db
+          .prepare('DELETE FROM app_meta WHERE key=?')
+          .run(`intake_source_text:v1:cookie-extra-0:head`);
+        throw Error('fictional rollback');
+      }),
+    /fictional rollback/,
+  );
+  assert.deepEqual(await listSourceAttentionRead(f.db, profileId), updated);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceAttentionPreparedSources - warm, 1);
+  assert.deepEqual(await listSourceAttentionRead(f.rebuild(), profileId), updated);
+  await assert.rejects(listSourceAttentionRead(f.db, 'another-profile'), code('PROFILE_SCOPE'));
 });
 
 function extractedEvidence(pages: number, extracted: number): SourceTextEvidence {

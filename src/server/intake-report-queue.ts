@@ -1,3 +1,4 @@
+import { reviewRecordIssues } from './intake-review-issue-state.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { HttpError } from './database.ts';
 import { getIntake, listIntakes, reviewIntake } from './intake.ts';
@@ -79,6 +80,22 @@ const personVisible = (
   state: IntakePersonProposal['state'],
   view: IntakeReportQueueView,
 ): boolean => view === 'all' || (view === 'active' ? state === 'pending' : state === 'later');
+/** Shared presentation policy for a fully reviewed selected occurrence. */
+export function reviewedIntakeQueueRecord(
+  record: IntakeReview['records'][number],
+  state: IntakeReportQueueRecordState,
+): IntakeReportQueueRecord {
+  const blocked =
+    hasUnreviewedPairChoices(record) ||
+    record.classification === 'unsupported' ||
+    record.identityReview?.blocking === true ||
+    reviewRecordIssues(record).some((issue) => issue.blocking && issue.status !== 'resolved');
+  return {
+    ...record,
+    queueState: state,
+    selectable: (state === 'pending' || state === 'deferred') && !blocked,
+  };
+}
 function options(input: QueueOptions, profileId: string, scope: string, defaultLimit: number) {
   const view = input.view || 'active';
   if (!['active', 'deferred', 'all'].includes(view))
@@ -296,18 +313,9 @@ function reader(db: DatabaseSync, root: string, profileId: string) {
         'REPORT_REFERENCE_UNAVAILABLE',
         'A report reference no longer matches its retained proposal; inspect the original',
       );
-    const blocked =
-      hasUnreviewedPairChoices(record) ||
-      record.classification === 'unsupported' ||
-      record.identityReview?.blocking === true ||
-      !!record.issues?.some((issue) => issue.blocking && issue.status !== 'resolved');
     return {
       review,
-      record: {
-        ...record,
-        queueState: member.state,
-        selectable: (member.state === 'pending' || member.state === 'deferred') && !blocked,
-      },
+      record: reviewedIntakeQueueRecord(record, member.state),
     };
   };
 }
@@ -322,14 +330,16 @@ function summarize(entry: QueueGroup, read: Reader): IntakeReportQueueGroup {
     if (state !== 'pending' && state !== 'deferred') continue;
     const { record } = read(entry, member);
     if (!record.selectable) tally.blocked++;
-    tally.questions +=
-      record.issues?.filter((issue) => issue.kind !== 'information' && issue.status !== 'resolved')
-        .length || 0;
+    tally.questions += reviewRecordIssues(record).filter(
+      (issue) => issue.kind !== 'information' && issue.status !== 'resolved',
+    ).length;
     const date = record.mapping.documentDate || record.mapping.date;
     dates.add(
       typeof date === 'string' &&
         /^\d{4}(?:-\d{2}(?:-\d{2})?)?$/.test(date) &&
-        !record.issues?.some((issue) => issue.kind === 'date' && issue.status !== 'resolved')
+        !reviewRecordIssues(record).some(
+          (issue) => issue.kind === 'date' && issue.status !== 'resolved',
+        )
         ? date
         : null,
     );
@@ -659,7 +669,7 @@ const feedKinds: IntakeImportFeedKind[] = [
   'unsupported',
   'person',
 ];
-function feedKind(record: IntakeReportQueueRecord): IntakeImportFeedRecord['feedKind'] {
+export function feedKind(record: IntakeReportQueueRecord): IntakeImportFeedRecord['feedKind'] {
   if (record.mapping.opticalPrescription) return 'vision';
   switch (record.kind) {
     case 'observation':

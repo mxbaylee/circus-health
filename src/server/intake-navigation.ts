@@ -2,7 +2,7 @@ import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getIntake, getIntakeOriginal, getRetainedIntakeOriginalReference } from './intake.ts';
+import { getIntakeRead, getIntakeOriginal, getRetainedIntakeOriginalReference } from './intake.ts';
 import { searchPdfEvidence } from './intake-pdf-session.ts';
 import { HttpError } from './database.ts';
 import { workflowHash } from './intake-workflow.ts';
@@ -147,18 +147,25 @@ export function htmlNavigationIndex({
   id,
   filename,
   text,
+  suppliedTarget,
 }: {
   db: DatabaseSync;
   id: string;
   filename: string;
   text: string;
+  /** Complete checked native lookup; absence must not come from a displayed page. */
+  suppliedTarget?: (
+    filename: string,
+  ) => { id: string } | { memberId: string; intakeId: string } | undefined;
 }) {
-  const own = JSON.parse(
-    (
-      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id) as
-        { details_json?: string } | undefined
-    )?.details_json || '{}',
-  ) as { intake?: { parentSourceFileId?: string } };
+  const own = suppliedTarget
+    ? {}
+    : (JSON.parse(
+        (
+          db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id) as
+            { details_json?: string } | undefined
+        )?.details_json || '{}',
+      ) as { intake?: { parentSourceFileId?: string } });
   const intakeDetails = own.intake;
   const siblings = intakeDetails?.parentSourceFileId
     ? db
@@ -235,8 +242,10 @@ export function htmlNavigationIndex({
       const supplied =
         path === '' || targetName === filename
           ? { id }
-          : siblings.find((sibling) => sibling.name === targetName) ||
-            inventory?.members?.find((member) => member.filename === targetName);
+          : suppliedTarget
+            ? suppliedTarget(targetName)
+            : siblings.find((sibling) => sibling.name === targetName) ||
+              inventory?.members?.find((member) => member.filename === targetName);
       if (supplied)
         Object.assign(reference, {
           ...('id' in supplied
@@ -244,7 +253,11 @@ export function htmlNavigationIndex({
                 sourceFileId: supplied.id,
                 contentUrl: `/api/sources/${encodeURIComponent(supplied.id)}/content`,
               }
-            : { memberId: supplied.memberId, intakeId: intakeDetails!.parentSourceFileId }),
+            : {
+                memberId: supplied.memberId,
+                intakeId:
+                  'intakeId' in supplied ? supplied.intakeId : intakeDetails!.parentSourceFileId,
+              }),
           fragment,
           status: 'supplied_uninspected',
         });
@@ -499,7 +512,7 @@ export async function followIndexedReference(context: NavigationContext) {
         ? 'Supplied archive member remains uninspected. Use health_intake_package read_member with the supplied intakeId and memberId; no content was read by following this reference.'
         : 'Target is not a separately supplied file. No network request was made.',
     };
-  const targetIntake = getIntake(
+  const targetIntake = getIntakeRead(
     context.db,
     context.root,
     context.profileId,

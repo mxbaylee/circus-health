@@ -1,3 +1,12 @@
+import { readSelectedClinicalReview } from '../../data/intake-clinical-review';
+import { firstReportGroup } from '../../../shared/intake-report-group-links';
+import { isIntakeSummary, type IntakeRead } from '../../../shared/intake-summary';
+import {
+  isCollectionImportFeed,
+  type CollectionImportFeed,
+} from '../../../shared/intake-clinical-pages';
+import { CollectionImportReview } from './CollectionImportReview';
+import { ImportReadingActivity } from './ImportReadingActivity';
 import { ImportAcceptanceOutcomes } from './ImportAcceptanceOutcomes';
 import type {
   IntakePartialAcceptanceReceipt,
@@ -69,7 +78,7 @@ import {
 } from './partial-save-plan';
 import { possibleSavedOverlapCount } from './possible-overlaps';
 import {
-  acceptedRecordsForScope,
+  loadAcceptedRecordsForScope,
   appendSavedPersonDestination,
   SavedPersonDestinations,
   SavedRecordDestinations,
@@ -264,7 +273,7 @@ export function ImportPage() {
     if (filters.editedOnly && filters.kind !== 'People') params.set('edited', 'true');
     return `/intakes/import-feed?${params}`;
   }, [filters, selectionQuery]);
-  const feed = useResource<IntakeImportFeed>(feedPath, 'review_open');
+  const feed = useResource<IntakeImportFeed | CollectionImportFeed>(feedPath, 'review_open');
   const [pagedFeed, setPagedFeed] = useState<IntakeImportFeed | null>(null);
   const [pagedFeedScope, setPagedFeedScope] = useState('');
   const [loadingMore, setLoadingMore] = useState(false);
@@ -340,7 +349,7 @@ export function ImportPage() {
   }, [profile?.id]);
 
   useEffect(() => {
-    setPagedFeed(feed.data);
+    setPagedFeed(isCollectionImportFeed(feed.data) ? null : feed.data);
     setPagedFeedScope(`${profile?.id || ''}:${feedPath}`);
   }, [feed.data, feedPath, profile?.id]);
   const requestScope = `${profile?.id || ''}:${feedPath}`;
@@ -523,10 +532,13 @@ export function ImportPage() {
     void Promise.all(
       [...new Set(acceptedBlocks.map((block) => block.intakeId))].map(
         async (intakeId) =>
-          [intakeId, (await api<Intake>(`/intakes/${encodeURIComponent(intakeId)}`)).data] as const,
+          [
+            intakeId,
+            (await api<IntakeRead>(`/intakes/${encodeURIComponent(intakeId)}`)).data,
+          ] as const,
       ),
     )
-      .then((intakes) => {
+      .then(async (intakes) => {
         if (cancelled || activeProfile.current !== requestedProfile) return;
         const byIntake = new Map(intakes);
         const next = new Map<string, IntakeAcceptedRecord>();
@@ -534,11 +546,16 @@ export function ImportPage() {
           const intake = byIntake.get(block.intakeId);
           if (!intake) continue;
           const rows = block.records.filter((record) => record.queueState === 'accepted');
-          const accepted = acceptedRecordsForScope(intake, {
-            groupId: block.groupId,
-            proposalId: block.proposalId,
-            recordIds: rows.map((record) => record.id),
-          });
+          const accepted = await loadAcceptedRecordsForScope(
+            intake.id,
+            {
+              groupId: block.groupId,
+              proposalId: block.proposalId,
+              recordIds: rows.map((record) => record.id),
+            },
+            intake,
+          );
+          if (cancelled) return;
           for (const row of rows) {
             const destination = accepted.find((record) => record.recordId === row.id);
             if (destination) next.set(row.feedKey, destination);
@@ -672,9 +689,17 @@ export function ImportPage() {
     setHistoricalSelection({ key, loading: true });
     void (async () => {
       try {
-        const intake = (await api<Intake>(`/intakes/${encodeURIComponent(intakeId)}`)).data;
+        const intake = (await api<IntakeRead>(`/intakes/${encodeURIComponent(intakeId)}`)).data;
         let groupId: string | undefined;
-        if (recordId || proposal !== null) {
+        if (isIntakeSummary(intake) && recordId) {
+          const selected = await readSelectedClinicalReview(intakeId, proposalId ?? null, recordId);
+          groupId = firstReportGroup(
+            selected.record.kind === 'record'
+              ? selected.record.record.reportGroups
+              : selected.record.reportGroups,
+          )?.groupId;
+          if (!groupId) throw new Error('That exact record has no retained report link.');
+        } else if (!isIntakeSummary(intake) && (recordId || proposal !== null)) {
           const query = proposalId ? `?proposalId=${encodeURIComponent(proposalId)}` : '';
           const review = (
             await api<IntakeReview>(`/intakes/${encodeURIComponent(intakeId)}/review${query}`)
@@ -684,9 +709,19 @@ export function ImportPage() {
             : review.records[0];
           if (recordId && !exactRecord)
             throw new Error('That exact record is no longer present in the selected proposal.');
-          groupId = exactRecord?.reportGroups?.[0]?.groupId;
+          groupId = firstReportGroup(exactRecord?.reportGroups)?.groupId;
         }
-        groupId ||= intake.workflow?.reportGroups?.[0]?.id;
+        if (!groupId && isIntakeSummary(intake)) {
+          const selected = (
+            await api<IntakeImportFeed | CollectionImportFeed>(
+              intake.links.reports + '&view=all&limit=1',
+            )
+          ).data;
+          groupId = isCollectionImportFeed(selected)
+            ? selected.records[0]?.groupId || selected.groups[0]?.groupId
+            : selected.blocks[0]?.groupId;
+        } else if (!groupId && !isIntakeSummary(intake))
+          groupId = intake.workflow?.reportGroups?.[0]?.id;
         if (!groupId)
           throw new Error('This historical link does not identify a retained report to review.');
         if (!cancelled) setHistoricalSelection({ key, groupId, loading: false });
@@ -2039,6 +2074,79 @@ export function ImportPage() {
     },
   };
 
+  if (isCollectionImportFeed(feed.data))
+    return (
+      <CollectionImportReview
+        initial={feed.data}
+        selection={detailSelection}
+        selectionLoading={activeHistoricalSelection?.loading}
+        selectionError={activeHistoricalSelection?.error}
+        path={feedPath}
+        onChanged={feed.reload}
+        sourceProps={sourceReviewProps}
+        onUpload={upload}
+        busy={busy}
+        status={uploadStatus || notice || operationStatus || ''}
+        error={error || batch.error || feed.error?.message || ''}
+        reading={
+          <>
+            {batch.pendingCreate && (
+              <p role="status">
+                Your originals are retained. The reading request still needs confirmation.
+                <button
+                  className="button secondary"
+                  type="button"
+                  disabled={batch.busy}
+                  onClick={() =>
+                    void batch
+                      .retryCreate()
+                      .then(() => feed.reload())
+                      .catch(() => {})
+                  }
+                >
+                  Retry reading
+                </button>
+              </p>
+            )}
+            {batch.batch && (
+              <ImportReadingActivity
+                activity={model.activity}
+                onStop={
+                  batch.batch.status === 'running'
+                    ? async () => {
+                        await batch.stop();
+                        feed.reload();
+                      }
+                    : undefined
+                }
+                onRetryExceptions={
+                  batch.batch.items.some((item) => item.exceptions?.length)
+                    ? async () => {
+                        await batch.retryExceptions();
+                        feed.reload();
+                      }
+                    : undefined
+                }
+                onResume={
+                  (batch.batch.status === 'stopped' ||
+                    (batch.batch.status === 'paused' &&
+                      batch.batch.reason !== 'needs_user_action' &&
+                      !batch.batch.automaticRun)) &&
+                  batch.batch.items.some(
+                    (item) => hasPausedIntakeReading(item) || !!item.resumeAutomaticRun,
+                  )
+                    ? async () => {
+                        await batch.resume();
+                        feed.reload();
+                      }
+                    : undefined
+                }
+              />
+            )}
+          </>
+        }
+      />
+    );
   return (
     <div className="page import-page">
       {(error || acceptance.error || batch.error) && (

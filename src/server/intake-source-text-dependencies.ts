@@ -1,5 +1,12 @@
-import { readStoredIntakeDetails } from './intake-state-access.ts';
+import { readStoredIntakeDetails, intakeSourceMetadata } from './intake-state-access.ts';
+import {
+  hasIntakeCollectionEnvelope,
+  openIntakeCollectionEnvelope,
+} from './intake-collection-envelope.ts';
+import { buildIntakeCollectionEnvelope } from './intake-envelope-build.ts';
 import { createHash } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
+import { iterateIntakeSourceAncestry } from './intake-source-ancestry.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
 import type { SourceTextRevision } from '../shared/intake-source-text.ts';
@@ -40,6 +47,70 @@ export function sourceTextConfirmationOnly(
   );
 }
 
+/** Source-text invalidation needs three pin fields and the parent relationship,
+ * never the package's candidates, units or retained report history. */
+function dependencyHeader(db: DatabaseSync, id: string) {
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+    )
+    .get(id) as { id: string; kind: string; sha256: string; details_json: string } | undefined;
+  if (!source) return undefined;
+  if (!hasIntakeCollectionEnvelope(db, source)) return readStoredIntakeDetails(db, id);
+  const view = openIntakeCollectionEnvelope(db, source),
+    intake = view.child(view.root(), 'intake');
+  if (!intake) throw Error('Missing source dependency header');
+  const field = (name: string): unknown => {
+    const value = view.field(intake, name, { bytes: 16384 });
+    if (value.kind === 'fragmented') throw Error('Invalid source dependency pin field');
+    return value.kind === 'value' ? value.value : undefined;
+  };
+  const revision = field('sourceTextRevisionId'),
+    token = field('sourceTextDependencyToken'),
+    requires = field('sourceTextRequiresInterpretation');
+  if (
+    (revision != null && typeof revision !== 'string') ||
+    (token != null && typeof token !== 'string') ||
+    (requires !== undefined && typeof requires !== 'boolean')
+  )
+    throw Error('Invalid source dependency pins');
+  return {
+    version: view.logical.domainVersion,
+    parentSourceFileId: intakeSourceMetadata(db, id).parentSourceFileId,
+    sourceTextRevisionId: revision ?? null,
+    sourceTextDependencyToken: token ?? null,
+    sourceTextRequiresInterpretation: requires ?? false,
+  };
+}
+
+/** Explicit cold compatibility preparation before a native source capture.
+ * V3 requires its one retained decode; subsequent invalidation reads fields.
+ * This must run outside the source revision's final transaction. */
+export async function prepareIntakeSourceDependencyHeaders(
+  db: DatabaseSync,
+  id: string,
+  options: { assertRunning?: () => void } = {},
+): Promise<void> {
+  const profileId = db
+    .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
+    .get()?.value;
+  if (typeof profileId !== 'string')
+    throw new HttpError(409, 'SOURCE_CHANGED', 'Retained source owner is missing');
+  let count = 0;
+  for (const { id: current } of iterateIntakeSourceAncestry(db, profileId, id, options)) {
+    const source = db
+      .prepare(
+        "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+      )
+      .get(current) as
+      { id: string; kind: string; sha256: string; details_json: string } | undefined;
+    if (!source) throw new HttpError(409, 'SOURCE_CHANGED', 'Retained source is missing');
+    if (!hasIntakeCollectionEnvelope(db, source))
+      await buildIntakeCollectionEnvelope(db, source, options);
+    if (++count % 64 === 0) await setImmediate();
+  }
+}
+
 /** Called inside the source revision's durable transaction, never as a separate best-effort write. */
 export function invalidateIntakeSourceTextDependencies(
   db: DatabaseSync,
@@ -57,7 +128,7 @@ export function invalidateIntakeSourceTextDependencies(
     .get(next.intakeId) as { sha256: string } | undefined;
   if (owner?.value !== next.profileId || !file || file.sha256 !== next.sourceHash)
     throw new HttpError(409, 'SOURCE_CHANGED', 'The source text no longer matches this intake');
-  const details = readStoredIntakeDetails(db, next.intakeId);
+  const details = dependencyHeader(db, next.intakeId);
   if (!details || typeof details !== 'object')
     throw new HttpError(409, 'SOURCE_CHANGED', 'The intake metadata is unavailable');
   // Proposals keep their old source pin and cannot be accepted after a material edit;
@@ -73,24 +144,19 @@ export function invalidateIntakeSourceTextDependencies(
   writeIntakeSourcePin(db, next.intakeId, pin);
   // A proposal for a ZIP/document may depend on an extracted descendant. Bind
   // every ancestor without pretending the child's revision is its own text.
-  const seen = new Set([next.intakeId]);
-  let parent: unknown = details.parentSourceFileId;
-  while (typeof parent === 'string' && parent) {
-    if (seen.has(parent) || seen.size > 32)
-      throw new HttpError(409, 'SOURCE_CHANGED', 'Invalid retained source ancestry');
-    seen.add(parent);
-    const ancestor = db
-      .prepare("SELECT id FROM source_files WHERE id=? AND kind='intake_original'")
-      .get(parent);
-    if (!ancestor) throw new HttpError(409, 'SOURCE_CHANGED', 'Retained parent source is missing');
-    const metadata = readStoredIntakeDetails(db, parent);
+  let first = true;
+  for (const { id: parent } of iterateIntakeSourceAncestry(db, next.profileId, next.intakeId)) {
+    if (first) {
+      first = false;
+      continue;
+    }
+    const metadata = dependencyHeader(db, parent);
     if (!metadata)
       throw new HttpError(409, 'SOURCE_CHANGED', 'Retained parent metadata is missing');
     const saved = withIntakeSourcePin(metadata, readIntakeSourcePin(db, parent));
     const bound = nextPin(db, next, parent, saved, saved.sourceTextRevisionId || null);
     if (pin.requiresInterpretation) bound.requiresInterpretation = true;
     writeIntakeSourcePin(db, parent, bound);
-    parent = metadata.parentSourceFileId;
   }
 }
 function nextPin(

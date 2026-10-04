@@ -41,7 +41,7 @@ The health container runs as UID 1000 with a read-only root filesystem. Unlocked
 
 Uploads default to 128 MiB and can be configured from 1–1024 MiB with `CRS_INTAKE_UPLOAD_MIB`. Non-PDF whole-document extraction defaults to 64 MiB and can be configured from 1–256 MiB with `CRS_INTAKE_EXTRACTION_MIB`. PDFs within the upload limit use one isolated, hash-pinned range session rather than this complete-document byte gate; PDF page count, range allocations, rendered output, worker heap and wall time remain independently bounded. Raising either configured limit can still increase work and does not promise successful parsing or complete extraction.
 
-ZIP inspection accepts at most 10,000 total entries, 5,000 files, 2 MiB of encoded names, 100 MiB of expanded file data, and 25 MiB per file. ZIPs may be followed through three source levels. Packages are inventoried before selected members are read; nested archives require explicit inspection. These limits do not promise successful extraction for every delivery within them.
+The [native ZIP path](../data/streamed-package-originals.md) uses paged inventories and streamed member publication without file-count, aggregate-name, per-member-byte or aggregate-expanded-byte product limits. Packages are validated before selected members are read; nested archives require separate explicit inspection and checked ancestry. Storage availability, supported compression, integrity checks and downstream parser/output limits still apply. Bounded buffers do not establish sufficient disk capacity or successful clinical extraction.
 
 Interrupted file uploads restart from the beginning. Extraction work resumes after a complete original has been retained.
 

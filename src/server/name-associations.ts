@@ -20,16 +20,23 @@ export interface NameSupport {
   independentManual?: boolean;
   independentPrimary?: boolean;
 }
-export interface NameAuthority {
+interface NameAuthorityHeader {
   noteId: string;
   name: string;
   status: 'active' | 'superseded' | 'unresolved';
   operationId: string;
   revision: number;
-  supportOperations: string[];
   at: string;
   origin?: 'confirmation' | 'ownership' | 'future';
 }
+export type NameAuthority = NameAuthorityHeader &
+  (
+    | { supportOperations: string[]; supportOperationsIncluded?: true }
+    | {
+        supportOperationsIncluded: false;
+        supportOperationsReference: import('../shared/ownership-name-reference.ts').OwnershipNameSupportReference;
+      }
+  );
 const key = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export function rememberNameSupport(
   db: Database,

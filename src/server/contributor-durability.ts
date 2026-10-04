@@ -3,7 +3,7 @@ import {
   rmSync,
   mkdirSync,
   copyFileSync,
-  readdirSync,
+  opendirSync,
   lstatSync,
   readFileSync,
   openSync,
@@ -12,6 +12,8 @@ import {
 } from 'node:fs';
 import { resolve, dirname, relative } from 'node:path';
 import { tmpdir } from 'node:os';
+import { disposableSqlite } from './disposable-sqlite.ts';
+import { portableWork } from './portable-work.ts';
 import { openDatabase, type Database } from './database.ts';
 import {
   attachRecordDurability,
@@ -117,31 +119,63 @@ const bookkeeping = (key: unknown) =>
   ((key.startsWith('personal_') && !/^personal_(assistant|restore)_/.test(key)) ||
     key === 'curation_revision');
 const quote = (name: string) => '"' + name.replaceAll('"', '""') + '"';
-function rows(db: Database): string {
-  const tables = db
-    .prepare(
-      "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_*' ORDER BY name",
-    )
-    .all();
-  return JSON.stringify(
-    tables.map(({ name }) => [
-      name,
-      db
-        .prepare(`SELECT * FROM ${quote(String(name))}`)
-        .all()
-        .filter((row) => name !== 'app_meta' || !bookkeeping(row.key))
-        .map((row) =>
-          JSON.stringify(
-            Object.fromEntries(
-              Object.keys(row)
-                .sort()
-                .map((key) => [key, row[key]]),
-            ),
+/** Stream the exact previous table/normalized-row comparison grammar. */
+function* rows(db: Database): Generator<string> {
+  const scratch = disposableSqlite('circus-contributor-compare-');
+  try {
+    scratch.db.exec('CREATE TABLE rows(sort BLOB, value TEXT)');
+    const insert = scratch.db.prepare('INSERT INTO rows VALUES(?,?)');
+    yield '[';
+    let firstTable = true;
+    for (const { name } of db
+      .prepare(
+        "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_*' ORDER BY name",
+      )
+      .iterate()) {
+      if (!firstTable) yield ',';
+      firstTable = false;
+      yield '[' + JSON.stringify(name) + ',[';
+      scratch.db.exec('DELETE FROM rows');
+      for (const row of db.prepare(`SELECT * FROM ${quote(String(name))}`).iterate()) {
+        if (name === 'app_meta' && bookkeeping(row.key)) continue;
+        const value = JSON.stringify(
+          Object.fromEntries(
+            Object.keys(row)
+              .sort()
+              .map((key) => [key, row[key]]),
           ),
-        )
-        .sort(),
-    ]),
-  );
+        );
+        const sort = Buffer.from(value, 'utf16le');
+        sort.swap16();
+        insert.run(sort, value);
+      }
+      let first = true;
+      for (const row of scratch.db.prepare('SELECT value FROM rows ORDER BY sort').iterate()) {
+        if (!first) yield ',';
+        first = false;
+        yield JSON.stringify(row.value);
+      }
+      yield ']]';
+    }
+    yield ']';
+  } finally {
+    scratch.close();
+  }
+}
+function equalRows(left: Database, right: Database): boolean {
+  const a = rows(left),
+    b = rows(right);
+  try {
+    while (true) {
+      const l = a.next(),
+        r = b.next();
+      if (l.done || r.done) return l.done === r.done;
+      if (l.value !== r.value) return false;
+    }
+  } finally {
+    a.return(undefined);
+    b.return(undefined);
+  }
 }
 /** Verify the cache against its own accepted baseline before catch-up can
  * overwrite rows. A newer selected head authorizes recovery of acknowledged
@@ -180,7 +214,7 @@ function assertIndexedContributorCache(
     });
     const accepted = openDatabase(path, profileId);
     try {
-      if (rows(db) !== rows(accepted))
+      if (!equalRows(db, accepted))
         throw Error(
           'Contributor cache conflicts with its indexed accepted authority before recovery',
         );
@@ -211,8 +245,7 @@ export function assertContributorCopyCoherence(
     rebuildContributorDatabase(path, root, profileId);
     const selected = openDatabase(path, profileId);
     try {
-      const accepted = rows(selected);
-      if (rows(db) !== accepted || (backup && rows(backup) !== accepted))
+      if (!equalRows(db, selected) || (backup && !equalRows(backup, selected)))
         throw Error('Contributor copy cache conflicts with selected record authority');
     } finally {
       selected.close();
@@ -228,6 +261,7 @@ export function copyContributorAuthority(
   root: string,
   profileId: string,
   targetRoot: string,
+  { onFile }: { onFile?: (path: string) => void } = {},
 ): string[] {
   const source = contributorAuthorityPath(root, profileId),
     target = contributorAuthorityPath(targetRoot, profileId);
@@ -240,12 +274,21 @@ export function copyContributorAuthority(
     const stat = lstatSync(from);
     if (stat.isDirectory()) {
       mkdirSync(to, { mode: 0o700 });
-      for (const entry of readdirSync(from))
-        if (entry !== 'writer.lock' && !entry.startsWith('.pending-'))
-          copy(resolve(from, entry), resolve(to, entry));
+      const directory = opendirSync(from);
+      try {
+        for (let entry = directory.readSync(); entry; entry = directory.readSync())
+          if (entry.name !== 'writer.lock' && !entry.name.startsWith('.pending-'))
+            copy(resolve(from, entry.name), resolve(to, entry.name));
+      } finally {
+        directory.closeSync();
+      }
     } else if (stat.isFile()) {
+      portableWork('fileCopyCalls', 1);
       copyFileSync(from, to);
-      files.push(relative(targetRoot, to));
+      portableWork('fileCopyBytes', stat.size);
+      const path = relative(targetRoot, to);
+      if (onFile) onFile(path);
+      else files.push(path);
     } else throw Error('Contributor authority copy contains nonregular files');
     const fd = openSync(to, 'r');
     try {

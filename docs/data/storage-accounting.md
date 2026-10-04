@@ -8,6 +8,8 @@ Status: accounting and UI implementation complete, with synthetic accounting/iso
 
 The [streamed package member path](streamed-package-originals.md) retains large ZIP members without whole-member payload buffers. Its stages and expanded children still consume runtime and archive capacity. The existing upload/extraction configuration and conservative admission estimate remain; [CRS-233](../todo/CRS-233.md) owns the unfinished storage-only rule and operator decisions.
 
+Paged intake nodes, operation receipts and retained review snapshots are accepted evidence and count in durable history, even when a checkpoint has not yet selected a domain-visible inventory or plan. Disposable inventory, search and policy indexes occupy runtime SQLite space and can be reconstructed. Do not count an immutable node again for each snapshot that references it. The [intake state contract](intake-state-storage.md#draft-history-growth-qualification) separates cold construction, warm changed-path writes and exact replay measurements; bounded buffers do not imply negligible disk growth or a qualified installation capacity.
+
 ## Original files and reuse
 
 Store byte-identical originals once within each profile. Retain each delivery occurrence, original filename, issuing/acquisition source, timestamp and evidence locator independently. If two distinct PDFs contain the same clinical record, preserve both original PDFs and let the reconciled record reference both occurrences. Clinical deduplication never rewrites or discards a distinct original artifact.

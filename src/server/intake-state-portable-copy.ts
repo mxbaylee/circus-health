@@ -2,18 +2,18 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { currentTransactionToken, type Database } from './database.ts';
 import {
-  captureIntakeStateCopySnapshot,
-  prepareProductionIntakeStateCopySnapshot,
+  prepareProductionIntakeStateCopyRows,
   type IntakeStateCopyPlan,
 } from './intake-state-bootstrap.ts';
+import { IntakeStateManifest } from './intake-state-manifest.ts';
 import { invalid } from './intake-state-evidence.ts';
 import { profilePaths } from './profile-storage.ts';
 import { hasContributorAuthority } from './contributor-record-storage.ts';
 import { assertContributorCopyCoherence } from './contributor-durability.ts';
 import {
-  loadPortable,
+  openPortableRows,
   personalDurabilityStatus,
-  type CompleteLoadedPortable,
+  type PortableRows,
   type PortableRow,
 } from './portable.ts';
 
@@ -37,39 +37,53 @@ const rowKey = (row: PortableRow): string =>
     ),
   );
 
-function assertSelectedRows(db: Database, portable: CompleteLoadedPortable): void {
+function assertSelectedRows(db: Database, portable: PortableRows): void {
   const tables = db
     .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")
     .all()
     .map((row) => String(row.name))
     .filter((table) => !disposableTable(table));
-  const expected = Object.keys(portable.rows).filter((table) => !disposableTable(table));
+  const expected = portable.tableNames().filter((table) => !disposableTable(table));
   if (tables.sort().join('\0') !== expected.sort().join('\0'))
     invalid('portable copy table inventory');
-  for (const table of tables) {
-    let selected = portable.rows[table];
-    let actual: PortableRow[] = db.prepare(`SELECT * FROM ${quote(table)}`).all();
-    if (table === 'app_meta') {
-      selected = selected
-        .filter((row) => !bookkeeping(row.key))
-        .map((row) => {
+  const spool = new IntakeStateManifest();
+  try {
+    spool.db.exec('CREATE TABLE comparison(row TEXT PRIMARY KEY,count INTEGER NOT NULL)');
+    for (const table of tables) {
+      spool.db.exec('DELETE FROM comparison');
+      for (let row of portable.rows(table)) {
+        if (table === 'app_meta') {
+          if (bookkeeping(row.key)) continue;
           if (row.key === 'revision')
-            return { ...row, value: String(portable.personal.value.revision) };
+            row = { ...row, value: String(portable.personal.value.revision) };
           if (row.key === 'clinical_review_revision')
-            return {
+            row = {
               ...row,
               value: String(
                 portable.personal.value.clinicalReviewRevision ?? portable.personal.value.revision,
               ),
             };
-          return row;
-        });
-      actual = actual.filter((row) => !bookkeeping(row.key));
+        }
+        spool.db
+          .prepare(
+            'INSERT INTO comparison VALUES(?,1) ON CONFLICT(row) DO UPDATE SET count=count+1',
+          )
+          .run(rowKey(row));
+      }
+      for (const row of db.prepare(`SELECT * FROM ${quote(table)}`).iterate()) {
+        if (table === 'app_meta' && bookkeeping(row.key)) continue;
+        const key = rowKey(row);
+        if (
+          !spool.db.prepare('UPDATE comparison SET count=count-1 WHERE row=? AND count>0').run(key)
+            .changes
+        )
+          invalid('portable copy unpublished/conflicting table: ' + table);
+      }
+      if (spool.db.prepare('SELECT 1 FROM comparison WHERE count<>0 LIMIT 1').get())
+        invalid('portable copy unpublished/conflicting table: ' + table);
     }
-    const left = selected.map(rowKey).sort(),
-      right = actual.map(rowKey).sort();
-    if (left.length !== right.length || left.some((row, index) => row !== right[index]))
-      invalid('portable copy unpublished/conflicting table: ' + table);
+  } finally {
+    spool.close();
   }
 }
 
@@ -78,7 +92,7 @@ export function assertPortableCopyCoherence(
   db: Database,
   root: string,
   profileId: string,
-): CompleteLoadedPortable | null {
+): PortableRows | null {
   if (hasContributorAuthority(root, profileId)) {
     assertContributorCopyCoherence(db, root, profileId);
     return null;
@@ -90,9 +104,14 @@ export function assertPortableCopyCoherence(
     invalid('portable copy source recovery required');
   if (existsSync(resolve(profilePaths(root, profileId).personal, 'pending.json')))
     invalid('portable copy source pending publication');
-  const portable = loadPortable(root, profileId) as CompleteLoadedPortable;
-  assertSelectedRows(db, portable);
-  return portable;
+  const portable = openPortableRows(root, profileId);
+  try {
+    assertSelectedRows(db, portable);
+    return portable;
+  } catch (error) {
+    portable.close();
+    throw error;
+  }
 }
 
 /** Certify the selected source and its coherent backup before any owner/path changes. */
@@ -105,17 +124,15 @@ export function preparePortableIntakeCopy(
 ): IntakeStateCopyPlan {
   if (hasContributorAuthority(root, sourceProfileId)) {
     assertContributorCopyCoherence(sourceDb, root, sourceProfileId, backupDb);
-    return prepareProductionIntakeStateCopySnapshot(
-      captureIntakeStateCopySnapshot(backupDb, sourceProfileId),
-      targetProfileId,
-    );
+    return prepareProductionIntakeStateCopyRows(backupDb, sourceProfileId, targetProfileId);
   }
   const portable = assertPortableCopyCoherence(sourceDb, root, sourceProfileId);
-  if (!backupDb.isOpen || backupDb.isTransaction || currentTransactionToken(backupDb))
-    invalid('portable copy backup transaction/closed');
-  assertSelectedRows(backupDb, portable!);
-  return prepareProductionIntakeStateCopySnapshot(
-    captureIntakeStateCopySnapshot(backupDb, sourceProfileId),
-    targetProfileId,
-  );
+  try {
+    if (!backupDb.isOpen || backupDb.isTransaction || currentTransactionToken(backupDb))
+      invalid('portable copy backup transaction/closed');
+    assertSelectedRows(backupDb, portable!);
+    return prepareProductionIntakeStateCopyRows(backupDb, sourceProfileId, targetProfileId);
+  } finally {
+    portable?.close();
+  }
 }

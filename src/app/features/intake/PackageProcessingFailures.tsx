@@ -1,25 +1,35 @@
 import { useState } from 'react';
 import type { IntakePackageFailure } from '../../../shared/intake';
+import type { IntakePackageFailurePage } from '../../../shared/intake-summary';
 
 export function PackageProcessingFailures({
   failures,
   busy,
   onRetry,
+  page,
+  onNext,
+  onFirst,
 }: {
-  failures: Record<string, IntakePackageFailure> | undefined;
+  failures?: Record<string, IntakePackageFailure>;
+  page?: IntakePackageFailurePage;
+  onNext?: () => void;
+  onFirst?: () => void;
   busy: boolean;
   onRetry: (failure: IntakePackageFailure) => void;
 }) {
   const [offset, setOffset] = useState(0);
-  const entries = Object.entries(failures || {});
+  const entries: [string, IntakePackageFailure][] = page
+    ? page.entries.map(({ key, failure }) => [key, failure])
+    : Object.entries(failures || {});
+  const total = page?.total ?? entries.length;
   if (!entries.length) return null;
   const start = Math.min(offset, Math.floor((entries.length - 1) / 50) * 50);
   return (
     <section aria-label="Unfinished package processing">
       <h4>Processing must wait</h4>
       <p>
-        {entries.length} unfinished operations. The original remains available; this scope is
-        incomplete and has not accepted clinical records.
+        {total} unfinished operations. The original remains available; this scope is incomplete and
+        has not accepted clinical records.
       </p>
       <ul>
         {entries.slice(start, start + 50).map(([key, failure]) => (
@@ -40,7 +50,20 @@ export function PackageProcessingFailures({
           </li>
         ))}
       </ul>
-      {entries.length > 50 && (
+      {page && (onFirst || !page.complete) && (
+        <div className="intake-actions">
+          <button disabled={busy || !onFirst} onClick={onFirst}>
+            First unfinished operations
+          </button>
+          <span>
+            Showing {entries.length} of {total}
+          </span>
+          <button disabled={busy || page.complete} onClick={onNext}>
+            Next unfinished operations
+          </button>
+        </div>
+      )}
+      {!page && entries.length > 50 && (
         <div className="intake-actions">
           <button disabled={busy || !start} onClick={() => setOffset(start - 50)}>
             Previous unfinished operations

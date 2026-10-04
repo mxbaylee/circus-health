@@ -1,7 +1,21 @@
+import { selectedReportGroups } from './intake-selected-report-groups.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { HttpError } from './database.ts';
 import type { Database } from './database.ts';
-import { getIntake, reviewIntake, saveIntakeDraftRepair, verifyIntakeOriginal } from './intake.ts';
+import {
+  getIntakeRead,
+  reviewIntake,
+  saveIntakeDraftRepair,
+  verifyIntakeOriginal,
+} from './intake.ts';
+import { isIntakeSummary } from '../shared/intake-summary.ts';
+import {
+  prepareCollectionClinicalReview,
+  prepareCollectionClinicalReviewDependencies,
+} from './intake-review-collection-host.ts';
+import { openIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
+import { retainedIntakeWorkflowCommand } from './intake-workflow-command.ts';
+import { saveIntakeDraftRepairRead } from './intake-draft-repair-native.ts';
 import { readIntakeEvidence } from './intake-evidence.ts';
 import { currentReviewDraft } from './intake-review.ts';
 import { datePrecision } from './clinical-import.ts';
@@ -125,7 +139,9 @@ export function resolveIntakeDraftRepairScope(
   input: unknown,
 ): IntakeDraftRepairScope {
   const chosen = selection(input);
-  const intake = getIntake(db, root, profileId, chosen.intakeId);
+  const intake = getIntakeRead(db, root, profileId, chosen.intakeId);
+  const native = isIntakeSummary(intake);
+  const view = native ? openIntakeCollectionEnvelope(db, { id: intake.id }) : undefined;
   const reviews = new Map<string, ReturnType<typeof reviewIntake>>();
   const originalWindow = (locator: string) => {
     if (intake.mimeType === 'application/pdf') {
@@ -174,75 +190,127 @@ export function resolveIntakeDraftRepairScope(
     const offset = Math.max(0, start - 1000);
     return { kind: 'text' as const, offset, limit: 12000 };
   };
-  const rows = chosen.rows.map((selected) => {
-    const reviewKey = selected.proposalId || '';
-    let review = reviews.get(reviewKey);
-    if (!review) {
-      review = reviewIntake(db, root, profileId, chosen.intakeId, selected.proposalId);
-      reviews.set(reviewKey, review);
-    }
-    const record = review.records.find((candidate) => candidate.id === selected.recordId);
-    if (!record || record.candidateVersionId !== selected.candidateVersionId)
-      throw new HttpError(409, 'DRAFT_REPAIR_STALE', 'A selected draft changed; choose it again');
-    if (!record.reportGroups?.some((group) => group.groupId === chosen.groupId))
-      throw new HttpError(409, 'DRAFT_REPAIR_SCOPE', 'Selected drafts must share one report');
-    if (record.reviewState === 'accepted' || record.reviewState === 'kept_original')
-      throw new HttpError(409, 'DRAFT_REPAIR_STATE', 'Only pending drafts can be repaired');
-    const allowedFields = selected.fields.filter(
-      (field) =>
-        (field === 'date' &&
-          (record.mapping.kind === 'observation' || record.mapping.kind === 'procedure')) ||
-        (record.mapping.kind === 'observation' &&
-          (field === 'method' || field === 'observationCategory')),
-    );
-    if (allowedFields.length !== selected.fields.length)
-      throw new HttpError(
-        400,
-        'DRAFT_REPAIR_FIELD',
-        'A selected field does not fit this draft kind',
+  const sessions: Extract<
+    ReturnType<typeof prepareCollectionClinicalReview>,
+    { status: 'ready' }
+  >['session'][] = [];
+  try {
+    const rows = chosen.rows.map((selected) => {
+      const reviewKey = selected.proposalId || '';
+      let review = reviews.get(reviewKey);
+      if (!review) {
+        if (native) {
+          const prepared = prepareCollectionClinicalReview(
+            db,
+            root,
+            profileId,
+            chosen.intakeId,
+            selected.proposalId,
+          );
+          if (prepared.status !== 'ready')
+            throw new HttpError(
+              409,
+              'DRAFT_REPAIR_PREPARATION',
+              'Prepare the selected draft review',
+            );
+          sessions.push(prepared.session);
+          review = prepared.session.review;
+        } else review = reviewIntake(db, root, profileId, chosen.intakeId, selected.proposalId);
+        reviews.set(reviewKey, review);
+      }
+      const record = review.records.find((candidate) => candidate.id === selected.recordId);
+      if (!record || record.candidateVersionId !== selected.candidateVersionId)
+        throw new HttpError(409, 'DRAFT_REPAIR_STALE', 'A selected draft changed; choose it again');
+      if (
+        !selectedReportGroups(record.reportGroups).some((group) => group.groupId === chosen.groupId)
+      )
+        throw new HttpError(409, 'DRAFT_REPAIR_SCOPE', 'Selected drafts must share one report');
+      if (record.reviewState === 'accepted' || record.reviewState === 'kept_original')
+        throw new HttpError(409, 'DRAFT_REPAIR_STATE', 'Only pending drafts can be repaired');
+      const allowedFields = selected.fields.filter(
+        (field) =>
+          (field === 'date' &&
+            (record.mapping.kind === 'observation' || record.mapping.kind === 'procedure')) ||
+          (record.mapping.kind === 'observation' &&
+            (field === 'method' || field === 'observationCategory')),
       );
-    const prior = currentReviewDraft(
-      intake.workflow!,
-      selected.proposalId,
-      record.id,
-      record.candidateVersionId!,
-    );
-    const mapping = { ...record.mapping, ...prior?.mapping, ...prior?.decision?.mapping };
-    const evidence = (record.evidence || []).slice(0, 20).map((item) => ({
-      id: hash([selected.recordId, item.label, item.locator, item.contentUrl || null]),
-      label: item.label,
-      locator: item.locator,
-      ...(item.contentUrl ? { contentUrl: item.contentUrl } : {}),
-      originalWindow: originalWindow(item.locator),
-    }));
-    if (!evidence.length)
-      throw new HttpError(
-        409,
-        'DRAFT_REPAIR_EVIDENCE',
-        'The selected draft has no exact source locator',
-      );
-    return {
-      proposalId: selected.proposalId,
-      recordId: selected.recordId,
-      candidateVersionId: selected.candidateVersionId,
-      kind: record.mapping.kind || record.kind,
-      title: record.title,
-      allowedFields,
-      before: Object.fromEntries(
-        allowedFields.map((field) => [field, String(mapping[field] ?? '')]),
-      ) as Partial<Record<IntakeDraftRepairField, string>>,
-      evidence,
+      if (allowedFields.length !== selected.fields.length)
+        throw new HttpError(
+          400,
+          'DRAFT_REPAIR_FIELD',
+          'A selected field does not fit this draft kind',
+        );
+      const prior = !isIntakeSummary(intake)
+        ? currentReviewDraft(
+            intake.workflow!,
+            selected.proposalId,
+            record.id,
+            record.candidateVersionId!,
+          )
+        : undefined;
+      const mapping = { ...record.mapping, ...prior?.mapping, ...prior?.decision?.mapping };
+      if (view) {
+        const draft = view.lookup('draft-record-version-last', [
+          selected.proposalId || '',
+          record.id,
+          record.candidateVersionId!,
+        ]);
+        const decision = draft && view.child(draft, 'decision');
+        for (const source of [
+          draft && view.child(draft, 'mapping'),
+          decision && view.child(decision, 'mapping'),
+        ])
+          if (source)
+            for (const field of allowedFields) {
+              const value = view.field(source, field, { bytes: 8192 });
+              if (value.kind === 'missing') continue;
+              if (value.kind !== 'value' || typeof value.value !== 'string')
+                throw new HttpError(
+                  409,
+                  'DRAFT_REPAIR_PREPARATION',
+                  'Prepare the selected draft field',
+                );
+              mapping[field] = value.value;
+            }
+      }
+      const evidence = (record.evidence || []).slice(0, 20).map((item) => ({
+        id: hash([selected.recordId, item.label, item.locator, item.contentUrl || null]),
+        label: item.label,
+        locator: item.locator,
+        ...(item.contentUrl ? { contentUrl: item.contentUrl } : {}),
+        originalWindow: originalWindow(item.locator),
+      }));
+      if (!evidence.length)
+        throw new HttpError(
+          409,
+          'DRAFT_REPAIR_EVIDENCE',
+          'The selected draft has no exact source locator',
+        );
+      return {
+        proposalId: selected.proposalId,
+        recordId: selected.recordId,
+        candidateVersionId: selected.candidateVersionId,
+        kind: record.mapping.kind || record.kind,
+        title: record.title,
+        allowedFields,
+        before: Object.fromEntries(
+          allowedFields.map((field) => [field, String(mapping[field] ?? '')]),
+        ) as Partial<Record<IntakeDraftRepairField, string>>,
+        evidence,
+      };
+    });
+    const basis = {
+      format: 'intake-draft-repair-scope-v2' as const,
+      intakeId: intake.id,
+      intakeVersion: intake.version,
+      groupId: chosen.groupId,
+      originalSha256: intake.sha256,
+      rows,
     };
-  });
-  const basis = {
-    format: 'intake-draft-repair-scope-v2' as const,
-    intakeId: intake.id,
-    intakeVersion: intake.version,
-    groupId: chosen.groupId,
-    originalSha256: intake.sha256,
-    rows,
-  };
-  return { ...basis, scopeToken: hash([profileId, basis]) };
+    return { ...basis, scopeToken: hash([profileId, basis]) };
+  } finally {
+    for (const session of sessions) session.close();
+  }
 }
 
 export function resolveIntakeDraftRepairContext(
@@ -252,10 +320,59 @@ export function resolveIntakeDraftRepairContext(
   context: UnknownRecord,
 ) {
   if (context.intakeRepair === undefined) return context;
+  const chosen = selection(context.intakeRepair);
+  // Native dependency preparation runs before provider dispatch. This retains
+  // only validated selected IDs while keeping chat creation synchronous.
+  if (isIntakeSummary(getIntakeRead(db, root, profileId, chosen.intakeId)))
+    return { ...context, intakeRepair: chosen };
   return {
     ...context,
     intakeRepair: resolveIntakeDraftRepairScope(db, root, profileId, context.intakeRepair),
   };
+}
+
+/** Cold selected review dependencies are prepared explicitly before dispatch.
+ * Existing retained scopes remain bound to their original digest. */
+export async function prepareIntakeDraftRepairScope(
+  db: Database,
+  root: string,
+  profileId: string,
+  value: unknown,
+  options: { assertRunning?: () => void } = {},
+): Promise<IntakeDraftRepairScope> {
+  const retained =
+    object(value) && value.format === 'intake-draft-repair-scope-v2'
+      ? retainedScope(profileId, value)
+      : undefined;
+  const chosen = retained
+    ? {
+        format: 'intake-draft-repair-selection-v1' as const,
+        intakeId: retained.intakeId,
+        groupId: retained.groupId,
+        rows: retained.rows.map((row) => ({
+          proposalId: row.proposalId,
+          recordId: row.recordId,
+          candidateVersionId: row.candidateVersionId,
+          fields: row.allowedFields,
+        })),
+      }
+    : selection(value);
+  options.assertRunning?.();
+  if (isIntakeSummary(getIntakeRead(db, root, profileId, chosen.intakeId)))
+    for (const proposalId of new Set(chosen.rows.map((row) => row.proposalId))) {
+      await prepareCollectionClinicalReviewDependencies(
+        db,
+        root,
+        profileId,
+        chosen.intakeId,
+        proposalId,
+        options,
+      );
+      options.assertRunning?.();
+    }
+  return retained
+    ? currentScope(db, root, profileId, retained)
+    : resolveIntakeDraftRepairScope(db, root, profileId, chosen);
 }
 
 type RepairEdit = {
@@ -543,6 +660,43 @@ function currentScope(
   return refreshed;
 }
 
+function repairOperationRecorded(
+  db: Database,
+  root: string,
+  profileId: string,
+  id: string,
+  request: {
+    operationId: string;
+    groupId: string;
+    corrections: IntakeDraftRepairUpdate['corrections'];
+  },
+): boolean {
+  const intake = getIntakeRead(db, root, profileId, id);
+  if (isIntakeSummary(intake)) {
+    try {
+      return retainedIntakeWorkflowCommand(
+        db,
+        { id },
+        { operationId: request.operationId, request },
+      );
+    } catch (error) {
+      if (!(error instanceof HttpError) || error.code !== 'OPERATION_CONFLICT') throw error;
+      throw new HttpError(409, 'DRAFT_REPAIR_RECEIPT', 'Saved repair receipt has another request');
+    }
+  }
+  const prior = (
+    intake.workflow as
+      | (typeof intake.workflow & {
+          operations: { id: string; fingerprint: string }[];
+        })
+      | undefined
+  )?.operations.find((item) => item.id === request.operationId);
+  if (!prior) return false;
+  if (prior.fingerprint !== workflowHash(request))
+    throw new HttpError(409, 'DRAFT_REPAIR_RECEIPT', 'Saved repair receipt has another request');
+  return true;
+}
+
 export function revalidateIntakeDraftRepairScope(
   db: Database,
   root: string,
@@ -632,6 +786,85 @@ export const intakeDraftRepairTool: HealthTool = {
   },
 };
 
+function applyRepair(
+  proposal: UnknownRecord,
+  context: UnknownRecord,
+  nativeAsync: boolean,
+): UnknownRecord | null | Promise<UnknownRecord> {
+  if (proposal.kind !== 'intake_draft_repair') return null;
+  const profileId = context.profileId as string;
+  const db = context.db as Database;
+  const root = context.root as string;
+  if (!object(proposal.changes))
+    throw new HttpError(409, 'DRAFT_REPAIR_RECEIPT', 'Saved draft repair is invalid');
+  const retained = retainedScope(profileId, proposal.changes.scope);
+  const chatScope = retainedScope(
+    profileId,
+    (context.chat as { context?: { intakeRepair?: unknown } } | undefined)?.context?.intakeRepair,
+  );
+  if (chatScope.scopeToken !== retained.scopeToken)
+    throw new HttpError(
+      409,
+      'DRAFT_REPAIR_RECEIPT',
+      'Saved repair does not match this conversation scope',
+    );
+  const edits = parseEdits(retained, {
+    scopeToken: retained.scopeToken,
+    edits: proposal.changes.edits,
+  });
+  retainedEvidenceReads(retained, proposal.changes.evidenceReads, edits);
+  const corrections: IntakeDraftRepairUpdate['corrections'] = edits.map((edit) => {
+    const row = retained.rows.find((candidate) => candidate.recordId === edit.recordId)!;
+    return {
+      proposalId: row.proposalId,
+      recordId: row.recordId,
+      candidateVersionId: row.candidateVersionId,
+      field: edit.field,
+      before: row.before[edit.field] || '',
+      after: edit.after,
+    };
+  });
+  const request = {
+    operationId: proposal.id as string,
+    groupId: retained.groupId,
+    corrections,
+  };
+  const completed = () => ({
+    applied: true,
+    resultUrl: `#/import?group=${encodeURIComponent(retained.groupId)}&intake=${encodeURIComponent(retained.intakeId)}`,
+    result: { changed: corrections.length, sourceUnchanged: true, acceptanceUnchanged: true },
+  });
+  if (repairOperationRecorded(db, root, profileId, retained.intakeId, request)) return completed();
+  if (isIntakeSummary(getIntakeRead(db, root, profileId, retained.intakeId))) {
+    if (!nativeAsync)
+      throw new HttpError(
+        409,
+        'DRAFT_REPAIR_PREPARATION',
+        'Apply this selected repair through asynchronous preparation',
+      );
+    return (async () => {
+      const scope = await prepareIntakeDraftRepairScope(db, root, profileId, retained);
+      await saveIntakeDraftRepairRead(db, root, profileId, scope.intakeId, {
+        version: scope.intakeVersion,
+        ...request,
+      });
+      return completed();
+    })();
+  }
+  const scope = currentScope(db, root, profileId, retained);
+  saveIntakeDraftRepair(db, root, profileId, scope.intakeId, {
+    version: scope.intakeVersion,
+    operationId: request.operationId,
+    groupId: scope.groupId,
+    corrections,
+  });
+  return {
+    applied: true,
+    resultUrl: `#/import?group=${encodeURIComponent(scope.groupId)}&intake=${encodeURIComponent(scope.intakeId)}`,
+    result: { changed: corrections.length, sourceUnchanged: true, acceptanceUnchanged: true },
+  };
+}
+
 export function intakeDraftRepairAssistantExtensions() {
   return {
     tools: [intakeDraftRepairReadTool, intakeDraftRepairTool],
@@ -645,7 +878,12 @@ export function intakeDraftRepairAssistantExtensions() {
       };
       const retained = chat.context?.intakeRepair;
       if (!retained) throw new HttpError(403, 'DRAFT_REPAIR_SCOPE', 'Select import drafts first');
-      const scope = currentScope(db, root, profileId, retained);
+      const scope = await prepareIntakeDraftRepairScope(db, root, profileId, retained, {
+        assertRunning:
+          typeof context.assertRunning === 'function'
+            ? (context.assertRunning as () => void)
+            : undefined,
+      });
       const state = context.state as RepairRunState | undefined;
       if (name === intakeDraftRepairReadTool.name) {
         if (
@@ -681,6 +919,7 @@ export function intakeDraftRepairAssistantExtensions() {
           ...(window.kind === 'pdf_page' ? { page: window.page, offset: 0 } : {}),
           ...(window.kind === 'text' ? { offset: window.offset } : {}),
           modelContext: true,
+          pagedContext: isIntakeSummary(getIntakeRead(db, root, profileId, scope.intakeId)),
           captureSourceText: false,
           pdf: context.pdf === true && window.kind === 'pdf_page',
           assertRunning: assertRunning as () => void,
@@ -837,78 +1076,14 @@ export function intakeDraftRepairAssistantExtensions() {
       chat.proposals.push(proposal);
       return proposal;
     },
-    apply(proposal: UnknownRecord, context: UnknownRecord) {
-      if (proposal.kind !== 'intake_draft_repair') return null;
-      const profileId = context.profileId as string;
-      const db = context.db as Database;
-      const root = context.root as string;
-      if (!object(proposal.changes))
-        throw new HttpError(409, 'DRAFT_REPAIR_RECEIPT', 'Saved draft repair is invalid');
-      const retained = retainedScope(profileId, proposal.changes.scope);
-      const chatScope = retainedScope(
-        profileId,
-        (context.chat as { context?: { intakeRepair?: unknown } } | undefined)?.context
-          ?.intakeRepair,
-      );
-      if (chatScope.scopeToken !== retained.scopeToken)
-        throw new HttpError(
-          409,
-          'DRAFT_REPAIR_RECEIPT',
-          'Saved repair does not match this conversation scope',
-        );
-      const edits = parseEdits(retained, {
-        scopeToken: retained.scopeToken,
-        edits: proposal.changes.edits,
-      });
-      retainedEvidenceReads(retained, proposal.changes.evidenceReads, edits);
-      const corrections: IntakeDraftRepairUpdate['corrections'] = edits.map((edit) => {
-        const row = retained.rows.find((candidate) => candidate.recordId === edit.recordId)!;
-        return {
-          proposalId: row.proposalId,
-          recordId: row.recordId,
-          candidateVersionId: row.candidateVersionId,
-          field: edit.field,
-          before: row.before[edit.field] || '',
-          after: edit.after,
-        };
-      });
-      const request = {
-        operationId: proposal.id as string,
-        groupId: retained.groupId,
-        corrections,
-      };
-      const existing = (
-        getIntake(db, root, profileId, retained.intakeId).workflow as
-          | (ReturnType<typeof getIntake>['workflow'] & {
-              operations: { id: string; fingerprint: string }[];
-            })
-          | undefined
-      )?.operations.find((candidate) => candidate.id === proposal.id);
-      if (existing) {
-        if (existing.fingerprint !== workflowHash(request))
-          throw new HttpError(
-            409,
-            'DRAFT_REPAIR_RECEIPT',
-            'Saved repair receipt has another request',
-          );
-        return {
-          applied: true,
-          resultUrl: `#/import?group=${encodeURIComponent(retained.groupId)}&intake=${encodeURIComponent(retained.intakeId)}`,
-          result: { changed: corrections.length, sourceUnchanged: true, acceptanceUnchanged: true },
-        };
-      }
-      const scope = currentScope(db, root, profileId, retained);
-      saveIntakeDraftRepair(db, root, profileId, scope.intakeId, {
-        version: scope.intakeVersion,
-        operationId: request.operationId,
-        groupId: scope.groupId,
-        corrections,
-      });
-      return {
-        applied: true,
-        resultUrl: `#/import?group=${encodeURIComponent(scope.groupId)}&intake=${encodeURIComponent(scope.intakeId)}`,
-        result: { changed: corrections.length, sourceUnchanged: true, acceptanceUnchanged: true },
-      };
+    apply(proposal: UnknownRecord, context: UnknownRecord): UnknownRecord | null {
+      return applyRepair(proposal, context, false) as UnknownRecord | null;
+    },
+    async applyAsync(
+      proposal: UnknownRecord,
+      context: UnknownRecord,
+    ): Promise<UnknownRecord | null> {
+      return applyRepair(proposal, context, true);
     },
     reconcile(proposal: UnknownRecord, context: UnknownRecord) {
       if (proposal.kind !== 'intake_draft_repair') return null;
@@ -945,24 +1120,14 @@ export function intakeDraftRepairAssistantExtensions() {
           after: edit.after,
         };
       });
-      const intake = getIntake(db, root, profileId, scope.intakeId);
-      const operation = (
-        intake.workflow as
-          | (typeof intake.workflow & {
-              operations: { id: string; fingerprint: string }[];
-            })
-          | undefined
-      )?.operations.find((candidate) => candidate.id === proposal.id);
-      if (!operation) return null;
       if (
-        operation.fingerprint !==
-        workflowHash({ operationId: proposal.id, groupId: scope.groupId, corrections })
+        !repairOperationRecorded(db, root, profileId, scope.intakeId, {
+          operationId: proposal.id,
+          groupId: scope.groupId,
+          corrections,
+        })
       )
-        throw new HttpError(
-          409,
-          'DRAFT_REPAIR_RECEIPT',
-          'Saved repair receipt has another request',
-        );
+        return null;
       return {
         resultUrl: `#/import?group=${encodeURIComponent(scope.groupId)}&intake=${encodeURIComponent(scope.intakeId)}`,
         result: { changed: edits.length, sourceUnchanged: true, acceptanceUnchanged: true },

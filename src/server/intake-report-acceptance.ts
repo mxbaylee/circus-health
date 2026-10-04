@@ -6,6 +6,10 @@ import {
   hasPartialAcceptance,
 } from './intake-partial-acceptance.ts';
 import { durableSelectionInputs } from './intake-selection-authority.ts';
+import {
+  hasNativeAcceptanceBlock,
+  applyNativeAcceptanceGroup,
+} from './intake-report-acceptance-native.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { createHash } from 'node:crypto';
 import { HttpError, now } from './database.ts';
@@ -91,6 +95,11 @@ function request(value: unknown): IntakeReportAcceptanceRequest {
         !text(selection.candidateVersionId) ||
         !object(selection.mapping) ||
         (selection.comparisons !== undefined && !Array.isArray(selection.comparisons)) ||
+        (selection.useRetainedDecision !== undefined &&
+          (selection.useRetainedDecision !== true ||
+            !text(selection.selectionReviewToken) ||
+            Object.keys(selection.mapping).length !== 0 ||
+            selection.comparisons !== undefined)) ||
         Object.keys(selection).some(
           (key) =>
             ![
@@ -100,6 +109,7 @@ function request(value: unknown): IntakeReportAcceptanceRequest {
               'mapping',
               'comparisons',
               'selectionReviewToken',
+              'useRetainedDecision',
             ].includes(key),
         )
       )
@@ -177,9 +187,46 @@ export async function acceptIntakeReportSelectionAsync(
 ): Promise<IntakeReportAcceptanceResult> {
   acceptanceOwner(db, profileId);
   const selected = request(input);
-  if (selected.mode !== 'partial-v1')
-    return acceptIntakeReportSelection(db, root, profileId, selected);
-  if (retained(db, selected.operationId))
+  if (
+    !hasNativeAcceptanceBlock(db, selected) &&
+    selected.blocks.some((block) =>
+      block.selections.some((selection) => selection.useRetainedDecision),
+    )
+  )
+    throw new HttpError(
+      400,
+      'REPORT_ACCEPTANCE_INPUT',
+      'Use explicit reviewed choices for this legacy intake',
+    );
+  if (selected.mode !== 'partial-v1') {
+    if (!hasNativeAcceptanceBlock(db, selected))
+      return acceptIntakeReportSelection(db, root, profileId, selected);
+    const { prepareIntakeLookupIndices } = await import('./intake-lookup-projection.ts');
+    await prepareIntakeLookupIndices(db);
+    const fingerprint = createHash('sha256').update(canonicalLiteral(selected)).digest('hex');
+    if (hasPartialAcceptance(db, selected.operationId))
+      throw new HttpError(
+        409,
+        'OPERATION_CONFLICT',
+        'Operation ID already belongs to a different acceptance mode.',
+      );
+    const previous = retained(db, selected.operationId);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint)
+        throw new HttpError(
+          409,
+          'OPERATION_CONFLICT',
+          'Acceptance operation ID already belongs to a different selection',
+        );
+      return {
+        receipt: previous.receipt,
+        replayed: true,
+        durability: flushIntake(db, root, profileId),
+      };
+    }
+    return applyNativeAcceptanceGroup(db, root, profileId, selected, fingerprint);
+  }
+  if (!hasNativeAcceptanceBlock(db, selected) && retained(db, selected.operationId))
     throw new HttpError(
       409,
       'OPERATION_CONFLICT',

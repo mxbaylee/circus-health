@@ -1,4 +1,6 @@
-import { readStoredIntakeDetails } from './intake-state-access.ts';
+import { readPreparedSourceAttention } from './intake-source-attention.ts';
+import { IntakeStateManifest } from './intake-state-manifest.ts';
+import { intakeSourceMetadata } from './intake-state-access.ts';
 import { sourceIssueCategory, sourceIssueNeedsReview } from '../shared/intake-source-issues.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { HttpError, transaction, type Database } from './database.ts';
@@ -432,108 +434,152 @@ function loadRevision(
   return revision;
 }
 
-/** Validate retained source-text metadata with the same decoders used by recovery and rebinding. */
+/** Validate retained source-text metadata with the same strict per-revision decoders. */
 export function validatePortableIntakeSourceText(
   tables: Record<string, Record<string, unknown>[]>,
   profileId: string,
 ): void {
-  const metadata = new Map<string, string>();
-  let bytes = 0,
-    count = 0;
-  for (const row of tables.app_meta ?? []) {
-    if (typeof row.key !== 'string' || typeof row.value !== 'string' || metadata.has(row.key))
+  validatePortableIntakeSourceTextRows({ rows: (table) => tables[table] ?? [] }, profileId);
+}
+export function validatePortableIntakeSourceTextRows(
+  source: { rows(table: string): Iterable<Record<string, unknown>> },
+  profileId: string,
+): void {
+  const manifest = new IntakeStateManifest(),
+    db = manifest.db;
+  try {
+    db.exec(
+      'CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE text_originals(id TEXT PRIMARY KEY,sha TEXT NOT NULL); CREATE TABLE revisions(key TEXT PRIMARY KEY,parent TEXT); CREATE TABLE heads(id TEXT PRIMARY KEY,revision TEXT NOT NULL); CREATE TABLE operations(id TEXT,revision TEXT); CREATE TABLE namespaces_text(id TEXT PRIMARY KEY);',
+    );
+    for (const row of source.rows('app_meta')) {
+      if (
+        typeof row.key !== 'string' ||
+        typeof row.value !== 'string' ||
+        db.prepare('SELECT 1 FROM metadata WHERE key=?').get(row.key)
+      )
+        corrupt();
+      db.prepare('INSERT INTO metadata VALUES(?,?)').run(row.key, row.value);
+    }
+    for (const row of source.rows('source_files'))
+      if (row.kind === 'intake_original') {
+        if (
+          typeof row.id !== 'string' ||
+          typeof row.sha256 !== 'string' ||
+          db.prepare('SELECT 1 FROM text_originals WHERE id=?').get(row.id)
+        )
+          corrupt();
+        db.prepare('INSERT INTO text_originals VALUES(?,?)').run(row.id, row.sha256);
+      }
+    let decodeBytes = 0;
+    const reader: MetadataReader = {
+      readMetadata(name) {
+        const raw = db.prepare('SELECT value FROM metadata WHERE key=?').get(name)?.value as
+          string | undefined;
+        decodeBytes += raw === undefined ? 0 : Buffer.byteLength(raw);
+        if (decodeBytes > DEFAULT_LIMITS.bytes) corrupt();
+        return raw;
+      },
+    };
+    for (const row of db
+      .prepare("SELECT key,value FROM metadata WHERE key GLOB 'intake_source_text:*'")
+      .iterate()) {
+      decodeBytes = 0;
+      const name = String(row.key),
+        raw = String(row.value);
+      const match =
+        /^intake_source_text:v1:(.+):(head|blob:([0-9a-f]{64})|revision:([0-9a-f-]{36})|operation:([0-9a-f-]{36}))$/.exec(
+          name,
+        );
+      if (!match) corrupt();
+      const [, intakeId, kind, blobId, revisionId, operationId] = match;
+      const original = db.prepare('SELECT sha FROM text_originals WHERE id=?').get(intakeId);
+      if (!original) corrupt();
+      db.prepare('INSERT OR IGNORE INTO namespaces_text VALUES(?)').run(intakeId);
+      if (kind === 'head') {
+        const head = parse(raw);
+        if (
+          !object(head) ||
+          head.sourceHash !== original.sha ||
+          typeof head.revisionId !== 'string' ||
+          !UUID.test(head.revisionId)
+        )
+          corrupt();
+        db.prepare('INSERT INTO heads VALUES(?,?)').run(intakeId, head.revisionId);
+      } else if (blobId) readBlob(reader, intakeId, blobId);
+      else if (operationId) {
+        const operation = parse(raw);
+        if (
+          !UUID.test(operationId) ||
+          !object(operation) ||
+          typeof operation.fingerprint !== 'string' ||
+          !HASH.test(operation.fingerprint) ||
+          typeof operation.revisionId !== 'string' ||
+          !UUID.test(operation.revisionId)
+        )
+          corrupt();
+        db.prepare('INSERT INTO operations VALUES(?,?)').run(intakeId, operation.revisionId);
+      } else {
+        const revision = loadRevision(
+          reader,
+          profileId,
+          intakeId,
+          String(original.sha),
+          revisionId,
+        );
+        db.prepare('INSERT INTO revisions VALUES(?,?)').run(
+          key(intakeId, 'revision:' + revisionId),
+          revision.parentRevisionId,
+        );
+      }
+    }
+    if (
+      db
+        .prepare(
+          'SELECT 1 FROM namespaces_text LEFT JOIN heads USING(id) WHERE heads.id IS NULL LIMIT 1',
+        )
+        .get()
+    )
       corrupt();
-    if (row.key.startsWith('intake_source_text:')) {
-      bytes += Buffer.byteLength(row.key) + Buffer.byteLength(row.value);
-      if (bytes > DEFAULT_LIMITS.bytes || ++count > 200_000) corrupt();
+    for (const row of db.prepare('SELECT id,revision FROM heads').iterate()) {
+      let next: string | null = String(row.revision);
+      while (next !== null) {
+        const name = key(String(row.id), 'revision:' + next);
+        const revision = db.prepare('SELECT parent FROM revisions WHERE key=?').get(name);
+        if (!revision || db.prepare('SELECT 1 FROM visited WHERE key=?').get(name)) corrupt();
+        db.prepare('INSERT INTO visited VALUES(?)').run(name);
+        next = revision.parent as string | null;
+      }
     }
-    metadata.set(row.key, row.value);
-  }
-  const originals = new Map(
-    (tables.source_files ?? [])
-      .filter((row) => row.kind === 'intake_original')
-      .map((row) => [row.id, row]),
-  );
-  let decodeBytes = 0;
-  const reader: MetadataReader = {
-    readMetadata(name) {
-      const raw = metadata.get(name);
-      decodeBytes += raw === undefined ? 0 : Buffer.byteLength(raw);
-      if (decodeBytes > DEFAULT_LIMITS.bytes) corrupt();
-      return raw;
-    },
-  };
-  const revisions = new Map<string, Pick<SourceTextRevision, 'intakeId' | 'parentRevisionId'>>();
-  const heads = new Map<string, string>();
-  const namespaces = new Set<string>();
-  const operations: Array<{ intakeId: string; revisionId: string }> = [];
-  for (const [name, raw] of metadata) {
-    if (!name.startsWith('intake_source_text:')) continue;
-    const match =
-      /^intake_source_text:v1:(.+):(head|blob:([0-9a-f]{64})|revision:([0-9a-f-]{36})|operation:([0-9a-f-]{36}))$/.exec(
-        name,
-      );
-    if (!match || !originals.has(match[1])) corrupt();
-    const [, intakeId, kind, blobId, revisionId, operationId] = match;
-    namespaces.add(intakeId);
-    const original = originals.get(intakeId)!;
-    if (kind === 'head') {
-      const head = parse(raw);
+    if (
+      db
+        .prepare(
+          'SELECT 1 FROM revisions LEFT JOIN visited USING(key) WHERE visited.key IS NULL LIMIT 1',
+        )
+        .get()
+    )
+      corrupt();
+    for (const row of db.prepare('SELECT id,revision FROM operations').iterate())
       if (
-        !object(head) ||
-        head.sourceHash !== original.sha256 ||
-        typeof head.revisionId !== 'string' ||
-        !UUID.test(head.revisionId)
+        !db
+          .prepare('SELECT 1 FROM visited WHERE key=?')
+          .get(key(String(row.id), 'revision:' + row.revision))
       )
         corrupt();
-      heads.set(intakeId, head.revisionId);
-    } else if (blobId) readBlob(reader, intakeId, blobId);
-    else if (operationId) {
-      const operation = parse(raw);
+    for (const row of db
+      .prepare("SELECT key,value FROM metadata WHERE key GLOB 'intake_source_pin:v1:*'")
+      .iterate()) {
+      const intakeId = String(row.key).slice('intake_source_pin:v1:'.length),
+        pin = parseIntakeSourcePin(String(row.value));
       if (
-        !UUID.test(operationId) ||
-        !object(operation) ||
-        typeof operation.fingerprint !== 'string' ||
-        !HASH.test(operation.fingerprint) ||
-        typeof operation.revisionId !== 'string' ||
-        !UUID.test(operation.revisionId)
+        pin?.revisionId &&
+        !db
+          .prepare('SELECT 1 FROM revisions WHERE key=?')
+          .get(key(intakeId, 'revision:' + pin.revisionId))
       )
         corrupt();
-      operations.push({ intakeId, revisionId: operation.revisionId });
-    } else {
-      const revision = loadRevision(
-        reader,
-        profileId,
-        intakeId,
-        String(original.sha256),
-        revisionId,
-      );
-      revisions.set(key(intakeId, `revision:${revisionId}`), {
-        intakeId: revision.intakeId,
-        parentRevisionId: revision.parentRevisionId,
-      });
     }
-  }
-  const selected = new Set<string>();
-  for (const intakeId of namespaces) if (!heads.has(intakeId)) corrupt();
-  for (const [intakeId, revisionId] of heads) {
-    let next: string | null = revisionId;
-    while (next !== null) {
-      const revisionKey = key(intakeId, `revision:${next}`);
-      const revision = revisions.get(revisionKey);
-      if (!revision || selected.has(revisionKey)) corrupt();
-      selected.add(revisionKey);
-      next = revision.parentRevisionId;
-    }
-  }
-  if (selected.size !== revisions.size) corrupt();
-  for (const { intakeId, revisionId } of operations)
-    if (!selected.has(key(intakeId, `revision:${revisionId}`))) corrupt();
-  for (const [name, raw] of metadata) {
-    if (!name.startsWith('intake_source_pin:v1:')) continue;
-    const intakeId = name.slice('intake_source_pin:v1:'.length);
-    const pin = parseIntakeSourcePin(raw);
-    if (pin?.revisionId && !revisions.has(key(intakeId, `revision:${pin.revisionId}`))) corrupt();
+  } finally {
+    manifest.close();
   }
 }
 export function getIntakeSourceTextReviewHistory(
@@ -593,7 +639,7 @@ export function rebindCopiedIntakeSourceText(
     throw new Error('Source-text copy rebinding requires an unpublished destination profile');
   const revisions = db
     .prepare("SELECT key FROM app_meta WHERE key LIKE 'intake_source_text:v1:%:revision:%'")
-    .all();
+    .iterate();
   for (const row of revisions) {
     const match = /^intake_source_text:v1:(.+):revision:([0-9a-f-]{36})$/.exec(String(row.key));
     if (!match) corrupt();
@@ -644,8 +690,8 @@ export function intakeSourceTextInterpretationRevisionId(
   const row = owner(db, profileId, intakeId);
   // The durable intake projection keeps the last material revision. The common
   // current-head path must not walk hundreds of whole-document approval receipts.
-  const metadata = readStoredIntakeDetails(db, intakeId);
   const pin = readIntakeSourcePin(db, intakeId);
+  const metadata = pin ? undefined : intakeSourceMetadata(db, intakeId);
   const material = pin ? pin.revisionId : metadata ? metadata.sourceTextRevisionId : null;
   if (id === head && typeof material === 'string') return material;
   let revision = loadRevision(db, profileId, intakeId, row.sha256, id);
@@ -736,6 +782,44 @@ function issueSummary(pages: SourceTextPage[], issues: SourceTextIssue[]): Sourc
 }
 
 /** Metadata-only queue. Completed originals never occupy an attention page. */
+function sourceAttentionSections(
+  db: Database,
+  profileId: string,
+  file: { id: string; sha256: string },
+) {
+  const head = currentIntakeSourceTextRevisionId(db, profileId, file.id);
+  if (!head) return 0;
+  const saved = loadStoredRevision(db, profileId, file.id, file.sha256, head);
+  let sections = saved.issueIndex?.summary.attentionSections;
+  if (sections === undefined) {
+    const pages = new Set<number>();
+    if (saved.issueIndex)
+      for (const chunk of saved.issueIndex.chunks) {
+        const issues = readBlob(db, file.id, chunk.ref) as SourceTextIssue[];
+        for (const issue of issues) if (sourceIssueNeedsReview(issue)) pages.add(issue.region.page);
+      }
+    else
+      for (const ref of saved.pageRefs) {
+        const page = readBlob(db, file.id, ref) as { issues: SourceTextIssue[] };
+        for (const issue of page.issues)
+          if (sourceIssueNeedsReview(issue)) pages.add(issue.region.page);
+      }
+    sections = pages.size;
+  }
+  if (!Number.isSafeInteger(sections) || sections < 0 || sections > saved.pageRefs.length)
+    corrupt();
+  return sections;
+}
+export async function listSourceAttentionRead(
+  db: Database,
+  profileId: string,
+  offset = 0,
+): Promise<SourceAttentionQueue> {
+  if (!Number.isSafeInteger(offset) || offset < 0) bad('Invalid source attention offset');
+  return readPreparedSourceAttention(db, profileId, offset, (file) =>
+    sourceAttentionSections(db, profileId, file),
+  );
+}
 export function listSourceAttention(
   db: Database,
   profileId: string,
@@ -753,40 +837,24 @@ export function listSourceAttention(
         ) +
         " ORDER BY json_extract(f.details_json,'$.intake.createdAt') DESC,f.id",
     )
-    .all() as { id: string; sha256: string }[];
+    .iterate() as Iterable<{ id: string; sha256: string }>;
   const items: SourceAttentionQueue['items'] = [];
+  let total = 0,
+    sectionsTotal = 0;
   for (const file of files) {
-    const head = currentIntakeSourceTextRevisionId(db, profileId, file.id);
-    if (!head) continue;
-    const saved = loadStoredRevision(db, profileId, file.id, file.sha256, head);
-    let sections = saved.issueIndex?.summary.attentionSections;
-    if (sections === undefined) {
-      const pages = new Set<number>();
-      if (saved.issueIndex)
-        for (const chunk of saved.issueIndex.chunks) {
-          const issues = readBlob(db, file.id, chunk.ref) as SourceTextIssue[];
-          for (const issue of issues)
-            if (sourceIssueNeedsReview(issue)) pages.add(issue.region.page);
-        }
-      else
-        for (const ref of saved.pageRefs) {
-          const page = readBlob(db, file.id, ref) as { issues: SourceTextIssue[] };
-          for (const issue of page.issues)
-            if (sourceIssueNeedsReview(issue)) pages.add(issue.region.page);
-        }
-      sections = pages.size;
+    const sections = sourceAttentionSections(db, profileId, file);
+    if (sections > 0) {
+      if (total >= offset && items.length < 30) items.push({ intakeId: file.id, sections });
+      total++;
+      sectionsTotal += sections;
     }
-    if (!Number.isSafeInteger(sections) || sections < 0 || sections > saved.pageRefs.length)
-      corrupt();
-    if (sections > 0) items.push({ intakeId: file.id, sections });
   }
-  const window = items.slice(offset, offset + 30);
   return {
-    sections: items.reduce((sum, item) => sum + item.sections, 0),
-    total: items.length,
-    items: window,
+    sections: sectionsTotal,
+    total,
+    items,
     offset,
-    nextOffset: offset + window.length < items.length ? offset + window.length : null,
+    nextOffset: offset + items.length < total ? offset + items.length : null,
   };
 }
 function persistIssueIndex(db: Database, revision: SourceTextRevision): StoredIssueIndexRefs {

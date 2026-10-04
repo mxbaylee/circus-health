@@ -45,13 +45,13 @@ function failureKey(sourceHash: string, key: string): string {
     .digest('hex');
 }
 
-function validateLocation(input: IntakePackageFailureInput): void {
+function validateLocation(input: IntakePackageFailureInput, paged = false): void {
   // The inspector admits 2,000 Unicode code points, including astral names.
   // Preserve those exact names; UTF-16 storage needs up to twice that length.
   for (const [name, maximum] of [
     ['memberId', 200],
-    ['filename', 4000],
-    ['locator', 4200],
+    ['filename', paged ? 1024 * 1024 : 4000],
+    ['locator', paged ? 1024 * 1024 + 20 : 4200],
   ] as const) {
     const value = input[name];
     if (value !== undefined && (typeof value !== 'string' || !value || value.length > maximum))
@@ -185,4 +185,176 @@ export function resolveIntakePackageFailure(
               : 'pending_conversion';
     },
   );
+}
+
+/** Native asynchronous adapters never hydrate a selected workflow or all
+ * failures. Legacy synchronous DTO callers retain their existing functions. */
+async function nativeFailures(db: DatabaseSync, root: string, profileId: string, id: string) {
+  const { assertIntakeOwner } = await import('./intake.ts');
+  const { intakeSourceVersion } = await import('./intake-state-access.ts');
+  const { selectedEnvelopeStore, openIntakeCollectionEnvelope } =
+    await import('./intake-collection-envelope.ts');
+  const { buildIntakeCollectionEnvelope } = await import('./intake-envelope-build.ts');
+  assertIntakeOwner(db, profileId);
+  void root;
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+    )
+    .get(id) as { id: string; kind: string; sha256: string; details_json: string } | undefined;
+  if (!source) throw new HttpError(404, 'NOT_FOUND', 'Retained source intake not found');
+  const { collections } = selectedEnvelopeStore(db, source);
+  const version = intakeSourceVersion(db, id);
+  const control =
+    version.logicalBinding === undefined
+      ? undefined
+      : collections.get(collections.openView(), 'logical', 'envelope.control', 'representation');
+  if (
+    typeof control !== 'string' ||
+    JSON.parse(control).format !== 'health-intake-record-envelope-v1'
+  )
+    await buildIntakeCollectionEnvelope(db, source);
+  const reader = openIntakeCollectionEnvelope(db, source);
+  const intake = reader.child(reader.root(), 'intake');
+  if (!intake) throw Error('Retained intake envelope is missing');
+  return {
+    source,
+    reader,
+    intake,
+    dictionary: reader.child(intake, 'packageFailures'),
+    version: intakeSourceVersion(db, id),
+  };
+}
+function nativeScalar(
+  reader: import('./intake-collection-envelope.ts').IntakeCollectionEnvelopeReader,
+  record: import('./intake-collection-envelope.ts').IntakeEnvelopeRecord,
+  field: string,
+) {
+  const value = reader.field(record, field, { bytes: 8192 });
+  if (value.kind === 'missing') return undefined;
+  if (value.kind === 'value') return value.value;
+  let text = '',
+    bytes = 0;
+  for (const chunk of reader.fieldChunks(record, field)) {
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > 2 * 1024 * 1024) throw Error('Package failure field exceeds ZIP record grammar');
+    text += chunk;
+  }
+  return JSON.parse(text);
+}
+async function nativeFailureMutation(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  current: Awaited<ReturnType<typeof nativeFailures>>,
+  changes: import('./intake-envelope-mutation.ts').IntakeEnvelopeMutation[],
+) {
+  const { randomUUID } = await import('node:crypto');
+  const { prepareIntakeEnvelopeMutation } = await import('./intake-envelope-mutation.ts');
+  const { selectedEnvelopeStore } = await import('./intake-collection-envelope.ts');
+  const { intakeTransaction } = await import('./intake.ts');
+  const { intakeSourceVersion } = await import('./intake-state-access.ts');
+  const operationId = randomUUID(),
+    requestDigest = createHash('sha256').update(operationId).digest('hex');
+  const prepared = await prepareIntakeEnvelopeMutation(db, current.source, {
+    reader: current.reader,
+    changes,
+    operationId,
+    requestDigest,
+    domainVersion: current.version.rawVersion + 1,
+  });
+  if (!prepared.prepared) throw Error('New package failure mutation unexpectedly replayed');
+  intakeTransaction(
+    db,
+    () => selectedEnvelopeStore(db, current.source).collections.stage(prepared.prepared!),
+    { operationId, fingerprint: requestDigest, actor: 'intake' },
+  );
+  void root;
+  void profileId;
+  return { version: intakeSourceVersion(db, id).version, changed: true };
+}
+export async function recordIntakePackageFailurePaged(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  input: IntakePackageFailureInput,
+) {
+  const key = operationKey(input.operationKey);
+  validateLocation(input, true);
+  const current = await nativeFailures(db, root, profileId, id);
+  const { intakeSourceMetadata } = await import('./intake-state-access.ts');
+  const failure: IntakePackageFailure = {
+    sourceFileId: id,
+    sourceHash: current.source.sha256,
+    operationKey: key,
+    originalFilename: intakeSourceMetadata(db, id).originalName,
+    contentUrl: `/api/sources/${encodeURIComponent(id)}/content`,
+    ...(input.memberId === undefined ? {} : { memberId: input.memberId }),
+    ...(input.ordinal === undefined ? {} : { ordinal: input.ordinal }),
+    ...(input.filename === undefined ? {} : { filename: input.filename }),
+    ...(input.locator === undefined ? {} : { locator: input.locator }),
+    reasonCode: input.reasonCode,
+    detail: sanitizePackageFailureDetail(input.detail),
+    status: 'pending',
+    scope: 'incomplete',
+    retryAction:
+      input.retryAction ||
+      (key === 'inventory'
+        ? 'inventory'
+        : key.startsWith('structure:')
+          ? 'read_structure'
+          : 'read_member'),
+  };
+  const slot = failureKey(current.source.sha256, key),
+    existing = current.dictionary && current.reader.child(current.dictionary, slot);
+  if (
+    existing &&
+    [...new Set([...Object.keys(failure), 'memberId', 'ordinal', 'filename', 'locator'])].every(
+      (field) =>
+        JSON.stringify(nativeScalar(current.reader, existing, field)) ===
+        JSON.stringify(failure[field as keyof IntakePackageFailure]),
+    )
+  )
+    return { version: current.version.version, changed: false, failure };
+  const changes: import('./intake-envelope-mutation.ts').IntakeEnvelopeMutation[] =
+    current.dictionary
+      ? [{ op: 'put', record: current.dictionary, field: slot, jsonText: JSON.stringify(failure) }]
+      : [
+          {
+            op: 'set',
+            record: current.intake,
+            field: 'packageFailures',
+            jsonText: JSON.stringify({ [slot]: failure }),
+          },
+        ];
+  if (nativeScalar(current.reader, current.intake, 'state') !== 'needs_review')
+    changes.push({ op: 'set', record: current.intake, field: 'state', jsonText: '"needs_review"' });
+  return { ...(await nativeFailureMutation(db, root, profileId, id, current, changes)), failure };
+}
+export async function resolveIntakePackageFailurePaged(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  input: { operationKey: string },
+) {
+  const key = operationKey(input.operationKey),
+    current = await nativeFailures(db, root, profileId, id);
+  const slot = failureKey(current.source.sha256, key),
+    pending = current.dictionary && current.reader.child(current.dictionary, slot);
+  if (
+    !pending ||
+    nativeScalar(current.reader, pending, 'sourceFileId') !== id ||
+    nativeScalar(current.reader, pending, 'sourceHash') !== current.source.sha256 ||
+    nativeScalar(current.reader, pending, 'operationKey') !== key
+  )
+    return { version: current.version.version, changed: false };
+  // The attention label remains until the bounded workflow count owner can
+  // prove its exact underlying disposition. Clearing this receipt never mints
+  // acceptance or assumes that unrelated review work has completed.
+  return nativeFailureMutation(db, root, profileId, id, current, [
+    { op: 'delete', record: current.dictionary!, field: slot },
+  ]);
 }

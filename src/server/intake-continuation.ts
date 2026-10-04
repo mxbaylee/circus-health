@@ -26,7 +26,7 @@ export type IntakeWithWorkflow = Intake & { workflow: NonNullable<Intake['workfl
 
 const MODEL_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
-interface ReadArgs extends Record<string, unknown> {
+export interface ReadArgs extends Record<string, unknown> {
   id?: string;
   action?: string;
   unitId?: string;
@@ -40,7 +40,7 @@ interface ReadArgs extends Record<string, unknown> {
   mappingVersion?: string;
 }
 
-interface ReadWindow {
+export interface ReadWindow {
   tool: string;
   args: ReadArgs;
 }
@@ -223,6 +223,12 @@ const withinJSON = (window: ReadWindow, supplied: ReadWindow): boolean => {
   );
 };
 
+/** Shared literal read identities for the durable selected-collection ledger. */
+export const conversionReadDescriptor = descriptor;
+export const conversionWindowKey = keyOf;
+export const conversionJSONScope = jsonScope;
+export const conversionScopeKey = hash;
+
 export function conversionCheckpoint(
   chat: ConversionChat,
   intake: IntakeWithWorkflow,
@@ -269,7 +275,7 @@ export function conversionCheckpoint(
   return checkpoint;
 }
 
-function conversionReadDetails(tool: string, args: ReadArgs, result: unknown) {
+export function conversionReadDetails(tool: string, args: ReadArgs, result: unknown) {
   if (!['health_intake_read', 'health_intake_package', 'health_intake_plan'].includes(tool))
     return null;
   const readResult = result as ReadResult | null | undefined;
@@ -302,13 +308,21 @@ export function deferConversionRead(
 ) {
   const details = conversionReadDetails(tool, args, result);
   if (!details) return null;
-  const { readResult, value, original, structure, current } = details;
+  const { structure, current } = details;
   const key = keyOf(current);
   if (checkpoint.seen.includes(key)) return null;
   if (structure && checkpoint.suppliedJSON?.some((item) => withinJSON(current, item))) return null;
   if (!checkpoint.pending.some((item) => keyOf(item) === key)) {
     checkpoint.pending.unshift(current);
   }
+  return conversionDeferredReceipt(tool, args, result);
+}
+
+/** Metadata-only acknowledgement receipt shared by legacy and native ledgers. */
+export function conversionDeferredReceipt(tool: string, args: ReadArgs, result: unknown) {
+  const details = conversionReadDetails(tool, args, result);
+  if (!details) return null;
+  const { readResult, value, original, structure, current } = details;
   const receipt: ReadResult = {
     ...(readResult?.imageContent ? { imageContent: true } : {}),
     ...(readResult?.pdfContent ? { pdfContent: true } : {}),

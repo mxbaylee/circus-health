@@ -421,10 +421,12 @@ export interface IntakeReviewRecord {
   candidateId?: string;
   candidateVersionId?: string;
   questions?: IntakeQuestion[];
-  reportGroups?: IntakeReviewGroupReference[];
+  questionsReference?: import('./intake-review-questions.ts').IntakeReviewQuestionsReference;
+  reportGroups?: import('./intake-report-group-links.ts').IntakeReviewGroupLinks;
   reviewState?: 'pending' | 'accepted' | 'kept_original';
   projectionUpgrade?: boolean;
   issues?: IntakeReviewIssue[];
+  issuesReference?: import('./intake-review-issues.ts').IntakeReviewIssuesReference;
   draft?: IntakeReviewDraft | null;
   /** Derived clinical field changes, excluding full unchanged snapshots and identity/source confirmation. */
   manuallyEdited?: boolean;
@@ -450,6 +452,7 @@ export interface IntakeReviewRecord {
   };
   mapping: IntakeClinicalMapping;
   identityReview?: {
+    ownershipBlockers?: import('./ownership-identity-values.ts').OwnershipIdentityBlockersReference;
     assignedPerson?: import('./intake-identity.ts').IntakeIdentityPerson;
     confidence?: IntakeIdentityConfidence;
     status: IntakeIdentityReviewStatus;
@@ -546,6 +549,13 @@ export interface IntakeImportCorrection {
   after: Partial<IntakeClinicalMapping>;
 }
 export interface IntakeReviewDraft {
+  /** V2 arrays contain this save's changes; complete history is separately addressed. */
+  format?: 'health-intake-review-draft-v2';
+  history?: IntakeReviewDraftHistory;
+  /** Review presentation includes the exact witnesses used by existing policy. */
+  resolutionScope?: 'policy_witnesses';
+  /** Omitted policy witnesses remain complete in the separately addressed history. */
+  resolutionsReference?: { format: 'health-intake-review-draft-resolutions-v1'; count: number };
   corrections?: IntakeImportCorrection[];
   id: string;
   proposalId: string | null;
@@ -559,6 +569,25 @@ export interface IntakeReviewDraft {
   answers?: Record<string, string>;
   at: string;
 }
+export interface IntakeNativeReviewDraftHistory {
+  format: 'health-intake-review-draft-history-v1';
+  intakeId: string;
+  sourceHash: string;
+  snapshotId: string;
+  resolutions: number;
+  corrections: number;
+}
+export interface IntakeLegacyReviewDraftHistory {
+  format: 'health-intake-review-draft-legacy-history-v1';
+  intakeId: string;
+  sourceHash: string;
+  draftId: string;
+  ordinal: number;
+  resolutions: number;
+  corrections: number;
+}
+export type IntakeReviewDraftHistory =
+  IntakeNativeReviewDraftHistory | IntakeLegacyReviewDraftHistory;
 export interface IntakeReviewDraftUpdate {
   /** Literal fields/values explained by this reason; independently checked against the changed patch. */
   correctionPatch?: Partial<IntakeClinicalMapping>;
@@ -612,6 +641,12 @@ export interface IntakeQuestionAnswer {
   at: string;
 }
 export interface IntakeQuestion {
+  /** Native review carries the last policy witness; all prior answers remain referenced. */
+  answerScope?: 'latest';
+  answerHistory?: {
+    count: number;
+    reference: import('./intake-clinical-pages.ts').IntakeReviewFragmentReference;
+  };
   otherRecordId?: string;
   id: string;
   key: string;
@@ -806,8 +841,12 @@ export interface IntakeEvidenceComparison {
   date: string | null;
   identity: string;
   version: string;
+  /** Exact same-original review cue when saved evidence is referenced rather than inline. */
+  originalOverlap?: boolean;
   mapping: IntakeClinicalMapping;
-  evidence: IntakeEvidenceLocator[];
+  evidence:
+    | IntakeEvidenceLocator[]
+    | import('./saved-duplicate-evidence.ts').SavedDuplicateEvidenceReference;
   previousDecision: null | {
     outcome: IntakePairDecision['outcome'];
     reason: string;
@@ -986,6 +1025,8 @@ export interface IntakeImportFeed {
 }
 
 export interface IntakeReportAcceptanceSelection {
+  /** Native fragmented views may approve the exact retained draft under both review tokens. */
+  useRetainedDecision?: true;
   selectionReviewToken?: string;
   recordId: string;
   candidateId: string;

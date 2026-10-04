@@ -7,7 +7,10 @@ import { randomUUID } from 'node:crypto';
 import { openDatabase, transaction, type Database } from '../database.ts';
 import { createProfileLifecycle, type ProfileCopyCheckpointContext } from '../profile-lifecycle.ts';
 import { getIntake, uploadIntake, reviewIntake, proposeConversion } from '../intake.ts';
-import { createManualSourceRecord } from '../intake-manual-source-record.ts';
+import {
+  createManualSourceRecord,
+  createManualSourceRecordRead,
+} from '../intake-manual-source-record.ts';
 import {
   prepareManualSourceCopy,
   stageManualSourceCopy,
@@ -23,12 +26,14 @@ import { profilePaths } from '../profile-storage.ts';
 import { rebuildContributorDatabase } from '../contributor-durability.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import type { ManualSourceRecordRequest } from '../../shared/intake-manual-source-record.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import { iterateIntakeEnvelopeText } from '../intake-collection-envelope.ts';
 
 const proofs = (db: Database) =>
   db
     .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_manual_copy:*' ORDER BY key")
     .all() as Array<{ key: string; value: string }>;
-async function fixture(t: TestContext, family = false) {
+async function fixture(t: TestContext, family = false, fullName = 'Fictional child') {
   const root = mkdtempSync(resolve(tmpdir(), 'fictional-manual-copy-'));
   const databases = new Map<string, Database>();
   let beforeStage: (context: ProfileCopyCheckpointContext) => void = () => {};
@@ -54,7 +59,7 @@ async function fixture(t: TestContext, family = false) {
     ? createNote(db, {
         kind: 'person',
         title: 'Fictional child',
-        person: { fullName: 'Fictional child' },
+        person: { fullName },
       })
     : getNote(db, 'person-note:self');
   const original = uploadIntake(db, root, source.id, {
@@ -133,6 +138,39 @@ async function fixture(t: TestContext, family = false) {
     },
   };
 }
+
+test('native schema copy preserves real manual author receipt and source pins through selected authority rebuild', async (t) => {
+  const f = await fixture(t, true, '界'.repeat(90000));
+  await buildIntakeCollectionEnvelope(f.db, { id: f.original.id });
+  const sourceText = [...iterateIntakeEnvelopeText(f.db, { id: f.original.id })].join('');
+  const copy = await f.copy(),
+    target = f.databases.get(copy.id)!;
+  assert.equal([...iterateIntakeEnvelopeText(target, { id: f.original.id })].join(''), sourceText);
+  const receipt = f.manual.intake.proposals[0]!.manualSourceRecord!;
+  const scope = {
+    profileId: copy.id,
+    intakeId: f.original.id,
+    sourceHash: f.original.sha256,
+    proposalId: f.manual.proposalId,
+    proposalHash: String(
+      target.prepare('SELECT sha256 FROM source_files WHERE id=?').get(f.manual.proposalId)!.sha256,
+    ),
+  };
+  assert.equal(copiedManualSourceRecordApplies(target, scope, receipt), true);
+  assert.equal(receipt.profileId, f.source.id);
+  assert.equal(proofs(target).length, 1);
+  const replay = await createManualSourceRecordRead(
+    target,
+    f.root,
+    copy.id,
+    f.original.id,
+    f.request,
+  );
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.proposalId, f.manual.proposalId);
+  assert.ok('format' in replay.intake);
+  assert.equal(proofs(target).length, 1);
+});
 
 test('genuine contributor manual copy preserves exact receipt, review and replay and supports new acceptance and nested authorship', async (t) => {
   const f = await fixture(t);

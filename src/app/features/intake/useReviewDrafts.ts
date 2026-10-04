@@ -1,3 +1,5 @@
+import type { IntakeClinicalReviewContext } from '../../../shared/intake-clinical-review';
+import { readSelectedClinicalReview } from '../../data/intake-clinical-review';
 import { useEffect, useRef, useState } from 'react';
 import type {
   Intake,
@@ -6,6 +8,7 @@ import type {
   IntakeReviewDraftUpdate,
   IntakeIssueResolution,
   IntakeReviewRecord,
+  IntakeReviewDraft,
 } from '../../../shared/intake';
 import { api, ApiError } from '../../data/api';
 import {
@@ -17,6 +20,8 @@ export type LocalReviewDraft = {
   correctionReason?: string;
   decision: IntakeReviewDecision;
   resolutions: IntakeIssueResolution[];
+  resolutionsReference?: IntakeReviewDraft['resolutionsReference'];
+  history?: IntakeReviewDraft['history'];
   disposition: 'pending' | 'review_later' | 'keep_original_only';
   answers: Record<string, string>;
 };
@@ -48,6 +53,9 @@ export function initialDraft(record: IntakeReviewRecord): LocalReviewDraft {
       },
     },
     resolutions: stored?.resolutions || [],
+    ...(stored?.resolutionsReference
+      ? { resolutionsReference: stored.resolutionsReference, history: stored.history }
+      : {}),
     disposition: stored?.disposition || 'pending',
     answers:
       stored?.answers ||
@@ -75,6 +83,9 @@ export function reconcileReviewDraft(
   );
   return {
     ...prior,
+    ...(record.draft?.resolutionsReference
+      ? { resolutionsReference: record.draft.resolutionsReference, history: record.draft.history }
+      : {}),
     decision: {
       ...prior.decision,
       recordId: record.id,
@@ -91,7 +102,7 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
   const [error, setError] = useState('');
   const [conflict, setConflict] = useState(false);
   const [comparison, setComparison] = useState<{
-    review: IntakeReview;
+    review: IntakeClinicalReviewContext;
     record: IntakeReviewRecord;
     local: LocalReviewDraft;
     key: string;
@@ -136,9 +147,12 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     versions.current.set(intake.id, Math.max(versions.current.get(intake.id) || 0, intake.version));
   }
   function hydrate(review: IntakeReview) {
+    hydrateRecords(review, review.records);
+  }
+  function hydrateRecords(review: IntakeClinicalReviewContext, records: IntakeReviewRecord[]) {
     observe({ id: review.intakeId, version: review.version });
     const next = { ...draftsRef.current };
-    for (const record of review.records) {
+    for (const record of records) {
       const key = draftKey(review, record);
       if (!next[key]) next[key] = initialDraft(record);
       else {
@@ -162,10 +176,10 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     draftsRef.current = next;
     setDrafts(next);
   }
-  function current(review: IntakeReview, record: IntakeReviewRecord) {
+  function current(review: IntakeClinicalReviewContext, record: IntakeReviewRecord) {
     return draftsRef.current[draftKey(review, record)] || initialDraft(record);
   }
-  function afterOwnSave(review: IntakeReview, record: IntakeReviewRecord) {
+  function afterOwnSave(review: IntakeClinicalReviewContext, record: IntakeReviewRecord) {
     const draft = current(review, record);
     return {
       ...draft,
@@ -272,7 +286,7 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     return active.current;
   }
   function update(
-    review: IntakeReview,
+    review: IntakeClinicalReviewContext,
     record: IntakeReviewRecord,
     patch: Partial<LocalReviewDraft>,
   ) {
@@ -289,6 +303,28 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     draftsRef.current = { ...draftsRef.current, [key]: next };
     setDrafts(draftsRef.current);
     if (!record.candidateVersionId) return;
+    // A referenced policy collection is never reconstructed in the browser. Keep
+    // only this edit and earlier unsent edits; an in-flight exact request remains
+    // separate and completes before the queued successor.
+    const pendingBody = queue.current.get(key)?.body;
+    const priorResolutions = new Map(prior.resolutions.map((value) => [value.issueId, value]));
+    const changedResolutions = next.resolutions.filter(
+      (value) => JSON.stringify(priorResolutions.get(value.issueId)) !== JSON.stringify(value),
+    );
+    const sparseResolutions = [
+      ...new Map(
+        [...(pendingBody?.resolutions || []), ...changedResolutions].map((value) => [
+          value.issueId,
+          value,
+        ]),
+      ).values(),
+    ];
+    const sparseAnswers = {
+      ...pendingBody?.answers,
+      ...Object.fromEntries(
+        Object.entries(next.answers).filter(([id, answer]) => prior.answers[id] !== answer),
+      ),
+    };
     queue.current.set(key, {
       intakeId: review.intakeId,
       candidateId: record.candidateId,
@@ -299,10 +335,10 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
         recordId: record.id,
         candidateVersionId: record.candidateVersionId,
         mapping: next.decision.mapping,
-        resolutions: next.resolutions,
+        resolutions: next.resolutionsReference ? sparseResolutions : next.resolutions,
         disposition: next.disposition,
         decision: next.decision,
-        answers: next.answers,
+        answers: next.resolutionsReference ? sparseAnswers : next.answers,
         correctionReason: sendReason,
       },
     });
@@ -332,17 +368,15 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     const generation = epoch.current;
     try {
       const proposal = failed.work.body.proposalId;
-      const review = (
-        await api<IntakeReview>(
-          `/api/profiles/${encodeURIComponent(profileId)}/intakes/${encodeURIComponent(failed.work.intakeId)}/review${proposal ? `?proposalId=${encodeURIComponent(proposal)}` : ''}`,
-        )
-      ).data;
-      if (generation !== epoch.current) return;
-      const record = review.records.find(
-        (item) =>
-          item.id === failed.work.body.recordId &&
-          item.candidateVersionId === failed.work.body.candidateVersionId,
+      const selected = await readSelectedClinicalReview(
+        failed.work.intakeId,
+        proposal || null,
+        failed.work.body.recordId,
+        failed.work.body.candidateVersionId,
       );
+      if (generation !== epoch.current) return;
+      const review = selected.context;
+      const record = selected.record.kind === 'record' ? selected.record.record : undefined;
       if (!record) {
         setError(
           'This candidate was replaced. Your edits remain here; review the new proposal before continuing.',
@@ -361,17 +395,15 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
     const generation = epoch.current;
     try {
       const proposal = snapshot.review.proposalId;
-      const latest = (
-        await api<IntakeReview>(
-          `/api/profiles/${encodeURIComponent(profileId)}/intakes/${encodeURIComponent(snapshot.review.intakeId)}/review${proposal ? `?proposalId=${encodeURIComponent(proposal)}` : ''}`,
-        )
-      ).data;
-      if (generation !== epoch.current) return null;
-      const record = latest.records.find(
-        (item) =>
-          item.id === snapshot.record.id &&
-          item.candidateVersionId === snapshot.record.candidateVersionId,
+      const selected = await readSelectedClinicalReview(
+        snapshot.review.intakeId,
+        proposal,
+        snapshot.record.id,
+        snapshot.record.candidateVersionId,
       );
+      if (generation !== epoch.current) return null;
+      const latest = selected.context;
+      const record = selected.record.kind === 'record' ? selected.record.record : undefined;
       if (!record) {
         setError(
           'This candidate was replaced. Your edits remain here; review the new proposal before continuing.',
@@ -425,6 +457,7 @@ export function useReviewDrafts(profileId: string, onSaved: (intake: Intake) => 
   return {
     drafts,
     hydrate,
+    hydrateRecords,
     current,
     afterOwnSave,
     clearPairCommits: () => {

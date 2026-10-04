@@ -73,7 +73,9 @@ jobs:
   server:
     name: Server (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Includes real encrypted recovery of a 5,001-file collection; keep this
+    # qualification in the required suite rather than skipping it for cost.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

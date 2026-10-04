@@ -4,7 +4,12 @@ import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
-import { prepareManualSourceCopy, stageManualSourceCopy } from './intake-manual-copy.ts';
+import { clearPackageSourceSession } from './intake-package-session.ts';
+import {
+  prepareManualSourceCopy,
+  stageManualSourceCopy,
+  disposeManualSourceCopyPlan,
+} from './intake-manual-copy.ts';
 import { personDisplayKey } from '../shared/person-display.ts';
 import { randomUUID, randomBytes } from 'node:crypto';
 import {
@@ -73,6 +78,7 @@ import {
 } from './intake-batch-journal.ts';
 import {
   prepareProductionIntakeStateCopy,
+  disposeIntakeStateCopyPlan,
   stageIntakeStateCopy,
   validateProductionIntakeAuthority,
 } from './intake-state-bootstrap.ts';
@@ -527,44 +533,45 @@ export function createEncryptedProfiles({
       if (initial) {
         if (copyState) {
           const intakePlan = prepareProductionIntakeStateCopy(copyState.db, copyState.id, id);
-          const manualPlan = prepareManualSourceCopy(
-            copyState.db,
-            copyState.root,
-            copyState.id,
-            id,
-          );
-          copyState.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-          mkdirSync(resolve(root, 'db'), { recursive: true, mode: 0o700 });
-          cpSync(copyState.db.location()!, dbPath);
-          // Rebind projection ownership before opening under the new profile.
-          const copied = new DatabaseSync(dbPath);
+          let manualPlan: ReturnType<typeof prepareManualSourceCopy> | undefined;
           try {
-            transaction(copied, () => {
-              copied.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
-              for (const [table, column] of [
-                ['source_files', 'path'],
-                ['assets', 'stored_path'],
-              ])
-                copied
-                  .prepare(`UPDATE ${table} SET ${column}=replace(${column},?,?)`)
-                  .run(`data/profiles/${copyState!.id}/`, `data/profiles/${id}/`);
-              rebindCopiedIntakeSourceText(copied, copyState!.id, id);
-              for (const t of copied
-                .prepare(
-                  "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
-                )
-                .all())
-                copied.exec(`DROP TABLE IF EXISTS "${(t.name as string).replaceAll('"', '""')}"`);
-              const publication = {
-                profileId: id,
-                readSelectedHead: () => recordStorage.read('head'),
-              };
-              stageIntakeStateCopy(copied, intakePlan, publication);
-              stageManualSourceCopy(copied, manualPlan, publication);
-              validateProductionIntakeAuthority(copied, id);
-            });
+            manualPlan = prepareManualSourceCopy(copyState.db, copyState.root, copyState.id, id);
+            copyState.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+            mkdirSync(resolve(root, 'db'), { recursive: true, mode: 0o700 });
+            cpSync(copyState.db.location()!, dbPath);
+            // Rebind projection ownership before opening under the new profile.
+            const copied = new DatabaseSync(dbPath);
+            try {
+              transaction(copied, () => {
+                copied.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
+                for (const [table, column] of [
+                  ['source_files', 'path'],
+                  ['assets', 'stored_path'],
+                ])
+                  copied
+                    .prepare(`UPDATE ${table} SET ${column}=replace(${column},?,?)`)
+                    .run(`data/profiles/${copyState!.id}/`, `data/profiles/${id}/`);
+                rebindCopiedIntakeSourceText(copied, copyState!.id, id);
+                for (const t of copied
+                  .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
+                  )
+                  .all())
+                  copied.exec(`DROP TABLE IF EXISTS "${(t.name as string).replaceAll('"', '""')}"`);
+                const publication = {
+                  profileId: id,
+                  readSelectedHead: () => recordStorage.read('head'),
+                };
+                stageIntakeStateCopy(copied, intakePlan, publication);
+                stageManualSourceCopy(copied, manualPlan!, publication);
+                validateProductionIntakeAuthority(copied, id);
+              });
+            } finally {
+              copied.close();
+            }
           } finally {
-            copied.close();
+            if (manualPlan) disposeManualSourceCopyPlan(manualPlan);
+            disposeIntakeStateCopyPlan(intakePlan);
           }
           // Copy selected durable evidence only. Plaintext workspace changes
           // cannot silently publish new source authority while making a copy.
@@ -658,6 +665,7 @@ export function createEncryptedProfiles({
             cacheHit = true;
           } catch {
             if (db) {
+              clearPackageSourceSession(db);
               clearIntakeStateCache(db);
               clearIntakeLookupCache(db);
               clearSourceContextClassificationCache(db);
@@ -701,6 +709,7 @@ export function createEncryptedProfiles({
             'This profile’s records and history are unavailable.',
           );
         }
+        clearPackageSourceSession(db);
         clearIntakeStateCache(db);
         clearIntakeLookupCache(db);
         clearSourceContextClassificationCache(db);
@@ -782,6 +791,7 @@ export function createEncryptedProfiles({
     cleanup(() => clearIntakeBatchJournalCache(state.root, state.id));
     if (state.db) {
       const db = state.db;
+      cleanup(() => clearPackageSourceSession(db));
       cleanup(() => clearIntakeStateCache(db));
       cleanup(() => clearIntakeLookupCache(db));
       cleanup(() => clearSourceContextClassificationCache(db));
@@ -1008,6 +1018,7 @@ export function createEncryptedProfiles({
         schemaVersion: LATEST_SCHEMA_VERSION,
       });
     } finally {
+      clearPackageSourceSession(state.db);
       clearIntakeStateCache(state.db);
       clearIntakeLookupCache(state.db);
       clearSourceContextClassificationCache(state.db);

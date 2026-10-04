@@ -9,12 +9,20 @@ import {
 } from './database.ts';
 import { flushRecordDurability, recordDurabilityStatus } from './record-versions.ts';
 import { storedIntakeDetails } from './intake-state-access.ts';
+import {
+  openIntakeCollectionEnvelope,
+  selectedEnvelopeStore,
+} from './intake-collection-envelope.ts';
+import type { IntakeEnvelopeSource } from './intake-authority.ts';
+import { INTAKE_LEGACY_BRIDGE_CONTROL } from './intake-state-migration.ts';
 import { canonicalLiteral, validateJSONL } from './intake-format.ts';
 import { profileOriginal } from './profile-storage.ts';
 import { validProfileId } from './profiles.ts';
 import { hashFile } from './vault-store.ts';
-import { validatePortableIntakeSourceText } from './intake-source-text.ts';
+import { validatePortableIntakeSourceTextRows } from './intake-source-text.ts';
 import type { IntakeCopyPublicationReader } from './intake-state-bootstrap.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
+import { DEFAULT_LIMITS } from './intake-state-evidence.ts';
 
 const PREFIX = 'intake_manual_copy:v1:';
 const FORMAT = 'health-intake-manual-copy-v1';
@@ -119,10 +127,20 @@ export interface ManualSourceCopyPlan {
 interface PlanData {
   source: Database;
   head: string;
-  sourceRows: Array<{ key: string; value: string }>;
-  proofs: CopyProof[];
+  scratch: ReturnType<typeof disposableSqlite>;
 }
 const plans = new WeakMap<ManualSourceCopyPlan, PlanData>();
+const planCleanup = new FinalizationRegistry<ReturnType<typeof disposableSqlite>>((scratch) =>
+  scratch.close(),
+);
+export function disposeManualSourceCopyPlan(plan: ManualSourceCopyPlan): void {
+  const data = plans.get(plan);
+  if (data) {
+    plans.delete(plan);
+    planCleanup.unregister(plan);
+    data.scratch.close();
+  }
+}
 function sourceHead(db: Database, profileId: string): string {
   if (
     !db.isOpen ||
@@ -141,18 +159,82 @@ function sourceHead(db: Database, profileId: string): string {
   if (typeof head !== 'string') fail('source selected head missing');
   return head;
 }
-function sourceTextInventory(db: Database, profileId: string): Set<string> {
-  const rows = db
-    .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_source_text:*'")
-    .all();
-  validatePortableIntakeSourceText(
+function sourceTextInventory(db: Database, profileId: string): { has(key: string): boolean } {
+  validatePortableIntakeSourceTextRows(
     {
-      app_meta: rows,
-      source_files: db.prepare("SELECT * FROM source_files WHERE kind='intake_original'").all(),
+      rows: (table) =>
+        table === 'app_meta'
+          ? db
+              .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_source_text:*'")
+              .iterate()
+          : table === 'source_files'
+            ? db.prepare("SELECT * FROM source_files WHERE kind='intake_original'").iterate()
+            : [],
     },
     profileId,
   );
-  return new Set(rows.map((row) => String(row.key)));
+  return { has: (key) => !!db.prepare('SELECT 1 FROM app_meta WHERE key=?').get(key) };
+}
+/** Only the proposal's copy eligibility fields are read from native schema.
+ * Each page is bound to the selected root; unknown proposal evidence stays in
+ * the authority copied by the separate checked graph traversal. */
+function* copyProposals(db: Database, source: IntakeEnvelopeSource) {
+  const selected = selectedEnvelopeStore(db, source);
+  const control =
+    selected.binding.logicalHead === undefined
+      ? undefined
+      : selected.collections.get(
+          selected.collections.openView(),
+          'logical',
+          'envelope.control',
+          'representation',
+        );
+  if (control === undefined || control === INTAKE_LEGACY_BRIDGE_CONTROL) {
+    yield* storedIntakeDetails(db, source)!.proposals;
+    return;
+  }
+  const reader = openIntakeCollectionEnvelope(db, source),
+    intake = reader.child(reader.root(), 'intake');
+  if (!intake) fail('selected intake missing');
+  let after: string | undefined;
+  for (;;) {
+    const page = reader.children(intake, 'proposals', { after, items: 32, bytes: 65536 });
+    for (const proposal of page.records) {
+      const receipt = reader.field(proposal, 'manualSourceRecord', { bytes: 256 * 1024 });
+      if (receipt.kind === 'missing' || (receipt.kind === 'value' && !receipt.value)) continue;
+      // A historical receipt may include a long retained person name or unknown
+      // fields. Preserve the existing strict per-value legacy byte allowance;
+      // the UI field-page budget is not an evidence admission limit.
+      let value: unknown;
+      if (receipt.kind === 'fragmented') {
+        let text = '',
+          bytes = 0;
+        for (const piece of reader.fieldChunks(proposal, 'manualSourceRecord')) {
+          bytes += Buffer.byteLength(piece);
+          if (bytes > DEFAULT_LIMITS.bytes) fail('manual receipt exceeds legacy per-value budget');
+          text += piece;
+        }
+        value = JSON.parse(text);
+      } else value = receipt.value;
+      const id = reader.field(proposal, 'id'),
+        revision = reader.field(proposal, 'sourceTextRevisionId');
+      if (
+        id.kind !== 'value' ||
+        typeof id.value !== 'string' ||
+        revision.kind !== 'value' ||
+        typeof revision.value !== 'string'
+      )
+        fail('manual proposal identity');
+      yield {
+        id: id.value,
+        sourceTextRevisionId: revision.value,
+        manualSourceRecord: value as ManualSourceRecordReceipt,
+      };
+    }
+    if (page.complete) return;
+    if (!page.after || page.after === after) fail('proposal traversal cursor');
+    after = page.after;
+  }
 }
 /** Preparation runs under the existing authorized source copy lease, before
  * owner/path changes. An opaque plan is required; supplied proof objects cannot
@@ -166,98 +248,106 @@ export function prepareManualSourceCopy(
   if (!validProfileId(targetProfileId) || targetProfileId === sourceProfileId)
     fail('target profile identity');
   const head = sourceHead(db, sourceProfileId);
-  const sourceRows = db
-    .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_manual_copy:*' ORDER BY key")
-    .all() as Array<{ key: string; value: string }>;
-  const unused = new Set(
-    sourceRows.map((row) => {
+  const scratch = disposableSqlite('manual-source-copy-'),
+    spool = scratch.db;
+  try {
+    spool.exec(
+      'CREATE TABLE source(key TEXT PRIMARY KEY,value TEXT NOT NULL,used INTEGER DEFAULT 0); CREATE TABLE proofs(ordinal INTEGER PRIMARY KEY,value TEXT NOT NULL);',
+    );
+    for (const row of db
+      .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_manual_copy:*' ORDER BY key")
+      .iterate()) {
       const proof = parseProof(row.value);
       if (proof.profileId !== sourceProfileId || row.key !== proofKey(proof))
         fail('source proof namespace or owner');
-      return row.key;
-    }),
-  );
-  const proofs: CopyProof[] = [],
-    copyId = randomUUID();
-  let revisions: Set<string> | undefined;
-  for (const original of db
-    .prepare("SELECT * FROM source_files WHERE kind='intake_original' ORDER BY id")
-    .all()) {
-    const details = storedIntakeDetails(db, { id: String(original.id), kind: 'intake_original' })!;
-    let verifiedOriginal = false;
-    for (const proposal of details.proposals) {
-      const receipt = proposal.manualSourceRecord;
-      if (!receipt) continue;
-      const file = db.prepare('SELECT * FROM source_files WHERE id=?').get(proposal.id);
-      if (!file || file.kind !== 'intake_proposal') fail('manual proposal evidence missing');
-      const scope: Boundary = {
-        profileId: sourceProfileId,
-        intakeId: String(original.id),
-        sourceHash: String(original.sha256),
-        proposalId: proposal.id,
-        proposalHash: String(file.sha256),
-      };
-      if (!receiptMatches(receipt, scope)) fail('manual receipt original binding');
-      if (
-        receipt.profileId !== sourceProfileId &&
-        !copiedManualSourceRecordApplies(db, scope, receipt)
-      )
-        continue;
-      unused.delete(proofKey(scope));
-      const proposalDetails: unknown = JSON.parse(String(file.details_json));
-      if (
-        !object(proposalDetails) ||
-        proposalDetails.originalSourceFileId !== original.id ||
-        digest(proposalDetails.manualSourceRecord) !== digest(receipt) ||
-        proposal.sourceTextRevisionId !== receipt.sourceTextRevisionId ||
-        proposalDetails.sourceTextRevisionId !== receipt.sourceTextRevisionId
-      )
-        fail('manual proposal receipt or source-text binding');
-      revisions ??= sourceTextInventory(db, sourceProfileId);
-      if (
-        !revisions.has(
-          `intake_source_text:v1:${original.id}:revision:${receipt.sourceTextRevisionId}`,
-        )
-      )
-        fail('manual source-text revision missing');
-      if (!verifiedOriginal) {
-        const path = profileOriginal(root, original.path, sourceProfileId);
-        if (statSync(path).size !== original.bytes || hashFile(path) !== original.sha256)
-          fail('original evidence changed');
-        verifiedOriginal = true;
-      }
-      const path = profileOriginal(root, file.path, sourceProfileId),
-        bytes = readFileSync(path);
-      if (
-        bytes.length !== file.bytes ||
-        createHash('sha256').update(bytes).digest('hex') !== scope.proposalHash
-      )
-        fail('proposal evidence changed');
-      const parsed = validateJSONL(bytes);
-      if (
-        !parsed.valid ||
-        parsed.entries.length !== 1 ||
-        parsed.entries[0].value.id !== `manual:${receipt.operationId}`
-      )
-        fail('manual proposal entry binding');
-      proofs.push({
-        ...scope,
-        profileId: targetProfileId,
-        format: FORMAT,
-        copyId,
-        sourceProfileId,
-        sourceHeadHash: digest(head),
-        authorProfileId: receipt.profileId,
-        receiptHash: digest(receipt),
-        sourceTextRevisionId: receipt.sourceTextRevisionId,
-      });
+      spool.prepare('INSERT INTO source(key,value) VALUES(?,?)').run(row.key, row.value);
     }
+    const copyId = randomUUID();
+    let revisions: { has(key: string): boolean } | undefined;
+    for (const original of db
+      .prepare("SELECT * FROM source_files WHERE kind='intake_original' ORDER BY id")
+      .iterate()) {
+      let verifiedOriginal = false;
+      for (const proposal of copyProposals(db, original as unknown as IntakeEnvelopeSource)) {
+        const receipt = proposal.manualSourceRecord;
+        if (!receipt) continue;
+        const file = db.prepare('SELECT * FROM source_files WHERE id=?').get(proposal.id);
+        if (!file || file.kind !== 'intake_proposal') fail('manual proposal evidence missing');
+        const scope: Boundary = {
+          profileId: sourceProfileId,
+          intakeId: String(original.id),
+          sourceHash: String(original.sha256),
+          proposalId: proposal.id,
+          proposalHash: String(file.sha256),
+        };
+        if (!receiptMatches(receipt, scope)) fail('manual receipt original binding');
+        if (
+          receipt.profileId !== sourceProfileId &&
+          !copiedManualSourceRecordApplies(db, scope, receipt)
+        )
+          continue;
+        spool.prepare('UPDATE source SET used=1 WHERE key=?').run(proofKey(scope));
+        const proposalDetails: unknown = JSON.parse(String(file.details_json));
+        if (
+          !object(proposalDetails) ||
+          proposalDetails.originalSourceFileId !== original.id ||
+          digest(proposalDetails.manualSourceRecord) !== digest(receipt) ||
+          proposal.sourceTextRevisionId !== receipt.sourceTextRevisionId ||
+          proposalDetails.sourceTextRevisionId !== receipt.sourceTextRevisionId
+        )
+          fail('manual proposal receipt or source-text binding');
+        revisions ??= sourceTextInventory(db, sourceProfileId);
+        if (
+          !revisions.has(
+            `intake_source_text:v1:${original.id}:revision:${receipt.sourceTextRevisionId}`,
+          )
+        )
+          fail('manual source-text revision missing');
+        if (!verifiedOriginal) {
+          const path = profileOriginal(root, original.path, sourceProfileId);
+          if (statSync(path).size !== original.bytes || hashFile(path) !== original.sha256)
+            fail('original evidence changed');
+          verifiedOriginal = true;
+        }
+        const path = profileOriginal(root, file.path, sourceProfileId),
+          bytes = readFileSync(path);
+        if (
+          bytes.length !== file.bytes ||
+          createHash('sha256').update(bytes).digest('hex') !== scope.proposalHash
+        )
+          fail('proposal evidence changed');
+        const parsed = validateJSONL(bytes);
+        if (
+          !parsed.valid ||
+          parsed.entries.length !== 1 ||
+          parsed.entries[0].value.id !== `manual:${receipt.operationId}`
+        )
+          fail('manual proposal entry binding');
+        const proof: CopyProof = {
+          ...scope,
+          profileId: targetProfileId,
+          format: FORMAT,
+          copyId,
+          sourceProfileId,
+          sourceHeadHash: digest(head),
+          authorProfileId: receipt.profileId,
+          receiptHash: digest(receipt),
+          sourceTextRevisionId: receipt.sourceTextRevisionId,
+        };
+        spool.prepare('INSERT INTO proofs(value) VALUES(?)').run(JSON.stringify(proof));
+      }
+    }
+    if (spool.prepare('SELECT 1 FROM source WHERE used=0 LIMIT 1').get())
+      fail('orphan or conflicting source proof');
+    if (sourceHead(db, sourceProfileId) !== head) fail('source changed during copy preparation');
+    const plan = Object.freeze({ sourceProfileId, targetProfileId });
+    plans.set(plan, { source: db, head, scratch });
+    planCleanup.register(plan, scratch, plan);
+    return plan;
+  } catch (error) {
+    scratch.close();
+    throw error;
   }
-  if (unused.size) fail('orphan or conflicting source proof');
-  if (sourceHead(db, sourceProfileId) !== head) fail('source changed during copy preparation');
-  const plan = Object.freeze({ sourceProfileId, targetProfileId });
-  plans.set(plan, { source: db, head, sourceRows, proofs });
-  return plan;
 }
 /** Install only within the existing unpublished copy transaction, after source
  * text and intake bootstrap rebinding and before the first genuine publication. */
@@ -281,15 +371,22 @@ export function stageManualSourceCopy(
       publication.readSelectedHead() !== null
     )
       fail('destination is not unpublished and target bound');
-    const current = db
-      .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_manual_copy:*' ORDER BY key")
-      .all();
-    if (canonicalLiteral(current) !== canonicalLiteral(data.sourceRows))
+    const spool = data.scratch.db;
+    let count = 0;
+    for (const row of db
+      .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_manual_copy:*'")
+      .iterate()) {
+      if (spool.prepare('SELECT value FROM source WHERE key=?').get(row.key)?.value !== row.value)
+        fail('copied proof inventory differs');
+      count++;
+    }
+    if (count !== Number(spool.prepare('SELECT count(*) n FROM source').get()!.n))
       fail('copied proof inventory differs');
-    const revisions = data.proofs.length
+    const revisions = spool.prepare('SELECT 1 FROM proofs LIMIT 1').get()
       ? sourceTextInventory(db, plan.targetProfileId)
       : new Set<string>();
-    for (const proof of data.proofs) {
+    for (const row of spool.prepare('SELECT value FROM proofs ORDER BY ordinal').iterate()) {
+      const proof = parseProof(row.value);
       const original = db
         .prepare('SELECT kind,sha256,path FROM source_files WHERE id=?')
         .get(proof.intakeId);
@@ -314,18 +411,20 @@ export function stageManualSourceCopy(
       )
         fail('destination original/proposal/revision differs');
     }
-    for (const row of data.sourceRows) {
+    for (const row of spool.prepare('SELECT key,value FROM source ORDER BY key').iterate()) {
       const archive = `private_copy_source_receipt:v1:${plan.sourceProfileId}:${row.key}`,
         prior = metadata(db, archive);
       if (prior !== undefined && prior !== row.value) fail('archived proof collision');
       db.prepare('INSERT OR IGNORE INTO app_meta(key,value) VALUES(?,?)').run(archive, row.value);
       db.prepare('DELETE FROM app_meta WHERE key=?').run(row.key);
     }
-    for (const proof of data.proofs)
+    for (const row of spool.prepare('SELECT value FROM proofs ORDER BY ordinal').iterate()) {
+      const proof = parseProof(row.value);
       db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
         proofKey(proof),
         JSON.stringify(proof),
       );
+    }
     if (
       publication.readSelectedHead() !== null ||
       sourceHead(data.source, plan.sourceProfileId) !== data.head

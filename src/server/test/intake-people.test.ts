@@ -19,6 +19,20 @@ import { validateJSONL } from '../intake-format.ts';
 import { intakePersonDisplayTitle } from '../intake-people-format.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { personSourceEvidence } from '../person-source-evidence.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import { clearIntakeStateCache } from '../intake-state-storage.ts';
+import {
+  prepareCollectionPeopleIndex,
+  openCollectionPeopleRead,
+  readCollectionPeoplePage,
+  readCollectionPersonFragment,
+} from '../intake-people-collection.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import {
+  applyIntakePersonRead,
+  saveIntakePersonDispositionRead,
+  getIntakePersonRead,
+} from '../intake-people-native.ts';
 
 const uuid = (suffix: string) => `00000000-0000-4000-8000-${suffix.padStart(12, '0')}`;
 const deterministicNoteId = (proposalId: string) => {
@@ -115,6 +129,183 @@ function fixture(t: TestContext) {
     },
   };
 }
+
+test('native People commands preserve disposition, exact replay and Personal apply without workflow hydration', async (t) => {
+  const f = fixture(t),
+    item = intake.uploadIntake(f.db, f.root, f.profileId, {
+      filename: 'fictional-people.jsonl',
+      newProviderName: 'Fictional archive',
+      bytes: Buffer.from(JSON.stringify(envelope())),
+    }),
+    groupId = item.workflow!.reportGroups![0]!.id,
+    person = getIntakePeopleQueue(f.db, f.root, f.profileId, groupId).people[0]!;
+  await buildIntakeCollectionEnvelope(f.db, { id: item.id, sha256: item.sha256 });
+  await prepareCollectionPeopleIndex(f.db, f.root, f.profileId, item.id);
+  const before = intakeWorkCounters(f.db),
+    request = {
+      operationId: uuid('951'),
+      intakeId: item.id,
+      intakeVersion: item.version,
+      proposalId: person.id,
+      proposalVersion: person.version,
+      state: 'later' as const,
+    };
+  const updated = await saveIntakePersonDispositionRead(f.db, f.root, f.profileId, request);
+  assert.equal(updated.version, item.version + 1);
+  assert.equal(
+    (await getIntakePersonRead(f.db, f.root, f.profileId, item.id, person.id)).state,
+    'later',
+  );
+  assert.equal(
+    (
+      await saveIntakePersonDispositionRead(f.db, f.root, f.profileId, {
+        ...request,
+        intakeVersion: 0,
+      })
+    ).version,
+    updated.version,
+  );
+  await assert.rejects(
+    saveIntakePersonDispositionRead(f.db, f.root, f.profileId, { ...request, state: 'excluded' }),
+    /different request/,
+  );
+  clearIntakeStateCache(f.db);
+  assert.equal(
+    (await getIntakePersonRead(f.db, f.root, f.profileId, item.id, person.id)).state,
+    'later',
+  );
+  const apply = {
+    operationId: uuid('952'),
+    intakeId: item.id,
+    proposalId: person.id,
+    proposalVersion: person.version,
+    action: 'add' as const,
+  };
+  const saved = await applyIntakePersonRead(f.db, f.root, f.profileId, apply);
+  assert.equal(saved.status, 'saved');
+  assert.equal(saved.replayed, false);
+  assert.equal((await applyIntakePersonRead(f.db, f.root, f.profileId, apply)).replayed, true);
+  assert.equal(
+    (await getIntakePersonRead(f.db, f.root, f.profileId, item.id, person.id)).state,
+    'saved',
+  );
+  const savedPage = readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+    groupId,
+    personId: person.id,
+    bytes: 1024,
+    limit: 1,
+  });
+  assert.equal(savedPage.totalPeople, 2);
+  assert.equal(savedPage.nextCursor, null);
+  const selectedSaved = savedPage.people[0]!;
+  assert.equal(selectedSaved.kind, 'reference');
+  if (selectedSaved.kind === 'reference') {
+    assert.equal(selectedSaved.reference.selection.id, person.id);
+    assert.equal(selectedSaved.reference.selection.state, 'saved');
+    assert.equal(selectedSaved.reference.policy.canAdd, false);
+    assert.equal(selectedSaved.reference.saved?.noteId, saved.noteId);
+  }
+  assert.equal(
+    intakeWorkCounters(f.db).warm.materializationReads,
+    before.warm.materializationReads,
+  );
+  await assert.rejects(
+    saveIntakePersonDispositionRead(f.db, f.root, f.profileId, {
+      ...request,
+      operationId: uuid('953'),
+      intakeVersion: updated.version,
+    }),
+    /saved Person/,
+  );
+});
+
+test('native People reads preserve complete legacy proposals and exact paged evidence through cache loss', async (t) => {
+  const f = fixture(t);
+  const item = intake.uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-people.jsonl',
+    newProviderName: 'Fictional archive',
+    bytes: Buffer.from(JSON.stringify(envelope())),
+  });
+  const groupId = item.workflow!.reportGroups![0]!.id;
+  const before = getIntakePeopleQueue(f.db, f.root, f.profileId, groupId);
+  saveIntakePersonDisposition(f.db, f.root, f.profileId, {
+    operationId: uuid('919'),
+    intakeId: item.id,
+    intakeVersion: item.version,
+    proposalId: before.people[0]!.id,
+    proposalVersion: before.people[0]!.version,
+    state: 'later',
+  });
+  const oracle = getIntakePeopleQueue(f.db, f.root, f.profileId, groupId);
+  await buildIntakeCollectionEnvelope(f.db, { id: item.id, sha256: item.sha256 });
+  assert.throws(
+    () => openCollectionPeopleRead(f.db, f.root, f.profileId, item.id),
+    /Prepare complete/,
+  );
+  await prepareCollectionPeopleIndex(f.db, f.root, f.profileId, item.id);
+  clearIntakeStateCache(f.db);
+  const work = intakeWorkCounters(f.db);
+  const reader = openCollectionPeopleRead(f.db, f.root, f.profileId, item.id);
+  assert.deepEqual(
+    [...reader.pointers(groupId)].map((pointer) => reader.person(pointer)),
+    oracle.people,
+  );
+  const page = readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+    groupId,
+    limit: 1,
+    bytes: 1024,
+  });
+  assert.equal(page.totalPeople, 2);
+  assert.equal(page.counts.later, 1);
+  assert.ok(page.nextCursor);
+  const targeted = readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+    groupId,
+    personId: oracle.people[1]!.id,
+    limit: 1,
+  });
+  assert.equal(targeted.totalPeople, 2);
+  assert.equal(targeted.nextCursor, null);
+  assert.equal(targeted.people[0]!.kind, 'person');
+  if (targeted.people[0]!.kind === 'person')
+    assert.equal(targeted.people[0]!.person.id, oracle.people[1]!.id);
+  assert.throws(
+    () =>
+      readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+        groupId,
+        personId: 'missing-fictional-person',
+      }),
+    /unavailable/,
+  );
+  const first = page.people[0]!;
+  if (first.kind === 'reference') {
+    const chunks: Buffer[] = [];
+    let offset = 0;
+    do {
+      const fragment = readCollectionPersonFragment(
+        f.db,
+        f.root,
+        f.profileId,
+        first.reference,
+        offset,
+        301,
+      );
+      chunks.push(Buffer.from(fragment.data, 'base64'));
+      if (fragment.complete) break;
+      offset = fragment.nextOffset!;
+    } while (true);
+    assert.deepEqual(
+      JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      JSON.parse(JSON.stringify(oracle.people[0])),
+    );
+  } else assert.deepEqual(first.person, oracle.people[0]);
+  const second = readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+    groupId,
+    limit: 1,
+    cursor: page.nextCursor!,
+  });
+  assert.equal(second.nextCursor, null);
+  assert.equal(intakeWorkCounters(f.db).warm.materializationReads, work.warm.materializationReads);
+});
 
 test('people-only source creates a separate populated queue without clinical rows or writes', (t) => {
   const f = fixture(t);

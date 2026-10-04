@@ -1,7 +1,8 @@
+import { intakeFilenameDisplay } from '../../../shared/intake-summary';
 import { useSourceAttentionRevision } from './useSourceAttentionRevision';
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ImportSourceSelection } from './import-source-selection';
-import type { Intake } from '../../../shared/intake';
+import type { IntakeHeader } from '../../../shared/intake-summary';
 import type {
   IntakeSourceText,
   SourceTextRevision,
@@ -34,7 +35,7 @@ export function SourceAttentionReview({
 }: {
   onRead?: () => Promise<void>;
   readingBlocked?: string;
-  intake: Intake;
+  intake: IntakeHeader;
   onRemainingChange?: (count: number) => void;
   onChanged: () => void;
   onPendingChange?: (pending: boolean) => void;
@@ -285,7 +286,10 @@ export function SourceAttentionReview({
     }
   }
   return (
-    <section className="source-attention" aria-label={`Text review for ${intake.filename}`}>
+    <section
+      className="source-attention"
+      aria-label={`Text review for ${intakeFilenameDisplay(intake)}`}
+    >
       <ReviewNavigationGuard anyLocationChange pending={() => pending} flush={async () => false} />
       {resource.loading && !data && <p role="status">Loading source sections…</p>}
       {resource.error && <p role="alert">{resource.error.message}</p>}
@@ -557,7 +561,7 @@ function AttentionOriginal({
   page,
   revisionId,
 }: {
-  intake: Intake;
+  intake: IntakeHeader;
   page: number;
   revisionId: string;
 }) {

@@ -1,8 +1,28 @@
+import {
+  bindReviewRecordIssues,
+  reviewRecordIssues,
+  reviewIssueCollection,
+  type ReviewIssueCollection,
+} from './intake-review-issue-state.ts';
+import {
+  bindReviewRecordQuestions,
+  mapReviewRecordQuestions,
+  reviewRecordQuestions,
+  type ReviewQuestionSelection,
+} from './intake-review-question-selection.ts';
+import { selectedReportGroups } from './intake-selected-report-groups.ts';
+import {
+  reviewDraftResolutions,
+  latestReviewDraftResolution,
+  knownReviewDraftResolution,
+} from './intake-review-draft-selection.ts';
+import { selectedSequence, type SelectedSequence } from './intake-selected-sequence.ts';
 import { candidateSourceIdentityV1 } from './intake-source-identity.ts';
 import { compatibleIdentityBirthDates } from '../shared/self-identity.ts';
 import { createHash } from 'node:crypto';
 import { HttpError, now, safeText } from './database.ts';
-import { accountedUnitKind } from './intake-unit-accounting.ts';
+import { workflowCounts } from './intake-workflow-reader.ts';
+import { legacyWorkflowCountReader } from './intake-workflow-legacy-reader.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { recordIntakeCandidateVersionHash } from './intake-file-work.ts';
 import { validatedIntakePeople } from './intake-people-format.ts';
@@ -32,13 +52,8 @@ import {
   reviewIssues,
   type SuggestionEvidenceScope,
 } from './intake-review.ts';
-import {
-  clinicalFields,
-  clinicalMappingEnvelope,
-  sourceContextEnvelope,
-} from './clinical-import.ts';
+import { clinicalMappingEnvelope, sourceContextEnvelope } from './clinical-import.ts';
 import type {
-  IntakeCandidateVersion,
   IntakeClinicalMapping,
   IntakeIssueResolution,
   IntakeQuestion,
@@ -92,6 +107,12 @@ export function intakeCandidateVersionId(
 ): string {
   const proposal = details.proposals?.find((p) => p.id === proposalId);
   const revision = proposal?.sourceTextDependencyToken || proposal?.sourceTextRevisionId;
+  return intakeCandidateVersionIdForRevision(entry, revision);
+}
+export function intakeCandidateVersionIdForRevision(
+  entry: Pick<IntakeEntry, 'value'>,
+  revision?: string | null,
+): string {
   return (
     'candidate-version:' +
     workflowHash(
@@ -123,9 +144,10 @@ interface WorkflowSummaryOptions {
 const typedReviewIssues = reviewIssues as unknown as (
   record: IntakeReview['records'][number],
   entry: IntakeEntry,
-  questions: IntakeQuestion[],
+  questions: ReturnType<typeof reviewRecordQuestions>,
   metadataScope: SuggestionEvidenceScope,
-) => IntakeReviewIssue[];
+  sink?: ReviewIssueCollection,
+) => ReviewIssueCollection;
 const typedActionableIssueKind = actionableIssueKind as unknown as (
   prompt: string,
   field?: string | null,
@@ -236,11 +258,7 @@ export function recordCandidateVersions(
   }
   recordReportGroups(file, workflow, contributions, entries);
 }
-export function addWorkflowQuestion(
-  file: WorkflowFile,
-  workflow: DurableWorkflow,
-  input: WorkflowQuestionInput,
-): WorkflowQuestion {
+export function intakeWorkflowQuestionValue(file: WorkflowFile, input: WorkflowQuestionInput) {
   const key = safeText(input.key, 'question key', 200),
     prompt = safeText(input.prompt, 'question', 4000).trim(),
     locator = safeText(input.locator, 'question evidence locator', 2000).trim();
@@ -250,15 +268,8 @@ export function addWorkflowQuestion(
       'QUESTION_INPUT',
       'Question key, prompt and original locator are required',
     );
-  if (input.candidateId && !workflow.candidates.some((item) => item.id === input.candidateId))
-    throw new HttpError(
-      404,
-      'CANDIDATE_NOT_FOUND',
-      'Question record does not belong to this delivery',
-    );
-  const id = 'question:' + workflowHash([file.id, key]),
-    existing = workflow.questions.find((item) => item.id === id);
-  const value = {
+  const id = 'question:' + workflowHash([file.id, key]);
+  return {
     id,
     key,
     candidateId: input.candidateId || null,
@@ -267,6 +278,20 @@ export function addWorkflowQuestion(
     locator,
     field: input.field ? safeText(input.field, 'question field', 100) : null,
   };
+}
+export function addWorkflowQuestion(
+  file: WorkflowFile,
+  workflow: DurableWorkflow,
+  input: WorkflowQuestionInput,
+): WorkflowQuestion {
+  const value = intakeWorkflowQuestionValue(file, input);
+  if (input.candidateId && !workflow.candidates.some((item) => item.id === input.candidateId))
+    throw new HttpError(
+      404,
+      'CANDIDATE_NOT_FOUND',
+      'Question record does not belong to this delivery',
+    );
+  const existing = workflow.questions.find((item) => item.id === value.id);
   if (existing) {
     if (
       Object.entries(value).some(
@@ -288,6 +313,76 @@ export function addWorkflowQuestion(
   };
   workflow.questions.push(question);
   return question;
+}
+export type WorkflowReviewGroup = import('./intake-identity-policy.ts').IdentityBoundaryHeader &
+  Pick<import('../shared/intake.ts').IntakeReportGroup, 'basis'>;
+export interface WorkflowReviewScope {
+  close?(): void;
+  issueSink?(record: IntakeReview['records'][number]): ReviewIssueCollection;
+  versionId(proposalId: string | null, entry: IntakeEntry): string;
+  references(
+    candidateId: string,
+    versionId: string,
+    recordId: string,
+    proposalId: string | null,
+  ): import('../shared/intake-report-group-links.ts').IntakeReviewGroupLinks;
+  reportSource(
+    record: IntakeReview['records'][number],
+    proposalId: string | null,
+  ): string | undefined;
+  questions(candidateId: string, versionId: string): ReviewQuestionSelection;
+  accepted(candidateId: string, versionId: string): boolean;
+  draft(proposalId: string | null, recordId: string, versionId: string): IntakeReviewDraft | null;
+  firstVersion(candidateId: string): string | undefined;
+  keptOriginal(candidateId: string, versionId: string): boolean;
+  group(reference: IntakeReviewGroupReference): WorkflowReviewGroup | undefined;
+  identityGroup(id: string): WorkflowReviewGroup | undefined;
+  currentVersion(group: WorkflowReviewGroup): string | null;
+  membership(
+    group: WorkflowReviewGroup,
+  ): import('./intake-identity-policy.ts').CurrentIdentityReceiptBoundary['membership'];
+  originalFingerprint(group: WorkflowReviewGroup): string;
+  receipts: SelectedSequence<import('./intake-identity-policy.ts').IdentityPolicyReceipt>;
+  packageEvidence: boolean;
+  manual(
+    proposalId: string | null,
+  ): import('../shared/intake-manual-source-record.ts').ManualSourceRecordReceipt | undefined;
+  competingBoundaryUnrepaired(
+    group: WorkflowReviewGroup,
+    operationId: string | undefined,
+    target: import('../shared/intake-identity.ts').IntakeIdentityScope['targets'][number],
+  ): boolean;
+  /** Complete proposal/report identity facts, including every off-page occurrence. */
+  evidence(
+    group: WorkflowReviewGroup | null,
+    record: IntakeReview['records'][number],
+    review: IntakeReview,
+    original: import('./intake-evidence-dates.ts').BirthDateEvidence | undefined,
+  ): {
+    collected: ReturnType<typeof collectEvidencedIdentity>;
+    structured: ReturnType<typeof collectEvidencedIdentity>['evidence'];
+  };
+}
+export interface SelectedWorkflowIdentityContext {
+  profileId: string;
+  people?: IdentityPolicyPersonSnapshot[];
+  copiedManualSourceApplies?: NonNullable<
+    Parameters<typeof workflowReview>[5]
+  >['copiedManualSourceApplies'];
+  resolutionCurrent?: NonNullable<Parameters<typeof workflowReview>[5]>['resolutionCurrent'];
+  grounded(
+    group: WorkflowReviewGroup,
+    issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor'>,
+    receipt: import('./intake-identity-policy.ts').IdentityGroundingReceipt,
+  ): boolean;
+  originalBirthDateEvidence?: (
+    group: WorkflowReviewGroup,
+  ) => import('./intake-evidence-dates.ts').BirthDateEvidence | undefined;
+  subjectGrounded?: (group: WorkflowReviewGroup) => boolean;
+  nameQuestionGrounded?: (
+    group: WorkflowReviewGroup,
+    issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor'>,
+  ) => boolean;
 }
 export function workflowReview<T extends IntakeReview>(
   file: WorkflowFile,
@@ -351,6 +446,121 @@ export function workflowReview<T extends IntakeReview>(
           groupReferences.set(key, refs);
         }
   }
+  const fullGroup = (group: WorkflowReviewGroup) =>
+    reportGroups.find((item) => item.id === group.id)!;
+  const scope: WorkflowReviewScope = {
+    versionId: (proposalId, entry) => intakeCandidateVersionId(details, proposalId, entry),
+    references: (candidateId, versionId, recordId, proposalId) =>
+      groupReferences.get(JSON.stringify([candidateId, versionId, recordId, proposalId])) || [],
+    reportSource: (record, proposalId) =>
+      intakeReportSourceForMember(
+        workflow.reportSourceConfirmations,
+        record.reportGroups,
+        record,
+        workflow.candidates
+          .find((candidate) => candidate.id === record.candidateId)
+          ?.versions.find((version) => version.id === record.candidateVersionId)
+          ?.occurrences.find(
+            (occurrence) =>
+              occurrence.recordId === record.id && occurrence.proposalId === proposalId,
+          ),
+      )?.confirmation.source,
+    questions: (candidateId, versionId) =>
+      workflow.questions.filter(
+        (q) =>
+          q.candidateId === candidateId &&
+          (!q.candidateVersionId || q.candidateVersionId === versionId),
+      ),
+    accepted: (candidateId, versionId) =>
+      workflow.decisions.some(
+        (d) =>
+          d.candidateId === candidateId &&
+          d.candidateVersionId === versionId &&
+          d.action === 'accept',
+      ),
+    draft: (proposalId, recordId, versionId) =>
+      currentReviewDraft(workflow, proposalId, recordId, versionId),
+    firstVersion: (candidateId) =>
+      workflow.candidates.find((candidate) => candidate.id === candidateId)?.versions[0]?.id,
+    keptOriginal: (candidateId, versionId) =>
+      !!workflow.candidates
+        .find((candidate) => candidate.id === candidateId)
+        ?.versions.some(
+          (version) => version.id === versionId && version.status === 'kept_original',
+        ),
+    group: (reference) =>
+      reportGroups.find(
+        (group) =>
+          group.id === reference.groupId &&
+          group.versions.some((version) => version.id === reference.groupVersionId),
+      ),
+    identityGroup: (id) => reportGroups.find((group) => group.id === id),
+    currentVersion: (group) => fullGroup(group).versions.at(-1)?.id || null,
+    membership: (group) => fullGroup(group).versions.at(-1)!.members,
+    originalFingerprint: (group) =>
+      identityOriginalFingerprint(file.id, file.sha256, fullGroup(group), workflow),
+    receipts: selectedSequence(workflow.identityConfirmations),
+    packageEvidence:
+      file.mime_type === 'application/zip' ||
+      workflow.plans.some((plan) => (plan.index.members?.length || 0) > 0),
+    manual: (proposalId) => details.proposals?.find((p) => p.id === proposalId)?.manualSourceRecord,
+    competingBoundaryUnrepaired: (group, operationId, target) =>
+      !!competingIdentityBoundaries(fullGroup(group), reportGroups).length &&
+      !identityBoundaryRepairApplies(
+        workflow.identityConfirmations?.find((receipt) => receipt.operationId === operationId),
+        fullGroup(group),
+        reportGroups,
+        [target],
+      ),
+    evidence: (group, record, current, original) => {
+      const related = group
+        ? current.records.filter((candidate) =>
+            selectedReportGroups(candidate.reportGroups).some(
+              (reference) => reference.groupId === group.id,
+            ),
+          )
+        : [record];
+      const issues = function* () {
+        for (const candidate of related)
+          for (const issue of reviewRecordIssues(candidate))
+            if (issue.kind === 'identity') yield issue;
+      };
+      return {
+        collected: collectEvidencedIdentity(issues(), group?.report?.subject?.text, original),
+        structured: collectEvidencedIdentity(issues()).evidence,
+      };
+    },
+  };
+  return workflowReviewSelected(
+    file,
+    scope,
+    review,
+    entries,
+    self,
+    identityContext && {
+      ...identityContext,
+      grounded: (group, issue, receipt) =>
+        identityContext.grounded(fullGroup(group), issue, receipt),
+      originalBirthDateEvidence:
+        identityContext.originalBirthDateEvidence &&
+        ((group) => identityContext.originalBirthDateEvidence!(fullGroup(group))),
+      subjectGrounded:
+        identityContext.subjectGrounded &&
+        ((group) => identityContext.subjectGrounded!(fullGroup(group))),
+      nameQuestionGrounded:
+        identityContext.nameQuestionGrounded &&
+        ((group, issue) => identityContext.nameQuestionGrounded!(fullGroup(group), issue)),
+    },
+  );
+}
+export function workflowReviewSelected<T extends IntakeReview>(
+  file: WorkflowFile,
+  scope: WorkflowReviewScope,
+  review: T,
+  entries: IntakeEntry[],
+  self?: IntakeIdentitySelfSnapshot,
+  identityContext?: SelectedWorkflowIdentityContext,
+): T {
   const inputFileId = review.proposalId || file.id;
   const entriesByRecordId = new Map(
     entries.map((entry) => [`${inputFileId}:line:${entry.line}`, entry]),
@@ -359,54 +569,23 @@ export function workflowReview<T extends IntakeReview>(
     const entry = entriesByRecordId.get(record.id);
     if (!entry) throw new Error('Clinical review entry is missing from its retained proposal');
     const candidateId = intakeCandidateId(file, entry);
-    const versionId = intakeCandidateVersionId(details, review.proposalId, entry);
+    const versionId = scope.versionId(review.proposalId, entry);
     record.candidateId = candidateId;
     record.candidateVersionId = versionId;
-    record.reportGroups =
-      groupReferences.get(JSON.stringify([candidateId, versionId, record.id, review.proposalId])) ||
-      [];
-    const reportSource = intakeReportSourceForMember(
-      workflow.reportSourceConfirmations,
-      record.reportGroups,
-      record,
-      workflow.candidates
-        .find((candidate) => candidate.id === candidateId)
-        ?.versions.find((version) => version.id === versionId)
-        ?.occurrences.find(
-          (occurrence) =>
-            occurrence.recordId === record.id && occurrence.proposalId === review.proposalId,
-        ),
-    );
-    if (reportSource) record.provider = reportSource.confirmation.source;
-    record.questions = workflow.questions.filter(
-      (q) =>
-        q.candidateId === candidateId &&
-        (!q.candidateVersionId || q.candidateVersionId === versionId),
-    );
+    record.reportGroups = scope.references(candidateId, versionId, record.id, review.proposalId);
+    const reportSource = scope.reportSource(record, review.proposalId);
+    if (reportSource) record.provider = reportSource;
+    bindReviewRecordQuestions(record, scope.questions(candidateId, versionId));
     record.reviewState =
-      !record.projectionUpgrade &&
-      workflow.decisions.some(
-        (d) =>
-          d.candidateId === candidateId &&
-          d.candidateVersionId === versionId &&
-          d.action === 'accept',
-      )
-        ? 'accepted'
-        : 'pending';
-    record.draft = currentReviewDraft(workflow, review.proposalId, record.id, versionId);
+      !record.projectionUpgrade && scope.accepted(candidateId, versionId) ? 'accepted' : 'pending';
+    record.draft = scope.draft(review.proposalId, record.id, versionId);
     // Legacy questions did not pin a version. An old identity answer is history,
     // not confirmation of a changed envelope. Keep the durable question intact.
-    if (
-      record.reviewState !== 'accepted' &&
-      workflow.candidates.find((candidate) => candidate.id === candidateId)?.versions[0]?.id !==
-        versionId
-    )
-      record.questions = record.questions.map((question) =>
+    if (record.reviewState !== 'accepted' && scope.firstVersion(candidateId) !== versionId)
+      mapReviewRecordQuestions(record, (question) =>
         !question.candidateVersionId &&
         typedActionableIssueKind(question.prompt, question.field) === 'identity' &&
-        !record.draft?.resolutions.some(
-          (resolution) => resolution.issueId === question.id && resolution.outcome !== 'unknown',
-        )
+        !knownReviewDraftResolution(record.draft, question.id)
           ? {
               ...question,
               status: 'unanswered',
@@ -417,24 +596,23 @@ export function workflowReview<T extends IntakeReview>(
           : question,
       );
 
-    const scopedReport = record.reportGroups
-      .map((reference) =>
-        reportGroups.find(
-          (group) =>
-            group.id === reference.groupId &&
-            group.versions.some((version) => version.id === reference.groupVersionId),
-        ),
-      )
-      .find((group) => group?.basis === 'report_anchor');
+    const scopedReference = selectedReportGroups(record.reportGroups).find(
+      (reference) => scope.group(reference)?.basis === 'report_anchor',
+    );
+    const scopedReport = scopedReference ? scope.group(scopedReference) : undefined;
     const issueScope = {
-      packageEvidence:
-        file.mime_type === 'application/zip' ||
-        workflow.plans.some((plan) => (plan.index.members?.length || 0) > 0),
+      packageEvidence: scope.packageEvidence,
       reportScoped: !!scopedReport,
       memberId: scopedReport?.memberId || null,
       reportSubject: scopedReport?.report?.subject?.text || null,
     };
-    let issues = typedReviewIssues(record, entry, record.questions, issueScope);
+    let issues = typedReviewIssues(
+      record,
+      entry,
+      reviewRecordQuestions(record),
+      issueScope,
+      scope.issueSink?.(record),
+    );
     // Prepared JSONL has no proposal id, but a host-resolved printed report
     // subject still needs an actionable identity target. Preserve an existing
     // exact typed target; otherwise add the same generic target as a proposal.
@@ -449,11 +627,17 @@ export function workflowReview<T extends IntakeReview>(
           identityConfirmationRequired?: boolean;
         }
       ).identityConfirmationRequired = true;
-      issues = typedReviewIssues(record, entry, record.questions, issueScope);
+      issues = typedReviewIssues(
+        record,
+        entry,
+        reviewRecordQuestions(record),
+        issueScope,
+        scope.issueSink?.(record),
+      );
     }
-    record.issues = issues;
+    bindReviewRecordIssues(record, issues);
     for (const issue of issues) {
-      const resolution = record.draft?.resolutions.findLast((r) => r.issueId === issue.id);
+      const resolution = latestReviewDraftResolution(record.draft, issue.id);
       if (resolution) {
         if (
           identityContext?.resolutionCurrent?.(resolution, {
@@ -464,21 +648,25 @@ export function workflowReview<T extends IntakeReview>(
             issue.kind === 'identity' &&
             !resolution.dependency &&
             ['this_is_me', 'other_person'].includes(resolution.outcome) &&
-            workflow.identityConfirmations?.some(
+            scope.receipts?.some(
               (receipt) =>
                 receipt.operationId === resolution.operationId &&
                 receipt.scope.intakeId === file.id &&
                 receipt.scope.sourceHash === file.sha256 &&
                 receipt.outcome ===
                   (resolution.outcome === 'other_person' ? 'this_is_person' : 'this_is_me') &&
-                record.reportGroups?.some((group) => group.groupId === receipt.scope.groupId) &&
+                selectedReportGroups(record.reportGroups).some(
+                  (group) => group.groupId === receipt.scope.groupId,
+                ) &&
                 (receipt.scope.assignmentTargets || receipt.scope.targets).some(
                   (target) =>
                     target.candidateId === record.candidateId &&
                     target.candidateVersionId === record.candidateVersionId &&
                     target.proposalId === review.proposalId &&
                     target.recordId === record.id &&
-                    (target.issueIds || [target.issueId]).includes(issue.id),
+                    selectedSequence(target.issueIds || [target.issueId]).some(
+                      (id) => id === issue.id,
+                    ),
                 ),
             )
           )
@@ -491,11 +679,14 @@ export function workflowReview<T extends IntakeReview>(
             issue.kind === 'identity' && ['unknown', 'other_person'].includes(resolution.outcome)
               ? resolution
               : undefined;
-          record.questions = record.questions.map((question) =>
-            question.id === issue.questionId
-              ? { ...question, status: 'unanswered', answers: [] }
-              : question,
-          );
+          if (issues.markQuestionReset) {
+            if (issue.questionId) issues.markQuestionReset(issue.questionId);
+          } else
+            mapReviewRecordQuestions(record, (question) =>
+              question.id === issue.questionId
+                ? { ...question, status: 'unanswered', answers: [] }
+                : question,
+            );
         } else {
           issue.resolution = resolution;
           issue.status = resolution.outcome === 'unknown' ? 'unresolved' : 'resolved';
@@ -503,38 +694,27 @@ export function workflowReview<T extends IntakeReview>(
         }
       }
     }
-    if (
-      workflow.candidates
-        .find((c) => c.id === candidateId)
-        ?.versions.some((v) => v.id === versionId && v.status === 'kept_original')
-    )
-      record.reviewState = 'kept_original';
-    record.suggestedMapping = Object.assign(
-      {},
-      ...record.questions
-        .filter((q) => {
-          const issue = issues.find((i) => i.questionId === q.id);
-          return (
-            q.status === 'answered' &&
-            issue?.kind !== 'information' &&
-            issue?.resolution?.outcome !== 'unknown' &&
-            (!issue?.resolution || issue.status === 'resolved')
-          );
-        })
-        .map((q) => q.answers.at(-1)?.mapping || {}),
-      record.draft?.mapping || {},
-    );
+    if (issues.questionWasReset)
+      mapReviewRecordQuestions(record, (question) =>
+        issues.questionWasReset!(question.id)
+          ? { ...question, status: 'unanswered', answers: [] }
+          : question,
+      );
+    if (scope.keptOriginal(candidateId, versionId)) record.reviewState = 'kept_original';
+    const suggested: Partial<IntakeClinicalMapping> = {};
+    for (const q of reviewRecordQuestions(record)) {
+      const issue = issues.findId ? issues.findId(q.id) : issues.find((i) => i.questionId === q.id);
+      if (
+        q.status === 'answered' &&
+        issue?.kind !== 'information' &&
+        issue?.resolution?.outcome !== 'unknown' &&
+        (!issue?.resolution || issue.status === 'resolved')
+      )
+        Object.assign(suggested, q.answers.at(-1)?.mapping || {});
+    }
+    record.suggestedMapping = Object.assign(suggested, record.draft?.mapping || {});
   }
   if (self) {
-    const recordsByGroup = new Map<string, IntakeReview['records']>();
-    for (const record of review.records)
-      for (const reference of record.reportGroups || []) {
-        const records = recordsByGroup.get(reference.groupId) || [];
-        if (!records.includes(record)) records.push(record);
-        recordsByGroup.set(reference.groupId, records);
-      }
-    // Self suggestions are fixed during this synchronous enrichment pass.
-    // Collect shared report facts once, rather than scanning every row per row.
     const groupEvidence = new Map<
       string,
       {
@@ -543,34 +723,23 @@ export function workflowReview<T extends IntakeReview>(
       }
     >();
     for (const record of review.records) {
-      const reference = record.reportGroups?.[0] || null;
-      const group = reference
-        ? reportGroups.find((candidate) => candidate.id === reference.groupId) || null
-        : null;
-      const related = group ? recordsByGroup.get(group.id) || [record] : [record];
-      const identityIssues = related.flatMap((candidate) =>
-        (candidate.issues || []).filter((issue) => issue.kind === 'identity'),
-      );
+      const reference = selectedReportGroups(record.reportGroups).find(() => true) || null;
+      const group = reference ? scope.identityGroup(reference.groupId) || null : null;
       const originalBirthDates = group
         ? identityContext?.originalBirthDateEvidence?.(group)
         : undefined;
       let collected = group ? groupEvidence.get(group.id) : undefined;
       if (!collected) {
-        collected = {
-          collected: collectEvidencedIdentity(
-            identityIssues,
-            group?.report?.subject?.text,
-            originalBirthDates,
-          ),
-          structured: collectEvidencedIdentity(identityIssues).evidence,
-        };
+        collected = scope.evidence(group, record, review, originalBirthDates);
         if (group) groupEvidence.set(group.id, collected);
       }
       const { evidence, conflicts, unreadableBirthDate, bannerBirthDates } = structuredClone(
         collected.collected,
       );
       const structuredEvidence = structuredClone(collected.structured);
-      const ownIdentityIssues = (record.issues || []).filter((issue) => issue.kind === 'identity');
+      const ownIdentityIssues = reviewRecordIssues(record).filter(
+        (issue) => issue.kind === 'identity',
+      );
       const genericIdentityIssueId =
         'issue:' +
         createHash('sha256')
@@ -598,11 +767,9 @@ export function workflowReview<T extends IntakeReview>(
             issue.resolution?.outcome === 'other_person'
           ),
       );
-      const currentGroupVersion = group?.versions.at(-1) || null;
-      const currentVersion = currentGroupVersion?.id || reference?.groupVersionId || null;
-      const originalFingerprint = group
-        ? identityOriginalFingerprint(file.id, file.sha256, group, workflow)
-        : null;
+      const currentVersion =
+        (group && scope.currentVersion(group)) || reference?.groupVersionId || null;
+      const originalFingerprint = group ? scope.originalFingerprint(group) : null;
       const hasUnstructuredIdentityQuestion = explicitIssues.some(
         (issue) =>
           !(
@@ -621,7 +788,7 @@ export function workflowReview<T extends IntakeReview>(
             !repeatedIdentityQuestionReceipt({
               issue,
               group,
-              receipts: workflow.identityConfirmations,
+              receipts: scope.receipts,
               profileId: identityContext.profileId,
               intakeId: file.id,
               sourceHash: file.sha256,
@@ -630,7 +797,7 @@ export function workflowReview<T extends IntakeReview>(
             })),
       );
       const explicit = exactCurrentIdentityResolutionOperationId({
-        receipts: workflow.identityConfirmations,
+        receipts: scope.receipts,
         occurrences: explicitIssues.length
           ? [
               {
@@ -639,24 +806,26 @@ export function workflowReview<T extends IntakeReview>(
                 proposalId: review.proposalId,
                 recordId: record.id,
                 issueIds: explicitIssues.map((issue) => issue.id),
-                resolutions: record.draft?.resolutions || [],
+                resolutions: reviewDraftResolutions(record.draft),
+                latestResolution: (issueId: string) =>
+                  latestReviewDraftResolution(record.draft, issueId),
               },
             ]
           : [],
         receiptApplies: (receipt) =>
           !!group &&
-          !!currentGroupVersion &&
+          !!currentVersion &&
           identityReceiptAppliesToCurrentBoundary(receipt, {
             intakeId: file.id,
             groupId: group.id,
-            groupVersionId: currentGroupVersion.id,
+            groupVersionId: currentVersion,
             sourceHash: file.sha256,
             memberId: group.memberId,
             report: group.report!.anchor,
             subject: group.report!.subject!,
             evidencedIdentity: evidence,
             evidenceOriginalFingerprint: originalFingerprint,
-            membership: currentGroupVersion.members,
+            membership: scope.membership(group),
           }),
       });
       const assessment = assessIdentityPolicy({
@@ -673,33 +842,35 @@ export function workflowReview<T extends IntakeReview>(
         group,
         groupVersionId: currentVersion,
         originalFingerprint,
-        receipts: workflow.identityConfirmations,
+        receipts: scope.receipts,
         hasUnstructuredIdentityQuestion,
         explicitlyConfirmedOperationId: explicit,
         currentRefusal: currentIdentityRefusal(ownIdentityIssues),
       });
       const personReceipt =
-        group?.report?.subject && currentGroupVersion
+        group?.report?.subject && currentVersion
           ? confirmedPersonReceipt({
-              receipts: workflow.identityConfirmations,
+              receipts: scope.receipts,
               boundary: {
                 profileId: identityContext?.profileId,
                 intakeId: file.id,
                 groupId: group.id,
-                groupVersionId: currentGroupVersion.id,
+                groupVersionId: currentVersion,
                 sourceHash: file.sha256,
                 memberId: group.memberId,
                 report: group.report!.anchor,
                 subject: group.report!.subject!,
                 evidencedIdentity: evidence,
                 evidenceOriginalFingerprint: originalFingerprint,
-                membership: currentGroupVersion.members,
+                membership: scope.membership(group),
               },
               candidateId: record.candidateId!,
               candidateVersionId: record.candidateVersionId!,
               proposalId: review.proposalId,
               recordId: record.id,
-              resolutions: record.draft?.resolutions || [],
+              resolutions: reviewDraftResolutions(record.draft),
+              latestResolution: (issueId: string) =>
+                latestReviewDraftResolution(record.draft, issueId),
               requiredIssueIds: ownIdentityIssues.map((issue) => issue.id),
             })
           : undefined;
@@ -752,7 +923,7 @@ export function workflowReview<T extends IntakeReview>(
       }
       // This receipt exists only on a host-created proposal, outside its untrusted JSONL.
       // It assigns this single human-authored record, not other records or printed aliases.
-      const manual = details.proposals?.find((p) => p.id === review.proposalId)?.manualSourceRecord;
+      const manual = scope.manual(review.proposalId);
       if (
         manual &&
         (manual.profileId === identityContext?.profileId ||
@@ -789,24 +960,14 @@ export function workflowReview<T extends IntakeReview>(
       }
       if (
         group &&
-        competingIdentityBoundaries(group, reportGroups).length &&
-        !identityBoundaryRepairApplies(
-          workflow.identityConfirmations?.find(
-            (receipt) => receipt.operationId === assessment.attribution?.confirmationOperationId,
-          ),
-          group,
-          reportGroups,
-          [
-            {
-              candidateId: record.candidateId!,
-              candidateVersionId: record.candidateVersionId!,
-              proposalId: review.proposalId,
-              recordId: record.id,
-              title: record.title,
-              issueId: genericIdentityIssueId,
-            },
-          ],
-        )
+        scope.competingBoundaryUnrepaired(group, assessment.attribution?.confirmationOperationId, {
+          candidateId: record.candidateId!,
+          candidateVersionId: record.candidateVersionId!,
+          proposalId: review.proposalId,
+          recordId: record.id,
+          title: record.title,
+          issueId: genericIdentityIssueId,
+        })
       ) {
         assessment.status = 'conflict';
         assessment.blocking = true;
@@ -894,14 +1055,14 @@ export function workflowReview<T extends IntakeReview>(
           issue.status = 'unresolved';
         }
         if (!ownIdentityIssues.some((issue) => issue.prompt === assessment.message))
-          record.issues!.push({
+          reviewIssueCollection(record).push({
             id: 'issue:' + workflowHash([record.candidateVersionId, 'identity-conflict']),
             kind: 'identity',
             prompt: assessment.message,
             field: 'subject',
             blocking: true,
             status: 'unresolved',
-            locator: ownIdentityIssues[0]?.locator || record.evidence[0]?.locator || 'Original',
+            locator: ownIdentityIssues.at(0)?.locator || record.evidence[0]?.locator || 'Original',
             questionId: null,
           });
       }
@@ -909,6 +1070,7 @@ export function workflowReview<T extends IntakeReview>(
   }
   return review;
 }
+
 export function workflowSummary(
   details: IntakeWorkflowDetails,
   { sourceContextVersionIds = new Set<string>() }: WorkflowSummaryOptions = {},
@@ -925,111 +1087,14 @@ export function workflowSummary(
         })),
       }
     : workflow;
-  const isSourceContext = (version: IntakeCandidateVersion): boolean => {
-    if (!version.sourceContext && !sourceContextVersionIds.has(version.id)) return false;
-    const draft = workflow.reviewDrafts.findLast((item) => item.candidateVersionId === version.id);
-    const accepted = workflow.decisions.findLast(
-      (item) => item.candidateVersionId === version.id && item.action === 'accept',
-    );
-    const reviewedKind =
-      draft?.decision?.mapping?.kind || draft?.mapping?.kind || accepted?.mapping?.kind;
-    return !Object.hasOwn(clinicalFields, reviewedKind || '');
-  };
-  const versionsById = new Map(
-    workflow.candidates
-      .flatMap((candidate) => candidate.versions)
-      .map((version) => [version.id, version]),
-  );
-  const candidatesById = new Map(workflow.candidates.map((candidate) => [candidate.id, candidate]));
-  const terminal = (candidateId: string | null, versionId: string | null): boolean =>
-    !!workflow.candidates
-      .find((c) => c.id === candidateId)
-      ?.versions.some((v) => v.id === versionId && v.status === 'kept_original');
-  const unanswered = workflow.questions.filter((q) => {
-    // Legacy questions did not pin a candidate version. Bind their derived state
-    // to the candidate's current version so an older draft cannot confirm future
-    // evidence that happens to retain the same question ID.
-    const version = q.candidateVersionId
-      ? versionsById.get(q.candidateVersionId)
-      : q.candidateId
-        ? candidatesById.get(q.candidateId)?.versions.at(-1)
-        : undefined;
-    if (version && isSourceContext(version)) return false;
-    if (terminal(q.candidateId, version?.id || q.candidateVersionId)) return false;
-    const reviewKind = typedActionableIssueKind(q.prompt, q.field);
-    if (reviewKind === 'information') return false;
-    const resolvedDecision = q.resolvedByDecisionId
-      ? workflow.decisions.find((decision) => decision.id === q.resolvedByDecisionId)
-      : undefined;
-    if (
-      q.status === 'resolved' &&
-      (q.candidateVersionId ||
-        !version ||
-        (resolvedDecision?.candidateId === q.candidateId &&
-          resolvedDecision.candidateVersionId === version.id))
-    )
-      return false;
-    const resolution = workflow.reviewDrafts
-      .filter(
-        (draft) =>
-          !!version &&
-          draft.candidateId === q.candidateId &&
-          draft.candidateVersionId === version.id,
-      )
-      .flatMap((draft) => draft.resolutions)
-      .findLast((resolution) => resolution.issueId === q.id);
-    const outcome = resolution?.outcome;
-    if (
-      outcome === 'other_person' &&
-      reviewKind === 'identity' &&
-      resolution?.operationId &&
-      workflow.identityConfirmations?.some(
-        (receipt) =>
-          receipt.outcome === 'this_is_person' &&
-          receipt.assignedPerson &&
-          receipt.operationId === resolution.operationId &&
-          (receipt.scope.assignmentTargets || receipt.scope.targets).some(
-            (target) =>
-              target.candidateId === q.candidateId &&
-              target.candidateVersionId === version?.id &&
-              (target.issueIds || [target.issueId]).includes(q.id),
-          ),
-      )
-    )
-      return false;
-    if (outcome === 'this_is_me' && reviewKind === 'identity') return false;
-    if (outcome === 'unknown' && reviewKind !== 'identity') return false;
-    return true;
-  }).length;
-  const pendingCandidates = workflow.candidates.filter((c) =>
-    c.versions.some((v) => v.status === 'pending' && !v.peopleOnly && !isSourceContext(v)),
-  ).length;
-  const pendingWork = workflow.plans
-    .filter((p) => p.status !== 'superseded')
-    .flatMap((p) => p.units.filter((u) => !accountedUnitKind(p, u))).length;
   return {
     workflow: {
       ...projectedWorkflow,
       reportGroups: reportGroupsWithLegacyFallback(projectedWorkflow),
     },
-    needsReview:
-      unanswered > 0 ||
-      pendingCandidates > 0 ||
-      pendingWork > 0 ||
-      Object.values(details.packageFailures || {}).some((failure) => failure.status === 'pending'),
-    pendingCount: pendingCandidates,
-    unansweredCount: unanswered,
-    pendingWorkCount: pendingWork,
-    reviewLaterCount: workflow.candidates
-      .flatMap((c) => c.versions)
-      .filter(
-        (v) =>
-          v.status === 'pending' &&
-          !v.peopleOnly &&
-          !isSourceContext(v) &&
-          workflow.reviewDrafts.findLast((d) => d.candidateVersionId === v.id)?.disposition ===
-            'review_later',
-      ).length,
+    ...workflowCounts(
+      legacyWorkflowCountReader(workflow, details.packageFailures, sourceContextVersionIds),
+    ),
   };
 }
 export function saveWorkflowDecisions(
@@ -1109,12 +1174,13 @@ export function saveWorkflowDecisions(
       .find((c) => c.id === record.candidateId)
       ?.versions.find((v) => v.id === record.candidateVersionId);
     if (version) version.status = 'accepted';
-    for (const reference of record.questions || []) {
+    for (const reference of reviewRecordQuestions(record)) {
       const question = workflow.questions.find((q) => q.id === reference.id);
       if (
         question?.status === 'answered' &&
         question.field !== 'duplicate' &&
-        record.issues?.find((i) => i.questionId === question.id)?.resolution?.outcome !== 'unknown'
+        reviewRecordIssues(record).find((i) => i.questionId === question.id)?.resolution
+          ?.outcome !== 'unknown'
       ) {
         question.status = 'resolved';
         question.resolvedAt = at;

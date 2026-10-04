@@ -1,3 +1,4 @@
+import { IdentityScopeEvidence } from './IdentityScopeEvidence';
 import { useEffect, useRef, useState } from 'react';
 import type { IntakeIdentityAnswers, IntakeIdentityReview } from '../../../shared/intake-identity';
 import { LoadingIndicator } from '../../components/LoadingIndicator';
@@ -39,22 +40,26 @@ export function ImportDetailIdentityPanel({
     futureNameOwner?: FutureNameChoice,
   ) => void;
 }) {
+  const scope = review?.scopeReference || review?.scope;
+  const [reviewedQuestions, setReviewedQuestions] = useState<string>();
+  const questionsReady =
+    !review?.scopeReference?.collection.questions || reviewedQuestions === scope?.scopeToken;
   const [personSelection, setPersonSelection] = useState<ImportPersonSelection>();
   const [futureNameOwner, setFutureNameOwner] = useState<FutureNameChoice>({ outcome: 'ask' });
   const [selectedPrintedName, setSelectedPrintedName] = useState('');
   const [reviewedBirthDate, setReviewedBirthDate] = useState<string | null>(
-    review?.scope?.birthDateReview?.suggested || null,
+    scope?.birthDateReview?.suggested || null,
   );
   const offered: { fullName?: string; birthDate?: string } = review?.offeredSelfFields.birthDate
     ? { birthDate: review.offeredSelfFields.birthDate }
     : {};
-  const selectionScope = review?.scope
+  const selectionScope = scope
     ? [
-        review.scope.profileId,
-        review.scope.intakeId,
-        review.scope.groupId,
-        review.scope.groupVersionId,
-        review.scope.memberId || '',
+        scope.profileId,
+        scope.intakeId,
+        scope.groupId,
+        scope.groupVersionId,
+        scope.memberId || '',
       ].join(':')
     : null;
   const [selected, setSelected] = useState<Set<'fullName' | 'birthDate'>>(
@@ -71,7 +76,7 @@ export function ImportDetailIdentityPanel({
     if (previous.scope !== selectionScope) {
       setSelectedPrintedName('');
       setFutureNameOwner({ outcome: 'ask' });
-      setReviewedBirthDate(review.scope?.birthDateReview?.suggested || null);
+      setReviewedBirthDate(scope?.birthDateReview?.suggested || null);
     }
     if (previous.scope !== selectionScope)
       setPersonSelection(
@@ -130,7 +135,7 @@ export function ImportDetailIdentityPanel({
       </section>
     );
 
-  if (review.status === 'conflict' && !review.scope)
+  if (review.status === 'conflict' && !scope)
     return (
       <section className="import-identity-question is-conflict" role="alert">
         <div>
@@ -170,7 +175,7 @@ export function ImportDetailIdentityPanel({
             ? review.assignedPerson
               ? `This report belongs to ${review.assignedPerson.fullName}.`
               : 'This report already matches Self.'
-            : `This report identifies “${review.evidencedIdentity.fullName || review.scope?.subject.text || 'Self'}”.`}
+            : `This report identifies “${review.evidencedIdentity.fullName || scope?.subject.text || 'Self'}”.`}
         </strong>
         {!review.scope?.questions?.some((question) => question.prompt === review.message) && (
           <small>{review.message}</small>
@@ -179,15 +184,27 @@ export function ImportDetailIdentityPanel({
         {review.evidencedIdentity.birthDate && (
           <small>Printed date of birth: {review.evidencedIdentity.birthDate}</small>
         )}
-        {review.scope && !confirmed && (
+        {scope && !confirmed && (
           <small>
             This confirmation applies to{' '}
-            {(review.scope.assignmentTargets || review.scope.targets).length}{' '}
-            {(review.scope.assignmentTargets || review.scope.targets).length === 1
+            {review.scopeReference?.collection.assignmentTargets ??
+              (review.scope?.assignmentTargets || review.scope?.targets || []).length}{' '}
+            {(review.scopeReference?.collection.assignmentTargets ??
+              (review.scope?.assignmentTargets || review.scope?.targets || []).length) === 1
               ? 'record'
               : 'records'}{' '}
             in this retained report scope.
           </small>
+        )}
+        {review.scopeReference && (
+          <IdentityScopeEvidence
+            key={scope!.scopeToken}
+            scope={review.scopeReference}
+            onRefresh={onRetry}
+            onQuestionsReviewed={(ready) =>
+              setReviewedQuestions(ready ? scope!.scopeToken : undefined)
+            }
+          />
         )}
         {review.scope?.questions?.map((question) => (
           <span
@@ -198,17 +215,17 @@ export function ImportDetailIdentityPanel({
             {question.textAnchor && <q>{question.textAnchor}</q>}
           </span>
         ))}
-        {review.scope && !review.evidencedIdentity.fullName && (
+        {scope && !review.evidencedIdentity.fullName && (
           <ImportPrintedName
             value={selectedPrintedName}
-            subjectText={review.scope.subject.text}
+            subjectText={scope!.subject.text}
             onChange={setSelectedPrintedName}
             disabled={busy}
           />
         )}
-        {review.scope?.birthDateReview && (
+        {scope?.birthDateReview && (
           <ImportBirthDateReview
-            review={review.scope.birthDateReview}
+            review={scope!.birthDateReview}
             value={reviewedBirthDate}
             onChange={setReviewedBirthDate}
             disabled={busy}
@@ -224,7 +241,7 @@ export function ImportDetailIdentityPanel({
           printedName={review.evidencedIdentity.fullName || selectedPrintedName}
           selection={personSelection}
           onChange={setPersonSelection}
-          disabled={busy || !review.scope}
+          disabled={busy || !scope}
         />
         {review.challengedName && (
           <ImportFutureNameChoice
@@ -265,20 +282,22 @@ export function ImportDetailIdentityPanel({
         {notice && <small role="status">{notice}</small>}
         {error && <small role="alert">{error}</small>}
       </div>
-      {!!review.scope && (
+      {!!scope && (
         <button
           className="button secondary"
           type="button"
           disabled={
             busy ||
-            !review.scope ||
+            loading ||
+            !questionsReady ||
+            !scope ||
             !personSelectionReady(personSelection, [
               review.self.fullName || '',
               ...(review.self.knownNames || []),
             ]) ||
             reviewedBirthDate === '' ||
             (!review.evidencedIdentity.fullName &&
-              !printedNameReady(selectedPrintedName, review.scope.subject.text))
+              !printedNameReady(selectedPrintedName, scope!.subject.text))
           }
           onClick={() => {
             if (unchanged) {
@@ -296,7 +315,7 @@ export function ImportDetailIdentityPanel({
                   ),
               personSelection,
               !review.evidencedIdentity.fullName ? selectedPrintedName.trim() : undefined,
-              review.scope?.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
+              scope?.birthDateReview ? { birthDate: reviewedBirthDate } : undefined,
               review.challengedName ? futureNameOwner : undefined,
             );
           }}

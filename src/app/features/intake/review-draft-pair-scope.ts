@@ -1,6 +1,6 @@
+import type { IntakeClinicalReviewContext } from '../../../shared/intake-clinical-review';
 import type { IntakePairScope } from '../../../shared/clinical-review';
 import type {
-  IntakeReview,
   IntakeReviewDecision,
   IntakeReviewDraftUpdate,
   IntakeReviewRecord,
@@ -58,7 +58,7 @@ function unchangedPair(before: IntakePairScope | undefined, after: IntakePairSco
  */
 export function refreshPairScopesAfterOwnDraft(
   profileId: string,
-  review: IntakeReview,
+  review: IntakeClinicalReviewContext,
   record: IntakeReviewRecord,
   decision: IntakeReviewDecision,
   commit?: ReviewDraftPairCommit,

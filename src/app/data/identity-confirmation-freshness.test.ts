@@ -317,3 +317,44 @@ test('non-version failures preserve existing exact recovery behavior', async (t)
       assert.deepEqual(retained, expectedRetained);
     });
 });
+
+test('native reference freshness retains complete snapshot authority while rebinding only the global version', () => {
+  const legacy = scope();
+  const { membership: _membership, targets: _targets, questions: _questions, ...header } = legacy;
+  const native: IntakeIdentityReview = review({
+    scope: null,
+    scopeReference: {
+      ...header,
+      format: 'health-intake-identity-scope-v2',
+      collection: {
+        snapshotId: 'snapshot-1',
+        membership: 1000,
+        targets: 500,
+        assignmentTargets: 500,
+        questions: 40,
+        competingSubjects: 0,
+      },
+    },
+  });
+  assert.equal(
+    sameDisplayedIdentityReview(native, {
+      ...native,
+      scopeReference: { ...native.scopeReference!, intakeVersion: 5, scopeToken: 'fresh-token' },
+    }),
+    true,
+  );
+  assert.equal(
+    sameDisplayedIdentityReview(native, {
+      ...native,
+      scopeReference: {
+        ...native.scopeReference!,
+        collection: {
+          ...native.scopeReference!.collection,
+          snapshotId: 'changed-complete-membership',
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(sameDisplayedIdentityReview(native, review()), false);
+});

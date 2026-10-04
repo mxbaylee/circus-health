@@ -1,3 +1,4 @@
+import { selectedSequence, type SelectedSequence } from './intake-selected-sequence.ts';
 import {
   bannerDatePattern,
   numericDateReadings,
@@ -17,6 +18,7 @@ import { canonicalLiteral } from './intake-format.ts';
 import type {
   IntakeClinicalIdentityAttribution,
   IntakeIssueResolution,
+  IntakePackageMember,
   IntakeReportGroup,
   IntakeReviewIssue,
   IntakeWorkflow,
@@ -33,6 +35,30 @@ import type {
   IntakeIdentityWarning,
 } from '../shared/intake-identity.ts';
 
+/** Read policy needs complete repeatable collections, not materialized receipt histories. */
+export type IdentityPolicyTarget = Omit<IntakeIdentityScope['targets'][number], 'issueIds'> & {
+  issueIds?: Iterable<string>;
+};
+export type IdentityPolicyTargets =
+  IdentityPolicyTarget[] | (SelectedSequence<IdentityPolicyTarget> & { readonly length: number });
+export type IdentityPolicyMember = Omit<
+  IntakeIdentityScope['membership'][number],
+  'occurrences'
+> & { occurrences: Iterable<IntakeIdentityScope['membership'][number]['occurrences'][number]> };
+export type IdentityPolicyQuestion =
+  | NonNullable<IntakeIdentityScope['questions']>[number]
+  | { matches(question: NonNullable<IntakeIdentityScope['questions']>[number]): boolean };
+export type IdentityPolicyReceipt = Omit<IntakeIdentityReceipt, 'scope' | 'draftIds'> & {
+  scope: Omit<IntakeIdentityScope, 'targets' | 'assignmentTargets' | 'membership' | 'questions'> & {
+    targets: IdentityPolicyTargets;
+    assignmentTargets?: IdentityPolicyTargets;
+    membership: Iterable<IdentityPolicyMember>;
+    questions?: IdentityPolicyQuestion[] | SelectedSequence<IdentityPolicyQuestion>;
+  };
+};
+export type IdentityGroundingReceipt = Pick<IdentityPolicyReceipt, 'operationId'> & {
+  scope: Pick<IntakeIdentityScope, 'scopeToken' | 'profileId'>;
+};
 export interface IdentityPolicyPersonSnapshot extends IntakeIdentityPerson {
   knownNames: string[];
   challengedNames?: string[];
@@ -42,22 +68,29 @@ export interface IdentityPolicyPersonSnapshot extends IntakeIdentityPerson {
 const hash = (value: unknown): string =>
   createHash('sha256').update(canonicalLiteral(value)).digest('hex');
 
-export function competingIdentityBoundaries(
-  group: IntakeReportGroup,
-  groups: IntakeReportGroup[],
-): IntakeReportGroup[] {
+export type IdentityBoundaryHeader = Pick<
+  IntakeReportGroup,
+  'id' | 'report' | 'sourceFileId' | 'sourceHash' | 'memberId'
+>;
+
+/** Complete-scope traversal; consumers can count or page without collecting all conflicts. */
+export function* iterateCompetingIdentityBoundaries<T extends IdentityBoundaryHeader>(
+  group: IdentityBoundaryHeader,
+  groups: Iterable<T>,
+): Generator<T> {
   // Separate model groups are not separate people. A header with no subject,
   // a different subject locator, or self/unknown role tags are not contradictory
   // printed identity. Keep each group's grounding/receipts independent.
   const subject = group.report?.subject?.text.trim();
-  if (!group.report?.anchor || !subject) return [];
+  if (!group.report?.anchor || !subject) return;
   const claim = (text: string) =>
     canonicalIdentityName(
       text.replace(/^(?:(?:patient|client)(?:\s+name)?|name|subject)\s*:\s*/i, ''),
     );
   const currentClaim = claim(subject);
-  return groups.filter(
-    (other) =>
+  const anchor = canonicalLiteral(group.report.anchor);
+  for (const other of groups)
+    if (
       other.id !== group.id &&
       !!other.report?.anchor &&
       !!other.report.subject?.text.trim() &&
@@ -65,8 +98,16 @@ export function competingIdentityBoundaries(
       other.sourceFileId === group.sourceFileId &&
       other.sourceHash === group.sourceHash &&
       other.memberId === group.memberId &&
-      canonicalLiteral(other.report?.anchor) === canonicalLiteral(group.report?.anchor),
-  );
+      canonicalLiteral(other.report?.anchor) === anchor
+    )
+      yield other;
+}
+
+export function competingIdentityBoundaries(
+  group: IntakeReportGroup,
+  groups: Iterable<IntakeReportGroup>,
+): IntakeReportGroup[] {
+  return Array.from(iterateCompetingIdentityBoundaries(group, groups));
 }
 
 const clean = (value: unknown): string | null =>
@@ -85,7 +126,7 @@ export function currentIdentityRefusal(
 
 /** Matching words never establish authority without both a human receipt and
  * host verification of this exact current report's retained original page. */
-export function repeatedIdentityQuestionReceipt({
+export function repeatedIdentityQuestionReceipt<T extends IdentityPolicyReceipt>({
   issue,
   group,
   receipts,
@@ -96,14 +137,14 @@ export function repeatedIdentityQuestionReceipt({
   grounded,
 }: {
   issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor' | 'resolution'>;
-  group: IntakeReportGroup;
-  receipts?: IntakeIdentityReceipt[];
+  group: IdentityBoundaryHeader;
+  receipts?: Iterable<T>;
   profileId: string;
   intakeId: string;
   sourceHash: string;
   originalFingerprint: string;
-  grounded: (receipt: IntakeIdentityReceipt) => boolean;
-}): IntakeIdentityReceipt | undefined {
+  grounded: (receipt: T) => boolean;
+}): T | undefined {
   const anchor = issue.textAnchor;
   const subject = group.report?.subject?.text;
   if (
@@ -112,7 +153,7 @@ export function repeatedIdentityQuestionReceipt({
     !subject
   )
     return undefined;
-  return receipts?.findLast(
+  return selectedSequence(receipts).findLast(
     (receipt) =>
       receipt.outcome === 'this_is_me' &&
       receipt.attestation === 'confirmed_displayed_identity_questions' &&
@@ -123,8 +164,10 @@ export function repeatedIdentityQuestionReceipt({
       receipt.scope.evidenceOriginalFingerprint === originalFingerprint &&
       receipt.scope.memberId === group.memberId &&
       canonicalIdentityName(receipt.scope.subject.text) === canonicalIdentityName(subject) &&
-      receipt.scope.questions?.some(
-        (question) => question.textAnchor === anchor && question.prompt === issue.prompt,
+      receipt.scope.questions?.some((question) =>
+        'matches' in question
+          ? question.matches({ textAnchor: anchor, prompt: issue.prompt })
+          : question.textAnchor === anchor && question.prompt === issue.prompt,
       ) &&
       grounded(receipt),
   );
@@ -186,14 +229,27 @@ export function identityOriginalFingerprint(
   group: IntakeReportGroup,
   workflow: Pick<IntakeWorkflow, 'plans'>,
 ): string {
-  if (!group.memberId) return hash(['intake-original', intakeId, sourceHash]);
-  const member = workflow.plans
-    .flatMap((plan) => plan.index.members || [])
-    .find((candidate) => candidate.memberId === group.memberId);
+  let member: IntakePackageMember | undefined;
+  if (group.memberId)
+    for (const plan of workflow.plans) {
+      member = plan.index.members?.find((candidate) => candidate.memberId === group.memberId);
+      if (member) break;
+    }
+  return identityOriginalFingerprintForMember(intakeId, sourceHash, group.memberId, member);
+}
+
+/** The member must come from a checked complete inventory lookup, including absence. */
+export function identityOriginalFingerprintForMember(
+  intakeId: string,
+  sourceHash: string,
+  memberId: string | null,
+  member: Pick<IntakePackageMember, 'locator' | 'sourceHash'> | undefined,
+): string {
+  if (!memberId) return hash(['intake-original', intakeId, sourceHash]);
   return hash([
     'intake-member-original',
     intakeId,
-    group.memberId,
+    memberId,
     member?.locator || null,
     member?.sourceHash || null,
   ]);
@@ -349,6 +405,9 @@ export function collectEvidencedIdentity(
   bannerBirthDates: string[][];
 } {
   const names: string[] = [];
+  const hasSubjectBoundary = subjectText !== undefined && subjectText !== null;
+  const printedBoundaryName = printedIdentityName(subjectText);
+  let contradictoryNameSuggestion = false;
   const subject = printedIdentityName(subjectText)
     ? originalSubjectBirthDateEvidence(subjectText!, subjectText!)
     : { dates: [], unreadable: false };
@@ -365,6 +424,16 @@ export function collectEvidencedIdentity(
     if (
       name &&
       printedIdentityName(name) === name &&
+      hasSubjectBoundary &&
+      (!printedBoundaryName ||
+        canonicalIdentityName(name) !== canonicalIdentityName(printedBoundaryName))
+    ) {
+      contradictoryNameSuggestion = true;
+      continue;
+    }
+    if (
+      name &&
+      printedIdentityName(name) === name &&
       !names.some((value) => canonicalIdentityName(value) === canonicalIdentityName(name))
     )
       names.push(name);
@@ -372,10 +441,11 @@ export function collectEvidencedIdentity(
     // reviewed with a host-derived suggestion; arbitrary model disagreement
     // does not create a second birth-date decision.
   }
-  if (names.length && subjectText !== undefined && subjectText !== null) {
+  if ((names.length || contradictoryNameSuggestion) && hasSubjectBoundary) {
     const printed = printedIdentityName(subjectText);
     if (
       !printed ||
+      contradictoryNameSuggestion ||
       names.some((name) => canonicalIdentityName(name) !== canonicalIdentityName(printed))
     ) {
       // A literal name elsewhere in a multi-person subject is not the patient.
@@ -438,8 +508,9 @@ export interface ExplicitIdentityResolutionOccurrence {
   candidateVersionId: string;
   proposalId: string | null;
   recordId: string;
-  issueIds: string[];
-  resolutions: IntakeIssueResolution[];
+  issueIds: Iterable<string>;
+  resolutions: Iterable<IntakeIssueResolution>;
+  latestResolution?: (issueId: string) => IntakeIssueResolution | undefined;
 }
 
 export interface CurrentIdentityReceiptBoundary {
@@ -455,7 +526,12 @@ export interface CurrentIdentityReceiptBoundary {
   verificationMode?: IntakeIdentityScope['verificationMode'];
   evidencedIdentity?: IntakeEvidencedIdentity;
   evidenceOriginalFingerprint: string | null;
-  membership: IntakeIdentityScope['membership'];
+  membership: IntakeIdentityScope['membership'] | SelectedIdentityMembership;
+}
+
+/** A complete selected report snapshot, never a presentation page. */
+export interface SelectedIdentityMembership {
+  retains(prior: Iterable<IdentityPolicyMember>): boolean;
 }
 
 function identityEvidenceCompatible(
@@ -488,10 +564,11 @@ function identityEvidenceCompatible(
 }
 
 function receiptMembershipIsRetained(
-  prior: IntakeIdentityScope['membership'],
-  current: IntakeIdentityScope['membership'],
+  prior: Iterable<IdentityPolicyMember>,
+  current: IntakeIdentityScope['membership'] | SelectedIdentityMembership,
 ): boolean {
-  return prior.every((priorMember) => {
+  if (!Array.isArray(current)) return current.retains(prior);
+  return selectedSequence(prior).every((priorMember) => {
     const currentMember = current.find(
       (member) =>
         member.candidateId === priorMember.candidateId &&
@@ -501,7 +578,7 @@ function receiptMembershipIsRetained(
       !!currentMember &&
       canonicalLiteral(currentMember.section || null) ===
         canonicalLiteral(priorMember.section || null) &&
-      priorMember.occurrences.every((priorOccurrence) =>
+      selectedSequence(priorMember.occurrences).every((priorOccurrence) =>
         currentMember.occurrences.some(
           (occurrence) => canonicalLiteral(occurrence) === canonicalLiteral(priorOccurrence),
         ),
@@ -516,7 +593,7 @@ function receiptMembershipIsRetained(
  * receipt contains the exact current candidate/version/record/issue target.
  */
 export function identityReceiptAppliesToCurrentBoundary(
-  receipt: IntakeIdentityReceipt,
+  receipt: IdentityPolicyReceipt,
   current: CurrentIdentityReceiptBoundary,
 ): boolean {
   const prior = receipt.scope;
@@ -545,7 +622,7 @@ export function identityReceiptAppliesToCurrentBoundary(
  * confirmed separately without allowing an older operation to cover them.
  */
 /** A family assignment is exact per retained candidate occurrence, never inferred from a name. */
-export function confirmedPersonReceipt({
+export function confirmedPersonReceipt<T extends IdentityPolicyReceipt>({
   receipts,
   boundary,
   candidateId,
@@ -553,18 +630,20 @@ export function confirmedPersonReceipt({
   proposalId,
   recordId,
   resolutions,
+  latestResolution,
   requiredIssueIds,
 }: {
-  receipts?: IntakeIdentityReceipt[];
+  receipts?: Iterable<T>;
   boundary: CurrentIdentityReceiptBoundary;
   candidateId: string;
   candidateVersionId: string;
   proposalId: string | null;
   recordId: string;
-  resolutions: IntakeIssueResolution[];
-  requiredIssueIds: string[];
-}): IntakeIdentityReceipt | undefined {
-  return receipts?.findLast((receipt) => {
+  resolutions: Iterable<IntakeIssueResolution>;
+  latestResolution?: (issueId: string) => IntakeIssueResolution | undefined;
+  requiredIssueIds: Iterable<string>;
+}): T | undefined {
+  return selectedSequence(receipts).findLast((receipt) => {
     if (
       receipt.outcome !== 'this_is_person' ||
       !receipt.assignedPerson ||
@@ -580,36 +659,41 @@ export function confirmedPersonReceipt({
     );
     return (
       !!target &&
-      requiredIssueIds.every((issueId) =>
-        (target.issueIds || [target.issueId]).includes(issueId),
+      selectedSequence(requiredIssueIds).every((issueId) =>
+        selectedSequence(target.issueIds || [target.issueId]).some((id) => id === issueId),
       ) &&
-      (target.issueIds || [target.issueId]).every((issueId) => {
-        const answer = resolutions.findLast((item) => item.issueId === issueId);
+      selectedSequence(target.issueIds || [target.issueId]).every((issueId) => {
+        const answer = latestResolution
+          ? latestResolution(issueId)
+          : selectedSequence(resolutions).findLast((item) => item.issueId === issueId);
         return answer?.operationId === receipt.operationId && answer.outcome === 'other_person';
       })
     );
   });
 }
 
-export function exactCurrentIdentityResolutionOperationId({
+export function exactCurrentIdentityResolutionOperationId<T extends IdentityPolicyReceipt>({
   receipts,
   occurrences,
   receiptApplies = () => true,
 }: {
-  receipts?: IntakeIdentityReceipt[];
-  occurrences: ExplicitIdentityResolutionOccurrence[];
-  receiptApplies?: (receipt: IntakeIdentityReceipt) => boolean;
+  receipts?: Iterable<T>;
+  occurrences: Iterable<ExplicitIdentityResolutionOccurrence>;
+  receiptApplies?: (receipt: T) => boolean;
 }): string | undefined {
-  if (!occurrences.length) return undefined;
+  let anyOccurrence = false;
   let latestReceiptIndex = -1;
   let latestOperationId: string | undefined;
   for (const occurrence of occurrences) {
-    if (!occurrence.issueIds.length) return undefined;
+    anyOccurrence = true;
+    if (!selectedSequence(occurrence.issueIds).some(() => true)) return undefined;
     for (const issueId of occurrence.issueIds) {
-      const resolution = occurrence.resolutions.findLast((item) => item.issueId === issueId);
+      const resolution = occurrence.latestResolution
+        ? occurrence.latestResolution(issueId)
+        : selectedSequence(occurrence.resolutions).findLast((item) => item.issueId === issueId);
       if (resolution?.outcome !== 'this_is_me' || !resolution.operationId) return undefined;
       const receiptIndex =
-        receipts?.findLastIndex((receipt) => {
+        selectedSequence(receipts).findLastIndex((receipt) => {
           if (receipt.operationId !== resolution.operationId || !receiptApplies(receipt))
             return false;
           const target = (receipt.scope.assignmentTargets || receipt.scope.targets).find(
@@ -619,7 +703,10 @@ export function exactCurrentIdentityResolutionOperationId({
               item.proposalId === occurrence.proposalId &&
               item.recordId === occurrence.recordId,
           );
-          return !!target && (target.issueIds || [target.issueId]).includes(issueId);
+          return (
+            !!target &&
+            selectedSequence(target.issueIds || [target.issueId]).some((id) => id === issueId)
+          );
         }) ?? -1;
       if (receiptIndex < 0) return undefined;
       if (receiptIndex > latestReceiptIndex) {
@@ -628,25 +715,25 @@ export function exactCurrentIdentityResolutionOperationId({
       }
     }
   }
-  return latestOperationId;
+  return anyOccurrence ? latestOperationId : undefined;
 }
 
 function receiptFor(
-  receipts: IntakeIdentityReceipt[] | undefined,
+  receipts: Iterable<IdentityPolicyReceipt> | undefined,
   groupId: string,
   groupVersionId: string,
   personFingerprint: string | undefined,
   originalFingerprint: string,
   evidence: IntakeEvidencedIdentity,
   subjectText: string | null,
-): IntakeIdentityReceipt | undefined {
+): IdentityPolicyReceipt | undefined {
   const subject = clean(subjectText);
-  const exactGroup = receipts?.findLast(
+  const exactGroup = selectedSequence(receipts).findLast(
     (receipt) =>
       receipt.scope.groupId === groupId && receipt.scope.groupVersionId === groupVersionId,
   );
   if (exactGroup) return exactGroup;
-  return receipts?.findLast((receipt) => {
+  return selectedSequence(receipts).findLast((receipt) => {
     if (
       personFingerprint &&
       receipt.scope.evidencedIdentity?.personFingerprint === personFingerprint
@@ -700,10 +787,10 @@ export function assessIdentityPolicy({
   people?: IdentityPolicyPersonSnapshot[];
   evidence: IntakeEvidencedIdentity;
   evidenceConflicts?: IntakeIdentityConflict[];
-  group: IntakeReportGroup | null;
+  group: IdentityBoundaryHeader | null;
   groupVersionId: string | null;
   originalFingerprint: string | null;
-  receipts?: IntakeIdentityReceipt[];
+  receipts?: Iterable<IdentityPolicyReceipt>;
   hasUnstructuredIdentityQuestion?: boolean;
   explicitlyConfirmedOperationId?: string;
   currentRefusal?: 'unknown' | 'other_person';
@@ -944,7 +1031,9 @@ export function assessIdentityPolicy({
   const explicitCandidate =
     explicitlyConfirmedOperationId && group && groupVersionId
       ? receiptFor(
-          receipts?.filter((candidate) => candidate.operationId === explicitlyConfirmedOperationId),
+          selectedSequence(receipts).filter(
+            (candidate) => candidate.operationId === explicitlyConfirmedOperationId,
+          ),
           group.id,
           groupVersionId,
           personFingerprint,
@@ -1161,7 +1250,7 @@ export function assessIdentityPolicy({
     };
   if (
     birthDate &&
-    receipts?.some(
+    selectedSequence(receipts).some(
       (prior) =>
         prior.scope.evidenceOriginalFingerprint === originalFingerprint &&
         prior.scope.evidencedIdentity?.birthDate &&
@@ -1267,8 +1356,8 @@ export function identityBoundaryRepairApplies(
           prior.candidateVersionId === target.candidateVersionId &&
           prior.proposalId === target.proposalId &&
           prior.recordId === target.recordId &&
-          (target.issueIds || [target.issueId]).every((issueId) =>
-            (prior.issueIds || [prior.issueId]).includes(issueId),
+          selectedSequence(target.issueIds || [target.issueId]).every((issueId) =>
+            selectedSequence(prior.issueIds || [prior.issueId]).some((id) => id === issueId),
           ),
       ),
     )

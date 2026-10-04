@@ -738,16 +738,21 @@ function requireDistinctPerson(
       'Another person already has this display name and icon. Choose a different display name or icon.',
     );
 }
-function createInner(db: Database, input: NoteValues): string {
+function createInner(
+  db: Database,
+  input: NoteValues,
+  preparedPerson?: { personId: string; icon?: string },
+): string {
   const kind = input.kind ?? 'note';
   if (typeof kind !== 'string' || !['note', 'historical', 'person'].includes(kind))
     throw new HttpError(400, 'INVALID_INPUT', 'Unknown note kind');
   const v = validateInput(db, input, { profile_json: '{}' }),
     id = input.id === undefined ? newId('note') : safeText(input.id, 'id'),
-    personId = kind === 'person' ? newId('person') : null,
+    personId = kind === 'person' ? preparedPerson?.personId || newId('person') : null,
     t = now();
   if (personId) {
     const name = v.title;
+    if (preparedPerson?.icon) v.person.icon = preparedPerson.icon;
     if (!v.person.icon) {
       const used = personDisplayIdentities(db);
       const choices = personIconCatalog.icons
@@ -953,18 +958,36 @@ export function createIntakeFamilyPersonInTransaction(
   db: Database,
   fullName: string,
   relationship?: string,
+  preparedPerson?: { noteId: string; personId: string; icon?: string },
 ) {
-  const id = createInner(db, {
-    kind: 'person',
-    title: fullName,
-    content: '',
-    person: {
-      fullName,
-      name: fullName,
-      tags: ['Family'],
-      ...(relationship ? { relationship } : {}),
+  if (
+    preparedPerson &&
+    (!/^note:[0-9a-f-]{36}$/i.test(preparedPerson.noteId) ||
+      !/^person:[0-9a-f-]{36}$/i.test(preparedPerson.personId) ||
+      db.prepare('SELECT 1 FROM notes WHERE id=?').get(preparedPerson.noteId) ||
+      db.prepare('SELECT 1 FROM people WHERE id=?').get(preparedPerson.personId))
+  )
+    throw new HttpError(
+      409,
+      'IDENTITY_SELECTION',
+      'The prepared family person destination changed',
+    );
+  const id = createInner(
+    db,
+    {
+      ...(preparedPerson ? { id: preparedPerson.noteId } : {}),
+      kind: 'person',
+      title: fullName,
+      content: '',
+      person: {
+        fullName,
+        name: fullName,
+        tags: ['Family'],
+        ...(relationship ? { relationship } : {}),
+      },
     },
-  });
+    preparedPerson,
+  );
   return getNote(db, id);
 }
 

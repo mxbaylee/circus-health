@@ -2,10 +2,21 @@ import { clearSourceContextClassificationCache } from './intake-source-context-c
 import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
+import { clearNativeOwnershipPlans } from './record-ownership-native.ts';
+import { clearPreparedClinicalProjections } from './intake-clinical-projection-plan.ts';
+import { clearIntakeLiteralSessions } from './intake-literal-session.ts';
+import { clearIntakeMappingSections } from './intake-model-mapping.ts';
+import { clearJournalActivityIndex } from './journal-activity-index.ts';
+import { clearIntakeCollectionEvidenceFragments } from './intake-evidence-fragment.ts';
+import { clearPreparedCollectionQueues } from './intake-queue-native.ts';
+import { clearCollectionReportQueues } from './intake-report-group-collection.ts';
+import { clearCollectionImportFeeds } from './intake-import-feed-collection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
+import { clearPackageSourceSession } from './intake-package-session.ts';
 import { sourceAssertionOwnership } from './source-assertion-ownership.ts';
 import { handleRecordOwnershipRoute } from './record-ownership-routes.ts';
 import { recordOwner } from './record-owner.ts';
+import { clinicalImportCorrectionHistory } from './clinical-import-corrections.ts';
 import { readProfileRegistry, recoverProfileDeletions } from './profile-registry.ts';
 import { diagnosticRoute } from '../shared/import-diagnostic-route.ts';
 import { createProfileLifecycle } from './profile-lifecycle.ts';
@@ -17,8 +28,12 @@ import { createNoteExports } from './note-exports.ts';
 import { personFilterOptions } from './collection-filters.ts';
 import { personSourceEvidence } from './person-source-evidence.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { listIntakes } from './intake.ts';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { iterateIntakeEnvelopeText } from './intake-collection-envelope.ts';
+import { listIntakeReads, intakeConversionChatId } from './intake.ts';
 import { exportImportAttribution } from './intake-attribution.ts';
+import { prepareIntakeAttributionSources } from './intake-attribution-source.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
 import type { Database } from './database.ts';
 import type { LinkTargetType } from '../shared/api.ts';
@@ -219,6 +234,11 @@ export function createApp({
           ? draftRepairActions.apply(proposal, context)
           : mappingActions.apply(proposal, context);
       },
+      async applyAsync(proposal, context) {
+        return proposal.kind === 'intake_draft_repair'
+          ? draftRepairActions.applyAsync(proposal, context)
+          : mappingActions.apply(proposal, context);
+      },
       reconcile(proposal, context) {
         return proposal.kind === 'intake_draft_repair'
           ? draftRepairActions.reconcile(proposal, context)
@@ -347,11 +367,16 @@ export function createApp({
         const eventArchive = await diagnostics.exportArchive(profileId, salt);
         let attribution: unknown;
         try {
-          const intakes = listIntakes(db, profileId, { visibility: 'all', limit: 100 }, root);
-          const metadata = assistant.attributionMetadata(profileId, intakes.data);
+          const intakes = listIntakeReads(db, profileId, { visibility: 'all', limit: 100 }, root);
+          const metadata = assistant.attributionMetadata(
+            profileId,
+            intakes.data.map((intake) => ({
+              conversionChatId: intakeConversionChatId(db, profileId, intake.id),
+            })),
+          );
           attribution = {
             ...exportImportAttribution({
-              intakes: intakes.data,
+              intakes: prepareIntakeAttributionSources(db, root, profileId, intakes.data),
               chats: metadata.chats,
               selectionIncomplete: intakes.total > intakes.data.length,
               historyIncomplete: metadata.omittedChats > 0 || metadata.unavailableChats > 0,
@@ -400,7 +425,13 @@ export function createApp({
           else if (parts[3] === 'retry') respond(assistant.retry(profileId, action));
           else if (parts[3] === 'cancel') respond(assistant.cancel(profileId, action));
           else if (parts[3] === 'apply')
-            respond(assistant.apply(profileId, action, (await jsonBody(req)).proposalId as string));
+            respond(
+              await assistant.applyRead(
+                profileId,
+                action,
+                (await jsonBody(req)).proposalId as string,
+              ),
+            );
           else throw new HttpError(404, 'NOT_FOUND', 'Assistant action not found');
         } else throw new HttpError(404, 'NOT_FOUND', 'Assistant resource not found');
         return;
@@ -675,11 +706,44 @@ export function createApp({
         }
         if (resource === 'sources') {
           if (id && action === 'content') {
-            const f = q.getSourceFile(db, id),
+            const f = q.sourceFileContentHeader(db, id),
               path = a.profileFile(root, f.path, profileId);
             serveOriginal(res, path, f.mimeType, f.path.split('/').pop());
-          } else if (id) respond(q.getSourceFile(db, id));
-          else list(q.sourceFiles(db, params));
+          } else if (id && action === 'operational-envelope') {
+            const header = q.sourceFileReference(db, id);
+            if (header.kind !== 'intake_original')
+              throw new HttpError(
+                400,
+                'INVALID_INPUT',
+                'Operational envelope export requires an original intake',
+              );
+            const iterator = iterateIntakeEnvelopeText(db, { id });
+            // Validate selection and the first fragment before starting a
+            // download. Later missing evidence aborts the stream; partial JSON
+            // can never become a completed retained export.
+            const first = iterator.next();
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            res.setHeader('Content-Disposition', 'attachment; filename="retained-intake.json"');
+            function* chunks() {
+              if (!first.done) yield first.value;
+              yield* iterator;
+            }
+            await pipeline(
+              Readable.from(chunks(), { objectMode: false, highWaterMark: 8192 }),
+              res,
+            );
+          } else if (id) {
+            const view = q.sourceRecordFileView(params),
+              reference = q.sourceFileReference(db, id);
+            const native = reference.detailsUrl.endsWith('/operational-envelope');
+            if (native && params.has('fileView') && view === 'full')
+              throw new HttpError(
+                400,
+                'INVALID_INPUT',
+                'Use the retained operational envelope export for complete native intake details',
+              );
+            respond(view === 'reference' || native ? reference : q.getSourceFile(db, id));
+          } else list(q.sourceFiles(db, params));
           return;
         }
         if (resource === 'source-records') {
@@ -702,6 +766,18 @@ export function createApp({
                   : q.getSourceRecord(db, id, { fileView: 'full' }),
               )
             : list(q.sourceRecords(db, params));
+          return;
+        }
+        if (resource === 'record-import-corrections' && !id) {
+          respond(
+            clinicalImportCorrectionHistory(db, {
+              profileId,
+              kind: params.get('kind'),
+              recordId: params.get('recordId'),
+              after: params.get('after'),
+              limit: params.get('limit'),
+            }),
+          );
           return;
         }
         if (resource === 'record-owner') {
@@ -1010,8 +1086,18 @@ export function createApp({
       for (const [profileId, db] of dbs) {
         void disposePdfEvidenceSessions(profileId);
         cleanup(() => diagnostics.clear(profileId));
+        cleanup(() => clearPackageSourceSession(db));
         cleanup(() => clearIntakeStateCache(db));
         cleanup(() => clearIntakeLookupCache(db));
+        cleanup(() => clearNativeOwnershipPlans(db));
+        cleanup(() => clearPreparedClinicalProjections(db));
+        cleanup(() => clearIntakeLiteralSessions(db));
+        cleanup(() => clearIntakeMappingSections(db));
+        cleanup(() => clearJournalActivityIndex(root, profileId));
+        cleanup(() => clearIntakeCollectionEvidenceFragments(db));
+        cleanup(() => clearPreparedCollectionQueues(db));
+        cleanup(() => clearCollectionReportQueues(db));
+        cleanup(() => clearCollectionImportFeeds(db));
         cleanup(() => clearSourceContextClassificationCache(db));
         cleanup(() => clearSourceTextProjectionCache(db));
         cleanup(() => clearSourceDetailsSearchCache(db));

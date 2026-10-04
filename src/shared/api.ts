@@ -148,6 +148,9 @@ export interface SourceFileReference extends Omit<SourceFile, 'details'> {
   detailsUrl: string;
   detailsIncluded: false;
 }
+/** Native paged authorities return a header reference rather than a complete
+ * operational envelope. Legacy full DTOs retain their existing details field. */
+export type SourceFileListItem = SourceFile | SourceFileReference;
 export interface SourceRecord {
   archived?: boolean;
   id: string;

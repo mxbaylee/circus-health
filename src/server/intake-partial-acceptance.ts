@@ -2,12 +2,17 @@ import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError, now } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
-import { createIntakeReviewSession, flushIntake, getIntake, intakeTransaction } from './intake.ts';
+import { createIntakeReviewSession, flushIntake, intakeTransaction } from './intake.ts';
 import { acceptanceOwner, applyAcceptanceGroup } from './intake-report-acceptance.ts';
 import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { effectiveKnownNames } from './name-associations.ts';
 import { getNote } from './notes.ts';
 import { canonicalIdentityName, possiblySameIdentityName } from '../shared/self-identity.ts';
+import { intakeSourceVersion } from './intake-state-access.ts';
+import {
+  hasNativeAcceptanceBlock,
+  applyNativeAcceptanceGroup,
+} from './intake-report-acceptance-native.ts';
 import type {
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceBlock,
@@ -35,6 +40,107 @@ type Manifest = {
   entries: Entry[];
   groups: number[][];
 };
+type ReviewSource = { filename: string; review(proposalId: string | null): IntakeReview };
+type AcceptanceStep = {
+  request: IntakeReportAcceptanceRequest;
+  fingerprint: string;
+  retainResult: NonNullable<Parameters<typeof applyAcceptanceGroup>[5]>;
+  reviews: Map<string, IntakeReview | null>;
+};
+/** A bounded set of selected proposal reviews, never an intake workflow page. */
+async function prepareNativePartialReviews(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  request: IntakeReportAcceptanceRequest,
+) {
+  const { hasIntakeCollectionEnvelope } = await import('./intake-collection-envelope.ts');
+  const { buildIntakeCollectionEnvelope } = await import('./intake-envelope-build.ts');
+  const { prepareRetainedPlanAccess } = await import('./intake-retained-plan.ts');
+  const { prepareCollectionWorkflowReadiness } = await import('./intake-workflow-readiness.ts');
+  const { prepareCollectionClinicalReview, prepareCollectionClinicalReviewDependencies } =
+    await import('./intake-review-collection-host.ts');
+  const { intakeSourceMetadata } = await import('./intake-state-access.ts');
+  const { activeMappingRules } = await import('./clinical-import.ts');
+  const { workflowHash } = await import('./intake-workflow.ts');
+  const { getIntakeRead } = await import('./intake.ts');
+  const { intakeFilenameDisplay } = await import('../shared/intake-summary.ts');
+  const prepared = new Map<string, ReviewSource | Error>();
+  const sessions: Extract<
+    ReturnType<typeof prepareCollectionClinicalReview>,
+    { status: 'ready' }
+  >['session'][] = [];
+  const close = () => {
+    for (const session of sessions) session.close();
+    sessions.length = 0;
+  };
+  try {
+    for (const id of new Set(request.blocks.map((block) => block.intakeId))) {
+      try {
+        if (!hasIntakeCollectionEnvelope(db, { id }))
+          await buildIntakeCollectionEnvelope(db, { id });
+        await prepareRetainedPlanAccess(db, profileId, id);
+        const currentMappingVersion = () =>
+          workflowHash(
+            activeMappingRules(
+              db,
+              intakeSourceMetadata(db, id).metadata?.sourceProviderId ||
+                String(
+                  db.prepare('SELECT provider_id FROM source_files WHERE id=?').get(id)
+                    ?.provider_id,
+                ),
+            ),
+          );
+        const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, id, {
+          mappingVersion: currentMappingVersion(),
+          currentMappingVersion,
+        });
+        if (ready.state !== 'ready')
+          throw new HttpError(
+            409,
+            'WORKFLOW_PREPARATION_REQUIRED',
+            'Prepare this report before approving its records',
+          );
+        const reviews = new Map<string | null, IntakeReview>();
+        for (const block of request.blocks.filter((block) => block.intakeId === id)) {
+          if (reviews.has(block.proposalId)) continue;
+          await prepareCollectionClinicalReviewDependencies(
+            db,
+            root,
+            profileId,
+            id,
+            block.proposalId,
+          );
+          const result = prepareCollectionClinicalReview(db, root, profileId, id, block.proposalId);
+          if (result.status !== 'ready')
+            throw new HttpError(
+              409,
+              'REVIEW_PREPARATION_REQUIRED',
+              'Prepare this selected clinical evidence before accepting it',
+            );
+          sessions.push(result.session);
+          reviews.set(block.proposalId, result.session.review);
+        }
+        prepared.set(id, {
+          filename: intakeFilenameDisplay(getIntakeRead(db, root, profileId, id)),
+          review(proposalId) {
+            const review = reviews.get(proposalId);
+            if (!review)
+              throw new HttpError(404, 'NOT_FOUND', 'Selected proposal was not prepared');
+            return review;
+          },
+        });
+      } catch (error) {
+        if (!(error instanceof HttpError) || [401, 403].includes(error.status)) throw error;
+        prepared.set(id, error);
+      }
+    }
+    return { sources: prepared, close };
+  } catch (error) {
+    close();
+    throw error;
+  }
+}
 const prefix = 'intake_partial_acceptance:v1:';
 const active = new WeakMap<DatabaseSync, Set<string>>();
 const activeFor = (db: DatabaseSync) => {
@@ -132,6 +238,7 @@ function initializePartialSelection(
   profileId: string,
   request: IntakeReportAcceptanceRequest,
   fingerprint: string,
+  preparedSources?: Map<string, ReviewSource | Error>,
 ): {
   manifest: Manifest;
   replayed: boolean;
@@ -169,7 +276,7 @@ function initializePartialSelection(
     // Unknown/stale inputs stay conservative and are rejected within their own boundary.
     const reportNames = new Map<string, string>();
     const reviewRecords = new Map<string, Map<string, IntakeReview['records'][number]>>();
-    const sessions = new Map<string, ReturnType<typeof createIntakeReviewSession> | Error>();
+    const sessions = new Map<string, ReviewSource | Error>(preparedSources);
     const dependencies = entries.map((entry) => {
       const keys = new Set<string>();
       for (const comparison of entry.selection.comparisons || [])
@@ -294,36 +401,94 @@ export async function acceptPartialSelectionAsync(
   request: IntakeReportAcceptanceRequest,
   fingerprint: string,
 ): Promise<IntakeReportAcceptanceResult> {
-  const { manifest, replayed, reviews, noteVersions, identityStamps } = initializePartialSelection(
-    db,
-    root,
-    profileId,
-    request,
-    fingerprint,
-  );
-  if (replayed) return reconcileManifest(db, root, profileId, manifest);
-  const operations = activeFor(db);
-  operations.add(request.operationId);
+  let preparedSources: Awaited<ReturnType<typeof prepareNativePartialReviews>> | undefined;
   try {
-    const steps = processManifestSteps(
-      db,
-      root,
-      profileId,
-      manifest,
-      false,
-      reviews,
-      noteVersions,
-      identityStamps,
-    );
-    let step = steps.next();
-    while (!step.done) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      acceptanceOwner(db, profileId);
-      step = steps.next();
+    if (hasNativeAcceptanceBlock(db, request)) {
+      const preparing = activeFor(db);
+      if (preparing.has(request.operationId))
+        throw new HttpError(
+          409,
+          'REPORT_ACCEPTANCE_IN_PROGRESS',
+          'This exact save is still processing. Check its receipt again.',
+        );
+      preparing.add(request.operationId);
+      try {
+        const { prepareIntakeLookupIndices } = await import('./intake-lookup-projection.ts');
+        const { retainedReportAcceptance } = await import('./intake-state-access.ts');
+        await prepareIntakeLookupIndices(db);
+        if (retainedReportAcceptance(db, request.operationId))
+          throw new HttpError(
+            409,
+            'OPERATION_CONFLICT',
+            'Operation ID already belongs to a different acceptance mode.',
+          );
+        if (!read<Manifest>(db, request.operationId))
+          preparedSources = await prepareNativePartialReviews(db, root, profileId, request);
+      } finally {
+        preparing.delete(request.operationId);
+      }
     }
-    return step.value;
+    const { manifest, replayed, reviews, noteVersions, identityStamps } =
+      initializePartialSelection(
+        db,
+        root,
+        profileId,
+        request,
+        fingerprint,
+        preparedSources?.sources,
+      );
+    if (replayed) return reconcileManifest(db, root, profileId, manifest);
+    const operations = activeFor(db);
+    operations.add(request.operationId);
+    try {
+      const steps = processManifestSteps(
+        db,
+        root,
+        profileId,
+        manifest,
+        false,
+        reviews,
+        noteVersions,
+        identityStamps,
+      );
+      let step = steps.next();
+      while (!step.done) {
+        try {
+          if (step.value) {
+            if (hasNativeAcceptanceBlock(db, step.value.request))
+              await applyNativeAcceptanceGroup(
+                db,
+                root,
+                profileId,
+                step.value.request,
+                step.value.fingerprint,
+                { retainResult: step.value.retainResult, reviewed: step.value.reviews },
+              );
+            else
+              applyAcceptanceGroup(
+                db,
+                root,
+                profileId,
+                step.value.request,
+                step.value.fingerprint,
+                step.value.retainResult,
+                step.value.reviews,
+              );
+          } else {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            acceptanceOwner(db, profileId);
+          }
+          step = steps.next();
+        } catch (error) {
+          step = steps.throw(error);
+        }
+      }
+      return step.value;
+    } finally {
+      operations.delete(request.operationId);
+    }
   } finally {
-    operations.delete(request.operationId);
+    preparedSources?.close();
   }
 }
 export function getPartialAcceptance(
@@ -362,7 +527,23 @@ function processManifest(
     identityStamps,
   );
   let step = steps.next();
-  while (!step.done) step = steps.next();
+  while (!step.done) {
+    try {
+      if (step.value)
+        applyAcceptanceGroup(
+          db,
+          root,
+          profileId,
+          step.value.request,
+          step.value.fingerprint,
+          step.value.retainResult,
+          step.value.reviews,
+        );
+      step = steps.next();
+    } catch (error) {
+      step = steps.throw(error);
+    }
+  }
   return step.value;
 }
 function* processManifestSteps(
@@ -374,7 +555,7 @@ function* processManifestSteps(
   reviews: Map<string, IntakeReview | null>,
   noteVersions: Map<string, number>,
   identityStamps: Map<string, string>,
-): Generator<void, IntakeReportAcceptanceResult> {
+): Generator<AcceptanceStep | void, IntakeReportAcceptanceResult> {
   const expectedVersions = new Map<string, number>();
   for (const entry of manifest.entries) {
     const review = reviews.get(canonicalLiteral([entry.block.intakeId, entry.block.proposalId]));
@@ -401,7 +582,7 @@ function* processManifestSteps(
       last.push(group);
     else units.push([group]);
   }
-  function run(groups: number[][]): boolean {
+  function* run(groups: number[][]): Generator<AcceptanceStep, boolean> {
     const group = groups.flat();
     acceptanceOwner(db, profileId);
     if (group.every((index) => read(db, itemKey(manifest, index)))) return true;
@@ -430,7 +611,7 @@ function* processManifestSteps(
         if (!currentVersions.has(entry.block.intakeId))
           currentVersions.set(
             entry.block.intakeId,
-            getIntake(db, root, profileId, entry.block.intakeId).version,
+            intakeSourceVersion(db, entry.block.intakeId).version,
           );
         if (expected !== undefined && currentVersions.get(entry.block.intakeId) !== expected)
           throw new HttpError(
@@ -464,13 +645,10 @@ function* processManifestSteps(
             );
         }
       }
-      applyAcceptanceGroup(
-        db,
-        root,
-        profileId,
-        { operationId, blocks: [...blocks.values()] },
+      yield {
+        request: { operationId, blocks: [...blocks.values()] },
         fingerprint,
-        (receipt) => {
+        retainResult: (receipt) => {
           const receiptBlocks = new Map(
             receipt.receipts.map((block) => [
               canonicalLiteral([block.intakeId, block.proposalId]),
@@ -513,12 +691,9 @@ function* processManifestSteps(
           }
         },
         reviews,
-      );
+      };
       for (const block of blocks.values())
-        expectedVersions.set(
-          block.intakeId,
-          getIntake(db, root, profileId, block.intakeId).version,
-        );
+        expectedVersions.set(block.intakeId, intakeSourceVersion(db, block.intakeId).version);
       return true;
     } catch (error) {
       // A published head with a lost acknowledgement is unknown, never a failure.
@@ -529,7 +704,7 @@ function* processManifestSteps(
         error instanceof HttpError && [400, 404, 409, 413, 422].includes(error.status);
       if (reviewFailure && groups.length > 1 && error.code !== 'REPORT_CHANGED_DURING_SAVE') {
         const middle = Math.floor(groups.length / 2);
-        return run(groups.slice(0, middle)) && run(groups.slice(middle));
+        return (yield* run(groups.slice(0, middle))) && (yield* run(groups.slice(middle)));
       }
       const affected = reviewFailure
         ? group
@@ -562,7 +737,7 @@ function* processManifestSteps(
     }
   }
   for (const unit of units) {
-    if (!run(unit)) break;
+    if (!(yield* run(unit))) break;
     yield;
   }
   return manifestResult(db, root, profileId, manifest, replayed);

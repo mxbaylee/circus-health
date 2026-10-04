@@ -11,6 +11,8 @@ import {
   intakeNamespace,
   limits,
   parseIntakeHead,
+  parseIntakeCollectionHead,
+  COLLECTION_FORMAT,
   validateIntakeIdentity,
   type IntakeStateIdentity,
 } from './intake-state-evidence.ts';
@@ -218,6 +220,8 @@ function identity(db: DatabaseSync, source: IntakeEnvelopeSource): IntakeStateId
 export interface IntakeEnvelopeBinding {
   key: string | null;
   head: string | null;
+  /** Present only for V4. Receipt/build churn preserves this logical binding. */
+  logicalHead?: string;
 }
 /** Small selected-head validation lets warm derived readers avoid loading intake views. */
 export function intakeEnvelopeAuthorityBinding(
@@ -234,6 +238,14 @@ export function intakeEnvelopeAuthorityBinding(
   if (!status?.configured || status.dirty) fail('requires configured current accepted authority');
   const key = intakeNamespace(selected) + 'head';
   const head = db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
+  if (
+    typeof head === 'string' &&
+    Buffer.byteLength(head) <= 4096 &&
+    (parse(head) as Record<string, unknown>)?.format === COLLECTION_FORMAT
+  ) {
+    const checked = parseIntakeCollectionHead(head, selected)!;
+    return { key, head, logicalHead: JSON.stringify(checked.logical) };
+  }
   if (!parseIntakeHead(head, selected, limits())) return fail('missing selected intake head');
   return { key, head: head as string };
 }
@@ -267,18 +279,27 @@ function selectedEnvelope(
   db: DatabaseSync,
   source: IntakeEnvelopeSource,
 ): { state: StateMaterialization; envelope: IntakeEnvelopeMaterialization } {
-  const state = createIntakeStateStorage(db, identity(db, source)).readMaterialization();
+  const storage = createIntakeStateStorage(db, identity(db, source));
+  const selected = intakeEnvelopeAuthorityBinding(db, source);
+  const state =
+    selected.logicalHead === undefined
+      ? storage.readMaterialization()
+      : storage.collections.readLegacyMaterialization();
   if (!state) return fail('missing selected envelope');
   const prior = materializedEnvelopes.get(state);
   if (prior && prior.detailsJson === source.details_json)
     return { state, envelope: prior.envelope };
-  const selected = validateRepresentation(source.details_json!, state.value, state.serialized);
+  const representation = validateRepresentation(
+    source.details_json!,
+    state.value,
+    state.serialized,
+  );
   const mode = intakeEnvelopeMode(source.details_json);
-  if (mode === 'raw') freezeEnvelope(selected.value);
+  if (mode === 'raw') freezeEnvelope(representation.value);
   const result = Object.freeze({
     mode,
-    value: selected.value,
-    text: selected.text,
+    value: representation.value,
+    text: representation.text,
     fingerprint: mode === 'normalized' ? state.fingerprint : null,
   });
   materializedEnvelopes.set(state, { detailsJson: source.details_json!, envelope: result });

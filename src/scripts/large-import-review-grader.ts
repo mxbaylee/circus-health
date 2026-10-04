@@ -226,6 +226,8 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
     duplicateOccurrences = 0;
   for (const review of input.reviews)
     for (const record of review.records) {
+      // This oracle requires inspected membership; an unloaded reference cannot qualify it.
+      const reportGroups = Array.isArray(record.reportGroups) ? record.reportGroups : [];
       observedRecords++;
       const occurrence = JSON.stringify([review.intakeId, review.proposalId, record.id]);
       if (occurrences.has(occurrence)) duplicateOccurrences++;
@@ -258,15 +260,13 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
         else for (const page of located) pages.add(page);
       }
       if (expected.pages.some((page) => !pages.has(page))) provenance.add('originalPages');
-      if (record.reportGroups?.length !== 1) {
+      if (reportGroups.length !== 1) {
         provenance.add('reportMembership');
         unresolved.add(expected.key);
       }
       const bound = input.people[person.key];
       const selfAuthority =
-        record.reportGroups?.length === 1
-          ? byGroup.get(record.reportGroups[0]!.groupId)
-          : undefined;
+        reportGroups.length === 1 ? byGroup.get(reportGroups[0]!.groupId) : undefined;
       const selfIdentity = selfAuthority?.identity;
       const selfScope = selfIdentity?.scope;
       // Normal Self confirmation stores subject:self without a personId or
@@ -313,7 +313,7 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
             ),
           ) &&
         memberships
-          .get(JSON.stringify([selfAuthority.retained.id, record.reportGroups![0]!.groupVersionId]))
+          .get(JSON.stringify([selfAuthority.retained.id, reportGroups[0]!.groupVersionId]))
           ?.has(
             occurrenceKey(
               review.proposalId,
@@ -334,7 +334,7 @@ export function gradeLargeImportReview(input: LargeImportReviewInput) {
         ownership.add('subject');
       if (record.mapping.subject === 'other' && bound?.noteId === 'person-note:self')
         ownership.add('subject');
-      for (const reference of record.reportGroups ?? []) {
+      for (const reference of reportGroups) {
         const authority = byGroup.get(reference.groupId);
         if (!authority) {
           provenance.add('reportAuthority');
