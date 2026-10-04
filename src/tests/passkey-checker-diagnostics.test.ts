@@ -57,6 +57,8 @@ test('diagnostics describe shape and bounded length without decoding or retainin
     requestMode: 'eval',
     inputShape: 'array-buffer',
     inputLength: 32,
+    extensionShape: 'object',
+    resultsShape: 'object',
     extensionPresent: true,
     resultsPresent: true,
     outputShape: 'string',
@@ -67,8 +69,66 @@ test('diagnostics describe shape and bounded length without decoding or retainin
     requestMode: 'evalByCredential',
     inputShape: 'array-buffer',
     inputLength: 32,
+    extensionShape: 'absent',
+    resultsShape: 'absent',
     extensionPresent: false,
     resultsPresent: false,
     outputShape: 'absent',
   });
+});
+test('actionable diagnostics reject unknown names, rules, stages, counts and unsafe shapes', () => {
+  const base = { requestMode: 'eval', inputShape: 'array-buffer', inputLength: 32 };
+  const extra = {
+    operation: 'confirm',
+    stage: 'native-get',
+    nativeErrorName: 'TypeError',
+    nativeErrorCategory: 'js-name',
+    applicationError: 'unknown-error',
+    validationRule: 'selected-credential',
+    requestCredentialMatched: true,
+    allowCredentialCount: 1,
+    excludedCredentialCount: 1,
+    userIdLength: 32,
+    credentialIdShape: 'array-buffer',
+    credentialIdLength: 2,
+    extensionShape: 'null',
+    resultsShape: 'absent',
+    diagnosticsUnavailable: true,
+  };
+  assert.equal(isPrfDiagnostics({ ...base, ...extra }), true);
+  assert.deepEqual(projectPrfDiagnostics({ ...base, ...extra, privateDump: 'fictional-secret' }), {
+    ...base,
+    ...extra,
+  });
+  for (const field of [
+    { operation: 'private' },
+    { stage: 'private' },
+    { validationRule: 'private' },
+    { nativeErrorName: 'private credential dump' },
+    { nativeErrorCategory: 'Error' },
+    { applicationError: 'private' },
+    { allowCredentialCount: 3 },
+    { excludedCredentialCount: -1 },
+    { userIdLength: 65 },
+    { credentialIdLength: 65_537 },
+    { extensionShape: 'private' },
+    { resultsShape: {} },
+    { diagnosticsUnavailable: 'yes' },
+  ]) {
+    assert.equal(projectPrfDiagnostics({ ...base, ...field }), undefined);
+    assert.equal(isPrfDiagnostics({ ...base, ...field }), false);
+  }
+  const proxy = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor() {
+        throw new Error('fictional-secret');
+      },
+      getPrototypeOf() {
+        throw new Error('fictional-secret');
+      },
+    },
+  );
+  assert.equal(projectPrfDiagnostics(proxy), undefined);
+  assert.equal(isPrfDiagnostics(proxy), false);
 });
