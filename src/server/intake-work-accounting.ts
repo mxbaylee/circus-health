@@ -65,6 +65,8 @@ const hostTemplate = {
   reviewIssuePolicyWrittenBytes: 0,
   reviewIssuePolicyReadBytes: 0,
   reviewIssuePolicyPeakValueBytes: 0,
+  // Public full source-text read attempts, including unavailable/refused calls.
+  sourceTextReadCalls: 0,
   sourceAttentionPreparedSources: 0,
   sourceAttentionReturnedSources: 0,
   reviewQuestionTokenBytes: 0,

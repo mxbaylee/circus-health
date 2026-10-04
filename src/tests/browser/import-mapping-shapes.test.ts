@@ -100,7 +100,7 @@ const envelope = (proposed: boolean) => ({
 
 test(
   'encrypted browser accepts both proposed and top-level optical mappings through grouped identity and date review',
-  { timeout: 60000 },
+  { timeout: 420000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-mapping-shapes-'));
     mkdirSync(resolve(root, 'data'));

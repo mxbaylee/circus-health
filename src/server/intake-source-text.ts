@@ -1,3 +1,4 @@
+import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { readPreparedSourceAttention } from './intake-source-attention.ts';
 import { IntakeStateManifest } from './intake-state-manifest.ts';
 import { intakeSourceMetadata } from './intake-state-access.ts';
@@ -743,6 +744,7 @@ export function getIntakeSourceText(
   intakeId: string,
   revisionId?: string,
 ): IntakeSourceText {
+  withIntakeWork(db, 'warm', () => recordIntakeWork('sourceTextReadCalls'));
   const row = source(db, root, profileId, intakeId),
     id = revisionId ?? currentIntakeSourceTextRevisionId(db, profileId, intakeId);
   return id

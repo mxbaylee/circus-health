@@ -398,6 +398,41 @@ fallback, page rendering, and embedded-asset behavior retain their existing
 policies. An unconverted source returns an explicit pending model scope and does
 not migrate as a side effect of a read.
 
+For a selected native PDF, one evidence result can reuse its bounded model
+summary and previously completed validation of its current source-text revision
+during the same read. The private receipt follows that actual result. It retains
+an encoded model summary of at most 16 KiB and fixed source, profile, mapping,
+revision and accepted-head bindings; it retains no text graph, page history,
+iterator or review session. Each model emission, including a later raster
+fallback, receives freshly parsed values. The per-result bound does not bound
+the number of live caller results.
+
+The required source and model checks still run before worker I/O. A reusable text
+receipt additionally requires completed validation of the current source-text
+revision before worker I/O. Reuse rechecks cancellation, source and mapping
+bindings, retained-original integrity and current accepted physical authority,
+then the original raw database witness. A changed witness found before selecting
+reuse takes the existing fresh path; failed verification or drift after selection
+refuses the operation. No failed guard becomes a cache miss. A source-text capture
+cannot certify its newly published revision using an earlier read. Legacy,
+pending, unavailable and ineligible results retain their existing validation
+paths and literal page, parent and embedded-child routing.
+
+The `sourceTextReadCalls` work counter records entry into the public full
+source-text reader, including unavailable and rejected attempts. It records an
+attempt, not a completed graph validation. Same-database reconstruction keeps
+its existing attribution, and a nested read for another database restores the
+outer attribution before returning.
+
+Matched fictional 4- and 16-page reads reduced native model-summary construction
+from 8 to 4 and 32 to 16, and complete source-text validation from 8 to 4 and 32
+to 16. PDF worker reads remained 4 and 16. These measured spans include evidence
+reading and its actual post-read validation; they exclude setup and surrounding
+assistant transport and plan work. Added binding hashes, raw witnesses, original
+metadata checks, serialization and fresh parsing remain required work. These
+counts establish a reduction in the named reads, not whole-import latency,
+physical disk cost, recovery or provider qualification.
+
 Native navigation uses a separate cursor bound to the source and selected index.
 Both the public navigation endpoint and assistant search/follow dispatch use
 this contract for native sources. Continue a search with `nextCursor` as `cursor`,
@@ -551,6 +586,14 @@ The original owner, raw database generation, selected view and consumed physical
 files remain pinned. Missing proof and fresh transaction callers use the original
 traversal; a previously pinned proof cannot be revived by fallback. Valid oversized
 metadata also uses the original traversal without introducing a new refusal limit.
+
+The verified prefix belongs to read preparation. Clinical projection copies the
+same checked source-scope adapter without the optional prefix, performing the
+complete original traversal after its own derived maintenance and inside
+speculative transactions. Source, view, grounding, physical artifact-union and
+plan-current guards remain required, including rechecks against earlier block
+writes. This neither refreshes a failed prefix proof nor grants SQL-change credit.
+Projection retains the original traversal cost.
 
 Repeated handles share one prefix while evaluating their own grounding proofs.
 Interleaved work uses independent original traversal; changed scratch triggers a

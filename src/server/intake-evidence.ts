@@ -1,5 +1,8 @@
 import { currentClinicalOperation } from './clinical-operation.ts';
 import { intakeSourceMetadata } from './intake-state-access.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { collectionModelIntakePins } from './intake-model-collection-backend.ts';
+import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { HttpError } from './database.ts';
 import { isRetainOnlyIntake } from './intake-source-policy.ts';
 import { currentIntakeSourceTextRevisionId, getIntakeSourceText } from './intake-source-text.ts';
@@ -22,6 +25,7 @@ import {
   getIntake,
   readIntake,
   getIntakeEvidenceHeader,
+  verifyIntakeOriginal,
   readIntakeLiteralWindow,
 } from './intake.ts';
 import {
@@ -77,6 +81,84 @@ interface EvidenceContext {
   diagnostics?: ImportDiagnosticSink;
   /** Host-selected paged evidence contract; never copied from tool arguments. */
   pagedContext?: boolean;
+}
+
+type ValidatedText = { stamp: string; revisionId: string; sourceHash: string };
+type NativePdfReceipt = {
+  context: EvidenceContext;
+  stamp: string;
+  binding: string;
+  mappingVersion: string;
+  encodedModel: string;
+  text?: ValidatedText;
+};
+type PdfMediaResult<T> = T &
+  ('imageContent' extends keyof T ? object : { imageContent?: undefined }) &
+  ('pdfContent' extends keyof T ? object : { pdfContent?: undefined }) &
+  ('pdfFallback' extends keyof T ? object : { pdfFallback?: undefined });
+// Receipts follow one actual result, including each separately emitted fallback.
+// They never keep a revision graph or a reader/session alive.
+const nativePdfReceipts = new WeakMap<object, NativePdfReceipt>();
+const countedJson = (db: DatabaseSync, value: unknown) =>
+  withIntakeWork(db, 'warm', () => {
+    const encoded = JSON.stringify(value);
+    recordIntakeWork('serializationCalls');
+    recordIntakeWork('serializedBytes', Buffer.byteLength(encoded));
+    return encoded;
+  });
+function pdfReceiptBinding(context: EvidenceContext, mappingVersion: string) {
+  const { db, root, profileId, id } = context;
+  context.assertRunning?.();
+  const header = getIntakeEvidenceHeader(db, root, profileId, id),
+    pins = collectionModelIntakePins(db, { id }, mappingVersion),
+    revision = currentIntakeSourceTextRevisionId(db, profileId, id);
+  if ([header.filename, header.providerId].some((value) => Buffer.byteLength(value) > 4096))
+    throw Error('Native PDF receipt source metadata changed beyond its bound');
+  verifyIntakeOriginal(db, root, profileId, id);
+  const durability = recordDurabilityStatus(db);
+  if (!durability?.configured || durability.dirty || durability.conflicted || durability.lastError)
+    throw Error('Native PDF evidence requires current accepted authority');
+  const encoded = countedJson(db, [
+    header,
+    pins,
+    revision,
+    durability.sequence,
+    durability.persistedRevision,
+  ]);
+  return withIntakeWork(db, 'warm', () => {
+    recordIntakeWork('hashCalls');
+    recordIntakeWork('hashedBytes', Buffer.byteLength(encoded));
+    return createHash('sha256').update(encoded).digest('hex');
+  });
+}
+function selectPdfReceipt(receipt: NativePdfReceipt) {
+  const { context } = receipt;
+  context.assertRunning?.();
+  // A miss is decided before selecting reuse. Once selected, every guard error
+  // or drift propagates; no callback can turn failed verification into a miss.
+  if (reviewReadStamp(context.db) !== receipt.stamp) return false;
+  const binding = pdfReceiptBinding(context, receipt.mappingVersion);
+  if (binding !== receipt.binding || reviewReadStamp(context.db) !== receipt.stamp)
+    throw Error('Native PDF evidence changed during receipt verification');
+  return true;
+}
+/** Host-only post-read validation. Foreign results and changed-before-admission
+ * receipts retain the original complete source-text validation path. */
+export function assertIntakeEvidenceSourceTextCurrent(
+  context: Pick<EvidenceContext, 'db' | 'root' | 'profileId' | 'id'>,
+  result: unknown,
+) {
+  const receipt = result && typeof result === 'object' ? nativePdfReceipts.get(result) : undefined;
+  if (
+    receipt?.text &&
+    receipt.context.db === context.db &&
+    receipt.context.root === context.root &&
+    receipt.context.profileId === context.profileId &&
+    receipt.context.id === context.id &&
+    selectPdfReceipt(receipt)
+  )
+    return;
+  getIntakeSourceText(context.db, context.root, context.profileId, context.id);
 }
 
 interface NavigateEvidenceContext extends EvidenceContext {
@@ -172,6 +254,7 @@ export async function captureIntakeSourceTextForRead({
   // than a top-level batch. Capture bounded local evidence before taking the
   // metadata/version snapshot, while leaving original preview reads read-only.
   if (modelContext && captureSourceText && recordDurabilityStatus(db)) {
+    const before = reviewReadStamp(db);
     const prior = getIntakeSourceText(db, root, profileId, id);
     if (sourceTextExtractionPending(prior)) {
       assertRunning();
@@ -191,6 +274,12 @@ export async function captureIntakeSourceTextForRead({
         priorRevisionId: prior.revision?.id ?? null,
         revisionId: captured.sourceText.revision?.id ?? null,
       });
+    } else if (prior.revision && before && reviewReadStamp(db) === before) {
+      return {
+        stamp: before,
+        revisionId: prior.revision.id,
+        sourceHash: prior.revision.sourceHash,
+      } satisfies ValidatedText;
     }
   }
 }
@@ -276,7 +365,7 @@ async function readEvidenceCore<
     inventory(context: Parameters<typeof inventoryIntakePackage>[0]): Promise<TInventory>;
   },
 ) {
-  await captureIntakeSourceTextForRead({
+  const validatedText = await captureIntakeSourceTextForRead({
     db,
     root,
     profileId,
@@ -317,6 +406,7 @@ async function readEvidenceCore<
     };
   const isPdf = intake.mimeType === 'application/pdf';
   const file = isPdf ? null : getIntakeOriginal(db, root, profileId, id);
+  const beforeModel = isPdf && modelContext && pagedContext ? reviewReadStamp(db) : undefined;
   const metadata = {
     instructions: INTAKE_SCHEMA_INSTRUCTIONS,
     sourceText: sourceTextReadMetadata(db, profileId, id),
@@ -333,6 +423,56 @@ async function readEvidenceCore<
           note: 'Original retained. PDF text and visuals are read from bounded page ranges.',
         }
       : access.window(modelContext),
+  };
+  let nativeReceipt: NativePdfReceipt | undefined;
+  const initialModel = metadata.intake as unknown as {
+    format?: string;
+    pins?: { sourceHash?: string };
+  };
+  if (
+    beforeModel &&
+    initialModel?.format === 'health-intake-model-evidence-context-v2' &&
+    [root, profileId, id, intake.filename, intake.providerId].every(
+      (value) => Buffer.byteLength(value) <= 4096,
+    ) &&
+    reviewReadStamp(db) === beforeModel
+  ) {
+    const encodedModel = countedJson(db, metadata.intake);
+    if (Buffer.byteLength(encodedModel) <= 16 * 1024) {
+      const context = { db, root, profileId, id, assertRunning },
+        binding = pdfReceiptBinding(context, mappingRulesVersion);
+      if (reviewReadStamp(db) === beforeModel)
+        nativeReceipt = {
+          context,
+          stamp: beforeModel,
+          binding,
+          mappingVersion: mappingRulesVersion,
+          encodedModel,
+          ...(validatedText?.stamp === beforeModel &&
+          validatedText.sourceHash === initialModel.pins?.sourceHash &&
+          currentIntakeSourceTextRevisionId(db, profileId, id) === validatedText.revisionId &&
+          reviewReadStamp(db) === beforeModel
+            ? { text: validatedText }
+            : {}),
+        };
+    }
+  }
+  const rememberPdf = <T extends object>(result: T): PdfMediaResult<T> => {
+    if (nativeReceipt) nativePdfReceipts.set(result, nativeReceipt);
+    return result as PdfMediaResult<T>;
+  };
+  const modelForPdf = () => {
+    if (nativeReceipt && selectPdfReceipt(nativeReceipt))
+      return withIntakeWork(db, 'warm', () => {
+        recordIntakeWork('jsonParseCalls');
+        recordIntakeWork('jsonParseBytes', Buffer.byteLength(nativeReceipt!.encodedModel));
+        return JSON.parse(nativeReceipt!.encodedModel) as TModel;
+      });
+    return access.model(intake, {
+      page: pageNumber,
+      mappingRules,
+      mappingRulesVersion,
+    });
   };
   if (file && ['image/png', 'image/jpeg', 'image/webp'].includes(file.mimeType)) {
     const { loadImage, createCanvas } = await import('@napi-rs/canvas');
@@ -409,13 +549,7 @@ async function readEvidenceCore<
                 'Native PDF input was unavailable for this page; a raster preview of the same original page is supplied.',
             }
           : {}),
-        intake: modelContext
-          ? access.model(intake, {
-              page: pageNumber,
-              mappingRules,
-              mappingRulesVersion,
-            })
-          : intake,
+        intake: modelContext ? modelForPdf() : intake,
         original: {
           page: pageNumber,
           totalPages: result.totalPages,
@@ -469,7 +603,7 @@ async function readEvidenceCore<
     const base64Started = performance.now();
     const imageContent = intakeImageDataUrl(result.image, result.mimeType);
     const base64Ms = Math.max(0, performance.now() - base64Started);
-    return { imageContent, ...(await present(result, base64Ms, nativePdfFallback)) };
+    return rememberPdf({ imageContent, ...(await present(result, base64Ms, nativePdfFallback)) });
   };
   if (!pdf) return raster();
   let result: PdfNativeEvidencePage;
@@ -492,13 +626,13 @@ async function readEvidenceCore<
   const base64Started = performance.now();
   const pdfContent = `data:application/pdf;base64,${Buffer.from(result.pdf).toString('base64')}`;
   const base64Ms = Math.max(0, performance.now() - base64Started);
-  return {
+  return rememberPdf({
     pdfContent,
     ...(await present(result, base64Ms)),
     // Host-only lazy fallback. The bridge invokes this only after an explicit
     // PDF transport rejection; no raster encode is paid on the successful path.
     pdfFallback: () => raster(true),
-  };
+  });
 }
 
 // A navigable index into retained bytes; indexing is not extraction or acceptance.

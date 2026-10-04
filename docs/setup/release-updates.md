@@ -116,6 +116,15 @@ No accepted record, archive format, operator setting or prior-build recovery
 requirement changes. Complete scratch verification remains proportional to the
 visited history; reduced native rereads do not make every review constant-cost.
 
+Native PDF evidence reads can reuse a checked model summary and previously
+completed validation of the current source-text revision within one result.
+Restart into the candidate and reload open import pages after updating; these
+receipts are disposable and require no migration, archive-format change or
+operator setting. Original-file checks, worker reads, literal page routing and
+malformed-authority refusal remain required. The focused read counts do not
+establish whole-import timing or replace acceptance, encrypted recovery and
+supported release-pair qualification.
+
 ## Repeatable fictional release qualification
 
 Run from a frozen candidate checkout with Docker and the contributor Node/browser prerequisites available. Choose an exact locally available prior commit and a fresh absolute external output directory outside Git:

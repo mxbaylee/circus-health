@@ -1104,13 +1104,13 @@ function* prepareCollectionClinicalReviewWork(
       projection: {
         materializeSourceProviders: () => finishClinicalReviewWork(validateAllProviders(true)),
         sourceScope: (entries) =>
-          clinicalSourceScopeCheck(
-            db,
-            reviewed,
-            entries,
-            inputFile.id,
-            (original) => sourceFor(original).sourceScope,
-          ),
+          clinicalSourceScopeCheck(db, reviewed, entries, inputFile.id, (original) => ({
+            ...sourceFor(original).sourceScope,
+            // Projection rechecks the complete scope after its own derived
+            // maintenance and inside a speculative write transaction. The
+            // immutable read-prefix certificate belongs only to preparation.
+            groundedSomeWork: undefined,
+          })),
         pairSource,
         reportSource,
         providerAuthorized(record, selectedProposal, providerId) {

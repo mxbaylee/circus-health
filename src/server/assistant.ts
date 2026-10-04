@@ -3582,7 +3582,8 @@ export function createAssistant({
               );
           }
         }
-        const { readIntakeEvidence } = await import('./intake-evidence.ts');
+        const { readIntakeEvidence, assertIntakeEvidenceSourceTextCurrent } =
+          await import('./intake-evidence.ts');
         const selectedEvidence = intake.getIntakeRead(
           db,
           root,
@@ -3638,12 +3639,20 @@ export function createAssistant({
           stringArgument(args, 'id'),
         );
         if (evidenceIntake.mimeType !== 'application/zip') {
-          const text = (await import('./intake-source-text.ts')).getIntakeSourceText(
-            db,
-            root,
-            profileId,
-            evidenceIntake.id,
-          );
+          if (evidenceIntake.mimeType === 'application/pdf')
+            assertIntakeEvidenceSourceTextCurrent(
+              { db, root, profileId, id: evidenceIntake.id },
+              result,
+            );
+          const text =
+            evidenceIntake.mimeType === 'application/pdf'
+              ? undefined
+              : (await import('./intake-source-text.ts')).getIntakeSourceText(
+                  db,
+                  root,
+                  profileId,
+                  evidenceIntake.id,
+                );
           if (
             evidenceIntake.parentSourceFileId &&
             !state.observedPackageMembers?.has(evidenceIntake.id)
@@ -3651,7 +3660,7 @@ export function createAssistant({
             (state.unknownSourceCoverage ||= new Set()).add(evidenceIntake.id);
           else if (
             evidenceIntake.mimeType !== 'application/pdf' &&
-            (text.revision?.pages.length ?? 0) !== 1
+            (text?.revision?.pages.length ?? 0) !== 1
           )
             (state.unknownSourceCoverage ||= new Set()).add(evidenceIntake.id);
           else
