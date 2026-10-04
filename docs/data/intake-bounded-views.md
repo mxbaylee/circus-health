@@ -540,6 +540,39 @@ authority proof and checks the current owner and caller cancellation guard befor
 resuming. A changed proof refuses the attempt; closing or aborting the generator
 releases its private policy scratch.
 
+Grounded source-scope checks retain a lazy, ordered verified prefix on the opened
+collection scope. Each new row still reads the original group and current version
+before comparing boundaries, preserving duplicate order, version selection and
+refusal of corruption reached by the original traversal. An early match does not
+inspect an otherwise unvisited suffix. Signed rows and a private frontier bind
+completeness and order in owned SQL scratch; matching candidates reconstruct the
+checked native group/version and run the original grounding and occurrence rules.
+The original owner, raw database generation, selected view and consumed physical
+files remain pinned. Missing proof and fresh transaction callers use the original
+traversal; a previously pinned proof cannot be revived by fallback. Valid oversized
+metadata also uses the original traversal without introducing a new refusal limit.
+
+Repeated handles share one prefix while evaluating their own grounding proofs.
+Interleaved work uses independent original traversal; changed scratch triggers a
+new complete, stable authenticated pass before cached traversal resumes. The
+scheduling marker grants no SQL-change credit. Closing the collection scope or a
+failed prefix owner invalidates retained prefix use. Metadata stays in SQL rather
+than a per-group JavaScript map, but complete signed scans remain
+O(incoming entries × verified prefix rows), with corresponding scratch, HMAC,
+parsing and serialization costs.
+
+A 2026-10-04 matched fictional 4/16-record first-review diagnostic completed on
+both versions. At 4 records, native version calls fell from 29 to 13;
+at 16, from 497 to 61. The complete 16-record HTTP response read 305,185,742 native
+logical bytes before the change and 201,941,504 afterward, with 10,275,478 added
+scratch text bytes read, 139,764 written and 5,023 scratch witness queries. Total
+counted hash and parse bytes fell, while serialization rose from 19,176 to 14,524,369
+bytes. These counters do not measure physical filesystem/WAL bytes or every CPU
+cost. The HTTP oracle checks success, scope references, complete competing counts
+and scratch cleanup; focused policy/authority tests separately check policy parity
+and refusal. Neither measurement establishes full wire/replay equivalence,
+corpus-independent cost or whole-import recovery performance.
+
 Derived reader and source-attention caches use fixed synchronous TEMP statements.
 Those statements receive neutral credits only after
 canonical table/index validation and restrictive SQLite authorization establish

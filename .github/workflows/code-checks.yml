@@ -71,7 +71,7 @@ jobs:
       - run: npm run test:ui
 
   server:
-    name: Server (${{ matrix.shard }}/4)
+    name: Server (${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
     # Includes real encrypted recovery of a 5,001-file collection; keep this
     # qualification in the required suite rather than skipping it for cost.
@@ -79,7 +79,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       HUSKY: '0'
     steps:
@@ -99,7 +99,7 @@ jobs:
       - name: Install the PDF renderer used by real export tests
         run: npx playwright install --with-deps chromium
       - name: Server tests with isolated fictional fixtures
-        run: npm run test:server -- --test-shard=${{ matrix.shard }}/4
+        run: npm run test:server -- --test-shard=${{ matrix.shard }}/8
 
   continuation:
     runs-on: ubuntu-latest

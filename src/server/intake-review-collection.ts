@@ -1,3 +1,4 @@
+import { createClinicalSourceScopePrefix } from './intake-source-scope-prefix.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { finishClinicalReviewWork, everyClinicalReviewWork } from './clinical-review-work.ts';
 import {
@@ -149,6 +150,11 @@ function* hashChunksWork(chunks: Iterable<string>): Generator<void, string, void
 export function collectionWorkflowReviewScope(input: {
   close?(): void;
   policySql?: import('node:sqlite').DatabaseSync;
+  sourceScopePrefixProof?: () => string | undefined;
+  sourceScopePrefixWork?: (
+    metric: import('./intake-source-scope-prefix.ts').SourceScopePrefixMetric,
+    count: number,
+  ) => void;
   issueSink?: import('./intake-workflow.ts').WorkflowReviewScope['issueSink'];
   bindIdentityWarnings?: import('./intake-workflow.ts').WorkflowReviewScope['bindIdentityWarnings'];
   bindIdentityWarningsWork?: import('./intake-workflow.ts').WorkflowReviewScope['bindIdentityWarningsWork'];
@@ -271,6 +277,7 @@ export function collectionWorkflowReviewScope(input: {
     const item = candidate(candidateId);
     return item && view.find('version', item, id);
   };
+  let sourceScopePrefix: ReturnType<typeof createClinicalSourceScopePrefix> | undefined;
   const groupRecords = () => children(workflow, 'reportGroups');
   const groupRecord = (id: string) => workflow && view.find('reportGroup', workflow, id);
   const referenceCache = new Map<string, WorkflowReviewGroup | undefined>();
@@ -1194,6 +1201,7 @@ export function collectionWorkflowReviewScope(input: {
   let questionInlineBytes = metadataBytes;
   const scope: SelectedWorkflowReviewScope = {
     close() {
+      sourceScopePrefix?.close();
       draftHandoff.clear();
       receiptScopeClosed = true;
       clearNativeReceipts();
@@ -1866,7 +1874,7 @@ export function collectionWorkflowReviewScope(input: {
         import('./clinical-source-scope.ts').ClinicalSourceScopeGroup,
         IntakeEnvelopeRecord
       >();
-      return {
+      const result: ClinicalOriginalScope = {
         ...proofs,
         packageSource: input.packageEvidence,
         groups: () =>
@@ -1982,6 +1990,29 @@ export function collectionWorkflowReviewScope(input: {
           }
         },
       };
+      if (input.policySql && input.sourceScopePrefixProof) {
+        sourceScopePrefix ??= createClinicalSourceScopePrefix({
+          sql: input.policySql,
+          scope: result,
+          rowBytes: metadataBytes,
+          work: input.sourceScopePrefixWork,
+          assertOpen() {
+            if (fallbackClosed || receiptScopeClosed) throw Error('Closed clinical source scope');
+            view.address(view.root());
+          },
+          proof: input.sourceScopePrefixProof,
+          groupAt(ordinal) {
+            const record = workflow && view.childAt(workflow, 'reportGroups', ordinal);
+            if (!record) throw Error('Missing verified clinical source group');
+            const header = groupHeader(record);
+            retainedGroups.set(header, record);
+            return header;
+          },
+        });
+        const prefix = sourceScopePrefix;
+        result.groundedSomeWork = (boundary, evaluate) => prefix.some(boundary, evaluate);
+      }
+      return result;
     },
     occurrence(candidateId, versionId, recordId, proposalId) {
       return finishClinicalReviewWork(

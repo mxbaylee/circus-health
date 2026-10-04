@@ -109,6 +109,13 @@ archive-format change. A stale selected owner refuses reuse, and grounding
 changes still require fresh preparation. The focused parity and ownership checks
 do not replace release-build acceptance and encrypted recovery qualification.
 
+Grounded source-scope preparation also reuses an authenticated ordered prefix
+within an opened collection scope. Restart into the candidate and reload pending
+reviews after updating; prefixes and their proofs are disposable and are rebuilt.
+No accepted record, archive format, operator setting or prior-build recovery
+requirement changes. Complete scratch verification remains proportional to the
+visited history; reduced native rereads do not make every review constant-cost.
+
 ## Repeatable fictional release qualification
 
 Run from a frozen candidate checkout with Docker and the contributor Node/browser prerequisites available. Choose an exact locally available prior commit and a fresh absolute external output directory outside Git:

@@ -21,6 +21,12 @@ const primitiveTemplate = {
   metadataReadBytes: 0,
 };
 const hostTemplate = {
+  clinicalSourceScopePrefixVerifiedGroups: 0,
+  clinicalSourceScopePrefixRowsRead: 0,
+  clinicalSourceScopePrefixMatchedGroups: 0,
+  clinicalSourceScopePrefixTextBytesRead: 0,
+  clinicalSourceScopePrefixTextBytesWritten: 0,
+  clinicalSourceScopePrefixScratchWitnessReads: 0,
   reviewQuestionHydrations: 0,
   reviewQuestionHydrationBytes: 0,
   reviewQuestionHydrationHits: 0,

@@ -377,7 +377,8 @@ test(
     const saveButtons = page.getByRole('button', { name: 'Confirm & save', exact: true });
     assert.equal(await saveButtons.count(), 2);
     for (const button of await saveButtons.all()) assert.equal(await button.isEnabled(), true);
-    const accepted = page.waitForResponse(
+    const accepted = fixtureBrowserResponse(
+      page,
       (response) =>
         response.url().endsWith('/intakes/report-acceptance') &&
         response.request().method() === 'POST',

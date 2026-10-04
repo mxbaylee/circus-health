@@ -519,6 +519,23 @@ function* prepareCollectionClinicalReviewWork(
       );
       const scope = collectionWorkflowReviewScope({
         policySql: issueScratch.db,
+        sourceScopePrefixProof() {
+          if (db.isTransaction) return undefined;
+          options.assertRunning?.();
+          assertCurrent();
+          const before = reviewReadStamp(db);
+          if (before === undefined) throw Error('Clinical source scope authority unavailable');
+          view.address(view.root());
+          assertPhysicalEvidenceCurrent();
+          options.assertRunning?.();
+          assertCurrent();
+          const after = reviewReadStamp(db);
+          if (after !== before)
+            throw Error('Clinical source scope authority changed during verification');
+          return after;
+        },
+        sourceScopePrefixWork: (metric, count) =>
+          withIntakeWork(db, 'warm', () => recordIntakeWork(metric, count)),
         issueSink,
         bindIdentityWarnings: (record, warnings) =>
           bindReviewIdentityWarnings(issueSink, record, warnings),

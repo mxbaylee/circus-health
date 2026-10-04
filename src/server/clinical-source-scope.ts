@@ -78,6 +78,13 @@ export interface ClinicalSourceScopeVersion {
     proposalId?: string | null,
   ): Generator<void, boolean, void>;
 }
+export interface ClinicalSourceScopeBoundary {
+  sourceFileId: string;
+  sourceHash: string;
+  memberId: string | null;
+  anchor: NonNullable<HealthRecordEnvelope['report']>['anchor'];
+  subject: NonNullable<HealthRecordEnvelope['report']>['subject'];
+}
 export interface ClinicalOriginalScope {
   profileId: string;
   hasParent: boolean;
@@ -85,6 +92,13 @@ export interface ClinicalOriginalScope {
   packageSource: boolean;
   childBoundary: string | null;
   groups(): SelectedSequence<ClinicalSourceScopeGroup>;
+  groundedSomeWork?(
+    boundary: ClinicalSourceScopeBoundary,
+    evaluate: (
+      group: ClinicalSourceScopeGroup,
+      current: ClinicalSourceScopeVersion | undefined,
+    ) => Generator<void, boolean, void>,
+  ): Generator<void, boolean, void>;
   version(group: ClinicalSourceScopeGroup, id?: string): ClinicalSourceScopeVersion | undefined;
   versionWork?(
     group: ClinicalSourceScopeGroup,
@@ -207,68 +221,84 @@ function* evidenceFor(
         }))
       );
     }));
+  const evaluateGrounded = function* (
+    group: ClinicalSourceScopeGroup,
+    current: ClinicalSourceScopeVersion | undefined,
+  ): Generator<void, boolean, void> {
+    if (
+      !current ||
+      group.sourceFileId !== original.id ||
+      group.sourceHash !== original.sha256 ||
+      canonicalLiteral(group.report?.anchor) !== canonicalLiteral(report.anchor) ||
+      canonicalLiteral(group.report?.subject) !== canonicalLiteral(report.subject) ||
+      group.memberId !== (report.memberId || null) ||
+      !(yield* occurrenceIn(current, version, recordId))
+    )
+      return false;
+    // A null-proposal occurrence with the original's own line ID is literal
+    // uploaded JSONL, including report headers outside its clinical payload.
+    if (
+      recordId.startsWith(`${original.id}:line:`) &&
+      /^[1-9]\d*$/.test(recordId.slice(`${original.id}:line:`.length)) &&
+      (yield* occurrenceIn(current, version, recordId, null))
+    )
+      return true;
+    if (
+      originalScope.subjectGroundedWork
+        ? yield* originalScope.subjectGroundedWork(group)
+        : originalScope.subjectGrounded(group)
+    )
+      return true;
+    const clinicalIssues = object(value.clinical).reviewIssues;
+    const questions = [
+      ...(Array.isArray(value.reviewIssues) ? value.reviewIssues : []),
+      ...(Array.isArray(clinicalIssues) ? clinicalIssues : []),
+    ]
+      .map(object)
+      .filter(
+        (issue) =>
+          issue.kind === 'identity' &&
+          typeof issue.prompt === 'string' &&
+          typeof issue.textAnchor === 'string',
+      );
+    return yield* someClinicalReviewWork(questions, function* (question) {
+      return yield* someClinicalReviewWork(originalScope.receipts(), function* (receipt) {
+        const issue = {
+          prompt: String(question.prompt),
+          textAnchor: String(question.textAnchor),
+        };
+        return !!(yield* repeatedIdentityQuestionReceiptWork({
+          issue,
+          group,
+          receipts: [receipt],
+          profileId: receipt.scope.profileId,
+          intakeId: original.id,
+          sourceHash: original.sha256,
+          originalFingerprint: originalScope.originalFingerprint(group),
+          grounded: (candidate) => originalScope.questionGrounded(group, issue, candidate),
+          groundedWork:
+            originalScope.questionGroundedWork &&
+            ((candidate) => originalScope.questionGroundedWork!(group, issue, candidate)),
+        }));
+      });
+    });
+  };
   const grounded =
     !confirmed &&
-    (yield* someClinicalReviewWork(originalScope.groups(), function* (group) {
-      const current = yield* versionFor(group);
-      if (
-        !current ||
-        group.sourceFileId !== original.id ||
-        group.sourceHash !== original.sha256 ||
-        canonicalLiteral(group.report?.anchor) !== canonicalLiteral(report.anchor) ||
-        canonicalLiteral(group.report?.subject) !== canonicalLiteral(report.subject) ||
-        group.memberId !== (report.memberId || null) ||
-        !(yield* occurrenceIn(current, version, recordId))
-      )
-        return false;
-      // A null-proposal occurrence with the original's own line ID is literal
-      // uploaded JSONL, including report headers outside its clinical payload.
-      if (
-        recordId.startsWith(`${original.id}:line:`) &&
-        /^[1-9]\d*$/.test(recordId.slice(`${original.id}:line:`.length)) &&
-        (yield* occurrenceIn(current, version, recordId, null))
-      )
-        return true;
-      if (
-        originalScope.subjectGroundedWork
-          ? yield* originalScope.subjectGroundedWork(group)
-          : originalScope.subjectGrounded(group)
-      )
-        return true;
-      const clinicalIssues = object(value.clinical).reviewIssues;
-      const questions = [
-        ...(Array.isArray(value.reviewIssues) ? value.reviewIssues : []),
-        ...(Array.isArray(clinicalIssues) ? clinicalIssues : []),
-      ]
-        .map(object)
-        .filter(
-          (issue) =>
-            issue.kind === 'identity' &&
-            typeof issue.prompt === 'string' &&
-            typeof issue.textAnchor === 'string',
-        );
-      return yield* someClinicalReviewWork(questions, function* (question) {
-        return yield* someClinicalReviewWork(originalScope.receipts(), function* (receipt) {
-          const issue = {
-            prompt: String(question.prompt),
-            textAnchor: String(question.textAnchor),
-          };
-          return !!(yield* repeatedIdentityQuestionReceiptWork({
-            issue,
-            group,
-            receipts: [receipt],
-            profileId: receipt.scope.profileId,
-            intakeId: original.id,
+    (originalScope.groundedSomeWork
+      ? yield* originalScope.groundedSomeWork(
+          {
+            sourceFileId: original.id,
             sourceHash: original.sha256,
-            originalFingerprint: originalScope.originalFingerprint(group),
-            grounded: (candidate) => originalScope.questionGrounded(group, issue, candidate),
-            groundedWork:
-              originalScope.questionGroundedWork &&
-              ((candidate) => originalScope.questionGroundedWork!(group, issue, candidate)),
-          }));
-        });
-      });
-    }));
+            memberId: report.memberId || null,
+            anchor: report.anchor,
+            subject: report.subject,
+          },
+          evaluateGrounded,
+        )
+      : yield* someClinicalReviewWork(originalScope.groups(), function* (group) {
+          return yield* evaluateGrounded(group, yield* versionFor(group));
+        }));
   // A prior accepted occurrence already has a durable scoped attribution.
   // Rebuilding SQLite must not turn its cold, non-authoritative grounding cache
   // into a demand to re-review every historical PDF page.
