@@ -10,6 +10,21 @@ The supported runtime is npm → Docker Compose → LiteLLM. The [batch coordina
 
 Local extraction uses bounded workers and local English Tesseract for supported raster evidence. Original/member reads may capture up to two pages before returning evidence. Native text, OCR alternatives and located exceptions are retained separately from clinical proposals. Unsupported formats and unreadable material remain visible.
 
+Upload publication, native conversion and extraction's short database phases
+share the existing per-database operation queue. Receiving the upload and running
+local extraction workers remain outside that queue. Extraction rechecks its
+original source and revision before each publication; queued work cannot adopt a
+newer human correction as its starting evidence. Exact operation retries share
+the worker or replay its retained result. An interrupted admitted operation
+remains recoverable without silently launching the unknown work again.
+
+Waiting for a database operation slot does not consume the extraction worker's
+stall allowance. The watchdog resumes its remaining allowance when work resumes;
+queue admission does not reset it as progress. Reported elapsed extraction time
+still includes the wait. Stop and authorization checks run again after queued
+publications before the batch advances or saves another checkpoint. These rules
+do not establish a model-speed target or serialize every possible database writer.
+
 Automatic processing continues while unique progress is made, with bounded operations and located stall recovery instead of document-wide allowances. See [automatic recovery](automatic-recovery.md) for durable intent, enqueue, provider deadlines, unknown-usage accounting and the owner rationale.
 
 Server reading continues after tab closure while authorized. Lock/logout/profile switch end the ordinary runtime; authorized unlock restores automatic intent, while explicit Stop remains stopped. Restricted post-logout authority remains CRS-081; this coordinator alone does not complete that experience.

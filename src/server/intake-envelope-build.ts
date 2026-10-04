@@ -1,4 +1,9 @@
 /** One explicit legacy decode followed by bounded accepted build checkpoints. */
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 import { reportSnapshotInlineTextFits } from './intake-report-snapshot-catalog.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
@@ -6,6 +11,7 @@ import type { Database } from './database.ts';
 import { readIntakeEnvelopeMaterialized, type IntakeEnvelopeSource } from './intake-authority.ts';
 import {
   collectionCellReader,
+  hasIntakeCollectionEnvelope,
   iterateSchemaEnvelopeText,
   selectedEnvelopeStore,
 } from './intake-collection-envelope.ts';
@@ -27,6 +33,27 @@ import {
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export async function buildIntakeCollectionEnvelope(
+  ...input: Parameters<typeof buildIntakeCollectionEnvelopeOwned>
+): Promise<Awaited<ReturnType<typeof buildIntakeCollectionEnvelopeOwned>> | undefined> {
+  const [db, source, options = {}] = input;
+  return runExclusiveClinicalOperation(
+    db,
+    async (operation) => {
+      // A previous queued caller may have completed this exact current source.
+      // The authenticated predicate still validates selected authority and schema.
+      if (hasIntakeCollectionEnvelope(db, source)) return undefined;
+      return buildIntakeCollectionEnvelopeOwned(db, source, {
+        ...options,
+        assertRunning() {
+          assertClinicalOperation(db, operation);
+          options.assertRunning?.();
+        },
+      });
+    },
+    { operation: currentClinicalOperation(db), assertRunning: options.assertRunning },
+  );
+}
+async function buildIntakeCollectionEnvelopeOwned(
   db: Database,
   source: IntakeEnvelopeSource,
   options: {

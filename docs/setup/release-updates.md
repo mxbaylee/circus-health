@@ -84,6 +84,22 @@ This section and its linked maintained contracts are the durable place to check 
 
 These describe current contracts, not proof that a selected pair of releases passed a drill. If the candidate needs a new authority migration, resolve that requirement before use; this procedure supplies neither a decoder nor automatic conversion.
 
+The candidate also coordinates upload publication, native conversion and short
+background-extraction database phases through the existing operation queue; see
+[import processing](../import/processing.md). Restart into the candidate and
+reload open import pages. Network reception and extraction workers stay outside
+the queue; a large participating operation may delay another database operation.
+Exact historical batch-exception replay remains supported, and new native
+clear-unit receipts retain their stronger unit binding. No archive format,
+operator setting or prior-build recovery requirement changes.
+
+[Question recipes](../data/intake-bounded-views.md) are authenticated disposable
+data owned by a review session, with fresh values on every borrow. Reload reviews
+after updating; replacing or closing a review releases its recipes and providers.
+They neither migrate retained questions nor change accepted evidence or recovery
+compatibility. Their per-question bound is not an aggregate memory or storage
+guarantee, and the focused work counts do not establish whole-import performance.
+
 ## Repeatable fictional release qualification
 
 Run from a frozen candidate checkout with Docker and the contributor Node/browser prerequisites available. Choose an exact locally available prior commit and a fresh absolute external output directory outside Git:

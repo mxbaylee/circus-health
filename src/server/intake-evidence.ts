@@ -1,3 +1,4 @@
+import { currentClinicalOperation } from './clinical-operation.ts';
 import { intakeSourceMetadata } from './intake-state-access.ts';
 import { HttpError } from './database.ts';
 import { isRetainOnlyIntake } from './intake-source-policy.ts';
@@ -109,6 +110,8 @@ async function captureForReader(
   context: Parameters<typeof extractIntakeSourceText>[0],
   assertRunning: () => void,
 ) {
+  if (currentClinicalOperation(context.db))
+    throw new Error('Source extraction cannot start or join inside a clinical operation');
   assertRunning();
   let captures = automaticCaptures.get(context.db);
   if (!captures) automaticCaptures.set(context.db, (captures = new Map()));

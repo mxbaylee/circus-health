@@ -1,4 +1,8 @@
-import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 import { latestReviewDraftResolution } from './intake-review-draft-selection.ts';
 import { cachedSourceContextVersions } from './intake-source-context-classification.ts';
 import {
@@ -655,7 +659,6 @@ function intakeRead(
 function hasCollectionIntakeSchema(db: DatabaseSync, file: SourceFileRow): boolean {
   return hasIntakeCollectionEnvelope(db, file);
 }
-const nativeSchemaPreparations = new WeakMap<DatabaseSync, Map<string, Promise<void>>>();
 /** Explicit, counted compatibility preparation before new public work. The
  * selected source and public version stay unchanged; a failed build leaves the
  * prior representation readable and a later call may retry it. */
@@ -665,28 +668,23 @@ export async function ensureNativeIntakeSchema(
   id: string,
   options: { assertRunning?: () => void } = {},
 ): Promise<void> {
-  owner(db, profileId);
-  options.assertRunning?.();
-  if (hasCollectionIntakeSchema(db, row(db, id))) return;
-  let pending = nativeSchemaPreparations.get(db);
-  if (!pending) nativeSchemaPreparations.set(db, (pending = new Map()));
-  let preparation = pending.get(id);
-  if (!preparation) {
-    preparation = (async () => {
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      owner(db, profileId);
+      options.assertRunning?.();
+      // Check readiness only after admission. A preceding owner may have built
+      // this source; there is no external pending promise to wait on in the lane.
+      if (hasCollectionIntakeSchema(db, row(db, id))) return;
       const { buildIntakeCollectionEnvelope } = await import('./intake-envelope-build.ts');
       await buildIntakeCollectionEnvelope(db, row(db, id), options);
-    })();
-    pending.set(id, preparation);
-  }
-  try {
-    await preparation;
-    owner(db, profileId);
-    options.assertRunning?.();
-    if (!hasCollectionIntakeSchema(db, row(db, id)))
-      throw new HttpError(409, 'INTAKE_CHANGED', 'The selected intake representation changed');
-  } finally {
-    if (pending.get(id) === preparation) pending.delete(id);
-  }
+      owner(db, profileId);
+      options.assertRunning?.();
+      if (!hasCollectionIntakeSchema(db, row(db, id)))
+        throw new HttpError(409, 'INTAKE_CHANGED', 'The selected intake representation changed');
+    },
+    { operation: currentClinicalOperation(db), assertRunning: options.assertRunning },
+  );
 }
 /** Original evidence does not require materializing its extraction history.
  * A legacy workflow has no compact public version until schema maintenance;
@@ -1031,20 +1029,42 @@ export async function uploadIntakeStream(
     throw new HttpError(403, 'PROFILE_BOUNDARY', 'Upload staging escaped its runtime');
   return (receiveIntakeUpload as unknown as ReceiveIntakeUpload)(
     req,
-    async (staged) => {
-      // Discovery order spans all retained originals. A preceding upload may
-      // have its native schema ready before its semantic lookup indexes; build
-      // those explicitly outside the synchronous publication transaction.
-      const { prepareIntakeLookupIndices } = await import('./intake-lookup-state.ts');
-      await prepareIntakeLookupIndices(db, { assertRunning: options?.assertRunning });
-      const retained = publishIntake(db, root, profileId, input, staged, options, (id) => ({ id }));
-      await ensureNativeIntakeSchema(db, profileId, retained.id, options);
-      return {
-        ...getIntakeRead(db, root, profileId, retained.id),
-        repeatedUpload: retained.repeatedUpload,
-        durability: flushIntake(db, root, profileId, options),
-      };
-    },
+    async (staged) =>
+      runExclusiveClinicalOperation(
+        db,
+        async (operation) => {
+          // Receive network bytes before admission; all same-database preparation
+          // and publication after staging share one existing clinical owner.
+          const ownedOptions = {
+            ...options,
+            assertRunning() {
+              assertClinicalOperation(db, operation);
+              options?.assertRunning?.();
+            },
+          };
+          // Discovery order spans all retained originals. A preceding upload may
+          // have its native schema ready before its semantic lookup indexes; build
+          // those explicitly outside the synchronous publication transaction.
+          const { prepareIntakeLookupIndices } = await import('./intake-lookup-state.ts');
+          await prepareIntakeLookupIndices(db, { assertRunning: ownedOptions.assertRunning });
+          const retained = publishIntake(
+            db,
+            root,
+            profileId,
+            input,
+            staged,
+            ownedOptions,
+            (id) => ({ id }),
+          );
+          await ensureNativeIntakeSchema(db, profileId, retained.id, ownedOptions);
+          return {
+            ...getIntakeRead(db, root, profileId, retained.id),
+            repeatedUpload: retained.repeatedUpload,
+            durability: flushIntake(db, root, profileId, ownedOptions),
+          };
+        },
+        { operation: currentClinicalOperation(db), assertRunning: options?.assertRunning },
+      ),
     { tempRoot },
   );
 }

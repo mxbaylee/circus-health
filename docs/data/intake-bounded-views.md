@@ -566,6 +566,18 @@ If cancellation rejects a newly prepared session, queue lease or plan before
 handoff, its producer disposes that result before admitting the next operation.
 Uncoordinated writes, including rolled-back writes, still invalidate held proofs.
 
+Native conversion and staged-upload publication use the same operation slot.
+Readiness is checked after admission, so two callers converting the same source
+do not repeat the build. Network reception happens before admission. Background
+source extraction holds the slot only for admission, initial evidence selection,
+publication and its terminal receipt; PDF, OCR and model work run outside it.
+Every publication retains the original source and revision pins. Starting or
+joining extraction from an active clinical owner is refused, preventing an owner
+from waiting on a worker that needs its slot. Batch stall and retry updates also
+select the current representation after admission, while preserving the captured
+semantic version and exact operation-replay rules. This coordinates participating
+writers; other changes still invalidate the original proof.
+
 Native identity previews can share preparation across external callers. A
 disconnected HTTP response cancels only its subscriber; preparation stops when
 the last subscriber leaves. Cancellation is checked at cooperative boundaries
@@ -595,6 +607,37 @@ complete cooperative traversal of the retained questions builds the private
 selection instead; a valid review gains no new preparation prerequisite. A
 malformed completed index is refused. The scratch rows are disposable and cannot
 supply an answer or create acceptance authority.
+
+Prepared reviews also retain authenticated lexical question recipes in that
+session's scratch database. Each borrow checks the original source, profile,
+logical view and physical authority, parses a fresh detached value, and attaches
+its checked canonical history provider. Recipes retain the complete question for
+zero or one answer, or the header and latest answer for longer histories; the
+canonical provider still supplies the complete retained history. A recipe admits
+at most 256 KiB of lexical input. Larger hydrated lexical values keep the existing read path
+and budget behavior. This is a per-question bound, not a total heap or disk bound.
+
+Raw SQL, peer, TEMP-schema and rollback changes during a borrow refuse. A changed
+cache epoch can discard recipes but cannot refresh the review's original proof.
+Present corrupt rows refuse; missing rows may be reconstructed under that proof.
+Closing or replacing the review invalidates its providers and releases its
+scratch. Evicting a source scope does not extend the review's lifetime. Epoch
+invalidation deletes all cached recipe rows synchronously and counts discarded
+rows; that counter does not measure all SQLite disk work.
+
+A controlled comparison uses four complete policy-like traversals and three repeat borrows:
+
+| Question count | Native hydrations, uncached → recipes | Native node reads, uncached → recipes | Unchanged parsed bytes | Added scratch read / write bytes | MAC input bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 35 → 8 | 15,242 → 5,408 | 92,548 | 76,335 / 22,618 | 123,873 |
+| 32 | 131 → 32 | 90,143 → 35,151 | 346,636 | 280,077 / 90,532 | 464,012 |
+
+These stable cases have 27 and 99 recipe hits and no discarded rows. They show
+fewer repeated native value reads alongside added scratch and authentication
+work, not lower total cost or latency. Separate regressions cover exact numeric
+text and history, detached nested values, physical changes and rollback after a
+hit, disposal, and actual review replacement. These results do not rerun or
+replace the full 140-question or encrypted 64-record qualifications.
 
 The complete fictional 140-question qualification retains exact question ordering, tokens, late-blocker refusal, answer persistence, cache-loss recovery and final acceptance. Its 2026-10-04 controlled run passes that full oracle; it does not establish interactive performance. Through the matching pre-acceptance boundary, shared sections reduce repeated policy rows from 700 to 560 and warm collection-node reads from about 4.21 GB to 3.55 GB, while physical-head reads rise from 729,818 to 742,761. The complete run counts about 4.82 GB of warm node reads, 0.67 GB of reconstruction node reads and 1,031,782 physical-head reads. These logical counters are not physical disk traffic or a total-work reduction. The retained-record and larger-import qualifications remain separate.
 

@@ -21,6 +21,15 @@ const primitiveTemplate = {
   metadataReadBytes: 0,
 };
 const hostTemplate = {
+  reviewQuestionHydrations: 0,
+  reviewQuestionHydrationBytes: 0,
+  reviewQuestionHydrationHits: 0,
+  reviewQuestionParseBytes: 0,
+  reviewQuestionScratchWrittenBytes: 0,
+  reviewQuestionScratchReadBytes: 0,
+  reviewQuestionScratchDiscardedRows: 0,
+  reviewQuestionRecipeMacCalls: 0,
+  reviewQuestionRecipeMacBytes: 0,
   schemaBuildOperations: 0,
   schemaBuildReplayedOperations: 0,
   schemaBuildTranscriptHashBytes: 0,

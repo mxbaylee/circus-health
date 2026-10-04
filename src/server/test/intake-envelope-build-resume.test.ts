@@ -1,3 +1,4 @@
+import { setImmediate } from 'node:timers/promises';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
@@ -293,6 +294,7 @@ test('conversion result and production aggregate counters count the actual trans
       cleanCheckpoints++;
     },
   });
+  assert.ok(built);
   assert.ok(cleanCheckpoints > 1);
   const after = intakeWorkCounters(f.db).warm;
   for (const [local, metric] of Object.entries({
@@ -629,37 +631,53 @@ test('active conversion refuses changed-and-restored source metadata and rollbac
   }
 });
 
-test('direct concurrent conversion cannot rewind a later authenticated checkpoint', async (t) => {
+test('independent direct conversions serialize and reuse the completed authenticated schema', async (t) => {
   const f = fixture(t, 3, 0);
-  let release!: () => void;
-  let reached!: () => void;
+  let release!: () => void, reached!: () => void;
   const checkpoint = new Promise<void>((resolve) => {
     reached = resolve;
   });
   const hold = new Promise<void>((resolve) => {
     release = resolve;
   });
+  t.signal.addEventListener('abort', release, { once: true });
+  let paused = false;
   const first = buildIntakeCollectionEnvelope(f.db, f.source, {
-    onCheckpoint: async () => {
-      reached();
-      await hold;
+    async onCheckpoint() {
+      if (!paused) {
+        paused = true;
+        reached();
+        await hold;
+      }
     },
-  });
-  const refused = assert.rejects(first, /authority changed|progress changed/);
+  }).then((built) => ({ built, writes: { ...f.writes } }));
   await checkpoint;
-  try {
-    const later = await pauseAfter(f.db, f.source, 1);
-    assert.ok(later.value.count > 63);
-    const after = { ...f.writes };
+  const accepted = selectedProgress(f.db, f.source).raw;
+  let secondDone = false;
+  const second = buildIntakeCollectionEnvelope(f.db, f.source).then((value) => {
+    secondDone = true;
+    return value;
+  });
+  t.after(async () => {
     release();
-    await refused;
-    assert.deepEqual(f.writes, after);
-    assert.equal(selectedProgress(f.db, f.source).raw, later.raw);
-    await ensureNativeIntakeSchema(f.db, f.identity.profileId, f.source.id);
-    assert.equal([...iterateIntakeEnvelopeText(f.db, f.source)].join(''), f.text);
+    await Promise.allSettled([first, second]);
+  });
+  try {
+    await setImmediate();
+    assert.equal(secondDone, false);
+    assert.equal(selectedProgress(f.db, f.source).raw, accepted);
   } finally {
     release();
   }
+  const [complete, reused] = await Promise.all([first, second]);
+  assert.ok(complete.built);
+  assert.equal(reused, undefined);
+  assert.deepEqual(
+    f.writes,
+    complete.writes,
+    'Queued reuse does not publish a second checkpoint or schema',
+  );
+  assert.equal([...iterateIntakeEnvelopeText(f.db, f.source)].join(''), f.text);
 });
 
 test('cold conversion and fixed warm edit count node and accepted journal writes separately at two history sizes', async (t) => {
@@ -803,6 +821,7 @@ test('conversion source search preserves exact text without projection SQL write
         assert.equal(sourceTextProjectionReadOnly(f.db), true);
       },
     });
+    assert.ok(built);
     assert.ok(inspected >= 2);
     assert.equal(built.sourceTextHash, sha(f.text));
     assert.equal(sourceTextProjectionReadOnly(f.db), false);
@@ -965,6 +984,7 @@ test('conversion search refuses preexisting bad authority outside path matches a
           inspected = true;
         },
       });
+      assert.ok(built);
       assert.equal(inspected, true);
       assert.equal(built.sourceTextHash, sha(f.text));
       assert.equal(sourceTextProjectionReadOnly(f.db), false);

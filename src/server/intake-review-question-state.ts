@@ -1,6 +1,12 @@
 /** Immutable answer canonical values separate review policy from audit history.
  * SHA-256 review-token compatibility still streams the complete old history. */
 import { randomUUID } from 'node:crypto';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import {
+  reviewQuestionHydrationWork,
+  type QuestionHydrationRecipe,
+  type ReviewQuestionHydrationCache,
+} from './intake-review-question-hydration.ts';
 import type { Database } from './database.ts';
 import { HttpError } from './database.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -19,11 +25,7 @@ import {
 } from './intake-json-canonical.ts';
 import { canonicalLiteral, parseLiteralJSON } from './intake-format.ts';
 import { workflowHash } from './intake-workflow.ts';
-import {
-  intakeReviewChildren,
-  readIntakeReviewValue,
-  IntakeReviewFragmentRequired,
-} from './intake-review-collection.ts';
+import { intakeReviewChildren, IntakeReviewFragmentRequired } from './intake-review-collection.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import type { IntakeQuestion, IntakeQuestionAnswer } from '../shared/intake.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
@@ -190,9 +192,17 @@ export function openReviewQuestionState(
   db: Database,
   source: IntakeEnvelopeSource,
   view: IntakeCollectionEnvelopeReader,
+  options: { cache?: ReviewQuestionHydrationCache; assertCurrent?: () => void } = {},
 ) {
+  const hydrationBinding = options.cache
+    ? (() => {
+        const selected = selectedEnvelopeStore(db, source);
+        return JSON.stringify([selected.identity, selected.binding.logicalHead]);
+      })()
+    : '';
   const { store } = collectionCellReader(db, source, 'builds', name(view.logical));
   const current = () => {
+    options.cache?.assertOpen();
     store.check();
     if (store.get('complete') !== POLICY) throw pending();
   };
@@ -220,80 +230,172 @@ export function openReviewQuestionState(
     const tail = decoder.decode();
     if (tail) yield tail;
   }
+  const parse = <T>(text: string): T => {
+    reviewQuestionHydrationWork(db, 'reviewQuestionParseBytes', Buffer.byteLength(text));
+    return parseLiteralJSON(text) as T;
+  };
+  const readText = (record: IntakeEnvelopeRecord, bytes: number): string => {
+    const chunks: string[] = [];
+    let size = 0;
+    for (const chunk of view.recordChunks(record)) {
+      const amount = Buffer.byteLength(chunk);
+      size += amount;
+      reviewQuestionHydrationWork(db, 'reviewQuestionHydrationBytes', amount);
+      if (size > bytes)
+        throw new IntakeReviewFragmentRequired({
+          format: 'health-intake-review-fragment-v1',
+          logical: view.logical,
+          address: view.address(record),
+        });
+      chunks.push(chunk);
+    }
+    return chunks.join('');
+  };
+  const selectedQuestion = (
+    question: IntakeEnvelopeRecord,
+    count: number,
+    original: Record<string, unknown>,
+    latest: IntakeQuestionAnswer,
+  ): IntakeQuestion => {
+    const selected = {
+      ...original,
+      answers: [latest],
+      answerScope: 'latest',
+      answerHistory: {
+        count,
+        reference: {
+          format: 'health-intake-review-fragment-v1',
+          logical: view.logical,
+          address: view.address(question),
+          field: 'answers',
+        },
+      },
+    } as IntakeQuestion;
+    (selected as SelectedQuestion)[proof] = {
+      header: original,
+      selectedAnswer: latest,
+      answers: function* () {
+        current();
+        yield '[';
+        for (let n = 0; n < count; n++) {
+          if (n) yield ',';
+          yield* answerChunks(view.childAt(question, 'answers', n)!);
+        }
+        yield ']';
+        current();
+      },
+    };
+    return selected;
+  };
+  const materialize = (question: IntakeEnvelopeRecord, recipe: QuestionHydrationRecipe) =>
+    recipe.kind === 'full'
+      ? parse<IntakeQuestion>(recipe.text)
+      : selectedQuestion(
+          question,
+          recipe.count,
+          parse<Record<string, unknown>>(recipe.header),
+          parse<IntakeQuestionAnswer>(recipe.latest),
+        );
+  function hydrate(
+    question: IntakeEnvelopeRecord,
+    count: number,
+    bytes: number,
+  ): { value: IntakeQuestion; recipe: QuestionHydrationRecipe } {
+    reviewQuestionHydrationWork(db, 'reviewQuestionHydrations');
+    if (count <= 1) {
+      const text = readText(question, bytes);
+      return {
+        value: parse<IntakeQuestion>(text),
+        recipe: { kind: 'full', count, cost: Buffer.byteLength(text), text },
+      };
+    }
+    current();
+    const header: string[] = ['{'];
+    let size = 2,
+      first = true,
+      after: string | undefined;
+    reviewQuestionHydrationWork(db, 'reviewQuestionHydrationBytes', 2);
+    const add = (text: string) => {
+      const amount = Buffer.byteLength(text);
+      size += amount;
+      reviewQuestionHydrationWork(db, 'reviewQuestionHydrationBytes', amount);
+      if (size > bytes)
+        throw new IntakeReviewFragmentRequired({
+          format: 'health-intake-review-fragment-v1',
+          logical: view.logical,
+          address: view.address(question),
+        });
+      header.push(text);
+    };
+    do {
+      const page = view.fields(question, { after, items: 32, bytes: Math.max(1024, bytes) });
+      for (const field of page.fields) {
+        if (field.name === 'answers') continue;
+        add((first ? '' : ',') + JSON.stringify(field.name) + ':');
+        first = false;
+        const child = view.child(question, field.name);
+        for (const piece of child
+          ? view.recordChunks(child)
+          : view.fieldChunks(question, field.name))
+          add(piece);
+      }
+      if (page.complete) break;
+      if (!page.after || page.after === after)
+        throw Error('Question header cursor did not advance');
+      after = page.after;
+    } while (true);
+    header.push('}');
+    const headerText = header.join(''),
+      original = parse<Record<string, unknown>>(headerText);
+    const latestText = readText(
+      view.childAt(question, 'answers', count - 1)!,
+      Math.max(0, bytes - size),
+    );
+    const latest = parse<IntakeQuestionAnswer>(latestText);
+    return {
+      value: selectedQuestion(question, count, original, latest),
+      recipe: {
+        kind: 'latest',
+        count,
+        cost: size + Buffer.byteLength(latestText),
+        header: headerText,
+        latest: latestText,
+      },
+    };
+  }
   return {
     question(question: IntakeEnvelopeRecord, bytes: number): IntakeQuestion {
+      options.cache?.assertOpen();
+      const expectedBefore = options.cache ? reviewReadStamp(db) : undefined;
+      options.assertCurrent?.();
       const count = view.childCount(question, 'answers');
-      if (count <= 1) return readIntakeReviewValue<IntakeQuestion>(view, question, bytes);
-      current();
-      const header: string[] = ['{'];
-      let size = 2,
-        first = true,
-        after: string | undefined;
-      const add = (text: string) => {
-        size += Buffer.byteLength(text);
-        if (size > bytes)
+      if (!options.cache) return hydrate(question, count, bytes).value;
+      const address = view.address(question);
+      return options.cache.read({
+        binding: hydrationBinding,
+        expectedBefore,
+        address,
+        count,
+        bytes,
+        assertCurrent() {
+          options.assertCurrent?.();
+          if (count > 1) current();
+          else store.check();
+          view.address(question);
+        },
+        overBudget() {
           throw new IntakeReviewFragmentRequired({
             format: 'health-intake-review-fragment-v1',
             logical: view.logical,
-            address: view.address(question),
+            address,
           });
-        header.push(text);
-      };
-      do {
-        const page = view.fields(question, { after, items: 32, bytes: Math.max(1024, bytes) });
-        for (const field of page.fields) {
-          if (field.name === 'answers') continue;
-          add((first ? '' : ',') + JSON.stringify(field.name) + ':');
-          first = false;
-          const child = view.child(question, field.name);
-          for (const piece of child
-            ? view.recordChunks(child)
-            : view.fieldChunks(question, field.name))
-            add(piece);
-        }
-        if (page.complete) break;
-        if (!page.after || page.after === after)
-          throw Error('Question header cursor did not advance');
-        after = page.after;
-      } while (true);
-      header.push('}');
-      const original = parseLiteralJSON(header.join('')) as Record<string, unknown>,
-        latest = readIntakeReviewValue<IntakeQuestionAnswer>(
-          view,
-          view.childAt(question, 'answers', count - 1)!,
-          Math.max(0, bytes - size),
-        );
-      const selected = {
-        ...original,
-        answers: [latest],
-        answerScope: 'latest',
-        answerHistory: {
-          count,
-          reference: {
-            format: 'health-intake-review-fragment-v1',
-            logical: view.logical,
-            address: view.address(question),
-            field: 'answers',
-          },
         },
-      } as IntakeQuestion;
-      (selected as SelectedQuestion)[proof] = {
-        header: original,
-        selectedAnswer: latest,
-        answers: function* () {
-          current();
-          yield '[';
-          for (let n = 0; n < count; n++) {
-            if (n) yield ',';
-            yield* answerChunks(view.childAt(question, 'answers', n)!);
-          }
-          yield ']';
-          current();
-        },
-      };
-      return selected;
+        hydrate: () => hydrate(question, count, bytes),
+        materialize: (recipe) => materialize(question, recipe),
+      });
     },
     *canonicalRecords(value: unknown): Generator<string> {
+      options.cache?.assertOpen();
       for (const piece of canonicalReviewValueChunks(value)) {
         withIntakeWork(db, 'warm', () =>
           recordIntakeWork('reviewQuestionTokenBytes', Buffer.byteLength(piece)),

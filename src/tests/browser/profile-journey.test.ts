@@ -56,13 +56,24 @@ test(
         const input = document.querySelector('input[type=file]');
         return input && !(input as HTMLInputElement).disabled;
       });
+      const failedUploadDiagnostics = runtime.captureDiagnostics();
       const uploaded = fixtureBrowserResponse(
         page,
         (response) => response.request().method() === 'POST' && response.url().endsWith('/intakes'),
       );
       await page.locator('input[type=file]').setInputFiles(file);
       const response = await uploaded;
-      assert(response.ok(), await response.text());
+      assert(
+        response.ok(),
+        response.ok()
+          ? undefined
+          : JSON.stringify({
+              serverDiagnostics: await failedUploadDiagnostics(),
+              fixture: 'fictional profile journey upload',
+              status: response.status(),
+              error: await response.text(),
+            }),
+      );
       // This journey reviews known JSONL manually. Finish any admitted background
       // capture before selecting evidence; an unavailable model must not race it.
       await stopFixtureImport(page, url, prefix, (await response.json()).data.id);

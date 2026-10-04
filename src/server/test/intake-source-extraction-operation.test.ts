@@ -147,7 +147,7 @@ test('durable admission failure prevents all extraction work', async (t) => {
   f.storage.publishHead = () => {
     throw new Error('Fictional storage interruption');
   };
-  assert.throws(
+  await assert.rejects(
     () =>
       runIntakeSourceExtractionOperation({
         ...f.context,

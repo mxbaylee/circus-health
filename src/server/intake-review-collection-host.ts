@@ -1,3 +1,4 @@
+import { createReviewQuestionHydrationCache } from './intake-review-question-hydration.ts';
 import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { indexedReviewQuestions } from './intake-review-question-index.ts';
 import { finishClinicalReviewWork, runClinicalReviewWork } from './clinical-review-work.ts';
@@ -385,14 +386,22 @@ function* prepareCollectionClinicalReviewWork(
       throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
   };
   const issueScratch = createReviewIssueScratch(db);
-  issueScratch.db.exec(
-    'CREATE TABLE consumed_source_files (id TEXT PRIMARY KEY, path TEXT, identity TEXT)',
-  );
-  const retainConsumedFile = issueScratch.db.prepare(
-    'INSERT OR IGNORE INTO consumed_source_files (id) VALUES (?)',
-  );
+  const questionHydrations = (() => {
+    try {
+      return createReviewQuestionHydrationCache(db, issueScratch.db);
+    } catch (error) {
+      issueScratch.close();
+      throw error;
+    }
+  })();
   let retainedIssueScratch = false;
   try {
+    issueScratch.db.exec(
+      'CREATE TABLE consumed_source_files (id TEXT PRIMARY KEY, path TEXT, identity TEXT)',
+    );
+    const retainConsumedFile = issueScratch.db.prepare(
+      'INSERT OR IGNORE INTO consumed_source_files (id) VALUES (?)',
+    );
     const opened = new Map<string, ReturnType<typeof open>>();
     function open(original: ClinicalScopeOriginal) {
       options.groundingDependency?.(original.id);
@@ -516,7 +525,13 @@ function* prepareCollectionClinicalReviewWork(
         bindIdentityWarningsWork: (record, warnings) =>
           bindReviewIdentityWarningsWork(issueSink, record, warnings),
         close: issueSink.dispose,
-        questionState: openReviewQuestionState(db, retained, view),
+        questionState: openReviewQuestionState(db, retained, view, {
+          cache: questionHydrations,
+          assertCurrent: () => {
+            assertCurrent();
+            view.address(view.root());
+          },
+        }),
         questionIndex: indexedReviewQuestions(db, retained, view, issueScratch.db, metadataBytes),
         membershipIndex: readCollectionReviewMembership(db, retained, view),
         readDraftWork: (record) =>
@@ -1150,7 +1165,11 @@ function* prepareCollectionClinicalReviewWork(
         try {
           close();
         } finally {
-          issueScratch.close();
+          try {
+            questionHydrations.close();
+          } finally {
+            issueScratch.close();
+          }
         }
       };
       retainedIssueScratch = true;
@@ -1161,7 +1180,13 @@ function* prepareCollectionClinicalReviewWork(
       return { status: 'fragment_required', reference: error.reference };
     throw error;
   } finally {
-    if (!retainedIssueScratch) issueScratch.close();
+    if (!retainedIssueScratch) {
+      try {
+        questionHydrations.close();
+      } finally {
+        issueScratch.close();
+      }
+    }
   }
 }
 

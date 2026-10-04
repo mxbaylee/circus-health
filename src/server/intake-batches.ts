@@ -1,3 +1,5 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
+import { retainedIntakeWorkflowCommand } from './intake-workflow-command.ts';
 import {
   setCollectionProcessingException,
   clearCollectionProcessingExceptions,
@@ -20,6 +22,7 @@ import {
   currentIntakeInterpretations,
   createIntakePlanRead,
   workflowMutation,
+  flushIntake,
 } from './intake.ts';
 import { isRetainOnlyIntake } from './intake-source-policy.ts';
 import { nextPendingReadingUnit } from './intake-unit-accounting.ts';
@@ -30,8 +33,8 @@ import {
   sourceTextExtractionPending,
   locateSourceExtractionProgress,
   extractIntakeSourceText,
-  retainSourceStall,
-  retrySourceExceptions,
+  retainSourceStallAsync as retainSourceStall,
+  retrySourceExceptionsAsync as retrySourceExceptions,
 } from './intake-source-extraction.ts';
 import {
   listIntakeBatches,
@@ -79,6 +82,98 @@ import type {
   IntakeBatchItemStatus,
   IntakeBatchReadingState,
 } from '../shared/intake-batch.ts';
+
+type BatchProcessingExceptionCommand =
+  | { kind: 'set'; operationId: string; unitId: string; at: string }
+  | { kind: 'clear-unit'; operationId: string; unitId: string; batchId: string; epoch: number }
+  | { kind: 'clear'; operationId: string };
+
+/** Short host mutation ownership; captured semantic authority is never refreshed after queueing. */
+export async function runBatchProcessingException(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  source: Pick<Intake, 'id' | 'sha256' | 'version'>,
+  requested: BatchProcessingExceptionCommand,
+  assertRunning: () => void,
+): Promise<void> {
+  const { id, sha256, version } = source;
+  const command = { ...requested };
+  const operationId = command.operationId;
+  if (
+    command.kind === 'clear-unit' &&
+    operationId !== 'resume-stall:' + command.batchId + ':' + command.unitId + ':' + command.epoch
+  )
+    throw new HttpError(409, 'OPERATION_CONFLICT', 'Invalid batch exception operation identity');
+  await runExclusiveClinicalOperation(
+    db,
+    async () => {
+      assertRunning();
+      const selected = getIntake(db, root, profileId, id);
+      if (selected.sha256 !== sha256)
+        throw new HttpError(409, 'SOURCE_CHANGED', 'The pinned original changed');
+      // Receipt replay intentionally precedes fresh-work version validation in both
+      // commands. Pass the original version unchanged; do not reject a valid replay.
+      const input = { version, operationId };
+      if (isIntakeSummary(selected)) {
+        if (command.kind === 'clear-unit') {
+          // Only this internally derived batch identity may replay its historical
+          // legacy recipe. New native receipts retain the stronger unit fingerprint.
+          let legacyReplay = false;
+          try {
+            legacyReplay = retainedIntakeWorkflowCommand(
+              db,
+              { id },
+              {
+                operationId,
+                request: { operationId },
+              },
+            );
+          } catch (error) {
+            if (!(error instanceof HttpError) || error.code !== 'OPERATION_CONFLICT') throw error;
+          }
+          if (legacyReplay) {
+            flushIntake(db, root, profileId);
+            return;
+          }
+          await clearCollectionProcessingException(db, root, profileId, id, {
+            ...input,
+            unitId: command.unitId,
+            assertRunning,
+          });
+        } else if (command.kind === 'set') {
+          await setCollectionProcessingException(db, root, profileId, id, {
+            ...input,
+            unitId: command.unitId,
+            exception: { reason: 'processing_stalled', at: command.at },
+            assertRunning,
+          });
+        } else
+          await clearCollectionProcessingExceptions(db, root, profileId, id, {
+            ...input,
+            assertRunning,
+          });
+      } else
+        workflowMutation(db, root, profileId, id, input, (workflow) => {
+          if (command.kind === 'clear') {
+            for (const plan of workflow.plans.filter((plan) => plan.status === 'active'))
+              for (const unit of plan.units) delete unit.processingException;
+          } else {
+            const unit = workflow.plans
+              .find((plan) => plan.status === 'active')
+              ?.units.find((unit) => unit.id === command.unitId);
+            if (command.kind === 'clear-unit') {
+              if (!unit)
+                throw new HttpError(409, 'PLAN_CHANGED', 'Active extraction unit not found');
+              delete unit.processingException;
+            } else if (unit)
+              unit.processingException = { reason: 'processing_stalled', at: command.at };
+          }
+        });
+    },
+    { operation: currentClinicalOperation(db), assertRunning },
+  );
+}
 
 interface AssistantChat {
   id: string;
@@ -541,7 +636,7 @@ export function createIntakeBatchManager({
         }
         pumping.add(profileId);
         void pump(profileId, batchId, expected)
-          .catch((error: unknown) => {
+          .catch(async (error: unknown) => {
             if (!live(profileId, expected)) return;
             const batch = batches.get(key(profileId, pumpBatches.get(profileId) || batchId));
             if (!batch || batch.status !== 'running') return;
@@ -555,68 +650,84 @@ export function createIntakeBatchManager({
                 'SOURCE_TEXT_CHANGED',
               ].includes(error.code)
             ) {
-              const sourceText = getIntakeSourceText(
-                dbFor(profileId),
-                root,
-                profileId,
-                current.intakeId,
-              );
-              const progress = locateSourceExtractionProgress(sourceText);
-              if (error.code === 'SOURCE_TEXT_CHANGED' && current.sourceExtraction) {
-                current.sourceExtraction.operationId = null;
-                current.sourceExtraction.expectedRevisionId = sourceText.revision?.id || null;
-              }
-              const unit = progress.page
-                ? `source:${current.intakeId}:page:${progress.page}`
-                : `source:${current.intakeId}`;
-              const attempts =
-                error.code === 'SOURCE_EXTRACTION_BUSY'
-                  ? 0
-                  : (current.sourceRetryUnit === unit ? current.sourceRetryAttempts || 0 : 0) + 1;
-              current.sourceRetryUnit = unit;
-              current.sourceRetryAttempts = attempts;
-              if (attempts >= 3) {
-                if (progress.page)
-                  retainSourceStall(
-                    dbFor(profileId),
-                    root,
-                    profileId,
-                    current.intakeId,
-                    progress.page,
-                  );
-                else
-                  itemExceptions(current).push({
-                    unitId: unit,
-                    locator: 'Retained file (source inventory unavailable)',
-                    reason: 'processing_stalled',
-                  });
-                current.sourceRetryAttempts = 0;
-                current.status = progress.page ? 'queued' : 'review_ready';
-                current.reason = 'processing_stalled';
-                current.retryAt = null;
-              } else {
-                current.status = 'queued';
-                current.reason =
-                  error.code === 'SOURCE_EXTRACTION_BUSY'
-                    ? 'waiting_for_local_capacity'
-                    : 'retrying_extraction';
-                current.retryAt = new Date(
-                  clock().getTime() +
-                    Math.min(
-                      300_000,
-                      Math.max(1, providerRetryBaseMs) * 2 ** Math.min(attempts, 6),
-                    ),
-                ).toISOString();
-              }
               try {
-                save(profileId, batch, 'source-extraction-capacity-wait');
-                batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
-                schedule(profileId, batch.id);
-                return;
-              } catch (journalError) {
-                // Never dispatch again unless the waiting checkpoint is durable.
-                // Fall through to the guarded pause path if its write failed.
-                error = journalError;
+                const sourceText = getIntakeSourceText(
+                  dbFor(profileId),
+                  root,
+                  profileId,
+                  current.intakeId,
+                );
+                const progress = locateSourceExtractionProgress(sourceText);
+                if (error.code === 'SOURCE_TEXT_CHANGED' && current.sourceExtraction) {
+                  current.sourceExtraction.operationId = null;
+                  current.sourceExtraction.expectedRevisionId = sourceText.revision?.id || null;
+                }
+                const unit = progress.page
+                  ? `source:${current.intakeId}:page:${progress.page}`
+                  : `source:${current.intakeId}`;
+                const attempts =
+                  error.code === 'SOURCE_EXTRACTION_BUSY'
+                    ? 0
+                    : (current.sourceRetryUnit === unit ? current.sourceRetryAttempts || 0 : 0) + 1;
+                current.sourceRetryUnit = unit;
+                current.sourceRetryAttempts = attempts;
+                if (attempts >= 3) {
+                  if (progress.page) {
+                    await retainSourceStall(
+                      dbFor(profileId),
+                      root,
+                      profileId,
+                      current.intakeId,
+                      progress.page,
+                      {
+                        assertRunning: () => {
+                          if (
+                            !live(profileId, expected) ||
+                            batch.status !== 'running' ||
+                            !authorized(profileId, current.intakeId, 'publish')
+                          )
+                            throw Error('SOURCE_EXTRACTION_CANCELLED');
+                        },
+                      },
+                    );
+                    if (!live(profileId, expected) || batch.status !== 'running') return;
+                  } else
+                    itemExceptions(current).push({
+                      unitId: unit,
+                      locator: 'Retained file (source inventory unavailable)',
+                      reason: 'processing_stalled',
+                    });
+                  current.sourceRetryAttempts = 0;
+                  current.status = progress.page ? 'queued' : 'review_ready';
+                  current.reason = 'processing_stalled';
+                  current.retryAt = null;
+                } else {
+                  current.status = 'queued';
+                  current.reason =
+                    error.code === 'SOURCE_EXTRACTION_BUSY'
+                      ? 'waiting_for_local_capacity'
+                      : 'retrying_extraction';
+                  current.retryAt = new Date(
+                    clock().getTime() +
+                      Math.min(
+                        300_000,
+                        Math.max(1, providerRetryBaseMs) * 2 ** Math.min(attempts, 6),
+                      ),
+                  ).toISOString();
+                }
+                try {
+                  save(profileId, batch, 'source-extraction-capacity-wait');
+                  batch.currentIndex = (batch.currentIndex + 1) % batch.items.length;
+                  schedule(profileId, batch.id);
+                  return;
+                } catch (journalError) {
+                  // Never dispatch again unless the waiting checkpoint is durable.
+                  // Fall through to the guarded pause path if its write failed.
+                  error = journalError;
+                }
+              } catch (publicationError) {
+                if (!live(profileId, expected)) return;
+                error = publicationError;
               }
             }
             if (
@@ -992,10 +1103,34 @@ export function createIntakeBatchManager({
     const deadline = new Promise<never>((_, reject) => {
       expire = reject;
     });
-    const watchdog = setTimeout(() => {
-      expired = true;
-      expire(Error('SOURCE_EXTRACTION_STALLED'));
-    }, sourceStallMs);
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    let remaining = sourceStallMs,
+      activeSince = 0,
+      working = false;
+    const waitingForClinicalOwner = (waiting: boolean) => {
+      if (expired || waiting === !working) return;
+      if (working) {
+        clearTimeout(watchdog);
+        watchdog = undefined;
+        remaining = Math.max(0, remaining - (performance.now() - activeSince));
+      }
+      working = !waiting;
+      if (working) {
+        activeSince = performance.now();
+        watchdog = setTimeout(() => {
+          expired = true;
+          expire(Error('SOURCE_EXTRACTION_STALLED'));
+        }, remaining);
+      }
+    };
+    const assertPublish = () => {
+      if (
+        !live(profileId, expected) ||
+        batch.status !== 'running' ||
+        !authorized(profileId, item.intakeId, 'publish')
+      )
+        throw Error('SOURCE_EXTRACTION_CANCELLED');
+    };
     let result: Awaited<ReturnType<typeof runIntakeSourceExtractionOperation>>;
     try {
       result = await runIntakeSourceExtractionOperation({
@@ -1005,31 +1140,35 @@ export function createIntakeBatchManager({
         id: item.intakeId,
         operationId: state.operationId,
         expectedRevisionId: state.expectedRevisionId,
-        extract: (context) =>
-          Promise.race([
-            extract({
+        extract: (context) => {
+          // Queue wait consumes no worker allowance. Resume the remaining budget;
+          // entering a coordinator phase is not extraction progress.
+          waitingForClinicalOwner(false);
+          let work: ReturnType<typeof extract>;
+          try {
+            work = extract({
               ...context,
               maxPages: 1,
-              assertRunning: () => {
+              onCoordinationWait: waitingForClinicalOwner,
+              assertRunning() {
                 context.assertRunning?.();
                 if (expired) throw Error('SOURCE_EXTRACTION_STALLED');
               },
-            }),
-            deadline,
-          ]),
-        assertRunning: () => {
-          if (
-            !live(profileId, expected) ||
-            batch.status !== 'running' ||
-            !authorized(profileId, item.intakeId, 'publish')
-          )
-            throw Error('SOURCE_EXTRACTION_CANCELLED');
+            });
+          } catch (error) {
+            waitingForClinicalOwner(true);
+            throw error;
+          }
+          return Promise.race([work, deadline]).finally(() => waitingForClinicalOwner(true));
         },
+        assertRunning: assertPublish,
       });
     } finally {
+      waitingForClinicalOwner(true);
       clearTimeout(watchdog);
     }
     if (!live(profileId, expected) || batch.status !== 'running') return 'blocked';
+    // Retained elapsed time still includes queue wait; only the worker watchdog excludes it.
     state.spentMs += Math.max(0, clock().getTime() - Date.parse(state.startedAt || now()));
     state.operationId = null;
     state.startedAt = null;
@@ -1055,8 +1194,12 @@ export function createIntakeBatchManager({
         item.sourceRetryUnit === unit ? (item.sourceRetryAttempts || 0) + 1 : 1;
       item.sourceRetryUnit = unit;
       if (item.sourceRetryAttempts >= 3) {
-        if (next.page) retainSourceStall(db, root, profileId, item.intakeId, next.page);
-        else {
+        if (next.page) {
+          await retainSourceStall(db, root, profileId, item.intakeId, next.page, {
+            assertRunning: assertPublish,
+          });
+          if (!live(profileId, expected) || batch.status !== 'running') return 'blocked';
+        } else {
           itemExceptions(item).push({
             unitId: unit,
             locator: 'Retained file (source inventory unavailable)',
@@ -1119,7 +1262,10 @@ export function createIntakeBatchManager({
       state.stalls = state.unitPage === next.page ? (state.stalls || 0) + 1 : 1;
       state.unitPage = next.page;
       if (state.stalls >= 3 && next.page) {
-        retainSourceStall(db, root, profileId, item.intakeId, next.page);
+        await retainSourceStall(db, root, profileId, item.intakeId, next.page, {
+          assertRunning: assertPublish,
+        });
+        if (!live(profileId, expected) || batch.status !== 'running') return 'blocked';
         state.stalls = 0;
       } else {
         item.reason = 'retrying_extraction';
@@ -1393,29 +1539,20 @@ export function createIntakeBatchManager({
           throw new HttpError(409, 'SOURCE_CHANGED', 'The pinned original changed');
         const operationId =
           'resume-stall:' + batch.id + ':' + exception.unitId + ':' + (item.exceptionEpoch || 0);
-        if (isIntakeSummary(intake))
-          await clearCollectionProcessingException(db, root, profileId, item.intakeId, {
-            version: intake.version,
+        await runBatchProcessingException(
+          db,
+          root,
+          profileId,
+          intake,
+          {
+            kind: 'clear-unit',
             operationId,
             unitId: exception.unitId,
-            assertRunning: assertRetryCurrent,
-          });
-        else
-          workflowMutation(
-            db,
-            root,
-            profileId,
-            item.intakeId,
-            { version: intake.version, operationId },
-            (workflow) => {
-              const unit = workflow.plans
-                .find((plan) => plan.status === 'active')
-                ?.units.find((unit) => unit.id === exception.unitId);
-              if (!unit)
-                throw new HttpError(409, 'PLAN_CHANGED', 'Active extraction unit not found');
-              delete unit.processingException;
-            },
-          );
+            batchId: batch.id,
+            epoch: item.exceptionEpoch || 0,
+          },
+          assertRetryCurrent,
+        );
         assertRetryCurrent();
         item.exceptionEpoch = (item.exceptionEpoch || 0) + 1;
         item.exceptions = item.exceptions.filter((retained) => retained !== exception);
@@ -1681,36 +1818,28 @@ export function createIntakeBatchManager({
             reason: 'processing_stalled' as const,
           };
           itemExceptions(item).push(exception);
-          if (isIntakeSummary(intake))
-            await setCollectionProcessingException(dbFor(profileId), root, profileId, intake.id, {
-              version: intake.version,
+          await runBatchProcessingException(
+            dbFor(profileId),
+            root,
+            profileId,
+            intake,
+            {
+              kind: 'set',
+              unitId: scope.unitId,
+              at: now(),
               operationId:
                 'stall:' + batch.id + ':' + scope.unitId + ':' + (item.exceptionEpoch || 0),
-              unitId: scope.unitId,
-              exception: { reason: 'processing_stalled', at: now() },
-              assertRunning: () => {
-                if (!live(profileId, expected) || !authorized(profileId, intake.id, 'publish'))
-                  throw Error('Import processing stopped');
-              },
-            });
-          else
-            workflowMutation(
-              dbFor(profileId),
-              root,
-              profileId,
-              intake.id,
-              {
-                version: intake.version,
-                operationId:
-                  'stall:' + batch.id + ':' + scope.unitId + ':' + (item.exceptionEpoch || 0),
-              },
-              (workflow) => {
-                const unit = workflow.plans
-                  .find((p) => p.status === 'active')
-                  ?.units.find((u) => u.id === scope.unitId);
-                if (unit) unit.processingException = { reason: 'processing_stalled', at: now() };
-              },
-            );
+            },
+            () => {
+              if (
+                !live(profileId, expected) ||
+                batch.status !== 'running' ||
+                !authorized(profileId, intake.id, 'publish')
+              )
+                throw Error('Import processing stopped');
+            },
+          );
+          if (!live(profileId, expected) || batch.status !== 'running') return;
           const latest = getIntake(dbFor(profileId), root, profileId, intake.id);
           const remaining = isIntakeSummary(latest)
             ? !!nativeAssistantUnit(
@@ -2327,33 +2456,34 @@ export function createIntakeBatchManager({
   async function retryExceptions(profileId: string, batchId: string): Promise<IntakeBatch> {
     const batch = get(profileId, batchId);
     const db = dbFor(profileId);
+    const expected = generation(profileId);
     for (const item of batch.items) {
       if (!item.exceptions?.length) continue;
-      if (!authorized(profileId, item.intakeId, 'publish'))
+      if (!live(profileId, expected) || !authorized(profileId, item.intakeId, 'publish'))
         throw new HttpError(403, 'PROFILE_SCOPE', 'Unlock this profile before retrying imports');
-      retrySourceExceptions(db, root, profileId, item.intakeId);
+      await retrySourceExceptions(db, root, profileId, item.intakeId, {
+        assertRunning: () => {
+          if (!live(profileId, expected) || !authorized(profileId, item.intakeId, 'publish'))
+            throw Error('Import processing authorization ended');
+        },
+      });
+      if (!live(profileId, expected)) throw Error('Import processing authorization ended');
       const intake = getIntake(db, root, profileId, item.intakeId);
-      if (isIntakeSummary(intake))
-        await clearCollectionProcessingExceptions(db, root, profileId, item.intakeId, {
-          version: intake.version,
+      await runBatchProcessingException(
+        db,
+        root,
+        profileId,
+        intake,
+        {
+          kind: 'clear',
           operationId: randomUUID(),
-          assertRunning: () => {
-            if (!authorized(profileId, item.intakeId, 'publish'))
-              throw Error('Import processing authorization ended');
-          },
-        });
-      else
-        workflowMutation(
-          db,
-          root,
-          profileId,
-          item.intakeId,
-          { version: intake.version, operationId: randomUUID() },
-          (workflow) => {
-            for (const plan of workflow.plans.filter((plan) => plan.status === 'active'))
-              for (const unit of plan.units) delete unit.processingException;
-          },
-        );
+        },
+        () => {
+          if (!live(profileId, expected) || !authorized(profileId, item.intakeId, 'publish'))
+            throw Error('Import processing authorization ended');
+        },
+      );
+      if (!live(profileId, expected)) throw Error('Import processing authorization ended');
       item.exceptionEpoch = (item.exceptionEpoch || 0) + 1;
       item.exceptions = [];
       item.stalls = undefined;

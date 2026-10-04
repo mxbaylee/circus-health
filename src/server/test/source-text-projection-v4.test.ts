@@ -104,6 +104,7 @@ test('native v4 source query equals independent raw SQLite text through cold rea
       }
     },
   });
+  assert.ok(built);
   assert.equal(checkpointInspected, true);
   assert.equal(built.sourceTextHash, createHash('sha256').update(text).digest('hex'));
   const before = structuredClone(intakeWorkCounters(db));
