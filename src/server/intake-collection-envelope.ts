@@ -1,3 +1,10 @@
+import { types as utilTypes } from 'node:util';
+import {
+  resolveSchemaMetadata,
+  schemaResolvedHeader,
+  schemaResolvedTarget,
+  schemaResolvedOrder,
+} from './intake-schema-record-resolution.ts';
 import type { Database } from './database.ts';
 import {
   intakeEnvelopeAuthorityBinding,
@@ -16,6 +23,7 @@ import {
   parseIntakeCollectionDescriptor,
   parseIntakeStoredValue,
   intakeCollectionCacheGeneration,
+  intakeSchemaRecordOwner,
 } from './intake-state-collections.ts';
 import {
   parseSchemaControl,
@@ -236,37 +244,15 @@ function* cellChunks(store: EnvelopeCellReader, key: string): Generator<string> 
   if (read !== value.bytes) fail('lexical cell byte count');
 }
 function target(value: unknown): SchemaTarget {
-  if (!value || typeof value !== 'object' || Object.keys(value).sort().join(',') !== 'id,type')
-    return fail('target grammar');
-  const item = value as SchemaTarget;
-  if (!['cell', 'record'].includes(item.type) || !/^[a-f0-9]{64}$/.test(item.id))
-    return fail('target grammar');
-  return item;
+  return schemaResolvedTarget(value);
 }
 function header(store: EnvelopeCellReader, id: string): SchemaRecord {
   if (!/^[a-f0-9]{64}$/.test(id)) return fail('record address');
-  const value = JSON.parse(textValue(store, 'r:' + id)) as SchemaRecord;
-  if (
-    Object.keys(value).sort().join(',') !== 'count,kind,shape' ||
-    typeof value.kind !== 'string' ||
-    !['object', 'array', 'scalar'].includes(value.shape) ||
-    !Number.isSafeInteger(value.count) ||
-    value.count < 0
-  )
-    fail('record header');
-  return value;
+  return schemaResolvedHeader(textValue(store, 'r:' + id));
 }
 function order(value: string | IntakeByteValue): SchemaOrder {
   if (typeof value !== 'string') return fail('fragmented order entry');
-  const parsed = JSON.parse(value) as SchemaOrder;
-  if (
-    !parsed ||
-    !/^[a-f0-9]{64}$/.test(parsed.prefix) ||
-    (parsed.name !== undefined && !/^[a-f0-9]{64}$/.test(parsed.name))
-  )
-    fail('order entry');
-  target(parsed.target);
-  return parsed;
+  return schemaResolvedOrder(value);
 }
 function* orderEntries(store: EnvelopeCellReader, id: string): Generator<SchemaOrder> {
   const prefix = 'o:' + id + ':';
@@ -332,6 +318,37 @@ function* iterateSchemaRecordValue(
   }
   yield* cellChunks(store, 's:' + id);
 }
+const schemaResolutionOwners = new WeakMap<
+  EnvelopeCellReader,
+  {
+    methods: readonly Function[];
+    resolve: (
+      mode: 'raw' | 'normalized',
+      root: string,
+      id: string,
+      selection: 'first' | 'last',
+    ) => SchemaRecord;
+    clear: () => void;
+    current: () => boolean;
+  }
+>();
+function inertSchemaControl(control: SchemaControl): string | undefined {
+  if (!control || typeof control !== 'object' || utilTypes.isProxy(control)) return undefined;
+  const values: unknown[] = [];
+  for (const name of ['format', 'mode', 'root']) {
+    const descriptor = Object.getOwnPropertyDescriptor(control, name);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'string')
+      return undefined;
+    values.push(descriptor.value);
+  }
+  if (
+    values[0] !== 'health-intake-record-envelope-v1' ||
+    !['raw', 'normalized'].includes(values[1] as string) ||
+    !/^[a-f0-9]{64}$/.test(values[2] as string)
+  )
+    return undefined;
+  return JSON.stringify(values);
+}
 export function createSchemaEnvelopeReader(
   store: EnvelopeCellReader,
   control: SchemaControl,
@@ -340,35 +357,60 @@ export function createSchemaEnvelopeReader(
   fieldSelection: 'first' | 'last' = 'last',
 ): IntakeCollectionEnvelopeReader {
   const handles = new WeakMap<IntakeEnvelopeRecord, string>();
+  const capturedControl = inertSchemaControl(control);
+  const ownedHeader = (id: string): SchemaRecord | undefined => {
+    const owner = schemaResolutionOwners.get(store);
+    if (!owner) return undefined;
+    const validMethods = ['get', 'check', 'range', 'chunks'].every((name, index) => {
+      const descriptor = Object.getOwnPropertyDescriptor(store, name);
+      return (
+        !!descriptor &&
+        Object.hasOwn(descriptor, 'value') &&
+        descriptor.value === owner.methods[index]
+      );
+    });
+    const currentControl = inertSchemaControl(control);
+    if (
+      typeof id !== 'string' ||
+      !validMethods ||
+      !owner.current() ||
+      !capturedControl ||
+      currentControl !== capturedControl ||
+      (fieldSelection !== 'first' && fieldSelection !== 'last')
+    ) {
+      owner.clear();
+      return undefined;
+    }
+    const [, mode, root] = JSON.parse(capturedControl) as [string, 'raw' | 'normalized', string];
+    const result = owner.resolve(mode, root, id, fieldSelection);
+    if (
+      inertSchemaControl(control) !== capturedControl ||
+      !owner.current() ||
+      !['get', 'check', 'range', 'chunks'].every((name, index) => {
+        const descriptor = Object.getOwnPropertyDescriptor(store, name);
+        return (
+          !!descriptor &&
+          Object.hasOwn(descriptor, 'value') &&
+          descriptor.value === owner.methods[index]
+        );
+      })
+    ) {
+      owner.clear();
+      fail('schema resolve authority changed');
+    }
+    return result;
+  };
+  const checkedHeader = (id: string): SchemaRecord => ownedHeader(id) ?? header(store, id);
   const resolve = (id: string): IntakeEnvelopeRecord => {
     store.check();
-    const meta = header(store, id);
-    let cursor = id,
-      depth = 0;
-    while (cursor !== control.root) {
-      if (++depth > 128) fail('record ancestry');
-      const edge = JSON.parse(textValue(store, 'p:' + cursor)) as {
-        parent: string;
-        ordinal: number;
-        field: string | null;
-      };
-      const item =
-        edge.field === null
-          ? order(textValue(store, 'o:' + edge.parent + ':' + schemaOrdinal(edge.ordinal))).target
-          : fieldSelection === 'last'
-            ? target(JSON.parse(textValue(store, 'f:' + edge.parent + ':' + edge.field)))
-            : order(
-                textValue(
-                  store,
-                  'o:' +
-                    edge.parent +
-                    ':' +
-                    schemaOrdinal(Number(textValue(store, 'b:' + edge.parent + ':' + edge.field))),
-                ),
-              ).target;
-      if (item.type !== 'record' || item.id !== cursor) fail('detached or shadowed record');
-      cursor = edge.parent;
-    }
+    const meta =
+      ownedHeader(id) ??
+      resolveSchemaMetadata(
+        (key) => textValue(store, key),
+        () => control.root,
+        id,
+        fieldSelection,
+      );
     const handle = Object.freeze({ kind: meta.kind }) as IntakeEnvelopeRecord;
     handles.set(handle, id);
     return handle;
@@ -379,7 +421,7 @@ export function createSchemaEnvelopeReader(
   };
   const fieldTarget = (record: IntakeEnvelopeRecord, name: string): SchemaTarget | undefined => {
     const id = address(record);
-    if (header(store, id).shape === 'scalar' && name === 'value') return { type: 'cell', id };
+    if (checkedHeader(id).shape === 'scalar' && name === 'value') return { type: 'cell', id };
     const value = store.get('f:' + id + ':' + schemaKey(name));
     if (value === undefined) return undefined;
     let selected = target(JSON.parse(typeof value === 'string' ? value : fail('field descriptor')));
@@ -518,7 +560,7 @@ export function createSchemaEnvelopeReader(
     properties = false,
   ): IntakeEnvelopeRecordPage => {
     const id = address(record),
-      meta = header(store, id),
+      meta = checkedHeader(id),
       prefix = 'o:' + id + ':';
     if (
       !Number.isSafeInteger(options.items) ||
@@ -570,7 +612,7 @@ export function createSchemaEnvelopeReader(
     address,
     resolve,
     info: (record) => {
-      const { shape, count } = header(store, address(record));
+      const { shape, count } = checkedHeader(address(record));
       return {
         shape,
         count: shape === 'object' ? Number(textValue(store, 'u:' + address(record))) : count,
@@ -663,7 +705,7 @@ export function createSchemaEnvelopeReader(
       const array = child(record, name);
       if (!array) return undefined;
       const id = address(array),
-        meta = header(store, id);
+        meta = checkedHeader(id);
       if (meta.shape !== 'array') fail('child index requires array');
       if (index >= meta.count) return undefined;
       const entry = order(textValue(store, 'o:' + id + ':' + schemaOrdinal(index)));
@@ -730,7 +772,7 @@ export function createSchemaEnvelopeReader(
       ordinal: number;
       field: string | null;
     };
-    if (edge.field === null || header(store, edge.parent).shape !== 'object')
+    if (edge.field === null || checkedHeader(edge.parent).shape !== 'object')
       fail('property order requires dictionary child');
     const first = Number(textValue(store, 'b:' + edge.parent + ':' + edge.field));
     if (!Number.isSafeInteger(first) || first < 0) fail('first property ordinal');
@@ -930,18 +972,23 @@ export function collectionCellReader(
       fail('stale logical envelope');
     view = collections.openView();
   };
-  return {
-    head,
-    collections,
-    store: {
-      check,
-      get: (key) => collections.get(view, area, collection, key),
-      range: (after, items, bytes) =>
-        collections.range(view, area, collection, { after, items, bytes }),
-      chunks: (value, after, bytes = 4096) =>
-        collections.readBytes(value, { after, items: 64, bytes }),
-    },
+  const store: EnvelopeCellReader = {
+    check,
+    get: (key) => collections.get(view, area, collection, key),
+    range: (after, items, bytes) =>
+      collections.range(view, area, collection, { after, items, bytes }),
+    chunks: (value, after, bytes = 4096) =>
+      collections.readBytes(value, { after, items: 64, bytes }),
   };
+  const owner = intakeSchemaRecordOwner(collections);
+  if (owner && area === 'logical' && collection === 'envelope.data')
+    schemaResolutionOwners.set(store, {
+      methods: Object.freeze([store.get, store.check, store.range, store.chunks]),
+      resolve: (mode, root, id, selection) => owner.resolve(view, mode, root, id, selection),
+      clear: owner.clear,
+      current: owner.current,
+    });
+  return { head, collections, store };
 }
 /** A V4 storage head can still select an exact V3 bridge after interrupted
  * conversion. Only a completed schema may enter native record consumers. */

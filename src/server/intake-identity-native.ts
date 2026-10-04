@@ -30,7 +30,7 @@ import {
   retainNativeIdentityPreview,
   clearNativeIdentityPreviews,
 } from './intake-identity-preview-cache.ts';
-import { verifyIntakeFileHash } from './intake-files.ts';
+import { verifyIntakeFileHashWork } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
 import {
   assertIntakeOwner,
@@ -1795,14 +1795,27 @@ function previewReadKey(
   ]);
 }
 /** Membership, including accepted/non-target occurrences, determines every required proposal. */
-function verifyPreviewArtifacts(context: Context) {
+function* verifyPreviewArtifactsWork(context: Context, stored: Rows): Generator<void, void, void> {
   const { db, root, profileId, id } = context;
   const seen = rows();
   try {
+    context.assertCurrent();
+    stored.assertArtifacts();
+    const original = getRetainedIntakeOriginalReference(db, root, profileId, id);
     withIntakeWork(db, 'warm', () => recordIntakeWork('identityPreviewArtifactChecks'));
-    verifyIntakeOriginal(db, root, profileId, id);
-    for (const member of context.membership())
+    const originalIdentity = yield* verifyIntakeFileHashWork(original.path, {
+      bytes: original.size,
+      sha256: original.sourceHash,
+    });
+    stored.retainArtifacts([{ id, path: original.path, identity: originalIdentity }]);
+    yield;
+    for (const member of context.membership()) {
+      yield;
       for (const occurrence of member.occurrences) {
+        // Checkpoints include empty and duplicate proposals: they still belong
+        // to the complete selected membership and can grow independently.
+        withIntakeWork(db, 'warm', () => recordIntakeWork('identityPreviewArtifactOccurrences'));
+        yield;
         context.assertCurrent();
         const proposalId = occurrence.proposalId;
         if (!proposalId || seen.get('verifiedProposals', proposalId)) continue;
@@ -1810,20 +1823,25 @@ function verifyPreviewArtifacts(context: Context) {
           .prepare('SELECT path,sha256,bytes FROM source_files WHERE id=?')
           .get(proposalId);
         if (!file) reject('A required retained proposal no longer exists');
+        const path = profileOriginal(root, String(file!.path), profileId);
         withIntakeWork(db, 'warm', () => recordIntakeWork('identityPreviewArtifactChecks'));
-        verifyIntakeFileHash(profileOriginal(root, String(file!.path), profileId), {
+        const identity = yield* verifyIntakeFileHashWork(path, {
           bytes: Number(file!.bytes),
           sha256: String(file!.sha256),
         });
+        // Retain the identity returned by verification, never a later stat.
+        // Existing cold-build proofs refuse a different identity for this id.
+        stored.retainArtifacts([{ id: proposalId, path, identity }]);
         seen.put('verifiedProposals', proposalId, true);
       }
-    withIntakeWork(db, 'warm', () => recordIntakeWork('identityPreviewArtifactChecks'));
-    verifyIntakeOriginal(db, root, profileId, id);
+    }
+    stored.assertArtifacts();
     context.assertCurrent();
   } finally {
     seen.close();
   }
 }
+
 function detachIdentityPreview(value: IntakeIdentityReview): IntakeIdentityReview {
   return JSON.parse(JSON.stringify(value), (_key, item, context) =>
     typeof item === 'number' && context?.source && JSON.stringify(item) !== context.source
@@ -1903,10 +1921,15 @@ export function getNativeIntakeIdentityReview(
         const cached = readNativeIdentityPreview(db, readKey);
         if (cached) {
           const context = await open(db, root, profileId, id, groupId, assertRunning);
+          let proof: Rows | undefined;
           try {
-            verifyPreviewArtifacts(context);
+            proof = rows();
+            await runNativeIdentityWork(context, proof, verifyPreviewArtifactsWork(context, proof));
             const value = detachIdentityPreview(cached.value);
-            verifyPreviewArtifacts(context);
+            // The complete first-verified set is still current after encoding.
+            // This final sweep checks metadata only; it never rehashes payloads.
+            proof.assertArtifacts();
+            context.assertCurrent();
             if (
               cached.stamp === reviewReadStamp(db) &&
               readKey === previewReadKey(db, root, profileId, id, groupId) &&
@@ -1917,7 +1940,11 @@ export function getNativeIntakeIdentityReview(
             if (!signal?.aborted) clearNativeIdentityPreviews(db);
             throw error;
           } finally {
-            context.scope.close?.();
+            try {
+              proof?.close();
+            } finally {
+              context.scope.close?.();
+            }
           }
           clearNativeIdentityPreviews(db);
         }
@@ -2071,7 +2098,7 @@ async function getNativeIntakeIdentityReviewInner(
       context = await open(db, root, profileId, id, groupId, assertRunning);
       self = selfSnapshot(db);
       correctedPerson = correction();
-      verifyPreviewArtifacts(context);
+      await runNativeIdentityWork(context, stored, verifyPreviewArtifactsWork(context, stored));
       const freshOriginal = await evidence(context);
       built = await build(context, freshOriginal, stored);
       const catalog = createReportSnapshotCatalog(db, context.file, {
@@ -2125,7 +2152,7 @@ async function getNativeIntakeIdentityReviewInner(
         correctedPerson,
         ...peoplePreview(db),
       };
-      verifyPreviewArtifacts(context);
+      await runNativeIdentityWork(context, stored, verifyPreviewArtifactsWork(context, stored));
       if (
         constructionStamp !== undefined &&
         constructionStamp === reviewReadStamp(db) &&

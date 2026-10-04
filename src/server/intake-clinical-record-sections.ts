@@ -17,6 +17,7 @@ import { assertIntakeOwner } from './intake.ts';
 import { visibilityState } from './visibility.ts';
 import { savedDuplicateOriginalOverlap } from './duplicate-evidence-index.ts';
 import {
+  readPreparedClinicalRecordSection,
   prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
@@ -399,120 +400,111 @@ export async function readClinicalRecordSection(
   intakeId: string,
   input: ClinicalRecordSectionRequest,
 ): Promise<ClinicalRecordSectionPage> {
-  return runExclusiveClinicalOperation(
+  validateSelection(input);
+  return readPreparedClinicalRecordSection(
     db,
-    async () => {
-      const { session, review, record } = await openSelectedClinicalRecord(
-        db,
-        root,
+    root,
+    profileId,
+    intakeId,
+    input,
+    ({ review, record }) => {
+      const limit = input.limit ?? 20,
+        budget = input.bytes ?? 65536;
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 20 ||
+        !Number.isSafeInteger(budget) ||
+        budget < 4096 ||
+        budget > 65536
+      )
+        throw new HttpError(400, 'REVIEW_WINDOW', 'Choose 1–20 items and 4096–65536 bytes');
+      const binding = fingerprint([
         profileId,
         intakeId,
-        input,
+        review.reviewToken,
+        input.proposalId,
+        input.recordId,
+        input.candidateVersionId,
+        input.section,
+        input.comparisonSearch || null,
+      ]);
+      const discovered = comparisonSearch(db, record, input);
+      const all = sectionData(
+        db,
+        review,
+        record,
+        input.section,
+        discovered?.matches.map((match) => match.id),
       );
-
-      try {
-        const limit = input.limit ?? 20,
-          budget = input.bytes ?? 65536;
-        if (
-          !Number.isSafeInteger(limit) ||
-          limit < 1 ||
-          limit > 20 ||
-          !Number.isSafeInteger(budget) ||
-          budget < 4096 ||
-          budget > 65536
-        )
-          throw new HttpError(400, 'REVIEW_WINDOW', 'Choose 1–20 items and 4096–65536 bytes');
-        const binding = fingerprint([
-          profileId,
-          intakeId,
-          review.reviewToken,
-          input.proposalId,
-          input.recordId,
-          input.candidateVersionId,
-          input.section,
-          input.comparisonSearch || null,
-        ]);
-        const discovered = comparisonSearch(db, record, input);
-        const all = sectionData(
-          db,
-          review,
-          record,
-          input.section,
-          discovered?.matches.map((match) => match.id),
-        );
-        let ordinal = 0;
-        if (input.cursor) {
-          try {
-            const value = JSON.parse(Buffer.from(input.cursor, 'base64url').toString());
-            if (
-              value.binding !== binding ||
-              !Number.isSafeInteger(value.ordinal) ||
-              value.ordinal < 0 ||
-              value.ordinal >= all.length
-            )
-              throw invalid();
-            ordinal = value.ordinal;
-          } catch {
+      let ordinal = 0;
+      if (input.cursor) {
+        try {
+          const value = JSON.parse(Buffer.from(input.cursor, 'base64url').toString());
+          if (
+            value.binding !== binding ||
+            !Number.isSafeInteger(value.ordinal) ||
+            value.ordinal < 0 ||
+            value.ordinal >= all.length
+          )
             throw invalid();
-          }
+          ordinal = value.ordinal;
+        } catch {
+          throw invalid();
         }
-        const items: ClinicalRecordSectionPage['items'] = [];
-        let used = 0;
-        for (; ordinal < all.length && items.length < limit; ordinal++) {
-          const selected = all.at(ordinal)!,
-            value = selected.value,
-            control = selected.control,
-            size = Buffer.byteLength(canonicalLiteral(value));
-          const reference: ClinicalRecordSectionReference = {
-            format: 'health-clinical-record-section-reference-v1',
-            proposalId: input.proposalId,
-            recordId: record.id,
-            candidateVersionId: input.candidateVersionId,
-            reviewToken: review.reviewToken,
-            section: input.section,
-            ordinal,
-            bytes: size,
-            ...(input.comparisonSearch ? { comparisonSearch: input.comparisonSearch } : {}),
-          };
-          const inline = { ordinal, control, detail: { kind: 'value' as const, value } },
-            ref = { ordinal, control, detail: { kind: 'reference' as const, reference } };
-          const item = Buffer.byteLength(canonicalLiteral(inline)) <= budget - used ? inline : ref;
-          const bytes = Buffer.byteLength(canonicalLiteral(item));
-          if (items.length && used + bytes > budget) break;
-          if (bytes > budget)
-            throw new HttpError(
-              409,
-              'REVIEW_CONTROL_REQUIRED',
-              'The selected action controls require a larger review window',
-            );
-          items.push(item);
-          used += bytes;
-        }
-        collectionClinicalProjectionContext(session).assertCurrent();
-        const { intakeId: id, proposalId, version, reviewToken, summary, sourceTextStale } = review;
-        return {
-          format: 'health-clinical-record-section-page-v1',
-          context: { intakeId: id, proposalId, version, reviewToken, summary, sourceTextStale },
-          selection: {
-            proposalId,
-            recordId: record.id,
-            candidateVersionId: input.candidateVersionId,
-            selectionReviewToken: record.selectionReviewToken,
-          },
-          section: input.section,
-          total: all.length,
-          items,
-          ...(discovered ? { discoveryPage: discovered.page } : {}),
-          nextCursor:
-            ordinal < all.length
-              ? Buffer.from(JSON.stringify({ binding, ordinal })).toString('base64url')
-              : null,
-        };
-      } finally {
-        session.close();
       }
+      const items: ClinicalRecordSectionPage['items'] = [];
+      let used = 0;
+      for (; ordinal < all.length && items.length < limit; ordinal++) {
+        const selected = all.at(ordinal)!,
+          value = selected.value,
+          control = selected.control,
+          size = Buffer.byteLength(canonicalLiteral(value));
+        const reference: ClinicalRecordSectionReference = {
+          format: 'health-clinical-record-section-reference-v1',
+          proposalId: input.proposalId,
+          recordId: record.id,
+          candidateVersionId: input.candidateVersionId,
+          reviewToken: review.reviewToken,
+          section: input.section,
+          ordinal,
+          bytes: size,
+          ...(input.comparisonSearch ? { comparisonSearch: input.comparisonSearch } : {}),
+        };
+        const inline = { ordinal, control, detail: { kind: 'value' as const, value } },
+          ref = { ordinal, control, detail: { kind: 'reference' as const, reference } };
+        const item = Buffer.byteLength(canonicalLiteral(inline)) <= budget - used ? inline : ref;
+        const bytes = Buffer.byteLength(canonicalLiteral(item));
+        if (items.length && used + bytes > budget) break;
+        if (bytes > budget)
+          throw new HttpError(
+            409,
+            'REVIEW_CONTROL_REQUIRED',
+            'The selected action controls require a larger review window',
+          );
+        items.push(item);
+        used += bytes;
+      }
+      const { intakeId: id, proposalId, version, reviewToken, summary, sourceTextStale } = review;
+      return {
+        format: 'health-clinical-record-section-page-v1',
+        context: { intakeId: id, proposalId, version, reviewToken, summary, sourceTextStale },
+        selection: {
+          proposalId,
+          recordId: record.id,
+          candidateVersionId: input.candidateVersionId,
+          selectionReviewToken: record.selectionReviewToken,
+        },
+        section: input.section,
+        total: all.length,
+        items,
+        ...(discovered ? { discoveryPage: discovered.page } : {}),
+        nextCursor:
+          ordinal < all.length
+            ? Buffer.from(JSON.stringify({ binding, ordinal })).toString('base64url')
+            : null,
+      };
     },
-    { operation: currentClinicalOperation(db) },
   );
 }
 export async function readClinicalRecordSectionFragment(
@@ -522,62 +514,53 @@ export async function readClinicalRecordSectionFragment(
   intakeId: string,
   input: { reference: ClinicalRecordSectionReference; offset?: number; bytes?: number },
 ) {
-  return runExclusiveClinicalOperation(
+  const { reference } = input,
+    offset = input.offset ?? 0,
+    bytes = input.bytes ?? 32768;
+  if (
+    !reference ||
+    reference.format !== 'health-clinical-record-section-reference-v1' ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    !Number.isSafeInteger(bytes) ||
+    bytes < 1 ||
+    bytes > 65536
+  )
+    throw invalid();
+  validateSelection(reference);
+  return readPreparedClinicalRecordSection(
     db,
-    async () => {
-      const { reference } = input,
-        offset = input.offset ?? 0,
-        bytes = input.bytes ?? 32768;
+    root,
+    profileId,
+    intakeId,
+    reference,
+    ({ review, record }) => {
+      if (reference.reviewToken !== review.reviewToken) throw invalid();
+      const discovered = comparisonSearch(db, record, reference);
+      const values = sectionData(
+        db,
+        review,
+        record,
+        reference.section,
+        discovered?.matches.map((match) => match.id),
+      );
       if (
-        !reference ||
-        reference.format !== 'health-clinical-record-section-reference-v1' ||
-        !Number.isSafeInteger(offset) ||
-        offset < 0 ||
-        !Number.isSafeInteger(bytes) ||
-        bytes < 1 ||
-        bytes > 65536
+        !Number.isSafeInteger(reference.ordinal) ||
+        reference.ordinal < 0 ||
+        reference.ordinal >= values.length
       )
         throw invalid();
-      const { session, record, review } = await openSelectedClinicalRecord(
-        db,
-        root,
-        profileId,
-        intakeId,
-        reference,
-      );
-
-      try {
-        if (reference.reviewToken !== review.reviewToken) throw invalid();
-        const discovered = comparisonSearch(db, record, reference);
-        const values = sectionData(
-          db,
-          review,
-          record,
-          reference.section,
-          discovered?.matches.map((match) => match.id),
-        );
-        if (
-          !Number.isSafeInteger(reference.ordinal) ||
-          reference.ordinal < 0 ||
-          reference.ordinal >= values.length
-        )
-          throw invalid();
-        const raw = Buffer.from(canonicalLiteral(values.at(reference.ordinal)!.value));
-        if (raw.length !== reference.bytes || offset > raw.length) throw invalid();
-        collectionClinicalProjectionContext(session).assertCurrent();
-        const end = Math.min(raw.length, offset + bytes);
-        return {
-          encoding: 'base64' as const,
-          data: raw.subarray(offset, end).toString('base64'),
-          totalBytes: raw.length,
-          complete: end === raw.length,
-          nextOffset: end === raw.length ? null : end,
-        };
-      } finally {
-        session.close();
-      }
+      const raw = Buffer.from(canonicalLiteral(values.at(reference.ordinal)!.value));
+      if (raw.length !== reference.bytes || offset > raw.length) throw invalid();
+      const end = Math.min(raw.length, offset + bytes);
+      return {
+        encoding: 'base64' as const,
+        data: raw.subarray(offset, end).toString('base64'),
+        totalBytes: raw.length,
+        complete: end === raw.length,
+        nextOffset: end === raw.length ? null : end,
+      };
     },
-    { operation: currentClinicalOperation(db) },
   );
 }
 export async function applyClinicalRecordAction(

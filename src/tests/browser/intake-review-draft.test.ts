@@ -162,7 +162,17 @@ test(
         },
         data: Buffer.from('Fictional retained original ' + clinical),
       });
-      assert.equal(uploaded.status(), 201);
+      assert.equal(
+        uploaded.status(),
+        201,
+        uploaded.status() === 201
+          ? undefined
+          : JSON.stringify({
+              fixture: 'fictional review draft upload',
+              clinical,
+              error: (await uploaded.json()).error ?? null,
+            }),
+      );
       let item = await stopFixtureImport(page, url, prefix, (await uploaded.json()).data.id);
       item = await api(`${prefix}/intakes/${encodeURIComponent(item.id)}/proposals`, {
         version: item.version,

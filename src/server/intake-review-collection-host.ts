@@ -1223,10 +1223,78 @@ export async function readPreparedCollectionClinicalReview(
   proposalId: string | null,
   input: ClinicalReadRequest,
 ): Promise<ClinicalReadResult<ClinicalReadValues[keyof ClinicalReadValues]>> {
+  return readPreparedClinicalTransport(db, root, profileId, intakeId, proposalId, (session) =>
+    input.kind === 'page'
+      ? session.page(input.section, input.options)
+      : input.kind === 'fragment'
+        ? session.fragment(input.reference, input.offset, input.bytes)
+        : session.selectedRecord(input.recordId, input.candidateVersionId, input.bytes),
+  );
+}
+
+type ClinicalSectionTransport =
+  | import('../shared/intake-clinical-record-sections.ts').ClinicalRecordSectionPage
+  | {
+      encoding: 'base64';
+      data: string;
+      totalBytes: number;
+      complete: boolean;
+      nextOffset: number | null;
+    };
+/** Internal synchronous renderer: only the detached bounded result may leave this callback. */
+export async function readPreparedClinicalRecordSection<T extends ClinicalSectionTransport>(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  selection: import('../shared/intake-clinical-record-sections.ts').ClinicalRecordSelection,
+  render: (selected: {
+    review: ClinicalReadSession['review'];
+    record: NonNullable<ReturnType<ClinicalReadSession['record']>>;
+  }) => T,
+): Promise<T> {
+  const result = await readPreparedClinicalTransport(
+    db,
+    root,
+    profileId,
+    intakeId,
+    selection.proposalId,
+    (session) => {
+      const record = session.record(selection.recordId, undefined, selection.candidateVersionId);
+      if (!record)
+        throw new HttpError(
+          409,
+          'REVIEW_SECTION_CHANGED',
+          'Refresh the selected record and its exact evidence before continuing',
+        );
+      return render({ review: session.review, record });
+    },
+  );
+  if (result.status !== 'ready')
+    throw new HttpError(
+      409,
+      'REVIEW_PREPARATION_REQUIRED',
+      'Prepare the complete selected evidence before continuing',
+    );
+  return result.value;
+}
+
+async function readPreparedClinicalTransport<T>(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  proposalId: string | null,
+  render: (session: ClinicalReadSession) => T,
+): Promise<ClinicalReadResult<T>> {
+  let discardResult = () => {};
   return runExclusiveClinicalOperation(
     db,
     async () => {
       const attempt = beginPreparedClinicalReviewRead(db);
+      discardResult = () => {
+        if (isPreparedClinicalReviewReadCurrent(db, attempt)) discardPreparedClinicalReviewRead(db);
+      };
       let owned: ClinicalReadSession | undefined;
       try {
         if (db.isTransaction) discardPreparedClinicalReviewRead(db);
@@ -1269,19 +1337,23 @@ export async function readPreparedCollectionClinicalReview(
           owned = prepared.session;
         }
         const session = cached?.session || owned!;
-        collectionClinicalProjectionContext(session).assertCurrent();
-        const output =
-          input.kind === 'page'
-            ? session.page(input.section, input.options)
-            : input.kind === 'fragment'
-              ? session.fragment(input.reference, input.offset, input.bytes)
-              : session.selectedRecord(input.recordId, input.candidateVersionId, input.bytes);
+        const projection = collectionClinicalProjectionContext(session);
+        const output = render(session);
+        if (
+          output &&
+          typeof output === 'object' &&
+          ('then' in output || Symbol.iterator in output || Symbol.asyncIterator in output)
+        )
+          throw new TypeError('Clinical transport rendering must return a synchronous bounded DTO');
         // Detach only emitted bounded transport; no caller gets the private session or record aliases.
         const value = JSON.parse(JSON.stringify(output), (_key, value, context) =>
           typeof value === 'number' && context?.source && JSON.stringify(value) !== context.source
             ? JSON.rawJSON(context.source)
             : value,
-        ) as ClinicalReadValues[keyof ClinicalReadValues];
+        ) as T;
+        // Recheck all consumed physical evidence after rendering and detachment.
+        // The SQL/registry/grounding guards below must run after the last physical stat.
+        projection.assertCurrent();
         assertIntakeOwner(db, profileId);
         if (
           requestRevision !== revision(db) ||
@@ -1316,6 +1388,6 @@ export async function readPreparedCollectionClinicalReview(
         owned?.close();
       }
     },
-    { operation: currentClinicalOperation(db) },
+    { operation: currentClinicalOperation(db), onDiscardResult: () => discardResult() },
   );
 }

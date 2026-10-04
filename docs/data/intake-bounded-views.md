@@ -512,6 +512,15 @@ and missing scratch is refused instead of treated as no blockers. The issue
 row/read/write and peak-value counters distinguish this disposable policy work
 from durable writes. The derived issue collection is never recovery authority.
 
+Read-only record sections and their fragments share the existing one-session
+public review cache with record and review pages. They select the exact record
+and candidate version from its complete policy, render a bounded response
+synchronously, and detach that response before rechecking consumed physical
+evidence and current authority. A caller receives no session or mutable policy
+alias. Failed rendering or a cancelled result handoff discards the matching
+cached attempt; mutation preparation continues to own its separate session.
+The first cold request still constructs the complete selected review.
+
 Cold native clinical preparation for retained-intake histories shares generator
 implementations with the transaction-bound synchronous policy. Native reads and prepublication preparation
 run at most 16 yielded work units before a real event-loop turn. These units include
@@ -600,6 +609,19 @@ checks exact synchronous/cooperative policy and token parity, an unrelated HTTP
 response during cold preparation, and scratch cleanup after cancellation or
 rolled-back SQL drift. It does not qualify the complete large-provider or
 physical release journeys.
+
+Identity previews apply the same cooperative work boundary to complete retained
+membership, including historical, empty and duplicate proposal occurrences, and
+to payload hash chunks after file-cache eviction. Each verified identity is
+retained in signed owned scratch using the identity returned by verification; a
+later pass cannot replace an earlier baseline. A warm preview verifies this
+complete set once, detaches its response, then checks the retained identities
+and current authority again. That final metadata sweep does not rehash file
+payloads. Cancelling the last subscriber closes both the verifier and its
+scratch. `identityPreviewArtifactOccurrences` counts inspected occurrences,
+including duplicates, separately from unique artifact verification and byte
+hashing. The file cache remains bounded at 256 entries; eviction requires
+authentication without making the resulting hash work synchronous.
 
 Report and feed reads serialize use of a shared review session, detach the
 bounded response before releasing it, and close sessions replaced by another

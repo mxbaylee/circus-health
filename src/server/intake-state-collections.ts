@@ -40,6 +40,8 @@ import {
   type IntakeTreeReadCertificate,
   type IntakeTreeRoot,
 } from './intake-state-tree.ts';
+import { resolveSchemaMetadata } from './intake-schema-record-resolution.ts';
+import type { SchemaRecord } from './intake-envelope-schema.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 
 declare const viewBrand: unique symbol;
@@ -108,7 +110,35 @@ interface PreparedData {
   size: number;
   legacyBridge?: IntakeLegacyBridgeProof;
 }
+interface SchemaRecordOwner {
+  resolve: (
+    view: IntakeCollectionView,
+    mode: 'raw' | 'normalized',
+    root: string,
+    id: string,
+    selection: 'first' | 'last',
+  ) => SchemaRecord;
+  clear: () => void;
+  current: () => boolean;
+}
+const schemaRecordOwners = new WeakMap<object, Readonly<SchemaRecordOwner>>();
+/** Only exact owner-produced handles obtain this fixed authenticated resolver. */
+export function intakeSchemaRecordOwner(
+  collections: object,
+): Readonly<SchemaRecordOwner> | undefined {
+  return schemaRecordOwners.get(collections);
+}
+interface ResolvedSchemaEntry {
+  header: Readonly<SchemaRecord>;
+  witness: string;
+  epoch: object;
+  bytes: number;
+}
 interface Registry {
+  schemaRecords: Map<string, ResolvedSchemaEntry>;
+  schemaRecordBytes: number;
+  schemaRecordEpoch: object;
+  schemaRecordWitness?: string;
   generation: object;
   pages: Map<string, IntakeTreeCachedNode>;
   views: WeakMap<IntakeCollectionView, ViewData>;
@@ -128,6 +158,11 @@ export function intakeCollectionCacheGeneration(db: Database): object {
 export function clearIntakeCollectionCache(db: Database): void {
   const registry = registries.get(db);
   registry?.pages.clear();
+  registry?.schemaRecords.clear();
+  if (registry) {
+    registry.schemaRecordBytes = 0;
+    registry.schemaRecordEpoch = {};
+  }
   if (registry) registry.views = new WeakMap();
   registry?.preparations.clear();
   registry?.byteValues.clear();
@@ -139,6 +174,9 @@ function registryFor(db: Database): Registry {
   if (!value) {
     value = {
       generation: Object.freeze({}),
+      schemaRecords: new Map(),
+      schemaRecordBytes: 0,
+      schemaRecordEpoch: {},
       pages: new Map(),
       views: new WeakMap(),
       preparations: new Map(),
@@ -321,7 +359,7 @@ export function createIntakeCollections(owner: {
     });
   // Audited callers synchronously consume tree iterators and detach bounded
   // results. No callback-bearing write or asynchronous preparation uses this path.
-  const runRead = <T>(fn: (pages: typeof tree) => T): T =>
+  const runRead = <T>(fn: (pages: typeof tree, certificate?: IntakeTreeReadCertificate) => T): T =>
     withIntakeWork(db, 'warm', () => {
       let certificate: IntakeTreeReadCertificate | undefined;
       try {
@@ -349,7 +387,7 @@ export function createIntakeCollections(owner: {
             invalid('collection read authority changed');
           }
         };
-        const result = fn(() => tree({ certificate: proof, check }));
+        const result = fn(() => tree({ certificate: proof, check }), proof);
         // Internal readers return only detached DTOs, buffers and opaque refs.
         if (result && typeof result === 'object' && ('then' in result || 'next' in result))
           invalid('collection read must finish synchronously');
@@ -561,6 +599,160 @@ export function createIntakeCollections(owner: {
         return value && structuredClone(value);
       });
     },
+    /** Fixed authenticated schema operation; callers cannot insert fabricated proofs. */
+    resolveSchemaRecord(
+      view: IntakeCollectionView,
+      mode: 'raw' | 'normalized',
+      root: string,
+      id: string,
+      fieldSelection: 'first' | 'last',
+    ): SchemaRecord {
+      let admission:
+        | {
+            registry: Registry;
+            schemaEpoch: object;
+            epoch: object;
+            witness: string;
+            key: string;
+            header: Readonly<SchemaRecord>;
+            bytes: number;
+          }
+        | undefined;
+      const result = runRead((_readTree, certificate) => {
+        if (
+          (mode !== 'raw' && mode !== 'normalized') ||
+          typeof root !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(root) ||
+          typeof id !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(id) ||
+          (fieldSelection !== 'first' && fieldSelection !== 'last')
+        )
+          invalid('schema resolve arguments');
+        const registry = registryFor(db);
+        // Cold reads retain the original point operations and every readiness observation.
+        const collection = schemaReadOperations.collection(view, 'logical', 'envelope.data');
+        if (!collection) invalid('missing selected envelope data');
+        const current = viewData(view);
+        const key = JSON.stringify([
+          identity,
+          prefix,
+          'logical',
+          'envelope.data',
+          current.head?.logical ?? null,
+          collection,
+          mode,
+          root,
+          fieldSelection,
+          id,
+        ]);
+        if (!certificate || registry.schemaRecordWitness !== certificate.witness) {
+          registry.schemaRecords.clear();
+          registry.schemaRecordBytes = 0;
+          registry.schemaRecordEpoch = {};
+          registry.schemaRecordWitness = certificate?.witness;
+        }
+        const schemaEpoch = registry.schemaRecordEpoch;
+        const cached = certificate && registry.schemaRecords.get(key);
+        if (
+          cached &&
+          cached.epoch === certificate!.epoch &&
+          cached.witness === certificate!.witness
+        ) {
+          registry.schemaRecords.delete(key);
+          registry.schemaRecords.set(key, cached);
+          // The hit returns only detached known primitives, after final physical proof.
+          ready();
+          return { ...cached.header };
+        }
+        if (cached) {
+          registry.schemaRecordBytes -= cached.bytes;
+          registry.schemaRecords.delete(key);
+        }
+        const text = (key: string): string => {
+          const value = schemaReadOperations.get(view, 'logical', 'envelope.data', key);
+          if (typeof value === 'string') {
+            if (Buffer.byteLength(value) > 8192)
+              throw Error('Intake collection envelope: field exceeds bounded header');
+            return value;
+          }
+          if (!value || value.bytes > 8192)
+            throw Error('Intake collection envelope: missing or fragmented schema header');
+          // Match textValue/cellChunks: obtain the exact selected byte capability again.
+          const selected = schemaReadOperations.get(view, 'logical', 'envelope.data', key);
+          if (!selected || typeof selected === 'string') invalid('schema header byte binding');
+          const decoder = new TextDecoder('utf-8', { fatal: true });
+          let result = '',
+            after: string | undefined,
+            count = 0;
+          do {
+            const page = schemaReadOperations.readBytes(selected, {
+              after,
+              items: 64,
+              bytes: 4096,
+            });
+            for (const chunk of page.chunks) {
+              count += chunk.length;
+              result += decoder.decode(chunk, { stream: true });
+            }
+            if (page.complete) break;
+            if (!page.after || page.after === after)
+              throw Error('Intake collection envelope: byte cursor did not advance');
+            after = page.after;
+          } while (true);
+          result += decoder.decode();
+          if (count !== selected.bytes)
+            throw Error('Intake collection envelope: lexical cell byte count');
+          return result;
+        };
+        const header = Object.freeze({
+          ...resolveSchemaMetadata(text, () => root, id, fieldSelection),
+        });
+        ready();
+        if (certificate) {
+          const bytes =
+            Buffer.byteLength(JSON.stringify({ key, header, witness: certificate.witness })) + 256;
+          admission = {
+            registry,
+            schemaEpoch,
+            epoch: certificate.epoch,
+            witness: certificate.witness,
+            key,
+            header,
+            bytes,
+          };
+        }
+        return { ...header };
+      });
+      // Admission follows the outer runRead final exact witness, never an optimistic result.
+      if (
+        admission &&
+        !db.isTransaction &&
+        registryFor(db) === admission.registry &&
+        admission.registry.schemaRecordEpoch === admission.schemaEpoch &&
+        readEpoch === admission.epoch &&
+        admission.bytes <= 256 * 1024
+      ) {
+        const { registry, key, header, witness, epoch, bytes } = admission;
+        const previous = registry.schemaRecords.get(key);
+        if (previous) registry.schemaRecordBytes -= previous.bytes;
+        registry.schemaRecords.set(key, { header, witness, epoch, bytes });
+        registry.schemaRecordBytes += bytes;
+        while (registry.schemaRecords.size > 32 || registry.schemaRecordBytes > 256 * 1024) {
+          const oldest = registry.schemaRecords.keys().next().value!;
+          registry.schemaRecordBytes -= registry.schemaRecords.get(oldest)!.bytes;
+          registry.schemaRecords.delete(oldest);
+        }
+      }
+      return result;
+    },
+    clearSchemaRecordCache(): void {
+      const registry = registries.get(db);
+      registry?.schemaRecords.clear();
+      if (registry) {
+        registry.schemaRecordBytes = 0;
+        registry.schemaRecordEpoch = {};
+      }
+    },
     collection(
       view: IntakeCollectionView,
       area: IntakeCollectionArea,
@@ -569,6 +761,32 @@ export function createIntakeCollections(owner: {
       return runRead((readTree) => {
         collectionName(name);
         return descriptor(readTree().get(readScope(view, area), name));
+      });
+    },
+    /** Authenticate one bounded namespace-presence lookup without exposing its iterator. */
+    hasCollectionPrefix(
+      view: IntakeCollectionView,
+      area: IntakeCollectionArea,
+      prefix: string,
+    ): boolean {
+      return runRead((readTree) => {
+        collectionName(prefix);
+        const pages = readTree(),
+          root = readScope(view, area),
+          exact = pages.get(root, prefix);
+        if (exact !== undefined) {
+          descriptor(exact);
+          return true;
+        }
+        const entries = pages.entries(root, prefix);
+        try {
+          const first = entries.next();
+          if (first.done || !first.value.key.startsWith(prefix)) return false;
+          descriptor(first.value.value);
+          return true;
+        } finally {
+          entries.return(undefined);
+        }
       });
     },
     get(
@@ -1100,8 +1318,18 @@ export function createIntakeCollections(owner: {
         };
       });
     },
-    stage(prepared: PreparedIntakeCollectionMutation): IntakeCollectionResult {
+    stage(
+      prepared: PreparedIntakeCollectionMutation,
+      options: { assertCurrent?: () => void } = {},
+    ): IntakeCollectionResult {
       return run(() => {
+        const guarded: unknown = options.assertCurrent?.();
+        if (
+          guarded &&
+          (typeof guarded === 'object' || typeof guarded === 'function') &&
+          'then' in guarded
+        )
+          invalid('collection publication guard must finish synchronously');
         const token = currentTransactionToken(db);
         if (!token || !db.isTransaction)
           invalid('collection stage requires application transaction');
@@ -1171,8 +1399,18 @@ export function createIntakeCollections(owner: {
         data.legacyBridge = proof;
       });
     },
-    commitMaintenance(prepared: PreparedIntakeCollectionMutation): IntakeCollectionResult {
+    commitMaintenance(
+      prepared: PreparedIntakeCollectionMutation,
+      options: { assertCurrent?: () => void } = {},
+    ): IntakeCollectionResult {
       return run(() => {
+        const guarded: unknown = options.assertCurrent?.();
+        if (
+          guarded &&
+          (typeof guarded === 'object' || typeof guarded === 'function') &&
+          'then' in guarded
+        )
+          invalid('collection publication guard must finish synchronously');
         const data = inspect(prepared),
           current = data.legacyBridge ? { raw: get(headKey), head: undefined } : selected();
         const retained = receipt(current.head, data.result.operationId, data.requestDigest);
@@ -1197,7 +1435,7 @@ export function createIntakeCollections(owner: {
           () => {
             if (data.legacyBridge) bridgeTransaction = currentTransactionToken(db);
             try {
-              return api.stage(prepared);
+              return api.stage(prepared, options);
             } finally {
               bridgeTransaction = undefined;
             }
@@ -1212,5 +1450,30 @@ export function createIntakeCollections(owner: {
       });
     },
   };
+  // Lexical references are captured before this owner handle becomes public.
+  const schemaReadOperations = Object.freeze({
+    collection: api.collection,
+    get: api.get,
+    readBytes: api.readBytes,
+  });
+  const schemaMethods = Object.freeze({
+    ...schemaReadOperations,
+    openView: api.openView,
+    binding: api.binding,
+    resolveSchemaRecord: api.resolveSchemaRecord,
+    clearSchemaRecordCache: api.clearSchemaRecordCache,
+  });
+  schemaRecordOwners.set(
+    api,
+    Object.freeze({
+      resolve: api.resolveSchemaRecord,
+      clear: api.clearSchemaRecordCache,
+      current: () =>
+        Object.entries(schemaMethods).every(([name, method]) => {
+          const descriptor = Object.getOwnPropertyDescriptor(api, name);
+          return !!descriptor && Object.hasOwn(descriptor, 'value') && descriptor.value === method;
+        }),
+    }),
+  );
   return api;
 }

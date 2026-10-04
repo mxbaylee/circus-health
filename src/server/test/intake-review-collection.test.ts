@@ -2217,8 +2217,10 @@ test('native common receipt provider rejects peer transaction callback refusal a
 // map fixture, measure ancestry and field resolution for 71 complete receipts.
 // Publish 71 accepted schema receipts, then compare complete old and new reads.
 // The local measured setup+both passes takes52seconds before CI overhead.
+// Count all authenticated tree visits, including certified hits. Raw misses
+// depend on the page cache; this asserts no SQL, byte or latency improvement.
 test(
-  'native receipt subtree field access preserves actual schema headers with fewer selected reads',
+  'native receipt subtree preserves actual schema headers with fewer logical tree node visits',
   { timeout: 120000 },
   async (t) => {
     const { readIntakeReviewValue, intakeReviewChildren } =
@@ -2278,11 +2280,29 @@ test(
       assert.equal(Array.from(receipt.scope.targets)[0]!.candidateId, f.target.candidateId);
     }
     const oldReads = afterBaseline.collectionReadBytes - before.collectionReadBytes,
-      newReads = after.collectionReadBytes - afterBaseline.collectionReadBytes;
+      newReads = after.collectionReadBytes - afterBaseline.collectionReadBytes,
+      oldNodeVisits =
+        afterBaseline.collectionNodeReads -
+        before.collectionNodeReads +
+        afterBaseline.collectionNodeCacheHits -
+        before.collectionNodeCacheHits,
+      newNodeVisits =
+        after.collectionNodeReads -
+        afterBaseline.collectionNodeReads +
+        after.collectionNodeCacheHits -
+        afterBaseline.collectionNodeCacheHits,
+      oldWitnessQueries =
+        afterBaseline.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+      newWitnessQueries =
+        after.collectionReadWitnessQueries - afterBaseline.collectionReadWitnessQueries;
     t.diagnostic(
       JSON.stringify({
         oldReads,
         newReads,
+        oldNodeVisits,
+        newNodeVisits,
+        oldWitnessQueries,
+        newWitnessQueries,
         headers: 71,
         scopeOpens:
           after.identityPolicyScopeReconstructions -
@@ -2291,8 +2311,16 @@ test(
       }),
     );
     assert.ok(
-      newReads < oldReads,
-      'per-receipt subtree resolves fields once without repeated intake ancestry',
+      newNodeVisits < oldNodeVisits,
+      'per-receipt subtree uses fewer logical tree node visits for complete header decoding',
+    );
+    assert.equal(
+      after.identityPolicyScopeReconstructions - afterBaseline.identityPolicyScopeReconstructions,
+      1,
+    );
+    assert.equal(
+      after.identityPolicyScopeCacheHits - afterBaseline.identityPolicyScopeCacheHits,
+      70,
     );
     assert.equal(
       after.identityPolicyReceiptReconstructions -

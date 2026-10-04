@@ -20,15 +20,27 @@ import {
   type SchemaTarget,
 } from './intake-envelope-schema.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
+import {
+  prepareEnvelopeBuildResume,
+  type EnvelopeBuildResume,
+} from './intake-envelope-build-resume.ts';
+import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export async function buildIntakeCollectionEnvelope(
   db: Database,
   source: IntakeEnvelopeSource,
-  options: { assertRunning?: () => void; onCheckpoint?: () => void | Promise<void> } = {},
+  options: {
+    assertRunning?: () => void;
+    onCheckpoint?: () => void | Promise<void>;
+  } = {},
 ) {
   const legacy = readIntakeEnvelopeMaterialized(db, source),
     { collections, binding } = selectedEnvelopeStore(db, source);
   const version = (legacy.value.intake as { version: number }).version;
+  const sourceTextHash = digest(legacy.text);
+  withIntakeWork(db, 'warm', () =>
+    recordIntakeWork('schemaBuildSourceHashBytes', Buffer.byteLength(legacy.text)),
+  );
   if (binding.logicalHead === undefined) {
     const id = randomUUID();
     collections.commitMaintenance(
@@ -39,63 +51,101 @@ export async function buildIntakeCollectionEnvelope(
       }),
     );
   }
-  const build = 'schema.' + randomUUID();
-  const { put, cell, flush, record } = createEnvelopeBuildWriter(
+  const resume = prepareEnvelopeBuildResume(
     db,
     source,
-    build,
-    version,
+    {
+      mode: legacy.mode,
+      version,
+      hash: sourceTextHash,
+      bytes: Buffer.byteLength(legacy.text),
+    },
     options,
   );
-  void put;
-  const text = legacy.text;
-  let start = 0;
-  while (/\s/.test(text[start] ?? '') && start < text.length) start++;
-  const end = valueEnd(text, start),
-    root = schemaKey('envelope', build);
-  await cell('$before', text.slice(0, start));
-  await record(text, start, end, 'root', root);
-  await cell('$after', text.slice(end));
-  await flush();
-  const control: SchemaControl = { format: ENVELOPE_SCHEMA, mode: legacy.mode, root };
-  const { store } = collectionCellReader(db, source, 'builds', build);
-  const expected = digest(text),
-    hash = createHash('sha256');
-  let bytes = 0;
-  for (const chunk of iterateSchemaEnvelopeText(store, control)) {
-    options.assertRunning?.();
-    hash.update(chunk);
-    bytes += Buffer.byteLength(chunk);
+  try {
+    const build = resume.build;
+    const { put, cell, flush, record } = createEnvelopeBuildWriter(
+      db,
+      source,
+      build,
+      version,
+      { ...options, assertRunning: resume.assertCurrent },
+      resume,
+    );
+    void put;
+    const text = legacy.text;
+    let start = 0;
+    while (/\s/.test(text[start] ?? '') && start < text.length) start++;
+    const end = valueEnd(text, start),
+      root = schemaKey('envelope', build);
+    await cell('$before', text.slice(0, start));
+    await record(text, start, end, 'root', root);
+    await cell('$after', text.slice(end));
+    await flush();
+    resume.finish();
+    const control: SchemaControl = {
+      format: ENVELOPE_SCHEMA,
+      mode: legacy.mode,
+      root,
+    };
+    const { store } = collectionCellReader(db, source, 'builds', build);
+    const expected = sourceTextHash,
+      hash = createHash('sha256');
+    let bytes = 0;
+    for (const chunk of iterateSchemaEnvelopeText(store, control)) {
+      resume.assertCurrent();
+      hash.update(chunk);
+      bytes += Buffer.byteLength(chunk);
+      resume.countWork('validationHashBytes', Buffer.byteLength(chunk));
+      resume.countWork('validationChunks');
+      if (resume.work.validationChunks % 64 === 0) {
+        resume.countWork('validationYields');
+        await setImmediate();
+        resume.assertCurrent();
+      }
+    }
+    if (hash.digest('hex') !== expected || bytes !== Buffer.byteLength(text))
+      throw Error('Schema build does not reproduce exact retained envelope');
+    // The owner independently verifies the candidate graph/export before granting
+    // the representation-only maintenance capability.
+    const id = randomUUID();
+    const prepared = collections.prepare(collections.openView(), {
+      operationId: id,
+      requestDigest: digest(id),
+      domainVersion: version,
+      changes: [
+        {
+          area: 'logical',
+          collection: 'envelope.data',
+          op: 'adoptCollection',
+          fromArea: 'builds',
+          fromCollection: build,
+        },
+        {
+          area: 'logical',
+          collection: 'envelope.control',
+          op: 'put',
+          key: 'representation',
+          value: JSON.stringify(control),
+        },
+      ],
+    });
+    await collections.certifySchemaAdoptionAsync(prepared, {
+      assertRunning: resume.assertCurrent,
+    });
+    resume.assertCurrent();
+    const result = collections.commitMaintenance(prepared, { assertCurrent: resume.assertWitness });
+    return {
+      result,
+      control,
+      build,
+      sourceTextHash: expected,
+      sourceTextBytes: bytes,
+      work: { ...resume.work },
+    };
+  } finally {
+    resume.close();
   }
-  if (hash.digest('hex') !== expected || bytes !== Buffer.byteLength(text))
-    throw Error('Schema build does not reproduce exact retained envelope');
-  // The owner independently verifies the candidate graph/export before granting
-  // the representation-only maintenance capability.
-  const id = randomUUID();
-  const prepared = collections.prepare(collections.openView(), {
-    operationId: id,
-    requestDigest: digest(id),
-    domainVersion: version,
-    changes: [
-      {
-        area: 'logical',
-        collection: 'envelope.data',
-        op: 'adoptCollection',
-        fromArea: 'builds',
-        fromCollection: build,
-      },
-      {
-        area: 'logical',
-        collection: 'envelope.control',
-        op: 'put',
-        key: 'representation',
-        value: JSON.stringify(control),
-      },
-    ],
-  });
-  await collections.certifySchemaAdoptionAsync(prepared, { assertRunning: options.assertRunning });
-  const result = collections.commitMaintenance(prepared);
-  return { result, control, build, sourceTextHash: expected, sourceTextBytes: bytes };
 }
 
 export function createEnvelopeBuildWriter(
@@ -103,7 +153,11 @@ export function createEnvelopeBuildWriter(
   source: IntakeEnvelopeSource,
   build: string,
   version: number,
-  options: { assertRunning?: () => void; onCheckpoint?: () => void | Promise<void> } = {},
+  options: {
+    assertRunning?: () => void;
+    onCheckpoint?: () => void | Promise<void>;
+  } = {},
+  resume?: EnvelopeBuildResume,
 ) {
   const { collections } = selectedEnvelopeStore(db, source);
   const changes: IntakeCollectionChange[] = [];
@@ -111,21 +165,39 @@ export function createEnvelopeBuildWriter(
     if (!changes.length) return;
     options.assertRunning?.();
     const id = randomUUID();
+    const progress = resume?.progress();
+    const batch = changes.splice(0);
+    if (progress) batch.push(progress);
     const prepared = collections.prepare(collections.openView(), {
       operationId: id,
       requestDigest: digest(id),
       domainVersion: version,
-      changes: changes.splice(0),
+      changes: batch,
     });
-    collections.commitMaintenance(prepared);
+    resume?.assertCurrent();
+    collections.commitMaintenance(prepared, resume ? { assertCurrent: resume.assertWitness } : {});
+    if (progress) resume!.committed(progress);
     await options.onCheckpoint?.();
     await setImmediate();
   };
+  const stage = async (change: IntakeCollectionChange) => {
+    if (!resume || (await resume.emit(change))) changes.push(change);
+    if (resume && changes.length >= 63) await flush();
+  };
   const put = async (key: string, value: string) => {
-    changes.push({ area: 'builds', collection: build, op: 'put', key, value });
-    if (changes.length >= 64) await flush();
+    const change: IntakeCollectionChange = {
+      area: 'builds',
+      collection: build,
+      op: 'put',
+      key,
+      value,
+    };
+    if (resume) await stage(change);
+    else changes.push(change);
+    if (!resume && changes.length >= 64) await flush();
   };
   const peek = (key: string): string | undefined => {
+    if (resume) return resume.peek(key);
     const pending = [...changes]
       .reverse()
       .find((change) => change.collection === build && 'key' in change && change.key === key);
@@ -137,8 +209,10 @@ export function createEnvelopeBuildWriter(
     return value;
   };
   const remove = async (key: string) => {
-    changes.push({ area: 'builds', collection: build, op: 'delete', key });
-    if (changes.length >= 64) await flush();
+    const change: IntakeCollectionChange = { area: 'builds', collection: build, op: 'delete', key };
+    if (resume) await stage(change);
+    else changes.push(change);
+    if (!resume && changes.length >= 64) await flush();
   };
   const cell = async (key: string, text: string) => {
     if (reportSnapshotInlineTextFits(text)) {
@@ -146,28 +220,32 @@ export function createEnvelopeBuildWriter(
       return;
     }
     await flush();
-    const blob = 'blob.' + randomUUID();
+    const blob = resume?.blobName(key) ?? 'blob.' + randomUUID();
     for (let at = 0; at < text.length;) {
       let end = Math.min(at + 1024, text.length);
       if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
-      changes.push({
+      const change: IntakeCollectionChange = {
         area: 'builds',
         collection: blob,
         op: 'appendBytes',
         bytes: Buffer.from(text.slice(at, end)),
-      });
+      };
+      if (resume) await stage(change);
+      else changes.push(change);
       at = end;
-      if (changes.length >= 64) await flush();
+      if (!resume && changes.length >= 64) await flush();
     }
     await flush();
-    changes.push({
+    const change: IntakeCollectionChange = {
       area: 'builds',
       collection: build,
       op: 'putBytes',
       key,
       fromArea: 'builds',
       fromCollection: blob,
-    });
+    };
+    if (resume) await stage(change);
+    else changes.push(change);
     await flush();
   };
   // The producer supplies bounded lexical pieces. Large values become checked
@@ -184,29 +262,33 @@ export function createEnvelopeBuildWriter(
       }
       if (!blob) {
         await flush();
-        blob = 'blob.' + randomUUID();
+        blob = resume?.blobName(key) ?? 'blob.' + randomUUID();
         // A supported inline buffer can exceed one byte leaf. Once promoted,
         // preserve the existing bounded UTF8 leaf format instead of appending it whole.
         for (let at = 0; at < small.length;) {
           let end = Math.min(at + 1024, small.length);
           if (end < small.length && /[\uD800-\uDBFF]/.test(small[end - 1]!)) end--;
-          changes.push({
+          const change: IntakeCollectionChange = {
             area: 'builds',
             collection: blob,
             op: 'appendBytes',
             bytes: Buffer.from(small.slice(at, end)),
-          });
+          };
+          if (resume) await stage(change);
+          else changes.push(change);
           at = end;
         }
         small = '';
       }
-      changes.push({
+      const change: IntakeCollectionChange = {
         area: 'builds',
         collection: blob,
         op: 'appendBytes',
         bytes: Buffer.from(text),
-      });
-      if (changes.length >= 64) await flush();
+      };
+      if (resume) await stage(change);
+      else changes.push(change);
+      if (!resume && changes.length >= 64) await flush();
     };
     for (const piece of pieces) {
       options.assertRunning?.();
@@ -226,14 +308,16 @@ export function createEnvelopeBuildWriter(
       return;
     }
     await flush();
-    changes.push({
+    const change: IntakeCollectionChange = {
       area: 'builds',
       collection: build,
       op: 'putBytes',
       key,
       fromArea: 'builds',
       fromCollection: blob,
-    });
+    };
+    if (resume) await stage(change);
+    else changes.push(change);
     await flush();
   };
   async function record(
@@ -275,7 +359,11 @@ export function createEnvelopeBuildWriter(
         if (nested) {
           await put(
             'p:' + occurrence,
-            JSON.stringify({ parent: id, ordinal: count, field: schemaKey(entry.name!) }),
+            JSON.stringify({
+              parent: id,
+              ordinal: count,
+              field: schemaKey(entry.name!),
+            }),
           );
           await record(text, entry.start, entry.end, nested, occurrence, id);
           target = { type: 'record', id: occurrence };

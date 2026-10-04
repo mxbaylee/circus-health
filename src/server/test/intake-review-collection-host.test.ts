@@ -1650,8 +1650,16 @@ test('public native review windows reuse one private session with detached exact
   assert.equal(overlap[1]!.status, 'fulfilled');
   assert.equal(
     intakeWorkCounters(db).warm.collectionPublicClinicalReviews,
-    before.collectionPublicClinicalReviews,
-    'older rejected read cannot dispose newer valid cache',
+    before.collectionPublicClinicalReviews + 1,
+    'serialized invalid read closes the old session before the queued valid read prepares once',
+  );
+  assert.equal(reviewIssueScratchCounts(db).databases, 1);
+  const afterOverlap = intakeWorkCounters(db).warm.collectionPublicClinicalReviews;
+  assert.equal(canonicalLiteral(await page()), original);
+  assert.equal(
+    intakeWorkCounters(db).warm.collectionPublicClinicalReviews,
+    afterOverlap,
+    'the completed newer request remains cached for the next exact read',
   );
   assert.equal(reviewIssueScratchCounts(db).databases, 1);
   assert.match(original, /:\s*-0[,}]/);
@@ -1659,27 +1667,34 @@ test('public native review windows reuse one private session with detached exact
   assert.match(original, /9007199254740993/);
   db.exec('CREATE TEMP TABLE fictional_private_review_stamp(n INTEGER)');
   await page();
-  assert.equal(
-    intakeWorkCounters(db).warm.collectionPublicClinicalReviews,
-    before.collectionPublicClinicalReviews + 1,
-  );
+  assert.equal(intakeWorkCounters(db).warm.collectionPublicClinicalReviews, afterOverlap + 1);
   clearIntakeStateCache(db);
   assert.equal(reviewIssueScratchCounts(db).databases, 0);
   // Concurrent cold preparation may finish uncached, but every unchanged request succeeds.
   await Promise.all([page(), page()]);
   assert.equal(reviewIssueScratchCounts(db).databases, 1);
   let reviews = intakeWorkCounters(db).warm.collectionPublicClinicalReviews;
+  const retainedBeforeTransaction = reviewIssueScratchCounts(db);
   db.exec('SAVEPOINT fictional_private_review');
   try {
-    await assert.rejects(page, /outside the application transaction/);
-    await assert.rejects(page, /outside the application transaction/);
-    assert.equal(reviewIssueScratchCounts(db).databases, 0);
+    await assert.rejects(page, /cannot (?:enter|wait) inside a transaction/);
+    await assert.rejects(page, /cannot (?:enter|wait) inside a transaction/);
+    assert.deepEqual(
+      reviewIssueScratchCounts(db),
+      retainedBeforeTransaction,
+      'refused admission neither opens work nor releases the prior cache owner',
+    );
   } finally {
     db.exec('ROLLBACK TO fictional_private_review;RELEASE fictional_private_review');
   }
   assert.equal(intakeWorkCounters(db).warm.collectionPublicClinicalReviews, reviews);
-  await page();
-  assert.equal(reviewIssueScratchCounts(db).databases, 1);
+  assert.equal(canonicalLiteral(await page()), original);
+  assert.equal(
+    intakeWorkCounters(db).warm.collectionPublicClinicalReviews,
+    reviews,
+    'an empty rolled-back savepoint did not enter or rebase the completed review',
+  );
+  assert.deepEqual(reviewIssueScratchCounts(db), retainedBeforeTransaction);
   await assert.rejects(() =>
     readPreparedCollectionClinicalReview(db, root, 'wrong-profile', source.id, null, {
       kind: 'page',
@@ -2338,3 +2353,324 @@ test(
     }
   },
 );
+
+test('selected questions, issues, fragments and public pages share complete detached review policy', async (t) => {
+  const { importIntakeRead } = await import('../intake.ts');
+  const { db, root, profileId } = fixture(t);
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-shared-section-policy.jsonl',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from(
+      JSON.stringify({
+        ...envelope('section-cache'),
+        clinical: {
+          ...envelope('section-cache').clinical,
+          subject: 'self',
+        },
+      }),
+    ),
+  });
+  const first = reviewIntake(db, root, profileId, source.id),
+    record = first.records[0]!;
+  const stored = JSON.parse(readIntakeEnvelopeText(db, { id: source.id }));
+  stored.intake.workflow.questions.push(
+    ...Array.from({ length: 7 }, (_, i) => ({
+      id: 'question:fictional-shared-section-' + i,
+      key: 'fictional-shared-section-' + i,
+      candidateId: record.candidateId,
+      candidateVersionId: record.candidateVersionId,
+      prompt: 'Confirm fictional text ' + 'x'.repeat(6000),
+      locator: 'page 1',
+      field: 'documentTitle',
+      status: i === 6 ? 'unanswered' : 'resolved',
+      createdAt: '2026-01-01T00:00:00Z',
+      answers:
+        i === 6
+          ? []
+          : [
+              {
+                id: `answer:fictional-shared-section-${i}`,
+                answer: 'Fictional prior confirmation',
+                mapping: {},
+                scope: 'record',
+                at: '2026-01-01T00:00:00Z',
+              },
+            ],
+    })),
+  );
+  writeIntakeFixtureEnvelope(db, source.id, stored);
+  const oracle = reviewIntake(db, root, profileId, source.id);
+  const lateQuestion = 'question:fictional-shared-section-6';
+  assert.deepEqual(
+    oracle.records[0]!.questions!.filter((question) => question.status === 'unanswered').map(
+      (question) => question.id,
+    ),
+    [lateQuestion],
+  );
+  const pendingIssues = oracle.records[0]!.issues!.filter(
+    (issue) => issue.blocking && issue.status !== 'resolved',
+  );
+  assert.deepEqual(
+    pendingIssues.map((issue) => issue.questionId),
+    [lateQuestion],
+  );
+  assert.equal(oracle.records[0]!.identityReview?.blocking ?? false, false);
+  await buildIntakeCollectionEnvelope(db, { id: source.id });
+  const selection = {
+    proposalId: null,
+    recordId: record.id,
+    candidateVersionId: record.candidateVersionId!,
+  };
+  const count = () => intakeWorkCounters(db).warm.collectionPublicClinicalReviews;
+  const before = count();
+  const questions = await readClinicalRecordSection(db, root, profileId, source.id, {
+    ...selection,
+    section: 'questions',
+    limit: 2,
+    bytes: 4096,
+  });
+  assert.equal(questions.total, 7);
+  assert.equal(questions.items.length, 2);
+  assert.ok(questions.nextCursor);
+  assert.equal(questions.context.reviewToken, oracle.reviewToken);
+  const reference = questions.items[0]!.detail;
+  assert.equal(reference.kind, 'reference');
+  if (reference.kind !== 'reference') throw Error('Expected complete referenced question');
+  const issues = await readClinicalRecordSection(db, root, profileId, source.id, {
+    ...selection,
+    section: 'issues',
+    limit: 2,
+    bytes: 4096,
+  });
+  assert.equal(issues.total, 7);
+  assert.equal(issues.context.reviewToken, oracle.reviewToken);
+  assert.ok(
+    questions.items.every(
+      (item) => item.control.kind === 'question' && item.control.id !== lateQuestion,
+    ),
+  );
+  assert.ok(
+    issues.items.every(
+      (item) => item.control.kind === 'issue' && item.control.id !== pendingIssues[0]!.id,
+    ),
+  );
+  const parts: Buffer[] = [];
+  let offset = 0;
+  do {
+    const part = await readClinicalRecordSectionFragment(db, root, profileId, source.id, {
+      reference: reference.reference,
+      offset,
+      bytes: 1024,
+    });
+    parts.push(Buffer.from(part.data, 'base64'));
+    if (part.nextOffset === null) break;
+    offset = part.nextOffset;
+  } while (true);
+  assert.deepEqual(JSON.parse(Buffer.concat(parts).toString()), oracle.records[0]!.questions![0]);
+  const publicPage = await reviewIntakeRead(db, root, profileId, source.id, null, {
+    items: 1,
+    bytes: 65536,
+  });
+  assert.ok(
+    'format' in publicPage && publicPage.format === 'health-intake-clinical-review-page-v2',
+  );
+  assert.equal(publicPage.reviewToken, oracle.reviewToken);
+  assert.equal(
+    count(),
+    before + 1,
+    'all bounded transports borrow the same complete policy session',
+  );
+  const canonical = canonicalLiteral(questions);
+  questions.items[0]!.control.kind = 'ownershipBlocker';
+  questions.context.reviewToken = 'fictional-caller-mutation';
+  assert.equal(
+    canonicalLiteral(
+      await readClinicalRecordSection(db, root, profileId, source.id, {
+        ...selection,
+        section: 'questions',
+        limit: 2,
+        bytes: 4096,
+      }),
+    ),
+    canonical,
+  );
+  assert.equal(count(), before + 1);
+  // The seventh question is absent from both windows but still prevents acceptance.
+  await assert.rejects(
+    importIntakeRead(db, root, profileId, source.id, {
+      version: oracle.version,
+      reviewToken: oracle.reviewToken,
+      decisions: [{ recordId: record.id, action: 'accept', mapping: oracle.records[0]!.mapping }],
+    }),
+    { code: 'QUESTIONS_PENDING' },
+  );
+  await assert.rejects(
+    readClinicalRecordSection(db, root, profileId, source.id, {
+      ...selection,
+      candidateVersionId: 'fictional-wrong-version',
+      section: 'questions',
+    }),
+    { code: 'REVIEW_SECTION_CHANGED' },
+  );
+  await assert.rejects(
+    readClinicalRecordSection(db, root, profileId, source.id, {
+      ...selection,
+      section: 'questions',
+      cursor: 'fictional-wrong-cursor',
+    }),
+    { code: 'REVIEW_SECTION_CHANGED' },
+  );
+  await assert.rejects(
+    readClinicalRecordSectionFragment(db, root, profileId, source.id, {
+      reference: { ...reference.reference, reviewToken: 'fictional-wrong-token' },
+    }),
+    { code: 'REVIEW_SECTION_CHANGED' },
+  );
+});
+
+test('selected section transport refuses changes during its final physical check', async (t) => {
+  const { clearIdentityGrounding } = await import('../intake-identity-grounding.ts');
+  const { db, root, profileId } = fixture(t);
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-section-final-check.jsonl',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from(JSON.stringify(envelope('section-final'))),
+  });
+  const record = reviewIntake(db, root, profileId, source.id).records[0]!;
+  await buildIntakeCollectionEnvelope(db, { id: source.id });
+  const selection = {
+    proposalId: null,
+    recordId: record.id,
+    candidateVersionId: record.candidateVersionId!,
+  };
+  const read = () =>
+    readClinicalRecordSection(db, root, profileId, source.id, { ...selection, section: 'mapping' });
+  const path = profileOriginal(
+    root,
+    String(db.prepare('SELECT path FROM source_files WHERE id=?').get(source.id)!.path),
+    profileId,
+  );
+  const originalBytes = readFileSync(path),
+    stat = nodeFs.statSync;
+  const peer = new DatabaseSync(String(db.prepare('PRAGMA database_list').get()!.file));
+  let peerMutation:
+    { before: unknown; after: unknown; row: unknown; complete: boolean } | undefined;
+  let calls = 0,
+    target = 0,
+    inject: (() => void) | undefined;
+  Reflect.set(nodeFs, 'statSync', ((selected, ...args) => {
+    if (String(selected) === path) {
+      calls++;
+      if (inject && calls === target) {
+        const action = inject;
+        inject = undefined;
+        action();
+      }
+    }
+    return Reflect.apply(stat, nodeFs, [selected, ...args]);
+  }) as typeof nodeFs.statSync);
+  syncBuiltinESMExports();
+  try {
+    for (const change of [
+      () => {
+        const before = db.prepare('PRAGMA data_version').get()!.data_version;
+        peerMutation = { before, after: before, row: null, complete: false };
+        peer
+          .prepare('INSERT INTO app_meta(key,value) VALUES(?,?)')
+          .run('fictional-section-final-aba', 'changed');
+        peer.prepare('DELETE FROM app_meta WHERE key=?').run('fictional-section-final-aba');
+        peerMutation.after = db.prepare('PRAGMA data_version').get()!.data_version;
+        peerMutation.row = peer
+          .prepare('SELECT value FROM app_meta WHERE key=?')
+          .get('fictional-section-final-aba');
+        peerMutation.complete = true;
+      },
+      () => clearIdentityGrounding(db),
+      () => writeFileSync(path, Buffer.alloc(originalBytes.length, 32)),
+    ]) {
+      await read();
+      calls = 0;
+      await read();
+      assert.ok(calls > 0);
+      target = calls;
+      calls = 0;
+      inject = change;
+      await assert.rejects(read, /changed|retained clinical|source/i);
+      if (peerMutation) {
+        assert.equal(peerMutation.complete, true, 'both peer commits completed');
+        assert.notEqual(peerMutation.after, peerMutation.before);
+        assert.equal(peerMutation.row, undefined, 'peer committed ABA restored the exact rows');
+        peerMutation = undefined;
+      }
+      assert.equal(inject, undefined, 'change reached the last consumed-original stat');
+      assert.equal(reviewIssueScratchCounts(db).databases, 0);
+      writeFileSync(path, originalBytes);
+    }
+  } finally {
+    Reflect.set(nodeFs, 'statSync', stat);
+    syncBuiltinESMExports();
+    writeFileSync(path, originalBytes);
+    peer.close();
+  }
+  await read();
+});
+
+test('selected section renderer refuses async values and cleans up a cancelled result handoff', async (t) => {
+  const { readPreparedClinicalRecordSection } = await import('../intake-review-collection-host.ts');
+  const { runExclusiveClinicalOperation } = await import('../clinical-operation.ts');
+  const { db, root, profileId } = fixture(t);
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-section-render-lifetime.jsonl',
+    newProviderName: 'Fictional clinic',
+    bytes: Buffer.from(JSON.stringify(envelope('section-lifetime'))),
+  });
+  const record = reviewIntake(db, root, profileId, source.id).records[0]!;
+  await buildIntakeCollectionEnvelope(db, { id: source.id });
+  const selection = {
+    proposalId: null,
+    recordId: record.id,
+    candidateVersionId: record.candidateVersionId!,
+  };
+  for (const output of [
+    Promise.resolve({}),
+    (function* () {
+      yield {};
+    })(),
+  ]) {
+    await assert.rejects(
+      readPreparedClinicalRecordSection(
+        db,
+        root,
+        profileId,
+        source.id,
+        selection,
+        () => output as never,
+      ),
+      /synchronous bounded DTO/,
+    );
+    assert.equal(reviewIssueScratchCounts(db).databases, 0);
+  }
+  const controller = new AbortController();
+  await assert.rejects(
+    runExclusiveClinicalOperation(
+      db,
+      async () => {
+        return readPreparedClinicalRecordSection(db, root, profileId, source.id, selection, () => {
+          queueMicrotask(() => controller.abort());
+          return { encoding: 'base64', data: '', totalBytes: 0, complete: true, nextOffset: null };
+        });
+      },
+      { signal: controller.signal },
+    ),
+    { name: 'AbortError' },
+  );
+  assert.equal(reviewIssueScratchCounts(db).databases, 0);
+  const page = await readClinicalRecordSection(db, root, profileId, source.id, {
+    ...selection,
+    section: 'mapping',
+  });
+  assert.ok(page.items.length > 0);
+  assert.equal(reviewIssueScratchCounts(db).databases, 1);
+  clearIntakeStateCache(db);
+  assert.equal(reviewIssueScratchCounts(db).databases, 0);
+});
