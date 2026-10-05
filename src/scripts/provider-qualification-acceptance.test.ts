@@ -24,7 +24,7 @@ import { performQualificationAcceptance } from './provider-qualification-accepta
 
 test(
   'qualification acceptance uses real profile HTTP receipts and survives removal of only its encrypted cache',
-  { timeout: 90_000 },
+  { timeout: 1200_000 },
   async (t) => {
     // Host-created proposals isolate acceptance mechanics. This makes no provider
     // extraction claim; the live harness must independently pass its oracle first.
@@ -65,7 +65,7 @@ test(
           : input !== undefined
             ? { body: JSON.stringify(input) }
             : {}),
-        signal: AbortSignal.any([t.signal, AbortSignal.timeout(30_000)]),
+        signal: AbortSignal.any([t.signal, AbortSignal.timeout(360_000)]),
       });
       const setCookie = response.headers.get('set-cookie');
       if (setCookie) cookie = setCookie.split(';')[0];

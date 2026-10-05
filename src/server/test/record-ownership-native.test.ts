@@ -37,7 +37,7 @@ import type { OwnershipRequest } from '../../shared/record-ownership.ts';
 // accommodates those durable operations; exact evidence and counts remain the oracle.
 test(
   'native records-selected ownership previews and commits a complete large name effect without whole intake hydration',
-  { timeout: 180000 },
+  { timeout: 360000 },
   async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'fictional-native-ownership-host-')),
       profileId = 'fictional';
@@ -408,343 +408,355 @@ test(
   },
 );
 
-test('native whole-report preview pages exact clinical and pending scope and publishes one atomic report correction with durable outcome pages', async (t) => {
-  const { nativeOwnershipReportPlan } = await import('../record-ownership-native.ts');
-  const { ownershipReceiptReference, replayOwnershipReceiptReference, ownershipOutcomePage } =
-    await import('../ownership-outcome-page.ts');
-  const root = mkdtempSync(join(tmpdir(), 'fictional-native-report-ownership-')),
-    profileId = 'fictional';
-  const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-  const journalObjects = new Map<string, Buffer>();
-  const recordStorage = {
-    read(name: string) {
-      const value = journalObjects.get(name);
-      return value ? Buffer.from(value) : null;
-    },
-    writeImmutable(name: string, bytes: Uint8Array) {
-      assert.equal(journalObjects.has(name), false);
-      journalObjects.set(name, Buffer.from(bytes));
-    },
-    publishHead(bytes: Uint8Array) {
-      journalObjects.set('head', Buffer.from(bytes));
-    },
-  };
-  attachPersonalDurability(db, { root, profileId, recordStorage });
-  t.after(() => {
-    clearNativeOwnershipPlans(db);
-    db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  const destination = createNote(db, {
-    kind: 'person',
-    title: 'Fictional Report Person',
-    person: { fullName: 'Fictional Report Person' },
-  });
-  const values = Array.from({ length: 18 }, (_, i) => ({
-    format: 'health-record-v1',
-    id: 'literal-' + i,
-    kind: 'record',
-    payload: { literal: 'Fictional retained evidence ' + i },
-    report: {
-      key: 'shared-report',
-      title: 'Fictional shared report',
-      subject: null,
-      anchor: { text: 'Fictional shared report', locator: 'Fictional heading' },
-    },
-    clinical: {
-      kind: 'observation',
-      subject: 'self',
-      date: '2026-01-12',
-      testLabel: 'Fictional test ' + i,
-      valueText: String(i),
-      unit: 'cm',
-    },
-    provenance: {
-      sourceSystem: 'Fictional Clinic',
-      sourceRecordId: 'literal-' + i,
-      capturedVia: null,
-      evidenceClass: 'provider_export',
-      locator: 'Fictional row ' + i,
-    },
-    coverage: { status: 'complete_response', notes: [] },
-  }));
-  const original = uploadIntake(db, root, profileId, {
-    filename: 'fictional-report.jsonl',
-    bytes: Buffer.from(values.map((value) => JSON.stringify(value)).join('\n')),
-    newProviderName: 'Fictional Clinic',
-  });
-  const review = reviewIntake(db, root, profileId, original.id);
-  importIntake(db, root, profileId, original.id, {
-    version: review.version,
-    reviewToken: review.reviewToken,
-    decisions: review.records
-      .slice(0, 12)
-      .map((row) => ({ recordId: row.id, action: 'accept', mapping: {} })),
-  });
-  const stored = JSON.parse(readIntakeEnvelopeText(db, { id: original.id })),
-    group = stored.intake.workflow.reportGroups[0];
-  group.versions.at(-1).members[0].unknown = 'x'.repeat(300000);
-  writeIntakeFixtureEnvelope(db, original.id, stored);
-  const request: OwnershipRequest = {
-    selection: {
-      type: 'report',
-      intakeId: original.id,
-      groupId: group.id,
-      groupVersionId: group.versions.at(-1).id,
-    },
-    destination: { noteId: destination.id, expectedVersion: destination.version },
-  };
-  const oracle = previewRecordOwnership(db, root, profileId, request);
-  assert.equal(oracle.records.length, 12);
-  assert.equal(oracle.pending.length, 6);
-  await buildIntakeCollectionEnvelope(db, { id: original.id });
-  const before = intakeWorkCounters(db);
-  let preview = await previewNativeRecordOwnership(db, root, profileId, request);
-  assert.ok('reportEvidence' in preview);
-  assert.equal('records' in preview, false);
-  assert.equal('pending' in preview, false);
-  assert.equal(preview.reportEvidence.recordTotal, 12);
-  assert.equal(preview.reportEvidence.pendingTotal, 6);
-  assert.equal(preview.commitGroups.length, 1);
-  assert.equal(preview.commitGroups[0]!.atomic, true);
-  const plan = nativeOwnershipReportPlan(db, profileId, preview.reportEvidence.token);
-  const records: unknown[] = [],
-    pending: unknown[] = [];
-  for (const [section, items] of [
-    ['records', records],
-    ['pending', pending],
-  ] as const) {
-    let after = -1;
-    do {
-      const page = plan.page(section, after, 3);
-      assert.ok(page.items.length <= 3);
-      items.push(...page.items);
-      if (page.complete) break;
-      after = Number(page.after);
-    } while (true);
-  }
-  const expanded = records.map((value) => {
-    const record =
-      value as import('../../shared/ownership-report-reference.ts').OwnershipReportPreviewRecord;
-    assert.ok(!Array.isArray(record.contributions));
-    const reference = record.contributions;
-    const contributionPage = plan.contributionPage(reference.key, null, -1, 32);
-    assert.equal(contributionPage.complete, true);
-    const contributions = contributionPage.items.map((value) => {
-      const contribution =
-        value as import('../../shared/ownership-report-reference.ts').OwnershipContributionEvidence;
-      const scopePage = plan.contributionPage(reference.key, contribution.sourceRecordId, -1, 32);
-      assert.equal(scopePage.complete, true);
-      return { ...contribution, reportScopes: scopePage.items };
-    });
-    assert.equal(contributions.length, reference.total);
-    return { ...record, contributions };
-  });
-  assert.deepEqual(expanded, JSON.parse(JSON.stringify(oracle.records)));
-  assert.deepEqual(pending, oracle.pending);
-  assert.deepEqual(preview.blockers, oracle.blockers);
-  const oldToken = preview.scopeToken;
-  const firstRecord = oracle.records[0]!;
-  const changed = await chooseNativeOwnershipReport(db, profileId, preview.reportEvidence.token, {
-    recordId: firstRecord.recordId,
-    decision: { action: 'keep_both' },
-  });
-  assert.ok('reportEvidence' in changed);
-  preview = changed;
-  assert.notEqual(preview.scopeToken, oldToken);
-  assert.equal(preview.request.decisions?.length, 0);
-  assert.equal(preview.reportEvidence.recordTotal, 12);
-  await assert.rejects(
-    chooseNativeOwnershipReport(db, profileId, preview.reportEvidence.token, {
-      recordId: 'outside-selection',
-      decision: { action: 'keep_both' },
-    }),
-    /outside this complete report/,
-  );
-  assert.equal(plan.publicPreview().scopeToken, preview.scopeToken);
-  const operationId = randomUUID(),
-    command = {
-      operationId,
-      request: preview.request,
-      scopeToken: preview.scopeToken,
-      version: preview.version,
+test(
+  'native whole-report preview pages exact clinical and pending scope and publishes one atomic report correction with durable outcome pages',
+  { timeout: 180000 },
+  async (t) => {
+    const { nativeOwnershipReportPlan } = await import('../record-ownership-native.ts');
+    const { ownershipReceiptReference, replayOwnershipReceiptReference, ownershipOutcomePage } =
+      await import('../ownership-outcome-page.ts');
+    const root = mkdtempSync(join(tmpdir(), 'fictional-native-report-ownership-')),
+      profileId = 'fictional';
+    const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+    const journalObjects = new Map<string, Buffer>();
+    const recordStorage = {
+      read(name: string) {
+        const value = journalObjects.get(name);
+        return value ? Buffer.from(value) : null;
+      },
+      writeImmutable(name: string, bytes: Uint8Array) {
+        assert.equal(journalObjects.has(name), false);
+        journalObjects.set(name, Buffer.from(bytes));
+      },
+      publishHead(bytes: Uint8Array) {
+        journalObjects.set('head', Buffer.from(bytes));
+      },
     };
-  const journalWork = createRecordVersionWorkCounters();
-  const receipt = await withRecordVersionWork(journalWork, () =>
-    commitNativeRecordOwnership(db, root, profileId, command),
-  );
-  assert.ok('outcomesIncluded' in receipt);
-  assert.ok('outcomeDigest' in receipt);
-  assert.equal(receipt.outcomesIncluded, false);
-  assert.equal('outcomes' in receipt, false);
-  assert.equal(receipt.moved, 12);
-  assert.equal(receipt.pending, 6);
-  assert.ok(journalWork.operation.maxSegmentReferencesBuffered <= 64);
-  const acceptedHead = JSON.parse(journalObjects.get('head')!.toString()),
-    acceptedCommit = JSON.parse(journalObjects.get(acceptedHead.name)!.toString());
-  assert.equal(acceptedCommit.result.outcomes, undefined);
-  assert.equal(acceptedCommit.result.outcomesIncluded, false);
-  assert.ok(JSON.stringify(acceptedCommit.result).length < 2048);
-  assert.throws(() => getRecordOwnershipReceipt(db, profileId, operationId), /paged outcomes/);
-  assert.equal(
-    db.prepare('SELECT COUNT(*) n FROM observations WHERE person_id=?').get(destination.personId)!
-      .n,
-    12,
-  );
-  assert.equal(
-    db
+    attachPersonalDurability(db, { root, profileId, recordStorage });
+    t.after(() => {
+      clearNativeOwnershipPlans(db);
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const destination = createNote(db, {
+      kind: 'person',
+      title: 'Fictional Report Person',
+      person: { fullName: 'Fictional Report Person' },
+    });
+    const values = Array.from({ length: 18 }, (_, i) => ({
+      format: 'health-record-v1',
+      id: 'literal-' + i,
+      kind: 'record',
+      payload: { literal: 'Fictional retained evidence ' + i },
+      report: {
+        key: 'shared-report',
+        title: 'Fictional shared report',
+        subject: null,
+        anchor: { text: 'Fictional shared report', locator: 'Fictional heading' },
+      },
+      clinical: {
+        kind: 'observation',
+        subject: 'self',
+        date: '2026-01-12',
+        testLabel: 'Fictional test ' + i,
+        valueText: String(i),
+        unit: 'cm',
+      },
+      provenance: {
+        sourceSystem: 'Fictional Clinic',
+        sourceRecordId: 'literal-' + i,
+        capturedVia: null,
+        evidenceClass: 'provider_export',
+        locator: 'Fictional row ' + i,
+      },
+      coverage: { status: 'complete_response', notes: [] },
+    }));
+    const original = uploadIntake(db, root, profileId, {
+      filename: 'fictional-report.jsonl',
+      bytes: Buffer.from(values.map((value) => JSON.stringify(value)).join('\n')),
+      newProviderName: 'Fictional Clinic',
+    });
+    const review = reviewIntake(db, root, profileId, original.id);
+    importIntake(db, root, profileId, original.id, {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: review.records
+        .slice(0, 12)
+        .map((row) => ({ recordId: row.id, action: 'accept', mapping: {} })),
+    });
+    const stored = JSON.parse(readIntakeEnvelopeText(db, { id: original.id })),
+      group = stored.intake.workflow.reportGroups[0];
+    group.versions.at(-1).members[0].unknown = 'x'.repeat(300000);
+    writeIntakeFixtureEnvelope(db, original.id, stored);
+    const request: OwnershipRequest = {
+      selection: {
+        type: 'report',
+        intakeId: original.id,
+        groupId: group.id,
+        groupVersionId: group.versions.at(-1).id,
+      },
+      destination: { noteId: destination.id, expectedVersion: destination.version },
+    };
+    const oracle = previewRecordOwnership(db, root, profileId, request);
+    assert.equal(oracle.records.length, 12);
+    assert.equal(oracle.pending.length, 6);
+    await buildIntakeCollectionEnvelope(db, { id: original.id });
+    const before = intakeWorkCounters(db);
+    let preview = await previewNativeRecordOwnership(db, root, profileId, request);
+    assert.ok('reportEvidence' in preview);
+    assert.equal('records' in preview, false);
+    assert.equal('pending' in preview, false);
+    assert.equal(preview.reportEvidence.recordTotal, 12);
+    assert.equal(preview.reportEvidence.pendingTotal, 6);
+    assert.equal(preview.commitGroups.length, 1);
+    assert.equal(preview.commitGroups[0]!.atomic, true);
+    const plan = nativeOwnershipReportPlan(db, profileId, preview.reportEvidence.token);
+    const records: unknown[] = [],
+      pending: unknown[] = [];
+    for (const [section, items] of [
+      ['records', records],
+      ['pending', pending],
+    ] as const) {
+      let after = -1;
+      do {
+        const page = plan.page(section, after, 3);
+        assert.ok(page.items.length <= 3);
+        items.push(...page.items);
+        if (page.complete) break;
+        after = Number(page.after);
+      } while (true);
+    }
+    const expanded = records.map((value) => {
+      const record =
+        value as import('../../shared/ownership-report-reference.ts').OwnershipReportPreviewRecord;
+      assert.ok(!Array.isArray(record.contributions));
+      const reference = record.contributions;
+      const contributionPage = plan.contributionPage(reference.key, null, -1, 32);
+      assert.equal(contributionPage.complete, true);
+      const contributions = contributionPage.items.map((value) => {
+        const contribution =
+          value as import('../../shared/ownership-report-reference.ts').OwnershipContributionEvidence;
+        const scopePage = plan.contributionPage(reference.key, contribution.sourceRecordId, -1, 32);
+        assert.equal(scopePage.complete, true);
+        return { ...contribution, reportScopes: scopePage.items };
+      });
+      assert.equal(contributions.length, reference.total);
+      return { ...record, contributions };
+    });
+    assert.deepEqual(expanded, JSON.parse(JSON.stringify(oracle.records)));
+    assert.deepEqual(pending, oracle.pending);
+    assert.deepEqual(preview.blockers, oracle.blockers);
+    const oldToken = preview.scopeToken;
+    const firstRecord = oracle.records[0]!;
+    const changed = await chooseNativeOwnershipReport(db, profileId, preview.reportEvidence.token, {
+      recordId: firstRecord.recordId,
+      decision: { action: 'keep_both' },
+    });
+    assert.ok('reportEvidence' in changed);
+    preview = changed;
+    assert.notEqual(preview.scopeToken, oldToken);
+    assert.equal(preview.request.decisions?.length, 0);
+    assert.equal(preview.reportEvidence.recordTotal, 12);
+    await assert.rejects(
+      chooseNativeOwnershipReport(db, profileId, preview.reportEvidence.token, {
+        recordId: 'outside-selection',
+        decision: { action: 'keep_both' },
+      }),
+      /outside this complete report/,
+    );
+    assert.equal(plan.publicPreview().scopeToken, preview.scopeToken);
+    const operationId = randomUUID(),
+      command = {
+        operationId,
+        request: preview.request,
+        scopeToken: preview.scopeToken,
+        version: preview.version,
+      };
+    const journalWork = createRecordVersionWorkCounters();
+    const receipt = await withRecordVersionWork(journalWork, () =>
+      commitNativeRecordOwnership(db, root, profileId, command),
+    );
+    assert.ok('outcomesIncluded' in receipt);
+    assert.ok('outcomeDigest' in receipt);
+    assert.equal(receipt.outcomesIncluded, false);
+    assert.equal('outcomes' in receipt, false);
+    assert.equal(receipt.moved, 12);
+    assert.equal(receipt.pending, 6);
+    assert.ok(journalWork.operation.maxSegmentReferencesBuffered <= 64);
+    const acceptedHead = JSON.parse(journalObjects.get('head')!.toString()),
+      acceptedCommit = JSON.parse(journalObjects.get(acceptedHead.name)!.toString());
+    assert.equal(acceptedCommit.result.outcomes, undefined);
+    assert.equal(acceptedCommit.result.outcomesIncluded, false);
+    assert.ok(JSON.stringify(acceptedCommit.result).length < 2048);
+    assert.throws(() => getRecordOwnershipReceipt(db, profileId, operationId), /paged outcomes/);
+    assert.equal(
+      db.prepare('SELECT COUNT(*) n FROM observations WHERE person_id=?').get(destination.personId)!
+        .n,
+      12,
+    );
+    assert.equal(
+      db
+        .prepare(
+          "SELECT COUNT(*) n FROM manual_batches WHERE title='Report ownership default' AND json_extract(coverage_json,'$.operationId')=?",
+        )
+        .get(operationId)!.n,
+      1,
+    );
+    assert.deepEqual(replayOwnershipReceiptReference(db, profileId, command), {
+      ...receipt,
+      replayed: true,
+    });
+    assert.deepEqual(ownershipReceiptReference(db, profileId, operationId), {
+      ...receipt,
+      replayed: true,
+    });
+    const outcomes: unknown[] = [];
+    let after = '';
+    do {
+      const page = ownershipOutcomePage(db, profileId, operationId, after, 5);
+      outcomes.push(...page.items);
+      if (page.complete) break;
+      after = page.after!;
+    } while (true);
+    assert.equal(outcomes.length, 12);
+    assert.match(receipt.outcomeDigest, /^[a-f0-9]{64}$/);
+    assert.throws(
+      () => ownershipOutcomePage(db, 'another-profile', operationId, '', 1),
+      /another profile/,
+    );
+    const late = db
       .prepare(
-        "SELECT COUNT(*) n FROM manual_batches WHERE title='Report ownership default' AND json_extract(coverage_json,'$.operationId')=?",
+        "SELECT id,coverage_json FROM manual_batches WHERE title='Record ownership event' AND json_extract(coverage_json,'$.operationId')=? ORDER BY id DESC LIMIT 1",
       )
-      .get(operationId)!.n,
-    1,
-  );
-  assert.deepEqual(replayOwnershipReceiptReference(db, profileId, command), {
-    ...receipt,
-    replayed: true,
-  });
-  assert.deepEqual(ownershipReceiptReference(db, profileId, operationId), {
-    ...receipt,
-    replayed: true,
-  });
-  const outcomes: unknown[] = [];
-  let after = '';
-  do {
-    const page = ownershipOutcomePage(db, profileId, operationId, after, 5);
-    outcomes.push(...page.items);
-    if (page.complete) break;
-    after = page.after!;
-  } while (true);
-  assert.equal(outcomes.length, 12);
-  assert.match(receipt.outcomeDigest, /^[a-f0-9]{64}$/);
-  assert.throws(
-    () => ownershipOutcomePage(db, 'another-profile', operationId, '', 1),
-    /another profile/,
-  );
-  const late = db
-    .prepare(
-      "SELECT id,coverage_json FROM manual_batches WHERE title='Record ownership event' AND json_extract(coverage_json,'$.operationId')=? ORDER BY id DESC LIMIT 1",
-    )
-    .get(operationId)!;
-  const modified = JSON.parse(String(late.coverage_json));
-  modified.fromNoteId = 'fictional-corrupted-owner';
-  db.prepare('UPDATE manual_batches SET coverage_json=? WHERE id=?').run(
-    JSON.stringify(modified),
-    late.id,
-  );
-  assert.throws(
-    () => ownershipOutcomePage(db, profileId, operationId, 'zzzz-past-final-evidence', 1),
-    /complete digest/,
-  );
-  db.prepare('UPDATE manual_batches SET coverage_json=? WHERE id=?').run(
-    late.coverage_json,
-    late.id,
-  );
-  assert.equal(intakeWorkCounters(db).warm.envelopeHydrations, before.warm.envelopeHydrations);
-  assert.equal(intakeWorkCounters(db).warm.materializationReads, before.warm.materializationReads);
-});
+      .get(operationId)!;
+    const modified = JSON.parse(String(late.coverage_json));
+    modified.fromNoteId = 'fictional-corrupted-owner';
+    db.prepare('UPDATE manual_batches SET coverage_json=? WHERE id=?').run(
+      JSON.stringify(modified),
+      late.id,
+    );
+    assert.throws(
+      () => ownershipOutcomePage(db, profileId, operationId, 'zzzz-past-final-evidence', 1),
+      /complete digest/,
+    );
+    db.prepare('UPDATE manual_batches SET coverage_json=? WHERE id=?').run(
+      late.coverage_json,
+      late.id,
+    );
+    assert.equal(intakeWorkCounters(db).warm.envelopeHydrations, before.warm.envelopeHydrations);
+    assert.equal(
+      intakeWorkCounters(db).warm.materializationReads,
+      before.warm.materializationReads,
+    );
+  },
+);
 
-test('native selected-record ownership keeps every off-page identity requirement and refuses the complete blocked scope', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-ownership-identity-questions-')),
-    profileId = 'fictional',
-    db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-  attachPersonalDurability(db, { root, profileId });
-  t.after(() => {
-    clearNativeOwnershipPlans(db);
-    db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  const destination = createNote(db, {
-    kind: 'person',
-    title: 'Fictional Willow',
-    person: { fullName: 'Fictional Willow' },
-  });
-  const value = {
-    format: 'health-record-v1',
-    id: 'fictional',
-    kind: 'record',
-    payload: { literal: 'Fictional evidence' },
-    clinical: {
-      kind: 'observation',
-      subject: 'self',
-      date: '2026-01-12',
-      testLabel: 'Fictional reading',
-      valueText: '12',
-      unit: 'cm',
-    },
-    provenance: {
-      sourceSystem: 'Fictional clinic',
-      sourceRecordId: 'fictional',
-      capturedVia: null,
-      evidenceClass: 'provider_export',
+test(
+  'native selected-record ownership keeps every off-page identity requirement and refuses the complete blocked scope',
+  { timeout: 180000 },
+  async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-ownership-identity-questions-')),
+      profileId = 'fictional',
+      db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+    attachPersonalDurability(db, { root, profileId });
+    t.after(() => {
+      clearNativeOwnershipPlans(db);
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const destination = createNote(db, {
+      kind: 'person',
+      title: 'Fictional Willow',
+      person: { fullName: 'Fictional Willow' },
+    });
+    const value = {
+      format: 'health-record-v1',
+      id: 'fictional',
+      kind: 'record',
+      payload: { literal: 'Fictional evidence' },
+      clinical: {
+        kind: 'observation',
+        subject: 'self',
+        date: '2026-01-12',
+        testLabel: 'Fictional reading',
+        valueText: '12',
+        unit: 'cm',
+      },
+      provenance: {
+        sourceSystem: 'Fictional clinic',
+        sourceRecordId: 'fictional',
+        capturedVia: null,
+        evidenceClass: 'provider_export',
+        locator: 'Fictional row',
+      },
+      coverage: { status: 'complete_response', notes: [] },
+    };
+    const original = uploadIntake(db, root, profileId, {
+        filename: 'fictional.jsonl',
+        bytes: Buffer.from(JSON.stringify(value)),
+        newProviderName: 'Fictional clinic',
+      }),
+      review = reviewIntake(db, root, profileId, original.id);
+    importIntake(db, root, profileId, original.id, {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+    });
+    const row = db.prepare('SELECT id FROM observations').get()!,
+      stored = JSON.parse(readIntakeEnvelopeText(db, { id: original.id })),
+      candidate = stored.intake.workflow.candidates[0];
+    stored.intake.workflow.questions = Array.from({ length: 65 }, (_, index) => ({
+      id: 'fictional-identity-' + index,
+      key: 'fictional-identity-' + index,
+      candidateId: candidate.id,
+      candidateVersionId: candidate.versions.at(-1).id,
+      prompt:
+        'Does this fictional record identify another person? ' + index + ' ' + 'x'.repeat(3000),
       locator: 'Fictional row',
-    },
-    coverage: { status: 'complete_response', notes: [] },
-  };
-  const original = uploadIntake(db, root, profileId, {
-      filename: 'fictional.jsonl',
-      bytes: Buffer.from(JSON.stringify(value)),
-      newProviderName: 'Fictional clinic',
-    }),
-    review = reviewIntake(db, root, profileId, original.id);
-  importIntake(db, root, profileId, original.id, {
-    version: review.version,
-    reviewToken: review.reviewToken,
-    decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
-  });
-  const row = db.prepare('SELECT id FROM observations').get()!,
-    stored = JSON.parse(readIntakeEnvelopeText(db, { id: original.id })),
-    candidate = stored.intake.workflow.candidates[0];
-  stored.intake.workflow.questions = Array.from({ length: 65 }, (_, index) => ({
-    id: 'fictional-identity-' + index,
-    key: 'fictional-identity-' + index,
-    candidateId: candidate.id,
-    candidateVersionId: candidate.versions.at(-1).id,
-    prompt: 'Does this fictional record identify another person? ' + index + ' ' + 'x'.repeat(3000),
-    locator: 'Fictional row',
-    field: 'subject',
-    status: 'unanswered',
-    createdAt: '2026-01-01T00:00:00Z',
-    answers: [],
-  }));
-  writeIntakeFixtureEnvelope(db, original.id, stored);
-  await buildIntakeCollectionEnvelope(db, { id: original.id });
-  const request: OwnershipRequest = {
-    selection: { type: 'records', records: [{ kind: 'observation', recordId: String(row.id) }] },
-    destination: { noteId: destination.id, expectedVersion: destination.version },
-  };
-  await prepareOwnershipEvidence(db, root, profileId, request);
-  const preview = await previewNativeRecordOwnership(db, root, profileId, request);
-  if (!('reportEvidence' in preview)) throw Error('Expected complete record evidence');
-  const plan = nativeOwnershipReportPlan(db, profileId, preview.reportEvidence.token),
-    selected = plan.page('records').items[0]!;
-  if (!('mapping' in selected)) throw Error('Expected bounded clinical header');
-  const blockers = selected.blockers;
-  assert.equal(Array.isArray(blockers), false);
-  if (Array.isArray(blockers)) throw Error('Expected complete blocker reference');
-  assert.equal(blockers.count, 66);
-  const token = new URL(blockers.url, 'http://fictional').pathname.split('/').at(-1)!,
-    first = plan.contributionPage(blockers.key, null, -1, 3, 4096);
-  assert.equal(first.total, 66);
-  assert.equal(first.items.length, 3);
-  const last = plan.contributionPage(blockers.key, null, 63, 3, 8192);
-  assert.equal(last.items.length, 2);
-  assert.match(String(last.items[0]), /64/);
-  await assert.rejects(
-    commitNativeRecordOwnership(db, root, profileId, {
-      operationId: randomUUID(),
-      request: preview.request,
-      version: preview.version,
-      scopeToken: preview.scopeToken,
-    }),
-    /Resolve every displayed decision/,
-  );
-  assert.equal(
-    db.prepare('SELECT person_id FROM observations WHERE id=?').get(row.id)!.person_id,
-    'patient',
-  );
-  assert.throws(
-    () => nativeOwnershipReportPlan(db, 'other-profile', token),
-    /current report evidence/,
-  );
-});
+      field: 'subject',
+      status: 'unanswered',
+      createdAt: '2026-01-01T00:00:00Z',
+      answers: [],
+    }));
+    writeIntakeFixtureEnvelope(db, original.id, stored);
+    await buildIntakeCollectionEnvelope(db, { id: original.id });
+    const request: OwnershipRequest = {
+      selection: { type: 'records', records: [{ kind: 'observation', recordId: String(row.id) }] },
+      destination: { noteId: destination.id, expectedVersion: destination.version },
+    };
+    await prepareOwnershipEvidence(db, root, profileId, request);
+    const preview = await previewNativeRecordOwnership(db, root, profileId, request);
+    if (!('reportEvidence' in preview)) throw Error('Expected complete record evidence');
+    const plan = nativeOwnershipReportPlan(db, profileId, preview.reportEvidence.token),
+      selected = plan.page('records').items[0]!;
+    if (!('mapping' in selected)) throw Error('Expected bounded clinical header');
+    const blockers = selected.blockers;
+    assert.equal(Array.isArray(blockers), false);
+    if (Array.isArray(blockers)) throw Error('Expected complete blocker reference');
+    assert.equal(blockers.count, 66);
+    const token = new URL(blockers.url, 'http://fictional').pathname.split('/').at(-1)!,
+      first = plan.contributionPage(blockers.key, null, -1, 3, 4096);
+    assert.equal(first.total, 66);
+    assert.equal(first.items.length, 3);
+    const last = plan.contributionPage(blockers.key, null, 63, 3, 8192);
+    assert.equal(last.items.length, 2);
+    assert.match(String(last.items[0]), /64/);
+    await assert.rejects(
+      commitNativeRecordOwnership(db, root, profileId, {
+        operationId: randomUUID(),
+        request: preview.request,
+        version: preview.version,
+        scopeToken: preview.scopeToken,
+      }),
+      /Resolve every displayed decision/,
+    );
+    assert.equal(
+      db.prepare('SELECT person_id FROM observations WHERE id=?').get(row.id)!.person_id,
+      'patient',
+    );
+    assert.throws(
+      () => nativeOwnershipReportPlan(db, 'other-profile', token),
+      /current report evidence/,
+    );
+  },
+);

@@ -74,7 +74,7 @@ beforeEach(() => {
   selectProfile(profile);
 });
 
-it('returns to actual variable member pages and resets navigation before a changed source or version loads', async () => {
+it('returns to actual variable member pages and rejects stale results after profile, source or version changes', async () => {
   const requests: string[] = [];
   let delayed: ((response: Response) => void) | undefined;
   let delayNext = false;
@@ -147,16 +147,191 @@ it('returns to actual variable member pages and resets navigation before a chang
   expect(requests.some((path) => path.includes('offset=40') && path.includes('version=2'))).toBe(
     false,
   );
+  delayed = undefined;
+  delayNext = true;
   await user.click(next());
-  expect(await screen.findByText('41–80 of 100')).toBeVisible();
-  view.rerender(
-    <PackageInventory intake={{ ...native, id: 'fictional-other-package', version: 2 }} />,
-  );
+  await waitFor(() => expect(delayed).toBeDefined());
+  const otherSource = { ...native, id: 'fictional-other-package', version: 2 };
+  view.rerender(<PackageInventory intake={otherSource} />);
   expect(await screen.findByText('1–40 of 100')).toBeVisible();
   expect(previous()).toBeDisabled();
   expect(requests.some((path) => path.includes('/fictional-other-package/package?offset=40'))).toBe(
     false,
   );
+  await act(async () => delayed!(pageResponse(40)));
+  expect(screen.queryByText('41–80 of 100')).not.toBeInTheDocument();
+
+  delayed = undefined;
+  delayNext = true;
+  await user.click(next());
+  await waitFor(() => expect(delayed).toBeDefined());
+  const otherProfile = { ...profile, id: 'fictional-other-package-profile' };
+  await act(async () => {
+    replaceProfiles([profile, otherProfile]);
+    selectProfile(otherProfile);
+  });
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  expect(previous()).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'First members' })).toBeDisabled();
+  expect(
+    requests.some(
+      (path) => path.includes('/profiles/' + otherProfile.id + '/') && path.includes('offset=40'),
+    ),
+  ).toBe(false);
+  await act(async () => delayed!(pageResponse(40)));
+  expect(screen.queryByText('41–80 of 100')).not.toBeInTheDocument();
+});
+
+it('bounds recent member navigation, preserves variable windows after back and forward, and offers an honest return to the first page', async () => {
+  const sizes = [3, 5, 2, 7, 4, 1, 6, 3, 2, 5, 1, 4];
+  const starts = sizes.map((_, index) =>
+    sizes.slice(0, index).reduce((sum, size) => sum + size, 0),
+  );
+  const total = sizes.reduce((sum, size) => sum + size, 0);
+  const requests: number[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes('/package?')) {
+        const offset = Number(new URL(path, 'http://fictional.local').searchParams.get('offset'));
+        const page = starts.indexOf(offset);
+        if (page < 0) throw Error('Guessed or skipped member page: ' + offset);
+        requests.push(offset);
+        return json({
+          format: 'health-intake-package-inventory-v2',
+          inventoryId: 'fictional-many-variable-pages',
+          totalMembers: total,
+          totalExpandedBytes: total * 2,
+          uniqueByteContents: total,
+          members: Array.from({ length: sizes[page] }, (_, index) => ({
+            ...member,
+            ordinal: offset + index,
+            memberId: `member:${offset + index}`,
+            filename: `fictional-window-member-${offset + index}`,
+          })),
+          offset,
+          nextOffset: starts[page + 1] ?? null,
+        });
+      }
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  render(
+    <PackageInventory
+      intake={{ ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2}
+    />,
+  );
+  const user = userEvent.setup();
+  const next = () => screen.getByRole('button', { name: 'Next members' });
+  const previous = () => screen.getByRole('button', { name: 'Previous members' });
+  const first = () => screen.getByRole('button', { name: 'First members' });
+  async function expectPage(page: number) {
+    expect(
+      await screen.findByText(`${starts[page] + 1}–${starts[page] + sizes[page]} of ${total}`),
+    ).toBeVisible();
+    const region = screen.getByRole('region', { name: 'Package contents' });
+    const rows = within(region).getAllByRole('listitem');
+    expect(rows).toHaveLength(sizes[page]);
+    expect(rows.map((row) => within(row).getByRole('button').textContent)).toEqual(
+      Array.from(
+        { length: sizes[page] },
+        (_, index) => `fictional-window-member-${starts[page] + index}`,
+      ),
+    );
+  }
+  await expectPage(0);
+  expect(previous()).toBeDisabled();
+  for (let page = 1; page < sizes.length; page++) {
+    await user.click(next());
+    await expectPage(page);
+  }
+  expect(next()).toBeDisabled();
+  for (const page of [10, 9]) {
+    await user.click(previous());
+    await expectPage(page);
+  }
+  for (const page of [10, 11]) {
+    await user.click(next());
+    await expectPage(page);
+  }
+  for (const page of [10, 9, 8, 7, 6, 5, 4, 3]) {
+    expect(previous()).toBeEnabled();
+    await user.click(previous());
+    await expectPage(page);
+  }
+  expect(previous()).toBeDisabled();
+  expect(first()).toBeEnabled();
+  expect(screen.getByText(/Earlier pages are outside your recent history/)).toHaveTextContent(
+    'Choose First members to return to the start.',
+  );
+  await user.click(first());
+  await expectPage(0);
+  expect(first()).toBeDisabled();
+  expect(previous()).toBeDisabled();
+  expect(
+    screen.queryByText(/Earlier pages are outside your recent history/),
+  ).not.toBeInTheDocument();
+  await user.click(next());
+  await expectPage(1);
+  await user.click(previous());
+  await expectPage(0);
+  expect(previous()).toBeDisabled();
+  expect(requests).toEqual([
+    ...starts,
+    ...[10, 9, 10, 11, 10, 9, 8, 7, 6, 5, 4, 3, 0, 1, 0].map((page) => starts[page]),
+  ]);
+});
+
+it('keeps First members available when a later member page fails', async () => {
+  const offsets: number[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes('/package?')) {
+        const offset = Number(new URL(path, 'http://fictional.local').searchParams.get('offset'));
+        offsets.push(offset);
+        if (offset === 1)
+          return new Response(
+            JSON.stringify({
+              error: { code: 'PACKAGE_WINDOW', message: 'Fictional next page is unavailable.' },
+            }),
+            { status: 409 },
+          );
+        return json({
+          format: 'health-intake-package-inventory-v2',
+          inventoryId: 'fictional-failed-next-page',
+          totalMembers: 2,
+          totalExpandedBytes: 4,
+          uniqueByteContents: 2,
+          members: [member],
+          offset: 0,
+          nextOffset: 1,
+        });
+      }
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  render(
+    <PackageInventory
+      intake={{ ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2}
+    />,
+  );
+  const user = userEvent.setup();
+  expect(await screen.findByText('1–1 of 2')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Next members' }));
+  expect(await screen.findByText('Fictional next page is unavailable.')).toBeVisible();
+  const first = screen.getByRole('button', { name: 'First members' });
+  expect(first).toBeEnabled();
+  await user.click(first);
+  expect(await screen.findByText('1–1 of 2')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Previous members' })).toBeDisabled();
+  expect(offsets).toEqual([0, 1, 0]);
 });
 
 it('loads native processing issues as selected pages without fetching a complete intake', async () => {

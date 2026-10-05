@@ -384,11 +384,15 @@ preparation does not acquire a new plan selection.
 
 The package browser's Previous members action follows the actual visited page
 starts, since the response byte budget can produce fewer than 50 members. It
-retains only scalar navigation offsets in a linked history, with constant work
-to move forward or back; it never retains earlier member payloads. This voluntary
-navigation history grows with visited pages and resets on profile, source or
-version changes. The page payload bound does not imply constant total navigation
-history memory. Requests from an earlier version cannot replace the current page.
+retains at most eight recent scalar offsets and no earlier member payloads, so
+navigation metadata stays bounded independently of the number of visited pages.
+After the retained history is exhausted, Previous members is unavailable and an
+explicit message directs the user to First members. First members returns to the
+start and clears recent history; it also remains available after a later page
+fails to load. Profile, source and version changes reset navigation, and results
+from an earlier scope cannot replace the current page. Returning through more
+than eight earlier pages requires starting again; no guessed fixed-size backward
+window skips or duplicates occurrences.
 
 Host-selected package evidence reads use a compact source header and literal
 window API. They do not construct an intake workflow to read a retained child.
@@ -650,6 +654,49 @@ closure prevents later reconciliation work. This leaves attention results and
 maintenance credits unchanged; the conversion proof still refuses uncoordinated
 SQL, including changes followed by rollback.
 
+Package inventory GETs acquire this slot before selecting the native or legacy
+path. Compatibility preparation, accepted inventory checkpoints, failure
+resolution and the final current-plan selection stay within the same owner.
+Disconnecting the HTTP response removes a waiting request or cancels active
+verification through the existing worker checks. A final liveness check runs
+before invoking the response callback. Completed immutable checkpoints remain
+retained, so a later request can resume the same inventory attempt. Source,
+physical-authority and plan checks remain in force. Cold inventory holds the
+slot through worker completion; unrelated HTTP remains responsive while other
+participating clinical work waits. This prevents the demonstrated package-read
+interference with conversion, without claiming that every writer is coordinated.
+
+Package-member HTTP and the shared package inventory producer also coordinate
+compatibility preparation, inventory checkpoints, child publication, and located
+failure creation or resolution. Package metadata requests join the slot because
+they can reconstruct inventory or resolve its retained failure. Selected-member
+worker staging runs outside admission unless the caller already owns the slot;
+the completed stage and original physical lease survive the publication wait.
+Admission checks the original source and current child/native state, preserving
+exact occurrence reuse without refreshing another operation's captured proof.
+Completed inventory readers are selected under the caller's lifecycle and must
+match the completed inventory's exact identity and source binding. Deferred PDF
+readers retain that caller lifecycle rather than a closed producer lease. See
+[streamed package originals](streamed-package-originals.md).
+
+Thirteen focused producer cases use fictional authority with actual HTTP, ZIP
+workers and retained files. A paused real selected-member ACK establishes worker
+completion before queued publication. They cover live publication and exact
+retry, waiting cancellation, closed ownership, same-byte physical replacement,
+stage failure and stale/canceled failure publication, immediate-owner nesting,
+cold inventory overlap, deferred PDF fallback and all three JSON structure
+failure/resolution paths. The cold inventory case exercises the shared producer,
+not the assistant tool dispatcher. These cases do not establish full application
+authorization, encrypted recovery or physical-device qualification.
+
+Five focused real HTTP cases and six existing compatibility cases cover live
+conversion overlap, waiting and active disconnects, retained-prefix resume,
+legacy results, immediate-owner route nesting, current-plan selection and stale
+reference refusal. These use fictional immutable authority and actual ZIP
+workers; they do not establish full application authorization, encrypted recovery
+or browser qualification. The nested-route case starts from an already converted
+source and does not separately qualify compatibility-to-build nesting.
+
 Native conversion and staged-upload publication use the same operation slot.
 Readiness is checked after admission, so two callers converting the same source
 do not repeat the build. Network reception happens before admission. Background
@@ -870,6 +917,55 @@ is traversed to verify its original and every required proposal before and after
 returning a warm preview. Physical byte verification retains its existing exact
 file-identity guard and rehashes changed files. The memo retains no policy session
 or provider and clears on lock, rollback, disposal and actual database close.
+
+Native identity evidence commitments stream the complete current scope, excluding
+only its intake version, together with the verified original source hash and
+ordered advisory warnings.
+They allow one unchanged-action retry after a definite version conflict; they do
+not replace version-specific scope or receipt authority. Current overflow warning
+references bind immutable content independently of the main scope, so a saved
+Person edit can select new warnings without overwriting historical scope rows.
+See the [identity API](../../src/server/INTAKE.md#common-report-identity-review)
+for proof, warning-selector and logical confirmation boundaries.
+
+The snapshot owner authenticates a complete-evidence alias and source/group
+locator in the existing build report catalog. Fresh complete evidence remains
+required before an accepted alias can reuse retained rows. First certification
+performs two bounded retained traversals: exact namespace certification against
+an independent fresh-producer seal, then complete primary-evidence and warning
+commitment reconstruction. Changed evidence generates the full desired primary
+and derived key set in owned scratch, compares complete retained values in bounded
+chunks, publishes differences and deletes obsolete tails. Stable row positions
+can retain unchanged cells; ordinal insertion or deletion may affect many cells.
+Content, schema and physical scratch guards cover the entire operation, including
+cleanup, and fixed row budgets yield through unchanged comparisons. Logical
+confirmation can borrow exact source-bound build references under both captured
+catalog bindings; it cannot move or refresh the build-only locator or use a
+missing target from another selected area. Historical receipt lookup stays
+logical-only.
+
+Fragmented text retains the existing byte format. Owner-branded prior references
+permit comparison of fixed surrogate-safe UTF-16 leaves, reuse of equal aligned
+leaves, publication of differing/appended leaves and removal of obsolete trailing
+leaves. Prior branded references are adopted before asynchronous generation.
+Tiny replacements return to inline storage with no byte-leaf changes or deletes,
+but still incur the constant adoption and mapping changes. Character insertion or
+deletion can resegment the changed scalar's suffix; there is no arbitrary minimal-edit
+locality guarantee. Complete final count, bytes, order and streamed hash remain
+checked. Read/hash work, changed keys, changed byte leaves and durable
+tree/contributor publication are separate costs; reuse does not imply zero
+physical writes.
+
+The [native giant-question cases](../../src/server/test/intake-identity-native-giant.test.ts)
+exercise the supported competing-subject question path. The
+[native route cases](../../src/server/test/intake-identity-native-routes.test.ts)
+cover aligned question edits. Giant warning inputs in the
+[byte-owner cases](../../src/server/test/intake-report-snapshot-bytes.test.ts)
+and giant `$scope` inputs in the
+[alias-owner cases](../../src/server/test/intake-identity-snapshot-alias.test.ts)
+are synthetic owner fixtures; they do not establish a native policy/model path.
+
+Current identity fragment consumers use source- and snapshot-bound authenticated continuation positions over the existing variable-length byte leaves. Their total leaf-read work scales with the full traversal plus bounded page-boundary lookahead, rather than rereading every preceding fragment. Byte counters include decoded lookahead leaves. Page reference sizing uses authenticated item lengths, while full question digest construction yields with current source and artifact checks. Numeric-only compatibility calls preserve arbitrary byte-offset semantics through a cooperative prefix scan; they retain the cumulative reread cost and are not a bounded-per-page access guarantee. A verified-original descriptor remains held through fragment work, and cancellation or same-byte physical replacement invalidates a resumed read.
 
 A cold preview that publishes a snapshot cannot certify its earlier response.
 Only a fresh full reconstruction captured before reopening its context, with an

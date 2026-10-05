@@ -2965,6 +2965,7 @@ interface IntakeChildContext {
   root: string;
   profileId: string;
   assertRunning?: () => void;
+  signal?: AbortSignal;
 }
 
 /** Host-only verified descriptor. No extraction-size ceiling applies to ranges. */
@@ -3130,50 +3131,96 @@ export async function withStagedIntakeChild(
     throw new HttpError(400, 'PACKAGE_MEMBER', 'Invalid verified member size or hash');
   getRetainedIntakeOriginalReference(db, root, profileId, parentId);
   const parent = row(db, parentId);
-  const nativeParent = hasCollectionIntakeSchema(db, parent);
   let publicationAttempted = false;
   try {
     return await withPackageSessionSource(
-      { ...context, id: parentId },
+      {
+        ...context,
+        id: parentId,
+        assertRunning: () => {
+          context.signal?.throwIfAborted();
+          context.assertRunning?.();
+        },
+      },
       async ({ sourceFd, assertCurrent: assertUnchanged }) => {
         const { id } = childIdentity(parentId, member.locator, member.sourceHash);
-        if (db.prepare('SELECT 1 FROM source_files WHERE id=?').get(id)) {
-          const retained = row(db, id),
-            d = intakeSourceMetadata(db, retained.id);
-          if (
-            d.parentSourceFileId !== parentId ||
-            d.locator !== member.locator ||
-            retained.sha256 !== member.sourceHash ||
-            retained.bytes !== member.bytes
-          )
-            throw new HttpError(409, 'SOURCE_CHANGED', 'Retained member scope changed');
-          return withVerifiedIntakeOriginalDescriptor({ ...context, id }, async () => {
-            if (nativeParent)
-              await ensureNativeIntakeSchema(db, profileId, id, { assertRunning: assertUnchanged });
-            return childDescriptor(retained, d);
-          });
-        }
+        // Extraction uses the original source lease outside admission. Recheck
+        // the retained parent and child under the current publication owner.
+        const publish = (staged: StagedUpload | null) =>
+          runExclusiveClinicalOperation(
+            db,
+            async () => {
+              context.signal?.throwIfAborted();
+              assertUnchanged();
+              const currentParent = row(db, parentId);
+              for (const field of [
+                'id',
+                'path',
+                'sha256',
+                'bytes',
+                'provider_id',
+                'batch_id',
+              ] as const)
+                if (currentParent[field] !== parent[field])
+                  throw new HttpError(409, 'SOURCE_CHANGED', 'Retained parent scope changed');
+              const nativeParent = hasCollectionIntakeSchema(db, currentParent);
+              if (db.prepare('SELECT 1 FROM source_files WHERE id=?').get(id)) {
+                const retained = row(db, id),
+                  d = intakeSourceMetadata(db, id);
+                if (
+                  d.parentSourceFileId !== parentId ||
+                  d.locator !== member.locator ||
+                  retained.sha256 !== member.sourceHash ||
+                  retained.bytes !== member.bytes
+                )
+                  throw new HttpError(409, 'SOURCE_CHANGED', 'Retained member scope changed');
+                return withVerifiedIntakeOriginalDescriptor(
+                  { ...context, id },
+                  async ({ assertRunning }) => {
+                    assertUnchanged();
+                    assertRunning();
+                    if (nativeParent)
+                      await ensureNativeIntakeSchema(db, profileId, id, {
+                        assertRunning: () => {
+                          assertUnchanged();
+                          assertRunning();
+                        },
+                      });
+                    assertUnchanged();
+                    return childDescriptor(row(db, id), intakeSourceMetadata(db, id));
+                  },
+                );
+              }
+              if (!staged)
+                throw new HttpError(409, 'SOURCE_CHANGED', 'Retained member disappeared');
+              const file = prepareIntakeChild(
+                context,
+                currentParent,
+                { filename: member.filename, locator: member.locator },
+                staged,
+              );
+              assertUnchanged();
+              publicationAttempted = true;
+              const retained = publishIntakeChildren(context, [file])[0]!;
+              if (nativeParent)
+                await ensureNativeIntakeSchema(db, profileId, retained.id, {
+                  assertRunning: assertUnchanged,
+                });
+              assertUnchanged();
+              return retained;
+            },
+            {
+              operation: currentClinicalOperation(db),
+              signal: context.signal,
+              assertRunning: assertUnchanged,
+            },
+          );
+        if (db.prepare('SELECT 1 FROM source_files WHERE id=?').get(id)) return publish(null);
         return withPrivateChildStage(
           root,
           member,
           (outputFd) => writer({ sourceFd, outputFd, assertRunning: assertUnchanged }),
-          async (staged) => {
-            assertUnchanged();
-            const file = prepareIntakeChild(
-              context,
-              parent,
-              { filename: member.filename, locator: member.locator },
-              staged,
-            );
-            assertUnchanged();
-            publicationAttempted = true;
-            const retained = publishIntakeChildren(context, [file])[0]!;
-            if (nativeParent)
-              await ensureNativeIntakeSchema(db, profileId, retained.id, {
-                assertRunning: assertUnchanged,
-              });
-            return retained;
-          },
+          (staged) => publish(staged),
         );
       },
     );

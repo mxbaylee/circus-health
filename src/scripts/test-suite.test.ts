@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { globSync } from 'node:fs';
 import { suiteFiles, testEnvironment } from './test-suite.ts';
 
 test('routine suites separate external qualification without dropping local integration coverage', () => {
@@ -13,6 +14,15 @@ test('routine suites separate external qualification without dropping local inte
   ]);
   assert.equal(new Set(suiteFiles('state')).size, suiteFiles('state').length);
   assert.throws(() => suiteFiles('typo'), /Unknown test suite/);
+});
+
+test('dedicated acceptance and tools retain every local tooling test exactly once', () => {
+  const tools = suiteFiles('tools'),
+    acceptance = suiteFiles('acceptance');
+  assert.deepEqual(acceptance, ['src/scripts/provider-qualification-acceptance.test.ts']);
+  const combined = [...tools, ...acceptance].sort();
+  assert.equal(new Set(combined).size, combined.length);
+  assert.deepEqual(combined, globSync('src/scripts/*.test.ts').sort());
 });
 
 test('routine child processes cannot inherit operator model credentials or external test opt-ins', () => {
@@ -34,5 +44,9 @@ test('routine child processes cannot inherit operator model credentials or exter
     CRS_PDF_CONTROLLED_TEST: '0',
   });
   assert.equal(testEnvironment(original, 'continuation').CRS_PDF_CONTROLLED_TEST, '1');
+  assert.deepEqual(testEnvironment(original, 'acceptance'), {
+    PATH: '/fictional/bin',
+    CRS_PDF_CONTROLLED_TEST: '0',
+  });
   assert.equal(original.CRS_AI_API_KEY, 'fictional-key');
 });

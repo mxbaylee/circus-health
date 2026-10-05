@@ -5,6 +5,11 @@ import { HttpError } from './database.ts';
 import { getIntake, workflowMutation } from './intake.ts';
 import { workflowSummary } from './intake-workflow.ts';
 
+interface FailurePublicationOptions {
+  /** Host lifecycle/source proof; never a transported processing argument. */
+  assertRunning?: () => void;
+}
+
 export interface IntakePackageFailureInput {
   operationKey: string;
   memberId?: string;
@@ -75,7 +80,9 @@ export function recordIntakePackageFailure(
   profileId: string,
   id: string,
   input: IntakePackageFailureInput,
+  options: FailurePublicationOptions = {},
 ) {
+  options.assertRunning?.();
   const key = operationKey(input.operationKey);
   validateLocation(input);
   const intake = getIntake(db, root, profileId, id);
@@ -112,6 +119,7 @@ export function recordIntakePackageFailure(
     id,
     { version: intake.version },
     (_workflow, _file, details) => {
+      options.assertRunning?.();
       details.packageFailures ??= {};
       details.packageFailures[slot] = failure;
     },
@@ -125,7 +133,9 @@ export function resolveIntakePackageFailure(
   profileId: string,
   id: string,
   input: { operationKey: string },
+  options: FailurePublicationOptions = {},
 ) {
+  options.assertRunning?.();
   const key = operationKey(input.operationKey);
   const intake = getIntake(db, root, profileId, id);
   const slot = failureKey(intake.sha256, key);
@@ -144,6 +154,7 @@ export function resolveIntakePackageFailure(
     id,
     { version: intake.version },
     (workflow, _file, details) => {
+      options.assertRunning?.();
       delete details.packageFailures![slot];
       // Only retire the attention state this processing failure promoted. The
       // normal intake paths' existing receipts determine its underlying state;
@@ -189,7 +200,14 @@ export function resolveIntakePackageFailure(
 
 /** Native asynchronous adapters never hydrate a selected workflow or all
  * failures. Legacy synchronous DTO callers retain their existing functions. */
-async function nativeFailures(db: DatabaseSync, root: string, profileId: string, id: string) {
+async function nativeFailures(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  options: FailurePublicationOptions,
+) {
+  options.assertRunning?.();
   const { assertIntakeOwner } = await import('./intake.ts');
   const { intakeSourceVersion } = await import('./intake-state-access.ts');
   const { selectedEnvelopeStore, openIntakeCollectionEnvelope } =
@@ -213,7 +231,8 @@ async function nativeFailures(db: DatabaseSync, root: string, profileId: string,
     typeof control !== 'string' ||
     JSON.parse(control).format !== 'health-intake-record-envelope-v1'
   )
-    await buildIntakeCollectionEnvelope(db, source);
+    await buildIntakeCollectionEnvelope(db, source, options);
+  options.assertRunning?.();
   const reader = openIntakeCollectionEnvelope(db, source);
   const intake = reader.child(reader.root(), 'intake');
   if (!intake) throw Error('Retained intake envelope is missing');
@@ -249,7 +268,9 @@ async function nativeFailureMutation(
   id: string,
   current: Awaited<ReturnType<typeof nativeFailures>>,
   changes: import('./intake-envelope-mutation.ts').IntakeEnvelopeMutation[],
+  options: FailurePublicationOptions,
 ) {
+  options.assertRunning?.();
   const { randomUUID } = await import('node:crypto');
   const { prepareIntakeEnvelopeMutation } = await import('./intake-envelope-mutation.ts');
   const { selectedEnvelopeStore } = await import('./intake-collection-envelope.ts');
@@ -263,8 +284,10 @@ async function nativeFailureMutation(
     operationId,
     requestDigest,
     domainVersion: current.version.rawVersion + 1,
+    assertRunning: options.assertRunning,
   });
   if (!prepared.prepared) throw Error('New package failure mutation unexpectedly replayed');
+  options.assertRunning?.();
   intakeTransaction(
     db,
     () => selectedEnvelopeStore(db, current.source).collections.stage(prepared.prepared!),
@@ -280,10 +303,12 @@ export async function recordIntakePackageFailurePaged(
   profileId: string,
   id: string,
   input: IntakePackageFailureInput,
+  options: FailurePublicationOptions = {},
 ) {
+  options.assertRunning?.();
   const key = operationKey(input.operationKey);
   validateLocation(input, true);
-  const current = await nativeFailures(db, root, profileId, id);
+  const current = await nativeFailures(db, root, profileId, id, options);
   const { intakeSourceMetadata } = await import('./intake-state-access.ts');
   const failure: IntakePackageFailure = {
     sourceFileId: id,
@@ -331,7 +356,10 @@ export async function recordIntakePackageFailurePaged(
         ];
   if (nativeScalar(current.reader, current.intake, 'state') !== 'needs_review')
     changes.push({ op: 'set', record: current.intake, field: 'state', jsonText: '"needs_review"' });
-  return { ...(await nativeFailureMutation(db, root, profileId, id, current, changes)), failure };
+  return {
+    ...(await nativeFailureMutation(db, root, profileId, id, current, changes, options)),
+    failure,
+  };
 }
 export async function resolveIntakePackageFailurePaged(
   db: DatabaseSync,
@@ -339,9 +367,11 @@ export async function resolveIntakePackageFailurePaged(
   profileId: string,
   id: string,
   input: { operationKey: string },
+  options: FailurePublicationOptions = {},
 ) {
+  options.assertRunning?.();
   const key = operationKey(input.operationKey),
-    current = await nativeFailures(db, root, profileId, id);
+    current = await nativeFailures(db, root, profileId, id, options);
   const slot = failureKey(current.source.sha256, key),
     pending = current.dictionary && current.reader.child(current.dictionary, slot);
   if (
@@ -354,7 +384,13 @@ export async function resolveIntakePackageFailurePaged(
   // The attention label remains until the bounded workflow count owner can
   // prove its exact underlying disposition. Clearing this receipt never mints
   // acceptance or assumes that unrelated review work has completed.
-  return nativeFailureMutation(db, root, profileId, id, current, [
-    { op: 'delete', record: current.dictionary!, field: slot },
-  ]);
+  return nativeFailureMutation(
+    db,
+    root,
+    profileId,
+    id,
+    current,
+    [{ op: 'delete', record: current.dictionary!, field: slot }],
+    options,
+  );
 }

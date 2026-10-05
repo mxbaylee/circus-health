@@ -321,6 +321,7 @@ function inspectSnapshot(
       nextNamespace = manifest.db.prepare(
         'SELECT prefix FROM namespaces WHERE prefix>? ORDER BY prefix LIMIT 1',
       );
+    const readSource = manifest.db.prepare('SELECT value FROM source WHERE key=?');
     let afterNamespace = '';
     for (;;) {
       // Graph inspection recreates namespace-local scratch tables. Keep no
@@ -331,9 +332,7 @@ function inspectSnapshot(
       checkpoint();
       const prefix = String(entry.prefix);
       afterNamespace = prefix;
-      const get = (key: string) =>
-        manifest.db.prepare('SELECT value FROM source WHERE key=?').get(key)?.value as
-          string | undefined;
+      const get = (key: string) => readSource.get(key)?.value as string | undefined;
       const rawHead = get(prefix + 'head');
       if (rawHead === undefined) invalid('missing copy head');
       const header = decode(rawHead, HEAD_BYTES);

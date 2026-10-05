@@ -2,6 +2,32 @@
 
 This procedure serves the Operator's [operate and recover](../design/personas.md#operate-and-recover) job on the supported localhost npm → Docker Compose → LiteLLM installation. It covers a checked update from supported authority and recovery from a failed candidate using a separately retained backup. Review the limits before updating: recovery returns the backup's state, so writes made after that backup are not recovered by this procedure. General downgrade compatibility and rollback prevention are not provided.
 
+Native identity reviews add an optional complete evidence commitment for one
+retry after unrelated intake-version progress. Restart into the reviewed build
+and reload open Import reviews so the browser uses current warning selectors and
+freshness checks. Missing or unsupported proofs require review after a conflict;
+uncertain writes retain exact-request recovery. Overflow advisory warnings use
+content-bound v2 references and warning-only page/fragment selectors, preserving
+earlier immutable scope evidence while showing warnings changed by a saved Person
+edit. Earlier clients can read legacy scope warning rows but cannot select these
+new current-warning references; use a supporting build for complete current
+warning review.
+
+Internal complete-evidence aliases and a guarded build-catalog locator reuse
+checked snapshots and publish differing rows or removed tails. Confirmation
+retains exact logical receipt authority and never updates that build locator.
+Missing pre-upgrade aliases are constructed from checked evidence; present corrupt
+references refuse. Aligned equal-length fragmented text edits can reuse unchanged
+byte leaves in the existing format, while character insertion or deletion can
+resegment a changed scalar's suffix. Existing snapshot and receipt bytes remain
+immutable. No operator setting or scope/receipt migration is required. Earlier
+inline-only readers still cannot recover referenced native receipts; keep the
+checked pre-update backup for prior-build recovery. See [identity
+review](../import/identity-review.md) and the [API
+contract](../../src/server/INTAKE.md#common-report-identity-review).
+
+Reload open Import reviews after updating so large identity evidence uses the current continuation protocol. Continuations are disposable transport state and expire on preview invalidation, rollback, lock or close; reopen the evidence after expiry. Earlier clients that send numeric offsets remain readable, but scan the prefix on each request. The retained snapshot, byte-leaf and receipt formats are unchanged.
+
 ## Identify the current and candidate builds
 
 Record the current checkout's exact revision and the running build's `buildId`, `revision` and `worktree` from `http://localhost:3001/api/runtime` (use your configured port). Record the application image ID and tag from that archive's specific Compose project. Retain the prior checkout/revision and dependencies needed to build it again; a mutable image tag alone is not a retained release. Keep receipts outside Git and omit credentials, recovery phrases, private source paths and health content from shared diagnostics.
@@ -89,11 +115,31 @@ background-extraction database phases through the existing operation queue; see
 [import processing](../import/processing.md). Source-attention list preparation
 also joins that queue, so its disposable count updates wait for active conversion
 instead of invalidating its original proof. Restart into the candidate and
-reload open import pages. Network reception and extraction workers stay outside
-the queue; a large participating operation may delay another database operation.
-Exact historical batch-exception replay remains supported, and new native
-clear-unit receipts retain their stronger unit binding. No archive format,
-operator setting or prior-build recovery requirement changes.
+reload open import pages. Network reception and background source-extraction
+workers stay outside the queue; a large participating operation may delay another
+database operation. Exact historical batch-exception replay remains supported,
+and new native clear-unit receipts retain their stronger unit binding. No archive
+format, operator setting or prior-build recovery requirement changes.
+
+Package inventory GETs also join the existing database owner, including their
+inventory worker and final current-plan selection. Restart into the reviewed
+candidate and reload open import pages. Disconnecting a request now stops its
+waiting or active work; a later request resumes completed immutable checkpoints.
+Earlier builds can continue inventory after disconnect and invalidate another
+conversion's held proof through inventory writes. Originals and accepted
+checkpoints remain the recovery authority. This changes no retained authority
+format and requires no authority migration or operator configuration change.
+
+Selected package members, shared inventory preparation and metadata reads now
+coordinate their database writes with the same owner. Earlier builds could
+publish a member from an already completed inventory, or write a located JSON
+processing failure, during another conversion and invalidate its held proof.
+Selected worker staging can finish while publication waits; cancellation or a
+changed physical parent then prevents publication and new failure writes. Exact
+member retry preserves the existing retained occurrence and workflow state.
+Restart into the reviewed candidate and reload open import pages. This adds no
+authority format, migration or operator setting; deferred PDF evidence continues
+through the current caller lifecycle.
 
 [Question recipes](../data/intake-bounded-views.md) are authenticated disposable
 data owned by a review session, with fresh values on every borrow. Reload reviews
@@ -124,6 +170,14 @@ operator setting. Original-file checks, worker reads, literal page routing and
 malformed-authority refusal remain required. The focused read counts do not
 establish whole-import timing or replace acceptance, encrypted recovery and
 supported release-pair qualification.
+
+Cold intake recovery and profile-copy validation reuse their fixed SQL read
+statements. Restart into the reviewed candidate through the update procedure
+above; this change needs no additional operator action. Retained formats,
+authority rules and configuration are unchanged, with no migration required.
+Complete reconstruction still traverses accepted history and validates the
+selected intake graph. The focused recovery evidence does not establish full
+64-record acceptance/recovery or general release-pair compatibility.
 
 ## Repeatable fictional release qualification
 

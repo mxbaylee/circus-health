@@ -68,7 +68,7 @@ type MemberRead = {
     note?: string;
   };
 };
-type PreviousMemberPage = { offset: number; previous: PreviousMemberPage | null };
+const memberPageHistoryLimit = 8;
 
 export function PackageInventory({ intake }: { intake: IntakeRead }) {
   const profile = useProfile();
@@ -76,12 +76,12 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
   const [navigation, setNavigation] = useState({
     scope: inventoryScope,
     offset: 0,
-    previous: null as PreviousMemberPage | null,
+    previous: [] as number[],
   });
   const currentNavigation =
     navigation.scope === inventoryScope
       ? navigation
-      : { scope: inventoryScope, offset: 0, previous: null };
+      : { scope: inventoryScope, offset: 0, previous: [] };
   const { offset, previous } = currentNavigation;
   const inventory = useResource<IntakePackageInventory | IntakePackageInventoryPaged>(
     `/intakes/${encodeURIComponent(intake.id)}/package?offset=${offset}&limit=50&version=${encodeURIComponent(intake.version)}`,
@@ -108,7 +108,7 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
   };
   useEffect(() => setFailureCursor(null), [intake.id, intake.version]);
   useEffect(() => {
-    setNavigation({ scope: inventoryScope, offset: 0, previous: null });
+    setNavigation({ scope: inventoryScope, offset: 0, previous: [] });
   }, [inventoryScope]);
   useEffect(() => {
     if (!inventory.loading && !inventory.refreshing) refreshFailures();
@@ -266,12 +266,12 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
             <div className="intake-actions">
               <button
                 className="text-link"
-                disabled={!previous || busy || inventory.loading || !!inventory.refreshing}
+                disabled={!previous.length || busy || inventory.loading || !!inventory.refreshing}
                 onClick={() =>
                   setNavigation({
                     scope: inventoryScope,
-                    offset: previous!.offset,
-                    previous: previous!.previous,
+                    offset: previous.at(-1)!,
+                    previous: previous.slice(0, -1),
                   })
                 }
               >
@@ -287,11 +287,11 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
                   data.nextOffset === null || busy || inventory.loading || !!inventory.refreshing
                 }
                 onClick={() =>
-                  // Retain only visited starts: byte-bounded pages need not contain fifty members.
+                  // Keep only recent actual starts: byte-bounded pages need not contain fifty members.
                   setNavigation({
                     scope: inventoryScope,
                     offset: data.nextOffset!,
-                    previous: { offset, previous },
+                    previous: [...previous.slice(1 - memberPageHistoryLimit), offset],
                   })
                 }
               >
@@ -301,6 +301,19 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
           </>
         )}
       </ResourceState>
+      <button
+        className="text-link"
+        disabled={offset === 0 || busy || inventory.loading || !!inventory.refreshing}
+        onClick={() => setNavigation({ scope: inventoryScope, offset: 0, previous: [] })}
+      >
+        First members
+      </button>
+      {offset > 0 && !previous.length && (
+        <p className="helper-text">
+          Earlier pages are outside your recent history. Choose First members to return to the
+          start.
+        </p>
+      )}
       {busy && <LoadingIndicator label="Reading selected member…" layout="panel" />}
       {error && (
         <p role="alert">

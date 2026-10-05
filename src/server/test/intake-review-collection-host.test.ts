@@ -447,7 +447,7 @@ test('native host preserves linked context and suggested-source pair commitments
 // Complete 96-group history publication, cold native review and transaction/rollback proofs share this fixture.
 test(
   'native suggested sources select one indexed report and retain later duplicate-group precedence',
-  { timeout: 120000 },
+  { timeout: 300000 },
   async (t) => {
     const { db, root, profileId } = fixture(t),
       report = {

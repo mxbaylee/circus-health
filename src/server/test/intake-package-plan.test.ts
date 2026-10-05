@@ -1,3 +1,5 @@
+import { IncomingMessage } from 'node:http';
+import { Socket } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
@@ -225,6 +227,7 @@ test('package route first successful inventory retry uses the current plan after
     resource: 'intakes',
     method: 'GET',
     action: 'package',
+    req: new IncomingMessage(new Socket()),
     params: new URLSearchParams('limit=2'),
     respond(value: unknown, _options: unknown, code = 200) {
       response = value;
@@ -300,7 +303,9 @@ test('package metadata retry preserves stale reference refusal after inventory r
     resource: 'intakes',
     method: 'POST',
     action: 'package-metadata',
-    req: { headers: { 'content-type': 'application/json' } },
+    req: Object.assign(new IncomingMessage(new Socket()), {
+      headers: { 'content-type': 'application/json' },
+    }),
     params: new URLSearchParams(),
     body: async () => Buffer.from(JSON.stringify({ reference: member.metadata })),
     respond: (value: unknown) => {
@@ -312,7 +317,12 @@ test('package metadata retry preserves stale reference refusal after inventory r
   assert.equal(readResponse(), undefined);
   await assert.rejects(handleIntakeRoute(context), { code: 'PACKAGE_METADATA_CHANGED' });
   assert.equal(readResponse(), undefined);
-  await handleIntakeRoute({ ...context, method: 'GET', action: 'package' });
+  await handleIntakeRoute({
+    ...context,
+    method: 'GET',
+    action: 'package',
+    req: new IncomingMessage(new Socket()),
+  });
   const current = (response as IntakePackageInventoryPaged).members[0]!;
   assert.ok('metadata' in current);
   assert.ok(current.metadata.version > member.metadata.version);

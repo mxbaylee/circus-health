@@ -58,6 +58,31 @@ reference commits the complete ordered conflict text by byte count and hash;
 review commitments still stream that full text. This presentation does not
 authorize common identity confirmation or treat an unopened question as absent.
 
+If unrelated background progress advances only the intake version while a person
+confirms, Import can read one fresh identity review and retry that same explicit
+action once. Native reviews require equal complete server evidence commitments
+before rebinding the version-specific scope reference. The proof includes every
+retained member and occurrence, pending assignment and question, competing claim,
+original/header pin and advisory warning, including content outside loaded pages.
+Self, offers, people and all other review fields must also remain equal. Changed,
+missing or malformed proof requires another review. An uncertain save keeps the
+exact request for recovery and never starts a freshness retry. Older reviews
+without this proof remain readable but require review after a version conflict.
+
+Complete warning references also pin the warning content. A saved Person edit can
+change model-only warnings while the report scope stays the same. Inline warnings
+show the current reading; large lists use a distinct immutable content snapshot,
+bound to every warning page, cursor and fragment. Earlier references stay
+readable. New reviews share unchanged retained rows while checking complete
+evidence; a changed warning is not hidden by an older scope snapshot. Scope
+publication changes only differing rows or removed tails, although an ordinal
+shift can affect many rows. Text changes at stable aligned positions can reuse
+unchanged fragments; insertions or deletions may rewrite the changed field's
+remaining fragments. Neither sharing nor a freshness retry confirms unseen
+changes or changes the report's accepted history.
+
+Large identity evidence opens one exact byte window at a time. Import follows a bound continuation for each next window and marks a question inspected only after the complete byte sequence has loaded. A refreshed report, expired continuation or changed source requires opening the evidence again; no incomplete or stale window enables confirmation.
+
 Confirmation pins the displayed reference and applies the complete current
 target set in the same durable transaction as the receipt and any selected blank
 Self-field or Family Person update. A lost response can be retried with the exact

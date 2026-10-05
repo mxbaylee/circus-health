@@ -48,6 +48,12 @@ Ownership split audit membership uses the same graph's `ownership.snapshots` cat
 
 Duplicate audit evidence can use the auxiliary `duplicate.snapshots` catalog under a stable intake custodian. Each immutable snapshot shares unchanged evidence values by a hash of the exact evidence-row ID, retaining the complete ID separately without imposing a new ID-length limit. The ordered evidence-array digest preserves SQLite BINARY order, including non-ASCII identifiers. Preparing a changed snapshot counts its complete comparison/digest pass and disposable membership scratch separately from changed-row durable writes; an unchanged snapshot reuses its existing reference without writing. Historical export cold-sorts only scalar IDs in disposable SQLite and streams authenticated values in that order. Final catalog changes compose into an existing intake acceptance preparation, or select with a separate custodian in the same ordinary clinical transaction. A helper fixture changing three rows at history sizes 8 and 128 records 319,559 and 446,631 newly added immutable journal-object bytes respectively, with 27 new objects in each case. Those measurements exclude the overwritten selected head and are not total transaction bytes. This helper measurement establishes snapshot locality; separate public acceptance fixtures exercise compound attachment, exact replay and cache-loss reconstruction.
 
+Cold recovery and profile-copy validation retain a prepared source-row SELECT
+for each owned manifest or graph traversal. Each lookup still reads its current
+retained row and performs the same reference, hash, historical-coverage and schema
+checks. Statement reuse does not cache evidence values, bypass cold validation
+or survive disposal of the private manifest.
+
 ## V3 bridge and schema-directed envelopes
 
 Conversion first verifies the complete supported V3 chain and current compact/raw agreement once, retaining the existing V3 per-value limits for that explicit compatibility operation. It selects a tagged legacy edge and a fixed legacy control marker without discarding old receipts or changing the public domain version. Interrupted builds continue to read the exact selected legacy value. Bounded auxiliary checkpoints do not repeatedly decode or serialize the whole old value.
@@ -59,6 +65,44 @@ New compatibility builds use a deterministic identity bound to the exact retaine
 Concurrent [source search](source-details-search.md#request-lifetime-and-limits) uses checked read-only authority while this preparation retains its original SQL witness. It defers disposable projection writes instead of refreshing the witness after an arbitrary callback. Upfront source validation, complete text matching and original mutation/physical-authority refusal remain required. This adds source-inventory and compatibility-read work during conversion; it does not change retained progress or grant unrelated writes a publication exemption.
 
 The [conversion recovery fixture](../../src/server/test/intake-envelope-build-resume.test.ts) interrupts raw and normalized builds, deletes their disposable SQLite database, reconstructs accepted authority and verifies that retry adds no duplicate prefix writes. It also refuses concurrent, malformed and changed-and-restored progress, including changes observed during the final physical checks before publication. In one 2026-10-04 run, four versus 24 fictional history entries wrote 920 versus 7,574 collection nodes and about 1.6 versus 13.2 MB of accepted journal data during cold conversion. A fixed version edit then wrote 18 nodes and three journal records at either size. Tree shape affects exact counts; these small fixtures establish the distinction between cold conversion and a changed-scope edit, not acceptable large-fixture capacity or linear total conversion cost.
+
+A separate 2026-10-04 qualification used raw fictional envelopes with 16 and 64
+candidate histories, including escaped Unicode, and genuine contributor accepted
+storage. It measured cold conversion separately from the same version-only 7→8
+edit, including that edit's preparation and publication:
+
+| Measured work | 16 histories | 64 histories |
+| --- | ---: | ---: |
+| Raw input bytes | 133,184 | 532,304 |
+| Cold collection nodes | 4,832 | 25,458 |
+| Cold encoded node bytes | 4,453,329 | 24,266,680 |
+| Cold immutable journal bytes | 8,521,064 | 45,535,942 |
+| Warm edit collection nodes | 20 | 23 |
+| Warm edit encoded node bytes | 24,943 | 30,653 |
+| Warm edit immutable journal bytes | 47,355 | 56,101 |
+
+Each warm edit published three immutable objects and one accepted head. Cold
+journal amplification rose from about 64 to 86 times the input: roughly four
+times the input required 5.34 times the journal bytes. This is substantial,
+growing cold amplification, not evidence of linear total conversion cost or
+acceptable installation capacity. SQLite logical page-file size grew by about
+30.89 and 166.31 MB. Node, journal and SQL history measurements overlap and must not be
+added as disjoint storage categories or described as physical I/O.
+
+At both sizes, an interruption after three real progress callbacks survived
+deletion and reconstruction of disposable SQLite. The retained prefixes contained
+113 and 142 operations; a callback can flush a partial batch, so its count does
+not imply a fixed number of operations. Stopping after verified prefix replay
+wrote zero new nodes, immutable bytes or accepted heads. Final retry preserved
+the exact raw export and repeated completion wrote nothing. Retry still reads
+and hashes the source and replays its transcript from the beginning. Rebuild read
+about 2.67 and 6.31 MB of accepted storage and published nothing. Storage and
+journal counters include temporary reconstruction plus reopening, validation
+and attachment. Native counters start on the reopened database and cannot
+measure the temporary reconstruction connection; oracle overhead is separate.
+These contributor fixtures do not establish
+encrypted-profile recovery, original-file preservation, whole-import performance
+or complete clinical acceptance.
 
 An older schema can retain metadata history or workflow People drafts as one lexical cell. Its explicit upgrade spools checked text into a private disk span index, splits known records through bounded byte checkpoints, and preserves duplicate properties, whitespace, escape spelling and unknown fields. Final format-only certification streams both complete exports with cooperative cancellation, requires unchanged public version/source metadata, and verifies that every other logical collection is unchanged. Cancellation leaves the prior selected field readable; an already structured field requires no reconstruction. Dedicated counters record equivalence hash bytes, chunks and yields separately from lexical scratch reads/writes. This is counted cold compatibility work, not an interactive whole-history read. The lexical input buffer bound excludes the verifier's depth stack and SQLite's bounded page cache.
 
@@ -80,7 +124,7 @@ Report V2 versions contain an explicit immutable member snapshot descriptor, not
 
 Candidate, contribution and report-version IDs preserve existing recipes. A genuinely new cumulative report version streams the complete canonical member input once for the old SHA-256 recipe; this is counted linear hashing work even when only changed member paths are written. Legacy report member conversion uses a private disk-backed JSON parser/sorter to preserve unknown fields, duplicate-key semantics and JavaScript number/string serialization without loading the old member array. That scratch database never supplies authority. Historical source-coverage exclusion includes every prior report version, including noncumulative retained history; its warm update adds only newly contributed occurrence identities.
 
-The counters distinguish proposal entries, cumulative report hash items/bytes, changed snapshot checkpoint operations, tree reads/writes, explicit canonicalization work and legacy reconstruction. Scratch byte counters cover controlled spool I/O, and SQLite-call counts do not claim physical SQLite I/O or RSS. These mechanisms and focused fixtures do not by themselves establish full large-import qualification or remove the public package safeguards; remaining integration and qualification stay in the active work list.
+The counters distinguish proposal entries, cumulative report hash items/bytes, changed snapshot checkpoint operations, tree reads/writes, explicit canonicalization work and legacy reconstruction. Scratch byte counters cover controlled spool I/O, and SQLite-call counts do not claim physical SQLite I/O or RSS. The implemented package inventory and retained-intake paths have [package qualification and work accounting](streamed-package-originals.md#qualification-and-work-accounting) and [complete clinical-review qualification](intake-bounded-views.md#selected-clinical-review-and-projection). Those results do not establish storage-only admission or qualify every import consumer: [CRS-232](../todo/CRS-232.md) retains text/JSONL and embedded-file consumers, and [CRS-233](../todo/CRS-233.md) retains storage admission and its unanswered owner choices.
 
 ## Native report source authority
 

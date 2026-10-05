@@ -49,25 +49,80 @@ function withoutGlobalVersion(scope: IntakeIdentityScope | IntakeIdentityScopeRe
   return boundary;
 }
 
+const sha256 = (value: unknown): value is string =>
+  typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+
+function certifiedNativeReview(review: IntakeIdentityReview): boolean {
+  const scope = review.scopeReference,
+    proof = review.evidenceCommitment;
+  if (
+    review.scope !== null ||
+    !scope ||
+    scope.format !== 'health-intake-identity-scope-v2' ||
+    !scope.collection ||
+    typeof scope.collection !== 'object' ||
+    Array.isArray(scope.collection) ||
+    !sha256(scope.scopeToken) ||
+    scope.collection.snapshotId !== 'identity:' + scope.scopeToken ||
+    !proof ||
+    typeof proof !== 'object' ||
+    Array.isArray(proof) ||
+    Object.keys(proof).sort().join(',') !== 'format,sha256' ||
+    proof.format !== 'health-intake-identity-evidence-v1' ||
+    !sha256(proof.sha256)
+  )
+    return false;
+  const warnings = review.warningsReference;
+  return (
+    !warnings ||
+    (warnings.format === 'health-intake-identity-warnings-v2' &&
+      sha256(warnings.sha256) &&
+      warnings.scopeToken === scope.scopeToken &&
+      warnings.snapshotId === 'identity-warnings:' + scope.scopeToken + ':' + warnings.sha256 &&
+      Number.isSafeInteger(warnings.count) &&
+      warnings.count >= 0)
+  );
+}
+
+function withoutNativeVersion(review: IntakeIdentityReview) {
+  const scope = review.scopeReference!;
+  return {
+    ...review,
+    scope: {
+      ...withoutGlobalVersion(scope),
+      collection: { ...scope.collection, snapshotId: undefined },
+    },
+    scopeReference: undefined,
+    ...(review.warningsReference
+      ? {
+          warningsReference: {
+            ...review.warningsReference,
+            scopeToken: undefined,
+            snapshotId: undefined,
+          },
+        }
+      : {}),
+  };
+}
+
 /**
- * Identity authorization is the entire server review except for the global
- * intake version and the scope token derived from it. Keeping the remaining
- * object whole makes a future server-added field fail closed until reviewed.
+ * Compare the whole displayed review. Native scopes require the host's complete
+ * evidence proof before excluding version-derived snapshot bindings; inline
+ * scopes compare every complete collection directly. Future fields fail closed.
  */
 export function sameDisplayedIdentityReview(
   displayed: IntakeIdentityReview,
   fresh: IntakeIdentityReview,
 ): boolean {
-  const shownScope = displayed.scopeReference || displayed.scope;
-  const freshScope = fresh.scopeReference || fresh.scope;
-  if (!shownScope || !freshScope) return false;
+  if (displayed.scopeFragmentReference || fresh.scopeFragmentReference) return false;
+  if (displayed.scopeReference || fresh.scopeReference) {
+    if (!certifiedNativeReview(displayed) || !certifiedNativeReview(fresh)) return false;
+    return canonical(withoutNativeVersion(displayed)) === canonical(withoutNativeVersion(fresh));
+  }
+  if (!displayed.scope || !fresh.scope) return false;
   return (
-    canonical({
-      ...displayed,
-      scope: withoutGlobalVersion(shownScope),
-      scopeReference: undefined,
-    }) ===
-    canonical({ ...fresh, scope: withoutGlobalVersion(freshScope), scopeReference: undefined })
+    canonical({ ...displayed, scope: withoutGlobalVersion(displayed.scope) }) ===
+    canonical({ ...fresh, scope: withoutGlobalVersion(fresh.scope) })
   );
 }
 

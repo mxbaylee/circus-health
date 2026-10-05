@@ -1,3 +1,8 @@
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 import { posix } from 'node:path';
 import {
   getIntake,
@@ -29,7 +34,10 @@ import type { EvidenceIndex, IndexedPackageMember } from './intake-plan.ts';
 import { modelIntakeContext, type ModelIntakeSection } from './intake-model-context.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
 import { checkIntakeSourceAncestry } from './intake-source-ancestry.ts';
-import { buildDurablePackageInventory } from './intake-package-state.ts';
+import {
+  buildDurablePackageInventory,
+  readDurablePackageInventory,
+} from './intake-package-state.ts';
 import { extractCheckedPackageMember } from './intake-package-index.ts';
 import { packageMetadataReference, packageMetadataFragment } from './intake-package-metadata.ts';
 import type {
@@ -45,6 +53,7 @@ interface PackageContext {
   profileId: string;
   id: string;
   assertRunning?: () => void;
+  signal?: AbortSignal;
   modelContext?: boolean;
   onSourceTextCaptured?: (
     transition: import('./intake-evidence.ts').SourceTextCaptureTransition,
@@ -177,6 +186,14 @@ export function packageInspectionHttpError(error: PackageInspectionError): HttpE
 
 export async function indexIntakePackage(context: PackageContext): Promise<PackageIndex> {
   await packageOriginal(context);
+  return withVerifiedIntakeOriginalDescriptor(context, async ({ sourceFd, assertRunning }) =>
+    indexIntakePackageForSource({ ...context, assertRunning }, sourceFd),
+  );
+}
+async function indexIntakePackageForSource(
+  context: PackageContext,
+  sourceFd: number,
+): Promise<PackageIndex> {
   const intake = getIntake(context.db, context.root, context.profileId, context.id);
   const saved = intake.workflow!.plans.find(
     (plan) => plan.status === 'active' && plan.index?.inventoryVersion === 1,
@@ -184,25 +201,45 @@ export async function indexIntakePackage(context: PackageContext): Promise<Packa
   if (saved && (saved as PackageIndex).sourceHash === intake.sha256) return saved as PackageIndex;
   let inventory: InspectedPackageMember[];
   try {
-    ({ members: inventory } = await withVerifiedIntakeOriginalDescriptor(
-      context,
-      ({ sourceFd, assertRunning }) => inspectPackageFile({ sourceFd, assertRunning }),
-    ));
+    ({ members: inventory } = await inspectPackageFile({
+      sourceFd,
+      assertRunning: context.assertRunning,
+    }));
   } catch (error) {
     context.assertRunning?.();
     if (!(error instanceof PackageInspectionError)) throw error;
-    recordIntakePackageFailure(context.db, context.root, context.profileId, context.id, {
-      operationKey: 'inventory',
-      filename: error.filename,
-      ordinal: error.ordinal,
-      locator: error.filename ? 'ZIP member ' + error.filename : undefined,
-      reasonCode: error.reasonCode,
-      detail: error.message,
+    await packagePublication(context, async (owned) => {
+      await packageOriginal(owned);
+      return recordIntakePackageFailure(
+        context.db,
+        context.root,
+        context.profileId,
+        context.id,
+        {
+          operationKey: 'inventory',
+          filename: error.filename,
+          ordinal: error.ordinal,
+          locator: error.filename ? 'ZIP member ' + error.filename : undefined,
+          reasonCode: error.reasonCode,
+          detail: error.message,
+        },
+        { assertRunning: owned.assertRunning },
+      );
     });
     throw packageInspectionHttpError(error);
   }
-  resolveIntakePackageFailure(context.db, context.root, context.profileId, context.id, {
-    operationKey: 'inventory',
+  await packagePublication(context, async (owned) => {
+    await packageOriginal(owned);
+    return resolveIntakePackageFailure(
+      context.db,
+      context.root,
+      context.profileId,
+      context.id,
+      {
+        operationKey: 'inventory',
+      },
+      { assertRunning: owned.assertRunning },
+    );
   });
   const hashes = new Map<string, string>();
   const members = inventory.map((member) => {
@@ -303,7 +340,35 @@ export interface PackagePlanScope {
     | undefined;
 }
 
+function packagePublication<T>(
+  context: PackageContext,
+  work: (owned: PackageContext) => Promise<T>,
+): Promise<T> {
+  return runExclusiveClinicalOperation(
+    context.db,
+    async (operation) => {
+      const assertRunning = () => {
+        assertClinicalOperation(context.db, operation);
+        context.signal?.throwIfAborted();
+        context.assertRunning?.();
+      };
+      return work({ ...context, assertRunning });
+    },
+    {
+      operation: currentClinicalOperation(context.db),
+      signal: context.signal,
+      assertRunning: context.assertRunning,
+    },
+  );
+}
 async function durablePackage(context: PackageContext) {
+  return packagePublication(context, (owned) =>
+    withVerifiedIntakeOriginalDescriptor(owned, async ({ assertRunning }) =>
+      durablePackageOwned({ ...owned, assertRunning }, context),
+    ),
+  );
+}
+async function durablePackageOwned(context: PackageContext, readerContext: PackageContext) {
   await packageOriginal(context, true);
   try {
     const result = await buildDurablePackageInventory({
@@ -318,19 +383,40 @@ async function durablePackage(context: PackageContext) {
       {
         operationKey: 'inventory',
       },
+      { assertRunning: context.assertRunning },
     );
-    return result.inventory;
+    context.assertRunning?.();
+    // The completed reader must keep only its caller lifecycle, never this
+    // short admission token or the inventory-building descriptor lease.
+    const inventory = readDurablePackageInventory({
+      ...readerContext,
+      rawDomainVersion: intakeSourceVersion(context.db, context.id).rawVersion,
+    });
+    if (
+      !inventory ||
+      inventory.inventoryId !== result.inventory.inventoryId ||
+      JSON.stringify(inventory.binding) !== JSON.stringify(result.inventory.binding)
+    )
+      throw new HttpError(409, 'PACKAGE_CHANGED', 'The completed package inventory changed');
+    return inventory;
   } catch (error) {
     context.assertRunning?.();
     if (!(error instanceof PackageInspectionError)) throw error;
-    await recordIntakePackageFailurePaged(context.db, context.root, context.profileId, context.id, {
-      operationKey: 'inventory',
-      filename: error.filename,
-      ordinal: error.ordinal,
-      locator: error.filename ? 'ZIP member ' + error.filename : undefined,
-      reasonCode: error.reasonCode,
-      detail: error.message,
-    });
+    await recordIntakePackageFailurePaged(
+      context.db,
+      context.root,
+      context.profileId,
+      context.id,
+      {
+        operationKey: 'inventory',
+        filename: error.filename,
+        ordinal: error.ordinal,
+        locator: error.filename ? 'ZIP member ' + error.filename : undefined,
+        reasonCode: error.reasonCode,
+        detail: error.message,
+      },
+      { assertRunning: context.assertRunning },
+    );
     throw packageInspectionHttpError(error);
   }
 }
@@ -632,6 +718,17 @@ export async function readIntakePackageMemberPaged(
   return bounded(result);
 }
 async function readPackageMember(context: PackageContext, paged: boolean) {
+  // Keep the captured original lease live through worker publication and any
+  // later failure admission. A fresh hash cannot authorize a replaced inode.
+  return withVerifiedIntakeOriginalDescriptor(context, async ({ assertRunning }) =>
+    readPackageMemberForSource({ ...context, assertRunning }, paged, context),
+  );
+}
+async function readPackageMemberForSource(
+  context: PackageContext,
+  paged: boolean,
+  callerContext: PackageContext,
+) {
   if (typeof context.memberId !== 'string' || !context.memberId || context.memberId.length > 200)
     throw new HttpError(400, 'PACKAGE_MEMBER', 'Use a member ID from this retained ZIP inventory');
   for (const key of ['offset', 'jsonOffset', 'limit', 'page'] as const) {
@@ -721,35 +818,45 @@ async function readPackageMember(context: PackageContext, paged: boolean) {
             error.code,
           )))
     ) {
-      await (paged ? recordIntakePackageFailurePaged : recordIntakePackageFailure)(
-        context.db,
-        context.root,
-        context.profileId,
-        context.id,
-        {
-          operationKey: 'extract:' + member.memberId,
-          memberId: member.memberId,
-          ordinal: member.ordinal,
-          filename: member.filename,
-          locator: member.locator,
-          reasonCode: error instanceof PackageInspectionError ? error.reasonCode : error.code,
-          detail: error.message,
-        },
-      );
+      await packagePublication(context, async (owned) => {
+        owned.assertRunning?.();
+        await packageOriginal(owned, paged);
+        await (paged ? recordIntakePackageFailurePaged : recordIntakePackageFailure)(
+          context.db,
+          context.root,
+          context.profileId,
+          context.id,
+          {
+            operationKey: 'extract:' + member.memberId,
+            memberId: member.memberId,
+            ordinal: member.ordinal,
+            filename: member.filename,
+            locator: member.locator,
+            reasonCode: error instanceof PackageInspectionError ? error.reasonCode : error.code,
+            detail: error.message,
+          },
+          { assertRunning: owned.assertRunning },
+        );
+      });
       if (!(error instanceof PackageInspectionError)) throw error;
       throw packageInspectionHttpError(error);
     }
     throw error;
   }
-  await (paged ? resolveIntakePackageFailurePaged : resolveIntakePackageFailure)(
-    context.db,
-    context.root,
-    context.profileId,
-    context.id,
-    {
-      operationKey: 'extract:' + member.memberId,
-    },
-  );
+  await packagePublication(context, async (owned) => {
+    owned.assertRunning?.();
+    await packageOriginal(owned, paged);
+    await (paged ? resolveIntakePackageFailurePaged : resolveIntakePackageFailure)(
+      context.db,
+      context.root,
+      context.profileId,
+      context.id,
+      {
+        operationKey: 'extract:' + member.memberId,
+      },
+      { assertRunning: owned.assertRunning },
+    );
+  });
   const { captureIntakeSourceTextForRead, sourceTextReadMetadata, readIntakeEvidence } =
     await import('./intake-evidence.ts');
   const pagedChild =
@@ -759,8 +866,11 @@ async function readPackageMember(context: PackageContext, paged: boolean) {
   if (pagedChild) {
     const { prepareIntakeSourceDependencyHeaders } =
       await import('./intake-source-text-dependencies.ts');
-    await prepareIntakeSourceDependencyHeaders(context.db, retainedChild.id, {
-      assertRunning: context.assertRunning,
+    await packagePublication(context, async (owned) => {
+      await packageOriginal(owned, true);
+      await prepareIntakeSourceDependencyHeaders(context.db, retainedChild.id, {
+        assertRunning: owned.assertRunning,
+      });
     });
   }
   await captureIntakeSourceTextForRead({ ...context, id: retainedChild.id });
@@ -806,23 +916,28 @@ async function readPackageMember(context: PackageContext, paged: boolean) {
       (window.text !== null && /^[\s]*[\[{]/.test(window.text))
     ) {
       if (member.bytes > MAX_INTAKE_BYTES) {
-        envelope.structureIssue =
-          'Original retained. JSON structure navigation above 25 MiB is unavailable; bounded source text remains readable.';
-        await (paged ? recordIntakePackageFailurePaged : recordIntakePackageFailure)(
-          context.db,
-          context.root,
-          context.profileId,
-          context.id,
-          {
-            operationKey: 'structure:' + member.memberId,
-            memberId: member.memberId,
-            ordinal: member.ordinal,
-            filename: member.filename,
-            locator: member.locator,
-            reasonCode: 'JSON_LIMIT',
-            detail: envelope.structureIssue,
-          },
-        );
+        const detail = (envelope.structureIssue =
+          'Original retained. JSON structure navigation above 25 MiB is unavailable; bounded source text remains readable.');
+        await packagePublication(context, async (owned) => {
+          await packageOriginal(owned, paged);
+          owned.assertRunning?.();
+          await (paged ? recordIntakePackageFailurePaged : recordIntakePackageFailure)(
+            context.db,
+            context.root,
+            context.profileId,
+            context.id,
+            {
+              operationKey: 'structure:' + member.memberId,
+              memberId: member.memberId,
+              ordinal: member.ordinal,
+              filename: member.filename,
+              locator: member.locator,
+              reasonCode: 'JSON_LIMIT',
+              detail,
+            },
+            { assertRunning: owned.assertRunning },
+          );
+        });
         if (context.jsonPointer !== undefined)
           throw new HttpError(413, 'JSON_LIMIT', envelope.structureIssue);
       } else {
@@ -841,35 +956,45 @@ async function readPackageMember(context: PackageContext, paged: boolean) {
           // Invalid caller windows/pointers are not unavailable source evidence.
           if (error instanceof HttpError && ['JSON_POINTER', 'JSON_WINDOW'].includes(error.code))
             throw error;
-          envelope.structureIssue =
-            'The retained member could not be safely indexed as JSON. The original and bounded source text remain available.';
-          await (paged ? recordIntakePackageFailurePaged : recordIntakePackageFailure)(
-            context.db,
-            context.root,
-            context.profileId,
-            context.id,
-            {
-              operationKey: 'structure:' + member.memberId,
-              memberId: member.memberId,
-              ordinal: member.ordinal,
-              filename: member.filename,
-              locator: member.locator,
-              reasonCode: 'JSON_STRUCTURE',
-              detail: envelope.structureIssue,
-            },
-          );
+          const detail = (envelope.structureIssue =
+            'The retained member could not be safely indexed as JSON. The original and bounded source text remain available.');
+          await packagePublication(context, async (owned) => {
+            await packageOriginal(owned, paged);
+            owned.assertRunning?.();
+            await (paged ? recordIntakePackageFailurePaged : recordIntakePackageFailure)(
+              context.db,
+              context.root,
+              context.profileId,
+              context.id,
+              {
+                operationKey: 'structure:' + member.memberId,
+                memberId: member.memberId,
+                ordinal: member.ordinal,
+                filename: member.filename,
+                locator: member.locator,
+                reasonCode: 'JSON_STRUCTURE',
+                detail,
+              },
+              { assertRunning: owned.assertRunning },
+            );
+          });
           if (context.jsonPointer !== undefined) throw error;
         }
         if (structure !== undefined) {
-          await (paged ? resolveIntakePackageFailurePaged : resolveIntakePackageFailure)(
-            context.db,
-            context.root,
-            context.profileId,
-            context.id,
-            {
-              operationKey: 'structure:' + member.memberId,
-            },
-          );
+          await packagePublication(context, async (owned) => {
+            await packageOriginal(owned, paged);
+            owned.assertRunning?.();
+            await (paged ? resolveIntakePackageFailurePaged : resolveIntakePackageFailure)(
+              context.db,
+              context.root,
+              context.profileId,
+              context.id,
+              {
+                operationKey: 'structure:' + member.memberId,
+              },
+              { assertRunning: owned.assertRunning },
+            );
+          });
           return { ...envelope, structure };
         }
       }
@@ -894,8 +1019,10 @@ async function readPackageMember(context: PackageContext, paged: boolean) {
       nextAction: 'inventory',
       note: 'Nested archive retained, not recursively expanded. Inventory this sourceFileId explicitly.',
     };
+  // Deferred evidence readers reacquire their own original authority; never
+  // retain this producer lease assertion in a returned PDF fallback.
   const evidence = await readIntakeEvidence({
-    ...context,
+    ...callerContext,
     id: retainedChild.id,
     captureSourceText: false,
     pagedContext: pagedChild,

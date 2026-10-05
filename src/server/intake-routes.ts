@@ -1,4 +1,9 @@
 import { intakeIdentityRequestLifetime } from './intake-identity-request.ts';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { intakeSourceRoute } from './intake-source-routes.ts';
 import { listSourceAttentionRead } from './intake-source-text.ts';
@@ -191,7 +196,9 @@ export async function handleIntakeRoute({
           version: pageInteger(params.get('version')) ?? -1,
         },
         (planId, unitId) => {
-          const scope = readPackagePlanScope(db, root, profileId, id, { planId });
+          const scope = readPackagePlanScope(db, root, profileId, id, {
+            planId,
+          });
           return scope?.planId === planId ? scope.unitById(unitId) : undefined;
         },
       ),
@@ -223,17 +230,36 @@ export async function handleIntakeRoute({
         window[key] = Number(value);
       }
     }
-    const context = { db, root, profileId, id, ...window };
-    if (isIntakeSummary(intake.getIntakeRead(db, root, profileId, id))) {
-      const { preparePagedPackagePlanCompatibility, readPackagePlanScope } =
-        await import('./intake-package-plan.ts');
-      await preparePagedPackagePlanCompatibility(db, root, profileId, id);
-      respond(
-        await inventoryIntakePackagePaged(context, () =>
-          readPackagePlanScope(db, root, profileId, id),
-        ),
+    const lifetime = intakeIdentityRequestLifetime(req, res);
+    try {
+      await runExclusiveClinicalOperation(
+        db,
+        async (operation) => {
+          const assertRunning = () => {
+            assertClinicalOperation(db, operation);
+            lifetime.signal.throwIfAborted();
+          };
+          const context = { db, root, profileId, id, ...window, assertRunning };
+          assertRunning();
+          let result;
+          if (isIntakeSummary(intake.getIntakeRead(db, root, profileId, id))) {
+            const { preparePagedPackagePlanCompatibility, readPackagePlanScope } =
+              await import('./intake-package-plan.ts');
+            await preparePagedPackagePlanCompatibility(db, root, profileId, id, {
+              assertRunning,
+            });
+            result = await inventoryIntakePackagePaged(context, () =>
+              readPackagePlanScope(db, root, profileId, id),
+            );
+          } else result = await inventoryIntakePackage(context);
+          assertRunning();
+          respond(result);
+        },
+        { operation: currentClinicalOperation(db), signal: lifetime.signal },
       );
-    } else respond(await inventoryIntakePackage(context));
+    } finally {
+      lifetime.dispose();
+    }
   } else if (method === 'GET' && id && action === 'navigate') {
     const { navigateIntakeEvidence } = await import('./intake-evidence.ts');
     respond(
@@ -262,6 +288,7 @@ export async function handleIntakeRoute({
     respond(
       await readNativeIdentityScopePage(db, root, profileId, id, params.get('groupId') || '', {
         scopeToken: params.get('scopeToken') || '',
+        snapshotId: params.get('snapshotId') || undefined,
         section: params.get('section') || '',
         cursor: params.get('cursor') || undefined,
         limit: pageInteger(params.get('limit')),
@@ -269,14 +296,29 @@ export async function handleIntakeRoute({
     );
   } else if (method === 'GET' && id && action === 'identity-scope-fragment') {
     const { readNativeIdentityScopeFragment } = await import('./intake-identity-native.ts');
-    respond(
-      await readNativeIdentityScopeFragment(db, root, profileId, id, params.get('groupId') || '', {
-        scopeToken: params.get('scopeToken') || '',
-        section: params.get('section') || '',
-        ordinal: pageInteger(params.get('ordinal')) ?? -1,
-        offset: pageInteger(params.get('offset')),
-      }),
-    );
+    const lifetime = intakeIdentityRequestLifetime(req, res);
+    try {
+      respond(
+        await readNativeIdentityScopeFragment(
+          db,
+          root,
+          profileId,
+          id,
+          params.get('groupId') || '',
+          {
+            scopeToken: params.get('scopeToken') || '',
+            snapshotId: params.get('snapshotId') || undefined,
+            section: params.get('section') || '',
+            ordinal: pageInteger(params.get('ordinal')) ?? -1,
+            offset: pageInteger(params.get('offset')),
+            cursor: params.has('cursor') ? params.get('cursor')! : undefined,
+          },
+          { signal: lifetime.signal },
+        ),
+      );
+    } finally {
+      lifetime.dispose();
+    }
   } else if (method === 'GET' && id && action === 'identity-scope')
     respond(await getIntakeIdentityScope(db, root, profileId, id, params.get('groupId') || ''));
   else if (method === 'GET' && id && action === 'identity-review') {
@@ -350,7 +392,12 @@ export async function handleIntakeRoute({
       db,
       root,
       profileId,
-      { filename, providerId, newProviderName, mimeType: req.headers['content-type'] },
+      {
+        filename,
+        providerId,
+        newProviderName,
+        mimeType: req.headers['content-type'],
+      },
       req,
     );
     try {
@@ -373,7 +420,17 @@ export async function handleIntakeRoute({
       throw new HttpError(400, 'INVALID_JSON', 'Expected a JSON object');
     }
     if (id && action && ['source-text', 'source-extract', 'source-records'].includes(action))
-      respond(await intakeSourceRoute({ db, root, profileId, id, action, params, input }));
+      respond(
+        await intakeSourceRoute({
+          db,
+          root,
+          profileId,
+          id,
+          action,
+          params,
+          input,
+        }),
+      );
     else if (id === 'report-acceptance' && !action)
       respond(await acceptIntakeReportSelectionAsync(db, root, profileId, input));
     else if (id === 'people-disposition' && !action)
@@ -648,61 +705,101 @@ export async function handleIntakeRoute({
         ),
       );
     } else if (id && action === 'package-metadata') {
-      selectedPageSource(db, profileId, id);
-      const reference = input.reference as IntakeMetadataFragmentReference;
-      if (
-        !reference ||
-        typeof reference !== 'object' ||
-        !['package_member', 'package_unit'].includes(reference.kind)
-      )
-        throw new HttpError(
-          400,
-          'PACKAGE_METADATA_REFERENCE',
-          'Use a metadata reference from the current package page',
+      const lifetime = intakeIdentityRequestLifetime(req, res);
+      try {
+        await runExclusiveClinicalOperation(
+          db,
+          async (operation) => {
+            const assertRunning = () => {
+              assertClinicalOperation(db, operation);
+              lifetime.signal.throwIfAborted();
+            };
+            assertRunning();
+
+            selectedPageSource(db, profileId, id);
+            const reference = input.reference as IntakeMetadataFragmentReference;
+            if (
+              !reference ||
+              typeof reference !== 'object' ||
+              !['package_member', 'package_unit'].includes(reference.kind)
+            )
+              throw new HttpError(
+                400,
+                'PACKAGE_METADATA_REFERENCE',
+                'Use a metadata reference from the current package page',
+              );
+            const { readPackagePlanScope, readPackageUnitMetadataFragment } =
+              await import('./intake-package-plan.ts');
+            if (reference.kind === 'package_unit')
+              respond(
+                readPackageUnitMetadataFragment(db, root, profileId, id, reference, {
+                  offset: input.offset as number | undefined,
+                  limit: input.limit as number | undefined,
+                }),
+              );
+            else {
+              const { readIntakePackageMetadataFragment } = await import('./intake-package.ts');
+              respond(
+                await readIntakePackageMetadataFragment(
+                  {
+                    db,
+                    root,
+                    profileId,
+                    id,
+                    assertRunning,
+                    signal: lifetime.signal,
+                    offset: input.offset as number | undefined,
+                    limit: input.limit as number | undefined,
+                  },
+                  reference,
+                  readPackagePlanScope(db, root, profileId, id),
+                ),
+              );
+            }
+
+            assertRunning();
+          },
+          { operation: currentClinicalOperation(db), signal: lifetime.signal },
         );
-      const { readPackagePlanScope, readPackageUnitMetadataFragment } =
-        await import('./intake-package-plan.ts');
-      if (reference.kind === 'package_unit')
-        respond(
-          readPackageUnitMetadataFragment(db, root, profileId, id, reference, {
-            offset: input.offset as number | undefined,
-            limit: input.limit as number | undefined,
-          }),
-        );
-      else {
-        const { readIntakePackageMetadataFragment } = await import('./intake-package.ts');
-        respond(
-          await readIntakePackageMetadataFragment(
-            {
-              db,
-              root,
-              profileId,
-              id,
-              offset: input.offset as number | undefined,
-              limit: input.limit as number | undefined,
-            },
-            reference,
-            readPackagePlanScope(db, root, profileId, id),
-          ),
-        );
+      } finally {
+        lifetime.dispose();
       }
     } else if (action === 'package-member') {
-      const { readIntakePackageMember, readIntakePackageMemberPaged } =
-        await import('./intake-package.ts');
-      const context = {
-        ...input,
-        db,
-        root,
-        profileId,
-        id: id!,
-        modelContext: false,
-      } as Parameters<typeof readIntakePackageMember>[0];
-      const native = isIntakeSummary(intake.getIntakeRead(db, root, profileId, id!));
-      const { preparePagedPackagePlanCompatibility, readPackagePlanScope } =
-        await import('./intake-package-plan.ts');
-      if (native) await preparePagedPackagePlanCompatibility(db, root, profileId, id!);
-      respond(
-        await measureImportPhase(
+      const lifetime = intakeIdentityRequestLifetime(req, res);
+      try {
+        const { readIntakePackageMember, readIntakePackageMemberPaged } =
+          await import('./intake-package.ts');
+        const context = {
+          ...input,
+          db,
+          root,
+          profileId,
+          id: id!,
+          modelContext: false,
+          signal: lifetime.signal,
+          assertRunning: () => lifetime.signal.throwIfAborted(),
+        } as Parameters<typeof readIntakePackageMember>[0];
+        const native = isIntakeSummary(intake.getIntakeRead(db, root, profileId, id!));
+        const { preparePagedPackagePlanCompatibility, readPackagePlanScope } =
+          await import('./intake-package-plan.ts');
+        if (native)
+          await runExclusiveClinicalOperation(
+            db,
+            async (operation) => {
+              const assertRunning = () => {
+                assertClinicalOperation(db, operation);
+                lifetime.signal.throwIfAborted();
+              };
+              await preparePagedPackagePlanCompatibility(db, root, profileId, id!, {
+                assertRunning,
+              });
+            },
+            {
+              operation: currentClinicalOperation(db),
+              signal: lifetime.signal,
+            },
+          );
+        const result = await measureImportPhase(
           'package_member_read',
           () =>
             native
@@ -713,8 +810,12 @@ export async function handleIntakeRoute({
               : readIntakePackageMember(context),
           {},
           { profileId, importId: id! },
-        ),
-      );
+        );
+        lifetime.signal.throwIfAborted();
+        respond(result);
+      } finally {
+        lifetime.dispose();
+      }
     } else if (action === 'package-roles') {
       const { saveIntakePackageRolesRead } = await import('./intake-package-plan.ts');
       respond(
@@ -775,7 +876,10 @@ export async function handleIntakeRoute({
       await intake.linkIntakeConversionRead(db, root, profileId, id!, chat.id);
       assistant.send(profileId, chat.id, {
         message: `Convert the selected delivery ${filename} (${id}) from ${current.provider} into a reviewable health-record-v1 proposal. Read all its pages or members using host tools, including selected-page PDFs or rendered page images and extracted embedded files where present. Use the original page references in metadata; each supplied PDF contains only its selected original page. Preserve originals, exact values, subject identity, locators and uncertainty. Propose separate clinical mappings for observed labs, medications, procedures and documents. Do not accept/import. Report any unreviewed pages/assets as coverage gaps.`,
-        context: { route: `/import?intake=${encodeURIComponent(id!)}`, intakeId: id! },
+        context: {
+          route: `/import?intake=${encodeURIComponent(id!)}`,
+          intakeId: id!,
+        },
       });
       respond({ chatId: chat.id });
     } else if (action === 'proposals')

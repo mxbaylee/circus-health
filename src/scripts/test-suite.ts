@@ -14,6 +14,7 @@ const externalTests = new Set([
   'src/server/test/intake-source-ocr-real.test.ts',
 ]);
 const continuation = 'src/server/test/intake-pdf-controlled.integration.test.ts';
+const acceptance = 'src/scripts/provider-qualification-acceptance.test.ts';
 const patterns: Record<string, string[]> = {
   server: ['src/server/test/*.test.ts'],
   browser: ['src/tests/browser/*.test.ts'],
@@ -26,12 +27,16 @@ const patterns: Record<string, string[]> = {
     'src/app/pages/*.test.ts',
   ],
   continuation: [continuation],
+  acceptance: [acceptance],
 };
 export function suiteFiles(suite: string): string[] {
   if (!patterns[suite]) throw new Error(`Unknown test suite: ${suite}`);
   return globSync(patterns[suite])
     .filter(
-      (file) => !externalTests.has(file) && (suite === 'continuation' || file !== continuation),
+      (file) =>
+        !externalTests.has(file) &&
+        (suite === 'continuation' || file !== continuation) &&
+        (suite === 'acceptance' || file !== acceptance),
     )
     .sort();
 }

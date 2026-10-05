@@ -11,6 +11,7 @@ import type {
 } from './intake-state-storage.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import { INTAKE_TREE_VALUE_BYTES } from './intake-state-tree.ts';
+import { schemaOrdinal } from './intake-envelope-schema.ts';
 import {
   assertClinicalOperation,
   currentClinicalOperation,
@@ -31,6 +32,12 @@ export interface ReportSnapshotPage {
   items: number;
   bytes: number;
 }
+export interface ReportSnapshotBytePage {
+  data: Buffer;
+  complete: boolean;
+  after: string | null;
+  skip: number;
+}
 export interface ReportSnapshotMapReader {
   preceding(key: string): { key: string; value: string | IntakeByteValue } | undefined;
   get(key: string): string | IntakeByteValue | undefined;
@@ -43,6 +50,8 @@ export interface ReportSnapshotMapReader {
     bytes: number;
   };
   chunks(key: string): Iterable<string>;
+  /** Bounded raw bytes; preserves UTF-8 splits and addresses the existing leaf ordinal. */
+  bytePage(key: string, position: { after: string | null; skip: number }): ReportSnapshotBytePage;
   assertCurrent(): void;
 }
 export interface ReportSnapshotMapWriter extends ReportSnapshotMapReader {
@@ -58,6 +67,13 @@ export interface ReportSnapshotCatalog {
   fork(snapshotId?: string): Promise<ReportSnapshotMapWriter>;
   forkReference(reader: ReportSnapshotMapReader): Promise<ReportSnapshotMapWriter>;
   publish(snapshotId: string, writer: ReportSnapshotMapWriter): Promise<void>;
+  /** Stage only the reserved current-identity locator; public snapshot names stay immutable. */
+  bindCurrentIdentityScope(groupId: string, alias: ReportSnapshotMapReader): Promise<void>;
+  /** Optimization-only same-source bridge. Historical receipt snapshot lookups never fall back. */
+  identityScopeReuseReader(
+    snapshotId: string,
+    area?: 'logical' | 'builds',
+  ): { reader: ReportSnapshotMapReader; area: 'logical' | 'builds' } | undefined;
   finalChanges(): Promise<IntakeCollectionChange[]>;
   assertCurrent(): void;
 }
@@ -95,6 +111,13 @@ export function createReportSnapshotCatalog(
     initialCatalog = JSON.stringify(
       collections.collection(collections.openView(), selectedArea, selectedCatalog) ?? null,
     );
+  const initialIdentityBuildCatalog =
+    selectedCatalog === REPORT_SNAPSHOT_CATALOG && selectedArea === 'logical'
+      ? JSON.stringify(
+          collections.collection(collections.openView(), 'builds', REPORT_SNAPSHOT_CATALOG) ?? null,
+        )
+      : undefined;
+  let borrowedIdentityBuild = false;
   const catalog = 'report.catalog.' + randomUUID();
   let initialized = false;
   const names = new WeakMap<ReportSnapshotMapWriter, string>();
@@ -110,7 +133,11 @@ export function createReportSnapshotCatalog(
       JSON.stringify(collections.binding(collections.openView())?.logical) !== logical ||
       JSON.stringify(
         collections.collection(collections.openView(), selectedArea, selectedCatalog) ?? null,
-      ) !== initialCatalog
+      ) !== initialCatalog ||
+      (borrowedIdentityBuild &&
+        JSON.stringify(
+          collections.collection(collections.openView(), 'builds', REPORT_SNAPSHOT_CATALOG) ?? null,
+        ) !== initialIdentityBuildCatalog)
     )
       throw Error('Stale report snapshot source or logical state');
   };
@@ -192,9 +219,69 @@ export function createReportSnapshotCatalog(
       chunks(key) {
         return chunks(() => result.get(key));
       },
+      bytePage(key, position) {
+        return bytePage(() => result.get(key), position);
+      },
     };
     references.set(result, resolve);
     return result;
+  }
+  function bytePage(
+    get: () => string | IntakeByteValue | undefined,
+    position: { after: string | null; skip: number },
+  ): ReportSnapshotBytePage {
+    assertCurrent();
+    if (
+      (position.after !== null && !/^[0-9]{16}$/.test(position.after)) ||
+      !Number.isSafeInteger(position.skip) ||
+      position.skip < 0 ||
+      position.skip >= 4096
+    )
+      throw Error('Invalid report byte page position');
+    const value = get();
+    if (value === undefined) throw Error('Missing report snapshot text');
+    if (typeof value === 'string') {
+      const bytes = Buffer.from(value);
+      if (position.after !== null || position.skip > bytes.length)
+        throw Error('Invalid inline report byte page position');
+      const data = bytes.subarray(position.skip, position.skip + 32768);
+      assertCurrent();
+      return { data, complete: true, after: null, skip: 0 };
+    }
+    const first = position.after === null ? 0 : Number(position.after) + 1;
+    if (!Number.isSafeInteger(first) || first < 0 || first >= value.chunks)
+      throw Error('Invalid report byte page ordinal');
+    const page = collections.readBytes(value, {
+      after: position.after ?? undefined,
+      items: 64,
+      bytes: 32768 + 4096,
+    });
+    if (!page.chunks.length || position.skip >= page.chunks[0]!.length)
+      throw Error('Invalid report byte page skip');
+    const output: Buffer[] = [];
+    let used = 0,
+      ordinal = first,
+      skip = position.skip;
+    for (const chunk of page.chunks) {
+      const take = Math.min(chunk.length - skip, 32768 - used);
+      output.push(chunk.subarray(skip, skip + take));
+      used += take;
+      if (skip + take < chunk.length) {
+        skip += take;
+        break;
+      }
+      ordinal++;
+      skip = 0;
+      if (used === 32768) break;
+    }
+    const complete = ordinal === value.chunks && skip === 0;
+    assertCurrent();
+    return {
+      data: Buffer.concat(output),
+      complete,
+      after: complete || ordinal === 0 ? null : schemaOrdinal(ordinal - 1),
+      skip: complete ? 0 : skip,
+    };
   }
   function* chunks(get: () => string | IntakeByteValue | undefined): Generator<string> {
     assertCurrent();
@@ -213,7 +300,11 @@ export function createReportSnapshotCatalog(
     let after: string | undefined;
     do {
       assertCurrent();
-      const page = collections.readBytes(value, { after, items: 16, bytes: 65536 });
+      const page = collections.readBytes(value, {
+        after,
+        items: 16,
+        bytes: 65536,
+      });
       for (const chunk of page.chunks) {
         const text = decoder.decode(chunk, { stream: true });
         if (text) yield text;
@@ -231,7 +322,14 @@ export function createReportSnapshotCatalog(
     const name = 'report.snapshot.' + randomUUID();
     await checkpoint(
       from
-        ? [{ area: 'builds', collection: name, op: 'adoptReferenced', value: from() }]
+        ? [
+            {
+              area: 'builds',
+              collection: name,
+              op: 'adoptReferenced',
+              value: from(),
+            },
+          ]
         : [
             {
               area: 'builds',
@@ -275,6 +373,10 @@ export function createReportSnapshotCatalog(
       chunks(key) {
         return chunks(() => result.get(key));
       },
+      bytePage(key, position) {
+        return bytePage(() => result.get(key), position);
+      },
+
       async put(key, value) {
         await checkpoint([{ area: 'builds', collection: name, op: 'put', key, value }]);
       },
@@ -308,81 +410,194 @@ export function createReportSnapshotCatalog(
         ]);
       },
       async putText(key, pieces) {
-        const blob = 'report.text.' + randomUUID();
-        let pending: IntakeCollectionChange[] = [],
-          any = false,
-          wroteBlob = false,
+        assertCurrent();
+        const prior = result.get(key),
+          retained = prior && typeof prior !== 'string' ? prior : undefined,
+          blob = 'report.text.' + randomUUID(),
+          producerHash = createHash('sha256');
+        let oldCount = retained?.chunks ?? 0,
+          ordinal = 0,
+          producedBytes = 0,
           carry = '',
-          piecesSinceCheck = 0;
+          piecesSinceCheck = 0,
+          chunksSinceCheck = 0,
+          fragmented = false,
+          prefix: Buffer[] = [],
+          prefixBytes = 0,
+          pending: IntakeCollectionChange[] = [];
+        const record = (
+          metric: keyof import('./intake-work-accounting.ts').IntakeHostWork,
+          bytes = 1,
+        ) => withIntakeWork(db, 'warm', () => recordIntakeWork(metric, bytes));
+        // Only the existing owner's branded byte capability can seed this fork.
+        // Public roots, names and self-described counts cannot select prior bytes.
+        // Adopt before an asynchronous producer can evict the bounded capability.
+        // An eventual inline replacement keeps this constant-cost unused fork.
+        if (retained)
+          await checkpoint([
+            {
+              area: 'builds',
+              collection: blob,
+              op: 'adoptBytesReferenced',
+              value: retained,
+            },
+          ]);
         const flush = async () => {
-          if (pending.length) {
-            await checkpoint(pending);
-            wroteBlob = true;
-            pending = [];
+          if (pending.length) await checkpoint(pending);
+          pending = [];
+        };
+        const checkedBytes = (raw: unknown) => {
+          if (typeof raw !== 'string' || raw.length > 5500)
+            throw Error('Invalid retained report text leaf');
+          const value = Buffer.from(raw, 'base64');
+          if (!value.length || value.length > 4096 || value.toString('base64') !== raw)
+            throw Error('Invalid retained report text leaf');
+          return value;
+        };
+        const writeChunk = async (chunk: Buffer) => {
+          assertCurrent();
+          record('reportSnapshotTextComparedChunks');
+          if (ordinal < oldCount) {
+            const previous = checkedBytes(
+              collections.get(collections.openView(), 'builds', blob, schemaOrdinal(ordinal)),
+            );
+            record('reportSnapshotTextReadBytes', previous.byteLength);
+            if (!previous.equals(chunk)) {
+              pending.push({
+                area: 'builds',
+                collection: blob,
+                op: 'replaceBytes',
+                index: ordinal,
+                bytes: chunk,
+              });
+              record('reportSnapshotTextChangedChunks');
+              record('reportSnapshotTextWrittenBytes', chunk.byteLength);
+            }
+          } else {
+            pending.push({
+              area: 'builds',
+              collection: blob,
+              op: 'appendBytes',
+              bytes: chunk,
+            });
+            record('reportSnapshotTextChangedChunks');
+            record('reportSnapshotTextWrittenBytes', chunk.byteLength);
           }
+          ordinal++;
+          if (pending.length === 16) await flush();
+          if (++chunksSinceCheck === 16) {
+            assertCurrent();
+            await setImmediate();
+            chunksSinceCheck = 0;
+            assertCurrent();
+          }
+        };
+        const emit = async (chunk: Buffer) => {
+          producerHash.update(chunk);
+          producedBytes += chunk.byteLength;
+          record('reportSnapshotTextHashBytes', chunk.byteLength);
+          if (!fragmented) {
+            prefix.push(chunk);
+            prefixBytes += chunk.byteLength;
+            if (prefixBytes <= 16384) return;
+            fragmented = true;
+            for (const buffered of prefix) await writeChunk(buffered);
+            prefix = [];
+          } else await writeChunk(chunk);
         };
         for await (const piece of pieces) {
           if (++piecesSinceCheck === 64) {
             assertCurrent();
             await setImmediate();
-            assertCurrent();
             piecesSinceCheck = 0;
+            assertCurrent();
           }
           if (typeof piece !== 'string') throw Error('Invalid report text chunk');
-          // JSON producers can yield punctuation-sized pieces. Coalesce them
-          // into bounded byte leaves so traversal scales with text bytes rather
-          // than the producer's token count. A split surrogate stays in carry.
+          // Keep the existing UTF-16/surrogate-safe leaf boundaries and UTF-8 codec.
           for (let at = 0; at < piece.length;) {
             const take = Math.min(1024 - carry.length, piece.length - at);
             carry += piece.slice(at, at + take);
             at += take;
             if (carry.length === 1024) {
               const end = /[\uD800-\uDBFF]/.test(carry.at(-1)!) ? 1023 : 1024;
-              pending.push({
-                area: 'builds',
-                collection: blob,
-                op: 'appendBytes',
-                bytes: Buffer.from(carry.slice(0, end)),
-              });
+              await emit(Buffer.from(carry.slice(0, end)));
               carry = carry.slice(end);
-              any = true;
-              if (pending.length === 16) await flush();
             }
           }
         }
         if (/[\uD800-\uDBFF]/.test(carry.at(-1) ?? ''))
           throw Error('Report text ended with an unpaired surrogate');
-        if (carry) {
+        if (carry) await emit(Buffer.from(carry));
+        if (!fragmented) {
+          const text = Buffer.concat(prefix).toString('utf8');
+          if (reportSnapshotInlineTextFits(text)) {
+            await result.put(key, text);
+            return;
+          }
+          fragmented = true;
+          for (const buffered of prefix) await writeChunk(buffered);
+          prefix = [];
+        }
+        await flush();
+        // Delete only the exact suffix, one checked byte-leaf change per operation.
+        while (oldCount > ordinal) {
           pending.push({
             area: 'builds',
             collection: blob,
-            op: 'appendBytes',
-            bytes: Buffer.from(carry),
+            op: 'truncateBytes',
+            length: --oldCount,
           });
-          any = true;
-        }
-        // Tiny values need no separate byte collection or attachment checkpoint.
-        // Reuse the already bounded UTF-8 leaves, preserving the streamed codec's
-        // exact text semantics and keeping large values on its existing path.
-        if (!wroteBlob) {
-          const leaves = pending.map((change) => {
-            if (change.op !== 'appendBytes') throw Error('Invalid pending snapshot text');
-            return change.bytes;
-          });
-          const size = leaves.reduce((total, leaf) => total + leaf.byteLength, 0);
-          if (size <= 16384) {
-            const text = Buffer.concat(leaves).toString('utf8');
-            if (reportSnapshotInlineTextFits(text)) {
-              await result.put(key, text);
-              return;
-            }
-          }
+          record('reportSnapshotTextDeletedChunks');
+          if (pending.length === 16) await flush();
         }
         await flush();
-        if (!any) {
+        if (!producedBytes) {
           await result.put(key, '');
           return;
         }
+        // Certify the retained complete text independently before attachment.
+        // This counted traversal also proves exact leaf count/order/absence.
+        const descriptor = collections.collection(collections.openView(), 'builds', blob);
+        if (
+          !descriptor ||
+          descriptor.kind !== 'bytes' ||
+          descriptor.bytes !== producedBytes ||
+          descriptor.root?.count !== ordinal
+        )
+          throw Error('Retained report text binding changed');
+        const actualHash = createHash('sha256');
+        let after: string | undefined,
+          verified = 0,
+          verifiedBytes = 0;
+        for (;;) {
+          assertCurrent();
+          const page = collections.range(collections.openView(), 'builds', blob, {
+            after,
+            items: 16,
+            bytes: 64 * 1024,
+          });
+          for (const item of page.items) {
+            if (item.key !== schemaOrdinal(verified++))
+              throw Error('Retained report text order changed');
+            const value = checkedBytes(item.value);
+            actualHash.update(value);
+            verifiedBytes += value.byteLength;
+            record('reportSnapshotTextReadBytes', value.byteLength);
+            record('reportSnapshotTextHashBytes', value.byteLength);
+          }
+          await setImmediate();
+          assertCurrent();
+          if (page.complete) break;
+          if (!page.after || page.after === after)
+            throw Error('Retained report text did not advance');
+          after = page.after;
+        }
+        if (
+          verified !== ordinal ||
+          verifiedBytes !== producedBytes ||
+          actualHash.digest('hex') !== producerHash.digest('hex')
+        )
+          throw Error('Retained report text content changed');
         await checkpoint([
           {
             area: 'builds',
@@ -438,6 +653,73 @@ export function createReportSnapshotCatalog(
           collection: catalog,
           op: 'putCollection',
           key,
+          fromArea: 'builds',
+          fromCollection: name,
+        },
+      ]);
+    },
+    identityScopeReuseReader(snapshotId, requestedArea) {
+      if (
+        selectedCatalog !== REPORT_SNAPSHOT_CATALOG ||
+        !/^identity-(?:current|evidence):[a-f0-9]{64}$/.test(snapshotId)
+      )
+        throw Error('Invalid identity scope reuse selector');
+      const selected = requestedArea === undefined || requestedArea === selectedArea;
+      if (selected) {
+        const found = open(snapshotId);
+        if (found) return { reader: found, area: selectedArea };
+        if (requestedArea !== undefined || selectedArea === 'builds') return undefined;
+      } else if (requestedArea !== 'builds' || selectedArea !== 'logical')
+        throw Error('Foreign identity scope reuse area');
+      borrowedIdentityBuild = true;
+      assertCurrent();
+      if (
+        !collections.getCollectionReference(
+          collections.openView(),
+          'builds',
+          REPORT_SNAPSHOT_CATALOG,
+          snapshotId,
+        )
+      )
+        return undefined;
+      return {
+        area: 'builds',
+        reader: reader(() => {
+          assertCurrent();
+          const found = collections.getCollectionReference(
+            collections.openView(),
+            'builds',
+            REPORT_SNAPSHOT_CATALOG,
+            snapshotId,
+          );
+          if (!found) throw Error('Missing accepted build identity alias');
+          return found;
+        }),
+      };
+    },
+    async bindCurrentIdentityScope(groupId, alias) {
+      assertCurrent();
+      if (selectedCatalog !== REPORT_SNAPSHOT_CATALOG || selectedArea !== 'builds')
+        throw Error('Identity locators require the source report build catalog');
+      if (
+        !groupId ||
+        alias.get('$format') !== 'health-intake-identity-scope-alias-v1' ||
+        alias.get('$groupId') !== groupId ||
+        alias.get('$intakeId') !== source.id ||
+        alias.get('$sourceHash') !== source.sha256
+      )
+        throw Error('Invalid current identity locator binding');
+      const resolve = references.get(alias);
+      if (!resolve) throw Error('Foreign identity alias reader');
+      const value = await writer(resolve),
+        name = names.get(value)!;
+      await init();
+      await checkpoint([
+        {
+          area: 'builds',
+          collection: catalog,
+          op: 'putCollection',
+          key: 'identity-current:' + hash(groupId),
           fromArea: 'builds',
           fromCollection: name,
         },

@@ -23,6 +23,23 @@ import {
 } from './database.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { canonicalLiteral } from './intake-format.ts';
+import {
+  identityScopeCommitmentsWork,
+  identitySnapshotQuestionHashWork,
+} from './intake-identity-commitment.ts';
+import { createIdentitySnapshotDelta } from './intake-identity-snapshot-delta.ts';
+import {
+  currentIdentityScopeAlias,
+  exactIdentityScopeAlias,
+  identityScopeAliasMatches,
+  publishIdentityScopeAlias,
+  identityCompleteSnapshotId,
+} from './intake-identity-snapshot-alias.ts';
+import {
+  retainIdentityWarningsSnapshot,
+  retainIdentityWarningContent,
+  openIdentityWarningsSnapshot,
+} from './intake-identity-warnings-snapshot.ts';
 import { collectSelectedEvidencedIdentityWork } from './intake-identity-name-evidence.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
@@ -33,6 +50,8 @@ import {
   readNativeIdentityPreview,
   retainNativeIdentityPreview,
   clearNativeIdentityPreviews,
+  openNativeIdentityFragmentCursor,
+  sealNativeIdentityFragmentCursor,
 } from './intake-identity-preview-cache.ts';
 import { verifyIntakeFileHashWork } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
@@ -59,7 +78,10 @@ import {
   intakeReviewChildren,
   collectionWorkflowReviewScope,
 } from './intake-review-collection.ts';
-import { createReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
+import {
+  createReportSnapshotCatalog,
+  reportSnapshotInlineTextFits,
+} from './intake-report-snapshot-catalog.ts';
 import { openReportMemberSnapshot } from './intake-report-member-state.ts';
 import {
   readNativeReviewDraft,
@@ -86,7 +108,6 @@ import {
   identitySnapshotScopeMatches,
 } from './intake-identity-snapshot.ts';
 import { schemaOrdinal } from './intake-envelope-schema.ts';
-import { INTAKE_TREE_VALUE_BYTES } from './intake-state-tree.ts';
 import {
   assessIdentityPolicyWork,
   collectEvidencedIdentityWork,
@@ -215,7 +236,9 @@ async function open(
   const groupRecord = workflow && view.find('reportGroup', workflow, groupId);
   if (!groupRecord) throw new HttpError(404, 'REPORT_GROUP_NOT_FOUND', 'Report group not found');
   if (workflow && view.childCount(workflow, 'plans'))
-    await prepareRetainedPlanAccess(db, profileId, id, { assertRunning: assertCurrent });
+    await prepareRetainedPlanAccess(db, profileId, id, {
+      assertRunning: assertCurrent,
+    });
   const plan =
     workflow && view.childCount(workflow, 'plans')
       ? readRetainedPlanEvidence(db, profileId, id)
@@ -230,7 +253,9 @@ async function open(
           sourceHash: scalar<string>(selected.view, selected.record, 'sourceHash')!,
         };
   };
-  const catalog = createReportSnapshotCatalog(db, file, { assertRunning: assertCurrent });
+  const catalog = createReportSnapshotCatalog(db, file, {
+    assertRunning: assertCurrent,
+  });
   const scope = collectionWorkflowReviewScope({
     view,
     catalog,
@@ -320,7 +345,11 @@ async function open(
           occurrences: selectedSequence(function* () {
             let after: string | undefined;
             while (true) {
-              const page = members.occurrences(selected, { after, items: 64, bytes: 256 * 1024 });
+              const page = members.occurrences(selected, {
+                after,
+                items: 64,
+                bytes: 256 * 1024,
+              });
               yield* page.occurrences;
               if (page.complete) return;
               if (!page.after || page.after === after)
@@ -336,7 +365,9 @@ async function open(
           candidateId: scalar<string>(view, selected, 'candidateId')!,
           candidateVersionId: scalar<string>(view, selected, 'candidateVersionId')!,
           ...(view.has(selected, 'section')
-            ? { section: scalar<IdentityPolicyMember['section']>(view, selected, 'section') }
+            ? {
+                section: scalar<IdentityPolicyMember['section']>(view, selected, 'section'),
+              }
             : {}),
           occurrences: selectedSequence(function* () {
             for (const occurrence of intakeReviewChildren(view, selected, 'occurrences'))
@@ -789,7 +820,10 @@ async function build(
   );
   type GroundedQuestion = {
     issue: Pick<IntakeReviewIssue, 'prompt' | 'textAnchor'>;
-    receipt: { operationId: string; scope: { scopeToken: string; profileId: string } };
+    receipt: {
+      operationId: string;
+      scope: { scopeToken: string; profileId: string };
+    };
   };
   const groundedQuestions = stored.sequence<GroundedQuestion>('groundedQuestions');
   const groundedNameQuestions =
@@ -1226,7 +1260,9 @@ async function build(
           yield '{"prompt":' + canonicalLiteral(prompt) + ',"textAnchor":"';
           let comma = false;
           for (const row of stored.raw('competingSubjects')) {
-            const claim = JSON.parse([...row.chunks()].join('')) as { subject: { text: string } };
+            const claim = JSON.parse([...row.chunks()].join('')) as {
+              subject: { text: string };
+            };
             if (comma) yield ' / ';
             comma = true;
             yield JSON.stringify(claim.subject.text).slice(1, -1);
@@ -1262,40 +1298,31 @@ async function build(
     evidenceOriginalFingerprint: original.originalFingerprint,
     ...(birthDateReview ? { birthDateReview } : {}),
   };
-  // Literal scope recipe retains complete ordered membership/targets/questions.
-  function* canonicalSnapshot() {
-    const keys = [
-      ...Object.keys(header),
-      'membership',
-      'targets',
-      'assignmentTargets',
-      ...(stored.count('questions') ? ['questions'] : []),
-      ...(stored.count('competingSubjects') ? ['competingSubjects'] : []),
-    ].sort();
-    yield '{';
-    let comma = false;
-    for (const name of keys) {
-      if (comma) yield ',';
-      comma = true;
-      yield JSON.stringify(name) + ':';
-      if (name === 'membership') yield* context.membershipChunks();
-      else if (SECTIONS.includes(name as (typeof SECTIONS)[number])) yield* stored.chunks(name);
-      else yield canonicalLiteral(header[name as keyof typeof header]);
-    }
-    yield '}';
-  }
-  const digest = createHash('sha256');
-  digest.update('[');
-  await run(
-    (function* () {
-      for (const piece of canonicalSnapshot()) {
-        digest.update(piece);
-        yield;
-      }
-    })(),
+  // Both commitments consume each complete ordered scope collection once.
+  // The existing version-specific token and retained snapshot remain authority.
+  const { scopeToken, evidenceCommitment, warningsSha256 } = await run(
+    identityScopeCommitmentsWork({
+      header,
+      sections: {
+        membership: context.membershipChunks(),
+        targets: stored.chunks('targets'),
+        assignmentTargets: stored.chunks('assignmentTargets'),
+        ...(stored.count('questions') ? { questions: stored.chunks('questions') } : {}),
+        ...(stored.count('competingSubjects')
+          ? { competingSubjects: stored.chunks('competingSubjects') }
+          : {}),
+      },
+      sourceHash: original.sourceHash,
+      warnings: stored.chunks('warnings'),
+      onHash: (kind, bytes) =>
+        recordIntakeWork(
+          kind === 'scope'
+            ? 'identityFreshnessScopeHashBytes'
+            : 'identityFreshnessWarningHashBytes',
+          bytes,
+        ),
+    }),
   );
-  digest.update(',' + canonicalLiteral(original.sourceHash) + ']');
-  const scopeToken = digest.digest('hex');
   const memberCount = await run(
     (function* () {
       let count = 0;
@@ -1453,6 +1480,9 @@ async function build(
   stored.assertArtifacts();
   return {
     display,
+    evidenceCommitment,
+    originalSourceHash: original.sourceHash,
+    warningsSha256,
     current,
     assessment,
     groundedQuestions,
@@ -1475,7 +1505,10 @@ function rememberPreview(db: DatabaseSync, reference: IntakeIdentityScopeReferen
   let entries = previewReferences.get(db);
   if (!entries) previewReferences.set(db, (entries = new Map()));
   entries.delete(reference.scopeToken);
-  entries.set(reference.scopeToken, { reference, binding: previewBinding(db, reference.intakeId) });
+  entries.set(reference.scopeToken, {
+    reference,
+    binding: previewBinding(db, reference.intakeId),
+  });
   while (entries.size > 256) entries.delete(entries.keys().next().value!);
 }
 async function pageReference(
@@ -1507,161 +1540,172 @@ async function writeSnapshot(
   built: Awaited<ReturnType<typeof build>>,
   stored: Rows,
   catalog: ReturnType<typeof createReportSnapshotCatalog>,
+  purpose: 'preview' | 'confirmation',
 ) {
-  const previous = catalog.open(built.display.collection.snapshotId);
-  if (previous) {
-    if (!identitySnapshotScopeMatches(previous, built.display))
-      throw Error('Identity snapshot binding mismatch');
+  const scope = built.display,
+    proof = built.evidenceCommitment,
+    warningCount = stored.count('warnings'),
+    run = <T>(work: Generator<void, T, void>) => runNativeIdentityWork(context, stored, work),
+    previous = catalog.open(scope.collection.snapshotId);
+  if (previous && !identitySnapshotScopeMatches(previous, scope))
+    throw Error('Identity snapshot binding mismatch');
+  // Present malformed locators refuse even if a separate exact-proof alias exists.
+  const current = currentIdentityScopeAlias(catalog, scope),
+    exact = exactIdentityScopeAlias(catalog, scope, proof);
+  if (exact) {
+    identityScopeAliasMatches(
+      exact,
+      scope,
+      built.originalSourceHash,
+      built.warningsSha256,
+      warningCount,
+    );
+    if (!previous) {
+      const writer = await catalog.forkReference(exact.snapshot);
+      const text = JSON.stringify(scope);
+      if (reportSnapshotInlineTextFits(text)) await writer.put('$scope', text);
+      else await writer.putText('$scope', [text]);
+      await catalog.publish(scope.collection.snapshotId, writer);
+    }
+    if (purpose === 'preview' && current?.proof.sha256 !== exact.proof.sha256)
+      await catalog.bindCurrentIdentityScope(scope.groupId, exact.reader);
+    withIntakeWork(context.db, 'warm', () => recordIntakeWork('identitySnapshotAliasHits'));
     return;
   }
-  const writer = await catalog.fork();
-  // Small JSON rows stay in bounded inline batches. Allocating a separate byte
-  // collection for every issue ID or occurrence amplifies unchanged tree paths.
-  let pending: { key: string; value: string }[] = [],
-    pendingBytes = 0;
-  const flush = async () => {
-    if (pending.length) await writer.putMany(pending);
-    pending = [];
-    pendingBytes = 0;
-  };
-  const put = async (key: string, value: string) => {
-    if (
-      Buffer.byteLength(value) > INTAKE_TREE_VALUE_BYTES ||
-      Buffer.byteLength(JSON.stringify({ kind: 'inline', text: value })) > INTAKE_TREE_VALUE_BYTES
-    ) {
-      await flush();
-      await writer.putText(key, [value]);
-      return;
-    }
-    const cost = Buffer.byteLength(key) + Buffer.byteLength(value);
-    if (pending.length && (pending.length === 16 || pendingBytes + cost > 64 * 1024)) await flush();
-    pending.push({ key, value });
-    pendingBytes += cost;
-  };
-  const putText = async (key: string, pieces: Iterable<string>) => {
-    const iterator = pieces[Symbol.iterator](),
-      prefix: string[] = [];
-    let bytes = 0;
-    for (;;) {
-      const next = iterator.next();
-      if (next.done) {
-        await put(key, prefix.join(''));
-        return;
-      }
-      bytes += Buffer.byteLength(next.value);
-      prefix.push(next.value);
-      if (bytes > INTAKE_TREE_VALUE_BYTES) {
-        await flush();
-        await writer.putText(
-          key,
-          (function* () {
-            yield* prefix;
-            for (;;) {
-              const next = iterator.next();
-              if (next.done) return;
-              yield next.value;
+  const warnings = await retainIdentityWarningContent({
+    db: context.db,
+    catalog,
+    digest: built.warningsSha256,
+    count: warningCount,
+    rows: stored.raw('warnings'),
+    priorContent: current?.warningContent,
+    run,
+  });
+  // A legacy same-token main can retain historical warnings. Only the private
+  // fork is updated/certified; that immutable main and its old readers stay exact.
+  const prior = current?.snapshot ?? previous,
+    writer = prior ? await catalog.forkReference(prior) : await catalog.forkReference(warnings),
+    delta = createIdentitySnapshotDelta({ db: context.db, writer });
+  try {
+    await delta.put('$format', IDENTITY_SNAPSHOT_FORMAT);
+    await delta.putText('$scope', () => [JSON.stringify(scope)]);
+    await delta.put('$warningCount', String(warningCount));
+    let warningOrdinal = 0;
+    for (const row of stored.raw('warnings'))
+      await delta.putText('warnings:' + schemaOrdinal(warningOrdinal++), () => row.chunks());
+    for (const section of SECTIONS) {
+      if (section === 'membership') continue;
+      let index = 0;
+      for (const row of stored.raw(section)) {
+        if (section === 'targets' || section === 'assignmentTargets') {
+          const target = stored.target(section, row.key)!,
+            { issueIds, ...header } = target;
+          const targetKey = section + ':' + schemaOrdinal(index);
+          let count = 0;
+          if (issueIds) {
+            for (const issueId of issueIds) {
+              await delta.put(
+                'targetIssue:' + targetKey + ':' + schemaOrdinal(count++),
+                JSON.stringify(issueId),
+              );
+              await delta.put(
+                'targetLookup:' +
+                  targetKey +
+                  ':' +
+                  createHash('sha256').update(issueId).digest('hex'),
+                '1',
+              );
             }
-          })(),
-        );
-        return;
-      }
-    }
-  };
-  await put('$format', IDENTITY_SNAPSHOT_FORMAT);
-  await putText('$scope', [JSON.stringify(built.display)]);
-  await put('$warningCount', String(stored.count('warnings')));
-  let warningOrdinal = 0;
-  for (const row of stored.raw('warnings'))
-    await putText('warnings:' + schemaOrdinal(warningOrdinal++), row.chunks());
-  for (const section of SECTIONS) {
-    if (section === 'membership') continue;
-    let index = 0;
-    for (const row of stored.raw(section)) {
-      if (section === 'targets' || section === 'assignmentTargets') {
-        const target = stored.target(section, row.key)!,
-          { issueIds, ...header } = target;
-        const targetKey = section + ':' + schemaOrdinal(index);
-        let count = 0;
-        if (issueIds) {
-          for (const issueId of issueIds) {
-            await put(
-              'targetIssue:' + targetKey + ':' + schemaOrdinal(count++),
-              JSON.stringify(issueId),
-            );
-            await put(
+          } else
+            await delta.put(
               'targetLookup:' +
                 targetKey +
                 ':' +
-                createHash('sha256').update(issueId).digest('hex'),
+                createHash('sha256').update(target.issueId).digest('hex'),
               '1',
             );
-          }
-        } else
-          await put(
-            'targetLookup:' +
-              targetKey +
-              ':' +
-              createHash('sha256').update(target.issueId).digest('hex'),
-            '1',
-          );
-        await putText('targetHeader:' + targetKey, [
-          JSON.stringify({
-            ...header,
-            hasIssueIds: !!issueIds,
-            issueCount: count,
-            hasIssueLookup: true,
-          }),
-        ]);
-      }
-      if (section === 'questions') {
-        const digest = createHash('sha256');
-        for (const piece of row.chunks()) digest.update(piece);
-        await put('questionHash:' + schemaOrdinal(index), digest.digest('hex'));
-      }
-      context.assertCurrent();
-      await putText(section + ':' + schemaOrdinal(index++), row.chunks());
-    }
-  }
-  let index = 0;
-  for (const member of context.membership()) {
-    const memberKey = schemaOrdinal(index++),
-      { occurrences, ...header } = member;
-    let occurrenceCount = 0;
-    for (const occurrence of occurrences) {
-      context.assertCurrent();
-      await putText('occurrence:' + memberKey + ':' + schemaOrdinal(occurrenceCount++), [
-        canonicalLiteral(occurrence),
-      ]);
-    }
-    await putText('member:' + memberKey, [canonicalLiteral({ ...header, occurrenceCount })]);
-    await flush();
-    await putText(
-      'membership:' + memberKey,
-      (function* () {
-        yield '{';
-        let comma = false;
-        for (const name of [...Object.keys(header), 'occurrences'].sort()) {
-          if (comma) yield ',';
-          comma = true;
-          yield JSON.stringify(name) + ':';
-          if (name !== 'occurrences') yield canonicalLiteral(header[name as keyof typeof header]);
-          else {
-            yield '[';
-            let comma = false;
-            for (let ordinal = 0; ordinal < occurrenceCount; ordinal++) {
-              if (comma) yield ',';
-              comma = true;
-              yield* writer.chunks('occurrence:' + memberKey + ':' + schemaOrdinal(ordinal));
-            }
-            yield ']';
-          }
+          await delta.putText('targetHeader:' + targetKey, () => [
+            JSON.stringify({
+              ...header,
+              hasIssueIds: !!issueIds,
+              issueCount: count,
+              hasIssueLookup: true,
+            }),
+          ]);
         }
-        yield '}';
-      })(),
-    );
+        if (section === 'questions') {
+          const digest = await run(identitySnapshotQuestionHashWork(row.chunks()));
+          await delta.put('questionHash:' + schemaOrdinal(index), digest);
+        }
+        context.assertCurrent();
+        await delta.putText(section + ':' + schemaOrdinal(index++), () => row.chunks());
+      }
+    }
+    let index = 0;
+    for (const member of context.membership()) {
+      const memberKey = schemaOrdinal(index++),
+        { occurrences, ...header } = member;
+      let occurrenceCount = 0;
+      for (const occurrence of occurrences) {
+        context.assertCurrent();
+        await delta.putText(
+          'occurrence:' + memberKey + ':' + schemaOrdinal(occurrenceCount++),
+          () => [canonicalLiteral(occurrence)],
+        );
+      }
+      await delta.putText('member:' + memberKey, () => [
+        canonicalLiteral({ ...header, occurrenceCount }),
+      ]);
+      await delta.flush();
+      await delta.putText('membership:' + memberKey, () =>
+        (function* () {
+          yield '{';
+          let comma = false;
+          for (const name of [...Object.keys(header), 'occurrences'].sort()) {
+            if (comma) yield ',';
+            comma = true;
+            yield JSON.stringify(name) + ':';
+            if (name !== 'occurrences') yield canonicalLiteral(header[name as keyof typeof header]);
+            else {
+              yield '[';
+              let comma = false;
+              for (let ordinal = 0; ordinal < occurrenceCount; ordinal++) {
+                if (comma) yield ',';
+                comma = true;
+                yield* writer.chunks('occurrence:' + memberKey + ':' + schemaOrdinal(ordinal));
+              }
+              yield ']';
+            }
+          }
+          yield '}';
+        })(),
+      );
+    }
+
+    await delta.finishCleanup();
+    // Bind certification to an immutable map reference, never to a mutable writer.
+    const completeId = identityCompleteSnapshotId(proof.sha256, scope.scopeToken);
+    await catalog.publish(completeId, writer);
+    const complete = catalog.open(completeId);
+    if (!complete) throw Error('Missing newly retained complete identity scope');
+    await delta.certify(complete);
+    const alias = await publishIdentityScopeAlias({
+      db: context.db,
+      catalog,
+      snapshot: complete,
+      warningContent: warnings,
+      scope,
+      proof,
+      originalSourceHash: built.originalSourceHash,
+      warningsSha256: built.warningsSha256,
+      warningCount,
+      run,
+    });
+    if (!previous) await catalog.publish(scope.collection.snapshotId, writer);
+    if (purpose === 'preview') await catalog.bindCurrentIdentityScope(scope.groupId, alias.reader);
+  } finally {
+    delta.close();
   }
-  await flush();
-  await catalog.publish(built.display.collection.snapshotId, writer);
 }
 async function collectGroupIdentity(context: Context, stored: Rows) {
   const run = <T>(work: Generator<void, T, void>) => runNativeIdentityWork(context, stored, work);
@@ -1718,7 +1762,10 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
           );
           if (selected.status !== 'ready')
             return reject('Prepare this exact retained clinical occurrence before identity review');
-          cached = { proposalId: occurrence.proposalId, session: selected.session };
+          cached = {
+            proposalId: occurrence.proposalId,
+            session: selected.session,
+          };
           context.assertCurrent();
           stored.retainArtifacts(
             collectionClinicalProjectionContext(selected.session).verifiedArtifacts(),
@@ -2079,7 +2126,10 @@ async function getNativeIntakeIdentityReviewInner(
         )
         .get(id, groupId);
       const correctedAuthority = correctionRow
-        ? (json(correctionRow.coverage_json) as { personId: string; noteId: string })
+        ? (json(correctionRow.coverage_json) as {
+            personId: string;
+            noteId: string;
+          })
         : null;
       const correctedNote = correctedAuthority ? getNote(db, correctedAuthority.noteId) : null;
       return correctedAuthority && correctedNote
@@ -2111,7 +2161,13 @@ async function getNativeIntakeIdentityReviewInner(
         }),
       );
       stored.assertArtifacts();
-      return { ...assessment, scope: null, self, correctedPerson, ...peoplePreview(db) };
+      return {
+        ...assessment,
+        scope: null,
+        self,
+        correctedPerson,
+        ...peoplePreview(db),
+      };
     }
     try {
       const original = await evidence(context);
@@ -2150,7 +2206,30 @@ async function getNativeIntakeIdentityReviewInner(
         catalogArea: 'builds',
         assertRunning: context.assertCurrent,
       });
-      await writeSnapshot(context, built, stored, catalog);
+      await writeSnapshot(context, built, stored, catalog, 'preview');
+      const inlineWarnings: IntakeIdentityWarning[] = [];
+      let warningBytes = 0;
+      for (const warning of stored.sequence<IntakeIdentityWarning>('warnings')) {
+        warningBytes += Buffer.byteLength(JSON.stringify(warning));
+        if (inlineWarnings.length >= 100 || warningBytes > 64 * 1024) break;
+        inlineWarnings.push(warning);
+      }
+      const warnings =
+        inlineWarnings.length === stored.count('warnings')
+          ? inlineWarnings.length
+            ? { warnings: inlineWarnings }
+            : {}
+          : {
+              warningsReference: await retainIdentityWarningsSnapshot({
+                db: context.db,
+                catalog,
+                scope: built.display,
+                digest: built.warningsSha256,
+                count: stored.count('warnings'),
+                rows: stored.raw('warnings'),
+                run: (work) => runNativeIdentityWork(context, stored, work),
+              }),
+            };
       const changes = await catalog.finalChanges();
       const collections = selectedEnvelopeStore(db, context.file).collections,
         operationId = randomUUID();
@@ -2165,26 +2244,6 @@ async function getNativeIntakeIdentityReviewInner(
           }),
         );
       rememberPreview(db, built.display);
-      const inlineWarnings: IntakeIdentityWarning[] = [];
-      let warningBytes = 0;
-      for (const warning of stored.sequence<IntakeIdentityWarning>('warnings')) {
-        warningBytes += Buffer.byteLength(JSON.stringify(warning));
-        if (inlineWarnings.length >= 100 || warningBytes > 64 * 1024) break;
-        inlineWarnings.push(warning);
-      }
-      const warnings =
-        inlineWarnings.length === stored.count('warnings')
-          ? inlineWarnings.length
-            ? { warnings: inlineWarnings }
-            : {}
-          : {
-              warningsReference: {
-                format: 'health-intake-identity-warnings-v1' as const,
-                scopeToken: built.display.scopeToken,
-                snapshotId: built.display.collection.snapshotId,
-                count: stored.count('warnings'),
-              },
-            };
       const value: IntakeIdentityReview = {
         ...built.assessment,
         ...built.presentation,
@@ -2192,6 +2251,7 @@ async function getNativeIntakeIdentityReviewInner(
         confirmationCount: built.confirmationCount,
         scope: null,
         scopeReference: built.display,
+        evidenceCommitment: built.evidenceCommitment,
         self,
         correctedPerson,
         ...peoplePreview(db),
@@ -2246,7 +2306,13 @@ export async function readNativeIdentityScopePage(
   profileId: string,
   id: string,
   groupId: string,
-  input: { scopeToken: string; section: string; cursor?: string; limit?: number },
+  input: {
+    scopeToken: string;
+    section: string;
+    snapshotId?: string;
+    cursor?: string;
+    limit?: number;
+  },
 ): Promise<IntakeIdentityScopePage> {
   return runExclusiveClinicalOperation(
     db,
@@ -2260,7 +2326,13 @@ async function readNativeIdentityScopePageInner(
   profileId: string,
   id: string,
   groupId: string,
-  input: { scopeToken: string; section: string; cursor?: string; limit?: number },
+  input: {
+    scopeToken: string;
+    section: string;
+    snapshotId?: string;
+    cursor?: string;
+    limit?: number;
+  },
 ): Promise<IntakeIdentityScopePage> {
   const reference = await pageReference(db, root, profileId, id, groupId, input.scopeToken);
   if (!reference || reference.scopeToken !== input.scopeToken)
@@ -2272,15 +2344,24 @@ async function readNativeIdentityScopePageInner(
     throw new HttpError(400, 'IDENTITY_SCOPE_PAGE', 'Choose a scope collection');
   const section = input.section as IntakeIdentityScopeSection,
     limit = input.limit ?? 25;
-  const reader = openIdentityScopeSnapshot(
-    createReportSnapshotCatalog(db, source(db, profileId, id), {
-      catalog: 'report.snapshots',
-      catalogArea: 'builds',
-    }),
-    reference,
-  );
+  if (input.snapshotId && section !== 'warnings')
+    throw new HttpError(
+      400,
+      'IDENTITY_SCOPE_PAGE',
+      'A warning snapshot selects only advisory warnings',
+    );
+  const catalog = createReportSnapshotCatalog(db, source(db, profileId, id), {
+    catalog: 'report.snapshots',
+    catalogArea: 'builds',
+  });
+  const base = openIdentityScopeSnapshot(catalog, reference);
+  const selected = input.snapshotId
+    ? openIdentityWarningsSnapshot(catalog, reference, input.snapshotId)
+    : undefined;
+  const reader = selected?.reader || base;
   const total =
-    section === 'warnings' ? Number(reader.get('$warningCount')) : reference.collection[section];
+    selected?.count ??
+    (section === 'warnings' ? Number(reader.get('$warningCount')) : reference.collection[section]);
   if (!Number.isSafeInteger(total) || total < 0)
     throw Error('Invalid retained identity collection count');
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
@@ -2292,7 +2373,7 @@ async function readNativeIdentityScopePageInner(
       if (
         !Array.isArray(value) ||
         value.length !== 3 ||
-        value[0] !== reference.scopeToken ||
+        value[0] !== (input.snapshotId || reference.scopeToken) ||
         value[1] !== section ||
         !Number.isSafeInteger(value[2]) ||
         value[2] < 0 ||
@@ -2308,8 +2389,11 @@ async function readNativeIdentityScopePageInner(
   let used = 0;
   for (; offset < total && items.length < limit; offset++) {
     const key = section + ':' + schemaOrdinal(offset);
-    let size = 0;
-    for (const piece of reader.chunks(key)) size += Buffer.byteLength(piece);
+    const value = reader.get(key);
+    if (value === undefined) throw Error('Missing report snapshot text');
+    // The owner's checked inline value or branded byte descriptor already pins
+    // this exact length; deciding between a value and reference needs no drain.
+    const size = typeof value === 'string' ? Buffer.byteLength(value) : value.bytes;
     const item: IntakeIdentityScopePage['items'][number] =
       size > 64 * 1024
         ? {
@@ -2317,12 +2401,16 @@ async function readNativeIdentityScopePageInner(
             reference: {
               format: 'health-intake-identity-item-v2',
               scopeToken: reference.scopeToken,
+              ...(input.snapshotId ? { snapshotId: input.snapshotId } : {}),
               section,
               ordinal: offset,
               bytes: size,
             },
           }
-        : { kind: 'value', value: readIdentitySnapshotValue(reader, key, 64 * 1024) };
+        : {
+            kind: 'value',
+            value: readIdentitySnapshotValue(reader, key, 64 * 1024),
+          };
     const cost = Buffer.byteLength(JSON.stringify(item));
     if (items.length && used + cost > 128 * 1024) break;
     used += cost;
@@ -2331,12 +2419,15 @@ async function readNativeIdentityScopePageInner(
   return {
     format: 'health-intake-identity-scope-page-v2',
     scopeToken: reference.scopeToken,
+    ...(input.snapshotId ? { snapshotId: input.snapshotId } : {}),
     section,
     total,
     items,
     nextCursor:
       offset < total
-        ? Buffer.from(JSON.stringify([reference.scopeToken, section, offset])).toString('base64url')
+        ? Buffer.from(
+            JSON.stringify([input.snapshotId || reference.scopeToken, section, offset]),
+          ).toString('base64url')
         : null,
   };
 }
@@ -2346,12 +2437,43 @@ export async function readNativeIdentityScopeFragment(
   profileId: string,
   id: string,
   groupId: string,
-  input: { scopeToken: string; section: string; ordinal: number; offset?: number },
+  input: {
+    scopeToken: string;
+    section: string;
+    snapshotId?: string;
+    ordinal: number;
+    offset?: number;
+    cursor?: string;
+  },
+  options: { signal?: AbortSignal } = {},
 ) {
   return runExclusiveClinicalOperation(
     db,
-    async () => readNativeIdentityScopeFragmentInner(db, root, profileId, id, groupId, input),
-    { operation: currentClinicalOperation(db) },
+    async () =>
+      withVerifiedIntakeOriginalDescriptor(
+        {
+          db,
+          root,
+          profileId,
+          id,
+          assertRunning: () => {
+            options.signal?.throwIfAborted();
+            assertClinicalOperation(db);
+          },
+        },
+        async ({ assertRunning: assertOriginal }) =>
+          readNativeIdentityScopeFragmentInner(
+            db,
+            root,
+            profileId,
+            id,
+            groupId,
+            input,
+            assertOriginal,
+            options.signal,
+          ),
+      ),
+    { operation: currentClinicalOperation(db), signal: options.signal },
   );
 }
 async function readNativeIdentityScopeFragmentInner(
@@ -2360,8 +2482,18 @@ async function readNativeIdentityScopeFragmentInner(
   profileId: string,
   id: string,
   groupId: string,
-  input: { scopeToken: string; section: string; ordinal: number; offset?: number },
+  input: {
+    scopeToken: string;
+    section: string;
+    snapshotId?: string;
+    ordinal: number;
+    offset?: number;
+    cursor?: string;
+  },
+  assertOriginal: () => void,
+  signal?: AbortSignal,
 ) {
+  assertOriginal();
   const reference =
     (await pageReference(db, root, profileId, id, groupId, input.scopeToken)) ||
     reject('The identity scope is unavailable');
@@ -2373,15 +2505,24 @@ async function readNativeIdentityScopeFragmentInner(
     reject('The identity scope changed; review its current pages');
   const section = input.section as IntakeIdentityScopeSection,
     offset = input.offset ?? 0;
-  const reader = openIdentityScopeSnapshot(
-    createReportSnapshotCatalog(db, source(db, profileId, id), {
-      catalog: 'report.snapshots',
-      catalogArea: 'builds',
-    }),
-    reference,
-  );
+  if (input.snapshotId && section !== 'warnings')
+    throw new HttpError(
+      400,
+      'IDENTITY_SCOPE_PAGE',
+      'A warning snapshot selects only advisory warnings',
+    );
+  const catalog = createReportSnapshotCatalog(db, source(db, profileId, id), {
+    catalog: 'report.snapshots',
+    catalogArea: 'builds',
+  });
+  const base = openIdentityScopeSnapshot(catalog, reference);
+  const selected = input.snapshotId
+    ? openIdentityWarningsSnapshot(catalog, reference, input.snapshotId)
+    : undefined;
+  const reader = selected?.reader || base;
   const total =
-    section === 'warnings' ? Number(reader.get('$warningCount')) : reference.collection[section];
+    selected?.count ??
+    (section === 'warnings' ? Number(reader.get('$warningCount')) : reference.collection[section]);
   if (
     !Number.isSafeInteger(input.ordinal) ||
     input.ordinal < 0 ||
@@ -2390,37 +2531,123 @@ async function readNativeIdentityScopeFragmentInner(
     offset < 0
   )
     throw new HttpError(400, 'IDENTITY_SCOPE_FRAGMENT', 'Choose an exact scope item fragment');
-  const chunks: Buffer[] = [];
-  let position = 0,
-    used = 0,
-    complete = true;
-  for (const piece of reader.chunks(section + ':' + schemaOrdinal(input.ordinal))) {
-    const bytes = Buffer.from(piece),
-      start = Math.max(0, offset - position);
-    position += bytes.length;
-    if (start >= bytes.length) continue;
-    const take = Math.min(bytes.length - start, 32768 - used);
-    if (take) {
-      chunks.push(bytes.subarray(start, start + take));
-      used += take;
+  assertOriginal();
+  const key = section + ':' + schemaOrdinal(input.ordinal),
+    value = reader.get(key);
+  if (value === undefined) throw Error('Missing report snapshot text');
+  const size = typeof value === 'string' ? Buffer.byteLength(value) : value.bytes;
+  if (input.cursor !== undefined) {
+    // Only explicit first-page mode mints a new transport key. An expired or
+    // malformed continuation never restarts or falls back to a prefix scan.
+    if (db.isTransaction) reject('Identity fragments require current selected authority');
+    const epoch = beginNativeIdentityPreview(db),
+      binding = hash([
+        'health-intake-identity-fragment-v1',
+        profileId,
+        id,
+        groupId,
+        source(db, profileId, id).sha256,
+        reference.scopeToken,
+        input.snapshotId || reference.collection.snapshotId,
+        section,
+        input.ordinal,
+        size,
+        previewBinding(db, id),
+      ]);
+    const position =
+      input.cursor === 'start'
+        ? offset === 0
+          ? { offset: 0, after: null, skip: 0 }
+          : reject('Start identity fragments at byte zero')
+        : openNativeIdentityFragmentCursor(db, epoch, binding, input.cursor, offset);
+    if (offset > size) reject('The identity fragment continuation is outside this item');
+    if (offset === size) {
+      if (offset !== 0) reject('This identity fragment continuation is already complete');
+      return {
+        encoding: 'base64' as const,
+        data: '',
+        complete: true,
+        nextOffset: null,
+        nextCursor: null,
+      };
     }
-    if (take < bytes.length - start) {
-      complete = false;
-      break;
-    }
+    const page = reader.bytePage(key, position),
+      nextOffset = offset + page.data.length;
+    if (!page.data.length || nextOffset > size || page.complete !== (nextOffset === size))
+      throw Error('Identity fragment byte length changed');
+    catalog.assertCurrent();
+    assertOriginal();
+    if (!nativeIdentityPreviewCurrent(db, epoch)) reject('The identity fragment changed');
+    return {
+      encoding: 'base64' as const,
+      data: page.data.toString('base64'),
+      complete: page.complete,
+      nextOffset: page.complete ? null : nextOffset,
+      nextCursor: page.complete
+        ? null
+        : sealNativeIdentityFragmentCursor(db, epoch, binding, {
+            offset: nextOffset,
+            after: page.after,
+            skip: page.skip,
+          }),
+    };
   }
-  if (offset > position)
+  if (offset > size)
     throw new HttpError(
       400,
       'IDENTITY_SCOPE_FRAGMENT',
       'The fragment offset is outside this scope item',
     );
-  return {
-    encoding: 'base64' as const,
-    data: Buffer.concat(chunks).toString('base64'),
-    complete,
-    nextOffset: complete ? null : offset + used,
-  };
+  // Numeric-only compatibility requests retain exact arbitrary byte offsets.
+  // They scan the prefix cooperatively; sequential clients use cursors above.
+  return runClinicalReviewWork(
+    (function* () {
+      const chunks: Buffer[] = [];
+      let position = 0,
+        used = 0;
+      for (const piece of reader.chunks(key)) {
+        const bytes = Buffer.from(piece),
+          start = Math.max(0, offset - position);
+        position += bytes.length;
+        withIntakeWork(db, 'warm', () =>
+          recordIntakeWork('identityFragmentLegacyReadBytes', bytes.length),
+        );
+        yield;
+        if (start >= bytes.length) continue;
+        const take = Math.min(bytes.length - start, 32768 - used);
+        if (take) {
+          chunks.push(bytes.subarray(start, start + take));
+          used += take;
+        }
+        if (used === 32768) break;
+      }
+      if (used !== Math.min(32768, size - offset))
+        throw Error('Identity fragment byte length changed');
+      assertOriginal();
+      const complete = offset + used === size;
+      return {
+        encoding: 'base64' as const,
+        data: Buffer.concat(chunks).toString('base64'),
+        complete,
+        nextOffset: complete ? null : offset + used,
+      };
+    })(),
+    {
+      signal,
+      capture() {
+        assertOriginal();
+        catalog.assertCurrent();
+        const stamp = reviewPreparationStamp(db);
+        if (stamp === undefined) reject('Identity fragments require current authority');
+        return () => {
+          assertOriginal();
+          catalog.assertCurrent();
+          if (reviewPreparationStamp(db) !== stamp)
+            reject('Identity fragment changed during preparation');
+        };
+      },
+    },
+  );
 }
 export function confirmNativeIntakeIdentityScope(
   db: DatabaseSync,
@@ -2449,7 +2676,12 @@ async function confirmNativeIntakeIdentityScopeInner(
     ...getIntakeRead(db, root, profileId, id),
     durability: flushIntake(db, root, profileId),
   });
-  if (retainedIntakeWorkflowCommand(db, file, { operationId: input.operationId, request }))
+  if (
+    retainedIntakeWorkflowCommand(db, file, {
+      operationId: input.operationId,
+      request,
+    })
+  )
     return response();
   if (!Number.isSafeInteger(input.version) || intakeSourceVersion(db, id).version !== input.version)
     throw new HttpError(
@@ -2599,7 +2831,7 @@ async function confirmNativeIntakeIdentityScopeInner(
           );
           stored.put('drafts', String(stored.count('drafts')), history.draft);
         }
-        await writeSnapshot(context, built, stored, catalog);
+        await writeSnapshot(context, built, stored, catalog, 'confirmation');
         const draftSnapshotId =
           built.display.collection.snapshotId + ':drafts:' + hash(input.operationId);
         const draftWriter = await catalog.fork();
@@ -2689,7 +2921,10 @@ async function confirmNativeIntakeIdentityScopeInner(
                   reject('The selected People destination changed during confirmation');
               selectedEnvelopeStore(db, file).collections.stage(prepared.prepared);
             },
-            { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
+            {
+              operationId: prepared.publicationId,
+              fingerprint: prepared.fingerprint,
+            },
           );
         return response();
       } finally {

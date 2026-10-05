@@ -80,6 +80,12 @@ export function IdentityScopeEvidence({
             scope={scope}
             section={section}
             expectedCount={section === 'warnings' ? warningsReference?.count : undefined}
+            warningSnapshotId={
+              section === 'warnings' &&
+              warningsReference?.format === 'health-intake-identity-warnings-v2'
+                ? warningsReference.snapshotId
+                : undefined
+            }
             onRefresh={onRefresh}
           />
         </>
@@ -91,12 +97,14 @@ function IdentityScopePage({
   scope,
   section,
   expectedCount,
+  warningSnapshotId,
   onReviewed,
   onRefresh,
 }: {
   scope: IntakeIdentityScopeReference;
   section: IntakeIdentityScopeSection;
   expectedCount?: number;
+  warningSnapshotId?: string;
   onReviewed?: (ready: boolean) => void;
   onRefresh: () => void;
 }) {
@@ -109,7 +117,7 @@ function IdentityScopePage({
     error?: string;
   }>();
   const [inspected, setInspected] = useState<Set<number>>(new Set());
-  const binding = JSON.stringify([profile?.id, scope]);
+  const binding = JSON.stringify([profile?.id, scope, warningSnapshotId]);
   const key = JSON.stringify([binding, section, position, revision]);
   const reviewed = useRef(onReviewed);
   reviewed.current = onReviewed;
@@ -130,6 +138,7 @@ function IdentityScopePage({
       limit: '20',
       bytes: '65536',
     });
+    if (warningSnapshotId) query.set('snapshotId', warningSnapshotId);
     if (position.cursor) query.set('cursor', position.cursor);
     void api<IntakeIdentityScopePage>(
       `/intakes/${encodeURIComponent(scope.intakeId)}/identity-scope-page?${query}`,
@@ -141,6 +150,7 @@ function IdentityScopePage({
         if (
           data.format !== 'health-intake-identity-scope-page-v2' ||
           data.scopeToken !== scope.scopeToken ||
+          data.snapshotId !== warningSnapshotId ||
           data.section !== section ||
           data.total !== expected ||
           data.items.length > 20 ||
@@ -157,6 +167,7 @@ function IdentityScopePage({
               (item.kind !== 'reference' ||
                 item.reference.format !== 'health-intake-identity-item-v2' ||
                 item.reference.scopeToken !== scope.scopeToken ||
+                item.reference.snapshotId !== warningSnapshotId ||
                 item.reference.section !== section ||
                 item.reference.ordinal !== position.offset + index ||
                 !Number.isSafeInteger(item.reference.bytes) ||
@@ -230,8 +241,9 @@ function IdentityScopePage({
                   scope={JSON.stringify([binding, item.reference])}
                   bytes={item.reference.bytes}
                   label={`${labels[section]} entry ${item.reference.ordinal + 1}`}
-                  path={`/intakes/${encodeURIComponent(scope.intakeId)}/identity-scope-fragment?${new URLSearchParams({ groupId: scope.groupId, scopeToken: scope.scopeToken, section, ordinal: String(item.reference.ordinal) })}`}
+                  path={`/intakes/${encodeURIComponent(scope.intakeId)}/identity-scope-fragment?${new URLSearchParams({ groupId: scope.groupId, scopeToken: scope.scopeToken, section, ordinal: String(item.reference.ordinal), ...(warningSnapshotId ? { snapshotId: warningSnapshotId } : {}) })}`}
                   method="GET"
+                  continuation
                   body={{}}
                   onRefresh={refresh}
                   onInspected={(ready) =>

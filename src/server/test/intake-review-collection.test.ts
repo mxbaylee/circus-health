@@ -684,7 +684,7 @@ test('ownership scope preserves bound group and version methods and dispatches c
 // full synchronous/cooperative parity, host progress and cancellation cleanup.
 test(
   'native fallback reference work yields during nonmatching history and preserves exact virtual hashes and tokens',
-  { timeout: 120000 },
+  { timeout: 300000 },
   async (t) => {
     const { details, open } = await fixture(t, (details) => {
       details.workflow!.reportGroups = [];

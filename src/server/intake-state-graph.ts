@@ -74,8 +74,8 @@ export function inspectIntakeCollectionGraph(
   db.exec(`CREATE TABLE graph_nested(hash TEXT,kind TEXT,ref TEXT NOT NULL,bytes INTEGER NOT NULL,done INTEGER DEFAULT 0,PRIMARY KEY(hash,kind));
     CREATE INDEX graph_nested_pending ON graph_nested(done);
     CREATE TABLE graph_copy_stack(position INTEGER PRIMARY KEY,hash TEXT,kind TEXT,ref TEXT NOT NULL,UNIQUE(hash,kind));`);
-  const source = (sha: string) =>
-    db.prepare('SELECT value FROM source WHERE key=?').get(prefix + 'node:' + sha)?.value;
+  const readSource = db.prepare('SELECT value FROM source WHERE key=?');
+  const source = (sha: string) => readSource.get(prefix + 'node:' + sha)?.value;
   const selected = parseIntakeCollectionHead(rawHead, identity)!;
   function enqueue(head: IntakeCollectionHead): void {
     const raw = JSON.stringify(head);

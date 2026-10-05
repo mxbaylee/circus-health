@@ -8,7 +8,11 @@ import type {
   IntakeIdentityScopePage,
   IntakeIdentityConfirmation,
 } from '../../shared/intake-identity';
-const profile = { id: 'fictional-identity-reader', name: 'Fictional Reader', placebo: true };
+const profile = {
+  id: 'fictional-identity-reader',
+  name: 'Fictional Reader',
+  placebo: true,
+};
 const review: IntakeIdentityReview = {
   status: 'confirmation_required',
   blocking: true,
@@ -42,7 +46,12 @@ const review: IntakeIdentityReview = {
     },
   },
   evidencedIdentity: { fullName: 'Fictional Reader' },
-  self: { noteId: 'person-note:self', version: 1, fullName: 'Fictional Reader', birthDate: null },
+  self: {
+    noteId: 'person-note:self',
+    version: 1,
+    fullName: 'Fictional Reader',
+    birthDate: null,
+  },
   offeredSelfFields: {},
   conflicts: [],
 };
@@ -97,19 +106,26 @@ it('shows complete identity counts and requires all question windows before exac
             )
           : json(
               page(
-                [{ kind: 'value', value: { prompt: 'FIRST IDENTITY QUESTION' } }],
+                [
+                  {
+                    kind: 'value',
+                    value: { prompt: 'FIRST IDENTITY QUESTION' },
+                  },
+                ],
                 'next-identity',
               ),
             );
       if (url.pathname.endsWith('/identity-scope-fragment')) {
         expect(init?.method).toBe('GET');
         const offset = Number(url.searchParams.get('offset'));
+        expect(url.searchParams.get('cursor')).toBe(offset ? 'fictional-next-fragment' : 'start');
         const end = Math.min(bytes.length, offset + 32768);
         return json({
           encoding: 'base64',
           data: Buffer.from(bytes.subarray(offset, end)).toString('base64'),
           complete: end === bytes.length,
           nextOffset: end === bytes.length ? null : end,
+          nextCursor: end === bytes.length ? null : 'fictional-next-fragment',
         });
       }
       if (url.pathname.endsWith('/identity-scope')) {
@@ -319,11 +335,17 @@ it('opens referenced advisory warnings as bounded evidence without treating the 
             items: [
               {
                 kind: 'value',
-                value: { code: 'fictional-warning-one', message: 'First retained warning' },
+                value: {
+                  code: 'fictional-warning-one',
+                  message: 'First retained warning',
+                },
               },
               {
                 kind: 'value',
-                value: { code: 'fictional-warning-two', message: 'Second retained warning' },
+                value: {
+                  code: 'fictional-warning-two',
+                  message: 'Second retained warning',
+                },
               },
             ],
             nextCursor: null,
@@ -344,7 +366,11 @@ it('opens referenced advisory warnings as bounded evidence without treating the 
     <NativeIdentity intakeId="fictional-intake" groupId="fictional-group" onChanged={vi.fn()} />,
   );
   expect(await screen.findByText(/2 advisory warnings are available/)).toBeVisible();
-  fireEvent.click(screen.getByRole('button', { name: 'Inspect affected records and membership' }));
+  fireEvent.click(
+    screen.getByRole('button', {
+      name: 'Inspect affected records and membership',
+    }),
+  );
   fireEvent.change(screen.getByRole('combobox', { name: 'Identity evidence section' }), {
     target: { value: 'warnings' },
   });
@@ -352,4 +378,154 @@ it('opens referenced advisory warnings as bounded evidence without treating the 
   expect(screen.getByText(/Second retained warning/)).toBeVisible();
   expect(visited).toContain('warnings');
   expect(screen.getByRole('button', { name: 'This is me' })).toBeEnabled();
+});
+
+it('pins content-aware warning pages/fragments and resets the window for changed same-count warnings', async () => {
+  const { IdentityScopeEvidence } = await import('../../app/features/import/IdentityScopeEvidence');
+  const scope = {
+    ...review.scopeReference!,
+    collection: { ...review.scopeReference!.collection, questions: 0 },
+  };
+  const reference = (digest: string) => ({
+    format: 'health-intake-identity-warnings-v2' as const,
+    scopeToken: scope.scopeToken,
+    snapshotId: 'identity-warnings:' + scope.scopeToken + ':' + digest,
+    count: 1,
+    sha256: digest,
+  });
+  const old = reference('a'.repeat(64)),
+    fresh = reference('b'.repeat(64));
+  const bytes = Buffer.from('FICTIONAL EARLIER WARNING '.repeat(2000) + 'FINAL FICTIONAL WARNING');
+  const selectors: { route: string; snapshotId: string | null }[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid'),
+        section = url.searchParams.get('section');
+      if (section === 'warnings')
+        selectors.push({
+          route: url.pathname,
+          snapshotId: url.searchParams.get('snapshotId'),
+        });
+      if (url.pathname.endsWith('/identity-scope-fragment')) {
+        expect(url.searchParams.get('snapshotId')).toBe(old.snapshotId);
+        const offset = Number(url.searchParams.get('offset')),
+          end = Math.min(bytes.length, offset + 32768);
+        expect(url.searchParams.get('cursor')).toBe(offset ? 'fictional-next-fragment' : 'start');
+        return json({
+          encoding: 'base64',
+          data: bytes.subarray(offset, end).toString('base64'),
+          complete: end === bytes.length,
+          nextOffset: end === bytes.length ? null : end,
+          nextCursor: end === bytes.length ? null : 'fictional-next-fragment',
+        });
+      }
+      if (url.pathname.endsWith('/identity-scope-page')) {
+        const snapshotId = url.searchParams.get('snapshotId');
+        if (section === 'warnings')
+          return json({
+            format: 'health-intake-identity-scope-page-v2',
+            scopeToken: scope.scopeToken,
+            snapshotId,
+            section,
+            total: 1,
+            nextCursor: null,
+            items:
+              snapshotId === old.snapshotId
+                ? [
+                    {
+                      kind: 'reference',
+                      reference: {
+                        format: 'health-intake-identity-item-v2',
+                        scopeToken: scope.scopeToken,
+                        snapshotId,
+                        section,
+                        ordinal: 0,
+                        bytes: bytes.length,
+                      },
+                    },
+                  ]
+                : [{ kind: 'value', value: 'CURRENT FICTIONAL WARNING' }],
+          });
+        return json({
+          format: 'health-intake-identity-scope-page-v2',
+          scopeToken: scope.scopeToken,
+          section,
+          total: scope.collection.assignmentTargets,
+          items: [{ kind: 'value', value: 'Fictional target' }],
+          nextCursor: 'next-target',
+        });
+      }
+      throw Error('Unexpected fictional warning request');
+    }),
+  );
+  const props = { scope, onQuestionsReviewed: vi.fn(), onRefresh: vi.fn() };
+  const view = render(<IdentityScopeEvidence {...props} warningsReference={old} />);
+  fireEvent.click(
+    screen.getByRole('button', {
+      name: 'Inspect affected records and membership',
+    }),
+  );
+  fireEvent.change(screen.getByRole('combobox', { name: 'Identity evidence section' }), {
+    target: { value: 'warnings' },
+  });
+  fireEvent.click(await screen.findByRole('button', { name: 'Open evidence' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Next evidence page' }));
+  expect(await screen.findByText(/FINAL FICTIONAL WARNING/)).toBeVisible();
+  view.rerender(<IdentityScopeEvidence {...props} warningsReference={fresh} />);
+  expect(await screen.findByText(/CURRENT FICTIONAL WARNING/)).toBeVisible();
+  expect(screen.queryByText(/FINAL FICTIONAL WARNING/)).not.toBeInTheDocument();
+  expect(selectors.filter((item) => item.route.endsWith('/identity-scope-fragment'))).toHaveLength(
+    2,
+  );
+  expect(selectors.at(-1)?.snapshotId).toBe(fresh.snapshotId);
+});
+
+it('refuses a content-aware warning page returned from another snapshot', async () => {
+  const { IdentityScopeEvidence } = await import('../../app/features/import/IdentityScopeEvidence');
+  const scope = {
+    ...review.scopeReference!,
+    collection: { ...review.scopeReference!.collection, questions: 0 },
+  };
+  const snapshotId = 'identity-warnings:' + scope.scopeToken + ':' + 'a'.repeat(64);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid'),
+        section = url.searchParams.get('section');
+      return json({
+        format: 'health-intake-identity-scope-page-v2',
+        scopeToken: scope.scopeToken,
+        section,
+        snapshotId: section === 'warnings' ? 'another-warning-snapshot' : undefined,
+        total: section === 'warnings' ? 1 : scope.collection.assignmentTargets,
+        items: [{ kind: 'value', value: 'WRONG FICTIONAL WARNING' }],
+        nextCursor: section === 'warnings' ? null : 'next-target',
+      });
+    }),
+  );
+  render(
+    <IdentityScopeEvidence
+      scope={scope}
+      warningsReference={{
+        format: 'health-intake-identity-warnings-v2',
+        scopeToken: scope.scopeToken,
+        snapshotId,
+        count: 1,
+        sha256: 'a'.repeat(64),
+      }}
+      onQuestionsReviewed={vi.fn()}
+      onRefresh={vi.fn()}
+    />,
+  );
+  fireEvent.click(
+    screen.getByRole('button', {
+      name: 'Inspect affected records and membership',
+    }),
+  );
+  fireEvent.change(screen.getByRole('combobox', { name: 'Identity evidence section' }), {
+    target: { value: 'warnings' },
+  });
+  expect(await screen.findByRole('alert')).toHaveTextContent('identity evidence page changed');
+  expect(screen.queryByText(/WRONG FICTIONAL WARNING/)).not.toBeInTheDocument();
 });

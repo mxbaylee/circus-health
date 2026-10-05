@@ -77,10 +77,28 @@ export type IntakeCollectionChange = {
   | { op: 'append'; value: string }
   | { op: 'replace'; index: number; value: string }
   | { op: 'appendBytes'; bytes: Uint8Array }
-  | { op: 'putBytes'; key: string; fromArea: IntakeCollectionArea; fromCollection: string }
-  | { op: 'putCollection'; key: string; fromArea: IntakeCollectionArea; fromCollection: string }
+  | { op: 'adoptBytesReferenced'; value: IntakeByteValue }
+  | { op: 'replaceBytes'; index: number; bytes: Uint8Array }
+  /** Exactly one authenticated last leaf per bounded maintenance change. */
+  | { op: 'truncateBytes'; length: number }
+  | {
+      op: 'putBytes';
+      key: string;
+      fromArea: IntakeCollectionArea;
+      fromCollection: string;
+    }
+  | {
+      op: 'putCollection';
+      key: string;
+      fromArea: IntakeCollectionArea;
+      fromCollection: string;
+    }
   | { op: 'adoptReferenced'; value: IntakeCollectionValue }
-  | { op: 'adoptCollection'; fromArea: IntakeCollectionArea; fromCollection: string }
+  | {
+      op: 'adoptCollection';
+      fromArea: IntakeCollectionArea;
+      fromCollection: string;
+    }
 );
 export interface IntakeCollectionMutation {
   operationId: string;
@@ -144,7 +162,16 @@ interface Registry {
   views: WeakMap<IntakeCollectionView, ViewData>;
   preparations: Map<PreparedIntakeCollectionMutation, PreparedData>;
   preparedBytes: number;
-  byteValues: Map<IntakeByteValue, { prefix: string; root: IntakeTreeRoot }>;
+  byteValues: Map<
+    IntakeByteValue,
+    {
+      prefix: string;
+      logical: string;
+      root: IntakeTreeRoot;
+      bytes: number;
+      count: number;
+    }
+  >;
   collectionValues: Map<
     IntakeCollectionValue,
     { prefix: string; logical: string; descriptor: IntakeCollectionDescriptor }
@@ -500,7 +527,13 @@ export function createIntakeCollections(owner: {
       chunks: value.root?.count ?? 0,
     }) as IntakeByteValue;
     const registry = registryFor(db);
-    registry.byteValues.set(capability, { prefix, root: value.root });
+    registry.byteValues.set(capability, {
+      prefix,
+      logical: JSON.stringify(selected().head?.logical ?? null),
+      root: value.root,
+      bytes: value.bytes,
+      count: value.root?.count ?? 0,
+    });
     if (registry.byteValues.size > 128)
       registry.byteValues.delete(registry.byteValues.keys().next().value!);
     return capability;
@@ -538,6 +571,34 @@ export function createIntakeCollections(owner: {
     values.set(value, retained);
     return retained.descriptor;
   }
+  function referencedBytes(value: IntakeByteValue, pages: ReturnType<typeof tree>) {
+    const retained = registryFor(db).byteValues.get(value);
+    if (
+      !retained ||
+      retained.prefix !== prefix ||
+      retained.logical !== JSON.stringify(selected().head?.logical ?? null) ||
+      value.kind !== 'bytes' ||
+      value.bytes !== retained.bytes ||
+      value.chunks !== retained.count ||
+      (retained.root?.count ?? 0) !== retained.count
+    )
+      invalid('foreign, stale or expired byte reference');
+    if (retained.root) pages.load(retained.root);
+    else if (retained.bytes !== 0) invalid('empty byte reference size');
+    return {
+      kind: 'bytes' as const,
+      root: retained.root,
+      bytes: retained.bytes,
+    };
+  }
+  function checkedByteChunk(raw: string | undefined) {
+    if (raw === undefined) invalid('missing byte chunk');
+    if (raw.length > 5500) invalid('byte chunk representation');
+    const chunk = Buffer.from(raw, 'base64');
+    if (!chunk.length || chunk.length > 4096 || chunk.toString('base64') !== raw)
+      invalid('byte chunk representation');
+    return chunk;
+  }
   const api = {
     prepareLegacyBridge(input: {
       operationId: string;
@@ -549,7 +610,12 @@ export function createIntakeCollections(owner: {
         const legacy = parseIntakeHead(raw, identity, limits());
         if (!legacy) invalid('legacy bridge requires v3 authority');
         const view = Object.freeze({}) as IntakeCollectionView;
-        registryFor(db).views.set(view, { prefix, raw: raw as string, head: undefined, legacy });
+        registryFor(db).views.set(view, {
+          prefix,
+          raw: raw as string,
+          head: undefined,
+          legacy,
+        });
         try {
           return api.prepare(view, {
             ...input,
@@ -891,7 +957,10 @@ export function createIntakeCollections(owner: {
             break;
           }
           bytes += added;
-          items.push({ key: item.key, value: publicValue(item.value, source.kind) });
+          items.push({
+            key: item.key,
+            value: publicValue(item.value, source.kind),
+          });
           recordIntakeWork('collectionItemsRead');
         }
         if (!complete && !items.length) invalid('reference range item exceeds byte budget');
@@ -928,7 +997,10 @@ export function createIntakeCollections(owner: {
             break;
           }
           bytes += added;
-          items.push({ key: item.key, value: collectionValue(item.value, readTree) });
+          items.push({
+            key: item.key,
+            value: collectionValue(item.value, readTree),
+          });
           recordIntakeWork('collectionItemsRead');
         }
         if (!complete && !items.length) invalid('reference range item exceeds byte budget');
@@ -963,7 +1035,10 @@ export function createIntakeCollections(owner: {
             complete = false;
             break;
           }
-          items.push({ key: item.key, value: publicValue(item.value, collection!.kind) });
+          items.push({
+            key: item.key,
+            value: publicValue(item.value, collection!.kind),
+          });
           bytes += size;
           recordIntakeWork('collectionItemsRead');
         }
@@ -995,6 +1070,8 @@ export function createIntakeCollections(owner: {
           const chunk = Buffer.from(item.value, 'base64');
           if (!chunk.length || chunk.length > 4096 || chunk.toString('base64') !== item.value)
             invalid('byte chunk representation');
+          recordIntakeWork('collectionByteChunkReads');
+          recordIntakeWork('collectionByteChunkReadBytes', chunk.length);
           if (chunks.length === options.items || bytes + chunk.length > options.bytes) {
             complete = false;
             break;
@@ -1040,6 +1117,18 @@ export function createIntakeCollections(owner: {
           collectionName(change.collection);
           let root = change.area === 'logical' ? logical : builds;
           const old = descriptor(pages.get(root, change.collection));
+          if (change.op === 'adoptBytesReferenced') {
+            const adopted = referencedBytes(change.value, pages);
+            root = pages.put(root, change.collection, JSON.stringify(adopted));
+            if (change.area === 'logical') logical = root;
+            else builds = root;
+            changedCollections.set(change.area + ':' + change.collection, {
+              area: change.area,
+              name: change.collection,
+              keys: null,
+            });
+            continue;
+          }
           if (change.op === 'adoptCollection' || change.op === 'adoptReferenced') {
             if (
               change.op === 'adoptCollection' &&
@@ -1069,7 +1158,7 @@ export function createIntakeCollections(owner: {
           }
           const kind = ['put', 'delete', 'putBytes', 'putCollection'].includes(change.op)
             ? 'map'
-            : change.op === 'appendBytes'
+            : ['appendBytes', 'replaceBytes', 'truncateBytes'].includes(change.op)
               ? 'bytes'
               : 'sequence';
           if (old && old.kind !== kind) invalid('collection kind mismatch');
@@ -1093,7 +1182,11 @@ export function createIntakeCollections(owner: {
                 pages.get(change.fromArea === 'logical' ? logical : builds, change.fromCollection),
               );
               if (!source || source.kind !== 'bytes') invalid('byte attachment source');
-              value = JSON.stringify({ kind: 'bytes', root: source.root, bytes: source.bytes });
+              value = JSON.stringify({
+                kind: 'bytes',
+                root: source.root,
+                bytes: source.bytes,
+              });
             }
             if (change.op === 'putCollection') {
               if (change.fromArea !== 'logical' && change.fromArea !== 'builds')
@@ -1103,7 +1196,10 @@ export function createIntakeCollections(owner: {
                 pages.get(change.fromArea === 'logical' ? logical : builds, change.fromCollection),
               );
               if (!source) invalid('missing collection reference source');
-              value = JSON.stringify({ kind: 'collection', descriptor: source });
+              value = JSON.stringify({
+                kind: 'collection',
+                descriptor: source,
+              });
             }
             byteCount += valueBytes(value ?? undefined) - valueBytes(prior);
             values = pages.put(values, change.key, value);
@@ -1116,6 +1212,34 @@ export function createIntakeCollections(owner: {
             changedKey = key;
             byteCount += Buffer.byteLength(change.value) - valueBytes(prior);
             values = pages.put(values, key, inlineValue(change.value));
+          } else if (change.op === 'replaceBytes' || change.op === 'truncateBytes') {
+            const count = values?.count ?? 0;
+            const index = change.op === 'replaceBytes' ? change.index : count - 1;
+            if (change.op === 'truncateBytes') {
+              integer(change.length);
+              if (!count || change.length !== count - 1)
+                invalid('byte truncation must remove one suffix chunk');
+            } else {
+              integer(index);
+              if (index >= count) invalid('byte replacement index');
+              if (
+                !(change.bytes instanceof Uint8Array) ||
+                !change.bytes.length ||
+                change.bytes.length > 4096
+              )
+                invalid('byte chunk budget');
+            }
+            changedKey = orderedKey(index);
+            const prior = checkedByteChunk(pages.get(values, changedKey));
+            if (change.op === 'replaceBytes') {
+              const chunk = Buffer.from(change.bytes);
+              values = pages.put(values, changedKey, chunk.toString('base64'));
+              byteCount += chunk.length - prior.length;
+            } else {
+              values = pages.put(values, changedKey, null);
+              byteCount -= prior.length;
+              if (!values && byteCount !== 0) invalid('empty byte collection size');
+            }
           } else if (change.op === 'appendBytes') {
             if (
               !(change.bytes instanceof Uint8Array) ||

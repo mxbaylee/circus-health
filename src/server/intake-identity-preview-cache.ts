@@ -1,3 +1,5 @@
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { HttpError } from './database.ts';
 /** Detached bounded presentation only. This never grants confirmation authority. */
 import type { DatabaseSync } from 'node:sqlite';
 import type { IntakeIdentityReview } from '../shared/intake-identity.ts';
@@ -11,6 +13,95 @@ const previews = new WeakMap<
 >();
 const epochs = new WeakMap<DatabaseSync, object>();
 const observed = new WeakSet<DatabaseSync>();
+const fragmentKeys = new WeakMap<DatabaseSync, Buffer>();
+export interface NativeIdentityFragmentPosition {
+  offset: number;
+  after: string | null;
+  skip: number;
+}
+function fragmentCursorFailure(): never {
+  throw new HttpError(409, 'IDENTITY_SCOPE_CURSOR', 'Reload this identity evidence fragment');
+}
+function fragmentPosition(value: unknown): value is NativeIdentityFragmentPosition {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const p = value as NativeIdentityFragmentPosition;
+  return (
+    Object.keys(p).sort().join(',') === 'after,offset,skip' &&
+    Number.isSafeInteger(p.offset) &&
+    p.offset >= 0 &&
+    (p.after === null || (typeof p.after === 'string' && /^[0-9]{16}$/.test(p.after))) &&
+    Number.isSafeInteger(p.skip) &&
+    p.skip >= 0 &&
+    p.skip < 4096
+  );
+}
+/** Presentation continuation only; no evidence or confirmation authority is minted. */
+export function sealNativeIdentityFragmentCursor(
+  db: DatabaseSync,
+  epoch: object,
+  binding: string,
+  position: NativeIdentityFragmentPosition,
+): string {
+  if (
+    !db.isOpen ||
+    db.isTransaction ||
+    !nativeIdentityPreviewCurrent(db, epoch) ||
+    !/^[a-f0-9]{64}$/.test(binding) ||
+    !fragmentPosition(position)
+  )
+    fragmentCursorFailure();
+  let key = fragmentKeys.get(db);
+  if (!key) {
+    key = randomBytes(32);
+    fragmentKeys.set(db, key);
+  }
+  const text = JSON.stringify(['health-intake-identity-fragment-v1', binding, position]);
+  return (
+    Buffer.from(text).toString('base64url') +
+    '.' +
+    createHmac('sha256', key).update(text).digest('hex')
+  );
+}
+export function openNativeIdentityFragmentCursor(
+  db: DatabaseSync,
+  epoch: object,
+  binding: string,
+  cursor: string,
+  offset: number,
+): NativeIdentityFragmentPosition {
+  const key = fragmentKeys.get(db);
+  if (
+    !db.isOpen ||
+    db.isTransaction ||
+    !nativeIdentityPreviewCurrent(db, epoch) ||
+    !key ||
+    typeof cursor !== 'string' ||
+    cursor.length > 2048
+  )
+    fragmentCursorFailure();
+  const match = /^([A-Za-z0-9_-]+)\.([a-f0-9]{64})$/.exec(cursor);
+  if (!match) fragmentCursorFailure();
+  const bytes = Buffer.from(match[1]!, 'base64url');
+  if (bytes.toString('base64url') !== match[1]) fragmentCursorFailure();
+  const expected = createHmac('sha256', key).update(bytes).digest();
+  if (!timingSafeEqual(expected, Buffer.from(match[2]!, 'hex'))) fragmentCursorFailure();
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    fragmentCursorFailure();
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length !== 3 ||
+    value[0] !== 'health-intake-identity-fragment-v1' ||
+    value[1] !== binding ||
+    !fragmentPosition(value[2]) ||
+    value[2].offset !== offset
+  )
+    fragmentCursorFailure();
+  return value[2];
+}
 function observe(db: DatabaseSync) {
   if (observed.has(db)) return;
   observeDatabaseClose(db, () => {
@@ -36,6 +127,8 @@ export function nativeIdentityPreviewCurrent(db: DatabaseSync, epoch: object) {
   return epochs.get(db) === epoch;
 }
 export function clearNativeIdentityPreviews(db: DatabaseSync) {
+  fragmentKeys.get(db)?.fill(0);
+  fragmentKeys.delete(db);
   previews.delete(db);
   epochs.set(db, {});
 }

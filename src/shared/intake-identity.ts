@@ -73,6 +73,12 @@ export interface IntakeIdentityReview {
   /** A corrected association for this printed name needs a separate future-use choice. */
   challengedName?: string;
   correctedPerson?: { personId: string; fullName: string };
+  /** Complete native scope except global version, plus ordered advisory warnings.
+   * Historical views may omit this proof and cannot be automatically rebound. */
+  evidenceCommitment?: {
+    format: 'health-intake-identity-evidence-v1';
+    sha256: string;
+  };
   scope: IntakeIdentityScope | null;
   scopeReference?: IntakeIdentityScopeReference;
   scopeFragmentReference?: import('./intake-clinical-pages.ts').IntakeReviewFragmentReference;
@@ -85,12 +91,21 @@ export interface IntakeIdentityReview {
   conflicts: IntakeIdentityConflict[];
   warnings?: IntakeIdentityWarning[];
   /** Explicit complete advisory collection when warnings do not fit the inline view. */
-  warningsReference?: {
-    format: 'health-intake-identity-warnings-v1';
-    scopeToken: string;
-    snapshotId: string;
-    count: number;
-  };
+  warningsReference?:
+    | {
+        format: 'health-intake-identity-warnings-v1';
+        scopeToken: string;
+        snapshotId: string;
+        count: number;
+      }
+    | {
+        format: 'health-intake-identity-warnings-v2';
+        scopeToken: string;
+        /** Content-aware warning binding; the report scope snapshot is unchanged. */
+        snapshotId: string;
+        count: number;
+        sha256: string;
+      };
 }
 
 export interface IntakeIdentityAnswers {
@@ -161,6 +176,8 @@ export type IntakeIdentityScopeSection =
 export interface IntakeIdentityScopePage {
   format: 'health-intake-identity-scope-page-v2';
   scopeToken: string;
+  /** Present only for an explicit content-aware warning snapshot selection. */
+  snapshotId?: string;
   section: IntakeIdentityScopeSection;
   total: number;
   items: (
@@ -170,6 +187,8 @@ export interface IntakeIdentityScopePage {
         reference: {
           format: 'health-intake-identity-item-v2';
           scopeToken: string;
+          /** Pins a content-aware warning fragment across pages. */
+          snapshotId?: string;
           section: IntakeIdentityScopeSection;
           ordinal: number;
           bytes: number;

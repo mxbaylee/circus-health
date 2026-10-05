@@ -7,6 +7,7 @@ import {
 } from '../../app/features/intake/ClinicalReviewPages';
 import { ReferencedClinicalRecord } from '../../app/features/intake/ReferencedClinicalRecord';
 import { CollectionImportReview } from '../../app/features/import/CollectionImportReview';
+import { CollectionEvidenceWindow } from '../../app/features/intake/CollectionEvidenceWindow';
 import { readSelectedClinicalReview } from '../../app/data/intake-clinical-review';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
 import type {
@@ -19,7 +20,11 @@ import type { CollectionImportFeed } from '../../shared/intake-clinical-pages';
 vi.mock('../../app/features/import/ImportSourceTextBrowser', () => ({
   ImportSourceTextBrowser: () => <p>Retained original browser</p>,
 }));
-const profile = { id: 'fictional-clinical-page', name: 'Fictional Reader', placebo: true };
+const profile = {
+  id: 'fictional-clinical-page',
+  name: 'Fictional Reader',
+  placebo: true,
+};
 const context: IntakeClinicalReviewContext = {
   intakeId: 'fictional-intake',
   proposalId: 'fictional-proposal',
@@ -107,7 +112,11 @@ it('holds only one 32 KiB evidence window and requires every sequential page bef
         return json(fragment(body.offset));
       }
       if (url.includes('/review-record?'))
-        return json({ format: 'health-intake-clinical-record-v2', context, record });
+        return json({
+          format: 'health-intake-clinical-record-v2',
+          context,
+          record,
+        });
       if (url.endsWith('/report-acceptance')) {
         const body = JSON.parse(String(init?.body));
         writes.push(body);
@@ -142,7 +151,12 @@ it('holds only one 32 KiB evidence window and requires every sequential page bef
             ],
           },
           replayed: false,
-          durability: { pending: false, mutationRevision: 8, persistedRevision: 8, error: null },
+          durability: {
+            pending: false,
+            mutationRevision: 8,
+            persistedRevision: 8,
+            error: null,
+          },
         });
       }
       throw new Error(`Unexpected request ${url}`);
@@ -157,7 +171,9 @@ it('holds only one 32 KiB evidence window and requires every sequential page bef
       onBack={vi.fn()}
     />,
   );
-  const save = screen.getByRole('button', { name: 'Save reviewed clinical record' });
+  const save = screen.getByRole('button', {
+    name: 'Save reviewed clinical record',
+  });
   expect(save).toBeDisabled();
   fireEvent.click(screen.getByRole('button', { name: 'Open evidence' }));
   await screen.findByRole('button', { name: 'Next evidence page' });
@@ -203,12 +219,20 @@ it('refuses a stale reference at final approval without posting a clinical mutat
     vi.fn(async (input) => {
       const url = String(input);
       if (url.includes('/review-fragment'))
-        return json({ encoding: 'base64', data: 'eA==', complete: true, nextOffset: null });
+        return json({
+          encoding: 'base64',
+          data: 'eA==',
+          complete: true,
+          nextOffset: null,
+        });
       if (url.includes('/review-record?'))
         return json({
           format: 'health-intake-clinical-record-v2',
           context,
-          record: { ...small, selection: { ...small.selection, selectionReviewToken: 'changed' } },
+          record: {
+            ...small,
+            selection: { ...small.selection, selectionReviewToken: 'changed' },
+          },
         });
       posts++;
       return json({});
@@ -308,7 +332,10 @@ it('opens independent source-context pages without accumulating previous values'
               {
                 kind: 'value',
                 ordinal: 40,
-                value: { label: 'Second fictional gap', detail: 'Second missing date' },
+                value: {
+                  label: 'Second fictional gap',
+                  detail: 'Second missing date',
+                },
               },
             ],
             nextCursor: null,
@@ -376,7 +403,11 @@ it('keeps native feed totals complete while replacing the single displayed windo
       extractionUnknownFiles: 1,
       extractionComplete: false,
       allCurrentReportsReviewed: false,
-      readingAccounting: { state: 'referenced', scope: 'full', binding: 'pinned' },
+      readingAccounting: {
+        state: 'referenced',
+        scope: 'full',
+        binding: 'pinned',
+      },
     },
   };
   const row = (id: string) => ({
@@ -444,7 +475,12 @@ it('accepts a referenced named person only after evidence pages and sends exact 
         body = JSON.parse(String(init?.body));
       requests.push({ url, body });
       if (url.endsWith('/people-fragment'))
-        return json({ encoding: 'base64', data: 'eA==', nextOffset: null, complete: true });
+        return json({
+          encoding: 'base64',
+          data: 'eA==',
+          nextOffset: null,
+          complete: true,
+        });
       if (url.endsWith('/people-apply')) return json({ status: 'saved' });
       throw new Error(`Unexpected request ${url}`);
     }),
@@ -474,7 +510,13 @@ it('accepts a referenced named person only after evidence pages and sends exact 
               },
               policy: { selfMatch: false, canAdd: true },
               matches: {
-                items: [{ noteId: 'retained-note', version: 4, title: 'Fictional match' }],
+                items: [
+                  {
+                    noteId: 'retained-note',
+                    version: 4,
+                    title: 'Fictional match',
+                  },
+                ],
                 total: 1,
                 truncated: false,
               },
@@ -518,7 +560,10 @@ for (const changedAuthority of [false, true])
       confidence: 1,
       uncertainties: [],
       evidence: [],
-      mapping: { kind: 'document' as const, documentTitle: 'Fictional summary' },
+      mapping: {
+        kind: 'document' as const,
+        documentTitle: 'Fictional summary',
+      },
       supportedFields: [],
       candidateId: 'candidate',
       candidateVersionId: 'version',
@@ -588,7 +633,11 @@ for (const changedAuthority of [false, true])
         extractionUnknownFiles: 0,
         extractionComplete: true,
         allCurrentReportsReviewed: false,
-        readingAccounting: { state: 'referenced', scope: 'full', binding: 'pinned' },
+        readingAccounting: {
+          state: 'referenced',
+          scope: 'full',
+          binding: 'pinned',
+        },
       },
     };
     const writes: Record<string, unknown>[] = [];
@@ -625,7 +674,12 @@ for (const changedAuthority of [false, true])
               receipts: [],
             },
             replayed: false,
-            durability: { pending: false, mutationRevision: 8, persistedRevision: 8, error: null },
+            durability: {
+              pending: false,
+              mutationRevision: 8,
+              persistedRevision: 8,
+              error: null,
+            },
           });
         }
         throw new Error(`Unexpected request ${url}`);
@@ -700,7 +754,11 @@ it('confirms the complete paged report source scope and retains the exact operat
       total: 10001,
       status: 'mixed',
       sourceCount: 1,
-      bySource: { items: [{ source: 'Fictional Clinic', count: 1 }], total: 1, nextCursor: null },
+      bySource: {
+        items: [{ source: 'Fictional Clinic', count: 1 }],
+        total: 1,
+        nextCursor: null,
+      },
     },
     sourceEvidence: { items: [], total: 0, nextCursor: null },
     conflictingSourceEvidence: false,
@@ -716,7 +774,10 @@ it('confirms the complete paged report source scope and retains the exact operat
         writes.push(JSON.parse(String(init?.body)));
         if (writes.length === 1)
           return json(
-            { code: 'UNCERTAIN', message: 'Fictional connection lost after publication.' },
+            {
+              code: 'UNCERTAIN',
+              message: 'Fictional connection lost after publication.',
+            },
             503,
           );
         return json({});
@@ -789,3 +850,244 @@ it('pins a generic field fragment total and refuses an inconsistent later respon
   expect(await screen.findByRole('alert')).toHaveTextContent('This evidence page changed');
   expect(reads).toBe(2);
 });
+
+it('carries identity continuations through split UTF-8 bytes and restarts after completion', async () => {
+  const bytes = Buffer.from('A😀Z'),
+    inspected = vi.fn(),
+    requests: Array<{ offset: number; cursor: string | null }> = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid'),
+        offset = Number(url.searchParams.get('offset')),
+        end = offset ? bytes.length : 3;
+      requests.push({ offset, cursor: url.searchParams.get('cursor') });
+      return json({
+        encoding: 'base64',
+        data: bytes.subarray(offset, end).toString('base64'),
+        complete: end === bytes.length,
+        nextOffset: end === bytes.length ? null : end,
+        nextCursor: end === bytes.length ? null : 'fictional/signed+cursor=one',
+      });
+    }),
+  );
+  render(
+    <CollectionEvidenceWindow
+      scope="fictional-identity"
+      label="Identity bytes"
+      path="/intakes/fictional/identity-scope-fragment?section=questions"
+      method="GET"
+      continuation
+      bytes={bytes.length}
+      body={{}}
+      onRefresh={vi.fn()}
+      onInspected={inspected}
+    />,
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Open evidence' }));
+  await screen.findByRole('button', { name: 'Next evidence page' });
+  expect(inspected).not.toHaveBeenCalledWith(true);
+  expect(screen.getByText('A')).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Next evidence page' }));
+  await screen.findByRole('button', { name: 'Read evidence again' });
+  expect(screen.getByText('😀Z')).toBeVisible();
+  expect(inspected).toHaveBeenLastCalledWith(true);
+  fireEvent.click(screen.getByRole('button', { name: 'Read evidence again' }));
+  await screen.findByRole('button', { name: 'Next evidence page' });
+  expect(requests).toEqual([
+    { offset: 0, cursor: 'start' },
+    { offset: 3, cursor: 'fictional/signed+cursor=one' },
+    { offset: 0, cursor: 'start' },
+  ]);
+  expect(inspected).toHaveBeenLastCalledWith(false);
+});
+
+it('drops the continuation and a late old page when the evidence scope changes', async () => {
+  let finish: ((response: Response) => void) | undefined;
+  const requests: Array<{ offset: string | null; cursor: string | null }> = [],
+    inspected = vi.fn();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      requests.push({
+        offset: url.searchParams.get('offset'),
+        cursor: url.searchParams.get('cursor'),
+      });
+      if (requests.length === 2)
+        return new Promise<Response>((resolve) => {
+          finish = resolve;
+        });
+      return json({
+        encoding: 'base64',
+        data: 'QQ==',
+        complete: false,
+        nextOffset: 1,
+        nextCursor: 'fictional-continuation-' + requests.length,
+      });
+    }),
+  );
+  const props = {
+    label: 'Identity bytes',
+    path: '/intakes/fictional/identity-scope-fragment',
+    method: 'GET' as const,
+    continuation: true,
+    bytes: 2,
+    body: {},
+    onRefresh: vi.fn(),
+    onInspected: inspected,
+  };
+  const view = render(<CollectionEvidenceWindow {...props} scope="old-identity" />);
+  fireEvent.click(screen.getByRole('button', { name: 'Open evidence' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Next evidence page' }));
+  await waitFor(() => expect(finish).toBeDefined());
+  view.rerender(<CollectionEvidenceWindow {...props} scope="current-identity" />);
+  await act(async () =>
+    finish!(
+      json({
+        encoding: 'base64',
+        data: 'Wg==',
+        complete: true,
+        nextOffset: null,
+        nextCursor: null,
+      }),
+    ),
+  );
+  expect(inspected).not.toHaveBeenCalledWith(true);
+  expect(screen.queryByText('Z')).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Open evidence' }));
+  await screen.findByRole('button', { name: 'Next evidence page' });
+  expect(requests).toEqual([
+    { offset: '0', cursor: 'start' },
+    { offset: '1', cursor: 'fictional-continuation-1' },
+    { offset: '0', cursor: 'start' },
+  ]);
+});
+
+it.each([
+  ['missing', undefined],
+  ['empty', ''],
+  ['start sentinel', 'start'],
+  ['oversized', 'x'.repeat(2049)],
+  ['nonstring', 7],
+])('refuses a %s identity continuation without advancing inspection', async (_name, nextCursor) => {
+  const inspected = vi.fn();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      json({
+        encoding: 'base64',
+        data: 'QQ==',
+        complete: false,
+        nextOffset: 1,
+        nextCursor,
+      }),
+    ),
+  );
+  render(
+    <CollectionEvidenceWindow
+      scope="fictional-identity"
+      label="Identity bytes"
+      path="/intakes/fictional/identity-scope-fragment"
+      method="GET"
+      continuation
+      bytes={2}
+      body={{}}
+      onRefresh={vi.fn()}
+      onInspected={inspected}
+    />,
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Open evidence' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('This evidence page changed');
+  expect(screen.getByRole('button', { name: 'Open evidence' })).toBeEnabled();
+  expect(screen.queryByText('A')).not.toBeInTheDocument();
+  expect(inspected).not.toHaveBeenCalledWith(true);
+});
+
+it('refuses an expired identity continuation without retrying in numeric-only mode', async () => {
+  const cursors: Array<string | null> = [],
+    inspected = vi.fn();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      cursors.push(url.searchParams.get('cursor'));
+      return cursors.length === 1
+        ? json({
+            encoding: 'base64',
+            data: 'QQ==',
+            complete: false,
+            nextOffset: 1,
+            nextCursor: 'fictional-expired-cursor',
+          })
+        : json(
+            {
+              code: 'IDENTITY_SCOPE_CURSOR',
+              message: 'Refresh expired identity evidence',
+            },
+            409,
+          );
+    }),
+  );
+  render(
+    <CollectionEvidenceWindow
+      scope="fictional-identity"
+      label="Identity bytes"
+      path="/intakes/fictional/identity-scope-fragment"
+      method="GET"
+      continuation
+      bytes={2}
+      body={{}}
+      onRefresh={vi.fn()}
+      onInspected={inspected}
+    />,
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Open evidence' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Next evidence page' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('Refresh expired identity evidence');
+  expect(cursors).toEqual(['start', 'fictional-expired-cursor']);
+  expect(inspected).not.toHaveBeenCalledWith(true);
+});
+
+it.each(['repeated', 'completed-with-cursor', 'completed-without-cursor'])(
+  'refuses a %s continuation response before declaring the evidence inspected',
+  async (kind) => {
+    let reads = 0;
+    const inspected = vi.fn();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        const first = ++reads === 1,
+          complete = !first && kind !== 'repeated';
+        return json({
+          encoding: 'base64',
+          data: first ? 'QQ==' : 'Wg==',
+          complete,
+          nextOffset: complete ? null : first ? 1 : 2,
+          ...(kind === 'completed-without-cursor' && !first
+            ? {}
+            : { nextCursor: 'fictional-repeated-cursor' }),
+        });
+      }),
+    );
+    render(
+      <CollectionEvidenceWindow
+        scope="fictional-identity"
+        label="Identity bytes"
+        path="/intakes/fictional/identity-scope-fragment"
+        method="GET"
+        continuation
+        bytes={kind === 'repeated' ? 3 : 2}
+        body={{}}
+        onRefresh={vi.fn()}
+        onInspected={inspected}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Open evidence' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Next evidence page' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('This evidence page changed');
+    expect(screen.getByText('A')).toBeVisible();
+    expect(screen.queryByText('Z')).not.toBeInTheDocument();
+    expect(inspected).not.toHaveBeenCalledWith(true);
+  },
+);

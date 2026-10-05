@@ -12,6 +12,7 @@ export function CollectionEvidenceWindow({
   path,
   body,
   method = 'POST',
+  continuation = false,
   onRefresh,
   onInspected,
 }: {
@@ -21,16 +22,18 @@ export function CollectionEvidenceWindow({
   path: string;
   body: Record<string, unknown>;
   method?: 'GET' | 'POST';
+  continuation?: boolean;
   onRefresh: () => void;
   onInspected?: (value: boolean) => void;
 }) {
   const profile = useProfile();
-  const scope = JSON.stringify([profile?.id, referenceScope]);
+  const scope = JSON.stringify([profile?.id, referenceScope, continuation]);
   const [window, setWindow] = useState<{
     text: string;
     next: number | null;
     offset: number;
     total: number;
+    cursor?: string | null;
   }>();
   const [busy, setBusy] = useState(false),
     [error, setError] = useState('');
@@ -58,6 +61,7 @@ export function CollectionEvidenceWindow({
     const controller = new AbortController();
     request.current = controller;
     const offset = window?.next ?? 0;
+    const cursor = continuation ? (offset ? window?.cursor : 'start') : undefined;
     if (!offset) {
       decoder.current = new TextDecoder('utf-8', { fatal: true });
       inspected.current?.(false);
@@ -71,14 +75,24 @@ export function CollectionEvidenceWindow({
         complete: boolean;
         nextOffset: number | null;
         totalBytes?: number;
+        nextCursor?: string | null;
       }>(
         method === 'GET'
-          ? `${path}${path.includes('?') ? '&' : '?'}offset=${offset}&bytes=32768`
+          ? `${path}${path.includes('?') ? '&' : '?'}offset=${offset}&bytes=32768${continuation ? `&cursor=${encodeURIComponent(cursor!)}` : ''}`
           : path,
         {
           method,
           signal: controller.signal,
-          ...(method === 'POST' ? { body: JSON.stringify({ ...body, offset, bytes: 32768 }) } : {}),
+          ...(method === 'POST'
+            ? {
+                body: JSON.stringify({
+                  ...body,
+                  offset,
+                  bytes: 32768,
+                  ...(continuation ? { cursor } : {}),
+                }),
+              }
+            : {}),
         },
       );
       if (controller.signal.aborted || active.current !== scope) return;
@@ -94,7 +108,15 @@ export function CollectionEvidenceWindow({
         chunk.length > 32768 ||
         end > total ||
         data.complete !== (end === total) ||
-        (data.complete ? data.nextOffset !== null : data.nextOffset !== end || end <= offset)
+        (data.complete ? data.nextOffset !== null : data.nextOffset !== end || end <= offset) ||
+        (continuation &&
+          (data.complete
+            ? data.nextCursor !== null
+            : typeof data.nextCursor !== 'string' ||
+              !data.nextCursor.length ||
+              data.nextCursor.length > 2048 ||
+              data.nextCursor === 'start' ||
+              data.nextCursor === cursor))
       )
         throw new Error('This evidence page changed. Refresh the report.');
       setWindow({
@@ -102,6 +124,7 @@ export function CollectionEvidenceWindow({
         total: total!,
         text: decoder.current.decode(chunk, { stream: !data.complete }),
         next: data.nextOffset,
+        ...(continuation ? { cursor: data.nextCursor } : {}),
       });
       inspected.current?.(data.complete);
     } catch (cause) {

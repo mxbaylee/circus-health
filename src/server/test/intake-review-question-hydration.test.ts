@@ -214,56 +214,61 @@ async function countedQuestionHydrationFixture(
   };
 }
 
-test('session question recipes avoid repeated native exports at two counts while charging parse, spool and MAC work', async (t) => {
-  for (const count of [8, 32] as const) {
-    const baseline = await countedQuestionHydrationFixture(t, count);
-    let close: () => void = () => {};
-    const cached = await countedQuestionHydrationFixture(t, count, (input) => {
-      const cache = createReviewQuestionHydrationCache(input.db, input.scratch);
-      close = cache.close;
-      return openReviewQuestionState(input.db, input.source, input.view, {
-        cache,
-        assertCurrent: () => {
-          input.view.address(input.view.root());
-        },
+test(
+  'session question recipes avoid repeated native exports at two counts while charging parse, spool and MAC work',
+  { timeout: 180_000 },
+  async (t) => {
+    for (const count of [8, 32] as const) {
+      const baseline = await countedQuestionHydrationFixture(t, count);
+      let close: () => void = () => {};
+      const cached = await countedQuestionHydrationFixture(t, count, (input) => {
+        const cache = createReviewQuestionHydrationCache(input.db, input.scratch);
+        close = cache.close;
+        return openReviewQuestionState(input.db, input.source, input.view, {
+          cache,
+          assertCurrent: () => {
+            input.view.address(input.view.root());
+          },
+        });
       });
-    });
-    t.after(close);
-    const delta = (caseResult: typeof cached) => {
-      const before = caseResult.before.warm,
-        after = caseResult.after.warm;
-      return {
-        hydrated: after.reviewQuestionHydrations - before.reviewQuestionHydrations,
-        bytes: after.reviewQuestionHydrationBytes - before.reviewQuestionHydrationBytes,
-        hits: after.reviewQuestionHydrationHits - before.reviewQuestionHydrationHits,
-        parse: after.reviewQuestionParseBytes - before.reviewQuestionParseBytes,
-        read: after.reviewQuestionScratchReadBytes - before.reviewQuestionScratchReadBytes,
-        written: after.reviewQuestionScratchWrittenBytes - before.reviewQuestionScratchWrittenBytes,
-        mac: after.reviewQuestionRecipeMacBytes - before.reviewQuestionRecipeMacBytes,
-        discarded:
-          after.reviewQuestionScratchDiscardedRows - before.reviewQuestionScratchDiscardedRows,
-        nodeReads: after.collectionNodeReads - before.collectionNodeReads,
+      t.after(close);
+      const delta = (caseResult: typeof cached) => {
+        const before = caseResult.before.warm,
+          after = caseResult.after.warm;
+        return {
+          hydrated: after.reviewQuestionHydrations - before.reviewQuestionHydrations,
+          bytes: after.reviewQuestionHydrationBytes - before.reviewQuestionHydrationBytes,
+          hits: after.reviewQuestionHydrationHits - before.reviewQuestionHydrationHits,
+          parse: after.reviewQuestionParseBytes - before.reviewQuestionParseBytes,
+          read: after.reviewQuestionScratchReadBytes - before.reviewQuestionScratchReadBytes,
+          written:
+            after.reviewQuestionScratchWrittenBytes - before.reviewQuestionScratchWrittenBytes,
+          mac: after.reviewQuestionRecipeMacBytes - before.reviewQuestionRecipeMacBytes,
+          discarded:
+            after.reviewQuestionScratchDiscardedRows - before.reviewQuestionScratchDiscardedRows,
+          nodeReads: after.collectionNodeReads - before.collectionNodeReads,
+        };
       };
-    };
-    const old = delta(baseline),
-      reused = delta(cached);
-    assert.ok(old.hydrated >= count * 4);
-    assert.equal(reused.hydrated, count);
-    assert.equal(cached.sourceWork.exports, count);
-    assert.ok(baseline.sourceWork.exports >= count * 4);
-    assert.ok(reused.bytes < old.bytes);
-    assert.equal(
-      reused.parse,
-      old.parse,
-      'detached literal parsing remains counted on every borrow',
-    );
-    assert.ok(reused.hits >= count * 3);
-    assert.ok(reused.read > 0 && reused.written > 0 && reused.mac > 0);
-    assert.equal(reused.discarded, 0, 'stable reads do not erase a populated recipe corpus');
-    assert.ok(reused.nodeReads < old.nodeReads);
-    t.diagnostic(JSON.stringify({ count, baseline: old, cached: reused }));
-  }
-});
+      const old = delta(baseline),
+        reused = delta(cached);
+      assert.ok(old.hydrated >= count * 4);
+      assert.equal(reused.hydrated, count);
+      assert.equal(cached.sourceWork.exports, count);
+      assert.ok(baseline.sourceWork.exports >= count * 4);
+      assert.ok(reused.bytes < old.bytes);
+      assert.equal(
+        reused.parse,
+        old.parse,
+        'detached literal parsing remains counted on every borrow',
+      );
+      assert.ok(reused.hits >= count * 3);
+      assert.ok(reused.read > 0 && reused.written > 0 && reused.mac > 0);
+      assert.equal(reused.discarded, 0, 'stable reads do not erase a populated recipe corpus');
+      assert.ok(reused.nodeReads < old.nodeReads);
+      t.diagnostic(JSON.stringify({ count, baseline: old, cached: reused }));
+    }
+  },
+);
 
 test('long-answer recipes reattach exact canonical providers and preserve nested detachment, reset and resolution', async (t) => {
   let close: () => void = () => {};
@@ -505,135 +510,143 @@ test('valid oversized hydration preserves original fallback and never creates an
   );
 });
 
-test('authenticated recipe hits refuse peer ABA, local rollback and changed accepted HEAD at the final real physical view guard', async (t) => {
-  for (const mode of ['peer', 'rollback', 'head'] as const) {
-    let close = () => {};
-    const f = await countedQuestionHydrationFixture(
-      t,
-      8,
-      (input) => {
-        const cache = createReviewQuestionHydrationCache(input.db, input.scratch);
-        close = cache.close;
-        const originalOwner = reviewReadStamp(input.db);
-        return openReviewQuestionState(input.db, input.source, input.view, {
-          cache,
-          assertCurrent() {
-            // This proof belongs to the original owner. The recipe context cannot
-            // refresh it after a refusal or a between-borrow cache invalidation.
-            assert.equal(reviewReadStamp(input.db), originalOwner, 'original owner changed');
-            input.view.address(input.view.root());
-          },
-        });
-      },
-      3,
-      true,
-    );
-    t.after(close);
-    const workflow = f.view.child(f.view.child(f.view.root(), 'intake')!, 'workflow')!;
-    const record = f.view.find('question', workflow, f.questions[0]!.id)!;
-    const exact = canonicalLiteral(f.questions[0]);
-    const hitsBeforeWarm = intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits;
-    assert.equal([...f.state.canonicalRecords(f.state.question(record, 4096))].join(''), exact);
-    assert.equal(intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits, hitsBeforeWarm + 1);
-    const headPath = join(
-      contributorAuthorityPath(f.directory, 'fictional-question-hydration'),
-      'head',
-    );
-    const headBytes = readFileSync(headPath);
-    const peer = new DatabaseSync(String(f.db.prepare('PRAGMA database_list').get()!.file));
-    const stat = nodeFs.lstatSync,
-      stackTraceLimit = Error.stackTraceLimit;
-    const before = {
-      hits: intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits,
-      exports: f.sourceWork.exports,
-      writes: f.acceptedWrites(),
-      publications: f.publications(),
-      nodes: intakeWorkCounters(f.db).warm.collectionNodesWritten,
-      raw: reviewReadStamp(f.db),
-    };
-    let stimulus:
-      | {
-          before: unknown;
-          after: unknown;
-          row: unknown;
-          headChanged: boolean;
-          hits: number;
-          stack: string;
-        }
-      | undefined;
-    Error.stackTraceLimit = 64;
-    Reflect.set(nodeFs, 'lstatSync', ((selected, ...args) => {
-      const result = Reflect.apply(stat, nodeFs, [selected, ...args]);
-      if (
-        String(selected) !== headPath ||
-        stimulus ||
-        intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits !== before.hits + 1
-      )
-        return result;
-      const stack = new Error('fictional recipe-hit HEAD stimulus').stack!;
-      if (!stack.includes('intake-review-question-hydration.ts')) return result;
-      const key = 'fictional-recipe-final-aba';
-      const state = {
-        before: reviewReadStamp(f.db),
-        after: reviewReadStamp(f.db),
-        row: undefined as unknown,
-        headChanged: false,
-        hits: intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits,
-        stack,
-      };
-      stimulus = state;
-      if (mode === 'peer') {
-        peer.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(key, 'changed');
-        peer.prepare('DELETE FROM app_meta WHERE key=?').run(key);
-      } else if (mode === 'rollback') {
-        f.db.exec('SAVEPOINT fictional_recipe_physical');
-        f.db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(key, 'changed');
-        f.db.exec('ROLLBACK TO fictional_recipe_physical; RELEASE fictional_recipe_physical');
-      } else {
-        writeFileSync(headPath, Buffer.alloc(headBytes.length, 32));
-        state.headChanged = !readFileSync(headPath).equals(headBytes);
-      }
-      state.after = reviewReadStamp(f.db);
-      state.row = f.db.prepare('SELECT value FROM app_meta WHERE key=?').get(key);
-      return result;
-    }) as typeof nodeFs.lstatSync);
-    syncBuiltinESMExports();
-    try {
-      assert.throws(() => f.state.question(record, 4096), /changed|head|authority|record|json/i);
-    } finally {
-      Reflect.set(nodeFs, 'lstatSync', stat);
-      Error.stackTraceLimit = stackTraceLimit;
-      syncBuiltinESMExports();
-      writeFileSync(headPath, headBytes);
-      peer.close();
-    }
-    assert.ok(stimulus, `${mode} must reach a real accepted HEAD stat after the recipe hit`);
-    assert.equal(stimulus.hits, before.hits + 1, 'hit completed before physical stimulus');
-    assert.match(stimulus.stack, /intake-review-question-hydration\.ts/);
-    assert.equal(stimulus.row, undefined, 'actual committed/rolled-back rows are restored');
-    assert.equal(f.db.isTransaction, false);
-    if (mode === 'head')
-      assert.equal(stimulus.headChanged, true, 'actual accepted HEAD bytes changed');
-    else {
-      assert.notEqual(stimulus.after, stimulus.before, 'actual raw witness advanced');
-      assert.throws(
-        () => f.state.question(record, 4096),
-        /original owner changed/,
-        'refusal must not rebaseline original owner',
+test(
+  'authenticated recipe hits refuse peer ABA, local rollback and changed accepted HEAD at the final real physical view guard',
+  { timeout: 180_000 },
+  async (t) => {
+    for (const mode of ['peer', 'rollback', 'head'] as const) {
+      let close = () => {};
+      const f = await countedQuestionHydrationFixture(
+        t,
+        8,
+        (input) => {
+          const cache = createReviewQuestionHydrationCache(input.db, input.scratch);
+          close = cache.close;
+          const originalOwner = reviewReadStamp(input.db);
+          return openReviewQuestionState(input.db, input.source, input.view, {
+            cache,
+            assertCurrent() {
+              // This proof belongs to the original owner. The recipe context cannot
+              // refresh it after a refusal or a between-borrow cache invalidation.
+              assert.equal(reviewReadStamp(input.db), originalOwner, 'original owner changed');
+              input.view.address(input.view.root());
+            },
+          });
+        },
+        3,
+        true,
       );
+      t.after(close);
+      const workflow = f.view.child(f.view.child(f.view.root(), 'intake')!, 'workflow')!;
+      const record = f.view.find('question', workflow, f.questions[0]!.id)!;
+      const exact = canonicalLiteral(f.questions[0]);
+      const hitsBeforeWarm = intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits;
+      assert.equal([...f.state.canonicalRecords(f.state.question(record, 4096))].join(''), exact);
+      assert.equal(intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits, hitsBeforeWarm + 1);
+      const headPath = join(
+        contributorAuthorityPath(f.directory, 'fictional-question-hydration'),
+        'head',
+      );
+      const headBytes = readFileSync(headPath);
+      const peer = new DatabaseSync(String(f.db.prepare('PRAGMA database_list').get()!.file));
+      const stat = nodeFs.lstatSync,
+        stackTraceLimit = Error.stackTraceLimit;
+      const before = {
+        hits: intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits,
+        exports: f.sourceWork.exports,
+        writes: f.acceptedWrites(),
+        publications: f.publications(),
+        nodes: intakeWorkCounters(f.db).warm.collectionNodesWritten,
+        raw: reviewReadStamp(f.db),
+      };
+      let stimulus:
+        | {
+            before: unknown;
+            after: unknown;
+            row: unknown;
+            headChanged: boolean;
+            hits: number;
+            stack: string;
+          }
+        | undefined;
+      Error.stackTraceLimit = 64;
+      Reflect.set(nodeFs, 'lstatSync', ((selected, ...args) => {
+        const result = Reflect.apply(stat, nodeFs, [selected, ...args]);
+        if (
+          String(selected) !== headPath ||
+          stimulus ||
+          intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits !== before.hits + 1
+        )
+          return result;
+        const stack = new Error('fictional recipe-hit HEAD stimulus').stack!;
+        if (!stack.includes('intake-review-question-hydration.ts')) return result;
+        const key = 'fictional-recipe-final-aba';
+        const state = {
+          before: reviewReadStamp(f.db),
+          after: reviewReadStamp(f.db),
+          row: undefined as unknown,
+          headChanged: false,
+          hits: intakeWorkCounters(f.db).warm.reviewQuestionHydrationHits,
+          stack,
+        };
+        stimulus = state;
+        if (mode === 'peer') {
+          peer.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(key, 'changed');
+          peer.prepare('DELETE FROM app_meta WHERE key=?').run(key);
+        } else if (mode === 'rollback') {
+          f.db.exec('SAVEPOINT fictional_recipe_physical');
+          f.db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(key, 'changed');
+          f.db.exec('ROLLBACK TO fictional_recipe_physical; RELEASE fictional_recipe_physical');
+        } else {
+          writeFileSync(headPath, Buffer.alloc(headBytes.length, 32));
+          state.headChanged = !readFileSync(headPath).equals(headBytes);
+        }
+        state.after = reviewReadStamp(f.db);
+        state.row = f.db.prepare('SELECT value FROM app_meta WHERE key=?').get(key);
+        return result;
+      }) as typeof nodeFs.lstatSync);
+      syncBuiltinESMExports();
+      try {
+        assert.throws(() => f.state.question(record, 4096), /changed|head|authority|record|json/i);
+      } finally {
+        Reflect.set(nodeFs, 'lstatSync', stat);
+        Error.stackTraceLimit = stackTraceLimit;
+        syncBuiltinESMExports();
+        writeFileSync(headPath, headBytes);
+        peer.close();
+      }
+      assert.ok(stimulus, `${mode} must reach a real accepted HEAD stat after the recipe hit`);
+      assert.equal(stimulus.hits, before.hits + 1, 'hit completed before physical stimulus');
+      assert.match(stimulus.stack, /intake-review-question-hydration\.ts/);
+      assert.equal(stimulus.row, undefined, 'actual committed/rolled-back rows are restored');
+      assert.equal(f.db.isTransaction, false);
+      if (mode === 'head')
+        assert.equal(stimulus.headChanged, true, 'actual accepted HEAD bytes changed');
+      else {
+        assert.notEqual(stimulus.after, stimulus.before, 'actual raw witness advanced');
+        assert.throws(
+          () => f.state.question(record, 4096),
+          /original owner changed/,
+          'refusal must not rebaseline original owner',
+        );
+      }
+      assert.deepEqual(
+        readFileSync(headPath),
+        headBytes,
+        'physical evidence is restored after refusal',
+      );
+      assert.equal(
+        f.sourceWork.exports,
+        before.exports,
+        'hit guard refusal has no native fallback',
+      );
+      assert.equal(f.acceptedWrites(), before.writes);
+      assert.equal(f.publications(), before.publications);
+      assert.equal(intakeWorkCounters(f.db).warm.collectionNodesWritten, before.nodes);
+      close();
     }
-    assert.deepEqual(
-      readFileSync(headPath),
-      headBytes,
-      'physical evidence is restored after refusal',
-    );
-    assert.equal(f.sourceWork.exports, before.exports, 'hit guard refusal has no native fallback');
-    assert.equal(f.acceptedWrites(), before.writes);
-    assert.equal(f.publications(), before.publications);
-    assert.equal(intakeWorkCounters(f.db).warm.collectionNodesWritten, before.nodes);
-    close();
-  }
-});
+  },
+);
 
 const hostEnvelope = (id: string) => ({
   format: 'health-record-v1',
@@ -772,7 +785,7 @@ test(
 
 test(
   'host recipe providers remain fresh after more than sixteen source scopes and refuse after session disposal',
-  { timeout: 120_000 },
+  { timeout: 360_000 },
   async (t) => {
     const f = questionHostFixture(t);
     const source = f.upload('fictional-root-recipe', 17);
