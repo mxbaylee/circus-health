@@ -11,12 +11,42 @@ import {
 } from './diagnostics.ts';
 import type { PrfDiagnostics, PrfDiagnosticsObserver, ValidationRule } from './diagnostics.ts';
 import type { RegistrationMode } from './round.ts';
+import { captureNative, createDebugTrace } from './debug.ts';
+import type { DebugTrace } from './debug.ts';
 
 export class CheckerError extends Error {
   readonly code: ErrorCode;
-  constructor(code: ErrorCode) {
-    super(ERROR_MESSAGES[code]);
+  constructor(code: ErrorCode, options?: ErrorOptions) {
+    super(ERROR_MESSAGES[code], options);
     this.code = code;
+  }
+}
+function beginCapture(context: unknown): DebugTrace | undefined {
+  try {
+    return createDebugTrace(context);
+  } catch {
+    return undefined;
+  }
+}
+function finishCapture(
+  diagnostics: PrfDiagnostics,
+  trace: DebugTrace | undefined,
+  observer?: PrfDiagnosticsObserver,
+) {
+  try {
+    if (trace) {
+      trace.record('operation.result', diagnostics);
+      diagnostics.debugJson = trace.export();
+    } else diagnostics.diagnosticsUnavailable = true;
+  } catch {
+    diagnostics.diagnosticsUnavailable = true;
+  } finally {
+    try {
+      trace?.close();
+    } catch {
+      diagnostics.diagnosticsUnavailable = true;
+    }
+    emitPrfDiagnostics(diagnostics, observer);
   }
 }
 function checkerErrorCode(error: unknown): ErrorCode | undefined {
@@ -49,7 +79,12 @@ function fail(diagnostics: PrfDiagnostics, code: ErrorCode, rule: ValidationRule
   diagnostics.validationRule = rule;
   throw new CheckerError(code);
 }
-function captureFailure(diagnostics: PrfDiagnostics, error: unknown) {
+function captureFailure(
+  diagnostics: PrfDiagnostics,
+  error: unknown,
+  trace?: DebugTrace,
+) {
+  trace?.record('operation.failed', { stage: diagnostics.stage, error });
   const code = checkerErrorCode(error);
   if (code) diagnostics.applicationError = code;
   else {
@@ -210,6 +245,7 @@ function extractPrf(
   value: Credential | null,
   credential: CredentialRecord,
   diagnostics: PrfDiagnostics,
+  trace?: DebugTrace,
 ): string {
   const result = publicCredential(value, diagnostics);
   diagnostics.stage = 'credential-match';
@@ -217,7 +253,9 @@ function extractPrf(
   if (!diagnostics.credentialMatched) fail(diagnostics, 'wrong-credential', 'selected-credential');
   diagnostics.stage = 'extension-read';
   const extensions = result.getClientExtensionResults();
+  trace?.record('prf.extensions', extensions);
   const captured = describePrfResponse(diagnostics, extensions);
+  trace?.record('prf.decoder-input', captured);
   diagnostics.stage = 'prf-validation';
   const prf = prfFrom({ clientExtensionResults: captured });
   if (!prf) {
@@ -280,6 +318,7 @@ export async function createCredential(
     operation: 'create',
     stage: 'request-construction',
   };
+  const trace = beginCapture({ operation: 'create', run, alias, existing, registrationMode });
   try {
     const salt = encodePrf(random(32).buffer);
     const options: CredentialCreationOptions = {
@@ -314,6 +353,7 @@ export async function createCredential(
         },
       }) as unknown as PublicKeyCredentialCreationOptions,
     };
+    trace?.record('request.constructed', options);
     Object.assign(
       diagnostics,
       describePrfRequest(registrationMode, options.publicKey?.extensions?.prf?.eval?.first),
@@ -331,14 +371,19 @@ export async function createCredential(
     const adapter = port ?? nativePort(run, diagnostics);
     diagnostics.stage = 'native-create';
     const result = publicCredential(
-      await observeNative(diagnostics, () => adapter.create(options)),
+      await observeNative(diagnostics, () =>
+        captureNative(trace, options, () => adapter.create(options)),
+      ),
       diagnostics,
     );
     try {
       diagnostics.stage = 'extension-read';
       const extensions = result.getClientExtensionResults();
-      describePrfResponse(diagnostics, extensions);
-    } catch {
+      trace?.record('prf.extensions', extensions);
+      const captured = describePrfResponse(diagnostics, extensions);
+      trace?.record('prf.creation-output', captured);
+    } catch (error) {
+      trace?.record('prf.creation-inspection-failed', error);
       diagnostics.diagnosticsUnavailable = true;
       // Creation alone is not PRF confirmation; optional evidence cannot lose an enrolled credential.
     }
@@ -350,10 +395,10 @@ export async function createCredential(
     diagnostics.stage = 'complete';
     return { alias, id, salt, ...(transports.length ? { transports } : {}) };
   } catch (error) {
-    captureFailure(diagnostics, error);
+    captureFailure(diagnostics, error, trace);
     throw error;
   } finally {
-    emitPrfDiagnostics(diagnostics, observer);
+    finishCapture(diagnostics, trace, observer);
   }
 }
 export async function confirmCredential(
@@ -368,16 +413,26 @@ export async function confirmCredential(
     operation: 'confirm',
     stage: 'request-construction',
   };
+  const trace = beginCapture({ operation: 'confirm', run, credential });
   try {
     const options = request(run, credential, true);
+    trace?.record('request.constructed', options);
     observeRequest(options, credential, diagnostics);
     diagnostics.stage = 'preflight';
     if (credential.cipher) fail(diagnostics, 'invalid-state', 'credential-unconfirmed');
     const adapter = port ?? nativePort(run, diagnostics);
     diagnostics.stage = 'native-get';
-    const assertion = await observeNative(diagnostics, () => adapter.get(options));
-    const prf = extractPrf(assertion, credential, diagnostics);
+    const assertion = await observeNative(diagnostics, () =>
+      captureNative(trace, options, () => adapter.get(options)),
+    );
+    const prf = extractPrf(assertion, credential, diagnostics, trace);
     diagnostics.stage = 'key-derivation';
+    trace?.record('crypto.derivation', {
+      algorithm: 'HKDF-SHA-256',
+      output: 'AES-GCM-256',
+      salt: credential.salt,
+      context: context(run, credential),
+    });
     const key = await keyFor(prf, run, credential);
     diagnostics.stage = 'encryption';
     const iv = random(12);
@@ -390,14 +445,15 @@ export async function confirmCredential(
       ...credential,
       cipher: { iv: encodePrf(iv.buffer), data: encodePrf(data) },
     };
+    trace?.record('crypto.fictional-cipher', confirmed.cipher);
     await decryptAndCompare(key, run, confirmed, diagnostics);
     diagnostics.stage = 'complete';
     return confirmed;
   } catch (error) {
-    captureFailure(diagnostics, error);
+    captureFailure(diagnostics, error, trace);
     throw error;
   } finally {
-    emitPrfDiagnostics(diagnostics, observer);
+    finishCapture(diagnostics, trace, observer);
   }
 }
 async function decryptAndCompare(
@@ -432,7 +488,7 @@ async function decryptAndCompare(
       Object.assign(diagnostics, nativeErrorEvidence(error));
       diagnostics.validationRule = 'fictional-decryption';
     }
-    throw new CheckerError('decrypt-failed');
+    throw new CheckerError('decrypt-failed', { cause: error });
   }
 }
 export async function verifyCredential(
@@ -447,23 +503,27 @@ export async function verifyCredential(
     operation: 'verify',
     stage: 'request-construction',
   };
+  const trace = beginCapture({ operation: 'verify', run, credential });
   try {
     const options = request(run, credential, false);
+    trace?.record('request.constructed', options);
     observeRequest(options, credential, diagnostics);
     diagnostics.stage = 'preflight';
     if (!credential.cipher) fail(diagnostics, 'unconfirmed', 'credential-confirmed');
     const adapter = port ?? nativePort(run, diagnostics);
     diagnostics.stage = 'native-get';
-    const assertion = await observeNative(diagnostics, () => adapter.get(options));
-    const prf = extractPrf(assertion, credential, diagnostics);
+    const assertion = await observeNative(diagnostics, () =>
+      captureNative(trace, options, () => adapter.get(options)),
+    );
+    const prf = extractPrf(assertion, credential, diagnostics, trace);
     diagnostics.stage = 'key-derivation';
     const key = await keyFor(prf, run, credential);
     await decryptAndCompare(key, run, credential, diagnostics);
     diagnostics.stage = 'complete';
   } catch (error) {
-    captureFailure(diagnostics, error);
+    captureFailure(diagnostics, error, trace);
     throw error;
   } finally {
-    emitPrfDiagnostics(diagnostics, observer);
+    finishCapture(diagnostics, trace, observer);
   }
 }
