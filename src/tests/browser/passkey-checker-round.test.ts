@@ -34,19 +34,16 @@ test('fresh checker round preserves old evidence and resumes each mode separatel
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${(server.address() as AddressInfo).port}/fixture`);
   const evidence = await page.evaluate(async () => {
+    type StoreModule = typeof import('../../app/passkey-checker/store.ts');
+    type EnvironmentModule = typeof import('../../app/passkey-checker/environment.ts');
+    type RoundModule = typeof import('../../app/passkey-checker/round.ts');
+    type ReportModule = typeof import('../../app/passkey-checker/report.ts');
     const root = '/src/app/passkey-checker/';
-    const { openCheckerStore } = (await import(
-      root + 'store.ts'
-    )) as typeof import('../../app/passkey-checker/store.ts');
-    const { createRun, inspectEnvironment } = (await import(
-      root + 'environment.ts'
-    )) as typeof import('../../app/passkey-checker/environment.ts');
-    const { roundDatabase, LEGACY_DATABASE } = (await import(
-      root + 'round.ts'
-    )) as typeof import('../../app/passkey-checker/round.ts');
-    const { reportMarkdown } = (await import(
-      root + 'report.ts'
-    )) as typeof import('../../app/passkey-checker/report.ts');
+    const { openCheckerStore } = (await import(root + 'store.ts')) as StoreModule;
+    const environmentModule = (await import(root + 'environment.ts')) as EnvironmentModule;
+    const { createRun, inspectEnvironment } = environmentModule;
+    const { roundDatabase, LEGACY_DATABASE } = (await import(root + 'round.ts')) as RoundModule;
+    const { reportMarkdown } = (await import(root + 'report.ts')) as ReportModule;
     const build = { version: '3', revision: 'fictional-round-fixture', worktree: 'clean' };
     const legacy = await openCheckerStore(indexedDB, LEGACY_DATABASE);
     const oldRun = createRun(build, inspectEnvironment());
@@ -118,7 +115,8 @@ test('fresh checker round preserves old evidence and resumes each mode separatel
   });
   assert.equal(evidence.oldUnchanged, true);
   assert.equal(evidence.baselineStillRetained, true);
-  assert.equal(evidence.rounds.every((round) => round.beganEmpty), true);
+  const allBeganEmpty = evidence.rounds.every((round) => round.beganEmpty);
+  assert.equal(allBeganEmpty, true);
   assert.notEqual(evidence.rounds[0].runId, evidence.rounds[1].runId);
   assert.ok(evidence.rounds.every((round) => round.runId !== evidence.oldRunId));
   for (const round of evidence.rounds) {
