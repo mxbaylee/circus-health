@@ -75,6 +75,8 @@ This section and its linked maintained contracts are the durable place to check 
 
 These describe current contracts, not proof that a selected pair of releases passed a drill. If the candidate needs a new authority migration, resolve that requirement before use; this procedure supplies neither a decoder nor automatic conversion.
 
+**Hosted checker publication, 2026-10-05:** the [static publication workflow](../security/hosted-passkey-checker.md#build-and-publish) now starts automatically on pushes to `main`, including reviewed PR merges; manual dispatch on `main` remains available. Older workflow revisions remain manual-only. Archive packaging uses disk rather than a bounded subprocess stdout buffer, preserving large source maps and validating extraction before updating `gh-pages`. Verify the completed Pages deploy job and the displayed source revision before collecting operator results; a generated-branch update alone is not deployment. This changes no household application, archive format, checker storage namespace or provider credential, and requires no data reset.
+
 ## Repeatable fictional release qualification
 
 Run from a frozen candidate checkout with Docker and the contributor Node/browser prerequisites available. Choose an exact locally available prior commit and a fresh absolute external output directory outside Git:
