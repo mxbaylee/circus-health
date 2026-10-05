@@ -59,7 +59,7 @@ test('publication validates exact clean revision and complete allowlisted output
     assert.throws(() => validateCheckerFiles(directory, revision), /exact clean reviewed revision/);
   }));
 
-test('local state, reports, sources and symlinks cannot enter publication', () => {
+test('local state, reports, unrelated sources and symlinks cannot enter publication', () => {
   for (const name of ['report.md', 'state.json', 'assets/index.js.map', 'assets/source.ts'])
     fixture((directory) => {
       writeFileSync(join(directory, name), 'fictional');
@@ -70,6 +70,45 @@ test('local state, reports, sources and symlinks cannot enter publication', () =
     assert.throws(() => validateCheckerFiles(directory), /symlinks/);
   });
 });
+
+test('source maps require a paired script and the same public source scope as the bundle', () =>
+  fixture((directory) => {
+    const path = join(directory, 'assets/index-abc.js.map');
+    const map = {
+      version: 3,
+      file: 'index-abc.js',
+      sources: ['../../src/app/passkey-checker/core.ts'],
+      sourcesContent: ['// fictional checker source'],
+      names: [],
+      mappings: 'AAAA',
+    };
+    writeFileSync(path, JSON.stringify(map));
+    assert.throws(() => validateCheckerFiles(directory), /not referenced/);
+    writeFileSync(
+      join(directory, 'assets/index-abc.js'),
+      '/* fictional fixture */\n//# sourceMappingURL=index-abc.js.map',
+    );
+    assert.equal(validateCheckerFiles(directory, revision).length, 4);
+    for (const sources of [
+      ['../../src/server/profile-passkeys.ts'],
+      ['https://example.invalid/source.ts'],
+      ['/private/source.ts'],
+      ['../../src/app/passkey-checker/../../server/example.ts'],
+    ]) {
+      writeFileSync(path, JSON.stringify({ ...map, sources }));
+      assert.throws(() => validateCheckerFiles(directory), /unexpected module|Unexpected/);
+    }
+    writeFileSync(path, JSON.stringify({ ...map, file: 'different.js' }));
+    assert.throws(() => validateCheckerFiles(directory), /Invalid checker source map/);
+    writeFileSync(path, JSON.stringify({ ...map, sourceRoot: 'https://example.invalid/' }));
+    assert.throws(() => validateCheckerFiles(directory), /Invalid checker source map/);
+    writeFileSync(path, JSON.stringify(map));
+    writeFileSync(join(directory, 'assets/orphan-abc.js.map'), JSON.stringify(map));
+    assert.throws(() => validateCheckerFiles(directory), /Orphan/);
+    rmSync(join(directory, 'assets/orphan-abc.js.map'));
+    rmSync(path);
+    assert.throws(() => validateCheckerFiles(directory), /source map is missing/);
+  }));
 
 test('manual publication refuses an unreviewed branch before any network or writes', () => {
   assert.throws(
@@ -136,6 +175,14 @@ test('the independent real checker build repeats byte-for-byte and uses the Page
   const before = snapshot();
   build();
   assert.deepEqual(snapshot(), before);
+  const files = Object.keys(before);
+  assert.ok(files.some((file) => file.endsWith('.js.map')));
+  for (const file of files.filter((name) => name.endsWith('.js'))) {
+    assert.ok(files.includes(`${file}.map`));
+    const map = JSON.parse(readFileSync(join('dist/passkey-checker', `${file}.map`), 'utf8'));
+    assert.ok(map.sources.length > 0);
+    assert.ok(map.mappings.length > 0);
+  }
   const html = readFileSync('dist/passkey-checker/index.html', 'utf8');
   assert.match(html, /src="\/circus-health\/assets\/[A-Za-z0-9_-]+\.js"/);
   assert.match(html, /href="\/circus-health\/assets\/[A-Za-z0-9_-]+\.css"/);
