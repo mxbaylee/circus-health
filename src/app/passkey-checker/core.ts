@@ -7,8 +7,10 @@ import {
   diagnosticShape,
   emitPrfDiagnostics,
   nativeErrorEvidence,
+  observeNative,
 } from './diagnostics.ts';
 import type { PrfDiagnostics, PrfDiagnosticsObserver, ValidationRule } from './diagnostics.ts';
+import type { RegistrationMode } from './round.ts';
 
 export class CheckerError extends Error {
   readonly code: ErrorCode;
@@ -108,13 +110,23 @@ function publicCredential(
     diagnostics.credentialIdShape = shape.shape;
     if (shape.length !== undefined) diagnostics.credentialIdLength = shape.length;
   }
-  if (Object.prototype.toString.call(rawId) !== '[object ArrayBuffer]')
+  if (shape?.shape !== 'array-buffer')
     fail(diagnostics, 'invalid-credential', 'credential-id-buffer');
   if (rawId.byteLength < 1 || rawId.byteLength > 1024)
     fail(diagnostics, 'invalid-credential', 'credential-id-length');
   diagnostics.extensionReaderPresent = typeof credential.getClientExtensionResults === 'function';
   if (!diagnostics.extensionReaderPresent)
     fail(diagnostics, 'invalid-credential', 'extension-reader');
+  try {
+    if (typeof credential.id === 'string')
+      diagnostics.credentialIdTextMatched = credential.id === encodePrf(rawId);
+    const attachment = credential.authenticatorAttachment;
+    if (attachment !== undefined && attachment !== null)
+      diagnostics.attachmentHint =
+        attachment === 'platform' || attachment === 'cross-platform' ? attachment : 'other';
+  } catch {
+    diagnostics.diagnosticsUnavailable = true;
+  }
   return credential;
 }
 function context(run: RunHeader, credential: CredentialRecord) {
@@ -260,9 +272,10 @@ export async function createCredential(
   existing: CredentialRecord[],
   port?: CredentialPort,
   observer?: PrfDiagnosticsObserver,
+  registrationMode: RegistrationMode = 'eval',
 ): Promise<CredentialRecord> {
   const diagnostics: PrfDiagnostics = {
-    requestMode: 'eval',
+    requestMode: registrationMode,
     inputShape: 'absent',
     operation: 'create',
     stage: 'request-construction',
@@ -295,12 +308,15 @@ export async function createCredential(
           id: bytes(entry.id),
           ...(entry.transports ? { transports: entry.transports } : {}),
         })),
-        extensions: { credProps: true, prf: { eval: { first: salt } } },
+        extensions: {
+          credProps: true,
+          prf: registrationMode === 'enable-only' ? {} : { eval: { first: salt } },
+        },
       }) as unknown as PublicKeyCredentialCreationOptions,
     };
     Object.assign(
       diagnostics,
-      describePrfRequest('eval', options.publicKey?.extensions?.prf?.eval?.first),
+      describePrfRequest(registrationMode, options.publicKey?.extensions?.prf?.eval?.first),
     );
     const creation = options.publicKey!;
     diagnostics.excludedCredentialCount = creation.excludeCredentials!.length;
@@ -314,7 +330,10 @@ export async function createCredential(
     // Calling the port precedes the first await, preserving the button's user activation.
     const adapter = port ?? nativePort(run, diagnostics);
     diagnostics.stage = 'native-create';
-    const result = publicCredential(await adapter.create(options), diagnostics);
+    const result = publicCredential(
+      await observeNative(diagnostics, () => adapter.create(options)),
+      diagnostics,
+    );
     try {
       diagnostics.stage = 'extension-read';
       const extensions = result.getClientExtensionResults();
@@ -356,7 +375,7 @@ export async function confirmCredential(
     if (credential.cipher) fail(diagnostics, 'invalid-state', 'credential-unconfirmed');
     const adapter = port ?? nativePort(run, diagnostics);
     diagnostics.stage = 'native-get';
-    const assertion = await adapter.get(options);
+    const assertion = await observeNative(diagnostics, () => adapter.get(options));
     const prf = extractPrf(assertion, credential, diagnostics);
     diagnostics.stage = 'key-derivation';
     const key = await keyFor(prf, run, credential);
@@ -435,7 +454,7 @@ export async function verifyCredential(
     if (!credential.cipher) fail(diagnostics, 'unconfirmed', 'credential-confirmed');
     const adapter = port ?? nativePort(run, diagnostics);
     diagnostics.stage = 'native-get';
-    const assertion = await adapter.get(options);
+    const assertion = await observeNative(diagnostics, () => adapter.get(options));
     const prf = extractPrf(assertion, credential, diagnostics);
     diagnostics.stage = 'key-derivation';
     const key = await keyFor(prf, run, credential);
