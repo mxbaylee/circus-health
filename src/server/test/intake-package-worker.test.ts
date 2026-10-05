@@ -370,22 +370,47 @@ test('ZIP worker cancellation exits a real child with its stdout receiver paused
 
 test('ZIP worker detects source mutation and refuses nonempty output', async (t) => {
   const setup = fixture(t, zipFixture([{ name: 'report.txt', data: 'fictional' }]));
-  let checks = 0;
-  await assert.rejects(
-    inspectPackageFile({
-      sourceFd: setup.sourceFd,
-      assertRunning: () => {
-        if (++checks === 2)
-          writeFileSync(setup.path, zipFixture([{ name: 'report.txt', data: 'different' }]));
-      },
-    }),
-    /source changed/,
-  );
+  const replacement = zipFixture([{ name: 'report.txt', data: 'different' }]);
+  let mutations = 0;
+  let exitCode: number | null | undefined;
+  let exitSignal: NodeJS.Signals | null | undefined;
+  const spawn = childProcess.spawn;
+  const mocked = t.mock.method(childProcess, 'spawn', (...args: unknown[]) => {
+    const child = Reflect.apply(spawn, childProcess, args) as ChildProcess;
+    // Mutate after the real inspector finishes reading, before the adapter's
+    // close-time identity check. A polling callback can instead race header
+    // reads and legitimately fail with PACKAGE_HEADER, missing this oracle.
+    child.once('exit', (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+      writeFileSync(setup.path, replacement);
+      mutations++;
+    });
+    return child;
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(inspectPackageFile({ sourceFd: setup.sourceFd }), (error) => {
+      assert.ok(error instanceof PackageInspectionError);
+      assert.equal(error.reasonCode, 'PACKAGE_CHANGED');
+      assert.match(error.message, /source changed/);
+      return true;
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(exitSignal, null);
+    assert.equal(mutations, 1);
+    assert.deepEqual(readFileSync(setup.path), replacement);
+    assert.equal(fstatSync(setup.outputFd).size, 0);
+  } finally {
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+  }
   writeSync(setup.outputFd, Buffer.from('existing'));
   await assert.rejects(
     inspectPackageFile({ ...setup, selectedOrdinal: 0 }),
     /empty private regular file/,
   );
+  assert.equal(readFileSync(setup.output, 'utf8'), 'existing');
 });
 
 test('ZIP worker rejects invalid descriptor selection pairs before launch', async (t) => {
