@@ -134,8 +134,7 @@ test('manual publication refuses an unreviewed branch before any network or writ
         stdio: 'pipe',
       }),
     (error) =>
-      error instanceof Error &&
-      /reviewed-main/.test(String((error as { stderr?: Buffer }).stderr)),
+      error instanceof Error && /reviewed-main/.test(String((error as { stderr?: Buffer }).stderr)),
   );
 });
 

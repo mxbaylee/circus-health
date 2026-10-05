@@ -25,7 +25,6 @@
     "test": "npm run test:server && npm run test:tools && npm run test:deploy && npm run test:continuation && npm run test:ui && npm run test:state",
     "test:browser": "npm run build && npm run test:browser:run",
     "format": "prettier --config .prettierrc.json --ignore-path .prettierignore --ignore-path .gitignore --write \"{src/app,src/server,src/shared,src/scripts,src/tests,deploy,scripts}/**/*.{ts,tsx,css,html,json}\" \"*.{ts,json}\" \"src/index.html\" \".prettierrc.json\" \"docs/design/app-palette.json\"",
-    "preformat:check": "prettier --config .prettierrc.json src/scripts/passkey-checker-build/validate.test.ts | diff -u src/scripts/passkey-checker-build/validate.test.ts - || true",
     "format:check": "prettier --config .prettierrc.json --ignore-path .prettierignore --ignore-path .gitignore --check \"{src/app,src/server,src/shared,src/scripts,src/tests,deploy,scripts}/**/*.{ts,tsx,css,html,json}\" \"*.{ts,json}\" \"src/index.html\" \".prettierrc.json\" \"docs/design/app-palette.json\"",
     "prepare": "husky",
     "help": "node deploy/run.ts help",
