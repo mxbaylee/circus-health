@@ -38,12 +38,16 @@ test('fresh checker round preserves old evidence and resumes each mode separatel
     type EnvironmentModule = typeof import('../../app/passkey-checker/environment.ts');
     type RoundModule = typeof import('../../app/passkey-checker/round.ts');
     type ReportModule = typeof import('../../app/passkey-checker/report.ts');
+    type DiagnosticsModule = typeof import('../../app/passkey-checker/diagnostics.ts');
     const root = '/src/app/passkey-checker/';
     const { openCheckerStore } = (await import(root + 'store.ts')) as StoreModule;
     const environmentModule = (await import(root + 'environment.ts')) as EnvironmentModule;
     const { createRun, inspectEnvironment } = environmentModule;
     const { roundDatabase, LEGACY_DATABASE } = (await import(root + 'round.ts')) as RoundModule;
     const { reportMarkdown } = (await import(root + 'report.ts')) as ReportModule;
+    const diagnosticsModule = (await import(root + 'diagnostics.ts')) as DiagnosticsModule;
+    const original = new DOMException('Fictional browser refusal', 'NotAllowedError');
+    const failureMetadata = diagnosticsModule.nativeErrorEvidence(original);
     const build = { version: '3', revision: 'fictional-round-fixture', worktree: 'clean' };
     const legacy = await openCheckerStore(indexedDB, LEGACY_DATABASE);
     const oldRun = createRun(build, inspectEnvironment());
@@ -80,6 +84,7 @@ test('fresh checker round preserves old evidence and resumes each mode separatel
           build,
           environment: run.environment,
           diagnostics: {
+            ...failureMetadata,
             requestMode: mode,
             inputShape: mode === 'enable-only' ? 'absent' : 'array-buffer',
             operation: 'create',
@@ -111,7 +116,7 @@ test('fresh checker round preserves old evidence and resumes each mode separatel
     baseline.close();
     const oldUnchanged = JSON.stringify(await legacy.load()) === before;
     legacy.close();
-    return { oldUnchanged, baselineStillRetained, rounds, oldRunId: oldRun.id };
+    return { oldUnchanged, baselineStillRetained, rounds, oldRunId: oldRun.id, failureMetadata };
   });
   assert.equal(evidence.oldUnchanged, true);
   assert.equal(evidence.baselineStillRetained, true);
@@ -122,8 +127,14 @@ test('fresh checker round preserves old evidence and resumes each mode separatel
   for (const round of evidence.rounds) {
     assert.equal(round.diagnostics?.nativeOutcome, 'rejected');
     assert.equal(round.diagnostics?.documentFocusedAtInvocation, false);
+    for (const [key, value] of Object.entries(evidence.failureMetadata))
+      assert.equal(round.diagnostics?.[key as keyof typeof round.diagnostics], value);
+    assert.equal(round.diagnostics?.nativeMessageLength, 'Fictional browser refusal'.length);
     assert.match(round.report, /native invocation outcome: rejected/);
     assert.match(round.report, /document focused at native invocation: false/);
+    assert.match(round.report, /native message availability \(text not exported\): text/);
+    assert.match(round.report, /native cause availability \(cause not exported\): absent/);
+    assert.doesNotMatch(round.report, /Fictional browser refusal/);
     assert.doesNotMatch(round.report, /fictional-failed-attempt|fictional-old-observation/);
   }
 });

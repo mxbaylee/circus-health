@@ -42,7 +42,23 @@ export function inspectEnvironment(userAgent = navigator.userAgent): Environment
             ? 'Linux'
             : '';
   if (os) environment.os = { value: os, source: 'browser-reported' };
-  // UA OS versions are frequently frozen or ambiguous; provider identity is manual only.
+  const version =
+    os === 'Android'
+      ? /Android\s+([\d.]+)/.exec(userAgent)?.[1]
+      : os === 'iOS/iPadOS'
+        ? /(?:CPU (?:iPhone )?OS|iPhone OS)\s+([\d_]+)/.exec(userAgent)?.[1]
+        : os === 'macOS'
+          ? /Mac OS X\s+([\d_.]+)/.exec(userAgent)?.[1]
+          : os === 'Windows'
+            ? /Windows NT\s+([\d.]+)/.exec(userAgent)?.[1]
+            : undefined;
+  // NT version is not the marketed Windows version; iPad desktop mode may look like macOS.
+  // Retain only advertised facts, visibly marked as hints, not a detected actual OS release.
+  if (version && version.length <= 40)
+    environment.osVersion = {
+      value: `${os === 'Windows' ? 'NT ' : ''}${version.replaceAll('_', '.')} (UA hint; may be frozen)`,
+      source: 'browser-reported',
+    };
   return environment;
 }
 export function checkSupport(): { supported: boolean; reason: string | null } {

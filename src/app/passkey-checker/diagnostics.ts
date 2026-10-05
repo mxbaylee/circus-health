@@ -1,5 +1,7 @@
 import { ERROR_MESSAGES } from './types.ts';
 import type { ErrorCode } from './types.ts';
+import { ERROR_METADATA_LABELS, inspectErrorMetadata, validErrorMetadataField } from './debug.ts';
+import type { ErrorMetadata } from './debug.ts';
 
 /** Allowlisted shape evidence only; never retain credential references or PRF contents. */
 export type DiagnosticShape =
@@ -76,7 +78,7 @@ export const NATIVE_ERROR_NAMES = [
   'unrecognized',
 ] as const;
 export type ValidationRule = (typeof VALIDATION_RULES)[number];
-export interface PrfDiagnostics {
+export interface PrfDiagnostics extends ErrorMetadata {
   requestMode: 'eval' | 'evalByCredential' | 'enable-only';
   operation?: 'create' | 'confirm' | 'verify';
   stage?: (typeof DIAGNOSTIC_STAGES)[number];
@@ -136,6 +138,7 @@ const SHAPES: readonly DiagnosticShape[] = [
 ];
 /** The report uses the same field list as the privacy projection. */
 export const ADDITIONAL_DIAGNOSTIC_LABELS = [
+  ...ERROR_METADATA_LABELS,
   ['prfEnabled', 'PRF enabled flag'],
   ['prfEnabledShape', 'PRF enabled flag shape'],
   ['residentCredentialReported', 'resident credential reported'],
@@ -283,6 +286,12 @@ export function describePrfResponse(
 }
 function fieldValid(key: (typeof FIELDS)[number], value: unknown): boolean {
   switch (key) {
+    case 'nativeMessageState':
+    case 'nativeStackState':
+    case 'nativeCauseState':
+    case 'nativeMessageLength':
+    case 'nativeStackLength':
+      return validErrorMetadataField(key, value);
     case 'nativeErrorCode':
       return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 25;
     case 'attachmentHint':
@@ -371,10 +380,10 @@ export function emitPrfDiagnostics(
   }
 }
 
-/** Read only a bounded native name; thrown accessors and private names stay unrecognized. */
+/** Bounded name and availability evidence; never retain the error's text or attached payload. */
 export function nativeErrorEvidence(
   error: unknown,
-): Pick<PrfDiagnostics, 'nativeErrorName' | 'nativeErrorCategory'> {
+): Pick<PrfDiagnostics, 'nativeErrorName' | 'nativeErrorCategory'> & ErrorMetadata {
   let name: unknown;
   try {
     name = error && typeof error === 'object' ? (error as { name?: unknown }).name : undefined;
@@ -390,7 +399,7 @@ export function nativeErrorEvidence(
       : ['Error', 'TypeError', 'RangeError', 'SyntaxError'].includes(nativeErrorName)
         ? 'js-name'
         : 'dom-name';
-  return { nativeErrorName, nativeErrorCategory };
+  return { nativeErrorName, nativeErrorCategory, ...inspectErrorMetadata(error) };
 }
 
 /** Never await before invoking the operation: Safari needs the original button gesture. */
