@@ -1,5 +1,5 @@
 import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, STEP_LABELS, stepsForAlias } from './types.ts';
-import { projectPrfDiagnostics } from './diagnostics.ts';
+import { ADDITIONAL_DIAGNOSTIC_LABELS, projectPrfDiagnostics } from './diagnostics.ts';
 import type { PrfDiagnostics, ValidationRule } from './diagnostics.ts';
 import { isVerifiedAAfterFailedB, isVerifiedReturnToA, latestBCreation } from './progress.ts';
 import type { CheckerState, Environment, Step } from './types.ts';
@@ -40,7 +40,7 @@ const expectedValidation: Record<ValidationRule, string> = {
   'fictional-decryption': 'successful decryption with fresh PRF output',
   'fictional-plaintext-match': 'the original fictional value for this run and credential',
 };
-const diagnosticFields: readonly [keyof PrfDiagnostics, string][] = [
+const diagnosticFields: readonly (readonly [keyof PrfDiagnostics, string])[] = [
   ['operation', 'operation'],
   ['stage', 'stage'],
   ['applicationError', 'application error code'],
@@ -61,6 +61,7 @@ const diagnosticFields: readonly [keyof PrfDiagnostics, string][] = [
   ['resultsShape', 'PRF results shape'],
   ['arrayEntriesValid', 'array entries are bytes'],
   ['diagnosticsUnavailable', 'some diagnostic details unavailable'],
+  ...ADDITIONAL_DIAGNOSTIC_LABELS,
 ];
 
 /** Allowlisted human report: never serialize the local model or WebAuthn objects. */
@@ -144,6 +145,8 @@ export function reportMarkdown(state: CheckerState): string {
     'Safe diagnostic lengths count bytes for buffers/views, items for arrays and characters for strings. An omitted field was unobserved, oversized or not applicable; it does not mean zero or a valid result. Older attempts have no newly inferred diagnostics.',
     '',
     'A native error name is a bounded name classification, not proof of the browser/provider cause. NotAllowedError does not distinguish cancellation, timeout or refusal. InvalidStateError with exclusions is consistent with duplicate exclusion but does not prove it; an unrecognized failure remains unresolved. Stage and validation facts identify the next debugging boundary without exporting native messages or payloads.',
+    '',
+    'An enable-only creation request is an explicit experiment, not a provider fix: it enables PRF without evaluating during creation. Confirmation still uses eval and fresh uses still use evalByCredential with the original credential and salt. Each mode uses a separate fictional run; combine A/B results only within that run. PRF enabled flags, attachment hints, focus and timing buckets do not establish compatibility or a native error cause.',
     '',
   ];
   for (const alias of ['A', 'B'] as const) {
