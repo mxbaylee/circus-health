@@ -92,7 +92,9 @@ test('the store projection accepts only valid scalar metadata and survives JSON 
 
 for (const synchronous of [true, false])
   test(`native ${synchronous ? 'throw' : 'rejection'} retains identity and reports available evidence`, async () => {
-    const original = Object.assign(new Error('fictional native failure'), { stack: 'fixture stack' });
+    const original = Object.assign(new Error('fictional native failure'), {
+      stack: 'fixture stack',
+    });
     let calls = 0;
     let captured: PrfDiagnostics | undefined;
     const pending = createCredential(
@@ -120,9 +122,11 @@ for (const synchronous of [true, false])
   });
 
 test('actual Markdown reports include availability and provider labels, not exception contents', () => {
-  const diagnostics = evidence(Object.assign(new Error('FICTIONAL_ORIGINAL_MESSAGE'), {
-    stack: 'FICTIONAL_ORIGINAL_STACK',
-  }));
+  const diagnostics = evidence(
+    Object.assign(new Error('FICTIONAL_ORIGINAL_MESSAGE'), {
+      stack: 'FICTIONAL_ORIGINAL_STACK',
+    }),
+  );
   const environment = structuredClone(run.environment);
   environment.provider = { value: 'Fictional Manager', source: 'operator' };
   environment.providerVersion = { value: '1.2.3', source: 'operator' };
@@ -130,18 +134,20 @@ test('actual Markdown reports include availability and provider labels, not exce
     run,
     credentials: [],
     observations: [],
-    attempts: [{
-      id: 'attempt-one',
-      alias: 'A',
-      step: 'create',
-      status: 'failed',
-      error: 'unknown-error',
-      startedAt: run.createdAt,
-      finishedAt: run.createdAt,
-      build: run.build,
-      environment,
-      diagnostics,
-    }],
+    attempts: [
+      {
+        id: 'attempt-one',
+        alias: 'A',
+        step: 'create',
+        status: 'failed',
+        error: 'unknown-error',
+        startedAt: run.createdAt,
+        finishedAt: run.createdAt,
+        build: run.build,
+        environment,
+        diagnostics,
+      },
+    ],
   };
   const report = reportMarkdown(JSON.parse(JSON.stringify(state)));
   assert.match(report, /native stack availability \(stack not exported\): text/);
@@ -153,8 +159,14 @@ test('actual Markdown reports include availability and provider labels, not exce
 test('OS releases are advertised hints, not inferred exact releases or provider identity', () => {
   for (const [ua, expected] of [
     ['Mozilla/5.0 (Android 17) Firefox/157.0', '17 (UA hint; may be frozen)'],
-    ['Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) Version/18.3 Safari/1', '18.3 (UA hint; may be frozen)'],
-    ['Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/18.0 Safari/1', '10.15.7 (UA hint; may be frozen)'],
+    [
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) Version/18.3 Safari/1',
+      '18.3 (UA hint; may be frozen)',
+    ],
+    [
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/18.0 Safari/1',
+      '10.15.7 (UA hint; may be frozen)',
+    ],
     ['Mozilla/5.0 (Windows NT 10.0) Chrome/130.0.0.0', 'NT 10.0 (UA hint; may be frozen)'],
   ]) {
     const current = inspectEnvironment(ua);
