@@ -1,6 +1,8 @@
 name: 🛂 Publish reviewed passkey checker
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
