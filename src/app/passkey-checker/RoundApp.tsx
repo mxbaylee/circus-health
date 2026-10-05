@@ -60,9 +60,9 @@ function CurrentRound({
       <section className="checker" aria-label="Diagnostic testing round">
         <h2>New diagnostic round: {TEST_ROUND}</h2>
         <p>
-          Active results start fresh for this round. Previous-round browser storage and all
-          provider passkeys are left intact. Results in each request mode resume independently
-          after reload. Export each mode separately; this is not a combined compatibility pass.
+          Active results start fresh for this round. Previous-round browser storage and all provider
+          passkeys are left intact. Results in each request mode resume independently after reload.
+          Export each mode separately; this is not a combined compatibility pass.
         </p>
         <label>
           Registration request
@@ -79,17 +79,17 @@ function CurrentRound({
           </select>
         </label>
         <p>
-          The experiment omits only the optional PRF evaluation during creation. Confirmation,
-          exact credential matching, required user verification, exclusions, salts and fresh
-          decryption checks remain mandatory. It is not an established provider fix. Each mode
-          has a separate fictional profile; switching modes does not create a second passkey for
-          the same profile. Test A and B together within one mode.
+          The experiment omits only the optional PRF evaluation during creation. Confirmation, exact
+          credential matching, required user verification, exclusions, salts and fresh decryption
+          checks remain mandatory. It is not an established provider fix. Each mode has a separate
+          fictional profile; switching modes does not create a second passkey for the same profile.
+          Test A and B together within one mode.
         </p>
         <p>
           After a confirmation failure, retry confirmation of the existing test passkey; do not
           create it again. After a failed B creation, use the separate fresh A recovery check.
-          Download reports even when a step fails. For a visible format message, record which
-          screen or field, expected format and actual format, without secrets or credential IDs.
+          Download reports even when a step fails. For a visible format message, record which screen
+          or field, expected format and actual format, without secrets or credential IDs.
         </p>
         <button type="button" disabled={disabled} onClick={() => void exportPrevious()}>
           Export previous-round report

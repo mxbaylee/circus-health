@@ -187,7 +187,10 @@ test('throwing optional metadata does not alter PRF extraction or native results
       throw Error('private');
     },
   });
-  await assert.rejects(observeNative(d, () => Promise.reject(oddError)), (e) => e === oddError);
+  await assert.rejects(
+    observeNative(d, () => Promise.reject(oddError)),
+    (e) => e === oddError,
+  );
 });
 
 test('creation flags are evidence, not a decryption pass', () => {
