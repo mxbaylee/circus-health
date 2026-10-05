@@ -51,7 +51,7 @@
     "@simplewebauthn/browser": "14.0.0",
     "@simplewebauthn/server": "14.0.1",
     "@tiptap/markdown": "3.31.3",
-    "@tiptap/react": "16.3.3",
+    "@tiptap/react": "3.31.3",
     "@tiptap/starter-kit": "3.31.3",
     "koffi": "3.3.1",
     "libsodium-wrappers-sumo": "0.8.4",
