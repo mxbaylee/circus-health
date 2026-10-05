@@ -1,8 +1,7 @@
 import { ERROR_MESSAGES } from './types.ts';
 import type { ErrorCode } from './types.ts';
-import { isDebugReport } from './debug.ts';
 
-/** Structured summary shapes; full fictional-test data is separate in debugJson. */
+/** Allowlisted shape evidence only; never retain credential references or PRF contents. */
 export type DiagnosticShape =
   | 'absent'
   | 'null'
@@ -78,8 +77,6 @@ export const NATIVE_ERROR_NAMES = [
 ] as const;
 export type ValidationRule = (typeof VALIDATION_RULES)[number];
 export interface PrfDiagnostics {
-  /** Full local diagnostic JSON for this fictional checker attempt, not production auth. */
-  debugJson?: string;
   requestMode: 'eval' | 'evalByCredential' | 'enable-only';
   operation?: 'create' | 'confirm' | 'verify';
   stage?: (typeof DIAGNOSTIC_STAGES)[number];
@@ -137,7 +134,7 @@ const SHAPES: readonly DiagnosticShape[] = [
   'number',
   'other',
 ];
-/** Structured summary labels; full trace text is rendered in a separate report section. */
+/** The report uses the same field list as the privacy projection. */
 export const ADDITIONAL_DIAGNOSTIC_LABELS = [
   ['prfEnabled', 'PRF enabled flag'],
   ['prfEnabledShape', 'PRF enabled flag shape'],
@@ -154,7 +151,6 @@ export const ADDITIONAL_DIAGNOSTIC_LABELS = [
 ] as const satisfies readonly (readonly [keyof PrfDiagnostics, string])[];
 const FIELDS = [
   ...ADDITIONAL_DIAGNOSTIC_LABELS.map(([key]) => key),
-  'debugJson',
   'operation',
   'stage',
   'applicationError',
@@ -242,7 +238,7 @@ export function describePrfRequest(
     ...(inputShape.length !== undefined ? { inputLength: inputShape.length } : {}),
   };
 }
-/** Read first once; callers may separately snapshot it for full checker diagnostics. */
+/** Capture first once for transient decoding; only the shape evidence enters diagnostics. */
 export function describePrfResponse(
   diagnostics: PrfDiagnostics,
   extensions: unknown,
@@ -287,8 +283,6 @@ export function describePrfResponse(
 }
 function fieldValid(key: (typeof FIELDS)[number], value: unknown): boolean {
   switch (key) {
-    case 'debugJson':
-      return isDebugReport(value);
     case 'nativeErrorCode':
       return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 25;
     case 'attachmentHint':
@@ -349,7 +343,7 @@ export function projectPrfDiagnostics(value: unknown): PrfDiagnostics | undefine
     return undefined;
   }
 }
-/** Stored diagnostics reject unknown keys; full trace JSON has its own schema and budget. */
+/** Stored diagnostics reject unknown keys, in addition to validating the allowlisted projection. */
 export function isPrfDiagnostics(value: unknown): value is PrfDiagnostics {
   if (!value || typeof value !== 'object') return false;
   try {
@@ -377,7 +371,7 @@ export function emitPrfDiagnostics(
   }
 }
 
-/** Read a bounded native name for summaries; full errors live in debugJson. */
+/** Read only a bounded native name; thrown accessors and private names stay unrecognized. */
 export function nativeErrorEvidence(
   error: unknown,
 ): Pick<PrfDiagnostics, 'nativeErrorName' | 'nativeErrorCategory'> {
