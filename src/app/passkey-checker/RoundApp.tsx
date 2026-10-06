@@ -117,9 +117,17 @@ export default function RoundApp({ guided = false }: { guided?: boolean } = {}) 
     void createCheckerController({
       build: BUILD_INFO,
       ...(guided ? { guidedMode: mode } : {}),
-      openStore: () => openCheckerStore(globalThis.indexedDB, guided ? `${roundDatabase(mode)}-abc-v1` : roundDatabase(mode)),
+      openStore: () =>
+        openCheckerStore(
+          globalThis.indexedDB,
+          guided ? `${roundDatabase(mode)}-abc-v1` : roundDatabase(mode),
+        ),
       deleteStore: (onBlocked) =>
-        deleteCheckerStore(globalThis.indexedDB, guided ? `${roundDatabase(mode)}-abc-v1` : roundDatabase(mode), onBlocked),
+        deleteCheckerStore(
+          globalThis.indexedDB,
+          guided ? `${roundDatabase(mode)}-abc-v1` : roundDatabase(mode),
+          onBlocked,
+        ),
       core: {
         ...core,
         createCredential: (run, alias, existing, port, observer) =>
@@ -159,6 +167,7 @@ export default function RoundApp({ guided = false }: { guided?: boolean } = {}) 
         <p role="status">Opening browser-local progress…</p>
       </main>
     );
-  if (guided) return <GuidedApp key={mode} controller={opened.controller} mode={mode} onMode={setMode} />;
+  if (guided)
+    return <GuidedApp key={mode} controller={opened.controller} mode={mode} onMode={setMode} />;
   return <CurrentRound key={mode} controller={opened.controller} mode={mode} onMode={setMode} />;
 }

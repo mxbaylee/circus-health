@@ -2,7 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { guidedFixture } from './passkey-checker-guided-fixture.ts';
 import { createCheckerController } from '../app/passkey-checker/controller.ts';
-import { guidedPlan, currentGuidedTask, verifiedFinal, verifiedRetention } from '../app/passkey-checker/guided.ts';
+import {
+  guidedPlan,
+  currentGuidedTask,
+  verifiedFinal,
+  verifiedRetention,
+} from '../app/passkey-checker/guided.ts';
 import { messageEvidence, validNativeMessage } from '../app/passkey-checker/message.ts';
 import { reportMarkdown } from '../app/passkey-checker/report.ts';
 import type { CheckerController } from '../app/passkey-checker/controller.ts';
@@ -42,7 +47,10 @@ for (const mode of ['eval', 'enable-only'] as const)
       assert.equal(request.authenticatorSelection!.residentKey, 'required');
       assert.equal(!!request.extensions!.prf!.eval, mode === 'eval');
       for (let prior = 0; prior < index; prior++)
-        assert.deepEqual(new Uint8Array(request.excludeCredentials![prior].id as ArrayBuffer), new Uint8Array(32).fill(prior + 1));
+        assert.deepEqual(
+          new Uint8Array(request.excludeCredentials![prior].id as ArrayBuffer),
+          new Uint8Array(32).fill(prior + 1),
+        );
     }
     assert.equal(gets.length, 6);
     assert.equal(state.run.userId, runId);
@@ -51,14 +59,17 @@ for (const mode of ['eval', 'enable-only'] as const)
     assert.match(report, /Creation mode: (?:eval|enable\\-only)/);
     assert.match(report, /Final recheck of original credential/);
     assert.doesNotMatch(report, /Use A after B creation fails: unfinished/);
-    for (const item of state.credentials) assert.ok(!report.includes(item.id) && !report.includes(item.salt));
+    for (const item of state.credentials)
+      assert.ok(!report.includes(item.id) && !report.includes(item.salt));
     controller.close();
   });
 
 for (const synchronousFailure of [true, false])
   test(`${synchronousFailure ? 'throw' : 'rejection'}: B failure captures message, checks A, and allows C without a false B pass`, async () => {
     const { controller } = await guidedFixture({ failCreate: new Set(['B']), synchronousFailure });
-    await advance(controller); await advance(controller); await advance(controller);
+    await advance(controller);
+    await advance(controller);
+    await advance(controller);
     const failure = controller.exportModel().attempts.at(-1)!;
     assert.equal(failure.diagnostics?.nativeOutcome, synchronousFailure ? 'threw' : 'rejected');
     assert.equal(failure.nativeMessage?.text, 'Fictional native refusal for this attempt.');
@@ -70,10 +81,16 @@ for (const synchronousFailure of [true, false])
     assert.ok(verifiedRetention(controller.exportModel(), recovery));
     await advance(controller, true);
     assert.equal(currentGuidedTask(controller.exportModel())?.alias, 'C');
-    await advance(controller); await advance(controller); await advance(controller); await advance(controller);
+    await advance(controller);
+    await advance(controller);
+    await advance(controller);
+    await advance(controller);
     const state = controller.exportModel();
     assert.equal(currentGuidedTask(state), undefined);
-    assert.deepEqual(state.credentials.find((row) => row.alias === 'A'), original);
+    assert.deepEqual(
+      state.credentials.find((row) => row.alias === 'A'),
+      original,
+    );
     assert.match(reportMarkdown(state), /Verify B: not applicable/);
     assert.match(reportMarkdown(state), /Fictional native refusal for this attempt/);
     assert.match(reportMarkdown(state), /skipped by operator; no automatic pass/);
@@ -94,8 +111,11 @@ test('each new C failure needs fresh A and B recovery, never stale recovery from
   assert.notEqual(first.id, second.id);
   assert.equal(currentGuidedTask(controller.exportModel())?.afterAttemptId, second.id);
   assert.equal(currentGuidedTask(controller.exportModel())?.alias, 'A');
-  await advance(controller, true); await advance(controller, true); await advance(controller, true);
-  await advance(controller); await advance(controller);
+  await advance(controller, true);
+  await advance(controller, true);
+  await advance(controller, true);
+  await advance(controller);
+  await advance(controller);
   assert.equal(currentGuidedTask(controller.exportModel()), undefined);
   controller.close();
 });
@@ -104,13 +124,16 @@ test('wrong selected credential is refused before PRF extraction and retains pre
   const wrongCredential = new Set<CredentialAlias>(['B']);
   const fixture = await guidedFixture({ wrongCredential });
   const c = fixture.controller;
-  await advance(c); await advance(c); await advance(c);
+  await advance(c);
+  await advance(c);
+  await advance(c);
   const reads = fixture.extensionReads();
   await advance(c);
   assert.equal(c.exportModel().attempts.at(-1)!.error, 'wrong-credential');
   assert.equal(fixture.extensionReads(), reads);
   assert.equal(currentGuidedTask(c.exportModel())?.alias, 'A');
-  await advance(c); await advance(c, true);
+  await advance(c);
+  await advance(c, true);
   assert.equal(currentGuidedTask(c.exportModel())?.alias, 'C');
   assert.equal(c.exportModel().credentials.find((row) => row.alias === 'B')!.cipher, undefined);
   c.close();
@@ -118,7 +141,8 @@ test('wrong selected credential is refused before PRF extraction and retains pre
 
 test('a capability flag and a 31-byte result do not turn confirmation into a pass', async () => {
   const { controller } = await guidedFixture({ badPrfLength: 31 });
-  await advance(controller); await advance(controller);
+  await advance(controller);
+  await advance(controller);
   const state = controller.exportModel();
   assert.equal(state.attempts.at(-1)!.status, 'failed');
   assert.equal(state.attempts.at(-1)!.error, 'prf-invalid');
@@ -128,42 +152,77 @@ test('a capability flag and a 31-byte result do not turn confirmation into a pas
 
 test('the controller refuses out-of-order operations, and skips do not invoke native code', async () => {
   const { controller, calls, gets } = await guidedFixture();
-  await controller.runStep('C', 'create'); await controller.runStep('A', 'use-1');
+  await controller.runStep('C', 'create');
+  await controller.runStep('A', 'use-1');
   assert.equal(calls.length + gets.length, 0);
   await advance(controller, true);
   assert.equal(calls.length, 0);
   assert.equal(currentGuidedTask(controller.exportModel())?.alias, 'B');
-  assert.equal(guidedPlan(controller.exportModel()).find((row) => row.alias === 'A' && row.step === 'confirm')?.result,
-    'not applicable · credential not created');
+  assert.equal(
+    guidedPlan(controller.exportModel()).find((row) => row.alias === 'A' && row.step === 'confirm')
+      ?.result,
+    'not applicable · credential not created',
+  );
   controller.close();
 });
 
 test('resumed pending operations are interrupted, never invented successes or automatic retries', async () => {
   const fixture = await guidedFixture();
   const state = fixture.controller.exportModel();
-  const attempt: Attempt = { id: 'fictional-interrupted', alias: 'A', step: 'create', status: 'pending',
-    sequence: 1, startedAt: state.run.createdAt, build: state.run.build, environment: state.run.environment };
+  const attempt: Attempt = {
+    id: 'fictional-interrupted',
+    alias: 'A',
+    step: 'create',
+    status: 'pending',
+    sequence: 1,
+    startedAt: state.run.createdAt,
+    build: state.run.build,
+    environment: state.run.environment,
+  };
   state.attempts.push(attempt);
   let writes = 0;
-  const controller = await createCheckerController({ ...fixture.options,
-    openStore: async () => ({ load: async () => ({ state: structuredClone(state), token: { runId: state.run.id, revision: 1 } }),
-      commit: async () => { writes++; return { runId: state.run.id, revision: 2 }; },
-      reset: async () => { throw new Error('not called'); }, close() {} }),
+  const controller = await createCheckerController({
+    ...fixture.options,
+    openStore: async () => ({
+      load: async () => ({
+        state: structuredClone(state),
+        token: { runId: state.run.id, revision: 1 },
+      }),
+      commit: async () => {
+        writes++;
+        return { runId: state.run.id, revision: 2 };
+      },
+      reset: async () => {
+        throw new Error('not called');
+      },
+      close() {},
+    }),
   });
   assert.equal(controller.exportModel().attempts[0].status, 'interrupted');
   assert.equal(writes, 1);
   assert.equal(fixture.calls.length, 0);
   assert.match(reportMarkdown(controller.exportModel()), /interrupted; unfinished/);
-  controller.close(); fixture.controller.close();
+  controller.close();
+  fixture.controller.close();
 });
 
 test('native message capture handles hostile properties and labels every transformation', () => {
-  assert.deepEqual(messageEvidence({ get message() { throw Error('do not leak'); } }), { state: 'unavailable' });
+  assert.deepEqual(
+    messageEvidence({
+      get message() {
+        throw Error('do not leak');
+      },
+    }),
+    { state: 'unavailable' },
+  );
   assert.deepEqual(messageEvidence({ message: 42 }), { state: 'non-text' });
   assert.deepEqual(messageEvidence({}), { state: 'absent' });
   assert.equal(messageEvidence('').length, 0);
   const secret = '0123456789abcdef0123456789abcdef';
-  const captured = messageEvidence(new Error(`Fictional ${secret} https://example.test/secret [1,2,3]`), [secret]);
+  const captured = messageEvidence(
+    new Error(`Fictional ${secret} https://example.test/secret [1,2,3]`),
+    [secret],
+  );
   assert.equal(captured.redacted, true);
   assert.ok(!captured.text!.includes(secret));
   assert.equal(messageEvidence('X '.repeat(1024)).truncated, true);

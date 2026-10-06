@@ -159,16 +159,27 @@ export function reportMarkdown(state: CheckerState): string {
     '',
   ];
   if (guided) {
-    lines.push('## Guided sequence', '', `Flow: abc-v1. Creation mode: ${safe(state.run.registrationMode)}.`, '',
-      ...guidedPlan(state).map((row) => `- ${row.title}: ${row.result}${row.active ? '; next available action' : ''}.`), '',
-      'Guided native failures may include a bounded message excerpt: known references, URLs, byte arrays and long opaque values are redacted; original length and transformation flags are explicit. Review excerpts before sharing. Stack/cause contents and native payloads are not captured.', '',
-      'Skipped is an explicit operator decision, not a successful native operation. Not applicable means its credential prerequisite is absent; it is not a pass. Earlier failures remain below even after a retry succeeds.', '');
+    lines.push(
+      '## Guided sequence',
+      '',
+      `Flow: abc-v1. Creation mode: ${safe(state.run.registrationMode)}.`,
+      '',
+      ...guidedPlan(state).map(
+        (row) => `- ${row.title}: ${row.result}${row.active ? '; next available action' : ''}.`,
+      ),
+      '',
+      'Guided native failures may include a bounded message excerpt: known references, URLs, byte arrays and long opaque values are redacted; original length and transformation flags are explicit. Review excerpts before sharing. Stack/cause contents and native payloads are not captured.',
+      '',
+      'Skipped is an explicit operator decision, not a successful native operation. Not applicable means its credential prerequisite is absent; it is not a pass. Earlier failures remain below even after a retry succeeds.',
+      '',
+    );
   }
-  for (const alias of guided ? GUIDED_ALIASES : ['A', 'B'] as const) {
+  for (const alias of guided ? GUIDED_ALIASES : (['A', 'B'] as const)) {
     lines.push(`### Credential ${alias}`, '');
     const latestB = latestBCreation(state);
     if (
-      !guided && alias === 'A' &&
+      !guided &&
+      alias === 'A' &&
       latestB?.status === 'failed' &&
       !state.credentials.some((credential) => credential.alias === 'B')
     ) {
@@ -182,14 +193,18 @@ export function reportMarkdown(state: CheckerState): string {
       );
     }
     for (const step of stepsForAlias(alias, guided)) {
-      const label = guided && step === 'use-1' ? 'Final recheck of original credential' : STEP_LABELS[step];
+      const label =
+        guided && step === 'use-1' ? 'Final recheck of original credential' : STEP_LABELS[step];
       const attempts = state.attempts.filter(
         (attempt) => attempt.alias === alias && attempt.step === step,
       );
       if (!attempts.length) {
         const row = guidedPlan(state).find((item) => item.alias === alias && item.step === step);
-        const unavailable = guided && (step === 'retained' && !row || row?.result.startsWith('not applicable'));
-        lines.push(`- ${label}: ${unavailable ? (row?.result ?? 'not applicable · no earlier confirmed credential required a recovery check') : 'unfinished; no automatic evidence'}.`);
+        const unavailable =
+          guided && ((step === 'retained' && !row) || row?.result.startsWith('not applicable'));
+        lines.push(
+          `- ${label}: ${unavailable ? (row?.result ?? 'not applicable · no earlier confirmed credential required a recovery check') : 'unfinished; no automatic evidence'}.`,
+        );
       }
       for (const [index, attempt] of attempts.entries()) {
         const status =
@@ -204,11 +219,11 @@ export function reportMarkdown(state: CheckerState): string {
               ? 'verified PRF and fictional decryption'
               : attempt.status === 'skipped'
                 ? 'skipped by operator; no automatic pass'
-              : attempt.status === 'failed'
-                ? 'failed'
-                : attempt.status === 'interrupted'
-                  ? 'interrupted; unfinished'
-                  : 'pending or unfinished; no verified result';
+                : attempt.status === 'failed'
+                  ? 'failed'
+                  : attempt.status === 'interrupted'
+                    ? 'interrupted; unfinished'
+                    : 'pending or unfinished; no verified result';
         const error =
           attempt.error && Object.hasOwn(ERROR_MESSAGES, attempt.error)
             ? `; ${ERROR_MESSAGES[attempt.error]}`
@@ -232,19 +247,32 @@ export function reportMarkdown(state: CheckerState): string {
         }
         if (guided && attempt.status === 'failed' && validNativeMessage(attempt.nativeMessage)) {
           const message = attempt.nativeMessage;
-          const excerpt = message.state === 'text'
-            ? messageEvidence(message.text, [state.run.id, state.run.userId,
-              ...state.credentials.flatMap((item) => [item.id, item.salt, item.cipher?.iv ?? '', item.cipher?.data ?? ''])])
-            : message;
-          lines.push(`  Native message excerpt: ${message.state === 'text' ? (message.length === 0 ? '(empty string)' : safe(excerpt.text, 1024)) : message.state}.`,
-            `  Message detail: state ${message.state}; original character count ${message.length ?? 'unobserved'}; truncated ${message.truncated ?? false}; redacted ${message.redacted || excerpt.redacted || false}. This is a transformed excerpt, not full native-error serialization.`);
+          const excerpt =
+            message.state === 'text'
+              ? messageEvidence(message.text, [
+                  state.run.id,
+                  state.run.userId,
+                  ...state.credentials.flatMap((item) => [
+                    item.id,
+                    item.salt,
+                    item.cipher?.iv ?? '',
+                    item.cipher?.data ?? '',
+                  ]),
+                ])
+              : message;
+          lines.push(
+            `  Native message excerpt: ${message.state === 'text' ? (message.length === 0 ? '(empty string)' : safe(excerpt.text, 1024)) : message.state}.`,
+            `  Message detail: state ${message.state}; original character count ${message.length ?? 'unobserved'}; truncated ${message.truncated ?? false}; redacted ${message.redacted || excerpt.redacted || false}. This is a transformed excerpt, not full native-error serialization.`,
+          );
         }
         if (step === 'retained') {
           const index = state.attempts.findIndex((row) => row.id === attempt.afterAttemptId);
           const source = state.attempts[index];
-          lines.push(source && ['failed', 'interrupted'].includes(source.status)
-            ? `  Linked failed addition: ${source.alias} ${source.step}, recorded operation ${index + 1}; finished ${safe(source.finishedAt)}.`
-            : '  Linked failed addition unavailable; no qualifying recovery evidence.');
+          lines.push(
+            source && ['failed', 'interrupted'].includes(source.status)
+              ? `  Linked failed addition: ${source.alias} ${source.step}, recorded operation ${index + 1}; finished ${safe(source.finishedAt)}.`
+              : '  Linked failed addition unavailable; no qualifying recovery evidence.',
+          );
         }
         // Project again at the export boundary: callers need not have loaded through
         // the strict store, and arbitrary/native diagnostic values must never leak.
@@ -268,7 +296,9 @@ export function reportMarkdown(state: CheckerState): string {
             fields.push(`returned credential matched: ${diagnostics.credentialMatched}`);
           for (const [key, label] of diagnosticFields)
             if (diagnostics[key] !== undefined)
-              fields.push(`${guided && key === 'nativeMessageState' ? 'native message availability (see bounded excerpt)' : label}: ${diagnostics[key]}`);
+              fields.push(
+                `${guided && key === 'nativeMessageState' ? 'native message availability (see bounded excerpt)' : label}: ${diagnostics[key]}`,
+              );
           if (diagnostics.validationRule !== undefined)
             fields.push(
               `validation rule: ${diagnostics.validationRule}`,

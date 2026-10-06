@@ -77,7 +77,9 @@ export async function createCheckerController(
   const fresh = (): CheckerState => ({
     run: {
       ...newRun(options.build, options.environment ?? inspectEnvironment()),
-      ...(options.guidedMode ? { flow: 'abc-v1' as const, registrationMode: options.guidedMode } : {}),
+      ...(options.guidedMode
+        ? { flow: 'abc-v1' as const, registrationMode: options.guidedMode }
+        : {}),
     },
     credentials: [],
     attempts: [],
@@ -187,8 +189,13 @@ export async function createCheckerController(
     if (!available()) return false;
     if (state.run.flow === 'abc-v1') {
       const next = currentGuidedTask(state);
-      return writes === 0 && !!next && next.alias === alias && next.step === step &&
-        next.afterAttemptId === afterAttemptId;
+      return (
+        writes === 0 &&
+        !!next &&
+        next.alias === alias &&
+        next.step === step &&
+        next.afterAttemptId === afterAttemptId
+      );
     }
     if (!['A', 'B'].includes(alias)) return false;
     const credential = state.credentials.find((item) => item.alias === alias);
@@ -255,13 +262,27 @@ export async function createCheckerController(
     },
     async skipStep(alias, step, afterAttemptId) {
       if (state.run.flow !== 'abc-v1' || !canRunStep(alias, step, afterAttemptId)) return;
-      const sequence = state.attempts.reduce((value, row) => Math.max(value, row.sequence ?? 0), state.attempts.length) + 1;
-      if (!Number.isSafeInteger(sequence)) { failed(new CheckerStorageError('incompatible')); return; }
+      const sequence =
+        state.attempts.reduce(
+          (value, row) => Math.max(value, row.sequence ?? 0),
+          state.attempts.length,
+        ) + 1;
+      if (!Number.isSafeInteger(sequence)) {
+        failed(new CheckerStorageError('incompatible'));
+        return;
+      }
       busy = true;
       const now = new Date().toISOString();
       const attempt: Attempt = {
-        id: identifier(), alias, step, status: 'skipped', sequence, startedAt: now, finishedAt: now,
-        build: structuredClone(options.build), environment: structuredClone(state.run.environment),
+        id: identifier(),
+        alias,
+        step,
+        status: 'skipped',
+        sequence,
+        startedAt: now,
+        finishedAt: now,
+        build: structuredClone(options.build),
+        environment: structuredClone(state.run.environment),
         ...(afterAttemptId ? { afterAttemptId } : {}),
       };
       state.attempts.push(attempt);
@@ -290,8 +311,11 @@ export async function createCheckerController(
         startedAt: new Date().toISOString(),
         build: structuredClone(options.build),
         environment: structuredClone(state.run.environment),
-        ...(step === 'retained' ? { afterAttemptId } :
-          step === 'use-after-b-failed' ? { afterAttemptId: latestBCreation(state)!.id } : {}),
+        ...(step === 'retained'
+          ? { afterAttemptId }
+          : step === 'use-after-b-failed'
+            ? { afterAttemptId: latestBCreation(state)!.id }
+            : {}),
       };
       state.attempts.push(attempt);
       publish();
@@ -328,10 +352,20 @@ export async function createCheckerController(
         attempt.status = step === 'create' ? 'created' : 'verified';
       } catch (error) {
         attempt.status = 'failed';
-        if (state.run.flow === 'abc-v1' &&
-          ['native-create', 'native-get'].includes(attempt.diagnostics?.stage ?? ''))
-          attempt.nativeMessage = messageEvidence(error, [state.run.id, state.run.userId,
-            ...state.credentials.flatMap((item) => [item.id, item.salt, item.cipher?.iv ?? '', item.cipher?.data ?? ''])]);
+        if (
+          state.run.flow === 'abc-v1' &&
+          ['native-create', 'native-get'].includes(attempt.diagnostics?.stage ?? '')
+        )
+          attempt.nativeMessage = messageEvidence(error, [
+            state.run.id,
+            state.run.userId,
+            ...state.credentials.flatMap((item) => [
+              item.id,
+              item.salt,
+              item.cipher?.iv ?? '',
+              item.cipher?.data ?? '',
+            ]),
+          ]);
         attempt.error = attempt.diagnostics?.applicationError ?? operations.sanitizeError(error);
       }
       attempt.finishedAt = new Date().toISOString();
@@ -350,7 +384,9 @@ export async function createCheckerController(
       if (!available()) return;
       if (
         !(state.run.flow === 'abc-v1' ? ['A', 'B', 'C'] : ['A', 'B']).includes(input.alias) ||
-        ![...stepsForAlias(input.alias, state.run.flow === 'abc-v1'), 'general'].includes(input.step) ||
+        ![...stepsForAlias(input.alias, state.run.flow === 'abc-v1'), 'general'].includes(
+          input.step,
+        ) ||
         !['worked', 'failed', 'could-not-test'].includes(input.outcome)
       )
         return;

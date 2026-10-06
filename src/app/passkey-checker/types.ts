@@ -26,7 +26,14 @@ export type Environment = Record<EnvironmentField, MetadataField>;
 export type CredentialAlias = 'A' | 'B' | 'C';
 export const KNOWN_TRANSPORTS = ['ble', 'hybrid', 'internal', 'nfc', 'usb'] as const;
 export type Step =
-  'create' | 'confirm' | 'use-1' | 'use-2' | 'use-3' | 'use-after-b' | 'use-after-b-failed' | 'retained';
+  | 'create'
+  | 'confirm'
+  | 'use-1'
+  | 'use-2'
+  | 'use-3'
+  | 'use-after-b'
+  | 'use-after-b-failed'
+  | 'retained';
 export const STEP_LABELS: Record<Step, string> = {
   retained: 'Check retained access after a failed addition',
   create: 'Create credential',
