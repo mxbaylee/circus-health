@@ -54,6 +54,16 @@ Retries use a stable operation ID. A partial final append or an uncommitted segm
 
 JSONL is the logical representation after decryption. Durable storage uses bounded authenticated encrypted segments/objects and commit metadata inside the vault. Segment rotation bounds file size and recovery work; it does not discard old versions or remove them from queries. Keep keys and credential changes outside the medical record history, with the secret-handling constraints in the encryption reference.
 
+### Rebuildable SQLite commit policy
+
+After accepted-record durability has successfully attached and its physical head matches the projection, WAL connections use synchronous=NORMAL. Opening a database, a failed attachment, or a non-WAL connection does not select this policy. The accepted journal owner still verifies and fsyncs immutable objects and the accepted head before the SQLite commit; encryption, exact operation replay, writer ownership and refusal of divergent authority are unchanged.
+
+SQLite can lose a recent NORMAL-mode WAL tail after an operating-system crash or power loss. That is a cache-loss case, not permission to lose acknowledged records: supported startup catches up or rebuilds the complete projection from the durable accepted history. A cache alone is never a backup. The [SQLite synchronous contract](https://www.sqlite.org/pragma.html#pragma_synchronous) distinguishes WAL consistency from per-commit cache durability. No operator tuning is needed, and no accepted-record or cache schema changes. An earlier compatible build retains its own connection policy and reads the same history.
+
+Record-version duplicate detection keeps its private disk-backed identity index in one explicit transaction for the lifetime of that validation scope. Its existing bounded page cache can spill to disk, and closing always discards the complete scratch index. Neither these scratch bytes nor a scratch commit become recovery evidence. Writer and recovery still inspect every version and reject duplicate identities and invalid predecessor references.
+
+Fictional regressions distinguish unattached and rejected/non-WAL attachment, failure before accepted-head publication, interruption after the durable head but before cache commit, complete replay and exact retry. Controlled interruption is not a physical power-loss test. The complete encrypted acceptance/cache-loss journey remains a separate required oracle.
+
 ## Source-text write amplification
 
 Bytes written for one operation must be proportional to what that operation changed (owner decision 2026-09-28; `AGENTS.md` states the same rule for all durable writes). Anything else is incorrect behavior, not a tuning choice.

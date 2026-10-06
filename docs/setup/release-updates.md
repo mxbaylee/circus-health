@@ -28,6 +28,8 @@ contract](../../src/server/INTAKE.md#common-report-identity-review).
 
 Reload open Import reviews after updating so large identity evidence uses the current continuation protocol. Continuations are disposable transport state and expire on preview invalidation, rollback, lock or close; reopen the evidence after expiry. Earlier clients that send numeric offsets remain readable, but scan the prefix on each request. The retained snapshot, byte-leaf and receipt formats are unchanged.
 
+Accepted-journal-backed WAL connections now use NORMAL synchronization for the rebuildable SQLite projection, instead of syncing that cache after every transaction. Durable accepted objects and heads still reach storage before acknowledgment. No operator setting or format migration is required; restart into the reviewed build and verify retained current/history state. An operating-system crash or power loss may require replaying a lost cache tail from accepted history. Keep the checked backup; a SQLite cache alone is not recovery authority. Unattached and non-WAL databases retain their existing settings. See [the record storage policy](../data/record-version-storage.md#rebuildable-sqlite-commit-policy).
+
 ## Identify the current and candidate builds
 
 Record the current checkout's exact revision and the running build's `buildId`, `revision` and `worktree` from `http://localhost:3001/api/runtime` (use your configured port). Record the application image ID and tag from that archive's specific Compose project. Retain the prior checkout/revision and dependencies needed to build it again; a mutable image tag alone is not a retained release. Keep receipts outside Git and omit credentials, recovery phrases, private source paths and health content from shared diagnostics.

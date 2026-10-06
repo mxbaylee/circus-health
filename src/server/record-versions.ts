@@ -586,7 +586,9 @@ function identity(table: TableSchema, row: Record<string, unknown>): string {
 function versionIdentityIndex() {
   const scratch = disposableSqlite('circus-record-identities-');
   try {
-    scratch.db.exec('CREATE TABLE identities(value TEXT PRIMARY KEY)');
+    // One disposable index lifetime, not one implicit pager transaction per row.
+    // Its bounded page cache still spills to disk; close discards this private work.
+    scratch.db.exec('CREATE TABLE identities(value TEXT PRIMARY KEY); BEGIN');
   } catch (error) {
     scratch.close();
     throw error;
@@ -1144,7 +1146,14 @@ export function attachRecordDurability(
       if (captured) db.exec('DELETE FROM __record_changed');
     },
   });
-  return recordDurabilityStatus(db)!;
+  const status = recordDurabilityStatus(db)!;
+  // Only this successfully attached accepted-record owner may relax cache sync.
+  // publish() still verifies and durably publishes immutable records and HEAD
+  // before SQLite COMMIT. A lost WAL tail is rebuilt from that accepted history.
+  // Unattached databases and non-WAL connections retain their existing settings.
+  if (!status.dirty && db.prepare('PRAGMA main.journal_mode').get()?.journal_mode === 'wal')
+    db.exec('PRAGMA main.synchronous=NORMAL');
+  return status;
 }
 const statusStatements = new WeakMap<
   Database,

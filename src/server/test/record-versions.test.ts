@@ -1,4 +1,5 @@
 import test, { type TestContext } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
@@ -1213,5 +1214,151 @@ test('failed manifest page publication and cancellation keep the prior atomic he
         .get()!.n,
       0,
     );
+  }
+});
+
+test('only a successfully attached accepted journal selects normal-synchronous WAL projection', (t) => {
+  const f = fixture(t);
+  f.db.exec('PRAGMA main.synchronous=FULL');
+  const synchronous = (db: Database) =>
+    Number(db.prepare('PRAGMA main.synchronous').get()?.synchronous);
+  assert.equal(synchronous(f.db), 2);
+  assert.throws(() =>
+    attachRecordDurability(f.db, { profileId: 'wrong-profile', storage: f.storage }),
+  );
+  assert.equal(synchronous(f.db), 2, 'failed attachment cannot alter cache policy');
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  assert.equal(f.db.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'wal');
+  assert.equal(synchronous(f.db), 1);
+  const unattached = f.open('unattached-policy.sqlite');
+  assert.equal(synchronous(unattached), 2, 'opening alone does not relax SQLite durability');
+  const rollback = f.open('rollback-policy.sqlite');
+  rollback.exec('PRAGMA main.journal_mode=DELETE; PRAGMA main.synchronous=FULL');
+  attachRecordDurability(rollback, { profileId, storage: f.storage });
+  assert.equal(rollback.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'delete');
+  assert.equal(synchronous(rollback), 2, 'non-WAL modes keep their existing durability');
+});
+
+test('journal-backed WAL refuses failed HEAD publication and recovers durable acceptance before cache COMMIT', (t) => {
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  assert.equal(f.db.prepare('PRAGMA main.synchronous').get()?.synchronous, 1);
+  const initialHead = stored(f, 'head');
+  const publish = f.storage.publishHead;
+  f.storage.publishHead = () => {
+    throw Error('fictional failure before accepted HEAD');
+  };
+  try {
+    assert.throws(
+      () =>
+        transaction(f.db, () => {
+          f.db
+            .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+            .run('unaccepted-cache-policy', 'Fictional unaccepted');
+        }),
+      /fictional failure before accepted HEAD/,
+    );
+  } finally {
+    f.storage.publishHead = publish;
+  }
+  assert.deepEqual(stored(f, 'head'), initialHead);
+  assert.equal(
+    f.db.prepare('SELECT 1 FROM people WHERE id=?').get('unaccepted-cache-policy'),
+    undefined,
+  );
+  assert.equal(durability(f.db).dirty, false);
+  const operation = { operationId: randomUUID(), fingerprint: 'fictional-cache-policy-recovery' };
+  const exec = f.db.exec;
+  let interrupted = false;
+  let expected: ReturnType<typeof logical> | undefined;
+  f.db.exec = function (sql: string) {
+    if (sql === 'COMMIT' && !interrupted) {
+      interrupted = true;
+      assert.notDeepEqual(
+        stored(f, 'head'),
+        initialHead,
+        'durable acceptance precedes cache commit',
+      );
+      expected = logical(f.db);
+      throw Error('fictional interruption before cache COMMIT');
+    }
+    return exec.call(this, sql);
+  };
+  try {
+    assert.throws(
+      () =>
+        transaction(
+          f.db,
+          () => {
+            f.db
+              .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+              .run('accepted-cache-policy', 'Fictional accepted');
+            return { saved: 'accepted-cache-policy' };
+          },
+          operation,
+        ),
+      /fictional interruption before cache COMMIT/,
+    );
+  } finally {
+    f.db.exec = exec;
+  }
+  assert.equal(interrupted, true);
+  assert.ok(expected);
+  assert.equal(
+    f.db.prepare('SELECT 1 FROM people WHERE id=?').get('accepted-cache-policy'),
+    undefined,
+  );
+  assert.equal(durability(f.db).dirty, true);
+  const recovered = rebuild(f, 'cache-policy-recovered.sqlite');
+  assert.deepEqual(
+    logical(recovered),
+    expected,
+    'every current and historical projection row is recovered',
+  );
+  const writes = f.writes.length;
+  assert.deepEqual(
+    transaction(
+      recovered,
+      () => {
+        throw Error('replay must not run a second mutation');
+      },
+      operation,
+    ),
+    { saved: 'accepted-cache-policy' },
+  );
+  assert.equal(f.writes.length, writes, 'exact replay publishes no duplicate accepted version');
+});
+
+test('record identity validation batches private scratch transactions without replacing its complete replay checks', (t) => {
+  const f = fixture(t);
+  const prepare = DatabaseSync.prototype.prepare;
+  let identityScopes = 0;
+  DatabaseSync.prototype.prepare = function (sql: string) {
+    if (sql === 'INSERT INTO identities VALUES(?)') {
+      assert.equal(
+        this.isTransaction,
+        true,
+        'all identities share the one disposable-index transaction',
+      );
+      identityScopes++;
+    }
+    return prepare.call(this, sql);
+  };
+  try {
+    attachRecordDurability(f.db, { profileId, storage: f.storage });
+    transaction(f.db, () => {
+      const insert = f.db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)');
+      for (let index = 0; index < 160; index++)
+        insert.run('scratch-policy-' + index, 'Fictional person ' + index);
+    });
+    const expected = logical(f.db);
+    const recovered = rebuild(f, 'scratch-policy-recovered.sqlite');
+    assert.deepEqual(logical(recovered), expected);
+    assert.ok(
+      identityScopes >= 4,
+      'the actual writer and complete recovery both use checked scratch scopes',
+    );
+  } finally {
+    DatabaseSync.prototype.prepare = prepare;
   }
 });
