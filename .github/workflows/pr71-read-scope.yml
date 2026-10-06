@@ -25,106 +25,45 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Add regressions against the exact inspected source
+      - name: Recover the exact inspected regression and candidate scripts
         run: |
-          test "$(git hash-object src/server/intake-state-collections.ts)" = a3e5eaac553acc00a1b530f2c6cf142aa8f7c16e
-          test "$(git hash-object src/server/test/intake-schema-resolution-authority.test.ts)" = 8afd566bce0cbe6da05a901a0e9115d04ba44622
           node --input-type=module <<'NODE'
-          import { appendFileSync } from 'node:fs';
-          appendFileSync('src/server/test/intake-schema-resolution-authority.test.ts', `
-          test('cold schema scope shares checks while retaining complete ancestry at two sizes', async (t) => {
-            for (const extras of [0, 40]) {
-              const f = await fixture(t, extras);
-              const view = f.selected.collections.openView();
-              f.selected.collections.clearSchemaRecordCache();
-              const original = f.authority.storage.read;
-              let heads = 0;
-              f.authority.storage.read = (name) => {
-                if (name === 'head') heads++;
-                return original(name);
-              };
-              const before = { ...intakeWorkCounters(f.db).warm };
-              try {
-                const result = f.selected.collections.resolveSchemaRecord(view, f.control.mode, f.control.root, f.id, 'last');
-                const after = intakeWorkCounters(f.db).warm;
-                const witnessQueries = after.collectionReadWitnessQueries - before.collectionReadWitnessQueries;
-                const items = after.collectionItemsRead - before.collectionItemsRead;
-                t.diagnostic(JSON.stringify({ fixture: 'cold schema scope', extras, heads, witnessQueries, items }));
-                assert.equal(result.kind, f.expected);
-                assert.ok(items >= f.nodes.length, 'complete header and ancestry remain inspected');
-                assert.equal(heads, 2, 'one entry and one final physical HEAD proof');
-                assert.equal(witnessQueries, 6, 'entry, selected binding and final SQL witness only');
-              } finally {
-                f.authority.storage.read = original;
-              }
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const text = execFileSync('git', ['show', '38dbd4711bce8cc780c02dbc9b5c24e560106259:.github/workflows/pr71-read-scope.yml'], { encoding: 'utf8' });
+          function extract(name, output) {
+            const marker = '      - name: ' + name + '\n';
+            assert.equal(text.split(marker).length, 2);
+            const step = text.split(marker)[1].split('\n      - ')[0];
+            const run = step.split('        run: |\n')[1];
+            assert.ok(run);
+            const script = [];
+            for (const line of run.split('\n')) {
+              if (line.trim() && !line.startsWith('          ')) break;
+              script.push(line.slice(10));
             }
-          });
-
-          test('cold schema scope refuses a missing physical HEAD at its final proof without SQL changes', async (t) => {
-            const f = await fixture(t);
-            const view = f.selected.collections.openView();
-            f.selected.collections.clearSchemaRecordCache();
-            const original = f.authority.storage.read;
-            const changes = f.db.prepare('SELECT total_changes() AS n').get()!.n;
-            let heads = 0;
-            f.authority.storage.read = (name) => {
-              if (name === 'head' && ++heads === 2) return null;
-              return original(name);
-            };
-            try {
-              assert.throws(() => f.selected.collections.resolveSchemaRecord(view, f.control.mode, f.control.root, f.id, 'last'), /accepted authority|invalid head|current projection/);
-              assert.equal(heads, 2);
-              assert.equal(f.db.prepare('SELECT total_changes() AS n').get()!.n, changes);
-            } finally {
-              f.authority.storage.read = original;
-            }
-            assert.equal(f.read(), f.expected);
-          });
-
-          for (const external of [false, true])
-            test('cold schema scope refuses final-proof SQL ABA from ' + (external ? 'peer' : 'local') + ' writes', async (t) => {
-              const f = await fixture(t);
-              const writer = external ? new DatabaseSync(f.path) : f.db;
-              const view = f.selected.collections.openView();
-              f.selected.collections.clearSchemaRecordCache();
-              const original = f.authority.storage.read;
-              let heads = 0, changed = false;
-              f.authority.storage.read = (name) => {
-                if (name === 'head' && ++heads === 2) {
-                  writer.prepare('INSERT INTO main.app_meta(key,value) VALUES(?,?)').run('fictional-cold-schema-aba', 'value');
-                  writer.prepare('DELETE FROM main.app_meta WHERE key=?').run('fictional-cold-schema-aba');
-                  changed = true;
-                }
-                return original(name);
-              };
-              try {
-                assert.throws(() => f.selected.collections.resolveSchemaRecord(view, f.control.mode, f.control.root, f.id, 'last'), /authority changed|stale|generation|collection/);
-                assert.equal(changed, true);
-              } finally {
-                f.authority.storage.read = original;
-                if (external) writer.close();
-              }
-              assert.equal(f.read(), f.expected);
-            });
-          `);
+            assert.ok(script.length > 2);
+            writeFileSync(join(process.env.RUNNER_TEMP, output), script.join('\n') + '\n');
+          }
+          extract('Add regressions against the exact inspected source', 'regressions.sh');
+          extract('Prove the counted-work regression fails before the product change', 'baseline.sh');
+          extract('Apply fixed synchronous schema scope reuse and observable test progress', 'candidate.sh');
           NODE
-      - name: Prove the counted-work regression fails before the product change
+          bash -e "$RUNNER_TEMP/regressions.sh"
+          bash -e "$RUNNER_TEMP/baseline.sh"
+          bash -e "$RUNNER_TEMP/candidate.sh"
+      - name: Preserve exact lexical oracle and derive the reduced readiness count
         run: |
-          set +e
-          node --test --test-name-pattern='cold schema scope shares checks' src/server/test/intake-schema-resolution-authority.test.ts > "$RUNNER_TEMP/baseline.txt" 2>&1
-          status=$?
-          set -e
-          cat "$RUNNER_TEMP/baseline.txt"
-          test "$status" -ne 0
-          grep -q 'one entry and one final physical HEAD proof' "$RUNNER_TEMP/baseline.txt"
-      - name: Apply fixed synchronous schema scope reuse and observable test progress
-        run: |
+          test "$(git hash-object src/server/test/intake-collection-envelope.test.ts)" = 024304bacb1df3ee3789f106a1395d0dc3521901
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { readFileSync, writeFileSync } from 'node:fs';
@@ -133,69 +72,24 @@ jobs:
             assert.equal(text.split(before).length, 2, 'exact unique patch anchor: ' + path);
             writeFileSync(path, text.replace(before, after));
           };
-          const source = 'src/server/intake-state-collections.ts';
-          replace(source,
-            "        // Cold reads retain the original point operations and every readiness observation.\n        const collection = schemaReadOperations.collection(view, 'logical', 'envelope.data');",
-            "        // This fixed, synchronous owner operation shares its lexical certificate.\n        // No callback, iterator or result escapes it; final ready() and the\n        // runRead seal still check physical HEAD and the exact SQL witness.\n        // Transactions retain all original point-operation observations.\n        const collection = certificate\n          ? descriptor(_readTree().get(readScope(view, 'logical'), 'envelope.data'))\n          : schemaReadOperations.collection(view, 'logical', 'envelope.data');");
-          replace(source,
-            "          const value = schemaReadOperations.get(view, 'logical', 'envelope.data', key);",
-            "          const value = certificate\n            ? (() => {\n                const raw = _readTree().get(collection.root, key);\n                if (raw !== undefined) recordIntakeWork('collectionItemsRead');\n                return raw === undefined ? undefined : publicValue(raw, collection.kind);\n              })()\n            : schemaReadOperations.get(view, 'logical', 'envelope.data', key);");
-          const acceptance = 'src/scripts/provider-qualification-acceptance.test.ts';
-          replace(acceptance,
-            '    let clinicalAcceptanceWrites = 0;',
-            `    let clinicalAcceptanceWrites = 0;
-              let requestsStarted = 0, requestsFinished = 0;
-              let activeRequest: { sequence: number; operation: string } | undefined;
-              const progress = () => console.info(JSON.stringify({
-                fixture: 'fictional qualification acceptance', requestsStarted, requestsFinished,
-                activeRequest: activeRequest ?? null, identityConfirmations: identityConfirmations.length,
-                clinicalAcceptanceWrites,
-              }));
-              const progressTimer = setInterval(progress, 30_000);
-              progressTimer.unref();
-              t.signal.addEventListener('abort', progress, { once: true });
-              t.after(() => {
-                clearInterval(progressTimer);
-                t.signal.removeEventListener('abort', progress);
-                progress();
-              });`);
-          replace(acceptance,
-            '      const response = await fetch(base + path, {',
-            `      const operation = ['identity-review', 'identity-scope-page', 'identity-scope',
-                'report-acceptance', 'report-queue', 'review', 'questions', 'proposals',
-                'intake-batches', 'stop', 'profile-setups', 'verify', 'intakes', 'lock', 'recover']
-                .find((label) => path.split('?')[0]!.endsWith('/' + label)) ?? 'other';
-              activeRequest = { sequence: ++requestsStarted, operation };
-              try {
-              const response = await fetch(base + path, {`);
-          replace(acceptance,
-            '      return result.data;\n    }',
-            '      return result.data;\n      } finally {\n        requestsFinished++;\n        activeRequest = undefined;\n      }\n    }');
-          const documentation = 'docs/data/intake-state-storage.md';
-          replace(documentation,
-            'Cold resolution checks the complete original ancestry through ordinary point reads.',
-            'Cold resolution checks the complete original ancestry. The fixed synchronous resolver shares its private per-call certificate for the selected collection and inline header/ancestry reads, instead of opening a nested collection call for every cell. It still checks physical accepted HEAD at entry and completion, and seals only after the final exact SQL/registry witness. Fragmented headers keep their checked byte-reference path; transactions retain the original point operations. No certificate is exposed to callers or retained across a yield.');
-          replace(documentation,
-            'The eight-record lexical-field fixture counts 1,734 physical accepted-head reads',
-            'Before scoped cold resolution, the eight-record lexical-field fixture counted 1,734 physical accepted-head reads');
-          replace(documentation,
-            'Each inspection resolves 57 headers; resolver entry, collection selection and',
-            'In that historical measurement each inspection resolved 57 headers; resolver entry, collection selection and');
-          replace(documentation,
-            'The [fictional resolved-header fixture](../../src/server/test/intake-schema-resolution-benefit.test.ts) preserves',
-            'A cold inline ancestry regression now counts two physical HEAD proofs and six witness queries at two fixture sizes, and explicitly rejects final-proof physical-head loss and local/peer SQL ABA. These counts cover the resolver operation, not the whole workflow.\n\nThe [fictional resolved-header fixture](../../src/server/test/intake-schema-resolution-benefit.test.ts) preserves');
+          replace('src/server/test/intake-collection-envelope.test.ts',
+            "    // Owned schema resolution adds entry/collection/final readiness around each\n    // of 57 headers per inspection: two more checks than the former header get.\n    // Two inspections therefore retain 1506 + 2 * 57 * 2 physical observations.\n    assert.equal(heads - headBefore, 1734, 'physical accepted HEAD includes schema owner guards');",
+            "    // Owned schema resolution keeps entry/final physical readiness around each\n    // of 57 headers per inspection, sharing the inner collection proof. That is\n    // one extra observation over the former header get, not the previous two.\n    // Two inspections therefore retain 1506 + 1 * 57 * 2 = 1620 observations.\n    assert.equal(heads - headBefore, 1620, 'physical accepted HEAD includes both schema owner guards');");
+          replace('docs/data/intake-state-storage.md',
+            'Before scoped cold resolution, the eight-record lexical-field fixture counted 1,734 physical accepted-head reads\nover two warm inspections, compared with 1,506 before owned schema resolution.\nIn that historical measurement each inspection resolved 57 headers; resolver entry, collection selection and\nfinal readiness replace one former header-read observation with three, adding\n228 observations overall. Prepared-statement reuse leaves this count unchanged.\nKeep this added authority-check work separate from reductions in native node\nreads and bytes; it is not a net-work or latency improvement.',
+            'The eight-record lexical-field fixture now counts 1,620 physical accepted-head\nreads over two warm inspections, down from 1,734 before scoped resolution, and\ncompared with 1,506 before owned schema resolution. Each inspection resolves 57\nheaders: entry and final readiness remain, while the inner collection selection\nshares the enclosing proof. Removing one redundant observation for each of\n114 resolutions accounts for the exact reduction. Both original lexical\ninspections and their complete output assertions remain. These counts still\nexceed the pre-owner baseline and do not establish whole-workflow improvement.');
           NODE
       - name: Format and typecheck the exact candidate
         run: |
-          npx prettier --write src/server/intake-state-collections.ts src/server/test/intake-schema-resolution-authority.test.ts src/scripts/provider-qualification-acceptance.test.ts docs/data/intake-state-storage.md
+          npx prettier --write src/server/intake-state-collections.ts src/server/test/intake-schema-resolution-authority.test.ts src/server/test/intake-collection-envelope.test.ts src/scripts/provider-qualification-acceptance.test.ts docs/data/intake-state-storage.md
           npm run typecheck
-      - name: Run complete schema and collection authority regressions
+      - name: Run all complete schema and collection authority regression files
         run: |
           node --test --test-concurrency=1 src/server/test/intake-schema-resolution-authority.test.ts src/server/test/intake-schema-resolution-benefit.test.ts src/server/test/intake-state-read-cache-authority.test.ts src/server/test/intake-collection-envelope.test.ts
       - name: Remove temporary workflow and verify the bounded change
         run: |
           rm .github/workflows/pr71-read-scope.yml
-          npx prettier --check src/server/intake-state-collections.ts src/server/test/intake-schema-resolution-authority.test.ts src/scripts/provider-qualification-acceptance.test.ts docs/data/intake-state-storage.md
+          npx prettier --check src/server/intake-state-collections.ts src/server/test/intake-schema-resolution-authority.test.ts src/server/test/intake-collection-envelope.test.ts src/scripts/provider-qualification-acceptance.test.ts docs/data/intake-state-storage.md
           git diff --check
           git diff --stat
       - name: Publish only after passing tests and matching the current branch
@@ -211,7 +105,7 @@ jobs:
           test "$current_main" = "$MAIN_SHA"
           git config user.name 'Baylee Schmeisser'
           git config user.email '119542904+mxbaylee@users.noreply.github.com'
-          git add src/server/intake-state-collections.ts src/server/test/intake-schema-resolution-authority.test.ts src/scripts/provider-qualification-acceptance.test.ts docs/data/intake-state-storage.md .github/workflows/pr71-read-scope.yml
+          git add src/server/intake-state-collections.ts src/server/test/intake-schema-resolution-authority.test.ts src/server/test/intake-collection-envelope.test.ts src/scripts/provider-qualification-acceptance.test.ts docs/data/intake-state-storage.md .github/workflows/pr71-read-scope.yml
           git commit -m '⚡ Share sealed schema reads and expose acceptance progress'
           git -c http.extraheader="AUTHORIZATION: basic $auth" push origin "HEAD:refs/heads/$TARGET_BRANCH"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
