@@ -44,7 +44,7 @@ async function fixture() {
 }
 async function click(name: string) {
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name, exact: true }));
+    fireEvent.click(screen.getByRole('button', { name }));
   });
 }
 test('failed B recovery follows B, continuing reaches C, and final rechecks stay at the bottom', async () => {
@@ -65,9 +65,7 @@ test('failed B recovery follows B, continuing reaches C, and final rechecks stay
   await waitFor(() => expect(controller.getSnapshot().busy).toBe(false));
   await click('Continue without this check');
   await waitFor(() =>
-    expect(
-      screen.getByRole('button', { name: 'Create C — changed username', exact: true }),
-    ).toBeTruthy(),
+    expect(screen.getByRole('button', { name: 'Create C — changed username' })).toBeTruthy(),
   );
   expect(screen.getByText('Unavailable — no credential was returned for this slot.')).toBeTruthy();
   expect(native.creations.length).toBe(2);
