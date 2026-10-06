@@ -7,6 +7,8 @@ import { createServer as createViteServer } from 'vite';
 import { chromium } from 'playwright';
 import type { CheckerState } from '../../app/passkey-checker/types.ts';
 
+const stylesheets = ['/src/app/tokens.css', '/src/app/passkey-checker/checker.css'];
+
 test('guided A/B/C: real IndexedDB resume, downloaded evidence and explicit clear preserve older rounds', async (t) => {
   const vite = await createViteServer({
     configFile: false,
@@ -19,7 +21,11 @@ test('guided A/B/C: real IndexedDB resume, downloaded evidence and explicit clea
     if (req.url === '/fixture') {
       res.setHeader('Content-Type', 'text/html');
       res.end(
-        '<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><title>Controlled guided checker</title><div id="root"></div>',
+        '<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><title>Controlled guided checker</title>' +
+          // CSS module imports inject /@vite/client even with HMR and WebSockets disabled.
+          // Native stylesheet links retain the real styles without that development client.
+          stylesheets.map((path) => `<link rel="stylesheet" href="${path}?direct">`).join('') +
+          '<div id="root"></div>',
       );
     } else
       vite.middlewares(req, res, () => {
@@ -40,7 +46,13 @@ test('guided A/B/C: real IndexedDB resume, downloaded evidence and explicit clea
     acceptDownloads: true,
   });
   const errors: string[] = [];
+  const devClientRequests: string[] = [];
+  const webSockets: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
+  page.on('request', (request) => {
+    if (new URL(request.url()).pathname === '/@vite/client') devClientRequests.push(request.url());
+  });
+  page.on('websocket', (socket) => webSockets.push(socket.url()));
   await page.goto(`http://127.0.0.1:${(server.address() as AddressInfo).port}/fixture`);
   async function mount() {
     await page.evaluate(async () => {
@@ -49,6 +61,17 @@ test('guided A/B/C: real IndexedDB resume, downloaded evidence and explicit clea
       const { mountGuidedFixture } = (await import(path)) as FixtureModule;
       await mountGuidedFixture();
     });
+    const loadedStyles = await page.evaluate(() =>
+      Array.from(document.styleSheets, (sheet) => ({
+        path: sheet.href === null ? null : new URL(sheet.href).pathname,
+        hasRules: sheet.cssRules.length > 0,
+      })),
+    );
+    assert.deepEqual(
+      loadedStyles,
+      stylesheets.map((path) => ({ path, hasRules: true })),
+      'both real stylesheets must load before and after reload',
+    );
   }
   async function settled() {
     await page.waitForFunction(() => {
@@ -152,5 +175,7 @@ test('guided A/B/C: real IndexedDB resume, downloaded evidence and explicit clea
   });
   assert.equal(cleared.current, 0);
   assert.equal(cleared.old, 'fictional-guided-run');
+  assert.deepEqual(devClientRequests, [], 'the fixture must not load the Vite development client');
+  assert.deepEqual(webSockets, [], 'the fixture must not open development WebSockets');
   assert.deepEqual(errors, []);
 });
