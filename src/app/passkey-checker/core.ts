@@ -281,6 +281,8 @@ export async function createCredential(
     stage: 'request-construction',
   };
   try {
+    if (alias === 'C' && run.flow !== 'abc-v1')
+      fail(diagnostics, 'invalid-state', 'alias-unused');
     const salt = encodePrf(random(32).buffer);
     const options: CredentialCreationOptions = {
       publicKey: withBinaryPrf({
@@ -289,8 +291,12 @@ export async function createCredential(
         rp: { name: 'Circus Health fictional compatibility checker', id: run.rpId },
         user: {
           id: bytes(run.userId),
-          name: `fictional-${run.id}-passkey-${alias}`,
-          displayName: `Fictional compatibility test — passkey ${alias}`,
+          name: run.flow === 'abc-v1'
+            ? `fictional-${run.id}${alias === 'C' ? '-renamed' : ''}`
+            : `fictional-${run.id}-passkey-${alias}`,
+          displayName: run.flow === 'abc-v1'
+            ? 'Fictional compatibility test'
+            : `Fictional compatibility test — passkey ${alias}`,
         },
         pubKeyCredParams: [
           { type: 'public-key', alg: -8 },
