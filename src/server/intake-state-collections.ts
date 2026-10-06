@@ -40,8 +40,11 @@ import {
   type IntakeTreeReadCertificate,
   type IntakeTreeRoot,
 } from './intake-state-tree.ts';
-import { resolveSchemaMetadata } from './intake-schema-record-resolution.ts';
-import type { SchemaRecord } from './intake-envelope-schema.ts';
+import {
+  resolveSchemaMetadata,
+  resolveSchemaFieldTarget,
+} from './intake-schema-record-resolution.ts';
+import type { SchemaRecord, SchemaTarget } from './intake-envelope-schema.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 
 declare const viewBrand: unique symbol;
@@ -129,6 +132,14 @@ interface PreparedData {
   legacyBridge?: IntakeLegacyBridgeProof;
 }
 interface SchemaRecordOwner {
+  field: (
+    view: IntakeCollectionView,
+    mode: 'raw' | 'normalized',
+    root: string,
+    id: string,
+    selection: 'first' | 'last',
+    name: string,
+  ) => { target: SchemaTarget | undefined };
   resolve: (
     view: IntakeCollectionView,
     mode: 'raw' | 'normalized',
@@ -599,6 +610,190 @@ export function createIntakeCollections(owner: {
       invalid('byte chunk representation');
     return chunk;
   }
+  /** No callback or iterator supplied by a caller can enter this private scope. */
+  function resolveSchemaRead(
+    view: IntakeCollectionView,
+    mode: 'raw' | 'normalized',
+    root: string,
+    id: string,
+    fieldSelection: 'first' | 'last',
+    operation: { kind: 'header' } | { kind: 'field'; name: string },
+  ): SchemaRecord | { target: SchemaTarget | undefined } {
+    let admission:
+      | {
+          registry: Registry;
+          schemaEpoch: object;
+          epoch: object;
+          witness: string;
+          key: string;
+          header: Readonly<SchemaRecord>;
+          bytes: number;
+        }
+      | undefined;
+    const result = runRead((_readTree, certificate) => {
+      if (
+        (mode !== 'raw' && mode !== 'normalized') ||
+        typeof root !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(root) ||
+        typeof id !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(id) ||
+        (fieldSelection !== 'first' && fieldSelection !== 'last') ||
+        (operation.kind === 'field' && typeof operation.name !== 'string')
+      )
+        invalid('schema resolve arguments');
+      const registry = registryFor(db);
+      // This fixed, synchronous owner operation shares its lexical certificate.
+      // No callback, iterator or result escapes it; final ready() and the
+      // runRead seal still check physical HEAD and the exact SQL witness.
+      // Transactions retain all original point-operation observations.
+      const collection = certificate
+        ? descriptor(_readTree().get(readScope(view, 'logical'), 'envelope.data'))
+        : schemaReadOperations.collection(view, 'logical', 'envelope.data');
+      if (!collection) invalid('missing selected envelope data');
+      const current = viewData(view);
+      const key = JSON.stringify([
+        identity,
+        prefix,
+        'logical',
+        'envelope.data',
+        current.head?.logical ?? null,
+        collection,
+        mode,
+        root,
+        fieldSelection,
+        id,
+      ]);
+      if (!certificate || registry.schemaRecordWitness !== certificate.witness) {
+        registry.schemaRecords.clear();
+        registry.schemaRecordBytes = 0;
+        registry.schemaRecordEpoch = {};
+        registry.schemaRecordWitness = certificate?.witness;
+      }
+      const schemaEpoch = registry.schemaRecordEpoch;
+      const cached = certificate && registry.schemaRecords.get(key);
+      const reusable =
+        cached && cached.epoch === certificate!.epoch && cached.witness === certificate!.witness;
+      if (cached && !reusable) {
+        registry.schemaRecordBytes -= cached.bytes;
+        registry.schemaRecords.delete(key);
+      }
+      const read = (key: string) =>
+        certificate
+          ? (() => {
+              const raw = _readTree().get(collection.root, key);
+              if (raw !== undefined) recordIntakeWork('collectionItemsRead');
+              return raw === undefined ? undefined : publicValue(raw, collection.kind);
+            })()
+          : schemaReadOperations.get(view, 'logical', 'envelope.data', key);
+      // Large lexical names remain streamed through the checked byte reader.
+      // The iterator is private and completely consumed before this scope seals.
+      function* chunks(key: string): Generator<string> {
+        const value = read(key);
+        if (value === undefined)
+          throw Error('Intake collection envelope: missing exact lexical cell');
+        if (typeof value === 'string') {
+          for (let at = 0; at < value.length;) {
+            let end = Math.min(at + 1024, value.length);
+            if (end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1]!)) end--;
+            yield value.slice(at, end);
+            at = end;
+          }
+          return;
+        }
+        const decoder = new TextDecoder('utf-8', { fatal: true });
+        let after: string | undefined,
+          count = 0;
+        do {
+          const page = schemaReadOperations.readBytes(value, { after, items: 64, bytes: 4096 });
+          for (const chunk of page.chunks) {
+            count += chunk.length;
+            const decoded = decoder.decode(chunk, { stream: true });
+            if (decoded) yield decoded;
+          }
+          if (page.complete) break;
+          if (!page.after || page.after === after)
+            throw Error('Intake collection envelope: byte cursor did not advance');
+          after = page.after;
+        } while (true);
+        const tail = decoder.decode();
+        if (tail) yield tail;
+        if (count !== value.bytes)
+          throw Error('Intake collection envelope: lexical cell byte count');
+      }
+      const text = (key: string): string => {
+        const value = read(key);
+        if (typeof value === 'string') {
+          if (Buffer.byteLength(value) > 8192)
+            throw Error('Intake collection envelope: field exceeds bounded header');
+          return value;
+        }
+        if (!value || value.bytes > 8192)
+          throw Error('Intake collection envelope: missing or fragmented schema header');
+        let result = '';
+        for (const chunk of chunks(key)) result += chunk;
+        return result;
+      };
+      const header = reusable
+        ? cached.header
+        : Object.freeze({
+            ...resolveSchemaMetadata(text, () => root, id, fieldSelection),
+          });
+      if (reusable) {
+        registry.schemaRecords.delete(key);
+        registry.schemaRecords.set(key, cached);
+      }
+      const value =
+        operation.kind === 'field'
+          ? {
+              target: resolveSchemaFieldTarget(
+                header,
+                id,
+                operation.name,
+                fieldSelection,
+                read,
+                text,
+                chunks,
+              ),
+            }
+          : { ...header };
+      ready();
+      if (certificate && !reusable) {
+        const bytes =
+          Buffer.byteLength(JSON.stringify({ key, header, witness: certificate.witness })) + 256;
+        admission = {
+          registry,
+          schemaEpoch,
+          epoch: certificate.epoch,
+          witness: certificate.witness,
+          key,
+          header,
+          bytes,
+        };
+      }
+      return value;
+    });
+    // Admission follows the outer runRead final exact witness, never an optimistic result.
+    if (
+      admission &&
+      !db.isTransaction &&
+      registryFor(db) === admission.registry &&
+      admission.registry.schemaRecordEpoch === admission.schemaEpoch &&
+      readEpoch === admission.epoch &&
+      admission.bytes <= 256 * 1024
+    ) {
+      const { registry, key, header, witness, epoch, bytes } = admission;
+      const previous = registry.schemaRecords.get(key);
+      if (previous) registry.schemaRecordBytes -= previous.bytes;
+      registry.schemaRecords.set(key, { header, witness, epoch, bytes });
+      registry.schemaRecordBytes += bytes;
+      while (registry.schemaRecords.size > 32 || registry.schemaRecordBytes > 256 * 1024) {
+        const oldest = registry.schemaRecords.keys().next().value!;
+        registry.schemaRecordBytes -= registry.schemaRecords.get(oldest)!.bytes;
+        registry.schemaRecords.delete(oldest);
+      }
+    }
+    return result;
+  }
   const api = {
     prepareLegacyBridge(input: {
       operationId: string;
@@ -665,7 +860,7 @@ export function createIntakeCollections(owner: {
         return value && structuredClone(value);
       });
     },
-    /** Fixed authenticated schema operation; callers cannot insert fabricated proofs. */
+    /** Fixed authenticated schema operations; callers cannot insert fabricated proofs. */
     resolveSchemaRecord(
       view: IntakeCollectionView,
       mode: 'raw' | 'normalized',
@@ -673,154 +868,21 @@ export function createIntakeCollections(owner: {
       id: string,
       fieldSelection: 'first' | 'last',
     ): SchemaRecord {
-      let admission:
-        | {
-            registry: Registry;
-            schemaEpoch: object;
-            epoch: object;
-            witness: string;
-            key: string;
-            header: Readonly<SchemaRecord>;
-            bytes: number;
-          }
-        | undefined;
-      const result = runRead((_readTree, certificate) => {
-        if (
-          (mode !== 'raw' && mode !== 'normalized') ||
-          typeof root !== 'string' ||
-          !/^[a-f0-9]{64}$/.test(root) ||
-          typeof id !== 'string' ||
-          !/^[a-f0-9]{64}$/.test(id) ||
-          (fieldSelection !== 'first' && fieldSelection !== 'last')
-        )
-          invalid('schema resolve arguments');
-        const registry = registryFor(db);
-        // This fixed, synchronous owner operation shares its lexical certificate.
-        // No callback, iterator or result escapes it; final ready() and the
-        // runRead seal still check physical HEAD and the exact SQL witness.
-        // Transactions retain all original point-operation observations.
-        const collection = certificate
-          ? descriptor(_readTree().get(readScope(view, 'logical'), 'envelope.data'))
-          : schemaReadOperations.collection(view, 'logical', 'envelope.data');
-        if (!collection) invalid('missing selected envelope data');
-        const current = viewData(view);
-        const key = JSON.stringify([
-          identity,
-          prefix,
-          'logical',
-          'envelope.data',
-          current.head?.logical ?? null,
-          collection,
-          mode,
-          root,
-          fieldSelection,
-          id,
-        ]);
-        if (!certificate || registry.schemaRecordWitness !== certificate.witness) {
-          registry.schemaRecords.clear();
-          registry.schemaRecordBytes = 0;
-          registry.schemaRecordEpoch = {};
-          registry.schemaRecordWitness = certificate?.witness;
-        }
-        const schemaEpoch = registry.schemaRecordEpoch;
-        const cached = certificate && registry.schemaRecords.get(key);
-        if (
-          cached &&
-          cached.epoch === certificate!.epoch &&
-          cached.witness === certificate!.witness
-        ) {
-          registry.schemaRecords.delete(key);
-          registry.schemaRecords.set(key, cached);
-          // The hit returns only detached known primitives, after final physical proof.
-          ready();
-          return { ...cached.header };
-        }
-        if (cached) {
-          registry.schemaRecordBytes -= cached.bytes;
-          registry.schemaRecords.delete(key);
-        }
-        const text = (key: string): string => {
-          const value = certificate
-            ? (() => {
-                const raw = _readTree().get(collection.root, key);
-                if (raw !== undefined) recordIntakeWork('collectionItemsRead');
-                return raw === undefined ? undefined : publicValue(raw, collection.kind);
-              })()
-            : schemaReadOperations.get(view, 'logical', 'envelope.data', key);
-          if (typeof value === 'string') {
-            if (Buffer.byteLength(value) > 8192)
-              throw Error('Intake collection envelope: field exceeds bounded header');
-            return value;
-          }
-          if (!value || value.bytes > 8192)
-            throw Error('Intake collection envelope: missing or fragmented schema header');
-          // Match textValue/cellChunks: obtain the exact selected byte capability again.
-          const selected = schemaReadOperations.get(view, 'logical', 'envelope.data', key);
-          if (!selected || typeof selected === 'string') invalid('schema header byte binding');
-          const decoder = new TextDecoder('utf-8', { fatal: true });
-          let result = '',
-            after: string | undefined,
-            count = 0;
-          do {
-            const page = schemaReadOperations.readBytes(selected, {
-              after,
-              items: 64,
-              bytes: 4096,
-            });
-            for (const chunk of page.chunks) {
-              count += chunk.length;
-              result += decoder.decode(chunk, { stream: true });
-            }
-            if (page.complete) break;
-            if (!page.after || page.after === after)
-              throw Error('Intake collection envelope: byte cursor did not advance');
-            after = page.after;
-          } while (true);
-          result += decoder.decode();
-          if (count !== selected.bytes)
-            throw Error('Intake collection envelope: lexical cell byte count');
-          return result;
-        };
-        const header = Object.freeze({
-          ...resolveSchemaMetadata(text, () => root, id, fieldSelection),
-        });
-        ready();
-        if (certificate) {
-          const bytes =
-            Buffer.byteLength(JSON.stringify({ key, header, witness: certificate.witness })) + 256;
-          admission = {
-            registry,
-            schemaEpoch,
-            epoch: certificate.epoch,
-            witness: certificate.witness,
-            key,
-            header,
-            bytes,
-          };
-        }
-        return { ...header };
-      });
-      // Admission follows the outer runRead final exact witness, never an optimistic result.
-      if (
-        admission &&
-        !db.isTransaction &&
-        registryFor(db) === admission.registry &&
-        admission.registry.schemaRecordEpoch === admission.schemaEpoch &&
-        readEpoch === admission.epoch &&
-        admission.bytes <= 256 * 1024
-      ) {
-        const { registry, key, header, witness, epoch, bytes } = admission;
-        const previous = registry.schemaRecords.get(key);
-        if (previous) registry.schemaRecordBytes -= previous.bytes;
-        registry.schemaRecords.set(key, { header, witness, epoch, bytes });
-        registry.schemaRecordBytes += bytes;
-        while (registry.schemaRecords.size > 32 || registry.schemaRecordBytes > 256 * 1024) {
-          const oldest = registry.schemaRecords.keys().next().value!;
-          registry.schemaRecordBytes -= registry.schemaRecords.get(oldest)!.bytes;
-          registry.schemaRecords.delete(oldest);
-        }
-      }
-      return result;
+      return resolveSchemaRead(view, mode, root, id, fieldSelection, {
+        kind: 'header',
+      }) as SchemaRecord;
+    },
+    resolveSchemaField(
+      view: IntakeCollectionView,
+      mode: 'raw' | 'normalized',
+      root: string,
+      id: string,
+      fieldSelection: 'first' | 'last',
+      name: string,
+    ): { target: SchemaTarget | undefined } {
+      return resolveSchemaRead(view, mode, root, id, fieldSelection, { kind: 'field', name }) as {
+        target: SchemaTarget | undefined;
+      };
     },
     clearSchemaRecordCache(): void {
       const registry = registries.get(db);
@@ -1596,12 +1658,14 @@ export function createIntakeCollections(owner: {
     openView: api.openView,
     binding: api.binding,
     resolveSchemaRecord: api.resolveSchemaRecord,
+    resolveSchemaField: api.resolveSchemaField,
     clearSchemaRecordCache: api.clearSchemaRecordCache,
   });
   schemaRecordOwners.set(
     api,
     Object.freeze({
       resolve: api.resolveSchemaRecord,
+      field: api.resolveSchemaField,
       clear: api.clearSchemaRecordCache,
       current: () =>
         Object.entries(schemaMethods).every(([name, method]) => {

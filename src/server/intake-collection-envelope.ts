@@ -1,6 +1,7 @@
 import { types as utilTypes } from 'node:util';
 import {
   resolveSchemaMetadata,
+  resolveSchemaFieldTarget,
   schemaResolvedHeader,
   schemaResolvedTarget,
   schemaResolvedOrder,
@@ -328,6 +329,13 @@ const schemaResolutionOwners = new WeakMap<
       id: string,
       selection: 'first' | 'last',
     ) => SchemaRecord;
+    field: (
+      mode: 'raw' | 'normalized',
+      root: string,
+      id: string,
+      selection: 'first' | 'last',
+      name: string,
+    ) => { target: SchemaTarget | undefined };
     clear: () => void;
     current: () => boolean;
   }
@@ -358,7 +366,10 @@ export function createSchemaEnvelopeReader(
 ): IntakeCollectionEnvelopeReader {
   const handles = new WeakMap<IntakeEnvelopeRecord, string>();
   const capturedControl = inertSchemaControl(control);
-  const ownedHeader = (id: string): SchemaRecord | undefined => {
+  const ownedRead = (
+    id: string,
+    operation: { kind: 'header' } | { kind: 'field'; name: string },
+  ): SchemaRecord | { target: SchemaTarget | undefined } | undefined => {
     const owner = schemaResolutionOwners.get(store);
     if (!owner) return undefined;
     const validMethods = ['get', 'check', 'range', 'chunks'].every((name, index) => {
@@ -382,7 +393,10 @@ export function createSchemaEnvelopeReader(
       return undefined;
     }
     const [, mode, root] = JSON.parse(capturedControl) as [string, 'raw' | 'normalized', string];
-    const result = owner.resolve(mode, root, id, fieldSelection);
+    const result =
+      operation.kind === 'field'
+        ? owner.field(mode, root, id, fieldSelection, operation.name)
+        : owner.resolve(mode, root, id, fieldSelection);
     if (
       inertSchemaControl(control) !== capturedControl ||
       !owner.current() ||
@@ -400,6 +414,7 @@ export function createSchemaEnvelopeReader(
     }
     return result;
   };
+  const ownedHeader = (id: string) => ownedRead(id, { kind: 'header' }) as SchemaRecord | undefined;
   const checkedHeader = (id: string): SchemaRecord => ownedHeader(id) ?? header(store, id);
   const resolve = (id: string): IntakeEnvelopeRecord => {
     store.check();
@@ -421,23 +436,18 @@ export function createSchemaEnvelopeReader(
   };
   const fieldTarget = (record: IntakeEnvelopeRecord, name: string): SchemaTarget | undefined => {
     const id = address(record);
-    if (checkedHeader(id).shape === 'scalar' && name === 'value') return { type: 'cell', id };
-    const value = store.get('f:' + id + ':' + schemaKey(name));
-    if (value === undefined) return undefined;
-    let selected = target(JSON.parse(typeof value === 'string' ? value : fail('field descriptor')));
-    const ordinal = Number(
-      textValue(store, (fieldSelection === 'first' ? 'b:' : 'l:') + id + ':' + schemaKey(name)),
+    const owned = ownedRead(id, { kind: 'field', name }) as
+      { target: SchemaTarget | undefined } | undefined;
+    if (owned) return owned.target;
+    return resolveSchemaFieldTarget(
+      checkedHeader(id),
+      id,
+      name,
+      fieldSelection,
+      (key) => store.get(key),
+      (key) => textValue(store, key),
+      (key) => cellChunks(store, key),
     );
-    if (!Number.isSafeInteger(ordinal) || ordinal < 0) fail('field ordinal');
-    const entry = order(textValue(store, 'o:' + id + ':' + schemaOrdinal(ordinal)));
-    if (fieldSelection === 'first') selected = entry.target;
-    if (
-      entry.name === undefined ||
-      hashIntakeJsonScalar(cellChunks(store, 'n:' + entry.name)).hash !== schemaKey(name) ||
-      JSON.stringify(entry.target) !== JSON.stringify(selected)
-    )
-      fail('field/order disagreement');
-    return selected;
   };
   const verifiedNames = new Set<string>();
   const keyedField = (record: IntakeEnvelopeRecord, key: string, verifyName = false) => {
@@ -985,6 +995,8 @@ export function collectionCellReader(
     schemaResolutionOwners.set(store, {
       methods: Object.freeze([store.get, store.check, store.range, store.chunks]),
       resolve: (mode, root, id, selection) => owner.resolve(view, mode, root, id, selection),
+      field: (mode, root, id, selection, name) =>
+        owner.field(view, mode, root, id, selection, name),
       clear: owner.clear,
       current: owner.current,
     });

@@ -12,10 +12,10 @@ import { intakeNamespace } from '../intake-state-evidence.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { collectionCellReader, createSchemaEnvelopeReader } from '../intake-collection-envelope.ts';
-import { parseSchemaControl, schemaOrdinal } from '../intake-envelope-schema.ts';
+import { parseSchemaControl, schemaOrdinal, schemaKey } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 
-async function fixture(t: test.TestContext, extras = 0) {
+async function fixture(t: test.TestContext, extras = 0, original?: string) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-schema-resolve-authority-'));
   const path = join(root, 'current.sqlite');
   const identity = {
@@ -26,9 +26,10 @@ async function fixture(t: test.TestContext, extras = 0) {
   const db = openDatabase(path, identity.profileId);
   const authority = memoryRecordAuthority(db);
   const initial = prepareInitialIntakeEnvelope(
-    '{"intake":{"version":0,"scope":{"subject":{"value":"old"},"subject":{"value":"new"}},"records":' +
-      JSON.stringify(Array.from({ length: extras }, (_, id) => ({ id }))) +
-      '}}',
+    original ??
+      '{"intake":{"version":0,"scope":{"subject":{"value":"old"},"subject":{"value":"new"}},"records":' +
+        JSON.stringify(Array.from({ length: extras }, (_, id) => ({ id }))) +
+        '}}',
   );
   transaction(db, () => {
     db.prepare(
@@ -108,6 +109,7 @@ async function fixture(t: test.TestContext, extras = 0) {
     read,
     expected,
     nodes: cells.map(nodeFor),
+    nodeFor,
   };
 }
 const restore = (db: DatabaseSync, row: { key: string; raw: string }) =>
@@ -560,3 +562,217 @@ for (const external of [false, true])
       assert.equal(f.read(), f.expected);
     },
   );
+
+test('named field lookup shares one sealed scope without losing lexical values', async (t) => {
+  for (const extras of [0, 40]) {
+    const f = await fixture(t, extras);
+    const record = f.reader.resolve(f.id);
+    assert.deepEqual(f.reader.field(record, 'value'), { kind: 'value', value: 'new' });
+    const original = f.authority.storage.read;
+    let heads = 0;
+    f.authority.storage.read = (name) => {
+      if (name === 'head') heads++;
+      return original(name);
+    };
+    const before = { ...intakeWorkCounters(f.db).warm };
+    try {
+      assert.deepEqual(f.reader.field(record, 'value'), { kind: 'value', value: 'new' });
+      const after = intakeWorkCounters(f.db).warm;
+      const witnessQueries =
+        after.collectionReadWitnessQueries - before.collectionReadWitnessQueries;
+      const items = after.collectionItemsRead - before.collectionItemsRead;
+      t.diagnostic(
+        JSON.stringify({ fixture: 'named field scope', extras, heads, witnessQueries, items }),
+      );
+      assert.equal(
+        heads,
+        6,
+        'two source/handle checks, field entry/final proofs and two payload checks',
+      );
+      assert.equal(witnessQueries, 24, 'four six-query scopes; field cells share one binding');
+      assert.equal(items, 6, 'four field witnesses and both original payload reads are retained');
+    } finally {
+      f.authority.storage.read = original;
+    }
+  }
+});
+
+for (const selection of ['first', 'last'] as const)
+  for (const external of [false, true])
+    test(
+      'named field scope refuses every field and ancestry cell: ' +
+        selection +
+        '/' +
+        (external ? 'peer' : 'local'),
+      async (t) => {
+        const f = await fixture(t);
+        const reader = createSchemaEnvelopeReader(
+          f.selected.store,
+          f.control,
+          f.selected.head.logical,
+          undefined,
+          selection,
+        );
+        const record = reader.resolve(
+          reader.address(reader.child(reader.child(reader.root(), 'intake')!, 'scope')!),
+        );
+        const id = reader.address(record);
+        const key = schemaKey('subject');
+        const ordinal = Number(
+          f.selected.store.get((selection === 'first' ? 'b:' : 'l:') + id + ':' + key),
+        );
+        const orderKey = 'o:' + id + ':' + schemaOrdinal(ordinal);
+        const order = JSON.parse(String(f.selected.store.get(orderKey)));
+        const cells = [
+          'r:' + id,
+          'p:' + id,
+          'f:' + id + ':' + key,
+          (selection === 'first' ? 'b:' : 'l:') + id + ':' + key,
+          orderKey,
+          'n:' + order.name,
+        ];
+        const rows = cells.map(f.nodeFor);
+        const writer = external ? new DatabaseSync(f.path) : f.db;
+        const read = () => reader.field(reader.child(record, 'subject')!, 'value');
+        const expected = { kind: 'value', value: selection === 'first' ? 'old' : 'new' };
+        try {
+          for (const row of rows) {
+            assert.deepEqual(read(), expected);
+            writer.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', row.key);
+            assert.throws(read, /tree|collection|schema|encoded bytes/, row.cell);
+            restore(writer, row);
+            assert.deepEqual(read(), expected);
+            writer.prepare('DELETE FROM main.app_meta WHERE key=?').run(row.key);
+            assert.throws(read, /tree|collection|schema|encoded bytes/, row.cell);
+            restore(writer, row);
+          }
+        } finally {
+          if (external) writer.close();
+        }
+        assert.deepEqual(read(), expected);
+      },
+    );
+
+for (const mode of ['physical-head', 'local-aba', 'peer-aba', 'temp-schema', 'registry'] as const)
+  test('named field scope refuses ' + mode + ' during its final proof', async (t) => {
+    const f = await fixture(t);
+    const writer = mode === 'peer-aba' ? new DatabaseSync(f.path) : f.db;
+    const original = f.authority.storage.read;
+    const view = f.selected.collections.openView();
+    const read = () =>
+      f.selected.collections.resolveSchemaField(
+        view,
+        f.control.mode,
+        f.control.root,
+        f.id,
+        'last',
+        'value',
+      );
+    const expected = read();
+    assert.equal(expected.target?.type, 'cell');
+    let heads = 0;
+    f.authority.storage.read = (name) => {
+      if (name === 'head' && ++heads === 2) {
+        if (mode === 'physical-head') return null;
+        if (mode === 'registry') clearIntakeStateCache(f.db);
+        else if (mode === 'temp-schema')
+          f.db.exec(
+            'CREATE TEMP TABLE fictional_field_shadow(id); DROP TABLE fictional_field_shadow',
+          );
+        else {
+          writer
+            .prepare('INSERT INTO main.app_meta(key,value) VALUES(?,?)')
+            .run('fictional-field-aba', 'value');
+          writer.prepare('DELETE FROM main.app_meta WHERE key=?').run('fictional-field-aba');
+        }
+      }
+      return original(name);
+    };
+    try {
+      assert.throws(read, /authority|stale|generation|collection|current projection|encoded bytes/);
+      assert.equal(
+        heads,
+        2,
+        'refusal occurs at the final physical check of the fixed field operation',
+      );
+    } finally {
+      f.authority.storage.read = original;
+      if (mode === 'peer-aba') writer.close();
+    }
+    const fresh = collectionCellReader(f.db, f.source);
+    assert.deepEqual(
+      fresh.collections.resolveSchemaField(
+        fresh.collections.openView(),
+        f.control.mode,
+        f.control.root,
+        f.id,
+        'last',
+        'value',
+      ),
+      expected,
+    );
+  });
+
+test('named field scope preserves complete fragmented escaped names, missing fields and detached results', async (t) => {
+  const name = 'fictional-🧷-"-\\-'.repeat(1100);
+  const original = JSON.stringify({
+    intake: {
+      version: 0,
+      scope: { subject: { value: 'new', [name]: 'complete fictional value' } },
+    },
+  });
+  const f = await fixture(t, 0, original);
+  const record = f.reader.resolve(f.id);
+  const expected = { kind: 'value', value: 'complete fictional value' };
+  assert.deepEqual(f.reader.field(record, name), expected);
+  assert.deepEqual(f.reader.field(record, 'missing'), { kind: 'missing' });
+  // Custom/proxy readers keep their independently checked point-read behavior.
+  const fallback = createSchemaEnvelopeReader(
+    new Proxy(f.selected.store, {}),
+    f.control,
+    f.selected.head.logical,
+  );
+  assert.deepEqual(fallback.field(fallback.resolve(f.id), name), expected);
+  const view = f.selected.collections.openView();
+  const first = f.selected.collections.resolveSchemaField(
+    view,
+    f.control.mode,
+    f.control.root,
+    f.id,
+    'last',
+    name,
+  );
+  const id = first.target!.id;
+  first.target!.id = '0'.repeat(64);
+  const next = f.selected.collections.resolveSchemaField(
+    view,
+    f.control.mode,
+    f.control.root,
+    f.id,
+    'last',
+    name,
+  );
+  assert.equal(next.target!.id, id, 'returned targets are not shared mutable cache objects');
+});
+
+test('named field scope refuses rollback-only repairs and does not borrow cached missing fields', async (t) => {
+  const f = await fixture(t);
+  const record = f.reader.resolve(f.id);
+  const row = f.nodeFor('f:' + f.id + ':' + schemaKey('value'));
+  const read = () => f.reader.field(record, 'value');
+  assert.deepEqual(read(), { kind: 'value', value: 'new' });
+  f.db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', row.key);
+  f.db.exec('SAVEPOINT fictional_field_repair');
+  try {
+    restore(f.db, row);
+    assert.deepEqual(read(), { kind: 'value', value: 'new' });
+  } finally {
+    f.db.exec('ROLLBACK TO fictional_field_repair; RELEASE fictional_field_repair');
+  }
+  assert.throws(read, /tree|collection|schema/);
+  restore(f.db, row);
+  assert.deepEqual(read(), { kind: 'value', value: 'new' });
+  assert.deepEqual(f.reader.field(record, 'missing'), { kind: 'missing' });
+  f.db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', f.nodes[0]!.key);
+  assert.throws(() => f.reader.field(record, 'missing'), /tree|collection|schema/);
+});

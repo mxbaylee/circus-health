@@ -881,13 +881,15 @@ test(
     assert.equal(inspect(), expected);
     const after = intakeWorkCounters(db),
       delta = (name: keyof typeof after.warm) => after.warm[name] - before.warm[name];
-    // Owned schema resolution keeps entry/final physical readiness around each
-    // of 57 headers per inspection, sharing the inner collection proof. That is
-    // one extra observation over the former header get, not the previous two.
-    // Two inspections therefore retain 1506 + 1 * 57 * 2 = 1620 observations.
+    // Each inspection has 49 present named fields (24 lexical values, 24 field
+    // list validations and the giant scalar) and eight missing fields. A present
+    // field now shares its four field-cell checks with its header proof; a missing
+    // field shares its one failed point lookup. Entry/final physical proofs and
+    // all original source, payload and generator checks remain: 1620 - 2*(49*4+8).
+    // Both complete lexical inspections and their exact output assertions remain.
     assert.equal(
       heads - headBefore,
-      1620,
+      1212,
       'physical accepted HEAD includes both schema owner guards',
     );
     assert.ok(

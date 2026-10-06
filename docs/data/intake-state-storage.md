@@ -28,16 +28,27 @@ Bounded synchronous collection reads can also reuse authenticated pages from the
 
 Transactions neither skip raw page reads nor certify pages: observing a transaction rotates the private read epoch, so a rolled-back repair or DDL change cannot leave a trusted page. Generic preparation, mutation, staging and callback-bearing paths authenticate raw pages and invalidate that epoch. Nested reads have separate lexical certificates; a nested mutator invalidates its enclosing read. Main and TEMP schema checks remain distinct because a TEMP table or view can shadow an already prepared unqualified node query. Promises and escaping iterators cannot be returned by this synchronous boundary. Cache disposal, source changes, refusal and closure require fresh authentication.
 
-The same per-database registry retains at most 32 resolved schema headers, with a combined 256 KiB encoded budget across readers and subtrees. Entries bind the exact selected logical collection, schema root, first/last field selection, record address and current raw authority. Cold resolution checks the complete original ancestry. The fixed synchronous resolver shares its private per-call certificate for the selected collection and inline header/ancestry reads, instead of opening a nested collection call for every cell. It still checks physical accepted HEAD at entry and completion, and seals only after the final exact SQL/registry witness. Fragmented headers keep their checked byte-reference path; transactions retain the original point operations. No certificate is exposed to callers or retained across a yield. A hit returns detached header primitives after fresh physical-head and final SQL/registry checks; it retains no lexical payload or generator. Only the original registered store and owner methods participate. Custom or replaced readers use the uncached path. Transactions, witness changes and explicit cache disposal clear retained headers; readers that outlive disposal cannot repopulate an old registry. Reuse avoids intermediate ancestry reads, but its owner checks can add physical-head observations for shallow records. It does not establish detection of a physical change that appears and disappears entirely between those observations.
+The same per-database registry retains at most 32 resolved schema headers, with a combined 256 KiB encoded budget across readers and subtrees. Entries bind the exact selected logical collection, schema root, first/last field selection, record address and current raw authority. Cold resolution checks the complete original ancestry. The fixed synchronous resolver shares its private per-call certificate for the selected collection and inline header/ancestry reads, instead of opening a nested collection call for every cell. It still checks physical accepted HEAD at entry and completion, and seals only after the final exact SQL/registry witness. Fragmented headers keep their checked byte-reference path; transactions retain the original point operations. No certificate is exposed to callers or retained across a yield. A hit returns detached header primitives after fresh physical-head and final SQL/registry checks; it retains no lexical payload or generator. Named-field resolution uses the same private fixed operation to read its authenticated header/ancestry, first-or-last ordinal, order entry and complete lexical field name under one per-call certificate. The selected field descriptor must still agree with the order entry and the name hash. Missing fields and scalar `value` follow the same header and final-proof checks. Fragmented names stream through the existing checked byte reader; no name, field payload or iterator is added to the memo. Both source/handle checks and subsequent field-value reads remain outside this shared field-target scope. Only the original registered store and owner methods participate. Custom or replaced readers use the uncached path. Transactions, witness changes and explicit cache disposal clear retained headers; readers that outlive disposal cannot repopulate an old registry. Reuse avoids intermediate ancestry reads, but its owner checks can add physical-head observations for shallow records. It does not establish detection of a physical change that appears and disappears entirely between those observations.
 
-The eight-record lexical-field fixture now counts 1,620 physical accepted-head
-reads over two warm inspections, down from 1,734 before scoped resolution, and
-compared with 1,506 before owned schema resolution. Each inspection resolves 57
-headers: entry and final readiness remain, while the inner collection selection
-shares the enclosing proof. Removing one redundant observation for each of
-114 resolutions accounts for the exact reduction. Both original lexical
-inspections and their complete output assertions remain. These counts still
-exceed the pre-owner baseline and do not establish whole-workflow improvement.
+The eight-record lexical-field fixture now counts 1,212 physical accepted-head
+reads over two warm inspections, down from 1,620 before named-field scope reuse
+(earlier owner-resolution measurements were 1,734 and 1,506). Each inspection
+contains 49 present named-field resolutions: 24 lexical values, 24 field-list
+validations and one giant scalar. It also checks eight missing fields. Sharing
+four field-cell checks for each present field and one failed point lookup for
+each absent field removes exactly 2 × (49 × 4 + 8) = 408 observations. Every
+entry/final field proof, source check and payload/generator check remains, as do
+both complete lexical inspections and their original exact-output assertions.
+
+A focused named-field fixture at zero and 40 unrelated records reads the same
+six items (four field witnesses and both original payload reads), with six
+physical HEAD observations instead of ten and 24 SQL witness queries instead of 48. The existing source/handle checks, fixed field entry/final proofs and two
+payload-read checks account for all six. These are counted reductions in these
+fixtures, not whole-workflow speedups or installation latency guarantees. Field
+scope regressions reject local/peer corruption, deletion, rollback-only repairs,
+final physical-head loss, committed local/peer ABA, TEMP schema changes and
+registry disposal. Complete fragmented escaped names retain the custom-reader
+fallback's output, and returned targets are detached.
 
 A cold inline ancestry regression now counts two physical HEAD proofs and six witness queries at two fixture sizes, and explicitly rejects final-proof physical-head loss and local/peer SQL ABA. These counts cover the resolver operation, not the whole workflow.
 
