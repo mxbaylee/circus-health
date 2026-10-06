@@ -1,0 +1,19 @@
+name: PR 71 PDF runtime compatibility library
+on:
+  push:
+    branches: [diagnostic/pr71-repair-workspace-20261006]
+    paths: [.github/workflows/pr71-runtime-libs.yml]
+permissions:
+  contents: read
+jobs:
+  library:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: sudo apt-get update && sudo apt-get install --yes libjpeg-turbo8
+      - run: cp -L /usr/lib/x86_64-linux-gnu/libjpeg.so.8 "$RUNNER_TEMP/libjpeg.so.8"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr71-pdf-runtime-library
+          path: ${{ runner.temp }}/libjpeg.so.8
+          retention-days: 1
