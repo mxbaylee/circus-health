@@ -177,3 +177,29 @@ body {
     max-width: none;
   }
 }
+
+.checker-guided-step {
+  scroll-margin-block: 24px;
+}
+.checker-guided-step[aria-current='step'] {
+  border-color: var(--blue);
+}
+.checker-guided-future {
+  padding-block: 10px;
+  color: var(--muted);
+}
+.checker .checker-confirm-save {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.checker .checker-confirm-save input {
+  width: auto;
+  margin-top: 7px;
+}
+.checker-report-preview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+}
