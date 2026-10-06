@@ -1,5 +1,14 @@
+import { messageEvidence, validNativeMessage } from './message.ts';
+import {
+  guidedPlan,
+  guidedSummary,
+  guidedInvocationEvidence,
+  GUIDED_ALIASES,
+  verifiedFinal,
+  verifiedRetention,
+} from './guided.ts';
 import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, STEP_LABELS, stepsForAlias } from './types.ts';
-import { projectPrfDiagnostics } from './diagnostics.ts';
+import { ADDITIONAL_DIAGNOSTIC_LABELS, projectPrfDiagnostics } from './diagnostics.ts';
 import type { PrfDiagnostics, ValidationRule } from './diagnostics.ts';
 import { isVerifiedAAfterFailedB, isVerifiedReturnToA, latestBCreation } from './progress.ts';
 import type { CheckerState, Environment, Step } from './types.ts';
@@ -40,7 +49,7 @@ const expectedValidation: Record<ValidationRule, string> = {
   'fictional-decryption': 'successful decryption with fresh PRF output',
   'fictional-plaintext-match': 'the original fictional value for this run and credential',
 };
-const diagnosticFields: readonly [keyof PrfDiagnostics, string][] = [
+const diagnosticFields: readonly (readonly [keyof PrfDiagnostics, string])[] = [
   ['operation', 'operation'],
   ['stage', 'stage'],
   ['applicationError', 'application error code'],
@@ -61,10 +70,12 @@ const diagnosticFields: readonly [keyof PrfDiagnostics, string][] = [
   ['resultsShape', 'PRF results shape'],
   ['arrayEntriesValid', 'array entries are bytes'],
   ['diagnosticsUnavailable', 'some diagnostic details unavailable'],
+  ...ADDITIONAL_DIAGNOSTIC_LABELS,
 ];
 
 /** Allowlisted human report: never serialize the local model or WebAuthn objects. */
 export function reportMarkdown(state: CheckerState): string {
+  const guided = state.run.flow === 'abc-v1';
   const privateReferences = new Set<string>();
   for (const credential of state.credentials) {
     privateReferences.add(credential.id);
@@ -118,7 +129,7 @@ export function reportMarkdown(state: CheckerState): string {
   const lines = [
     '# Passkey compatibility operator record',
     '',
-    `Report schema: ${REPORT_VERSION}. Local editable operator record; not a signed attestation.`,
+    `Report schema: ${guided ? 4 : REPORT_VERSION}. Local editable operator record; not a signed attestation.`,
     `Run started: ${safe(state.run.createdAt)}.`,
     `Initial tool build: ${buildText(state.run.build)}.`,
     `Recorded origin: ${safe(state.run.origin)}. Relying-party domain: ${safe(state.run.rpId)}.`,
@@ -137,19 +148,46 @@ export function reportMarkdown(state: CheckerState): string {
     '',
     'Creation alone, capability flags and signatures do not pass PRF compatibility. Confirmation verifies an exact-credential 32-byte PRF result and encrypts, decrypts and compares a fictional value. Each verified subsequent use obtains a fresh PRF result, checks the exact credential and decrypts and compares the retained fictional ciphertext. There is no backend signature/challenge verification.',
     '',
-    'Use A after B is created requires B to have been created; B need not be confirmed. This separate fresh-use step must verify A and decrypt its retained fictional value. Earlier uses of A do not complete it. A distinct B credential and successful hosted checks do not prove an independent authenticator.',
+    guided
+      ? 'Guided A/B/C run: A and B share the native username; C changes only that username. The opaque user ID and native displayName remain the same. Exclusions and PRF mode are retained. A/B/C are local aliases, not different accounts.'
+      : 'Use A after B is created requires B to have been created; B need not be confirmed. This separate fresh-use step must verify A and decrypt its retained fictional value. Earlier uses of A do not complete it. A distinct B credential and successful hosted checks do not prove an independent authenticator.',
     '',
-    'Use A after B creation fails is a separate recovery check linked to that failed creation attempt. It requires fresh PRF output and decryption of A’s original fictional value. It does not verify B or complete two-credential enrollment. A later B creation failure needs its own fresh A check; historical results remain unchanged.',
+    guided
+      ? 'A retained-access check is linked to its exact failed/interrupted addition. Final A/B/C rechecks occur after the enrollment sequence and decrypt each original retained ciphertext. This shortened diagnostic flow does not claim three fresh uses or real-application qualification. C is a sequential naming experiment, not proof that names caused an outcome.'
+      : 'Use A after B creation fails is a separate recovery check linked to that failed creation attempt. It requires fresh PRF output and decryption of A’s original fictional value. It does not verify B or complete two-credential enrollment. A later B creation failure needs its own fresh A check; historical results remain unchanged.',
     '',
     'Safe diagnostic lengths count bytes for buffers/views, items for arrays and characters for strings. An omitted field was unobserved, oversized or not applicable; it does not mean zero or a valid result. Older attempts have no newly inferred diagnostics.',
     '',
-    'A native error name is a bounded name classification, not proof of the browser/provider cause. NotAllowedError does not distinguish cancellation, timeout or refusal. InvalidStateError with exclusions is consistent with duplicate exclusion but does not prove it; an unrecognized failure remains unresolved. Stage and validation facts identify the next debugging boundary without exporting native messages or payloads.',
+    guided
+      ? 'A native error name and any bounded message excerpt are observations, not proof of a provider cause. NotAllowedError does not distinguish cancellation, timeout or refusal. InvalidStateError with exclusions is consistent with duplicate exclusion but does not prove it. No raw native payload is exported.'
+      : 'A native error name is a bounded name classification, not proof of the browser/provider cause. NotAllowedError does not distinguish cancellation, timeout or refusal. InvalidStateError with exclusions is consistent with duplicate exclusion but does not prove it; an unrecognized failure remains unresolved. Stage and validation facts identify the next debugging boundary without exporting native messages or payloads.',
+    '',
+    'An enable-only creation request is an explicit experiment, not a provider fix: it enables PRF without evaluating during creation. Confirmation still uses eval and fresh uses still use evalByCredential with the original credential and salt. Each mode uses a separate fictional run; combine A/B results only within that run. PRF enabled flags, attachment hints, focus and timing buckets do not establish compatibility or a native error cause.',
     '',
   ];
-  for (const alias of ['A', 'B'] as const) {
+  if (guided) {
+    lines.push(
+      '## Guided sequence',
+      '',
+      guidedSummary(state),
+      '',
+      `Flow: abc-v1. Creation mode: ${safe(state.run.registrationMode)}.`,
+      '',
+      ...guidedPlan(state).map(
+        (row) => `- ${row.title}: ${row.result}${row.active ? '; next available action' : ''}.`,
+      ),
+      '',
+      'Guided native failures may include a bounded message excerpt: known references, URLs, byte arrays and long opaque values are redacted; original length and transformation flags are explicit. Review excerpts before sharing. Stack/cause contents and native payloads are not captured.',
+      '',
+      'Skipped records the skip path, not a successful native operation or proof of human intent. Not applicable means its credential prerequisite is absent; it is not a pass. Earlier failures remain below even after a retry succeeds.',
+      '',
+    );
+  }
+  for (const alias of guided ? GUIDED_ALIASES : (['A', 'B'] as const)) {
     lines.push(`### Credential ${alias}`, '');
     const latestB = latestBCreation(state);
     if (
+      !guided &&
       alias === 'A' &&
       latestB?.status === 'failed' &&
       !state.credentials.some((credential) => credential.alias === 'B')
@@ -163,12 +201,20 @@ export function reportMarkdown(state: CheckerState): string {
         '',
       );
     }
-    for (const step of stepsForAlias(alias)) {
+    for (const step of stepsForAlias(alias, guided)) {
+      const label =
+        guided && step === 'use-1' ? 'Final recheck of original credential' : STEP_LABELS[step];
       const attempts = state.attempts.filter(
         (attempt) => attempt.alias === alias && attempt.step === step,
       );
-      if (!attempts.length)
-        lines.push(`- ${STEP_LABELS[step]}: unfinished; no automatic evidence.`);
+      if (!attempts.length) {
+        const row = guidedPlan(state).find((item) => item.alias === alias && item.step === step);
+        const unavailable =
+          guided && ((step === 'retained' && !row) || row?.result.startsWith('not applicable'));
+        lines.push(
+          `- ${label}: ${unavailable ? (row?.result ?? 'not applicable · no earlier confirmed credential required a recovery check') : 'unfinished; no automatic evidence'}.`,
+        );
+      }
       for (const [index, attempt] of attempts.entries()) {
         const status =
           attempt.status === 'created' && step === 'create'
@@ -176,19 +222,23 @@ export function reportMarkdown(state: CheckerState): string {
             : attempt.status === 'verified' &&
                 step !== 'create' &&
                 (step !== 'use-after-b' || isVerifiedReturnToA(state, attempt)) &&
-                (step !== 'use-after-b-failed' || isVerifiedAAfterFailedB(state, attempt))
+                (step !== 'use-after-b-failed' || isVerifiedAAfterFailedB(state, attempt)) &&
+                (step !== 'retained' || verifiedRetention(state, attempt)) &&
+                (!guided || step !== 'use-1' || verifiedFinal(state, attempt))
               ? 'verified PRF and fictional decryption'
-              : attempt.status === 'failed'
-                ? 'failed'
-                : attempt.status === 'interrupted'
-                  ? 'interrupted; unfinished'
-                  : 'pending or unfinished; no verified result';
+              : attempt.status === 'skipped'
+                ? 'skipped by operator; no automatic pass'
+                : attempt.status === 'failed'
+                  ? 'failed'
+                  : attempt.status === 'interrupted'
+                    ? 'interrupted; unfinished'
+                    : 'pending or unfinished; no verified result';
         const error =
           attempt.error && Object.hasOwn(ERROR_MESSAGES, attempt.error)
             ? `; ${ERROR_MESSAGES[attempt.error]}`
             : '';
         lines.push(
-          `- ${STEP_LABELS[step]}, attempt ${index + 1}: ${status}${error}.`,
+          `- ${label}, attempt ${index + 1}: ${status}${error}.`,
           `  Started ${safe(attempt.startedAt)}; finished ${attempt.finishedAt ? safe(attempt.finishedAt) : 'unfinished'}. Build: ${buildText(attempt.build)}.`,
         );
         lines.push(...environmentLines(attempt.environment).map((line) => `  ${line}`));
@@ -204,9 +254,42 @@ export function reportMarkdown(state: CheckerState): string {
               : '  Linked failed B creation: unavailable or invalid; no qualifying recovery evidence.',
           );
         }
+        if (guided && attempt.status === 'failed' && validNativeMessage(attempt.nativeMessage)) {
+          const message = attempt.nativeMessage;
+          const excerpt =
+            message.state === 'text'
+              ? messageEvidence(message.text, [
+                  state.run.id,
+                  state.run.userId,
+                  ...state.credentials.flatMap((item) => [
+                    item.id,
+                    item.salt,
+                    item.cipher?.iv ?? '',
+                    item.cipher?.data ?? '',
+                  ]),
+                ])
+              : message;
+          lines.push(
+            `  Native message excerpt: ${message.state === 'text' ? (message.length === 0 ? '(empty string)' : safe(excerpt.text, 1024)) : message.state}.`,
+            `  Message detail: state ${message.state}; original character count ${message.length ?? 'unobserved'}; truncated ${message.truncated ?? false}; redacted ${message.redacted || excerpt.redacted || false}. This is a transformed excerpt, not full native-error serialization.`,
+          );
+        }
+        if (step === 'retained') {
+          const index = state.attempts.findIndex((row) => row.id === attempt.afterAttemptId);
+          const source = state.attempts[index];
+          lines.push(
+            source && ['failed', 'interrupted'].includes(source.status)
+              ? `  Linked failed addition: ${source.alias} ${source.step}, recorded operation ${index + 1}; finished ${safe(source.finishedAt)}.`
+              : '  Linked failed addition unavailable; no qualifying recovery evidence.',
+          );
+        }
         // Project again at the export boundary: callers need not have loaded through
         // the strict store, and arbitrary/native diagnostic values must never leak.
         const diagnostics = projectPrfDiagnostics(attempt.diagnostics);
+        if (guided)
+          lines.push(
+            `  Request disposition: ${guidedInvocationEvidence({ ...attempt, diagnostics })}`,
+          );
         if (diagnostics) {
           const fields: string[] = [
             `request mode: ${diagnostics.requestMode}`,
@@ -225,7 +308,10 @@ export function reportMarkdown(state: CheckerState): string {
           if (diagnostics.credentialMatched !== undefined)
             fields.push(`returned credential matched: ${diagnostics.credentialMatched}`);
           for (const [key, label] of diagnosticFields)
-            if (diagnostics[key] !== undefined) fields.push(`${label}: ${diagnostics[key]}`);
+            if (diagnostics[key] !== undefined)
+              fields.push(
+                `${guided && key === 'nativeMessageState' ? 'native message availability (see bounded excerpt)' : label}: ${diagnostics[key]}`,
+              );
           if (diagnostics.validationRule !== undefined)
             fields.push(
               `validation rule: ${diagnostics.validationRule}`,
@@ -245,8 +331,8 @@ export function reportMarkdown(state: CheckerState): string {
   );
   if (!state.observations.length) lines.push('No manual observations recorded.');
   for (const observation of state.observations) {
-    const alias = observation.alias === 'B' ? 'B' : 'A';
-    const step = stepsForAlias(alias).some((step) => step === observation.step)
+    const alias = guided && observation.alias === 'C' ? 'C' : observation.alias === 'B' ? 'B' : 'A';
+    const step = stepsForAlias(alias, guided).some((step) => step === observation.step)
       ? STEP_LABELS[observation.step as Step]
       : 'General observation';
     lines.push(

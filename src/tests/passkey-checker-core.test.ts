@@ -158,8 +158,13 @@ test('native adapter refuses insecure contexts and error classification never in
     'Mozilla/5.0 (Windows NT 10.0) Chrome/140.0.0.0 Safari/537.36',
   );
   assert.equal(environment.browser.source, 'browser-reported');
-  assert.equal(environment.osVersion.source, 'unknown');
+  assert.deepEqual(environment.osVersion, {
+    value: 'NT 10.0 (UA hint; may be frozen)',
+    source: 'browser-reported',
+  });
   assert.equal(environment.provider.source, 'unknown');
+  assert.equal(environment.providerVersion.source, 'unknown');
+  assert.deepEqual(inspectEnvironment('').osVersion, { value: '', source: 'unknown' });
 });
 test('controlled diagnostics: capture once and distinguish absence, rejected shapes, mismatch and native refusal', async () => {
   let calls = 0;

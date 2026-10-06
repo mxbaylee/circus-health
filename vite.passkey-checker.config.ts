@@ -33,6 +33,6 @@ export default defineConfig({
   build: {
     outDir: fileURLToPath(new URL('./dist/passkey-checker/', import.meta.url)),
     emptyOutDir: true,
-    sourcemap: false,
+    sourcemap: true,
   },
 });

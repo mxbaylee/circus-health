@@ -1,5 +1,7 @@
 import { ERROR_MESSAGES } from './types.ts';
 import type { ErrorCode } from './types.ts';
+import { ERROR_METADATA_LABELS, inspectErrorMetadata, validErrorMetadataField } from './debug.ts';
+import type { ErrorMetadata } from './debug.ts';
 
 /** Allowlisted shape evidence only; never retain credential references or PRF contents. */
 export type DiagnosticShape =
@@ -76,8 +78,8 @@ export const NATIVE_ERROR_NAMES = [
   'unrecognized',
 ] as const;
 export type ValidationRule = (typeof VALIDATION_RULES)[number];
-export interface PrfDiagnostics {
-  requestMode: 'eval' | 'evalByCredential';
+export interface PrfDiagnostics extends ErrorMetadata {
+  requestMode: 'eval' | 'evalByCredential' | 'enable-only';
   operation?: 'create' | 'confirm' | 'verify';
   stage?: (typeof DIAGNOSTIC_STAGES)[number];
   applicationError?: ErrorCode;
@@ -107,6 +109,18 @@ export interface PrfDiagnostics {
   outputShape?: DiagnosticShape;
   outputLength?: number;
   credentialMatched?: boolean;
+  prfEnabled?: boolean;
+  prfEnabledShape?: DiagnosticShape;
+  residentCredentialReported?: boolean;
+  credentialIdTextMatched?: boolean;
+  attachmentHint?: 'platform' | 'cross-platform' | 'other';
+  userActivationAtInvocation?: boolean;
+  documentVisibleAtInvocation?: boolean;
+  documentFocusedAtInvocation?: boolean;
+  topLevelContext?: boolean;
+  nativeOutcome?: 'returned' | 'threw' | 'rejected';
+  nativeDuration?: 'under-1s' | '1-5s' | '5-15s' | '15-60s' | 'over-60s';
+  nativeErrorCode?: number;
 }
 export type PrfDiagnosticsObserver = (diagnostics: PrfDiagnostics) => void;
 export type DiagnosticObserver = PrfDiagnosticsObserver;
@@ -122,7 +136,24 @@ const SHAPES: readonly DiagnosticShape[] = [
   'number',
   'other',
 ];
+/** The report uses the same field list as the privacy projection. */
+export const ADDITIONAL_DIAGNOSTIC_LABELS = [
+  ...ERROR_METADATA_LABELS,
+  ['prfEnabled', 'PRF enabled flag'],
+  ['prfEnabledShape', 'PRF enabled flag shape'],
+  ['residentCredentialReported', 'resident credential reported'],
+  ['credentialIdTextMatched', 'returned id and rawId agree'],
+  ['attachmentHint', 'authenticator attachment hint'],
+  ['userActivationAtInvocation', 'user activation at native invocation'],
+  ['documentVisibleAtInvocation', 'document visible at native invocation'],
+  ['documentFocusedAtInvocation', 'document focused at native invocation'],
+  ['topLevelContext', 'top-level browsing context'],
+  ['nativeOutcome', 'native invocation outcome'],
+  ['nativeDuration', 'native duration bucket'],
+  ['nativeErrorCode', 'native numeric error code'],
+] as const satisfies readonly (readonly [keyof PrfDiagnostics, string])[];
 const FIELDS = [
+  ...ADDITIONAL_DIAGNOSTIC_LABELS.map(([key]) => key),
   'operation',
   'stage',
   'applicationError',
@@ -222,6 +253,20 @@ export function describePrfResponse(
   } catch {
     diagnostics.diagnosticsUnavailable = true;
   }
+  // Optional creation metadata cannot veto a valid output or a successful creation.
+  try {
+    const enabled = (prf as { enabled?: unknown } | undefined)?.enabled;
+    if (enabled !== undefined) diagnostics.prfEnabledShape = diagnosticShape(enabled).shape;
+    if (typeof enabled === 'boolean') diagnostics.prfEnabled = enabled;
+  } catch {
+    diagnostics.diagnosticsUnavailable = true;
+  }
+  try {
+    const rk = (extensions as { credProps?: { rk?: unknown } } | undefined)?.credProps?.rk;
+    if (typeof rk === 'boolean') diagnostics.residentCredentialReported = rk;
+  } catch {
+    diagnostics.diagnosticsUnavailable = true;
+  }
   const results = prf?.results;
   diagnostics.resultsPresent = results !== undefined;
   try {
@@ -241,6 +286,20 @@ export function describePrfResponse(
 }
 function fieldValid(key: (typeof FIELDS)[number], value: unknown): boolean {
   switch (key) {
+    case 'nativeMessageState':
+    case 'nativeStackState':
+    case 'nativeCauseState':
+    case 'nativeMessageLength':
+    case 'nativeStackLength':
+      return validErrorMetadataField(key, value);
+    case 'nativeErrorCode':
+      return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 25;
+    case 'attachmentHint':
+      return ['platform', 'cross-platform', 'other'].includes(value as string);
+    case 'nativeOutcome':
+      return ['returned', 'threw', 'rejected'].includes(value as string);
+    case 'nativeDuration':
+      return ['under-1s', '1-5s', '5-15s', '15-60s', 'over-60s'].includes(value as string);
     case 'operation':
       return ['create', 'confirm', 'verify'].includes(value as string);
     case 'stage':
@@ -259,12 +318,13 @@ function fieldValid(key: (typeof FIELDS)[number], value: unknown): boolean {
     case 'userIdLength':
       return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 64;
     case 'requestMode':
-      return value === 'eval' || value === 'evalByCredential';
+      return value === 'eval' || value === 'evalByCredential' || value === 'enable-only';
     case 'inputShape':
     case 'outputShape':
     case 'credentialIdShape':
     case 'extensionShape':
     case 'resultsShape':
+    case 'prfEnabledShape':
       return SHAPES.includes(value as DiagnosticShape);
     case 'inputLength':
     case 'outputLength':
@@ -320,10 +380,10 @@ export function emitPrfDiagnostics(
   }
 }
 
-/** Read only a bounded native name; thrown accessors and private names stay unrecognized. */
+/** Bounded name and availability evidence; never retain the error's text or attached payload. */
 export function nativeErrorEvidence(
   error: unknown,
-): Pick<PrfDiagnostics, 'nativeErrorName' | 'nativeErrorCategory'> {
+): Pick<PrfDiagnostics, 'nativeErrorName' | 'nativeErrorCategory'> & ErrorMetadata {
   let name: unknown;
   try {
     name = error && typeof error === 'object' ? (error as { name?: unknown }).name : undefined;
@@ -339,5 +399,71 @@ export function nativeErrorEvidence(
       : ['Error', 'TypeError', 'RangeError', 'SyntaxError'].includes(nativeErrorName)
         ? 'js-name'
         : 'dom-name';
-  return { nativeErrorName, nativeErrorCategory };
+  return { nativeErrorName, nativeErrorCategory, ...inspectErrorMetadata(error) };
+}
+
+/** Never await before invoking the operation: Safari needs the original button gesture. */
+export async function observeNative<T>(
+  diagnostics: PrfDiagnostics,
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    const active = globalThis.navigator?.userActivation?.isActive;
+    if (typeof active === 'boolean') diagnostics.userActivationAtInvocation = active;
+  } catch {
+    diagnostics.diagnosticsUnavailable = true;
+  }
+  try {
+    if (typeof document !== 'undefined') {
+      if (['visible', 'hidden'].includes(document.visibilityState))
+        diagnostics.documentVisibleAtInvocation = document.visibilityState === 'visible';
+      if (typeof document.hasFocus === 'function')
+        diagnostics.documentFocusedAtInvocation = document.hasFocus();
+    }
+    if (typeof window !== 'undefined') diagnostics.topLevelContext = window.top === window.self;
+  } catch {
+    diagnostics.diagnosticsUnavailable = true;
+  }
+  let started: number | undefined;
+  try {
+    started = globalThis.performance?.now();
+  } catch {
+    diagnostics.diagnosticsUnavailable = true;
+  }
+  let returned = false;
+  try {
+    const pending = operation();
+    returned = true;
+    const result = await pending;
+    diagnostics.nativeOutcome = 'returned';
+    return result;
+  } catch (error) {
+    diagnostics.nativeOutcome = returned ? 'rejected' : 'threw';
+    try {
+      const code =
+        error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+      if (typeof code === 'number' && Number.isInteger(code) && code >= 0 && code <= 25)
+        diagnostics.nativeErrorCode = code;
+    } catch {
+      diagnostics.diagnosticsUnavailable = true;
+    }
+    throw error;
+  } finally {
+    try {
+      const elapsed = started === undefined ? undefined : performance.now() - started;
+      if (elapsed !== undefined && Number.isFinite(elapsed) && elapsed >= 0)
+        diagnostics.nativeDuration =
+          elapsed < 1000
+            ? 'under-1s'
+            : elapsed < 5000
+              ? '1-5s'
+              : elapsed < 15000
+                ? '5-15s'
+                : elapsed < 60000
+                  ? '15-60s'
+                  : 'over-60s';
+    } catch {
+      diagnostics.diagnosticsUnavailable = true;
+    }
+  }
 }
