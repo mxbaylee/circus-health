@@ -12,6 +12,8 @@ export async function guidedFixture(
     failCreate?: Set<CredentialAlias>;
     wrongCredential?: Set<CredentialAlias>;
     badPrfLength?: number;
+    missingPrf?: Set<CredentialAlias>;
+    changedPrf?: Set<CredentialAlias>;
     synchronousFailure?: boolean;
   } = {},
 ) {
@@ -30,10 +32,19 @@ export async function guidedFixture(
       rawId: id.buffer,
       getClientExtensionResults() {
         extensionReads++;
+        const alias = (['A', 'B', 'C'] as const)[id[0] - 1];
         return {
           prf: {
             enabled: true,
-            results: { first: new Uint8Array(input.badPrfLength ?? 32).fill(id[0]).buffer },
+            ...(input.missingPrf?.has(alias)
+              ? {}
+              : {
+                  results: {
+                    first: new Uint8Array(input.badPrfLength ?? 32).fill(
+                      id[0] + (input.changedPrf?.has(alias) ? 16 : 0),
+                    ).buffer,
+                  },
+                }),
           },
         };
       },
