@@ -1,0 +1,130 @@
+name: PR 71 named-field repair validation
+on:
+  push:
+    branches: [diagnostic/pr71-repair-workspace-20261006]
+    paths: [.github/workflows/pr71-field-repair.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HUSKY: '0'
+      SOURCE_SHA: d5b9dcc0f191246cfe2627557a5486237773d2c2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: d5b9dcc0f191246cfe2627557a5486237773d2c2
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Retrieve and verify the six exact public-source patches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { mkdirSync, writeFileSync } from 'node:fs';
+          const patches = {
+            docs: 'b9e9f92484a6cd19359ffa33767dac43623ac459',
+            envelope: 'e9e85c45dc085faa22cfba31c0b9956b6dd38817',
+            recipe: 'c44eddf61a74ff5af5de9f04a8cd19655cb8e08f',
+            owner: '4a9b7c201f04e6159633d0ee05b5eb6f9765c715',
+            lexical: '2ac446c532d710a6d197646157ff8362517e95f3',
+            authority: '5255e75b9f4029cdba1f80d5bab1e50617554b71',
+          };
+          const directory = process.env.RUNNER_TEMP + '/field-patches';
+          mkdirSync(directory);
+          for (const [name, sha] of Object.entries(patches)) {
+            const response = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs/' + sha, {
+              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json' },
+            });
+            assert.equal(response.status, 200, 'patch retrieval status');
+            const blob = await response.json();
+            assert.equal(blob.encoding, 'base64');
+            const bytes = Buffer.from(blob.content, 'base64');
+            assert.equal(createHash('sha1').update('blob ' + bytes.length + '\0').update(bytes).digest('hex'), sha);
+            writeFileSync(directory + '/' + name + '.patch', bytes);
+          }
+          NODE
+      - name: Demonstrate the new work-count regression on the unchanged parent
+        run: |
+          git apply "$RUNNER_TEMP/field-patches/authority.patch"
+          set +e
+          node --test --test-name-pattern='named field lookup' src/server/test/intake-schema-resolution-authority.test.ts > "$RUNNER_TEMP/field-red.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/field-red.log"
+          test "$status" = 1
+          grep -F '"heads":10,"witnessQueries":48,"items":6' "$RUNNER_TEMP/field-red.log"
+          git checkout -- src/server/test/intake-schema-resolution-authority.test.ts
+      - name: Apply the exact locally tested repair
+        run: |
+          git apply --check "$RUNNER_TEMP"/field-patches/*.patch
+          git apply "$RUNNER_TEMP"/field-patches/*.patch
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          const files = {
+            'docs/data/intake-state-storage.md': 'c151cc3583832027052e5ae3adf58baff542ab01',
+            'src/server/intake-collection-envelope.ts': '17820263f0d5aecf542cd66d32c4165dafc2130c',
+            'src/server/intake-schema-record-resolution.ts': '67e1a7c5cac610e46562d4eaf1deedae8b24f6ec',
+            'src/server/intake-state-collections.ts': '727a50361df68fced295ff779f80957b180ce824',
+            'src/server/test/intake-collection-envelope.test.ts': '6e161e3277a12bfd69a0eff82a7be2e0a38a2baa',
+            'src/server/test/intake-schema-resolution-authority.test.ts': 'ac2fcd281875a32b2c325d4cd1d89f8f7d3ab27d',
+          };
+          assert.deepEqual(execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).trim().split('\n'), Object.keys(files));
+          for (const [path, sha] of Object.entries(files)) assert.equal(execFileSync('git', ['hash-object', path], { encoding: 'utf8' }).trim(), sha, path);
+          writeFileSync(process.env.RUNNER_TEMP + '/field-files.json', JSON.stringify(files));
+          writeFileSync(process.env.RUNNER_TEMP + '/field-paths.txt', Object.keys(files).join('\n') + '\n');
+          NODE
+          git diff --check
+          mapfile -t files < "$RUNNER_TEMP/field-paths.txt"
+          npx prettier --check "${files[@]}"
+      - run: npm run typecheck
+      - run: node scripts/repository-file-inventory.ts --check
+      - name: Complete field, schema, corruption and lexical regressions
+        run: |
+          node --test --test-concurrency=1 src/server/test/intake-schema-resolution-authority.test.ts src/server/test/intake-schema-resolution-benefit.test.ts src/server/test/intake-state-read-cache-authority.test.ts src/server/test/intake-collection-envelope.test.ts
+      - name: Publish only verified source objects, never a branch or merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const files = JSON.parse(readFileSync(process.env.RUNNER_TEMP + '/field-files.json', 'utf8'));
+          async function request(path, body) {
+            const response = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/' + path, {
+              method: body === undefined ? 'GET' : 'POST',
+              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+              ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            });
+            assert.ok(response.ok, 'Git object publication status ' + response.status);
+            return response.json();
+          }
+          const parent = await request('commits/' + process.env.SOURCE_SHA);
+          const tree = [];
+          for (const [path, expected] of Object.entries(files)) {
+            const blob = await request('blobs', { content: readFileSync(path, 'utf8'), encoding: 'utf-8' });
+            assert.equal(blob.sha, expected, path);
+            tree.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
+          }
+          const result = await request('trees', { base_tree: parent.tree.sha, tree });
+          const evidence = { parent: process.env.SOURCE_SHA, tree: result.sha, files, checks: 'new regression red on parent; 58 focused tests green; four TypeScript projects; formatting; file inventory' };
+          console.log(JSON.stringify(evidence));
+          writeFileSync(process.env.RUNNER_TEMP + '/field-tree.json', JSON.stringify(evidence, null, 2));
+          NODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr71-field-tree-evidence
+          path: ${{ runner.temp }}/field-tree.json
+          retention-days: 1
