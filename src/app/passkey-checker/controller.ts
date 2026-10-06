@@ -1,3 +1,5 @@
+import { messageEvidence } from './message.ts';
+import { currentGuidedTask } from './guided.ts';
 import * as operations from './core.ts';
 import { createRun, inspectEnvironment } from './environment.ts';
 import { projectPrfDiagnostics } from './diagnostics.ts';
@@ -28,9 +30,10 @@ export interface CheckerSnapshot {
 export interface CheckerController {
   getSnapshot(): CheckerSnapshot;
   subscribe(listener: () => void): () => void;
-  canRunStep(alias: CredentialAlias, step: Step): boolean;
+  canRunStep(alias: CredentialAlias, step: Step, afterAttemptId?: string): boolean;
   updateEnvironment(patch: Partial<Record<keyof Environment, string>>): Promise<void>;
-  runStep(alias: CredentialAlias, step: Step): Promise<void>;
+  runStep(alias: CredentialAlias, step: Step, afterAttemptId?: string): Promise<void>;
+  skipStep?(alias: CredentialAlias, step: Step, afterAttemptId?: string): Promise<void>;
   addObservation(input: Pick<Observation, 'alias' | 'step' | 'outcome' | 'note'>): Promise<void>;
   exportModel(): CheckerState;
   reset(): Promise<void>;
@@ -39,6 +42,7 @@ export interface CheckerController {
 }
 export interface ControllerOptions {
   build: BuildInfo;
+  guidedMode?: 'eval' | 'enable-only';
   environment?: Environment;
   /** Development fixtures only; the shipped UI always uses the native core. */
   core?: Pick<typeof operations, 'createCredential' | 'confirmCredential' | 'verifyCredential'>;
@@ -71,7 +75,12 @@ export async function createCheckerController(
   const remove =
     options.deleteStore ?? ((onBlocked) => deleteCheckerStore(undefined, undefined, onBlocked));
   const fresh = (): CheckerState => ({
-    run: newRun(options.build, options.environment ?? inspectEnvironment()),
+    run: {
+      ...newRun(options.build, options.environment ?? inspectEnvironment()),
+      ...(options.guidedMode
+        ? { flow: 'abc-v1' as const, registrationMode: options.guidedMode }
+        : {}),
+    },
     credentials: [],
     attempts: [],
     observations: [],
@@ -138,7 +147,9 @@ export async function createCheckerController(
     if (retained) {
       if (
         retained.state.run.origin !== state.run.origin ||
-        retained.state.run.rpId !== state.run.rpId
+        retained.state.run.rpId !== state.run.rpId ||
+        retained.state.run.flow !== state.run.flow ||
+        retained.state.run.registrationMode !== state.run.registrationMode
       )
         throw new CheckerStorageError('incompatible');
       const currentHints = state.run.environment;
@@ -174,8 +185,19 @@ export async function createCheckerController(
   }
   publish();
 
-  function canRunStep(alias: CredentialAlias, step: Step): boolean {
-    if (!available() || !['A', 'B'].includes(alias)) return false;
+  function canRunStep(alias: CredentialAlias, step: Step, afterAttemptId?: string): boolean {
+    if (!available()) return false;
+    if (state.run.flow === 'abc-v1') {
+      const next = currentGuidedTask(state);
+      return (
+        writes === 0 &&
+        !!next &&
+        next.alias === alias &&
+        next.step === step &&
+        next.afterAttemptId === afterAttemptId
+      );
+    }
+    if (!['A', 'B'].includes(alias)) return false;
     const credential = state.credentials.find((item) => item.alias === alias);
     if (step === 'create')
       return !credential && (alias === 'A' || state.credentials.some((item) => item.alias === 'A'));
@@ -221,7 +243,7 @@ export async function createCheckerController(
     },
     canRunStep,
     async updateEnvironment(patch) {
-      if (!available()) return;
+      if (!available() || (state.run.flow === 'abc-v1' && state.attempts.length)) return;
       for (const key of ENVIRONMENT_FIELDS)
         if (patch[key] !== undefined) {
           const previous = state.run.environment[key];
@@ -238,8 +260,39 @@ export async function createCheckerController(
       publish();
       await save({ run: state.run });
     },
-    async runStep(alias, step) {
-      if (!canRunStep(alias, step)) return;
+    async skipStep(alias, step, afterAttemptId) {
+      if (state.run.flow !== 'abc-v1' || !canRunStep(alias, step, afterAttemptId)) return;
+      const sequence =
+        state.attempts.reduce(
+          (value, row) => Math.max(value, row.sequence ?? 0),
+          state.attempts.length,
+        ) + 1;
+      if (!Number.isSafeInteger(sequence)) {
+        failed(new CheckerStorageError('incompatible'));
+        return;
+      }
+      busy = true;
+      const now = new Date().toISOString();
+      const attempt: Attempt = {
+        id: identifier(),
+        alias,
+        step,
+        status: 'skipped',
+        sequence,
+        startedAt: now,
+        finishedAt: now,
+        build: structuredClone(options.build),
+        environment: structuredClone(state.run.environment),
+        ...(afterAttemptId ? { afterAttemptId } : {}),
+      };
+      state.attempts.push(attempt);
+      publish();
+      await save({ attempt });
+      busy = false;
+      publish();
+    },
+    async runStep(alias, step, afterAttemptId) {
+      if (!canRunStep(alias, step, afterAttemptId)) return;
       let previousSequence = state.attempts.length;
       for (const previous of state.attempts)
         if (previous.sequence !== undefined)
@@ -258,7 +311,11 @@ export async function createCheckerController(
         startedAt: new Date().toISOString(),
         build: structuredClone(options.build),
         environment: structuredClone(state.run.environment),
-        ...(step === 'use-after-b-failed' ? { afterAttemptId: latestBCreation(state)!.id } : {}),
+        ...(step === 'retained'
+          ? { afterAttemptId }
+          : step === 'use-after-b-failed'
+            ? { afterAttemptId: latestBCreation(state)!.id }
+            : {}),
       };
       state.attempts.push(attempt);
       publish();
@@ -295,6 +352,20 @@ export async function createCheckerController(
         attempt.status = step === 'create' ? 'created' : 'verified';
       } catch (error) {
         attempt.status = 'failed';
+        if (
+          state.run.flow === 'abc-v1' &&
+          ['native-create', 'native-get'].includes(attempt.diagnostics?.stage ?? '')
+        )
+          attempt.nativeMessage = messageEvidence(error, [
+            state.run.id,
+            state.run.userId,
+            ...state.credentials.flatMap((item) => [
+              item.id,
+              item.salt,
+              item.cipher?.iv ?? '',
+              item.cipher?.data ?? '',
+            ]),
+          ]);
         attempt.error = attempt.diagnostics?.applicationError ?? operations.sanitizeError(error);
       }
       attempt.finishedAt = new Date().toISOString();
@@ -312,8 +383,10 @@ export async function createCheckerController(
     async addObservation(input) {
       if (!available()) return;
       if (
-        !['A', 'B'].includes(input.alias) ||
-        ![...stepsForAlias(input.alias), 'general'].includes(input.step) ||
+        !(state.run.flow === 'abc-v1' ? ['A', 'B', 'C'] : ['A', 'B']).includes(input.alias) ||
+        ![...stepsForAlias(input.alias, state.run.flow === 'abc-v1'), 'general'].includes(
+          input.step,
+        ) ||
         !['worked', 'failed', 'could-not-test'].includes(input.outcome)
       )
         return;

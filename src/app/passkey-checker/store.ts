@@ -1,3 +1,4 @@
+import { validNativeMessage } from './message.ts';
 import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, KNOWN_TRANSPORTS, stepsForAlias } from './types.ts';
 import { isPrfDiagnostics } from './diagnostics.ts';
 import { fictionalValue } from './core.ts';
@@ -89,8 +90,8 @@ function environment(value: unknown): boolean {
     )
   );
 }
-function alias(value: unknown): value is 'A' | 'B' {
-  return value === 'A' || value === 'B';
+function alias(value: unknown): value is 'A' | 'B' | 'C' {
+  return value === 'A' || value === 'B' || value === 'C';
 }
 function encoded(value: unknown, minBytes: number, maxBytes = minBytes): boolean {
   if (!text(value, Math.ceil((maxBytes * 4) / 3)) || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
@@ -107,17 +108,25 @@ function encoded(value: unknown, minBytes: number, maxBytes = minBytes): boolean
 }
 function validRun(value: unknown): value is RunHeader {
   return (
-    keys(value, [
-      'schemaVersion',
-      'id',
-      'origin',
-      'secureContext',
-      'rpId',
-      'userId',
-      'createdAt',
-      'build',
-      'environment',
-    ]) &&
+    keys(
+      value,
+      [
+        'schemaVersion',
+        'id',
+        'origin',
+        'secureContext',
+        'rpId',
+        'userId',
+        'createdAt',
+        'build',
+        'environment',
+      ],
+      ['flow', 'registrationMode'],
+    ) &&
+    (value.flow === undefined
+      ? value.registrationMode === undefined
+      : value.flow === 'abc-v1' &&
+        ['eval', 'enable-only'].includes(String(value.registrationMode))) &&
     value.schemaVersion === 1 &&
     typeof value.secureContext === 'boolean' &&
     text(value.id) &&
@@ -151,20 +160,24 @@ function validAttempt(value: unknown): value is Attempt {
     keys(
       value,
       ['id', 'alias', 'step', 'status', 'startedAt', 'build', 'environment'],
-      ['error', 'finishedAt', 'diagnostics', 'afterAttemptId', 'sequence'],
+      ['error', 'finishedAt', 'diagnostics', 'afterAttemptId', 'sequence', 'nativeMessage'],
     ) &&
     text(value.id) &&
     alias(value.alias) &&
-    stepsForAlias(value.alias).some((step) => step === value.step) &&
-    ['pending', 'created', 'verified', 'failed', 'interrupted'].includes(String(value.status)) &&
+    [...stepsForAlias(value.alias), 'retained'].some((step) => step === value.step) &&
+    ['pending', 'created', 'verified', 'failed', 'interrupted', 'skipped'].includes(
+      String(value.status),
+    ) &&
     (value.error === undefined ||
       (typeof value.error === 'string' && Object.hasOwn(ERROR_MESSAGES, value.error))) &&
     date(value.startedAt) &&
     (value.finishedAt === undefined || date(value.finishedAt)) &&
     (value.diagnostics === undefined || isPrfDiagnostics(value.diagnostics)) &&
+    (value.nativeMessage === undefined ||
+      (value.status === 'failed' && validNativeMessage(value.nativeMessage))) &&
     (value.sequence === undefined ||
       (Number.isSafeInteger(value.sequence) && Number(value.sequence) > 0)) &&
-    (value.step === 'use-after-b-failed'
+    (value.step === 'use-after-b-failed' || value.step === 'retained'
       ? text(value.afterAttemptId) && value.afterAttemptId !== value.id
       : value.afterAttemptId === undefined) &&
     build(value.build) &&
@@ -178,7 +191,8 @@ function validObservation(value: unknown): value is Observation {
     keys(value, ['id', 'alias', 'step', 'outcome', 'note', 'createdAt', 'build', 'environment']) &&
     text(value.id) &&
     alias(value.alias) &&
-    (value.step === 'general' || stepsForAlias(value.alias).some((step) => step === value.step)) &&
+    (value.step === 'general' ||
+      [...stepsForAlias(value.alias), 'retained'].some((step) => step === value.step)) &&
     ['worked', 'failed', 'could-not-test'].includes(String(value.outcome)) &&
     typeof value.note === 'string' &&
     value.note.length <= 2000 &&
@@ -260,6 +274,17 @@ export async function openCheckerStore(
       if (reset) for (const table of TABLES) tx.objectStore(table).clear();
       const run = change.run ?? previous!.run;
       if (
+        run.flow !== 'abc-v1' &&
+        (change.credential?.alias === 'C' ||
+          change.attempt?.alias === 'C' ||
+          change.attempt?.step === 'retained' ||
+          change.attempt?.status === 'skipped' ||
+          change.attempt?.nativeMessage !== undefined ||
+          change.observation?.alias === 'C' ||
+          change.observation?.step === 'retained')
+      )
+        throw new CheckerStorageError('incompatible');
+      if (
         change.credential?.cipher &&
         !encoded(
           change.credential.cipher.data,
@@ -322,7 +347,7 @@ export async function openCheckerStore(
           !validRun(header.run) ||
           !Number.isSafeInteger(header.revision) ||
           Number(header.revision) < 1 ||
-          credentials.length > 2 ||
+          credentials.length > (header.run.flow === 'abc-v1' ? 3 : 2) ||
           !credentials.every(validCredential) ||
           !attempts.every(validAttempt) ||
           new Set(
@@ -339,6 +364,19 @@ export async function openCheckerStore(
         )
           throw new CheckerStorageError('incompatible');
         const run = header.run;
+        if (
+          run.flow !== 'abc-v1' &&
+          (credentials.some((value) => value.alias === 'C') ||
+            attempts.some(
+              (value) =>
+                value.alias === 'C' ||
+                value.step === 'retained' ||
+                value.status === 'skipped' ||
+                value.nativeMessage !== undefined,
+            ) ||
+            observations.some((value) => value.alias === 'C' || value.step === 'retained'))
+        )
+          throw new CheckerStorageError('incompatible');
         if (
           credentials.some(
             (credential) =>

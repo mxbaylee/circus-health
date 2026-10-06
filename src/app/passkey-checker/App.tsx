@@ -7,6 +7,7 @@ import { ERROR_MESSAGES, ENVIRONMENT_FIELDS, stepsForAlias } from './types';
 import type { CredentialAlias, EnvironmentField, ErrorCode, Observation, Step } from './types';
 
 const stepNames: Record<Step, string> = {
+  retained: 'Check retained access',
   create: 'Create a test passkey',
   confirm: 'Confirm the test passkey',
   'use-1': 'Use it again: 1 of 3',

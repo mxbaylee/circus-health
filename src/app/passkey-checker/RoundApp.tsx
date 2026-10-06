@@ -1,3 +1,4 @@
+import GuidedApp from './GuidedApp.tsx';
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import App from './App';
 import { BUILD_INFO } from './build';
@@ -102,7 +103,7 @@ function CurrentRound({
 }
 
 /** Mode selection changes only the native creation request, never the credential API. */
-export default function RoundApp() {
+export default function RoundApp({ guided = false }: { guided?: boolean } = {}) {
   const [mode, setMode] = useState<RegistrationMode>('eval');
   const [opened, setOpened] = useState<{
     mode: RegistrationMode;
@@ -115,9 +116,18 @@ export default function RoundApp() {
     setFailed(false);
     void createCheckerController({
       build: BUILD_INFO,
-      openStore: () => openCheckerStore(globalThis.indexedDB, roundDatabase(mode)),
+      ...(guided ? { guidedMode: mode } : {}),
+      openStore: () =>
+        openCheckerStore(
+          globalThis.indexedDB,
+          guided ? `${roundDatabase(mode)}-abc-v1` : roundDatabase(mode),
+        ),
       deleteStore: (onBlocked) =>
-        deleteCheckerStore(globalThis.indexedDB, roundDatabase(mode), onBlocked),
+        deleteCheckerStore(
+          globalThis.indexedDB,
+          guided ? `${roundDatabase(mode)}-abc-v1` : roundDatabase(mode),
+          onBlocked,
+        ),
       core: {
         ...core,
         createCredential: (run, alias, existing, port, observer) =>
@@ -138,7 +148,7 @@ export default function RoundApp() {
       current = false;
       owned?.close();
     };
-  }, [mode]);
+  }, [mode, guided]);
   if (failed)
     return (
       <main className="checker">
@@ -157,5 +167,7 @@ export default function RoundApp() {
         <p role="status">Opening browser-local progress…</p>
       </main>
     );
+  if (guided)
+    return <GuidedApp key={mode} controller={opened.controller} mode={mode} onMode={setMode} />;
   return <CurrentRound key={mode} controller={opened.controller} mode={mode} onMode={setMode} />;
 }

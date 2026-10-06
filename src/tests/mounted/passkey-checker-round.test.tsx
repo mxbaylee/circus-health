@@ -69,11 +69,20 @@ test('round modes cannot switch during prompts or saves', async () => {
     globalThis.indexedDB,
     roundDatabase('eval'),
   );
-  act(() => first.change({ busy: true }));
+  // Await React's complete update flush before asserting externally notified state.
+  // Synchronous act does not guarantee that every scheduled update has committed.
+  await act(async () => {
+    first.change({ busy: true });
+  });
   expect((select as HTMLSelectElement).disabled).toBe(true);
-  act(() => first.change({ busy: false, storage: 'saving' }));
+  await act(async () => {
+    first.change({ busy: false, storage: 'saving' });
+  });
   expect((select as HTMLSelectElement).disabled).toBe(true);
-  act(() => first.change({ storage: 'saved' }));
+  await act(async () => {
+    first.change({ storage: 'saved' });
+  });
+  expect((select as HTMLSelectElement).disabled).toBe(false);
   fireEvent.change(select, { target: { value: 'enable-only' } });
   await waitFor(() => expect(dependencies.createController).toHaveBeenCalledTimes(2));
   expect(first.value.close).toHaveBeenCalledOnce();
