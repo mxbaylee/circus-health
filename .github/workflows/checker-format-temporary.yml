@@ -1,0 +1,85 @@
+name: Temporary guided-checker formatting
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'feat/checker-guided-abc-flow' && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      HUSKY: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Verify formatter fingerprints and commit only the agreed formatting
+        env:
+          SOURCE_HEAD: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          import * as prettier from 'prettier';
+          const expected = {
+            'src/tests/passkey-checker-guided-fixture.ts': ['802295ba8d8775cdbe8b99b7760337afcfd2e950', 'eae2ad57d141c045fe95f2761d1f54d4304cc490'],
+            'src/tests/passkey-checker-guided.test.ts': ['be6099cb1646982c565f8a9cda2b6eef1a91f81d', 'b1c1a2d1df8a67e178f389952f4b4d18453b8f1d'],
+            'src/tests/browser/passkey-checker-guided.test.ts': ['2dbf021bc1e6c4b403b83e5166c8259ba9228f90', 'bd216a3c7f916db46fa728e904661883aef97268'],
+            'src/tests/fixtures/passkey-checker-guided-ui.tsx': ['899b50bb37196e1d7851a0afca998ea959df3ea1', 'aeac8b0d07d135cf0958634fe8840f0c16b84c55'],
+            'src/app/passkey-checker/controller.ts': ['f477e21a1082e0cb908d1b10e483a9424ee3499f', 'a76b8e2f2d4fb4f327c25c9f0dd50a554f00b2fe'],
+            'src/app/passkey-checker/core.ts': ['6b894df9cb9c95f55b5e06ceef22b8e75346e836', 'a28e8d4c9fd03fb9821521e22b547ae34658b1a4'],
+            'src/app/passkey-checker/guided.ts': ['73c03e6c2dda5c6b7addd4dfe1e204e581094565', 'cf0ae039ad74640291b9ce6e5e520acad94071e5'],
+            'src/app/passkey-checker/message.ts': ['61da28a8dbb957f28770bf7efed429c35bc66396', '39fbbac4490e3492eef748e9e6c40e6357c6b519'],
+            'src/app/passkey-checker/report.ts': ['cbc99b9e4ba7d83ed73767b8f50c3be5b5f3682d', '49779fb780c918d83bae1be4a50b96b3393e8067'],
+            'src/app/passkey-checker/store.ts': ['24a1f697550915613d4e62e7f798ccf831f7432d', '34c0ab87e294cb347d70416c0e641a040bb8dff1'],
+            'src/app/passkey-checker/types.ts': ['2cd620f68d6bab19d8e235ca6791b3ef205a9d40', '5bd3e027412b423ed9ab609901d4f34910b35422'],
+            'src/app/passkey-checker/GuidedApp.tsx': ['24a7968e5e10f1e8fe143c7ac0c915cebf34752c', '857ba7e64ef64077c9dfa50eb82bff560f51cfba'],
+            'src/app/passkey-checker/RoundApp.tsx': ['5d391d7a09a991de945350c3fa81c9584cd010d5', 'a30beca99fd522ba12aa83dd7152667c72178e52'],
+          };
+          const blob = text => createHash('sha1').update(`blob ${Buffer.byteLength(text)}\0`).update(text).digest('hex');
+          const branch = 'refs/heads/feat/checker-guided-abc-flow';
+          const git = args => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: {
+            ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1',
+            GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+            GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${process.env.GH_TOKEN}`).toString('base64')}`,
+          }}).trim();
+          try {
+            if (!/^[a-f0-9]{40}$/.test(process.env.SOURCE_HEAD ?? '') || git(['rev-parse', 'HEAD']) !== process.env.SOURCE_HEAD)
+              throw Error('Wrong source checkout');
+            if (git(['status', '--porcelain'])) throw Error('Unexpected checkout changes');
+            for (const [file, [before, after]] of Object.entries(expected)) {
+              const input = readFileSync(file, 'utf8');
+              if (![before, after].includes(blob(input))) throw Error('Source fingerprint changed');
+              const output = await prettier.format(input, { ...(await prettier.resolveConfig(file)), filepath: file });
+              if (blob(output) !== after) throw Error('Formatter fingerprint changed');
+              writeFileSync(file, output);
+            }
+            const changed = git(['diff', '--name-only']).split('\n').filter(Boolean);
+            if (!changed.length) { console.log('Verified formatting already present.'); process.exit(0); }
+            if (changed.some(file => !Object.hasOwn(expected, file))) throw Error('Unexpected changed path');
+            const remote = git(['ls-remote', '--heads', 'origin', branch]).split(/\s/)[0];
+            if (remote !== process.env.SOURCE_HEAD) throw Error('Feature branch advanced');
+            git(['add', '--', ...changed]);
+            git(['-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', '🎨 Apply verified pinned formatting to the guided checker']);
+            git(['push', 'origin', `HEAD:${branch}`]);
+            console.log(`Formatted feature-branch commit ${git(['rev-parse', 'HEAD'])}.`);
+          } catch {
+            console.error('Formatting publication stopped; no raw process error or token is logged. Inspect source/branch fingerprints.');
+            process.exit(1);
+          }
+          NODE
