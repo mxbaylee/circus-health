@@ -9,18 +9,18 @@ permissions:
   contents: read
 
 jobs:
-  sample:
+  candidate:
     if: github.repository == 'mxbaylee/circus-health'
-    name: SQL diagnostic ${{ matrix.suite }} - not qualification
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [continuation, acceptance]
+    timeout-minutes: 12
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.publish.outputs.sha }}
     env:
       HUSKY: '0'
-      SUITE: ${{ matrix.suite }}
+      TARGET_BRANCH: codex/crs-231-paged-package-authority
+      MAIN_SHA: b8a5a01413042a097960e16b6412692531b1b3e7
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -31,60 +31,202 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
+      - name: Apply the inspected bounded candidate and its recovery regressions
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+          const replace = (path, before, after) => {
+            const text = readFileSync(path, 'utf8');
+            assert.equal(text.split(before).length, 2, `exact unique patch anchor: ${path}`);
+            writeFileSync(path, text.replace(before, after));
+          };
+          const source = 'src/server/record-versions.ts';
+          replace(source,
+            "    scratch.db.exec('CREATE TABLE identities(value TEXT PRIMARY KEY)');",
+            "    // One disposable index lifetime, not one implicit pager transaction per row.\n" +
+            "    // Its bounded page cache still spills to disk; close discards this private work.\n" +
+            "    scratch.db.exec('CREATE TABLE identities(value TEXT PRIMARY KEY); BEGIN');");
+          replace(source,
+            '  return recordDurabilityStatus(db)!;\n}\nconst statusStatements',
+            "  const status = recordDurabilityStatus(db)!;\n" +
+            "  // Only this successfully attached accepted-record owner may relax cache sync.\n" +
+            "  // publish() still verifies and durably publishes immutable records and HEAD\n" +
+            "  // before SQLite COMMIT. A lost WAL tail is rebuilt from that accepted history.\n" +
+            "  // Unattached databases and non-WAL connections retain their existing settings.\n" +
+            "  if (!status.dirty && db.prepare('PRAGMA main.journal_mode').get()?.journal_mode === 'wal')\n" +
+            "    db.exec('PRAGMA main.synchronous=NORMAL');\n" +
+            "  return status;\n}\nconst statusStatements");
+          const tests = 'src/server/test/record-versions.test.ts';
+          replace(tests, "import test, { type TestContext } from 'node:test';", "import test, { type TestContext } from 'node:test';\nimport { DatabaseSync } from 'node:sqlite';");
+          appendFileSync(tests, `
+          test('only a successfully attached accepted journal selects normal-synchronous WAL projection', (t) => {
+            const f = fixture(t);
+            f.db.exec('PRAGMA main.synchronous=FULL');
+            const synchronous = (db: Database) => Number(db.prepare('PRAGMA main.synchronous').get()?.synchronous);
+            assert.equal(synchronous(f.db), 2);
+            assert.throws(() => attachRecordDurability(f.db, { profileId: 'wrong-profile', storage: f.storage }));
+            assert.equal(synchronous(f.db), 2, 'failed attachment cannot alter cache policy');
+            attachRecordDurability(f.db, { profileId, storage: f.storage });
+            assert.equal(f.db.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'wal');
+            assert.equal(synchronous(f.db), 1);
+            const unattached = f.open('unattached-policy.sqlite');
+            assert.equal(synchronous(unattached), 2, 'opening alone does not relax SQLite durability');
+            const rollback = f.open('rollback-policy.sqlite');
+            rollback.exec('PRAGMA main.journal_mode=DELETE; PRAGMA main.synchronous=FULL');
+            attachRecordDurability(rollback, { profileId, storage: f.storage });
+            assert.equal(rollback.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'delete');
+            assert.equal(synchronous(rollback), 2, 'non-WAL modes keep their existing durability');
+          });
+
+          test('journal-backed WAL refuses failed HEAD publication and recovers durable acceptance before cache COMMIT', (t) => {
+            const f = fixture(t);
+            attachRecordDurability(f.db, { profileId, storage: f.storage });
+            assert.equal(f.db.prepare('PRAGMA main.synchronous').get()?.synchronous, 1);
+            const initialHead = stored(f, 'head');
+            const publish = f.storage.publishHead;
+            f.storage.publishHead = () => { throw Error('fictional failure before accepted HEAD'); };
+            try {
+              assert.throws(() => transaction(f.db, () => {
+                f.db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)').run('unaccepted-cache-policy', 'Fictional unaccepted');
+              }), /fictional failure before accepted HEAD/);
+            } finally {
+              f.storage.publishHead = publish;
+            }
+            assert.deepEqual(stored(f, 'head'), initialHead);
+            assert.equal(f.db.prepare('SELECT 1 FROM people WHERE id=?').get('unaccepted-cache-policy'), undefined);
+            assert.equal(durability(f.db).dirty, false);
+            const operation = { operationId: randomUUID(), fingerprint: 'fictional-cache-policy-recovery' };
+            const exec = f.db.exec;
+            let interrupted = false;
+            let expected: ReturnType<typeof logical> | undefined;
+            f.db.exec = function (sql: string) {
+              if (sql === 'COMMIT' && !interrupted) {
+                interrupted = true;
+                assert.notDeepEqual(stored(f, 'head'), initialHead, 'durable acceptance precedes cache commit');
+                expected = logical(f.db);
+                throw Error('fictional interruption before cache COMMIT');
+              }
+              return exec.call(this, sql);
+            };
+            try {
+              assert.throws(() => transaction(f.db, () => {
+                f.db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)').run('accepted-cache-policy', 'Fictional accepted');
+                return { saved: 'accepted-cache-policy' };
+              }, operation), /fictional interruption before cache COMMIT/);
+            } finally {
+              f.db.exec = exec;
+            }
+            assert.equal(interrupted, true);
+            assert.ok(expected);
+            assert.equal(f.db.prepare('SELECT 1 FROM people WHERE id=?').get('accepted-cache-policy'), undefined);
+            assert.equal(durability(f.db).dirty, true);
+            const recovered = rebuild(f, 'cache-policy-recovered.sqlite');
+            assert.deepEqual(logical(recovered), expected, 'every current and historical projection row is recovered');
+            const writes = f.writes.length;
+            assert.deepEqual(transaction(recovered, () => { throw Error('replay must not run a second mutation'); }, operation), { saved: 'accepted-cache-policy' });
+            assert.equal(f.writes.length, writes, 'exact replay publishes no duplicate accepted version');
+          });
+
+          test('record identity validation batches private scratch transactions without replacing its complete replay checks', (t) => {
+            const f = fixture(t);
+            const prepare = DatabaseSync.prototype.prepare;
+            let identityScopes = 0;
+            DatabaseSync.prototype.prepare = function (sql: string) {
+              if (sql === 'INSERT INTO identities VALUES(?)') {
+                assert.equal(this.isTransaction, true, 'all identities share the one disposable-index transaction');
+                identityScopes++;
+              }
+              return prepare.call(this, sql);
+            };
+            try {
+              attachRecordDurability(f.db, { profileId, storage: f.storage });
+              transaction(f.db, () => {
+                const insert = f.db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)');
+                for (let index = 0; index < 160; index++) insert.run('scratch-policy-' + index, 'Fictional person ' + index);
+              });
+              const expected = logical(f.db);
+              const recovered = rebuild(f, 'scratch-policy-recovered.sqlite');
+              assert.deepEqual(logical(recovered), expected);
+              assert.ok(identityScopes >= 4, 'the actual writer and complete recovery both use checked scratch scopes');
+            } finally {
+              DatabaseSync.prototype.prepare = prepare;
+            }
+          });
+          `);
+          replace('docs/data/record-version-storage.md',
+            '## Source-text write amplification',
+            `### Rebuildable SQLite commit policy
+
+          After accepted-record durability has successfully attached and its physical head matches the projection, WAL connections use \\`synchronous=NORMAL\\`. Opening a database, a failed attachment, or a non-WAL connection does not select this policy. The accepted journal owner still verifies and fsyncs immutable objects and the accepted head before the SQLite commit; encryption, exact operation replay, writer ownership and refusal of divergent authority are unchanged.
+
+          SQLite can lose a recent NORMAL-mode WAL tail after an operating-system crash or power loss. That is a cache-loss case, not permission to lose acknowledged records: supported startup catches up or rebuilds the complete projection from the durable accepted history. A cache alone is never a backup. The [SQLite synchronous contract](https://www.sqlite.org/pragma.html#pragma_synchronous) distinguishes WAL consistency from per-commit cache durability. No operator tuning is needed, and no accepted-record or cache schema changes. An earlier compatible build retains its own connection policy and reads the same history.
+
+          Record-version duplicate detection keeps its private disk-backed identity index in one explicit transaction for the lifetime of that validation scope. Its existing bounded page cache can spill to disk, and closing always discards the complete scratch index. Neither these scratch bytes nor a scratch commit become recovery evidence. Writer and recovery still inspect every version and reject duplicate identities and invalid predecessor references.
+
+          Fictional regressions distinguish unattached and rejected/non-WAL attachment, failure before accepted-head publication, interruption after the durable head but before cache commit, complete replay and exact retry. Controlled interruption is not a physical power-loss test. The complete encrypted acceptance/cache-loss journey remains a separate required oracle.
+
+          ## Source-text write amplification`.replaceAll('\\`','`'));
+          replace('docs/setup/release-updates.md',
+            '## Identify the current and candidate builds',
+            `Accepted-journal-backed WAL connections now use NORMAL synchronization for the rebuildable SQLite projection, instead of syncing that cache after every transaction. Durable accepted objects and heads still reach storage before acknowledgment. No operator setting or format migration is required; restart into the reviewed build and verify retained current/history state. An operating-system crash or power loss may require replaying a lost cache tail from accepted history. Keep the checked backup; a SQLite cache alone is not recovery authority. Unattached and non-WAL databases retain their existing settings. See [the record storage policy](../data/record-version-storage.md#rebuildable-sqlite-commit-policy).
+
+          ## Identify the current and candidate builds`);
+          NODE
+      - name: Format the candidate and inspect its exact changes
+        run: |
+          npx --no-install prettier --config .prettierrc.json --write src/server/record-versions.ts src/server/test/record-versions.test.ts docs/data/record-version-storage.md docs/setup/release-updates.md
+          git diff --check
+          git diff --stat
+          git diff -- src/server/record-versions.ts
+      - run: npm run typecheck
+      - name: Run all record-version fault, history and recovery regressions
+        run: node --test --test-concurrency=1 --test-timeout=600000 src/server/test/record-versions.test.ts
+      - name: Remove temporary execution workflow and verify candidate formatting
+        run: |
+          git rm .github/workflows/pr71-step1.yml
+          npm run format:check
+          node scripts/repository-file-inventory.ts --check
+      - name: Publish this bounded candidate to the PR, not main
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)" = "$GITHUB_SHA"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$MAIN_SHA"
+          git add src/server/record-versions.ts src/server/test/record-versions.test.ts docs/data/record-version-storage.md docs/setup/release-updates.md
+          git diff --cached --check
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m '⚡ Avoid redundant cache sync and per-row scratch commits under accepted authority'
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  focused:
+    needs: candidate
+    name: Step 1 unchanged ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [continuation, acceptance]
+    env:
+      HUSKY: '0'
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
       - run: |
           sudo apt-get update
           sudo apt-get install --yes qpdf
-      - name: Locate the prior failing scenarios and inspect the reported dependency alert
-        run: |
-          git grep -nE 'two uploaded originals run sequentially|Stop, reload, and explicit resume retry|superseded-only receipt history|all per-record issue witnesses|same-token warning changes|owned native manual_report_label|many retained questions keep' -- src/server/test || true
-          npm audit --omit=dev || true
-      - name: Collect bounded diagnostic-only SQL work counts
-        shell: bash
-        run: |
-          cat > "$RUNNER_TEMP/sql-sample.mjs" <<'NODE'
-          import { DatabaseSync } from 'node:sqlite';
-          import { performance } from 'node:perf_hooks';
-          const rows = new Map(), labels = new WeakMap();
-          const normalized = sql => String(sql).replace(/'(?:''|[^'])*'/g, '?').replace(/\s+/g, ' ').slice(0,500);
-          function record(label, operation) {
-            if (!rows.has(label) && rows.size >= 1024) label = 'other';
-            let row = rows.get(label);
-            if (!row) rows.set(label, row = {count:0,ms:0,max:0});
-            const start = performance.now();
-            try { return operation(); }
-            finally { const elapsed=performance.now()-start; row.count++; row.ms+=elapsed; row.max=Math.max(row.max,elapsed); }
-          }
-          const probe = new DatabaseSync(':memory:');
-          const statementPrototype = Object.getPrototypeOf(probe.prepare('SELECT 1'));
-          probe.close();
-          const prepare = DatabaseSync.prototype.prepare;
-          DatabaseSync.prototype.prepare = function(sql,...args) {
-            const label=normalized(sql);
-            const statement=record('prepare '+label,()=>prepare.call(this,sql,...args));
-            labels.set(statement,label);
-            return statement;
-          };
-          const exec=DatabaseSync.prototype.exec;
-          DatabaseSync.prototype.exec=function(sql,...args) {
-            return record('exec '+normalized(sql),()=>exec.call(this,sql,...args));
-          };
-          for (const method of ['run','get','all']) {
-            const original=statementPrototype[method];
-            statementPrototype[method]=function(...args) {
-              return record(method+' '+(labels.get(this)||'unknown'),()=>original.apply(this,args));
-            };
-          }
-          setTimeout(() => {
-            console.log('DIAGNOSTIC SQL COUNTS; instrumentation overhead included; NOT A TEST PASS');
-            for (const order of ['ms','count']) {
-              console.log('ORDER',order);
-              console.log([...rows].sort((a,b)=>b[1][order]-a[1][order]).slice(0,18).map(([sql,r])=>JSON.stringify({sql,...r})).join('\n'));
-            }
-          },90000).unref();
-          NODE
-          set +e
-          timeout --signal=TERM --kill-after=10s 105s npm run "test:$SUITE" -- --import="$RUNNER_TEMP/sql-sample.mjs"
-          status=$?
-          set -e
-          echo "Diagnostic exit=$status; this deliberate interruption is not qualification."
-          test "$status" -eq 124 -o "$status" -eq 0 -o "$status" -eq 1
+      - name: Execute the complete original suite with no profiler or shortened oracle
+        run: npm run "test:$SUITE"
