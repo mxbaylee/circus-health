@@ -1,3 +1,4 @@
+import type { NativeMessage } from './message.ts';
 import type { PrfDiagnostics } from './diagnostics.ts';
 
 /** Public, browser-local fictional checker data. Never add PRF output or keys. */
@@ -22,11 +23,12 @@ export const ENVIRONMENT_FIELDS = [
 ] as const;
 export type EnvironmentField = (typeof ENVIRONMENT_FIELDS)[number];
 export type Environment = Record<EnvironmentField, MetadataField>;
-export type CredentialAlias = 'A' | 'B';
+export type CredentialAlias = 'A' | 'B' | 'C';
 export const KNOWN_TRANSPORTS = ['ble', 'hybrid', 'internal', 'nfc', 'usb'] as const;
 export type Step =
-  'create' | 'confirm' | 'use-1' | 'use-2' | 'use-3' | 'use-after-b' | 'use-after-b-failed';
+  'create' | 'confirm' | 'use-1' | 'use-2' | 'use-3' | 'use-after-b' | 'use-after-b-failed' | 'retained';
 export const STEP_LABELS: Record<Step, string> = {
+  retained: 'Check retained access after a failed addition',
   create: 'Create credential',
   confirm: 'Confirm PRF and fictional encryption',
   'use-1': 'Fresh use 1',
@@ -35,7 +37,8 @@ export const STEP_LABELS: Record<Step, string> = {
   'use-after-b': 'Use A after B is created',
   'use-after-b-failed': 'Use A after B creation fails',
 };
-export function stepsForAlias(alias: CredentialAlias): Step[] {
+export function stepsForAlias(alias: CredentialAlias, guided = false): Step[] {
+  if (guided) return ['create', 'confirm', 'retained', 'use-1'];
   const steps: Step[] = ['create', 'confirm', 'use-1', 'use-2', 'use-3'];
   return alias === 'A' ? [...steps, 'use-after-b', 'use-after-b-failed'] : steps;
 }
@@ -62,6 +65,9 @@ export const ERROR_MESSAGES = {
 export type ErrorCode = keyof typeof ERROR_MESSAGES;
 export interface RunHeader {
   schemaVersion: 1;
+  /** New guided runs never rewrite the legacy A/B request or evidence. */
+  flow?: 'abc-v1';
+  registrationMode?: 'eval' | 'enable-only';
   id: string;
   origin: string;
   secureContext: boolean;
@@ -83,10 +89,11 @@ export interface Attempt {
   id: string;
   alias: CredentialAlias;
   step: Step;
-  status: 'pending' | 'created' | 'verified' | 'failed' | 'interrupted';
+  status: 'pending' | 'created' | 'verified' | 'failed' | 'interrupted' | 'skipped';
   error?: ErrorCode;
   diagnostics?: PrfDiagnostics;
-  /** Local attempt reference, only for A's check after this exact B creation failed. */
+  nativeMessage?: NativeMessage;
+  /** Local reference for a fresh check after this exact failed addition. */
   afterAttemptId?: string;
   /** Causal order for new attempts; legacy rows retain their original timestamps. */
   sequence?: number;
