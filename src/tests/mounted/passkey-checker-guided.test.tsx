@@ -1,5 +1,5 @@
 import { webcrypto } from 'node:crypto';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import GuidedApp from '../../app/passkey-checker/GuidedApp';
 import type { CheckerController } from '../../app/passkey-checker/controller';
@@ -40,7 +40,15 @@ async function fixture(failB = false) {
 }
 async function click(name: string) {
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name, exact: true }));
+    fireEvent.click(screen.getByRole('button', { name }));
+  });
+  // The event handler intentionally does not return its WebCrypto promise.
+  // Wait for the real operation and save to finish before the next UI action.
+  await waitFor(() => {
+    for (const controller of controllers) {
+      expect(controller.getSnapshot().busy).toBe(false);
+      expect(controller.getSnapshot().storage).not.toBe('saving');
+    }
   });
 }
 const clearButton = () =>
@@ -54,13 +62,13 @@ async function acknowledge() {
 test('failed B recovery appears below the failure and continuing reaches C without a false B pass', async () => {
   const { controller, calls } = await fixture(true);
   for (const name of ['Create A', 'Verify A', 'Create B']) await click(name);
-  const recovery = screen.getByRole('button', { name: 'Recheck A', exact: true });
+  const recovery = screen.getByRole('button', { name: 'Recheck A' });
   const b = screen.getByRole('region', { name: 'Create B · same username as A' });
   expect(b.compareDocumentPosition(recovery) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  expect(document.activeElement).toBe(recovery);
+  await waitFor(() => expect(document.activeElement).toBe(recovery));
   await click('Recheck A');
   await click("Couldn't test — continue");
-  expect(screen.getByRole('button', { name: 'Create C', exact: true })).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Create C' })).toBeTruthy();
   expect(screen.getAllByText('not applicable · credential not created').length).toBeGreaterThan(0);
   expect(calls).toHaveLength(2);
   expect(controller.exportModel().credentials.some((row) => row.alias === 'B')).toBe(false);
