@@ -193,24 +193,22 @@ export const currentGuidedTask = (state: CheckerState) =>
 /** A separate explicit action resumes only a skipped, still-unconfirmed saved credential. */
 export function canResumeConfirmation(state: CheckerState, alias: CredentialAlias): boolean {
   const current = currentGuidedTask(state);
-  if (
-    state.run.flow !== 'abc-v1' ||
-    current?.step === 'retained' ||
-    failed(current?.attempt)
-  )
+  if (state.run.flow !== 'abc-v1' || current?.step === 'retained' || failed(current?.attempt))
     return false;
   const credential = state.credentials.find((item) => item.alias === alias);
   return (
     !!credential &&
     !credential.cipher &&
-    state.attempts.filter((row) => row.alias === alias && row.step === 'confirm').at(-1)
-      ?.status === 'skipped'
+    state.attempts.filter((row) => row.alias === alias && row.step === 'confirm').at(-1)?.status ===
+      'skipped'
   );
 }
 
 /** A terminal sequence is not necessarily a completed verification. */
 export function guidedSummary(state: CheckerState): string {
-  const requests = state.attempts.filter((row) => row.step === 'confirm' && row.status !== 'skipped');
+  const requests = state.attempts.filter(
+    (row) => row.step === 'confirm' && row.status !== 'skipped',
+  );
   if (!requests.length)
     return 'Verification not attempted. Created passkeys and skipped steps are not a compatibility pass or a provider validation failure.';
   const confirmed = GUIDED_ALIASES.filter((alias) =>

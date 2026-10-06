@@ -65,9 +65,7 @@ async function skip() {
   }) as HTMLButtonElement;
   expect(button.disabled).toBe(true);
   await act(async () => {
-    fireEvent.click(
-      screen.getByLabelText('I understand this skips the test without verifying it'),
-    );
+    fireEvent.click(screen.getByLabelText('I understand this skips the test without verifying it'));
   });
   await click('Skip this test without verifying');
 }

@@ -45,7 +45,8 @@ test('three creation/skip pairs remain resumable after reload, without rewriting
   const state = JSON.parse(JSON.stringify(skippedRun())) as CheckerState;
   const before = structuredClone(state);
   assert.equal(currentGuidedTask(state), undefined);
-  for (const alias of ['A', 'B', 'C'] as const) assert.equal(canResumeConfirmation(state, alias), true);
+  for (const alias of ['A', 'B', 'C'] as const)
+    assert.equal(canResumeConfirmation(state, alias), true);
   assert.match(guidedSummary(state), /^Verification not attempted/);
   assert.deepEqual(state, before);
 });

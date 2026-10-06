@@ -253,9 +253,11 @@ export default function GuidedApp({
                         lastFocused.current = '';
                         setNotice('');
                         // Invoke from this gesture, without awaiting storage or another UI action.
-                        void controller.runStep(row.alias, 'confirm', undefined, true).catch(() =>
-                          setNotice('Verification could not finish. Keep this report and retry.'),
-                        );
+                        void controller
+                          .runStep(row.alias, 'confirm', undefined, true)
+                          .catch(() =>
+                            setNotice('Verification could not finish. Keep this report and retry.'),
+                          );
                       }}
                     >
                       {`Verify existing ${row.alias}`}
@@ -281,8 +283,8 @@ export default function GuidedApp({
                   )}
                   {row.step === 'confirm' && (
                     <p>
-                      Creation is complete. Choose Verify below to test the saved passkey now.
-                      This requests that same credential; it does not create another one.
+                      Creation is complete. Choose Verify below to test the saved passkey now. This
+                      requests that same credential; it does not create another one.
                     </p>
                   )}
                   {(row.step === 'use-1' || row.step === 'retained') && (

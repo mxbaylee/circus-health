@@ -287,7 +287,9 @@ export function reportMarkdown(state: CheckerState): string {
         // the strict store, and arbitrary/native diagnostic values must never leak.
         const diagnostics = projectPrfDiagnostics(attempt.diagnostics);
         if (guided)
-          lines.push(`  Request disposition: ${guidedInvocationEvidence({ ...attempt, diagnostics })}`);
+          lines.push(
+            `  Request disposition: ${guidedInvocationEvidence({ ...attempt, diagnostics })}`,
+          );
         if (diagnostics) {
           const fields: string[] = [
             `request mode: ${diagnostics.requestMode}`,
