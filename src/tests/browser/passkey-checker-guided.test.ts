@@ -5,6 +5,7 @@ import { createServer as createHttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createServer as createViteServer } from 'vite';
 import { chromium } from 'playwright';
+import type { CheckerState } from '../../app/passkey-checker/types.ts';
 
 test('guided A/B/C: real IndexedDB resume, downloaded evidence and explicit clear preserve older rounds', async (t) => {
   const vite = await createViteServer({
@@ -110,7 +111,24 @@ test('guided A/B/C: real IndexedDB resume, downloaded evidence and explicit clea
   assert.match(report, /Report schema: 4/);
   assert.match(report, /all three final checks verified/);
   assert.match(report, /registration username matches A: false/);
-  assert.doesNotMatch(report, /ciphertext":|"salt":|rawId|fictional-guided-run/);
+  // A diagnostic label may mention rawId; exported credential values must never appear.
+  // Compare the actual stored values, including Markdown-escaped representations.
+  const retained = JSON.parse(after) as CheckerState;
+  const decodedReport = report.replace(/\\([\\`*_{}\[\]()#+.!|~-])/g, '$1');
+  assert.doesNotMatch(decodedReport, /"(?:rawId|salt|cipher|ciphertext)"\s*:/);
+  for (const value of [
+    retained.run.id,
+    retained.run.userId,
+    ...retained.credentials.flatMap((credential) => [
+      credential.id,
+      credential.salt,
+      credential.cipher!.iv,
+      credential.cipher!.data,
+    ]),
+  ]) {
+    assert.ok(!report.includes(value), 'raw credential material must not be exported');
+    assert.ok(!decodedReport.includes(value), 'escaped credential material must not be exported');
+  }
   assert.equal(
     await page.getByRole('button', { name: 'Clear this run', exact: true }).isDisabled(),
     true,
