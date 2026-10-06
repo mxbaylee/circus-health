@@ -1,0 +1,41 @@
+name: PR 71 step 1 diagnostic
+
+on:
+  push:
+    branches: [codex/crs-231-paged-package-authority]
+    paths: [.github/workflows/pr71-step1.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  integration-inspection:
+    if: github.repository == 'mxbaylee/circus-health'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HUSKY: '0'
+      MAIN_SHA: b8a5a01413042a097960e16b6412692531b1b3e7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Inspect integration without publishing or weakening checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse origin/main)" = "$MAIN_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git log -1 --oneline
+          git merge --no-commit --no-ff "$MAIN_SHA" || true
+          echo '=== conflict paths ==='
+          git diff --name-only --diff-filter=U
+          echo '=== conflict details ==='
+          git diff --cc | head -700 || true
+          echo '=== focused suite locations ==='
+          grep -nE 'acceptance|continuation' package.json src/scripts/test-suite.ts
+          echo '=== observed tree status ==='
+          git status --short
