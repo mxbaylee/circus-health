@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createServer as createViteServer } from 'vite';
+import react from '@vitejs/plugin-react';
 import { chromium } from 'playwright';
 import type {} from '../fixtures/passkey-checker-guided-ui.tsx';
 
@@ -13,15 +14,25 @@ for (const failB of [false, true])
       configFile: false,
       root: process.cwd(),
       publicDir: false,
+      plugins: [react()],
       server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'custom',
     });
     const server = createServer((req, res) => {
       if (req.url?.startsWith('/fixture')) {
         res.setHeader('Content-Type', 'text/html');
-        res.end(
-          '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fictional guided checker</title></head><body><div id="root"></div><script type="module" src="/src/tests/fixtures/passkey-checker-guided-ui.tsx"></script></body></html>',
-        );
+        // Custom middleware must still use Vite's React/HTML transformation pipeline.
+        void vite
+          .transformIndexHtml(
+            '/fixture',
+            '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fictional guided checker</title></head><body><div id="root"></div><script type="module" src="/src/tests/fixtures/passkey-checker-guided-ui.tsx"></script></body></html>',
+          )
+          .then((html) => res.end(html))
+          .catch((error: unknown) => {
+            console.error('Fictional checker fixture failed to transform:', error);
+            res.statusCode = 500;
+            res.end('Fictional checker fixture failed to transform.');
+          });
       } else
         vite.middlewares(req, res, () => {
           res.statusCode = 404;
@@ -37,8 +48,16 @@ for (const failB of [false, true])
     t.after(() => browser.close());
     t.signal.addEventListener('abort', () => void browser.close(), { once: true });
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(10000);
     const errors: string[] = [];
-    page.on('pageerror', (error) => errors.push(error.message));
+    page.on('pageerror', (error) => {
+      errors.push(error.message);
+      console.error('Fictional checker browser exception:', error.stack ?? error.message);
+    });
+    page.on('console', (message) => {
+      if (message.type() === 'error') console.error('Fictional checker console:', message.text());
+    });
     await page.goto(
       `http://127.0.0.1:${(server.address() as AddressInfo).port}/fixture${failB ? '?failB=1' : ''}`,
     );
