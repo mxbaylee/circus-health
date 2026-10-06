@@ -27,7 +27,7 @@ for (const mode of ['eval', 'enable-only'] as const)
     assert.match(reportMarkdown(original), /Verification not attempted/);
     assert.match(reportMarkdown(original), /no native operation requested by this attempt/);
     for (const alias of ['A', 'B', 'C'] as const) {
-      const count = gets.length;
+      const count: number = gets.length;
       const pending = controller.runStep(alias, 'confirm', undefined, true);
       assert.equal(gets.length, count + 1, 'native invocation precedes the first await');
       await controller.runStep(alias, 'confirm', undefined, true);
