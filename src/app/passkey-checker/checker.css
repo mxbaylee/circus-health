@@ -177,3 +177,12 @@ body {
     max-width: none;
   }
 }
+.checker [aria-current='step'] {
+  border-color: var(--blue);
+  scroll-margin-block: 24px;
+}
+.checker input[type='checkbox'] {
+  display: inline-block;
+  width: auto;
+  margin-right: 8px;
+}

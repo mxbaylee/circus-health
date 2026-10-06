@@ -1,8 +1,21 @@
-import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, STEP_LABELS, stepsForAlias } from './types.ts';
+import {
+  CREDENTIAL_ALIASES,
+  ENVIRONMENT_FIELDS,
+  ERROR_MESSAGES,
+  STEP_LABELS,
+  stepsForAlias,
+} from './types.ts';
+import {
+  allGuidedCredentialsVerified,
+  guidedStepUnavailable,
+  guidedRows,
+  isGuidedVerification,
+  nextGuidedAction,
+} from './guided.ts';
 import { ADDITIONAL_DIAGNOSTIC_LABELS, projectPrfDiagnostics } from './diagnostics.ts';
 import type { PrfDiagnostics, ValidationRule } from './diagnostics.ts';
 import { isVerifiedAAfterFailedB, isVerifiedReturnToA, latestBCreation } from './progress.ts';
-import type { CheckerState, Environment, Step } from './types.ts';
+import type { CheckerState, CredentialAlias, Environment, Step } from './types.ts';
 
 export { isVerifiedReturnToA } from './progress.ts';
 
@@ -17,7 +30,7 @@ const expectedValidation: Record<ValidationRule, string> = {
   'secure-context': 'HTTPS in a secure browser context',
   'relying-party-scope': 'the saved origin and relying-party domain',
   'required-browser-api': 'native credential operations and browser cryptography',
-  'alias-unused': 'an unused A or B slot',
+  'alias-unused': 'an unused credential slot',
   'credential-unconfirmed': 'a credential that has not already been confirmed',
   'credential-confirmed': 'previously confirmed fictional ciphertext',
   'credential-returned': 'a returned public credential',
@@ -26,7 +39,7 @@ const expectedValidation: Record<ValidationRule, string> = {
   'credential-id-length': 'between 1 and 1024 credential-reference bytes',
   'extension-reader': 'a callable client-extension reader',
   'selected-credential': 'the exact credential selected in the request',
-  'distinct-credential': 'a credential different from the existing A/B references',
+  'distinct-credential': 'a credential different from every existing reference',
   'prf-extension-present': 'a returned PRF extension containing results',
   'prf-results-present': 'PRF results containing the first output',
   'prf-output-present': 'a first PRF output',
@@ -119,7 +132,7 @@ export function reportMarkdown(state: CheckerState): string {
   const lines = [
     '# Passkey compatibility operator record',
     '',
-    `Report schema: ${REPORT_VERSION}. Local editable operator record; not a signed attestation.`,
+    `Report schema: ${state.run.flow === 'abc-username-v1' ? 4 : REPORT_VERSION}. Local editable operator record; not a signed attestation.`,
     `Run started: ${safe(state.run.createdAt)}.`,
     `Initial tool build: ${buildText(state.run.build)}.`,
     `Recorded origin: ${safe(state.run.origin)}. Relying-party domain: ${safe(state.run.rpId)}.`,
@@ -149,10 +162,40 @@ export function reportMarkdown(state: CheckerState): string {
     'An enable-only creation request is an explicit experiment, not a provider fix: it enables PRF without evaluating during creation. Confirmation still uses eval and fresh uses still use evalByCredential with the original credential and salt. Each mode uses a separate fictional run; combine A/B results only within that run. PRF enabled flags, attachment hints, focus and timing buckets do not establish compatibility or a native error cause.',
     '',
   ];
-  for (const alias of ['A', 'B'] as const) {
+  const guided = state.run.flow === 'abc-username-v1';
+  if (guided) {
+    lines.push(
+      '## A/B/C username experiment',
+      '',
+      `Protocol: abc-username-v1. Creation PRF mode: ${safe(state.run.registrationMode)}.`,
+      'A and B use the same username. C changes only the username; the display name and user handle stay fixed. Known credentials remain excluded. No raw names or handles are exported.',
+      'Provider labels are fixed within this run. Keep the actual provider unchanged; the page cannot detect provider switching. This sequential experiment is not proof that a name caused a result: stored credentials and exclusions can accumulate before C.',
+      'This shorter flow replaces three repeated uses with one confirmation and a final fresh verification for each confirmed credential. It is not a complete replay of the production enrollment/unlock or server verification flow.',
+      `Walkthrough: ${nextGuidedAction(state) ? 'unfinished' : 'finished, including any explicitly skipped steps'}. A/B/C retained access: ${allGuidedCredentialsVerified(state) ? 'all three final checks verified' : 'partial or failed; not an all-three pass'}.`,
+      '',
+      '### Chronological operation record',
+      '',
+      ...state.attempts.map((row) => {
+        const failure = state.attempts.find((item) => item.id === row.afterAttemptId);
+        return `- Sequence ${Number.isSafeInteger(row.sequence) ? row.sequence : 'unknown'}: ${CREDENTIAL_ALIASES.includes(row.alias) ? row.alias : 'unknown'} / ${STEP_LABELS[row.step] ?? 'unknown'} / ${['created', 'verified', 'failed', 'pending', 'interrupted', 'skipped'].includes(row.status) ? row.status : 'unknown'}${row.status === 'skipped' ? ' (operator continuation; no native request or automatic pass)' : ''}${failure ? `; after ${CREDENTIAL_ALIASES.includes(failure.alias) ? failure.alias : 'unknown'} creation sequence ${Number.isSafeInteger(failure.sequence) ? failure.sequence : 'unknown'}` : ''}.`;
+      }),
+      '',
+    );
+  }
+  if (guided) {
+    for (let index = lines.length - 1; index >= 0; index--)
+      if (
+        lines[index].startsWith('Use A after B is created requires') ||
+        lines[index].startsWith('Use A after B creation fails is')
+      )
+        lines.splice(index, 1);
+  }
+  const aliases: readonly CredentialAlias[] = guided ? CREDENTIAL_ALIASES : ['A', 'B'];
+  for (const alias of aliases) {
     lines.push(`### Credential ${alias}`, '');
     const latestB = latestBCreation(state);
     if (
+      !guided &&
       alias === 'A' &&
       latestB?.status === 'failed' &&
       !state.credentials.some((credential) => credential.alias === 'B')
@@ -166,26 +209,33 @@ export function reportMarkdown(state: CheckerState): string {
         '',
       );
     }
-    for (const step of stepsForAlias(alias)) {
+    for (const step of stepsForAlias(alias, state.run.flow)) {
       const attempts = state.attempts.filter(
         (attempt) => attempt.alias === alias && attempt.step === step,
       );
-      if (!attempts.length)
-        lines.push(`- ${STEP_LABELS[step]}: unfinished; no automatic evidence.`);
+      if (!attempts.length) {
+        const unavailable = guided ? guidedStepUnavailable(state, alias, step) : undefined;
+        lines.push(
+          `- ${STEP_LABELS[step]}: ${unavailable ?? (guided && step === 'recover' ? (guidedRows(state).some((action) => action.alias === alias && action.step === 'recover') ? 'unfinished — a retained-access check is required' : 'Not applicable — no recovery operation for this credential.') : 'unfinished; no automatic evidence')}.`,
+        );
+      }
       for (const [index, attempt] of attempts.entries()) {
         const status =
           attempt.status === 'created' && step === 'create'
             ? 'created only; PRF not verified'
             : attempt.status === 'verified' &&
                 step !== 'create' &&
+                (!guided || isGuidedVerification(state, attempt)) &&
                 (step !== 'use-after-b' || isVerifiedReturnToA(state, attempt)) &&
                 (step !== 'use-after-b-failed' || isVerifiedAAfterFailedB(state, attempt))
               ? 'verified PRF and fictional decryption'
-              : attempt.status === 'failed'
-                ? 'failed'
-                : attempt.status === 'interrupted'
-                  ? 'interrupted; unfinished'
-                  : 'pending or unfinished; no verified result';
+              : attempt.status === 'skipped'
+                ? 'skipped by operator; no native request or automatic evidence'
+                : attempt.status === 'failed'
+                  ? 'failed'
+                  : attempt.status === 'interrupted'
+                    ? 'interrupted; unfinished'
+                    : 'pending or unfinished; no verified result';
         const error =
           attempt.error && Object.hasOwn(ERROR_MESSAGES, attempt.error)
             ? `; ${ERROR_MESSAGES[attempt.error]}`
@@ -205,6 +255,14 @@ export function reportMarkdown(state: CheckerState): string {
             failed?.status === 'failed'
               ? `  Linked failed B creation: attempt ${index + 1}; finished ${safe(failed.finishedAt)}.`
               : '  Linked failed B creation: unavailable or invalid; no qualifying recovery evidence.',
+          );
+        }
+        if (step === 'recover') {
+          const failure = state.attempts.find((row) => row.id === attempt.afterAttemptId);
+          lines.push(
+            failure
+              ? `  Linked ${failure.alias} creation: sequence ${failure.sequence}; ${failure.status}; finished ${safe(failure.finishedAt)}.`
+              : '  Linked creation unavailable; no qualifying recovery evidence.',
           );
         }
         // Project again at the export boundary: callers need not have loaded through
@@ -248,8 +306,8 @@ export function reportMarkdown(state: CheckerState): string {
   );
   if (!state.observations.length) lines.push('No manual observations recorded.');
   for (const observation of state.observations) {
-    const alias = observation.alias === 'B' ? 'B' : 'A';
-    const step = stepsForAlias(alias).some((step) => step === observation.step)
+    const alias = aliases.includes(observation.alias) ? observation.alias : 'A';
+    const step = stepsForAlias(alias, state.run.flow).some((step) => step === observation.step)
       ? STEP_LABELS[observation.step as Step]
       : 'General observation';
     lines.push(

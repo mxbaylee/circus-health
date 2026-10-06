@@ -1,25 +1,13 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import App from './App';
+import GuidedApp, { downloadReport } from './GuidedApp';
 import { BUILD_INFO } from './build';
 import { createCheckerController } from './controller';
 import type { CheckerController } from './controller';
-import * as core from './core';
+import { createRun } from './environment';
 import { reportMarkdown } from './report';
 import { deleteCheckerStore, openCheckerStore } from './store';
-import { LEGACY_DATABASE, roundDatabase, TEST_ROUND } from './round';
+import { guidedDatabase, GUIDED_ROUND, LEGACY_DATABASE, roundDatabase } from './round';
 import type { RegistrationMode } from './round';
-
-function downloadReport(text: string, name: string) {
-  const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }));
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = name;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  // Leave the object alive long enough for the browser's download navigation.
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
-}
 
 function CurrentRound({
   controller,
@@ -33,81 +21,86 @@ function CurrentRound({
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
   const [exporting, setExporting] = useState(false);
   const [notice, setNotice] = useState('');
+  const [previousDatabase, setPreviousDatabase] = useState(LEGACY_DATABASE);
   const disabled = snapshot.busy || snapshot.storage === 'saving' || exporting;
   async function exportPrevious() {
     setExporting(true);
     setNotice('');
     let previous: Awaited<ReturnType<typeof openCheckerStore>> | undefined;
     try {
-      previous = await openCheckerStore(globalThis.indexedDB, LEGACY_DATABASE);
+      previous = await openCheckerStore(globalThis.indexedDB, previousDatabase);
       const retained = await previous.load();
       if (!retained) setNotice('No previous-round results are saved in this browser.');
       else {
         downloadReport(reportMarkdown(retained.state), 'passkey-checker-previous-round.md');
-        setNotice(
-          'Previous-round report prepared. Its results were not changed or copied into this round.',
-        );
+        setNotice('Previous-round download requested. Those results were not changed or cleared.');
       }
     } catch {
-      setNotice('Previous-round results could not be read. They were not deleted or replaced.');
+      setNotice(
+        'Previous-round results could not be read or downloaded. They were not deleted or replaced.',
+      );
     } finally {
       previous?.close();
       setExporting(false);
     }
   }
   return (
-    <>
-      <section className="checker" aria-label="Diagnostic testing round">
-        <h2>New diagnostic round: {TEST_ROUND}</h2>
-        <p>
-          Active results start fresh for this round. Previous-round browser storage and all provider
-          passkeys are left intact. Results in each request mode resume independently after reload.
-          Export each mode separately; this is not a combined compatibility pass.
-        </p>
-        <label>
-          Registration request
-          <select
-            value={mode}
-            disabled={disabled}
-            onChange={(event) => {
-              if (event.target.value === 'eval' || event.target.value === 'enable-only')
-                onMode(event.target.value);
-            }}
-          >
-            <option value="eval">Existing request (default)</option>
-            <option value="enable-only">Experiment: enable PRF, evaluate at confirmation</option>
-          </select>
-        </label>
-        <p>
-          The experiment omits only the optional PRF evaluation during creation. Confirmation, exact
-          credential matching, required user verification, exclusions, salts and fresh decryption
-          checks remain mandatory. It is not an established provider fix. Each mode has a separate
-          fictional profile; switching modes does not create a second passkey for the same profile.
-          Test A and B together within one mode.
-        </p>
-        <p>
-          After a confirmation failure, retry confirmation of the existing test passkey; do not
-          create it again. After a failed B creation, use the separate fresh A recovery check.
-          Download reports even when a step fails. For a visible format message, record which screen
-          or field, expected format and actual format, without secrets or credential IDs.
-        </p>
-        <button type="button" disabled={disabled} onClick={() => void exportPrevious()}>
-          Export previous-round report
-        </button>
-        {notice && <p role="status">{notice}</p>}
-      </section>
-      <App controller={controller} />
-    </>
+    <GuidedApp
+      controller={controller}
+      settings={
+        <details>
+          <summary>Advanced: creation PRF mode</summary>
+          <label>
+            Registration request
+            <select
+              value={mode}
+              disabled={disabled}
+              onChange={(event) => {
+                if (event.target.value === 'eval' || event.target.value === 'enable-only')
+                  onMode(event.target.value);
+              }}
+            >
+              <option value="eval">Existing request (default)</option>
+              <option value="enable-only">Experiment: enable PRF, evaluate at confirmation</option>
+            </select>
+          </label>
+          <p>
+            Default requests creation-time PRF evaluation, as the app does. The alternative omits
+            only that evaluation. Each mode resumes its own separate A/B/C run; never combine modes
+            into one pass. Select the same mode again after reloading to resume it.
+          </p>
+        </details>
+      }
+      previous={
+        <details>
+          <summary>Previous results</summary>
+          <p>These downloads are historical A/B rounds, not the current A/B/C report above.</p>
+          <label>
+            Previous testing round
+            <select
+              value={previousDatabase}
+              disabled={disabled}
+              onChange={(event) => setPreviousDatabase(event.target.value)}
+            >
+              <option value={LEGACY_DATABASE}>Original A/B round</option>
+              <option value={roundDatabase('eval')}>2026-10-05 A/B — default request</option>
+              <option value={roundDatabase('enable-only')}>
+                2026-10-05 A/B — enable-only experiment
+              </option>
+            </select>
+          </label>
+          <button type="button" disabled={disabled} onClick={() => void exportPrevious()}>
+            Export previous-round report
+          </button>
+          {notice && <p role="status">{notice}</p>}
+        </details>
+      }
+    />
   );
 }
-
-/** Mode selection changes only the native creation request, never the credential API. */
 export default function RoundApp() {
   const [mode, setMode] = useState<RegistrationMode>('eval');
-  const [opened, setOpened] = useState<{
-    mode: RegistrationMode;
-    controller: CheckerController;
-  }>();
+  const [opened, setOpened] = useState<{ mode: RegistrationMode; controller: CheckerController }>();
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     let current = true;
@@ -115,14 +108,14 @@ export default function RoundApp() {
     setFailed(false);
     void createCheckerController({
       build: BUILD_INFO,
-      openStore: () => openCheckerStore(globalThis.indexedDB, roundDatabase(mode)),
+      newRun: (build, environment) => ({
+        ...createRun(build, environment),
+        flow: GUIDED_ROUND,
+        registrationMode: mode,
+      }),
+      openStore: () => openCheckerStore(globalThis.indexedDB, guidedDatabase(mode)),
       deleteStore: (onBlocked) =>
-        deleteCheckerStore(globalThis.indexedDB, roundDatabase(mode), onBlocked),
-      core: {
-        ...core,
-        createCredential: (run, alias, existing, port, observer) =>
-          core.createCredential(run, alias, existing, port, observer, mode),
-      },
+        deleteCheckerStore(globalThis.indexedDB, guidedDatabase(mode), onBlocked),
     })
       .then((controller) => {
         if (!current) controller.close();

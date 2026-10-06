@@ -3,7 +3,8 @@ import { createRun, inspectEnvironment } from './environment.ts';
 import { projectPrfDiagnostics } from './diagnostics.ts';
 import type { DiagnosticObserver } from './diagnostics.ts';
 import { isVerifiedAAfterFailedB, isVerifiedReturnToA, latestBCreation } from './progress.ts';
-import { ENVIRONMENT_FIELDS, stepsForAlias } from './types.ts';
+import { CREDENTIAL_ALIASES, ENVIRONMENT_FIELDS, stepsForAlias } from './types.ts';
+import { nextGuidedAction } from './guided.ts';
 import type {
   Attempt,
   BuildInfo,
@@ -31,6 +32,8 @@ export interface CheckerController {
   canRunStep(alias: CredentialAlias, step: Step): boolean;
   updateEnvironment(patch: Partial<Record<keyof Environment, string>>): Promise<void>;
   runStep(alias: CredentialAlias, step: Step): Promise<void>;
+  /** Only the current guided step may be explicitly skipped; never synthesizes a pass. */
+  skipStep?(alias: CredentialAlias, step: Step): Promise<void>;
   addObservation(input: Pick<Observation, 'alias' | 'step' | 'outcome' | 'note'>): Promise<void>;
   exportModel(): CheckerState;
   reset(): Promise<void>;
@@ -88,7 +91,12 @@ export async function createCheckerController(
   const listeners = new Set<() => void>();
   let snapshot: CheckerSnapshot;
   function available(): boolean {
-    return !closed && !busy && ['saved', 'saving', 'ephemeral'].includes(storage);
+    return (
+      !closed &&
+      !busy &&
+      ['saved', 'saving', 'ephemeral'].includes(storage) &&
+      (state.run.flow !== 'abc-username-v1' || writes === 0)
+    );
   }
   function publish() {
     snapshot = {
@@ -138,7 +146,9 @@ export async function createCheckerController(
     if (retained) {
       if (
         retained.state.run.origin !== state.run.origin ||
-        retained.state.run.rpId !== state.run.rpId
+        retained.state.run.rpId !== state.run.rpId ||
+        retained.state.run.flow !== state.run.flow ||
+        retained.state.run.registrationMode !== state.run.registrationMode
       )
         throw new CheckerStorageError('incompatible');
       const currentHints = state.run.environment;
@@ -175,7 +185,12 @@ export async function createCheckerController(
   publish();
 
   function canRunStep(alias: CredentialAlias, step: Step): boolean {
-    if (!available() || !['A', 'B'].includes(alias)) return false;
+    if (!available() || !CREDENTIAL_ALIASES.includes(alias)) return false;
+    if (state.run.flow === 'abc-username-v1') {
+      const next = nextGuidedAction(state);
+      return next?.alias === alias && next.step === step;
+    }
+    if (alias === 'C') return false;
     const credential = state.credentials.find((item) => item.alias === alias);
     if (step === 'create')
       return !credential && (alias === 'A' || state.credentials.some((item) => item.alias === 'A'));
@@ -211,7 +226,7 @@ export async function createCheckerController(
       (item) => item.alias === alias && item.step === previous && item.status === 'verified',
     );
   }
-  return {
+  const controller: CheckerController = {
     getSnapshot: () => snapshot,
     subscribe(listener) {
       listeners.add(listener);
@@ -221,7 +236,13 @@ export async function createCheckerController(
     },
     canRunStep,
     async updateEnvironment(patch) {
-      if (!available()) return;
+      if (
+        closed ||
+        busy ||
+        !['saved', 'saving', 'ephemeral'].includes(storage) ||
+        (state.run.flow === 'abc-username-v1' && state.attempts.length > 0)
+      )
+        return;
       for (const key of ENVIRONMENT_FIELDS)
         if (patch[key] !== undefined) {
           const previous = state.run.environment[key];
@@ -238,134 +259,14 @@ export async function createCheckerController(
       publish();
       await save({ run: state.run });
     },
-    async runStep(alias, step) {
-      if (!canRunStep(alias, step)) return;
-      let previousSequence = state.attempts.length;
-      for (const previous of state.attempts)
-        if (previous.sequence !== undefined)
-          previousSequence = Math.max(previousSequence, previous.sequence);
-      if (!Number.isSafeInteger(previousSequence) || previousSequence >= Number.MAX_SAFE_INTEGER) {
-        failed(new CheckerStorageError('incompatible'));
-        return;
-      }
-      busy = true;
-      const attempt: Attempt = {
-        id: identifier(),
-        alias,
-        step,
-        status: 'pending',
-        sequence: previousSequence + 1,
-        startedAt: new Date().toISOString(),
-        build: structuredClone(options.build),
-        environment: structuredClone(state.run.environment),
-        ...(step === 'use-after-b-failed' ? { afterAttemptId: latestBCreation(state)!.id } : {}),
-      };
-      state.attempts.push(attempt);
-      publish();
-      const pendingSave = save({ attempt });
-      // No await (including IndexedDB) may precede this native prompt invocation.
-      // Safari requires the original button gesture for credential operations.
-      try {
-        const credential = state.credentials.find((item) => item.alias === alias);
-        const observe: DiagnosticObserver = (diagnostics) => {
-          const safe = projectPrfDiagnostics(diagnostics);
-          if (safe) attempt.diagnostics = safe;
-        };
-        const result =
-          step === 'create'
-            ? await core.createCredential(state.run, alias, state.credentials, undefined, observe)
-            : step === 'confirm'
-              ? await core.confirmCredential(state.run, credential!, undefined, observe)
-              : await core.verifyCredential(state.run, credential!, undefined, observe);
-        if (result) {
-          const publicCredential = {
-            alias: result.alias,
-            id: result.id,
-            salt: result.salt,
-            ...(result.transports ? { transports: [...result.transports] } : {}),
-            ...(result.cipher
-              ? { cipher: { iv: result.cipher.iv, data: result.cipher.data } }
-              : {}),
-          };
-          state.credentials = [
-            ...state.credentials.filter((item) => item.alias !== alias),
-            publicCredential,
-          ];
-        }
-        attempt.status = step === 'create' ? 'created' : 'verified';
-      } catch (error) {
-        attempt.status = 'failed';
-        attempt.error = attempt.diagnostics?.applicationError ?? operations.sanitizeError(error);
-      }
-      attempt.finishedAt = new Date().toISOString();
-      publish();
-      await pendingSave;
-      await save({
-        attempt,
-        ...(step === 'create' || step === 'confirm'
-          ? { credential: state.credentials.find((item) => item.alias === alias) }
-          : {}),
-      });
-      busy = false;
-      publish();
-    },
+    runStep: (alias, step) => runStep(alias, step, false),
+    skipStep: (alias, step) => runStep(alias, step, true),
     async addObservation(input) {
-      if (!available()) return;
-      if (
-        !['A', 'B'].includes(input.alias) ||
-        ![...stepsForAlias(input.alias), 'general'].includes(input.step) ||
-        !['worked', 'failed', 'could-not-test'].includes(input.outcome)
-      )
-        return;
-      const observation: Observation = {
-        id: identifier(),
-        alias: input.alias,
-        step: input.step,
-        outcome: input.outcome,
-        note: input.note.slice(0, 2000),
-        createdAt: new Date().toISOString(),
-        build: structuredClone(options.build),
-        environment: structuredClone(state.run.environment),
-      };
-      state.observations.push(observation);
-      publish();
-      await save({ observation });
+      return addObservation(input);
     },
     exportModel: () => structuredClone(state),
     async reset() {
-      if (busy || closed || storage === 'conflict') return;
-      busy = true;
-      publish();
-      await queue;
-      const replacement = fresh();
-      try {
-        if (storage === 'ephemeral') {
-          // Unsaved mode must not erase an unreadable or concurrently changed stored run.
-          state = replacement;
-        } else if (storage === 'incompatible') {
-          store?.close();
-          await remove(() => {
-            warning =
-              'Reset is waiting for another checker tab to close its storage connection. Export remains available. The reset will complete when that connection closes.';
-            publish();
-          });
-          store = await open();
-          token = await store.commit(null, { run: replacement.run });
-          state = replacement;
-          storage = 'saved';
-          warning = undefined;
-        } else {
-          if (!store) store = await open();
-          token = await store.reset(token, replacement.run);
-          state = replacement;
-          storage = 'saved';
-          warning = undefined;
-        }
-      } catch (error) {
-        failed(error);
-      }
-      busy = false;
-      publish();
+      return reset();
     },
     continueInMemory() {
       if (busy || closed || !['unavailable', 'incompatible'].includes(storage)) return;
@@ -380,4 +281,141 @@ export async function createCheckerController(
       publish();
     },
   };
+  return controller;
+
+  async function runStep(alias: CredentialAlias, step: Step, skip: boolean) {
+    if (!canRunStep(alias, step) || (skip && state.run.flow !== 'abc-username-v1')) return;
+    const guided = state.run.flow === 'abc-username-v1' ? nextGuidedAction(state) : undefined;
+    let previousSequence = state.attempts.length;
+    for (const previous of state.attempts)
+      if (previous.sequence !== undefined)
+        previousSequence = Math.max(previousSequence, previous.sequence);
+    if (!Number.isSafeInteger(previousSequence) || previousSequence >= Number.MAX_SAFE_INTEGER) {
+      failed(new CheckerStorageError('incompatible'));
+      return;
+    }
+    busy = true;
+    const attempt: Attempt = {
+      id: identifier(),
+      alias,
+      step,
+      status: skip ? 'skipped' : 'pending',
+      sequence: previousSequence + 1,
+      startedAt: new Date().toISOString(),
+      build: structuredClone(options.build),
+      environment: structuredClone(state.run.environment),
+      ...(step === 'use-after-b-failed' ? { afterAttemptId: latestBCreation(state)!.id } : {}),
+      ...(guided?.afterAttemptId ? { afterAttemptId: guided.afterAttemptId } : {}),
+    };
+    state.attempts.push(attempt);
+    publish();
+    if (skip) {
+      attempt.finishedAt = attempt.startedAt;
+      await save({ attempt });
+      busy = false;
+      publish();
+      return;
+    }
+    const pendingSave = save({ attempt });
+    // No await (including IndexedDB) may precede this native prompt invocation.
+    // Safari requires the original button gesture for credential operations.
+    try {
+      const credential = state.credentials.find((item) => item.alias === alias);
+      const observe: DiagnosticObserver = (diagnostics) => {
+        const safe = projectPrfDiagnostics(diagnostics);
+        if (safe) attempt.diagnostics = safe;
+      };
+      const result =
+        step === 'create'
+          ? await core.createCredential(state.run, alias, state.credentials, undefined, observe)
+          : step === 'confirm'
+            ? await core.confirmCredential(state.run, credential!, undefined, observe)
+            : await core.verifyCredential(state.run, credential!, undefined, observe);
+      if (result) {
+        const publicCredential = {
+          alias: result.alias,
+          id: result.id,
+          salt: result.salt,
+          ...(result.transports ? { transports: [...result.transports] } : {}),
+          ...(result.cipher ? { cipher: { iv: result.cipher.iv, data: result.cipher.data } } : {}),
+        };
+        state.credentials = [
+          ...state.credentials.filter((item) => item.alias !== alias),
+          publicCredential,
+        ];
+      }
+      attempt.status = step === 'create' ? 'created' : 'verified';
+    } catch (error) {
+      attempt.status = 'failed';
+      attempt.error = attempt.diagnostics?.applicationError ?? operations.sanitizeError(error);
+    }
+    attempt.finishedAt = new Date().toISOString();
+    publish();
+    await pendingSave;
+    await save({
+      attempt,
+      ...(step === 'create' || step === 'confirm'
+        ? { credential: state.credentials.find((item) => item.alias === alias) }
+        : {}),
+    });
+    busy = false;
+    publish();
+  }
+  async function addObservation(input: Pick<Observation, 'alias' | 'step' | 'outcome' | 'note'>) {
+    if (!available()) return;
+    if (
+      !CREDENTIAL_ALIASES.includes(input.alias) ||
+      ![...stepsForAlias(input.alias, state.run.flow), 'general'].includes(input.step) ||
+      !['worked', 'failed', 'could-not-test'].includes(input.outcome)
+    )
+      return;
+    const observation: Observation = {
+      id: identifier(),
+      alias: input.alias,
+      step: input.step,
+      outcome: input.outcome,
+      note: input.note.slice(0, 2000),
+      createdAt: new Date().toISOString(),
+      build: structuredClone(options.build),
+      environment: structuredClone(state.run.environment),
+    };
+    state.observations.push(observation);
+    publish();
+    await save({ observation });
+  }
+  async function reset() {
+    if (busy || closed || storage === 'conflict') return;
+    busy = true;
+    publish();
+    await queue;
+    const replacement = fresh();
+    try {
+      if (storage === 'ephemeral') {
+        // Unsaved mode must not erase an unreadable or concurrently changed stored run.
+        state = replacement;
+      } else if (storage === 'incompatible') {
+        store?.close();
+        await remove(() => {
+          warning =
+            'Reset is waiting for another checker tab to close its storage connection. Export remains available. The reset will complete when that connection closes.';
+          publish();
+        });
+        store = await open();
+        token = await store.commit(null, { run: replacement.run });
+        state = replacement;
+        storage = 'saved';
+        warning = undefined;
+      } else {
+        if (!store) store = await open();
+        token = await store.reset(token, replacement.run);
+        state = replacement;
+        storage = 'saved';
+        warning = undefined;
+      }
+    } catch (error) {
+      failed(error);
+    }
+    busy = false;
+    publish();
+  }
 }

@@ -14,6 +14,8 @@ const stepNames: Record<Step, string> = {
   'use-3': 'Use it again: 3 of 3',
   'use-after-b': 'Use A after B is created',
   'use-after-b-failed': 'Use A after B creation fails',
+  recheck: 'Final fresh verification',
+  recover: 'Check retained access',
 };
 const fieldNames: Record<EnvironmentField, string> = {
   browser: 'Browser',

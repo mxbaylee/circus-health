@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { CheckerController, CheckerSnapshot } from '../../app/passkey-checker/controller';
 import type { CheckerState } from '../../app/passkey-checker/types';
+import type { ReactNode } from 'react';
 
 const dependencies = vi.hoisted(() => ({
   createController: vi.fn(),
@@ -18,11 +19,18 @@ vi.mock('../../app/passkey-checker/store', () => ({
 vi.mock('../../app/passkey-checker/build', () => ({
   BUILD_INFO: { version: '3', revision: 'fictional', worktree: 'clean' },
 }));
-vi.mock('../../app/passkey-checker/App', () => ({
-  default: () => <div>Fictional checker body</div>,
+vi.mock('../../app/passkey-checker/GuidedApp', () => ({
+  default: ({ settings, previous }: { settings: ReactNode; previous: ReactNode }) => (
+    <>
+      {settings}
+      <div>Fictional checker body</div>
+      {previous}
+    </>
+  ),
+  downloadReport: vi.fn(),
 }));
 import RoundApp from '../../app/passkey-checker/RoundApp';
-import { LEGACY_DATABASE, roundDatabase } from '../../app/passkey-checker/round';
+import { LEGACY_DATABASE, guidedDatabase } from '../../app/passkey-checker/round';
 
 function controller() {
   let snapshot = {
@@ -61,13 +69,14 @@ test('round modes cannot switch during prompts or saves', async () => {
     .mockResolvedValueOnce(first.value)
     .mockResolvedValueOnce(second.value);
   render(<RoundApp />);
+  fireEvent.click(await screen.findByText('Advanced: creation PRF mode'));
   const select = await screen.findByLabelText('Registration request');
   expect((select as HTMLSelectElement).value).toBe('eval');
   const baseline = dependencies.createController.mock.calls[0][0];
   await baseline.openStore();
   expect(dependencies.openStore).toHaveBeenLastCalledWith(
     globalThis.indexedDB,
-    roundDatabase('eval'),
+    guidedDatabase('eval'),
   );
   act(() => first.change({ busy: true }));
   expect((select as HTMLSelectElement).disabled).toBe(true);
@@ -81,13 +90,13 @@ test('round modes cannot switch during prompts or saves', async () => {
   await experimental.openStore();
   expect(dependencies.openStore).toHaveBeenLastCalledWith(
     globalThis.indexedDB,
-    roundDatabase('enable-only'),
+    guidedDatabase('enable-only'),
   );
   const onBlocked = () => {};
   await experimental.deleteStore(onBlocked);
   expect(dependencies.deleteStore).toHaveBeenCalledWith(
     globalThis.indexedDB,
-    roundDatabase('enable-only'),
+    guidedDatabase('enable-only'),
     onBlocked,
   );
   expect(dependencies.deleteStore).not.toHaveBeenCalledWith(
@@ -103,6 +112,7 @@ test('missing previous results are not deleted or replaced', async () => {
   const old = { load: vi.fn().mockResolvedValue(null), close: vi.fn() };
   dependencies.openStore.mockResolvedValue(old);
   render(<RoundApp />);
+  fireEvent.click(await screen.findByText('Previous results'));
   fireEvent.click(await screen.findByRole('button', { name: 'Export previous-round report' }));
   await screen.findByText('No previous-round results are saved in this browser.');
   expect(dependencies.openStore).toHaveBeenCalledWith(globalThis.indexedDB, LEGACY_DATABASE);

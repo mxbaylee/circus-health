@@ -121,6 +121,9 @@ export interface PrfDiagnostics extends ErrorMetadata {
   nativeOutcome?: 'returned' | 'threw' | 'rejected';
   nativeDuration?: 'under-1s' | '1-5s' | '5-15s' | '15-60s' | 'over-60s';
   nativeErrorCode?: number;
+  usernameMatchesA?: boolean;
+  displayNameMatchesA?: boolean;
+  userHandleMatchesRun?: boolean;
 }
 export type PrfDiagnosticsObserver = (diagnostics: PrfDiagnostics) => void;
 export type DiagnosticObserver = PrfDiagnosticsObserver;
@@ -151,6 +154,9 @@ export const ADDITIONAL_DIAGNOSTIC_LABELS = [
   ['nativeOutcome', 'native invocation outcome'],
   ['nativeDuration', 'native duration bucket'],
   ['nativeErrorCode', 'native numeric error code'],
+  ['usernameMatchesA', 'registration username matches A'],
+  ['displayNameMatchesA', 'registration display name matches A'],
+  ['userHandleMatchesRun', 'registration user handle matches this run'],
 ] as const satisfies readonly (readonly [keyof PrfDiagnostics, string])[];
 const FIELDS = [
   ...ADDITIONAL_DIAGNOSTIC_LABELS.map(([key]) => key),

@@ -22,10 +22,19 @@ export const ENVIRONMENT_FIELDS = [
 ] as const;
 export type EnvironmentField = (typeof ENVIRONMENT_FIELDS)[number];
 export type Environment = Record<EnvironmentField, MetadataField>;
-export type CredentialAlias = 'A' | 'B';
+export const CREDENTIAL_ALIASES = ['A', 'B', 'C'] as const;
+export type CredentialAlias = (typeof CREDENTIAL_ALIASES)[number];
 export const KNOWN_TRANSPORTS = ['ble', 'hybrid', 'internal', 'nfc', 'usb'] as const;
 export type Step =
-  'create' | 'confirm' | 'use-1' | 'use-2' | 'use-3' | 'use-after-b' | 'use-after-b-failed';
+  | 'create'
+  | 'confirm'
+  | 'use-1'
+  | 'use-2'
+  | 'use-3'
+  | 'use-after-b'
+  | 'use-after-b-failed'
+  | 'recheck'
+  | 'recover';
 export const STEP_LABELS: Record<Step, string> = {
   create: 'Create credential',
   confirm: 'Confirm PRF and fictional encryption',
@@ -34,8 +43,11 @@ export const STEP_LABELS: Record<Step, string> = {
   'use-3': 'Fresh use 3',
   'use-after-b': 'Use A after B is created',
   'use-after-b-failed': 'Use A after B creation fails',
+  recheck: 'Final fresh verification',
+  recover: 'Check retained access after an additional creation failed',
 };
-export function stepsForAlias(alias: CredentialAlias): Step[] {
+export function stepsForAlias(alias: CredentialAlias, flow?: RunHeader['flow']): Step[] {
+  if (flow === 'abc-username-v1') return ['create', 'confirm', 'recover', 'recheck'];
   const steps: Step[] = ['create', 'confirm', 'use-1', 'use-2', 'use-3'];
   return alias === 'A' ? [...steps, 'use-after-b', 'use-after-b-failed'] : steps;
 }
@@ -62,6 +74,9 @@ export const ERROR_MESSAGES = {
 export type ErrorCode = keyof typeof ERROR_MESSAGES;
 export interface RunHeader {
   schemaVersion: 1;
+  /** Absent on historical A/B rounds; never infer a new protocol for an old run. */
+  flow?: 'abc-username-v1';
+  registrationMode?: 'eval' | 'enable-only';
   id: string;
   origin: string;
   secureContext: boolean;
@@ -83,10 +98,10 @@ export interface Attempt {
   id: string;
   alias: CredentialAlias;
   step: Step;
-  status: 'pending' | 'created' | 'verified' | 'failed' | 'interrupted';
+  status: 'pending' | 'created' | 'verified' | 'failed' | 'interrupted' | 'skipped';
   error?: ErrorCode;
   diagnostics?: PrfDiagnostics;
-  /** Local attempt reference, only for A's check after this exact B creation failed. */
+  /** Local reference for a retained-access check after this exact failed/interrupted creation. */
   afterAttemptId?: string;
   /** Causal order for new attempts; legacy rows retain their original timestamps. */
   sequence?: number;

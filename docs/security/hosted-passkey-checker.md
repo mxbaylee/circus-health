@@ -2,7 +2,11 @@
 
 The [Operator](../design/personas.md#operate-and-recover) uses the [hosted checker](https://mxbaylee.github.io/circus-health/) to collect browser, operating-system and passkey-provider observations with fictional material. The standalone static site runs entirely in the browser, without a Circus Health server, Docker, LiteLLM or health profile. Its reviewed publication procedure is below.
 
-## Use the checker
+## Current guided A/B/C sequence
+
+Follow the [guided username experiment](hosted-passkey-guided-flow.md) for the current downward-moving A/B/C flow, report schema 4, failure continuations, final original-credential checks, and download-before-clear behavior. This supersedes the former A/B operator sequence below; old results remain separately exportable and are not rewritten as new-protocol evidence. The current default uses identical usernames for A/B and changes only C's username, with a fixed user handle/display name, PRF mode and exclusion policy. The shared security boundaries and Build and publish procedure below still apply.
+
+## Previous A/B sequence — historical reports only
 
 1. Open the page manually in the actual browser being tested. Reload and verify its displayed revision before collecting results. Native operations require valid HTTPS and a secure context.
 2. Review browser/OS names and versions and enter the actual provider/version where known. Browser hints are not proof of provider identity; unknown stays unknown. Check labels again before switching authenticators.
@@ -32,7 +36,7 @@ The experiment is a bounded hypothesis about request compatibility, not a diagno
 
 `RoundApp.tsx` binds the selected mode to the existing controller's native create operation; it does not override `navigator.credentials` or inject synthetic physical results. The production [enrollment](../../src/app/components/passkey-enrollment.ts), [unlock](../../src/app/components/passkey-unlock.ts) and [server wrapping](../../src/server/profile-passkeys.ts) flows are unchanged. Browser-generated checker challenges and HKDF-SHA-256/AES-GCM fictional encryption do not qualify their server/session/recovery contracts.
 
-## Browser-local progress and reports
+## Historical A/B progress and reports
 
 The IndexedDB/run representation stays version 1 with separate changed-only attempt/observation rows. Public references, salts and fictional ciphertext stay local; PRF bytes and derived keys are transient. Each attempt preserves its own build, date, sequence and environment snapshot. Reloaded pending operations are interrupted, not assumed successful. Current browser hints refresh without rewriting historical labels. Cross-tab conflicts and unavailable/incompatible storage are surfaced, not replaced with a successful empty run; explicit unsaved mode remains available.
 
@@ -43,6 +47,10 @@ Only safe booleans, enums, names, categories and bounded lengths/codes are store
 `NotAllowedError` remains ambiguous between cancellation, timeout and refusal. `InvalidStateError` with exclusions is consistent with duplicate refusal, not proof of that cause in a run. Firefox's original unclassified second-registration failure is not silently assigned Chrome's diagnosis. No arbitrary native message, stack, response, ID, salt, PRF bytes, key or ciphertext enters the report. Known local credential identifiers are redacted from free text. Human notes remain bounded, escaped, explicitly unverified statements; do not include secrets or health information.
 
 ### Update and compatibility
+
+For current builds, use [guided update and compatibility](hosted-passkey-guided-flow.md#update-and-compatibility). Guided results have separate protocol/mode namespaces and do not replace or migrate the old A/B stores described below.
+
+#### Historical A/B migration
 
 Reload the reviewed build and verify its revision. **The owner's requested result reset is implemented as fresh active round namespaces**, separately for the default and experimental mode. Previous `circus-health-passkey-checker-v1` storage is not deleted or rewritten; **Export previous-round report** reads it separately. Missing or unreadable prior storage is reported, not treated as a recovered report. Credentials in password managers/authenticators are never deleted. Mode switching resumes each mode's own run and is disabled during a native operation or queued save.
 

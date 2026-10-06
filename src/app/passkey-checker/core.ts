@@ -11,6 +11,7 @@ import {
 } from './diagnostics.ts';
 import type { PrfDiagnostics, PrfDiagnosticsObserver, ValidationRule } from './diagnostics.ts';
 import type { RegistrationMode } from './round.ts';
+import { registrationNames } from './guided.ts';
 
 export class CheckerError extends Error {
   readonly code: ErrorCode;
@@ -274,6 +275,7 @@ export async function createCredential(
   observer?: PrfDiagnosticsObserver,
   registrationMode: RegistrationMode = 'eval',
 ): Promise<CredentialRecord> {
+  if (run.flow === 'abc-username-v1') registrationMode = run.registrationMode ?? 'eval';
   const diagnostics: PrfDiagnostics = {
     requestMode: registrationMode,
     inputShape: 'absent',
@@ -289,8 +291,7 @@ export async function createCredential(
         rp: { name: 'Circus Health fictional compatibility checker', id: run.rpId },
         user: {
           id: bytes(run.userId),
-          name: `fictional-${run.id}-passkey-${alias}`,
-          displayName: `Fictional compatibility test — passkey ${alias}`,
+          ...registrationNames(run, alias),
         },
         pubKeyCredParams: [
           { type: 'public-key', alg: -8 },
@@ -319,6 +320,13 @@ export async function createCredential(
       describePrfRequest(registrationMode, options.publicKey?.extensions?.prf?.eval?.first),
     );
     const creation = options.publicKey!;
+    if (run.flow === 'abc-username-v1') {
+      const baseline = registrationNames(run, 'A');
+      diagnostics.usernameMatchesA = creation.user.name === baseline.name;
+      diagnostics.displayNameMatchesA = creation.user.displayName === baseline.displayName;
+      diagnostics.userHandleMatchesRun =
+        encodePrf((creation.user.id as Uint8Array).buffer as ArrayBuffer) === run.userId;
+    }
     diagnostics.excludedCredentialCount = creation.excludeCredentials!.length;
     diagnostics.userIdLength = (creation.user.id as Uint8Array).byteLength;
     diagnostics.requiredUserVerification =
