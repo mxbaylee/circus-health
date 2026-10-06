@@ -1,0 +1,28 @@
+name: PR 71 step-one source capture
+on:
+  push:
+    branches: [diagnostic/pr71-step1-next-pass]
+    paths: [.github/workflows/pr71-step1-source.yml]
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 742e9509ff7c50f0073b647926f0334ac9aa7d78
+          persist-credentials: false
+      - name: Archive tracked source only
+        run: |
+          test "$(git rev-parse HEAD)" = 742e9509ff7c50f0073b647926f0334ac9aa7d78
+          mkdir "$RUNNER_TEMP/step1-source"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/step1-source/source.tar.gz"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/step1-source/source-tree.txt"
+          sha256sum "$RUNNER_TEMP/step1-source/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr71-step1-source
+          path: ${{ runner.temp }}/step1-source
+          retention-days: 1
