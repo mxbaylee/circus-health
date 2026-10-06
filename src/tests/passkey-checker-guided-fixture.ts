@@ -1,8 +1,8 @@
-import * as operations from '../../app/passkey-checker/core.ts';
-import type { CredentialPort } from '../../app/passkey-checker/core.ts';
-import { encodePrf } from '../../app/components/passkey-prf.ts';
-import { inspectEnvironment } from '../../app/passkey-checker/environment.ts';
-import type { CredentialAlias, RunHeader } from '../../app/passkey-checker/types.ts';
+import * as operations from '../app/passkey-checker/core.ts';
+import type { CredentialPort } from '../app/passkey-checker/core.ts';
+import { encodePrf } from '../app/components/passkey-prf.ts';
+import { inspectEnvironment } from '../app/passkey-checker/environment.ts';
+import type { CredentialAlias, RunHeader } from '../app/passkey-checker/types.ts';
 
 /** Controlled ports are test-only. Crypto, request construction and strict decoding remain real. */
 export function guidedRun(mode: 'eval' | 'enable-only' = 'eval'): RunHeader {

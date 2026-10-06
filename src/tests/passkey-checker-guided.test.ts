@@ -11,7 +11,7 @@ import {
 } from '../app/passkey-checker/guided.ts';
 import { guidedDatabase, roundDatabase, LEGACY_DATABASE } from '../app/passkey-checker/round.ts';
 import { reportMarkdown } from '../app/passkey-checker/report.ts';
-import { guidedCore, guidedRun } from './fixtures/passkey-checker-guided.ts';
+import { guidedCore, guidedRun } from './passkey-checker-guided-fixture.ts';
 
 function memoryStore() {
   let retained: StoredChecker | null = null;

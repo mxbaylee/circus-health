@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import GuidedApp from '../../app/passkey-checker/GuidedApp';
 import { createCheckerController } from '../../app/passkey-checker/controller';
-import { guidedCore, guidedRun } from '../fixtures/passkey-checker-guided';
+import { guidedCore, guidedRun } from '../passkey-checker-guided-fixture';
 
 beforeEach(() => {
   vi.stubGlobal('crypto', webcrypto);

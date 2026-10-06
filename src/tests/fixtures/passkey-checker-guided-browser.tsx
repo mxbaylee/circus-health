@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import GuidedApp from '../../app/passkey-checker/GuidedApp';
 import { createCheckerController } from '../../app/passkey-checker/controller';
 import { openCheckerStore } from '../../app/passkey-checker/store';
-import { guidedCore, guidedRun } from './passkey-checker-guided';
+import { guidedCore, guidedRun } from '../passkey-checker-guided-fixture';
 import '../../app/tokens.css';
 import '../../app/passkey-checker/checker.css';
 
