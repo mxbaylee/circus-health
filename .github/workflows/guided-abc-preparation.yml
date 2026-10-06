@@ -41,8 +41,9 @@ jobs:
           if (createHash('sha256').update(patch).digest('hex') !== '5507ef0aa1aea642a5ad8476b4bb6b390ea7b9f9ffce45dd968996e9db2f4dc3') throw Error('Source patch fingerprint mismatch');
           writeFileSync(`${process.env.RUNNER_TEMP}/guided-abc.patch`, patch);
           NODE
-          git apply --check "$RUNNER_TEMP/guided-abc.patch"
-          git apply "$RUNNER_TEMP/guided-abc.patch"
+          # The generated documentation hunks intentionally use exact one-line headings.
+          git apply --unidiff-zero --check "$RUNNER_TEMP/guided-abc.patch"
+          git apply --unidiff-zero "$RUNNER_TEMP/guided-abc.patch"
           rm .github/guided-abc-part-*.b64
       - run: npm ci
       - name: Format with the pinned repository toolchain
