@@ -9,33 +9,153 @@ permissions:
   contents: read
 
 jobs:
-  integration-inspection:
+  integrate:
     if: github.repository == 'mxbaylee/circus-health'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.publish.outputs.sha }}
     env:
       HUSKY: '0'
       MAIN_SHA: b8a5a01413042a097960e16b6412692531b1b3e7
+      TARGET_BRANCH: codex/crs-231-paged-package-authority
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Inspect integration without publishing or weakening checks
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Merge the inspected main revision with a bounded resolution
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse origin/main)" = "$MAIN_SHA"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git log -1 --oneline
           git merge --no-commit --no-ff "$MAIN_SHA" || true
-          echo '=== conflict paths ==='
-          git diff --name-only --diff-filter=U
-          echo '=== conflict details ==='
-          git diff --cc | head -700 || true
-          echo '=== focused suite locations ==='
-          grep -nE 'acceptance|continuation' package.json src/scripts/test-suite.ts
-          echo '=== observed tree status ==='
-          git status --short
+          test "$(git diff --name-only --diff-filter=U)" = 'docs/setup/release-updates.md'
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const path = 'docs/setup/release-updates.md';
+          const text = readFileSync(path, 'utf8');
+          let count = 0;
+          const fixed = text.replace(/^<<<<<<< HEAD\n([\s\S]*?)^=======\n([\s\S]*?)^>>>>>>> [^\n]+\n/gm, (_, ours, theirs) => {
+            count++;
+            if (count === 1) {
+              assert(ours.includes('| Paged intake authority'));
+              const row = /^\| Hosted checker progress[^\n]+/m;
+              assert(row.test(ours) && row.test(theirs));
+              return ours.replace(row, theirs.match(row)[0]);
+            }
+            assert.equal(count, 2);
+            assert(ours.includes('Cold intake recovery'));
+            assert(theirs.includes('**Guided checker A/B/C:**'));
+            return ours.trimEnd() + '\n\n' + theirs;
+          });
+          assert.equal(count, 2);
+          assert(!/^(<<<<<<<|=======|>>>>>>>)/m.test(fixed));
+          writeFileSync(path, fixed);
+          NODE
+          git add docs/setup/release-updates.md
+          git diff --cached --stat
+          git diff --cached --check
+          git diff "$MAIN_SHA" -- src/server/test/intake-package-worker.test.ts
+      - run: npm ci
+      - name: Format only the resolution and temporary execution workflow
+        run: |
+          npx --no-install prettier --config .prettierrc.json --write docs/setup/release-updates.md .github/workflows/pr71-step1.yml
+          git add docs/setup/release-updates.md .github/workflows/pr71-step1.yml
+          npm run format:check
+          node scripts/repository-file-inventory.ts --check
+      - run: npm run typecheck
+      - name: Verify the preserved package-worker source-mutation regression
+        run: node --test --test-timeout=30000 src/server/test/intake-package-worker.test.ts
+      - name: Publish integration to this PR only, stopping on concurrent changes
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)" = "$GITHUB_SHA"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$MAIN_SHA"
+          git diff --cached --check
+          git commit -m 'Merge main into PR 71, preserving intake and hosted-checker guidance'
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  focused:
+    needs: integrate
+    name: Step 1 ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [continuation, acceptance]
+    env:
+      HUSKY: '0'
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.integrate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --yes qpdf
+      - name: Execute the complete unchanged oracle with a CPU profile
+        run: |
+          mkdir -p "$RUNNER_TEMP/profiles"
+          npm run "test:$SUITE" -- --cpu-prof --cpu-prof-interval=10000 --cpu-prof-dir="$RUNNER_TEMP/profiles"
+      - name: Summarize profile costs without publishing runtime data
+        if: always()
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdirSync, readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const dir = join(process.env.RUNNER_TEMP, 'profiles');
+          const files = readdirSync(dir, { recursive: false }).filter(x => x.endsWith('.cpuprofile'));
+          for (const file of files) {
+            const profile = JSON.parse(readFileSync(join(dir, file), 'utf8'));
+            const nodes = new Map(profile.nodes.map(n => [n.id, n]));
+            const parents = new Map();
+            for (const n of profile.nodes) for (const c of n.children || []) parents.set(c, n.id);
+            const self = new Map(), inclusive = new Map();
+            const key = id => {
+              const f = nodes.get(id).callFrame;
+              return `${f.functionName || '(anonymous)'} ${f.url.replace(process.env.GITHUB_WORKSPACE || '', '')}:${f.lineNumber + 1}`;
+            };
+            for (let i = 0; i < (profile.samples || []).length; i++) {
+              let id = profile.samples[i];
+              const delta = (profile.timeDeltas[i] || 0) / 1000;
+              const k = key(id);
+              self.set(k, (self.get(k) || 0) + delta);
+              const seen = new Set();
+              while (id) {
+                const k = key(id);
+                if (!seen.has(k)) inclusive.set(k, (inclusive.get(k) || 0) + delta);
+                seen.add(k);
+                id = parents.get(id);
+              }
+            }
+            console.log('PROFILE', file, 'milliseconds', (profile.endTime - profile.startTime) / 1000);
+            for (const [label, data] of [['SELF', self], ['INCLUSIVE', inclusive]]) {
+              console.log(label);
+              console.log([...data].sort((a,b) => b[1]-a[1]).slice(0,30).map(([k,v]) => `${Math.round(v)} ${k}`).join('\n'));
+            }
+          }
+          NODE
