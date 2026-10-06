@@ -1,0 +1,57 @@
+name: PR 82 formatting recovery
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: >-
+      github.repository == 'mxbaylee/circus-health' &&
+      github.event.pull_request.number == 82 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'diagnostics/crs-236-proton-skipped-verification'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HUSKY: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Format only the five reported paths
+        run: |
+          npx --no-install prettier --config .prettierrc.json --write \
+            src/app/passkey-checker/guided.ts \
+            src/app/passkey-checker/GuidedApp.tsx \
+            src/app/passkey-checker/report.ts \
+            src/tests/mounted/passkey-checker-guided.test.tsx \
+            src/tests/passkey-checker-resume-plan.test.ts
+          git diff --check
+          git diff --stat
+      - name: Publish formatting only, without forcing or merging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add -- \
+            src/app/passkey-checker/guided.ts \
+            src/app/passkey-checker/GuidedApp.tsx \
+            src/app/passkey-checker/report.ts \
+            src/tests/mounted/passkey-checker-guided.test.tsx \
+            src/tests/passkey-checker-resume-plan.test.ts
+          if git diff --cached --quiet; then exit 0; fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m '🎨 Apply pinned formatter to PR 82'
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+            push origin HEAD:refs/heads/diagnostics/crs-236-proton-skipped-verification
