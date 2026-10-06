@@ -58,6 +58,17 @@ async function acknowledge() {
     fireEvent.click(screen.getByLabelText("I've checked that this report was saved"));
   });
 }
+async function skip() {
+  await click("Can't test this step?");
+  const button = screen.getByRole('button', {
+    name: 'Skip this test without verifying',
+  }) as HTMLButtonElement;
+  expect(button.disabled).toBe(true);
+  await act(async () => {
+    fireEvent.click(screen.getByLabelText('I understand this skips the test without verifying it'));
+  });
+  await click('Skip this test without verifying');
+}
 
 test('failed B recovery appears below the failure and continuing reaches C without a false B pass', async () => {
   const { controller, calls } = await fixture(true);
@@ -67,7 +78,7 @@ test('failed B recovery appears below the failure and continuing reaches C witho
   expect(b.compareDocumentPosition(recovery) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   await waitFor(() => expect(document.activeElement).toBe(recovery));
   await click('Recheck A');
-  await click("Couldn't test — continue");
+  await skip();
   expect(screen.getByRole('button', { name: 'Create C' })).toBeTruthy();
   expect(screen.getAllByText('not applicable · credential not created').length).toBeGreaterThan(0);
   expect(calls).toHaveLength(2);
@@ -125,4 +136,37 @@ test('an unsaved observation blocks mode switching, download and clear until exp
   expect(controller.exportModel().observations.at(-1)?.note).toBe('Fictional note.');
   expect(mode.disabled).toBe(false);
   expect(clearButton().disabled).toBe(true);
+});
+
+test('skip is acknowledged separately and the existing credential can be verified later', async () => {
+  const { controller, calls, gets } = await fixture();
+  await click('Create A');
+  const created = controller.exportModel().credentials[0];
+  await click("Can't test this step?");
+  expect(gets).toHaveLength(0);
+  expect(controller.exportModel().attempts).toHaveLength(1);
+  await click('Cancel skip');
+  await skip();
+  const skipped = controller.exportModel().attempts[1];
+  expect(skipped.status).toBe('skipped');
+  expect(gets).toHaveLength(0);
+  expect(screen.getByText(/^Verification not attempted/)).toBeTruthy();
+  await click('Verify existing A');
+  expect(calls).toHaveLength(1);
+  expect(gets).toHaveLength(1);
+  const state = controller.exportModel();
+  expect(state.credentials[0].id).toBe(created.id);
+  expect(state.credentials[0].salt).toBe(created.salt);
+  expect(state.credentials[0].cipher).toBeTruthy();
+  expect(state.attempts[1]).toEqual(skipped);
+  expect(state.attempts.at(-1)?.status).toBe('verified');
+  expect(screen.queryByRole('button', { name: 'Verify existing A' })).toBeNull();
+  await waitFor(() =>
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Create B' })),
+  );
+  await click("Can't test this step?");
+  expect(
+    (screen.getByRole('button', { name: 'Skip this test without verifying' }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
 });

@@ -1,5 +1,12 @@
 import { messageEvidence, validNativeMessage } from './message.ts';
-import { guidedPlan, GUIDED_ALIASES, verifiedFinal, verifiedRetention } from './guided.ts';
+import {
+  guidedPlan,
+  guidedSummary,
+  guidedInvocationEvidence,
+  GUIDED_ALIASES,
+  verifiedFinal,
+  verifiedRetention,
+} from './guided.ts';
 import { ENVIRONMENT_FIELDS, ERROR_MESSAGES, STEP_LABELS, stepsForAlias } from './types.ts';
 import { ADDITIONAL_DIAGNOSTIC_LABELS, projectPrfDiagnostics } from './diagnostics.ts';
 import type { PrfDiagnostics, ValidationRule } from './diagnostics.ts';
@@ -162,6 +169,8 @@ export function reportMarkdown(state: CheckerState): string {
     lines.push(
       '## Guided sequence',
       '',
+      guidedSummary(state),
+      '',
       `Flow: abc-v1. Creation mode: ${safe(state.run.registrationMode)}.`,
       '',
       ...guidedPlan(state).map(
@@ -170,7 +179,7 @@ export function reportMarkdown(state: CheckerState): string {
       '',
       'Guided native failures may include a bounded message excerpt: known references, URLs, byte arrays and long opaque values are redacted; original length and transformation flags are explicit. Review excerpts before sharing. Stack/cause contents and native payloads are not captured.',
       '',
-      'Skipped is an explicit operator decision, not a successful native operation. Not applicable means its credential prerequisite is absent; it is not a pass. Earlier failures remain below even after a retry succeeds.',
+      'Skipped records the skip path, not a successful native operation or proof of human intent. Not applicable means its credential prerequisite is absent; it is not a pass. Earlier failures remain below even after a retry succeeds.',
       '',
     );
   }
@@ -277,6 +286,10 @@ export function reportMarkdown(state: CheckerState): string {
         // Project again at the export boundary: callers need not have loaded through
         // the strict store, and arbitrary/native diagnostic values must never leak.
         const diagnostics = projectPrfDiagnostics(attempt.diagnostics);
+        if (guided)
+          lines.push(
+            `  Request disposition: ${guidedInvocationEvidence({ ...attempt, diagnostics })}`,
+          );
         if (diagnostics) {
           const fields: string[] = [
             `request mode: ${diagnostics.requestMode}`,

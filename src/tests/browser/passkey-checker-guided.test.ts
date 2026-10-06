@@ -104,12 +104,40 @@ for (const failB of [false, true])
       await page.getByRole('button', { name, exact: true }).click();
       await idle();
     };
+    const skip = async () => {
+      await act("Can't test this step?");
+      const button = page.getByRole('button', {
+        name: 'Skip this test without verifying',
+        exact: true,
+      });
+      assert.equal(await button.isEnabled(), false);
+      // Exercise the separate acknowledgment and commit via actual keyboard activation.
+      await page
+        .getByRole('checkbox', { name: 'I understand this skips the test without verifying it' })
+        .press('Space');
+      await button.press('Enter');
+      await idle();
+    };
     await act('Create A');
-    await act('Verify A');
+    await skip();
+    const skipped = await page.evaluate(() => window.checkerFixture.controller.exportModel());
+    assert.equal(skipped.attempts.at(-1)?.status, 'skipped');
+    assert.equal(skipped.credentials[0].cipher, undefined);
+    await page.reload();
+    await mount();
+    const restored = await page.evaluate(() => window.checkerFixture.controller.exportModel());
+    assert.deepEqual(restored.credentials, skipped.credentials);
+    assert.deepEqual(restored.attempts, skipped.attempts);
+    await act('Verify existing A');
+    const resumed = await page.evaluate(() => window.checkerFixture.controller.exportModel());
+    assert.deepEqual(resumed.attempts.slice(0, 2), skipped.attempts);
+    assert.equal(resumed.credentials[0].id, skipped.credentials[0].id);
+    assert.equal(resumed.credentials[0].salt, skipped.credentials[0].salt);
+    assert.ok(resumed.credentials[0].cipher);
     await act('Create B');
     if (failB) {
       await act('Recheck A');
-      await act("Couldn't test — continue");
+      await skip();
     } else await act('Verify B');
     const before = await page.evaluate(() => window.checkerFixture.controller.exportModel());
     await page.reload();
@@ -163,6 +191,8 @@ for (const failB of [false, true])
       const text = readFileSync(file, 'utf8');
       assert.equal(text, await page.evaluate(() => window.checkerFixture.report()));
       assert.match(text, /Report schema: 4/);
+      assert.match(text, /no native operation requested by this attempt/);
+      assert.match(text, /Native invocation: observed \(returned\)/);
       const decoded = text.replace(/\\([\\`*_{}\[\]()#+.!|~-])/g, '$1');
       for (const value of [
         before.run.id,

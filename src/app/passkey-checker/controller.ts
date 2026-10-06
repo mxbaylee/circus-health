@@ -1,5 +1,5 @@
 import { messageEvidence } from './message.ts';
-import { currentGuidedTask } from './guided.ts';
+import { canResumeConfirmation, currentGuidedTask } from './guided.ts';
 import * as operations from './core.ts';
 import { createRun, inspectEnvironment } from './environment.ts';
 import { projectPrfDiagnostics } from './diagnostics.ts';
@@ -32,7 +32,12 @@ export interface CheckerController {
   subscribe(listener: () => void): () => void;
   canRunStep(alias: CredentialAlias, step: Step, afterAttemptId?: string): boolean;
   updateEnvironment(patch: Partial<Record<keyof Environment, string>>): Promise<void>;
-  runStep(alias: CredentialAlias, step: Step, afterAttemptId?: string): Promise<void>;
+  runStep(
+    alias: CredentialAlias,
+    step: Step,
+    afterAttemptId?: string,
+    resumeSkipped?: boolean,
+  ): Promise<void>;
   skipStep?(alias: CredentialAlias, step: Step, afterAttemptId?: string): Promise<void>;
   addObservation(input: Pick<Observation, 'alias' | 'step' | 'outcome' | 'note'>): Promise<void>;
   exportModel(): CheckerState;
@@ -291,8 +296,16 @@ export async function createCheckerController(
       busy = false;
       publish();
     },
-    async runStep(alias, step, afterAttemptId) {
-      if (!canRunStep(alias, step, afterAttemptId)) return;
+    async runStep(alias, step, afterAttemptId, resumeSkipped = false) {
+      // Resumption is explicit and cannot reopen creation, confirmed ciphertext or recovery gates.
+      const allowed = resumeSkipped
+        ? available() &&
+          writes === 0 &&
+          step === 'confirm' &&
+          afterAttemptId === undefined &&
+          canResumeConfirmation(state, alias)
+        : canRunStep(alias, step, afterAttemptId);
+      if (!allowed) return;
       let previousSequence = state.attempts.length;
       for (const previous of state.attempts)
         if (previous.sequence !== undefined)
