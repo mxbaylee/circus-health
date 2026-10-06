@@ -881,10 +881,15 @@ test(
     assert.equal(inspect(), expected);
     const after = intakeWorkCounters(db),
       delta = (name: keyof typeof after.warm) => after.warm[name] - before.warm[name];
-    // Owned schema resolution adds entry/collection/final readiness around each
-    // of 57 headers per inspection: two more checks than the former header get.
-    // Two inspections therefore retain 1506 + 2 * 57 * 2 physical observations.
-    assert.equal(heads - headBefore, 1734, 'physical accepted HEAD includes schema owner guards');
+    // Owned schema resolution keeps entry/final physical readiness around each
+    // of 57 headers per inspection, sharing the inner collection proof. That is
+    // one extra observation over the former header get, not the previous two.
+    // Two inspections therefore retain 1506 + 1 * 57 * 2 = 1620 observations.
+    assert.equal(
+      heads - headBefore,
+      1620,
+      'physical accepted HEAD includes both schema owner guards',
+    );
     assert.ok(
       delta('collectionNodeReads') < 7486 / 4,
       'compared with the measured original 7486 reads',

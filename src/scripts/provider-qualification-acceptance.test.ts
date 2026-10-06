@@ -48,30 +48,76 @@ test(
     let cookie = '';
     const identityConfirmations: unknown[] = [];
     let clinicalAcceptanceWrites = 0;
+    let requestsStarted = 0,
+      requestsFinished = 0;
+    let activeRequest: { sequence: number; operation: string } | undefined;
+    const progress = () =>
+      console.info(
+        JSON.stringify({
+          fixture: 'fictional qualification acceptance',
+          requestsStarted,
+          requestsFinished,
+          activeRequest: activeRequest ?? null,
+          identityConfirmations: identityConfirmations.length,
+          clinicalAcceptanceWrites,
+        }),
+      );
+    const progressTimer = setInterval(progress, 30_000);
+    progressTimer.unref();
+    t.signal.addEventListener('abort', progress, { once: true });
+    t.after(() => {
+      clearInterval(progressTimer);
+      t.signal.removeEventListener('abort', progress);
+      progress();
+    });
     async function request<T>(path: string, input?: unknown, bytes?: Buffer): Promise<T> {
       if (input !== undefined && path.endsWith('/identity-scope'))
         identityConfirmations.push(input);
       if (input !== undefined && path.endsWith('/report-acceptance')) clinicalAcceptanceWrites++;
-      const response = await fetch(base + path, {
-        method: input !== undefined || bytes ? 'POST' : 'GET',
-        headers: {
-          Origin: origin,
-          Cookie: cookie,
-          'Content-Type': bytes ? 'application/pdf' : 'application/json',
-          ...(bytes ? { 'X-Filename': 'fictional-quick-qualification.pdf' } : {}),
-        },
-        ...(bytes
-          ? { body: Uint8Array.from(bytes).buffer }
-          : input !== undefined
-            ? { body: JSON.stringify(input) }
-            : {}),
-        signal: AbortSignal.any([t.signal, AbortSignal.timeout(360_000)]),
-      });
-      const setCookie = response.headers.get('set-cookie');
-      if (setCookie) cookie = setCookie.split(';')[0];
-      const result = (await response.json()) as { data: T; error?: unknown };
-      assert.equal(response.ok, true, `${path}: ${JSON.stringify(result.error)}`);
-      return result.data;
+      const operation =
+        [
+          'identity-review',
+          'identity-scope-page',
+          'identity-scope',
+          'report-acceptance',
+          'report-queue',
+          'review',
+          'questions',
+          'proposals',
+          'intake-batches',
+          'stop',
+          'profile-setups',
+          'verify',
+          'intakes',
+          'lock',
+          'recover',
+        ].find((label) => path.split('?')[0]!.endsWith('/' + label)) ?? 'other';
+      activeRequest = { sequence: ++requestsStarted, operation };
+      try {
+        const response = await fetch(base + path, {
+          method: input !== undefined || bytes ? 'POST' : 'GET',
+          headers: {
+            Origin: origin,
+            Cookie: cookie,
+            'Content-Type': bytes ? 'application/pdf' : 'application/json',
+            ...(bytes ? { 'X-Filename': 'fictional-quick-qualification.pdf' } : {}),
+          },
+          ...(bytes
+            ? { body: Uint8Array.from(bytes).buffer }
+            : input !== undefined
+              ? { body: JSON.stringify(input) }
+              : {}),
+          signal: AbortSignal.any([t.signal, AbortSignal.timeout(360_000)]),
+        });
+        const setCookie = response.headers.get('set-cookie');
+        if (setCookie) cookie = setCookie.split(';')[0];
+        const result = (await response.json()) as { data: T; error?: unknown };
+        assert.equal(response.ok, true, `${path}: ${JSON.stringify(result.error)}`);
+        return result.data;
+      } finally {
+        requestsFinished++;
+        activeRequest = undefined;
+      }
     }
     const setup = await request<{ setupId: string; recoveryKit: unknown }>('/api/profile-setups', {
       name: 'Qualification',

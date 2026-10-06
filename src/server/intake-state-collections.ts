@@ -695,8 +695,13 @@ export function createIntakeCollections(owner: {
         )
           invalid('schema resolve arguments');
         const registry = registryFor(db);
-        // Cold reads retain the original point operations and every readiness observation.
-        const collection = schemaReadOperations.collection(view, 'logical', 'envelope.data');
+        // This fixed, synchronous owner operation shares its lexical certificate.
+        // No callback, iterator or result escapes it; final ready() and the
+        // runRead seal still check physical HEAD and the exact SQL witness.
+        // Transactions retain all original point-operation observations.
+        const collection = certificate
+          ? descriptor(_readTree().get(readScope(view, 'logical'), 'envelope.data'))
+          : schemaReadOperations.collection(view, 'logical', 'envelope.data');
         if (!collection) invalid('missing selected envelope data');
         const current = viewData(view);
         const key = JSON.stringify([
@@ -735,7 +740,13 @@ export function createIntakeCollections(owner: {
           registry.schemaRecords.delete(key);
         }
         const text = (key: string): string => {
-          const value = schemaReadOperations.get(view, 'logical', 'envelope.data', key);
+          const value = certificate
+            ? (() => {
+                const raw = _readTree().get(collection.root, key);
+                if (raw !== undefined) recordIntakeWork('collectionItemsRead');
+                return raw === undefined ? undefined : publicValue(raw, collection.kind);
+              })()
+            : schemaReadOperations.get(view, 'logical', 'envelope.data', key);
           if (typeof value === 'string') {
             if (Buffer.byteLength(value) > 8192)
               throw Error('Intake collection envelope: field exceeds bounded header');

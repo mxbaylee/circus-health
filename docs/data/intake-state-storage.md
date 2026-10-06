@@ -28,15 +28,18 @@ Bounded synchronous collection reads can also reuse authenticated pages from the
 
 Transactions neither skip raw page reads nor certify pages: observing a transaction rotates the private read epoch, so a rolled-back repair or DDL change cannot leave a trusted page. Generic preparation, mutation, staging and callback-bearing paths authenticate raw pages and invalidate that epoch. Nested reads have separate lexical certificates; a nested mutator invalidates its enclosing read. Main and TEMP schema checks remain distinct because a TEMP table or view can shadow an already prepared unqualified node query. Promises and escaping iterators cannot be returned by this synchronous boundary. Cache disposal, source changes, refusal and closure require fresh authentication.
 
-The same per-database registry retains at most 32 resolved schema headers, with a combined 256 KiB encoded budget across readers and subtrees. Entries bind the exact selected logical collection, schema root, first/last field selection, record address and current raw authority. Cold resolution checks the complete original ancestry through ordinary point reads. A hit returns detached header primitives after fresh physical-head and final SQL/registry checks; it retains no lexical payload or generator. Only the original registered store and owner methods participate. Custom or replaced readers use the uncached path. Transactions, witness changes and explicit cache disposal clear retained headers; readers that outlive disposal cannot repopulate an old registry. Reuse avoids intermediate ancestry reads, but its owner checks can add physical-head observations for shallow records. It does not establish detection of a physical change that appears and disappears entirely between those observations.
+The same per-database registry retains at most 32 resolved schema headers, with a combined 256 KiB encoded budget across readers and subtrees. Entries bind the exact selected logical collection, schema root, first/last field selection, record address and current raw authority. Cold resolution checks the complete original ancestry. The fixed synchronous resolver shares its private per-call certificate for the selected collection and inline header/ancestry reads, instead of opening a nested collection call for every cell. It still checks physical accepted HEAD at entry and completion, and seals only after the final exact SQL/registry witness. Fragmented headers keep their checked byte-reference path; transactions retain the original point operations. No certificate is exposed to callers or retained across a yield. A hit returns detached header primitives after fresh physical-head and final SQL/registry checks; it retains no lexical payload or generator. Only the original registered store and owner methods participate. Custom or replaced readers use the uncached path. Transactions, witness changes and explicit cache disposal clear retained headers; readers that outlive disposal cannot repopulate an old registry. Reuse avoids intermediate ancestry reads, but its owner checks can add physical-head observations for shallow records. It does not establish detection of a physical change that appears and disappears entirely between those observations.
 
-The eight-record lexical-field fixture counts 1,734 physical accepted-head reads
-over two warm inspections, compared with 1,506 before owned schema resolution.
-Each inspection resolves 57 headers; resolver entry, collection selection and
-final readiness replace one former header-read observation with three, adding
-228 observations overall. Prepared-statement reuse leaves this count unchanged.
-Keep this added authority-check work separate from reductions in native node
-reads and bytes; it is not a net-work or latency improvement.
+The eight-record lexical-field fixture now counts 1,620 physical accepted-head
+reads over two warm inspections, down from 1,734 before scoped resolution, and
+compared with 1,506 before owned schema resolution. Each inspection resolves 57
+headers: entry and final readiness remain, while the inner collection selection
+shares the enclosing proof. Removing one redundant observation for each of
+114 resolutions accounts for the exact reduction. Both original lexical
+inspections and their complete output assertions remain. These counts still
+exceed the pre-owner baseline and do not establish whole-workflow improvement.
+
+A cold inline ancestry regression now counts two physical HEAD proofs and six witness queries at two fixture sizes, and explicitly rejects final-proof physical-head loss and local/peer SQL ABA. These counts cover the resolver operation, not the whole workflow.
 
 The [fictional resolved-header fixture](../../src/server/test/intake-schema-resolution-benefit.test.ts) preserves exact lexical output across 288 repeated resolutions. In a matched 2026-10-04 comparison with only this memo disabled, point-item reads fell from 2,016 to zero, tree visits from 18,848 to 576 and witness queries from 13,824 to 4,608. Both runs already had a warm node cache and read zero raw node bytes. Physical-head observations fell from 2,592 to 1,440; every resolution still checked current physical authority. These overlapping work counts describe this fixture, not complete workflow cost or an installation latency guarantee.
 
@@ -71,15 +74,15 @@ candidate histories, including escaped Unicode, and genuine contributor accepted
 storage. It measured cold conversion separately from the same version-only 7→8
 edit, including that edit's preparation and publication:
 
-| Measured work | 16 histories | 64 histories |
-| --- | ---: | ---: |
-| Raw input bytes | 133,184 | 532,304 |
-| Cold collection nodes | 4,832 | 25,458 |
-| Cold encoded node bytes | 4,453,329 | 24,266,680 |
-| Cold immutable journal bytes | 8,521,064 | 45,535,942 |
-| Warm edit collection nodes | 20 | 23 |
-| Warm edit encoded node bytes | 24,943 | 30,653 |
-| Warm edit immutable journal bytes | 47,355 | 56,101 |
+| Measured work                     | 16 histories | 64 histories |
+| --------------------------------- | -----------: | -----------: |
+| Raw input bytes                   |      133,184 |      532,304 |
+| Cold collection nodes             |        4,832 |       25,458 |
+| Cold encoded node bytes           |    4,453,329 |   24,266,680 |
+| Cold immutable journal bytes      |    8,521,064 |   45,535,942 |
+| Warm edit collection nodes        |           20 |           23 |
+| Warm edit encoded node bytes      |       24,943 |       30,653 |
+| Warm edit immutable journal bytes |       47,355 |       56,101 |
 
 Each warm edit published three immutable objects and one accepted head. Cold
 journal amplification rose from about 64 to 86 times the input: roughly four

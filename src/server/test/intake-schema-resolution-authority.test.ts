@@ -448,3 +448,115 @@ for (const kind of ['same-key-reentry', 'clear-during-admission'] as const)
     assert.equal(f.read(), f.expected);
     assert.equal(intakeWorkCounters(f.db).warm.collectionItemsRead, before);
   });
+
+test('cold schema scope shares checks while retaining complete ancestry at two sizes', async (t) => {
+  for (const extras of [0, 40]) {
+    const f = await fixture(t, extras);
+    const view = f.selected.collections.openView();
+    f.selected.collections.clearSchemaRecordCache();
+    const original = f.authority.storage.read;
+    let heads = 0;
+    f.authority.storage.read = (name) => {
+      if (name === 'head') heads++;
+      return original(name);
+    };
+    const before = { ...intakeWorkCounters(f.db).warm };
+    try {
+      const result = f.selected.collections.resolveSchemaRecord(
+        view,
+        f.control.mode,
+        f.control.root,
+        f.id,
+        'last',
+      );
+      const after = intakeWorkCounters(f.db).warm;
+      const witnessQueries =
+        after.collectionReadWitnessQueries - before.collectionReadWitnessQueries;
+      const items = after.collectionItemsRead - before.collectionItemsRead;
+      t.diagnostic(
+        JSON.stringify({ fixture: 'cold schema scope', extras, heads, witnessQueries, items }),
+      );
+      assert.equal(result.kind, f.expected);
+      assert.ok(items >= f.nodes.length, 'complete header and ancestry remain inspected');
+      assert.equal(heads, 2, 'one entry and one final physical HEAD proof');
+      assert.equal(witnessQueries, 6, 'entry, selected binding and final SQL witness only');
+    } finally {
+      f.authority.storage.read = original;
+    }
+  }
+});
+
+test('cold schema scope refuses a missing physical HEAD at its final proof without SQL changes', async (t) => {
+  const f = await fixture(t);
+  const view = f.selected.collections.openView();
+  f.selected.collections.clearSchemaRecordCache();
+  const original = f.authority.storage.read;
+  const changes = f.db.prepare('SELECT total_changes() AS n').get()!.n;
+  let heads = 0;
+  f.authority.storage.read = (name) => {
+    if (name === 'head' && ++heads === 2) return null;
+    return original(name);
+  };
+  try {
+    assert.throws(
+      () =>
+        f.selected.collections.resolveSchemaRecord(
+          view,
+          f.control.mode,
+          f.control.root,
+          f.id,
+          'last',
+        ),
+      /accepted authority|invalid head|current projection/,
+    );
+    assert.equal(heads, 2);
+    assert.equal(f.db.prepare('SELECT total_changes() AS n').get()!.n, changes);
+  } finally {
+    f.authority.storage.read = original;
+  }
+  assert.equal(f.read(), f.expected);
+});
+
+for (const external of [false, true])
+  test(
+    'cold schema scope refuses final-proof SQL ABA from ' +
+      (external ? 'peer' : 'local') +
+      ' writes',
+    async (t) => {
+      const f = await fixture(t);
+      const writer = external ? new DatabaseSync(f.path) : f.db;
+      const view = f.selected.collections.openView();
+      f.selected.collections.clearSchemaRecordCache();
+      const original = f.authority.storage.read;
+      let heads = 0,
+        changed = false;
+      f.authority.storage.read = (name) => {
+        if (name === 'head' && ++heads === 2) {
+          writer
+            .prepare('INSERT INTO main.app_meta(key,value) VALUES(?,?)')
+            .run('fictional-cold-schema-aba', 'value');
+          writer.prepare('DELETE FROM main.app_meta WHERE key=?').run('fictional-cold-schema-aba');
+          changed = true;
+        }
+        return original(name);
+      };
+      try {
+        assert.throws(
+          () =>
+            f.selected.collections.resolveSchemaRecord(
+              view,
+              f.control.mode,
+              f.control.root,
+              f.id,
+              'last',
+            ),
+          /authority changed|stale|generation|collection/,
+        );
+        assert.equal(changed, true);
+      } finally {
+        f.authority.storage.read = original;
+        if (external) writer.close();
+      }
+      assert.equal(f.read(), f.expected);
+    },
+  );
