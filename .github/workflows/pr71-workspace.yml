@@ -1,0 +1,48 @@
+name: PR 71 offline diagnostic workspace
+
+on:
+  push:
+    branches: [diagnostic/pr71-repair-workspace-20261006]
+    paths: [.github/workflows/pr71-workspace.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HUSKY: '0'
+      SOURCE_SHA: d5b9dcc0f191246cfe2627557a5486237773d2c2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: d5b9dcc0f191246cfe2627557a5486237773d2c2
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - run: sudo apt-get update && sudo apt-get install --yes qpdf
+      - name: Archive only tracked source, installed dependencies and public runtime
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$RUNNER_TEMP/offline/source" "$RUNNER_TEMP/offline/tools/bin" "$RUNNER_TEMP/offline/tools/lib"
+          git archive "$SOURCE_SHA" | tar -x -C "$RUNNER_TEMP/offline/source"
+          cp -a node_modules "$RUNNER_TEMP/offline/source/node_modules"
+          cp "$(command -v node)" "$RUNNER_TEMP/offline/tools/bin/node"
+          cp "$(command -v qpdf)" "$RUNNER_TEMP/offline/tools/bin/qpdf"
+          ldd "$(command -v qpdf)"
+          cp -L /usr/lib/x86_64-linux-gnu/libqpdf.so.29 "$RUNNER_TEMP/offline/tools/lib/libqpdf.so.29"
+          printf '%s\n' "$SOURCE_SHA" > "$RUNNER_TEMP/offline/SOURCE_SHA"
+          tar -czf "$RUNNER_TEMP/pr71-offline-workspace.tar.gz" -C "$RUNNER_TEMP/offline" .
+          sha256sum "$RUNNER_TEMP/pr71-offline-workspace.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr71-offline-workspace
+          path: ${{ runner.temp }}/pr71-offline-workspace.tar.gz
+          retention-days: 1
+          compression-level: 0
