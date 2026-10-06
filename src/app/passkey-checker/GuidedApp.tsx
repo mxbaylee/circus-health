@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CheckerController } from './controller.ts';
 import { checkSupport } from './environment.ts';
-import { guidedPlan } from './guided.ts';
+import { canResumeConfirmation, guidedPlan, guidedSummary } from './guided.ts';
+import SkipStep from './SkipStep.tsx';
 import { downloadReport } from './download.ts';
 import { reportMarkdown } from './report.ts';
 import { openCheckerStore } from './store.ts';
@@ -234,11 +235,34 @@ export default function GuidedApp({
                     : row.result === 'created'
                       ? 'Created · encryption not verified yet'
                       : row.result === 'skipped'
-                        ? 'Skipped by you · not a pass'
+                        ? 'Skipped · not a pass'
                         : row.result}
                 </strong>
               </p>
               {error && <p className="checker-error">{ERROR_MESSAGES[error]}</p>}
+              {row.step === 'confirm' &&
+                row.attempt?.status === 'skipped' &&
+                canResumeConfirmation(state, row.alias) && (
+                  <div className="checker-actions">
+                    <button
+                      type="button"
+                      disabled={blocked || !support.supported || previousBusy}
+                      onClick={() => {
+                        if (blocked || previousBusy) return;
+                        userAdvanced.current = true;
+                        lastFocused.current = '';
+                        setNotice('');
+                        // Invoke from this gesture, without awaiting storage or another UI action.
+                        void controller.runStep(row.alias, 'confirm', undefined, true).catch(() =>
+                          setNotice('Verification could not finish. Keep this report and retry.'),
+                        );
+                      }}
+                    >
+                      {`Verify existing ${row.alias}`}
+                    </button>
+                    <p>Uses the saved credential and keeps the original skip in your report.</p>
+                  </div>
+                )}
               {row.active && (
                 <>
                   {row.step === 'create' && row.alias !== 'A' && (
@@ -257,8 +281,8 @@ export default function GuidedApp({
                   )}
                   {row.step === 'confirm' && (
                     <p>
-                      Use the passkey just created. Retry verifies that same credential; it does not
-                      create another one.
+                      Creation is complete. Choose Verify below to test the saved passkey now.
+                      This requests that same credential; it does not create another one.
                     </p>
                   )}
                   {(row.step === 'use-1' || row.step === 'retained') && (
@@ -280,14 +304,13 @@ export default function GuidedApp({
                           ? `Verify ${row.alias}`
                           : `Recheck ${row.alias}`}
                     </button>
-                    <button
-                      type="button"
-                      disabled={blocked || previousBusy || !controller.skipStep}
-                      onClick={() => act(true)}
-                    >
-                      Couldn't test — continue
-                    </button>
                   </div>
+                  <SkipStep
+                    key={state.run.id + row.key + (row.attempt?.id ?? '')}
+                    title={row.title}
+                    disabled={blocked || previousBusy || !controller.skipStep}
+                    onSkip={() => act(true)}
+                  />
                   <p className="checker-source">
                     Failures and retries remain in the report. Continuing never marks this step
                     successful.
@@ -305,6 +328,7 @@ export default function GuidedApp({
         <p role="status" aria-live="polite">
           {notice}
         </p>
+        <p role="status">{guidedSummary(state)}</p>
         <p>
           {current
             ? 'You may stop and download a partial report at any time.'

@@ -28,7 +28,7 @@ export function verifiedRetention(state: CheckerState, attempt: Attempt): boolea
     !!failure &&
     failed(failure) &&
     ['create', 'confirm'].includes(failure.step) &&
-    GUIDED_ALIASES.indexOf(attempt.alias) < GUIDED_ALIASES.indexOf(failure.alias) &&
+    attempt.alias !== failure.alias &&
     follows(attempt, failure) &&
     state.credentials.some((item) => item.alias === attempt.alias && item.cipher) &&
     state.attempts.some(
@@ -40,6 +40,11 @@ export function verifiedRetention(state: CheckerState, attempt: Attempt): boolea
     )
   );
 }
+
+const afterEnrollment = (state: CheckerState, attempt: Attempt) =>
+  state.attempts
+    .filter((row) => row.step === 'create' || row.step === 'confirm')
+    .every((row) => follows(attempt, row));
 
 export function verifiedFinal(state: CheckerState, attempt: Attempt): boolean {
   return (
@@ -53,9 +58,7 @@ export function verifiedFinal(state: CheckerState, attempt: Attempt): boolean {
         row.status === 'verified' &&
         follows(attempt, row),
     ) &&
-    state.attempts
-      .filter((row) => row.step === 'create' || row.step === 'confirm')
-      .every((row) => follows(attempt, row))
+    afterEnrollment(state, attempt)
   );
 }
 
@@ -124,12 +127,18 @@ export function guidedPlan(state: CheckerState): GuidedTask[] {
         : step === 'confirm'
           ? attempt?.status === 'verified' && !!credential?.cipher
           : !!attempt && verifiedFinal(state, attempt);
-    if (complete || attempt?.status === 'skipped') continue;
-    if (attempt?.status === 'verified')
+    // Resuming a skipped confirmation invalidates old final checks, including skips.
+    if (
+      complete ||
+      (attempt?.status === 'skipped' && (step !== 'use-1' || afterEnrollment(state, attempt)))
+    )
+      continue;
+    if (attempt?.status === 'verified' || attempt?.status === 'skipped')
       row.result = 'not verified · a fresh post-enrollment check is required';
     if (failed(attempt) && step !== 'use-1') {
       // Keep the failed row in place; recovery and then Retry/Continue appear below it.
-      for (const earlier of GUIDED_ALIASES.slice(0, GUIDED_ALIASES.indexOf(alias))) {
+      // A resumed A may follow a confirmed B/C: causal order, not alias order, owns recovery.
+      for (const earlier of GUIDED_ALIASES.filter((item) => item !== alias)) {
         if (
           !state.credentials.some((item) => item.alias === earlier && item.cipher) ||
           !state.attempts.some(
@@ -180,3 +189,47 @@ export function guidedPlan(state: CheckerState): GuidedTask[] {
 
 export const currentGuidedTask = (state: CheckerState) =>
   guidedPlan(state).find((row) => row.active);
+
+/** A separate explicit action resumes only a skipped, still-unconfirmed saved credential. */
+export function canResumeConfirmation(state: CheckerState, alias: CredentialAlias): boolean {
+  const current = currentGuidedTask(state);
+  if (
+    state.run.flow !== 'abc-v1' ||
+    current?.step === 'retained' ||
+    failed(current?.attempt)
+  )
+    return false;
+  const credential = state.credentials.find((item) => item.alias === alias);
+  return (
+    !!credential &&
+    !credential.cipher &&
+    state.attempts.filter((row) => row.alias === alias && row.step === 'confirm').at(-1)
+      ?.status === 'skipped'
+  );
+}
+
+/** A terminal sequence is not necessarily a completed verification. */
+export function guidedSummary(state: CheckerState): string {
+  const requests = state.attempts.filter((row) => row.step === 'confirm' && row.status !== 'skipped');
+  if (!requests.length)
+    return 'Verification not attempted. Created passkeys and skipped steps are not a compatibility pass or a provider validation failure.';
+  const confirmed = GUIDED_ALIASES.filter((alias) =>
+    state.credentials.some((item) => item.alias === alias && item.cipher),
+  ).length;
+  const rechecked = GUIDED_ALIASES.filter((alias) =>
+    state.attempts.some((row) => row.alias === alias && verifiedFinal(state, row)),
+  ).length;
+  return `Verification requested; ${confirmed}/3 credentials confirmed and ${rechecked}/3 fresh final rechecks verified. Inspect failed, skipped and unavailable steps separately.`;
+}
+
+/** Report existing attempt/invocation evidence without inventing UI intent or legacy facts. */
+export function guidedInvocationEvidence(attempt: Attempt): string {
+  if (attempt.status === 'skipped')
+    return 'Skip recorded; no native operation requested by this attempt. This record alone does not establish human intent.';
+  const outcome = attempt.diagnostics?.nativeOutcome;
+  const invocation =
+    outcome === 'returned' || outcome === 'threw' || outcome === 'rejected'
+      ? `observed (${outcome})`
+      : 'unobserved or unfinished; absence is not proof that no call occurred';
+  return `Operation requested and accepted by the controller. Native invocation: ${invocation}.`;
+}
