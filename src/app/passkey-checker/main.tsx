@@ -3,4 +3,4 @@ import RoundApp from './RoundApp';
 import '../tokens.css';
 import './checker.css';
 
-createRoot(document.getElementById('root')!).render(<RoundApp />);
+createRoot(document.getElementById('root')!).render(<RoundApp guided />);
