@@ -25,8 +25,10 @@ const FORMAT = 'health-contributor-record-authority-v1';
 function fail(message: string): never {
   throw Error('Contributor authority: ' + message);
 }
+// Keep each physical-path proof fresh; the native resolver avoids repeating
+// Node's JavaScript component walk without caching or skipping symlink checks.
 function directory(path: string): void {
-  if (!lstatSync(path).isDirectory() || realpathSync(path) !== resolve(path))
+  if (!lstatSync(path).isDirectory() || realpathSync.native(path) !== resolve(path))
     fail('directory must be physical and profile scoped');
 }
 function sync(path: string): void {
@@ -48,7 +50,7 @@ function readFile(path: string): Buffer | null {
     }
     return null;
   }
-  if (!lstatSync(path).isFile() || realpathSync(path) !== path)
+  if (!lstatSync(path).isFile() || realpathSync.native(path) !== path)
     fail('authority must be a regular physical file');
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {

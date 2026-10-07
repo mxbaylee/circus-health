@@ -50,6 +50,42 @@ final physical-head loss, committed local/peer ABA, TEMP schema changes and
 registry disposal. Complete fragmented escaped names retain the custom-reader
 fallback's output, and returned targets are detached.
 
+Staged envelope readers use the same fixed schema resolver for their selected
+`builds` collection. Its memo key includes the collection area and name, exact
+build-directory root, logical head, schema root and descriptor. Each operation
+still checks the live source, current authority, complete ancestry and final
+SQL/registry witness. A checkpoint refreshes the reader's view; an explicitly
+retained pre-checkpoint build view refuses as stale. No staged selection is
+silently read from the published `envelope.data`, and two builds cannot share a
+header merely because their record addresses match. Transactions keep the checked
+point-read fallback, and byte/name streams retain their existing validation.
+This is an in-memory read optimization: stored formats, durable publication and
+recovery authority are unchanged.
+
+The small staged-reader regression compares identical published and staged data
+with zero and 40 unrelated records. Before staged owner registration, a warm
+record-header resolution used nine physical HEAD observations, 48 SQL witness
+queries and seven cell reads. It now matches the published reader's four HEAD
+observations, 12 witness queries and zero repeated header/ancestry cell reads.
+A named-field read falls from nine/48/seven to six/24/six respectively, retaining
+both payload reads and exact values. These measured operations do not establish
+whole-workflow latency or a complete continuation/recovery pass.
+
+For the short debugging loop, run the two counted regressions directly:
+
+```sh
+node --test --test-name-pattern='staged schema reads share' src/server/test/intake-schema-resolution-authority.test.ts
+```
+
+The remaining staged tests in that file cover build isolation, checked checkpoint
+refresh, stale views, local/peer corruption and deletion, duplicate selection,
+rollback-only repairs, final physical-head loss, SQL ABA, TEMP schema changes and
+registry disposal. Run the complete schema/collection regression files after a
+change, followed by the unchanged `npm run test:continuation` and
+`npm run test:acceptance` scenarios before claiming both workflows complete. A short
+fixture does not replace either full scenario or turn their existing AI stubs
+into live-provider qualification.
+
 A cold inline ancestry regression now counts two physical HEAD proofs and six witness queries at two fixture sizes, and explicitly rejects final-proof physical-head loss and local/peer SQL ABA. These counts cover the resolver operation, not the whole workflow.
 
 The [fictional resolved-header fixture](../../src/server/test/intake-schema-resolution-benefit.test.ts) preserves exact lexical output across 288 repeated resolutions. In a matched 2026-10-04 comparison with only this memo disabled, point-item reads fell from 2,016 to zero, tree visits from 18,848 to 576 and witness queries from 13,824 to 4,608. Both runs already had a warm node cache and read zero raw node bytes. Physical-head observations fell from 2,592 to 1,440; every resolution still checked current physical authority. These overlapping work counts describe this fixture, not complete workflow cost or an installation latency guarantee.
@@ -250,7 +286,7 @@ Portable export, load and rebuild retain exact `app_meta` values and raw source 
 
 Receipt handling distinguishes live accepted People from operations whose supporting history is not copied. Accepted intake People receipts stored under `personal_assistant_*` remain active after profile rebinding, retaining their public proposal, person, note and version identities. Source `personal_assistant_*` and `personal_restore_*` receipt strings are also retained exactly under `private_copy_source_receipt:v1:<sourceProfileId>:<originalKey>` in `app_meta`. Generic assistant/restore receipts depending on uncopied chats or historical generations are removed from active target replay; their archived strings remain source evidence. A shared key prefix alone does not make an accepted People receipt disposable.
 
-The staged journal is independently validated before final profile-directory rename publishes the target. Before attempted publication is recorded, a failed unpublished stage can be cleaned up and preparation retried only against a currently available coherent source. Persisted intent pins the initial target record head and portable artifacts before publication and marks `publicationAttempted` before rename. After publication, the same operation recovers the final destination independently of an advanced or absent source. A never-registered target must match its pinned initial heads and requested name before activation. A registered completed target instead retains its current selected head, later accepted edits and current name; even an active target retry checks durable readiness. Missing SQLite caches reconstruct from selected journal evidence. A valid earlier accepted cache can catch up from a published head, while conflicting or unacknowledged SQL changes refuse. A process crash between saving `publicationAttempted` and rename can leave an unpublished stage but no final target. Restart cannot distinguish that case from a deleted published survivor, so missing final storage with published or ambiguous intent refuses automatic recopy; retain the intent and available archive/stage evidence for explicit operator recovery. Only the live failing operation can clear an attempted-publication marker when its surviving stage and absent final directory prove that rename did not publish.
+The staged journal is independently validated before final profile-directory rename publishes the target. Before attempted publication is recorded, a failed unpublished stage can be cleaned up and preparation retried only against a currently available coherent source. Persisted intent pins the initial target record head and portable artifacts before publication and marks `publicationAttempted` before rename. After publication, the same operation recovers the final destination independently of an advanced or absent source. A never-registered target must match its pinned initial heads and requested name before activation. A registered completed target instead retains its current selected head, later accepted edits and current name, even if the source advanced or disappeared. An already active target retry checks durable readiness. Missing SQLite caches reconstruct from selected journal evidence. A valid earlier accepted cache can catch up from a published head, while conflicting or unacknowledged SQL changes refuse. A process crash between saving `publicationAttempted` and rename can leave an unpublished stage but no final target. Restart cannot distinguish that case from a deleted published survivor, so missing final storage with published or ambiguous intent refuses automatic recopy; retain the intent and available archive/stage evidence for explicit operator recovery. Only the live failing operation can clear an attempted-publication marker when its surviving stage and absent final directory prove that rename did not publish.
 
 Physical original copying and hash checks, SQLite backup, full selected-table comparison, bounded intake decoding/cloning/framing, portable export and rebuild scale with retained state. Existing contributor-profile opening also performs independent journal reconstruction and comparison; bounded mutation rows do not imply changed-only opening or copy computation. Contributor `attachPersonalDurability` now supplies the same accepted-record transaction boundary for intake `app_meta`, source metadata and clinical state. These mechanics do not establish capacity, large-import, provider, physical-device or power-loss qualification. The fictional contributor lifecycle and failure matrix in [`contributor-intake-copy.test.ts`](../../src/server/test/contributor-intake-copy.test.ts), alongside [`profile-lifecycle.test.ts`](../../src/server/test/profile-lifecycle.test.ts), exercises retry, source preservation, original verification and rebuild boundaries.
 

@@ -139,6 +139,8 @@ interface SchemaRecordOwner {
     id: string,
     selection: 'first' | 'last',
     name: string,
+    area?: IntakeCollectionArea,
+    collection?: string,
   ) => { target: SchemaTarget | undefined };
   resolve: (
     view: IntakeCollectionView,
@@ -146,6 +148,8 @@ interface SchemaRecordOwner {
     root: string,
     id: string,
     selection: 'first' | 'last',
+    area?: IntakeCollectionArea,
+    collection?: string,
   ) => SchemaRecord;
   clear: () => void;
   current: () => boolean;
@@ -618,6 +622,8 @@ export function createIntakeCollections(owner: {
     id: string,
     fieldSelection: 'first' | 'last',
     operation: { kind: 'header' } | { kind: 'field'; name: string },
+    area: IntakeCollectionArea,
+    name: string,
   ): SchemaRecord | { target: SchemaTarget | undefined } {
     let admission:
       | {
@@ -641,22 +647,24 @@ export function createIntakeCollections(owner: {
         (operation.kind === 'field' && typeof operation.name !== 'string')
       )
         invalid('schema resolve arguments');
+      collectionName(name);
       const registry = registryFor(db);
       // This fixed, synchronous owner operation shares its lexical certificate.
       // No callback, iterator or result escapes it; final ready() and the
       // runRead seal still check physical HEAD and the exact SQL witness.
       // Transactions retain all original point-operation observations.
       const collection = certificate
-        ? descriptor(_readTree().get(readScope(view, 'logical'), 'envelope.data'))
-        : schemaReadOperations.collection(view, 'logical', 'envelope.data');
+        ? descriptor(_readTree().get(readScope(view, area), name))
+        : schemaReadOperations.collection(view, area, name);
       if (!collection) invalid('missing selected envelope data');
       const current = viewData(view);
       const key = JSON.stringify([
         identity,
         prefix,
-        'logical',
-        'envelope.data',
+        area,
+        name,
         current.head?.logical ?? null,
+        ...(area === 'builds' ? [current.head?.builds ?? null] : []),
         collection,
         mode,
         root,
@@ -684,7 +692,7 @@ export function createIntakeCollections(owner: {
               if (raw !== undefined) recordIntakeWork('collectionItemsRead');
               return raw === undefined ? undefined : publicValue(raw, collection.kind);
             })()
-          : schemaReadOperations.get(view, 'logical', 'envelope.data', key);
+          : schemaReadOperations.get(view, area, name, key);
       // Large lexical names remain streamed through the checked byte reader.
       // The iterator is private and completely consumed before this scope seals.
       function* chunks(key: string): Generator<string> {
@@ -867,10 +875,21 @@ export function createIntakeCollections(owner: {
       root: string,
       id: string,
       fieldSelection: 'first' | 'last',
+      area: IntakeCollectionArea = 'logical',
+      collection = 'envelope.data',
     ): SchemaRecord {
-      return resolveSchemaRead(view, mode, root, id, fieldSelection, {
-        kind: 'header',
-      }) as SchemaRecord;
+      return resolveSchemaRead(
+        view,
+        mode,
+        root,
+        id,
+        fieldSelection,
+        {
+          kind: 'header',
+        },
+        area,
+        collection,
+      ) as SchemaRecord;
     },
     resolveSchemaField(
       view: IntakeCollectionView,
@@ -879,8 +898,19 @@ export function createIntakeCollections(owner: {
       id: string,
       fieldSelection: 'first' | 'last',
       name: string,
+      area: IntakeCollectionArea = 'logical',
+      collection = 'envelope.data',
     ): { target: SchemaTarget | undefined } {
-      return resolveSchemaRead(view, mode, root, id, fieldSelection, { kind: 'field', name }) as {
+      return resolveSchemaRead(
+        view,
+        mode,
+        root,
+        id,
+        fieldSelection,
+        { kind: 'field', name },
+        area,
+        collection,
+      ) as {
         target: SchemaTarget | undefined;
       };
     },

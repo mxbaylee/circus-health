@@ -991,12 +991,13 @@ export function collectionCellReader(
       collections.readBytes(value, { after, items: 64, bytes }),
   };
   const owner = intakeSchemaRecordOwner(collections);
-  if (owner && area === 'logical' && collection === 'envelope.data')
+  if (owner && ((area === 'logical' && collection === 'envelope.data') || area === 'builds'))
     schemaResolutionOwners.set(store, {
       methods: Object.freeze([store.get, store.check, store.range, store.chunks]),
-      resolve: (mode, root, id, selection) => owner.resolve(view, mode, root, id, selection),
+      resolve: (mode, root, id, selection) =>
+        owner.resolve(view, mode, root, id, selection, area, collection),
       field: (mode, root, id, selection, name) =>
-        owner.field(view, mode, root, id, selection, name),
+        owner.field(view, mode, root, id, selection, name, area, collection),
       clear: owner.clear,
       current: owner.current,
     });

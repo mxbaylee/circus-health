@@ -9,6 +9,8 @@ import {
   readdirSync,
   statSync,
   symlinkSync,
+  renameSync,
+  realpathSync,
 } from 'node:fs';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -384,4 +386,75 @@ test('contributor copy compares exact streamed row multisets and publishes autho
   assert.equal(collected.length, 0);
   assert.ok(files > 3);
   assert.equal(selectedContributorHead(target, 'cedar'), selectedContributorHead(root, 'cedar'));
+});
+
+// These are physical reads through the real filesystem, not cached path claims.
+test('authority reads retain every fresh native physical-path proof and current head bytes', (t) => {
+  const { root, paths } = fixture(t);
+  const storage = openContributorRecordStorage(root, 'cedar', { initialize: true });
+  t.after(() => storage.close());
+  storage.publishHead(Buffer.from('first fictional head'));
+  const head = resolve(contributorAuthorityPath(root, 'cedar'), 'head');
+  const physical = realpathSync.native;
+  const observed: string[] = [];
+  const probe = t.mock.method(realpathSync, 'native', (...args: Parameters<typeof physical>) => {
+    observed.push(String(args[0]));
+    return physical(...args);
+  });
+  try {
+    for (const value of ['second fictional head', 'third fictional head']) {
+      writeFileSync(head, value);
+      observed.length = 0;
+      assert.equal(storage.read('head')?.toString(), value);
+      assert.deepEqual(observed, [paths.root, paths.records, paths.records, head]);
+    }
+    // The OS resolver is required, not a positive pathname cached by this backend.
+    probe.mock.mockImplementation(() => {
+      throw Error('fictional native resolver refusal');
+    });
+    assert.throws(() => storage.read('head'), /native resolver refusal/);
+  } finally {
+    probe.mock.restore();
+  }
+  assert.equal(storage.read('head')?.toString(), 'third fictional head');
+});
+
+for (const component of ['ancestor', 'profile', 'records', 'objects'] as const)
+  test('open contributor backend rejects a linked ' + component + ' on its next read', (t) => {
+    const { root, paths } = fixture(t);
+    const storage = openContributorRecordStorage(root, 'cedar', { initialize: true });
+    t.after(() => storage.close());
+    const name = 'objects/' + randomUUID();
+    storage.writeImmutable(name, Buffer.from('fictional unchanged object'));
+    const selected =
+      component === 'ancestor'
+        ? resolve(root, 'data')
+        : component === 'profile'
+          ? paths.root
+          : component === 'records'
+            ? paths.records
+            : resolve(paths.records, 'objects');
+    const moved = selected + '.moved';
+    renameSync(selected, moved);
+    symlinkSync(moved, selected, 'dir');
+    try {
+      assert.throws(() => storage.read(name), /physical|profile scoped/);
+    } finally {
+      rmSync(selected);
+      renameSync(moved, selected);
+    }
+    assert.equal(storage.read(name)?.toString(), 'fictional unchanged object');
+  });
+
+test('native path validation preserves missing, broken-link and nonregular-file refusal', (t) => {
+  const { root, paths } = fixture(t);
+  const storage = openContributorRecordStorage(root, 'cedar', { initialize: true });
+  t.after(() => storage.close());
+  const missing = 'objects/' + randomUUID();
+  assert.equal(storage.read(missing), null);
+  symlinkSync(resolve(paths.records, 'absent-target'), resolve(paths.records, missing));
+  assert.throws(() => storage.read(missing), /nonregular authority/);
+  rmSync(resolve(paths.records, missing));
+  symlinkSync(resolve(paths.records, 'objects'), resolve(paths.records, missing), 'dir');
+  assert.throws(() => storage.read(missing), /regular physical/);
 });

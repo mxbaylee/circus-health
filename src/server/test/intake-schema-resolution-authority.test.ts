@@ -776,3 +776,267 @@ test('named field scope refuses rollback-only repairs and does not borrow cached
   f.db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', f.nodes[0]!.key);
   assert.throws(() => f.reader.field(record, 'missing'), /tree|collection|schema/);
 });
+
+async function stagedFixture(t: test.TestContext, extras = 0) {
+  const f = await fixture(t, extras);
+  const build = 'mutation.' + randomUUID();
+  const collections = f.selected.collections;
+  const operationId = randomUUID();
+  collections.commitMaintenance(
+    collections.prepare(collections.openView(), {
+      operationId,
+      requestDigest: 'e'.repeat(64),
+      domainVersion: f.selected.head.logical.domainVersion,
+      changes: [
+        {
+          area: 'builds',
+          collection: build,
+          op: 'adoptCollection',
+          fromArea: 'logical',
+          fromCollection: 'envelope.data',
+        },
+      ],
+    }),
+  );
+  const selected = collectionCellReader(f.db, f.source, 'builds', build);
+  const staged = createSchemaEnvelopeReader(selected.store, f.control, selected.head.logical);
+  return { ...f, build, staged, stagedStore: selected.store };
+}
+
+for (const extras of [0, 40])
+  test(`staged schema reads share published-reader proof work: ${extras} unrelated records`, async (t) => {
+    const f = await stagedFixture(t, extras);
+    const original = f.authority.storage.read;
+    let heads = 0;
+    f.authority.storage.read = (name) => {
+      if (name === 'head') heads++;
+      return original(name);
+    };
+    t.after(() => {
+      f.authority.storage.read = original;
+    });
+    const measure = (read: () => unknown) => {
+      read();
+      const start = heads;
+      const before = { ...intakeWorkCounters(f.db).warm };
+      const value = read();
+      const after = intakeWorkCounters(f.db).warm;
+      return {
+        value,
+        heads: heads - start,
+        witnessQueries: after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+        items: after.collectionItemsRead - before.collectionItemsRead,
+      };
+    };
+    const published = measure(() => f.reader.resolve(f.id).kind);
+    const staged = measure(() => f.staged.resolve(f.id).kind);
+    const publishedRecord = f.reader.resolve(f.id),
+      stagedRecord = f.staged.resolve(f.id);
+    const publishedField = measure(() => f.reader.field(publishedRecord, 'value'));
+    const stagedField = measure(() => f.staged.field(stagedRecord, 'value'));
+    t.diagnostic(JSON.stringify({ extras, published, staged, publishedField, stagedField }));
+    assert.deepEqual(staged.value, published.value);
+    assert.deepEqual(stagedField.value, { kind: 'value', value: 'new' });
+    assert.deepEqual(
+      staged,
+      published,
+      'same ancestry proof without reopening a scope for each staged cell',
+    );
+    assert.deepEqual(stagedField, publishedField, 'same field proof and exact payload reads');
+  });
+
+function changeStagedHeader(
+  f: Awaited<ReturnType<typeof stagedFixture>>,
+  build: string,
+  kind: string,
+) {
+  const collections = f.selected.collections;
+  const header = JSON.parse(
+    String(collections.get(collections.openView(), 'builds', build, 'r:' + f.id)),
+  );
+  collections.commitMaintenance(
+    collections.prepare(collections.openView(), {
+      operationId: randomUUID(),
+      requestDigest: 'd'.repeat(64),
+      domainVersion: f.selected.head.logical.domainVersion,
+      changes: [
+        {
+          area: 'builds',
+          collection: build,
+          op: 'put',
+          key: 'r:' + f.id,
+          value: JSON.stringify({ ...header, kind }),
+        },
+      ],
+    }),
+  );
+}
+
+test('staged schema memo binds the exact build and refreshes only after a checked checkpoint', async (t) => {
+  const f = await stagedFixture(t);
+  const collections = f.selected.collections,
+    other = 'mutation.' + randomUUID();
+  collections.commitMaintenance(
+    collections.prepare(collections.openView(), {
+      operationId: randomUUID(),
+      requestDigest: 'b'.repeat(64),
+      domainVersion: f.selected.head.logical.domainVersion,
+      changes: [
+        {
+          area: 'builds',
+          collection: other,
+          op: 'adoptCollection',
+          fromArea: 'logical',
+          fromCollection: 'envelope.data',
+        },
+      ],
+    }),
+  );
+  const otherStore = collectionCellReader(f.db, f.source, 'builds', other);
+  const otherReader = createSchemaEnvelopeReader(
+    otherStore.store,
+    f.control,
+    otherStore.head.logical,
+  );
+  assert.equal(f.staged.resolve(f.id).kind, 'subject');
+  assert.equal(otherReader.resolve(f.id).kind, 'subject');
+  const oldView = collections.openView();
+  changeStagedHeader(f, f.build, 'fictional-staged-kind');
+  assert.deepEqual(collections.binding(collections.openView())!.logical, f.selected.head.logical);
+  assert.throws(
+    () =>
+      collections.resolveSchemaRecord(
+        oldView,
+        f.control.mode,
+        f.control.root,
+        f.id,
+        'last',
+        'builds',
+        f.build,
+      ),
+    /stale collection view/,
+  );
+  assert.equal(f.staged.resolve(f.id).kind, 'fictional-staged-kind');
+  assert.equal(otherReader.resolve(f.id).kind, 'subject');
+  assert.equal(f.reader.resolve(f.id).kind, 'subject');
+  changeStagedHeader(f, other, 'fictional-other-kind');
+  assert.equal(otherReader.resolve(f.id).kind, 'fictional-other-kind');
+  assert.equal(f.staged.resolve(f.id).kind, 'fictional-staged-kind');
+});
+
+for (const external of [false, true])
+  test(`staged schema reads reject warm ancestry corruption and deletion: ${external ? 'peer' : 'local'}`, async (t) => {
+    const f = await stagedFixture(t);
+    const writer = external ? new DatabaseSync(f.path) : f.db;
+    const read = () => f.staged.field(f.staged.resolve(f.id), 'value');
+    const expected = { kind: 'value', value: 'new' };
+    try {
+      for (const row of f.nodes) {
+        assert.deepEqual(read(), expected);
+        writer.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', row.key);
+        assert.throws(read, /tree|collection|schema|encoded bytes/, row.cell);
+        restore(writer, row);
+        assert.deepEqual(read(), expected);
+        writer.prepare('DELETE FROM main.app_meta WHERE key=?').run(row.key);
+        assert.throws(read, /tree|collection|schema|encoded bytes/, row.cell);
+        restore(writer, row);
+      }
+    } finally {
+      if (external) writer.close();
+    }
+    assert.deepEqual(read(), expected);
+  });
+
+for (const mode of ['physical-head', 'local-aba', 'peer-aba', 'temp-schema', 'registry'] as const)
+  test(`staged field scope rejects ${mode} at its final proof`, async (t) => {
+    const f = await stagedFixture(t);
+    const writer = mode === 'peer-aba' ? new DatabaseSync(f.path) : f.db;
+    const original = f.authority.storage.read;
+    const view = f.selected.collections.openView();
+    const read = () =>
+      f.selected.collections.resolveSchemaField(
+        view,
+        f.control.mode,
+        f.control.root,
+        f.id,
+        'last',
+        'value',
+        'builds',
+        f.build,
+      );
+    const expected = read();
+    assert.equal(expected.target?.type, 'cell');
+    let heads = 0;
+    f.authority.storage.read = (name) => {
+      if (name === 'head' && ++heads === 2) {
+        if (mode === 'physical-head') return null;
+        if (mode === 'registry') clearIntakeStateCache(f.db);
+        else if (mode === 'temp-schema')
+          f.db.exec(
+            'CREATE TEMP TABLE fictional_staged_shadow(id); DROP TABLE fictional_staged_shadow',
+          );
+        else {
+          writer
+            .prepare('INSERT INTO main.app_meta(key,value) VALUES(?,?)')
+            .run('fictional-staged-aba', 'value');
+          writer.prepare('DELETE FROM main.app_meta WHERE key=?').run('fictional-staged-aba');
+        }
+      }
+      return original(name);
+    };
+    try {
+      assert.throws(read, /authority|stale|generation|collection|current projection|encoded bytes/);
+      assert.equal(heads, 2);
+    } finally {
+      f.authority.storage.read = original;
+      if (mode === 'peer-aba') writer.close();
+    }
+    const fresh = collectionCellReader(f.db, f.source, 'builds', f.build);
+    assert.deepEqual(
+      fresh.collections.resolveSchemaField(
+        fresh.collections.openView(),
+        f.control.mode,
+        f.control.root,
+        f.id,
+        'last',
+        'value',
+        'builds',
+        f.build,
+      ),
+      expected,
+    );
+  });
+
+test('staged field scope preserves duplicate selection and refuses rollback-only repairs', async (t) => {
+  const f = await stagedFixture(t);
+  for (const selection of ['first', 'last'] as const) {
+    const reader = createSchemaEnvelopeReader(
+      f.stagedStore,
+      f.control,
+      f.selected.head.logical,
+      undefined,
+      selection,
+    );
+    const scope = reader.child(reader.child(reader.root(), 'intake')!, 'scope')!;
+    const subject = reader.child(scope, 'subject')!;
+    assert.deepEqual(reader.field(subject, 'value'), {
+      kind: 'value',
+      value: selection === 'first' ? 'old' : 'new',
+    });
+  }
+  const row = f.nodeFor('f:' + f.id + ':' + schemaKey('value'));
+  const record = f.staged.resolve(f.id),
+    read = () => f.staged.field(record, 'value');
+  assert.deepEqual(read(), { kind: 'value', value: 'new' });
+  f.db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', row.key);
+  f.db.exec('SAVEPOINT fictional_staged_repair');
+  try {
+    restore(f.db, row);
+    assert.deepEqual(read(), { kind: 'value', value: 'new' });
+  } finally {
+    f.db.exec('ROLLBACK TO fictional_staged_repair; RELEASE fictional_staged_repair');
+  }
+  assert.throws(read, /tree|collection|schema/);
+  restore(f.db, row);
+  assert.deepEqual(read(), { kind: 'value', value: 'new' });
+});
