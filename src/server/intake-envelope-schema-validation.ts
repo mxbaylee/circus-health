@@ -84,7 +84,7 @@ export function* validateIntakeSchemaReachabilitySteps(
     function* rows(prefix: string) {
       let after = prefix;
       for (;;) {
-        const page = store.range(after, 64, 65536);
+        const page = store.range(after, 64, 65536, prefix);
         for (const row of page.items) {
           if (!row.key.startsWith(prefix)) return;
           yield row;

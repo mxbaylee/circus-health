@@ -54,6 +54,48 @@ Copy and recovery validation use private, disk-backed scratch indexes. The manif
 
 The [scratch regressions](../../src/server/test/intake-state-manifest.test.ts) exercise the real cold validator, exact rows at two sizes, and cancellation at an actual schema-validation yield. They count zero per-row autocommit writes, retain duplicate rejection and unchanged source snapshots, and verify that generator return/throw removes the private files without holding a source transaction. These focused results do not replace complete HTTP acceptance and encrypted cache-loss recovery qualification.
 
+### Cold-recovery debugging and scoped schema reads
+
+Cold schema validation and lexical reconstruction request the exact ordered-key prefix
+being inspected. The cold graph reader stops at the first authenticated key outside
+that prefix instead of filling the remainder of a 64-item page with neighboring
+records. Item and byte limits, continuation and count checks, complete name/parent/
+order validation, and the separate complete historical graph traversal remain.
+The prefix is an optional hint on the internal cell-reader interface: existing and
+custom readers can ignore it, and consumers still check every returned key. A
+prefix-aware reader refuses a cursor outside the requested prefix. No durable
+format, source selection, encryption, publication or cache authority changes.
+
+`intake-recovery-breakdown.test.ts` runs real accepted-journal reconstruction,
+manifest copying, historical-graph validation, complete schema/lexical validation,
+reattachment and lookup preparation separately on small fictional 4/16-record
+hierarchies. It compares the same complete lexical output with a three-argument
+reader that ignores the hint. In the measured fixtures, reads fell from 13,611 to
+3,632 and 49,399 to 14,763 respectively; read bytes fell from 10,797,183 to 3,488,405
+and 41,234,297 to 14,251,768. These are scoped work counts, not a claim about full
+HTTP recovery speed. Fixture journal values describe pending fictional intake,
+not a completed clinical acceptance or an encrypted-storage performance result.
+
+The encrypted-profile opener uses the existing optional diagnostic spans for
+`profile_vault_open`, `profile_workspace_materialize`, `profile_record_replay`,
+`profile_intake_validation`, `profile_durability_attach` and `profile_runtime_install`. The acceptance fixture observes only these fixed
+phase names and numeric timings, labels unlock separately, and reports request
+age and process CPU time. Its observation occurs before normal diagnostic
+lifecycle filtering: a locked/uninstalled profile may suppress ordinary stored
+events. No diagnostic store is attached early, and a failing optional sink cannot
+change recovery. These phases separate operations but are not new time limits.
+
+Run the short reproduction with:
+
+```sh
+node --test src/server/test/intake-recovery-breakdown.test.ts src/server/test/profile-recovery-diagnostics.test.ts
+```
+
+Then run complete affected corruption/recovery tests and `npm run test:acceptance`.
+The original 64-record HTTP acceptance, receipt replay, owned encrypted-cache
+removal and recovered clinical/provenance comparisons remain the completion gate.
+Neither a small-stage pass nor a timed-out last-operation label proves that gate.
+
 ## Work and qualification boundary
 
 The [verified intake work reuse contract](intake-processing-work.md) describes retained V3 materializations, prepared intents, isolated candidate changes and derived-reader reuse. Its detached reads and explicit compatibility conversions retain their validation, serialization and ownership-copy costs. V4 [bounded views](intake-bounded-views.md) and changed-path mutations avoid those full-workflow reads. Complete ordered JSON identity recipes still require counted streaming hashes when new plans or report versions are created. Cold reconstruction and first raw conversion have different costs from warm mutations. Lookup and search work is measured separately, including selected DTO reads and durable readiness-head reads. Compact source rows and bounded contribution frames alone do not prove computation proportional only to changed bytes.

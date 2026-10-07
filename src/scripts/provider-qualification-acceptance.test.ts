@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createVaultApp } from '../server/vault-app.ts';
+import { createImportDiagnostics } from '../server/import-diagnostics.ts';
 import { getRetainedIntakeOriginalReference } from '../server/intake.ts';
 import type { IntakeIdentityReview } from '../shared/intake-identity.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
@@ -31,13 +32,35 @@ test(
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'fictional-qualification-recovery-')));
     const dataDirectory = join(root, 'data');
     mkdirSync(dataDirectory);
+    const startedAt = performance.now();
+    const diagnostics = createImportDiagnostics({
+      enabled: process.env.CRS_IMPORT_DIAGNOSTICS === 'true',
+    });
+    // Observe only fixed stage names/numeric timing before normal lifecycle
+    // filtering; a locked profile deliberately has no attached diagnostic store.
+    const recordDiagnostic = diagnostics.record;
+    diagnostics.record = (event, fields, context) => {
+      if (typeof fields?.phase === 'string' && fields.phase.startsWith('profile_'))
+        console.info(
+          JSON.stringify({
+            fixture: 'fictional qualification recovery stage',
+            event,
+            phase: fields.phase,
+            durationMs: fields.durationMs ?? null,
+            elapsedMs: performance.now() - startedAt,
+          }),
+        );
+      recordDiagnostic(event, fields, context);
+    };
     const app = createVaultApp({
       dataDirectory,
+      diagnostics,
       runtimeDirectory: join(root, 'runtime'),
       assistantOptions: { availability: async () => ({ available: false }) },
     });
     t.after(() => {
       app.close();
+      diagnostics.close();
       rmSync(root, { recursive: true, force: true });
     });
     await new Promise<void>((done) => app.server.listen(0, '127.0.0.1', done));
@@ -51,13 +74,17 @@ test(
     let requestsStarted = 0,
       requestsFinished = 0;
     let activeRequest: { sequence: number; operation: string } | undefined;
+    let requestStartedAt = 0;
     const progress = () =>
       console.info(
         JSON.stringify({
           fixture: 'fictional qualification acceptance',
           requestsStarted,
           requestsFinished,
-          activeRequest: activeRequest ?? null,
+          elapsedMs: performance.now() - startedAt,
+          activeRequest: activeRequest
+            ? { ...activeRequest, elapsedMs: performance.now() - requestStartedAt }
+            : null,
           identityConfirmations: identityConfirmations.length,
           clinicalAcceptanceWrites,
         }),
@@ -90,9 +117,13 @@ test(
           'verify',
           'intakes',
           'lock',
+          'unlock',
           'recover',
         ].find((label) => path.split('?')[0]!.endsWith('/' + label)) ?? 'other';
       activeRequest = { sequence: ++requestsStarted, operation };
+      requestStartedAt = performance.now();
+      const cpuStarted = process.cpuUsage();
+      if (operation === 'unlock') progress();
       try {
         const response = await fetch(base + path, {
           method: input !== undefined || bytes ? 'POST' : 'GET',
@@ -115,6 +146,17 @@ test(
         assert.equal(response.ok, true, `${path}: ${JSON.stringify(result.error)}`);
         return result.data;
       } finally {
+        if (operation === 'unlock' || operation === 'lock' || operation === 'report-acceptance') {
+          const cpu = process.cpuUsage(cpuStarted);
+          console.info(
+            JSON.stringify({
+              fixture: 'fictional qualification request finished',
+              ...activeRequest,
+              elapsedMs: performance.now() - requestStartedAt,
+              processCpuMs: (cpu.user + cpu.system) / 1000,
+            }),
+          );
+        }
         requestsFinished++;
         activeRequest = undefined;
       }

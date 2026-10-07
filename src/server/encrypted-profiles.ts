@@ -422,13 +422,17 @@ export function createEncryptedProfiles({
       root = resolve(runtime, id),
       workspace = resolve(root, 'data/profiles', id),
       dbPath = resolve(root, 'db/database.sqlite');
+    const stage = <T>(phase: string, operation: () => T): T =>
+      measureImportPhase(phase, operation, {}, { profileId: id }, diagnostics);
     // A previous process's runtime is never an authority.
     rmSync(root, { recursive: true, force: true });
     mkdirSync(root, { recursive: true, mode: 0o700 });
     ensureProfileDirectories(root, id);
     let vault: Vault;
     try {
-      vault = openVault({ directory, profileId: id, key, initialize: initial });
+      vault = stage('profile_vault_open', () =>
+        openVault({ directory, profileId: id, key, initialize: initial }),
+      );
     } catch (error) {
       key.fill(0);
       rmSync(root, { recursive: true, force: true });
@@ -462,7 +466,9 @@ export function createEncryptedProfiles({
         'PROFILE_RUNTIME_CAPACITY',
         'to unlock this profile with its required workspace and one configured upload',
       );
-      vault.materialize(workspace, { exclude: deferredOriginal });
+      stage('profile_workspace_materialize', () =>
+        vault.materialize(workspace, { exclude: deferredOriginal }),
+      );
       disposeBatchPublication = registerIntakeBatchPublication(root, id, (names) =>
         vault.trackWorkspaceFiles(workspace, names),
       );
@@ -518,11 +524,13 @@ export function createEncryptedProfiles({
       };
       const rebuildHistory = () => {
         try {
-          return rebuildRecordDatabase(dbPath, {
-            profileId: id,
-            storage: recordStorage,
-            verifyReferences,
-          });
+          return stage('profile_record_replay', () =>
+            rebuildRecordDatabase(dbPath, {
+              profileId: id,
+              storage: recordStorage,
+              verifyReferences,
+            }),
+          );
         } catch {
           throw archiveRefusal(
             'Profile accepted record history',
@@ -696,13 +704,15 @@ export function createEncryptedProfiles({
         }
       }
       try {
-        validateProductionIntakeAuthority(db, id);
-        (attachPersonalDurability as unknown as AttachVaultDurability)(db, {
-          root,
-          profileId: id,
-          recordStorage,
-          verifyReferences,
-        });
+        stage('profile_intake_validation', () => validateProductionIntakeAuthority(db!, id));
+        stage('profile_durability_attach', () =>
+          (attachPersonalDurability as unknown as AttachVaultDurability)(db!, {
+            root,
+            profileId: id,
+            recordStorage,
+            verifyReferences,
+          }),
+        );
       } catch (error) {
         if (!cacheHit) {
           if (initial) throw error;
@@ -722,13 +732,15 @@ export function createEncryptedProfiles({
         for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true });
         rebuildHistory();
         db = openDatabase(dbPath, id);
-        validateProductionIntakeAuthority(db, id);
-        (attachPersonalDurability as unknown as AttachVaultDurability)(db, {
-          root,
-          profileId: id,
-          recordStorage,
-          verifyReferences,
-        });
+        stage('profile_intake_validation', () => validateProductionIntakeAuthority(db!, id));
+        stage('profile_durability_attach', () =>
+          (attachPersonalDurability as unknown as AttachVaultDurability)(db!, {
+            root,
+            profileId: id,
+            recordStorage,
+            verifyReferences,
+          }),
+        );
         cacheHit = false;
       }
       writeProfileRegistry(root, [
@@ -749,7 +761,7 @@ export function createEncryptedProfiles({
         disposeOriginalResolver,
         disposeBatchPublication,
       };
-      if (!pendingActivation) installOpened(state);
+      if (!pendingActivation) stage('profile_runtime_install', () => installOpened(state));
       return state;
     } catch (e) {
       discardFailedOpen(

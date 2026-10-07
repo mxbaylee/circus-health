@@ -119,6 +119,8 @@ export interface EnvelopeCellReader {
     after: string,
     items: number,
     bytes: number,
+    /** Optional contiguous key scope; older/custom stores may ignore it. */
+    prefix?: string,
   ): { items: Array<{ key: string; value: string | IntakeByteValue }>; complete: boolean };
   chunks(
     value: IntakeByteValue,
@@ -260,7 +262,7 @@ function* orderEntries(store: EnvelopeCellReader, id: string): Generator<SchemaO
   let after = prefix,
     seen = 0;
   do {
-    const page = store.range(after, 64, 32768);
+    const page = store.range(after, 64, 32768, prefix);
     for (const item of page.items) {
       if (!item.key.startsWith(prefix)) {
         if (seen !== header(store, id).count) fail('record count');
@@ -1167,11 +1169,16 @@ export function createIntakeEnvelopeGraphReader(
       const raw = tree.get(data.root, key);
       return raw === undefined ? undefined : publicValue(raw);
     },
-    range(after, items, bytes) {
+    range(after, items, bytes, prefix) {
+      if (prefix !== undefined && (typeof prefix !== 'string' || !after.startsWith(prefix)))
+        fail('graph range prefix cursor');
       const result: Array<{ key: string; value: string | IntakeByteValue }> = [];
       let size = 0,
         complete = true;
       for (const row of tree.entries(data.root, after)) {
+        // The authenticated, ordered boundary proves this prefix is complete.
+        // Do not hydrate the rest of a page from unrelated record namespaces.
+        if (prefix !== undefined && !row.key.startsWith(prefix)) break;
         const added = Buffer.byteLength(row.key) + Buffer.byteLength(row.value);
         if (result.length === items || size + added > bytes) {
           complete = false;
