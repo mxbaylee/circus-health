@@ -16,6 +16,12 @@ export class IntakeStateManifest {
       CREATE TABLE namespaces(prefix TEXT PRIMARY KEY);
       CREATE TABLE visited(key TEXT PRIMARY KEY);
     `);
+      // Only this manifest owns the scratch connection. Keep its work in one
+      // transaction instead of committing every copied row/tree visit. It is
+      // never reopened as evidence or published: close discards the transaction
+      // and removes the private files. Cache/temporary storage remain bounded
+      // and disk-backed; the source and accepted journal use their own owners.
+      this.db.exec('BEGIN');
     } catch (error) {
       this.scratch.close();
       throw error;

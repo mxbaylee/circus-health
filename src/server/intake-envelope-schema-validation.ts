@@ -59,6 +59,10 @@ export function* validateIntakeSchemaReachabilitySteps(
     db.exec(
       'CREATE TABLE records(id TEXT PRIMARY KEY,parent TEXT,ordinal INTEGER,field TEXT,semantic TEXT,path TEXT NOT NULL,parentShape TEXT,done INTEGER DEFAULT 0); CREATE INDEX records_pending ON records(done,path); CREATE TABLE expected(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE expected_counts(prefix TEXT PRIMARY KEY,count INTEGER NOT NULL);',
     );
+    // This private work queue is discarded on completion, refusal or generator
+    // return. Batch its writes without holding a source-database transaction or
+    // changing the store checks performed across cooperative yields.
+    db.exec('BEGIN');
     db.prepare("INSERT INTO records(id,path) VALUES(?,'')").run(control.root);
     const firstExpected = (key: string, value: string) => {
       const inserted = db
