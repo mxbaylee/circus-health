@@ -94,6 +94,38 @@ Selected envelope consumers reuse at most 32 storage handles per database after 
 
 Ordinary domain publication retains the existing accepted-record transaction and clinical revision behavior. Maintenance publication is narrower: a private host capability binds exact before/after heads, source details/pins, intended result and changed rows. The database verifies the captured write set and readback. It permits auxiliary changes or a separately certified representation transition, never a caller Boolean authorizing clinical-revision suppression. A derived projection may prepare against the exact prospective logical descriptor, checkpoint auxiliary work, then reprepare against the latest auxiliary head. The final owner verifies that its logical descriptor is unchanged and its added changes are auxiliary only.
 
+Maintenance metadata checks reuse at most two lazily prepared SQL statements within
+one synchronous preparation, transaction-entry or readback invocation. They still
+execute the separate length and value reads in their original order for every
+selected key, with the original byte limits, immutable-collision checks, source
+bindings, captured write-set and final-head verification. No metadata value,
+authority result or statement is retained across those phases, a nested public
+invocation or another connection. A failed preparation cannot seed later reuse.
+This changes SQL compilation work only, not accepted rows, checkpoint frequency,
+archive formats, durability, or the operator update procedure.
+
+The maintenance regression at four and 48 changed entries retains respectively
+28 and 116 length-check executions while reducing compilation of that query from
+28/116 statements to three (one for each validation phase). It verifies every
+actual write and its independent journal reconstruction, later immutable
+collisions, nested preparation and TEMP-view rebinding. The host-only
+`intake-acceptance-work.test.ts` fixture separately measures original/proposal setup,
+schema preparation, membership, complete review, acceptance and receipt replay
+at two/eight fictional documents. Its real acceptance path preserves exact titles,
+receipts and original bytes while checking that SQL compilation is not repeated
+for each metadata read. It uses the existing fictional in-memory journal backend;
+it is not an HTTP, encrypted-storage or whole-workflow latency qualification.
+
+Run the narrow regression first, then the acceptance-stage fixture:
+
+```sh
+node --test --test-name-pattern='maintenance metadata SQL' src/server/test/intake-state-maintenance.test.ts
+node --test src/server/test/intake-acceptance-work.test.ts
+```
+
+The complete maintenance, grouped-acceptance and recovery suites remain required,
+as do the original HTTP acceptance/cache-loss and 100-page continuation gates.
+
 Ownership split audit membership uses the same graph's `ownership.snapshots` catalog in the auxiliary area. Once referenced by accepted clinical evidence, these snapshots are retained authority, not disposable unfinished builds. A preparation streams exact ordered source IDs, reconciles additions/removals against the previous immutable membership, and forks changed paths for the moving and remaining contributions. The ordinary clinical transaction selects one catalog root per custodian together with its clinical rows. This audit selection preserves the intake's public version; the clinical transaction still advances clinical review revision. Source/logical/catalog guards reject competing preparations. The reference stores custodian source ID/hash, snapshot ID, count and exact ordered-JSON digest; profile graph copy preserves those public identities and rebinds its authenticated nodes. Paged reads and cache recovery do not depend on retained SQLite historical version IDs. Cold construction, full membership hashing and changed writes have separate counters.
 
 Duplicate audit evidence can use the auxiliary `duplicate.snapshots` catalog under a stable intake custodian. Each immutable snapshot shares unchanged evidence values by a hash of the exact evidence-row ID, retaining the complete ID separately without imposing a new ID-length limit. The ordered evidence-array digest preserves SQLite BINARY order, including non-ASCII identifiers. Preparing a changed snapshot counts its complete comparison/digest pass and disposable membership scratch separately from changed-row durable writes; an unchanged snapshot reuses its existing reference without writing. Historical export cold-sorts only scalar IDs in disposable SQLite and streams authenticated values in that order. Final catalog changes compose into an existing intake acceptance preparation, or select with a separate custodian in the same ordinary clinical transaction. A helper fixture changing three rows at history sizes 8 and 128 records 319,559 and 446,631 newly added immutable journal-object bytes respectively, with 27 new objects in each case. Those measurements exclude the overwritten selected head and are not total transaction bytes. This helper measurement establishes snapshot locality; separate public acceptance fixtures exercise compound attachment, exact replay and cache-loss reconstruction.

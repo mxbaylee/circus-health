@@ -73,19 +73,32 @@ function boundedJson(value: unknown, limit: number): string {
   if (typeof encoded !== 'string' || bytes(encoded) > limit) fail('result budget');
   return encoded;
 }
-function readMeta(db: DatabaseSync, key: string, limit = HEAD_BYTES): string | undefined {
-  const size = db
-    .prepare('SELECT length(CAST(value AS BLOB)) AS bytes FROM app_meta WHERE key=?')
-    .get(key)?.bytes;
-  if (size === undefined) return undefined;
-  if (typeof size !== 'number' || size > limit) fail('metadata budget');
-  const value = db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
-  if (typeof value !== 'string') fail('metadata representation');
-  return value;
+/** Statement reuse lasts only for one synchronous validation phase. Every size
+ * and value read still executes, in its original order. No values, authority
+ * results or statements survive into publication/reentry or another connection. */
+function metadataReader(db: DatabaseSync) {
+  let readSize: ReturnType<DatabaseSync['prepare']> | undefined;
+  let readValue: ReturnType<DatabaseSync['prepare']> | undefined;
+  return (key: string, limit = HEAD_BYTES): string | undefined => {
+    readSize ??= db.prepare(
+      'SELECT length(CAST(value AS BLOB)) AS bytes FROM app_meta WHERE key=?',
+    );
+    const size = readSize.get(key)?.bytes;
+    if (size === undefined) return undefined;
+    if (typeof size !== 'number' || size > limit) fail('metadata budget');
+    readValue ??= db.prepare('SELECT value FROM app_meta WHERE key=?');
+    const value = readValue.get(key)?.value;
+    if (typeof value !== 'string') fail('metadata representation');
+    return value;
+  };
 }
-function sourceBinding(db: DatabaseSync, identity: IntakeStateIdentity): string {
+function sourceBinding(
+  db: DatabaseSync,
+  identity: IntakeStateIdentity,
+  readMeta: ReturnType<typeof metadataReader>,
+): string {
   if (!db.isOpen) fail('closed database');
-  if (readMeta(db, 'owner_profile_id') !== identity.profileId) fail('database owner');
+  if (readMeta('owner_profile_id') !== identity.profileId) fail('database owner');
   const size = db
     .prepare('SELECT length(CAST(details_json AS BLOB)) AS bytes FROM source_files WHERE id=?')
     .get(identity.intakeId)?.bytes;
@@ -140,9 +153,10 @@ export function prepareIntakeMaintenancePublication(
     fail('operation fingerprint');
   const prefix = intakeNamespace(identity);
   const headKey = prefix + 'head';
-  if (readMeta(db, headKey) !== candidate.beforeHead) fail('stale prepared head');
-  const source = sourceBinding(db, identity);
-  const sourcePin = readMeta(db, intakeSourcePinKey(identity.intakeId));
+  const readMeta = metadataReader(db);
+  if (readMeta(headKey) !== candidate.beforeHead) fail('stale prepared head');
+  const source = sourceBinding(db, identity, readMeta);
+  const sourcePin = readMeta(intakeSourcePinKey(identity.intakeId));
   if (candidate.legacyBridge !== undefined) {
     verifyIntakeLegacyBridgeProof(candidate.legacyBridge, db, {
       identity,
@@ -179,7 +193,7 @@ export function prepareIntakeMaintenancePublication(
       if (value !== candidate.afterHead) fail('head write');
       writes.set(key, value);
     } else {
-      const prior = readMeta(db, key, MAX_ROW_BYTES);
+      const prior = readMeta(key, MAX_ROW_BYTES);
       if (prior !== undefined) {
         if (prior !== value) fail('immutable collision');
         // Existing nodes must be reused without touching their accepted rows.
@@ -236,6 +250,7 @@ export function beginIntakeMaintenancePublication(
   operation: { operationId?: unknown; fingerprint?: unknown },
 ): void {
   const publication = selected(db, capability);
+  const readMeta = metadataReader(db);
   if (publication.token) fail('capability already entered');
   publication.token = token;
   if (
@@ -244,9 +259,9 @@ export function beginIntakeMaintenancePublication(
   )
     fail('operation binding');
   if (
-    readMeta(db, publication.headKey) !== publication.beforeHead ||
-    sourceBinding(db, publication.identity) !== publication.source ||
-    readMeta(db, intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin
+    readMeta(publication.headKey) !== publication.beforeHead ||
+    sourceBinding(db, publication.identity, readMeta) !== publication.source ||
+    readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin
   )
     fail('stale authority or source binding');
   if (
@@ -267,6 +282,7 @@ export function verifyIntakeMaintenancePublication(
   result: unknown,
 ): void {
   const publication = selected(db, capability);
+  const readMeta = metadataReader(db);
   if (publication.token !== token || publication.verified) fail('transaction binding');
   if (
     Number(db.prepare('PRAGMA main.schema_version').get()!.schema_version) !==
@@ -276,8 +292,8 @@ export function verifyIntakeMaintenancePublication(
   )
     fail('capture/schema changed during publication');
   if (
-    sourceBinding(db, publication.identity) !== publication.source ||
-    readMeta(db, intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin ||
+    sourceBinding(db, publication.identity, readMeta) !== publication.source ||
+    readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin ||
     boundedJson(result, HEAD_BYTES) !== publication.result
   )
     fail('source or result changed');
@@ -296,11 +312,11 @@ export function verifyIntakeMaintenancePublication(
     const key = identity[0] as string;
     const expected = publication.writes.get(key);
     if (expected === undefined || seen.has(key)) fail('unexpected accepted key');
-    if (readMeta(db, key, MAX_ROW_BYTES) !== expected) fail('accepted write readback');
+    if (readMeta(key, MAX_ROW_BYTES) !== expected) fail('accepted write readback');
     seen.add(key);
   }
   if (seen.size !== publication.writes.size) fail('missing prepared write');
-  const afterHead = readMeta(db, publication.headKey);
+  const afterHead = readMeta(publication.headKey);
   if (afterHead !== publication.afterHead) fail('selected head readback');
   // A migration certificate already proved this exact representation-only
   // bridge before preparation. Its bound head and every write were read back

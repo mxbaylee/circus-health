@@ -443,3 +443,147 @@ test('a real pending clinical review keeps its exact token across the legacy bri
   assert.equal(workAfter.warm.envelopeHydrations, workBefore.warm.envelopeHydrations);
   assert.equal(workAfter.primitive.coldReconstructions, workBefore.primitive.coldReconstructions);
 });
+
+for (const count of [4, 48])
+  test(`maintenance metadata SQL is prepared per phase, not per affected row: ${count} entries`, (t) => {
+    const f = fixture(t);
+    const changes: IntakeCollectionChange[] = Array.from({ length: count }, (_, index) => ({
+      area: 'builds',
+      collection: 'fictional.preparation',
+      op: 'put',
+      key: `entry-${String(index).padStart(4, '0')}`,
+      value: `Fictional reviewed entry ${index}`,
+    }));
+    const c = candidate(f, changes);
+    const sql = 'SELECT length(CAST(value AS BLOB)) AS bytes FROM app_meta WHERE key=?';
+    const prepare = f.db.prepare;
+    let preparations = 0;
+    const reads: string[] = [];
+    const probe = t.mock.method(f.db, 'prepare', function (this: Database, query: string) {
+      const statement = prepare.call(this, query);
+      if (query === sql) {
+        preparations++;
+        const get = statement.get;
+        statement.get = (...args: unknown[]) => {
+          reads.push(String(args[0]));
+          return Reflect.apply(get, statement, args) as ReturnType<typeof get>;
+        };
+      }
+      return statement;
+    });
+    let prepareCount = 0,
+      prepareReads = 0,
+      publishCount = 0,
+      publishReads = 0;
+    const clinical = clinicalReviewRevision(f.db);
+    try {
+      const capability = prepareIntakeMaintenancePublication(f.db, c);
+      prepareCount = preparations;
+      prepareReads = reads.length;
+      const nodes = c.writes.filter((row) => row.key !== intakeNamespace(f.identity) + 'head');
+      assert.equal(prepareReads, nodes.length + 3, 'every new node plus head/owner/pin is read');
+      assert.deepEqual(
+        reads.slice(3),
+        nodes.map((row) => row.key),
+        'all immutable collision checks remain ordered',
+      );
+      preparations = 0;
+      reads.length = 0;
+      const result = transaction(f.db, () => write(f.db, c), operation(c, capability));
+      assert.deepEqual(result, c.result);
+      publishCount = preparations;
+      publishReads = reads.length;
+      assert.equal(
+        publishReads,
+        c.writes.length + 6,
+        'entry, source, every changed row and final HEAD remain checked',
+      );
+      assert.equal(clinicalReviewRevision(f.db), clinical);
+      for (const row of c.writes)
+        assert.equal(
+          f.db.prepare('SELECT value FROM app_meta WHERE key=?').get(row.key)?.value,
+          row.value,
+        );
+    } finally {
+      probe.mock.restore();
+    }
+    const rebuilt = f.rebuild();
+    for (const row of c.writes)
+      assert.equal(
+        rebuilt.prepare('SELECT value FROM app_meta WHERE key=?').get(row.key)?.value,
+        row.value,
+      );
+    assert.equal(clinicalReviewRevision(rebuilt), clinical);
+    t.diagnostic(
+      JSON.stringify({
+        count,
+        writes: c.writes.length,
+        prepareCount,
+        prepareReads,
+        publishCount,
+        publishReads,
+      }),
+    );
+    assert.equal(prepareCount, 1, 'one lazy length-check statement for preparation');
+    assert.equal(
+      publishCount,
+      2,
+      'independent statements for entry and readback; none cross phases',
+    );
+  });
+
+test('metadata statement scopes tolerate nested preparation and do not outlive TEMP rebinding', (t) => {
+  const f = fixture(t);
+  const c = candidate(f);
+  let entered = false;
+  let nested: ReturnType<typeof prepareIntakeMaintenancePublication> | undefined;
+  f.db.function('fictional_nested_metadata', (value) => {
+    if (!entered) {
+      entered = true;
+      nested = prepareIntakeMaintenancePublication(f.db, c);
+    }
+    return value;
+  });
+  f.db.exec(`CREATE TEMP VIEW app_meta AS SELECT key,
+    CASE WHEN key='owner_profile_id' THEN fictional_nested_metadata(value) ELSE value END AS value
+    FROM main.app_meta`);
+  const capability = prepareIntakeMaintenancePublication(f.db, c);
+  assert.equal(entered, true);
+  assert.ok(nested, 'nested validation completes with an independent statement scope');
+  f.db.exec('DROP VIEW temp.app_meta');
+  const result = transaction(f.db, () => write(f.db, c), operation(c, capability));
+  assert.deepEqual(result, c.result);
+  assert.throws(() => transaction(f.db, () => write(f.db, c), operation(c, nested!)), /stale/);
+});
+
+test('metadata statements never replace later size and immutable collision checks with earlier values', (t) => {
+  const f = fixture(t);
+  const c = candidate(f);
+  let calls = 0;
+  const target = c.writes.find((row) => row.key !== intakeNamespace(f.identity) + 'head')!;
+  const prepare = f.db.prepare;
+  const probe = t.mock.method(f.db, 'prepare', function (this: Database, sql: string) {
+    const statement = prepare.call(this, sql);
+    if (sql === 'SELECT length(CAST(value AS BLOB)) AS bytes FROM app_meta WHERE key=?') {
+      const get = statement.get;
+      statement.get = (...args: unknown[]) => {
+        calls++;
+        if (String(args[0]) === target.key) {
+          // A later read must see a row which did not exist at phase entry.
+          prepare
+            .call(f.db, 'INSERT INTO app_meta(key,value) VALUES(?,?)')
+            .run(target.key, 'changed fictional node');
+        }
+        return Reflect.apply(get, statement, args) as ReturnType<typeof get>;
+      };
+    }
+    return statement;
+  });
+  try {
+    assert.throws(() => prepareIntakeMaintenancePublication(f.db, c), /immutable collision/);
+    assert.ok(calls > 3);
+  } finally {
+    probe.mock.restore();
+    f.db.prepare('DELETE FROM app_meta WHERE key=?').run(target.key);
+  }
+});
