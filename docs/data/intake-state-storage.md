@@ -136,6 +136,9 @@ retained row and performs the same reference, hash, historical-coverage and sche
 checks. Statement reuse does not cache evidence values, bypass cold validation
 or survive disposal of the private manifest.
 
+The cold historical-graph walk also prepares its fixed scratch membership, visited-row, receipt, history and sequence-summary statements once per graph invocation, after creating its private tables. It still decodes every incoming reference before checking the visited index and executes every lookup, disagreement check and write. No evidence value, validation result or cursor is cached by the statement set; another namespace or invocation uses a new set. The existing 4/16-record recovery fixture separately counts statement compilation and actual graph executions, then verifies the complete source snapshot, lexical representation, accepted replay and lookup preparation. These small host tests do not replace the full HTTP acceptance/encrypted recovery scenario.
+
+
 ## V3 bridge and schema-directed envelopes
 
 Conversion first verifies the complete supported V3 chain and current compact/raw agreement once, retaining the existing V3 per-value limits for that explicit compatibility operation. It selects a tagged legacy edge and a fixed legacy control marker without discarding old receipts or changing the public domain version. Interrupted builds continue to read the exact selected legacy value. Bounded auxiliary checkpoints do not repeatedly decode or serialize the whole old value.
@@ -237,6 +240,8 @@ These measurements were refreshed on 2026-10-04 after batching small history ent
 The journal fixture uses genuine accepted transactions and reconstruction with a memory-backed storage adapter. It does not measure physical encrypted writes, filesystem capacity or wall-clock performance. A companion Unicode fixture checks the same 20,027 UTF-16-unit value supplied in single-unit pieces or one whole string, including split surrogate pairs, bounded coalesced leaves, immutable publication and cache disposal. Batched current-selection checks retain exact text without a selected-tree traversal for every producer fragment.
 
 ## Exact serialization domain
+
+Stored evidence decoding checks the same encoded UTF-8 byte limit before JSON parsing. It rejects literal unpaired UTF-16 surrogates without a temporary UTF-8 buffer round trip; it parses the original text, never a repaired string. Escaped JSON surrogate sequences retain their previous parsing semantics. Exact metadata schemas compare literal own enumerable key sets without sorting or mutating the expected names. A key containing NUL cannot impersonate several required fields through delimiter concatenation. These checks do not broaden the normalized value domain below or change the supported evidence format.
 
 The native acceptance participant prepares the existing clinical SQL projection under a rollback-only savepoint and retains its exact changed-row plan. Verified auxiliary intake checkpoints may occur during envelope preparation; only the transaction owner's checked maintenance outcome can refresh that plan's metadata guard. An ordinary policy/source change still invalidates it. Final publication applies clinical rows first and selects the prepared envelope in the same ordinary transaction. A failed transaction requires a fresh envelope preparation for retry.
 

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { toUSVString } from 'node:util';
 import { applyIntakeChanges, serializeIntakeJson, type IntakeJson } from './intake-state-codec.ts';
 import type { ChatDecodeBudget } from './chat-journal-codec.ts';
 import { recordIntakeSerialization, recordIntakeWork } from './intake-work-accounting.ts';
@@ -131,14 +132,16 @@ function copied(bytes: Buffer): Buffer {
   recordIntakeWork('evidenceBufferCopiedBytes', bytes.length);
   return bytes;
 }
-export function exact(value: unknown, keys: string[]): asserts value is Record<string, unknown> {
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.keys(value).sort().join('\0') !== keys.sort().join('\0')
-  )
-    invalid('schema');
+export function exact(
+  value: unknown,
+  keys: readonly string[],
+): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) invalid('schema');
+  // Compare literal own enumerable names, not delimiter-joined strings: a name
+  // containing NUL must not impersonate two expected fields. Object.keys is
+  // unique, so equal cardinality plus membership also rejects duplicate schemas.
+  const actual = Object.keys(value);
+  if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) invalid('schema');
 }
 export function integer(value: unknown, minimum = 0): asserts value is number {
   if (!Number.isSafeInteger(value) || Number(value) < minimum) invalid('integer');
@@ -161,13 +164,17 @@ function same(a: unknown, b: unknown): boolean {
   );
 }
 export function decode(value: unknown, max: number): unknown {
-  if (typeof value !== 'string' || Buffer.byteLength(value) > max) invalid('encoded bytes');
-  const bytes = copied(Buffer.from(value));
-  recordIntakeWork('evidenceDecodeCopyBytes', bytes.length);
-  if (bytes.toString('utf8') !== value) invalid('UTF-8');
+  if (typeof value !== 'string') invalid('encoded bytes');
+  const bytes = Buffer.byteLength(value);
+  if (bytes > max) invalid('encoded bytes');
+  // UTF-8 encoding replaces unpaired surrogates. The same scalar-value check
+  // rejects that lossy round trip without allocating and decoding a Buffer for
+  // every already-valid stored page. Never parse the repaired string: escaped
+  // JSON surrogates retain their original JSON.parse semantics.
+  if (toUSVString(value) !== value) invalid('UTF-8');
   try {
     recordIntakeWork('jsonParseCalls');
-    recordIntakeWork('jsonParseBytes', bytes.length);
+    recordIntakeWork('jsonParseBytes', bytes);
     return JSON.parse(value) as unknown;
   } catch {
     invalid('JSON');

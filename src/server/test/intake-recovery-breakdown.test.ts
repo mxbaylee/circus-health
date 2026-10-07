@@ -104,13 +104,46 @@ for (const count of [4, 16])
       const head = parseIntakeCollectionHead(get.get(prefix + 'head')!.value, identity)!;
       let checkpoints = 0;
       started = performance.now();
-      inspectIntakeCollectionGraph(
-        manifest,
-        identity,
-        String(get.get(prefix + 'head')!.value),
-        undefined,
-        () => checkpoints++,
-      );
+      const statements = new Map<string, { prepares: number; executions: number }>();
+      const prepare = manifest.db.prepare;
+      // Observe the actual scratch operations, without retaining their row arguments.
+      manifest.db.prepare = function (sql) {
+        const statement = prepare.call(this, sql);
+        if (
+          sql === 'SELECT ref,bytes FROM graph_seen WHERE hash=? AND kind=?' ||
+          sql === 'INSERT INTO graph_seen VALUES(?,?,?,?,?)'
+        ) {
+          let count = statements.get(sql);
+          if (!count) statements.set(sql, (count = { prepares: 0, executions: 0 }));
+          count.prepares++;
+          const observed = count;
+          for (const method of ['get', 'run'] as const) {
+            const execute = statement[method];
+            statement[method] = ((...args: unknown[]) => {
+              observed.executions++;
+              return Reflect.apply(execute, statement, args);
+            }) as typeof statement.get & typeof statement.run;
+          }
+        }
+        return statement;
+      };
+      try {
+        inspectIntakeCollectionGraph(
+          manifest,
+          identity,
+          String(get.get(prefix + 'head')!.value),
+          undefined,
+          () => checkpoints++,
+        );
+      } finally {
+        manifest.db.prepare = prepare;
+      }
+      t.diagnostic(JSON.stringify({ stage: 'graph-sql-work', count, queries: [...statements] }));
+      assert.equal(statements.size, 2);
+      for (const [sql, work] of statements) {
+        assert.ok(work.executions > 100, `${sql}: complete graph work was executed`);
+        assert.equal(work.prepares, 1, `${sql}: one compilation per private graph validation`);
+      }
       t.diagnostic(
         JSON.stringify({
           stage: 'historical-graph',

@@ -1,5 +1,7 @@
 # Update an installation and recover from a failed candidate
 
+Evidence decoding and private historical-graph validation now avoid redundant UTF-8 buffer copies, schema-key sorting and repeated scratch-query compilation. Supported evidence versions, encoded-byte limits, original JSON parsing and accepted-head checks are unchanged; no data migration or configuration change is required. Updating to a reviewed build also tightens exact metadata-schema validation: delimiter-containing keys can no longer impersonate multiple required names. Malformed metadata is refused rather than repaired or reset. This does not change ordinary user-text handling or claim that a prior build's successful read qualified malformed evidence.
+
 This procedure serves the Operator's [operate and recover](../design/personas.md#operate-and-recover) job on the supported localhost npm → Docker Compose → LiteLLM installation. It covers a checked update from supported authority and recovery from a failed candidate using a separately retained backup. Review the limits before updating: recovery returns the backup's state, so writes made after that backup are not recovered by this procedure. General downgrade compatibility and rollback prevention are not provided.
 
 Native identity reviews add an optional complete evidence commitment for one

@@ -74,19 +74,35 @@ export function inspectIntakeCollectionGraph(
   db.exec(`CREATE TABLE graph_nested(hash TEXT,kind TEXT,ref TEXT NOT NULL,bytes INTEGER NOT NULL,done INTEGER DEFAULT 0,PRIMARY KEY(hash,kind));
     CREATE INDEX graph_nested_pending ON graph_nested(done);
     CREATE TABLE graph_copy_stack(position INTEGER PRIMARY KEY,hash TEXT,kind TEXT,ref TEXT NOT NULL,UNIQUE(hash,kind));`);
+  // Only the compiled fixed SQL belongs to this invocation. Each incoming
+  // reference is still decoded before its scratch lookup; no source row,
+  // validation result or query cursor is retained by these statements. The
+  // manifest owns this disposable connection, and a later namespace/invocation
+  // prepares fresh statements after recreating its scratch tables.
+  const scratch = {
+    readHead: db.prepare('SELECT raw FROM graph_heads WHERE sequence=?'),
+    insertHead: db.prepare('INSERT OR IGNORE INTO graph_heads(sequence,raw) VALUES(?,?)'),
+    markVisited: db.prepare('INSERT OR IGNORE INTO visited VALUES(?)'),
+    readSeen: db.prepare('SELECT ref,bytes FROM graph_seen WHERE hash=? AND kind=?'),
+    readNested: db.prepare('SELECT ref,bytes FROM graph_nested WHERE hash=? AND kind=?'),
+    insertNested: db.prepare(
+      'INSERT INTO graph_nested(hash,kind,ref,bytes) VALUES(?,?,?,?) ON CONFLICT(hash,kind) DO NOTHING',
+    ),
+    readReceipt: db.prepare('SELECT value FROM graph_receipts WHERE id=?'),
+    insertReceipt: db.prepare('INSERT OR IGNORE INTO graph_receipts VALUES(?,?)'),
+    readHistory: db.prepare('SELECT value FROM graph_history WHERE sequence=?'),
+    insertHistory: db.prepare('INSERT OR IGNORE INTO graph_history VALUES(?,?)'),
+    readMaxSequence: db.prepare('SELECT max_sequence FROM graph_seen WHERE hash=? AND kind=?'),
+    insertSeen: db.prepare('INSERT INTO graph_seen VALUES(?,?,?,?,?)'),
+  };
   const readSource = db.prepare('SELECT value FROM source WHERE key=?');
   const source = (sha: string) => readSource.get(prefix + 'node:' + sha)?.value;
   const selected = parseIntakeCollectionHead(rawHead, identity)!;
   function enqueue(head: IntakeCollectionHead): void {
     const raw = JSON.stringify(head);
-    const previous = db
-      .prepare('SELECT raw FROM graph_heads WHERE sequence=?')
-      .get(head.storageSequence);
+    const previous = scratch.readHead.get(head.storageSequence);
     if (previous && previous.raw !== raw) invalid('conflicting historical selection');
-    db.prepare('INSERT OR IGNORE INTO graph_heads(sequence,raw) VALUES(?,?)').run(
-      head.storageSequence,
-      raw,
-    );
+    scratch.insertHead.run(head.storageSequence, raw);
   }
   let legacyHead: Head | undefined;
   let legacyValue: IntakeJson | undefined;
@@ -109,11 +125,10 @@ export function inspectIntakeCollectionGraph(
       identity,
       limits(),
       head,
-      (key) => db.prepare('SELECT value FROM source WHERE key=?').get(key)?.value,
+      (key) => readSource.get(key)?.value,
       checkpoint,
     );
-    for (const key of basis.consumed)
-      db.prepare('INSERT OR IGNORE INTO visited VALUES(?)').run(key);
+    for (const key of basis.consumed) scratch.markVisited.run(key);
     legacyDomainVersion = legacyIntakeEnvelopeDomainVersion(basis.value);
     legacyHead = head;
     if (targetProfileId || validateRepresentation) legacyValue = basis.value;
@@ -127,14 +142,12 @@ export function inspectIntakeCollectionGraph(
     try {
       // Always decode each incoming reference, even when the subtree was already visited.
       const node = decodeIntakeTreeNode(source(ref.hash), ref, identity);
-      const seen = db
-        .prepare('SELECT ref,bytes FROM graph_seen WHERE hash=? AND kind=?')
-        .get(ref.hash, kind);
+      const seen = scratch.readSeen.get(ref.hash, kind);
       if (seen) {
         if (seen.ref !== JSON.stringify(ref)) invalid('historical reference disagreement');
         return Number(seen.bytes);
       }
-      db.prepare('INSERT OR IGNORE INTO visited VALUES(?)').run(prefix + 'node:' + ref.hash);
+      scratch.markVisited.run(prefix + 'node:' + ref.hash);
       let ownBytes = Buffer.byteLength(node.value);
       let maxSequence = 0;
       if (kind === 'directory') {
@@ -162,17 +175,13 @@ export function inspectIntakeCollectionGraph(
           if (!descriptor.root) {
             if (descriptor.bytes !== 0) invalid('empty referenced collection bytes');
           } else {
-            const prior = db
-              .prepare('SELECT ref,bytes FROM graph_nested WHERE hash=? AND kind=?')
-              .get(descriptor.root.hash, descriptor.kind);
+            const prior = scratch.readNested.get(descriptor.root.hash, descriptor.kind);
             if (
               prior &&
               (prior.ref !== JSON.stringify(descriptor.root) || prior.bytes !== descriptor.bytes)
             )
               invalid('referenced collection disagreement');
-            db.prepare(
-              'INSERT INTO graph_nested(hash,kind,ref,bytes) VALUES(?,?,?,?) ON CONFLICT(hash,kind) DO NOTHING',
-            ).run(
+            scratch.insertNested.run(
               descriptor.root.hash,
               descriptor.kind,
               JSON.stringify(descriptor.root),
@@ -200,9 +209,9 @@ export function inspectIntakeCollectionGraph(
         maxSequence = result.storageSequence;
         if (result.storageSequence > selected.storageSequence) invalid('future collection receipt');
         walk(result.logical.root, 'directory');
-        const prior = db.prepare('SELECT value FROM graph_receipts WHERE id=?').get(node.key);
+        const prior = scratch.readReceipt.get(node.key);
         if (prior && prior.value !== node.value) invalid('conflicting historical receipt');
-        db.prepare('INSERT OR IGNORE INTO graph_receipts VALUES(?,?)').run(node.key, node.value);
+        scratch.insertReceipt.run(node.key, node.value);
       } else {
         const value = parseIntakeCollectionHistory(node.value, identity);
         const sequence = Number(node.key);
@@ -224,9 +233,9 @@ export function inspectIntakeCollectionGraph(
           invalid('history domain version');
         walk(value.logical.root as IntakeTreeRoot, 'directory');
         walk(value.builds as IntakeTreeRoot, 'directory');
-        const prior = db.prepare('SELECT value FROM graph_history WHERE sequence=?').get(sequence);
+        const prior = scratch.readHistory.get(sequence);
         if (prior && prior.value !== node.value) invalid('conflicting historical transition');
-        db.prepare('INSERT OR IGNORE INTO graph_history VALUES(?,?)').run(sequence, node.value);
+        scratch.insertHistory.run(sequence, node.value);
       }
       if (kind === 'bytes' || kind === 'sequence') {
         const index = Number(node.key);
@@ -239,19 +248,9 @@ export function inspectIntakeCollectionGraph(
         if (child)
           maxSequence = Math.max(
             maxSequence,
-            Number(
-              db
-                .prepare('SELECT max_sequence FROM graph_seen WHERE hash=? AND kind=?')
-                .get(child.hash, kind)!.max_sequence,
-            ),
+            Number(scratch.readMaxSequence.get(child.hash, kind)!.max_sequence),
           );
-      db.prepare('INSERT INTO graph_seen VALUES(?,?,?,?,?)').run(
-        ref.hash,
-        kind,
-        JSON.stringify(ref),
-        bytes,
-        maxSequence,
-      );
+      scratch.insertSeen.run(ref.hash, kind, JSON.stringify(ref), bytes, maxSequence);
       return bytes;
     } finally {
       depth--;
@@ -276,19 +275,13 @@ export function inspectIntakeCollectionGraph(
     ] as const) {
       if (
         !ref ||
-        Number(
-          db
-            .prepare('SELECT max_sequence FROM graph_seen WHERE hash=? AND kind=?')
-            .get(ref.hash, kind)!.max_sequence,
-        ) > head.storageSequence
+        Number(scratch.readMaxSequence.get(ref.hash, kind)!.max_sequence) > head.storageSequence
       )
         invalid('historical future evidence');
     }
     if (head.history?.first !== ordered(1) || head.history.last !== ordered(head.storageSequence))
       invalid('historical sequence coverage');
-    const eventRow = db
-      .prepare('SELECT value FROM graph_history WHERE sequence=?')
-      .get(head.storageSequence);
+    const eventRow = scratch.readHistory.get(head.storageSequence);
     if (!eventRow) invalid('missing historical transition');
     const event = JSON.parse(String(eventRow.value));
     if (!same(event.logical, head.logical) || !same(event.builds, head.builds))
@@ -316,9 +309,7 @@ export function inspectIntakeCollectionGraph(
     invalid('historical evidence coverage');
   for (const row of db.prepare('SELECT sequence,value FROM graph_history').iterate()) {
     const event = JSON.parse(String(row.value));
-    const receipt = db
-      .prepare('SELECT value FROM graph_receipts WHERE id=?')
-      .get(event.operationId);
+    const receipt = scratch.readReceipt.get(event.operationId);
     if (!receipt) invalid('missing historical receipt');
     const result = JSON.parse(String(receipt.value)).result;
     if (
@@ -331,7 +322,7 @@ export function inspectIntakeCollectionGraph(
     )
       invalid('receipt history agreement');
   }
-  db.prepare('INSERT OR IGNORE INTO visited VALUES(?)').run(prefix + 'head');
+  scratch.markVisited.run(prefix + 'head');
   if (
     db
       .prepare(
