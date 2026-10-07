@@ -84,6 +84,20 @@ Source text follows the rule for its own records:
 
 Every new durable write path needs a fictional-fixture test asserting that journal growth stays linear in the number of changes, at two document sizes. A test that only checks correctness does not catch this.
 
+### Replay SQL reuse and the short debugging loop
+
+Cold reconstruction retains the original complete-version validation, reference verification, delete-before-insert ordering, historical indexing and final integrity checks. Within each replayed transaction, it prepares each touched table's delete/insert statement at most once per phase and executes that statement for every applicable record. The statement maps are local to that call and bounded by the configured table set; no records, authorization results or prepared statements are reused across replay calls or connections. Durable formats, encryption, accepted publication and cache compatibility are unchanged.
+
+The fictional replay-only regression rebuilds the same accepted archive into two fresh databases at both four and 64 people, preserving updates, tombstones, predecessor/field history and exact current/history index rows. For the 64-person history, SQL preparation falls from 130 deletes and 129 inserts to four deletes and three inserts, while all 259 corresponding row executions remain. Complete-version validation counts and archive bytes remain unchanged. These are scoped work counts, not an unlock latency or full HTTP acceptance claim.
+
+Run this checkpoint without repeating the import/review setup:
+
+```sh
+node --test src/server/test/record-replay-sql.test.ts
+```
+
+Then run the complete record-version and affected recovery tests. The separate `npm run test:acceptance` and `npm run test:continuation` scenarios still establish their end-to-end outcomes; this short regression does not replace either one.
+
 ## History retention
 
 There is no history compaction scheduler or historical-version offloading. Authoritative versions and originals remain available; derived SQLite caches can be replaced and rebuilt. History occupies storage, and complete cache loss requires replaying retained versions.

@@ -890,23 +890,38 @@ function applyVersions(
   versions: Iterable<DurableRecordVersion>,
 ): void {
   // Values are complete records, never patches or rerun application operations.
+  // Reuse only SQL bytecode within this transaction's replay, bounded by the
+  // configured table set. Every version still performs its original row work;
+  // no statement or record is shared with another replay or retained afterward.
+  const removals = new Map<TableSchema, ReturnType<Database['prepare']>>();
+  const insertions = new Map<TableSchema, ReturnType<Database['prepare']>>();
   // Delete changed rows first to allow accepted changes to unique associations.
   for (const version of versions) {
     recordVersionWork('replayDeleteAttempts');
     const table = config.schema.find((table) => table.name === version.entity);
     if (!table || !Array.isArray(parseRecordJson(version.recordId)))
       fail('unknown record identity');
-    db.prepare(
-      `DELETE FROM ${q(table!.name)} WHERE ${table!.pk.map((key) => q(key) + '=?').join(' AND ')}`,
-    ).run(...(parseRecordJson(version.recordId) as SQLInputValue[]));
+    let remove = removals.get(table!);
+    if (!remove) {
+      remove = db.prepare(
+        `DELETE FROM ${q(table!.name)} WHERE ${table!.pk.map((key) => q(key) + '=?').join(' AND ')}`,
+      );
+      removals.set(table!, remove);
+    }
+    remove.run(...(parseRecordJson(version.recordId) as SQLInputValue[]));
   }
   for (const version of versions)
     if (!version.deleted) {
       recordVersionWork('replayInsertAttempts');
       const table = config.schema.find((table) => table.name === version.entity)!;
-      db.prepare(
-        `INSERT INTO ${q(table.name)} (${table.columns.map(q).join(',')}) VALUES(${table.columns.map(() => '?').join(',')})`,
-      ).run(...table.columns.map((key) => version.contents[key] as SQLInputValue));
+      let insert = insertions.get(table);
+      if (!insert) {
+        insert = db.prepare(
+          `INSERT INTO ${q(table.name)} (${table.columns.map(q).join(',')}) VALUES(${table.columns.map(() => '?').join(',')})`,
+        );
+        insertions.set(table, insert);
+      }
+      insert.run(...table.columns.map((key) => version.contents[key] as SQLInputValue));
     }
 }
 function verifyTargets(db: Database): void {
