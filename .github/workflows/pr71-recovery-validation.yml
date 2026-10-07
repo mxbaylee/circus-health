@@ -1,0 +1,137 @@
+name: PR 71 recovery-prefix validation
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: >-
+      github.repository == 'mxbaylee/circus-health' &&
+      github.event.pull_request.number == 71 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'codex/crs-231-paged-package-authority'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HUSKY: '0'
+      SOURCE_SHA: 56667b52933c36834abc4c33c1d48cd84f6be3a5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 56667b52933c36834abc4c33c1d48cd84f6be3a5
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Verify and apply the exact locally tested patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { writeFileSync } from 'node:fs';
+          import { gunzipSync } from 'node:zlib';
+          const chunks = [
+            'a48d53288469d6c9d0d3eda7e3c9dfb9afba7357',
+            '8ba3a1b563ab14fb430f3a1c2e2eb76be89c441a',
+            'b7f2202dda0acab1de87ee8cd6074018cc935a34',
+            'd609ceeaa61b51948700c1bd8a064a1ae6f4bbee',
+            '0f5cb596a3144af96fcf1676412d5d33ce852e52',
+            '06e2ccc7a5f2c64b3d0fb71481cfdbf5dbdc6e22',
+          ];
+          let encoded = '';
+          for (const sha of chunks) {
+            const response = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs/' + sha, {
+              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json' },
+            });
+            assert.equal(response.status, 200);
+            const blob = await response.json();
+            assert.equal(blob.encoding, 'base64');
+            const bytes = Buffer.from(blob.content, 'base64');
+            assert.equal(createHash('sha1').update('blob ' + bytes.length + '\0').update(bytes).digest('hex'), sha);
+            encoded += bytes.toString('utf8');
+          }
+          const patch = gunzipSync(Buffer.from(encoded, 'base64'));
+          assert.equal(createHash('sha256').update(patch).digest('hex'), '6d86fb1f99751b251650e0437ef8f9e32c38ecb9cd5769912ae8667aebf743d2');
+          writeFileSync(process.env.RUNNER_TEMP + '/recovery.patch', patch);
+          NODE
+          git apply --check "$RUNNER_TEMP/recovery.patch"
+          git apply "$RUNNER_TEMP/recovery.patch"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          const files = {
+            'docs/data/intake-envelope-authority.md': 'f1307f6becf9a96ccf9732fc726225b803c81b60',
+            'src/scripts/provider-qualification-acceptance.test.ts': 'e546d1cfa4382cc4f4db24779b805e7727e9a0dd',
+            'src/server/encrypted-profiles.ts': 'd30bf04fdad26529715d188e742c874844a0c0a9',
+            'src/server/intake-collection-envelope.ts': 'b34781296179ed48f9ff0797aed7cbb9b19a1644',
+            'src/server/intake-envelope-schema-validation.ts': '6cf8af92c06194a8aabbfb8366eb31e6fca80734',
+            'src/server/test/intake-recovery-breakdown.test.ts': 'ca40635abc26518a26dc95cce1cbf6617ef8f500',
+            'src/server/test/profile-recovery-diagnostics.test.ts': 'e601603c58d4de42783b080fb3dd65ff357de033',
+          };
+          for (const [path, sha] of Object.entries(files)) assert.equal(execFileSync('git', ['hash-object', path], { encoding: 'utf8' }).trim(), sha, path);
+          execFileSync('git', ['add', '--', ...Object.keys(files)]);
+          assert.deepEqual(execFileSync('git', ['diff', '--cached', '--name-only'], { encoding: 'utf8' }).trim().split('\n'), Object.keys(files));
+          assert.equal(execFileSync('git', ['write-tree'], { encoding: 'utf8' }).trim(), 'bd68ec8f7f3325d9532e0305aa91fac133788448');
+          writeFileSync(process.env.RUNNER_TEMP + '/recovery-files.json', JSON.stringify(files));
+          writeFileSync(process.env.RUNNER_TEMP + '/recovery-paths.txt', Object.keys(files).join('\n') + '\n');
+          NODE
+          git diff --cached --check
+          mapfile -t files < "$RUNNER_TEMP/recovery-paths.txt"
+          node node_modules/prettier/bin/prettier.cjs --check "${files[@]}"
+      - run: npm run typecheck
+      - run: node scripts/repository-file-inventory.ts --check
+      - name: Complete recovery and validation regressions
+        run: |
+          node --test --test-concurrency=1 \
+            src/server/test/intake-recovery-breakdown.test.ts \
+            src/server/test/profile-recovery-diagnostics.test.ts \
+            src/server/test/intake-state-manifest.test.ts \
+            src/server/test/intake-state-graph.test.ts \
+            src/server/test/intake-state-bootstrap.test.ts \
+            src/server/test/intake-state-production-recovery.test.ts \
+            src/server/test/intake-work-accounting.test.ts \
+            src/server/test/intake-schema-resolution-authority.test.ts \
+            src/server/test/intake-schema-resolution-benefit.test.ts \
+            src/server/test/intake-state-read-cache-authority.test.ts \
+            src/server/test/intake-collection-envelope.test.ts \
+            src/server/test/import-diagnostics.test.ts
+      - name: Publish verified source objects only, without advancing a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const files = JSON.parse(readFileSync(process.env.RUNNER_TEMP + '/recovery-files.json', 'utf8'));
+          async function request(path, body) {
+            const response = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/' + path, {
+              method: body === undefined ? 'GET' : 'POST',
+              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+              ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            });
+            assert.ok(response.ok, 'Git object status ' + response.status);
+            return response.json();
+          }
+          const parent = await request('commits/' + process.env.SOURCE_SHA);
+          assert.equal(parent.tree.sha, '549f64695e26eb323df41c7d1cad42764214ed31');
+          const entries = [];
+          for (const [path, sha] of Object.entries(files)) {
+            const blob = await request('blobs', { content: readFileSync(path, 'utf8'), encoding: 'utf-8' });
+            assert.equal(blob.sha, sha, path);
+            entries.push({ path, mode: '100644', type: 'blob', sha });
+          }
+          const tree = await request('trees', { base_tree: parent.tree.sha, tree: entries });
+          assert.equal(tree.sha, 'bd68ec8f7f3325d9532e0305aa91fac133788448');
+          console.log('VERIFIED_RECOVERY_TREE ' + JSON.stringify({ parent: process.env.SOURCE_SHA, tree: tree.sha, files }));
+          NODE
