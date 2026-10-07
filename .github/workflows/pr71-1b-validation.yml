@@ -1,0 +1,125 @@
+name: PR 71 acceptance checkpoint validation
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: >-
+      github.repository == 'mxbaylee/circus-health' &&
+      github.event.pull_request.number == 71 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'codex/crs-231-paged-package-authority'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HUSKY: '0'
+      SOURCE_SHA: 7cd008b62a03878651b2689165bab35679f9e70b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 7cd008b62a03878651b2689165bab35679f9e70b
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Verify and apply the exact locally tested four-file patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { writeFileSync } from 'node:fs';
+          import { gunzipSync } from 'node:zlib';
+          import { execFileSync } from 'node:child_process';
+          const parts = [
+            'a1bf2b4698e705123ee174479d37e21d4fc1c7b7',
+            '30bc9a62e6741be38b6465fcf4d21f704674126d',
+            '0cd6070bd43f66a7883375a809212a8591b61801',
+          ];
+          let encoded = '';
+          for (const sha of parts) {
+            const response = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs/' + sha, {
+              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json' },
+            });
+            assert.equal(response.status, 200);
+            const blob = await response.json();
+            assert.equal(blob.encoding, 'base64');
+            const bytes = Buffer.from(blob.content, 'base64');
+            assert.equal(createHash('sha1').update('blob ' + bytes.length + '\0').update(bytes).digest('hex'), sha);
+            encoded += bytes.toString('utf8');
+          }
+          const patch = gunzipSync(Buffer.from(encoded, 'base64'));
+          assert.equal(createHash('sha256').update(patch).digest('hex'), '59daf89da5349b8404df488e557b0eceffb149f4aa07fbda10fda7330e3567f9');
+          const path = process.env.RUNNER_TEMP + '/acceptance-work.patch';
+          writeFileSync(path, patch);
+          execFileSync('git', ['apply', '--check', path]);
+          execFileSync('git', ['apply', path]);
+          const files = {
+            'docs/data/intake-state-storage.md': '9752834ff79911dbb03803879fa01759af4bb7da',
+            'src/server/intake-state-maintenance.ts': '8139c88fbd6470cafeeae22fd21d7b75c5c20c6a',
+            'src/server/test/intake-acceptance-work.test.ts': '1f723dc002c24497ba0c32ce7b7915a79b677e3f',
+            'src/server/test/intake-state-maintenance.test.ts': 'ab8223f2b7a699a676d0d65a8d963a0357112456',
+          };
+          for (const [path, sha] of Object.entries(files)) assert.equal(execFileSync('git', ['hash-object', path], { encoding: 'utf8' }).trim(), sha, path);
+          execFileSync('git', ['add', '--', ...Object.keys(files)]);
+          assert.deepEqual(execFileSync('git', ['diff', '--cached', '--name-only'], { encoding: 'utf8' }).trim().split('\n'), Object.keys(files));
+          assert.equal(execFileSync('git', ['write-tree'], { encoding: 'utf8' }).trim(), 'ee076750ebad5052ab4e491d5cfcac7828b537fb');
+          writeFileSync(process.env.RUNNER_TEMP + '/acceptance-work-files.json', JSON.stringify(files));
+          NODE
+          git diff --cached --check
+          npx --no-install prettier --check \
+            docs/data/intake-state-storage.md \
+            src/server/intake-state-maintenance.ts \
+            src/server/test/intake-acceptance-work.test.ts \
+            src/server/test/intake-state-maintenance.test.ts
+      - run: npm run typecheck
+      - run: node scripts/repository-file-inventory.ts --check
+      - name: Complete acceptance, checkpoint, cancellation and recovery regressions
+        run: |
+          node --test --test-concurrency=1 \
+            src/server/test/intake-acceptance-work.test.ts \
+            src/server/test/intake-state-maintenance.test.ts \
+            src/server/test/intake-report-acceptance-native.test.ts \
+            src/server/test/intake-collection-acceptance-group.test.ts \
+            src/server/test/clinical-review-maintenance.test.ts \
+            src/server/test/intake-source-cooperative-maintenance.test.ts \
+            src/server/test/intake-state-production-recovery.test.ts
+      - name: Publish verified source objects only, not a branch or merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const files = JSON.parse(readFileSync(process.env.RUNNER_TEMP + '/acceptance-work-files.json', 'utf8'));
+          async function publish(path, body) {
+            const response = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/' + path, {
+              method: 'POST',
+              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            assert.ok(response.ok, 'Git object publication status ' + response.status);
+            return response.json();
+          }
+          const tree = [];
+          for (const [path, expected] of Object.entries(files)) {
+            assert.equal(execFileSync('git', ['hash-object', path], { encoding: 'utf8' }).trim(), expected, path);
+            const blob = await publish('blobs', { content: readFileSync(path, 'utf8'), encoding: 'utf-8' });
+            assert.equal(blob.sha, expected, path);
+            tree.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
+          }
+          const result = await publish('trees', { base_tree: 'f6605a947d914a3e6502795f4d7d88bab06afdba', tree });
+          assert.equal(result.sha, 'ee076750ebad5052ab4e491d5cfcac7828b537fb');
+          console.log('VERIFIED_ACCEPTANCE_WORK_TREE ' + JSON.stringify({ tree: result.sha, files }));
+          NODE
