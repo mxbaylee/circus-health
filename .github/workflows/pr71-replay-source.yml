@@ -1,0 +1,38 @@
+name: PR 71 replay source checkpoint
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    if: >-
+      github.repository == 'mxbaylee/circus-health' &&
+      github.event.pull_request.number == 71 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'codex/crs-231-paged-package-authority'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 3c8086670027e0e53cf24025262eb2bcf6f2a814
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Archive tracked source only
+        run: |
+          test "$(git rev-parse HEAD)" = 3c8086670027e0e53cf24025262eb2bcf6f2a814
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/source.tar.gz"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/source-tree.txt"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/source-revision.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr71-replay-source
+          path: |
+            ${{ runner.temp }}/source.tar.gz
+            ${{ runner.temp }}/source-tree.txt
+            ${{ runner.temp }}/source-revision.txt
+          retention-days: 1
