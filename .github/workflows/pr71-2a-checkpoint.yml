@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   capture:
@@ -15,7 +14,7 @@ jobs:
     timeout-minutes: 8
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-step0
+      OUTPUT: /tmp/pr71-step1-baseline
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -26,80 +25,45 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - name: Capture pinned source and failure evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Prepare isolated contributor tools
         run: |
-          mkdir -p "$OUTPUT/logs"
-          test "$(git rev-parse HEAD)" = 353f8f167a7871f36e13a584da844af5265f5c7e
+          mkdir -p "$OUTPUT/profiles" /tmp/pr71-step1-tools/bin
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
-          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
-          git ls-tree -r HEAD > "$OUTPUT/source-tree.txt"
-          git archive HEAD | gzip -n > "$OUTPUT/source.tar.gz"
-          node --input-type=module <<'NODE'
-          import { writeFileSync } from 'node:fs';
-          const root = process.env.OUTPUT;
-          const api = 'https://api.github.com/repos/mxbaylee/circus-health';
-          const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' };
-          async function get(path, name, json = true) {
-            const response = await fetch(api + path, { headers, signal: AbortSignal.timeout(30000) });
-            const text = await response.text();
-            writeFileSync(`${root}/${name}`, text);
-            if (!response.ok) throw Error(`${path}: HTTP ${response.status}`);
-            return json ? JSON.parse(text) : text;
-          }
-          const original = await get('/actions/runs/37664169344/attempts/1/jobs?per_page=100', 'original-jobs.json');
-          if (original.total_count !== original.jobs.length) throw Error('Incomplete original job inventory');
-          const latest = await get('/actions/runs/37664169344/jobs?per_page=100', 'latest-jobs.json');
-          if (latest.total_count !== latest.jobs.length) throw Error('Incomplete latest job inventory');
-          await get('/actions/runs/37664169344', 'run-snapshot.json');
-          await get('/pulls/71', 'pr-snapshot.json');
-          const ids = new Set([112939001573, 112939002157, 112939001688, 112939001770, 112939002076, 112939001940, 112939001687]);
-          for (const job of latest.jobs) if (job.status === 'completed' && ['failure', 'cancelled'].includes(job.conclusion)) ids.add(job.id);
-          const summary = [];
-          for (const id of ids) {
-            const job = [...original.jobs, ...latest.jobs].find(job => job.id === id);
-            if (!job) throw Error(`Missing job ${id}`);
-            try {
-              const text = await get(`/actions/jobs/${id}/logs`, `logs/${id}.log`, false);
-              const lines = text.split('\n');
-              const start = lines.findIndex(line => line.includes('failing tests:'));
-              summary.push({ id, name: job.name, conclusion: job.conclusion, runAttempt: job.run_attempt, failureExcerpt: start < 0 ? lines.filter(line => line.includes('##[error]')) : lines.slice(start, start + 90) });
-            } catch (error) {
-              summary.push({ id, name: job.name, runAttempt: job.run_attempt, captureError: String(error) });
-            }
-          }
-          writeFileSync(`${root}/failure-summary.json`, JSON.stringify(summary, null, 2));
-          writeFileSync(`${root}/environment.json`, JSON.stringify({ node: process.version, platform: process.platform, arch: process.arch, diagnosticRunId: process.env.GITHUB_RUN_ID, diagnosticAttempt: process.env.GITHUB_RUN_ATTEMPT, workflowSha: process.env.GITHUB_SHA }, null, 2));
-          console.log(JSON.stringify(summary, null, 2));
-          NODE
-      - name: Install exact contributor dependencies
-        run: npm ci > "$OUTPUT/npm-ci.log" 2>&1
-      - name: Verify the existing small acceptance reproducer
+          git status --porcelain > "$OUTPUT/source-status.txt"
+          npm ci > "$OUTPUT/npm-ci.log" 2>&1
+          cp "$(command -v node)" /tmp/pr71-step1-tools/bin/node
+          tar --exclude='*.ttf' --exclude='*.otf' --exclude='*.woff' --exclude='*.woff2' --exclude='*.pfb' -czf /tmp/pr71-step1-tools/dependencies.tar.gz node_modules
+          sha256sum package-lock.json > /tmp/pr71-step1-tools/package-lock.sha256
+          cd /tmp/pr71-step1-tools
+          sha256sum bin/node dependencies.tar.gz package-lock.sha256 > SHA256SUMS
+      - name: Profile only the existing eight-record host diagnostic
         run: |
           node --input-type=module <<'NODE'
           import { spawnSync } from 'node:child_process';
           import { openSync, closeSync, writeFileSync } from 'node:fs';
           import { testEnvironment } from './src/scripts/test-suite.ts';
-          const args = ['--test', '--test-concurrency=1', '--test-reporter=spec', 'src/server/test/intake-acceptance-work.test.ts'];
-          const fd = openSync(`${process.env.OUTPUT}/small-acceptance.log`, 'w');
+          const args = ['--cpu-prof', `--cpu-prof-dir=${process.env.OUTPUT}/profiles`, '--test', '--test-concurrency=1', '--test-name-pattern=8 records', '--test-reporter=spec', 'src/server/test/intake-acceptance-work.test.ts'];
+          const fd = openSync(`${process.env.OUTPUT}/baseline.log`, 'w');
           const result = spawnSync(process.execPath, args, { env: testEnvironment(process.env, 'server'), stdio: ['ignore', fd, fd] });
           closeSync(fd);
-          writeFileSync(`${process.env.OUTPUT}/small-acceptance-result.json`, JSON.stringify({ command: ['node', ...args], status: result.status, signal: result.signal, error: result.error?.message ?? null, scope: 'Original 2- and 8-record host-only reproducer; not full HTTP/encrypted recovery qualification' }, null, 2));
+          writeFileSync(`${process.env.OUTPUT}/result.json`, JSON.stringify({ command: ['node', ...args], node: process.version, status: result.status, signal: result.signal, error: result.error?.message ?? null, scope: 'Profiled eight-record diagnostic; not encrypted recovery qualification' }, null, 2));
           process.exitCode = result.status ?? 1;
           NODE
-      - name: Hash retained output
+      - name: Hash retained diagnostic evidence
         if: always()
         run: |
-          if [ -d "$OUTPUT" ]; then
-            cd "$OUTPUT"
-            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-          fi
+          cd "$OUTPUT"
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step0-workspace-and-evidence
-          path: /tmp/pr71-step0
+          name: pr71-step1-baseline
+          path: /tmp/pr71-step1-baseline
           if-no-files-found: error
           retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr71-step1-offline-tools
+          path: /tmp/pr71-step1-tools
+          if-no-files-found: error
+          retention-days: 2
