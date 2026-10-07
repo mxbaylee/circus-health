@@ -1,8 +1,8 @@
-name: PR 71 step 2A checkpoint
+name: PR 71 bounded workspace
 
 on:
   push:
-    branches: [codex/crs-231-paged-package-authority]
+    branches: [codex/pr71-step0-workspace]
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
 
 permissions:
@@ -12,43 +12,86 @@ permissions:
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8
+    env:
+      HUSKY: '0'
+      OUTPUT: ${{ runner.temp }}/pr71-step0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 6dbd3cf81548b4d90ce68c6880370af08228f06c
+          ref: 353f8f167a7871f36e13a584da844af5265f5c7e
           persist-credentials: false
           fetch-depth: 1
-      - name: Retain exact public source and existing CI evidence
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Capture pinned source and original attempt evidence
         env:
           GH_TOKEN: ${{ github.token }}
-          OUTPUT: ${{ runner.temp }}/step2a
         run: |
           mkdir -p "$OUTPUT/logs"
+          test "$(git rev-parse HEAD)" = 353f8f167a7871f36e13a584da844af5265f5c7e
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
+          git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
+          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
           git ls-tree -r HEAD > "$OUTPUT/source-tree.txt"
-          git archive HEAD | gzip > "$OUTPUT/source.tar.gz"
+          git archive HEAD | gzip -n > "$OUTPUT/source.tar.gz"
           node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
           import { writeFileSync } from 'node:fs';
-          const jobs = [112925397649, 112925397543, 112925397689, 112925397619, 112925397704];
-          const summary = [];
-          for (const id of jobs) {
-            const response = await fetch(`https://api.github.com/repos/mxbaylee/circus-health/actions/jobs/${id}/logs`, {
-              headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' },
-            });
-            assert.ok(response.ok, `log ${id}: ${response.status}`);
+          const root = process.env.OUTPUT;
+          const api = 'https://api.github.com/repos/mxbaylee/circus-health';
+          const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' };
+          async function get(path, name, json = true) {
+            const response = await fetch(api + path, { headers, signal: AbortSignal.timeout(30000) });
+            if (!response.ok) throw Error(`${path}: HTTP ${response.status}`);
             const text = await response.text();
-            writeFileSync(`${process.env.OUTPUT}/logs/${id}.log`, text);
+            writeFileSync(`${root}/${name}`, text);
+            return json ? JSON.parse(text) : text;
+          }
+          const jobs = await get('/actions/runs/37664169344/attempts/1/jobs?per_page=100', 'original-jobs.json');
+          if (jobs.total_count !== jobs.jobs.length) throw Error('Incomplete original job inventory');
+          await get('/pulls/71', 'pr-snapshot.json');
+          const ids = [112939001573, 112939002157, 112939001688, 112939001770, 112939002076, 112939001940, 112939001687];
+          const summary = [];
+          for (const id of ids) {
+            const job = jobs.jobs.find(job => job.id === id);
+            if (!job) throw Error(`Missing original job ${id}`);
+            const text = await get(`/actions/jobs/${id}/logs`, `logs/${id}.log`, false);
             const lines = text.split('\n');
             const start = lines.findIndex(line => line.includes('failing tests:'));
-            summary.push({ id, failures: start < 0 ? lines.filter(line => line.includes('##[error]')) : lines.slice(start, start + 75) });
+            summary.push({ id, name: job.name, conclusion: job.conclusion, runAttempt: job.run_attempt, failureExcerpt: start < 0 ? lines.filter(line => line.includes('##[error]')) : lines.slice(start, start + 90) });
           }
-          writeFileSync(`${process.env.OUTPUT}/failures.json`, JSON.stringify(summary, null, 2));
+          writeFileSync(`${root}/failure-summary.json`, JSON.stringify(summary, null, 2));
+          writeFileSync(`${root}/environment.json`, JSON.stringify({ node: process.version, platform: process.platform, arch: process.arch, diagnosticRunId: process.env.GITHUB_RUN_ID, diagnosticAttempt: process.env.GITHUB_RUN_ATTEMPT, workflowSha: process.env.GITHUB_SHA }, null, 2));
           console.log(JSON.stringify(summary, null, 2));
           NODE
+      - name: Install exact contributor dependencies
+        run: npm ci > "$OUTPUT/npm-ci.log" 2>&1
+      - name: Verify the existing small acceptance reproducer
+        run: |
+          node --input-type=module <<'NODE'
+          import { spawnSync } from 'node:child_process';
+          import { openSync, closeSync, writeFileSync } from 'node:fs';
+          import { testEnvironment } from './src/scripts/test-suite.ts';
+          const args = ['--test', '--test-concurrency=1', '--test-reporter=spec', 'src/server/test/intake-acceptance-work.test.ts'];
+          const fd = openSync(`${process.env.OUTPUT}/small-acceptance.log`, 'w');
+          const result = spawnSync(process.execPath, args, { env: testEnvironment(process.env, 'server'), stdio: ['ignore', fd, fd] });
+          closeSync(fd);
+          writeFileSync(`${process.env.OUTPUT}/small-acceptance-result.json`, JSON.stringify({ command: ['node', ...args], status: result.status, signal: result.signal, error: result.error?.message ?? null, scope: 'Original 2- and 8-record host-only reproducer; not full HTTP/encrypted recovery qualification' }, null, 2));
+          process.exitCode = result.status ?? 1;
+          NODE
+      - name: Hash retained output
+        if: always()
+        run: |
+          if [ -d "$OUTPUT" ]; then
+            cd "$OUTPUT"
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
         with:
-          name: pr71-step2a-source-and-logs
-          path: ${{ runner.temp }}/step2a
-          retention-days: 2
+          name: pr71-step0-workspace-and-evidence
+          path: ${{ runner.temp }}/pr71-step0
+          if-no-files-found: error
+          retention-days: 14
