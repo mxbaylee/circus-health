@@ -446,10 +446,21 @@ export function createIntakeCollections(owner: {
         throw error;
       }
     });
-  function selected(): ViewData {
+  function selected(certificate?: IntakeTreeReadCertificate): ViewData {
     const raw = get(headKey);
-    const generation = readWitness(),
+    const generation = certificate?.witness ?? readWitness(),
       registry = registryFor(db);
+    // Only the fixed schema resolver passes its private synchronous certificate.
+    // Reuse the entry snapshot, not a new mid-read baseline. runRead must still
+    // match it after the final physical HEAD check before returning any result.
+    if (
+      certificate &&
+      (certificate.state !== 'active' ||
+        certificate.epoch !== readEpoch ||
+        certificate.registry !== registry.generation ||
+        db.isTransaction)
+    )
+      invalid('collection read authority changed');
     // total_changes does not advance on ROLLBACK. Never retain a selection
     // authenticated inside a transaction: a savepoint rollback may restore
     // different bytes without changing the head or the generation stamp.
@@ -492,10 +503,14 @@ export function createIntakeCollections(owner: {
       proof,
     );
   }
-  function readScope(view: IntakeCollectionView, area: IntakeCollectionArea) {
+  function readScope(
+    view: IntakeCollectionView,
+    area: IntakeCollectionArea,
+    certificate?: IntakeTreeReadCertificate,
+  ) {
     if (area !== 'logical' && area !== 'builds') invalid('collection area');
     const before = viewData(view),
-      current = selected();
+      current = selected(certificate);
     const beforeRoot = area === 'logical' ? before.head?.logical : before.head?.builds;
     const currentRoot = area === 'logical' ? current.head?.logical : current.head?.builds;
     if (!same(beforeRoot, currentRoot)) invalid('stale collection view');
@@ -654,7 +669,7 @@ export function createIntakeCollections(owner: {
       // runRead seal still check physical HEAD and the exact SQL witness.
       // Transactions retain all original point-operation observations.
       const collection = certificate
-        ? descriptor(_readTree().get(readScope(view, area), name))
+        ? descriptor(_readTree().get(readScope(view, area, certificate), name))
         : schemaReadOperations.collection(view, area, name);
       if (!collection) invalid('missing selected envelope data');
       const current = viewData(view);

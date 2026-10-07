@@ -66,15 +66,32 @@ The small staged-reader regression compares identical published and staged data
 with zero and 40 unrelated records. Before staged owner registration, a warm
 record-header resolution used nine physical HEAD observations, 48 SQL witness
 queries and seven cell reads. It now matches the published reader's four HEAD
-observations, 12 witness queries and zero repeated header/ancestry cell reads.
-A named-field read falls from nine/48/seven to six/24/six respectively, retaining
+observations, 10 witness queries and zero repeated header/ancestry cell reads.
+A named-field read falls from nine/48/seven to six/22/six respectively, retaining
 both payload reads and exact values. These measured operations do not establish
 whole-workflow latency or a complete continuation/recovery pass.
 
-For the short debugging loop, run the two counted regressions directly:
+The fixed synchronous schema resolver reuses its private read certificate's entry
+SQL witness for the selected-root binding instead of sampling an extra mid-read
+baseline. It still samples the closing SQL witness after its final physical HEAD
+check, and refuses local/peer ABA, schema changes, registry disposal or an expired
+read epoch. General collection reads, transactions and custom readers keep their
+existing checked paths. No certificate or newly admitted schema result survives
+an unsuccessful seal or is borrowed across a yield.
+
+The direct warm header/field regression counts four rather than six witness
+queries, with both physical HEAD checks unchanged, for published and staged data
+at zero and 40 unrelated records. Header reuse still reads no repeated ancestry
+cells; field resolution retains all four first/last ordinal, order and lexical-name
+cell reads. These are logical SQL-query counts, not physical I/O measurements.
+Mutation regressions inject local/peer ABA, TEMP schema changes and registry
+disposal immediately after the entry snapshot, in addition to the existing
+final-proof and transaction/rollback refusal tests.
+
+For the short debugging loop, run the counted and entry-mutation regressions directly:
 
 ```sh
-node --test --test-name-pattern='staged schema reads share' src/server/test/intake-schema-resolution-authority.test.ts
+node --test --test-name-pattern='staged schema reads share|fixed schema reads seal|schema witness reuse refuses' src/server/test/intake-schema-resolution-authority.test.ts
 ```
 
 The remaining staged tests in that file cover build isolation, checked checkpoint
@@ -86,7 +103,7 @@ change, followed by the unchanged `npm run test:continuation` and
 fixture does not replace either full scenario or turn their existing AI stubs
 into live-provider qualification.
 
-A cold inline ancestry regression now counts two physical HEAD proofs and six witness queries at two fixture sizes, and explicitly rejects final-proof physical-head loss and local/peer SQL ABA. These counts cover the resolver operation, not the whole workflow.
+A cold inline ancestry regression now counts two physical HEAD proofs and four witness queries at two fixture sizes, and explicitly rejects final-proof physical-head loss and local/peer SQL ABA. These counts cover the resolver operation, not the whole workflow.
 
 The [fictional resolved-header fixture](../../src/server/test/intake-schema-resolution-benefit.test.ts) preserves exact lexical output across 288 repeated resolutions. In a matched 2026-10-04 comparison with only this memo disabled, point-item reads fell from 2,016 to zero, tree visits from 18,848 to 576 and witness queries from 13,824 to 4,608. Both runs already had a warm node cache and read zero raw node bytes. Physical-head observations fell from 2,592 to 1,440; every resolution still checked current physical authority. These overlapping work counts describe this fixture, not complete workflow cost or an installation latency guarantee.
 

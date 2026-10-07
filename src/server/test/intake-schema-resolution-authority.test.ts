@@ -481,7 +481,11 @@ test('cold schema scope shares checks while retaining complete ancestry at two s
       assert.equal(result.kind, f.expected);
       assert.ok(items >= f.nodes.length, 'complete header and ancestry remain inspected');
       assert.equal(heads, 2, 'one entry and one final physical HEAD proof');
-      assert.equal(witnessQueries, 6, 'entry, selected binding and final SQL witness only');
+      assert.equal(
+        witnessQueries,
+        4,
+        'entry and final SQL witnesses; selected binding reuses entry',
+      );
     } finally {
       f.authority.storage.read = original;
     }
@@ -589,7 +593,11 @@ test('named field lookup shares one sealed scope without losing lexical values',
         6,
         'two source/handle checks, field entry/final proofs and two payload checks',
       );
-      assert.equal(witnessQueries, 24, 'four six-query scopes; field cells share one binding');
+      assert.equal(
+        witnessQueries,
+        22,
+        'three six-query scopes plus the four-query fixed field scope',
+      );
       assert.equal(items, 6, 'four field witnesses and both original payload reads are retained');
     } finally {
       f.authority.storage.read = original;
@@ -1040,3 +1048,137 @@ test('staged field scope preserves duplicate selection and refuses rollback-only
   restore(f.db, row);
   assert.deepEqual(read(), { kind: 'value', value: 'new' });
 });
+
+for (const extras of [0, 40])
+  test(`fixed schema reads seal one witness interval: ${extras} unrelated records`, async (t) => {
+    const f = await stagedFixture(t, extras);
+    const collections = f.selected.collections;
+    const view = collections.openView();
+    const original = f.authority.storage.read;
+    let heads = 0;
+    f.authority.storage.read = (name) => {
+      if (name === 'head') heads++;
+      return original(name);
+    };
+    try {
+      for (const area of ['logical', 'builds'] as const) {
+        const collection = area === 'logical' ? 'envelope.data' : f.build;
+        for (const operation of ['header', 'field'] as const) {
+          const read = () =>
+            operation === 'header'
+              ? collections.resolveSchemaRecord(
+                  view,
+                  f.control.mode,
+                  f.control.root,
+                  f.id,
+                  'last',
+                  area,
+                  collection,
+                )
+              : collections.resolveSchemaField(
+                  view,
+                  f.control.mode,
+                  f.control.root,
+                  f.id,
+                  'last',
+                  'value',
+                  area,
+                  collection,
+                );
+          const expected = read();
+          const before = intakeWorkCounters(f.db).warm;
+          const beforeHeads = heads;
+          assert.deepEqual(read(), expected);
+          const after = intakeWorkCounters(f.db).warm;
+          const measured = {
+            extras,
+            area,
+            operation,
+            heads: heads - beforeHeads,
+            witnessQueries:
+              after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+            items: after.collectionItemsRead - before.collectionItemsRead,
+          };
+          t.diagnostic(JSON.stringify(measured));
+          assert.equal(measured.heads, 2, 'entry and final physical HEAD are both checked');
+          assert.equal(
+            measured.items,
+            operation === 'header' ? 0 : 4,
+            'preserve the complete field witnesses',
+          );
+          assert.equal(
+            measured.witnessQueries,
+            4,
+            'one two-query entry witness and one final witness; no duplicate selected-binding snapshot',
+          );
+        }
+      }
+      assert.deepEqual(f.reader.field(f.reader.resolve(f.id), 'value'), {
+        kind: 'value',
+        value: 'new',
+      });
+      assert.deepEqual(f.staged.field(f.staged.resolve(f.id), 'value'), {
+        kind: 'value',
+        value: 'new',
+      });
+    } finally {
+      f.authority.storage.read = original;
+    }
+  });
+
+for (const mode of ['local-aba', 'peer-aba', 'temp-schema', 'registry'] as const)
+  test(`schema witness reuse refuses ${mode} immediately after its entry snapshot`, async (t) => {
+    const f = await fixture(t);
+    const writer = mode === 'peer-aba' ? new DatabaseSync(f.path) : f.db;
+    const prepare = f.db.prepare;
+    let armed = false,
+      fired = 0;
+    f.db.prepare = function (sql: string) {
+      const statement = prepare.call(f.db, sql);
+      if (sql === 'PRAGMA temp.schema_version') {
+        const get = statement.get;
+        statement.get = (...args: unknown[]) => {
+          const result = Reflect.apply(get, statement, args) as ReturnType<typeof get>;
+          if (armed) {
+            armed = false;
+            fired++;
+            if (mode === 'registry') clearIntakeStateCache(f.db);
+            else if (mode === 'temp-schema')
+              f.db.exec(
+                'CREATE TEMP TABLE fictional_entry_witness(id); DROP TABLE fictional_entry_witness',
+              );
+            else {
+              writer
+                .prepare('INSERT INTO main.app_meta(key,value) VALUES(?,?)')
+                .run('fictional-entry-aba', 'value');
+              writer.prepare('DELETE FROM main.app_meta WHERE key=?').run('fictional-entry-aba');
+            }
+          }
+          return result;
+        };
+      }
+      return statement;
+    };
+    try {
+      const collections = createIntakeStateStorage(f.db, {
+        profileId: 'fictional-schema-memo',
+        intakeId: f.source.id,
+        sourceHash: f.source.sha256,
+      }).collections;
+      const view = collections.openView();
+      const read = () =>
+        collections.resolveSchemaField(view, f.control.mode, f.control.root, f.id, 'last', 'value');
+      assert.equal(read().target?.type, 'cell');
+      armed = true;
+      assert.throws(read, /authority changed|stale|expired|collection/);
+      assert.equal(fired, 1, 'one mutation immediately after the captured entry witness');
+    } finally {
+      armed = false;
+      f.db.prepare = prepare;
+      if (mode === 'peer-aba') writer.close();
+    }
+    assert.deepEqual(f.reader.field(f.reader.resolve(f.id), 'value'), {
+      kind: 'value',
+      value: 'new',
+    });
+  });
