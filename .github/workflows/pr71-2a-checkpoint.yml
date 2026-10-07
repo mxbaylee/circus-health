@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 8
     env:
       HUSKY: '0'
-      OUTPUT: ${{ runner.temp }}/pr71-step0
+      OUTPUT: /tmp/pr71-step0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -26,7 +26,7 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - name: Capture pinned source and original attempt evidence
+      - name: Capture pinned source and failure evidence
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -44,23 +44,31 @@ jobs:
           const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' };
           async function get(path, name, json = true) {
             const response = await fetch(api + path, { headers, signal: AbortSignal.timeout(30000) });
-            if (!response.ok) throw Error(`${path}: HTTP ${response.status}`);
             const text = await response.text();
             writeFileSync(`${root}/${name}`, text);
+            if (!response.ok) throw Error(`${path}: HTTP ${response.status}`);
             return json ? JSON.parse(text) : text;
           }
-          const jobs = await get('/actions/runs/37664169344/attempts/1/jobs?per_page=100', 'original-jobs.json');
-          if (jobs.total_count !== jobs.jobs.length) throw Error('Incomplete original job inventory');
+          const original = await get('/actions/runs/37664169344/attempts/1/jobs?per_page=100', 'original-jobs.json');
+          if (original.total_count !== original.jobs.length) throw Error('Incomplete original job inventory');
+          const latest = await get('/actions/runs/37664169344/jobs?per_page=100', 'latest-jobs.json');
+          if (latest.total_count !== latest.jobs.length) throw Error('Incomplete latest job inventory');
+          await get('/actions/runs/37664169344', 'run-snapshot.json');
           await get('/pulls/71', 'pr-snapshot.json');
-          const ids = [112939001573, 112939002157, 112939001688, 112939001770, 112939002076, 112939001940, 112939001687];
+          const ids = new Set([112939001573, 112939002157, 112939001688, 112939001770, 112939002076, 112939001940, 112939001687]);
+          for (const job of latest.jobs) if (job.status === 'completed' && ['failure', 'cancelled'].includes(job.conclusion)) ids.add(job.id);
           const summary = [];
           for (const id of ids) {
-            const job = jobs.jobs.find(job => job.id === id);
-            if (!job) throw Error(`Missing original job ${id}`);
-            const text = await get(`/actions/jobs/${id}/logs`, `logs/${id}.log`, false);
-            const lines = text.split('\n');
-            const start = lines.findIndex(line => line.includes('failing tests:'));
-            summary.push({ id, name: job.name, conclusion: job.conclusion, runAttempt: job.run_attempt, failureExcerpt: start < 0 ? lines.filter(line => line.includes('##[error]')) : lines.slice(start, start + 90) });
+            const job = [...original.jobs, ...latest.jobs].find(job => job.id === id);
+            if (!job) throw Error(`Missing job ${id}`);
+            try {
+              const text = await get(`/actions/jobs/${id}/logs`, `logs/${id}.log`, false);
+              const lines = text.split('\n');
+              const start = lines.findIndex(line => line.includes('failing tests:'));
+              summary.push({ id, name: job.name, conclusion: job.conclusion, runAttempt: job.run_attempt, failureExcerpt: start < 0 ? lines.filter(line => line.includes('##[error]')) : lines.slice(start, start + 90) });
+            } catch (error) {
+              summary.push({ id, name: job.name, runAttempt: job.run_attempt, captureError: String(error) });
+            }
           }
           writeFileSync(`${root}/failure-summary.json`, JSON.stringify(summary, null, 2));
           writeFileSync(`${root}/environment.json`, JSON.stringify({ node: process.version, platform: process.platform, arch: process.arch, diagnosticRunId: process.env.GITHUB_RUN_ID, diagnosticAttempt: process.env.GITHUB_RUN_ATTEMPT, workflowSha: process.env.GITHUB_SHA }, null, 2));
@@ -92,6 +100,6 @@ jobs:
         if: always()
         with:
           name: pr71-step0-workspace-and-evidence
-          path: ${{ runner.temp }}/pr71-step0
+          path: /tmp/pr71-step0
           if-no-files-found: error
           retention-days: 14
