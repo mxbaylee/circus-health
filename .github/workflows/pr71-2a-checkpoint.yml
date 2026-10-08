@@ -18,11 +18,11 @@ jobs:
     timeout-minutes: 15
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-exact257-preparation
+      OUTPUT: /tmp/pr71-wal32-cycles
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 24bd6ea680fef7500e56e5a654a5c7ed4c2558da
+          ref: 4318908faa03447e6a844b277f98b3d8da87589e
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -30,14 +30,14 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Observe the original retained-artifact preparation without changing its guard
+      - name: Observe WAL cycles and publication writes including final drain
         env:
-          CRS_ARTIFACT_HISTORY_PHASES: '1'
-          CRS_ARTIFACT_HISTORY_DIAGNOSTICS: '1'
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
         run: |
           mkdir -p "$OUTPUT"
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          node --test --test-concurrency=1 --test-timeout=30000 --test-reporter=spec src/server/test/intake-identity-native-artifact-history.test.ts 2>&1 | tee "$OUTPUT/original257.log"
+          node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/wal-cycles.log"
       - name: Hash diagnostic evidence
         if: always()
         run: |
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-exact257-preparation
-          path: /tmp/pr71-exact257-preparation
+          name: pr71-wal32-cycles
+          path: /tmp/pr71-wal32-cycles
           if-no-files-found: error
           retention-days: 14
