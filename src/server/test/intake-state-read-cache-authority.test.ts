@@ -67,11 +67,12 @@ function restore(db: DatabaseSync, row: { key: string; raw: string }) {
 
 // Mutate after at least one actual result item has been visited, not during
 // input validation. The public call must refuse its complete mixed result.
-function duringRange(f: ReturnType<typeof fixture>, mutate: () => void) {
+function duringRange(f: ReturnType<typeof fixture>, mutate: () => void, scoped = false) {
   const before = intakeWorkCounters(f.db).warm.collectionItemsRead;
   let fired = false;
   const read = () =>
     f.store.range(f.store.openView(), 'logical', 'values', {
+      ...(scoped ? { after: '0', prefix: '0' } : {}),
       get items() {
         if (!fired && intakeWorkCounters(f.db).warm.collectionItemsRead > before) {
           fired = true;
@@ -161,37 +162,43 @@ test('cached collection nodes cannot outlive missing, corrupt or replaced accept
   }
 });
 
-for (const kind of [
-  'local-restored',
-  'peer-restored',
-  'main-schema',
-  'temp-schema',
-  'registry',
-] as const) {
-  test(`a bounded range refuses whole-call generation drift: ${kind}`, (t) => {
-    const f = fixture(t),
-      leaf = f.ancestors.at(-1)!;
-    const peer = kind === 'peer-restored' ? new DatabaseSync(f.file) : undefined;
-    try {
-      const pending = duringRange(f, () => {
-        if (kind === 'registry') clearIntakeStateCache(f.db);
-        else if (kind === 'main-schema') f.db.exec('CREATE TABLE fictional_read_drift(value TEXT)');
-        else if (kind === 'temp-schema')
-          f.db.exec('CREATE TEMP TABLE fictional_read_drift(value TEXT)');
-        else {
-          const writer = peer ?? f.db;
-          writer.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', leaf.key);
-          restore(writer, leaf);
-        }
-      });
-      assert.throws(pending.read, /changed|stale|generation|collection|read/i);
-      assert.equal(pending.fired(), true);
-      assert.equal(f.read(), 'fictional-0', 'a new call may authenticate the final exact state');
-    } finally {
-      peer?.close();
-    }
-  });
-}
+for (const scoped of [false, true])
+  for (const kind of [
+    'local-restored',
+    'peer-restored',
+    'main-schema',
+    'temp-schema',
+    'registry',
+  ] as const) {
+    test(`a ${scoped ? 'prefix-scoped' : 'bounded'} range refuses whole-call generation drift: ${kind}`, (t) => {
+      const f = fixture(t),
+        leaf = f.ancestors.at(-1)!;
+      const peer = kind === 'peer-restored' ? new DatabaseSync(f.file) : undefined;
+      try {
+        const pending = duringRange(
+          f,
+          () => {
+            if (kind === 'registry') clearIntakeStateCache(f.db);
+            else if (kind === 'main-schema')
+              f.db.exec('CREATE TABLE fictional_read_drift(value TEXT)');
+            else if (kind === 'temp-schema')
+              f.db.exec('CREATE TEMP TABLE fictional_read_drift(value TEXT)');
+            else {
+              const writer = peer ?? f.db;
+              writer.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', leaf.key);
+              restore(writer, leaf);
+            }
+          },
+          scoped,
+        );
+        assert.throws(pending.read, /changed|stale|generation|collection|read/i);
+        assert.equal(pending.fired(), true);
+        assert.equal(f.read(), 'fictional-0', 'a new call may authenticate the final exact state');
+      } finally {
+        peer?.close();
+      }
+    });
+  }
 
 test('nested read and rolled-back mutation cannot rebase an outer range certificate', (t) => {
   const f = fixture(t);

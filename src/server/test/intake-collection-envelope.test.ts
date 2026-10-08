@@ -916,3 +916,73 @@ test(
     );
   },
 );
+
+for (const unrelated of [0, 80])
+  test(`native lexical order pages stay within each record with ${unrelated} unrelated records`, async (t) => {
+    const selected =
+      '{"id":"selected","versions":[{"id":"version","value":12.00,"value":13.00,"occurrences":[{"proposalId":"first","recordId":"same"},{"proposalId":"second","recordId":"same"}]}]}';
+    const extras = Array.from({ length: unrelated }, (_, n) =>
+      JSON.stringify({
+        id: `unrelated-${n}`,
+        versions: [{ id: `other-${n}`, value: 'not selected' }],
+      }),
+    );
+    const raw =
+      '{"intake":{"version":1,"workflow":{"candidates":[' +
+      [selected, ...extras].join(',') +
+      ']}}}';
+    const { db, source } = fixture(t, raw);
+    await buildIntakeCollectionEnvelope(db, source);
+    const native = collectionCellReader(db, source);
+    const control = parseSchemaControl(
+      native.collections.get(
+        native.collections.openView(),
+        'logical',
+        'envelope.control',
+        'representation',
+      ),
+    );
+    let scopedItems = 0,
+      offScopeItems = 0,
+      legacyItems = 0;
+    const make = (legacy: boolean) =>
+      createSchemaEnvelopeReader(
+        {
+          ...native.store,
+          range(after, items, bytes, prefix) {
+            const page = native.store.range(after, items, bytes, legacy ? undefined : prefix);
+            if (prefix) {
+              if (legacy) legacyItems += page.items.length;
+              else {
+                scopedItems += page.items.length;
+                offScopeItems += page.items.filter((item) => !item.key.startsWith(prefix)).length;
+              }
+            }
+            return page;
+          },
+        },
+        control,
+        native.head.logical,
+      );
+    const read = (view: ReturnType<typeof make>) => {
+      const intake = view.child(view.root(), 'intake')!;
+      const workflow = view.child(intake, 'workflow')!;
+      const record = view.childAt(workflow, 'candidates', 0)!;
+      return [...view.recordChunks(record)].join('');
+    };
+    const legacy = read(make(true));
+    assert.equal(legacy, selected, 'the fallback keeps the complete selected lexical record');
+    assert.equal(read(make(false)), legacy);
+    assert.equal(
+      offScopeItems,
+      0,
+      'native prefix hints must not materialize unrelated order entries',
+    );
+    assert.equal(
+      scopedItems,
+      13,
+      'all selected fields, nested array entries and duplicate occurrences remain',
+    );
+    assert.ok(legacyItems > scopedItems, 'the old unscoped reader performs redundant item work');
+    t.diagnostic(JSON.stringify({ unrelated, scopedItems, legacyItems, offScopeItems }));
+  });

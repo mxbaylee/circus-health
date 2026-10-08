@@ -987,8 +987,8 @@ export function collectionCellReader(
   const store: EnvelopeCellReader = {
     check,
     get: (key) => collections.get(view, area, collection, key),
-    range: (after, items, bytes) =>
-      collections.range(view, area, collection, { after, items, bytes }),
+    range: (after, items, bytes, prefix) =>
+      collections.range(view, area, collection, { after, items, bytes, prefix }),
     chunks: (value, after, bytes = 4096) =>
       collections.readBytes(value, { after, items: 64, bytes }),
   };

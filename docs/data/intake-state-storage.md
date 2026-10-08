@@ -155,6 +155,24 @@ or survive disposal of the private manifest.
 
 The cold historical-graph walk also prepares its fixed scratch membership, visited-row, receipt, history and sequence-summary statements once per graph invocation, after creating its private tables. It still decodes every incoming reference before checking the visited index and executes every lookup, disagreement check and write. No evidence value, validation result or cursor is cached by the statement set; another namespace or invocation uses a new set. The existing 4/16-record recovery fixture separately counts statement compilation and actual graph executions, then verifies the complete source snapshot, lexical representation, accepted replay and lookup preparation. These small host tests do not replace the full HTTP acceptance/encrypted recovery scenario.
 
+### Prefix-scoped lexical order reads
+
+Native schema record traversal passes its existing order-key prefix to the selected
+collection range. The authenticated range stops at the first key outside that
+prefix before charging the page's item/byte budget or returning unrelated values.
+The exclusive cursor must belong to the prefix; `complete` is scoped to that
+namespace, while `count` remains the whole collection's authenticated count.
+Unscoped callers retain their previous behavior. Original schema record-count,
+order-key, lexical-value and depth checks still run, including duplicate properties
+and occurrences. The first boundary node and every visited node remain checked.
+
+This removes unrelated order-entry materialization during retained-artifact and
+receipt traversal. It does not filter clinical history, skip superseded receipt
+validation, cache complete records or increase page/cache limits. Custom cell
+readers may continue to ignore the optional hint and use the checked fallback.
+The same synchronous SQL/registry seal and physical-source checks apply; no
+certificate is extended across a generator yield. Storage formats and recovery
+authority are unchanged.
 
 ## V3 bridge and schema-directed envelopes
 

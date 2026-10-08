@@ -35,6 +35,7 @@ import {
   createIntakeTree,
   decodeIntakeTreeNode,
   intakeTreeRef,
+  intakeTreeKey,
   INTAKE_TREE_VALUE_BYTES,
   type IntakeTreeCachedNode,
   type IntakeTreeReadCertificate,
@@ -1135,19 +1136,30 @@ export function createIntakeCollections(owner: {
       view: IntakeCollectionView,
       area: IntakeCollectionArea,
       name: string,
-      options: { after?: string; items: number; bytes: number },
+      options: { after?: string; prefix?: string; items: number; bytes: number },
     ) {
       return runRead((readTree) => {
         collectionName(name);
         integer(options.items, 1);
         integer(options.bytes, 1);
         if (options.items > 100 || options.bytes > 256 * 1024) invalid('collection range budget');
+        // A scoped range retains the existing exclusive cursor. Its namespace
+        // must contain that cursor, so the first different key proves completion.
+        // Count below still describes the whole authenticated collection.
+        const prefix = options.prefix,
+          after = options.after;
+        if (prefix !== undefined) {
+          intakeTreeKey(prefix);
+          if (typeof after !== 'string' || !after.startsWith(prefix))
+            invalid('collection range cursor outside prefix');
+        }
         const pages = readTree(),
           collection = descriptor(pages.get(readScope(view, area), name));
         const items: Array<{ key: string; value: string | IntakeByteValue }> = [];
         let bytes = 0,
           complete = true;
-        for (const item of pages.entries(collection?.root ?? null, options.after)) {
+        for (const item of pages.entries(collection?.root ?? null, after)) {
+          if (prefix !== undefined && !item.key.startsWith(prefix)) break;
           const size = Buffer.byteLength(item.key) + Buffer.byteLength(item.value);
           if (items.length === options.items || bytes + size > options.bytes) {
             complete = false;

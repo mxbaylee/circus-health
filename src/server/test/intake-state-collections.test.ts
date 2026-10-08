@@ -816,3 +816,90 @@ test('live collection views survive unrelated reader churn and still expire at a
   const reopened = createIntakeStateStorage(db, identity).collections;
   assert.equal(reopened.get(reopened.openView(), 'logical', 'members', 'one'), 'second');
 });
+
+test('prefix-scoped collection ranges preserve page boundaries and reject foreign cursors', (t) => {
+  const { db, identity } = fixture(t);
+  const store = createIntakeStateStorage(db, identity).collections;
+  const changes: IntakeCollectionChange[] = [
+    ...['a:0', 'h:0', 'h:1', 'h:2'].map((key) => ({
+      area: 'logical' as const,
+      collection: 'scoped',
+      op: 'put' as const,
+      key,
+      value: key,
+    })),
+    {
+      area: 'logical',
+      collection: 'scoped',
+      op: 'put',
+      key: 'z:0',
+      value: 'unrelated'.repeat(800),
+    },
+  ];
+  mutate(db, store, changes, 1);
+  const view = store.openView();
+  const first = store.range(view, 'logical', 'scoped', {
+    after: 'h:',
+    prefix: 'h:',
+    items: 2,
+    bytes: 100,
+  });
+  assert.deepEqual(
+    first.items.map((item) => item.key),
+    ['h:0', 'h:1'],
+  );
+  assert.equal(first.complete, false);
+  assert.equal(first.after, 'h:1');
+  assert.equal(first.count, 5, 'count remains the whole collection count, not a scope count');
+  const last = store.range(view, 'logical', 'scoped', {
+    after: first.after!,
+    prefix: 'h:',
+    items: 2,
+    bytes: 100,
+  });
+  assert.deepEqual(
+    last.items.map((item) => item.key),
+    ['h:2'],
+  );
+  assert.equal(last.complete, true, 'outside-prefix values do not exhaust the scoped byte window');
+  assert.equal(last.after, null);
+  const empty = store.range(view, 'logical', 'scoped', {
+    after: 'q:',
+    prefix: 'q:',
+    items: 1,
+    bytes: 1,
+  });
+  assert.deepEqual(empty.items, []);
+  assert.equal(empty.complete, true);
+  assert.equal(empty.bytes, 0);
+  const whole = store.range(view, 'logical', 'scoped', { after: 'h:', items: 10, bytes: 32768 });
+  assert.deepEqual(
+    whole.items.map((item) => item.key),
+    ['h:0', 'h:1', 'h:2', 'z:0'],
+  );
+  assert.throws(
+    () =>
+      store.range(store.openView(), 'logical', 'scoped', {
+        after: 'a:',
+        prefix: 'h:',
+        items: 1,
+        bytes: 100,
+      }),
+    /prefix/,
+  );
+  assert.throws(
+    () =>
+      store.range(store.openView(), 'logical', 'scoped', { prefix: 'h:', items: 1, bytes: 100 }),
+    /prefix/,
+  );
+  assert.throws(
+    () =>
+      store.range(store.openView(), 'logical', 'scoped', {
+        after: 'h:',
+        prefix: 'h:',
+        items: 1,
+        bytes: 1,
+      }),
+    /byte budget/,
+  );
+});
