@@ -6,195 +6,66 @@ on:
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
 
 jobs:
-  verify:
+  capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 4
     env:
-      HUSKY: '0'
-      OUTPUT: /tmp/pr71-step3-combined
+      OUTPUT: /tmp/pr71-published-evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: fcfc73f3bc0ec2262027d62a7e1faf8b1db15315
+          ref: 1808014ab21bb558c0fd4203402ac0ae05810b98
           persist-credentials: false
-          fetch-depth: 2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version-file: .nvmrc
-          package-manager-cache: false
-      - name: Assemble only the two preserved source changes and interaction regressions
-        run: |
-          mkdir -p "$OUTPUT"
-          test "$(git rev-parse HEAD)" = fcfc73f3bc0ec2262027d62a7e1faf8b1db15315
-          git fetch --no-tags --depth=2 origin d65e15c071e0a3bf7e111e90b4ee972a4f5ec6bb
-          cat > "$OUTPUT/interaction.patch" <<'PATCH'
-          diff --git a/src/server/test/intake-state-read-cache-authority.test.ts b/src/server/test/intake-state-read-cache-authority.test.ts
-          index 1273d00..2734ef2 100644
-          --- a/src/server/test/intake-state-read-cache-authority.test.ts
-          +++ b/src/server/test/intake-state-read-cache-authority.test.ts
-          @@ -307,8 +307,8 @@ test('throwing getters, registry invalidation and foreign handles cannot retain
-             assert.equal(closing.fired(), true);
-           });
-           
-          -// The second change invokes its callback only after the first has traversed
-          -// retained pages. No mid-call source may mint a preparation from a mixed basis.
-          +// Input callbacks follow retained-page authentication, including the selected
-          +// collection directory. No callback may mint a preparation from a mixed basis.
-           function duringPreparation(f: ReturnType<typeof fixture>, mutate: () => void) {
-             const operationId = randomUUID();
-             const view = f.store.openView();
-          @@ -471,3 +471,64 @@ test('transaction-only preparation cannot certify a rolled-back raw-page repair'
-             }
-             assert.equal(f.read(), 'fictional-0');
-           });
-          +
-          +for (const kind of ['peer-restored', 'registry'] as const)
-          +  test(`completed map batches cannot rebase preparation authority across a barrier: ${kind}`, (t) => {
-          +    const f = fixture(t);
-          +    const peer = kind === 'peer-restored' ? new DatabaseSync(f.file) : undefined;
-          +    const leaf = f.ancestors.at(-1)!;
-          +    const operationId = randomUUID();
-          +    const before = intakeWorkCounters(f.db).warm.collectionPreparedBytes;
-          +    let fired = false;
-          +    try {
-          +      assert.throws(
-          +        () =>
-          +          f.store.prepare(f.store.openView(), {
-          +            operationId,
-          +            requestDigest: digest(operationId),
-          +            domainVersion: 2,
-          +            changes: [
-          +              { area: 'logical', collection: 'values', op: 'put', key: '000', value: 'changed-0' },
-          +              { area: 'logical', collection: 'values', op: 'put', key: '001', value: 'changed-1' },
-          +              { area: 'logical', collection: 'values', op: 'delete', key: '099' },
-          +              {
-          +                area: 'logical',
-          +                collection: 'values',
-          +                op: 'put',
-          +                key: '002',
-          +                get value() {
-          +                  assert.ok(
-          +                    intakeWorkCounters(f.db).warm.collectionPreparedBytes > before,
-          +                    'the first grouped batch has already prepared real tree nodes',
-          +                  );
-          +                  assert.equal(fired, false);
-          +                  fired = true;
-          +                  if (peer) {
-          +                    peer
-          +                      .prepare('UPDATE main.app_meta SET value=? WHERE key=?')
-          +                      .run('{}', leaf.key);
-          +                    restore(peer, leaf);
-          +                  } else clearIntakeStateCache(f.db);
-          +                  return 'changed-2';
-          +                },
-          +              },
-          +            ],
-          +          }),
-          +        /changed|stale|generation|collection|preparation/i,
-          +      );
-          +      assert.equal(fired, true);
-          +      assert.equal(f.store.replay(operationId, digest(operationId)), undefined);
-          +      for (let n = 0; n < 3; n++)
-          +        assert.equal(
-          +          f.store.get(f.store.openView(), 'logical', 'values', String(n).padStart(3, '0')),
-          +          `fictional-${n}`,
-          +          'neither the earlier batch nor the later batch was published',
-          +        );
-          +      const fresh = duringPreparation(f, () => {});
-          +      const result = transaction(f.db, () => f.store.stage(fresh.prepare()));
-          +      assert.equal(f.read(), 'changed-0');
-          +      assert.deepEqual(f.store.replay(fresh.operationId, digest(fresh.operationId)), result);
-          +    } finally {
-          +      peer?.close();
-          +    }
-          +  });
-          PATCH
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import {readFileSync,writeFileSync} from 'node:fs';
-          import {execFileSync,spawnSync} from 'node:child_process';
-          const git=(...args)=>execFileSync('git',args,{encoding:'utf8'}).trim();
-          assert.equal(git('rev-parse','HEAD^{tree}'),'66daf07de8386bf45fc539bfa526c0db90e2c8e6');
-          assert.equal(git('rev-parse','d65e15c071e0a3bf7e111e90b4ee972a4f5ec6bb^{tree}'),'061267352dbc359a4044817ad901938d17cb938f');
-          const patch=execFileSync('git',['diff','6091456889e59ea77757f30c81fe0c3f879c7abb','d65e15c071e0a3bf7e111e90b4ee972a4f5ec6bb']);
-          const patchPath=`${process.env.OUTPUT}/witness.patch`;
-          writeFileSync(patchPath,patch);
-          const applied=spawnSync('git',['apply','--3way',patchPath],{encoding:'utf8'});
-          assert.equal(applied.status,1,applied.stderr);
-          const conflicts=git('diff','--name-only','--diff-filter=U').split('\n').sort();
-          assert.deepEqual(conflicts,['docs/setup/release-updates.md','src/server/test/intake-state-collections.test.ts']);
-          for(const path of conflicts){
-            let count=0;
-            const text=readFileSync(path,'utf8').replace(/^<<<<<<< ours\n([\s\S]*?)^=======\n([\s\S]*?)^>>>>>>> theirs\n/gm,(_whole,ours,theirs)=>{
-              count++;
-              if(path.endsWith('.test.ts'))return ours+'\n'+theirs;
-              const batch=ours.split('\n').filter(line=>line.startsWith('| Bounded map mutation preparation'));
-              assert.equal(batch.length,1);
-              assert.ok(theirs.startsWith('| Authenticated collection page reuse'));
-              return batch[0]+'\n'+theirs;
-            });
-            assert.equal(count,1,`Unexpected conflict count in ${path}`);
-            assert.ok(!/^<<<<<<< |^=======|^>>>>>>> /m.test(text));
-            writeFileSync(path,text);
-          }
-          git('add','docs','src');
-          git('apply','--check',`${process.env.OUTPUT}/interaction.patch`);
-          git('apply',`${process.env.OUTPUT}/interaction.patch`);
-          git('add','docs','src');
-          assert.equal(git('write-tree'),'cc699e9c0115a04973dab2dc856caf7baa43965b');
-          writeFileSync(`${process.env.OUTPUT}/candidate-tree.txt`,git('write-tree')+'\n');
-          writeFileSync(`${process.env.OUTPUT}/integration.patch`,execFileSync('git',['diff','--cached']));
-          console.log('Exact combined candidate tree verified');
-          NODE
-          npm ci > "$OUTPUT/npm-ci.log" 2>&1
-      - name: Run complete focused integration files and static checks
-        run: |
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import {openSync,closeSync,writeFileSync,statSync} from 'node:fs';
-          import {spawnSync} from 'node:child_process';
-          import {testEnvironment} from './src/scripts/test-suite.ts';
-          const root=process.env.OUTPUT;
-          const tests=['intake-state-tree','intake-state-collections','intake-state-read-cache-authority','intake-schema-resolution-authority','intake-collection-envelope','intake-envelope-build-resume','intake-state-maintenance','intake-workflow-command','intake-envelope-upgrade'].map(name=>`src/server/test/${name}.test.ts`);
-          tests.forEach(path=>assert.ok(statSync(path).isFile()));
-          const checks=[['focused',process.execPath,['--test','--test-concurrency=1','--test-reporter=spec',...tests],testEnvironment(process.env,'server')]];
-          for(const config of ['tsconfig.json','tsconfig.server.json','tsconfig.tools.json','tsconfig.tests.json'])checks.push([config,process.execPath,['node_modules/typescript/bin/tsc','--noEmit','-p',config],process.env]);
-          checks.push(['format',process.execPath,['node_modules/prettier/bin/prettier.cjs','--check','src/server/intake-state-collections.ts','src/server/test/intake-state-collections.test.ts','src/server/test/intake-state-read-cache-authority.test.ts'],process.env]);
-          checks.push(['inventory',process.execPath,['scripts/repository-file-inventory.ts','--check'],process.env]);
-          checks.push(['whitespace','git',['diff','--cached','--check'],process.env]);
-          const results=[];
-          for(const [name,command,args,env] of checks){
-            const started=new Date().toISOString(),fd=openSync(`${root}/${name}.log`,'w');
-            const result=spawnSync(command,args,{env,stdio:['ignore',fd,fd]});closeSync(fd);
-            results.push({name,command:[command,...args],started,finished:new Date().toISOString(),exitStatus:result.status,signal:result.signal,error:result.error?.message??null});
-            writeFileSync(`${root}/checks.json`,JSON.stringify(results,null,2));
-            assert.equal(result.status,0,`${name} failed: ${result.error??result.signal??result.status}`);
-          }
-          console.log(JSON.stringify(results,null,2));
-          NODE
-      - name: Preserve verified source tree without moving any branch ref
+          fetch-depth: 3
+      - name: Preserve exact source and completed WIP evidence without rerunning tests
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git archive cc699e9c0115a04973dab2dc856caf7baa43965b | gzip -n > "$OUTPUT/source.tar.gz"
-          git ls-tree -r cc699e9c0115a04973dab2dc856caf7baa43965b > "$OUTPUT/source-tree.txt"
+          mkdir -p "$OUTPUT/logs"
+          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
+          git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
+          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
+          git cat-file -p HEAD^ > "$OUTPUT/batch-commit.txt"
+          git archive HEAD | gzip -n > "$OUTPUT/source.tar.gz"
+          git ls-tree -r HEAD > "$OUTPUT/source-tree.txt"
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
-          import {readFileSync,writeFileSync} from 'node:fs';
-          import {execFileSync} from 'node:child_process';
-          const git=(...args)=>execFileSync('git',args,{encoding:'utf8'}).trim();
-          const tree=git('write-tree');assert.equal(tree,'cc699e9c0115a04973dab2dc856caf7baa43965b');
-          const paths=git('diff','--cached','--name-only').split('\n');assert.equal(paths.length,5);
-          const response=await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/trees',{
-            method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
-            body:JSON.stringify({base_tree:'66daf07de8386bf45fc539bfa526c0db90e2c8e6',tree:paths.map(path=>({path,mode:'100644',type:'blob',content:readFileSync(path,'utf8')}))}),signal:AbortSignal.timeout(60000)
-          });
-          const result=await response.json();assert.ok(response.ok,JSON.stringify(result));assert.equal(result.sha,tree);
-          writeFileSync(`${process.env.OUTPUT}/preserved.json`,JSON.stringify({base:'fcfc73f3bc0ec2262027d62a7e1faf8b1db15315',witness:'d65e15c071e0a3bf7e111e90b4ee972a4f5ec6bb',tree,paths,refsChanged:false,node:process.version},null,2));
-          console.log(JSON.stringify({tree,paths,refsChanged:false},null,2));
+          import {writeFileSync} from 'node:fs';
+          const root=process.env.OUTPUT;
+          const api='https://api.github.com/repos/mxbaylee/circus-health';
+          const headers={Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'};
+          async function get(path,file,json=true){
+            const response=await fetch(api+path,{headers,signal:AbortSignal.timeout(30000)});
+            const text=await response.text();writeFileSync(`${root}/${file}`,text);
+            assert.ok(response.ok,`${path}: HTTP ${response.status}`);
+            return json?JSON.parse(text):text;
+          }
+          const run=await get('/actions/runs/37735896498','batch-run.json');
+          assert.equal(run.head_sha,'fcfc73f3bc0ec2262027d62a7e1faf8b1db15315');
+          const jobs=await get('/actions/runs/37735896498/attempts/1/jobs?per_page=100','batch-jobs.json');
+          assert.equal(jobs.total_count,jobs.jobs.length);
+          const summaries=[];
+          for(const job of jobs.jobs){
+            if(job.status!=='completed')continue;
+            if(job.conclusion==='success'&&!['acceptance','continuation','Browser (2/6)'].includes(job.name))continue;
+            try {
+              const text=await get(`/actions/jobs/${job.id}/logs`,`logs/${job.id}.log`,false);
+              const lines=text.split('\n');const start=lines.findIndex(line=>line.includes('failing tests:'));
+              summaries.push({id:job.id,name:job.name,conclusion:job.conclusion,startedAt:job.started_at,completedAt:job.completed_at,excerpt:start>=0?lines.slice(start,start+110):lines.filter(line=>/##\[error\]|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|duration_ms/.test(line))});
+            }catch(error){summaries.push({id:job.id,name:job.name,captureError:String(error)});}
+          }
+          writeFileSync(`${root}/failure-summary.json`,JSON.stringify(summaries,null,2));
+          await get('/pulls/71','pr.json');
+          await get('/issues/71/comments?since=2026-10-08T06%3A07%3A00Z&per_page=100','review-comments.json');
+          await get('/git/ref/heads/codex/pr71-step3-witness-wip','witness-ref.json');
+          await get('/git/commits/d65e15c071e0a3bf7e111e90b4ee972a4f5ec6bb','witness-commit.json');
+          await get('/actions/runs/37737310074','combined-run.json');
+          await get('/actions/runs/37737310074/jobs?per_page=100','combined-jobs.json');
+          console.log(JSON.stringify(summaries,null,2));
           NODE
       - name: Hash retained output
         if: always()
@@ -206,7 +77,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step3-combined-verified
-          path: /tmp/pr71-step3-combined
+          name: pr71-published-evidence
+          path: /tmp/pr71-published-evidence
           if-no-files-found: error
           retention-days: 14
