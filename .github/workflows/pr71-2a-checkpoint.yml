@@ -6,100 +6,83 @@ on:
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
 
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 18
     env:
-      HUSKY: '0'
-      OUTPUT: /tmp/pr71-step3-index-sql
+      OUTPUT: /tmp/pr71-step3c-receipt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 51e356cc33bfaae265fb4389ed9a3cfb85d15537
+          ref: 9a4b2e0f6effac08fce454b246a808f03355eed1
           persist-credentials: false
-          fetch-depth: 1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+          fetch-depth: 2
+      - name: Preserve exact published source immediately
+        run: |
+          mkdir -p "$OUTPUT/logs"
+          test "$(git rev-parse HEAD)" = 9a4b2e0f6effac08fce454b246a808f03355eed1
+          test "$(git rev-parse HEAD^{tree})" = 5d0d4b5adef4556377818457000697d55beb6b52
+          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
+          git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
+          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
+          git cat-file -p HEAD^ > "$OUTPUT/parent-commit.txt"
+          git archive HEAD | gzip -n > "$OUTPUT/source.tar.gz"
+          git ls-tree -r HEAD > "$OUTPUT/source-tree.txt"
+          git diff HEAD^ HEAD > "$OUTPUT/published.patch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          node-version-file: .nvmrc
-          package-manager-cache: false
-      - name: Prepare pinned source and contributor dependencies
-        run: |
-          mkdir -p "$OUTPUT"
-          test "$(git rev-parse HEAD)" = 51e356cc33bfaae265fb4389ed9a3cfb85d15537
-          git rev-parse HEAD > "$OUTPUT/base-sha.txt"
-          npm ci > "$OUTPUT/npm-ci.log" 2>&1
-      - name: Recover the checksum-pinned patch and prove its counted regression
+          name: pr71-step3c-source-receipt
+          path: /tmp/pr71-step3c-receipt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Observe the existing required run without dispatching tests
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
-          import {gunzipSync} from 'node:zlib';
           import {writeFileSync} from 'node:fs';
-          import {createHash} from 'node:crypto';
-          import {spawnSync} from 'node:child_process';
-          import {testEnvironment} from './src/scripts/test-suite.ts';
-          const url='https://api.github.com/repos/mxbaylee/circus-health/contents/.github/workflows/pr71-2a-checkpoint.yml?ref=3b039d4db87633cb00e3e268bcc44a4e462c3229';
-          const response=await fetch(url,{headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(30000)});
-          assert.ok(response.ok);const file=await response.json();assert.equal(file.sha,'d8d2135df2187562fcb06b0db60ad44b558376fc');
-          const original=Buffer.from(file.content,'base64');
-          const blob=createHash('sha1').update(`blob ${original.length}\0`).update(original).digest('hex');assert.equal(blob,file.sha);
-          writeFileSync(`${process.env.OUTPUT}/original-transfer.yml`,original);
-          let encoded=/const encoded = '([^']+)'/.exec(original.toString('utf8'))?.[1];assert.ok(encoded);
-          const corrections=[['JSB8bU','JSB/bU'],['P9nTT2Q','P9nT2Q'],['uttZZ19','uttZ19'],['Mhsn9d9','Mhsnsh9d9']];
-          for(const [from,to] of corrections){assert.equal(encoded.split(from).length,2);encoded=encoded.replace(from,to);}
-          const patch=gunzipSync(Buffer.from(encoded,'base64'));
-          assert.equal(createHash('sha256').update(patch).digest('hex'),'1ccfd45e169acd637aa63a46b6ae68d94bae72d0aeca867991294e2de6528aa1');
-          writeFileSync(`${process.env.OUTPUT}/repair.patch`,patch);
-          function git(...args){const result=spawnSync('git',args,{encoding:'utf8'});assert.equal(result.status,0,result.stderr);return result.stdout.trim();}
-          git('apply','--check',`${process.env.OUTPUT}/repair.patch`);
-          git('apply','--include=src/server/test/record-replay-sql.test.ts',`${process.env.OUTPUT}/repair.patch`);
-          const args=['--test','--test-concurrency=1','--test-name-pattern=publication reads fresh','--test-reporter=spec','src/server/test/record-replay-sql.test.ts'];
-          const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),encoding:'utf8',maxBuffer:16*1024*1024});
-          const text=result.stdout+result.stderr;
-          writeFileSync(`${process.env.OUTPUT}/red.log`,text);writeFileSync(`${process.env.OUTPUT}/red-result.json`,JSON.stringify({args,status:result.status,signal:result.signal}));
-          assert.equal(result.status,1);assert.match(text,/tests 2/);assert.match(text,/fail 2/);assert.match(text,/cancelled 0/);assert.match(text,/skipped 0/);assert.match(text,/one fresh read statement/);
-          git('apply','--exclude=src/server/test/record-replay-sql.test.ts',`${process.env.OUTPUT}/repair.patch`);
-          git('add','docs/data/record-version-storage.md','docs/setup/release-updates.md','src/server/record-versions.ts','src/server/test/record-replay-sql.test.ts');
-          assert.equal(git('write-tree'),'5d0d4b5adef4556377818457000697d55beb6b52');git('diff','--cached','--check');
-          writeFileSync(`${process.env.OUTPUT}/candidate-tree.txt`,git('write-tree')+'\n');
-          NODE
-      - name: Execute complete record, history and encrypted-profile regressions
-        run: |
-          node --input-type=module <<'NODE'
-          import {spawnSync} from 'node:child_process';
-          import {openSync,closeSync,writeFileSync} from 'node:fs';
-          import {testEnvironment} from './src/scripts/test-suite.ts';
-          const names=['record-versions','record-history-index-growth','record-note-history','record-replay-sql','record-status-read-reuse','contributor-record-storage','encrypted-profiles'];
-          const args=['--test','--test-concurrency=1','--test-reporter=spec',...names.map(n=>`src/server/test/${n}.test.ts`)];
-          const fd=openSync(`${process.env.OUTPUT}/green.log`,'w');
-          const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});closeSync(fd);
-          writeFileSync(`${process.env.OUTPUT}/green-result.json`,JSON.stringify({args,status:result.status,signal:result.signal}));process.exitCode=result.status??1;
-          NODE
-      - name: Verify all static checks
-        run: |
-          npm run typecheck > "$OUTPUT/typecheck.log" 2>&1
-          npx prettier --check src/server/record-versions.ts src/server/test/record-replay-sql.test.ts > "$OUTPUT/format.log" 2>&1
-          node scripts/repository-file-inventory.ts --check > "$OUTPUT/inventory.log" 2>&1
-      - name: Store verified source blobs without updating any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git archive "$(git write-tree)" | gzip -n > "$OUTPUT/source.tar.gz"
-          git ls-tree -r "$(git write-tree)" > "$OUTPUT/source-tree.txt"
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import {readFileSync,writeFileSync} from 'node:fs';
-          const files=[['docs/data/record-version-storage.md','2af280885b021285fd38dc8f6ef3a22c8d51972a'],['docs/setup/release-updates.md','42d7f1e9adaa5324e60d0283ee200ddb7e7d8b01'],['src/server/record-versions.ts','a4bff35fd9f7ff741e11cb9fda97a1256d9c1504'],['src/server/test/record-replay-sql.test.ts','36d94166369ec90aa0c1f0082be8e8d422a62b1a']];
-          const blobs=[];
-          for(const [path,sha] of files){
-            const response=await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs',{method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},body:JSON.stringify({content:readFileSync(path,'utf8'),encoding:'utf-8'})});
-            const result=await response.json();assert.ok(response.ok,JSON.stringify(result));assert.equal(result.sha,sha);blobs.push({path,sha,mode:'100644',type:'blob'});
+          import {setTimeout as sleep} from 'node:timers/promises';
+          const root=process.env.OUTPUT,api='https://api.github.com/repos/mxbaylee/circus-health';
+          async function get(path,file,json=true){
+            const response=await fetch(api+path,{headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(30000)});
+            const text=await response.text();if(file)writeFileSync(`${root}/${file}`,text);
+            assert.ok(response.ok,`${path}: HTTP ${response.status}`);return json?JSON.parse(text):text;
           }
-          writeFileSync(`${process.env.OUTPUT}/blobs.json`,JSON.stringify(blobs,null,2));console.log(JSON.stringify(blobs));
+          await get('/pulls/71','pr-at-start.json');
+          await get('/git/ref/heads/codex/pr71-step3-safety-20261008','safety-ref.json');
+          await get('/git/ref/heads/codex/pr71-step3-witness-wip','witness-ref.json');
+          await get('/issues/comments/6063003743','preservation-comment.json');
+          await get('/issues/comments/6063465224','bounded-review-request.json');
+          await get('/issues/comments/6063504616','bounded-review-result.json');
+          const observations=[];
+          let jobs,run;
+          for(let attempt=0;attempt<15;attempt++){
+            run=await get('/actions/runs/37802077446','run.json');assert.equal(run.head_sha,'9a4b2e0f6effac08fce454b246a808f03355eed1');
+            jobs=await get('/actions/runs/37802077446/attempts/1/jobs?per_page=100','jobs.json');assert.equal(jobs.total_count,jobs.jobs.length);
+            const gates=jobs.jobs.filter(job=>['history','acceptance','continuation','checks'].includes(job.name)).map(({id,name,status,conclusion})=>({id,name,status,conclusion}));
+            observations.push({observedAt:new Date().toISOString(),runStatus:run.status,gates});writeFileSync(`${root}/observations.json`,JSON.stringify(observations,null,2));
+            if(run.status==='completed'||attempt===14)break;
+            await sleep(60000);
+          }
+          await get('/pulls/71','pr-at-end.json');
+          const summaries=[];
+          for(const job of jobs.jobs){
+            if(job.status!=='completed')continue;
+            if(job.conclusion==='success'&&!['history','acceptance','continuation','Browser (1/6)','Browser (2/6)','Browser (5/6)','checks'].includes(job.name))continue;
+            try{
+              const text=await get(`/actions/jobs/${job.id}/logs`,`logs/${job.id}.log`,false);
+              const lines=text.split('\n'),start=lines.findIndex(line=>line.includes('failing tests:'));
+              summaries.push({id:job.id,name:job.name,conclusion:job.conclusion,startedAt:job.started_at,completedAt:job.completed_at,excerpt:start>=0?lines.slice(start,start+90):lines.filter(line=>/##\[error\]|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|ℹ skipped|duration_ms|retained proposal artifacts|superseded-only receipt|recovery stage|request finished/.test(line))});
+            }catch(error){summaries.push({id:job.id,name:job.name,captureError:String(error)});}
+          }
+          const counts={};for(const job of jobs.jobs){const key=job.conclusion??job.status;counts[key]=(counts[key]??0)+1;}
+          const summary={observedAt:new Date().toISOString(),head:run.head_sha,runId:run.id,attempt:1,runStatus:run.status,runConclusion:run.conclusion,counts,summaries};
+          writeFileSync(`${root}/summary.json`,JSON.stringify(summary,null,2));console.log(JSON.stringify(summary,null,2));
           NODE
       - name: Hash retained evidence
         if: always()
@@ -111,7 +94,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step3-index-sql
-          path: /tmp/pr71-step3-index-sql
+          name: pr71-step3c-ci-receipt
+          path: /tmp/pr71-step3c-receipt
           if-no-files-found: error
           retention-days: 14
