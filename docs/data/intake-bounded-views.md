@@ -293,6 +293,12 @@ changes, cache disposal, failed authority checks and database closure discard
 reuse; consumers still perform their normal admission and post-yield checks.
 Direct and inventory-recipe package scopes continue through their existing readers.
 
+Progress reuse checks count node lookups (raw node reads plus authenticated cache
+hits) and SQL authority queries separately. Both must strictly decrease when a
+pending work unit exists, while raw node reads must not increase. A fully warm
+direct plan can legitimately make zero raw node reads on both paths; that is not
+a regression. A no-reuse control must still fail these counted checks.
+
 The coordinator's current-interpretation check retains at most eight scalar
 results per database, without materializing proposal IDs. Reuse requires the
 same owner, source/version pins, collection-cache generation and SQLite

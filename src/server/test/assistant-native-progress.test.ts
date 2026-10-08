@@ -114,8 +114,28 @@ for (const kind of ['retained', 'direct', 'package'] as const)
       assert.deepEqual(actual.reading.workUnit, oldWorkUnit);
       const previousReads = afterOld.collectionNodeReads - before.collectionNodeReads,
         selectedReads = after.collectionNodeReads - afterOld.collectionNodeReads;
-      if (oldWorkUnit)
-        assert.ok(selectedReads < previousReads, 'reuse removes repeated unit/history resolution');
+      const previousLookups =
+          previousReads + afterOld.collectionNodeCacheHits - before.collectionNodeCacheHits,
+        selectedLookups =
+          selectedReads + after.collectionNodeCacheHits - afterOld.collectionNodeCacheHits,
+        previousWitnesses =
+          afterOld.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+        selectedWitnesses =
+          after.collectionReadWitnessQueries - afterOld.collectionReadWitnessQueries;
+      // A fully warm direct plan can perform zero raw node reads on both paths.
+      // Reuse must still remove real lookups and SQL authority work, not merely
+      // benefit from running second against pages loaded by the baseline.
+      if (oldWorkUnit) {
+        assert.ok(selectedReads <= previousReads, 'reuse must not add raw node reads');
+        assert.ok(
+          selectedLookups < previousLookups,
+          'reuse removes repeated node lookups, including authenticated cache hits',
+        );
+        assert.ok(
+          selectedWitnesses < previousWitnesses,
+          'reuse removes repeated SQL authority queries even with a fully warm node cache',
+        );
+      }
       for (const counter of [
         'sourceDTOHydrations',
         'envelopeHydrations',
@@ -123,7 +143,16 @@ for (const kind of ['retained', 'direct', 'package'] as const)
       ] as const)
         assert.equal(after[counter], before[counter]);
       t.diagnostic(
-        JSON.stringify({ kind, workUnit: oldWorkUnit?.id, previousReads, selectedReads }),
+        JSON.stringify({
+          kind,
+          workUnit: oldWorkUnit?.id,
+          previousReads,
+          selectedReads,
+          previousLookups,
+          selectedLookups,
+          previousWitnesses,
+          selectedWitnesses,
+        }),
       );
       return actual;
     };
