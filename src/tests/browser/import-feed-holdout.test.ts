@@ -260,6 +260,11 @@ function runtimeFailureSummary(capture: {
   }
 }
 
+const runtimeFailureReport = (
+  route: string,
+  diagnostic: ReturnType<typeof runtimeFailureSummary>,
+) => JSON.stringify({ route: diagnosticRoute(route), diagnostic });
+
 test('holdout transport diagnostics retain fixed socket state without private routes', () => {
   const privateRoute = '/api/profiles/private-profile/intakes/import-feed?private-token=secret';
   const capture = {
@@ -285,7 +290,11 @@ test('holdout transport diagnostics retain fixed socket state without private ro
       '\n',
   };
   const summary = runtimeFailureSummary(capture);
-  const output = JSON.stringify(summary);
+  const output = runtimeFailureReport(privateRoute, summary);
+  const reported = JSON.parse(output);
+  assert.equal(reported.route, '/api/profiles/:profile/intakes/import-feed');
+  assert.equal(reported.diagnostic.connections.activeRequests[0].method, 'GET');
+  assert.equal(reported.diagnostic.connections.recent[0].event, 'socket-close');
   assert.match(output, /api\/profiles\/:profile\/intakes\/import-feed/);
   assert.match(output, /socket-close/);
   assert.doesNotMatch(output, /private-profile|private-token|secret|private stderr/);
@@ -555,8 +564,7 @@ test(
           }
           console.error(
             'Fictional holdout failed request',
-            diagnosticRoute(prefix + path),
-            diagnostic,
+            runtimeFailureReport(prefix + path, diagnostic),
           );
           throw error;
         }

@@ -98,6 +98,28 @@ const envelope = (proposed: boolean) => ({
   ],
 });
 
+const opticalDiagnosticReport = (event: string, snapshot: Record<string, unknown>) =>
+  JSON.stringify({ event, ...snapshot });
+
+test('optical diagnostic JSON preserves nested phase and request evidence', () => {
+  const snapshot = {
+    phase: 'top-level original upload',
+    phaseDurationMs: 12,
+    apiTransportAttempts: 2,
+    apiTransportSettled: 1,
+    inFlight: [{ method: 'POST', path: '/api/profiles/:id/intakes', durationMs: 5 }],
+    recentBrowserRequests: [{ method: 'GET', path: '/api/intakes/:id/review', status: 200 }],
+  };
+  const output = opticalDiagnosticReport('phase-complete', snapshot);
+  const reported = JSON.parse(output);
+  assert.equal(reported.event, 'phase-complete');
+  assert.equal(reported.phaseDurationMs, 12);
+  assert.equal(reported.apiTransportAttempts, 2);
+  assert.equal(reported.inFlight[0].method, 'POST');
+  assert.equal(reported.recentBrowserRequests[0].status, 200);
+  assert.doesNotMatch(output, /\[Object\]/);
+});
+
 test(
   'encrypted browser accepts both proposed and top-level optical mappings through grouped identity and date review',
   { timeout: 420000 },
@@ -106,19 +128,9 @@ test(
     let phase = 'runtime startup';
     let phaseStarted = Date.now();
     let completed = false;
-    const enterPhase = (name: string) => {
-      phase = name;
-      phaseStarted = Date.now();
-    };
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-mapping-shapes-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startProcessRuntime(t, {
-      dataDirectory: resolve(root, 'data'),
-      runtimeDirectory,
-      port: 0,
-      host: '127.0.0.1',
-    });
     const inFlight = new Map<number, { method: string; path: string; started: number }>();
     const browserInFlight = new Map<Request, { method: string; path: string; started: number }>();
     const recentBrowserRequests: Array<{
@@ -128,6 +140,11 @@ test(
       durationMs: number;
     }> = [];
     let requestNumber = 0;
+    let apiTransportSettled = 0;
+    let apiTransportRejected = 0;
+    let browserApiStarted = 0;
+    let browserApiFinished = 0;
+    let browserApiFailed = 0;
     let evictedApiRequests = 0;
     let evictedBrowserRequests = 0;
     const routeSegments = new Set([
@@ -159,6 +176,13 @@ test(
     const diagnosticSnapshot = () => ({
       phase,
       phaseDurationMs: Date.now() - phaseStarted,
+      // Cumulative transport counts are not successful clinical operations.
+      apiTransportAttempts: requestNumber,
+      apiTransportSettled,
+      apiTransportRejected,
+      browserApiStarted,
+      browserApiFinished,
+      browserApiFailed,
       inFlight: [...inFlight.values()].map((request) => ({
         method: request.method,
         path: request.path,
@@ -173,6 +197,19 @@ test(
       evictedBrowserRequests,
       recentBrowserRequests,
     });
+    const logDiagnostic = (event: string) => {
+      if (diagnosticsEnabled)
+        console.error(
+          'Fictional optical browser diagnostic',
+          opticalDiagnosticReport(event, diagnosticSnapshot()),
+        );
+    };
+    const enterPhase = (name: string) => {
+      logDiagnostic('phase-complete');
+      phase = name;
+      phaseStarted = Date.now();
+      logDiagnostic('phase-start');
+    };
     const trackRequest = async <T>(method: string, path: string, run: () => Promise<T>) => {
       if (!diagnosticsEnabled) return run();
       const id = ++requestNumber;
@@ -183,18 +220,27 @@ test(
       inFlight.set(id, { method, path: diagnosticPath(path), started: Date.now() });
       try {
         return await run();
+      } catch (error) {
+        apiTransportRejected++;
+        throw error;
       } finally {
+        apiTransportSettled++;
         inFlight.delete(id);
       }
     };
-    const onAbort = () =>
-      console.error('Fictional optical browser interrupted', diagnosticSnapshot());
+    const onAbort = () => logDiagnostic('interrupted');
     if (diagnosticsEnabled) t.signal.addEventListener('abort', onAbort, { once: true });
+    logDiagnostic('phase-start');
+    const runtime = await startProcessRuntime(t, {
+      dataDirectory: resolve(root, 'data'),
+      runtimeDirectory,
+      port: 0,
+      host: '127.0.0.1',
+    });
     let removePageListeners = () => {};
     let browser: Browser | undefined;
     t.after(async () => {
-      if (diagnosticsEnabled && !completed)
-        console.error('Fictional optical browser final phase', diagnosticSnapshot());
+      if (!completed) logDiagnostic('final-phase');
       if (diagnosticsEnabled) t.signal.removeEventListener('abort', onAbort);
       removePageListeners();
       await browser?.close();
@@ -208,6 +254,7 @@ test(
       const onRequest = (request: Request) => {
         const path = new URL(request.url()).pathname;
         if (!path.startsWith('/api/')) return;
+        browserApiStarted++;
         if (browserInFlight.size === 16) {
           browserInFlight.delete(browserInFlight.keys().next().value!);
           evictedBrowserRequests++;
@@ -219,6 +266,10 @@ test(
         });
       };
       const finish = (request: Request, status: number | 'failed') => {
+        if (new URL(request.url()).pathname.startsWith('/api/')) {
+          if (status === 'failed') browserApiFailed++;
+          else browserApiFinished++;
+        }
         const started = browserInFlight.get(request);
         if (!started) return;
         browserInFlight.delete(request);
@@ -910,6 +961,7 @@ test(
     );
     assert.deepEqual(await queueOriginal.body(), queueBytes);
     assert.deepEqual(errors, []);
+    logDiagnostic('journey-complete');
     completed = true;
   },
 );
