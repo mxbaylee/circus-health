@@ -6,132 +6,99 @@ on:
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
 
 jobs:
   capture:
-    strategy:
-      fail-fast: false
-      matrix:
-        case: [focused, artifact, receipt]
     runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    timeout-minutes: 10
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-step3
-      CASE: ${{ matrix.case }}
+      OUTPUT: /tmp/pr71-step3-phases
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: af98227c397c2c5939b5b49a13effa8e2ebf838d
+          ref: 6091456889e59ea77757f30c81fe0c3f879c7abb
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - name: Prepare pinned tooling and checksum-verified patch
+      - name: Prepare phase-only copy of the unchanged full artifact scenario
         run: |
           mkdir -p "$OUTPUT"
-          test "$(git rev-parse HEAD)" = af98227c397c2c5939b5b49a13effa8e2ebf838d
-          git rev-parse HEAD > "$OUTPUT/base-sha.txt"
+          test "$(git rev-parse HEAD)" = 6091456889e59ea77757f30c81fe0c3f879c7abb
+          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
+          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
+          git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
           npm ci > "$OUTPUT/npm-ci.log" 2>&1
           node --input-type=module <<'NODE'
-          import { gunzipSync } from 'node:zlib';
+          import { readFileSync,writeFileSync } from 'node:fs';
+          import { resolve,dirname } from 'node:path';
+          import { pathToFileURL } from 'node:url';
           import { createHash } from 'node:crypto';
-          import { writeFileSync } from 'node:fs';
-          const uri='https://raw.githubusercontent.com/mxbaylee/circus-health/0ec4513ffead41a7ceb3846471e54ff417bc81f0/.github/workflows/pr71-2a-checkpoint.yml';
-          const response=await fetch(uri,{signal:AbortSignal.timeout(30000)});
-          if(!response.ok)throw Error(`Pinned transfer source: HTTP ${response.status}`);
-          const text=await response.text();
-          const match=text.match(/const encoded = '([A-Za-z0-9+/=]+)'/);
-          if(!match)throw Error('Missing literal patch payload');
-          // Repair the single duplicated transfer character, then require the
-          // already independently computed SHA-256 of the complete local diff.
-          const encoded=match[1].replace('SmURZZ6g','SmURZ6g');
-          const patch=gunzipSync(Buffer.from(encoded,'base64'));
-          const sha=createHash('sha256').update(patch).digest('hex');
-          if(sha!=='5ab77a3a0b152eee85f538bcef99445ea0f6391dfdf7f733f74267026f35e75b')throw Error('Patch transfer checksum mismatch');
-          writeFileSync(`${process.env.OUTPUT}/repair.patch`,patch);
-          writeFileSync(`${process.env.OUTPUT}/transfer.json`,JSON.stringify({uri,patchSha256:sha,bytes:patch.length},null,2));
+          const path=resolve('src/server/test/intake-identity-native-artifact-history.test.ts');
+          const original=readFileSync(path,'utf8');
+          let text=original;
+          const replace=(before,after)=>{
+            if(text.split(before).length!==2)throw Error(`Nonunique phase anchor: ${before}`);
+            text=text.replace(before,after);
+          };
+          replace('async function artifactHistoryFixture(t: test.TestContext) {',`async function artifactHistoryFixture(t: test.TestContext) {
+            const started = performance.now();
+            let prior = started;
+            const phase = (name: string, db?: Parameters<typeof intakeWorkCounters>[0]) => {
+              const now = performance.now();
+              t.diagnostic(JSON.stringify({ diagnostic: 'unchanged full artifact history phases', phase: name, elapsedMs: now-started, phaseMs: now-prior, work: db ? {...intakeWorkCounters(db).warm} : null }));
+              prior = now;
+            };
+            phase('start');`);
+          replace('  assert.notEqual(oldVersionId, latestVersionId);',"  phase('seed-ready', f.db);\n  assert.notEqual(oldVersionId, latestVersionId);");
+          replace('  const prepared = await prepareIntakeWorkflowCommand(',"  phase('history-preparation-start', f.db);\n  const prepared = await prepareIntakeWorkflowCommand(");
+          replace("  if (prepared.replayed) throw Error('Unexpected artifact fixture replay');", "  phase('history-prepared', f.db);\n  if (prepared.replayed) throw Error('Unexpected artifact fixture replay');");
+          replace('  const cold = await f.review();', "  phase('history-published', f.db);\n  const cold = await f.review();\n  phase('cold-review-complete', f.db);");
+          replace('  const stable = await f.review();', "  const stable = await f.review();\n  phase('stable-review-complete', f.db);");
+          replace('    ...f,\n    artifacts,',"    ...f,\n    phase,\n    artifacts,");
+          replace('    const f = await artifactHistoryFixture(t);', "    const f = await artifactHistoryFixture(t);\n    f.phase('fixture-and-public-membership-complete', f.db);");
+          replace('        assert.deepEqual(await warm, expectedWarm);', "        assert.deepEqual(await warm, expectedWarm);\n        f.phase('full-warm-and-cooperation-complete', f.db);");
+          const imports=[];
+          text=text.replace(/from\s+(['"])(\.[^'"]+)\1/g,(_all,quote,specifier)=>{
+            const target=pathToFileURL(resolve(dirname(path),specifier)).href;
+            imports.push({specifier,target});return `from ${quote}${target}${quote}`;
+          });
+          if(!imports.length)throw Error('Missing relative source imports');
+          if(!text.includes('{ timeout: 450000 }')||!text.includes('n < 256')||!text.includes('449'))throw Error('Lost original fixture or guard');
+          writeFileSync(`${process.env.OUTPUT}/artifact-phases.test.ts`,text);
+          writeFileSync(`${process.env.OUTPUT}/diagnostic-source.json`,JSON.stringify({source:path,sourceSha256:createHash('sha256').update(original).digest('hex'),adaptedSha256:createHash('sha256').update(text).digest('hex'),scope:'Phase-output and absolute-import additions only; original constants, assertions and 450000ms guard unchanged',imports},null,2));
           NODE
-      - name: Verify the expected regression failure before the repair
-        if: matrix.case == 'focused'
-        run: |
-          git apply --include='src/server/test/*' "$OUTPUT/repair.patch"
-          node --input-type=module <<'NODE'
-          import { spawnSync } from 'node:child_process';
-          import { writeFileSync } from 'node:fs';
-          import { testEnvironment } from './src/scripts/test-suite.ts';
-          const args=['--test','--test-concurrency=1','--test-reporter=spec','--test-name-pattern=native lexical order pages|prefix-scoped collection ranges','src/server/test/intake-collection-envelope.test.ts','src/server/test/intake-state-collections.test.ts'];
-          const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),encoding:'utf8',maxBuffer:8*1024*1024});
-          const log=(result.stdout??'')+(result.stderr??'');
-          writeFileSync(`${process.env.OUTPUT}/red.log`,log);
-          writeFileSync(`${process.env.OUTPUT}/red-result.json`,JSON.stringify({command:['node',...args],status:result.status,signal:result.signal,error:result.error?.message??null},null,2));
-          if(result.status!==1||!/ℹ fail 3\b/.test(log)||!/ℹ cancelled 0\b/.test(log)||!/ℹ skipped 0\b/.test(log))throw Error('Expected three assertion failures without cancellations or skips');
-          NODE
-      - name: Apply and verify the exact candidate tree
-        run: |
-          if [ "$CASE" = focused ]; then
-            git apply --exclude='src/server/test/*' "$OUTPUT/repair.patch"
-          else
-            git apply "$OUTPUT/repair.patch"
-          fi
-          git add docs/data/intake-state-storage.md docs/setup/release-updates.md src/server/intake-collection-envelope.ts src/server/intake-state-collections.ts src/server/test/intake-collection-envelope.test.ts src/server/test/intake-state-collections.test.ts src/server/test/intake-state-read-cache-authority.test.ts
-          git write-tree > "$OUTPUT/candidate-tree.txt"
-          test "$(cat "$OUTPUT/candidate-tree.txt")" = be1e57f3544eee63316b61036b378d9041927183
-          git diff --cached --check
-      - name: Execute complete unchanged history or focused test files
+      - name: Execute the original full oracle with phase observations
         run: |
           node --input-type=module <<'NODE'
-          import { spawnSync } from 'node:child_process';
-          import { openSync,closeSync,writeFileSync } from 'node:fs';
-          import { testEnvironment } from './src/scripts/test-suite.ts';
-          const files={
-            artifact:['src/server/test/intake-identity-native-artifact-history.test.ts'],
-            receipt:['src/server/test/intake-identity-native-receipt-history.test.ts'],
-            focused:['src/server/test/intake-collection-envelope.test.ts','src/server/test/intake-state-collections.test.ts','src/server/test/intake-state-read-cache-authority.test.ts','src/server/test/intake-schema-resolution-authority.test.ts']
-          }[process.env.CASE];
-          if(!files)throw Error('Unknown test case');
-          const args=['--test','--test-concurrency=1','--test-reporter=spec',...files];
-          const start=new Date().toISOString();
+          import {spawnSync} from 'node:child_process';
+          import {openSync,closeSync,writeFileSync} from 'node:fs';
+          import {testEnvironment} from './src/scripts/test-suite.ts';
+          const args=['--test','--test-concurrency=1','--test-reporter=spec',`${process.env.OUTPUT}/artifact-phases.test.ts`];
+          const started=new Date().toISOString();
           const fd=openSync(`${process.env.OUTPUT}/tests.log`,'w');
           const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});
           closeSync(fd);
-          const receipt={case:process.env.CASE,command:['node',...args],start,end:new Date().toISOString(),node:process.version,status:result.status,signal:result.signal,error:result.error?.message??null};
-          writeFileSync(`${process.env.OUTPUT}/test-result.json`,JSON.stringify(receipt,null,2));
-          console.log(JSON.stringify(receipt,null,2));
+          writeFileSync(`${process.env.OUTPUT}/test-result.json`,JSON.stringify({command:['node',...args],started,finished:new Date().toISOString(),node:process.version,status:result.status,signal:result.signal,error:result.error?.message??null},null,2));
           process.exitCode=result.status??1;
           NODE
-      - name: Check all types, formatting and repository inventory
-        if: matrix.case == 'focused'
-        run: |
-          npm run typecheck > "$OUTPUT/typecheck.log" 2>&1
-          npx prettier --check docs/data/intake-state-storage.md docs/setup/release-updates.md src/server/intake-collection-envelope.ts src/server/intake-state-collections.ts src/server/test/intake-collection-envelope.test.ts src/server/test/intake-state-collections.test.ts src/server/test/intake-state-read-cache-authority.test.ts > "$OUTPUT/format.log" 2>&1
-          node scripts/repository-file-inventory.ts --check > "$OUTPUT/inventory.log" 2>&1
-          git diff --cached --check
-      - name: Preserve exact source and verified blobs without updating any branch
-        if: matrix.case == 'focused'
+      - name: Retain current actual PR checks and bounded review
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git archive be1e57f3544eee63316b61036b378d9041927183 | gzip -n > "$OUTPUT/source.tar.gz"
-          git ls-tree -r be1e57f3544eee63316b61036b378d9041927183 > "$OUTPUT/source-tree.txt"
           node --input-type=module <<'NODE'
-          import { execFileSync } from 'node:child_process';
-          import { readFileSync,writeFileSync } from 'node:fs';
-          const paths=execFileSync('git',['diff','--cached','--name-only'],{encoding:'utf8'}).trim().split('\n');
-          if(paths.length!==7)throw Error('Wrong changed-file count');
-          const blobs=[];
-          for(const path of paths){
-            const content=readFileSync(path,'utf8');
-            const expected=execFileSync('git',['hash-object',path],{encoding:'utf8'}).trim();
-            const response=await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs',{method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},body:JSON.stringify({content,encoding:'utf-8'}),signal:AbortSignal.timeout(30000)});
+          import {writeFileSync} from 'node:fs';
+          const api='https://api.github.com/repos/mxbaylee/circus-health';
+          for(const [path,file] of [['/actions/runs/37720471221','normal-run.json'],['/actions/runs/37720471221/jobs?per_page=100','normal-jobs.json'],['/issues/comments/6051256915','bounded-review-request.json'],['/issues/comments/6051280549','bounded-review-result.json'],['/pulls/71','pr.json']]){
+            const response=await fetch(api+path,{headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(30000)});
             if(!response.ok)throw Error(`${path}: HTTP ${response.status}`);
-            const actual=await response.json();
-            if(actual.sha!==expected)throw Error(`Blob mismatch: ${path}`);
-            blobs.push({path,mode:'100644',type:'blob',sha:actual.sha});
-            writeFileSync(`${process.env.OUTPUT}/blobs.json`,JSON.stringify(blobs,null,2));
+            writeFileSync(`${process.env.OUTPUT}/${file}`,await response.text());
           }
           NODE
       - name: Hash retained output
@@ -144,7 +111,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step3-${{ matrix.case }}
-          path: /tmp/pr71-step3
+          name: pr71-step3-full-artifact-phases
+          path: /tmp/pr71-step3-phases
           if-no-files-found: error
           retention-days: 14
