@@ -396,7 +396,13 @@ export function* iterateRecordCommitSegments(
     fail('unsupported segment index');
   const scratch = disposableSqlite('circus-record-segments-');
   try {
-    scratch.db.exec('CREATE TABLE segments(ordinal INTEGER PRIMARY KEY,reference TEXT NOT NULL)');
+    // This private ordering index is consumed on this connection and discarded.
+    // Keep its bounded disk-backed work in one transaction instead of an
+    // implicit pager transaction per reference. Journal objects are still read
+    // and authenticated by the original reader on every traversal.
+    scratch.db.exec(
+      'CREATE TABLE segments(ordinal INTEGER PRIMARY KEY,reference TEXT NOT NULL); BEGIN',
+    );
     const insert = scratch.db.prepare('INSERT INTO segments VALUES(?,?)');
     let ref = commit.segments.head,
       expected = commit.segments.count;
@@ -473,7 +479,7 @@ function committedSince(
   const scratch = disposableSqlite('circus-record-ancestry-');
   try {
     scratch.db.exec(
-      'CREATE TABLE ancestry (ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, reference TEXT NOT NULL)',
+      'CREATE TABLE ancestry (ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, reference TEXT NOT NULL); BEGIN',
     );
     const insert = scratch.db.prepare('INSERT INTO ancestry VALUES(?,?,?)');
     const seen = scratch.db.prepare('SELECT 1 FROM ancestry WHERE name=?');

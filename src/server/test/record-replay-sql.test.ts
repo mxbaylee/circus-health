@@ -1,7 +1,7 @@
 /** Replay-only work regression; the full HTTP/encrypted acceptance gate remains separate. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -71,12 +71,35 @@ for (const count of [4, 64])
     for (let attempt = 0; attempt < 2; attempt++) {
       const prepared = { remove: 0, insert: 0 };
       const executed = { remove: 0, insert: 0 };
+      const scratch = {
+        ancestry: { inserts: 0, outsideTransaction: 0, connections: 0 },
+        segments: { inserts: 0, outsideTransaction: 0, connections: 0 },
+      };
+      const scratchConnections: Array<{ db: DatabaseSync; path: string }> = [];
       const prepare = DatabaseSync.prototype.prepare;
       const probe = t.mock.method(
         DatabaseSync.prototype,
         'prepare',
         function (this: DatabaseSync, sql: string) {
           const statement = prepare.call(this, sql);
+          const scratchKind =
+            sql === 'INSERT INTO ancestry VALUES(?,?,?)'
+              ? 'ancestry'
+              : sql === 'INSERT INTO segments VALUES(?,?)'
+                ? 'segments'
+                : undefined;
+          if (scratchKind) {
+            const connection = this;
+            const work = scratch[scratchKind];
+            work.connections++;
+            scratchConnections.push({ db: connection, path: connection.location()! });
+            const run = statement.run;
+            statement.run = (...args: unknown[]) => {
+              work.inserts++;
+              if (!connection.isTransaction) work.outsideTransaction++;
+              return Reflect.apply(run, statement, args) as ReturnType<typeof run>;
+            };
+          }
           const kind =
             sql === 'DELETE FROM "people" WHERE "id"=?'
               ? 'remove'
@@ -103,6 +126,12 @@ for (const count of [4, 64])
       } finally {
         probe.mock.restore();
       }
+      const measuredScratch = structuredClone(scratch);
+      assert.ok(scratchConnections.length > 0, 'the real disk-backed ordering indexes were used');
+      for (const connection of scratchConnections) {
+        assert.equal(connection.db.isOpen, false, 'scratch never outlives its traversal');
+        assert.equal(existsSync(connection.path), false, 'scratch is deleted after consumption');
+      }
       const rebuilt = openDatabase(path, profileId);
       opened.push(rebuilt);
       authority.attach(rebuilt);
@@ -127,8 +156,25 @@ for (const count of [4, 64])
         work.reconstruction.indexedVersionAttempts,
       );
       t.diagnostic(
-        JSON.stringify({ count, attempt, prepared, executed, work: work.reconstruction }),
+        JSON.stringify({
+          count,
+          attempt,
+          prepared,
+          executed,
+          scratch: measuredScratch,
+          work: work.reconstruction,
+        }),
       );
+      assert.equal(measuredScratch.ancestry.inserts, work.reconstruction.ancestryReferencesSpooled);
+      assert.equal(measuredScratch.segments.inserts, work.reconstruction.segmentReferencesSpooled);
+      for (const kind of ['ancestry', 'segments'] as const) {
+        assert.ok(measuredScratch[kind].inserts > 0);
+        assert.equal(
+          measuredScratch[kind].outsideTransaction,
+          0,
+          kind + ': ordering-index inserts share one private transaction per traversal',
+        );
+      }
       assert.deepEqual(
         prepared,
         { remove: 4, insert: 3 },

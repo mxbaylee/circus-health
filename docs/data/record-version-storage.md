@@ -90,6 +90,18 @@ Cold reconstruction retains the original complete-version validation, reference 
 
 The fictional replay-only regression rebuilds the same accepted archive into two fresh databases at both four and 64 people, preserving updates, tombstones, predecessor/field history and exact current/history index rows. For the 64-person history, SQL preparation falls from 130 deletes and 129 inserts to four deletes and three inserts, while all 259 corresponding row executions remain. Complete-version validation counts and archive bytes remain unchanged. These are scoped work counts, not an unlock latency or full HTTP acceptance claim.
 
+Ancestry and V2 segment-reference ordering indexes also keep their inserts in one
+private transaction per traversal, rather than an implicit pager transaction per
+reference. Their existing 2 MiB SQLite page cache and file-backed temporary storage
+remain unchanged. The transaction is discarded with the scratch connection on
+normal completion, refusal or iterator termination; it is never committed as
+recovery evidence. Every selected commit, manifest page and segment is still read
+from the original journal and authenticated in the same order. V1 decoding and
+accepted-database transaction boundaries are unchanged. The replay regression
+observes the actual scratch inserts inside a transaction, reconciles their counts
+with the existing replay counters, and verifies that the scratch files and
+connections are gone afterward.
+
 Run this checkpoint without repeating the import/review setup:
 
 ```sh
