@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { globSync } from 'node:fs';
-import { suiteFiles, testEnvironment } from './test-suite.ts';
+import { globSync, readFileSync } from 'node:fs';
+import { suiteConcurrency, suiteFiles, testEnvironment } from './test-suite.ts';
 
 test('routine suites separate external qualification without dropping local integration coverage', () => {
   const server = suiteFiles('server');
@@ -48,5 +48,42 @@ test('routine child processes cannot inherit operator model credentials or exter
     PATH: '/fictional/bin',
     CRS_PDF_CONTROLLED_TEST: '0',
   });
+  assert.deepEqual(testEnvironment(original, 'history'), {
+    PATH: '/fictional/bin',
+    CRS_PDF_CONTROLLED_TEST: '0',
+  });
   assert.equal(original.CRS_AI_API_KEY, 'fictional-key');
+});
+
+test('serial history is required and all routine server files execute exactly once', () => {
+  const history = suiteFiles('history');
+  assert.deepEqual(history, [
+    'src/server/test/intake-identity-native-artifact-history.test.ts',
+    'src/server/test/intake-identity-native-receipt-history.test.ts',
+  ]);
+  const external = new Set([
+    'src/server/test/model-providers.integration.test.ts',
+    'src/server/test/native-provider-workflow.integration.test.ts',
+    'src/server/test/proxy-model-bridge.integration.test.ts',
+    'src/server/test/hardened-consumers.integration.test.ts',
+    'src/server/test/launch.integration.test.ts',
+    'src/server/test/intake-source-ocr-real.test.ts',
+  ]);
+  const expected = globSync('src/server/test/*.test.ts')
+    .filter((file) => !external.has(file))
+    .sort();
+  const actual = [...suiteFiles('server'), ...history, ...suiteFiles('continuation')].sort();
+  assert.deepEqual(actual, expected);
+  assert.equal(new Set(actual).size, actual.length);
+  assert.equal(suiteConcurrency('history'), 1);
+  assert.equal(suiteConcurrency('server'), 2);
+  assert.equal(suiteConcurrency('browser'), 1);
+  assert.throws(() => suiteConcurrency('typo'), /Unknown test suite/);
+
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+  assert.equal(pkg.scripts['test:history'], 'node src/scripts/test-suite.ts history');
+  assert.ok(pkg.scripts.test.split(' && ').includes('npm run test:history'));
+  const workflow = readFileSync('.github/workflows/code-checks.yml', 'utf8');
+  assert.match(workflow, /needs: \[[^\]]*\bhistory\b[^\]]*\]/);
+  assert.match(workflow, /\n  history:\n[\s\S]*?run: npm run test:history\n/);
 });
