@@ -12,94 +12,55 @@ permissions:
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 4
     env:
-      HUSKY: '0'
-      OUTPUT: /tmp/pr71-step3-phases
+      OUTPUT: /tmp/pr71-step3-ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: 6091456889e59ea77757f30c81fe0c3f879c7abb
           persist-credentials: false
           fetch-depth: 1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version-file: .nvmrc
-          package-manager-cache: false
-      - name: Prepare phase-only copy of the unchanged full artifact scenario
+      - name: Retain existing complete CI logs without executing tests
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$OUTPUT"
+          mkdir -p "$OUTPUT/logs"
           test "$(git rev-parse HEAD)" = 6091456889e59ea77757f30c81fe0c3f879c7abb
           git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
           git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
-          npm ci > "$OUTPUT/npm-ci.log" 2>&1
           node --input-type=module <<'NODE'
-          import { readFileSync,writeFileSync } from 'node:fs';
-          import { resolve,dirname } from 'node:path';
-          import { pathToFileURL } from 'node:url';
+          import { writeFileSync } from 'node:fs';
           import { createHash } from 'node:crypto';
-          const path=resolve('src/server/test/intake-identity-native-artifact-history.test.ts');
-          const original=readFileSync(path,'utf8');
-          let text=original;
-          const replace=(before,after)=>{
-            if(text.split(before).length!==2)throw Error(`Nonunique phase anchor: ${before}`);
-            text=text.replace(before,after);
-          };
-          replace('async function artifactHistoryFixture(t: test.TestContext) {',`async function artifactHistoryFixture(t: test.TestContext) {
-            const started = performance.now();
-            let prior = started;
-            const phase = (name: string, db?: Parameters<typeof intakeWorkCounters>[0]) => {
-              const now = performance.now();
-              t.diagnostic(JSON.stringify({ diagnostic: 'unchanged full artifact history phases', phase: name, elapsedMs: now-started, phaseMs: now-prior, work: db ? {...intakeWorkCounters(db).warm} : null }));
-              prior = now;
-            };
-            phase('start');`);
-          replace('  assert.notEqual(oldVersionId, latestVersionId);',"  phase('seed-ready', f.db);\n  assert.notEqual(oldVersionId, latestVersionId);");
-          replace('  const prepared = await prepareIntakeWorkflowCommand(',"  phase('history-preparation-start', f.db);\n  const prepared = await prepareIntakeWorkflowCommand(");
-          replace("  if (prepared.replayed) throw Error('Unexpected artifact fixture replay');", "  phase('history-prepared', f.db);\n  if (prepared.replayed) throw Error('Unexpected artifact fixture replay');");
-          replace('  const cold = await f.review();', "  phase('history-published', f.db);\n  const cold = await f.review();\n  phase('cold-review-complete', f.db);");
-          replace('  const stable = await f.review();', "  const stable = await f.review();\n  phase('stable-review-complete', f.db);");
-          replace('    ...f,\n    artifacts,',"    ...f,\n    phase,\n    artifacts,");
-          replace('    const f = await artifactHistoryFixture(t);', "    const f = await artifactHistoryFixture(t);\n    f.phase('fixture-and-public-membership-complete', f.db);");
-          replace('        assert.deepEqual(await warm, expectedWarm);', "        assert.deepEqual(await warm, expectedWarm);\n        f.phase('full-warm-and-cooperation-complete', f.db);");
-          const imports=[];
-          text=text.replace(/from\s+(['"])(\.[^'"]+)\1/g,(_all,quote,specifier)=>{
-            const target=pathToFileURL(resolve(dirname(path),specifier)).href;
-            imports.push({specifier,target});return `from ${quote}${target}${quote}`;
-          });
-          if(!imports.length)throw Error('Missing relative source imports');
-          if(!text.includes('{ timeout: 450000 }')||!text.includes('n < 256')||!text.includes('449'))throw Error('Lost original fixture or guard');
-          writeFileSync(`${process.env.OUTPUT}/artifact-phases.test.ts`,text);
-          writeFileSync(`${process.env.OUTPUT}/diagnostic-source.json`,JSON.stringify({source:path,sourceSha256:createHash('sha256').update(original).digest('hex'),adaptedSha256:createHash('sha256').update(text).digest('hex'),scope:'Phase-output and absolute-import additions only; original constants, assertions and 450000ms guard unchanged',imports},null,2));
-          NODE
-      - name: Execute the original full oracle with phase observations
-        run: |
-          node --input-type=module <<'NODE'
-          import {spawnSync} from 'node:child_process';
-          import {openSync,closeSync,writeFileSync} from 'node:fs';
-          import {testEnvironment} from './src/scripts/test-suite.ts';
-          const args=['--test','--test-concurrency=1','--test-reporter=spec',`${process.env.OUTPUT}/artifact-phases.test.ts`];
-          const started=new Date().toISOString();
-          const fd=openSync(`${process.env.OUTPUT}/tests.log`,'w');
-          const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});
-          closeSync(fd);
-          writeFileSync(`${process.env.OUTPUT}/test-result.json`,JSON.stringify({command:['node',...args],started,finished:new Date().toISOString(),node:process.version,status:result.status,signal:result.signal,error:result.error?.message??null},null,2));
-          process.exitCode=result.status??1;
-          NODE
-      - name: Retain current actual PR checks and bounded review
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          node --input-type=module <<'NODE'
-          import {writeFileSync} from 'node:fs';
           const api='https://api.github.com/repos/mxbaylee/circus-health';
-          for(const [path,file] of [['/actions/runs/37720471221','normal-run.json'],['/actions/runs/37720471221/jobs?per_page=100','normal-jobs.json'],['/issues/comments/6051256915','bounded-review-request.json'],['/issues/comments/6051280549','bounded-review-result.json'],['/pulls/71','pr.json']]){
-            const response=await fetch(api+path,{headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(30000)});
+          const headers={Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'};
+          async function get(path,file,json=true){
+            const response=await fetch(api+path,{headers,signal:AbortSignal.timeout(30000)});
+            const text=await response.text();
+            writeFileSync(`${process.env.OUTPUT}/${file}`,text);
             if(!response.ok)throw Error(`${path}: HTTP ${response.status}`);
-            writeFileSync(`${process.env.OUTPUT}/${file}`,await response.text());
+            return json?JSON.parse(text):text;
           }
+          const run=await get('/actions/runs/37720471221','run.json');
+          if(run.status!=='completed'||run.head_sha!=='6091456889e59ea77757f30c81fe0c3f879c7abb')throw Error('Run is not the completed candidate');
+          const inventory=await get('/actions/runs/37720471221/jobs?per_page=100','jobs.json');
+          if(inventory.total_count!==inventory.jobs.length)throw Error('Incomplete job inventory');
+          await get('/pulls/71','pr.json');
+          await get('/issues/comments/6051256915','bounded-review-request.json');
+          await get('/issues/comments/6051280549','bounded-review-result.json');
+          const summaries=[];
+          for(const job of inventory.jobs){
+            if(job.conclusion==='success'&&!['acceptance','continuation','Browser (5/6)'].includes(job.name))continue;
+            if(job.status!=='completed')throw Error(`Unexpected incomplete job ${job.id}`);
+            const text=await get(`/actions/jobs/${job.id}/logs`,`logs/${job.id}.log`,false);
+            const lines=text.split('\n');
+            const index=lines.findIndex(line=>line.includes('failing tests:'));
+            summaries.push({id:job.id,name:job.name,conclusion:job.conclusion,started_at:job.started_at,completed_at:job.completed_at,logSha256:createHash('sha256').update(text).digest('hex'),summary:lines.filter(line=>/ℹ (tests|pass|fail|cancelled|skipped|duration_ms)\b|##\[error\]/u.test(line)),failureExcerpt:index<0?[]:lines.slice(index,index+90)});
+          }
+          const counts={};for(const job of inventory.jobs)counts[job.conclusion]=(counts[job.conclusion]??0)+1;
+          writeFileSync(`${process.env.OUTPUT}/summary.json`,JSON.stringify({source:run.head_sha,runId:run.id,runAttempt:run.run_attempt,status:run.status,conclusion:run.conclusion,counts,jobs:summaries},null,2));
+          console.log(JSON.stringify({runId:run.id,status:run.status,conclusion:run.conclusion,counts},null,2));
           NODE
       - name: Hash retained output
         if: always()
@@ -111,7 +72,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step3-full-artifact-phases
-          path: /tmp/pr71-step3-phases
+          name: pr71-step3-final-ci
+          path: /tmp/pr71-step3-ci
           if-no-files-found: error
           retention-days: 14
