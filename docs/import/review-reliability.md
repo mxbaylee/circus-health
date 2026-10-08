@@ -43,6 +43,8 @@ After a version conflict, explicitly reapplying a referenced draft uses the fres
 
 Source attention reconciles local save responses and resource refreshes by profile/intake scope and revision. A pristine editor follows the current source text. A dirty editor retains its text, displays the new revision for comparison and requires an explicit rebase or replacement before saving. Older responses cannot mask newer source state. Selection eligibility and remaining issue counts use the current revision, including while a local editor remains open.
 
+The native overview disables clinical and People save controls while a source operation is pending, matching its existing mutation guard. The selected People remain selected when that operation finishes; an enabled save then uses the normal separate People requests. Waiting does not relax source validation, retry identity or the distinction between clinical and People outcomes.
+
 The shared person chooser retains the exact selected Person and keyboard focus through refresh. Duplicate names include birth date, relationship and stable identifiers. The same canonical Self-name and saved-alias rule prevents creating a second Self through report assignment or People proposal acceptance. Caregivers may still confirm current medication use for relatives; exact record/version and active-profile authorization apply. Relative records, counts and charts remain separate from Self.
 
 Current limitations, open in [CRS-141](../todo/CRS-141.md): above 1000 selections, a coupled group can be split across two operations; journaled bytes grow faster than the selection within one operation, and each sequential operation on a large intake costs more than the last; saved outcomes do not name the person.
