@@ -6,220 +6,84 @@ on:
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
-      HUSKY: '0'
-      OUTPUT: /tmp/pr71-step2-verified
+      OUTPUT: /tmp/pr71-step2-ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: f91a911bd596beaab3d57308d953ba717eaa25c7
+          ref: af98227c397c2c5939b5b49a13effa8e2ebf838d
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - name: Prepare pinned tooling and the counted regression
+      - name: Preserve exact source identity and completed gate evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$OUTPUT/logs"
-          test "$(git rev-parse HEAD)" = f91a911bd596beaab3d57308d953ba717eaa25c7
-          git rev-parse HEAD > "$OUTPUT/base-sha.txt"
-          npm ci > "$OUTPUT/npm-ci.log" 2>&1
-          node --input-type=module <<'NODE'
-          import { readFileSync, writeFileSync } from 'node:fs';
-          const path = 'src/server/test/record-replay-sql.test.ts';
-          let text = readFileSync(path, 'utf8');
-          function replace(before, after) {
-            if (text.split(before).length !== 2) throw Error(`Unexpected test anchor: ${before}`);
-            text = text.replace(before, after);
-          }
-          replace('      const executed = { remove: 0, insert: 0 };', `      const executed = { remove: 0, insert: 0 };
-                const scratch = {
-                  ancestry: { inserts: 0, outsideTransaction: 0, connections: 0 },
-                  segments: { inserts: 0, outsideTransaction: 0, connections: 0 },
-                };
-                const scratchConnections: Array<{ db: DatabaseSync; path: string }> = [];`);
-          replace('          const statement = prepare.call(this, sql);', `          const statement = prepare.call(this, sql);
-                    const scratchKind =
-                      sql === 'INSERT INTO ancestry VALUES(?,?,?)'
-                        ? 'ancestry'
-                        : sql === 'INSERT INTO segments VALUES(?,?)'
-                          ? 'segments'
-                          : undefined;
-                    if (scratchKind) {
-                      const connection = this;
-                      const work = scratch[scratchKind];
-                      work.connections++;
-                      scratchConnections.push({db: connection, path: connection.location()!});
-                      const run = statement.run;
-                      statement.run = (...args: unknown[]) => {
-                        work.inserts++;
-                        if (!connection.isTransaction) work.outsideTransaction++;
-                        return Reflect.apply(run, statement, args) as ReturnType<typeof run>;
-                      };
-                    }`);
-          replace("import { mkdtempSync, rmSync } from 'node:fs';", "import { mkdtempSync, rmSync, existsSync } from 'node:fs';");
-          replace('      const rebuilt = openDatabase(path, profileId);', `      const measuredScratch = structuredClone(scratch);
-                assert.ok(scratchConnections.length > 0, 'the real disk-backed ordering indexes were used');
-                for (const connection of scratchConnections) {
-                  assert.equal(connection.db.isOpen, false, 'scratch never outlives its traversal');
-                  assert.equal(existsSync(connection.path), false, 'scratch is deleted after consumption');
-                }
-                const rebuilt = openDatabase(path, profileId);`);
-          replace('JSON.stringify({ count, attempt, prepared, executed, work: work.reconstruction })', 'JSON.stringify({ count, attempt, prepared, executed, scratch: measuredScratch, work: work.reconstruction })');
-          replace('      assert.deepEqual(\n        prepared,', `      assert.equal(measuredScratch.ancestry.inserts, work.reconstruction.ancestryReferencesSpooled);
-                assert.equal(measuredScratch.segments.inserts, work.reconstruction.segmentReferencesSpooled);
-                for (const kind of ['ancestry', 'segments'] as const) {
-                  assert.ok(measuredScratch[kind].inserts > 0);
-                  assert.equal(
-                    measuredScratch[kind].outsideTransaction,
-                    0,
-                    kind + ': ordering-index inserts share one private transaction per traversal',
-                  );
-                }
-                assert.deepEqual(
-                  prepared,`);
-          writeFileSync(path, text);
-          NODE
-          npx prettier --write src/server/test/record-replay-sql.test.ts
-          test "$(git hash-object src/server/test/record-replay-sql.test.ts)" = df3004a07bd54429659748ab601f2712507266b1
-      - name: Capture complete prior-head CI evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
+          test "$(git rev-parse HEAD)" = af98227c397c2c5939b5b49a13effa8e2ebf838d
+          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
+          git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
+          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
           node --input-type=module <<'NODE'
           import { writeFileSync } from 'node:fs';
+          import { setTimeout as sleep } from 'node:timers/promises';
+          const root = process.env.OUTPUT;
           const api = 'https://api.github.com/repos/mxbaylee/circus-health';
           const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' };
-          async function get(path, file) {
+          async function get(path, file, json = true) {
             const response = await fetch(api + path, { headers, signal: AbortSignal.timeout(30000) });
-            if (!response.ok) throw Error(`${path}: ${response.status}`);
+            if (!response.ok) throw Error(`${path}: HTTP ${response.status}`);
             const text = await response.text();
-            writeFileSync(`${process.env.OUTPUT}/${file}`, text);
-            return text;
+            if (file) writeFileSync(`${root}/${file}`, text);
+            return json ? JSON.parse(text) : text;
           }
-          const jobs = JSON.parse(await get('/actions/runs/37701995577/attempts/1/jobs?per_page=100', 'prior-jobs.json'));
-          if (jobs.total_count !== jobs.jobs.length) throw Error('Incomplete job inventory');
-          await get('/actions/runs/37701995577', 'prior-run.json');
-          await get('/pulls/71', 'pr-snapshot.json');
-          const wanted = new Set(['acceptance', 'continuation', 'Server (4/16)', 'Server (6/16)', 'Browser (5/6)', 'Browser (6/6)', 'Server (8/16)']);
-          const summary = [];
-          for (const job of jobs.jobs.filter(job => wanted.has(job.name))) {
-            const text = await get(`/actions/jobs/${job.id}/logs`, `logs/${job.id}.log`);
-            const lines = text.split('\n');
-            const failure = lines.findIndex(line => line.includes('failing tests:'));
-            summary.push({ id: job.id, name: job.name, conclusion: job.conclusion, startedAt: job.started_at, completedAt: job.completed_at, excerpt: failure < 0 ? lines.filter(line => /duration_ms|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|##\[error\]/u.test(line)) : lines.slice(failure, failure + 55) });
+          // Observe the existing run, never dispatch or re-run a test. Stop after
+          // a bounded wait and retain an explicitly incomplete snapshot if needed.
+          const polls = [];
+          let jobs;
+          for (let attempt = 0; attempt < 11; attempt++) {
+            jobs = await get('/actions/runs/37715662544/attempts/1/jobs?per_page=100', 'jobs.json');
+            if (jobs.total_count !== jobs.jobs.length) throw Error('Incomplete job listing');
+            const gates = jobs.jobs.filter(job => ['acceptance', 'continuation'].includes(job.name));
+            if (gates.length !== 2) throw Error('Missing exact gate jobs');
+            polls.push({ observedAt: new Date().toISOString(), gates: gates.map(({id,name,status,conclusion}) => ({id,name,status,conclusion})) });
+            writeFileSync(`${root}/gate-observations.json`, JSON.stringify(polls, null, 2));
+            if (gates.every(job => job.status === 'completed') || attempt === 10) break;
+            await sleep(60000);
           }
-          writeFileSync(`${process.env.OUTPUT}/prior-summary.json`, JSON.stringify(summary, null, 2));
-          console.log(JSON.stringify(summary, null, 2));
-          NODE
-      - name: Prove the scratch-work assertion fails on unchanged implementation
-        run: |
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import { spawnSync } from 'node:child_process';
-          import { writeFileSync } from 'node:fs';
-          import { testEnvironment } from './src/scripts/test-suite.ts';
-          const command = ['--test', '--test-concurrency=1', '--test-reporter=spec', 'src/server/test/record-replay-sql.test.ts'];
-          const result = spawnSync(process.execPath, command, { env: testEnvironment(process.env, 'server'), encoding: 'utf8' });
-          const log = result.stdout + result.stderr;
-          writeFileSync(`${process.env.OUTPUT}/red.log`, log);
-          writeFileSync(`${process.env.OUTPUT}/red-result.json`, JSON.stringify({ command, status: result.status, signal: result.signal }, null, 2));
-          assert.equal(result.status, 1);
-          assert.ok(log.includes('ancestry: ordering-index inserts share one private transaction per traversal'));
-          assert.ok(/ℹ fail 2/u.test(log) && /ℹ cancelled 0/u.test(log) && /ℹ skipped 0/u.test(log));
-          NODE
-      - name: Apply the exact repair and check its full tree
-        run: |
-          node --input-type=module <<'NODE'
-          import { readFileSync, writeFileSync } from 'node:fs';
-          function edit(path, pairs) {
-            let text = readFileSync(path, 'utf8');
-            for (const [before, after] of pairs) {
-              if (text.split(before).length !== 2) throw Error(`Unexpected anchor in ${path}: ${before}`);
-              text = text.replace(before, after);
-            }
-            writeFileSync(path, text);
+          const run = await get('/actions/runs/37715662544', 'run.json');
+          if (run.head_sha !== 'af98227c397c2c5939b5b49a13effa8e2ebf838d') throw Error('Wrong candidate run');
+          await get('/pulls/71', 'pr.json');
+          await get('/issues/comments/6050628885', 'bounded-review-request.json');
+          await get('/issues/comments/6050652895', 'bounded-review-result.json');
+          const wanted = new Set(['acceptance', 'continuation', 'Server (4/16)', 'Server (6/16)', 'Browser (5/6)', 'Browser (6/6)', 'Server (8/16)', 'checks']);
+          const summaries = [];
+          for (const job of jobs.jobs) {
+            if (job.status !== 'completed') continue;
+            if (!wanted.has(job.name) && job.conclusion === 'success') continue;
+            try {
+              const text = await get(`/actions/jobs/${job.id}/logs`, `logs/${job.id}.log`, false);
+              const lines = text.split('\n');
+              const failures = lines.findIndex(line => line.includes('failing tests:'));
+              summaries.push({ id:job.id, name:job.name, conclusion:job.conclusion, startedAt:job.started_at, completedAt:job.completed_at, excerpt:failures >= 0 ? lines.slice(failures,failures+65) : lines.filter(line => /duration_ms|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|##\[error\]|recovery stage/.test(line)) });
+            } catch (error) { summaries.push({id:job.id,name:job.name,captureError:String(error)}); }
           }
-          edit('src/server/record-versions.ts', [
-            ["scratch.db.exec('CREATE TABLE segments(ordinal INTEGER PRIMARY KEY,reference TEXT NOT NULL)');", `// This private ordering index is consumed on this connection and discarded.
-              // Keep its bounded disk-backed work in one transaction instead of an
-              // implicit pager transaction per reference. Journal objects are still read
-              // and authenticated by the original reader on every traversal.
-              scratch.db.exec('CREATE TABLE segments(ordinal INTEGER PRIMARY KEY,reference TEXT NOT NULL); BEGIN');`],
-            ["'CREATE TABLE ancestry (ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, reference TEXT NOT NULL)',", "'CREATE TABLE ancestry (ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, reference TEXT NOT NULL); BEGIN',"],
-          ]);
-          const anchor = 'Run this checkpoint without repeating the import/review setup:';
-          edit('docs/data/record-version-storage.md', [[anchor, `Ancestry and V2 segment-reference ordering indexes also keep their inserts in one
-          private transaction per traversal, rather than an implicit pager transaction per
-          reference. Their existing 2 MiB SQLite page cache and file-backed temporary storage
-          remain unchanged. The transaction is discarded with the scratch connection on
-          normal completion, refusal or iterator termination; it is never committed as
-          recovery evidence. Every selected commit, manifest page and segment is still read
-          from the original journal and authenticated in the same order. V1 decoding and
-          accepted-database transaction boundaries are unchanged. The replay regression
-          observes the actual scratch inserts inside a transaction, reconciles their counts
-          with the existing replay counters, and verifies that the scratch files and
-          connections are gone afterward.
-
-          ${anchor}`]]);
-          const note = 'No SQLite-schema or encrypted-framing change is required; old monolithic objects retain their prior whole-object decoder boundary.';
-          edit('docs/setup/release-updates.md', [[note, note + ' Private ancestry/manifest ordering now batches scratch inserts within each traversal; restart into the candidate to use it. This changes no retained format, archive verification, cache compatibility or operator setting.']]);
-          NODE
-          npx prettier --write docs/data/record-version-storage.md docs/setup/release-updates.md src/server/record-versions.ts src/server/test/record-replay-sql.test.ts
-          git diff --check
-          git add docs/data/record-version-storage.md docs/setup/release-updates.md src/server/record-versions.ts src/server/test/record-replay-sql.test.ts
-          git write-tree > "$OUTPUT/candidate-tree.txt"
-          test "$(cat "$OUTPUT/candidate-tree.txt")" = 85a7515529c92332df7c42ffa66e28f84ae978cf
-          git diff --cached > "$OUTPUT/full-repair.patch"
-      - name: Verify complete record and recovery regressions
-        run: |
-          node --input-type=module <<'NODE'
-          import { spawnSync } from 'node:child_process';
-          import { writeFileSync, openSync, closeSync } from 'node:fs';
-          import { testEnvironment } from './src/scripts/test-suite.ts';
-          const command = ['--test', '--test-concurrency=1', '--test-reporter=spec', 'src/server/test/record-replay-sql.test.ts', 'src/server/test/record-versions.test.ts', 'src/server/test/profile-recovery-diagnostics.test.ts', 'src/server/test/intake-state-production-recovery.test.ts', 'src/server/test/intake-recovery-breakdown.test.ts'];
-          const fd = openSync(`${process.env.OUTPUT}/green.log`, 'w');
-          const result = spawnSync(process.execPath, command, { env: testEnvironment(process.env, 'server'), stdio: ['ignore', fd, fd] });
-          closeSync(fd);
-          writeFileSync(`${process.env.OUTPUT}/green-result.json`, JSON.stringify({ command, status: result.status, signal: result.signal }, null, 2));
-          process.exitCode = result.status ?? 1;
-          NODE
-      - name: Check types, formatting and inventory
-        run: |
-          npm run typecheck > "$OUTPUT/typecheck.log" 2>&1
-          npx prettier --check docs/data/record-version-storage.md docs/setup/release-updates.md src/server/record-versions.ts src/server/test/record-replay-sql.test.ts > "$OUTPUT/format.log" 2>&1
-          node scripts/repository-file-inventory.ts --check > "$OUTPUT/inventory.log" 2>&1
-      - name: Retain exact verified source and Git blobs without updating any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git archive "$(cat "$OUTPUT/candidate-tree.txt")" | gzip -n > "$OUTPUT/candidate-source.tar.gz"
-          git ls-tree -r "$(cat "$OUTPUT/candidate-tree.txt")" > "$OUTPUT/source-tree.txt"
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import { readFileSync, writeFileSync } from 'node:fs';
-          import { execFileSync } from 'node:child_process';
-          const paths = ['docs/data/record-version-storage.md', 'docs/setup/release-updates.md', 'src/server/record-versions.ts', 'src/server/test/record-replay-sql.test.ts'];
-          const elements = [];
-          for (const path of paths) {
-            const expected = execFileSync('git', ['hash-object', path], { encoding: 'utf8' }).trim();
-            const response = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs', { method: 'POST', headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' }, body: JSON.stringify({ content: readFileSync(path, 'utf8'), encoding: 'utf-8' }), signal: AbortSignal.timeout(30000) });
-            assert.equal(response.status, 201);
-            const blob = await response.json();
-            assert.equal(blob.sha, expected);
-            elements.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
-          }
-          writeFileSync(`${process.env.OUTPUT}/tree-elements.json`, JSON.stringify(elements, null, 2));
-          writeFileSync(`${process.env.OUTPUT}/environment.json`, JSON.stringify({ node: process.version, platform: process.platform, arch: process.arch, workflowSha: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID }, null, 2));
-          console.log(JSON.stringify(elements, null, 2));
+          const counts = {};
+          for (const job of jobs.jobs) {const key = job.conclusion ?? job.status; counts[key] = (counts[key] ?? 0) + 1;}
+          const gates = jobs.jobs.filter(job => ['acceptance','continuation'].includes(job.name)).map(({id,name,status,conclusion,started_at,completed_at})=>({id,name,status,conclusion,started_at,completed_at}));
+          const summary = {observedAt:new Date().toISOString(),runId:run.id,attempt:run.run_attempt,headSha:run.head_sha,runStatus:run.status,runConclusion:run.conclusion,counts,gates,gatesPassed:gates.every(job=>job.status==='completed' && job.conclusion==='success'),summaries};
+          writeFileSync(`${root}/summary.json`,JSON.stringify(summary,null,2));
+          console.log(JSON.stringify(summary,null,2));
           NODE
       - name: Hash retained output
         if: always()
@@ -229,7 +93,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step2-verified
-          path: /tmp/pr71-step2-verified
+          name: pr71-step2-ci-receipt
+          path: /tmp/pr71-step2-ci
           if-no-files-found: error
           retention-days: 14
