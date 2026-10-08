@@ -2,6 +2,7 @@ import { launchBrowser, newTestPage } from './harness.ts';
 import { sameDisplayedIdentityReview } from '../../app/data/identity-confirmation-freshness.ts';
 import { startProcessRuntime } from './process-runtime.ts';
 import { diagnosticRoute } from './runtime-connection-diagnostics.ts';
+import { observeFixtureClientConnections } from './runtime-client-connection-diagnostics.ts';
 import {
   fixtureBrowserResponse,
   fixtureNativeFeedReady,
@@ -207,6 +208,14 @@ function runtimeFailureSummary(capture: {
       typeof input === 'number' && Number.isFinite(input)
         ? Math.max(0, Math.min(Math.round(input), 1_000_000_000))
         : undefined;
+    const port = (input: unknown) =>
+      typeof input === 'number' && Number.isInteger(input) && input > 0 && input <= 65535
+        ? input
+        : undefined;
+    const diagnosticRequest = (input: unknown) =>
+      typeof input === 'number' && Number.isInteger(input) && input > 0 && input <= 1_000_000_000
+        ? input
+        : undefined;
     const method = (input: unknown) =>
       typeof input === 'string' &&
       ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(input)
@@ -217,6 +226,7 @@ function runtimeFailureSummary(capture: {
       [
         'socket-open',
         'socket-close',
+        'socket-timeout',
         'request-start',
         'response-finish',
         'response-close',
@@ -232,11 +242,21 @@ function runtimeFailureSummary(capture: {
         totalSockets: number(value.totalSockets),
         totalRequests: number(value.totalRequests),
         openSocketCount: number(value.openSocketCount),
+        openSocketOverflow: number(value.openSocketOverflow),
         activeRequestCount: number(value.activeRequestCount),
+        activeRequestOverflow: number(value.activeRequestOverflow),
+        observationFailures: number(value.observationFailures),
+        openSockets: rows(value.openSockets, 12).map((row: Record<string, unknown>) => ({
+          socketId: number(row.id),
+          socketRequests: number(row.requests),
+          remotePort: port(row.remotePort),
+        })),
         activeRequests: rows(value.activeRequests, 12).map((row: Record<string, unknown>) => ({
           requestId: number(row.requestId),
           socketId: number(row.socketId),
           socketRequests: number(row.socketRequests),
+          remotePort: port(row.remotePort),
+          diagnosticRequest: diagnosticRequest(row.diagnosticRequest),
           method: method(row.method),
           path: diagnosticRoute(String(row.path)),
           durationMs: number(row.durationMs),
@@ -247,6 +267,8 @@ function runtimeFailureSummary(capture: {
           socketId: number(row.socketId),
           socketRequests: number(row.socketRequests),
           requestId: number(row.requestId),
+          remotePort: port(row.remotePort),
+          diagnosticRequest: diagnosticRequest(row.diagnosticRequest),
           method: method(row.method),
           path: diagnosticRoute(String(row.path)),
           status: number(row.status),
@@ -263,7 +285,8 @@ function runtimeFailureSummary(capture: {
 const runtimeFailureReport = (
   route: string,
   diagnostic: ReturnType<typeof runtimeFailureSummary>,
-) => JSON.stringify({ route: diagnosticRoute(route), diagnostic });
+  client?: ReturnType<ReturnType<typeof observeFixtureClientConnections>['snapshot']>,
+) => JSON.stringify({ route: diagnosticRoute(route), diagnostic, client });
 
 test('holdout transport diagnostics retain fixed socket state without private routes', () => {
   const privateRoute = '/api/profiles/private-profile/intakes/import-feed?private-token=secret';
@@ -276,11 +299,22 @@ test('holdout transport diagnostics retain fixed socket state without private ro
         keepAliveTimeoutMs: 5000,
         openSocketCount: 2,
         activeRequestCount: 1,
-        activeRequests: [{ requestId: 8, socketId: 3, method: 'GET', path: privateRoute }],
+        openSockets: [{ id: 3, requests: 2, remotePort: 49321 }],
+        activeRequests: [
+          {
+            requestId: 8,
+            socketId: 3,
+            remotePort: 49321,
+            diagnosticRequest: 17,
+            method: 'GET',
+            path: privateRoute,
+          },
+        ],
         recent: [
           {
-            event: 'socket-close',
+            event: 'socket-timeout',
             socketId: 3,
+            remotePort: 49321,
             path: privateRoute,
             hadError: true,
             ageMs: 4,
@@ -290,13 +324,47 @@ test('holdout transport diagnostics retain fixed socket state without private ro
       '\n',
   };
   const summary = runtimeFailureSummary(capture);
-  const output = runtimeFailureReport(privateRoute, summary);
+  const client = {
+    matched: true,
+    activeCount: 0,
+    overCapacity: 0,
+    observationFailures: 0,
+    recent: [
+      {
+        event: 'socket-assigned' as const,
+        diagnosticRequest: 17,
+        localPort: 49321,
+        reusedSocket: true,
+        ageMs: 3,
+      },
+      {
+        event: 'request-error' as const,
+        diagnosticRequest: 17,
+        localPort: 49321,
+        reusedSocket: true,
+        error: 'ECONNRESET' as const,
+        ageMs: 1,
+      },
+    ],
+  };
+  const output = runtimeFailureReport(privateRoute, summary, client);
   const reported = JSON.parse(output);
   assert.equal(reported.route, '/api/profiles/:profile/intakes/import-feed');
   assert.equal(reported.diagnostic.connections.activeRequests[0].method, 'GET');
-  assert.equal(reported.diagnostic.connections.recent[0].event, 'socket-close');
+  assert.equal(reported.diagnostic.connections.activeRequests[0].diagnosticRequest, 17);
+  assert.equal(reported.diagnostic.connections.openSockets[0].remotePort, 49321);
+  assert.equal(reported.diagnostic.connections.recent[0].event, 'socket-timeout');
+  assert.equal(
+    reported.client.recent[0].diagnosticRequest,
+    reported.diagnostic.connections.activeRequests[0].diagnosticRequest,
+  );
+  assert.equal(
+    reported.client.recent[0].localPort,
+    reported.diagnostic.connections.openSockets[0].remotePort,
+  );
+  assert.equal(reported.client.recent[1].error, 'ECONNRESET');
   assert.match(output, /api\/profiles\/:profile\/intakes\/import-feed/);
-  assert.match(output, /socket-close/);
+  assert.match(output, /socket-timeout/);
   assert.doesNotMatch(output, /private-profile|private-token|secret|private stderr/);
   assert.deepEqual(runtimeFailureSummary({ ...capture, diagnostics: 'malformed' }), {
     status: 'captured',
@@ -316,6 +384,8 @@ test('holdout transport diagnostics retain fixed socket state without private ro
           method: ['GET'],
           path: privateRoute,
           durationMs: -2,
+          remotePort: 'secret-port',
+          diagnosticRequest: 'secret-request',
         })),
         recent: Array.from({ length: 40 }, () => ({
           event: ['socket-close'],
@@ -330,6 +400,8 @@ test('holdout transport diagnostics retain fixed socket state without private ro
   assert.equal(many.connections.activeRequests.length, 12);
   assert.equal(many.connections.recent.length, 32);
   assert.equal(many.connections.activeRequests[0]?.method, 'OTHER');
+  assert.equal(many.connections.activeRequests[0]?.remotePort, undefined);
+  assert.equal(many.connections.activeRequests[0]?.diagnosticRequest, undefined);
   assert.equal(many.connections.activeRequests[0]?.durationMs, 0);
   assert.equal(many.connections.recent[0]?.event, 'other');
   assert.equal(many.connections.recent[0]?.durationMs, 1_000_000_000);
@@ -481,6 +553,8 @@ test(
       if (viewport) await page.setViewportSize(viewport);
     }
     const url = `http://127.0.0.1:${runtime.port}`;
+    const clientSockets = observeFixtureClientConnections(runtime.port);
+    t.after(() => clientSockets.close());
     await page.goto(url);
     const profileId = await page.evaluate(async () => {
       const post = async (path: string, body: unknown) => {
@@ -552,7 +626,10 @@ test(
         try {
           response = await page.request.fetch(url + prefix + path, {
             method,
-            headers: method === 'GET' ? undefined : { Origin: url },
+            headers: {
+              ...(method === 'GET' ? {} : { Origin: url }),
+              'X-CRS-Test-Request': String(requestId),
+            },
             data: body,
           });
         } catch (error) {
@@ -564,7 +641,7 @@ test(
           }
           console.error(
             'Fictional holdout failed request',
-            runtimeFailureReport(prefix + path, diagnostic),
+            runtimeFailureReport(prefix + path, diagnostic, clientSockets.snapshot(requestId)),
           );
           throw error;
         }
