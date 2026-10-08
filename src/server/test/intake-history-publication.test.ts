@@ -110,6 +110,142 @@ function observePublication(
     walBytes: fileBytes(databasePath + '-wal'),
     pageSize,
   });
+  // A WAL file may retain its length after its valid frames reset. Read only
+  // SQLite's fixed header; never treat file length as frame count.
+  const walSample = () => {
+    let files: { mainBytes: number | null; walBytes: number | null; pageSize: number };
+    try {
+      files = databaseFiles();
+    } catch {
+      files = { mainBytes: null, walBytes: null, pageSize };
+    }
+    let header: { cycle: string; checkpointSequence: number } | null = null;
+    if (files.walBytes !== null && files.walBytes >= 32) {
+      try {
+        const fd = fs.openSync(databasePath + '-wal', 'r');
+        try {
+          const bytes = Buffer.allocUnsafe(32);
+          if (fs.readSync(fd, bytes, 0, 32, 0) === 32) {
+            const magic = bytes.readUInt32BE(0);
+            if (
+              (magic === 0x377f0682 || magic === 0x377f0683) &&
+              bytes.readUInt32BE(4) === 3007000 &&
+              bytes.readUInt32BE(8) === pageSize
+            )
+              header = {
+                cycle: bytes.subarray(16, 24).toString('hex'),
+                checkpointSequence: bytes.readUInt32BE(12),
+              };
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch {
+        // A missing or short header is an unavailable sample, not zero frames.
+      }
+    }
+    return { ...files, header, processFsWriteUnits: process.resourceUsage().fsWrite };
+  };
+  type WalSample = ReturnType<typeof walSample>;
+  type WalCommitWindow = {
+    firstCommit: number;
+    lastCommit: number;
+    commits: number;
+    nodesWritten: number;
+    commitMs: number;
+    commitFsWriteUnits: number;
+    betweenCommitFsWriteUnits: number;
+    mainFileLengthDeltaBeforeCommit: number;
+    walFileLengthDeltaBeforeCommit: number;
+    mainFileLengthDeltaDuringCommit: number;
+    walFileLengthDeltaDuringCommit: number;
+    mainFileLengthGrowthCommits: number;
+    unavailableFileLengthPairs: number;
+    cycleChangedBeforeCommit: number;
+    cycleChangedDuringCommit: number;
+    sequenceChangedBeforeCommit: number;
+    sequenceChangedDuringCommit: number;
+    unavailableBetweenCommitHeaderPairs: number;
+    unavailableHeaderPairs: number;
+  };
+  const walCommitWindows = new Map<number, WalCommitWindow>();
+  let previousCommitAfter: WalSample | undefined;
+  let previousCommitNodes = intakeWorkCounters(db).warm.collectionNodesWritten;
+  let fixtureCommitAttempts = 0;
+  let walObservationFailures = 0;
+  const observeWalCommit = (
+    before: WalSample,
+    after: WalSample,
+    elapsedMs: number,
+    fsWriteUnits: number,
+  ) => {
+    const ordinal = fixtureCommitAttempts;
+    const windowIndex = Math.min(15, Math.floor((ordinal - 1) / 32));
+    const window = walCommitWindows.get(windowIndex) ?? {
+      firstCommit: ordinal,
+      lastCommit: ordinal,
+      commits: 0,
+      nodesWritten: 0,
+      commitMs: 0,
+      commitFsWriteUnits: 0,
+      betweenCommitFsWriteUnits: 0,
+      mainFileLengthDeltaBeforeCommit: 0,
+      walFileLengthDeltaBeforeCommit: 0,
+      mainFileLengthDeltaDuringCommit: 0,
+      walFileLengthDeltaDuringCommit: 0,
+      mainFileLengthGrowthCommits: 0,
+      unavailableFileLengthPairs: 0,
+      cycleChangedBeforeCommit: 0,
+      cycleChangedDuringCommit: 0,
+      sequenceChangedBeforeCommit: 0,
+      sequenceChangedDuringCommit: 0,
+      unavailableBetweenCommitHeaderPairs: 0,
+      unavailableHeaderPairs: 0,
+    };
+    const nodes = intakeWorkCounters(db).warm.collectionNodesWritten;
+    window.lastCommit = ordinal;
+    window.commits++;
+    window.nodesWritten += nodes - previousCommitNodes;
+    window.commitMs += elapsedMs;
+    window.commitFsWriteUnits += fsWriteUnits;
+    if (previousCommitAfter) {
+      window.betweenCommitFsWriteUnits +=
+        before.processFsWriteUnits - previousCommitAfter.processFsWriteUnits;
+      if (
+        before.mainBytes !== null &&
+        before.walBytes !== null &&
+        previousCommitAfter.mainBytes !== null &&
+        previousCommitAfter.walBytes !== null
+      ) {
+        window.mainFileLengthDeltaBeforeCommit += before.mainBytes - previousCommitAfter.mainBytes;
+        window.walFileLengthDeltaBeforeCommit += before.walBytes - previousCommitAfter.walBytes;
+      } else window.unavailableFileLengthPairs++;
+    }
+    if (
+      before.mainBytes !== null &&
+      before.walBytes !== null &&
+      after.mainBytes !== null &&
+      after.walBytes !== null
+    ) {
+      window.mainFileLengthDeltaDuringCommit += after.mainBytes - before.mainBytes;
+      window.walFileLengthDeltaDuringCommit += after.walBytes - before.walBytes;
+      if (after.mainBytes > before.mainBytes) window.mainFileLengthGrowthCommits++;
+    } else window.unavailableFileLengthPairs++;
+    if (before.header && after.header) {
+      if (before.header.cycle !== after.header.cycle) window.cycleChangedDuringCommit++;
+      if (before.header.checkpointSequence !== after.header.checkpointSequence)
+        window.sequenceChangedDuringCommit++;
+    } else window.unavailableHeaderPairs++;
+    if (previousCommitAfter?.header && before.header) {
+      if (previousCommitAfter.header.cycle !== before.header.cycle)
+        window.cycleChangedBeforeCommit++;
+      if (previousCommitAfter.header.checkpointSequence !== before.header.checkpointSequence)
+        window.sequenceChangedBeforeCommit++;
+    } else if (previousCommitAfter) window.unavailableBetweenCommitHeaderPairs++;
+    walCommitWindows.set(windowIndex, window);
+    previousCommitAfter = after;
+    previousCommitNodes = nodes;
+  };
   const databaseFilesBefore = databaseFiles();
   const recordBtrees = [
     '__record_versions',
@@ -354,18 +490,31 @@ function observePublication(
     const executeSql = DatabaseSync.prototype.exec;
     install(DatabaseSync.prototype, 'exec', function (this: DatabaseSync, query: string) {
       const shape = execShape(query);
+      const fixtureCommit = shape === 'COMMIT' && this === db;
+      if (fixtureCommit) fixtureCommitAttempts++;
+      const commitBefore = fixtureCommit ? walSample() : undefined;
       const time = performance.now();
       const fsWrite = process.resourceUsage().fsWrite;
       try {
         return executeSql.call(this, query);
       } finally {
+        const elapsedMs = performance.now() - time;
+        const fsWriteUnits = process.resourceUsage().fsWrite - fsWrite;
         const value = dbExec.get(shape) ?? { calls: 0, elapsedMs: 0, fsWrite: 0 };
         value.calls++;
-        value.elapsedMs += performance.now() - time;
-        value.fsWrite += process.resourceUsage().fsWrite - fsWrite;
+        value.elapsedMs += elapsedMs;
+        value.fsWrite += fsWriteUnits;
         dbExec.set(shape, value);
-        if (shape === 'COMMIT' && this === db)
-          maxObservedWalBytes = Math.max(maxObservedWalBytes, fileBytes(databasePath + '-wal'));
+        if (commitBefore) {
+          try {
+            const commitAfter = walSample();
+            observeWalCommit(commitBefore, commitAfter, elapsedMs, fsWriteUnits);
+            if (commitAfter.walBytes !== null)
+              maxObservedWalBytes = Math.max(maxObservedWalBytes, commitAfter.walBytes);
+          } catch {
+            walObservationFailures++;
+          }
+        }
       }
     });
     for (const method of ['prepare', 'stage', 'commitMaintenance'] as const) {
@@ -470,6 +619,17 @@ function observePublication(
       dispose();
       const recordBtreesAfter = recordBtreeFootprint();
       const end = snapshot();
+      const observedWalCommits = [...walCommitWindows.values()].reduce(
+        (sum, window) => sum + window.commits,
+        0,
+      );
+      assert.ok(walCommitWindows.size <= 16);
+      assert.equal(observedWalCommits + walObservationFailures, fixtureCommitAttempts);
+      if (!walObservationFailures)
+        assert.equal(
+          [...walCommitWindows.values()].reduce((sum, window) => sum + window.nodesWritten, 0),
+          end.collectionNodesWritten - start.collectionNodesWritten,
+        );
       const maintenanceNodes = maintenanceSegments.get('stage')?.work.collectionNodesWritten ?? 0;
       const publication = maintenanceSegments.get('postVerifyPublication');
       const retainedJournalGrowthBytes = journalBytes(archive) - retainedBytesBefore;
@@ -535,6 +695,13 @@ function observePublication(
             databaseFilesAfterDrain,
             maxObservedWalBytesAfterCommit: maxObservedWalBytes,
           },
+          walCommitWindows: [...walCommitWindows.values()],
+          walCommitWindowOracle: {
+            fixtureCommitAttempts,
+            observedWalCommits,
+            walObservationFailures,
+            nodeParityChecked: walObservationFailures === 0,
+          },
           record,
           totalSql: sql,
           filesystem: Object.fromEntries(filesystem),
@@ -552,7 +719,15 @@ function observePublication(
               .map(([key, value]) => [key, value - start[key as keyof typeof start]]),
           ),
           resourceUsage: process.resourceUsage(),
-          note: 'Instrumented durations include probe overhead. Nested phases overlap; final checkpoint drain is separate from maintenance. Whole-probe process fsWrite includes preparation, staging, publication and final drain after a setup-only WAL drain. Batch occupancy counts prepared changes and repeats of keyed changes only; byte append operations have no key. Batch COMMIT and process fsWrite totals cover successful maintenance calls, while WAL/main file size deltas reflect file lengths, not frames or physical I/O. dbstat traverses eight named record B-trees on a separate read-only connection outside the publication interval after WAL drains; its output count is fixed but scan work grows with those trees. Allocated pages are neither whole-cache size, VFS write bytes nor a causal index-cost comparison. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. Linux process fsWrite deltas are kernel-reported write units, not attributable to one SQLite connection; normalized values are unavailable on other platforms. WAL size is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; the configured threshold can be overshot by a bounded transaction, so the fixture uses an independent 256 MiB ceiling. maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
+          note: [
+            'Instrumented durations include probe overhead. Nested phases overlap; final checkpoint drain is separate from maintenance. Whole-probe process fsWrite includes preparation, staging, publication and final drain after a setup-only WAL drain.',
+            'Batch occupancy counts prepared changes and repeats of keyed changes only; byte append operations have no key. Batch COMMIT and process fsWrite totals cover successful maintenance calls.',
+            'WAL commit windows hold at most 16 buckets: the first 15 span 32 fixture-connection COMMIT attempts each, and the final bucket absorbs overflow. Each sample reads only the fixed 32-byte WAL header and main/WAL file lengths, not allocated disk blocks or valid frame counts. Unavailable file-length/header pairs are counted, not read as zero.',
+            'Between-commit deltas exclude the first call and include all intervening process work, not only SQLite. Header cycle or sequence changes observed before COMMIT may have occurred at the next transaction start; they do not assign checkpoint cost to that COMMIT. Main-file pages can be rewritten without growing the file.',
+            'dbstat traverses eight named record B-trees on a separate read-only connection outside publication after WAL drains; its bounded output does not bound scan work. Page lengths are neither whole-cache size, VFS write bytes nor a causal index-cost comparison.',
+            'Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped.',
+            'Filesystem bytes are API transfers, not physical device I/O. Linux process fsWrite deltas are kernel-reported write units, not attributable to one SQLite connection; normalized values are unavailable on other platforms. WAL length is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; a bounded transaction can overshoot the configured threshold, so the fixture keeps an independent 256 MiB ceiling. maxRSS and prepared-byte peaks cover process/connection lifetime, not cumulative work.',
+          ].join(' '),
         }),
       );
       assert.ok((phases.get('prepare')?.calls ?? 0) > 0);
