@@ -6,15 +6,20 @@ on:
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
 
 permissions:
-  contents: read
-  actions: read
+  contents: write
 
 jobs:
   capture:
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [focused, artifact, receipt]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 12
     env:
-      OUTPUT: /tmp/pr71-step2-ci
+      HUSKY: '0'
+      OUTPUT: /tmp/pr71-step3
+      CASE: ${{ matrix.case }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -25,75 +30,111 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - name: Preserve exact source identity and completed gate evidence
+      - name: Prepare pinned tooling and checksum-verified patch
+        run: |
+          mkdir -p "$OUTPUT"
+          test "$(git rev-parse HEAD)" = af98227c397c2c5939b5b49a13effa8e2ebf838d
+          git rev-parse HEAD > "$OUTPUT/base-sha.txt"
+          npm ci > "$OUTPUT/npm-ci.log" 2>&1
+          node --input-type=module <<'NODE'
+          import { gunzipSync } from 'node:zlib';
+          import { createHash } from 'node:crypto';
+          import { writeFileSync } from 'node:fs';
+          const encoded = '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';
+          const patch = gunzipSync(Buffer.from(encoded, 'base64'));
+          if (createHash('sha256').update(patch).digest('hex') !== '5ab77a3a0b152eee85f538bcef99445ea0f6391dfdf7f733f74267026f35e75b') throw Error('Patch transfer checksum mismatch');
+          writeFileSync(`${process.env.OUTPUT}/repair.patch`, patch);
+          NODE
+      - name: Verify the expected regression failure before the repair
+        if: matrix.case == 'focused'
+        run: |
+          git apply --include='src/server/test/*' "$OUTPUT/repair.patch"
+          node --input-type=module <<'NODE'
+          import { spawnSync } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          import { testEnvironment } from './src/scripts/test-suite.ts';
+          const args = ['--test', '--test-concurrency=1', '--test-reporter=spec', '--test-name-pattern=native lexical order pages|prefix-scoped collection ranges', 'src/server/test/intake-collection-envelope.test.ts', 'src/server/test/intake-state-collections.test.ts'];
+          const result = spawnSync(process.execPath, args, {env:testEnvironment(process.env,'server'),encoding:'utf8',maxBuffer:8*1024*1024});
+          const log = (result.stdout ?? '') + (result.stderr ?? '');
+          writeFileSync(`${process.env.OUTPUT}/red.log`,log);
+          writeFileSync(`${process.env.OUTPUT}/red-result.json`,JSON.stringify({command:['node',...args],status:result.status,signal:result.signal,error:result.error?.message??null},null,2));
+          if (result.status !== 1 || !/ℹ fail 3\b/.test(log) || !/ℹ cancelled 0\b/.test(log) || !/ℹ skipped 0\b/.test(log)) throw Error('Expected three assertion failures without cancellations or skips');
+          NODE
+      - name: Apply and verify the exact candidate tree
+        run: |
+          if [ "$CASE" = focused ]; then
+            git apply --exclude='src/server/test/*' "$OUTPUT/repair.patch"
+          else
+            git apply "$OUTPUT/repair.patch"
+          fi
+          git add docs/data/intake-state-storage.md docs/setup/release-updates.md src/server/intake-collection-envelope.ts src/server/intake-state-collections.ts src/server/test/intake-collection-envelope.test.ts src/server/test/intake-state-collections.test.ts src/server/test/intake-state-read-cache-authority.test.ts
+          git write-tree > "$OUTPUT/candidate-tree.txt"
+          test "$(cat "$OUTPUT/candidate-tree.txt")" = be1e57f3544eee63316b61036b378d9041927183
+          git diff --cached --check
+      - name: Execute complete unchanged history or focused test files
+        run: |
+          node --input-type=module <<'NODE'
+          import { spawnSync } from 'node:child_process';
+          import { openSync,closeSync,writeFileSync } from 'node:fs';
+          import { testEnvironment } from './src/scripts/test-suite.ts';
+          const files = {
+            artifact: ['src/server/test/intake-identity-native-artifact-history.test.ts'],
+            receipt: ['src/server/test/intake-identity-native-receipt-history.test.ts'],
+            focused: ['src/server/test/intake-collection-envelope.test.ts','src/server/test/intake-state-collections.test.ts','src/server/test/intake-state-read-cache-authority.test.ts','src/server/test/intake-schema-resolution-authority.test.ts']
+          }[process.env.CASE];
+          if (!files) throw Error('Unknown test case');
+          const args=['--test','--test-concurrency=1','--test-reporter=spec',...files];
+          const start=new Date().toISOString();
+          const fd=openSync(`${process.env.OUTPUT}/tests.log`,'w');
+          const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});
+          closeSync(fd);
+          const receipt={case:process.env.CASE,command:['node',...args],start,end:new Date().toISOString(),node:process.version,status:result.status,signal:result.signal,error:result.error?.message??null};
+          writeFileSync(`${process.env.OUTPUT}/test-result.json`,JSON.stringify(receipt,null,2));
+          console.log(JSON.stringify(receipt,null,2));
+          process.exitCode=result.status??1;
+          NODE
+      - name: Check all types, formatting and repository inventory
+        if: matrix.case == 'focused'
+        run: |
+          npm run typecheck > "$OUTPUT/typecheck.log" 2>&1
+          npx prettier --check docs/data/intake-state-storage.md docs/setup/release-updates.md src/server/intake-collection-envelope.ts src/server/intake-state-collections.ts src/server/test/intake-collection-envelope.test.ts src/server/test/intake-state-collections.test.ts src/server/test/intake-state-read-cache-authority.test.ts > "$OUTPUT/format.log" 2>&1
+          node scripts/repository-file-inventory.ts --check > "$OUTPUT/inventory.log" 2>&1
+          git diff --cached --check
+      - name: Preserve exact source and verified blobs without updating any branch
+        if: matrix.case == 'focused'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$OUTPUT/logs"
-          test "$(git rev-parse HEAD)" = af98227c397c2c5939b5b49a13effa8e2ebf838d
-          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
-          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
+          git archive be1e57f3544eee63316b61036b378d9041927183 | gzip -n > "$OUTPUT/source.tar.gz"
+          git ls-tree -r be1e57f3544eee63316b61036b378d9041927183 > "$OUTPUT/source-tree.txt"
           node --input-type=module <<'NODE'
-          import { writeFileSync } from 'node:fs';
-          import { setTimeout as sleep } from 'node:timers/promises';
-          const root = process.env.OUTPUT;
-          const api = 'https://api.github.com/repos/mxbaylee/circus-health';
-          const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' };
-          async function get(path, file, json = true) {
-            const response = await fetch(api + path, { headers, signal: AbortSignal.timeout(30000) });
-            if (!response.ok) throw Error(`${path}: HTTP ${response.status}`);
-            const text = await response.text();
-            if (file) writeFileSync(`${root}/${file}`, text);
-            return json ? JSON.parse(text) : text;
+          import { execFileSync } from 'node:child_process';
+          import { readFileSync,writeFileSync } from 'node:fs';
+          const paths=execFileSync('git',['diff','--cached','--name-only'],{encoding:'utf8'}).trim().split('\n');
+          if(paths.length!==7) throw Error('Wrong changed-file count');
+          const blobs=[];
+          for(const path of paths){
+            const content=readFileSync(path,'utf8');
+            const expected=execFileSync('git',['hash-object',path],{encoding:'utf8'}).trim();
+            const response=await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs',{method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},body:JSON.stringify({content,encoding:'utf-8'}),signal:AbortSignal.timeout(30000)});
+            if(!response.ok)throw Error(`${path}: HTTP ${response.status}`);
+            const actual=await response.json();
+            if(actual.sha!==expected)throw Error(`Blob mismatch: ${path}`);
+            blobs.push({path,mode:'100644',type:'blob',sha:actual.sha});
+            writeFileSync(`${process.env.OUTPUT}/blobs.json`,JSON.stringify(blobs,null,2));
           }
-          // Observe the existing run, never dispatch or re-run a test. Stop after
-          // a bounded wait and retain an explicitly incomplete snapshot if needed.
-          const polls = [];
-          let jobs;
-          for (let attempt = 0; attempt < 11; attempt++) {
-            jobs = await get('/actions/runs/37715662544/attempts/1/jobs?per_page=100', 'jobs.json');
-            if (jobs.total_count !== jobs.jobs.length) throw Error('Incomplete job listing');
-            const gates = jobs.jobs.filter(job => ['acceptance', 'continuation'].includes(job.name));
-            if (gates.length !== 2) throw Error('Missing exact gate jobs');
-            polls.push({ observedAt: new Date().toISOString(), gates: gates.map(({id,name,status,conclusion}) => ({id,name,status,conclusion})) });
-            writeFileSync(`${root}/gate-observations.json`, JSON.stringify(polls, null, 2));
-            if (gates.every(job => job.status === 'completed') || attempt === 10) break;
-            await sleep(60000);
-          }
-          const run = await get('/actions/runs/37715662544', 'run.json');
-          if (run.head_sha !== 'af98227c397c2c5939b5b49a13effa8e2ebf838d') throw Error('Wrong candidate run');
-          await get('/pulls/71', 'pr.json');
-          await get('/issues/comments/6050628885', 'bounded-review-request.json');
-          await get('/issues/comments/6050652895', 'bounded-review-result.json');
-          const wanted = new Set(['acceptance', 'continuation', 'Server (4/16)', 'Server (6/16)', 'Browser (5/6)', 'Browser (6/6)', 'Server (8/16)', 'checks']);
-          const summaries = [];
-          for (const job of jobs.jobs) {
-            if (job.status !== 'completed') continue;
-            if (!wanted.has(job.name) && job.conclusion === 'success') continue;
-            try {
-              const text = await get(`/actions/jobs/${job.id}/logs`, `logs/${job.id}.log`, false);
-              const lines = text.split('\n');
-              const failures = lines.findIndex(line => line.includes('failing tests:'));
-              summaries.push({ id:job.id, name:job.name, conclusion:job.conclusion, startedAt:job.started_at, completedAt:job.completed_at, excerpt:failures >= 0 ? lines.slice(failures,failures+65) : lines.filter(line => /duration_ms|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|##\[error\]|recovery stage/.test(line)) });
-            } catch (error) { summaries.push({id:job.id,name:job.name,captureError:String(error)}); }
-          }
-          const counts = {};
-          for (const job of jobs.jobs) {const key = job.conclusion ?? job.status; counts[key] = (counts[key] ?? 0) + 1;}
-          const gates = jobs.jobs.filter(job => ['acceptance','continuation'].includes(job.name)).map(({id,name,status,conclusion,started_at,completed_at})=>({id,name,status,conclusion,started_at,completed_at}));
-          const summary = {observedAt:new Date().toISOString(),runId:run.id,attempt:run.run_attempt,headSha:run.head_sha,runStatus:run.status,runConclusion:run.conclusion,counts,gates,gatesPassed:gates.every(job=>job.status==='completed' && job.conclusion==='success'),summaries};
-          writeFileSync(`${root}/summary.json`,JSON.stringify(summary,null,2));
-          console.log(JSON.stringify(summary,null,2));
           NODE
       - name: Hash retained output
         if: always()
         run: |
-          cd "$OUTPUT"
-          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          if [ -d "$OUTPUT" ]; then
+            cd "$OUTPUT"
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step2-ci-receipt
-          path: /tmp/pr71-step2-ci
+          name: pr71-step3-${{ matrix.case }}
+          path: /tmp/pr71-step3
           if-no-files-found: error
           retention-days: 14
