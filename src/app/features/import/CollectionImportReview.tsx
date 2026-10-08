@@ -817,6 +817,7 @@ export function CollectionImportReview({
         )}
         actions={{
           busy: busy || mutationPending || authorityUnavailable,
+          peopleBusy: peoplePage.loading || peoplePage.refreshing || !!peoplePage.error,
           uploadBusy: busy || mutationPending,
           uploadUnavailable,
           onFiles: onUpload,

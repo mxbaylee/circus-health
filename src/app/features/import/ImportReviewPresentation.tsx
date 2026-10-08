@@ -204,6 +204,7 @@ export interface ImportReviewModel {
 
 export interface ImportReviewActions {
   busy?: boolean;
+  peopleBusy?: boolean;
   /** A stale review window does not prevent retaining a new original. */
   uploadBusy?: boolean;
   /** Upload prerequisites can load independently from the review queue. */
@@ -1042,7 +1043,7 @@ export function ImportReviewPresentation({
                       <button
                         className="button primary"
                         type="button"
-                        disabled={actions.busy}
+                        disabled={actions.busy || actions.peopleBusy}
                         onClick={() =>
                           move(
                             readyPeople.map((record) => record.id),
@@ -1258,7 +1259,11 @@ export function ImportReviewPresentation({
                                 <button
                                   className="button primary"
                                   type="button"
-                                  disabled={!record.eligible || actions.busy}
+                                  disabled={
+                                    !record.eligible ||
+                                    actions.busy ||
+                                    (record.kind === 'People' && actions.peopleBusy)
+                                  }
                                   aria-describedby={
                                     !record.eligible && record.saveBlockReason
                                       ? saveBlockDescriptionId(record.id)

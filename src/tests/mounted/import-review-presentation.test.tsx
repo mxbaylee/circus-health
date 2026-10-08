@@ -925,7 +925,7 @@ it('keeps an evidenced match saveable while offering a separate optional Self fi
           },
         ],
       }}
-      actions={{ onConfirmIdentity }}
+      actions={{ onConfirmIdentity, peopleBusy: true }}
     />,
   );
   expect(screen.getByRole('button', { name: 'Confirm & save' })).not.toBeDisabled();
