@@ -1202,7 +1202,7 @@ export function attachRecordDurability(
   // Unattached databases and non-WAL connections retain their existing settings.
   if (!status.dirty && db.prepare('PRAGMA main.journal_mode').get()?.journal_mode === 'wal') {
     db.exec('PRAGMA main.synchronous=NORMAL');
-    db.exec('PRAGMA main.wal_autocheckpoint=8192');
+    db.exec('PRAGMA main.wal_autocheckpoint=32768');
   }
   return status;
 }

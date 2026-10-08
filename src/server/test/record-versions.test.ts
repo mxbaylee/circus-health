@@ -1234,7 +1234,7 @@ test('only a successfully attached accepted journal selects normal-synchronous W
   attachRecordDurability(f.db, { profileId, storage: f.storage });
   assert.equal(f.db.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'wal');
   assert.equal(synchronous(f.db), 1);
-  assert.equal(checkpointPages(f.db), 8192);
+  assert.equal(checkpointPages(f.db), 32768);
   const unattached = f.open('unattached-policy.sqlite');
   assert.equal(synchronous(unattached), 2, 'opening alone does not relax SQLite durability');
   assert.equal(checkpointPages(unattached), 1000);
@@ -1265,7 +1265,7 @@ test('attached WAL policy reduces actual checkpoint restarts while preserving ac
       path = resolve(f.root, 'current.sqlite'),
       wal = path + '-wal';
     attachRecordDurability(f.db, { profileId, storage: f.storage });
-    if (threshold === 1000) f.db.exec('PRAGMA main.wal_autocheckpoint=1000');
+    f.db.exec(`PRAGMA main.wal_autocheckpoint=${threshold}`);
     assert.equal(
       f.db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint,
       threshold,
@@ -1315,6 +1315,92 @@ test('attached WAL policy reduces actual checkpoint restarts while preserving ac
   };
   assert.equal(run(1000), 1, 'default threshold restarts the WAL after the large commit');
   assert.equal(run(8192), 0, 'attached threshold avoids that checkpoint restart');
+});
+
+test('larger attached WAL window avoids repeated resets without deferring accepted recovery', (t) => {
+  const walSalt = (path: string) => {
+    const file = openSync(path, 'r');
+    try {
+      const header = Buffer.alloc(24);
+      assert.equal(readSync(file, header, 0, header.length, 0), header.length);
+      assert.ok([0x377f0682, 0x377f0683].includes(header.readUInt32BE(0)));
+      return header.subarray(16, 24).toString('hex');
+    } finally {
+      closeSync(file);
+    }
+  };
+  const run = (threshold: 8192 | 32768) => {
+    const f = fixture(t),
+      path = resolve(f.root, 'current.sqlite'),
+      wal = path + '-wal';
+    attachRecordDurability(f.db, { profileId, storage: f.storage });
+    if (threshold === 8192) f.db.exec('PRAGMA main.wal_autocheckpoint=8192');
+    const configured = Number(
+      f.db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint,
+    );
+    assert.equal(f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get()?.busy, 0);
+    let priorSalt: string | undefined;
+    let resets = 0;
+    let maxWalBytes = 0;
+    const observe = () => {
+      const salt = walSalt(wal);
+      if (priorSalt && salt !== priorSalt) resets++;
+      priorSalt = salt;
+      maxWalBytes = Math.max(maxWalBytes, statSync(wal).size);
+    };
+    for (let index = 0; index < 7; index++) {
+      transaction(f.db, () => {
+        f.db
+          .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+          .run('fictional-checkpoint-' + index, 'Fictional ' + 'x'.repeat(5 * 1024 * 1024));
+      });
+      observe();
+    }
+    transaction(f.db, () => {
+      f.db
+        .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+        .run('fictional-checkpoint-last', 'Fictional small');
+    });
+    observe();
+    const contentDigests = (db: Database) => {
+      const selected: Array<{ id: string; bytes: number; sha256: string }> = [];
+      for (const row of db
+        .prepare(
+          "SELECT id,display_name FROM people WHERE id LIKE 'fictional-checkpoint-%' ORDER BY id",
+        )
+        .iterate()) {
+        const value = String(row.display_name);
+        const hash = createHash('sha256');
+        for (let offset = 0; offset < value.length; offset += 64 * 1024)
+          hash.update(value.slice(offset, offset + 64 * 1024));
+        selected.push({
+          id: String(row.id),
+          bytes: Buffer.byteLength(value),
+          sha256: hash.digest('hex'),
+        });
+      }
+      return selected;
+    };
+    const current = contentDigests(f.db);
+    assert.equal(current.length, 8);
+    const beforeDrain = statSync(path).size;
+    const drain = f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get();
+    assert.equal(drain?.busy, 0);
+    assert.equal(statSync(wal).size, 0);
+    assert.ok(statSync(path).size >= beforeDrain);
+    const recovered = rebuild(f, `recovered-wal-window-${threshold}.sqlite`);
+    assert.deepEqual(contentDigests(recovered), current);
+    assert.equal(history(recovered, 'people', 'fictional-checkpoint-0').length, 1);
+    assert.equal(history(recovered, 'people', 'fictional-checkpoint-6').length, 1);
+    return { configured, resets, maxWalBytes };
+  };
+  const baseline = run(8192),
+    candidate = run(32768);
+  t.diagnostic(JSON.stringify({ baseline, candidate }));
+  assert.equal(baseline.configured, 8192);
+  assert.ok(baseline.resets >= 1, '8192-page window must actually restart this WAL');
+  assert.equal(candidate.resets, 0, 'attached candidate keeps this bounded WAL cycle open');
+  assert.equal(candidate.configured, 32768);
 });
 
 test('journal-backed WAL refuses failed HEAD publication and recovers durable acceptance before cache COMMIT', (t) => {
