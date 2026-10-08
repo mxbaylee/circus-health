@@ -18,11 +18,11 @@ jobs:
     timeout-minutes: 15
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-wal32-cycles
+      OUTPUT: /tmp/pr71-wal64-comparison
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 98858d6e44bdf8771e01de79f08407a98fa4080d
+          ref: 10e4a44a7df8db4bf652ef750f60ee9e6677f5aa
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -30,14 +30,16 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Classify prior commit reset correlations including final drain
+      - name: Compare bounded checkpoint policies on the same host including final drains
         env:
           CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
           CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
         run: |
           mkdir -p "$OUTPUT"
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/wal-cycles.log"
+          for pages in 32768 65536; do
+            CRS_HISTORY_WAL_CHECKPOINT_PAGES="$pages" node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/wal-$pages.log"
+          done
       - name: Hash diagnostic evidence
         if: always()
         run: |
@@ -46,7 +48,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-wal32-cycles
-          path: /tmp/pr71-wal32-cycles
+          name: pr71-wal64-comparison
+          path: /tmp/pr71-wal64-comparison
           if-no-files-found: error
           retention-days: 14
