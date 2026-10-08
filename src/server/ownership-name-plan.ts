@@ -95,6 +95,8 @@ export async function prepareOwnershipNamePlan(
       CREATE TABLE targets(support INTEGER,ordinal INTEGER,record_id TEXT,PRIMARY KEY(support,ordinal));
       CREATE TABLE affected(effect TEXT,record_id TEXT,ordinal INTEGER,PRIMARY KEY(effect,record_id));
       CREATE TABLE scopes(intake_id TEXT,group_id TEXT,record_id TEXT,ordinal INTEGER,PRIMARY KEY(intake_id,group_id,record_id));
+      CREATE TABLE owner_notes(person_id TEXT PRIMARY KEY,note_id TEXT NOT NULL,ordinal INTEGER NOT NULL);
+      CREATE INDEX owner_notes_note ON owner_notes(note_id,ordinal);
       CREATE TABLE choices(key TEXT PRIMARY KEY,outcome TEXT);`);
     let affectedOrdinal = 0,
       scopeOrdinal = 0;
@@ -125,15 +127,23 @@ export async function prepareOwnershipNamePlan(
         await tick();
       }
     }
-    const ownerNotes = new Map<string, string>();
+    let ownerOrdinal = 0;
     for (const person of owners) {
       const row = db
         .prepare("SELECT id FROM notes WHERE kind='person' AND person_id=?")
         .get(person);
-      if (row) ownerNotes.set(person, String(row.id));
+      if (row)
+        sql
+          .prepare('INSERT INTO owner_notes VALUES(?,?,?)')
+          .run(person, String(row.id), ownerOrdinal++);
+      await tick();
     }
+    const ownerNote = sql.prepare('SELECT note_id FROM owner_notes WHERE person_id=?'),
+      noteOwner = sql.prepare(
+        'SELECT person_id FROM owner_notes WHERE note_id=? ORDER BY ordinal LIMIT 1',
+      );
     const effectFor = (person: string, name: string) => {
-      const note = ownerNotes.get(person);
+      const note = ownerNote.get(person)?.note_id;
       if (!note) return undefined;
       const canonical = canonicalIdentityName(name),
         key = ownershipHash([note, canonical]);
@@ -166,9 +176,9 @@ export async function prepareOwnershipNamePlan(
         intakeId: string;
         groupId: string;
       };
-      const person = [...ownerNotes].find(([, note]) => note === value.noteId)?.[0];
+      const person = noteOwner.get(value.noteId)?.person_id;
       if (!person || superseded(value.operationId)) continue;
-      const key = effectFor(person, value.name);
+      const key = effectFor(String(person), value.name);
       if (!key) continue;
       if (sources.has(value.sourceRecordId) || reportAffected(value.intakeId, value.groupId))
         sql.prepare('UPDATE effects SET candidate=1,name=? WHERE key=?').run(value.name, key);
@@ -223,9 +233,9 @@ export async function prepareOwnershipNamePlan(
         intakeId: string;
         groupId: string;
       };
-      const person = [...ownerNotes].find(([, note]) => note === value.noteId)?.[0];
+      const person = noteOwner.get(value.noteId)?.person_id;
       if (!person || superseded(value.operationId)) continue;
-      const key = effectFor(person, value.name);
+      const key = effectFor(String(person), value.name);
       if (!key) continue;
       const affected = sources.has(value.sourceRecordId);
       const support = sql
@@ -247,7 +257,11 @@ export async function prepareOwnershipNamePlan(
       if (affected) addAffected(key, value.sourceRecordId);
       await tick();
     }
-    for (const [person, noteId] of ownerNotes) {
+    for (const owner of sql
+      .prepare('SELECT person_id,note_id FROM owner_notes ORDER BY ordinal')
+      .iterate()) {
+      const person = String(owner.person_id),
+        noteId = String(owner.note_id);
       const note = getNote(db, noteId);
       for (const name of note.person.sourceKnownNames || []) {
         if (!safeSourceIdentityName(name.name)) continue;

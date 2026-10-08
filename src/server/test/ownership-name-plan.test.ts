@@ -14,8 +14,199 @@ import { prepareIntakeLookupIndices } from '../intake-lookup-state.ts';
 import { createNote, getNote } from '../notes.ts';
 import { prepareOwnershipNamePlan } from '../ownership-name-plan.ts';
 import { previewOwnershipNames } from '../ownership-names.ts';
-import { ownershipHash } from '../ownership-journal.ts';
+import { appendOwnershipDecision, ownershipHash } from '../ownership-journal.ts';
+import { disposableSqlite } from '../disposable-sqlite.ts';
+import { createOwnershipPreviewStore } from '../ownership-preview-store.ts';
 import type { OwnershipRequest } from '../../shared/record-ownership.ts';
+
+for (const ownerCount of [3, 17])
+  test(`native report name routing keeps ${ownerCount} owners on disk without owner-map copies`, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-many-owner-name-plan-')),
+      db = openDatabase(join(root, 'cache.sqlite'), 'fictional'),
+      scratch = disposableSqlite('fictional-name-plan-owners-');
+    memoryRecordAuthority(db);
+    t.after(() => {
+      scratch.close();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const people = Array.from({ length: ownerCount }, (_, ordinal) =>
+        createNote(db, {
+          kind: 'person',
+          title: 'Fictional Owner ' + ordinal,
+          person: { fullName: 'Fictional Owner ' + String.fromCharCode(65 + ordinal) },
+        }),
+      ),
+      sourceIds = people.map((_, ordinal) => 'fictional-record-' + ordinal),
+      receipts = people.map((person, ordinal) => ({
+        operationId: 'fictional-confirm-' + ordinal,
+        assignedPerson: { personId: person.personId },
+        confirmedPrintedName: 'Fictional Printed ' + String.fromCharCode(65 + ordinal),
+        scope: {
+          intakeId: 'original',
+          groupId: 'group',
+          targets: [{ recordId: sourceIds[ordinal] }],
+        },
+      }));
+    registerRawIntakeFixture(
+      db,
+      'original',
+      JSON.stringify({
+        intake: {
+          version: 0,
+          workflow: {
+            identityConfirmations: receipts,
+            reportGroups: [{ id: 'group', versions: [{ id: 'version', members: [] }] }],
+            reportAcceptances: [],
+          },
+        },
+      }),
+    );
+    transaction(db, () => {
+      for (const [ordinal, id] of sourceIds.entries()) {
+        db.prepare('INSERT INTO source_records(id,source_file_id,raw_json) VALUES(?,?,?)').run(
+          id,
+          'original',
+          '{}',
+        );
+        appendOwnershipDecision(db, 'fictional-support-' + ordinal, 'Ownership name support', {
+          operationId: 'fictional-support-' + ordinal,
+          noteId: people[ordinal]!.id,
+          name: receipts[ordinal]!.confirmedPrintedName,
+          sourceRecordId: id,
+          intakeId: 'original',
+          groupId: 'group',
+        });
+      }
+    });
+    const sources = new Set(sourceIds),
+      owners = new Set(people.map((person) => person.personId!)),
+      request: OwnershipRequest = {
+        selection: {
+          type: 'report',
+          intakeId: 'original',
+          groupId: 'group',
+          groupVersionId: 'version',
+        },
+        destination: { noteId: people[0]!.id, expectedVersion: people[0]!.version },
+      },
+      legacy = previewOwnershipNames(db, sources, owners, request);
+    assert.equal(legacy.length, ownerCount);
+    await buildIntakeCollectionEnvelope(db, { id: 'original' });
+    await prepareIntakeLookupIndices(db);
+    const store = createOwnershipPreviewStore(scratch.db, sources, 'fictional-evidence');
+    scratch.db.exec('CREATE TABLE fixture_owner_notes(person TEXT PRIMARY KEY,note TEXT)');
+    for (const person of people) {
+      store.sink.owners.add(person.personId!);
+      scratch.db
+        .prepare('INSERT INTO fixture_owner_notes VALUES(?,?)')
+        .run(person.personId!, person.id);
+    }
+    const ownerNote = scratch.db.prepare(
+        'SELECT 1 FROM fixture_owner_notes WHERE person=? AND note=?',
+      ),
+      originalSet = Map.prototype.set,
+      originalIterator = Map.prototype[Symbol.iterator];
+    let ownerMapEntries = 0,
+      ownerMapTraversals = 0;
+    Map.prototype.set = function (key, value) {
+      if (typeof key === 'string' && typeof value === 'string' && ownerNote.get(key, value))
+        ownerMapEntries++;
+      return originalSet.call(this, key, value);
+    };
+    Map.prototype[Symbol.iterator] = function () {
+      const first = originalIterator.call(this).next().value;
+      if (
+        first &&
+        typeof first[0] === 'string' &&
+        typeof first[1] === 'string' &&
+        ownerNote.get(first[0], first[1])
+      )
+        ownerMapTraversals++;
+      return originalIterator.call(this);
+    };
+    let plan: Awaited<ReturnType<typeof prepareOwnershipNamePlan>> | undefined;
+    try {
+      plan = await prepareOwnershipNamePlan(
+        db,
+        'fictional',
+        store.sink.sources,
+        store.sink.owners,
+        request,
+        { ownedReportScopes: true },
+      );
+    } finally {
+      Map.prototype.set = originalSet;
+      Map.prototype[Symbol.iterator] = originalIterator;
+      t.after(() => plan?.close());
+    }
+    assert.equal(plan.reference.total, ownerCount);
+    assert.equal(plan.reference.digest, ownershipHash(legacy));
+    t.diagnostic(JSON.stringify({ ownerCount, ownerMapEntries, ownerMapTraversals }));
+    assert.equal(ownerMapEntries, 0, 'complete report owners must not enter a JS routing map');
+    assert.equal(ownerMapTraversals, 0, 'support lookup must not expand the complete owner map');
+  });
+
+test('native report name owner preparation yields to cancellation without publishing decisions', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-canceled-owner-routing-')),
+    db = openDatabase(join(root, 'cache.sqlite'), 'fictional'),
+    scratch = disposableSqlite('fictional-canceled-name-owners-');
+  memoryRecordAuthority(db);
+  t.after(() => {
+    scratch.close();
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const store = createOwnershipPreviewStore(scratch.db, new Set(), 'fictional-evidence');
+  let destination: ReturnType<typeof createNote> | undefined;
+  for (let ordinal = 0; ordinal < 65; ordinal++) {
+    const person = createNote(db, {
+      kind: 'person',
+      title: 'Fictional Owner ' + ordinal,
+      person: { fullName: 'Fictional Owner ' + ordinal },
+    });
+    destination ??= person;
+    store.sink.owners.add(person.personId!);
+  }
+  let cancelled = false;
+  const interrupt = setImmediate(() => {
+    cancelled = true;
+  });
+  t.after(() => clearImmediate(interrupt));
+  await assert.rejects(
+    prepareOwnershipNamePlan(
+      db,
+      'fictional',
+      store.sink.sources,
+      store.sink.owners,
+      {
+        selection: {
+          type: 'report',
+          intakeId: 'fictional-report',
+          groupId: 'group',
+          groupVersionId: 'version',
+        },
+        destination: { noteId: destination!.id, expectedVersion: destination!.version },
+      },
+      {
+        ownedReportScopes: true,
+        assertRunning() {
+          if (cancelled) throw Error('Fictional owner preparation stopped');
+        },
+      },
+    ),
+    /Fictional owner preparation stopped/,
+  );
+  assert.equal(cancelled, true);
+  assert.equal(
+    db
+      .prepare(
+        "SELECT COUNT(*) n FROM manual_batches WHERE title IN ('Remembered name correction','Identity receipt supersession','Ownership name support')",
+      )
+      .get()!.n,
+    0,
+  );
+});
 
 test(
   'native name plan retains complete large receipt targets, matches the legacy effect digest, pages evidence and stages atomically',
