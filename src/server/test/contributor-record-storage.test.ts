@@ -19,7 +19,11 @@ import { backup } from 'node:sqlite';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability, rebuildProfile, writePortableSources } from '../portable.ts';
-import { attachRecordDurability, recordDurabilityStatus } from '../record-versions.ts';
+import {
+  attachRecordDurability,
+  queryRecordHistory,
+  recordDurabilityStatus,
+} from '../record-versions.ts';
 import {
   openContributorRecordStorage,
   contributorAuthorityPath,
@@ -350,6 +354,115 @@ test('selected authority refuses an unindexed existing cache without resetting i
   } finally {
     reopened.close();
   }
+});
+
+test('old contributor projection refuses direct reuse and staged recovery preserves accepted history', (t) => {
+  const { root, paths, db } = fixture(t);
+  const authorityBytes = (archiveRoot: string) => {
+    const authority = contributorAuthorityPath(archiveRoot, 'cedar');
+    const files: Array<[string, Buffer]> = [
+      ['record-authority.json', readFileSync(resolve(authority, '../record-authority.json'))],
+    ];
+    const visit = (directory: string, relative = '') => {
+      for (const name of readdirSync(directory).sort()) {
+        if (name === 'writer.lock') continue;
+        const path = resolve(directory, name);
+        const child = relative ? `${relative}/${name}` : name;
+        if (statSync(path).isDirectory()) visit(path, child);
+        else files.push([child, readFileSync(path)]);
+      }
+    };
+    visit(authority);
+    return files;
+  };
+  db.prepare("INSERT INTO app_meta VALUES('fictional:projection','initial')").run();
+  attachPersonalDurability(db, { root, profileId: 'cedar' });
+  transaction(db, () =>
+    db.prepare("UPDATE app_meta SET value='accepted' WHERE key='fictional:projection'").run(),
+  );
+  const history = queryRecordHistory(db, {
+    profileId: 'cedar',
+    entity: 'app_meta',
+    recordId: 'fictional:projection',
+  });
+  assert.equal(history.entries.length, 2);
+  assert.deepEqual(
+    history.entries[1]!.changes.map((change) => change.field),
+    ['key', 'value'],
+  );
+  assert.deepEqual(history.entries[1]!.changes[1]!.after, {
+    present: true,
+    value: 'initial',
+  });
+  const head = selectedContributorHead(root, 'cedar');
+  db.prepare('UPDATE __record_state SET projection=2 WHERE singleton=1').run();
+  db.close();
+  const acceptedBytes = authorityBytes(root);
+
+  const reopened = openDatabase(paths.database, 'cedar');
+  try {
+    assert.throws(
+      () => attachPersonalDurability(reopened, { root, profileId: 'cedar', initialize: false }),
+      /unsupported or incomplete history projection; rebuild cache/,
+    );
+    assert.equal(
+      reopened.prepare("SELECT value FROM app_meta WHERE key='fictional:projection'").get()?.value,
+      'accepted',
+    );
+    assert.equal(reopened.prepare('SELECT projection FROM __record_state').get()?.projection, 2);
+    assert.equal(selectedContributorHead(root, 'cedar'), head);
+  } finally {
+    reopened.close();
+  }
+  assert.deepEqual(authorityBytes(root), acceptedBytes);
+
+  const target = resolve(root, 'recovered');
+  rebuildProfile(root, 'cedar', target);
+  assert.deepEqual(authorityBytes(root), acceptedBytes);
+  assert.deepEqual(authorityBytes(target), acceptedBytes);
+  const restored = openDatabase(resolve(target, 'data/profiles/cedar/db/database.sqlite'), 'cedar');
+  try {
+    attachPersonalDurability(restored, { root: target, profileId: 'cedar', initialize: false });
+    assert.equal(
+      restored.prepare("SELECT value FROM app_meta WHERE key='fictional:projection'").get()?.value,
+      'accepted',
+    );
+    assert.deepEqual(
+      queryRecordHistory(restored, {
+        profileId: 'cedar',
+        entity: 'app_meta',
+        recordId: 'fictional:projection',
+      }),
+      history,
+    );
+  } finally {
+    restored.close();
+  }
+  assert.equal(selectedContributorHead(root, 'cedar'), head);
+  assert.equal(existsSync(paths.database), true);
+  const source = openDatabase(paths.database, 'cedar');
+  try {
+    assert.equal(source.prepare('SELECT projection FROM __record_state').get()?.projection, 2);
+    assert.equal(
+      source.prepare("SELECT value FROM app_meta WHERE key='fictional:projection'").get()?.value,
+      'accepted',
+    );
+  } finally {
+    source.close();
+  }
+
+  const authority = contributorAuthorityPath(target, 'cedar');
+  const committed = JSON.parse(readFileSync(resolve(authority, 'head'), 'utf8')) as {
+    name: string;
+  };
+  writeFileSync(resolve(authority, committed.name), 'corrupt');
+  assert.throws(
+    () => rebuildProfile(target, 'cedar', resolve(root, 'refused')),
+    /corrupt committed object/,
+  );
+  assert.equal(existsSync(resolve(root, 'refused')), false);
+  assert.equal(selectedContributorHead(root, 'cedar'), head);
+  assert.deepEqual(authorityBytes(root), acceptedBytes);
 });
 
 test('contributor copy compares exact streamed row multisets and publishes authority paths to a bounded sink', async (t) => {

@@ -179,7 +179,7 @@ const FORMAT = 'health-record-versions-v1';
 const COMMIT_FORMAT = 'health-record-versions-v2';
 const SEGMENT_REFERENCE_WINDOW = 64;
 const SEGMENT_PAGE_BYTES = 32768;
-const PROJECTION = 2;
+const PROJECTION = 3;
 const LIMIT = 256 * 1024;
 const q = (s: string): string => '"' + s.replaceAll('"', '""') + '"';
 const literal = (s: string): string => "'" + s.replaceAll("'", "''") + "'";
@@ -575,6 +575,19 @@ function values(contents: unknown): Map<string, string | undefined> {
     }
   return found;
 }
+function implicitInitialMetadataFields(version: DurableRecordVersion): boolean {
+  return (
+    version.entity === 'app_meta' &&
+    version.previousVersion === null &&
+    !version.deleted &&
+    version.contents !== null &&
+    typeof version.contents === 'object' &&
+    !Array.isArray(version.contents) &&
+    Object.keys(version.contents).sort().join(',') === 'key,value' &&
+    typeof version.contents.key === 'string' &&
+    typeof version.contents.value === 'string'
+  );
+}
 const currentStatements = new WeakMap<Database, ReturnType<Database['prepare']>>();
 function current(db: Database, entity: string, id: string): CurrentVersionRow | undefined {
   let statement = currentStatements.get(db);
@@ -686,10 +699,7 @@ function indexTransaction(
     for (const version of versions) {
       recordVersionWork('indexedVersionAttempts');
       const previous = validateVersion(db, config, commit, version, identities);
-      const before = values(
-          previous && !previous.deleted ? parseRecordJson(previous.contents_json) : null,
-        ),
-        after = values(version.deleted ? null : version.contents);
+      const implicitFields = implicitInitialMetadataFields(version);
       const { contents, ...metadata } = version;
       insertVersion.run(
         version.versionId,
@@ -705,37 +715,43 @@ function indexTransaction(
         stringifyRecordJson(metadata),
       );
       selectVersion.run(version.entity, version.recordId, version.versionId);
-      const fields: SQLInputValue[] = [];
-      const flushFields = () => {
-        if (!fields.length) return;
-        const rows = fields.length / 9;
-        let insert = fieldStatements.get(rows);
-        if (!insert) {
-          insert = db.prepare(
-            'INSERT INTO __record_fields VALUES' +
-              Array(rows).fill('(?,?,?,?,?,?,?,?,?)').join(','),
-          );
-          fieldStatements.set(rows, insert);
-        }
-        insert.run(...fields);
-        fields.length = 0;
-      };
-      for (const field of new Set([...before.keys(), ...after.keys()]))
-        if (before.get(field) !== after.get(field)) {
-          fields.push(
-            version.versionId,
-            config.profileId,
-            version.entity,
-            version.recordId,
-            field,
-            version.sequence,
-            previous?.version_id ?? null,
-            Number(before.has(field)),
-            Number(after.has(field)),
-          );
-          if (fields.length === 32 * 9) flushFields();
-        }
-      flushFields();
+      if (!implicitFields) {
+        const before = values(
+            previous && !previous.deleted ? parseRecordJson(previous.contents_json) : null,
+          ),
+          after = values(version.deleted ? null : version.contents);
+        const fields: SQLInputValue[] = [];
+        const flushFields = () => {
+          if (!fields.length) return;
+          const rows = fields.length / 9;
+          let insert = fieldStatements.get(rows);
+          if (!insert) {
+            insert = db.prepare(
+              'INSERT INTO __record_fields VALUES' +
+                Array(rows).fill('(?,?,?,?,?,?,?,?,?)').join(','),
+            );
+            fieldStatements.set(rows, insert);
+          }
+          insert.run(...fields);
+          fields.length = 0;
+        };
+        for (const field of new Set([...before.keys(), ...after.keys()]))
+          if (before.get(field) !== after.get(field)) {
+            fields.push(
+              version.versionId,
+              config.profileId,
+              version.entity,
+              version.recordId,
+              field,
+              version.sequence,
+              previous?.version_id ?? null,
+              Number(before.has(field)),
+              Number(after.has(field)),
+            );
+            if (fields.length === 32 * 9) flushFields();
+          }
+        flushFields();
+      }
     }
   } finally {
     identities.close();
@@ -1374,8 +1390,12 @@ export function queryRecordHistory(
   let sql =
     'SELECT v.version_id FROM __record_versions v WHERE v.profile_id=? AND v.entity=? AND v.record_id=? AND v.sequence<?';
   if (field !== undefined) {
+    const fieldReference =
+      'EXISTS(SELECT 1 FROM __record_fields f WHERE f.version_id=v.version_id AND f.field=?)';
     sql +=
-      ' AND EXISTS(SELECT 1 FROM __record_fields f WHERE f.version_id=v.version_id AND f.field=?)';
+      entity === 'app_meta' && (field === 'key' || field === 'value')
+        ? ` AND (${fieldReference} OR (v.previous_version IS NULL AND v.deleted=0))`
+        : ` AND ${fieldReference}`;
     params.push(field);
   }
   sql += ' ORDER BY v.sequence DESC LIMIT ?';
@@ -1405,32 +1425,40 @@ export function queryRecordHistory(
       fail('invalid indexed previous version');
     const before = values(prior && !prior.deleted ? prior.contents : null);
     const after = values(version.deleted ? null : version.contents);
-    const changes: RecordFieldChange[] = db
+    const storedChanges = db
       .prepare('SELECT * FROM __record_fields WHERE version_id=? ORDER BY field')
-      .all(version.versionId)
-      .map((change) => {
-        const name = String(change.field);
-        if (
-          change.profile_id !== version.profileId ||
-          change.entity !== version.entity ||
-          change.record_id !== version.recordId ||
-          change.sequence !== version.sequence ||
-          change.before_version !== version.previousVersion ||
-          change.before_present !== Number(before.has(name)) ||
-          change.after_present !== Number(after.has(name)) ||
-          before.get(name) === after.get(name)
-        )
-          fail('invalid indexed field reference');
-        return {
-          field: name,
-          before: before.has(name)
-            ? { present: true as const, value: parseRecordJson(before.get(name)!) }
-            : { present: false as const },
-          after: after.has(name)
-            ? { present: true as const, value: parseRecordJson(after.get(name)!) }
-            : { present: false as const },
-        };
-      });
+      .all(version.versionId);
+    const implicitFields = implicitInitialMetadataFields(version);
+    if (implicitFields && storedChanges.length) fail('unexpected indexed field reference');
+    const changes: RecordFieldChange[] = implicitFields
+      ? [...after.keys()].sort().map((field) => ({
+          field,
+          before: { present: false as const },
+          after: { present: true as const, value: parseRecordJson(after.get(field)!) },
+        }))
+      : storedChanges.map((change) => {
+          const name = String(change.field);
+          if (
+            change.profile_id !== version.profileId ||
+            change.entity !== version.entity ||
+            change.record_id !== version.recordId ||
+            change.sequence !== version.sequence ||
+            change.before_version !== version.previousVersion ||
+            change.before_present !== Number(before.has(name)) ||
+            change.after_present !== Number(after.has(name)) ||
+            before.get(name) === after.get(name)
+          )
+            fail('invalid indexed field reference');
+          return {
+            field: name,
+            before: before.has(name)
+              ? { present: true as const, value: parseRecordJson(before.get(name)!) }
+              : { present: false as const },
+            after: after.has(name)
+              ? { present: true as const, value: parseRecordJson(after.get(name)!) }
+              : { present: false as const },
+          };
+        });
     const expected = [...new Set([...before.keys(), ...after.keys()])]
       .filter((name) => before.get(name) !== after.get(name))
       .sort();

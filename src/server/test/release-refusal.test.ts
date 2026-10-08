@@ -370,3 +370,76 @@ test('incompatible cache rebuilds supported authority and the actual runtime exc
   }
   assert.deepEqual(inventory(data, true), before);
 });
+
+test('authenticated old history projection rebuilds accepted state but cannot rescue invalid authority', async (t) => {
+  const f = await fixture(t);
+  const oldProjection = (data: string) =>
+    mutateEncrypted(f, data, ({ read, write }) => {
+      const path = resolve(f.base, 'old-projection.sqlite');
+      writeFileSync(path, read('cache/sqlite.enc', 'sqlite-cache'), { mode: 0o600 });
+      try {
+        const cache = new DatabaseSync(path);
+        try {
+          cache.prepare('UPDATE __record_state SET projection=2 WHERE singleton=1').run();
+          cache.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+        } finally {
+          cache.close();
+        }
+        write('cache/sqlite.enc', 'sqlite-cache', readFileSync(path));
+      } finally {
+        rmSync(path, { force: true });
+      }
+    });
+
+  const data = f.copy('old-projection');
+  oldProjection(data);
+  const before = inventory(data, true);
+  const app = await f.start(data);
+  const unlocked = await app.request(f.prefix + '/unlock', { recovery: f.setup.recoveryKit });
+  assert.equal(unlocked.status, 200);
+  assert.equal(unlocked.body.data.metrics.cacheHit, false);
+  const note = await app.request(f.prefix + '/notes/' + f.note.id);
+  assert.equal(note.status, 200);
+  assert.equal(note.body.data.content, 'Accepted correction');
+  await app.runtime.close();
+  assert.deepEqual(inventory(data, true), before);
+
+  const lease = await acquireStorageLock(data);
+  const manager = createEncryptedProfiles({
+    dataDirectory: data,
+    runtimeDirectory: resolve(f.base, 'old-projection-verification'),
+  });
+  try {
+    manager.unlock(f.setup.profileId, f.setup.recoveryKit);
+    assert.deepEqual(
+      queryRecordHistory(manager.opened.get(f.setup.profileId)!.db, {
+        profileId: f.setup.profileId,
+        entity: 'notes',
+        recordId: f.note.id,
+      }),
+      f.history,
+    );
+  } finally {
+    manager.close();
+    await lease.release();
+  }
+  assert.deepEqual(inventory(data, true), before);
+
+  const invalid = f.copy('old-projection-invalid-authority');
+  oldProjection(invalid);
+  mutateEncrypted(f, invalid, ({ read, write }) => {
+    const head = JSON.parse(read('vault/manifest.enc', 'manifest').toString());
+    head.recordsHead = Buffer.from('{}').toString('base64');
+    write('vault/manifest.enc', 'manifest', Buffer.from(JSON.stringify(head)));
+  });
+  const invalidBefore = inventory(invalid);
+  const refused = await f.start(invalid);
+  const response = await refused.request(f.prefix + '/unlock', {
+    recovery: f.setup.recoveryKit,
+  });
+  assert.equal(response.status, 409);
+  assert.equal(response.body.error.code, 'ARCHIVE_UNSUPPORTED');
+  assert.match(response.body.error.message, /Profile accepted record history/);
+  await refused.runtime.close();
+  assert.deepEqual(inventory(invalid), invalidBefore);
+});

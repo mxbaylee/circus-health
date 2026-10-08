@@ -36,6 +36,17 @@ Accepted-journal-backed WAL connections now use NORMAL synchronization and a 32,
 
 ## Identify the current and candidate builds
 
+The derived record-history cache now uses projection 3. It omits redundant field
+references for initial scalar metadata while retaining complete accepted versions
+and identical history results. A projection-2 cache is incompatible, not an
+authority migration: after the checked backup, restart and unlock each profile
+to rebuild from authenticated accepted history, then verify current and earlier
+state. Rebuild work follows retained history and may make the first unlock longer.
+Do not relabel the cache or delete accepted records. Prior-build verification must
+use a separate restored copy and rebuild its disposable cache under that build;
+this does not make unsupported journal or intake formats backward compatible.
+Direct contributor helpers follow their separate [staged recovery procedure](../data/contributor-record-authority.md#runtime-writes-and-reconstruction).
+
 Record the current checkout's exact revision and the running build's `buildId`, `revision` and `worktree` from `http://localhost:3001/api/runtime` (use your configured port). Record the application image ID and tag from that archive's specific Compose project. Retain the prior checkout/revision and dependencies needed to build it again; a mutable image tag alone is not a retained release. Keep receipts outside Git and omit credentials, recovery phrases, private source paths and health content from shared diagnostics.
 
 Select the intended candidate checkout and review its [release, configuration and format notes](#release-configuration-and-format-notes) against the prior checkout. `npm run image:build` can build it without opening an archive. `npm run start` builds from the invoking checkout; `CRS_IMAGE` selects the tag used for that build, not an immutable prebuilt release. Record the resulting candidate image/build identity after starting. Distinct production builds have distinct build IDs; restarting one image retains its ID. An unknown identity stays unknown, and a dirty worktree cannot be claimed to equal its recorded revision. See the [readiness API](../../src/server/API.md#public-runtime-readiness) and [connection behavior](connection-awareness.md).
