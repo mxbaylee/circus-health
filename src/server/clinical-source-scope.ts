@@ -6,6 +6,7 @@ import {
 import { selectedSequence, type SelectedSequence } from './intake-selected-sequence.ts';
 import { storedIntakeDetails } from './intake-state-access.ts';
 import { latestOwnershipDecision } from './ownership-journal.ts';
+import { ownershipDecisionQueries } from './ownership-decision-index.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { HealthRecordEnvelope, IntakeWorkflow } from '../shared/intake.ts';
 import { createHash } from 'node:crypto';
@@ -396,14 +397,21 @@ export function* clinicalSourceScopeRecordIdsWork(
   db: DatabaseSync,
   identity: string,
 ): Generator<string | void> {
-  for (const row of db
-    .prepare("SELECT coverage_json FROM manual_batches WHERE title='Import record exception'")
-    .iterate()) {
-    yield;
-    const exception = object(parse(row.coverage_json).recordException);
-    if (exception.identityKey === identity)
-      yield typeof exception.recordId === 'string' ? exception.recordId : '';
-  }
+  const indexed = ownershipDecisionQueries(db);
+  if (indexed) {
+    for (const recordId of indexed.exceptionRecordIds(identity)) {
+      yield;
+      yield recordId;
+    }
+  } else
+    for (const row of db
+      .prepare("SELECT coverage_json FROM manual_batches WHERE title='Import record exception'")
+      .iterate()) {
+      yield;
+      const exception = object(parse(row.coverage_json).recordException);
+      if (exception.identityKey === identity)
+        yield typeof exception.recordId === 'string' ? exception.recordId : '';
+    }
   for (const table of tables) {
     const kind = table === 'procedures' ? 'procedure' : table.slice(0, -1);
     for (const row of db

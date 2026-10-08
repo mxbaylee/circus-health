@@ -1,10 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { openDatabase } from '../database.ts';
 import {
   prepareOwnershipDecisionIndex,
   ownershipDecisionQueries,
   ownershipDecisionIndexWork,
+  ownershipExceptionIndexWork,
 } from '../ownership-decision-index.ts';
 import { latestOwnershipDecision } from '../ownership-journal.ts';
 test('native ownership decision joins remain indexed across warm writes, rollback and disposable index loss', async () => {
@@ -200,4 +205,63 @@ test('native ownership decision joins remain indexed across warm writes, rollbac
   } finally {
     db.close();
   }
+});
+
+test('exception identity routing retains every record and invalidates on changes and index loss', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-exception-routing-'));
+  const path = join(root, 'profile.sqlite');
+  const db = openDatabase(path, 'fictional');
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const put = db.prepare(
+    "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES(?,'Import record exception','verified','2026-01-01',?)",
+  );
+  for (let index = 0; index < 97; index++)
+    put.run(
+      'unrelated-' + index,
+      JSON.stringify({
+        recordException: { identityKey: 'other-' + index, recordId: 'record-' + index },
+      }),
+    );
+  put.run(
+    'match-a',
+    JSON.stringify({ recordException: { identityKey: 'selected', recordId: 'first' } }),
+  );
+  put.run(
+    'match-b',
+    JSON.stringify({ recordException: { identityKey: 'selected', recordId: 'second' } }),
+  );
+  await prepareOwnershipDecisionIndex(db);
+  let selected = ownershipDecisionQueries(db)!;
+  assert.deepEqual([...selected.exceptionRecordIds('selected')], ['first', 'second']);
+  assert.deepEqual(ownershipExceptionIndexWork(db), { queries: 1, rows: 2 });
+  db.exec('BEGIN');
+  db.prepare(
+    "UPDATE manual_batches SET coverage_json=json_set(coverage_json,'$.recordException.identityKey','other') WHERE id='match-a'",
+  ).run();
+  assert.deepEqual([...selected.exceptionRecordIds('selected')], ['second']);
+  db.prepare("DELETE FROM manual_batches WHERE id='match-b'").run();
+  assert.deepEqual([...selected.exceptionRecordIds('selected')], []);
+  db.exec('ROLLBACK');
+  assert.deepEqual([...selected.exceptionRecordIds('selected')], ['first', 'second']);
+  put.run(
+    'match-c',
+    JSON.stringify({ recordException: { identityKey: 'selected', recordId: 'third' } }),
+  );
+  assert.deepEqual([...selected.exceptionRecordIds('selected')], ['first', 'second', 'third']);
+  using peer = new DatabaseSync(path);
+  peer.prepare("DELETE FROM manual_batches WHERE id='match-a'").run();
+  assert.throws(() => [...selected.exceptionRecordIds('selected')], /Prepare complete accepted/);
+  await prepareOwnershipDecisionIndex(db);
+  selected = ownershipDecisionQueries(db)!;
+  assert.deepEqual([...selected.exceptionRecordIds('selected')], ['second', 'third']);
+  db.exec('DROP INDEX temp.__ownership_decision_index_exception_identity');
+  assert.throws(() => [...selected.exceptionRecordIds('selected')], /Prepare complete accepted/);
+  await prepareOwnershipDecisionIndex(db);
+  assert.deepEqual(
+    [...ownershipDecisionQueries(db)!.exceptionRecordIds('selected')],
+    ['second', 'third'],
+  );
 });

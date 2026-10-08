@@ -227,6 +227,7 @@ export async function prepareCollectionClinicalReviewDependencies(
       const validation = validateJSONL(bytes);
       if (!validation.valid)
         throw new HttpError(400, 'INVALID_JSONL', 'Convert the original before clinical review');
+      await prepareOwnershipDecisionIndex(db, { assertRunning: assertCurrent });
       // A small cache removes nearby duplicate evidence without retaining a set
       // proportional to the installation's accepted source history.
       const prepared = new Set<string>();
@@ -293,7 +294,6 @@ export async function prepareCollectionClinicalReviewDependencies(
       assertCurrent();
       await verify(inputFile);
       await prepareDuplicateEvidenceIndex(db, { assertRunning: assertCurrent });
-      await prepareOwnershipDecisionIndex(db, { assertRunning: assertCurrent });
     },
     { operation: currentClinicalOperation(db) },
   );

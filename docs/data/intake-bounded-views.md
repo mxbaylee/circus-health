@@ -481,6 +481,16 @@ occurrences. The complete prospective proof is selected with the domain command;
 missing prior preparation remains pending rather than triggering a read-side
 history walk. Older membership proof policies require explicit cold preparation.
 
+Native clinical source-collision checks select every retained record exception
+for each exact issuing identity through a disposable, checked decision index.
+Dependency preparation builds that index cooperatively before selecting earlier
+sources; subsequent lookups visit matching exception pointers rather than
+rereading unrelated exception history per proposal entry. A previously prepared
+index that loses its authority refuses selection; callers without a prepared
+index retain the complete synchronous journal scan. This does not change the
+broader cross-intake mapping, exception-selection and saved-record catalog
+boundary in [CRS-235](../todo/CRS-235.md).
+
 `health-intake-clinical-review-page-v2` pages records, source context or coverage
 gaps with the exact review and record selection tokens. A page contains at most
 100 items and requests at most 256 KiB of item data. Large records retain an
