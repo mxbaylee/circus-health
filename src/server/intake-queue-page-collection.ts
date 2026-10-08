@@ -40,7 +40,7 @@ function window(input: Options, binding: string, scope: string) {
       'REPORT_QUEUE_WINDOW',
       'Choose active, deferred or all, 1 to 100 rows, and 1024 to 262144 bytes',
     );
-  let after = '';
+  let after: [string, string, string, number] | null = null;
   if (input.cursor) {
     let raw: unknown;
     try {
@@ -54,17 +54,21 @@ function window(input: Options, binding: string, scope: string) {
       raw[0] !== binding ||
       raw[1] !== scope ||
       raw[2] !== view ||
-      typeof raw[3] !== 'string'
+      !Array.isArray(raw[3]) ||
+      raw[3].length !== 4 ||
+      raw[3].slice(0, 3).some((value: unknown) => typeof value !== 'string') ||
+      !Number.isSafeInteger(raw[3][3]) ||
+      raw[3][3] < 0
     )
       throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this queue');
-    after = raw[3];
+    after = raw[3] as [string, string, string, number];
   }
   return {
     view,
     limit,
     bytes,
     after,
-    cursor: (order: string) =>
+    cursor: (order: [string, string, string, number]) =>
       Buffer.from(canonicalLiteral([binding, scope, view, order])).toString('base64url'),
   };
 }
@@ -77,24 +81,19 @@ export async function readCollectionReportQueuePage(
   const activityPin = journalActivityBinding(root, profileId),
     queue = await openCollectionReportQueue(db, root, profileId);
   try {
-    const page = window(input, queue.binding + ':' + activityPin, 'groups'),
+    const page = window(input, queue.binding + ':' + activityPin, 'groups-v3'),
       groups: (
         | { kind: 'group'; group: CollectionReportGroupSummary }
         | { kind: 'reference'; reference: CollectionReportGroupReference }
       )[] = [];
-    let totalGroups = 0,
-      used = 0,
-      full = false,
+    const selected = queue.groupWindow(page.view, page.after, page.limit + 1);
+    let used = 0,
       more = false,
-      last = '';
-    for (const pointer of queue.groups(page.view)) {
-      totalGroups++;
-      const order =
-        pointer.order + ':' + pointer.intakeId + ':' + String(pointer.ordinal).padStart(16, '0');
-      if (order <= page.after) continue;
-      if (full || groups.length >= page.limit) {
+      last: [string, string, string, number] | null = null;
+    for (const pointer of selected.pointers) {
+      if (groups.length >= page.limit) {
         more = true;
-        continue;
+        break;
       }
       const group = await collectionReportGroupSummary(db, root, profileId, queue, pointer),
         bytes = Buffer.byteLength(canonicalLiteral(group));
@@ -114,13 +113,12 @@ export async function readCollectionReportQueuePage(
             : { kind: 'group', group },
         size = Buffer.byteLength(canonicalLiteral(item));
       if (groups.length && used + size > page.bytes) {
-        full = true;
         more = true;
-        continue;
+        break;
       }
       groups.push(item);
       used += size;
-      last = order;
+      last = [pointer.order, pointer.intakeId, pointer.groupId, pointer.ordinal];
     }
     if (journalActivityBinding(root, profileId) !== activityPin)
       throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Reading activity changed');
@@ -128,8 +126,8 @@ export async function readCollectionReportQueuePage(
       format: 'health-intake-report-queue-page-v2' as const,
       view: page.view,
       groups,
-      totalGroups,
-      nextCursor: more ? page.cursor(last) : null,
+      totalGroups: selected.totalGroups,
+      nextCursor: more && last ? page.cursor(last) : null,
       activity: readCollectionQueueActivity(db, root, profileId, queue),
     };
   } finally {
@@ -150,11 +148,7 @@ export async function readCollectionReportGroupDetail(
 ) {
   const queue = await openCollectionReportQueue(db, root, profileId);
   try {
-    const pointer = (() => {
-      for (const pointer of queue.groups('all'))
-        if (pointer.groupId === groupId && (!input.intakeId || pointer.intakeId === input.intakeId))
-          return pointer;
-    })();
+    const pointer = queue.findGroup(groupId, input.intakeId);
     if (!pointer) throw new HttpError(404, 'REPORT_GROUP_NOT_FOUND', 'Report group not found');
     const group = await collectionReportGroupSummary(db, root, profileId, queue, pointer),
       records = await readCollectionIntakeReportRecords(
@@ -209,15 +203,7 @@ export async function readCollectionReportGroupFragment(
       reference.binding !== queue.binding
     )
       throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report');
-    const pointer = (() => {
-      for (const pointer of queue.groups('all'))
-        if (
-          pointer.intakeId === reference.intakeId &&
-          pointer.groupId === reference.groupId &&
-          pointer.ordinal === reference.ordinal
-        )
-          return pointer;
-    })();
+    const pointer = queue.findGroup(reference.groupId, reference.intakeId, reference.ordinal);
     if (!pointer) throw new HttpError(404, 'REPORT_GROUP_NOT_FOUND', 'Report group not found');
     const bytes = Buffer.from(
       canonicalLiteral(await collectionReportGroupSummary(db, root, profileId, queue, pointer)),
@@ -254,15 +240,7 @@ export async function readCollectionReportSourceCoverage(
     throw new HttpError(400, 'REPORT_QUEUE_WINDOW', 'Choose current or saved source coverage');
   const queue = await openCollectionReportQueue(db, root, profileId);
   try {
-    const pointer = (() => {
-      for (const pointer of queue.groups('all'))
-        if (
-          pointer.intakeId === input.intakeId &&
-          pointer.groupId === input.groupId &&
-          (input.ordinal === undefined || pointer.ordinal === input.ordinal)
-        )
-          return pointer;
-    })();
+    const pointer = queue.findGroup(input.groupId, input.intakeId, input.ordinal);
     if (!pointer) throw new HttpError(404, 'REPORT_GROUP_NOT_FOUND', 'Report group not found');
     const summary = await collectionReportGroupSummary(db, root, profileId, queue, pointer, input);
     return {

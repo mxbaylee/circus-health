@@ -4,6 +4,8 @@ Evidence decoding and private historical-graph validation now avoid redundant UT
 
 This procedure serves the Operator's [operate and recover](../design/personas.md#operate-and-recover) job on the supported localhost npm → Docker Compose → LiteLLM installation. It covers a checked update from supported authority and recovery from a failed candidate using a separately retained backup. Review the limits before updating: recovery returns the backup's state, so writes made after that backup are not recovered by this procedure. General downgrade compatibility and rollback prevention are not provided.
 
+Native Import report-group pages now use a disposable indexed group order and retained page totals. After updating, reload an open Import queue if its older group cursor is refused; its cursor is navigation state and is not portable across this change. No original, accepted-record or operator-configuration migration is required. The prior build continues to use its own queue ordering and cache behavior. See the [report review queue contract](../../src/server/INTAKE.md#report-review-queue).
+
 Native identity reviews add an optional complete evidence commitment for one
 retry after unrelated intake-version progress. Restart into the reviewed build
 and reload open Import reviews so the browser uses current warning selectors and

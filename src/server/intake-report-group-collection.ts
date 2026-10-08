@@ -511,11 +511,22 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
   cache.exec(
     'CREATE TABLE memberTotals(intake TEXT,groupId TEXT,state TEXT,count INTEGER,PRIMARY KEY(intake,groupId,state))',
   );
+  cache.exec(
+    'CREATE TABLE groupMemberTotals(intake TEXT,ordinal INTEGER,state TEXT,count INTEGER,PRIMARY KEY(intake,ordinal,state))',
+  );
+  cache.exec(
+    "CREATE TABLE groupVisibility(intake TEXT,ordinal INTEGER,id TEXT,ordering TEXT,active INTEGER,deferred INTEGER,allVisible INTEGER,PRIMARY KEY(intake,ordinal));CREATE INDEX visibleActive ON groupVisibility(active,ordering,intake,id,ordinal);CREATE INDEX visibleDeferred ON groupVisibility(deferred,ordering,intake,id,ordinal);CREATE INDEX visibleAll ON groupVisibility(allVisible,ordering,intake,id,ordinal);CREATE INDEX visibleIntakeAll ON groupVisibility(intake,allVisible,ordering,id,ordinal);CREATE INDEX visibleIdentity ON groupVisibility(id,intake,ordinal);CREATE TABLE groupTotals(view TEXT PRIMARY KEY,count INTEGER);INSERT INTO groupTotals VALUES('active',0),('deferred',0),('all',0);CREATE TABLE visibilityDirty(intake TEXT,ordinal INTEGER,PRIMARY KEY(intake,ordinal))",
+  );
   const changeMemberCount = (
     intakeId: string,
     member: CollectionReportQueueMember,
     delta: number,
   ) => {
+    cache
+      .prepare(
+        'INSERT INTO groupMemberTotals VALUES(?,?,?,?) ON CONFLICT(intake,ordinal,state) DO UPDATE SET count=count+excluded.count',
+      )
+      .run(intakeId, member.groupOrdinal, member.state, delta);
     for (const group of ['', member.groupId])
       cache
         .prepare(
@@ -616,10 +627,11 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     clinicalRevision = '';
   const refresh = async () => {
     const expected = bindingNow(),
-      currentRevision = intakeClinicalCachePin(db);
+      currentRevision = intakeClinicalCachePin(db),
+      removedSources: string[] = [];
     const proofScratch = disposableSqlite('circus-queue-refresh-proof-');
     const artifacts = createClinicalReviewArtifactProof(proofScratch.db, 'clinical_artifacts');
-    cache.exec('BEGIN;UPDATE sources SET seen=0,dirty=0');
+    cache.exec('BEGIN;UPDATE sources SET seen=0,dirty=0;DELETE FROM visibilityDirty');
     try {
       for (const source of collectionQueueSources(db, profileId)) {
         const pin = canonicalLiteral(intakeSourceVersion(db, source.id)),
@@ -722,6 +734,9 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                 change.members,
               );
             cache
+              .prepare('INSERT OR IGNORE INTO visibilityDirty VALUES(?,?)')
+              .run(source.id, ordinal);
+            cache
               .prepare(
                 'INSERT INTO groups VALUES(?,?,?,?,?,?,?) ON CONFLICT(intake,groupOrdinal) DO UPDATE SET span=excluded.span',
               )
@@ -765,6 +780,9 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                 )
                   continue;
                 const oldMember = JSON.parse(String(oldRow.value)) as CollectionReportQueueMember;
+                cache
+                  .prepare('INSERT OR IGNORE INTO visibilityDirty VALUES(?,?)')
+                  .run(source.id, oldMember.groupOrdinal);
                 changeMemberCount(source.id, oldMember, -1);
                 cache.prepare('DELETE FROM members WHERE rowid=?').run(oldRow.rowid);
                 cache
@@ -812,6 +830,9 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                   "SELECT rowid,value,groupOrdinal FROM members WHERE intake=? AND candidate=? AND (?='' OR version=?)",
                 )
                 .iterate(source.id, candidate.id, candidate.version, candidate.version)) {
+                cache
+                  .prepare('INSERT OR IGNORE INTO visibilityDirty VALUES(?,?)')
+                  .run(source.id, row.groupOrdinal);
                 const member = currentCollectionReportQueueMember(
                   db,
                   profileId,
@@ -914,6 +935,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           'groups',
           'members',
           'memberTotals',
+          'groupMemberTotals',
           'people',
           'summaries',
           'memberFacts',
@@ -966,10 +988,12 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
             .run(source.id, pointer.groupId, people.state(pointer));
       }
       for (const row of cache.prepare('SELECT id FROM sources WHERE seen=0').iterate()) {
+        removedSources.push(String(row.id));
         for (const table of [
           'groups',
           'members',
           'memberTotals',
+          'groupMemberTotals',
           'people',
           'summaries',
           'memberFacts',
@@ -1034,6 +1058,59 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           }
         }
       }
+      const insertVisibility = `INSERT INTO groupVisibility
+        SELECT g.intake,g.groupOrdinal,g.id,g.ordering,
+          CASE WHEN EXISTS(SELECT 1 FROM groupMemberTotals m WHERE m.intake=g.intake AND m.ordinal=g.groupOrdinal AND m.state='pending' AND m.count>0) OR EXISTS(SELECT 1 FROM people p WHERE p.intake=g.intake AND p.groupId=g.id AND p.state='pending') THEN 1 ELSE 0 END,
+          CASE WHEN EXISTS(SELECT 1 FROM groupMemberTotals m WHERE m.intake=g.intake AND m.ordinal=g.groupOrdinal AND m.state='deferred' AND m.count>0) OR EXISTS(SELECT 1 FROM people p WHERE p.intake=g.intake AND p.groupId=g.id AND p.state='later') THEN 1 ELSE 0 END,
+          CASE WHEN EXISTS(SELECT 1 FROM groupMemberTotals m WHERE m.intake=g.intake AND m.ordinal=g.groupOrdinal AND m.count>0) OR EXISTS(SELECT 1 FROM people p WHERE p.intake=g.intake AND p.groupId=g.id) THEN 1 ELSE 0 END
+        FROM groups g WHERE g.intake=?`,
+        visibilityCounts = (intakeId: string, ordinal?: number) => {
+          const row = cache
+            .prepare(
+              `SELECT count(*) rows,coalesce(sum(active),0) active,coalesce(sum(deferred),0) deferred,coalesce(sum(allVisible),0) allVisible FROM groupVisibility WHERE intake=?${ordinal === undefined ? '' : ' AND ordinal=?'}`,
+            )
+            .get(intakeId, ...(ordinal === undefined ? [] : [ordinal]))!;
+          withIntakeWork(db, 'warm', () =>
+            recordIntakeWork('collectionQueueVisibilityRows', Number(row.rows)),
+          );
+          return row;
+        },
+        changeVisibilityTotals = (
+          old: { [key: string]: unknown },
+          next: { [key: string]: unknown },
+        ) => {
+          for (const [view, key] of [
+            ['active', 'active'],
+            ['deferred', 'deferred'],
+            ['all', 'allVisible'],
+          ])
+            cache
+              .prepare('UPDATE groupTotals SET count=count+? WHERE view=?')
+              .run(Number(next[key]) - Number(old[key]), view);
+        };
+      const rebuilt = new Set(removedSources);
+      for (const row of cache.prepare('SELECT id FROM sources WHERE dirty=1').iterate())
+        rebuilt.add(String(row.id));
+      for (const intakeId of rebuilt) {
+        const old = visibilityCounts(intakeId);
+        cache.prepare('DELETE FROM groupVisibility WHERE intake=?').run(intakeId);
+        cache.prepare(insertVisibility).run(intakeId);
+        changeVisibilityTotals(old, visibilityCounts(intakeId));
+      }
+      for (const row of cache
+        .prepare(
+          'SELECT d.intake,d.ordinal FROM visibilityDirty d JOIN sources s ON s.id=d.intake WHERE s.dirty=2',
+        )
+        .iterate()) {
+        const intakeId = String(row.intake),
+          ordinal = Number(row.ordinal),
+          old = visibilityCounts(intakeId, ordinal);
+        cache
+          .prepare('DELETE FROM groupVisibility WHERE intake=? AND ordinal=?')
+          .run(intakeId, ordinal);
+        cache.prepare(insertVisibility + ' AND g.groupOrdinal=?').run(intakeId, ordinal);
+        changeVisibilityTotals(old, visibilityCounts(intakeId, ordinal));
+      }
       if (bindingNow() !== expected) throw changed();
       artifacts.assertCurrent();
       cache.exec('COMMIT');
@@ -1056,6 +1133,14 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
   const assertCurrent = () => {
     if (closed || bindingNow() !== binding) throw changed();
   };
+  const groupPointer = (row: { [key: string]: unknown }) => ({
+    intakeId: String(row.intake),
+    groupId: String(row.id),
+    ordinal: Number(row.groupOrdinal),
+    order: String(row.ordering),
+    basis: String(row.basis),
+    address: row.address === null ? null : String(row.address),
+  });
   let reviewCache: Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>> | undefined,
     reviewKey = '',
     reviewObservedStamp: string | undefined,
@@ -1445,46 +1530,52 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       view: IntakeReportQueueView = 'all',
       selectedIntake?: string,
     ): Generator<CollectionReportQueueGroupPointer & { intakeId: string }> {
+      const visible =
+        view === 'active' ? 'active' : view === 'deferred' ? 'deferred' : 'allVisible';
       for (const row of cache
-        .prepare('SELECT * FROM groups WHERE (? IS NULL OR intake=?) ORDER BY ordering,intake,id')
-        .iterate(selectedIntake || null, selectedIntake || null)) {
-        const intakeId = String(row.intake),
-          groupId = String(row.id);
-        const clinical = cache
-          .prepare('SELECT value FROM members WHERE intake=? AND groupOrdinal=?')
-          .iterate(intakeId, Number(row.groupOrdinal));
-        let visible = false;
-        for (const item of clinical) {
-          const state = (JSON.parse(String(item.value)) as CollectionReportQueueMember).state;
-          if (view === 'all' || state === (view === 'active' ? 'pending' : 'deferred')) {
-            visible = true;
-            break;
-          }
-        }
-        if (!visible)
-          for (const item of cache
-            .prepare('SELECT state FROM people WHERE intake=? AND groupId=?')
-            .iterate(intakeId, groupId))
-            if (view === 'all' || item.state === (view === 'active' ? 'pending' : 'later')) {
-              visible = true;
-              break;
-            }
-        if (visible)
-          yield {
-            intakeId,
-            groupId,
-            ordinal: Number(row.groupOrdinal),
-            order: String(row.ordering),
-            basis: String(row.basis),
-            address: row.address === null ? null : String(row.address),
-          };
+        .prepare(
+          `SELECT g.* FROM groupVisibility v JOIN groups g ON g.intake=v.intake AND g.groupOrdinal=v.ordinal WHERE v.${visible}=1${selectedIntake ? ' AND v.intake=?' : ''} ORDER BY v.ordering,v.intake,v.id,v.ordinal`,
+        )
+        .iterate(...(selectedIntake ? [selectedIntake] : []))) {
+        withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueuePagePointerRows'));
+        yield groupPointer(row);
       }
+    },
+    groupWindow(
+      view: IntakeReportQueueView,
+      after: [string, string, string, number] | null,
+      limit: number,
+    ) {
+      const visible =
+          view === 'active' ? 'active' : view === 'deferred' ? 'deferred' : 'allVisible',
+        total = cache.prepare('SELECT count FROM groupTotals WHERE view=?').get(view),
+        rows = cache
+          .prepare(
+            `SELECT g.* FROM groupVisibility v JOIN groups g ON g.intake=v.intake AND g.groupOrdinal=v.ordinal WHERE v.${visible}=1${after ? ' AND (v.ordering,v.intake,v.id,v.ordinal)>(?,?,?,?)' : ''} ORDER BY v.ordering,v.intake,v.id,v.ordinal LIMIT ?`,
+          )
+          .all(...(after || []), limit);
+      withIntakeWork(db, 'warm', () =>
+        recordIntakeWork('collectionQueuePagePointerRows', rows.length),
+      );
+      return { totalGroups: Number(total?.count ?? 0), pointers: rows.map(groupPointer) };
+    },
+    findGroup(groupId: string, intakeId?: string, ordinal?: number) {
+      const row = cache
+        .prepare(
+          `SELECT g.* FROM groupVisibility v JOIN groups g ON g.intake=v.intake AND g.groupOrdinal=v.ordinal WHERE v.allVisible=1 AND v.id=?${intakeId ? ' AND v.intake=?' : ''}${ordinal === undefined ? '' : ' AND v.ordinal=?'} ORDER BY v.ordering,v.intake,v.id,v.ordinal LIMIT 1`,
+        )
+        .get(groupId, ...(intakeId ? [intakeId] : []), ...(ordinal === undefined ? [] : [ordinal]));
+      if (!row) return undefined;
+      withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueuePagePointerRows'));
+      return groupPointer(row);
     },
     *members(intakeId: string, groupOrdinal: number): Generator<CollectionReportQueueMember> {
       for (const row of cache
         .prepare('SELECT value FROM members WHERE intake=? AND groupOrdinal=? ORDER BY ordinal')
-        .iterate(intakeId, groupOrdinal))
+        .iterate(intakeId, groupOrdinal)) {
+        withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueuePageMemberDecodes'));
         yield JSON.parse(String(row.value));
+      }
     },
     recordMemberWindow(
       intakeId: string,
