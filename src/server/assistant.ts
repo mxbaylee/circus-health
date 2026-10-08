@@ -4967,11 +4967,13 @@ export function createAssistant({
                       : !isNativeAssistantCheckpoint(checkpoint)
                         ? startAttributionRequest(checkpoint, scopeKeys)
                         : [];
+                  if (active.get(profileId) !== state || state.generation !== generation) return;
                   if (typeof params.requestId === 'string')
                     (state.attributionRequests ||= new Map()).set(params.requestId, scopes);
                 } catch {
                   /* Optional attribution never changes request admission. */
                 }
+                if (active.get(profileId) !== state || state.generation !== generation) return;
                 checkpoint.modelRequests = (checkpoint.modelRequests || 0) + 1;
                 checkpoint.unmeasuredRequests = (checkpoint.unmeasuredRequests || 0) + 1;
                 const basisIntake = conversionIntake(profileId, chat);

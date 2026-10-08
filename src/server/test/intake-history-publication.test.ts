@@ -77,6 +77,7 @@ function observePublication(
   archive: string,
   databasePath: string,
   pageSize: number,
+  walCheckpointPages: number,
 ) {
   const collections = selectedEnvelopeStore(db, { id }).collections;
   const record = createRecordVersionWorkCounters();
@@ -324,6 +325,7 @@ function observePublication(
       );
       const databaseFilesAfterDrain = databaseFiles();
       const probeFsWrite = process.resourceUsage().fsWrite - probeFsWriteBefore;
+      const fsWriteAvailable = process.platform === 'linux';
       assert.equal(checkpoint?.busy, 0, 'fixture checkpoint must drain without another reader');
       assert.ok(pageSize > 0 && pageSize <= 65536);
       assert.ok(
@@ -348,16 +350,21 @@ function observePublication(
             journalObjectReadBytesPerNode: maintenanceNodes
               ? (publication?.record.objectReadBytes ?? 0) / maintenanceNodes
               : null,
-            processFsWriteUnitsPerNode: maintenanceNodes ? probeFsWrite / maintenanceNodes : null,
-            postVerifyPublicationFsWriteUnitsPerNode: maintenanceNodes
-              ? (publication?.processFsWrite ?? 0) / maintenanceNodes
-              : null,
-            postVerifyPublicationAndFinalDrainFsWriteUnitsPerNode: maintenanceNodes
-              ? ((publication?.processFsWrite ?? 0) + finalCheckpointDrain.processFsWrite) /
-                maintenanceNodes
-              : null,
+            processFsWriteUnitsPerNode:
+              maintenanceNodes && fsWriteAvailable ? probeFsWrite / maintenanceNodes : null,
+            postVerifyPublicationFsWriteUnitsPerNode:
+              maintenanceNodes && fsWriteAvailable
+                ? (publication?.processFsWrite ?? 0) / maintenanceNodes
+                : null,
+            postVerifyPublicationAndFinalDrainFsWriteUnitsPerNode:
+              maintenanceNodes && fsWriteAvailable
+                ? ((publication?.processFsWrite ?? 0) + finalCheckpointDrain.processFsWrite) /
+                  maintenanceNodes
+                : null,
           },
           walCheckpoint: {
+            thresholdPages: walCheckpointPages,
+            thresholdBytes: walCheckpointPages * pageSize,
             result: checkpoint,
             finalDrain: finalCheckpointDrain,
             databaseFilesBefore,
@@ -382,7 +389,7 @@ function observePublication(
               .map(([key, value]) => [key, value - start[key as keyof typeof start]]),
           ),
           resourceUsage: process.resourceUsage(),
-          note: 'Instrumented durations include probe overhead. Nested phases overlap; final checkpoint drain is separate from maintenance. Whole-probe process fsWrite includes preparation, staging, publication and final drain after a setup-only WAL drain. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. Process fsWrite deltas are kernel-reported write units and are not attributable to one SQLite connection. WAL size is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; the configured auto-checkpoint threshold can be overshot by a transaction. maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
+          note: 'Instrumented durations include probe overhead. Nested phases overlap; final checkpoint drain is separate from maintenance. Whole-probe process fsWrite includes preparation, staging, publication and final drain after a setup-only WAL drain. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. Linux process fsWrite deltas are kernel-reported write units, not attributable to one SQLite connection; normalized values are unavailable on other platforms. WAL size is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; the configured threshold can be overshot by a bounded transaction, so the fixture uses an independent 256 MiB ceiling. maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
         }),
       );
       assert.ok((phases.get('prepare')?.calls ?? 0) > 0);
@@ -585,6 +592,7 @@ async function publicationFixture(t: test.TestContext, count: number) {
     profilePaths(f.root, f.profileId).records,
     profilePaths(f.root, f.profileId).database,
     pageSize,
+    selectedWalCheckpoint,
   );
   const prepared = await withRecordVersionWork(probe.record, () =>
     prepareIntakeWorkflowCommand(

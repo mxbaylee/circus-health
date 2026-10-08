@@ -22,7 +22,7 @@ import { join, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { createHash, randomUUID } from 'node:crypto';
 import { openDatabase } from '../database.ts';
-import { transaction } from '../database.ts';
+import { observeTransactionOutcome, transaction } from '../database.ts';
 import { createAssistant } from '../assistant.ts';
 import { readChat, listChats, writeChat } from '../assistant-journal.ts';
 import { createNote, getNote, saveNote, finishNote } from '../notes.ts';
@@ -8297,6 +8297,65 @@ test('native package assistant dispatch retains scalar checkpoints and acknowled
   assert.ok('format' in getIntakeRead(f.db, f.root, 'cedar', source.id));
   f.assistant.cancel('cedar', chat.id);
 });
+
+for (const attributionOutcome of ['complete', 'closed'] as const)
+  test(`Stop during native request attribution preserves terminal state: ${attributionOutcome}`, async (t) => {
+    fictionalModel(t);
+    const f = fixture(t),
+      source = uploadIntake(f.db, f.root, 'cedar', {
+        filename: 'fictional-attribution-stop.txt',
+        bytes: Buffer.from('Independently fictional interrupted attribution.'),
+      }),
+      { linkIntakeConversionRead } = await import('../intake.ts'),
+      chat = f.assistant.create('cedar', { title: 'Fictional attribution Stop' });
+    await linkIntakeConversionRead(f.db, f.root, 'cedar', source.id, chat.id);
+    f.assistant.send('cedar', chat.id, {
+      message: 'Read the fictional source',
+      context: { intakeId: source.id },
+    });
+    const bridge = await waitForConversionBridge(t, f, chat),
+      stopped = Promise.withResolvers<void>();
+    assert.ok(isNativeAssistantCheckpoint(chat.conversionCheckpoint));
+    const checkpoint = chat.conversionCheckpoint;
+    let maintenance = 0,
+      terminal: Pick<AssistantChat, 'reading' | 'conversionCheckpoint' | 'intakeModelAttempts'>;
+    // Stop after the attribution writer publishes its staged counters, before
+    // its actual setImmediate yield resumes into the request-start callback.
+    const dispose = observeTransactionOutcome(f.db, (outcome) => {
+      if (!outcome.succeeded || !outcome.intakeMaintenance || ++maintenance !== 2) return;
+      setImmediate(() => {
+        f.assistant.cancel('cedar', chat.id);
+        terminal = structuredClone({
+          reading: chat.reading,
+          conversionCheckpoint: chat.conversionCheckpoint,
+          intakeModelAttempts: chat.intakeModelAttempts,
+        });
+        if (attributionOutcome === 'closed') f.db.close();
+        stopped.resolve();
+      });
+    });
+    t.after(dispose);
+    const request = bridge.callbacks.onEvent('model/requestStarted', {
+      turnId: 'fictional-attribution-stop',
+      requestId: 'fictional-attribution-request',
+      requestDigest: createHash('sha256').update('fictional request').digest('hex'),
+      requestBytes: 17,
+      model: 'synthetic-test',
+      attempt: 1,
+    });
+    await stopped.promise;
+    assert.equal(bridge.closed, true);
+    assert.equal(chat.status, 'cancelled');
+    await assert.doesNotReject(async () => request);
+    assert.deepEqual(chat.reading, terminal!.reading);
+    assert.equal(checkpoint.modelRequests, terminal!.conversionCheckpoint?.modelRequests);
+    assert.equal(checkpoint.unmeasuredRequests, terminal!.conversionCheckpoint?.unmeasuredRequests);
+    const retained = readTestChat(f.root, 'cedar', chat.id);
+    assert.equal(retained.status, 'cancelled');
+    assert.deepEqual(retained.reading, JSON.parse(JSON.stringify(terminal!.reading)));
+    assert.deepEqual(retained.intakeModelAttempts, terminal!.intakeModelAttempts);
+    assert.equal(retained.intakeModelAttempts?.length, 1, 'admission receipt remains retained');
+  });
 
 test('native direct conversion prepares its first plan before provider dispatch without a legacy checkpoint', async (t) => {
   fictionalModel(t);
