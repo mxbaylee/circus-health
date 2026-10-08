@@ -138,14 +138,14 @@ export function* ownershipIntakeScopes(
   for (const group of children(workflow, 'reportGroups', false)) {
     const id = text(group, 'id');
     if (!(options.exactGroups ? options.exactGroups.has(id) : contains(group))) continue;
+    const versions = options.version ? view.childCount(group, 'versions') : 0;
+    const last = versions ? view.childAt(group, 'versions', versions - 1) : undefined;
+    const version = options.version ? { versionId: last ? text(last, 'id') : undefined } : {};
     if (options.subject === false) {
-      const last = options.version
-        ? view.childAt(group, 'versions', view.childCount(group, 'versions') - 1)
-        : undefined;
       yield {
         id,
         subjectText: '',
-        ...(options.version ? { versionId: last ? text(last, 'id') : undefined } : {}),
+        ...version,
       };
       continue;
     }
@@ -167,7 +167,7 @@ export function* ownershipIntakeScopes(
       if (selected.kind === 'value')
         subjectText = (selected.value as { text?: string } | null)?.text || '';
     }
-    yield { id, subjectText };
+    yield { id, subjectText, ...version };
   }
   view.address(view.root());
 }
