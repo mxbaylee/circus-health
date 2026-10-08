@@ -619,12 +619,13 @@ async function publicationFixture(t: test.TestContext, count: number) {
   assert.equal(baselineCache, -2000, 'comparison requires the default 2000 KiB cache');
   assert.equal(baselineWalCheckpoint, 8192, 'comparison requires the attached WAL policy');
   if (candidateWalCheckpoint === '1000') f.db.exec('PRAGMA main.wal_autocheckpoint=1000');
+  else if (candidateWalCheckpoint === '32768') f.db.exec('PRAGMA main.wal_autocheckpoint=32768');
   else if (candidateWalCheckpoint !== undefined && candidateWalCheckpoint !== '8192')
     throw Error('Unsupported history diagnostic WAL threshold');
   const selectedWalCheckpoint = Number(
     f.db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint,
   );
-  assert.equal(selectedWalCheckpoint, candidateWalCheckpoint === '1000' ? 1000 : 8192);
+  assert.equal(selectedWalCheckpoint, Number(candidateWalCheckpoint ?? 8192));
   assert.equal(Number(f.db.prepare('PRAGMA cache_size').get()?.cache_size), baselineCache);
   const pageSize = Number(f.db.prepare('PRAGMA main.page_size').get()?.page_size);
   t.diagnostic(
