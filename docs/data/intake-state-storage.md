@@ -22,6 +22,24 @@ Typed nested collection values capture an existing checked map, sequence or byte
 
 A preparation contains at most 64 primitive changes, 4,096 changed rows and 8 MiB of encoded writes. Retained preparations are capped at eight and 16 MiB together; the page cache holds 128 pages and byte/collection reference registries are bounded. Large commands checkpoint private incomplete builds in smaller batches and yield to the event loop, then select a fixed number of roots. They do not publish partial domain changes. Opaque preparations are source/head bound, disposable and transaction scoped; replay is resolved before issuing a new one-use maintenance capability. Existing identical immutable rows do not enlarge the allowed changed set.
 
+Adjacent inline puts to the same map now share one bounded tree preparation. All
+inputs are validated, including values later overwritten in the same batch; the
+last put to a key wins. At most the existing 64 changes are sorted and partitioned
+along shared authenticated paths, and the collection directory is updated once
+for that run instead of once per key. Deletes, adoption, byte/collection references
+and changes to another map end the run, preserving their original ordering and
+intermediate reference snapshots. Untouched subtrees and exact no-op roots are
+reused; the prior immutable history is not rewritten.
+
+The temporary sorted input and prior-value map are confined to one synchronous
+preparation and each contain at most 64 entries. Existing page, encoded-preparation,
+write-set and registry limits remain; this is not a new retained cache or a larger
+checkpoint. Different balanced shapes are permitted for newly written nodes in
+the unchanged format. The collection tests count cumulative prepared bytes at two
+retained sizes and verify exact values, no-op receipts, reference snapshots and
+accepted-journal rebuild. These are logical allocation/serialization measurements,
+not physical I/O, durable-write reduction or full-import latency qualification.
+
 Unchanged reads reuse authentication of the four selected roots only while the exact head, SQLite local-write counter, external data version, main and TEMP schema versions, and disposable registry remain unchanged. Source/profile ownership, accepted-authority readiness and the physical accepted head are checked on every collection call. These memos cover the SQLite projection, not external artifact validation.
 
 Bounded synchronous collection reads can also reuse authenticated pages from the existing 128-page cache. A private per-call certificate captures the unadjusted SQLite witness and registry generation before reading, then seals the pages only after the final witness still matches. Every hit checks the complete authenticated reference and source identity; a miss uses the ordinary SQL read with its 32 KiB UTF-8 limit and node authentication. A changed witness refuses the whole result rather than blessing partially stale output. The certificate retains only scalar witness data and generation identities, with no visited-page list or result references. Returned values are detached or opaque owner-bound capabilities.

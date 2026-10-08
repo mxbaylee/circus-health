@@ -1242,11 +1242,51 @@ export function createIntakeCollections(owner: {
           string,
           { area: IntakeCollectionArea; name: string; keys: Set<string> | null }
         >();
-        for (const change of input.changes) {
+        for (let changeIndex = 0; changeIndex < input.changes.length; changeIndex++) {
+          const change = input.changes[changeIndex]!;
           if (change.area !== 'logical' && change.area !== 'builds') invalid('collection area');
           collectionName(change.collection);
           let root = change.area === 'logical' ? logical : builds;
           const old = descriptor(pages.get(root, change.collection));
+          if (change.op === 'put') {
+            if (old && old.kind !== 'map') invalid('collection kind mismatch');
+            const entries = [{ key: change.key, value: inlineValue(change.value) }];
+            // Only adjacent inline puts to this exact collection commute. Flush
+            // before deletion, adoption, byte references or another collection.
+            while (changeIndex + 1 < input.changes.length) {
+              const next = input.changes[changeIndex + 1]!;
+              if (
+                next.op !== 'put' ||
+                next.area !== change.area ||
+                next.collection !== change.collection
+              )
+                break;
+              entries.push({ key: next.key, value: inlineValue(next.value) });
+              changeIndex++;
+            }
+            const batch = pages.putMany(old?.root ?? null, entries);
+            let byteCount = old?.bytes ?? 0;
+            for (const [key, value] of new Map(entries.map((entry) => [entry.key, entry.value])))
+              byteCount += valueBytes(value) - valueBytes(batch.previous.get(key));
+            integer(byteCount);
+            root = pages.put(
+              root,
+              change.collection,
+              JSON.stringify({ kind: 'map', root: batch.root, bytes: byteCount }),
+            );
+            if (change.area === 'logical') logical = root;
+            else builds = root;
+            const changeKey = change.area + ':' + change.collection;
+            const remembered = changedCollections.get(changeKey);
+            if (remembered) for (const entry of entries) remembered.keys?.add(entry.key);
+            else
+              changedCollections.set(changeKey, {
+                area: change.area,
+                name: change.collection,
+                keys: new Set(entries.map((entry) => entry.key)),
+              });
+            continue;
+          }
           if (change.op === 'adoptBytesReferenced') {
             const adopted = referencedBytes(change.value, pages);
             root = pages.put(root, change.collection, JSON.stringify(adopted));
@@ -1295,15 +1335,10 @@ export function createIntakeCollections(owner: {
           let values = old?.root ?? null,
             byteCount = old?.bytes ?? 0;
           let changedKey: string;
-          if (
-            change.op === 'put' ||
-            change.op === 'delete' ||
-            change.op === 'putBytes' ||
-            change.op === 'putCollection'
-          ) {
+          if (change.op === 'delete' || change.op === 'putBytes' || change.op === 'putCollection') {
             changedKey = change.key;
             const prior = pages.get(values, change.key);
-            let value: string | null = change.op === 'put' ? inlineValue(change.value) : null;
+            let value: string | null = null;
             if (change.op === 'putBytes') {
               if (change.fromArea !== 'logical' && change.fromArea !== 'builds')
                 invalid('byte attachment area');

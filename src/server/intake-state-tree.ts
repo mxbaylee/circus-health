@@ -266,6 +266,71 @@ export function createIntakeTree(
     if (left === node.left && right === node.right) return root;
     return balance(node.key, node.value, left, right);
   };
+  /** Apply one already bounded map run by visiting its shared paths together.
+   * No pending page, old value or sorted input escapes this preparation. */
+  const putMany = (
+    root: IntakeTreeRoot,
+    input: ReadonlyArray<{ key: string; value: string }>,
+  ): { root: IntakeTreeRoot; previous: Map<string, string> } => {
+    if (input.length > 64) invalid('collection batch budget');
+    const unique = new Map<string, string>();
+    for (const entry of input) {
+      intakeTreeKey(entry.key);
+      if (
+        typeof entry.value !== 'string' ||
+        Buffer.byteLength(entry.value) > INTAKE_TREE_VALUE_BYTES
+      )
+        invalid('collection value bytes');
+      // Validate every input, including superseded values; the last write wins.
+      unique.set(entry.key, entry.value);
+    }
+    const changes = [...unique].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const previous = new Map<string, string>();
+    // Joining arbitrarily different AVL heights needs a spine walk. The normal
+    // single-change balancer then sees at most a two-level local difference.
+    const join = (
+      key: string,
+      value: string,
+      left: IntakeTreeRoot,
+      right: IntakeTreeRoot,
+    ): IntakeTreeRef => {
+      if (height(left) > height(right) + 1) {
+        const node = load(left!);
+        return balance(node.key, node.value, node.left, join(key, value, node.right, right));
+      }
+      if (height(right) > height(left) + 1) {
+        const node = load(right!);
+        return balance(node.key, node.value, join(key, value, left, node.left), node.right);
+      }
+      return make(key, value, left, right);
+    };
+    const build = (start: number, end: number): IntakeTreeRoot => {
+      if (start === end) return null;
+      const mid = (start + end) >>> 1;
+      const [key, value] = changes[mid]!;
+      return make(key, value, build(start, mid), build(mid + 1, end));
+    };
+    const apply = (ref: IntakeTreeRoot, start: number, end: number): IntakeTreeRoot => {
+      if (start === end) return ref;
+      if (!ref) return build(start, end);
+      const node = load(ref);
+      let lo = start,
+        hi = end;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (changes[mid]![0] < node.key) lo = mid + 1;
+        else hi = mid;
+      }
+      const matching = lo < end && changes[lo]![0] === node.key;
+      const value = matching ? changes[lo]![1] : node.value;
+      if (matching) previous.set(node.key, node.value);
+      const left = apply(node.left, start, lo);
+      const right = apply(node.right, lo + Number(matching), end);
+      if (value === node.value && left === node.left && right === node.right) return ref;
+      return join(node.key, value, left, right);
+    };
+    return { root: apply(root, 0, changes.length), previous };
+  };
   function* entries(
     root: IntakeTreeRoot,
     after?: string,
@@ -307,5 +372,5 @@ export function createIntakeTree(
     };
     for (const root of roots) yield* walk(root);
   }
-  return { get, rank, preceding, put, entries, writes, load };
+  return { get, rank, preceding, put, putMany, entries, writes, load };
 }

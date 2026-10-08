@@ -903,3 +903,145 @@ test('prefix-scoped collection ranges preserve page boundaries and reject foreig
     /byte budget/,
   );
 });
+
+for (const history of [0, 128])
+  test(`bounded map preparation shares paths for one 64-change run: ${history} retained entries`, (t) => {
+    const { db, identity, rebuild } = fixture(t);
+    const store = createIntakeStateStorage(db, identity).collections;
+    let version = 0;
+    for (let offset = 0; offset < history; offset += 64)
+      mutate(
+        db,
+        store,
+        Array.from({ length: 64 }, (_, i) => ({
+          area: 'logical',
+          collection: 'batched',
+          op: 'put',
+          key: `a${String(offset + i).padStart(4, '0')}`,
+          value: `retained-${offset + i}`,
+        })),
+        ++version,
+      );
+    const changes: IntakeCollectionChange[] = Array.from({ length: 64 }, (_, i) => ({
+      area: 'logical',
+      collection: 'batched',
+      op: 'put',
+      key: `z${String((i * 37) % 64).padStart(4, '0')}`,
+      value: `new-${(i * 37) % 64}`,
+    }));
+    const id = randomUUID(),
+      view = store.openView();
+    const before = { ...intakeWorkCounters(db).warm };
+    const prepared = store.prepare(view, {
+      operationId: id,
+      requestDigest: digest(id),
+      domainVersion: ++version,
+      changes,
+    });
+    const after = { ...intakeWorkCounters(db).warm };
+    const measured = {
+      reads: after.collectionNodeReads - before.collectionNodeReads,
+      preparedBytes: after.collectionPreparedBytes - before.collectionPreparedBytes,
+    };
+    t.diagnostic(JSON.stringify({ history, ...measured }));
+    // The bounded new suffix has one shared old-tree path. These generous work
+    // ceilings distinguish a batched walk from reading/copying it for every key.
+    assert.ok(measured.reads < 96, 'one map run must not reread the shared old path per key');
+    assert.ok(
+      measured.preparedBytes < 128 * 1024,
+      'one map run must not serialize intermediate roots per key',
+    );
+    const result = transaction(db, () => store.stage(prepared));
+    const expected = [
+      ...Array.from({ length: history }, (_, i) => ({
+        key: `a${String(i).padStart(4, '0')}`,
+        value: `retained-${i}`,
+      })),
+      ...Array.from({ length: 64 }, (_, i) => ({
+        key: `z${String(i).padStart(4, '0')}`,
+        value: `new-${i}`,
+      })),
+    ];
+    const readAll = (s: typeof store) => {
+      const v = s.openView();
+      const rows: ReturnType<typeof s.range>['items'] = [];
+      let cursor: string | null = null;
+      do {
+        const page = s.range(v, 'logical', 'batched', {
+          items: 32,
+          bytes: 64 * 1024,
+          ...(cursor ? { after: cursor } : {}),
+        });
+        rows.push(...page.items);
+        cursor = page.after;
+      } while (cursor);
+      return rows;
+    };
+    assert.deepEqual(readAll(store), expected);
+    assert.deepEqual(store.replay(id, digest(id)), result);
+    const cold = createIntakeStateStorage(rebuild(), identity).collections;
+    assert.deepEqual(readAll(cold), expected);
+    assert.deepEqual(cold.replay(id, digest(id)), result);
+  });
+
+test('map batching stops at reference, adoption and delete barriers and preserves exact no-op replay', (t) => {
+  const { db, identity, rebuild } = fixture(t),
+    store = createIntakeStateStorage(db, identity).collections;
+  mutate(
+    db,
+    store,
+    [
+      { area: 'logical', collection: 'items', op: 'put', key: 'a', value: 'first' },
+      { area: 'logical', collection: 'items', op: 'put', key: 'a', value: 'second' },
+      { area: 'logical', collection: 'items', op: 'put', key: 'b', value: 'before' },
+      {
+        area: 'logical',
+        collection: 'snapshots',
+        op: 'putCollection',
+        key: 'old',
+        fromArea: 'logical',
+        fromCollection: 'items',
+      },
+      { area: 'logical', collection: 'items', op: 'delete', key: 'a' },
+      { area: 'logical', collection: 'items', op: 'put', key: 'a', value: 'third' },
+      { area: 'logical', collection: 'items', op: 'put', key: 'c', value: 'later' },
+      {
+        area: 'builds',
+        collection: 'copy',
+        op: 'adoptCollection',
+        fromArea: 'logical',
+        fromCollection: 'items',
+      },
+      { area: 'logical', collection: 'items', op: 'put', key: 'a', value: 'final' },
+    ],
+    1,
+  );
+  const inspect = (selected: typeof store) => {
+    const view = selected.openView();
+    assert.equal(selected.get(view, 'logical', 'items', 'a'), 'final');
+    assert.equal(selected.get(view, 'builds', 'copy', 'a'), 'third');
+    const reference = selected.getCollectionReference(view, 'logical', 'snapshots', 'old')!;
+    assert.equal(selected.getReferenced(reference, 'a'), 'second');
+    assert.equal(selected.getReferenced(reference, 'c'), undefined);
+    assert.equal(selected.range(view, 'logical', 'items', { items: 10, bytes: 2048 }).count, 3);
+  };
+  inspect(store);
+  const id = randomUUID();
+  const before = store.binding(store.openView())!.logical;
+  const result = mutate(
+    db,
+    store,
+    [
+      { area: 'logical', collection: 'items', op: 'put', key: 'a', value: 'temporary long value' },
+      { area: 'logical', collection: 'items', op: 'put', key: 'a', value: 'final' },
+    ],
+    1,
+    id,
+  );
+  assert.equal(result.changed, false);
+  assert.deepEqual(store.binding(store.openView())!.logical, before);
+  assert.deepEqual(store.replay(id, digest(id)), result);
+  const cold = createIntakeStateStorage(rebuild(), identity).collections;
+  inspect(cold);
+  assert.deepEqual(cold.replay(id, digest(id)), result);
+});

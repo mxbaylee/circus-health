@@ -173,3 +173,107 @@ test('sealed readonly page certificates retain at most the existing 128 authenti
   assert.throws(() => foreign.load(ref), /cached tree source binding/);
   assert.equal(rawReads, 0, 'the certified hit still verifies complete reference and source');
 });
+
+test('bounded map batches preserve exact history through tall joins, repeats and ordinary deletion', () => {
+  const persisted = new Map<string, string>();
+  const expected = new Map<string, string>();
+  let root: IntakeTreeRoot = null,
+    state = 38491;
+  const ordered = (map: Map<string, string>) =>
+    [...map]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, value]) => ({ key, value }));
+  let retained: { root: IntakeTreeRoot; entries: ReturnType<typeof ordered> } | undefined;
+  for (let batch = 0; batch < 32; batch++) {
+    const pages = createIntakeTree(identity, (hash) => persisted.get(hash), new Map());
+    const before = new Map(expected);
+    const changes = Array.from({ length: 64 }, (_, i) => {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      const key =
+        batch % 4 === 0
+          ? `a${String(batch * 64 + i).padStart(5, '0')}`
+          : batch % 4 === 1
+            ? `z${String(batch * 64 + i).padStart(5, '0')}`
+            : String(state % 600).padStart(5, '0');
+      return { key, value: `fictional-${state} 🌿` };
+    });
+    changes[63] = { key: changes[0]!.key, value: 'last duplicate wins' };
+    const result = pages.putMany(root, changes);
+    assert.deepEqual(
+      [...result.previous].sort(),
+      [...new Set(changes.map((c) => c.key))]
+        .filter((k) => before.has(k))
+        .map((k) => [k, before.get(k)!])
+        .sort(),
+    );
+    for (const entry of changes) expected.set(entry.key, entry.value);
+    root = result.root;
+    const key = changes[17]!.key;
+    root = pages.put(root, key, null);
+    expected.delete(key);
+    root = pages.put(root, 'ordinary', 'still supported');
+    expected.set('ordinary', 'still supported');
+    for (const page of pages.writes([root])) {
+      decodeIntakeTreeNode(page.raw, page.ref, identity);
+      persisted.set(page.hash, page.raw);
+    }
+    const cold = createIntakeTree(identity, (hash) => persisted.get(hash), new Map());
+    assert.deepEqual([...cold.entries(root)], ordered(expected));
+    assert.equal(root?.count, expected.size);
+    assert.ok(root!.height < 24);
+    if (batch === 0) retained = { root, entries: ordered(expected) };
+    assert.deepEqual(
+      [...cold.entries(retained!.root)],
+      retained!.entries,
+      'old roots remain exact',
+    );
+    const unchanged = cold.putMany(
+      root,
+      changes.slice(0, 16).map(({ key }) => ({ key, value: expected.get(key)! })),
+    );
+    assert.equal(unchanged.root, root, 'exact no-op keeps its original root object and hash');
+    assert.equal([...cold.writes([unchanged.root])].length, 0);
+  }
+  const cold = createIntakeTree(identity, (hash) => persisted.get(hash), new Map());
+  assert.equal(cold.putMany(root, []).root, root);
+  assert.throws(
+    () =>
+      cold.putMany(
+        root,
+        Array.from({ length: 65 }, () => ({ key: 'k', value: 'v' })),
+      ),
+    /batch budget/,
+  );
+  assert.throws(
+    () =>
+      cold.putMany(root, [
+        { key: 'k', value: 'x'.repeat(8193) },
+        { key: 'k', value: 'valid' },
+      ]),
+    /value bytes/,
+    'an overwritten invalid value is still refused',
+  );
+  assert.throws(() => cold.putMany(root, [{ key: 'x'.repeat(1025), value: 'v' }]), /key/);
+  assert.throws(
+    () =>
+      cold.putMany({ ...root!, count: root!.count + 1 }, [
+        { key: 'ordinary', value: 'replacement' },
+      ]),
+    /reference/,
+  );
+  const foreign = createIntakeTree(
+    { ...identity, profileId: 'foreign' },
+    (hash) => persisted.get(hash),
+    new Map(),
+  );
+  assert.throws(
+    () => foreign.putMany(root, [{ key: 'ordinary', value: 'replacement' }]),
+    /source binding/,
+  );
+  const corrupt = createIntakeTree(
+    identity,
+    (hash) => (hash === root!.hash ? '{}' : persisted.get(hash)),
+    new Map(),
+  );
+  assert.throws(() => corrupt.putMany(root, [{ key: 'ordinary', value: 'replacement' }]), /schema/);
+});
