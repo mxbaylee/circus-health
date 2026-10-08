@@ -1,6 +1,7 @@
 import { launchBrowser, newTestPage } from './harness.ts';
 import { sameDisplayedIdentityReview } from '../../app/data/identity-confirmation-freshness.ts';
 import { startProcessRuntime } from './process-runtime.ts';
+import { diagnosticRoute } from './runtime-connection-diagnostics.ts';
 import {
   fixtureBrowserResponse,
   fixtureNativeFeedReady,
@@ -176,6 +177,154 @@ async function until<T>(
   }
   throw new Error('Timed out waiting for ' + description);
 }
+
+function runtimeFailureSummary(capture: {
+  status: string;
+  diagnostics: string;
+  truncated: boolean;
+}) {
+  const status = [
+    'captured',
+    'child-exited',
+    'aborted',
+    'deadline-exceeded',
+    'ipc-unavailable',
+  ].includes(capture.status)
+    ? capture.status
+    : 'unknown';
+  const base = { status, truncated: capture.truncated };
+  const marker = 'Fictional runtime connections: ';
+  const start = capture.diagnostics.lastIndexOf(marker);
+  if (start < 0) return { ...base, connections: 'unavailable' };
+  const line = capture.diagnostics.slice(start + marker.length).split('\n', 1)[0];
+  try {
+    const value = JSON.parse(line) as Record<string, unknown>;
+    const rows = (input: unknown, limit: number) =>
+      Array.isArray(input)
+        ? input.slice(-limit).filter((row) => row && typeof row === 'object')
+        : [];
+    const number = (input: unknown) =>
+      typeof input === 'number' && Number.isFinite(input)
+        ? Math.max(0, Math.min(Math.round(input), 1_000_000_000))
+        : undefined;
+    const method = (input: unknown) =>
+      typeof input === 'string' &&
+      ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(input)
+        ? input
+        : 'OTHER';
+    const event = (input: unknown) =>
+      typeof input === 'string' &&
+      [
+        'socket-open',
+        'socket-close',
+        'request-start',
+        'response-finish',
+        'response-close',
+      ].includes(input)
+        ? input
+        : 'other';
+    return {
+      ...base,
+      connections: {
+        keepAliveTimeoutMs: number(value.keepAliveTimeoutMs),
+        headersTimeoutMs: number(value.headersTimeoutMs),
+        requestTimeoutMs: number(value.requestTimeoutMs),
+        totalSockets: number(value.totalSockets),
+        totalRequests: number(value.totalRequests),
+        openSocketCount: number(value.openSocketCount),
+        activeRequestCount: number(value.activeRequestCount),
+        activeRequests: rows(value.activeRequests, 12).map((row: Record<string, unknown>) => ({
+          requestId: number(row.requestId),
+          socketId: number(row.socketId),
+          socketRequests: number(row.socketRequests),
+          method: method(row.method),
+          path: diagnosticRoute(String(row.path)),
+          durationMs: number(row.durationMs),
+        })),
+        recent: rows(value.recent, 32).map((row: Record<string, unknown>) => ({
+          event: event(row.event),
+          ageMs: number(row.ageMs),
+          socketId: number(row.socketId),
+          socketRequests: number(row.socketRequests),
+          requestId: number(row.requestId),
+          method: method(row.method),
+          path: diagnosticRoute(String(row.path)),
+          status: number(row.status),
+          durationMs: number(row.durationMs),
+          hadError: row.hadError === true,
+        })),
+      },
+    };
+  } catch {
+    return { ...base, connections: 'unavailable' };
+  }
+}
+
+test('holdout transport diagnostics retain fixed socket state without private routes', () => {
+  const privateRoute = '/api/profiles/private-profile/intakes/import-feed?private-token=secret';
+  const capture = {
+    status: 'captured',
+    truncated: false,
+    diagnostics:
+      'private stderr must not be reported\nFictional runtime connections: ' +
+      JSON.stringify({
+        keepAliveTimeoutMs: 5000,
+        openSocketCount: 2,
+        activeRequestCount: 1,
+        activeRequests: [{ requestId: 8, socketId: 3, method: 'GET', path: privateRoute }],
+        recent: [
+          {
+            event: 'socket-close',
+            socketId: 3,
+            path: privateRoute,
+            hadError: true,
+            ageMs: 4,
+          },
+        ],
+      }) +
+      '\n',
+  };
+  const summary = runtimeFailureSummary(capture);
+  const output = JSON.stringify(summary);
+  assert.match(output, /api\/profiles\/:profile\/intakes\/import-feed/);
+  assert.match(output, /socket-close/);
+  assert.doesNotMatch(output, /private-profile|private-token|secret|private stderr/);
+  assert.deepEqual(runtimeFailureSummary({ ...capture, diagnostics: 'malformed' }), {
+    status: 'captured',
+    truncated: false,
+    connections: 'unavailable',
+  });
+  assert.equal(
+    runtimeFailureSummary({ ...capture, status: 'child-exited', diagnostics: '' }).status,
+    'child-exited',
+  );
+  const many = runtimeFailureSummary({
+    ...capture,
+    diagnostics:
+      'Fictional runtime connections: ' +
+      JSON.stringify({
+        activeRequests: Array.from({ length: 20 }, () => ({
+          method: ['GET'],
+          path: privateRoute,
+          durationMs: -2,
+        })),
+        recent: Array.from({ length: 40 }, () => ({
+          event: ['socket-close'],
+          path: privateRoute,
+          durationMs: 2_000_000_000,
+        })),
+      }) +
+      '\n',
+  });
+  assert.equal(typeof many.connections, 'object');
+  if (typeof many.connections !== 'object') throw Error('Expected bounded connection fields');
+  assert.equal(many.connections.activeRequests.length, 12);
+  assert.equal(many.connections.recent.length, 32);
+  assert.equal(many.connections.activeRequests[0]?.method, 'OTHER');
+  assert.equal(many.connections.activeRequests[0]?.durationMs, 0);
+  assert.equal(many.connections.recent[0]?.event, 'other');
+  assert.equal(many.connections.recent[0]?.durationMs, 1_000_000_000);
+});
 
 test(
   'encrypted Import holdout defers blocked work, saves exact destinations and recovers a lost acceptance acknowledgement',
@@ -388,9 +537,7 @@ test(
       const started = Date.now();
       const requestId = ++requestNumber;
       inFlight.set(requestId, { method, path: diagnosticPath(path), started });
-      const captureRequestDiagnostics = process.env.CRS_TEST_DIAGNOSTICS
-        ? runtime.captureDiagnostics()
-        : undefined;
+      const captureRequestDiagnostics = runtime.captureDiagnostics();
       try {
         let response;
         try {
@@ -400,12 +547,17 @@ test(
             data: body,
           });
         } catch (error) {
-          if (captureRequestDiagnostics)
-            console.error(
-              'Fictional holdout failed request',
-              diagnosticPath(path),
-              await captureRequestDiagnostics(),
-            );
+          let diagnostic: ReturnType<typeof runtimeFailureSummary>;
+          try {
+            diagnostic = runtimeFailureSummary(await captureRequestDiagnostics());
+          } catch {
+            diagnostic = { status: 'capture-failed', truncated: false, connections: 'unavailable' };
+          }
+          console.error(
+            'Fictional holdout failed request',
+            diagnosticRoute(prefix + path),
+            diagnostic,
+          );
           throw error;
         }
         if (process.env.CRS_TEST_DIAGNOSTICS)
