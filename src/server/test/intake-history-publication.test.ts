@@ -169,6 +169,42 @@ function observePublication(
     unavailableHeaderPairs: number;
   };
   const walCommitWindows = new Map<number, WalCommitWindow>();
+  type PriorCommit = {
+    after: WalSample;
+    nodesWritten: number;
+    elapsedMs: number;
+    fsWriteUnits: number;
+    mainFileLengthGrowth: boolean | null;
+  };
+  type PriorCommitTotals = {
+    commits: number;
+    nodesWritten: number;
+    commitMs: number;
+    commitFsWriteUnits: number;
+    mainFileLengthGrowthCommits: number;
+    unavailableMainFileLengthPairs: number;
+  };
+  const priorCommitTotals = (): PriorCommitTotals => ({
+    commits: 0,
+    nodesWritten: 0,
+    commitMs: 0,
+    commitFsWriteUnits: 0,
+    mainFileLengthGrowthCommits: 0,
+    unavailableMainFileLengthPairs: 0,
+  });
+  const resetFollowed = priorCommitTotals();
+  const noResetFollowed = priorCommitTotals();
+  const unclassified = priorCommitTotals();
+  const unclassifiedReasons = { finalCommit: 0, unavailableHeader: 0, observationGap: 0 };
+  const addPrior = (totals: PriorCommitTotals, prior: PriorCommit) => {
+    totals.commits++;
+    totals.nodesWritten += prior.nodesWritten;
+    totals.commitMs += prior.elapsedMs;
+    totals.commitFsWriteUnits += prior.fsWriteUnits;
+    if (prior.mainFileLengthGrowth === null) totals.unavailableMainFileLengthPairs++;
+    else if (prior.mainFileLengthGrowth) totals.mainFileLengthGrowthCommits++;
+  };
+  let pendingPrior: PriorCommit | undefined;
   let previousCommitAfter: WalSample | undefined;
   let previousCommitNodes = intakeWorkCounters(db).warm.collectionNodesWritten;
   let fixtureCommitAttempts = 0;
@@ -243,6 +279,27 @@ function observePublication(
         window.sequenceChangedBeforeCommit++;
     } else if (previousCommitAfter) window.unavailableBetweenCommitHeaderPairs++;
     walCommitWindows.set(windowIndex, window);
+    if (pendingPrior) {
+      if (pendingPrior.after.header && before.header)
+        addPrior(
+          pendingPrior.after.header.cycle === before.header.cycle ? noResetFollowed : resetFollowed,
+          pendingPrior,
+        );
+      else {
+        addPrior(unclassified, pendingPrior);
+        unclassifiedReasons.unavailableHeader++;
+      }
+    }
+    pendingPrior = {
+      after,
+      nodesWritten: nodes - previousCommitNodes,
+      elapsedMs,
+      fsWriteUnits,
+      mainFileLengthGrowth:
+        before.mainBytes !== null && after.mainBytes !== null
+          ? after.mainBytes > before.mainBytes
+          : null,
+    };
     previousCommitAfter = after;
     previousCommitNodes = nodes;
   };
@@ -513,6 +570,11 @@ function observePublication(
               maxObservedWalBytes = Math.max(maxObservedWalBytes, commitAfter.walBytes);
           } catch {
             walObservationFailures++;
+            if (pendingPrior) {
+              addPrior(unclassified, pendingPrior);
+              unclassifiedReasons.observationGap++;
+              pendingPrior = undefined;
+            }
           }
         }
       }
@@ -623,13 +685,28 @@ function observePublication(
         (sum, window) => sum + window.commits,
         0,
       );
+      if (pendingPrior) {
+        addPrior(unclassified, pendingPrior);
+        unclassifiedReasons.finalCommit++;
+        pendingPrior = undefined;
+      }
+      const classified = [resetFollowed, noResetFollowed, unclassified];
       assert.ok(walCommitWindows.size <= 16);
       assert.equal(observedWalCommits + walObservationFailures, fixtureCommitAttempts);
+      assert.equal(
+        classified.reduce((sum, bucket) => sum + bucket.commits, 0),
+        observedWalCommits,
+      );
+      assert.equal(
+        Object.values(unclassifiedReasons).reduce((sum, count) => sum + count, 0),
+        unclassified.commits,
+      );
       if (!walObservationFailures)
-        assert.equal(
+        for (const nodes of [
           [...walCommitWindows.values()].reduce((sum, window) => sum + window.nodesWritten, 0),
-          end.collectionNodesWritten - start.collectionNodesWritten,
-        );
+          classified.reduce((sum, bucket) => sum + bucket.nodesWritten, 0),
+        ])
+          assert.equal(nodes, end.collectionNodesWritten - start.collectionNodesWritten);
       const maintenanceNodes = maintenanceSegments.get('stage')?.work.collectionNodesWritten ?? 0;
       const publication = maintenanceSegments.get('postVerifyPublication');
       const retainedJournalGrowthBytes = journalBytes(archive) - retainedBytesBefore;
@@ -696,6 +773,12 @@ function observePublication(
             maxObservedWalBytesAfterCommit: maxObservedWalBytes,
           },
           walCommitWindows: [...walCommitWindows.values()],
+          priorCommitResetCorrelation: {
+            resetFollowed,
+            noResetFollowed,
+            unclassified,
+            unclassifiedReasons,
+          },
           walCommitWindowOracle: {
             fixtureCommitAttempts,
             observedWalCommits,
@@ -724,6 +807,7 @@ function observePublication(
             'Batch occupancy counts prepared changes and repeats of keyed changes only; byte append operations have no key. Batch COMMIT and process fsWrite totals cover successful maintenance calls.',
             'WAL commit windows hold at most 16 buckets: the first 15 span 32 fixture-connection COMMIT attempts each, and the final bucket absorbs overflow. Each sample reads only the fixed 32-byte WAL header and main/WAL file lengths, not allocated disk blocks or valid frame counts. Unavailable file-length/header pairs are counted, not read as zero.',
             'Between-commit deltas exclude the first call and include all intervening process work, not only SQLite. Header cycle or sequence changes observed before COMMIT may have occurred at the next transaction start; they do not assign checkpoint cost to that COMMIT. Main-file pages can be rewritten without growing the file.',
+            'Prior-COMMIT buckets classify one observed COMMIT attempt by the WAL header cycle before the next observed attempt; exec-finally observations also include failed COMMITs. The last attempt and unavailable or interrupted observations remain unclassified. After an observation gap, a node delta can span attempts while elapsed time and process writes belong only to the current observed exec, so such samples are not per-COMMIT ratios. Reset-followed cost is a correlation, not proof that the prior COMMIT performed a checkpoint.',
             'dbstat traverses eight named record B-trees on a separate read-only connection outside publication after WAL drains; its bounded output does not bound scan work. Page lengths are neither whole-cache size, VFS write bytes nor a causal index-cost comparison.',
             'Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped.',
             'Filesystem bytes are API transfers, not physical device I/O. Linux process fsWrite deltas are kernel-reported write units, not attributable to one SQLite connection; normalized values are unavailable on other platforms. WAL length is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; a bounded transaction can overshoot the configured threshold, so the fixture keeps an independent 256 MiB ceiling. maxRSS and prepared-byte peaks cover process/connection lifetime, not cumulative work.',
