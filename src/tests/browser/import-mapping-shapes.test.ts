@@ -11,7 +11,7 @@ import { launchBrowser, newTestPage } from './harness.ts';
 import { startProcessRuntime } from './process-runtime.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
-import type { Browser, Response } from 'playwright';
+import type { Browser, Request, Response } from 'playwright';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
 import type { CollectionReportDetail } from '../../shared/intake-clinical-pages.ts';
 import test from 'node:test';
@@ -102,6 +102,14 @@ test(
   'encrypted browser accepts both proposed and top-level optical mappings through grouped identity and date review',
   { timeout: 420000 },
   async (t) => {
+    const diagnosticsEnabled = process.env.CRS_TEST_DIAGNOSTICS === '1';
+    let phase = 'runtime startup';
+    let phaseStarted = Date.now();
+    let completed = false;
+    const enterPhase = (name: string) => {
+      phase = name;
+      phaseStarted = Date.now();
+    };
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-mapping-shapes-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
@@ -111,8 +119,84 @@ test(
       port: 0,
       host: '127.0.0.1',
     });
+    const inFlight = new Map<number, { method: string; path: string; started: number }>();
+    const browserInFlight = new Map<Request, { method: string; path: string; started: number }>();
+    const recentBrowserRequests: Array<{
+      method: string;
+      path: string;
+      status: number | 'failed';
+      durationMs: number;
+    }> = [];
+    let requestNumber = 0;
+    let evictedApiRequests = 0;
+    let evictedBrowserRequests = 0;
+    const routeSegments = new Set([
+      'api',
+      'profiles',
+      'profile-setups',
+      'verify',
+      'intakes',
+      'sources',
+      'content',
+      'proposals',
+      'review',
+      'review-record',
+      'review-draft',
+      'review-record-action',
+      'report-queue',
+      'report-acceptance',
+      'import-feed',
+      'vision-prescriptions',
+      'intake-batches',
+      'stop',
+    ]);
+    const diagnosticPath = (path: string) =>
+      path
+        .split('?')[0]!
+        .split('/')
+        .map((part) => (part && !routeSegments.has(part) ? ':id' : part))
+        .join('/');
+    const diagnosticSnapshot = () => ({
+      phase,
+      phaseDurationMs: Date.now() - phaseStarted,
+      inFlight: [...inFlight.values()].map((request) => ({
+        method: request.method,
+        path: request.path,
+        durationMs: Date.now() - request.started,
+      })),
+      browserInFlight: [...browserInFlight.values()].map((request) => ({
+        method: request.method,
+        path: request.path,
+        durationMs: Date.now() - request.started,
+      })),
+      evictedApiRequests,
+      evictedBrowserRequests,
+      recentBrowserRequests,
+    });
+    const trackRequest = async <T>(method: string, path: string, run: () => Promise<T>) => {
+      if (!diagnosticsEnabled) return run();
+      const id = ++requestNumber;
+      if (inFlight.size === 16) {
+        inFlight.delete(inFlight.keys().next().value!);
+        evictedApiRequests++;
+      }
+      inFlight.set(id, { method, path: diagnosticPath(path), started: Date.now() });
+      try {
+        return await run();
+      } finally {
+        inFlight.delete(id);
+      }
+    };
+    const onAbort = () =>
+      console.error('Fictional optical browser interrupted', diagnosticSnapshot());
+    if (diagnosticsEnabled) t.signal.addEventListener('abort', onAbort, { once: true });
+    let removePageListeners = () => {};
     let browser: Browser | undefined;
     t.after(async () => {
+      if (diagnosticsEnabled && !completed)
+        console.error('Fictional optical browser final phase', diagnosticSnapshot());
+      if (diagnosticsEnabled) t.signal.removeEventListener('abort', onAbort);
+      removePageListeners();
       await browser?.close();
       await runtime.close();
       rmSync(runtimeDirectory, { recursive: true, force: true });
@@ -120,7 +204,46 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser);
+    if (diagnosticsEnabled) {
+      const onRequest = (request: Request) => {
+        const path = new URL(request.url()).pathname;
+        if (!path.startsWith('/api/')) return;
+        if (browserInFlight.size === 16) {
+          browserInFlight.delete(browserInFlight.keys().next().value!);
+          evictedBrowserRequests++;
+        }
+        browserInFlight.set(request, {
+          method: request.method(),
+          path: diagnosticPath(path),
+          started: Date.now(),
+        });
+      };
+      const finish = (request: Request, status: number | 'failed') => {
+        const started = browserInFlight.get(request);
+        if (!started) return;
+        browserInFlight.delete(request);
+        recentBrowserRequests.push({
+          method: started.method,
+          path: started.path,
+          status,
+          durationMs: Date.now() - started.started,
+        });
+        if (recentBrowserRequests.length > 8) recentBrowserRequests.shift();
+      };
+      const onRequestFinished = async (request: Request) =>
+        finish(request, (await request.response().catch(() => null))?.status() ?? 'failed');
+      const onRequestFailed = (request: Request) => finish(request, 'failed');
+      page.on('request', onRequest);
+      page.on('requestfinished', onRequestFinished);
+      page.on('requestfailed', onRequestFailed);
+      removePageListeners = () => {
+        page.off('request', onRequest);
+        page.off('requestfinished', onRequestFinished);
+        page.off('requestfailed', onRequestFailed);
+      };
+    }
     const url = `http://127.0.0.1:${runtime.port}`;
+    enterPhase('encrypted profile setup');
     await page.goto(url);
     const setup = await page.evaluate(async () => {
       const api = async (path: string, body?: unknown) => {
@@ -147,10 +270,11 @@ test(
     });
     const prefix = `/api/profiles/${setup.profileId}`;
     const api = async (path: string, body?: unknown) => {
-      const response =
+      const response = await trackRequest(body === undefined ? 'GET' : 'POST', path, () =>
         body === undefined
-          ? await page.request.get(url + path)
-          : await page.request.post(url + path, { headers: { Origin: url }, data: body });
+          ? page.request.get(url + path)
+          : page.request.post(url + path, { headers: { Origin: url }, data: body }),
+      );
       const json = await response.json();
       assert(response.ok(), JSON.stringify(json));
       return json.data;
@@ -194,16 +318,21 @@ test(
       await page.setViewportSize({ width: 1440, height: 1000 });
     }
     for (const clinical of [false, true]) {
+      const shape = clinical ? 'proposed' : 'top-level';
+      enterPhase(shape + ' original upload');
       const value = envelope(clinical);
-      const uploaded = await page.request.post(url + prefix + '/intakes', {
-        headers: {
-          Origin: url,
-          'Content-Type': 'text/plain',
-          'X-Filename': 'fictional-review.txt',
-        },
-        data: Buffer.from('Fictional retained original ' + clinical),
-      });
+      const uploaded = await trackRequest('POST', prefix + '/intakes', () =>
+        page.request.post(url + prefix + '/intakes', {
+          headers: {
+            Origin: url,
+            'Content-Type': 'text/plain',
+            'X-Filename': 'fictional-review.txt',
+          },
+          data: Buffer.from('Fictional retained original ' + clinical),
+        }),
+      );
       assert.equal(uploaded.status(), 201);
+      enterPhase(shape + ' proposal publication');
       let item = await stopFixtureImport(page, url, prefix, (await uploaded.json()).data.id);
       item = await api(`${prefix}/intakes/${encodeURIComponent(item.id)}/proposals`, {
         version: item.version,
@@ -213,6 +342,7 @@ test(
       const path = `${prefix}/intakes/${encodeURIComponent(item.id)}`;
       const proposalId = await fixtureProposalId(api, prefix, item.id);
       const reviewPath = path + '/review?proposalId=' + encodeURIComponent(proposalId);
+      enterPhase(shape + ' initial review');
       const originalReview = await fixtureReview(api, reviewPath);
       assert.deepEqual(originalReview.records[0].mapping.opticalPrescription, optical);
       assert.equal(
@@ -231,6 +361,7 @@ test(
         recordId: originalReview.records[0].id,
         candidateVersionId: originalReview.records[0].candidateVersionId,
       };
+      enterPhase(shape + ' browser record review');
       await page.goto('about:blank');
       await fixtureNativeReportReady(page, prefix, reportScope, () => page.goto(url + reportUrl));
       const exactLinks = page.locator('.import-detail-record-link:not([data-saved-record-id])');
@@ -249,6 +380,7 @@ test(
       await page.getByRole('button', { name: 'This is me', exact: true }).waitFor();
       assert.equal(await page.getByRole('article').count(), 1);
       await capture(clinical ? 'proposed-review' : 'top-level-review');
+      enterPhase(shape + ' identity and date choice');
       assert.equal(await page.getByRole('button', { name: 'This is me', exact: true }).count(), 1);
       await page.getByRole('button', { name: 'This is me', exact: true }).click();
       const choice = page.getByRole('button', { name: 'March 8, 2017', exact: true });
@@ -289,6 +421,7 @@ test(
       assert.equal(refreshedChoice.status(), 200, await refreshedChoice.text());
       assert.equal(await refreshedChoice.finished(), null);
       if (clinical) {
+        enterPhase('proposed relationship review');
         // Both shape fixtures describe independent retained source occurrences.
         // Review their relationship before accepting the second prescription.
         const related = page.locator('details.intake-related-disclosure');
@@ -323,6 +456,7 @@ test(
           assert.equal(command.pair.reason, reason);
         });
       }
+      enterPhase(shape + ' clinical acceptance');
       const accepted = fixtureBrowserResponse(
         page,
         (response) => response.url().endsWith('/intakes/report-acceptance') && response.ok(),
@@ -338,6 +472,7 @@ test(
         await page.getByRole('button', { name: 'Confirm and save record', exact: true }).count(),
         0,
       );
+      enterPhase(shape + ' saved evidence and navigation');
       const stored = await fixtureReview(api, reviewPath);
       assert.equal(stored.records[0].mapping.subject, 'self');
       assert.equal(stored.records[0].mapping.date, '2017-03-08');
@@ -370,10 +505,15 @@ test(
       await capture(clinical ? 'proposed-vision' : 'top-level-vision');
       await page.reload();
       await page.getByRole('article').waitFor();
-      const original = await page.request.get(url + fixtureSourcePath(prefix, item.contentUrl));
+      enterPhase(shape + ' original and proposal reread');
+      const originalPath = fixtureSourcePath(prefix, item.contentUrl);
+      const original = await trackRequest('GET', originalPath, () =>
+        page.request.get(url + originalPath),
+      );
       assert.equal(await original.text(), 'Fictional retained original ' + clinical);
-      const proposal = await page.request.get(
-        url + prefix + '/sources/' + encodeURIComponent(proposalId) + '/content',
+      const proposalPath = prefix + '/sources/' + encodeURIComponent(proposalId) + '/content';
+      const proposal = await trackRequest('GET', proposalPath, () =>
+        page.request.get(url + proposalPath),
       );
       assert.deepEqual(JSON.parse(await proposal.text()), value);
       await page.goto('about:blank');
@@ -430,18 +570,22 @@ test(
     const queueBytes = Buffer.from(
       queueRecords.map((record) => JSON.stringify(record)).join('\n') + '\n',
     );
-    const queued = await page.request.post(url + prefix + '/intakes', {
-      headers: {
-        Origin: url,
-        'Content-Type': 'application/x-ndjson',
-        'X-Filename':
-          'fictional-twenty-record-review-with-a-long-original-delivery-filename-for-mobile-layout-checks.jsonl',
-      },
-      data: queueBytes,
-    });
+    enterPhase('guided queue upload');
+    const queued = await trackRequest('POST', prefix + '/intakes', () =>
+      page.request.post(url + prefix + '/intakes', {
+        headers: {
+          Origin: url,
+          'Content-Type': 'application/x-ndjson',
+          'X-Filename':
+            'fictional-twenty-record-review-with-a-long-original-delivery-filename-for-mobile-layout-checks.jsonl',
+        },
+        data: queueBytes,
+      }),
+    );
     assert.equal(queued.status(), 201);
     const queueItem = await stopFixtureImport(page, url, prefix, (await queued.json()).data.id);
     const queuePath = `${prefix}/intakes/${encodeURIComponent(queueItem.id)}`;
+    enterPhase('guided queue initial review');
     const initialQueue = await fixtureReview(api, queuePath + '/review');
     assert.equal(initialQueue.records.length, 20);
     const queueReportUrl = await fixtureReportUrl(api, prefix, queueItem.id);
@@ -575,6 +719,7 @@ test(
       );
       await page.getByRole('region', { name: 'Review actions' }).waitFor();
     }
+    enterPhase('guided queue first record and pages');
     await openQueueRecord(0);
     assert.equal(await page.getByRole('article').count(), 1);
     await capture('guided-queue-first');
@@ -606,6 +751,7 @@ test(
       return true;
     });
     const savedReportRead = reportAfterAcknowledgement(() => saveAcknowledgedAt);
+    enterPhase('guided queue first acceptance');
     await page.getByRole('button', { name: 'Confirm and save record', exact: true }).click();
     const savedReceipt = await firstSave;
     assert.equal(savedReceipt.status(), 200);
@@ -618,6 +764,7 @@ test(
         initialQueue.records[0].id,
     );
     assert.equal(savedRow?.queueState, 'accepted');
+    enterPhase('guided queue second record');
     await openQueueRecord(1, savedReport);
     assert.equal(imports.length, 1);
     assert.equal(imports[0].blocks.length, 1);
@@ -646,6 +793,7 @@ test(
       return true;
     });
     const deferredReportRead = reportAfterAcknowledgement(() => deferAcknowledgedAt);
+    enterPhase('guided queue defer second record');
     await page
       .locator('.intake-guided-actions')
       .getByRole('button', { name: 'Review later', exact: true })
@@ -660,6 +808,7 @@ test(
         initialQueue.records[1].id,
     );
     assert.equal(deferredRow?.queueState, 'deferred');
+    enterPhase('guided queue third record');
     await openQueueRecord(2, deferredReport);
     assert.equal(await page.getByRole('article').count(), 1);
     let editAcknowledgedAt: number | undefined;
@@ -694,6 +843,7 @@ test(
         return (await response.json()).data;
       }),
     );
+    enterPhase('guided queue edit third record');
     await page.getByLabel('Result', { exact: true }).fill('18.5');
     const editReceipt = await edited;
     assert.equal(editReceipt.status(), 200);
@@ -734,6 +884,7 @@ test(
     await page.getByRole('tab', { name: 'Details', exact: true }).click();
     assert.equal(await page.getByRole('article').count(), 1, 'Details restores the exact editor');
     assert.equal(await page.getByLabel('Result', { exact: true }).inputValue(), '18.5');
+    enterPhase('guided queue reload and retained evidence');
     await fixtureNativeRecordReady(
       page,
       prefix,
@@ -753,10 +904,12 @@ test(
     assert.equal(imports.length, 1, 'Reload and draft review never accept more records');
     assert.equal(await page.locator('.import-detail').count(), 1);
     await capture('guided-queue-resumed');
-    const queueOriginal = await page.request.get(
-      url + fixtureSourcePath(prefix, queueItem.contentUrl),
+    const queueOriginalPath = fixtureSourcePath(prefix, queueItem.contentUrl);
+    const queueOriginal = await trackRequest('GET', queueOriginalPath, () =>
+      page.request.get(url + queueOriginalPath),
     );
     assert.deepEqual(await queueOriginal.body(), queueBytes);
     assert.deepEqual(errors, []);
+    completed = true;
   },
 );
