@@ -88,6 +88,32 @@ Every new durable write path needs a fictional-fixture test asserting that journ
 
 Cold reconstruction retains the original complete-version validation, reference verification, delete-before-insert ordering, historical indexing and final integrity checks. Within each replayed transaction, it prepares each touched table's delete/insert statement at most once per phase and executes that statement for every applicable record. The statement maps are local to that call and bounded by the configured table set; no records, authorization results or prepared statements are reused across replay calls or connections. Durable formats, encryption, accepted publication and cache compatibility are unchanged.
 
+Publication now also prepares a changed-row SELECT once per touched table within
+one collection traversal. Every changed identity still executes that SELECT and
+reads its current predecessor; no row, result or authorization is cached. The
+statement map is limited to the configured schema and discarded after that
+traversal, including early termination.
+
+The derived field-history index groups up to 32 changed-field rows from one
+complete validated version in one INSERT statement. It preserves field order,
+predecessor references and absent/null distinctions, flushes before the next
+version, and retains at most 32 statement shapes for that indexing call. The
+bounded parameter list contains references and presence metadata, not copies of
+record contents. Every field row still executes; the accepted version, segment
+and commit bytes, validation/readback order, transaction boundaries and SQLite
+projection format are unchanged. A failure after a real field batch rolls back
+the entire publication before accepted HEAD advances. Replay uses the same
+indexer and reconstructs the exact current and historical rows.
+
+The publication regression uses four and 64 changed people plus nested source
+fields across inserts, updates and deletion. It checks actual SQL executions,
+exact operation replay, empty field deltas, interruption and two fresh rebuilds.
+For its 64-person insertion, row-SELECT compilation falls from 64 to one for the
+people table, retaining all 64 row reads; 342 field rows use 69 rather than 342
+INSERT calls. This trades a bounded set of statement shapes for fewer execution
+calls; it does not reduce field rows, authenticated journal reads or durable
+bytes, or establish a full import/identity latency improvement.
+
 The fictional replay-only regression rebuilds the same accepted archive into two fresh databases at both four and 64 people, preserving updates, tombstones, predecessor/field history and exact current/history index rows. For the 64-person history, SQL preparation falls from 130 deletes and 129 inserts to four deletes and three inserts, while all 259 corresponding row executions remain. Complete-version validation counts and archive bytes remain unchanged. These are scoped work counts, not an unlock latency or full HTTP acceptance claim.
 
 Ancestry and V2 segment-reference ordering indexes also keep their inserts in one

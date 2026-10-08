@@ -677,8 +677,11 @@ function indexTransaction(
     insertVersion = db.prepare('INSERT INTO __record_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)'),
     selectVersion = db.prepare(
       'INSERT INTO __record_current VALUES(?,?,?) ON CONFLICT(entity,record_id) DO UPDATE SET version_id=excluded.version_id',
-    ),
-    insertField = db.prepare('INSERT INTO __record_fields VALUES(?,?,?,?,?,?,?,?,?)');
+    );
+  // Only SQL bytecode is shared within this indexing call. Keep at most 32
+  // statement shapes; metadata arguments never cross a complete-version
+  // boundary, and every version still follows the original validation order.
+  const fieldStatements = new Map<number, ReturnType<Database['prepare']>>();
   try {
     for (const version of versions) {
       recordVersionWork('indexedVersionAttempts');
@@ -702,9 +705,24 @@ function indexTransaction(
         stringifyRecordJson(metadata),
       );
       selectVersion.run(version.entity, version.recordId, version.versionId);
+      const fields: SQLInputValue[] = [];
+      const flushFields = () => {
+        if (!fields.length) return;
+        const rows = fields.length / 9;
+        let insert = fieldStatements.get(rows);
+        if (!insert) {
+          insert = db.prepare(
+            'INSERT INTO __record_fields VALUES' +
+              Array(rows).fill('(?,?,?,?,?,?,?,?,?)').join(','),
+          );
+          fieldStatements.set(rows, insert);
+        }
+        insert.run(...fields);
+        fields.length = 0;
+      };
       for (const field of new Set([...before.keys(), ...after.keys()]))
-        if (before.get(field) !== after.get(field))
-          insertField.run(
+        if (before.get(field) !== after.get(field)) {
+          fields.push(
             version.versionId,
             config.profileId,
             version.entity,
@@ -715,6 +733,9 @@ function indexTransaction(
             Number(before.has(field)),
             Number(after.has(field)),
           );
+          if (fields.length === 32 * 9) flushFields();
+        }
+      flushFields();
     }
   } finally {
     identities.close();
@@ -753,15 +774,22 @@ function* collect(
     : (db.prepare('SELECT * FROM __record_changed ORDER BY entity,record_id').iterate() as Iterable<
         SqliteRow & { entity: string; record_id: string }
       >);
+  // A new traversal owns these statements, bounded by the configured tables.
+  // Never memoize rows: even a deletion or an unchanged field must read the
+  // current transaction's row and predecessor again.
+  const readers = new Map<TableSchema, ReturnType<Database['prepare']>>();
   for (const { entity, record_id: recordId } of keys) {
     const table = config.schema.find((table) => table.name === entity),
       id = parseRecordJson(recordId) as SQLInputValue[];
     if (entity === 'app_meta' && internalKey(id[0] as string)) continue;
-    const contents = db
-      .prepare(
+    let read = readers.get(table!);
+    if (!read) {
+      read = db.prepare(
         `SELECT * FROM ${q(entity)} WHERE ${table!.pk.map((key) => q(key) + '=?').join(' AND ')}`,
-      )
-      .get(...id);
+      );
+      readers.set(table!, read);
+    }
+    const contents = read.get(...id);
     const previous = current(db, entity, recordId);
     if (!contents && (!previous || previous.deleted)) continue;
     yield {
