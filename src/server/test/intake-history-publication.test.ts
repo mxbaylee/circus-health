@@ -675,7 +675,8 @@ function observePublication(
       assert.equal(checkpoint?.busy, 0, 'fixture checkpoint must drain without another reader');
       assert.ok(pageSize > 0 && pageSize <= 65536);
       assert.ok(
-        Math.max(maxObservedWalBytes, databaseFilesBeforeDrain.walBytes) <= 256 * 1024 * 1024,
+        Math.max(maxObservedWalBytes, databaseFilesBeforeDrain.walBytes) <=
+          (walCheckpointPages === 65536 ? 512 : 256) * 1024 * 1024,
         'bounded fictional WAL fixture exceeded its diagnostic file ceiling',
       );
       dispose();
@@ -810,7 +811,7 @@ function observePublication(
             'Prior-COMMIT buckets classify one observed COMMIT attempt by the WAL header cycle before the next observed attempt; exec-finally observations also include failed COMMITs. The last attempt and unavailable or interrupted observations remain unclassified. After an observation gap, a node delta can span attempts while elapsed time and process writes belong only to the current observed exec, so such samples are not per-COMMIT ratios. Reset-followed cost is a correlation, not proof that the prior COMMIT performed a checkpoint.',
             'dbstat traverses eight named record B-trees on a separate read-only connection outside publication after WAL drains; its bounded output does not bound scan work. Page lengths are neither whole-cache size, VFS write bytes nor a causal index-cost comparison.',
             'Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped.',
-            'Filesystem bytes are API transfers, not physical device I/O. Linux process fsWrite deltas are kernel-reported write units, not attributable to one SQLite connection; normalized values are unavailable on other platforms. WAL length is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; a bounded transaction can overshoot the configured threshold, so the fixture keeps an independent 256 MiB ceiling. maxRSS and prepared-byte peaks cover process/connection lifetime, not cumulative work.',
+            'Filesystem bytes are API transfers, not physical device I/O. Linux process fsWrite deltas are kernel-reported write units, not attributable to one SQLite connection; normalized values are unavailable on other platforms. WAL length is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; a bounded transaction can overshoot the configured threshold, so the fixture keeps an independent 256 MiB ceiling, or 512 MiB for the fixture-only 65,536-page comparison. maxRSS and prepared-byte peaks cover process/connection lifetime, not cumulative work.',
           ].join(' '),
         }),
       );
@@ -879,6 +880,7 @@ async function publicationFixture(t: test.TestContext, count: number) {
   assert.equal(baselineWalCheckpoint, 32768, 'comparison requires the attached WAL policy');
   if (candidateWalCheckpoint === '1000') f.db.exec('PRAGMA main.wal_autocheckpoint=1000');
   else if (candidateWalCheckpoint === '8192') f.db.exec('PRAGMA main.wal_autocheckpoint=8192');
+  else if (candidateWalCheckpoint === '65536') f.db.exec('PRAGMA main.wal_autocheckpoint=65536');
   else if (candidateWalCheckpoint !== undefined && candidateWalCheckpoint !== '32768')
     throw Error('Unsupported history diagnostic WAL threshold');
   const selectedWalCheckpoint = Number(
