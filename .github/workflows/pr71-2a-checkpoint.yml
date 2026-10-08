@@ -26,19 +26,71 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - name: Prepare the bounded patch
+      - name: Prepare pinned tooling and the counted regression
         run: |
           mkdir -p "$OUTPUT/logs"
           test "$(git rev-parse HEAD)" = f91a911bd596beaab3d57308d953ba717eaa25c7
           git rev-parse HEAD > "$OUTPUT/base-sha.txt"
           npm ci > "$OUTPUT/npm-ci.log" 2>&1
           node --input-type=module <<'NODE'
-          import { gunzipSync } from 'node:zlib';
-          import { writeFileSync } from 'node:fs';
-          const encoded = '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';
-          writeFileSync(`${process.env.OUTPUT}/repair.patch`, gunzipSync(Buffer.from(encoded, 'base64')));
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const path = 'src/server/test/record-replay-sql.test.ts';
+          let text = readFileSync(path, 'utf8');
+          function replace(before, after) {
+            if (text.split(before).length !== 2) throw Error(`Unexpected test anchor: ${before}`);
+            text = text.replace(before, after);
+          }
+          replace('      const executed = { remove: 0, insert: 0 };', `      const executed = { remove: 0, insert: 0 };
+                const scratch = {
+                  ancestry: { inserts: 0, outsideTransaction: 0, connections: 0 },
+                  segments: { inserts: 0, outsideTransaction: 0, connections: 0 },
+                };
+                const scratchConnections: Array<{ db: DatabaseSync; path: string }> = [];`);
+          replace('          const statement = prepare.call(this, sql);', `          const statement = prepare.call(this, sql);
+                    const scratchKind =
+                      sql === 'INSERT INTO ancestry VALUES(?,?,?)'
+                        ? 'ancestry'
+                        : sql === 'INSERT INTO segments VALUES(?,?)'
+                          ? 'segments'
+                          : undefined;
+                    if (scratchKind) {
+                      const connection = this;
+                      const work = scratch[scratchKind];
+                      work.connections++;
+                      scratchConnections.push({db: connection, path: connection.location()!});
+                      const run = statement.run;
+                      statement.run = (...args: unknown[]) => {
+                        work.inserts++;
+                        if (!connection.isTransaction) work.outsideTransaction++;
+                        return Reflect.apply(run, statement, args) as ReturnType<typeof run>;
+                      };
+                    }`);
+          replace("import { mkdtempSync, rmSync } from 'node:fs';", "import { mkdtempSync, rmSync, existsSync } from 'node:fs';");
+          replace('      const rebuilt = openDatabase(path, profileId);', `      const measuredScratch = structuredClone(scratch);
+                assert.ok(scratchConnections.length > 0, 'the real disk-backed ordering indexes were used');
+                for (const connection of scratchConnections) {
+                  assert.equal(connection.db.isOpen, false, 'scratch never outlives its traversal');
+                  assert.equal(existsSync(connection.path), false, 'scratch is deleted after consumption');
+                }
+                const rebuilt = openDatabase(path, profileId);`);
+          replace('JSON.stringify({ count, attempt, prepared, executed, work: work.reconstruction })', 'JSON.stringify({ count, attempt, prepared, executed, scratch: measuredScratch, work: work.reconstruction })');
+          replace('      assert.deepEqual(\n        prepared,', `      assert.equal(measuredScratch.ancestry.inserts, work.reconstruction.ancestryReferencesSpooled);
+                assert.equal(measuredScratch.segments.inserts, work.reconstruction.segmentReferencesSpooled);
+                for (const kind of ['ancestry', 'segments'] as const) {
+                  assert.ok(measuredScratch[kind].inserts > 0);
+                  assert.equal(
+                    measuredScratch[kind].outsideTransaction,
+                    0,
+                    kind + ': ordering-index inserts share one private transaction per traversal',
+                  );
+                }
+                assert.deepEqual(
+                  prepared,`);
+          writeFileSync(path, text);
           NODE
-      - name: Capture complete previous-head CI evidence
+          npx prettier --write src/server/test/record-replay-sql.test.ts
+          test "$(git hash-object src/server/test/record-replay-sql.test.ts)" = df3004a07bd54429659748ab601f2712507266b1
+      - name: Capture complete prior-head CI evidence
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -68,9 +120,8 @@ jobs:
           writeFileSync(`${process.env.OUTPUT}/prior-summary.json`, JSON.stringify(summary, null, 2));
           console.log(JSON.stringify(summary, null, 2));
           NODE
-      - name: Prove the new scratch-work assertion fails on unchanged implementation
+      - name: Prove the scratch-work assertion fails on unchanged implementation
         run: |
-          git apply --include=src/server/test/record-replay-sql.test.ts "$OUTPUT/repair.patch"
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { spawnSync } from 'node:child_process';
@@ -87,7 +138,42 @@ jobs:
           NODE
       - name: Apply the exact repair and check its full tree
         run: |
-          git apply --exclude=src/server/test/record-replay-sql.test.ts "$OUTPUT/repair.patch"
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          function edit(path, pairs) {
+            let text = readFileSync(path, 'utf8');
+            for (const [before, after] of pairs) {
+              if (text.split(before).length !== 2) throw Error(`Unexpected anchor in ${path}: ${before}`);
+              text = text.replace(before, after);
+            }
+            writeFileSync(path, text);
+          }
+          edit('src/server/record-versions.ts', [
+            ["scratch.db.exec('CREATE TABLE segments(ordinal INTEGER PRIMARY KEY,reference TEXT NOT NULL)');", `// This private ordering index is consumed on this connection and discarded.
+              // Keep its bounded disk-backed work in one transaction instead of an
+              // implicit pager transaction per reference. Journal objects are still read
+              // and authenticated by the original reader on every traversal.
+              scratch.db.exec('CREATE TABLE segments(ordinal INTEGER PRIMARY KEY,reference TEXT NOT NULL); BEGIN');`],
+            ["'CREATE TABLE ancestry (ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, reference TEXT NOT NULL)',", "'CREATE TABLE ancestry (ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, reference TEXT NOT NULL); BEGIN',"],
+          ]);
+          const anchor = 'Run this checkpoint without repeating the import/review setup:';
+          edit('docs/data/record-version-storage.md', [[anchor, `Ancestry and V2 segment-reference ordering indexes also keep their inserts in one
+          private transaction per traversal, rather than an implicit pager transaction per
+          reference. Their existing 2 MiB SQLite page cache and file-backed temporary storage
+          remain unchanged. The transaction is discarded with the scratch connection on
+          normal completion, refusal or iterator termination; it is never committed as
+          recovery evidence. Every selected commit, manifest page and segment is still read
+          from the original journal and authenticated in the same order. V1 decoding and
+          accepted-database transaction boundaries are unchanged. The replay regression
+          observes the actual scratch inserts inside a transaction, reconciles their counts
+          with the existing replay counters, and verifies that the scratch files and
+          connections are gone afterward.
+
+          ${anchor}`]]);
+          const note = 'No SQLite-schema or encrypted-framing change is required; old monolithic objects retain their prior whole-object decoder boundary.';
+          edit('docs/setup/release-updates.md', [[note, note + ' Private ancestry/manifest ordering now batches scratch inserts within each traversal; restart into the candidate to use it. This changes no retained format, archive verification, cache compatibility or operator setting.']]);
+          NODE
+          npx prettier --write docs/data/record-version-storage.md docs/setup/release-updates.md src/server/record-versions.ts src/server/test/record-replay-sql.test.ts
           git diff --check
           git add docs/data/record-version-storage.md docs/setup/release-updates.md src/server/record-versions.ts src/server/test/record-replay-sql.test.ts
           git write-tree > "$OUTPUT/candidate-tree.txt"
