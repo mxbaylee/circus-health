@@ -12,6 +12,9 @@ import {
 import { canonicalLiteral, validateJSONL, validationSummary } from '../intake-format.ts';
 import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
 import { intakeFileIdentity } from '../intake-files.ts';
+import { observeTransactionBeforePublication, type Database } from '../database.ts';
+import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
 import { getNativeIntakeIdentityReview } from '../intake-identity-native.ts';
@@ -32,6 +35,307 @@ import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { nativeIdentityPreviewCounts } from '../intake-identity-preview-cache.ts';
 import type { IntakeIdentityScope } from '../../shared/intake-identity.ts';
 import { fixture, envelope } from './intake-identity-native-fixture.ts';
+
+// Opt-in, aggregate-only observation of the actual 257-artifact preparation.
+// Inclusive method totals overlap; maintenance segments partition that call.
+function observeArtifactHistoryPreparation(t: test.TestContext, db: Database, id: string) {
+  const collections = selectedEnvelopeStore(db, { id }).collections;
+  const workKeys = [
+    'collectionNodeReads',
+    'collectionReadWitnessQueries',
+    'collectionNodeCacheHits',
+    'collectionPreparedBytes',
+    'collectionNodesWritten',
+    'collectionWrittenBytes',
+    'candidatePathCopies',
+    'candidateCopiedMembers',
+    'candidateVerificationCalls',
+    'candidateVerificationBytes',
+    'hashCalls',
+    'hashedBytes',
+  ] as const;
+  const work = () => {
+    const counters = intakeWorkCounters(db).warm;
+    return Object.fromEntries(workKeys.map((key) => [key, counters[key]])) as Record<
+      string,
+      number
+    >;
+  };
+  const point = () => ({
+    ms: performance.now(),
+    cpu: process.cpuUsage(),
+    fsWrite: process.resourceUsage().fsWrite,
+    work: work(),
+  });
+  type Point = ReturnType<typeof point>;
+  type Totals = {
+    calls: number;
+    ms: number;
+    cpuMicros: number;
+    fsWrite: number;
+    work: Record<string, number>;
+  };
+  const totals = new Map<string, Totals>();
+  const add = (name: string, before: Point, after: Point) => {
+    const value = totals.get(name) ?? { calls: 0, ms: 0, cpuMicros: 0, fsWrite: 0, work: {} };
+    value.calls++;
+    value.ms += after.ms - before.ms;
+    value.cpuMicros += after.cpu.user + after.cpu.system - before.cpu.user - before.cpu.system;
+    value.fsWrite += after.fsWrite - before.fsWrite;
+    for (const key of workKeys) {
+      const delta = after.work[key]! - before.work[key]!;
+      if (delta) value.work[key] = (value.work[key] ?? 0) + delta;
+    }
+    totals.set(name, value);
+  };
+  const start = point();
+  const stack: Array<{ name: string; started: number }> = [];
+  const occupancy = {
+    prepared: 0,
+    committed: 0,
+    changes: 0,
+    full: 0,
+    partial: 0,
+    histogram: Array<number>(65).fill(0),
+  };
+  const commitExecAttempts = { calls: 0, ms: 0, fsWrite: 0 };
+  const methodCalls = { prepare: 0, stage: 0, commitMaintenance: 0 };
+  const maxCompletedMethodMs = { prepare: 0, stage: 0, commitMaintenance: 0 };
+  let lastEnteredMethod: { name: string; ordinal: number; elapsedMs: number } | null = null;
+  let lastCompletedMethod: {
+    name: string;
+    ordinal: number;
+    elapsedMs: number;
+    durationMs: number;
+  } | null = null;
+  const preparedKinds = new WeakMap<object, 'build' | 'adoption' | 'other'>();
+  const byKind = {
+    build: { prepared: 0, committed: 0, changes: 0 },
+    adoption: { prepared: 0, committed: 0, changes: 0 },
+    other: { prepared: 0, committed: 0, changes: 0 },
+  };
+  const restores: Array<() => void> = [];
+  let active: { entry: Point; stageEntry?: Point; stageExit?: Point; verified?: Point } | undefined;
+  let closed = false;
+  const snapshot = () => {
+    const now = point();
+    const changedWork = Object.fromEntries(
+      workKeys.map((key) => [key, now.work[key]! - start.work[key]!]),
+    );
+    return {
+      elapsedMs: now.ms - start.ms,
+      activeCall: stack.at(-1)?.name ?? null,
+      activeCallMs: stack.length ? now.ms - stack.at(-1)!.started : null,
+      lastEnteredMethod,
+      lastCompletedMethod,
+      maxCompletedMethodMs: { ...maxCompletedMethodMs },
+      selectedHandleStable: selectedEnvelopeStore(db, { id }).collections === collections,
+      processCpuMicros: now.cpu.user + now.cpu.system - start.cpu.user - start.cpu.system,
+      processFsWriteUnits: now.fsWrite - start.fsWrite,
+      work: changedWork,
+      preparedBatches: { ...occupancy, histogram: [...occupancy.histogram] },
+      preparedBatchKinds: Object.fromEntries(
+        Object.entries(byKind).map(([kind, counts]) => [kind, { ...counts }]),
+      ),
+      commitExecAttempts: { ...commitExecAttempts },
+      inclusiveMethodAndExclusiveMaintenanceSegments: Object.fromEntries(
+        [...totals].map(([key, value]) => [key, { ...value, work: { ...value.work } }]),
+      ),
+      note: 'Process CPU/fsWrite include other work; fsWrite units are OS-specific. Method totals count completed attempts and overlap nested calls; prepared/committed batch counts require successful calls. Prepared bytes are cumulative, not resident memory. Unlisted SQL/filesystem work is unmeasured. Timer/abort callbacks cannot run inside a synchronous blocked call; last-entry/completion markers expose that limit after it returns.',
+    };
+  };
+  let lastSnapshot: ReturnType<typeof snapshot> | undefined;
+  const fallbackSnapshot = () => ({
+    elapsedMs: performance.now() - start.ms,
+    activeCall: stack.at(-1)?.name ?? null,
+    activeCallMs: stack.length ? performance.now() - stack.at(-1)!.started : null,
+    lastEnteredMethod,
+    lastCompletedMethod,
+    maxCompletedMethodMs: { ...maxCompletedMethodMs },
+    preparedBatches: { ...occupancy, histogram: [...occupancy.histogram] },
+    preparedBatchKinds: Object.fromEntries(
+      Object.entries(byKind).map(([kind, counts]) => [kind, { ...counts }]),
+    ),
+    commitExecAttempts: { ...commitExecAttempts },
+    inclusiveMethodAndExclusiveMaintenanceSegments: Object.fromEntries(
+      [...totals].map(([key, value]) => [key, { ...value, work: { ...value.work } }]),
+    ),
+    lastCompleteSnapshot: lastSnapshot ?? null,
+    note: 'Fallback does not read the possibly closed database; cumulative work may lag the last method.',
+  });
+  const emit = (reason: string) => {
+    if (closed) return;
+    try {
+      lastSnapshot = snapshot();
+      process.stderr.write(
+        JSON.stringify({ probe: 'artifact-history-preparation', reason, ...lastSnapshot }) + '\n',
+      );
+    } catch {
+      try {
+        process.stderr.write(
+          JSON.stringify({
+            probe: 'artifact-history-preparation',
+            reason: reason + '-snapshot-unavailable',
+            ...fallbackSnapshot(),
+          }) + '\n',
+        );
+      } catch {
+        // Diagnostics must not alter the guarded publication result.
+      }
+    }
+  };
+  const onAbort = () => emit('abort');
+  let intervals = 0;
+  const timer = setInterval(() => {
+    if (intervals++ < 20) emit('interval');
+  }, 30000);
+  timer.unref();
+  t.signal.addEventListener('abort', onAbort, { once: true });
+  const dispose = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(timer);
+    t.signal.removeEventListener('abort', onAbort);
+    for (const restore of restores.reverse()) restore();
+  };
+  t.after(() => {
+    if (!closed) emit('teardown');
+    dispose();
+  });
+  const install = (target: object, key: string, replacement: unknown) => {
+    const original = Reflect.get(target, key);
+    if (!Reflect.set(target, key, replacement) || Reflect.get(target, key) !== replacement)
+      throw Error('Artifact history diagnostic method is not replaceable');
+    restores.push(() => Reflect.set(target, key, original));
+  };
+  try {
+    const originalExec = DatabaseSync.prototype.exec;
+    install(DatabaseSync.prototype, 'exec', function (this: DatabaseSync, query: string) {
+      const isCommit = this === db && /^COMMIT\s*;?\s*$/i.test(query.trim());
+      const before = isCommit ? point() : undefined;
+      try {
+        return originalExec.call(this, query);
+      } finally {
+        if (before) {
+          const after = point();
+          commitExecAttempts.calls++;
+          commitExecAttempts.ms += after.ms - before.ms;
+          commitExecAttempts.fsWrite += after.fsWrite - before.fsWrite;
+        }
+      }
+    });
+    const removeObserver = observeTransactionBeforePublication(db, () => {
+      if (active) active.verified = point();
+    });
+    restores.push(removeObserver);
+    for (const method of ['prepare', 'stage', 'commitMaintenance'] as const) {
+      const original = collections[method];
+      install(collections, method, (...args: unknown[]) => {
+        const before = point();
+        const ordinal = ++methodCalls[method];
+        lastEnteredMethod = { name: method, ordinal, elapsedMs: before.ms - start.ms };
+        stack.push({ name: method, started: before.ms });
+        if (method === 'commitMaintenance') active = { entry: before };
+        if (method === 'stage' && active) active.stageEntry = before;
+        let succeeded = false;
+        let result: unknown;
+        try {
+          result = Reflect.apply(original, collections, args);
+          succeeded = true;
+          return result;
+        } finally {
+          const after = point();
+          add(method, before, after);
+          const durationMs = after.ms - before.ms;
+          maxCompletedMethodMs[method] = Math.max(maxCompletedMethodMs[method], durationMs);
+          lastCompletedMethod = {
+            name: method,
+            ordinal,
+            elapsedMs: after.ms - start.ms,
+            durationMs,
+          };
+          if (method === 'prepare' && succeeded) {
+            const changes = (args[1] as { changes?: unknown } | undefined)?.changes;
+            if (Array.isArray(changes) && changes.length <= 64) {
+              const kind =
+                changes.length === 1 && changes[0]?.op === 'adoptCollection'
+                  ? 'adoption'
+                  : changes.every((change) => change?.area === 'builds')
+                    ? 'build'
+                    : 'other';
+              occupancy.prepared++;
+              occupancy.changes += changes.length;
+              occupancy.histogram[changes.length]!++;
+              if (changes.length === 64) occupancy.full++;
+              else occupancy.partial++;
+              byKind[kind].prepared++;
+              byKind[kind].changes += changes.length;
+              if (result && typeof result === 'object') preparedKinds.set(result, kind);
+            }
+          }
+          if (method === 'stage' && active) active.stageExit = after;
+          let milestone = false;
+          if (method === 'commitMaintenance' && active) {
+            const { entry, stageEntry, stageExit, verified } = active;
+            if (stageEntry) add('maintenancePreStage', entry, stageEntry);
+            if (stageEntry && stageExit) add('maintenanceStage', stageEntry, stageExit);
+            if (stageExit && verified) add('maintenancePostStageVerify', stageExit, verified);
+            if (verified) add('maintenancePostVerifyPublication', verified, after);
+            active = undefined;
+            if (succeeded) {
+              occupancy.committed++;
+              const prepared = args[0];
+              if (prepared && typeof prepared === 'object') {
+                const kind = preparedKinds.get(prepared);
+                if (kind) byKind[kind].committed++;
+              }
+              milestone =
+                occupancy.committed <= 16384 &&
+                (occupancy.committed & (occupancy.committed - 1)) === 0;
+            }
+          }
+          stack.pop();
+          if (milestone) emit('commit-power-of-two');
+        }
+      });
+    }
+  } catch (error) {
+    dispose();
+    throw error;
+  }
+  emit('start');
+  return {
+    snapshot,
+    finish() {
+      emit('publication-complete');
+      dispose();
+    },
+  };
+}
+
+if (process.env.CRS_ARTIFACT_HISTORY_DIAGNOSTICS === 'smoke')
+  test('artifact history preparation probe plumbing', async (t) => {
+    const f = await fixture(t, false, 1);
+    await buildIntakeCollectionEnvelope(f.db, { id: f.original.id });
+    const probe = observeArtifactHistoryPreparation(t, f.db, f.original.id);
+    const collections = selectedEnvelopeStore(f.db, { id: f.original.id }).collections;
+    const id = randomUUID();
+    const prepared = collections.prepare(collections.openView(), {
+      operationId: id,
+      requestDigest: workflowHash(id),
+      domainVersion: intakeSourceVersion(f.db, f.original.id).version,
+      changes: [{ area: 'builds', collection: id, op: 'put', key: 'marker', value: 'fictional' }],
+    });
+    collections.commitMaintenance(prepared);
+    const result = probe.snapshot();
+    assert.equal(result.selectedHandleStable, true);
+    assert.equal(result.preparedBatches.prepared, 1);
+    assert.equal(result.preparedBatches.committed, 1);
+    assert.equal(result.commitExecAttempts.calls, 1);
+    assert.equal(result.inclusiveMethodAndExclusiveMaintenanceSegments.prepare?.calls, 1);
+    assert.equal(result.inclusiveMethodAndExclusiveMaintenanceSegments.maintenanceStage?.calls, 1);
+    probe.finish();
+  });
 
 // This fixture converts its small seed, then publishes genuine retained JSONL
 // history through one supported native workflow command.
@@ -186,6 +490,10 @@ async function artifactHistoryFixture(t: test.TestContext, phase: (name: string)
     257,
   );
   assert.equal(new Set(details.proposals.map((value) => value.id)).size, 257);
+  const finishProbe =
+    process.env.CRS_ARTIFACT_HISTORY_DIAGNOSTICS === '1'
+      ? observeArtifactHistoryPreparation(t, f.db, f.original.id)
+      : undefined;
   phase('publication-prepare-start');
   const prepared = await prepareIntakeWorkflowCommand(
     f.db,
@@ -236,6 +544,7 @@ async function artifactHistoryFixture(t: test.TestContext, phase: (name: string)
     { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
   );
   phase('publication-stage-complete');
+  finishProbe?.finish();
   phase('cold-http-start');
   const cold = await f.review();
   assert.ok(cold.scopeReference);
