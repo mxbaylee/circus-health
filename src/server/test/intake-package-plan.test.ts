@@ -25,6 +25,7 @@ import {
   readPackagePlanScope,
   readPackageUnitPage,
   savePagedPackageRoles,
+  saveIntakePackageRolesRead,
   readPackageUnitMetadataFragment,
   preparePagedPackagePlanCompatibility,
   readSelectedPackageRoleHash,
@@ -666,6 +667,148 @@ test('paged role decisions retain exact history and off-page references without 
       roles: [{ ...input.roles[0], reason: 'Changed request' }],
     }),
     (error: unknown) => error instanceof HttpError && error.code === 'OPERATION_CONFLICT',
+  );
+});
+
+test('new public role command refuses a changed physical original while exact replay remains available', async (t) => {
+  const f = fixture(t, 3),
+    plan = await createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+      version: f.intake.version,
+      operationId: 'role-source-plan',
+    }),
+    memberId = readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.inventory.member(0)!.memberId,
+    role = {
+      memberId,
+      role: 'clinical' as const,
+      reason: 'Fictional selected report',
+      coverage: 'pending' as const,
+      references: [],
+    },
+    path = profileOriginal(
+      f.root,
+      String(f.db.prepare('SELECT path FROM source_files WHERE id=?').get(f.id)!.path),
+      f.profileId,
+    );
+  const original = readFileSync(path),
+    changed = Buffer.from(original),
+    replacement = path + '.replacement';
+  changed[0] = changed[0]! ^ 1;
+  writeFileSync(replacement, changed);
+  renameSync(replacement, path);
+  await assert.rejects(
+    saveIntakePackageRolesRead(f.db, f.root, f.profileId, f.id, {
+      version: plan.version,
+      operationId: 'changed-role',
+      planId: plan.plan.id,
+      roles: [role],
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
+  assert.equal(
+    readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.memberState(memberId)!.role,
+    null,
+  );
+  writeFileSync(path, original);
+  const accepted = await saveIntakePackageRolesRead(f.db, f.root, f.profileId, f.id, {
+    version: plan.version,
+    operationId: 'accepted-role',
+    planId: plan.plan.id,
+    roles: [role],
+  });
+  assert.ok(accepted);
+  writeFileSync(replacement, changed);
+  renameSync(replacement, path);
+  const replay = await saveIntakePackageRolesRead(f.db, f.root, f.profileId, f.id, {
+    version: plan.version,
+    operationId: 'accepted-role',
+    planId: plan.plan.id,
+    roles: [role],
+  });
+  assert.ok(replay);
+});
+
+test('new public role command refuses a same-byte symlink', async (t) => {
+  const f = fixture(t, 3),
+    plan = await createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+      version: f.intake.version,
+      operationId: 'symlink-role-plan',
+    }),
+    memberId = readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.inventory.member(0)!.memberId,
+    path = profileOriginal(
+      f.root,
+      String(f.db.prepare('SELECT path FROM source_files WHERE id=?').get(f.id)!.path),
+      f.profileId,
+    );
+  const moved = path + '.moved';
+  renameSync(path, moved);
+  symlinkSync(moved, path);
+  await assert.rejects(
+    saveIntakePackageRolesRead(f.db, f.root, f.profileId, f.id, {
+      version: plan.version,
+      operationId: 'symlink-role',
+      planId: plan.plan.id,
+      roles: [
+        {
+          memberId,
+          role: 'clinical',
+          reason: 'Fictional selected report',
+          coverage: 'pending',
+          references: [],
+        },
+      ],
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
+  assert.equal(
+    readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.memberState(memberId)!.role,
+    null,
+  );
+});
+
+test('new paged role command refuses replacement after role work begins', async (t) => {
+  const f = fixture(t, 3),
+    plan = await createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+      version: f.intake.version,
+      operationId: 'late-role-plan',
+    }),
+    memberId = readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.inventory.member(0)!.memberId,
+    path = profileOriginal(
+      f.root,
+      String(f.db.prepare('SELECT path FROM source_files WHERE id=?').get(f.id)!.path),
+      f.profileId,
+    );
+  const changed = Buffer.from(readFileSync(path)),
+    replacement = path + '.replacement',
+    before = intakeWorkCounters(f.db).warm.hashCalls;
+  changed[0] = changed[0]! ^ 1;
+  let replaced = false;
+  await assert.rejects(
+    savePagedPackageRoles(f.db, f.root, f.profileId, f.id, {
+      version: plan.version,
+      operationId: 'late-role',
+      planId: plan.plan.id,
+      roles: [
+        {
+          memberId,
+          role: 'clinical',
+          reason: 'Fictional selected report',
+          coverage: 'pending',
+          references: [],
+        },
+      ],
+      assertRunning() {
+        if (replaced || intakeWorkCounters(f.db).warm.hashCalls <= before) return;
+        writeFileSync(replacement, changed);
+        renameSync(replacement, path);
+        replaced = true;
+      },
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
+  assert.equal(replaced, true);
+  assert.equal(
+    readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.memberState(memberId)!.role,
+    null,
   );
 });
 

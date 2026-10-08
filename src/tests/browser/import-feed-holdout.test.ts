@@ -191,8 +191,39 @@ test(
       port: 0,
       host: '127.0.0.1',
     });
+    const captureRuntimeDiagnostics = runtime.captureDiagnostics();
+    let phase = 'browser setup';
+    let phaseStarted = Date.now();
+    let requestNumber = 0;
+    const inFlight = new Map<number, { method: string; path: string; started: number }>();
+    const enterPhase = (name: string) => {
+      phase = name;
+      phaseStarted = Date.now();
+    };
+    const diagnosticPath = (path: string) =>
+      path
+        .split('?')[0]!
+        .split('/')
+        .map((part) => (/%3A|^[0-9a-f-]{20,}$/i.test(part) ? ':id' : part))
+        .join('/');
+    t.signal.addEventListener(
+      'abort',
+      () =>
+        console.error('Fictional holdout interrupted', {
+          phase,
+          phaseDurationMs: Date.now() - phaseStarted,
+          inFlight: [...inFlight.values()].map((request) => ({
+            method: request.method,
+            path: request.path,
+            durationMs: Date.now() - request.started,
+          })),
+        }),
+      { once: true },
+    );
     let browser: Browser | undefined;
     t.after(async () => {
+      if (process.env.CRS_TEST_DIAGNOSTICS)
+        console.error('Fictional holdout runtime:', await captureRuntimeDiagnostics());
       await browser?.close();
       await runtime.close();
       rmSync(runtimeDirectory, { recursive: true, force: true });
@@ -262,23 +293,44 @@ test(
       ).id as string;
     });
     const prefix = `/api/profiles/${profileId}`;
+    enterPhase('upload and initial Import feed');
     async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
       const started = Date.now();
-      const response = await page.request.fetch(url + prefix + path, {
-        method,
-        headers: method === 'GET' ? undefined : { Origin: url },
-        data: body,
-      });
-      if (process.env.CRS_TEST_DIAGNOSTICS)
-        console.error(
-          'Fixture request',
-          path.split('?')[0],
-          Date.now() - started,
-          response.status(),
-        );
-      const json = await response.json();
-      assert.ok(response.ok(), JSON.stringify(json));
-      return json.data as T;
+      const requestId = ++requestNumber;
+      inFlight.set(requestId, { method, path: diagnosticPath(path), started });
+      const captureRequestDiagnostics = process.env.CRS_TEST_DIAGNOSTICS
+        ? runtime.captureDiagnostics()
+        : undefined;
+      try {
+        let response;
+        try {
+          response = await page.request.fetch(url + prefix + path, {
+            method,
+            headers: method === 'GET' ? undefined : { Origin: url },
+            data: body,
+          });
+        } catch (error) {
+          if (captureRequestDiagnostics)
+            console.error(
+              'Fictional holdout failed request',
+              diagnosticPath(path),
+              await captureRequestDiagnostics(),
+            );
+          throw error;
+        }
+        if (process.env.CRS_TEST_DIAGNOSTICS)
+          console.error(
+            'Fixture request',
+            diagnosticPath(path),
+            Date.now() - started,
+            response.status(),
+          );
+        const json = await response.json();
+        assert.ok(response.ok(), JSON.stringify(json));
+        return json.data as T;
+      } finally {
+        inFlight.delete(requestId);
+      }
     }
     async function upload(rows: HealthRecordEnvelope[], filename: string) {
       const bytes = Buffer.from(rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
@@ -540,6 +592,7 @@ test(
     // JSONL repeats report headings in payload and metadata. It does not establish
     // one unambiguous original patient header, so each report needs its own choice.
     const laboratoryReady = await readFeed();
+    enterPhase('second report identity confirmation');
     assert.equal(laboratoryReady.counts.blocked, 4);
     const visitGroup = await openReport(clinical.intake.id, 'Fictional Linden visit report');
     await page
@@ -563,6 +616,7 @@ test(
       (value) => value.counts.blocked === 1,
       'two report confirmations to leave only the uncertain reading blocked',
     );
+    enterPhase('source inspection and Later selection');
     page.off('request', captureInitialIdentity);
     assert.equal(
       initialIdentityPosts.length,
@@ -632,6 +686,7 @@ test(
       (value) => value.counts.deferred === 5 && value.people.counts.later === 2,
       'all seven explicitly selected rows deferred',
     );
+    enterPhase('clinical acceptance and receipt recovery');
     assert.equal(deferred.counts.pending, 0);
     assert.equal(deferred.counts.blocked, 1);
     assert.equal(
@@ -687,6 +742,7 @@ test(
       (value) => value.counts.accepted === 4,
       'four clinical records committed despite the lost acknowledgement',
     );
+    enterPhase('People apply and definite failure');
     assert.equal(clinicalSaved.people.counts.saved, 0, 'clinical save has its own honest count');
     assert.equal(clinicalSaved.people.counts.later, 2);
     await page.getByRole('button', { name: 'Check save status', exact: true }).waitFor();
@@ -718,9 +774,11 @@ test(
       await route.continue();
     });
     await page.getByRole('button', { name: 'Add 2 people', exact: true }).click();
+    enterPhase('second Person failure feedback');
     await page
       .getByText('The second fictional Person changed before saving.', { exact: true })
       .waitFor({ timeout: 0 });
+    enterPhase('first Person durable result');
     const partiallySaved = await until(
       readFeed,
       (value) => value.people.counts.saved === 1 && value.people.counts.later === 1,
@@ -736,6 +794,7 @@ test(
     });
     await firstDestination.waitFor();
     assert.equal(await firstDestination.getAttribute('href'), firstSavedPerson.saved.resultUrl);
+    enterPhase('retry second Person');
     await page.getByRole('button', { name: 'Add 1 person', exact: true }).click();
     await page
       .getByRole('status')
@@ -746,6 +805,7 @@ test(
       (value) => value.counts.accepted === 4 && value.people.counts.saved === 2,
       'four clinical records and two separate People saved',
     );
+    enterPhase('saved destination verification');
     assert.equal(await justSavedPeople.getByRole('link').count(), 2);
     assert.equal(
       await firstDestination.getAttribute('href'),
@@ -875,6 +935,7 @@ test(
         'original JSONL remains byte exact after review and acceptance',
       );
     }
+    enterPhase('identity freshness retry');
 
     // The original click sends its displayed scope. Unrelated version-only
     // progress permits one exact-boundary retry of that same explicit action.
@@ -1081,6 +1142,7 @@ test(
       4,
       'identity confirmation never implicitly accepts clinical results',
     );
+    enterPhase('shared report identity question');
 
     const questionPrompt = 'Does the printed patient Fictional Sol Linden identify you?';
     const questionAnchor = 'Patient: Fictional Sol Linden';
@@ -1194,6 +1256,7 @@ test(
     );
     await page.getByRole('button', { name: 'This is me', exact: true }).click();
     await anonymousDecisionResponse;
+    enterPhase('individual identity return to Import');
     await until(
       () => readReview(anonymousOriginal.intake.id),
       (value) => value.records[0]!.mapping.subject === 'self',

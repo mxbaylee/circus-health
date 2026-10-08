@@ -902,127 +902,132 @@ export async function savePagedPackageRoles(
       replayed: true,
     };
   }
-  if (input.version !== before.version)
-    throw new HttpError(
-      409,
-      'VERSION_CONFLICT',
-      'This intake changed. Reload it before continuing.',
-    );
-  const scope = readPackagePlanScope(db, root, profileId, id);
-  if (!scope || scope.planId !== input.planId)
-    throw new HttpError(409, 'PLAN_CHANGED', 'Active extraction plan not found');
-  const { validatePackageRolePlanPaged } = await import('./intake-package.ts');
-  const roles = validatePackageRolePlanPaged(scope.inventory, input),
-    planRecord = view.find('plan', flow.workflow!, scope.planId)!;
-  const assertCurrent = () => {
-    input.assertRunning?.();
-    assertIntakeOwner(db, profileId);
-    const current = intakeSourceVersion(db, id);
-    if (current.version !== before.version || current.logicalBinding !== before.logicalBinding)
-      throw new HttpError(
-        409,
-        'VERSION_CONFLICT',
-        'This intake changed. Reload it before continuing.',
-      );
-  };
-  assertCurrent();
-  const at = new Date().toISOString(),
-    operationId = randomUUID();
-  const derived = await roleDerivedPreparation(
-    db,
-    root,
-    profileId,
-    id,
-    file,
-    scope.planId,
-    view.address(planRecord),
-    roles.map((x) => x.memberId),
-    input.operationId,
-    assertCurrent,
-  );
-  const prepared = await prepareIntakeEnvelopeMutation(db, file, {
-    prepareDerived: derived.prepare,
-    reader: view,
-    changes: [
-      {
-        op: 'append',
-        record: planRecord,
-        field: 'packageRolesHistory',
-        jsonText: JSON.stringify({ id: input.operationId, roles, at }),
-      },
-      {
-        op: 'append',
-        record: flow.workflow!,
-        field: 'operations',
-        jsonText: JSON.stringify({ id: input.operationId, fingerprint, at }),
-      },
-    ],
-    additionalLogicalChanges: [
-      ...scope.compatibilityChanges(),
-      ...roles.map((role, ordinal) => ({
-        area: 'logical' as const,
-        collection: decisionCollection('roles', scope.planId),
-        op: 'put' as const,
-        key: role.memberId,
-        value: JSON.stringify({
-          historyId: input.operationId,
-          ordinal,
-          referenceCount: role.references.length,
-          missingReferenceCount: role.references.filter((ref) => ref.status === 'not_supplied')
-            .length,
-          ambiguousReferenceCount: role.references.filter((ref) => ref.status === 'ambiguous')
-            .length,
-          roleHash: workflowHash(role, (text) =>
-            withIntakeWork(db, 'warm', () => {
-              recordIntakeWork('hashCalls');
-              recordIntakeWork('hashedBytes', Buffer.byteLength(text));
-            }),
-          ),
-        } satisfies RoleSelection),
-      })),
-      {
-        area: 'logical',
-        collection: 'package.commands',
-        op: 'put',
-        key,
-        value: JSON.stringify({ fingerprint, planId: scope.planId }),
-      },
-    ],
-    operationId,
-    requestDigest: fingerprint,
-    domainVersion: before.rawVersion + 1,
-    assertRunning: assertCurrent,
-  });
-  assertCurrent();
-  intakeTransaction(
-    db,
-    () => {
+  return withPackageSessionSource(
+    { db, root, profileId, id, assertRunning: input.assertRunning },
+    async (lease) => {
+      if (input.version !== before.version)
+        throw new HttpError(
+          409,
+          'VERSION_CONFLICT',
+          'This intake changed. Reload it before continuing.',
+        );
+      const scope = readPackagePlanScope(db, root, profileId, id);
+      if (!scope || scope.planId !== input.planId)
+        throw new HttpError(409, 'PLAN_CHANGED', 'Active extraction plan not found');
+      const { validatePackageRolePlanPaged } = await import('./intake-package.ts');
+      const roles = validatePackageRolePlanPaged(scope.inventory, input),
+        planRecord = view.find('plan', flow.workflow!, scope.planId)!;
+      const assertCurrent = () => {
+        lease.assertCurrent();
+        assertIntakeOwner(db, profileId);
+        const current = intakeSourceVersion(db, id);
+        if (current.version !== before.version || current.logicalBinding !== before.logicalBinding)
+          throw new HttpError(
+            409,
+            'VERSION_CONFLICT',
+            'This intake changed. Reload it before continuing.',
+          );
+      };
       assertCurrent();
-      derived.assertCurrent();
-      collections.stage(prepared.prepared!);
-      invalidateCollectionReaderRoleDependencies(
+      const at = new Date().toISOString(),
+        operationId = randomUUID();
+      const derived = await roleDerivedPreparation(
+        db,
+        root,
+        profileId,
+        id,
+        file,
+        scope.planId,
+        view.address(planRecord),
+        roles.map((x) => x.memberId),
+        input.operationId,
+        assertCurrent,
+      );
+      const prepared = await prepareIntakeEnvelopeMutation(db, file, {
+        prepareDerived: derived.prepare,
+        reader: view,
+        changes: [
+          {
+            op: 'append',
+            record: planRecord,
+            field: 'packageRolesHistory',
+            jsonText: JSON.stringify({ id: input.operationId, roles, at }),
+          },
+          {
+            op: 'append',
+            record: flow.workflow!,
+            field: 'operations',
+            jsonText: JSON.stringify({ id: input.operationId, fingerprint, at }),
+          },
+        ],
+        additionalLogicalChanges: [
+          ...scope.compatibilityChanges(),
+          ...roles.map((role, ordinal) => ({
+            area: 'logical' as const,
+            collection: decisionCollection('roles', scope.planId),
+            op: 'put' as const,
+            key: role.memberId,
+            value: JSON.stringify({
+              historyId: input.operationId,
+              ordinal,
+              referenceCount: role.references.length,
+              missingReferenceCount: role.references.filter((ref) => ref.status === 'not_supplied')
+                .length,
+              ambiguousReferenceCount: role.references.filter((ref) => ref.status === 'ambiguous')
+                .length,
+              roleHash: workflowHash(role, (text) =>
+                withIntakeWork(db, 'warm', () => {
+                  recordIntakeWork('hashCalls');
+                  recordIntakeWork('hashedBytes', Buffer.byteLength(text));
+                }),
+              ),
+            } satisfies RoleSelection),
+          })),
+          {
+            area: 'logical',
+            collection: 'package.commands',
+            op: 'put',
+            key,
+            value: JSON.stringify({ fingerprint, planId: scope.planId }),
+          },
+        ],
+        operationId,
+        requestDigest: fingerprint,
+        domainVersion: before.rawVersion + 1,
+        assertRunning: assertCurrent,
+      });
+      assertCurrent();
+      intakeTransaction(
+        db,
+        () => {
+          assertCurrent();
+          derived.assertCurrent();
+          collections.stage(prepared.prepared!);
+          invalidateCollectionReaderRoleDependencies(
+            db,
+            id,
+            roles.map((role) => role.memberId),
+          );
+        },
+        { operationId, fingerprint },
+      );
+      const after = intakeSourceVersion(db, id);
+      observeIntakeLogicalVersion(
         db,
         id,
-        roles.map((role) => role.memberId),
+        { version: before.version, logicalBinding: before.logicalBinding! },
+        { version: after.version, logicalBinding: after.logicalBinding! },
+        'plan',
       );
+      return {
+        format: 'health-intake-package-plan-result-v2',
+        intakeId: id,
+        version: after.version,
+        plan: scope.plan,
+        replayed: false,
+      };
     },
-    { operationId, fingerprint },
   );
-  const after = intakeSourceVersion(db, id);
-  observeIntakeLogicalVersion(
-    db,
-    id,
-    { version: before.version, logicalBinding: before.logicalBinding! },
-    { version: after.version, logicalBinding: after.logicalBinding! },
-    'plan',
-  );
-  return {
-    format: 'health-intake-package-plan-result-v2',
-    intakeId: id,
-    version: after.version,
-    plan: scope.plan,
-    replayed: false,
-  };
 }
 
 export function readPackageUnitPage(
@@ -1581,112 +1586,120 @@ export async function saveIntakePackageRolesRead(
       );
     return finish();
   }
-  const scope = readRetainedPlanScope(db, profileId, id, {
-    planId: input.planId,
-    activeOnly: true,
-  });
-  if (!scope) {
-    await savePagedPackageRoles(db, root, profileId, id, input);
-    return finish();
-  }
-  if (before.version !== input.version)
-    throw new HttpError(
-      409,
-      'VERSION_CONFLICT',
-      'This intake changed. Reload it before continuing.',
-    );
-  const { validatePackageRolesInScope } = await import('./intake-package.ts');
-  const roles = validatePackageRolesInScope(
-    {
-      inventoried:
-        !!scope.indexRecord && optional(scope.reader, scope.indexRecord, 'inventoryVersion') === 1,
-      byId: scope.memberById,
-      byExactName: scope.membersByExactName,
-    },
-    input,
-  );
-  const assertCurrent = () => {
-    input.assertRunning?.();
-    scope.assertCurrent();
-  };
-  assertCurrent();
-  const operationId = randomUUID(),
-    at = new Date().toISOString();
-  const derived = await roleDerivedPreparation(
-    db,
-    root,
-    profileId,
-    id,
-    file,
-    scope.planId,
-    scope.reader.address(scope.record),
-    roles.map((x) => x.memberId),
-    input.operationId,
-    assertCurrent,
-  );
-  const prepared = await prepareIntakeEnvelopeMutation(db, file, {
-    reader: view,
-    operationId,
-    requestDigest: fingerprint,
-    domainVersion: before.rawVersion + 1,
-    assertRunning: assertCurrent,
-    changes: [
-      {
-        op: 'append',
-        record: view.resolve(scope.reader.address(scope.record)),
-        field: 'packageRolesHistory',
-        jsonText: JSON.stringify({ id: input.operationId, roles, at }),
-      },
-      {
-        op: 'append',
-        record: flow.workflow!,
-        field: 'operations',
-        jsonText: JSON.stringify({ id: input.operationId, fingerprint, at }),
-      },
-    ],
-    additionalLogicalChanges: [
-      ...scope.roleMergeChanges(),
-      ...roles.map((role, ordinal) => ({
-        area: 'logical' as const,
-        collection: scope.decisionCollection('roles'),
-        op: 'put' as const,
-        key: role.memberId,
-        value: JSON.stringify({
-          historyId: input.operationId,
-          ordinal,
-          referenceCount: role.references.length,
-          missingReferenceCount: role.references.filter((x) => x.status === 'not_supplied').length,
-          ambiguousReferenceCount: role.references.filter((x) => x.status === 'ambiguous').length,
-          roleHash: workflowHash(role),
-        }),
-      })),
-    ],
-    prepareDerived: derived.prepare,
-  });
-  assertCurrent();
-  intakeTransaction(
-    db,
-    () => {
+  return withPackageSessionSource(
+    { db, root, profileId, id, assertRunning: input.assertRunning },
+    async (lease) => {
+      const scope = readRetainedPlanScope(db, profileId, id, {
+        planId: input.planId,
+        activeOnly: true,
+      });
+      if (!scope) {
+        await savePagedPackageRoles(db, root, profileId, id, input);
+        return finish();
+      }
+      if (before.version !== input.version)
+        throw new HttpError(
+          409,
+          'VERSION_CONFLICT',
+          'This intake changed. Reload it before continuing.',
+        );
+      const { validatePackageRolesInScope } = await import('./intake-package.ts');
+      const roles = validatePackageRolesInScope(
+        {
+          inventoried:
+            !!scope.indexRecord &&
+            optional(scope.reader, scope.indexRecord, 'inventoryVersion') === 1,
+          byId: scope.memberById,
+          byExactName: scope.membersByExactName,
+        },
+        input,
+      );
+      const assertCurrent = () => {
+        lease.assertCurrent();
+        scope.assertCurrent();
+      };
       assertCurrent();
-      derived.assertCurrent();
-      selectedEnvelopeStore(db, file).collections.stage(prepared.prepared!);
-      invalidateCollectionReaderRoleDependencies(
+      const operationId = randomUUID(),
+        at = new Date().toISOString();
+      const derived = await roleDerivedPreparation(
+        db,
+        root,
+        profileId,
+        id,
+        file,
+        scope.planId,
+        scope.reader.address(scope.record),
+        roles.map((x) => x.memberId),
+        input.operationId,
+        assertCurrent,
+      );
+      const prepared = await prepareIntakeEnvelopeMutation(db, file, {
+        reader: view,
+        operationId,
+        requestDigest: fingerprint,
+        domainVersion: before.rawVersion + 1,
+        assertRunning: assertCurrent,
+        changes: [
+          {
+            op: 'append',
+            record: view.resolve(scope.reader.address(scope.record)),
+            field: 'packageRolesHistory',
+            jsonText: JSON.stringify({ id: input.operationId, roles, at }),
+          },
+          {
+            op: 'append',
+            record: flow.workflow!,
+            field: 'operations',
+            jsonText: JSON.stringify({ id: input.operationId, fingerprint, at }),
+          },
+        ],
+        additionalLogicalChanges: [
+          ...scope.roleMergeChanges(),
+          ...roles.map((role, ordinal) => ({
+            area: 'logical' as const,
+            collection: scope.decisionCollection('roles'),
+            op: 'put' as const,
+            key: role.memberId,
+            value: JSON.stringify({
+              historyId: input.operationId,
+              ordinal,
+              referenceCount: role.references.length,
+              missingReferenceCount: role.references.filter((x) => x.status === 'not_supplied')
+                .length,
+              ambiguousReferenceCount: role.references.filter((x) => x.status === 'ambiguous')
+                .length,
+              roleHash: workflowHash(role),
+            }),
+          })),
+        ],
+        prepareDerived: derived.prepare,
+      });
+      assertCurrent();
+      intakeTransaction(
+        db,
+        () => {
+          assertCurrent();
+          derived.assertCurrent();
+          selectedEnvelopeStore(db, file).collections.stage(prepared.prepared!);
+          invalidateCollectionReaderRoleDependencies(
+            db,
+            id,
+            roles.map((role) => role.memberId),
+          );
+        },
+        { operationId, fingerprint },
+      );
+      const after = intakeSourceVersion(db, id);
+      observeIntakeLogicalVersion(
         db,
         id,
-        roles.map((role) => role.memberId),
+        { version: before.version, logicalBinding: before.logicalBinding! },
+        { version: after.version, logicalBinding: after.logicalBinding! },
+        'plan',
       );
+      return finish();
     },
-    { operationId, fingerprint },
   );
-  const after = intakeSourceVersion(db, id);
-  observeIntakeLogicalVersion(
-    db,
-    id,
-    { version: before.version, logicalBinding: before.logicalBinding! },
-    { version: after.version, logicalBinding: after.logicalBinding! },
-    'plan',
-  );
-  return finish();
 }
 
 async function roleDerivedPreparation(

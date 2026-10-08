@@ -42,6 +42,16 @@ function journalBytes(path: string): number {
   return bytes;
 }
 
+// Node's test mocks retain every call argument/result. These probes keep only
+// numeric aggregates, so observing SQL does not retain the returned history.
+function replaceMethod(target: object, key: string, replacement: unknown) {
+  const original = Reflect.get(target, key);
+  Reflect.set(target, key, replacement);
+  return () => {
+    Reflect.set(target, key, original);
+  };
+}
+
 function observePublication(t: test.TestContext, db: Database, id: string, archive: string) {
   const collections = selectedEnvelopeStore(db, { id }).collections;
   const record = createRecordVersionWorkCounters();
@@ -65,7 +75,7 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
   const fsProbes = (['readFileSync', 'writeFileSync', 'fsyncSync', 'lstatSync'] as const).map(
     (method) => {
       const original = fs[method];
-      return t.mock.method(fs, method, (...args: unknown[]) => {
+      return replaceMethod(fs, method, (...args: unknown[]) => {
         const time = performance.now();
         let bytes = 0;
         try {
@@ -92,7 +102,7 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
   const statementPrototype = Object.getPrototypeOf(db.prepare('SELECT 1'));
   const statementProbes = (['run', 'get', 'all', 'iterate'] as const).map((method) => {
     const original = statementPrototype[method];
-    return t.mock.method(
+    return replaceMethod(
       statementPrototype,
       method,
       function (this: { sourceSQL: string }, ...args: unknown[]) {
@@ -111,7 +121,7 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
     );
   });
   const prepareSql = DatabaseSync.prototype.prepare;
-  const sqlProbe = t.mock.method(
+  const sqlProbe = replaceMethod(
     DatabaseSync.prototype,
     'prepare',
     function (this: DatabaseSync, query: string) {
@@ -121,7 +131,7 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
   );
   const probes = (['prepare', 'stage', 'commitMaintenance'] as const).map((method) => {
     const original = collections[method];
-    return t.mock.method(collections, method, (...args: unknown[]) => {
+    return replaceMethod(collections, method, (...args: unknown[]) => {
       const phase = [...stack, method].join('/');
       stack.push(method);
       const before = snapshot(),
@@ -174,10 +184,10 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
   let disposed = false;
   const dispose = () => {
     if (!disposed) {
-      for (const probe of probes) probe.mock.restore();
-      sqlProbe.mock.restore();
-      for (const probe of statementProbes) probe.mock.restore();
-      for (const probe of fsProbes) probe.mock.restore();
+      for (const restore of probes) restore();
+      sqlProbe();
+      for (const restore of statementProbes) restore();
+      for (const restore of fsProbes) restore();
       syncBuiltinESMExports();
       disposed = true;
     }
