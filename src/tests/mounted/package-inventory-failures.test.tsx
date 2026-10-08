@@ -182,6 +182,140 @@ it('returns to actual variable member pages and rejects stale results after prof
   expect(screen.queryByText('41–80 of 100')).not.toBeInTheDocument();
 });
 
+it.each(['profile', 'source', 'version'] as const)(
+  'drops a late member read when the %s changes, even if the member ID is reused',
+  async (change) => {
+    const oldMember = { ...member, filename: 'fictional-old-member.json' };
+    const newMember = { ...member, filename: 'fictional-new-member.json' };
+    let changed = false;
+    let releaseOld!: (response: Response) => void;
+    let reads = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+        const path = String(input);
+        if (path.includes('/package?'))
+          return json({
+            intakeId: changed ? 'fictional-new-package' : intake.id,
+            version: changed ? 2 : 1,
+            totalMembers: 1,
+            totalExpandedBytes: 2,
+            uniqueByteContents: 1,
+            members: [changed ? newMember : oldMember],
+            offset: 0,
+            nextOffset: null,
+          });
+        if (path.includes('/package-failures?'))
+          return json({ entries: [], total: 0, complete: true, nextCursor: null });
+        if (path.endsWith('/package-member') && options.method === 'POST') {
+          reads++;
+          if (reads === 1)
+            return new Promise<Response>((resolve) => {
+              releaseOld = resolve;
+            });
+          return json({ member: newMember, original: { text: 'Current fictional member text' } });
+        }
+        throw Error('Unexpected request ' + path);
+      }),
+    );
+    const view = render(<PackageInventory intake={intake} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: oldMember.filename }));
+    await waitFor(() => expect(reads).toBe(1));
+    changed = true;
+    if (change === 'profile') {
+      const nextProfile = { ...profile, id: 'fictional-new-profile' };
+      await act(async () => {
+        replaceProfiles([profile, nextProfile]);
+        selectProfile(nextProfile);
+      });
+    } else
+      view.rerender(
+        <PackageInventory
+          intake={
+            change === 'source'
+              ? { ...intake, id: 'fictional-new-package', version: 2 }
+              : { ...intake, version: 2 }
+          }
+        />,
+      );
+    expect(await screen.findByRole('button', { name: newMember.filename })).toBeVisible();
+    expect(screen.queryByRole('region', { name: 'Selected package member' })).toBeNull();
+    expect(screen.queryByText('Reading selected member…')).toBeNull();
+    await act(async () =>
+      releaseOld(
+        change === 'profile'
+          ? new Response(JSON.stringify({ error: { message: 'Old fictional read refused' } }), {
+              status: 409,
+            })
+          : json({ member: oldMember, original: { text: 'Old fictional member text' } }),
+      ),
+    );
+    expect(screen.queryByText('Old fictional member text')).toBeNull();
+    expect(screen.queryByText('Old fictional read refused')).toBeNull();
+    expect(screen.queryByRole('link', { name: 'Open retained member' })).toBeNull();
+    await user.click(screen.getByRole('button', { name: newMember.filename }));
+    expect(await screen.findByText('Current fictional member text')).toBeVisible();
+  },
+);
+
+it('clears selected detail, history and error when the intake version changes', async () => {
+  let reads = 0;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+      const path = String(input);
+      if (path.includes('/package?')) return inventory();
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      if (path.endsWith('/package-member') && options.method === 'POST') {
+        reads++;
+        if (reads === 3)
+          return new Response(JSON.stringify({ error: { message: 'Fictional read refused' } }), {
+            status: 409,
+          });
+        return json({
+          member,
+          structure: {
+            jsonPointer: reads === 1 ? '' : '/section',
+            type: 'object',
+            totalChildren: reads === 1 ? 1 : 0,
+            children:
+              reads === 1
+                ? [
+                    {
+                      key: 'Fictional section',
+                      jsonPointer: '/section',
+                      type: 'string',
+                      totalChildren: 0,
+                    },
+                  ]
+                : [],
+            literal: reads === 1 ? null : 'Fictional old section',
+            offset: 0,
+            nextOffset: reads === 1 ? null : 1,
+            nextJSONOffset: null,
+          },
+        });
+      }
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  const view = render(<PackageInventory intake={intake} />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('button', { name: member.filename }));
+  await user.click(await screen.findByRole('button', { name: 'Fictional section' }));
+  expect(await screen.findByText('Fictional old section')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Back to parent section' })).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Continue literal text' }));
+  expect(await screen.findByText('Fictional read refused')).toBeVisible();
+  view.rerender(<PackageInventory intake={{ ...intake, version: 2 }} />);
+  expect(screen.queryByRole('region', { name: 'Selected package member' })).toBeNull();
+  expect(screen.queryByText('Fictional read refused')).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Back to parent section' })).toBeNull();
+  expect(screen.queryByText('Reading selected member…')).toBeNull();
+});
+
 it('bounds recent member navigation, preserves variable windows after back and forward, and offers an honest return to the first page', async () => {
   const sizes = [3, 5, 2, 7, 4, 1, 6, 3, 2, 5, 1, 4];
   const starts = sizes.map((_, index) =>

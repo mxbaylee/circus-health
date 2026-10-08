@@ -3,7 +3,7 @@ import type {
   IntakePackageMemberReference,
 } from '../../../shared/intake-package-paging';
 import { PackageMemberDetails } from './PackageMemberDetails';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type {
   IntakePackageFailure,
   IntakePackageInventory,
@@ -73,6 +73,18 @@ const memberPageHistoryLimit = 8;
 export function PackageInventory({ intake }: { intake: IntakeRead }) {
   const profile = useProfile();
   const inventoryScope = JSON.stringify([profile?.id, intake.id, intake.version]);
+  return (
+    <ScopedPackageInventory key={inventoryScope} intake={intake} inventoryScope={inventoryScope} />
+  );
+}
+
+function ScopedPackageInventory({
+  intake,
+  inventoryScope,
+}: {
+  intake: IntakeRead;
+  inventoryScope: string;
+}) {
   const [navigation, setNavigation] = useState({
     scope: inventoryScope,
     offset: 0,
@@ -91,6 +103,16 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState<string[]>([]);
+  const memberRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => memberRequest.current?.abort(), []);
+  const startMemberRequest = () => {
+    memberRequest.current?.abort();
+    const controller = new AbortController();
+    memberRequest.current = controller;
+    return controller;
+  };
+  const currentMemberRequest = (controller: AbortController) =>
+    memberRequest.current === controller && !controller.signal.aborted;
   const [failureCursor, setFailureCursor] = useState<string | null>(null);
   const paged = isIntakeSummary(intake);
   const failureState = useResource<IntakeRead>(
@@ -117,6 +139,7 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
     member: PackageMember,
     window: { jsonPointer?: string; jsonOffset?: number; offset?: number; page?: number } = {},
   ) {
+    const controller = startMemberRequest();
     setBusy(true);
     setError('');
     setSelected(member);
@@ -126,14 +149,20 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
         {
           method: 'POST',
           body: JSON.stringify({ memberId: member.memberId, limit: 50, ...window }),
+          signal: controller.signal,
         },
       );
-      setRead(result.data.metadata ? { ...result.data, ...result.data.metadata } : result.data);
+      if (currentMemberRequest(controller))
+        setRead(result.data.metadata ? { ...result.data, ...result.data.metadata } : result.data);
     } catch (error) {
-      setError(error instanceof Error ? error.message : 'This member could not be inspected.');
+      if (currentMemberRequest(controller))
+        setError(error instanceof Error ? error.message : 'This member could not be inspected.');
     } finally {
-      setBusy(false);
-      refreshFailures();
+      if (currentMemberRequest(controller)) {
+        memberRequest.current = null;
+        setBusy(false);
+        refreshFailures();
+      }
     }
   }
   async function retryFailure(failure: IntakePackageFailure) {
@@ -142,6 +171,7 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
       return;
     }
     if (!failure.memberId) return;
+    const controller = startMemberRequest();
     setSelected(null);
     setRead(null);
     setHistory([]);
@@ -157,18 +187,25 @@ export function PackageInventory({ intake }: { intake: IntakeRead }) {
             limit: 50,
             ...(failure.retryAction === 'read_structure' ? { jsonPointer: '' } : {}),
           }),
+          signal: controller.signal,
         },
       );
       const resultRead = result.data.metadata
         ? { ...result.data, ...result.data.metadata }
         : result.data;
-      setSelected(resultRead.member);
-      setRead(resultRead);
+      if (currentMemberRequest(controller)) {
+        setSelected(resultRead.member);
+        setRead(resultRead);
+      }
     } catch (error) {
-      setError(error instanceof Error ? error.message : 'This operation could not finish.');
+      if (currentMemberRequest(controller))
+        setError(error instanceof Error ? error.message : 'This operation could not finish.');
     } finally {
-      setBusy(false);
-      refreshFailures();
+      if (currentMemberRequest(controller)) {
+        memberRequest.current = null;
+        setBusy(false);
+        refreshFailures();
+      }
     }
   }
   return (

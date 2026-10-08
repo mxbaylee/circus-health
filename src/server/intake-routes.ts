@@ -817,16 +817,19 @@ export async function handleIntakeRoute({
         lifetime.dispose();
       }
     } else if (action === 'package-roles') {
-      const { saveIntakePackageRolesRead } = await import('./intake-package-plan.ts');
-      respond(
-        await saveIntakePackageRolesRead(
-          db,
-          root,
-          profileId,
-          id!,
-          input as unknown as Parameters<typeof saveIntakePackageRolesRead>[4],
-        ),
-      );
+      const lifetime = intakeIdentityRequestLifetime(req, res);
+      try {
+        const { saveIntakePackageRolesRead } = await import('./intake-package-plan.ts');
+        lifetime.signal.throwIfAborted();
+        const result = await saveIntakePackageRolesRead(db, root, profileId, id!, {
+          ...(input as unknown as Parameters<typeof saveIntakePackageRolesRead>[4]),
+          assertRunning: () => lifetime.signal.throwIfAborted(),
+        });
+        lifetime.signal.throwIfAborted();
+        respond(result);
+      } finally {
+        lifetime.dispose();
+      }
     } else if (action === 'batch')
       respond(
         await intake.submitIntakeBatchRead(

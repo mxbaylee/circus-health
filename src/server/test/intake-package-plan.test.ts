@@ -1,4 +1,4 @@
-import { IncomingMessage } from 'node:http';
+import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -810,6 +810,83 @@ test('new paged role command refuses replacement after role work begins', async 
     readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.memberState(memberId)!.role,
     null,
   );
+});
+
+test('package role route disconnect cancels prepared selection and permits exact retry', async (t) => {
+  const f = fixture(t, 1),
+    plan = await createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+      version: f.intake.version,
+      operationId: 'disconnect-plan',
+    }),
+    memberId = readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.inventory.member(0)!.memberId,
+    input = {
+      version: plan.version,
+      operationId: 'disconnect-role',
+      planId: plan.plan.id,
+      roles: [
+        {
+          memberId,
+          role: 'clinical',
+          reason: 'Fictional report',
+          coverage: 'pending',
+          references: [],
+        },
+      ],
+    },
+    req = Object.assign(new IncomingMessage(new Socket()), {
+      headers: { 'content-type': 'application/json' },
+    }),
+    res = new ServerResponse(req);
+  let responses = 0;
+  const context = {
+    ...f,
+    resource: 'intakes',
+    method: 'POST',
+    action: 'package-roles',
+    req,
+    res,
+    params: new URLSearchParams(),
+    body: async () => Buffer.from(JSON.stringify(input)),
+    respond() {
+      responses++;
+    },
+  } as unknown as Parameters<typeof handleIntakeRoute>[0];
+  const collections = selectedEnvelopeStore(f.db, { id: f.id }).collections,
+    prepare = collections.prepare;
+  let disconnected = false;
+  const probe = t.mock.method(collections, 'prepare', (...args: Parameters<typeof prepare>) => {
+    const prepared = prepare(...args);
+    if (!disconnected) {
+      disconnected = true;
+      res.emit('close');
+    }
+    return prepared;
+  });
+  try {
+    await assert.rejects(handleIntakeRoute(context), { name: 'AbortError' });
+  } finally {
+    probe.mock.restore();
+  }
+  assert.equal(disconnected, true, 'disconnect occurs after actual collection preparation');
+  assert.equal(responses, 0);
+  assert.equal(req.listenerCount('aborted'), 0);
+  assert.equal(res.listenerCount('close'), 0);
+  assert.equal(intakeSourceVersion(f.db, f.id).version, plan.version);
+  assert.equal(
+    readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.memberState(memberId)!.role,
+    null,
+  );
+  await handleIntakeRoute(context);
+  assert.equal(responses, 1);
+  assert.equal(intakeSourceVersion(f.db, f.id).version, plan.version + 1);
+  assert.equal(
+    readPackagePlanScope(f.db, f.root, f.profileId, f.id)!.memberState(memberId)!.role?.role,
+    'clinical',
+  );
+  await handleIntakeRoute(context);
+  assert.equal(intakeSourceVersion(f.db, f.id).version, plan.version + 1);
+  assert.equal(req.listenerCount('aborted'), 0);
+  assert.equal(res.listenerCount('close'), 0);
 });
 
 test('changed extraction settings require explicit replacement and preserve the prior plan and command', async (t) => {
