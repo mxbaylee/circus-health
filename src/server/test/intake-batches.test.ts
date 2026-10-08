@@ -2,7 +2,7 @@ import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { HttpError, openDatabase, transaction } from '../database.ts';
@@ -10,7 +10,13 @@ import { profilePaths } from '../profile-storage.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
 import { createAssistant } from '../assistant.ts';
-import { writeIntakeBatch, readIntakeBatch } from '../intake-batch-journal.ts';
+import {
+  writeIntakeBatch,
+  readIntakeBatch,
+  createIntakeBatchJournalWorkCounters,
+  withIntakeBatchJournalWork,
+  clearIntakeBatchJournalCache,
+} from '../intake-batch-journal.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import {
   getIntake,
@@ -1657,6 +1663,113 @@ test('a published Stop with failed acknowledgement cannot return success until i
   assert.equal(attempts, 5, 'idempotent Stop retries acknowledgement before returning');
   assert.equal(f.manager.create(profileId, request).scheduled, false);
 });
+
+test('acknowledgement retry verifies the reconciled head without replaying retained batch events', (t) => {
+  let rejectAcknowledgement = true;
+  let attempts = 0;
+  const f = setup(
+    t,
+    {},
+    {
+      journalWriter(root, id, batch, reason) {
+        writeIntakeBatch(root, id, batch, reason);
+        if (reason !== 'stopped') return;
+        attempts++;
+        if (rejectAcknowledgement) throw Error('Fictional acknowledgement loss');
+      },
+    },
+  );
+  const intake = fictionalAppendOriginal(f, 'counted-acknowledgement');
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-counted-acknowledgement',
+    intakeIds: [intake.id],
+  });
+  // Retain real journal history before the first uncertain acknowledgement.
+  const external = readIntakeBatch(f.root, profileId, batch.id);
+  for (let i = 0; i < 24; i++) {
+    external.reason = `fictional-history-${i}`;
+    writeIntakeBatch(f.root, profileId, external, 'fictional-history');
+  }
+  assert.throws(() => f.manager.stop(profileId, batch.id), { code: 'INTAKE_BATCH_STALE' });
+  assert.throws(() => f.manager.stop(profileId, batch.id), /acknowledgement loss/);
+  assert.equal(attempts, 1);
+  const retry = createIntakeBatchJournalWorkCounters();
+  rejectAcknowledgement = false;
+  const stopped = withIntakeBatchJournalWork(retry, () => f.manager.stop(profileId, batch.id));
+  assert.equal(stopped.status, 'stopped');
+  assert.equal(attempts, 2, 'the writer must acknowledge even an already committed Stop');
+  assert.ok(retry.currentAssertions > 0);
+  assert.ok(retry.headReads > 0, 'retry must read current physical authority');
+  assert.equal(retry.replayedEvents, 0);
+  assert.equal(retry.eventReads, 0);
+  assert.equal(retry.directoryEntries, 0);
+  assert.equal(retry.publishedEvents, 0, 'exact retry must not append another event');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(readIntakeBatch(f.root, profileId, batch.id))),
+    stopped,
+  );
+});
+
+for (const change of ['external-head', 'cache-loss', 'corrupt-head'] as const)
+  test(`acknowledgement retry revalidates ${change} after its first reconciliation`, (t) => {
+    let rejectAcknowledgement = true;
+    let attempts = 0;
+    const f = setup(
+      t,
+      {},
+      {
+        journalWriter(root, id, batch, reason) {
+          writeIntakeBatch(root, id, batch, reason);
+          if (reason !== 'stopped') return;
+          attempts++;
+          if (rejectAcknowledgement) throw Error('Fictional acknowledgement loss');
+        },
+      },
+    );
+    const intake = fictionalAppendOriginal(f, `retry-${change}`);
+    const batch = f.manager.create(profileId, {
+      operationId: `fictional-retry-${change}`,
+      intakeIds: [intake.id],
+    });
+    assert.throws(() => f.manager.stop(profileId, batch.id), /acknowledgement loss/);
+    rejectAcknowledgement = false;
+    const head = resolve(
+      profilePaths(f.root, profileId).root,
+      'intake-batches',
+      batch.id,
+      'events',
+      'current',
+    );
+    const bytes = readFileSync(head);
+    if (change === 'external-head') {
+      const external = readIntakeBatch(f.root, profileId, batch.id);
+      external.updatedAt = '2026-01-02T00:00:00.000Z';
+      writeIntakeBatch(f.root, profileId, external, 'fictional-external-update');
+    } else if (change === 'cache-loss') clearIntakeBatchJournalCache(f.root, profileId);
+    else writeFileSync(head, '{}');
+    const retry = createIntakeBatchJournalWorkCounters();
+    if (change === 'corrupt-head') {
+      try {
+        withIntakeBatchJournalWork(retry, () =>
+          assert.throws(
+            () => f.manager.get(profileId, batch.id),
+            /Invalid or unsupported reading batch journal/,
+          ),
+        );
+        assert.equal(attempts, 1, 'corrupt authority cannot reach the acknowledgement writer');
+      } finally {
+        writeFileSync(head, bytes);
+      }
+      assert.equal(f.manager.get(profileId, batch.id).status, 'stopped');
+    } else {
+      const accepted = withIntakeBatchJournalWork(retry, () => f.manager.get(profileId, batch.id));
+      assert.equal(accepted.status, 'stopped');
+      if (change === 'external-head') assert.equal(accepted.updatedAt, '2026-01-02T00:00:00.000Z');
+      assert.ok(retry.replayedEvents >= 2, 'changed/revoked authority must reconstruct');
+      assert.equal(attempts, 2);
+    }
+    assert.equal(retry.publishedEvents, 0);
+  });
 
 test('application close reports a queue publication failure after closing assistant, server, and every database', async (t) => {
   const root = mkdtempSync(resolve(tmpdir(), 'health-batch-close-failure-'));

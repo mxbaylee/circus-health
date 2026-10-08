@@ -16,6 +16,8 @@ This reconciliation also returns a retained completed batch. Replaying its origi
 
 Eligible items rotate while other files wait. Absolute retry deadlines survive restart. The initial batch snapshot is followed by field deltas proportional to the changed state. Original bytes, proposals, candidate versions and provider receipts retain their separate authorities. Stop records every automatic item as stopped regardless of the batch cursor and cancels linked work. Resume restores each saved automatic item from the first eligible file, including older stopped journal entries whose queued files lost their automatic flags. Human-review pauses and completed files are not inferred to be automatic. A saved explicit Stop stays stopped; recognized historical machine interruptions migrate to automatic continuation, while unrecognized historical pauses stay visible for explicit review.
 
+An uncertain batch publication reconstructs accepted journal state before exposing a retry. A later acknowledgement retry rechecks the current physical head and writer state. If that reconciled state remains clean and current, it does not replay the retained events again; changed or revoked authority still requires reconstruction. The writer must acknowledge before success is returned, even when the original operation already committed. Corrupt authority remains a failure, not permission to start another operation.
+
 ## Productive work and stalled units
 
 There is no document-wide page, step, elapsed-time, request or token allowance. Individual worker, request, slice and shared-capacity bounds remain. Cumulative usage and unique progress survive continuation; legacy cumulative budgets cannot restore the manual-pause dead end.

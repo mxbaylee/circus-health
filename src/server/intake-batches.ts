@@ -388,8 +388,18 @@ export function createIntakeBatchManager({
   function retryPublication(profileId: string): void {
     for (const [id, pending] of failedPublications) {
       if (pending.batch.profileId !== profileId) continue;
-      // Refresh again: a failed retry may itself have published before throwing.
-      refreshIntakeBatch(root, profileId, pending.batch);
+      // A failed retry may itself publish. Reuse only a clean, freshly checked
+      // reconciled basis; changed or revoked authority still requires cold replay.
+      let current = false;
+      if (!pendingIntakeBatchChanges(pending.batch).length) {
+        try {
+          assertCurrentIntakeBatch(root, profileId, pending.batch);
+          current = true;
+        } catch {
+          // The authoritative refresh below must succeed before retrying a write.
+        }
+      }
+      if (!current) refreshIntakeBatch(root, profileId, pending.batch);
       journalWriter(root, profileId, pending.batch, pending.reason);
       failedPublications.delete(id);
       queueState.delete(pending.batch);

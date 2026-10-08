@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
-import type { Database } from '../database.ts';
+import { observeTransactionBeforePublication, type Database } from '../database.ts';
 import { readIntakeEnvelopeText } from '../intake-authority.ts';
 import {
   registerIntakeFile,
@@ -42,8 +42,8 @@ function journalBytes(path: string): number {
   return bytes;
 }
 
-// Node's test mocks retain every call argument/result. These probes keep only
-// numeric aggregates, so observing SQL does not retain the returned history.
+// Node's test mocks retain every call argument/result. These probes retain
+// aggregate counts and SQL shapes, never bound values or returned history.
 function replaceMethod(target: object, key: string, replacement: unknown) {
   const original = Reflect.get(target, key);
   Reflect.set(target, key, replacement);
@@ -55,27 +55,99 @@ function replaceMethod(target: object, key: string, replacement: unknown) {
 function observePublication(t: test.TestContext, db: Database, id: string, archive: string) {
   const collections = selectedEnvelopeStore(db, { id }).collections;
   const record = createRecordVersionWorkCounters();
-  const phases = new Map<
-    string,
-    {
-      calls: number;
-      elapsedMs: number;
-      cpuMicros: number;
-      sqlPrepared: number;
-      sqlExecuted: number;
-      work: Record<string, number>;
-    }
-  >();
+  type Totals = {
+    calls: number;
+    elapsedMs: number;
+    cpuMicros: number;
+    sqlPrepared: number;
+    sqlExecuted: number;
+    work: Record<string, number>;
+    record: Record<string, number>;
+    filesystem: Record<string, { calls: number; elapsedMs: number; bytes: number }>;
+  };
+  const phases = new Map<string, Totals>();
+  const maintenanceSegments = new Map<string, Totals>();
   const stack: string[] = [];
   const snapshot = () => intakeWorkCounters(db).warm;
   const start = snapshot();
   const sql = { prepared: 0, executed: 0 };
   const retainedBytesBefore = journalBytes(archive);
   const filesystem = new Map<string, { calls: number; elapsedMs: number; bytes: number }>();
-  const fsProbes = (['readFileSync', 'writeFileSync', 'fsyncSync', 'lstatSync'] as const).map(
-    (method) => {
+  const sqlTimings = new Map<string, { calls: number; elapsedMs: number }>();
+  const restores: Array<() => void> = [];
+  let removeObserver: (() => void) | undefined;
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    removeObserver?.();
+    for (const restore of restores.reverse()) restore();
+    syncBuiltinESMExports();
+  };
+  t.after(dispose);
+  const install = (target: object, key: string, replacement: unknown) => {
+    restores.push(replaceMethod(target, key, replacement));
+  };
+  const point = () => ({
+    elapsedMs: performance.now(),
+    cpu: process.cpuUsage(),
+    sql: { ...sql },
+    work: { ...snapshot() } as Record<string, number>,
+    record: { ...record.operation } as Record<string, number>,
+    filesystem: Object.fromEntries(
+      [...filesystem].map(([key, value]) => [key, { ...value }]),
+    ) as Record<string, { calls: number; elapsedMs: number; bytes: number }>,
+  });
+  type Point = ReturnType<typeof point>;
+  const difference = (before: Record<string, number>, after: Record<string, number>) =>
+    Object.fromEntries(
+      Object.entries(after)
+        .filter(
+          ([key, value]) =>
+            !key.includes('Peak') && !key.startsWith('max') && value !== (before[key] ?? 0),
+        )
+        .map(([key, value]) => [key, value - (before[key] ?? 0)]),
+    );
+  const accumulate = (target: Map<string, Totals>, name: string, before: Point, after: Point) => {
+    const value = target.get(name) ?? {
+      calls: 0,
+      elapsedMs: 0,
+      cpuMicros: 0,
+      sqlPrepared: 0,
+      sqlExecuted: 0,
+      work: {},
+      record: {},
+      filesystem: {},
+    };
+    value.calls++;
+    value.elapsedMs += after.elapsedMs - before.elapsedMs;
+    value.cpuMicros += after.cpu.user + after.cpu.system - before.cpu.user - before.cpu.system;
+    value.sqlPrepared += after.sql.prepared - before.sql.prepared;
+    value.sqlExecuted += after.sql.executed - before.sql.executed;
+    for (const [key, count] of Object.entries(difference(before.work, after.work)))
+      value.work[key] = (value.work[key] ?? 0) + count;
+    for (const [key, count] of Object.entries(difference(before.record, after.record)))
+      value.record[key] = (value.record[key] ?? 0) + count;
+    for (const [key, totals] of Object.entries(after.filesystem)) {
+      const prior = before.filesystem[key] ?? { calls: 0, elapsedMs: 0, bytes: 0 };
+      const delta = value.filesystem[key] ?? { calls: 0, elapsedMs: 0, bytes: 0 };
+      delta.calls += totals.calls - prior.calls;
+      delta.elapsedMs += totals.elapsedMs - prior.elapsedMs;
+      delta.bytes += totals.bytes - prior.bytes;
+      value.filesystem[key] = delta;
+    }
+    target.set(name, value);
+    return value;
+  };
+  let activeMaintenance:
+    { entry: Point; stageEntry?: Point; stageExit?: Point; verified?: Point } | undefined;
+  removeObserver = observeTransactionBeforePublication(db, () => {
+    if (activeMaintenance) activeMaintenance.verified = point();
+  });
+  try {
+    for (const method of ['readFileSync', 'writeFileSync', 'fsyncSync', 'lstatSync'] as const) {
       const original = fs[method];
-      return replaceMethod(fs, method, (...args: unknown[]) => {
+      install(fs, method, (...args: unknown[]) => {
         const time = performance.now();
         let bytes = 0;
         try {
@@ -95,104 +167,79 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
           filesystem.set(method, value);
         }
       });
-    },
-  );
-  syncBuiltinESMExports();
-  const sqlTimings = new Map<string, { calls: number; elapsedMs: number }>();
-  const statementPrototype = Object.getPrototypeOf(db.prepare('SELECT 1'));
-  const statementProbes = (['run', 'get', 'all', 'iterate'] as const).map((method) => {
-    const original = statementPrototype[method];
-    return replaceMethod(
-      statementPrototype,
-      method,
-      function (this: { sourceSQL: string }, ...args: unknown[]) {
-        sql.executed++;
-        const time = performance.now();
-        try {
-          return Reflect.apply(original, this, args);
-        } finally {
-          const key = method + ':' + this.sourceSQL;
-          const value = sqlTimings.get(key) ?? { calls: 0, elapsedMs: 0 };
-          value.calls++;
-          value.elapsedMs += performance.now() - time;
-          sqlTimings.set(key, value);
-        }
-      },
-    );
-  });
-  const prepareSql = DatabaseSync.prototype.prepare;
-  const sqlProbe = replaceMethod(
-    DatabaseSync.prototype,
-    'prepare',
-    function (this: DatabaseSync, query: string) {
+    }
+    syncBuiltinESMExports();
+    const statementPrototype = Object.getPrototypeOf(db.prepare('SELECT 1'));
+    for (const method of ['run', 'get', 'all', 'iterate'] as const) {
+      const original = statementPrototype[method];
+      install(
+        statementPrototype,
+        method,
+        function (this: { sourceSQL: string }, ...args: unknown[]) {
+          sql.executed++;
+          const time = performance.now();
+          try {
+            return Reflect.apply(original, this, args);
+          } finally {
+            const key = method + ':' + this.sourceSQL;
+            const value = sqlTimings.get(key) ?? { calls: 0, elapsedMs: 0 };
+            value.calls++;
+            value.elapsedMs += performance.now() - time;
+            sqlTimings.set(key, value);
+          }
+        },
+      );
+    }
+    const prepareSql = DatabaseSync.prototype.prepare;
+    install(DatabaseSync.prototype, 'prepare', function (this: DatabaseSync, query: string) {
       sql.prepared++;
       return prepareSql.call(this, query);
-    },
-  );
-  const probes = (['prepare', 'stage', 'commitMaintenance'] as const).map((method) => {
-    const original = collections[method];
-    return replaceMethod(collections, method, (...args: unknown[]) => {
-      const phase = [...stack, method].join('/');
-      stack.push(method);
-      const before = snapshot(),
-        beforeSql = { ...sql },
-        cpu = process.cpuUsage(),
-        time = performance.now();
-      try {
-        return Reflect.apply(original, collections, args);
-      } finally {
-        const after = snapshot(),
-          used = process.cpuUsage(cpu);
-        const delta = Object.fromEntries(
-          Object.entries(after)
-            .filter(
-              ([key, value]) =>
-                !key.includes('Peak') && value !== before[key as keyof typeof before],
-            )
-            .map(([key, value]) => [key, value - before[key as keyof typeof before]]),
-        );
-        const value = phases.get(phase) ?? {
-          calls: 0,
-          elapsedMs: 0,
-          cpuMicros: 0,
-          sqlPrepared: 0,
-          sqlExecuted: 0,
-          work: {},
-        };
-        value.calls++;
-        value.elapsedMs += performance.now() - time;
-        value.cpuMicros += used.user + used.system;
-        value.sqlPrepared += sql.prepared - beforeSql.prepared;
-        value.sqlExecuted += sql.executed - beforeSql.executed;
-        for (const [key, count] of Object.entries(delta))
-          value.work[key] = (value.work[key] ?? 0) + count;
-        phases.set(phase, value);
-        if (process.env.CRS_HISTORY_CHECKPOINTS === '1')
-          t.diagnostic(
-            JSON.stringify({
-              phase,
-              checkpoint: value.calls,
-              work: delta,
-              sqlPrepared: sql.prepared - beforeSql.prepared,
-              sqlExecuted: sql.executed - beforeSql.executed,
-            }),
-          );
-        stack.pop();
-      }
     });
-  });
-  let disposed = false;
-  const dispose = () => {
-    if (!disposed) {
-      for (const restore of probes) restore();
-      sqlProbe();
-      for (const restore of statementProbes) restore();
-      for (const restore of fsProbes) restore();
-      syncBuiltinESMExports();
-      disposed = true;
+    for (const method of ['prepare', 'stage', 'commitMaintenance'] as const) {
+      const original = collections[method];
+      install(collections, method, (...args: unknown[]) => {
+        const phase = [...stack, method].join('/');
+        stack.push(method);
+        const before = point();
+        if (method === 'commitMaintenance') activeMaintenance = { entry: before };
+        if (phase === 'commitMaintenance/stage' && activeMaintenance)
+          activeMaintenance.stageEntry = before;
+        try {
+          return Reflect.apply(original, collections, args);
+        } finally {
+          const after = point();
+          const value = accumulate(phases, phase, before, after);
+          if (phase === 'commitMaintenance/stage' && activeMaintenance)
+            activeMaintenance.stageExit = after;
+          if (method === 'commitMaintenance' && activeMaintenance) {
+            const { entry, stageEntry, stageExit, verified } = activeMaintenance;
+            if (stageEntry) accumulate(maintenanceSegments, 'preStage', entry, stageEntry);
+            if (stageEntry && stageExit)
+              accumulate(maintenanceSegments, 'stage', stageEntry, stageExit);
+            if (stageExit && verified)
+              accumulate(maintenanceSegments, 'postStageVerify', stageExit, verified);
+            if (verified) accumulate(maintenanceSegments, 'postVerifyPublication', verified, after);
+            activeMaintenance = undefined;
+          }
+          if (process.env.CRS_HISTORY_CHECKPOINTS === '1')
+            t.diagnostic(
+              JSON.stringify({
+                phase,
+                checkpoint: value.calls,
+                work: difference(before.work, after.work),
+                record: difference(before.record, after.record),
+                sqlPrepared: after.sql.prepared - before.sql.prepared,
+                sqlExecuted: after.sql.executed - before.sql.executed,
+              }),
+            );
+          stack.pop();
+        }
+      });
     }
-  };
-  t.after(dispose);
+  } catch (error) {
+    dispose();
+    throw error;
+  }
   return {
     record,
     finish() {
@@ -201,6 +248,7 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
       t.diagnostic(
         JSON.stringify({
           phases: Object.fromEntries(phases),
+          maintenanceSegments: Object.fromEntries(maintenanceSegments),
           record,
           totalSql: sql,
           filesystem: Object.fromEntries(filesystem),
@@ -216,11 +264,15 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
               .map(([key, value]) => [key, value - start[key as keyof typeof start]]),
           ),
           resourceUsage: process.resourceUsage(),
-          note: 'Instrumented durations include probe overhead. Nested phases overlap. SQL covers all connections; iterate timing excludes iteration. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. fsRead/fsWrite are OS counters; maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
+          note: 'Instrumented durations include probe overhead. Nested phases overlap; maintenance segments do not. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL covers all connections; iterate timing excludes iteration. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. fsRead/fsWrite are OS counters; maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
         }),
       );
       assert.ok((phases.get('prepare')?.calls ?? 0) > 0);
       assert.ok((phases.get('commitMaintenance/stage')?.calls ?? 0) > 0);
+      assert.equal(
+        maintenanceSegments.get('postVerifyPublication')?.calls,
+        phases.get('commitMaintenance')?.calls,
+      );
     },
   };
 }

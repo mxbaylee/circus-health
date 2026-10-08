@@ -26,4 +26,13 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - run: node --test src/server/test/intake-history-publication.test.ts
+      - run: |
+          mkdir -p "$RUNNER_TEMP/pr71-cpu-prof"
+          node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof" --test src/server/test/intake-history-publication.test.ts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr71-history-cpu-profile
+          path: ${{ runner.temp }}/pr71-cpu-prof/*.cpuprofile
+          if-no-files-found: ignore
+          retention-days: 3
