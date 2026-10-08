@@ -6,64 +6,100 @@ on:
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
 
 permissions:
-  contents: read
-  actions: read
+  contents: write
 
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8
     env:
-      OUTPUT: /tmp/pr71-step3-published
+      HUSKY: '0'
+      OUTPUT: /tmp/pr71-step3-index-sql
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: 51e356cc33bfaae265fb4389ed9a3cfb85d15537
           persist-credentials: false
-          fetch-depth: 5
-      - name: Preserve pinned source and available evidence without rerunning tests
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Recover checked source delta
+        run: |
+          mkdir -p "$OUTPUT"
+          test "$(git rev-parse HEAD)" = 51e356cc33bfaae265fb4389ed9a3cfb85d15537
+          git rev-parse HEAD > "$OUTPUT/base-sha.txt"
+          node --input-type=module <<'NODE'
+          import {gunzipSync} from 'node:zlib';
+          import {writeFileSync} from 'node:fs';
+          import {createHash} from 'node:crypto';
+          import assert from 'node:assert/strict';
+          const encoded = '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';
+          const patch = gunzipSync(Buffer.from(encoded,'base64'));
+          assert.equal(createHash('sha256').update(patch).digest('hex'),'1ccfd45e169acd637aa63a46b6ae68d94bae72d0aeca867991294e2de6528aa1');
+          writeFileSync(`${process.env.OUTPUT}/repair.patch`,patch);
+          NODE
+          npm ci > "$OUTPUT/npm-ci.log" 2>&1
+          git apply --check "$OUTPUT/repair.patch"
+          git apply --include=src/server/test/record-replay-sql.test.ts "$OUTPUT/repair.patch"
+      - name: Verify counted regressions fail before the implementation change
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {spawnSync} from 'node:child_process';
+          import {writeFileSync} from 'node:fs';
+          import {testEnvironment} from './src/scripts/test-suite.ts';
+          const args=['--test','--test-concurrency=1','--test-name-pattern=publication reads fresh','--test-reporter=spec','src/server/test/record-replay-sql.test.ts'];
+          const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),encoding:'utf8',maxBuffer:16*1024*1024});
+          const text=result.stdout+result.stderr;
+          writeFileSync(`${process.env.OUTPUT}/red.log`,text);
+          writeFileSync(`${process.env.OUTPUT}/red-result.json`,JSON.stringify({args,status:result.status,signal:result.signal}));
+          assert.equal(result.status,1);assert.match(text,/tests 2/);assert.match(text,/fail 2/);assert.match(text,/cancelled 0/);assert.match(text,/skipped 0/);assert.match(text,/one fresh read statement/);
+          NODE
+      - name: Apply the repair and verify exact candidate source
+        run: |
+          git apply --exclude=src/server/test/record-replay-sql.test.ts "$OUTPUT/repair.patch"
+          git add docs/data/record-version-storage.md docs/setup/release-updates.md src/server/record-versions.ts src/server/test/record-replay-sql.test.ts
+          test "$(git write-tree)" = 5d0d4b5adef4556377818457000697d55beb6b52
+          git diff --cached --check
+          git write-tree > "$OUTPUT/candidate-tree.txt"
+      - name: Execute complete record, history and encrypted-profile regressions
+        run: |
+          node --input-type=module <<'NODE'
+          import {spawnSync} from 'node:child_process';
+          import {openSync,closeSync,writeFileSync} from 'node:fs';
+          import {testEnvironment} from './src/scripts/test-suite.ts';
+          const names=['record-versions','record-history-index-growth','record-note-history','record-replay-sql','record-status-read-reuse','contributor-record-storage','encrypted-profiles'];
+          const args=['--test','--test-concurrency=1','--test-reporter=spec',...names.map(n=>`src/server/test/${n}.test.ts`)];
+          const fd=openSync(`${process.env.OUTPUT}/green.log`,'w');
+          const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});closeSync(fd);
+          writeFileSync(`${process.env.OUTPUT}/green-result.json`,JSON.stringify({args,status:result.status,signal:result.signal}));
+          process.exitCode=result.status??1;
+          NODE
+      - name: Verify static checks
+        run: |
+          npm run typecheck > "$OUTPUT/typecheck.log" 2>&1
+          npx prettier --check src/server/record-versions.ts src/server/test/record-replay-sql.test.ts > "$OUTPUT/format.log" 2>&1
+          node scripts/repository-file-inventory.ts --check > "$OUTPUT/inventory.log" 2>&1
+      - name: Store verified source blobs without updating any branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$OUTPUT/logs" "$OUTPUT/commits"
-          test "$(git rev-parse HEAD)" = 51e356cc33bfaae265fb4389ed9a3cfb85d15537
-          test "$(git rev-parse HEAD^{tree})" = e9b52942e7ecbe2f5eecd8b5e7339ab5e5effb2e
-          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
-          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
-          git archive HEAD | gzip -n > "$OUTPUT/source.tar.gz"
-          git ls-tree -r HEAD > "$OUTPUT/source-tree.txt"
-          for SHA in 51e356cc33bfaae265fb4389ed9a3cfb85d15537 25a86bb9c3ddb5516747561df56d879b08727077 1808014ab21bb558c0fd4203402ac0ae05810b98 fcfc73f3bc0ec2262027d62a7e1faf8b1db15315 6091456889e59ea77757f30c81fe0c3f879c7abb; do git cat-file -p "$SHA" > "$OUTPUT/commits/$SHA.txt"; done
-          git diff 6091456889e59ea77757f30c81fe0c3f879c7abb HEAD > "$OUTPUT/published-changes.patch"
+          git archive "$(git write-tree)" | gzip -n > "$OUTPUT/source.tar.gz"
+          git ls-tree -r "$(git write-tree)" > "$OUTPUT/source-tree.txt"
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
-          import {writeFileSync} from 'node:fs';
-          const root=process.env.OUTPUT,api='https://api.github.com/repos/mxbaylee/circus-health';
-          async function get(path,file,json=true){
-            const r=await fetch(api+path,{headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(30000)});
-            const text=await r.text();writeFileSync(`${root}/${file}`,text);assert.ok(r.ok,`${path}: HTTP ${r.status}`);return json?JSON.parse(text):text;
+          import {readFileSync,writeFileSync} from 'node:fs';
+          const files=[['docs/data/record-version-storage.md','2af280885b021285fd38dc8f6ef3a22c8d51972a'],['docs/setup/release-updates.md','42d7f1e9adaa5324e60d0283ee200ddb7e7d8b01'],['src/server/record-versions.ts','a4bff35fd9f7ff741e11cb9fda97a1256d9c1504'],['src/server/test/record-replay-sql.test.ts','36d94166369ec90aa0c1f0082be8e8d422a62b1a']];
+          const blobs=[];
+          for(const [path,sha] of files){
+            const response=await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs',{method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},body:JSON.stringify({content:readFileSync(path,'utf8'),encoding:'utf-8'})});
+            const result=await response.json();assert.ok(response.ok,JSON.stringify(result));assert.equal(result.sha,sha);blobs.push({path,sha,mode:'100644',type:'blob'});
           }
-          const run=await get('/actions/runs/37739859601','run.json');assert.equal(run.head_sha,'51e356cc33bfaae265fb4389ed9a3cfb85d15537');
-          const jobs=await get('/actions/runs/37739859601/attempts/1/jobs?per_page=100','jobs.json');assert.equal(jobs.total_count,jobs.jobs.length);
-          await get('/pulls/71','pr.json');
-          await get('/issues/71/comments?since=2026-10-08T06%3A07%3A00Z&per_page=100','review-comments.json');
-          await get('/pulls/71/reviews?per_page=100','reviews.json');
-          await get('/pulls/71/comments?since=2026-10-08T06%3A07%3A00Z&per_page=100','review-inline-comments.json');
-          await get('/git/ref/heads/codex/pr71-step3-witness-wip','witness-ref.json');
-          const summaries=[];
-          for(const job of jobs.jobs){
-            if(job.status!=='completed')continue;
-            if(job.conclusion==='success'&&!['history','acceptance','continuation'].includes(job.name))continue;
-            try{const text=await get(`/actions/jobs/${job.id}/logs`,`logs/${job.id}.log`,false);
-              const lines=text.split('\n'),start=lines.findIndex(line=>line.includes('failing tests:'));
-              summaries.push({id:job.id,name:job.name,status:job.status,conclusion:job.conclusion,startedAt:job.started_at,completedAt:job.completed_at,excerpt:start>=0?lines.slice(start,start+100):lines.filter(line=>/##\[error\]|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|duration_ms|native identity/.test(line))});
-            }catch(error){summaries.push({id:job.id,name:job.name,captureError:String(error)});}
-          }
-          const counts={};for(const job of jobs.jobs){const key=job.conclusion??job.status;counts[key]=(counts[key]??0)+1;}
-          const summary={observedAt:new Date().toISOString(),head:run.head_sha,runId:run.id,runStatus:run.status,runConclusion:run.conclusion,counts,gates:jobs.jobs.filter(j=>['history','acceptance','continuation'].includes(j.name)).map(({id,name,status,conclusion,started_at,completed_at})=>({id,name,status,conclusion,started_at,completed_at})),summaries};
-          writeFileSync(`${root}/summary.json`,JSON.stringify(summary,null,2));console.log(JSON.stringify(summary,null,2));
+          writeFileSync(`${process.env.OUTPUT}/blobs.json`,JSON.stringify(blobs,null,2));console.log(JSON.stringify(blobs));
           NODE
-      - name: Hash retained output
+      - name: Hash retained evidence
         if: always()
         run: |
           if [ -d "$OUTPUT" ]; then
@@ -73,7 +109,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step3-published-${{ github.run_attempt }}
-          path: /tmp/pr71-step3-published
+          name: pr71-step3-index-sql
+          path: /tmp/pr71-step3-index-sql
           if-no-files-found: error
           retention-days: 14
