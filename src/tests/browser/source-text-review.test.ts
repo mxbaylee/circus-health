@@ -337,12 +337,39 @@ test(
       sourceRequests.push(pending);
       return pending;
     });
+    let releaseInitialFeed!: () => void;
+    const heldInitialFeed = new Promise<void>((resolve) => {
+      releaseInitialFeed = resolve;
+    });
+    const initialFeedRoute = '**/intakes/import-feed?*';
+    await page.route(initialFeedRoute, async (route) => {
+      await heldInitialFeed;
+      await route.continue();
+    });
+    const sourceResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'GET' &&
+        new URL(response.url()).pathname === `${prefix}/intakes/${encodeURIComponent(intake.id)}`,
+    );
+    const feedResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'GET' &&
+        new URL(response.url()).pathname === `${prefix}/intakes/import-feed`,
+    );
     const attentionInAll = page.getByRole('region', {
       name: 'Text review for fictional-source-review.txt',
       exact: true,
     });
     try {
       await page.reload();
+      await page.getByText('Opening import review…', { exact: true }).waitFor();
+      assert.equal(
+        await page.locator('#import-review-title').count(),
+        0,
+        'The initial unknown feed must not expose a review tree that a native response replaces',
+      );
+      releaseInitialFeed();
+      assert.equal(await (await feedResponse).finished(), null);
       await page.getByRole('tab', { name: /^Needs attention/ }).waitFor();
       await requestedSource;
       assert.equal(
@@ -351,11 +378,14 @@ test(
         'Queue count does not imply the source section has loaded',
       );
       releaseSource();
+      assert.equal(await (await sourceResponse).finished(), null);
       await attentionInAll.waitFor({ state: 'visible' });
       assert(await attentionInAll.isVisible(), 'Source sections are visible in All');
     } finally {
+      releaseInitialFeed();
       releaseSource();
       await Promise.all(sourceRequests);
+      await page.unroute(initialFeedRoute);
       await page.unroute(intakeRoute);
     }
     await attentionInAll.getByText('1 section not reviewed', { exact: true }).waitFor();

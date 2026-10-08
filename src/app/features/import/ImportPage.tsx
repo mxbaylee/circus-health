@@ -2024,6 +2024,22 @@ export function ImportPage() {
     },
   };
 
+  if (!feed.data)
+    return (
+      <div className="page import-page">
+        {feed.error ? (
+          <div className="import-error" role="alert">
+            {feed.error.message}{' '}
+            <button className="button secondary" onClick={feed.reload}>
+              Retry import review
+            </button>
+          </div>
+        ) : (
+          <LoadingIndicator label="Opening import review…" layout="centered" />
+        )}
+      </div>
+    );
+
   if (isCollectionImportFeed(feed.data))
     return (
       <CollectionImportReview
