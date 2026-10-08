@@ -9,78 +9,45 @@ permissions:
   contents: write
 
 jobs:
-  verify:
+  preserve:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    env:
-      HUSKY: '0'
-      OUTPUT: /tmp/pr71-history-lane
+    timeout-minutes: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: 25a86bb9c3ddb5516747561df56d879b08727077
           persist-credentials: false
           fetch-depth: 1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version-file: .nvmrc
-          package-manager-cache: false
-      - name: Assemble the checked required-history lane
+      - name: Store only checksum-verified Git blobs without changing a tree or ref
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$OUTPUT"
+          git fetch --no-tags --depth=1 origin 0910d84013d539698384c93f6152b1eb8fd98b5b
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import {inflateSync} from 'node:zlib';
           import {createHash} from 'node:crypto';
-          import {writeFileSync} from 'node:fs';
-          import {execFileSync} from 'node:child_process';
-          const encoded='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';
-          const patch=inflateSync(Buffer.from(encoded,'base64'));
-          assert.equal(createHash('sha256').update(patch).digest('hex'),'01c1557e4b8c5907b96a8b6f960ea4b5f9c837876376d46b4103873fbba2838c');
-          const file=`${process.env.OUTPUT}/repair.patch`;writeFileSync(file,patch);
-          execFileSync('git',['apply','--check',file]);execFileSync('git',['apply',file]);execFileSync('git',['add','-A']);
-          assert.equal(execFileSync('git',['write-tree'],{encoding:'utf8'}).trim(),'e9b52942e7ecbe2f5eecd8b5e7339ab5e5effb2e');
-          NODE
-          npm ci > "$OUTPUT/npm-ci.log" 2>&1
-      - name: Verify suite coverage, environment isolation and static checks
-        run: |
-          node --test src/scripts/test-suite.test.ts > "$OUTPUT/partition.log" 2>&1
-          npm run typecheck > "$OUTPUT/typecheck.log" 2>&1
-          node node_modules/prettier/bin/prettier.cjs --check src/scripts/test-suite.ts src/scripts/test-suite.test.ts package.json > "$OUTPUT/format.log" 2>&1
-          node scripts/repository-file-inventory.ts --check > "$OUTPUT/inventory.log" 2>&1
-          git diff --cached --check
-          git diff --exit-code
-          git diff --cached --exit-code -- src/server/test/intake-identity-native-artifact-history.test.ts src/server/test/intake-identity-native-receipt-history.test.ts
-      - name: Preserve exact source before normal required CI execution
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git archive e9b52942e7ecbe2f5eecd8b5e7339ab5e5effb2e | gzip -n > "$OUTPUT/source.tar.gz"
-          git ls-tree -r e9b52942e7ecbe2f5eecd8b5e7339ab5e5effb2e > "$OUTPUT/source-tree.txt"
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
           import {readFileSync,writeFileSync} from 'node:fs';
           import {execFileSync} from 'node:child_process';
-          const tree='e9b52942e7ecbe2f5eecd8b5e7339ab5e5effb2e';
-          const paths=execFileSync('git',['diff','--cached','--name-only'],{encoding:'utf8'}).trim().split('\n');assert.equal(paths.length,6);
-          const response=await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/trees',{
-            method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
-            body:JSON.stringify({base_tree:'ef05a5e4330aa36aea9860d548b5919d457241d8',tree:paths.map(path=>({path,mode:'100644',type:'blob',content:readFileSync(path,'utf8')}))}),signal:AbortSignal.timeout(60000)
-          });
-          const result=await response.json();assert.ok(response.ok,JSON.stringify(result));assert.equal(result.sha,tree);
-          writeFileSync(`${process.env.OUTPUT}/preserved.json`,JSON.stringify({base:'25a86bb9c3ddb5516747561df56d879b08727077',tree,paths,refsChanged:false,node:process.version},null,2));
+          const git=(...args)=>execFileSync('git',args,{encoding:'utf8'}).trim();
+          assert.equal(git('rev-parse','HEAD'),'25a86bb9c3ddb5516747561df56d879b08727077');
+          const recipe=git('show','0910d84013d539698384c93f6152b1eb8fd98b5b:.github/workflows/pr71-2a-checkpoint.yml');
+          const matches=[...recipe.matchAll(/const encoded='([^']+)';/g)];assert.equal(matches.length,1);
+          const patch=inflateSync(Buffer.from(matches[0][1],'base64'));
+          assert.equal(createHash('sha256').update(patch).digest('hex'),'01c1557e4b8c5907b96a8b6f960ea4b5f9c837876376d46b4103873fbba2838c');
+          writeFileSync('/tmp/history-lane.patch',patch);
+          git('apply','--check','/tmp/history-lane.patch');git('apply','/tmp/history-lane.patch');git('add','-A');
+          assert.equal(git('write-tree'),'e9b52942e7ecbe2f5eecd8b5e7339ab5e5effb2e');
+          const paths=git('diff','--cached','--name-only').split('\n');assert.equal(paths.length,6);
+          const entries=[];
+          for(const path of paths){
+            const content=readFileSync(path),expected=git('hash-object',path);
+            const response=await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs',{
+              method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
+              body:JSON.stringify({content:content.toString('base64'),encoding:'base64'}),signal:AbortSignal.timeout(30000)
+            });
+            const result=await response.json();assert.ok(response.ok,JSON.stringify(result));assert.equal(result.sha,expected);
+            entries.push({path,mode:'100644',type:'blob',sha:result.sha});
+          }
+          console.log(JSON.stringify({tree:'e9b52942e7ecbe2f5eecd8b5e7339ab5e5effb2e',baseTree:'ef05a5e4330aa36aea9860d548b5919d457241d8',entries,refsChanged:false},null,2));
           NODE
-      - name: Hash retained output
-        if: always()
-        run: |
-          if [ -d "$OUTPUT" ]; then
-            cd "$OUTPUT"
-            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-          fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: pr71-history-lane-verified
-          path: /tmp/pr71-history-lane
-          if-no-files-found: error
-          retention-days: 14
