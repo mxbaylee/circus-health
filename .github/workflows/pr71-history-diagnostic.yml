@@ -27,13 +27,15 @@ jobs:
           package-manager-cache: false
       - run: npm ci
       - run: |
-          mkdir -p "$RUNNER_TEMP/pr71-cpu-prof/baseline" "$RUNNER_TEMP/pr71-cpu-prof/wal-8192"
+          mkdir -p "$RUNNER_TEMP/pr71-cpu-prof/baseline" "$RUNNER_TEMP/pr71-cpu-prof/wal-8192" "$RUNNER_TEMP/pr71-cpu-prof/native-grounding"
           set +e
           CRS_HISTORY_WAL_CHECKPOINT_PAGES=1000 node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof/baseline" --test src/server/test/intake-history-publication.test.ts 2>&1 | tee "$RUNNER_TEMP/pr71-history-baseline.log"
           baseline_status=${PIPESTATUS[0]}
           CRS_HISTORY_WAL_CHECKPOINT_PAGES=8192 node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof/wal-8192" --test src/server/test/intake-history-publication.test.ts 2>&1 | tee "$RUNNER_TEMP/pr71-history-wal-8192.log"
           candidate_status=${PIPESTATUS[0]}
-          test "$baseline_status" -eq 0 && test "$candidate_status" -eq 0
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC=1 CRS_IDENTITY_CPU_PROFILE_DIR="$RUNNER_TEMP/pr71-cpu-prof/native-grounding" node --test --test-name-pattern='native identity grounding phase counts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$RUNNER_TEMP/pr71-native-grounding.log"
+          grounding_status=${PIPESTATUS[0]}
+          test "$baseline_status" -eq 0 && test "$candidate_status" -eq 0 && test "$grounding_status" -eq 0
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
@@ -41,5 +43,6 @@ jobs:
           path: |
             ${{ runner.temp }}/pr71-cpu-prof/**/*.cpuprofile
             ${{ runner.temp }}/pr71-history-*.log
+            ${{ runner.temp }}/pr71-native-grounding.log
           if-no-files-found: ignore
           retention-days: 3

@@ -2,7 +2,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { writeFileSync, opendirSync, statSync } from 'node:fs';
+import crypto from 'node:crypto';
+import { Session } from 'node:inspector';
 import { syncBuiltinESMExports } from 'node:module';
+import timers from 'node:timers/promises';
 import { dirname, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -27,6 +30,7 @@ import { prepareIntakeWorkflowCommand } from '../intake-workflow-command.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import { fixture, envelope } from './intake-identity-native-fixture.ts';
+import { getNativeIntakeIdentityReview } from '../intake-identity-native.ts';
 
 function journalBytes(path: string): number {
   let bytes = 0;
@@ -645,6 +649,7 @@ async function publicationFixture(t: test.TestContext, count: number) {
   );
   probe.finish();
   assert.equal(intakeSourceVersion(f.db, f.original.id).version, details.version + 1);
+  return f;
 }
 
 for (const count of [4, 8])
@@ -655,3 +660,210 @@ for (const count of [4, 8])
       await publicationFixture(t, count);
     },
   );
+
+if (process.env.CRS_IDENTITY_GROUNDING_DIAGNOSTIC === '1')
+  for (const count of [4, 8])
+    test(`native identity grounding phase counts: ${count} new artifacts`, async (t) => {
+      const f = await publicationFixture(t, count);
+      const start = { ...intakeWorkCounters(f.db).warm };
+      const record = createRecordVersionWorkCounters();
+      const counters = {
+        proofSweeps: 0,
+        proofRows: 0,
+        proofSweepMs: 0,
+        statCalls: 0,
+        statMs: 0,
+        fsyncCalls: 0,
+        fsyncMs: 0,
+        hmacCalls: 0,
+        sourceVersionReads: 0,
+        sourceVersionGetMs: 0,
+        readStampReads: 0,
+        readStampGetMs: 0,
+        tempSchemaReads: 0,
+        tempSchemaGetMs: 0,
+        immediateCalls: 0,
+        commitExecs: 0,
+        commitExecMs: 0,
+      };
+      const restores: Array<() => void> = [];
+      let disposed = false;
+      const dispose = () => {
+        if (disposed) return;
+        disposed = true;
+        for (const restore of restores.reverse()) restore();
+        syncBuiltinESMExports();
+      };
+      t.after(dispose);
+      const install = (target: object, key: string, replacement: unknown) => {
+        restores.push(replaceMethod(target, key, replacement));
+      };
+      try {
+        const originalStat = fs.statSync;
+        install(fs, 'statSync', (...args: Parameters<typeof originalStat>) => {
+          const before = performance.now();
+          try {
+            return Reflect.apply(originalStat, fs, args);
+          } finally {
+            counters.statCalls++;
+            counters.statMs += performance.now() - before;
+          }
+        });
+        const originalFsync = fs.fsyncSync;
+        install(fs, 'fsyncSync', (...args: Parameters<typeof originalFsync>) => {
+          const before = performance.now();
+          try {
+            return Reflect.apply(originalFsync, fs, args);
+          } finally {
+            counters.fsyncCalls++;
+            counters.fsyncMs += performance.now() - before;
+          }
+        });
+        const originalHmac = crypto.createHmac;
+        install(crypto, 'createHmac', (...args: Parameters<typeof originalHmac>) => {
+          counters.hmacCalls++;
+          return Reflect.apply(originalHmac, crypto, args);
+        });
+        const originalImmediate = timers.setImmediate;
+        install(timers, 'setImmediate', (...args: Parameters<typeof originalImmediate>) => {
+          counters.immediateCalls++;
+          return Reflect.apply(originalImmediate, timers, args);
+        });
+        syncBuiltinESMExports();
+        const statementPrototype = Object.getPrototypeOf(f.db.prepare('SELECT 1'));
+        const originalExec = DatabaseSync.prototype.exec;
+        install(DatabaseSync.prototype, 'exec', function (this: DatabaseSync, query: string) {
+          const commit = /^COMMIT\s*;?\s*$/i.test(query);
+          const before = performance.now();
+          try {
+            return originalExec.call(this, query);
+          } finally {
+            if (commit) {
+              counters.commitExecs++;
+              counters.commitExecMs += performance.now() - before;
+            }
+          }
+        });
+        const originalGet = statementPrototype.get;
+        install(
+          statementPrototype,
+          'get',
+          function (this: { sourceSQL: string }, ...args: unknown[]) {
+            const sourceVersion = this.sourceSQL.startsWith(
+                'SELECT id,kind,sha256,details_json FROM source_files',
+              ),
+              readStamp = this.sourceSQL.startsWith('SELECT total_changes() AS changes'),
+              tempSchema = this.sourceSQL === 'PRAGMA temp.schema_version',
+              before = performance.now();
+            if (sourceVersion) counters.sourceVersionReads++;
+            if (readStamp) counters.readStampReads++;
+            if (tempSchema) counters.tempSchemaReads++;
+            try {
+              return Reflect.apply(originalGet, this, args);
+            } finally {
+              const elapsed = performance.now() - before;
+              if (sourceVersion) counters.sourceVersionGetMs += elapsed;
+              if (readStamp) counters.readStampGetMs += elapsed;
+              if (tempSchema) counters.tempSchemaGetMs += elapsed;
+            }
+          },
+        );
+        const originalIterate = statementPrototype.iterate;
+        install(
+          statementPrototype,
+          'iterate',
+          function (this: { sourceSQL: string }, ...args: unknown[]) {
+            const rows = Reflect.apply(originalIterate, this, args) as Iterable<unknown>;
+            if (
+              this.sourceSQL !==
+              'SELECT id,path,identity,signature FROM identity_artifact_proof ORDER BY id'
+            )
+              return rows;
+            counters.proofSweeps++;
+            return (function* () {
+              const before = performance.now();
+              try {
+                for (const row of rows) {
+                  counters.proofRows++;
+                  yield row;
+                }
+              } finally {
+                counters.proofSweepMs += performance.now() - before;
+              }
+            })();
+          },
+        );
+      } catch (error) {
+        dispose();
+        throw error;
+      }
+      const profileDirectory = process.env.CRS_IDENTITY_CPU_PROFILE_DIR;
+      const profiler = profileDirectory ? new Session() : undefined;
+      if (profiler) {
+        try {
+          profiler.connect();
+          await new Promise<void>((resolve, reject) =>
+            profiler.post('Profiler.enable', (error) => (error ? reject(error) : resolve())),
+          );
+          await new Promise<void>((resolve, reject) =>
+            profiler.post('Profiler.start', (error) => (error ? reject(error) : resolve())),
+          );
+        } catch (error) {
+          profiler.disconnect();
+          dispose();
+          throw error;
+        }
+      }
+      const before = performance.now(),
+        beforeCpu = process.cpuUsage();
+      try {
+        const review = await withRecordVersionWork(record, () =>
+          getNativeIntakeIdentityReview(f.db, f.root, f.profileId, f.original.id, f.groupId),
+        );
+        assert.ok(review);
+      } finally {
+        const elapsedMs = performance.now() - before,
+          cpu = process.cpuUsage(beforeCpu),
+          after = intakeWorkCounters(f.db).warm;
+        let cpuProfileBytes = 0;
+        if (profiler) {
+          try {
+            const profile = await new Promise<unknown>((resolve, reject) =>
+              profiler.post('Profiler.stop', (error, result) =>
+                error ? reject(error) : resolve(result.profile),
+              ),
+            );
+            const encoded = JSON.stringify(profile);
+            writeFileSync(join(profileDirectory!, `native-grounding-${count}.cpuprofile`), encoded);
+            cpuProfileBytes = Buffer.byteLength(encoded);
+          } finally {
+            profiler.disconnect();
+            dispose();
+          }
+        } else dispose();
+        t.diagnostic(
+          JSON.stringify({
+            nativeGroundingDiagnostic: {
+              newArtifacts: count,
+              retainedProposals: count + 1,
+              ...counters,
+              elapsedMs,
+              cpuMicros: cpu.user + cpu.system,
+              cpuProfileBytes,
+              fullPreparations:
+                after.identityPreviewFullPreparations - start.identityPreviewFullPreparations,
+              collectionNodesWritten: after.collectionNodesWritten - start.collectionNodesWritten,
+              collectionWrittenBytes: after.collectionWrittenBytes - start.collectionWrittenBytes,
+              recordWork: record.operation,
+              artifactChecks:
+                after.identityPreviewArtifactChecks - start.identityPreviewArtifactChecks,
+              artifactOccurrences:
+                after.identityPreviewArtifactOccurrences - start.identityPreviewArtifactOccurrences,
+              note: 'Aggregate fixture-only observation. Proof sweep elapsed includes caller HMAC/stat work between iterator rows, not isolated SQLite scan time. Stat/HMAC and immediate counts include other native work. Timing includes probe overhead and is not a gate.',
+            },
+          }),
+        );
+      }
+      assert.ok(counters.proofSweeps > 0);
+      assert.ok(counters.proofRows >= count + 2);
+    });
