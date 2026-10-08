@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { openDatabase, transaction } from '../database.ts';
+import { openDatabase, observeTransactionBeforePublication, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { uploadIntake } from '../intake.ts';
@@ -65,6 +65,7 @@ async function fixture(
   referenced = true,
   duplicate = false,
   modify?: (d: IntakeDetails) => void,
+  versionsInFirstSource?: number,
 ) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-context-state-')),
     profileId = 'cookie-dough',
@@ -94,8 +95,18 @@ async function fixture(
   transaction(db, () => {
     for (let n = 0; n < count; n++) {
       const id = 'fictional-proposal-' + n,
-        entry = value(id, n % 2 === 0),
-        raw = Buffer.from(JSON.stringify(entry)),
+        entry = value(
+          id,
+          n === 0 && versionsInFirstSource !== undefined ? versionsInFirstSource > 0 : n % 2 === 0,
+        ),
+        entries = [
+          entry,
+          ...Array.from(
+            { length: n === 0 ? Math.max(0, (versionsInFirstSource ?? 1) - 1) : 0 },
+            (_, ordinal) => value(`${id}-extra-${ordinal}`, true),
+          ),
+        ],
+        raw = Buffer.from(entries.map((item) => JSON.stringify(item)).join('\n')),
         parsed = validateJSONL(raw);
       assert.equal(parsed.valid, true);
       bytes.push(raw);
@@ -188,6 +199,303 @@ test('cold native classification matches actual legacy fallback and warm points 
     () => readSelectedSourceContextClassification(f.db, f.root, 'foreign', f.id),
     /different profile/,
   );
+});
+test('cold source-context publication grows by one bounded source-cache commit per additional proposal', async (t) => {
+  const counts: number[] = [];
+  for (const proposals of [4, 8]) {
+    const f = await fixture(t, proposals);
+    let publications = 0;
+    const remove = observeTransactionBeforePublication(f.db, () => {
+      publications++;
+    });
+    try {
+      const prepared = await prepareSelectedSourceContextClassification(
+        f.db,
+        f.root,
+        f.profileId,
+        f.id,
+      );
+      assert.equal(prepared.state, 'ready');
+      if (prepared.state !== 'ready') continue;
+      for (const [ordinal, id] of f.versionIds.entries())
+        assert.equal(prepared.isSourceContextVersion(id), ordinal % 2 === 0);
+    } finally {
+      remove();
+    }
+    counts.push(publications);
+  }
+  assert.equal(counts.length, 2);
+  t.diagnostic(
+    JSON.stringify({
+      sourceContextClassificationPublications: { four: counts[0], eight: counts[1] },
+    }),
+  );
+  assert.ok(
+    counts[1]! - counts[0]! <= 5,
+    `four additional changed proposals published ${counts[1]! - counts[0]!} extra transactions`,
+  );
+});
+test('source-context cache publishes exact empty and 61-65 version sets in bounded atomic batches', async (t) => {
+  for (const versions of [0, 1, 61, 62, 63, 64, 65])
+    await t.test(`${versions} source-context versions`, async (caseContext) => {
+      const f = await fixture(caseContext, 1, true, false, undefined, versions),
+        collections = selectedEnvelopeStore(f.db, f.file).collections,
+        originalPrepare = collections.prepare;
+      const batches: Array<{
+        changes: number;
+        writeBytes: number;
+        versionKeys: string[];
+        initializes: number;
+        removesInitialization: number;
+        completes: boolean;
+      }> = [];
+      let versionCollection = '',
+        controlCollection = '';
+      collections.prepare = (view, input) => {
+        const sourceChanges = input.changes.filter((change) =>
+          change.collection.startsWith('source.context.file.'),
+        );
+        const prepared = originalPrepare(view, input);
+        if (sourceChanges.length) {
+          const versionChanges = sourceChanges.filter((change) =>
+            change.collection.endsWith('.versions'),
+          );
+          const controlChanges = sourceChanges.filter((change) =>
+            change.collection.endsWith('.control'),
+          );
+          versionCollection ||= versionChanges[0]?.collection ?? '';
+          controlCollection ||= controlChanges[0]?.collection ?? '';
+          batches.push({
+            changes: input.changes.length,
+            writeBytes: collections.inspectPrepared(prepared).writeBytes,
+            versionKeys: versionChanges
+              .filter((change) => change.op === 'put' && change.key !== 'initializing')
+              .map((change) => (change.op === 'put' ? change.key : '')),
+            initializes: versionChanges.filter(
+              (change) => change.op === 'put' && change.key === 'initializing',
+            ).length,
+            removesInitialization: versionChanges.filter(
+              (change) => change.op === 'delete' && change.key === 'initializing',
+            ).length,
+            completes: controlChanges.some(
+              (change) =>
+                change.op === 'put' && change.key === 'complete' && change.value === 'ready',
+            ),
+          });
+        }
+        return prepared;
+      };
+      caseContext.after(() => {
+        collections.prepare = originalPrepare;
+      });
+      const prepared = await prepareSelectedSourceContextClassification(
+        f.db,
+        f.root,
+        f.profileId,
+        f.id,
+      );
+      assert.equal(prepared.state, 'ready');
+      assert.ok(versionCollection);
+      assert.ok(controlCollection);
+      const parsed = validateJSONL(f.bytes[0]!);
+      assert.equal(parsed.valid, true);
+      const expected = versions
+        ? parsed.entries.map((entry) => intakeCandidateVersionIdForRevision(entry, 'revision-1'))
+        : [];
+      assert.deepEqual(batches.flatMap((batch) => batch.versionKeys).sort(), [...expected].sort());
+      assert.equal(
+        batches.reduce((sum, batch) => sum + batch.initializes, 0),
+        1,
+      );
+      assert.equal(
+        batches.reduce((sum, batch) => sum + batch.removesInitialization, 0),
+        1,
+      );
+      assert.equal(batches.filter((batch) => batch.completes).length, 1);
+      assert.equal(batches.at(-1)?.completes, true);
+      assert.ok(batches.every((batch) => batch.changes <= 64));
+      assert.ok(batches.every((batch) => batch.writeBytes <= 8 * 1024 * 1024));
+      assert.equal(batches.length, versions <= 61 ? 1 : 2);
+      assert.ok(collections.collection(collections.openView(), 'builds', versionCollection));
+      assert.equal(
+        collections.get(collections.openView(), 'builds', versionCollection, 'initializing'),
+        undefined,
+      );
+      for (const key of expected)
+        assert.equal(
+          collections.get(collections.openView(), 'builds', versionCollection, key),
+          '1',
+        );
+      assert.equal(
+        collections.get(collections.openView(), 'builds', controlCollection, 'complete'),
+        'ready',
+      );
+      const published = batches.length;
+      let warmPublications = 0;
+      const removeWarmObserver = observeTransactionBeforePublication(f.db, () => {
+        warmPublications++;
+      });
+      let warm: Awaited<ReturnType<typeof prepareSelectedSourceContextClassification>>;
+      try {
+        warm = await prepareSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id);
+      } finally {
+        removeWarmObserver();
+      }
+      assert.equal(warm.state, 'ready');
+      assert.equal(batches.length, published, 'warm reuse publishes no source-cache batch');
+      assert.equal(warmPublications, 0, 'warm reuse publishes no maintenance transaction');
+    });
+});
+test('intermediate source-cache versions never become ready after source replacement or cancellation', async (t) => {
+  for (const failure of ['replacement', 'cancellation'] as const)
+    await t.test(failure, async (caseContext) => {
+      const f = await fixture(caseContext, 1, true, false, undefined, 65),
+        collections = selectedEnvelopeStore(f.db, f.file).collections,
+        originalPrepare = collections.prepare,
+        path = join(f.root, f.paths.relativeRoot, 'sources', f.sourceIds[0] + '.jsonl');
+      let interrupted = false,
+        cancel = false,
+        readySourceCachePublications = 0;
+      collections.prepare = (view, input) => {
+        const sourceVersionBatch = input.changes.some(
+          (change) =>
+            change.collection.startsWith('source.context.file.') &&
+            change.collection.endsWith('.versions'),
+        );
+        const sourceReady = input.changes.some(
+          (change) =>
+            change.collection.startsWith('source.context.file.') &&
+            change.collection.endsWith('.control') &&
+            change.op === 'put' &&
+            change.key === 'complete' &&
+            change.value === 'ready',
+        );
+        if (sourceReady) readySourceCachePublications++;
+        const prepared = originalPrepare(view, input);
+        if (sourceVersionBatch && !sourceReady && !interrupted) {
+          interrupted = true;
+          setImmediate(() => {
+            if (failure === 'cancellation') cancel = true;
+            else {
+              const replacement = path + '.replacement';
+              writeFileSync(replacement, Buffer.alloc(f.bytes[0]!.length, 32));
+              renameSync(replacement, path);
+            }
+          });
+        }
+        return prepared;
+      };
+      caseContext.after(() => {
+        collections.prepare = originalPrepare;
+      });
+      const options = {
+        assertRunning() {
+          if (cancel) throw Error('fictional source-cache cancellation');
+        },
+      };
+      if (failure === 'cancellation')
+        await assert.rejects(
+          prepareSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id, options),
+          /fictional source-cache cancellation/,
+        );
+      else {
+        const pending = await prepareSelectedSourceContextClassification(
+          f.db,
+          f.root,
+          f.profileId,
+          f.id,
+          options,
+        );
+        assert.equal(pending.state, 'pending');
+      }
+      assert.equal(interrupted, true, 'a source-cache intermediate batch was published');
+      assert.equal(readySourceCachePublications, 0);
+      assert.equal(
+        readSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id).state,
+        'pending',
+      );
+      collections.prepare = originalPrepare;
+      if (failure === 'replacement') writeFileSync(path, f.bytes[0]!);
+      f.db.close();
+      const cold = openDatabase(f.paths.database, f.profileId);
+      try {
+        attachPersonalDurability(cold, { root: f.root, profileId: f.profileId });
+        assert.equal(
+          readSelectedSourceContextClassification(cold, f.root, f.profileId, f.id).state,
+          'pending',
+        );
+        const recovered = await prepareSelectedSourceContextClassification(
+          cold,
+          f.root,
+          f.profileId,
+          f.id,
+        );
+        assert.equal(recovered.state, 'ready');
+        if (recovered.state !== 'ready') return;
+        const parsed = validateJSONL(f.bytes[0]!);
+        assert.equal(parsed.valid, true);
+        assert.equal(parsed.entries.length, 65);
+        for (const entry of parsed.entries) {
+          const versionId = intakeCandidateVersionIdForRevision(entry, 'revision-1');
+          const selected = recovered.isSourceContextVersion(versionId);
+          assert.equal(selected, entry === parsed.entries[0]);
+        }
+      } finally {
+        cold.close();
+      }
+    });
+});
+test('source-cache completion rechecks physical evidence after preparing its final batch', async (t) => {
+  const f = await fixture(t, 1, true, false, undefined, 1),
+    collections = selectedEnvelopeStore(f.db, f.file).collections,
+    originalPrepare = collections.prepare,
+    path = join(f.root, f.paths.relativeRoot, 'sources', f.sourceIds[0] + '.jsonl');
+  let changed = false,
+    controlCollection = '';
+  collections.prepare = (view, input) => {
+    const complete = input.changes.find(
+      (change) =>
+        change.collection.startsWith('source.context.file.') &&
+        change.collection.endsWith('.control') &&
+        change.op === 'put' &&
+        change.key === 'complete' &&
+        change.value === 'ready',
+    );
+    const prepared = originalPrepare(view, input);
+    if (complete && !changed) {
+      changed = true;
+      controlCollection = complete.collection;
+      const replacement = path + '.replacement';
+      writeFileSync(replacement, Buffer.alloc(f.bytes[0]!.length, 32));
+      renameSync(replacement, path);
+    }
+    return prepared;
+  };
+  t.after(() => {
+    collections.prepare = originalPrepare;
+  });
+  const pending = await prepareSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id);
+  assert.equal(changed, true);
+  assert.equal(pending.state, 'pending');
+  assert.notEqual(
+    collections.get(collections.openView(), 'builds', controlCollection, 'complete'),
+    'ready',
+  );
+  assert.equal(
+    readSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id).state,
+    'pending',
+  );
+  collections.prepare = originalPrepare;
+  writeFileSync(path, f.bytes[0]!);
+  const recovered = await prepareSelectedSourceContextClassification(
+    f.db,
+    f.root,
+    f.profileId,
+    f.id,
+  );
+  assert.equal(recovered.state, 'ready');
+  if (recovered.state === 'ready')
+    assert.equal(recovered.isSourceContextVersion(f.versionIds[0]!), true);
 });
 test('empty referenced set uses all allowed sources and first duplicate proposal revision', async (t) => {
   const f = await fixture(t, 4, false, true);

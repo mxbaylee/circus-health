@@ -565,23 +565,62 @@ async function prepareClassification(
         unavailable = true;
         continue;
       }
-      const cacheWriter = createEnvelopeBuildWriter(
-        db,
-        file,
-        cache + '.versions',
-        view.logical.domainVersion,
-        { assertRunning: assertCurrent },
-      );
-      await cacheWriter.put('initializing', '1');
-      await cacheWriter.remove('initializing');
+      const versionCollection = cache + '.versions';
+      let cacheChanges: IntakeCollectionChange[] = [
+        {
+          area: 'builds',
+          collection: versionCollection,
+          op: 'put',
+          key: 'initializing',
+          value: '1',
+        },
+        { area: 'builds', collection: versionCollection, op: 'delete', key: 'initializing' },
+      ];
+      const flushCache = async (complete: boolean) => {
+        if (complete) {
+          assertCurrent();
+          checkWitness(db, root, profileId, witness);
+          cacheChanges.push({
+            area: 'builds',
+            collection: cache + '.control',
+            op: 'put',
+            key: 'complete',
+            value: 'ready',
+          });
+        }
+        if (!cacheChanges.length) return;
+        assertCurrent();
+        const changes = cacheChanges;
+        cacheChanges = [];
+        const operationId = randomUUID();
+        const prepared = store.prepare(store.openView(), {
+          operationId,
+          requestDigest: workflowHash(operationId),
+          domainVersion: view.logical.domainVersion,
+          changes,
+        });
+        store.commitMaintenance(prepared, {
+          assertCurrent() {
+            assertCurrent();
+            if (complete) checkWitness(db, root, profileId, witness);
+          },
+        });
+        await setImmediate();
+      };
       for (const record of parsed.entries)
         if (sourceContextEnvelope(record.value)) {
           const versionId = withIntakeFileWork(work, () =>
             intakeCandidateVersionIdForRevision(record, revision),
           );
-          await cacheWriter.put(versionId, '1');
+          cacheChanges.push({
+            area: 'builds',
+            collection: versionCollection,
+            op: 'put',
+            key: versionId,
+            value: '1',
+          });
+          if (cacheChanges.length === 64) await flushCache(false);
         }
-      await cacheWriter.flush();
       assertCurrent();
       try {
         checkWitness(db, root, profileId, witness);
@@ -589,15 +628,18 @@ async function prepareClassification(
         unavailable = true;
         continue;
       }
-      const cacheControl = createEnvelopeBuildWriter(
-        db,
-        file,
-        cache + '.control',
-        view.logical.domainVersion,
-        { assertRunning: assertCurrent },
-      );
-      await cacheControl.put('complete', 'ready');
-      await cacheControl.flush();
+      try {
+        await flushCache(true);
+      } catch (error) {
+        if (
+          error instanceof SourceContextClassificationPending &&
+          (error.reason === 'source_changed' || error.reason === 'source_evidence_unavailable')
+        ) {
+          unavailable = true;
+          continue;
+        }
+        throw error;
+      }
     }
     await writers.sources.put(selected.id, JSON.stringify(witness));
     for (const version of entries(cache + '.versions')) {

@@ -76,6 +76,14 @@ The deferred-unit acceptance fixture uses 90 seconds for real encrypted publicat
 
 The complete 140-question fixture uses a test-local 450-second host guard. Its controlled run took about 351 seconds through exact policy and tokens, late-blocker refusal, answering, cache-loss recovery and final acceptance. Every original assertion is retained; this is neither a model-latency target nor evidence of acceptable interactive performance. Counted collection and physical-head reads remain substantial and are documented in [bounded intake views](docs/data/intake-bounded-views.md).
 
+The off-page package recovery and retained queue-window fixtures each use a
+300-second host hang guard. The former preserves real role/model review,
+clinical acceptance, backup reconstruction and exact retries across 61 members;
+the latter retains 13 groups, complete cursor traversal and changed-source work
+counts. Queue setup omits unused preparations and traverses the same groups in
+two pages. Neither fixture makes live model requests, and these guards do not
+change the original history, acceptance, continuation or browser budgets.
+
 The 257-artifact identity fixture uses a 450-second host guard. Its 449 occurrence
 checks, exact membership, payload-work counters, cancellation and same-byte
 replacement refusal remain the oracle. Retained-history preparation has exceeded
