@@ -1200,8 +1200,10 @@ export function attachRecordDurability(
   // publish() still verifies and durably publishes immutable records and HEAD
   // before SQLite COMMIT. A lost WAL tail is rebuilt from that accepted history.
   // Unattached databases and non-WAL connections retain their existing settings.
-  if (!status.dirty && db.prepare('PRAGMA main.journal_mode').get()?.journal_mode === 'wal')
+  if (!status.dirty && db.prepare('PRAGMA main.journal_mode').get()?.journal_mode === 'wal') {
     db.exec('PRAGMA main.synchronous=NORMAL');
+    db.exec('PRAGMA main.wal_autocheckpoint=8192');
+  }
   return status;
 }
 const statusStatements = new WeakMap<

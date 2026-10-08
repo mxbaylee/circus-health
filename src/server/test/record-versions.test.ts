@@ -2,7 +2,7 @@ import test, { type TestContext } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { openDatabase, transaction, revision, type Database, type SqliteRow } from '../database.ts';
@@ -1222,21 +1222,99 @@ test('only a successfully attached accepted journal selects normal-synchronous W
   f.db.exec('PRAGMA main.synchronous=FULL');
   const synchronous = (db: Database) =>
     Number(db.prepare('PRAGMA main.synchronous').get()?.synchronous);
+  const checkpointPages = (db: Database) =>
+    Number(db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint);
   assert.equal(synchronous(f.db), 2);
+  assert.equal(checkpointPages(f.db), 1000);
   assert.throws(() =>
     attachRecordDurability(f.db, { profileId: 'wrong-profile', storage: f.storage }),
   );
   assert.equal(synchronous(f.db), 2, 'failed attachment cannot alter cache policy');
+  assert.equal(checkpointPages(f.db), 1000, 'failed attachment keeps the default WAL threshold');
   attachRecordDurability(f.db, { profileId, storage: f.storage });
   assert.equal(f.db.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'wal');
   assert.equal(synchronous(f.db), 1);
+  assert.equal(checkpointPages(f.db), 8192);
   const unattached = f.open('unattached-policy.sqlite');
   assert.equal(synchronous(unattached), 2, 'opening alone does not relax SQLite durability');
+  assert.equal(checkpointPages(unattached), 1000);
   const rollback = f.open('rollback-policy.sqlite');
   rollback.exec('PRAGMA main.journal_mode=DELETE; PRAGMA main.synchronous=FULL');
   attachRecordDurability(rollback, { profileId, storage: f.storage });
   assert.equal(rollback.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'delete');
   assert.equal(synchronous(rollback), 2, 'non-WAL modes keep their existing durability');
+  assert.equal(checkpointPages(rollback), 1000, 'non-WAL modes keep their checkpoint setting');
+});
+
+test('attached WAL policy reduces actual checkpoint restarts while preserving accepted recovery', (t) => {
+  const walSalt = (path: string) => {
+    // SQLite WAL header: salts at bytes 16..23 change on reset after a completed checkpoint.
+    // https://www.sqlite.org/fileformat2.html#the_write_ahead_log
+    const file = openSync(path, 'r');
+    try {
+      const header = Buffer.alloc(24);
+      assert.equal(readSync(file, header, 0, header.length, 0), header.length);
+      assert.ok([0x377f0682, 0x377f0683].includes(header.readUInt32BE(0)));
+      return header.subarray(16, 24).toString('hex');
+    } finally {
+      closeSync(file);
+    }
+  };
+  const run = (threshold: 1000 | 8192) => {
+    const f = fixture(t),
+      path = resolve(f.root, 'current.sqlite'),
+      wal = path + '-wal';
+    attachRecordDurability(f.db, { profileId, storage: f.storage });
+    if (threshold === 1000) f.db.exec('PRAGMA main.wal_autocheckpoint=1000');
+    assert.equal(
+      f.db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint,
+      threshold,
+    );
+    const pageSize = Number(f.db.prepare('PRAGMA main.page_size').get()?.page_size);
+    assert.equal(f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get()?.busy, 0);
+    transaction(f.db, () => {
+      f.db
+        .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+        .run('fictional-wal-large', 'Fictional ' + 'x'.repeat(5 * 1024 * 1024));
+    });
+    const firstSalt = walSalt(wal),
+      firstWalBytes = statSync(wal).size;
+    assert.ok(firstWalBytes >= 32 + 1000 * (pageSize + 24));
+    assert.ok(firstWalBytes < 32 + 8192 * (pageSize + 24));
+    transaction(f.db, () => {
+      f.db
+        .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+        .run('fictional-wal-small', 'Fictional small');
+    });
+    const restarts = Number(walSalt(wal) !== firstSalt);
+    const beforeDrain = statSync(path).size;
+    assert.equal(f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get()?.busy, 0);
+    assert.equal(statSync(wal).size, 0);
+    assert.ok(statSync(path).size >= beforeDrain);
+    const recovered = rebuild(f, `recovered-wal-${threshold}.sqlite`);
+    const currentLarge = f.db
+      .prepare('SELECT display_name FROM people WHERE id=?')
+      .get('fictional-wal-large')?.display_name;
+    const currentSmall = f.db
+      .prepare('SELECT display_name FROM people WHERE id=?')
+      .get('fictional-wal-small')?.display_name;
+    assert.equal(
+      recovered.prepare('SELECT display_name FROM people WHERE id=?').get('fictional-wal-large')
+        ?.display_name,
+      currentLarge,
+    );
+    assert.equal(
+      recovered.prepare('SELECT display_name FROM people WHERE id=?').get('fictional-wal-small')
+        ?.display_name,
+      currentSmall,
+    );
+    assert.equal(currentLarge, 'Fictional ' + 'x'.repeat(5 * 1024 * 1024));
+    assert.equal(currentSmall, 'Fictional small');
+    assert.equal(history(recovered, 'people', 'fictional-wal-large').length, 1);
+    return restarts;
+  };
+  assert.equal(run(1000), 1, 'default threshold restarts the WAL after the large commit');
+  assert.equal(run(8192), 0, 'attached threshold avoids that checkpoint restart');
 });
 
 test('journal-backed WAL refuses failed HEAD publication and recovers durable acceptance before cache COMMIT', (t) => {

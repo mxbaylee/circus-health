@@ -29,7 +29,7 @@ jobs:
       - run: |
           mkdir -p "$RUNNER_TEMP/pr71-cpu-prof/baseline" "$RUNNER_TEMP/pr71-cpu-prof/wal-8192"
           set +e
-          CRS_HISTORY_WAL_CHECKPOINT_PAGES=default node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof/baseline" --test src/server/test/intake-history-publication.test.ts 2>&1 | tee "$RUNNER_TEMP/pr71-history-baseline.log"
+          CRS_HISTORY_WAL_CHECKPOINT_PAGES=1000 node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof/baseline" --test src/server/test/intake-history-publication.test.ts 2>&1 | tee "$RUNNER_TEMP/pr71-history-baseline.log"
           baseline_status=${PIPESTATUS[0]}
           CRS_HISTORY_WAL_CHECKPOINT_PAGES=8192 node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof/wal-8192" --test src/server/test/intake-history-publication.test.ts 2>&1 | tee "$RUNNER_TEMP/pr71-history-wal-8192.log"
           candidate_status=${PIPESTATUS[0]}
