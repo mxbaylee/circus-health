@@ -2,7 +2,7 @@ import { IncomingMessage } from 'node:http';
 import { Socket } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, HttpError } from '../database.ts';
@@ -30,7 +30,7 @@ import {
   readSelectedPackageRoleHash,
 } from '../intake-package-plan.ts';
 import { clearIntakeStateCache } from '../intake-state-storage.ts';
-import { clearPackageSourceSession } from '../intake-package-session.ts';
+import { clearPackageSourceSession, packageSourceSessionWork } from '../intake-package-session.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { decisionIndexGet } from '../intake-reading-state.ts';
 import { intakeSourceVersion } from '../intake-state-access.ts';
@@ -148,6 +148,101 @@ test('actual native package plan creates implicit distinct units, exact identity
     }),
     (error: unknown) => error instanceof HttpError && error.code === 'VERSION_CONFLICT',
   );
+});
+
+test('new plan verifies a reused inventory against same-size physical replacement', async (t) => {
+  const f = fixture(t, 3),
+    context = {
+      ...f,
+      rawDomainVersion: intakeSourceVersion(f.db, f.id).rawVersion,
+    };
+  const built = await buildDurablePackageInventory(context);
+  assert.equal(built.inventory.summary.members, 3);
+  const path = profileOriginal(
+    f.root,
+    String(f.db.prepare('SELECT path FROM source_files WHERE id=?').get(f.id)!.path),
+    f.profileId,
+  );
+  const original = readFileSync(path),
+    changed = Buffer.from(original),
+    replacement = join(f.root, 'changed-fictional.zip');
+  changed[0] = changed[0]! ^ 1;
+  writeFileSync(replacement, changed);
+  renameSync(replacement, path);
+  await assert.rejects(
+    createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+      version: f.intake.version,
+      operationId: 'changed-source-plan',
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
+  assert.equal(readPackagePlanScope(f.db, f.root, f.profileId, f.id), undefined);
+  writeFileSync(path, original);
+  const before = packageSourceSessionWork(f.db)?.coldHashBytes ?? 0;
+  const plan = await createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+    version: f.intake.version,
+    operationId: 'verified-source-plan',
+  });
+  assert.equal(plan.plan.unitCount, 3);
+  assert.equal((packageSourceSessionWork(f.db)?.coldHashBytes ?? 0) - before, original.length);
+});
+
+test('new plan refuses a symlink substituted after inventory verification', async (t) => {
+  const f = fixture(t, 3);
+  await buildDurablePackageInventory({
+    ...f,
+    rawDomainVersion: intakeSourceVersion(f.db, f.id).rawVersion,
+  });
+  const path = profileOriginal(
+    f.root,
+    String(f.db.prepare('SELECT path FROM source_files WHERE id=?').get(f.id)!.path),
+    f.profileId,
+  );
+  const moved = path + '.moved';
+  renameSync(path, moved);
+  symlinkSync(moved, path);
+  await assert.rejects(
+    createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+      version: f.intake.version,
+      operationId: 'symlink-source-plan',
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
+  assert.equal(readPackagePlanScope(f.db, f.root, f.profileId, f.id), undefined);
+});
+
+test('new plan refuses source replacement during asynchronous unit preparation', async (t) => {
+  const f = fixture(t);
+  await buildDurablePackageInventory({
+    ...f,
+    rawDomainVersion: intakeSourceVersion(f.db, f.id).rawVersion,
+  });
+  const path = profileOriginal(
+    f.root,
+    String(f.db.prepare('SELECT path FROM source_files WHERE id=?').get(f.id)!.path),
+    f.profileId,
+  );
+  const original = readFileSync(path),
+    changed = Buffer.from(original),
+    replacement = path + '.replacement',
+    before = intakeWorkCounters(f.db).warm.packagePlanUnitIds;
+  changed[0] = changed[0]! ^ 1;
+  let replaced = false;
+  await assert.rejects(
+    createPagedPackagePlan(f.db, f.root, f.profileId, f.id, {
+      version: f.intake.version,
+      operationId: 'changed-during-plan',
+      assertRunning() {
+        if (replaced || intakeWorkCounters(f.db).warm.packagePlanUnitIds <= before) return;
+        writeFileSync(replacement, changed);
+        renameSync(replacement, path);
+        replaced = true;
+      },
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
+  assert.equal(replaced, true);
+  assert.equal(readPackagePlanScope(f.db, f.root, f.profileId, f.id), undefined);
 });
 
 test('selected package routes use authorized bounded pages and exact unit details', async (t) => {

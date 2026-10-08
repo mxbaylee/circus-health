@@ -47,6 +47,16 @@ Current limitations, open in [CRS-141](../todo/CRS-141.md): above 1000 selection
 
 ## Regression evidence and implementation boundaries
 
+Native queue preparation retains ownership of its active disposable scratch
+database until it has rolled back or completed. Clearing the queue cache revokes
+the preparation immediately but leaves that scratch open until its owner unwinds;
+the revoked result cannot become the next cached queue. Profile closure therefore
+preserves the original cancellation cause instead of masking it with a rollback
+against a closed scratch database. A subsequent authorized read creates fresh
+scratch. The focused `intake-queue-lifecycle.test.ts` covers profile closure and
+cache clearing with an open profile. This does not establish the cause of every
+browser connection reset or replace the complete Stop/reload/Resume journey.
+
 The implementation and independently fictional tests below cover the current contracts. Count tests measure one prepared original review context and journal writes, bytes and rows at 10, 50 and 200 selections; a separate multi-proposal test verifies one original context for three distinct proposal blocks. Each distinct proposal still requires its own retained-byte validation and exact review token. A 500-selection yielded save serves a read before completion. Real process-restart browser coverage replays the original operation. Person badge/list checks use mounted per-path API responses; they are not a full destination-page browser journey. The overview's approval state, outcome rendering, identity controls and source controls, plus the detail identity panel, are split into smaller modules. The detail record editor remains in its existing component.
 
 - Counts/links and owner interpretation (R19/R28): `PersonClinicalRecords`, the existing `/record-owner` resolver, shared `person-scope` helpers and `SavedRecordDestinations`; `clinical-person-ownership.test.ts`, `person-clinical-records.test.tsx`, `person-scope.test.ts` and `import-review-reliability.test.tsx`.

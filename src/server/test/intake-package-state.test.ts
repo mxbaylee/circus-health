@@ -139,6 +139,8 @@ test('complete inventory persists exact occurrences without changing logical rev
   const retry = await buildDurablePackageInventory(f.context);
   assert.equal(retry.reused, true);
   assert.equal(retry.work.checkpoints, 0);
+  assert.equal(retry.sourceVerificationWork.coldHashBytes, 0);
+  assert.equal(retry.sourceVerificationWork.verificationCacheHits, 1);
   assert.equal(f.objects.size, beforeObjects);
   const cold = packageSourceSessionWork(f.context.db)!.coldHashBytes;
   assert.equal(cold, f.bytes.length);
@@ -149,7 +151,8 @@ test('complete inventory persists exact occurrences without changing logical rev
   const replay = await buildDurablePackageInventory(context);
   assert.equal(replay.reused, true);
   assert.equal(f.objects.size, beforeObjects);
-  assert.equal(packageSourceSessionWork(context.db), null);
+  assert.equal(replay.sourceVerificationWork.coldHashBytes, f.bytes.length);
+  assert.equal(packageSourceSessionWork(context.db)!.coldHashBytes, f.bytes.length);
   assert.deepEqual(readdirSync(join(context.root, '.package-index-staging')), []);
 });
 

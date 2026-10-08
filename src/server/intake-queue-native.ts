@@ -56,8 +56,13 @@ type PreparedQueue = {
 };
 const preparedQueues = new WeakMap<DatabaseSync, Map<string, PreparedQueue>>();
 const preparingQueues = new WeakMap<DatabaseSync, Map<string, Promise<void>>>();
+const activeScratch = new WeakMap<DatabaseSync, Set<PreparedQueue['scratch']>>();
+const queueGenerations = new WeakMap<DatabaseSync, number>();
 export function clearPreparedCollectionQueues(db: DatabaseSync) {
-  for (const value of preparedQueues.get(db)?.values() || []) value.scratch.close();
+  queueGenerations.set(db, (queueGenerations.get(db) ?? 0) + 1);
+  const active = activeScratch.get(db);
+  for (const value of preparedQueues.get(db)?.values() || [])
+    if (!active?.has(value.scratch)) value.scratch.close();
   preparedQueues.delete(db);
 }
 
@@ -166,8 +171,17 @@ async function prepareCollectionQueueReadNow(
     return;
   }
   const scratch = previous?.scratch || disposableSqlite('circus-queue-preparation-');
+  const generation = queueGenerations.get(db) ?? 0;
+  let active = activeScratch.get(db);
+  if (!active) {
+    active = new Set();
+    activeScratch.set(db, active);
+  }
+  active.add(scratch);
   let retained = !!previous;
   const assertCurrent = () => {
+    if ((queueGenerations.get(db) ?? 0) !== generation)
+      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
     options.assertRunning?.();
     assertIntakeOwner(db, profileId);
     if (clinicalReviewRevision(db) !== revision)
@@ -343,7 +357,9 @@ async function prepareCollectionQueueReadNow(
     scratch.db.exec('ROLLBACK');
     throw error;
   } finally {
-    if (!retained) scratch.close();
+    active.delete(scratch);
+    if (!active.size) activeScratch.delete(db);
+    if (!retained || (queueGenerations.get(db) ?? 0) !== generation) scratch.close();
   }
 }
 export async function listIntakeReportQueueRead(

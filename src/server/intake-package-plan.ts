@@ -38,6 +38,7 @@ import {
   buildDurablePackageInventory,
   readDurablePackageInventory,
 } from './intake-package-state.ts';
+import { withPackageSessionSource } from './intake-package-session.ts';
 import { extractionPins, packageMemberUnit, streamedExtractionPlanId } from './intake-plan.ts';
 import { workflowHash } from './intake-workflow.ts';
 import { observeIntakeLogicalVersion } from './import-version-diagnostics.ts';
@@ -1325,205 +1326,216 @@ export async function createPagedPackagePlan(
   const pins = extractionPins(db, file),
     pinsHash = workflowHash(pins),
     logical = before.logicalBinding;
-  const assertCurrent = () => {
-    input.assertRunning?.();
-    assertIntakeOwner(db, profileId);
-    const current = source(db, profileId, id),
-      version = intakeSourceVersion(db, id);
-    if (
-      version.version !== before.version ||
-      version.logicalBinding !== logical ||
-      workflowHash(extractionPins(db, current)) !== pinsHash
-    )
-      throw new HttpError(
-        409,
-        'EXTRACTION_CONFIG_CHANGED',
-        'Source or extraction settings changed. Reload before creating the plan.',
-      );
-  };
-  const { inventory } = await buildDurablePackageInventory({
-    db,
-    root,
-    profileId,
-    id,
-    rawDomainVersion: before.rawVersion,
-    assertRunning: assertCurrent,
-  });
-  const current = activeRecord(db, file, view),
-    currentId = current ? scalar<string>(view, current, 'id') : undefined;
-  if (current) await prepareLegacyPlan(db, file, view, current, inventory, assertCurrent);
-  const recipeKey = workflowHash([inventory.inventoryId, pins]),
-    knownId = collections.get(collections.openView(), 'logical', 'package.recipes', recipeKey),
-    known =
-      typeof knownId === 'string' && flow.workflow
-        ? view.find('plan', flow.workflow, knownId)
-        : undefined;
-  if (knownId !== undefined && !known) throw Error('Retained package recipe plan is missing');
-  let plan: IntakePackagePlanV2;
-  // A selected descriptor already proves this complete ordered unit recipe.
-  // Repeating the same pins needs no second O(N) identity pass.
-  if (
-    current &&
-    workflowHash(readPlan(view, current, inventory).pins) === pinsHash &&
-    readPlan(view, current, inventory).inventory.id === inventory.inventoryId
-  )
-    plan = readPlan(view, current, inventory);
-  else if (known) {
-    plan = readPlan(view, known, inventory);
-    if (workflowHash(plan.pins) !== pinsHash || plan.inventory.id !== inventory.inventoryId)
-      throw Error('Retained package recipe binding disagrees');
-  } else {
-    function* ids() {
-      for (let offset = 0; offset < inventory.summary.members; offset += 100)
-        for (const member of inventory.range({ offset, limit: 100 }))
-          yield packageMemberUnit(member).id;
-    }
-    const identity = await streamedExtractionPlanId(db, id, pins, ids(), assertCurrent);
-    const retained = flow.workflow && view.find('plan', flow.workflow, identity.id);
-    if (retained) {
-      await prepareLegacyPlan(db, file, view, retained, inventory, assertCurrent);
-      plan = readPlan(view, retained, inventory);
-    } else {
-      if (currentId && input.replacePlanId !== currentId)
-        throw new HttpError(
-          409,
-          'PLAN_CHANGED',
-          'Explicitly replace the prior extraction plan; completed work remains retained',
-        );
-      plan = {
-        format: 'health-intake-package-plan-v2',
-        id: identity.id,
-        createdAt: new Date().toISOString(),
-        status: 'active',
-        pins,
-        inventory: {
-          id: inventory.inventoryId,
-          sourceHash: inventory.binding.sourceHash,
-          memberCount: inventory.summary.members,
-          totalExpandedBytes: inventory.summary.expandedBytes,
-          uniqueByteContents: inventory.uniqueByteContents,
-        },
-        unitRecipe: 'health-intake-package-member-unit-v1',
-        unitCount: identity.unitCount,
+  return withPackageSessionSource(
+    { db, root, profileId, id, assertRunning: input.assertRunning },
+    async (lease) => {
+      const assertCurrent = () => {
+        lease.assertCurrent();
+        assertIntakeOwner(db, profileId);
+        const current = source(db, profileId, id),
+          version = intakeSourceVersion(db, id);
+        if (
+          version.version !== before.version ||
+          version.logicalBinding !== logical ||
+          workflowHash(extractionPins(db, current)) !== pinsHash
+        )
+          throw new HttpError(
+            409,
+            'EXTRACTION_CONFIG_CHANGED',
+            'Source or extraction settings changed. Reload before creating the plan.',
+          );
       };
-    }
-  }
-  assertCurrent();
-  const retained = flow.workflow && view.find('plan', flow.workflow, plan.id);
-  const selectionId = retained ? currentId : plan.id;
-  if (!selectionId) throw Error('Retained package plan has no active selection');
-  const at = new Date().toISOString(),
-    operation = externalId ? { id: externalId, fingerprint, at } : undefined,
-    changes: IntakeEnvelopeMutation[] = [];
-  if (flow.workflow) {
-    if (!retained) {
-      if (current)
+      const { inventory } = await buildDurablePackageInventory({
+        db,
+        root,
+        profileId,
+        id,
+        rawDomainVersion: before.rawVersion,
+        assertRunning: assertCurrent,
+      });
+      const current = activeRecord(db, file, view),
+        currentId = current ? scalar<string>(view, current, 'id') : undefined;
+      if (current) await prepareLegacyPlan(db, file, view, current, inventory, assertCurrent);
+      const recipeKey = workflowHash([inventory.inventoryId, pins]),
+        knownId = collections.get(collections.openView(), 'logical', 'package.recipes', recipeKey),
+        known =
+          typeof knownId === 'string' && flow.workflow
+            ? view.find('plan', flow.workflow, knownId)
+            : undefined;
+      if (knownId !== undefined && !known) throw Error('Retained package recipe plan is missing');
+      let plan: IntakePackagePlanV2;
+      // A selected descriptor already proves this complete ordered unit recipe.
+      // Repeating the same pins needs no second O(N) identity pass.
+      if (
+        current &&
+        workflowHash(readPlan(view, current, inventory).pins) === pinsHash &&
+        readPlan(view, current, inventory).inventory.id === inventory.inventoryId
+      )
+        plan = readPlan(view, current, inventory);
+      else if (known) {
+        plan = readPlan(view, known, inventory);
+        if (workflowHash(plan.pins) !== pinsHash || plan.inventory.id !== inventory.inventoryId)
+          throw Error('Retained package recipe binding disagrees');
+      } else {
+        function* ids() {
+          for (let offset = 0; offset < inventory.summary.members; offset += 100)
+            for (const member of inventory.range({ offset, limit: 100 }))
+              yield packageMemberUnit(member).id;
+        }
+        const identity = await streamedExtractionPlanId(db, id, pins, ids(), assertCurrent);
+        const retained = flow.workflow && view.find('plan', flow.workflow, identity.id);
+        if (retained) {
+          await prepareLegacyPlan(db, file, view, retained, inventory, assertCurrent);
+          plan = readPlan(view, retained, inventory);
+        } else {
+          if (currentId && input.replacePlanId !== currentId)
+            throw new HttpError(
+              409,
+              'PLAN_CHANGED',
+              'Explicitly replace the prior extraction plan; completed work remains retained',
+            );
+          plan = {
+            format: 'health-intake-package-plan-v2',
+            id: identity.id,
+            createdAt: new Date().toISOString(),
+            status: 'active',
+            pins,
+            inventory: {
+              id: inventory.inventoryId,
+              sourceHash: inventory.binding.sourceHash,
+              memberCount: inventory.summary.members,
+              totalExpandedBytes: inventory.summary.expandedBytes,
+              uniqueByteContents: inventory.uniqueByteContents,
+            },
+            unitRecipe: 'health-intake-package-member-unit-v1',
+            unitCount: identity.unitCount,
+          };
+        }
+      }
+      assertCurrent();
+      const retained = flow.workflow && view.find('plan', flow.workflow, plan.id);
+      const selectionId = retained ? currentId : plan.id;
+      if (!selectionId) throw Error('Retained package plan has no active selection');
+      const at = new Date().toISOString(),
+        operation = externalId ? { id: externalId, fingerprint, at } : undefined,
+        changes: IntakeEnvelopeMutation[] = [];
+      if (flow.workflow) {
+        if (!retained) {
+          if (current)
+            changes.push({
+              op: 'set',
+              record: current,
+              field: 'status',
+              jsonText: JSON.stringify('superseded'),
+            });
+          changes.push({
+            op: 'append',
+            record: flow.workflow,
+            field: 'plans',
+            jsonText: JSON.stringify(plan),
+          });
+        }
+        if (operation)
+          changes.push({
+            op: 'append',
+            record: flow.workflow,
+            field: 'operations',
+            jsonText: JSON.stringify(operation),
+          });
+      } else
         changes.push({
           op: 'set',
-          record: current,
-          field: 'status',
-          jsonText: JSON.stringify('superseded'),
+          record: flow.intake,
+          field: 'workflow',
+          jsonText: JSON.stringify({
+            format: 'health-intake-workflow-v1',
+            plans: [plan],
+            operations: operation ? [operation] : [],
+          }),
         });
-      changes.push({
-        op: 'append',
-        record: flow.workflow,
-        field: 'plans',
-        jsonText: JSON.stringify(plan),
+      const storageOperationId = randomUUID();
+      const prepared = await prepareIntakeEnvelopeMutation(db, file, {
+        reader: view,
+        changes,
+        additionalLogicalChanges: [
+          ...(current ? compatibilityAdoptions(db, file, view, current) : []),
+          ...(retained && plan.id !== currentId
+            ? compatibilityAdoptions(db, file, view, retained)
+            : []),
+          {
+            area: 'logical',
+            collection: 'package.recipes',
+            op: 'put',
+            key: recipeKey,
+            value: plan.id,
+          },
+          {
+            area: 'logical',
+            collection: 'package.selection',
+            op: 'put',
+            key: 'active',
+            value: selectionId,
+          },
+          ...(commandKey
+            ? [
+                {
+                  area: 'logical' as const,
+                  collection: 'package.commands',
+                  op: 'put' as const,
+                  key: commandKey,
+                  value: JSON.stringify({ fingerprint, planId: plan.id }),
+                },
+              ]
+            : []),
+        ],
+        operationId: storageOperationId,
+        requestDigest: fingerprint,
+        domainVersion: before.rawVersion + 1,
+        assertRunning: assertCurrent,
+        prepareDerived: async (derived) => {
+          const stagedFlow = workflow(derived.reader),
+            addresses: string[] = [];
+          if (!retained) {
+            if (current) addresses.push(view.address(current));
+            const appended = derived.reader.childAt(
+              stagedFlow.workflow!,
+              'plans',
+              flow.workflow ? view.childCount(flow.workflow, 'plans') : 0,
+            );
+            if (!appended) throw Error('New package reader plan is missing');
+            addresses.push(derived.reader.address(appended));
+          }
+          return recordCollectionReaderCoverageTransition(db, file, derived, {
+            planAddresses: addresses,
+          });
+        },
       });
-    }
-    if (operation)
-      changes.push({
-        op: 'append',
-        record: flow.workflow,
-        field: 'operations',
-        jsonText: JSON.stringify(operation),
-      });
-  } else
-    changes.push({
-      op: 'set',
-      record: flow.intake,
-      field: 'workflow',
-      jsonText: JSON.stringify({
-        format: 'health-intake-workflow-v1',
-        plans: [plan],
-        operations: operation ? [operation] : [],
-      }),
-    });
-  const storageOperationId = randomUUID();
-  const prepared = await prepareIntakeEnvelopeMutation(db, file, {
-    reader: view,
-    changes,
-    additionalLogicalChanges: [
-      ...(current ? compatibilityAdoptions(db, file, view, current) : []),
-      ...(retained && plan.id !== currentId
-        ? compatibilityAdoptions(db, file, view, retained)
-        : []),
-      { area: 'logical', collection: 'package.recipes', op: 'put', key: recipeKey, value: plan.id },
-      {
-        area: 'logical',
-        collection: 'package.selection',
-        op: 'put',
-        key: 'active',
-        value: selectionId,
-      },
-      ...(commandKey
-        ? [
-            {
-              area: 'logical' as const,
-              collection: 'package.commands',
-              op: 'put' as const,
-              key: commandKey,
-              value: JSON.stringify({ fingerprint, planId: plan.id }),
-            },
-          ]
-        : []),
-    ],
-    operationId: storageOperationId,
-    requestDigest: fingerprint,
-    domainVersion: before.rawVersion + 1,
-    assertRunning: assertCurrent,
-    prepareDerived: async (derived) => {
-      const stagedFlow = workflow(derived.reader),
-        addresses: string[] = [];
-      if (!retained) {
-        if (current) addresses.push(view.address(current));
-        const appended = derived.reader.childAt(
-          stagedFlow.workflow!,
-          'plans',
-          flow.workflow ? view.childCount(flow.workflow, 'plans') : 0,
-        );
-        if (!appended) throw Error('New package reader plan is missing');
-        addresses.push(derived.reader.address(appended));
-      }
-      return recordCollectionReaderCoverageTransition(db, file, derived, {
-        planAddresses: addresses,
-      });
-    },
-  });
-  assertCurrent();
-  intakeTransaction(
-    db,
-    () => {
       assertCurrent();
-      collections.stage(prepared.prepared!);
+      intakeTransaction(
+        db,
+        () => {
+          assertCurrent();
+          collections.stage(prepared.prepared!);
+        },
+        { operationId: storageOperationId, fingerprint },
+      );
+      const after = intakeSourceVersion(db, id);
+      observeIntakeLogicalVersion(
+        db,
+        id,
+        { version: before.version, logicalBinding: before.logicalBinding! },
+        { version: after.version, logicalBinding: after.logicalBinding! },
+        'plan',
+      );
+      return {
+        format: 'health-intake-package-plan-result-v2',
+        intakeId: id,
+        version: after.version,
+        plan,
+        replayed: false,
+      };
     },
-    { operationId: storageOperationId, fingerprint },
   );
-  const after = intakeSourceVersion(db, id);
-  observeIntakeLogicalVersion(
-    db,
-    id,
-    { version: before.version, logicalBinding: before.logicalBinding! },
-    { version: after.version, logicalBinding: after.logicalBinding! },
-    'plan',
-  );
-  return {
-    format: 'health-intake-package-plan-result-v2',
-    intakeId: id,
-    version: after.version,
-    plan,
-    replayed: false,
-  };
 }
 
 /** Host dispatch preserves retained expanded units and the legacy role merge.

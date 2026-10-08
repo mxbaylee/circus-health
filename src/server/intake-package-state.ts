@@ -385,25 +385,33 @@ export async function buildDurablePackageInventory(
     fail('Package inventory requires initialized intake authority');
   const existing = readDurablePackageInventory(context);
   if (existing)
-    return {
-      inventory: existing,
-      reused: true,
-      work: {
-        checkpoints: 0,
-        retainedRecords: existing.summary.members,
-        reusedRecords: existing.summary.members,
-        verifiedRecords: 0,
-        checkpointEdits: 0,
-        checkpointEncodedBytes: 0,
-        peakCheckpointEdits: 0,
-        peakCheckpointEncodedBytes: 0,
-        prefixDescriptorReadBytes: 0,
-        prefixDescriptorHashBytes: 0,
-      },
-      traversalWork: undefined,
-      sourceVerificationWork: emptyPackageSourceVerificationWork(),
-      spoolWork: undefined,
-    };
+    return withPackageSessionSource(context, async (lease) => {
+      lease.assertCurrent();
+      if (
+        JSON.stringify(existing.binding) !== JSON.stringify(lease.binding) ||
+        readDurablePackageInventory(context)?.inventoryId !== existing.inventoryId
+      )
+        fail('Complete inventory changed during source verification');
+      return {
+        inventory: existing,
+        reused: true,
+        work: {
+          checkpoints: 0,
+          retainedRecords: existing.summary.members,
+          reusedRecords: existing.summary.members,
+          verifiedRecords: 0,
+          checkpointEdits: 0,
+          checkpointEncodedBytes: 0,
+          peakCheckpointEdits: 0,
+          peakCheckpointEncodedBytes: 0,
+          prefixDescriptorReadBytes: 0,
+          prefixDescriptorHashBytes: 0,
+        },
+        traversalWork: undefined,
+        sourceVerificationWork: { ...lease.verificationWork },
+        spoolWork: undefined,
+      };
+    });
   let current = store.openView();
   const attemptText = plain(store.get(current, 'builds', 'package.attempts', binding.sourceHash));
   const inventoryId = attemptText ?? hash(randomUUID());

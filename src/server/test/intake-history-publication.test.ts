@@ -1,7 +1,8 @@
 /** Small publication diagnosis; the original full identity histories remain separate gates. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import fs, { writeFileSync, opendirSync, statSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
@@ -18,7 +19,7 @@ import {
   workflowHash,
 } from '../intake-workflow.ts';
 import { canonicalLiteral, validateJSONL, validationSummary } from '../intake-format.ts';
-import { profileOriginal } from '../profile-storage.ts';
+import { profileOriginal, profilePaths } from '../profile-storage.ts';
 import { intakeTransaction } from '../intake.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { selectedEnvelopeStore } from '../intake-collection-envelope.ts';
@@ -27,7 +28,21 @@ import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import { fixture, envelope } from './intake-identity-native-fixture.ts';
 
-function observePublication(t: test.TestContext, db: Database, id: string) {
+function journalBytes(path: string): number {
+  let bytes = 0;
+  const directory = opendirSync(path);
+  try {
+    for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+      const child = join(path, entry.name);
+      bytes += entry.isDirectory() ? journalBytes(child) : statSync(child).size;
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return bytes;
+}
+
+function observePublication(t: test.TestContext, db: Database, id: string, archive: string) {
   const collections = selectedEnvelopeStore(db, { id }).collections;
   const record = createRecordVersionWorkCounters();
   const phases = new Map<
@@ -45,23 +60,63 @@ function observePublication(t: test.TestContext, db: Database, id: string) {
   const snapshot = () => intakeWorkCounters(db).warm;
   const start = snapshot();
   const sql = { prepared: 0, executed: 0 };
+  const retainedBytesBefore = journalBytes(archive);
+  const filesystem = new Map<string, { calls: number; elapsedMs: number; bytes: number }>();
+  const fsProbes = (['readFileSync', 'writeFileSync', 'fsyncSync', 'lstatSync'] as const).map(
+    (method) => {
+      const original = fs[method];
+      return t.mock.method(fs, method, (...args: unknown[]) => {
+        const time = performance.now();
+        let bytes = 0;
+        try {
+          const result = Reflect.apply(original, fs, args);
+          if (method === 'readFileSync' && (typeof result === 'string' || Buffer.isBuffer(result)))
+            bytes = Buffer.byteLength(result);
+          if (method === 'writeFileSync') {
+            if (typeof args[1] === 'string') bytes = Buffer.byteLength(args[1]);
+            else if (ArrayBuffer.isView(args[1])) bytes = args[1].byteLength;
+          }
+          return result;
+        } finally {
+          const value = filesystem.get(method) ?? { calls: 0, elapsedMs: 0, bytes: 0 };
+          value.calls++;
+          value.elapsedMs += performance.now() - time;
+          value.bytes += bytes;
+          filesystem.set(method, value);
+        }
+      });
+    },
+  );
+  syncBuiltinESMExports();
+  const sqlTimings = new Map<string, { calls: number; elapsedMs: number }>();
+  const statementPrototype = Object.getPrototypeOf(db.prepare('SELECT 1'));
+  const statementProbes = (['run', 'get', 'all', 'iterate'] as const).map((method) => {
+    const original = statementPrototype[method];
+    return t.mock.method(
+      statementPrototype,
+      method,
+      function (this: { sourceSQL: string }, ...args: unknown[]) {
+        sql.executed++;
+        const time = performance.now();
+        try {
+          return Reflect.apply(original, this, args);
+        } finally {
+          const key = method + ':' + this.sourceSQL;
+          const value = sqlTimings.get(key) ?? { calls: 0, elapsedMs: 0 };
+          value.calls++;
+          value.elapsedMs += performance.now() - time;
+          sqlTimings.set(key, value);
+        }
+      },
+    );
+  });
   const prepareSql = DatabaseSync.prototype.prepare;
   const sqlProbe = t.mock.method(
     DatabaseSync.prototype,
     'prepare',
     function (this: DatabaseSync, query: string) {
       sql.prepared++;
-      const statement = prepareSql.call(this, query);
-      for (const method of ['run', 'get', 'all', 'iterate'] as const) {
-        const original = statement[method].bind(statement);
-        Object.assign(statement, {
-          [method]: (...args: unknown[]) => {
-            sql.executed++;
-            return Reflect.apply(original, statement, args);
-          },
-        });
-      }
-      return statement;
+      return prepareSql.call(this, query);
     },
   );
   const probes = (['prepare', 'stage', 'commitMaintenance'] as const).map((method) => {
@@ -80,7 +135,10 @@ function observePublication(t: test.TestContext, db: Database, id: string) {
           used = process.cpuUsage(cpu);
         const delta = Object.fromEntries(
           Object.entries(after)
-            .filter(([key, value]) => value !== before[key as keyof typeof before])
+            .filter(
+              ([key, value]) =>
+                !key.includes('Peak') && value !== before[key as keyof typeof before],
+            )
             .map(([key, value]) => [key, value - before[key as keyof typeof before]]),
         );
         const value = phases.get(phase) ?? {
@@ -113,24 +171,42 @@ function observePublication(t: test.TestContext, db: Database, id: string) {
       }
     });
   });
+  let disposed = false;
+  const dispose = () => {
+    if (!disposed) {
+      for (const probe of probes) probe.mock.restore();
+      sqlProbe.mock.restore();
+      for (const probe of statementProbes) probe.mock.restore();
+      for (const probe of fsProbes) probe.mock.restore();
+      syncBuiltinESMExports();
+      disposed = true;
+    }
+  };
+  t.after(dispose);
   return {
     record,
     finish() {
-      for (const probe of probes) probe.mock.restore();
-      sqlProbe.mock.restore();
+      dispose();
       const end = snapshot();
       t.diagnostic(
         JSON.stringify({
           phases: Object.fromEntries(phases),
           record,
           totalSql: sql,
+          filesystem: Object.fromEntries(filesystem),
+          retainedJournalGrowthBytes: journalBytes(archive) - retainedBytesBefore,
+          connectionPeakPreparedBytes: end.collectionPeakPreparedBytes,
+          sqlTimings: [...sqlTimings].sort((a, b) => b[1].elapsedMs - a[1].elapsedMs).slice(0, 12),
           work: Object.fromEntries(
             Object.entries(end)
-              .filter(([key, value]) => value !== start[key as keyof typeof start])
+              .filter(
+                ([key, value]) =>
+                  !key.includes('Peak') && value !== start[key as keyof typeof start],
+              )
               .map(([key, value]) => [key, value - start[key as keyof typeof start]]),
           ),
           resourceUsage: process.resourceUsage(),
-          note: 'Nested phases overlap; fsRead/fsWrite are OS operation counts and maxRSS is process peak, not cumulative logical bytes.',
+          note: 'Instrumented durations include probe overhead. Nested phases overlap. SQL covers all connections; iterate timing excludes iteration. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. fsRead/fsWrite are OS counters; maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
         }),
       );
       assert.ok((phases.get('prepare')?.calls ?? 0) > 0);
@@ -288,7 +364,12 @@ async function publicationFixture(t: test.TestContext, count: number) {
     count + 1,
   );
   assert.equal(new Set(details.proposals.map((value) => value.id)).size, count + 1);
-  const probe = observePublication(t, f.db, f.original.id);
+  const probe = observePublication(
+    t,
+    f.db,
+    f.original.id,
+    profilePaths(f.root, f.profileId).records,
+  );
   const prepared = await withRecordVersionWork(probe.record, () =>
     prepareIntakeWorkflowCommand(
       f.db,

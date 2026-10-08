@@ -76,11 +76,15 @@ The deferred-unit acceptance fixture uses 90 seconds for real encrypted publicat
 
 The complete 140-question fixture uses a test-local 450-second host guard. Its controlled run took about 351 seconds through exact policy and tokens, late-blocker refusal, answering, cache-loss recovery and final acceptance. Every original assertion is retained; this is neither a model-latency target nor evidence of acceptable interactive performance. Counted collection and physical-head reads remain substantial and are documented in [bounded intake views](docs/data/intake-bounded-views.md).
 
-The 257-artifact identity fixture also uses a 450-second host guard. Its complete
-controlled run took about 412 seconds through real native history publication,
-public membership, warm verification, cancellation and same-byte file-replacement
-refusal. Its 449 occurrence checks and payload-work counters remain the oracle;
-the large preparation footprint remains an explicit cost limitation.
+The 257-artifact identity fixture uses a 450-second host guard. Its 449 occurrence
+checks, exact membership, payload-work counters, cancellation and same-byte
+replacement refusal remain the oracle. Retained-history preparation has exceeded
+that guard in required CI; a local pass or an earlier head's timing is not current
+qualification. Diagnose publication separately with the small fictional
+`intake-history-publication.test.ts` before rerunning the original full history.
+The probe separates tree preparation, staging, maintenance, SQL and filesystem API
+work. Its instrumented timings include probe overhead; byte totals, retained
+journal growth and process/connection high-water marks are distinct measurements.
 
 The retained-plan retry fixture uses 300 seconds to publish 65 plans, clear their selected catalog in one version and verify units after cache loss. The off-page proposal-closure fixture uses 180 seconds for 65 questions and 65 unrelated versions, cancellation, atomic publication and reconstruction. The corrected-ownership fixture uses 180 seconds for a committed person correction, 97 retained identity receipts, exact policy comparison, in-history request progress and cancellation cleanup. Their work counts, retained evidence and exact replay assertions determine correctness; these budgets only bound a stalled host fixture.
 
