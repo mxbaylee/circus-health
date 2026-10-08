@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/pr71-history-diagnostic.yml
       - src/server/test/intake-history-publication.test.ts
+      - src/server/intake-source-context-state.ts
 
 permissions:
   contents: read
