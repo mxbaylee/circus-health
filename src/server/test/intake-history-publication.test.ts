@@ -662,7 +662,9 @@ for (const count of [4, 8])
   );
 
 if (process.env.CRS_IDENTITY_GROUNDING_DIAGNOSTIC === '1')
-  for (const count of [4, 8])
+  for (const count of process.env.CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED === '1'
+    ? [4, 8, 16, 32]
+    : [4, 8])
     test(`native identity grounding phase counts: ${count} new artifacts`, async (t) => {
       const f = await publicationFixture(t, count);
       const start = { ...intakeWorkCounters(f.db).warm };
@@ -798,68 +800,122 @@ if (process.env.CRS_IDENTITY_GROUNDING_DIAGNOSTIC === '1')
         throw error;
       }
       const profileDirectory = process.env.CRS_IDENTITY_CPU_PROFILE_DIR;
-      const profiler = profileDirectory ? new Session() : undefined;
-      if (profiler) {
-        try {
-          profiler.connect();
-          await new Promise<void>((resolve, reject) =>
-            profiler.post('Profiler.enable', (error) => (error ? reject(error) : resolve())),
-          );
-          await new Promise<void>((resolve, reject) =>
-            profiler.post('Profiler.start', (error) => (error ? reject(error) : resolve())),
-          );
-        } catch (error) {
-          profiler.disconnect();
-          dispose();
-          throw error;
-        }
-      }
-      const before = performance.now(),
-        beforeCpu = process.cpuUsage();
-      try {
-        const review = await withRecordVersionWork(record, () =>
-          getNativeIntakeIdentityReview(f.db, f.root, f.profileId, f.original.id, f.groupId),
+      const profileSelection = process.env.CRS_IDENTITY_CPU_PROFILE_PHASE || 'all';
+      if (!['all', 'coldHttp', 'stableHttp', 'directWarm'].includes(profileSelection))
+        throw Error('Unsupported native grounding profile phase');
+      let cpuProfileBytes = 0;
+      const phases: Array<Record<string, unknown>> = [];
+      const point = () => ({
+        time: performance.now(),
+        cpu: process.cpuUsage(),
+        fsWrite: process.resourceUsage().fsWrite,
+        counters: { ...counters },
+        work: { ...intakeWorkCounters(f.db).warm },
+        record: { ...record.operation },
+      });
+      const delta = (before: Record<string, number>, after: Record<string, number>) =>
+        Object.fromEntries(
+          Object.entries(after)
+            .filter(
+              ([key, value]) =>
+                !key.includes('Peak') && !key.startsWith('max') && value !== (before[key] ?? 0),
+            )
+            .map(([key, value]) => [key, value - (before[key] ?? 0)]),
         );
-        assert.ok(review);
-      } finally {
-        const elapsedMs = performance.now() - before,
-          cpu = process.cpuUsage(beforeCpu),
-          after = intakeWorkCounters(f.db).warm;
-        let cpuProfileBytes = 0;
-        if (profiler) {
-          try {
-            const profile = await new Promise<unknown>((resolve, reject) =>
-              profiler.post('Profiler.stop', (error, result) =>
-                error ? reject(error) : resolve(result.profile),
-              ),
+      const measure = async (name: string, run: () => Promise<unknown>) => {
+        const before = point();
+        const shouldProfile =
+          !!profileDirectory && (profileSelection === 'all' || profileSelection === name);
+        const profiler = shouldProfile ? new Session() : undefined;
+        let profilerConnected = false;
+        let profilerStarted = false;
+        let outcome = 'failed';
+        try {
+          if (profiler) {
+            profiler.connect();
+            profilerConnected = true;
+            await new Promise<void>((resolve, reject) =>
+              profiler.post('Profiler.enable', (error) => (error ? reject(error) : resolve())),
             );
-            const encoded = JSON.stringify(profile);
-            writeFileSync(join(profileDirectory!, `native-grounding-${count}.cpuprofile`), encoded);
-            cpuProfileBytes = Buffer.byteLength(encoded);
-          } finally {
-            profiler.disconnect();
-            dispose();
+            await new Promise<void>((resolve, reject) =>
+              profiler.post('Profiler.start', (error) => (error ? reject(error) : resolve())),
+            );
+            profilerStarted = true;
           }
-        } else dispose();
+          const review = await run();
+          assert.ok(review);
+          outcome = 'completed';
+          return review;
+        } finally {
+          const after = point();
+          const phase: Record<string, unknown> = {
+            name,
+            outcome,
+            elapsedMs: after.time - before.time,
+            cpuMicros: after.cpu.user + after.cpu.system - before.cpu.user - before.cpu.system,
+            processFsWrite: after.fsWrite - before.fsWrite,
+            ...delta(before.counters, after.counters),
+            intakeWork: delta(before.work, after.work),
+            recordWork: name === 'directWarm' ? delta(before.record, after.record) : null,
+          };
+          phases.push(phase);
+          if (profiler) {
+            try {
+              if (profilerStarted) {
+                const profile = await new Promise<unknown>((resolve, reject) =>
+                  profiler.post('Profiler.stop', (error, result) =>
+                    error ? reject(error) : resolve(result.profile),
+                  ),
+                );
+                const encoded = JSON.stringify(profile);
+                writeFileSync(
+                  join(profileDirectory!, `native-${name}-${count}.cpuprofile`),
+                  encoded,
+                );
+                const profileBytes = Buffer.byteLength(encoded);
+                phase.cpuProfileBytes = profileBytes;
+                cpuProfileBytes += profileBytes;
+              }
+            } finally {
+              if (profilerConnected) profiler.disconnect();
+            }
+          }
+        }
+      };
+      const before = point();
+      try {
+        await measure('coldHttp', () => f.review());
+        await measure('stableHttp', () => f.review());
+        await measure('directWarm', () =>
+          withRecordVersionWork(record, () =>
+            getNativeIntakeIdentityReview(f.db, f.root, f.profileId, f.original.id, f.groupId),
+          ),
+        );
+      } finally {
+        const afterPoint = point(),
+          after = intakeWorkCounters(f.db).warm;
+        dispose();
         t.diagnostic(
           JSON.stringify({
             nativeGroundingDiagnostic: {
               newArtifacts: count,
               retainedProposals: count + 1,
               ...counters,
-              elapsedMs,
-              cpuMicros: cpu.user + cpu.system,
+              phases,
+              elapsedMs: afterPoint.time - before.time,
+              cpuMicros:
+                afterPoint.cpu.user + afterPoint.cpu.system - before.cpu.user - before.cpu.system,
               cpuProfileBytes,
               fullPreparations:
                 after.identityPreviewFullPreparations - start.identityPreviewFullPreparations,
               collectionNodesWritten: after.collectionNodesWritten - start.collectionNodesWritten,
               collectionWrittenBytes: after.collectionWrittenBytes - start.collectionWrittenBytes,
-              recordWork: record.operation,
+              recordWorkDirectWarm: record.operation,
               artifactChecks:
                 after.identityPreviewArtifactChecks - start.identityPreviewArtifactChecks,
               artifactOccurrences:
                 after.identityPreviewArtifactOccurrences - start.identityPreviewArtifactOccurrences,
-              note: 'Aggregate fixture-only observation. Proof sweep elapsed includes caller HMAC/stat work between iterator rows, not isolated SQLite scan time. Stat/HMAC and immediate counts include other native work. Timing includes probe overhead and is not a gate.',
+              note: "Aggregate fixture-only observation. Cold and stable phases use the same HTTP route as the original 257-artifact fixture; directWarm matches its guarded native call. Record-version work is unavailable for HTTP phases because their request context does not inherit this test call's work scope; recordWorkDirectWarm covers only the direct call. Counter deltas exclude peak gauges. Failed phases retain partial counts. All diagnostic sizes remain below the 256-file verification cache boundary and do not prove the full-run outcome. Proof sweep elapsed includes caller HMAC/stat work between iterator rows, not isolated SQLite scan time. Stat/HMAC and immediate counts include other native work. Timing includes probe overhead and is not a gate.",
             },
           }),
         );
