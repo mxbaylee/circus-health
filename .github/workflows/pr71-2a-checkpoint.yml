@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 4318908faa03447e6a844b277f98b3d8da87589e
+          ref: 98858d6e44bdf8771e01de79f08407a98fa4080d
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -30,7 +30,7 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Observe WAL cycles and publication writes including final drain
+      - name: Classify prior commit reset correlations including final drain
         env:
           CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
           CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
