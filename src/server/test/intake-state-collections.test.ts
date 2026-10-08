@@ -1045,3 +1045,103 @@ test('map batching stops at reference, adoption and delete barriers and preserve
   inspect(cold);
   assert.deepEqual(cold.replay(id, digest(id)), result);
 });
+
+for (const inTransaction of [false, true])
+  for (const unrelated of [0, 80])
+    test(`collection preparation ${inTransaction ? 'retains raw transaction reads' : 'authenticates unchanged pages once within its own seal'}: ${unrelated}`, (t) => {
+      const { db, identity } = fixture(t);
+      const prefix = intakeNamespace(identity) + 'node:';
+      let probing = false;
+      const reads = new Map<string, number>();
+      const prepare = db.prepare.bind(db);
+      t.mock.method(db, 'prepare', (sql: string) => {
+        const statement = prepare(sql);
+        if (sql.startsWith('SELECT length(CAST(value AS BLOB))')) {
+          const get = statement.get;
+          statement.get = (...args) => {
+            const key = args.at(-1);
+            if (probing && typeof key === 'string' && key.startsWith(prefix))
+              reads.set(key, (reads.get(key) ?? 0) + 1);
+            return Reflect.apply(get, statement, args);
+          };
+        }
+        return statement;
+      });
+      const store = createIntakeStateStorage(db, identity).collections;
+      for (let start = 0; start < 64 + unrelated; start += 64)
+        mutate(
+          db,
+          store,
+          Array.from({ length: Math.min(64, 64 + unrelated - start) }, (_, n) => ({
+            area: 'logical' as const,
+            collection: 'values',
+            op: 'put' as const,
+            key: String(start + n).padStart(3, '0'),
+            value: `fictional-${start + n}`,
+          })),
+          1,
+        );
+      const operationId = randomUUID(),
+        view = store.openView();
+      let nodeReads = 0;
+      const prepareMeasured = () => {
+        const before = intakeWorkCounters(db).warm.collectionNodeReads;
+        probing = true;
+        try {
+          return store.prepare(view, {
+            operationId,
+            requestDigest: digest(operationId),
+            domainVersion: 2,
+            changes: Array.from({ length: 32 }, (_, n) => ({
+              area: 'logical' as const,
+              collection: 'values',
+              op: 'put' as const,
+              key: String(n).padStart(3, '0'),
+              value: `changed-${n}`,
+            })),
+          });
+        } finally {
+          nodeReads = intakeWorkCounters(db).warm.collectionNodeReads - before;
+          probing = false;
+        }
+      };
+      const result = inTransaction
+        ? transaction(db, () => store.stage(prepareMeasured()))
+        : (() => {
+            const prepared = prepareMeasured();
+            return transaction(db, () => store.stage(prepared));
+          })();
+      t.diagnostic(
+        JSON.stringify({
+          inTransaction,
+          unrelated,
+          distinct: reads.size,
+          reads: [...reads.values()].reduce((a, b) => a + b, 0),
+          maxReads: Math.max(...reads.values()),
+          nodeReads,
+        }),
+      );
+      for (let n = 0; n < 64 + unrelated; n++)
+        assert.equal(
+          store.get(store.openView(), 'logical', 'values', String(n).padStart(3, '0')),
+          n < 32 ? `changed-${n}` : `fictional-${n}`,
+        );
+      assert.deepEqual(store.replay(operationId, digest(operationId)), result);
+      assert.ok(reads.size > 0, 'the preparation authenticates actual retained pages');
+      assert.equal(
+        [...reads.values()].reduce((sum, n) => sum + n, 0),
+        nodeReads,
+        'actual SQL reads reconcile with the public preparation work counter',
+      );
+      if (inTransaction)
+        assert.ok(
+          Math.max(...reads.values()) > 1,
+          'transaction-bound preparation must not borrow the optimistic page certificate',
+        );
+      else
+        assert.equal(
+          Math.max(...reads.values()),
+          1,
+          'no unchanged node is fetched twice within this bounded preparation',
+        );
+    });

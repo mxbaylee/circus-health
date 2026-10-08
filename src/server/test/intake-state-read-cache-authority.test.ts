@@ -306,3 +306,229 @@ test('throwing getters, registry invalidation and foreign handles cannot retain 
   assert.throws(closing.read, /closed|not open|authority changed/i);
   assert.equal(closing.fired(), true);
 });
+
+// Input callbacks follow retained-page authentication, including the selected
+// collection directory. No callback may mint a preparation from a mixed basis.
+function duringPreparation(f: ReturnType<typeof fixture>, mutate: () => void) {
+  const operationId = randomUUID();
+  const view = f.store.openView();
+  const before = intakeWorkCounters(f.db).warm.collectionNodeReads;
+  let fired = false;
+  return {
+    operationId,
+    fired: () => fired,
+    prepare: () =>
+      f.store.prepare(view, {
+        operationId,
+        requestDigest: digest(operationId),
+        domainVersion: 2,
+        changes: [
+          { area: 'logical', collection: 'values', op: 'put', key: '000', value: 'changed-0' },
+          {
+            area: 'logical',
+            collection: 'values',
+            op: 'put',
+            key: '001',
+            get value() {
+              if (!fired) {
+                assert.ok(
+                  intakeWorkCounters(f.db).warm.collectionNodeReads > before,
+                  'the callback follows actual retained-page authentication',
+                );
+                fired = true;
+                mutate();
+              }
+              return 'changed-1';
+            },
+          },
+        ],
+      }),
+  };
+}
+
+for (const kind of [
+  'local-restored',
+  'peer-restored',
+  'main-schema',
+  'temp-schema',
+  'registry',
+] as const)
+  test(`bounded preparation refuses whole-call authority drift: ${kind}`, (t) => {
+    const f = fixture(t),
+      leaf = f.ancestors.at(-1)!;
+    const peer = kind === 'peer-restored' ? new DatabaseSync(f.file) : undefined;
+    try {
+      const pending = duringPreparation(f, () => {
+        if (kind === 'registry') clearIntakeStateCache(f.db);
+        else if (kind === 'main-schema')
+          f.db.exec('CREATE TABLE fictional_prepare_drift(value TEXT)');
+        else if (kind === 'temp-schema')
+          f.db.exec('CREATE TEMP TABLE fictional_prepare_drift(value TEXT)');
+        else {
+          const writer = peer ?? f.db;
+          writer.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', leaf.key);
+          restore(writer, leaf);
+        }
+      });
+      assert.throws(pending.prepare, /changed|stale|generation|collection|read/i);
+      assert.equal(pending.fired(), true);
+      assert.equal(f.store.replay(pending.operationId, digest(pending.operationId)), undefined);
+      assert.equal(f.read(), 'fictional-0', 'no prepared replacement was published');
+      const fresh = duringPreparation(f, () => {});
+      const prepared = fresh.prepare();
+      if (kind === 'local-restored') {
+        // Restoring raw bytes is not authorization to journal a direct SQL write.
+        assert.throws(
+          () => transaction(f.db, () => f.store.stage(prepared)),
+          /uncommitted direct writes/,
+        );
+        f.store.disposePreparation(prepared);
+        assert.equal(f.read(), 'fictional-0');
+      } else {
+        const result = transaction(f.db, () => f.store.stage(prepared));
+        assert.equal(f.read(), 'changed-0');
+        assert.deepEqual(f.store.replay(fresh.operationId, digest(fresh.operationId)), result);
+      }
+    } finally {
+      peer?.close();
+    }
+  });
+
+for (const kind of ['missing', 'corrupt', 'replaced'] as const)
+  test(`bounded preparation refuses changed physical authority after page reads: ${kind}`, (t) => {
+    const f = fixture(t),
+      other = fixture(t);
+    const original = Buffer.from(f.authority.objects.get('head')!);
+    const pending = duringPreparation(f, () => {
+      if (kind === 'missing') f.authority.objects.delete('head');
+      else
+        f.authority.objects.set(
+          'head',
+          kind === 'corrupt'
+            ? Buffer.from('{}')
+            : Buffer.from(other.authority.objects.get('head')!),
+        );
+    });
+    try {
+      assert.throws(
+        pending.prepare,
+        /invalid head|accepted authority requires configured current projection|collection/i,
+      );
+      assert.equal(pending.fired(), true);
+    } finally {
+      f.authority.objects.set('head', original);
+    }
+    assert.equal(f.read(), 'fictional-0');
+    assert.equal(f.store.replay(pending.operationId, digest(pending.operationId)), undefined);
+  });
+
+test('nested preparation revokes its caller and cannot retain a provisional capability', (t) => {
+  const f = fixture(t);
+  let nested: ReturnType<typeof f.store.prepare> | undefined;
+  const pending = duringPreparation(f, () => {
+    nested = duringPreparation(f, () => {}).prepare();
+  });
+  assert.throws(pending.prepare, /collection read authority changed/);
+  assert.equal(pending.fired(), true);
+  assert.ok(nested);
+  assert.throws(() => f.store.inspectPrepared(nested!), /expired|foreign|preparation/);
+  assert.equal(f.read(), 'fictional-0');
+});
+
+test('cancelled preparation cannot certify retained pages or expose a partial result', (t) => {
+  const f = fixture(t);
+  const cancellation = Error('Fictional preparation cancellation');
+  const pending = duringPreparation(f, () => {
+    throw cancellation;
+  });
+  assert.throws(pending.prepare, (error) => error === cancellation);
+  assert.equal(pending.fired(), true);
+  assert.equal(f.store.replay(pending.operationId, digest(pending.operationId)), undefined);
+  const leaf = f.ancestors.at(-1)!;
+  f.db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', leaf.key);
+  assert.throws(f.read, /tree|schema|collection/);
+  restore(f.db, leaf);
+  assert.equal(f.read(), 'fictional-0');
+});
+
+test('transaction-only preparation cannot certify a rolled-back raw-page repair', (t) => {
+  const f = fixture(t),
+    leaf = f.ancestors.at(-1)!;
+  f.db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', leaf.key);
+  f.db.exec('SAVEPOINT fictional_preparation_repair');
+  try {
+    restore(f.db, leaf);
+    const repaired = duringPreparation(f, () => {}).prepare();
+    f.store.disposePreparation(repaired);
+    const changes = f.db.prepare('SELECT total_changes() AS n').get()!.n;
+    f.db.exec('ROLLBACK TO fictional_preparation_repair; RELEASE fictional_preparation_repair');
+    assert.equal(f.db.prepare('SELECT total_changes() AS n').get()!.n, changes);
+    assert.throws(() => duringPreparation(f, () => {}).prepare(), /tree|schema|collection/);
+  } finally {
+    if (f.db.isTransaction)
+      f.db.exec('ROLLBACK TO fictional_preparation_repair; RELEASE fictional_preparation_repair');
+    restore(f.db, leaf);
+  }
+  assert.equal(f.read(), 'fictional-0');
+});
+
+for (const kind of ['peer-restored', 'registry'] as const)
+  test(`completed map batches cannot rebase preparation authority across a barrier: ${kind}`, (t) => {
+    const f = fixture(t);
+    const peer = kind === 'peer-restored' ? new DatabaseSync(f.file) : undefined;
+    const leaf = f.ancestors.at(-1)!;
+    const operationId = randomUUID();
+    const before = intakeWorkCounters(f.db).warm.collectionPreparedBytes;
+    let fired = false;
+    try {
+      assert.throws(
+        () =>
+          f.store.prepare(f.store.openView(), {
+            operationId,
+            requestDigest: digest(operationId),
+            domainVersion: 2,
+            changes: [
+              { area: 'logical', collection: 'values', op: 'put', key: '000', value: 'changed-0' },
+              { area: 'logical', collection: 'values', op: 'put', key: '001', value: 'changed-1' },
+              { area: 'logical', collection: 'values', op: 'delete', key: '099' },
+              {
+                area: 'logical',
+                collection: 'values',
+                op: 'put',
+                key: '002',
+                get value() {
+                  assert.ok(
+                    intakeWorkCounters(f.db).warm.collectionPreparedBytes > before,
+                    'the first grouped batch has already prepared real tree nodes',
+                  );
+                  assert.equal(fired, false);
+                  fired = true;
+                  if (peer) {
+                    peer
+                      .prepare('UPDATE main.app_meta SET value=? WHERE key=?')
+                      .run('{}', leaf.key);
+                    restore(peer, leaf);
+                  } else clearIntakeStateCache(f.db);
+                  return 'changed-2';
+                },
+              },
+            ],
+          }),
+        /changed|stale|generation|collection|preparation/i,
+      );
+      assert.equal(fired, true);
+      assert.equal(f.store.replay(operationId, digest(operationId)), undefined);
+      for (let n = 0; n < 3; n++)
+        assert.equal(
+          f.store.get(f.store.openView(), 'logical', 'values', String(n).padStart(3, '0')),
+          `fictional-${n}`,
+          'neither the earlier batch nor the later batch was published',
+        );
+      const fresh = duringPreparation(f, () => {});
+      const result = transaction(f.db, () => f.store.stage(fresh.prepare()));
+      assert.equal(f.read(), 'changed-0');
+      assert.deepEqual(f.store.replay(fresh.operationId, digest(fresh.operationId)), result);
+    } finally {
+      peer?.close();
+    }
+  });

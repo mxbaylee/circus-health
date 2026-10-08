@@ -400,8 +400,10 @@ export function createIntakeCollections(owner: {
         throw error;
       }
     });
-  // Audited callers synchronously consume tree iterators and detach bounded
-  // results. No callback-bearing write or asynchronous preparation uses this path.
+  // Callers synchronously consume tree iterators and detach bounded results.
+  // Preparation starts a fresh epoch and returns only an opaque capability after
+  // its final authority check; input callbacks cannot rebase the entry witness.
+  // No write or asynchronous work is authorized by this certificate.
   const runRead = <T>(fn: (pages: typeof tree, certificate?: IntakeTreeReadCertificate) => T): T =>
     withIntakeWork(db, 'warm', () => {
       let certificate: IntakeTreeReadCertificate | undefined;
@@ -451,7 +453,7 @@ export function createIntakeCollections(owner: {
     const raw = get(headKey);
     const generation = certificate?.witness ?? readWitness(),
       registry = registryFor(db);
-    // Only the fixed schema resolver passes its private synchronous certificate.
+    // Fixed schema reads and bounded preparation pass a private certificate.
     // Reuse the entry snapshot, not a new mid-read baseline. runRead must still
     // match it after the final physical HEAD check before returning any result.
     if (
@@ -1224,18 +1226,22 @@ export function createIntakeCollections(owner: {
       view: IntakeCollectionView,
       input: IntakeCollectionMutation,
     ): PreparedIntakeCollectionMutation {
-      return run(() => {
+      // Do not inherit a caller's optimistic read, even if an input getter
+      // starts this preparation from another read. Existing page-cache bounds
+      // apply; SQL transactions retain the uncached, checked fallback.
+      readEpoch = {};
+      return runRead((readTree, certificate) => {
         uuid(input.operationId);
         if (!/^[a-f0-9]{64}$/.test(input.requestDigest)) invalid('collection request digest');
         integer(input.domainVersion);
         if (!Array.isArray(input.changes) || input.changes.length > 64)
           invalid('collection change budget');
         const before = viewData(view),
-          current = before.legacy ? { raw: get(headKey), head: undefined } : selected();
+          current = before.legacy ? { raw: get(headKey), head: undefined } : selected(certificate);
         if (before.raw !== current.raw) invalid('stale collection preparation basis; reopen view');
-        if (receipt(current.head, input.operationId, input.requestDigest))
+        if (receipt(current.head, input.operationId, input.requestDigest, readTree))
           invalid('collection operation already retained; use replay');
-        const pages = tree();
+        const pages = readTree();
         let logical = before.head?.logical.root ?? null,
           builds = before.head?.builds ?? null;
         const changedCollections = new Map<
@@ -1588,6 +1594,10 @@ export function createIntakeCollections(owner: {
           size,
           legacyBridge,
         });
+        // The candidate does not escape until its physical authority and
+        // closing SQL/registry witness are checked. runRead invalidates every
+        // provisional capability if this seal fails.
+        ready();
         return prepared;
       });
     },
