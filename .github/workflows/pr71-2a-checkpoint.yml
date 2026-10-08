@@ -18,11 +18,11 @@ jobs:
     timeout-minutes: 15
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-history-phases
+      OUTPUT: /tmp/pr71-original-history-phase
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 4cd445b14bed66c0a39c6abee4194deeda278ec8
+          ref: 9815f9b0ca88ba21261b8c9f443869bc6220a7f6
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -30,15 +30,13 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Count publication and cold, stable and warm identity phases
+      - name: Locate the original unchanged artifact-history phase
         env:
-          CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
-          CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
-          CRS_IDENTITY_CPU_PROFILE_DIR: /tmp/pr71-history-phases
+          CRS_ARTIFACT_HISTORY_PHASES: '1'
         run: |
           mkdir -p "$OUTPUT"
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          node --test --test-name-pattern='native identity grounding phase counts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/phases.log"
+          npm run test:history -- --test-name-pattern='native warm identity' 2>&1 | tee "$OUTPUT/phases.log"
       - name: Hash diagnostic evidence
         if: always()
         run: |
@@ -47,7 +45,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-history-phases
-          path: /tmp/pr71-history-phases
+          name: pr71-original-history-phase
+          path: /tmp/pr71-original-history-phase
           if-no-files-found: error
           retention-days: 14
