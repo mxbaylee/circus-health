@@ -245,6 +245,39 @@ function nativeReportDetail(): CollectionReportDetail {
   };
 }
 
+it('keeps an unknown list feed unavailable and retries without exposing provisional review', async () => {
+  selectProfile({ id: 'fictional-list-error', name: 'Rowan', placebo: true });
+  let feedReads = 0;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.endsWith('/import-feed')) {
+        feedReads += 1;
+        return new Response(
+          JSON.stringify({
+            error: { code: 'UNAVAILABLE', message: 'Fictional feed unavailable.' },
+          }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.pathname.endsWith('/intakes/limits'))
+        return response({ uploadBytes: 1024, extractionBytes: 1024 });
+      return response([]);
+    }),
+  );
+  const view = render(
+    <MemoryRouter initialEntries={['/import']}>
+      <ImportPage />
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole('alert')).toHaveTextContent('Fictional feed unavailable.');
+  expect(view.container.querySelector('#import-review-title')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Retry import review' }));
+  await waitFor(() => expect(feedReads).toBe(2));
+  expect(view.container.querySelector('#import-review-title')).toBeNull();
+});
+
 it.each(['native', 'legacy', 'legacy-error'] as const)(
   'mounts a direct %s report once after its initial feed settles, then refreshes once for grounding',
   async (format) => {

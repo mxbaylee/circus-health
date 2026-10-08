@@ -2024,7 +2024,12 @@ export function ImportPage() {
     },
   };
 
-  if (!feed.data)
+  const fullDetailSelection =
+    detailSelection &&
+    (!detailSelection.recordId ||
+      detailSelection.personId ||
+      searchParams.get('review') === 'full');
+  if (!feed.data && !(feed.error && fullDetailSelection))
     return (
       <div className="page import-page">
         {feed.error ? (
@@ -2194,10 +2199,7 @@ export function ImportPage() {
             Open Import
           </button>
         </section>
-      ) : detailSelection &&
-        (!detailSelection.recordId ||
-          detailSelection.personId ||
-          searchParams.get('review') === 'full') ? (
+      ) : fullDetailSelection ? (
         feed.loading && !feed.data ? null : (
           <ImportDetailReview
             selection={detailSelection}
