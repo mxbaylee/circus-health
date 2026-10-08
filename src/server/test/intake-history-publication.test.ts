@@ -42,6 +42,15 @@ function journalBytes(path: string): number {
   return bytes;
 }
 
+function fileBytes(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+}
+
 // Node's test mocks retain every call argument/result. These probes retain
 // aggregate counts and SQL shapes, never bound values or returned history.
 function replaceMethod(target: object, key: string, replacement: unknown) {
@@ -61,7 +70,14 @@ function execShape(query: string): string {
   return (value.match(/^[A-Z]+/)?.[0] ?? 'OTHER') + (value.includes(';') ? ' MULTI' : '');
 }
 
-function observePublication(t: test.TestContext, db: Database, id: string, archive: string) {
+function observePublication(
+  t: test.TestContext,
+  db: Database,
+  id: string,
+  archive: string,
+  databasePath: string,
+  pageSize: number,
+) {
   const collections = selectedEnvelopeStore(db, { id }).collections;
   const record = createRecordVersionWorkCounters();
   type Totals = {
@@ -81,8 +97,16 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
   const stack: string[] = [];
   const snapshot = () => intakeWorkCounters(db).warm;
   const start = snapshot();
+  const probeFsWriteBefore = process.resourceUsage().fsWrite;
   const sql = { prepared: 0, executed: 0 };
   const retainedBytesBefore = journalBytes(archive);
+  const databaseFiles = () => ({
+    mainBytes: fileBytes(databasePath),
+    walBytes: fileBytes(databasePath + '-wal'),
+    pageSize,
+  });
+  const databaseFilesBefore = databaseFiles();
+  let maxObservedWalBytes = databaseFilesBefore.walBytes;
   const filesystem = new Map<string, { calls: number; elapsedMs: number; bytes: number }>();
   const dbExec = new Map<string, { calls: number; elapsedMs: number; fsWrite: number }>();
   const sqlTimings = new Map<string, { calls: number; elapsedMs: number }>();
@@ -236,6 +260,8 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
         value.elapsedMs += performance.now() - time;
         value.fsWrite += process.resourceUsage().fsWrite - fsWrite;
         dbExec.set(shape, value);
+        if (shape === 'COMMIT' && this === db)
+          maxObservedWalBytes = Math.max(maxObservedWalBytes, fileBytes(databasePath + '-wal'));
       }
     });
     for (const method of ['prepare', 'stage', 'commitMaintenance'] as const) {
@@ -286,6 +312,24 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
   return {
     record,
     finish() {
+      const databaseFilesBeforeDrain = databaseFiles();
+      const drainBefore = point();
+      const checkpoint = db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get();
+      const drainAfter = point();
+      const finalCheckpointDrain = accumulate(
+        maintenanceSegments,
+        'finalCheckpointDrain',
+        drainBefore,
+        drainAfter,
+      );
+      const databaseFilesAfterDrain = databaseFiles();
+      const probeFsWrite = process.resourceUsage().fsWrite - probeFsWriteBefore;
+      assert.equal(checkpoint?.busy, 0, 'fixture checkpoint must drain without another reader');
+      assert.ok(pageSize > 0 && pageSize <= 65536);
+      assert.ok(
+        Math.max(maxObservedWalBytes, databaseFilesBeforeDrain.walBytes) <= 256 * 1024 * 1024,
+        'bounded fictional WAL fixture exceeded its diagnostic file ceiling',
+      );
       dispose();
       const end = snapshot();
       const maintenanceNodes = maintenanceSegments.get('stage')?.work.collectionNodesWritten ?? 0;
@@ -304,14 +348,28 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
             journalObjectReadBytesPerNode: maintenanceNodes
               ? (publication?.record.objectReadBytes ?? 0) / maintenanceNodes
               : null,
-            processFsWriteUnitsPerNode: maintenanceNodes
+            processFsWriteUnitsPerNode: maintenanceNodes ? probeFsWrite / maintenanceNodes : null,
+            postVerifyPublicationFsWriteUnitsPerNode: maintenanceNodes
               ? (publication?.processFsWrite ?? 0) / maintenanceNodes
               : null,
+            postVerifyPublicationAndFinalDrainFsWriteUnitsPerNode: maintenanceNodes
+              ? ((publication?.processFsWrite ?? 0) + finalCheckpointDrain.processFsWrite) /
+                maintenanceNodes
+              : null,
+          },
+          walCheckpoint: {
+            result: checkpoint,
+            finalDrain: finalCheckpointDrain,
+            databaseFilesBefore,
+            databaseFilesBeforeDrain,
+            databaseFilesAfterDrain,
+            maxObservedWalBytesAfterCommit: maxObservedWalBytes,
           },
           record,
           totalSql: sql,
           filesystem: Object.fromEntries(filesystem),
           dbExec: Object.fromEntries(dbExec),
+          probeProcessFsWrite: probeFsWrite,
           retainedJournalGrowthBytes,
           connectionPeakPreparedBytes: end.collectionPeakPreparedBytes,
           sqlTimings: [...sqlTimings].sort((a, b) => b[1].elapsedMs - a[1].elapsedMs).slice(0, 12),
@@ -324,7 +382,7 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
               .map(([key, value]) => [key, value - start[key as keyof typeof start]]),
           ),
           resourceUsage: process.resourceUsage(),
-          note: 'Instrumented durations include probe overhead. Nested phases overlap; maintenance segments do not. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. Process fsWrite deltas are kernel-reported write units and are not attributable to one SQLite connection. maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
+          note: 'Instrumented durations include probe overhead. Nested phases overlap; final checkpoint drain is separate from maintenance. Whole-probe process fsWrite includes preparation, staging, publication and final drain after a setup-only WAL drain. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. Process fsWrite deltas are kernel-reported write units and are not attributable to one SQLite connection. WAL size is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; the configured auto-checkpoint threshold can be overshot by a transaction. maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
         }),
       );
       assert.ok((phases.get('prepare')?.calls ?? 0) > 0);
@@ -384,16 +442,29 @@ async function publicationFixture(t: test.TestContext, count: number) {
   assert.equal(proposal.sourceTextDependencyToken ?? null, null);
   assert.equal(seedGroupVersion.members.length, 1);
   const baselineCache = Number(f.db.prepare('PRAGMA cache_size').get()?.cache_size);
-  const candidateCache = process.env.CRS_HISTORY_CACHE_MIB;
-  if (candidateCache === '16') {
-    assert.equal(baselineCache, -2000, 'candidate requires the default 2 MiB cache baseline');
-    f.db.exec('PRAGMA cache_size=-16384');
-  } else if (candidateCache !== undefined && candidateCache !== 'default') {
-    throw Error('Unsupported history diagnostic cache setting');
-  }
-  const selectedCache = Number(f.db.prepare('PRAGMA cache_size').get()?.cache_size);
-  assert.equal(selectedCache, candidateCache === '16' ? -16384 : baselineCache);
-  t.diagnostic(JSON.stringify({ cacheKiB: -selectedCache, baselineCacheKiB: -baselineCache }));
+  const baselineWalCheckpoint = Number(
+    f.db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint,
+  );
+  const candidateWalCheckpoint = process.env.CRS_HISTORY_WAL_CHECKPOINT_PAGES;
+  assert.equal(baselineCache, -2000, 'comparison requires the default 2000 KiB cache');
+  assert.equal(baselineWalCheckpoint, 1000, 'comparison requires the default WAL threshold');
+  if (candidateWalCheckpoint === '8192') f.db.exec('PRAGMA main.wal_autocheckpoint=8192');
+  else if (candidateWalCheckpoint !== undefined && candidateWalCheckpoint !== 'default')
+    throw Error('Unsupported history diagnostic WAL threshold');
+  const selectedWalCheckpoint = Number(
+    f.db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint,
+  );
+  assert.equal(selectedWalCheckpoint, candidateWalCheckpoint === '8192' ? 8192 : 1000);
+  assert.equal(Number(f.db.prepare('PRAGMA cache_size').get()?.cache_size), baselineCache);
+  const pageSize = Number(f.db.prepare('PRAGMA main.page_size').get()?.page_size);
+  t.diagnostic(
+    JSON.stringify({
+      cacheKiB: -baselineCache,
+      baselineWalCheckpointPages: baselineWalCheckpoint,
+      walCheckpointPages: selectedWalCheckpoint,
+      pageSize,
+    }),
+  );
   await buildIntakeCollectionEnvelope(f.db, { id: f.original.id });
   intakeTransaction(
     f.db,
@@ -497,11 +568,23 @@ async function publicationFixture(t: test.TestContext, count: number) {
     count + 1,
   );
   assert.equal(new Set(details.proposals.map((value) => value.id)).size, count + 1);
+  const setupDrainBefore = process.resourceUsage().fsWrite;
+  const setupDrain = f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get();
+  assert.equal(setupDrain?.busy, 0, 'fixture setup checkpoint must drain');
+  t.diagnostic(
+    JSON.stringify({
+      setupWalDrain: setupDrain,
+      setupDrainProcessFsWrite: process.resourceUsage().fsWrite - setupDrainBefore,
+      setupWalBytesAfterDrain: fileBytes(profilePaths(f.root, f.profileId).database + '-wal'),
+    }),
+  );
   const probe = observePublication(
     t,
     f.db,
     f.original.id,
     profilePaths(f.root, f.profileId).records,
+    profilePaths(f.root, f.profileId).database,
+    pageSize,
   );
   const prepared = await withRecordVersionWork(probe.record, () =>
     prepareIntakeWorkflowCommand(
