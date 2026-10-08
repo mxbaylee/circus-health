@@ -15,35 +15,44 @@ defaults:
 jobs:
   diagnose:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-browser-diagnostics
+      OUTPUT: /tmp/pr71-projection-comparison
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: 15036736e60cabbacdc48cc8229297373b9e0eaf
+          path: before
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 12c9bd4bf1ca600c3b30e49d73bd93cabe342a0d
+          path: after
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version-file: .nvmrc
+          node-version-file: after/.nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Install scoped PDF dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes qpdf
-      - run: npm run build:assets
-      - run: npx playwright install --with-deps chromium
-      - name: Original optical and holdout journeys with bounded diagnostics
+        working-directory: before
+      - run: npm ci
+        working-directory: after
+      - name: Compare bounded projection work on one host including final drains
         env:
-          CRS_TEST_DIAGNOSTICS: '1'
-          CRS_TEST_SCREENSHOTS: /tmp/pr71-browser-diagnostics/screenshots
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
         run: |
-          mkdir -p "$OUTPUT/screenshots"
-          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          node --input-type=module -e 'import {spawnSync} from "node:child_process"; import {testEnvironment} from "./src/scripts/test-suite.ts"; const r=spawnSync(process.execPath,["--test","--test-concurrency=1","--test-timeout=60000","--test-name-pattern=encrypted browser accepts both|encrypted Import holdout","src/tests/browser/import-mapping-shapes.test.ts","src/tests/browser/import-feed-holdout.test.ts"],{stdio:"inherit",env:testEnvironment(process.env,"browser")}); if(r.error)throw r.error; process.exitCode=r.status??1;' 2>&1 | tee "$OUTPUT/browser.log"
+          set -o pipefail
+          mkdir -p "$OUTPUT"
+          status=0
+          for source in before after; do
+            git -C "$source" rev-parse HEAD > "$OUTPUT/$source-source-sha.txt"
+            (cd "$source" && node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts) 2>&1 | tee "$OUTPUT/$source.log" || status=1
+          done
+          exit "$status"
       - name: Hash diagnostic evidence
         if: always()
         run: |
@@ -52,7 +61,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-browser-diagnostics
-          path: /tmp/pr71-browser-diagnostics
+          name: pr71-projection-comparison
+          path: /tmp/pr71-projection-comparison
           if-no-files-found: error
           retention-days: 14
