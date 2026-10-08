@@ -7,94 +7,81 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 18
+    timeout-minutes: 10
     env:
-      OUTPUT: /tmp/pr71-step3c-receipt
+      HUSKY: '0'
+      OUTPUT: /tmp/pr71-step3c-artifact-phases
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: 9a4b2e0f6effac08fce454b246a808f03355eed1
           persist-credentials: false
-          fetch-depth: 2
-      - name: Preserve exact published source immediately
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Prepare a phase-only copy without changing the original oracle
         run: |
-          mkdir -p "$OUTPUT/logs"
+          mkdir -p "$OUTPUT"
           test "$(git rev-parse HEAD)" = 9a4b2e0f6effac08fce454b246a808f03355eed1
-          test "$(git rev-parse HEAD^{tree})" = 5d0d4b5adef4556377818457000697d55beb6b52
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
           git rev-parse HEAD^{tree} > "$OUTPUT/source-tree-sha.txt"
-          git cat-file -p HEAD > "$OUTPUT/source-commit.txt"
-          git cat-file -p HEAD^ > "$OUTPUT/parent-commit.txt"
-          git archive HEAD | gzip -n > "$OUTPUT/source.tar.gz"
-          git ls-tree -r HEAD > "$OUTPUT/source-tree.txt"
-          git diff HEAD^ HEAD > "$OUTPUT/published.patch"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: pr71-step3c-source-receipt
-          path: /tmp/pr71-step3c-receipt
-          if-no-files-found: error
-          retention-days: 14
-      - name: Observe the existing required run without dispatching tests
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
+          npm ci > "$OUTPUT/npm-ci.log" 2>&1
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
-          import {writeFileSync} from 'node:fs';
-          import {setTimeout as sleep} from 'node:timers/promises';
-          const root=process.env.OUTPUT,api='https://api.github.com/repos/mxbaylee/circus-health';
-          async function get(path,file,json=true){
-            const response=await fetch(api+path,{headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(30000)});
-            const text=await response.text();if(file)writeFileSync(`${root}/${file}`,text);
-            assert.ok(response.ok,`${path}: HTTP ${response.status}`);return json?JSON.parse(text):text;
-          }
-          await get('/pulls/71','pr-at-start.json');
-          await get('/git/ref/heads/codex/pr71-step3-safety-20261008','safety-ref.json');
-          await get('/git/ref/heads/codex/pr71-step3-witness-wip','witness-ref.json');
-          await get('/issues/comments/6063003743','preservation-comment.json');
-          await get('/issues/comments/6063465224','bounded-review-request.json');
-          await get('/issues/comments/6063504616','bounded-review-result.json');
-          const observations=[];
-          let jobs,run;
-          for(let attempt=0;attempt<15;attempt++){
-            run=await get('/actions/runs/37802077446','run.json');assert.equal(run.head_sha,'9a4b2e0f6effac08fce454b246a808f03355eed1');
-            jobs=await get('/actions/runs/37802077446/attempts/1/jobs?per_page=100','jobs.json');assert.equal(jobs.total_count,jobs.jobs.length);
-            const gates=jobs.jobs.filter(job=>['history','acceptance','continuation','checks'].includes(job.name)).map(({id,name,status,conclusion})=>({id,name,status,conclusion}));
-            observations.push({observedAt:new Date().toISOString(),runStatus:run.status,gates});writeFileSync(`${root}/observations.json`,JSON.stringify(observations,null,2));
-            if(run.status==='completed'||attempt===14)break;
-            await sleep(60000);
-          }
-          await get('/pulls/71','pr-at-end.json');
-          const summaries=[];
-          for(const job of jobs.jobs){
-            if(job.status!=='completed')continue;
-            if(job.conclusion==='success'&&!['history','acceptance','continuation','Browser (1/6)','Browser (2/6)','Browser (5/6)','checks'].includes(job.name))continue;
-            try{
-              const text=await get(`/actions/jobs/${job.id}/logs`,`logs/${job.id}.log`,false);
-              const lines=text.split('\n'),start=lines.findIndex(line=>line.includes('failing tests:'));
-              summaries.push({id:job.id,name:job.name,conclusion:job.conclusion,startedAt:job.started_at,completedAt:job.completed_at,excerpt:start>=0?lines.slice(start,start+90):lines.filter(line=>/##\[error\]|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|ℹ skipped|duration_ms|retained proposal artifacts|superseded-only receipt|recovery stage|request finished/.test(line))});
-            }catch(error){summaries.push({id:job.id,name:job.name,captureError:String(error)});}
-          }
-          const counts={};for(const job of jobs.jobs){const key=job.conclusion??job.status;counts[key]=(counts[key]??0)+1;}
-          const summary={observedAt:new Date().toISOString(),head:run.head_sha,runId:run.id,attempt:1,runStatus:run.status,runConclusion:run.conclusion,counts,summaries};
-          writeFileSync(`${root}/summary.json`,JSON.stringify(summary,null,2));console.log(JSON.stringify(summary,null,2));
+          import {readFileSync,writeFileSync} from 'node:fs';
+          import {resolve,dirname} from 'node:path';
+          import {pathToFileURL} from 'node:url';
+          import {createHash} from 'node:crypto';
+          const originalPath=resolve('src/server/test/intake-identity-native-artifact-history.test.ts');
+          const original=readFileSync(originalPath,'utf8');let text=original;
+          const changes=[];
+          function replace(from,to){assert.equal(text.split(from).length,2,from);text=text.replace(from,to);changes.push({from,to});}
+          const marker=`const phaseStart=performance.now();let previous=phaseStart,previousCpu=process.cpuUsage(),previousWork={};
+          function mark(phase,db){const now=performance.now(),cpu=process.cpuUsage(),work={...intakeWorkCounters(db).warm};console.error(JSON.stringify({diagnostic:'full original artifact history with phase observations',phase,elapsedMs:now-phaseStart,durationMs:now-previous,cpuMs:((cpu.user-previousCpu.user)+(cpu.system-previousCpu.system))/1000,maxRssKiB:process.resourceUsage().maxRSS,work:Object.fromEntries(Object.entries(work).filter(([k,v])=>v!==(previousWork[k]??0)).map(([k,v])=>[k,v-(previousWork[k]??0)]))}));previous=now;previousCpu=cpu;previousWork=work;}
+          `;
+          replace('async function artifactHistoryFixture(t: test.TestContext) {',marker+'async function artifactHistoryFixture(t: test.TestContext) {');
+          replace('  await buildIntakeCollectionEnvelope',"  mark('seed-ready',f.db);\n  await buildIntakeCollectionEnvelope");
+          replace('  const prepared = await prepareIntakeWorkflowCommand(',"  mark('preparation-start',f.db);\n  const prepared = await prepareIntakeWorkflowCommand(");
+          replace("  if (prepared.replayed) throw Error('Unexpected artifact fixture replay');","  mark('prepared',f.db);\n  if (prepared.replayed) throw Error('Unexpected artifact fixture replay');");
+          replace('  const cold = await f.review();',"  mark('published',f.db);\n  const cold = await f.review();\n  mark('cold-review',f.db);");
+          replace('  const stable = await f.review();',"  const stable = await f.review();\n  mark('stable-review',f.db);");
+          replace('  const totalBytes = Number(',"  mark('membership-checked',f.db);\n  const totalBytes = Number(");
+          replace('      const after = intakeWorkCounters(f.db).warm;',"      mark('warm-complete',f.db);\n      const after = intakeWorkCounters(f.db).warm;");
+          // Reversing every observation must recover every original byte.
+          let recovered=text;for(const {from,to} of [...changes].reverse()){assert.equal(recovered.split(to).length,2);recovered=recovered.replace(to,from);}assert.equal(recovered,original);
+          text=text.replace(/from '([^']+)'/g,(match,specifier)=>specifier.startsWith('.')?`from '${pathToFileURL(resolve(dirname(originalPath),specifier)).href}'`:match);
+          const hash=value=>createHash('sha256').update(value).digest('hex');
+          writeFileSync(`${process.env.OUTPUT}/original-test.ts`,original);
+          writeFileSync(`${process.env.OUTPUT}/phase-only.test.ts`,text);
+          writeFileSync(`${process.env.OUTPUT}/derivative.json`,JSON.stringify({source:'9a4b2e0f6effac08fce454b246a808f03355eed1',originalPath,originalSha256:hash(original),derivativeSha256:hash(text),changes,scope:'Only phase observations and equivalent absolute imports. Original constants, assertions and 450000 ms case guard retained. Not a profiled run.'},null,2));
           NODE
-      - name: Hash retained evidence
+      - name: Execute the unchanged full scenario with phase observations
+        run: |
+          node --input-type=module <<'NODE'
+          import {spawnSync} from 'node:child_process';
+          import {openSync,closeSync,writeFileSync} from 'node:fs';
+          import {testEnvironment} from './src/scripts/test-suite.ts';
+          const args=['--test','--test-concurrency=1','--test-reporter=spec',`${process.env.OUTPUT}/phase-only.test.ts`];
+          const fd=openSync(`${process.env.OUTPUT}/phase.log`,'w'),started=new Date().toISOString();
+          const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});closeSync(fd);
+          writeFileSync(`${process.env.OUTPUT}/result.json`,JSON.stringify({args,node:process.version,started,finished:new Date().toISOString(),status:result.status,signal:result.signal,error:result.error?.message??null},null,2));process.exitCode=result.status??1;
+          NODE
+      - name: Verify original source unchanged and retain hashes
         if: always()
         run: |
-          if [ -d "$OUTPUT" ]; then
-            cd "$OUTPUT"
-            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-          fi
+          git diff --exit-code
+          cd "$OUTPUT"
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step3c-ci-receipt
-          path: /tmp/pr71-step3c-receipt
+          name: pr71-step3c-artifact-phases
+          path: /tmp/pr71-step3c-artifact-phases
           if-no-files-found: error
           retention-days: 14
