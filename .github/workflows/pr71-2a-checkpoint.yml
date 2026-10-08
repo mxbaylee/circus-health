@@ -7,45 +7,39 @@ on:
 
 permissions:
   contents: read
-  actions: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  capture:
+  diagnose:
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    timeout-minutes: 15
     env:
-      OUTPUT: /tmp/pr71-step3c-final-ci
+      HUSKY: '0'
+      OUTPUT: /tmp/pr71-history-phases
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 9a4b2e0f6effac08fce454b246a808f03355eed1
+          ref: 4cd445b14bed66c0a39c6abee4194deeda278ec8
           persist-credentials: false
           fetch-depth: 1
-      - name: Capture complete final status and previously unfinished job evidence
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Count publication and cold, stable and warm identity phases
         env:
-          GH_TOKEN: ${{ github.token }}
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
+          CRS_IDENTITY_CPU_PROFILE_DIR: /tmp/pr71-history-phases
         run: |
-          mkdir -p "$OUTPUT/logs"
+          mkdir -p "$OUTPUT"
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import {writeFileSync} from 'node:fs';
-          const root=process.env.OUTPUT,api='https://api.github.com/repos/mxbaylee/circus-health';
-          async function get(path,file,json=true){const response=await fetch(api+path,{headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(30000)});const text=await response.text();writeFileSync(`${root}/${file}`,text);assert.ok(response.ok,`${path}: HTTP ${response.status}`);return json?JSON.parse(text):text;}
-          const run=await get('/actions/runs/37802077446','run.json');assert.equal(run.head_sha,'9a4b2e0f6effac08fce454b246a808f03355eed1');assert.equal(run.status,'completed');
-          const jobs=await get('/actions/runs/37802077446/attempts/1/jobs?per_page=100','jobs.json');assert.equal(jobs.total_count,jobs.jobs.length);assert.ok(jobs.jobs.every(job=>job.status==='completed'));
-          await get('/pulls/71','pr.json');
-          const details=[];
-          for(const job of jobs.jobs){
-            if(!['Server (9/16)','checks'].includes(job.name))continue;
-            const text=await get(`/actions/jobs/${job.id}/logs`,`logs/${job.id}.log`,false),lines=text.split('\n');
-            details.push({id:job.id,name:job.name,conclusion:job.conclusion,startedAt:job.started_at,completedAt:job.completed_at,excerpt:lines.filter(line=>/##\[error\]|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|ℹ skipped|failing tests:|✖/.test(line)),tail:lines.slice(-50)});
-          }
-          const counts={};for(const job of jobs.jobs)counts[job.conclusion]=(counts[job.conclusion]??0)+1;
-          const summary={observedAt:new Date().toISOString(),run:run.id,head:run.head_sha,status:run.status,conclusion:run.conclusion,total:jobs.total_count,counts,details};
-          writeFileSync(`${root}/summary.json`,JSON.stringify(summary,null,2));console.log(JSON.stringify(summary,null,2));
-          NODE
-      - name: Hash evidence
+          node --test --test-name-pattern='native identity grounding phase counts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/phases.log"
+      - name: Hash diagnostic evidence
         if: always()
         run: |
           cd "$OUTPUT"
@@ -53,7 +47,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step3c-final-ci
-          path: /tmp/pr71-step3c-final-ci
+          name: pr71-history-phases
+          path: /tmp/pr71-history-phases
           if-no-files-found: error
           retention-days: 14
