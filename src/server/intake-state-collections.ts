@@ -404,14 +404,37 @@ export function createIntakeCollections(owner: {
   // Preparation starts a fresh epoch and returns only an opaque capability after
   // its final authority check; input callbacks cannot rebase the entry witness.
   // No write or asynchronous work is authorized by this certificate.
-  const runRead = <T>(fn: (pages: typeof tree, certificate?: IntakeTreeReadCertificate) => T): T =>
+  const runRead = <T>(
+    fn: (pages: typeof tree, certificate?: IntakeTreeReadCertificate) => T,
+    options: { sealTransaction?: boolean } = {},
+  ): T =>
     withIntakeWork(db, 'warm', () => {
       let certificate: IntakeTreeReadCertificate | undefined;
       try {
         ready();
         if (db.isTransaction) {
           readEpoch = {};
-          return fn(tree);
+          if (!options.sealTransaction) return fn(tree);
+          // Raw transaction reads still need a whole-call lifecycle seal before
+          // a callback-bearing preparation can expose its capability.
+          const epoch = readEpoch,
+            generation = registryFor(db).generation,
+            token = currentTransactionToken(db),
+            witness = readWitness();
+          const check = () => {
+            if (
+              !db.isTransaction ||
+              currentTransactionToken(db) !== token ||
+              readEpoch !== epoch ||
+              registryFor(db).generation !== generation
+            )
+              invalid('collection preparation authority changed');
+          };
+          const result = fn(tree);
+          check();
+          if (readWitness() !== witness) invalid('collection preparation authority changed');
+          check();
+          return result;
         }
         const registry = registryFor(db);
         certificate = {
@@ -1230,7 +1253,7 @@ export function createIntakeCollections(owner: {
       // starts this preparation from another read. Existing page-cache bounds
       // apply; SQL transactions retain the uncached, checked fallback.
       readEpoch = {};
-      return runRead((readTree, certificate) => {
+      const prepareCurrent = (readTree: typeof tree, certificate?: IntakeTreeReadCertificate) => {
         uuid(input.operationId);
         if (!/^[a-f0-9]{64}$/.test(input.requestDigest)) invalid('collection request digest');
         integer(input.domainVersion);
@@ -1599,7 +1622,8 @@ export function createIntakeCollections(owner: {
         // provisional capability if this seal fails.
         ready();
         return prepared;
-      });
+      };
+      return runRead(prepareCurrent, { sealTransaction: true });
     },
     /** Small copies only; this exposes neither mutable candidate pages nor an
      * authority capability that a caller can manufacture from hashes. */

@@ -472,6 +472,82 @@ test('transaction-only preparation cannot certify a rolled-back raw-page repair'
   assert.equal(f.read(), 'fictional-0');
 });
 
+for (const kind of ['registry', 'nested-preparation'] as const)
+  test(`transaction-bound preparation refuses a completed-batch lifecycle change: ${kind}`, (t) => {
+    const f = fixture(t);
+    const operationId = randomUUID();
+    const before = intakeWorkCounters(f.db).warm.collectionPreparedBytes;
+    let fired = false;
+    let outer: ReturnType<typeof f.store.prepare> | undefined;
+    let nested: ReturnType<typeof f.store.prepare> | undefined;
+    assert.throws(
+      () =>
+        transaction(f.db, () => {
+          outer = f.store.prepare(f.store.openView(), {
+            operationId,
+            requestDigest: digest(operationId),
+            domainVersion: 2,
+            changes: [
+              { area: 'logical', collection: 'values', op: 'put', key: '000', value: 'changed-0' },
+              { area: 'logical', collection: 'values', op: 'put', key: '001', value: 'changed-1' },
+              { area: 'logical', collection: 'values', op: 'delete', key: '099' },
+              {
+                area: 'logical',
+                collection: 'values',
+                op: 'put',
+                key: '002',
+                get value() {
+                  assert.ok(
+                    intakeWorkCounters(f.db).warm.collectionPreparedBytes > before,
+                    'the getter follows an actual completed grouped batch',
+                  );
+                  assert.equal(fired, false);
+                  fired = true;
+                  if (kind === 'registry') clearIntakeStateCache(f.db);
+                  else {
+                    const nestedId = randomUUID();
+                    nested = f.store.prepare(f.store.openView(), {
+                      operationId: nestedId,
+                      requestDigest: digest(nestedId),
+                      domainVersion: 1,
+                      changes: [
+                        {
+                          area: 'builds',
+                          collection: 'fictional-nested',
+                          op: 'put',
+                          key: 'key',
+                          value: 'value',
+                        },
+                      ],
+                    });
+                  }
+                  return 'changed-2';
+                },
+              },
+            ],
+          });
+          return f.store.stage(outer);
+        }),
+      /changed|stale|generation|collection|preparation/i,
+    );
+    assert.equal(fired, true);
+    assert.equal(outer, undefined, 'the revoked preparation must not escape its call');
+    if (kind === 'nested-preparation') {
+      assert.ok(nested);
+      assert.throws(() => f.store.inspectPrepared(nested!), /expired|foreign|preparation/);
+    }
+    assert.equal(f.store.replay(operationId, digest(operationId)), undefined);
+    for (let n = 0; n < 3; n++)
+      assert.equal(
+        f.store.get(f.store.openView(), 'logical', 'values', String(n).padStart(3, '0')),
+        `fictional-${n}`,
+      );
+    const fresh = duringPreparation(f, () => {});
+    const result = transaction(f.db, () => f.store.stage(fresh.prepare()));
+    assert.equal(f.read(), 'changed-0');
+    assert.deepEqual(f.store.replay(fresh.operationId, digest(fresh.operationId)), result);
+  });
+
 for (const kind of ['peer-restored', 'registry'] as const)
   test(`completed map batches cannot rebase preparation authority across a barrier: ${kind}`, (t) => {
     const f = fixture(t);

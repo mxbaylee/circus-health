@@ -46,6 +46,13 @@ Bounded synchronous collection reads can also reuse authenticated pages from the
 
 Transactions neither skip raw page reads nor certify pages: observing a transaction rotates the private read epoch, so a rolled-back repair or DDL change cannot leave a trusted page. Mutation and staging invalidate that epoch. Bounded synchronous collection preparation starts its own fresh epoch and can reuse retained pages only within its private certificate; it never borrows its caller's proof. It checks physical authority again before returning, and the closing SQL/registry witness must still match the entry snapshot. Input callbacks that change that authority or start nested preparation invalidate the whole result, including provisional preparation capabilities. No certificate authorizes publication, skips the existing stage checks, or spans a checkpoint or yield. Nested reads have separate lexical certificates; a nested mutator invalidates its enclosing read. Main and TEMP schema checks remain distinct because a TEMP table or view can shadow an already prepared unqualified node query. Promises and escaping iterators cannot be returned by this synchronous boundary. Cache disposal, source changes, refusal and closure require fresh authentication.
 
+Transaction-bound preparation keeps the raw-page fallback but also seals its
+entry read epoch, registry generation, transaction identity and exact SQL witness
+before returning a capability. A callback cannot clear the registry or start a
+nested preparation and then register an old candidate in the replacement
+registry. Refusal poisons the enclosing application transaction and invalidates
+provisional capabilities; a fresh preparation is required after rollback.
+
 For a bounded 32-change preparation over 64 selected entries, the counted regression
 observes 35 rather than 70 retained-node SQL reads, or 38 rather than 75 with 80
 unrelated entries. Each visited node fits in the unchanged 128-page cache in those
