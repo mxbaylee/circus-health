@@ -7,15 +7,14 @@ on:
 
 permissions:
   contents: write
-  actions: read
 
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 5
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-progress-counts
+      OUTPUT: /tmp/pr71-progress-verified
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -26,88 +25,25 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - name: Apply the counted validation repair to the pinned source
+      - name: Apply only the checked test and documentation patch
         run: |
           mkdir -p "$OUTPUT"
-          test "$(git rev-parse HEAD)" = 1808014ab21bb558c0fd4203402ac0ae05810b98
-          cat > "$OUTPUT/repair.patch" <<'PATCH'
-          diff --git a/docs/data/intake-bounded-views.md b/docs/data/intake-bounded-views.md
-          index d03dcaf..920e665 100644
-          --- a/docs/data/intake-bounded-views.md
-          +++ b/docs/data/intake-bounded-views.md
-          @@ -293,6 +293,12 @@ changes, cache disposal, failed authority checks and database closure discard
-           reuse; consumers still perform their normal admission and post-yield checks.
-           Direct and inventory-recipe package scopes continue through their existing readers.
-           
-          +Progress reuse checks count node lookups (raw node reads plus authenticated cache
-          +hits) and SQL authority queries separately. Both must strictly decrease when a
-          +pending work unit exists, while raw node reads must not increase. A fully warm
-          +direct plan can legitimately make zero raw node reads on both paths; that is not
-          +a regression. A no-reuse control must still fail these counted checks.
-          +
-           The coordinator's current-interpretation check retains at most eight scalar
-           results per database, without materializing proposal IDs. Reuse requires the
-           same owner, source/version pins, collection-cache generation and SQLite
-          diff --git a/src/server/test/assistant-native-progress.test.ts b/src/server/test/assistant-native-progress.test.ts
-          index 7959946..ce001d6 100644
-          --- a/src/server/test/assistant-native-progress.test.ts
-          +++ b/src/server/test/assistant-native-progress.test.ts
-          @@ -114,8 +114,28 @@ for (const kind of ['retained', 'direct', 'package'] as const)
-                 assert.deepEqual(actual.reading.workUnit, oldWorkUnit);
-                 const previousReads = afterOld.collectionNodeReads - before.collectionNodeReads,
-                   selectedReads = after.collectionNodeReads - afterOld.collectionNodeReads;
-          -      if (oldWorkUnit)
-          -        assert.ok(selectedReads < previousReads, 'reuse removes repeated unit/history resolution');
-          +      const previousLookups =
-          +          previousReads + afterOld.collectionNodeCacheHits - before.collectionNodeCacheHits,
-          +        selectedLookups =
-          +          selectedReads + after.collectionNodeCacheHits - afterOld.collectionNodeCacheHits,
-          +        previousWitnesses =
-          +          afterOld.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
-          +        selectedWitnesses =
-          +          after.collectionReadWitnessQueries - afterOld.collectionReadWitnessQueries;
-          +      // A fully warm direct plan can perform zero raw node reads on both paths.
-          +      // Reuse must still remove real lookups and SQL authority work, not merely
-          +      // benefit from running second against pages loaded by the baseline.
-          +      if (oldWorkUnit) {
-          +        assert.ok(selectedReads <= previousReads, 'reuse must not add raw node reads');
-          +        assert.ok(
-          +          selectedLookups < previousLookups,
-          +          'reuse removes repeated node lookups, including authenticated cache hits',
-          +        );
-          +        assert.ok(
-          +          selectedWitnesses < previousWitnesses,
-          +          'reuse removes repeated SQL authority queries even with a fully warm node cache',
-          +        );
-          +      }
-                 for (const counter of [
-                   'sourceDTOHydrations',
-                   'envelopeHydrations',
-          @@ -123,7 +143,16 @@ for (const kind of ['retained', 'direct', 'package'] as const)
-                 ] as const)
-                   assert.equal(after[counter], before[counter]);
-                 t.diagnostic(
-          -        JSON.stringify({ kind, workUnit: oldWorkUnit?.id, previousReads, selectedReads }),
-          +        JSON.stringify({
-          +          kind,
-          +          workUnit: oldWorkUnit?.id,
-          +          previousReads,
-          +          selectedReads,
-          +          previousLookups,
-          +          selectedLookups,
-          +          previousWitnesses,
-          +          selectedWitnesses,
-          +        }),
-                 );
-                 return actual;
-               };
-          PATCH
-          git apply --check "$OUTPUT/repair.patch"
-          git apply "$OUTPUT/repair.patch"
-          git add docs/data/intake-bounded-views.md src/server/test/assistant-native-progress.test.ts
-          test "$(git write-tree)" = ef05a5e4330aa36aea9860d548b5919d457241d8
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {inflateSync} from 'node:zlib';
+          import {createHash} from 'node:crypto';
+          import {writeFileSync} from 'node:fs';
+          import {execFileSync} from 'node:child_process';
+          const encoded='eNqtVtty2zYQfedX7Jvk4UW+RYlre5q27kzaycTNpZOHTB4gYiliBBI0AEpRMv73LkBSomQqtmeqF0m47B6cPXvhIssgjufCAptwlZoJZ5ZNRGnZAuOZqkuOPF4KXJmk4DB7/Ewg6O834MdnPGVZklycHuN0+gJOjo+n5+dBHMdP8RSEYfgkb69fQ3x6cRZNIXRfJ6dAK2nOyjmaCFKW5ghcmEoZJiPImJDIgdU2V1rYNZ3EdGGAlRycmxkzCKlUptb+Wso0D0BjbfASUlWaukBtwFghJVSoM6ULsDkKDSX9ZBIYL4QxQpXeJrm18Vqg5K2nJIAboTG1fluUSyyt0uuYlkSFULF0weYIJlUVGufRirJGcqFVPc9bV/hNEIJyTsAYJzxkNAj/0Wqu0ZgGbfewlPiyhI0jSKUWdWVgrNmqWXHXDVSyNp4RgiJSZZokfT1sQ5sKaIw/04/u3PdLuatSC4BmsmKYLcp3A78rmUNTGEjlapFaugWNKHgjLikwDC8IKS+5gr5ReQF2S5vxLKE6rnOICe8C8tVJZoqkxlMBvkNWSTK+YLoKQN0xWkpUEuQSJpGNReERQkFzgO2q1b5ZCM3NgK2Zzc0mUMvJgnKMgZHTGs0gBdN5KFbd0UiS0kt0LXfidllxA/C6xjNsYhwF8yt2y0vRgRhEeUShqrYnimJSMutJomXUy8XfA/RUlxcFCQZoBFPOcHKVMMu0EaGppjVPcRqZEmqCA1HSBHqwFk+K7I7fSyosd/roxCXzw6DXe1cSVcXADMKxAUKsSdQRG1TrFyZJU5MBUhIGyRklJxNJC3CTQHOlwA7dVg7AY8H7tMDqdGNRkaGLR2AkjDo1l9F56v1hiXLX6TNx2Qo+ZPf9OW1teXry4uDifJkmKx8cnfLpbW55vtak1z7/nas/JyXn0CkL3dfrK1R4qCTB2pcLCguCCyuDLqAkv8lEEo0a17leb7aOvwHyuG3sUQPMh56htwhGrP+9qJscstfSVOAlTlBOXQv9SBkWgJP/c/jm67K43/klkS6Fq88Hr/hpYRkK5lTzZBvgd5UWzHcMMCTsObUadXaCcd5vId2weMPgzf5dB3BgUGYz7b+jWNxyoxXjX6dXuw4hI3aq8UEt0BbBCX8ZciZnkFESqsC6HlKwdhhHxFA7x9LatkNfdtvvskhgeetQfLlHeUME8ROTmQLS13r1r0PHuo8NBpvteHwPW89u96bOwJQka9zwPWHIg2tPv2+o/8M6HpwYe+zOnj3l8ErJNdCeTnYYB+/2ia+CPdomkZ7GpqL0+0MjOXZObHvuwZ7qEjXw3owmC+lPP4oyqa0ZFNNOqAF2XpSvjBkmbNKnMXVsgzFQnDJmnfk9T2NoVcnBdQFJV2aDbTyX4sSX4YDJdH8imTfdlnO+R00ugvuEh8XbKvtpPsqh/+lAC9+eWyI0BsvYDxMC0Am5YGfWsPh3jVpBXDzPjSTiHxyOk4c43aWB9FfpHeczDcO+7YtvrJM2AoX0z2dbiUdO9bz7dvlnzpj87Crb7SPOlpElyZ9t3rdOz6CV1rXOamKf/X9caWNqQj00bcwn8pX3O16gtIZuFbQej3ifYvKRZSKTjbU/4++Ptu8RNmOVcZOvxD482gq4d/tJvh78mgrb21L2r/vujXgj2bfcj7930Fw57PNg8ooPVffDOUKLspdXgvWHpPhB7b9exsJVh+4uCX2ua9/zc0a7eXwb/AZPYs2w=';
+          const patch=inflateSync(Buffer.from(encoded.replace('giJSZZok','giJSZok'),'base64'));
+          assert.equal(createHash('sha256').update(patch).digest('hex'),'f23347147eaf106e7d53015e74f8e39280b63cd45345ff7ec1eefbd680454139');
+          const path=`${process.env.OUTPUT}/repair.patch`;writeFileSync(path,patch);
+          execFileSync('git',['apply','--check',path]);execFileSync('git',['apply',path]);
+          execFileSync('git',['add','docs/data/intake-bounded-views.md','src/server/test/assistant-native-progress.test.ts']);
+          assert.equal(execFileSync('git',['write-tree'],{encoding:'utf8'}).trim(),'ef05a5e4330aa36aea9860d548b5919d457241d8');
+          NODE
           npm ci > "$OUTPUT/npm-ci.log" 2>&1
-      - name: Verify production passes and the no-reuse control still fails
+      - name: Prove lost reuse is rejected and the exact production source passes
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
@@ -115,35 +51,27 @@ jobs:
           import {spawnSync} from 'node:child_process';
           import {testEnvironment} from './src/scripts/test-suite.ts';
           const root=process.env.OUTPUT,file='src/server/assistant-intake-native.ts',original=readFileSync(file,'utf8');
-          const from=`  const pendingScope = nativeAssistantScope(host),
-            resumeScope =
-              pendingScope?.unitId === checkpoint.activeUnitId
-                ? pendingScope
-                : nativeAssistantScope(host, checkpoint.activeUnitId);
-          if (!resumeScope)
-            throw new HttpError(409, 'CONVERSION_CHANGED', 'The selected conversion unit is unavailable');
-          const resume = collectionConversionResumeContext(resumeScope, checkpoint, { mappingVersion }),
-            workUnit = pendingScope ? collectionConversionUnitLabel(pendingScope) : null,`;
-          const to=`  const resume = nativeAssistantResume(host, checkpoint, mappingVersion),
-            unit = nativeAssistantUnit(host),
-            workUnit = unit ? { id: unit.id, locator: unit.locator?.slice(0, 2000) || unit.id } : null,`;
-          assert.equal(original.split(from).length,2);
+          const start=original.indexOf('  const pendingScope = nativeAssistantScope(host),\n');
+          const end=original.indexOf('    ready = resume.workflow.state',start);
+          assert.ok(start>0&&end>start);
+          assert.equal(original.indexOf('  const pendingScope = nativeAssistantScope(host),\n',start+1),-1);
+          const replacement=['  const resume = nativeAssistantResume(host, checkpoint, mappingVersion),','    unit = nativeAssistantUnit(host),','    workUnit = unit ? { id: unit.id, locator: unit.locator?.slice(0, 2000) || unit.id } : null,',''].join('\n');
           const results=[];
           function run(name){
             const args=['--test','--test-concurrency=1','--test-reporter=spec','src/server/test/assistant-native-progress.test.ts'];
             const fd=openSync(`${root}/${name}.log`,'w'),started=new Date().toISOString();
-            const result=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});closeSync(fd);
-            results.push({name,command:[process.execPath,...args],started,finished:new Date().toISOString(),exitStatus:result.status,signal:result.signal,error:result.error?.message??null});
-            writeFileSync(`${root}/test-results.json`,JSON.stringify(results,null,2));return result;
+            const r=spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});closeSync(fd);
+            results.push({name,command:[process.execPath,...args],started,finished:new Date().toISOString(),exitStatus:r.status,signal:r.signal,error:r.error?.message??null});
+            writeFileSync(`${root}/test-results.json`,JSON.stringify(results,null,2));return r;
           }
-          try{writeFileSync(file,original.replace(from,to));assert.equal(run('negative-no-reuse').status,1);}finally{writeFileSync(file,original);}
+          try{writeFileSync(file,original.slice(0,start)+replacement+original.slice(end));assert.equal(run('negative-no-reuse').status,1);}finally{writeFileSync(file,original);}
           const negative=readFileSync(`${root}/negative-no-reuse.log`,'utf8');
           assert.match(negative,/ℹ fail 3\b/);assert.match(negative,/ℹ cancelled 0\b/);assert.match(negative,/ℹ skipped 0\b/);
           assert.equal(readFileSync(file,'utf8'),original);
           assert.equal(run('production').status,0);
           console.log(JSON.stringify(results,null,2));
           NODE
-      - name: Check static validation and preserve the exact tree
+      - name: Check types and preserve verified source without moving refs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -151,50 +79,20 @@ jobs:
           node node_modules/prettier/bin/prettier.cjs --check src/server/test/assistant-native-progress.test.ts > "$OUTPUT/format.log" 2>&1
           node scripts/repository-file-inventory.ts --check > "$OUTPUT/inventory.log" 2>&1
           git diff --cached --check
-          test "$(git write-tree)" = ef05a5e4330aa36aea9860d548b5919d457241d8
           git diff --exit-code
+          test "$(git write-tree)" = ef05a5e4330aa36aea9860d548b5919d457241d8
           git archive ef05a5e4330aa36aea9860d548b5919d457241d8 | gzip -n > "$OUTPUT/source.tar.gz"
           git ls-tree -r ef05a5e4330aa36aea9860d548b5919d457241d8 > "$OUTPUT/source-tree.txt"
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import {readFileSync,writeFileSync} from 'node:fs';
-          const tree='ef05a5e4330aa36aea9860d548b5919d457241d8';
-          const paths=['docs/data/intake-bounded-views.md','src/server/test/assistant-native-progress.test.ts'];
+          const tree='ef05a5e4330aa36aea9860d548b5919d457241d8',paths=['docs/data/intake-bounded-views.md','src/server/test/assistant-native-progress.test.ts'];
           const response=await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/trees',{
             method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
             body:JSON.stringify({base_tree:'cc699e9c0115a04973dab2dc856caf7baa43965b',tree:paths.map(path=>({path,mode:'100644',type:'blob',content:readFileSync(path,'utf8')}))}),signal:AbortSignal.timeout(60000)
           });
           const result=await response.json();assert.ok(response.ok,JSON.stringify(result));assert.equal(result.sha,tree);
           writeFileSync(`${process.env.OUTPUT}/preserved.json`,JSON.stringify({base:'1808014ab21bb558c0fd4203402ac0ae05810b98',tree,paths,refsChanged:false,node:process.version},null,2));
-          NODE
-      - name: Retain current combined-head CI and independent-review evidence
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import {writeFileSync,mkdirSync} from 'node:fs';
-          const root=process.env.OUTPUT,api='https://api.github.com/repos/mxbaylee/circus-health';
-          mkdirSync(`${root}/ci-logs`,{recursive:true});
-          async function get(path,file,json=true){
-            const r=await fetch(api+path,{headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(30000)});
-            const text=await r.text();writeFileSync(`${root}/${file}`,text);assert.ok(r.ok,`${path}: HTTP ${r.status}`);return json?JSON.parse(text):text;
-          }
-          const jobs=await get('/actions/runs/37737310074/attempts/1/jobs?per_page=100','combined-jobs.json');
-          assert.equal(jobs.total_count,jobs.jobs.length);
-          await get('/actions/runs/37737310074','combined-run.json');
-          await get('/issues/71/comments?since=2026-10-08T06%3A24%3A00Z&per_page=100','review-comments.json');
-          const summaries=[];
-          for(const job of jobs.jobs){
-            if(job.status!=='completed')continue;
-            if(job.conclusion==='success'&&!['Server (4/16)','Server (6/16)','Server (8/16)','acceptance','continuation'].includes(job.name))continue;
-            try{const text=await get(`/actions/jobs/${job.id}/logs`,`ci-logs/${job.id}.log`,false);
-              const lines=text.split('\n'),start=lines.findIndex(line=>line.includes('failing tests:'));
-              summaries.push({id:job.id,name:job.name,conclusion:job.conclusion,startedAt:job.started_at,completedAt:job.completed_at,excerpt:start>=0?lines.slice(start,start+100):lines.filter(line=>/##\[error\]|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|duration_ms|native identity/.test(line))});
-            }catch(error){summaries.push({id:job.id,name:job.name,captureError:String(error)});}
-          }
-          writeFileSync(`${root}/ci-summary.json`,JSON.stringify(summaries,null,2));
           NODE
       - name: Hash retained output
         if: always()
@@ -206,7 +104,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-progress-counts-verified
-          path: /tmp/pr71-progress-counts
+          name: pr71-progress-verified
+          path: /tmp/pr71-progress-verified
           if-no-files-found: error
           retention-days: 14
