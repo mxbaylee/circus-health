@@ -1,6 +1,7 @@
 import { launchBrowser, newTestPage } from './harness.ts';
 import { sameDisplayedIdentityReview } from '../../app/data/identity-confirmation-freshness.ts';
 import { startProcessRuntime } from './process-runtime.ts';
+import { fetchFixtureApi, fixtureApiHeaders } from './fixture-api-request.ts';
 import { diagnosticRoute } from './runtime-connection-diagnostics.ts';
 import { observeFixtureClientConnections } from './runtime-client-connection-diagnostics.ts';
 import {
@@ -624,7 +625,7 @@ test(
       try {
         let response;
         try {
-          response = await page.request.fetch(url + prefix + path, {
+          response = await fetchFixtureApi(page.request, url + prefix + path, {
             method,
             headers: {
               ...(method === 'GET' ? {} : { Origin: url }),
@@ -661,7 +662,8 @@ test(
     }
     async function upload(rows: HealthRecordEnvelope[], filename: string) {
       const bytes = Buffer.from(rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
-      const response = await page.request.post(url + prefix + '/intakes', {
+      const response = await fetchFixtureApi(page.request, url + prefix + '/intakes', {
+        method: 'POST',
         headers: { Origin: url, 'Content-Type': 'application/x-ndjson', 'X-Filename': filename },
         data: bytes,
       });
@@ -1051,7 +1053,10 @@ test(
     await page.route('**/intakes/report-acceptance', async (route) => {
       if (route.request().method() !== 'POST') return route.continue();
       acceptanceRequests.push(route.request().postDataJSON() as IntakeReportAcceptanceRequest);
-      const response = await route.fetch({ timeout: 180000 });
+      const response = await route.fetch({
+        timeout: 180000,
+        headers: fixtureApiHeaders(route.request().headers()),
+      });
       if (!lostAcknowledgement && response.ok()) {
         lostAcknowledgement = true;
         await route.abort('failed');
@@ -1260,7 +1265,7 @@ test(
       'relative history and clinician contact never modify Self',
     );
     for (const original of [clinical, people]) {
-      const response = await page.request.get(url + original.intake.contentUrl);
+      const response = await fetchFixtureApi(page.request, url + original.intake.contentUrl);
       assert.equal(response.status(), 200, await response.text());
       assert.deepEqual(
         await response.body(),
