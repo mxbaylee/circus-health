@@ -27,12 +27,19 @@ jobs:
           package-manager-cache: false
       - run: npm ci
       - run: |
-          mkdir -p "$RUNNER_TEMP/pr71-cpu-prof"
-          node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof" --test src/server/test/intake-history-publication.test.ts
+          mkdir -p "$RUNNER_TEMP/pr71-cpu-prof/baseline" "$RUNNER_TEMP/pr71-cpu-prof/cache-16"
+          set +e
+          CRS_HISTORY_CACHE_MIB=default node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof/baseline" --test src/server/test/intake-history-publication.test.ts 2>&1 | tee "$RUNNER_TEMP/pr71-history-baseline.log"
+          baseline_status=${PIPESTATUS[0]}
+          CRS_HISTORY_CACHE_MIB=16 node --cpu-prof --cpu-prof-dir="$RUNNER_TEMP/pr71-cpu-prof/cache-16" --test src/server/test/intake-history-publication.test.ts 2>&1 | tee "$RUNNER_TEMP/pr71-history-cache-16.log"
+          candidate_status=${PIPESTATUS[0]}
+          test "$baseline_status" -eq 0 && test "$candidate_status" -eq 0
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: pr71-history-cpu-profile
-          path: ${{ runner.temp }}/pr71-cpu-prof/*.cpuprofile
+          name: pr71-history-cache-comparison
+          path: |
+            ${{ runner.temp }}/pr71-cpu-prof/**/*.cpuprofile
+            ${{ runner.temp }}/pr71-history-*.log
           if-no-files-found: ignore
           retention-days: 3

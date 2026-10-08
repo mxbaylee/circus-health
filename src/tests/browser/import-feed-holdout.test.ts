@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { type Browser, type Request } from 'playwright';
+import { type Browser, type Page, type Request } from 'playwright';
 import type { Medication, Note, Observation, Procedure } from '../../shared/api.ts';
 import type {
   HealthRecordEnvelope,
@@ -190,12 +190,25 @@ test(
       codeRoot: process.env.CRS_TEST_CODE_ROOT,
       port: 0,
       host: '127.0.0.1',
+      connectionDiagnostics: true,
     });
     const captureRuntimeDiagnostics = runtime.captureDiagnostics();
     let phase = 'browser setup';
     let phaseStarted = Date.now();
     let requestNumber = 0;
     const inFlight = new Map<number, { method: string; path: string; started: number }>();
+    const browserInFlight = new Map<Request, { method: string; path: string; started: number }>();
+    const recentBrowserRequests: Array<{
+      method: string;
+      path: string;
+      status: number | 'failed';
+      durationMs: number;
+    }> = [];
+    let peopleApplyStep = 'not started';
+    let peopleApplyPosts = 0;
+    let completed = false;
+    let failureDiagnosticsPrinted = false;
+    let pageForDiagnostics: Page | undefined;
     const enterPhase = (name: string) => {
       phase = name;
       phaseStarted = Date.now();
@@ -206,22 +219,64 @@ test(
         .split('/')
         .map((part) => (/%3A|^[0-9a-f-]{20,}$/i.test(part) ? ':id' : part))
         .join('/');
+    const requestDiagnostics = () => ({
+      phase,
+      phaseDurationMs: Date.now() - phaseStarted,
+      inFlight: [...inFlight.values()].map((request) => ({
+        method: request.method,
+        path: request.path,
+        durationMs: Date.now() - request.started,
+      })),
+      browserInFlight: [...browserInFlight.values()].map((request) => ({
+        method: request.method,
+        path: request.path,
+        durationMs: Date.now() - request.started,
+      })),
+      recentBrowserRequests,
+      peopleApplyStep,
+      peopleApplyPosts,
+    });
     t.signal.addEventListener(
       'abort',
-      () =>
-        console.error('Fictional holdout interrupted', {
-          phase,
-          phaseDurationMs: Date.now() - phaseStarted,
-          inFlight: [...inFlight.values()].map((request) => ({
-            method: request.method,
-            path: request.path,
-            durationMs: Date.now() - request.started,
-          })),
-        }),
+      () => {
+        if (!completed && !failureDiagnosticsPrinted) {
+          failureDiagnosticsPrinted = true;
+          console.error('Fictional holdout interrupted', requestDiagnostics());
+        }
+      },
       { once: true },
     );
     let browser: Browser | undefined;
     t.after(async () => {
+      if (!completed) {
+        if (!failureDiagnosticsPrinted) {
+          failureDiagnosticsPrinted = true;
+          console.error('Fictional holdout final step', requestDiagnostics());
+        }
+        if (pageForDiagnostics && !pageForDiagnostics.isClosed()) {
+          try {
+            const ui = await pageForDiagnostics.evaluate(() => ({
+              definiteFailureVisible: globalThis.document.body.innerText.includes(
+                'The second fictional Person changed before saving.',
+              ),
+              uncertainFailureVisible: globalThis.document.body.innerText.includes(
+                'The outcome is unconfirmed.',
+              ),
+              selectedItemsUpdatedVisible:
+                globalThis.document.body.innerText.includes('selected item updated.'),
+              addPeopleButtonPresent: [...globalThis.document.querySelectorAll('button')].some(
+                (button) => /^Add [12] people?$/.test(button.textContent?.trim() || ''),
+              ),
+            }));
+            console.error('Fictional holdout final UI', ui);
+            const screenshot = resolve(tmpdir(), 'circus-import-feed-holdout-failure.png');
+            await pageForDiagnostics.screenshot({ path: screenshot, timeout: 5000 });
+            console.error('Fictional holdout screenshot', screenshot);
+          } catch (cause) {
+            console.error('Fictional holdout UI diagnostic unavailable', String(cause));
+          }
+        }
+      }
       if (process.env.CRS_TEST_DIAGNOSTICS)
         console.error('Fictional holdout runtime:', await captureRuntimeDiagnostics());
       await browser?.close();
@@ -231,6 +286,7 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
+    pageForDiagnostics = page;
     page.on('pageerror', (error) =>
       console.error('Fictional holdout browser error:', error.message),
     );
@@ -293,6 +349,40 @@ test(
       ).id as string;
     });
     const prefix = `/api/profiles/${profileId}`;
+    page.on('request', (request) => {
+      const path = new URL(request.url()).pathname;
+      if (!path.startsWith(prefix + '/')) return;
+      browserInFlight.set(request, {
+        method: request.method(),
+        path: diagnosticPath(path.slice(prefix.length)),
+        started: Date.now(),
+      });
+    });
+    page.on('requestfinished', async (request) => {
+      const started = browserInFlight.get(request);
+      if (!started) return;
+      browserInFlight.delete(request);
+      const response = await request.response().catch(() => null);
+      recentBrowserRequests.push({
+        method: started.method,
+        path: started.path,
+        status: response?.status() ?? 'failed',
+        durationMs: Date.now() - started.started,
+      });
+      if (recentBrowserRequests.length > 8) recentBrowserRequests.shift();
+    });
+    page.on('requestfailed', (request) => {
+      const started = browserInFlight.get(request);
+      if (!started) return;
+      browserInFlight.delete(request);
+      recentBrowserRequests.push({
+        method: started.method,
+        path: started.path,
+        status: 'failed',
+        durationMs: Date.now() - started.started,
+      });
+      if (recentBrowserRequests.length > 8) recentBrowserRequests.shift();
+    });
     enterPhase('upload and initial Import feed');
     async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
       const started = Date.now();
@@ -758,7 +848,9 @@ test(
     await page.route(peopleApplyPattern, async (route) => {
       if (route.request().method() !== 'POST') return route.continue();
       peopleApplyRequests.push(route.request().postDataJSON() as IntakePersonApplyRequest);
+      peopleApplyPosts = peopleApplyRequests.length;
       if (peopleApplyRequests.length === 2) {
+        peopleApplyStep = 'fulfilling second POST with definite 409';
         await route.fulfill({
           status: 409,
           contentType: 'application/json',
@@ -769,10 +861,14 @@ test(
             },
           }),
         });
+        peopleApplyStep = 'second POST fulfilled with definite 409';
         return;
       }
+      peopleApplyStep = 'forwarding first POST';
       await route.continue();
+      peopleApplyStep = 'first POST forwarded';
     });
+    peopleApplyStep = 'clicking Add 2 people';
     await page.getByRole('button', { name: 'Add 2 people', exact: true }).click();
     enterPhase('second Person failure feedback');
     await page
@@ -1268,5 +1364,6 @@ test(
     await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
     assert.ok(page.url().endsWith('/import'), 'secondary review returns to the new inbox');
     assert.equal((await readFeed()).counts.accepted, 4, 'returning does not accept the result');
+    completed = true;
   },
 );

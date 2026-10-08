@@ -52,6 +52,15 @@ function replaceMethod(target: object, key: string, replacement: unknown) {
   };
 }
 
+function execShape(query: string): string {
+  const value = query.trimStart().toUpperCase();
+  if (/^COMMIT\s*;?\s*$/.test(value)) return 'COMMIT';
+  if (/^BEGIN IMMEDIATE\s*;?\s*$/.test(value)) return 'BEGIN IMMEDIATE';
+  if (/^ROLLBACK\s*;?\s*$/.test(value)) return 'ROLLBACK';
+  if (/^PRAGMA\b/.test(value)) return 'PRAGMA';
+  return (value.match(/^[A-Z]+/)?.[0] ?? 'OTHER') + (value.includes(';') ? ' MULTI' : '');
+}
+
 function observePublication(t: test.TestContext, db: Database, id: string, archive: string) {
   const collections = selectedEnvelopeStore(db, { id }).collections;
   const record = createRecordVersionWorkCounters();
@@ -64,6 +73,8 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
     work: Record<string, number>;
     record: Record<string, number>;
     filesystem: Record<string, { calls: number; elapsedMs: number; bytes: number }>;
+    dbExec: Record<string, { calls: number; elapsedMs: number; fsWrite: number }>;
+    processFsWrite: number;
   };
   const phases = new Map<string, Totals>();
   const maintenanceSegments = new Map<string, Totals>();
@@ -73,6 +84,7 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
   const sql = { prepared: 0, executed: 0 };
   const retainedBytesBefore = journalBytes(archive);
   const filesystem = new Map<string, { calls: number; elapsedMs: number; bytes: number }>();
+  const dbExec = new Map<string, { calls: number; elapsedMs: number; fsWrite: number }>();
   const sqlTimings = new Map<string, { calls: number; elapsedMs: number }>();
   const restores: Array<() => void> = [];
   let removeObserver: (() => void) | undefined;
@@ -91,12 +103,17 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
   const point = () => ({
     elapsedMs: performance.now(),
     cpu: process.cpuUsage(),
+    fsWrite: process.resourceUsage().fsWrite,
     sql: { ...sql },
     work: { ...snapshot() } as Record<string, number>,
     record: { ...record.operation } as Record<string, number>,
     filesystem: Object.fromEntries(
       [...filesystem].map(([key, value]) => [key, { ...value }]),
     ) as Record<string, { calls: number; elapsedMs: number; bytes: number }>,
+    dbExec: Object.fromEntries([...dbExec].map(([key, value]) => [key, { ...value }])) as Record<
+      string,
+      { calls: number; elapsedMs: number; fsWrite: number }
+    >,
   });
   type Point = ReturnType<typeof point>;
   const difference = (before: Record<string, number>, after: Record<string, number>) =>
@@ -118,12 +135,15 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
       work: {},
       record: {},
       filesystem: {},
+      dbExec: {},
+      processFsWrite: 0,
     };
     value.calls++;
     value.elapsedMs += after.elapsedMs - before.elapsedMs;
     value.cpuMicros += after.cpu.user + after.cpu.system - before.cpu.user - before.cpu.system;
     value.sqlPrepared += after.sql.prepared - before.sql.prepared;
     value.sqlExecuted += after.sql.executed - before.sql.executed;
+    value.processFsWrite += after.fsWrite - before.fsWrite;
     for (const [key, count] of Object.entries(difference(before.work, after.work)))
       value.work[key] = (value.work[key] ?? 0) + count;
     for (const [key, count] of Object.entries(difference(before.record, after.record)))
@@ -135,6 +155,14 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
       delta.elapsedMs += totals.elapsedMs - prior.elapsedMs;
       delta.bytes += totals.bytes - prior.bytes;
       value.filesystem[key] = delta;
+    }
+    for (const [key, totals] of Object.entries(after.dbExec)) {
+      const prior = before.dbExec[key] ?? { calls: 0, elapsedMs: 0, fsWrite: 0 };
+      const delta = value.dbExec[key] ?? { calls: 0, elapsedMs: 0, fsWrite: 0 };
+      delta.calls += totals.calls - prior.calls;
+      delta.elapsedMs += totals.elapsedMs - prior.elapsedMs;
+      delta.fsWrite += totals.fsWrite - prior.fsWrite;
+      value.dbExec[key] = delta;
     }
     target.set(name, value);
     return value;
@@ -195,6 +223,21 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
       sql.prepared++;
       return prepareSql.call(this, query);
     });
+    const executeSql = DatabaseSync.prototype.exec;
+    install(DatabaseSync.prototype, 'exec', function (this: DatabaseSync, query: string) {
+      const shape = execShape(query);
+      const time = performance.now();
+      const fsWrite = process.resourceUsage().fsWrite;
+      try {
+        return executeSql.call(this, query);
+      } finally {
+        const value = dbExec.get(shape) ?? { calls: 0, elapsedMs: 0, fsWrite: 0 };
+        value.calls++;
+        value.elapsedMs += performance.now() - time;
+        value.fsWrite += process.resourceUsage().fsWrite - fsWrite;
+        dbExec.set(shape, value);
+      }
+    });
     for (const method of ['prepare', 'stage', 'commitMaintenance'] as const) {
       const original = collections[method];
       install(collections, method, (...args: unknown[]) => {
@@ -245,14 +288,31 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
     finish() {
       dispose();
       const end = snapshot();
+      const maintenanceNodes = maintenanceSegments.get('stage')?.work.collectionNodesWritten ?? 0;
+      const publication = maintenanceSegments.get('postVerifyPublication');
+      const retainedJournalGrowthBytes = journalBytes(archive) - retainedBytesBefore;
       t.diagnostic(
         JSON.stringify({
           phases: Object.fromEntries(phases),
           maintenanceSegments: Object.fromEntries(maintenanceSegments),
+          normalizedMaintenance: {
+            nodes: maintenanceNodes,
+            nodeBytes: maintenanceSegments.get('stage')?.work.collectionWrittenBytes ?? 0,
+            journalEncodedBytesPerNode: maintenanceNodes
+              ? (publication?.record.encodedBytes ?? 0) / maintenanceNodes
+              : null,
+            journalObjectReadBytesPerNode: maintenanceNodes
+              ? (publication?.record.objectReadBytes ?? 0) / maintenanceNodes
+              : null,
+            processFsWriteUnitsPerNode: maintenanceNodes
+              ? (publication?.processFsWrite ?? 0) / maintenanceNodes
+              : null,
+          },
           record,
           totalSql: sql,
           filesystem: Object.fromEntries(filesystem),
-          retainedJournalGrowthBytes: journalBytes(archive) - retainedBytesBefore,
+          dbExec: Object.fromEntries(dbExec),
+          retainedJournalGrowthBytes,
           connectionPeakPreparedBytes: end.collectionPeakPreparedBytes,
           sqlTimings: [...sqlTimings].sort((a, b) => b[1].elapsedMs - a[1].elapsedMs).slice(0, 12),
           work: Object.fromEntries(
@@ -264,7 +324,7 @@ function observePublication(t: test.TestContext, db: Database, id: string, archi
               .map(([key, value]) => [key, value - start[key as keyof typeof start]]),
           ),
           resourceUsage: process.resourceUsage(),
-          note: 'Instrumented durations include probe overhead. Nested phases overlap; maintenance segments do not. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL covers all connections; iterate timing excludes iteration. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. fsRead/fsWrite are OS counters; maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
+          note: 'Instrumented durations include probe overhead. Nested phases overlap; maintenance segments do not. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. Process fsWrite deltas are kernel-reported write units and are not attributable to one SQLite connection. maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
         }),
       );
       assert.ok((phases.get('prepare')?.calls ?? 0) > 0);
@@ -323,6 +383,17 @@ async function publicationFixture(t: test.TestContext, count: number) {
   assert.equal(proposal.sourceTextRevisionId ?? null, null);
   assert.equal(proposal.sourceTextDependencyToken ?? null, null);
   assert.equal(seedGroupVersion.members.length, 1);
+  const baselineCache = Number(f.db.prepare('PRAGMA cache_size').get()?.cache_size);
+  const candidateCache = process.env.CRS_HISTORY_CACHE_MIB;
+  if (candidateCache === '16') {
+    assert.equal(baselineCache, -2000, 'candidate requires the default 2 MiB cache baseline');
+    f.db.exec('PRAGMA cache_size=-16384');
+  } else if (candidateCache !== undefined && candidateCache !== 'default') {
+    throw Error('Unsupported history diagnostic cache setting');
+  }
+  const selectedCache = Number(f.db.prepare('PRAGMA cache_size').get()?.cache_size);
+  assert.equal(selectedCache, candidateCache === '16' ? -16384 : baselineCache);
+  t.diagnostic(JSON.stringify({ cacheKiB: -selectedCache, baselineCacheKiB: -baselineCache }));
   await buildIntakeCollectionEnvelope(f.db, { id: f.original.id });
   intakeTransaction(
     f.db,

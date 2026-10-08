@@ -11,6 +11,7 @@ export type ProcessRuntimeOptions = {
   port: number;
   host: string;
   unavailableModelAlias?: string;
+  connectionDiagnostics?: boolean;
 };
 
 type DiagnosticStatus =
