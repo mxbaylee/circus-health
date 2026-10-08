@@ -7,371 +7,134 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 10
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-step1-verified
+      OUTPUT: /tmp/pr71-step2-verified
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 353f8f167a7871f36e13a584da844af5265f5c7e
+          ref: f91a911bd596beaab3d57308d953ba717eaa25c7
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - name: Prepare exact bounded repair
+      - name: Prepare the bounded patch
         run: |
-          mkdir -p "$OUTPUT"
-          test "$(git rev-parse HEAD)" = 353f8f167a7871f36e13a584da844af5265f5c7e
+          mkdir -p "$OUTPUT/logs"
+          test "$(git rev-parse HEAD)" = f91a911bd596beaab3d57308d953ba717eaa25c7
           git rev-parse HEAD > "$OUTPUT/base-sha.txt"
           npm ci > "$OUTPUT/npm-ci.log" 2>&1
-          cat > "$OUTPUT/repair.patch" <<'PATCH'
-          diff --git a/docs/data/intake-state-storage.md b/docs/data/intake-state-storage.md
-          index ed9fae0..8cc2a23 100644
-          --- a/docs/data/intake-state-storage.md
-          +++ b/docs/data/intake-state-storage.md
-          @@ -68,4 +68,4 @@ record-header resolution used nine physical HEAD observations, 48 SQL witness
-           queries and seven cell reads. It now matches the published reader's four HEAD
-          -observations, 12 witness queries and zero repeated header/ancestry cell reads.
-          -A named-field read falls from nine/48/seven to six/24/six respectively, retaining
-          +observations, 10 witness queries and zero repeated header/ancestry cell reads.
-          +A named-field read falls from nine/48/seven to six/22/six respectively, retaining
-           both payload reads and exact values. These measured operations do not establish
-          @@ -73,6 +73,23 @@ whole-workflow latency or a complete continuation/recovery pass.
-           
-          -For the short debugging loop, run the two counted regressions directly:
-          +The fixed synchronous schema resolver reuses its private read certificate's entry
-          +SQL witness for the selected-root binding instead of sampling an extra mid-read
-          +baseline. It still samples the closing SQL witness after its final physical HEAD
-          +check, and refuses local/peer ABA, schema changes, registry disposal or an expired
-          +read epoch. General collection reads, transactions and custom readers keep their
-          +existing checked paths. No certificate or newly admitted schema result survives
-          +an unsuccessful seal or is borrowed across a yield.
-          +
-          +The direct warm header/field regression counts four rather than six witness
-          +queries, with both physical HEAD checks unchanged, for published and staged data
-          +at zero and 40 unrelated records. Header reuse still reads no repeated ancestry
-          +cells; field resolution retains all four first/last ordinal, order and lexical-name
-          +cell reads. These are logical SQL-query counts, not physical I/O measurements.
-          +Mutation regressions inject local/peer ABA, TEMP schema changes and registry
-          +disposal immediately after the entry snapshot, in addition to the existing
-          +final-proof and transaction/rollback refusal tests.
-          +
-          +For the short debugging loop, run the counted and entry-mutation regressions directly:
-           
-           ```sh
-          -node --test --test-name-pattern='staged schema reads share' src/server/test/intake-schema-resolution-authority.test.ts
-          +node --test --test-name-pattern='staged schema reads share|fixed schema reads seal|schema witness reuse refuses' src/server/test/intake-schema-resolution-authority.test.ts
-           ```
-          @@ -88,3 +105,3 @@ into live-provider qualification.
-           
-          -A cold inline ancestry regression now counts two physical HEAD proofs and six witness queries at two fixture sizes, and explicitly rejects final-proof physical-head loss and local/peer SQL ABA. These counts cover the resolver operation, not the whole workflow.
-          +A cold inline ancestry regression now counts two physical HEAD proofs and four witness queries at two fixture sizes, and explicitly rejects final-proof physical-head loss and local/peer SQL ABA. These counts cover the resolver operation, not the whole workflow.
-           
-          diff --git a/src/server/intake-state-collections.ts b/src/server/intake-state-collections.ts
-          --- a/src/server/intake-state-collections.ts
-          +++ b/src/server/intake-state-collections.ts
-          @@ -448,6 +448,17 @@
-               });
-          -  function selected(): ViewData {
-          +  function selected(certificate?: IntakeTreeReadCertificate): ViewData {
-               const raw = get(headKey);
-          -    const generation = readWitness(),
-          +    const generation = certificate?.witness ?? readWitness(),
-                 registry = registryFor(db);
-          +    // Only the fixed schema resolver passes its private synchronous certificate.
-          +    // Reuse the entry snapshot, not a new mid-read baseline. runRead must still
-          +    // match it after the final physical HEAD check before returning any result.
-          +    if (
-          +      certificate &&
-          +      (certificate.state !== 'active' ||
-          +        certificate.epoch !== readEpoch ||
-          +        certificate.registry !== registry.generation ||
-          +        db.isTransaction)
-          +    )
-          +      invalid('collection read authority changed');
-               // total_changes does not advance on ROLLBACK. Never retain a selection
-          @@ -494,6 +505,10 @@
-             }
-          -  function readScope(view: IntakeCollectionView, area: IntakeCollectionArea) {
-          +  function readScope(
-          +    view: IntakeCollectionView,
-          +    area: IntakeCollectionArea,
-          +    certificate?: IntakeTreeReadCertificate,
-          +  ) {
-               if (area !== 'logical' && area !== 'builds') invalid('collection area');
-               const before = viewData(view),
-          -      current = selected();
-          +      current = selected(certificate);
-               const beforeRoot = area === 'logical' ? before.head?.logical : before.head?.builds;
-          @@ -656,3 +671,3 @@
-                 const collection = certificate
-          -        ? descriptor(_readTree().get(readScope(view, area), name))
-          +        ? descriptor(_readTree().get(readScope(view, area, certificate), name))
-                   : schemaReadOperations.collection(view, area, name);
-          diff --git a/src/server/test/intake-schema-resolution-authority.test.ts b/src/server/test/intake-schema-resolution-authority.test.ts
-          index 4dced49..9e2ae0e 100644
-          --- a/src/server/test/intake-schema-resolution-authority.test.ts
-          +++ b/src/server/test/intake-schema-resolution-authority.test.ts
-          @@ -483,3 +483,7 @@ test('cold schema scope shares checks while retaining complete ancestry at two s
-                 assert.equal(heads, 2, 'one entry and one final physical HEAD proof');
-          -      assert.equal(witnessQueries, 6, 'entry, selected binding and final SQL witness only');
-          +      assert.equal(
-          +        witnessQueries,
-          +        4,
-          +        'entry and final SQL witnesses; selected binding reuses entry',
-          +      );
-               } finally {
-          @@ -591,3 +595,7 @@ test('named field lookup shares one sealed scope without losing lexical values',
-                 );
-          -      assert.equal(witnessQueries, 24, 'four six-query scopes; field cells share one binding');
-          +      assert.equal(
-          +        witnessQueries,
-          +        22,
-          +        'three six-query scopes plus the four-query fixed field scope',
-          +      );
-                 assert.equal(items, 6, 'four field witnesses and both original payload reads are retained');
-          @@ -1042 +1050,135 @@ test('staged field scope preserves duplicate selection and refuses rollback-only
-           });
-          +
-          +for (const extras of [0, 40])
-          +  test(`fixed schema reads seal one witness interval: ${extras} unrelated records`, async (t) => {
-          +    const f = await stagedFixture(t, extras);
-          +    const collections = f.selected.collections;
-          +    const view = collections.openView();
-          +    const original = f.authority.storage.read;
-          +    let heads = 0;
-          +    f.authority.storage.read = (name) => {
-          +      if (name === 'head') heads++;
-          +      return original(name);
-          +    };
-          +    try {
-          +      for (const area of ['logical', 'builds'] as const) {
-          +        const collection = area === 'logical' ? 'envelope.data' : f.build;
-          +        for (const operation of ['header', 'field'] as const) {
-          +          const read = () =>
-          +            operation === 'header'
-          +              ? collections.resolveSchemaRecord(
-          +                  view,
-          +                  f.control.mode,
-          +                  f.control.root,
-          +                  f.id,
-          +                  'last',
-          +                  area,
-          +                  collection,
-          +                )
-          +              : collections.resolveSchemaField(
-          +                  view,
-          +                  f.control.mode,
-          +                  f.control.root,
-          +                  f.id,
-          +                  'last',
-          +                  'value',
-          +                  area,
-          +                  collection,
-          +                );
-          +          const expected = read();
-          +          const before = intakeWorkCounters(f.db).warm;
-          +          const beforeHeads = heads;
-          +          assert.deepEqual(read(), expected);
-          +          const after = intakeWorkCounters(f.db).warm;
-          +          const measured = {
-          +            extras,
-          +            area,
-          +            operation,
-          +            heads: heads - beforeHeads,
-          +            witnessQueries:
-          +              after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
-          +            items: after.collectionItemsRead - before.collectionItemsRead,
-          +          };
-          +          t.diagnostic(JSON.stringify(measured));
-          +          assert.equal(measured.heads, 2, 'entry and final physical HEAD are both checked');
-          +          assert.equal(
-          +            measured.items,
-          +            operation === 'header' ? 0 : 4,
-          +            'preserve the complete field witnesses',
-          +          );
-          +          assert.equal(
-          +            measured.witnessQueries,
-          +            4,
-          +            'one two-query entry witness and one final witness; no duplicate selected-binding snapshot',
-          +          );
-          +        }
-          +      }
-          +      assert.deepEqual(f.reader.field(f.reader.resolve(f.id), 'value'), {
-          +        kind: 'value',
-          +        value: 'new',
-          +      });
-          +      assert.deepEqual(f.staged.field(f.staged.resolve(f.id), 'value'), {
-          +        kind: 'value',
-          +        value: 'new',
-          +      });
-          +    } finally {
-          +      f.authority.storage.read = original;
-          +    }
-          +  });
-          +
-          +for (const mode of ['local-aba', 'peer-aba', 'temp-schema', 'registry'] as const)
-          +  test(`schema witness reuse refuses ${mode} immediately after its entry snapshot`, async (t) => {
-          +    const f = await fixture(t);
-          +    const writer = mode === 'peer-aba' ? new DatabaseSync(f.path) : f.db;
-          +    const prepare = f.db.prepare;
-          +    let armed = false,
-          +      fired = 0;
-          +    f.db.prepare = function (sql: string) {
-          +      const statement = prepare.call(f.db, sql);
-          +      if (sql === 'PRAGMA temp.schema_version') {
-          +        const get = statement.get;
-          +        statement.get = (...args: unknown[]) => {
-          +          const result = Reflect.apply(get, statement, args) as ReturnType<typeof get>;
-          +          if (armed) {
-          +            armed = false;
-          +            fired++;
-          +            if (mode === 'registry') clearIntakeStateCache(f.db);
-          +            else if (mode === 'temp-schema')
-          +              f.db.exec(
-          +                'CREATE TEMP TABLE fictional_entry_witness(id); DROP TABLE fictional_entry_witness',
-          +              );
-          +            else {
-          +              writer
-          +                .prepare('INSERT INTO main.app_meta(key,value) VALUES(?,?)')
-          +                .run('fictional-entry-aba', 'value');
-          +              writer.prepare('DELETE FROM main.app_meta WHERE key=?').run('fictional-entry-aba');
-          +            }
-          +          }
-          +          return result;
-          +        };
-          +      }
-          +      return statement;
-          +    };
-          +    try {
-          +      const collections = createIntakeStateStorage(f.db, {
-          +        profileId: 'fictional-schema-memo',
-          +        intakeId: f.source.id,
-          +        sourceHash: f.source.sha256,
-          +      }).collections;
-          +      const view = collections.openView();
-          +      const read = () =>
-          +        collections.resolveSchemaField(view, f.control.mode, f.control.root, f.id, 'last', 'value');
-          +      assert.equal(read().target?.type, 'cell');
-          +      armed = true;
-          +      assert.throws(read, /authority changed|stale|expired|collection/);
-          +      assert.equal(fired, 1, 'one mutation immediately after the captured entry witness');
-          +    } finally {
-          +      armed = false;
-          +      f.db.prepare = prepare;
-          +      if (mode === 'peer-aba') writer.close();
-          +    }
-          +    assert.deepEqual(f.reader.field(f.reader.resolve(f.id), 'value'), {
-          +      kind: 'value',
-          +      value: 'new',
-          +    });
-          +  });
-          PATCH
-          git apply --check "$OUTPUT/repair.patch"
-          git apply --include=src/server/test/intake-schema-resolution-authority.test.ts "$OUTPUT/repair.patch"
-      - name: Prove the counted regression fails on unchanged application code
+          node --input-type=module <<'NODE'
+          import { gunzipSync } from 'node:zlib';
+          import { writeFileSync } from 'node:fs';
+          const encoded = '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';
+          writeFileSync(`${process.env.OUTPUT}/repair.patch`, gunzipSync(Buffer.from(encoded, 'base64')));
+          NODE
+      - name: Capture complete previous-head CI evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs';
+          const api = 'https://api.github.com/repos/mxbaylee/circus-health';
+          const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' };
+          async function get(path, file) {
+            const response = await fetch(api + path, { headers, signal: AbortSignal.timeout(30000) });
+            if (!response.ok) throw Error(`${path}: ${response.status}`);
+            const text = await response.text();
+            writeFileSync(`${process.env.OUTPUT}/${file}`, text);
+            return text;
+          }
+          const jobs = JSON.parse(await get('/actions/runs/37701995577/attempts/1/jobs?per_page=100', 'prior-jobs.json'));
+          if (jobs.total_count !== jobs.jobs.length) throw Error('Incomplete job inventory');
+          await get('/actions/runs/37701995577', 'prior-run.json');
+          await get('/pulls/71', 'pr-snapshot.json');
+          const wanted = new Set(['acceptance', 'continuation', 'Server (4/16)', 'Server (6/16)', 'Browser (5/6)', 'Browser (6/6)', 'Server (8/16)']);
+          const summary = [];
+          for (const job of jobs.jobs.filter(job => wanted.has(job.name))) {
+            const text = await get(`/actions/jobs/${job.id}/logs`, `logs/${job.id}.log`);
+            const lines = text.split('\n');
+            const failure = lines.findIndex(line => line.includes('failing tests:'));
+            summary.push({ id: job.id, name: job.name, conclusion: job.conclusion, startedAt: job.started_at, completedAt: job.completed_at, excerpt: failure < 0 ? lines.filter(line => /duration_ms|ℹ tests|ℹ pass|ℹ fail|ℹ cancelled|##\[error\]/u.test(line)) : lines.slice(failure, failure + 55) });
+          }
+          writeFileSync(`${process.env.OUTPUT}/prior-summary.json`, JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify(summary, null, 2));
+          NODE
+      - name: Prove the new scratch-work assertion fails on unchanged implementation
+        run: |
+          git apply --include=src/server/test/record-replay-sql.test.ts "$OUTPUT/repair.patch"
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { spawnSync } from 'node:child_process';
           import { writeFileSync } from 'node:fs';
           import { testEnvironment } from './src/scripts/test-suite.ts';
-          const args = ['--test', '--test-concurrency=1', '--test-reporter=spec', '--test-name-pattern=fixed schema reads seal|schema witness reuse refuses', 'src/server/test/intake-schema-resolution-authority.test.ts'];
-          const r = spawnSync(process.execPath, args, { env: testEnvironment(process.env, 'server'), encoding: 'utf8' });
-          const text = r.stdout + r.stderr;
-          writeFileSync(`${process.env.OUTPUT}/red.log`, text);
-          writeFileSync(`${process.env.OUTPUT}/red-result.json`, JSON.stringify({ command: ['node', ...args], status: r.status, signal: r.signal }, null, 2));
-          assert.equal(r.status, 1);
-          for (const required of ['tests 6', 'pass 4', 'fail 2', 'cancelled 0', 'skipped 0', '6 !== 4']) assert.ok(text.includes(required), required);
+          const command = ['--test', '--test-concurrency=1', '--test-reporter=spec', 'src/server/test/record-replay-sql.test.ts'];
+          const result = spawnSync(process.execPath, command, { env: testEnvironment(process.env, 'server'), encoding: 'utf8' });
+          const log = result.stdout + result.stderr;
+          writeFileSync(`${process.env.OUTPUT}/red.log`, log);
+          writeFileSync(`${process.env.OUTPUT}/red-result.json`, JSON.stringify({ command, status: result.status, signal: result.signal }, null, 2));
+          assert.equal(result.status, 1);
+          assert.ok(log.includes('ancestry: ordering-index inserts share one private transaction per traversal'));
+          assert.ok(/ℹ fail 2/u.test(log) && /ℹ cancelled 0/u.test(log) && /ℹ skipped 0/u.test(log));
           NODE
-      - name: Apply repair and verify all four exact source hashes
+      - name: Apply the exact repair and check its full tree
         run: |
-          git apply --exclude=src/server/test/intake-schema-resolution-authority.test.ts "$OUTPUT/repair.patch"
+          git apply --exclude=src/server/test/record-replay-sql.test.ts "$OUTPUT/repair.patch"
+          git diff --check
+          git add docs/data/record-version-storage.md docs/setup/release-updates.md src/server/record-versions.ts src/server/test/record-replay-sql.test.ts
+          git write-tree > "$OUTPUT/candidate-tree.txt"
+          test "$(cat "$OUTPUT/candidate-tree.txt")" = 85a7515529c92332df7c42ffa66e28f84ae978cf
+          git diff --cached > "$OUTPUT/full-repair.patch"
+      - name: Verify complete record and recovery regressions
+        run: |
           node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import { readFileSync, writeFileSync } from 'node:fs';
-          import { execFileSync } from 'node:child_process';
-          const path = 'docs/setup/release-updates.md';
-          const before = 'Header reuse checks current physical authority while reducing intermediate observations.';
-          const after = before + ' The fixed synchronous schema resolver reuses its entry SQL witness for selected-root binding and still compares the closing witness after the final physical accepted-head check; general reads and transaction fallbacks are unchanged.';
-          const text = readFileSync(path, 'utf8');
-          assert.equal(text.split(before).length, 2);
-          writeFileSync(path, text.replace(before, after));
-          const files = [
-            {path: 'src/server/intake-state-collections.ts', sha: '60c5143d10bfc22823c933772096d07493afb709'},
-            {path: 'src/server/test/intake-schema-resolution-authority.test.ts', sha: '9e2ae0eb19bfb10b38188c496bd1f0d696861714'},
-            {path: 'docs/data/intake-state-storage.md', sha: '8cc2a2317893f29d9331ac0d9ab14a25aacd97b1'},
-            {path: 'docs/setup/release-updates.md', sha: '7cf42d5de513bc0ac2d84e9162ddfd6508e4f960'},
-          ];
-          for (const file of files) assert.equal(execFileSync('git', ['hash-object', file.path], {encoding:'utf8'}).trim(), file.sha);
-          writeFileSync(`${process.env.OUTPUT}/source-manifest.json`, JSON.stringify(files, null, 2));
-          execFileSync('git', ['add', '--', ...files.map(f => f.path)]);
-          const tree = execFileSync('git', ['write-tree'], {encoding:'utf8'}).trim();
-          assert.equal(tree, '49d7da22e69df5e5c45d2c6513fce8a69520859d');
-          writeFileSync(`${process.env.OUTPUT}/candidate-tree.txt`, tree + '\n');
+          import { spawnSync } from 'node:child_process';
+          import { writeFileSync, openSync, closeSync } from 'node:fs';
+          import { testEnvironment } from './src/scripts/test-suite.ts';
+          const command = ['--test', '--test-concurrency=1', '--test-reporter=spec', 'src/server/test/record-replay-sql.test.ts', 'src/server/test/record-versions.test.ts', 'src/server/test/profile-recovery-diagnostics.test.ts', 'src/server/test/intake-state-production-recovery.test.ts', 'src/server/test/intake-recovery-breakdown.test.ts'];
+          const fd = openSync(`${process.env.OUTPUT}/green.log`, 'w');
+          const result = spawnSync(process.execPath, command, { env: testEnvironment(process.env, 'server'), stdio: ['ignore', fd, fd] });
+          closeSync(fd);
+          writeFileSync(`${process.env.OUTPUT}/green-result.json`, JSON.stringify({ command, status: result.status, signal: result.signal }, null, 2));
+          process.exitCode = result.status ?? 1;
           NODE
-          git diff --cached --check
-          git diff --cached --binary > "$OUTPUT/full-repair.patch"
-      - name: Check types, formatting, inventory and complete focused collections
+      - name: Check types, formatting and inventory
         run: |
           npm run typecheck > "$OUTPUT/typecheck.log" 2>&1
-          npx --no-install prettier --check src/server/intake-state-collections.ts src/server/test/intake-schema-resolution-authority.test.ts > "$OUTPUT/format.log" 2>&1
+          npx prettier --check docs/data/record-version-storage.md docs/setup/release-updates.md src/server/record-versions.ts src/server/test/record-replay-sql.test.ts > "$OUTPUT/format.log" 2>&1
           node scripts/repository-file-inventory.ts --check > "$OUTPUT/inventory.log" 2>&1
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import { spawnSync } from 'node:child_process';
-          import { openSync, closeSync, writeFileSync } from 'node:fs';
-          import { testEnvironment } from './src/scripts/test-suite.ts';
-          const files = ['intake-schema-resolution-authority.test.ts', 'intake-schema-resolution-benefit.test.ts', 'intake-state-read-cache-authority.test.ts', 'intake-collection-envelope.test.ts', 'intake-state-collections.test.ts'];
-          const args = ['--test', '--test-concurrency=1', '--test-reporter=spec', ...files.map(f => 'src/server/test/' + f)];
-          const fd = openSync(`${process.env.OUTPUT}/green.log`, 'w');
-          const r = spawnSync(process.execPath, args, {env: testEnvironment(process.env, 'server'), stdio: ['ignore',fd,fd]});
-          closeSync(fd);
-          writeFileSync(`${process.env.OUTPUT}/green-result.json`, JSON.stringify({command:['node',...args], status:r.status, signal:r.signal},null,2));
-          assert.equal(r.status,0);
-          NODE
-      - name: Verify the unchanged two- and eight-record acceptance diagnostic
-        run: |
-          node --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import { spawnSync } from 'node:child_process';
-          import { openSync, closeSync, writeFileSync } from 'node:fs';
-          import { testEnvironment } from './src/scripts/test-suite.ts';
-          const args = ['--test','--test-concurrency=1','--test-reporter=spec','src/server/test/intake-acceptance-work.test.ts'];
-          const fd = openSync(`${process.env.OUTPUT}/small-acceptance.log`,'w');
-          const r = spawnSync(process.execPath,args,{env:testEnvironment(process.env,'server'),stdio:['ignore',fd,fd]});
-          closeSync(fd);
-          writeFileSync(`${process.env.OUTPUT}/small-acceptance-result.json`,JSON.stringify({command:['node',...args],status:r.status,signal:r.signal,scope:'Host-only 2/8-record diagnostic, not full HTTP/encrypted recovery qualification'},null,2));
-          assert.equal(r.status,0);
-          NODE
-      - name: Retain verified Git blobs without changing any branch
+      - name: Retain exact verified source and Git blobs without updating any branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git archive "$(cat "$OUTPUT/candidate-tree.txt")" | gzip -n > "$OUTPUT/candidate-source.tar.gz"
+          git ls-tree -r "$(cat "$OUTPUT/candidate-tree.txt")" > "$OUTPUT/source-tree.txt"
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { readFileSync, writeFileSync } from 'node:fs';
           import { execFileSync } from 'node:child_process';
-          const files = JSON.parse(readFileSync(`${process.env.OUTPUT}/source-manifest.json`,'utf8'));
+          const paths = ['docs/data/record-version-storage.md', 'docs/setup/release-updates.md', 'src/server/record-versions.ts', 'src/server/test/record-replay-sql.test.ts'];
           const elements = [];
-          for (const f of files) {
-            assert.equal(execFileSync('git',['hash-object',f.path],{encoding:'utf8'}).trim(),f.sha);
-            const r = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs',{method:'POST',headers:{Authorization:`Bearer ${process.env.GH_TOKEN}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},body:JSON.stringify({content:readFileSync(f.path,'utf8'),encoding:'utf-8'}),signal:AbortSignal.timeout(30000)});
-            assert.ok(r.ok,`blob ${f.path}: HTTP ${r.status}`);
-            const saved = await r.json(); assert.equal(saved.sha,f.sha);
-            elements.push({path:f.path,mode:'100644',type:'blob',sha:saved.sha});
+          for (const path of paths) {
+            const expected = execFileSync('git', ['hash-object', path], { encoding: 'utf8' }).trim();
+            const response = await fetch('https://api.github.com/repos/mxbaylee/circus-health/git/blobs', { method: 'POST', headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' }, body: JSON.stringify({ content: readFileSync(path, 'utf8'), encoding: 'utf-8' }), signal: AbortSignal.timeout(30000) });
+            assert.equal(response.status, 201);
+            const blob = await response.json();
+            assert.equal(blob.sha, expected);
+            elements.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
           }
-          writeFileSync(`${process.env.OUTPUT}/tree-elements.json`,JSON.stringify(elements,null,2));
-          writeFileSync(`${process.env.OUTPUT}/environment.json`,JSON.stringify({node:process.version,platform:process.platform,arch:process.arch,runId:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,workflowSha:process.env.GITHUB_SHA,refsUpdated:false},null,2));
+          writeFileSync(`${process.env.OUTPUT}/tree-elements.json`, JSON.stringify(elements, null, 2));
+          writeFileSync(`${process.env.OUTPUT}/environment.json`, JSON.stringify({ node: process.version, platform: process.platform, arch: process.arch, workflowSha: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID }, null, 2));
+          console.log(JSON.stringify(elements, null, 2));
           NODE
-          git archive 49d7da22e69df5e5c45d2c6513fce8a69520859d | gzip -n > "$OUTPUT/candidate-source.tar.gz"
       - name: Hash retained output
         if: always()
         run: |
@@ -380,7 +143,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-step1-verified
-          path: /tmp/pr71-step1-verified
+          name: pr71-step2-verified
+          path: /tmp/pr71-step2-verified
           if-no-files-found: error
           retention-days: 14
