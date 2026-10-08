@@ -330,6 +330,95 @@ it('retains referenced resolution history while coalescing only changed decision
   expect(view.result.current.current(initial, row).resolutionsReference?.count).toBe(4000);
 });
 
+it.each([false, true])(
+  'reapplies only unsent referenced decisions after conflict (newer queued edit: %s)',
+  async (newerEdit) => {
+    const initial = review(7, '42');
+    const row = initial.records[0]!;
+    row.draft = {
+      id: 'fictional-referenced-draft',
+      format: 'health-intake-review-draft-v2',
+      proposalId: initial.proposalId,
+      recordId: row.id,
+      candidateId: row.candidateId!,
+      candidateVersionId: row.candidateVersionId!,
+      mapping: {},
+      resolutions: [],
+      resolutionsReference: { format: 'health-intake-review-draft-resolutions-v1', count: 4000 },
+      answers: { old: 'Previously saved answer' },
+      disposition: 'pending',
+      at: '2026-10-04T00:00:00Z',
+    };
+    const latest = {
+      ...initial,
+      version: 10,
+      reviewToken: 'fictional-fresh-token',
+      records: [
+        {
+          ...row,
+          draft: {
+            ...row.draft,
+            resolutionsReference: {
+              format: 'health-intake-review-draft-resolutions-v1' as const,
+              count: 4001,
+            },
+            answers: { old: 'Newer retained answer' },
+          },
+        },
+      ],
+    };
+    const requests: Record<string, any>[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input, options) => {
+        if (String(input).includes('/review-record?')) return json(latest);
+        requests.push(JSON.parse(String(options?.body)));
+        if (requests.length === 2)
+          return json({ code: 'VERSION_CONFLICT', message: 'Review changed.' }, 409);
+        if (requests.length === 3) throw new TypeError('Fictional lost reapply response');
+        return json({ ...intake, version: 7 + requests.length });
+      }),
+    );
+    const view = renderHook(() => useReviewDrafts(profile.id, vi.fn()));
+    const saved = { issueId: 'saved-choice', outcome: 'confirmed' as const };
+    const unsent = { issueId: 'unsent-choice', outcome: 'acknowledged' as const };
+    act(() => {
+      view.result.current.hydrate(initial);
+      view.result.current.update(initial, row, { resolutions: [saved] });
+    });
+    await act(() => view.result.current.flush());
+    act(() => {
+      view.result.current.update(initial, row, {
+        resolutions: [saved, unsent],
+        answers: { old: 'Previously saved answer', new: 'Unsent fictional answer' },
+      });
+    });
+    await act(() => view.result.current.flush());
+    expect(view.result.current.conflict).toBe(true);
+    const reapplied = newerEdit ? { ...unsent, outcome: 'unknown' as const } : unsent;
+    const answer = newerEdit ? 'Newer unsent answer' : 'Unsent fictional answer';
+    if (newerEdit)
+      act(() => {
+        view.result.current.update(initial, row, {
+          resolutions: [saved, reapplied],
+          answers: { old: 'Previously saved answer', new: answer },
+        });
+      });
+    await act(() => view.result.current.inspectConflict());
+    await act(() => view.result.current.reapply());
+    expect(requests[2]).toMatchObject({
+      version: 10,
+      resolutions: [reapplied],
+      answers: { new: answer },
+    });
+    expect(requests[2]!.resolutions).toEqual([reapplied]);
+    expect(requests[2]!.answers).toEqual({ new: answer });
+    expect(requests[2]!.operationId).not.toBe(requests[1]!.operationId);
+    await act(() => view.result.current.retry());
+    expect(requests[3]).toEqual(requests[2]);
+  },
+);
+
 it('preserves independently saved native pair choices through resolutions, mapping edits and exact uncertain retries', async () => {
   const initial = review(7, '42');
   const requests: Record<string, any>[] = [];

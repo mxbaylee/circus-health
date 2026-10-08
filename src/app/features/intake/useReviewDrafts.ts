@@ -497,11 +497,29 @@ export function useReviewDrafts(
   async function reapply() {
     const fresh = await refreshComparison();
     if (!fresh) return false;
+    const key = fresh.snapshot.key;
+    const failed = failedWork.current?.key === key ? failedWork.current.work.body : undefined;
+    const pending = queue.current.get(key)?.body;
     failedWork.current = null;
-    queue.current.delete(fresh.snapshot.key);
+    queue.current.delete(key);
     update(fresh.review, fresh.record, fresh.snapshot.local);
-    const work = queue.current.get(fresh.snapshot.key);
-    if (work) work.version = fresh.review.version;
+    const work = queue.current.get(key);
+    if (work) {
+      work.version = fresh.review.version;
+      // Referenced drafts retain saved choices outside the browser. Reapply
+      // only unsent patches, never the local cache of earlier saved choices.
+      if (fresh.snapshot.local.resolutionsReference) {
+        work.body.resolutions = [
+          ...new Map(
+            [...(failed?.resolutions || []), ...(pending?.resolutions || [])].map((value) => [
+              value.issueId,
+              value,
+            ]),
+          ).values(),
+        ];
+        work.body.answers = { ...failed?.answers, ...pending?.answers };
+      }
+    }
     paused.current = false;
     setComparison(null);
     setConflict(false);
