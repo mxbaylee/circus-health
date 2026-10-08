@@ -117,6 +117,75 @@ test('scratch batching retains exact rows, duplicate refusal and disposal at dif
   }
 });
 
+test('cold schema validation compiles fixed scratch statements once per traversal', async (t) => {
+  for (const records of [4, 16]) {
+    const { db, profile, source } = await fixture(t, records);
+    const selected = collectionCellReader(db, source);
+    const control = parseSchemaControl(
+      selected.collections.get(
+        selected.collections.openView(),
+        'logical',
+        'envelope.control',
+        'representation',
+      ),
+    );
+    const before = JSON.stringify(captureIntakeStateCopySnapshot(db, profile));
+    let scratch: DatabaseSync | undefined;
+    const counts = new Map<string, { prepared: number; executed: number }>();
+    const exec = DatabaseSync.prototype.exec;
+    const prepare = DatabaseSync.prototype.prepare;
+    const execProbe = t.mock.method(
+      DatabaseSync.prototype,
+      'exec',
+      function (this: DatabaseSync, sql: string) {
+        if (sql.includes('CREATE TABLE records(id TEXT PRIMARY KEY')) scratch = this;
+        return exec.call(this, sql);
+      },
+    );
+    const prepareProbe = t.mock.method(
+      DatabaseSync.prototype,
+      'prepare',
+      function (this: DatabaseSync, sql: string) {
+        const statement = prepare.call(this, sql);
+        if (this === scratch) {
+          const count = counts.get(sql) ?? { prepared: 0, executed: 0 };
+          counts.set(sql, count);
+          count.prepared++;
+          for (const method of ['run', 'get', 'iterate'] as const) {
+            const original = statement[method];
+            Object.defineProperty(statement, method, {
+              value: (...args: Parameters<typeof original>) => {
+                count.executed++;
+                return Reflect.apply(original, statement, args);
+              },
+            });
+          }
+        }
+        return statement;
+      },
+    );
+    try {
+      for (const _step of validateIntakeSchemaReachabilitySteps(selected.store, control)) {
+        // Consume the complete real schema, including every cooperative boundary.
+      }
+    } finally {
+      prepareProbe.mock.restore();
+      execProbe.mock.restore();
+    }
+    assert.ok(scratch && !scratch.isOpen, 'scratch closes after complete validation');
+    assert.equal(counts.size, 10, 'exercise all fixed scratch statement shapes');
+    assert.equal(
+      [...counts.values()].reduce((total, count) => total + count.executed, 0),
+      records === 4 ? 583 : 1951,
+      'retain every scratch lookup and write for the complete fictional schema',
+    );
+    assert.equal(JSON.stringify(captureIntakeStateCopySnapshot(db, profile)), before);
+    t.diagnostic(JSON.stringify({ records, statements: [...counts.values()] }));
+    for (const [sql, count] of counts)
+      assert.equal(count.prepared, 1, 'compile once per traversal: ' + sql);
+  }
+});
+
 for (const finish of ['return', 'throw'] as const)
   test('schema scratch transaction closes on generator ' + finish, async (t) => {
     const { db, profile, source } = await fixture(t, 48);

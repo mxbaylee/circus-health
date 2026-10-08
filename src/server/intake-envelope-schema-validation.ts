@@ -64,23 +64,33 @@ export function* validateIntakeSchemaReachabilitySteps(
     // changing the store checks performed across cooperative yields.
     db.exec('BEGIN');
     db.prepare("INSERT INTO records(id,path) VALUES(?,'')").run(control.root);
+    // Reuse only bytecode owned by this scratch traversal, never source values
+    // or validation results across cooperative yields.
+    const insertExpected = db.prepare(
+        'INSERT INTO expected VALUES(?,?) ON CONFLICT(key) DO NOTHING',
+      ),
+      incrementExpectedCount = db.prepare(
+        'INSERT INTO expected_counts VALUES(?,1) ON CONFLICT(prefix) DO UPDATE SET count=count+1',
+      ),
+      updateExpected = db.prepare('UPDATE expected SET value=? WHERE key=?'),
+      selectExpectedCount = db.prepare('SELECT count FROM expected_counts WHERE prefix=?'),
+      selectExpected = db.prepare('SELECT value FROM expected WHERE key=?'),
+      nextRecord = db.prepare(
+        'SELECT id,parent,ordinal,field,semantic,path,parentShape FROM records WHERE done=0 ORDER BY path LIMIT 1',
+      ),
+      insertRecord = db.prepare(
+        'INSERT INTO records(id,parent,ordinal,field,semantic,path,parentShape) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING',
+      ),
+      finishRecord = db.prepare('UPDATE records SET done=1 WHERE id=?');
     const firstExpected = (key: string, value: string) => {
-      const inserted = db
-        .prepare('INSERT INTO expected VALUES(?,?) ON CONFLICT(key) DO NOTHING')
-        .run(key, value);
-      if (inserted.changes)
-        db.prepare(
-          'INSERT INTO expected_counts VALUES(?,1) ON CONFLICT(prefix) DO UPDATE SET count=count+1',
-        ).run(key.slice(0, key.lastIndexOf(':') + 1));
+      const inserted = insertExpected.run(key, value);
+      if (inserted.changes) incrementExpectedCount.run(key.slice(0, key.lastIndexOf(':') + 1));
     };
     const expected = (key: string, value: string) => {
       firstExpected(key, value);
-      db.prepare('UPDATE expected SET value=? WHERE key=?').run(value, key);
+      updateExpected.run(value, key);
     };
-    const expectedCount = (prefix: string) =>
-      Number(
-        db.prepare('SELECT count FROM expected_counts WHERE prefix=?').get(prefix)?.count ?? 0,
-      );
+    const expectedCount = (prefix: string) => Number(selectExpectedCount.get(prefix)?.count ?? 0);
     function* rows(prefix: string) {
       let after = prefix;
       for (;;) {
@@ -99,7 +109,7 @@ export function* validateIntakeSchemaReachabilitySteps(
       let count = 0;
       for (const row of rows(prefix)) {
         if (++work % 64 === 0) yield;
-        const wanted = db.prepare('SELECT value FROM expected WHERE key=?').get(row.key);
+        const wanted = selectExpected.get(row.key);
         if (!wanted || typeof row.value !== 'string' || row.value !== wanted.value)
           fail('phantom or inconsistent operational descriptor');
         count++;
@@ -109,11 +119,7 @@ export function* validateIntakeSchemaReachabilitySteps(
     };
     for (;;) {
       if (++work % 64 === 0) yield;
-      const retained = db
-        .prepare(
-          'SELECT id,parent,ordinal,field,semantic,path,parentShape FROM records WHERE done=0 ORDER BY path LIMIT 1',
-        )
-        .get();
+      const retained = nextRecord.get();
       if (!retained) break;
       const id = String(retained.id),
         meta = readSchemaRecordHeader(store, id);
@@ -162,9 +168,7 @@ export function* validateIntakeSchemaReachabilitySteps(
           if (name.kind !== 'string' || lexical.kind !== 'string' || name.hash !== lexical.hash)
             fail('schema lexical/property agreement');
           field = name.hash;
-          const previous =
-            db.prepare('SELECT value FROM expected WHERE key=?').get('l:' + id + ':' + field)
-              ?.value ?? 'null';
+          const previous = selectExpected.get('l:' + id + ':' + field)?.value ?? 'null';
           if (store.get('d:' + id + ':' + schemaOrdinal(ordinal)) !== previous)
             fail('schema property predecessor');
           expected('f:' + id + ':' + field, JSON.stringify(entry.target));
@@ -172,19 +176,15 @@ export function* validateIntakeSchemaReachabilitySteps(
           firstExpected('b:' + id + ':' + field, String(ordinal));
         } else if (entry.name !== undefined) fail('array property name');
         if (entry.target.type === 'record') {
-          const inserted = db
-            .prepare(
-              'INSERT INTO records(id,parent,ordinal,field,semantic,path,parentShape) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING',
-            )
-            .run(
-              entry.target.id,
-              id,
-              ordinal,
-              field,
-              meta.shape === 'object' ? id : retained.semantic,
-              retained.path + '/' + schemaOrdinal(ordinal),
-              meta.shape,
-            );
+          const inserted = insertRecord.run(
+            entry.target.id,
+            id,
+            ordinal,
+            field,
+            meta.shape === 'object' ? id : retained.semantic,
+            retained.path + '/' + schemaOrdinal(ordinal),
+            meta.shape,
+          );
           if (!inserted.changes) fail('duplicate or cyclic live schema record');
         }
         count++;
@@ -199,9 +199,7 @@ export function* validateIntakeSchemaReachabilitySteps(
         expected('m:' + retained.parent + ':' + scalar.hash, id);
       }
       if (meta.shape === 'object' && retained.semantic !== null) {
-        const raw = db
-          .prepare('SELECT value FROM expected WHERE key=?')
-          .get('f:' + id + ':' + schemaKey('id'))?.value;
+        const raw = selectExpected.get('f:' + id + ':' + schemaKey('id'))?.value;
         if (typeof raw === 'string') {
           const target = JSON.parse(raw) as { type: string; id: string };
           if (target.type === 'cell') {
@@ -235,7 +233,7 @@ export function* validateIntakeSchemaReachabilitySteps(
         )
           fail('schema next property ordinal');
       }
-      db.prepare('UPDATE records SET done=1 WHERE id=?').run(id);
+      finishRecord.run(id);
     }
     for (const row of db.prepare('SELECT id FROM records').iterate()) {
       yield* compare('i:' + row.id + ':');

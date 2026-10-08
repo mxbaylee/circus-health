@@ -90,6 +90,15 @@ Every new durable write path needs a fictional-fixture test asserting that journ
 
 Cold reconstruction retains the original complete-version validation, reference verification, delete-before-insert ordering, historical indexing and final integrity checks. Within each replayed transaction, it prepares each touched table's delete/insert statement at most once per phase and executes that statement for every applicable record. The statement maps are local to that call and bounded by the configured table set; no records, authorization results or prepared statements are reused across replay calls or connections. Durable formats, encryption, accepted publication and cache compatibility are unchanged.
 
+Cold intake schema validation likewise prepares its ten fixed scratch SQL
+statements once per traversal. It still executes every property, ancestry,
+membership and descriptor check, including fresh source checks across cooperative
+yields. The statements belong only to the disposable validation database; normal
+completion, refusal and generator cancellation discard that database. Fictional
+four- and sixteen-candidate regressions retain 583 and 1,951 scratch executions
+while requiring ten compilations each. This reduces SQL compilation work, not
+authenticated reads or durable writes, and does not establish an unlock latency.
+
 Publication now also prepares a changed-row SELECT once per touched table within
 one collection traversal. Every changed identity still executes that SELECT and
 reads its current predecessor; no row, result or authorization is cached. The
