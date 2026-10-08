@@ -111,10 +111,109 @@ function observePublication(
     pageSize,
   });
   const databaseFilesBefore = databaseFiles();
+  const recordBtrees = [
+    '__record_versions',
+    '__record_fields',
+    '__record_current',
+    '__record_history',
+    '__record_time',
+    '__record_link_owner',
+    '__record_attachment_owner',
+    '__record_field_history',
+  ] as const;
+  const recordBtreeFootprint = () => {
+    try {
+      const rows = (() => {
+        const reader = new DatabaseSync(databasePath, { readOnly: true });
+        try {
+          return reader
+            .prepare(
+              `SELECT name,count(*) AS pages,sum(pgsize) AS bytes FROM dbstat WHERE name IN (${recordBtrees.map(() => '?').join(',')}) GROUP BY name`,
+            )
+            .all(...recordBtrees);
+        } finally {
+          reader.close();
+        }
+      })();
+      const found = new Map(rows.map((row) => [String(row.name), row]));
+      return Object.fromEntries(
+        recordBtrees.map((name) => [
+          name,
+          {
+            pages: Number(found.get(name)?.pages ?? 0),
+            bytes: Number(found.get(name)?.bytes ?? 0),
+          },
+        ]),
+      );
+    } catch {
+      return null;
+    }
+  };
+  const recordBtreesBefore = recordBtreeFootprint();
   let maxObservedWalBytes = databaseFilesBefore.walBytes;
   const filesystem = new Map<string, { calls: number; elapsedMs: number; bytes: number }>();
   const dbExec = new Map<string, { calls: number; elapsedMs: number; fsWrite: number }>();
   const sqlTimings = new Map<string, { calls: number; elapsedMs: number }>();
+  type BatchKind = 'build' | 'adoption' | 'other';
+  type BatchInfo = { kind: BatchKind; changes: number; keyed: number; repeated: number };
+  const preparedBatches = new WeakMap<object, BatchInfo>();
+  const batchOccupancy = new Map<
+    BatchKind,
+    {
+      prepared: number;
+      committed: number;
+      changes: number;
+      keyed: number;
+      repeated: number;
+      histogram: number[];
+      commitMs: number;
+      commitFsWrite: number;
+      processFsWrite: number;
+      walFileSizeDelta: number;
+      mainFileSizeDelta: number;
+    }
+  >();
+  const batchTotals = (kind: BatchKind) => {
+    let totals = batchOccupancy.get(kind);
+    if (!totals) {
+      totals = {
+        prepared: 0,
+        committed: 0,
+        changes: 0,
+        keyed: 0,
+        repeated: 0,
+        histogram: Array(65).fill(0) as number[],
+        commitMs: 0,
+        commitFsWrite: 0,
+        processFsWrite: 0,
+        walFileSizeDelta: 0,
+        mainFileSizeDelta: 0,
+      };
+      batchOccupancy.set(kind, totals);
+    }
+    return totals;
+  };
+  const describeBatch = (input: unknown): BatchInfo | undefined => {
+    const changes = (input as { changes?: unknown })?.changes;
+    if (!Array.isArray(changes) || changes.length > 64) return undefined;
+    const kind: BatchKind =
+      changes.length === 1 && changes[0]?.op === 'adoptCollection'
+        ? 'adoption'
+        : changes.every((change) => change?.area === 'builds')
+          ? 'build'
+          : 'other';
+    const keys = new Set<string>();
+    let keyed = 0;
+    let repeated = 0;
+    for (const change of changes) {
+      if (typeof change?.key !== 'string') continue;
+      keyed++;
+      const key = JSON.stringify([change.area, change.collection, change.key]);
+      if (keys.has(key)) repeated++;
+      else keys.add(key);
+    }
+    return { kind, changes: changes.length, keyed, repeated };
+  };
   const restores: Array<() => void> = [];
   let removeObserver: (() => void) | undefined;
   let disposed = false;
@@ -275,14 +374,46 @@ function observePublication(
         const phase = [...stack, method].join('/');
         stack.push(method);
         const before = point();
+        const committedBatch =
+          method === 'commitMaintenance' && args[0] && typeof args[0] === 'object'
+            ? preparedBatches.get(args[0])
+            : undefined;
+        const filesBefore = committedBatch ? databaseFiles() : undefined;
+        let completed = false;
         if (method === 'commitMaintenance') activeMaintenance = { entry: before };
         if (phase === 'commitMaintenance/stage' && activeMaintenance)
           activeMaintenance.stageEntry = before;
         try {
-          return Reflect.apply(original, collections, args);
+          const result = Reflect.apply(original, collections, args);
+          completed = true;
+          if (method === 'prepare' && result && typeof result === 'object') {
+            const batch = describeBatch(args[1]);
+            if (batch) {
+              preparedBatches.set(result, batch);
+              const totals = batchTotals(batch.kind);
+              totals.prepared++;
+              totals.changes += batch.changes;
+              totals.keyed += batch.keyed;
+              totals.repeated += batch.repeated;
+              totals.histogram[batch.changes]++;
+            }
+          }
+          return result;
         } finally {
           const after = point();
           const value = accumulate(phases, phase, before, after);
+          if (committedBatch && completed) {
+            const totals = batchTotals(committedBatch.kind);
+            const previousCommit = before.dbExec.COMMIT ?? { elapsedMs: 0, fsWrite: 0 };
+            const currentCommit = after.dbExec.COMMIT ?? { elapsedMs: 0, fsWrite: 0 };
+            const filesAfter = databaseFiles();
+            totals.committed++;
+            totals.commitMs += currentCommit.elapsedMs - previousCommit.elapsedMs;
+            totals.commitFsWrite += currentCommit.fsWrite - previousCommit.fsWrite;
+            totals.processFsWrite += after.fsWrite - before.fsWrite;
+            totals.walFileSizeDelta += filesAfter.walBytes - filesBefore!.walBytes;
+            totals.mainFileSizeDelta += filesAfter.mainBytes - filesBefore!.mainBytes;
+          }
           if (phase === 'commitMaintenance/stage' && activeMaintenance)
             activeMaintenance.stageExit = after;
           if (method === 'commitMaintenance' && activeMaintenance) {
@@ -337,6 +468,7 @@ function observePublication(
         'bounded fictional WAL fixture exceeded its diagnostic file ceiling',
       );
       dispose();
+      const recordBtreesAfter = recordBtreeFootprint();
       const end = snapshot();
       const maintenanceNodes = maintenanceSegments.get('stage')?.work.collectionNodesWritten ?? 0;
       const publication = maintenanceSegments.get('postVerifyPublication');
@@ -345,6 +477,33 @@ function observePublication(
         JSON.stringify({
           phases: Object.fromEntries(phases),
           maintenanceSegments: Object.fromEntries(maintenanceSegments),
+          batchOccupancy: Object.fromEntries(
+            [...batchOccupancy].map(([kind, totals]) => [
+              kind,
+              {
+                ...totals,
+                histogram: totals.histogram.flatMap((calls, changes) =>
+                  calls ? [[changes, calls]] : [],
+                ),
+              },
+            ]),
+          ),
+          recordBtreeFootprint:
+            recordBtreesBefore && recordBtreesAfter
+              ? {
+                  before: recordBtreesBefore,
+                  after: recordBtreesAfter,
+                  growth: Object.fromEntries(
+                    recordBtrees.map((name) => [
+                      name,
+                      {
+                        pages: recordBtreesAfter[name].pages - recordBtreesBefore[name].pages,
+                        bytes: recordBtreesAfter[name].bytes - recordBtreesBefore[name].bytes,
+                      },
+                    ]),
+                  ),
+                }
+              : null,
           normalizedMaintenance: {
             nodes: maintenanceNodes,
             nodeBytes: maintenanceSegments.get('stage')?.work.collectionWrittenBytes ?? 0,
@@ -393,7 +552,7 @@ function observePublication(
               .map(([key, value]) => [key, value - start[key as keyof typeof start]]),
           ),
           resourceUsage: process.resourceUsage(),
-          note: 'Instrumented durations include probe overhead. Nested phases overlap; final checkpoint drain is separate from maintenance. Whole-probe process fsWrite includes preparation, staging, publication and final drain after a setup-only WAL drain. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. Linux process fsWrite deltas are kernel-reported write units, not attributable to one SQLite connection; normalized values are unavailable on other platforms. WAL size is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; the configured threshold can be overshot by a bounded transaction, so the fixture uses an independent 256 MiB ceiling. maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
+          note: 'Instrumented durations include probe overhead. Nested phases overlap; final checkpoint drain is separate from maintenance. Whole-probe process fsWrite includes preparation, staging, publication and final drain after a setup-only WAL drain. Batch occupancy counts prepared changes and repeats of keyed changes only; byte append operations have no key. Batch COMMIT and process fsWrite totals cover successful maintenance calls, while WAL/main file size deltas reflect file lengths, not frames or physical I/O. dbstat traverses eight named record B-trees on a separate read-only connection outside the publication interval after WAL drains; its output count is fixed but scan work grows with those trees. Allocated pages are neither whole-cache size, VFS write bytes nor a causal index-cost comparison. Post-stage verify ends after accepted-row verification; post-verify publication includes revision bookkeeping and journal encode/index/head publication. SQL and db.exec cover all connections; iterate timing excludes iteration. db.exec shapes exclude SQL text/values. Intake work is fixture-connection scoped. Filesystem bytes are API transfers, not physical device I/O. Linux process fsWrite deltas are kernel-reported write units, not attributable to one SQLite connection; normalized values are unavailable on other platforms. WAL size is sampled after fixture-connection COMMIT, not a physical write count or absolute peak; the configured threshold can be overshot by a bounded transaction, so the fixture uses an independent 256 MiB ceiling. maxRSS and prepared-byte peaks cover the process/connection lifetime, not cumulative work.',
         }),
       );
       assert.ok((phases.get('prepare')?.calls ?? 0) > 0);

@@ -37,7 +37,7 @@ import { fixture, envelope } from './intake-identity-native-fixture.ts';
 // history through one supported native workflow command.
 // Its historical member is intentionally not the candidate's latest version:
 // identity clinical preparation may skip it, but artifact verification may not.
-async function artifactHistoryFixture(t: test.TestContext) {
+async function artifactHistoryFixture(t: test.TestContext, phase: (name: string) => void) {
   const f = await fixture(t, false, 1),
     raw = JSON.parse(readIntakeEnvelopeText(f.db, { id: f.original.id })),
     details = raw.intake as IntakeDetails,
@@ -186,6 +186,7 @@ async function artifactHistoryFixture(t: test.TestContext) {
     257,
   );
   assert.equal(new Set(details.proposals.map((value) => value.id)).size, 257);
+  phase('publication-prepare-start');
   const prepared = await prepareIntakeWorkflowCommand(
     f.db,
     { id: f.original.id },
@@ -222,6 +223,7 @@ async function artifactHistoryFixture(t: test.TestContext) {
       },
     },
   );
+  phase('publication-prepare-complete');
   if (prepared.replayed) throw Error('Unexpected artifact fixture replay');
   intakeTransaction(
     f.db,
@@ -233,12 +235,18 @@ async function artifactHistoryFixture(t: test.TestContext) {
     },
     { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
   );
+  phase('publication-stage-complete');
+  phase('cold-http-start');
   const cold = await f.review();
   assert.ok(cold.scopeReference);
+  phase('cold-http-complete');
+  phase('stable-http-start');
   const stable = await f.review();
   assert.ok(stable.scopeReference);
   assert.equal(nativeIdentityPreviewCounts(f.db).entries, 1);
   assert.equal(stable.scopeReference.collection.membership, 3);
+  phase('stable-http-complete');
+  phase('membership-pages-start');
   const membership = await f.request(
     `identity-scope-page?groupId=${encodeURIComponent(f.groupId)}&scopeToken=${stable.scopeReference.scopeToken}&section=membership&limit=3`,
   );
@@ -282,6 +290,7 @@ async function artifactHistoryFixture(t: test.TestContext) {
     new Set(members.flatMap((member) => member.occurrences.map((value) => value.proposalId))),
     new Set(details.proposals.map((value) => value.id)),
   );
+  phase('membership-pages-complete');
   const totalBytes = Number(
     f.db
       .prepare(
@@ -305,7 +314,21 @@ test(
   'native warm identity cooperates across 257 retained proposal artifacts and duplicate occurrences',
   { timeout: 450000 },
   async (t) => {
-    const f = await artifactHistoryFixture(t);
+    const started = performance.now();
+    const phase = (name: string) => {
+      if (process.env.CRS_ARTIFACT_HISTORY_PHASES === '1')
+        process.stderr.write(
+          JSON.stringify({
+            fixture: 'fictional retained artifact history',
+            phase: name,
+            elapsedMs: performance.now() - started,
+          }) + '\n',
+        );
+    };
+    phase('fixture-start');
+    t.after(() => phase('test-teardown'));
+    const f = await artifactHistoryFixture(t, phase);
+    phase('fixture-complete');
     // Node's test runner isolates files in child processes. Observe actual allocations
     // in this fixture's process; sibling files' temporary scopes are not ours.
     const allocatedScopes = new Set<string>(),
@@ -339,6 +362,7 @@ test(
         before = { ...intakeWorkCounters(f.db).warm },
         fileWork = createIntakeFileWorkCounters();
       let complete = false;
+      phase('direct-warm-start');
       const warm = withIntakeFileWork(fileWork, () =>
         getNativeIntakeIdentityReview(f.db, f.root, f.profileId, f.original.id, f.groupId),
       );
@@ -407,6 +431,7 @@ test(
         );
         expectedWarm.scopeReference.original.contentUrl = `/api/sources/${encodeURIComponent(f.original.id)}/content`;
         assert.deepEqual(await warm, expectedWarm);
+        phase('direct-warm-complete');
       } finally {
         await warm.catch(() => undefined);
       }
@@ -462,6 +487,7 @@ test(
       controller.abort();
       await refused;
       await runExclusiveClinicalOperation(f.db, async () => undefined);
+      phase('subscriber-cancellation-drained');
       const stopped = { ...intakeWorkCounters(f.db).warm };
       for (let n = 0; n < 4; n++) await setImmediate();
       assert.equal(
