@@ -36,7 +36,8 @@ export async function makeNativeQueueFixture(
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'fictional-native-queue-')));
   const profileId = 'fictional-native-queue';
   const paths = ensureProfileDirectories(root, profileId);
-  const db = openDatabase(paths.database, profileId);
+  // Membership cooperation uses a disposable cache; the physical original stays on disk.
+  const db = openDatabase(mode === 'people-membership' ? ':memory:' : paths.database, profileId);
   const cleanup = () => {
     if (db.isOpen) {
       clearIntakeStateCache(db);
