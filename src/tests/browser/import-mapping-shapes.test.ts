@@ -104,7 +104,16 @@ const opticalDiagnosticReport = (event: string, snapshot: Record<string, unknown
 test('optical diagnostic JSON preserves nested phase and request evidence', () => {
   const snapshot = {
     phase: 'top-level original upload',
+    currentAwait: 'first acceptance response',
     phaseDurationMs: 12,
+    firstAcceptance: {
+      acceptanceRequests: 1,
+      acceptanceResponses: 0,
+      reportRequests: 0,
+      firstSaveMatched: false,
+      firstSaveFulfilled: false,
+      reportReadFulfilled: false,
+    },
     apiTransportAttempts: 2,
     apiTransportSettled: 1,
     inFlight: [{ method: 'POST', path: '/api/profiles/:id/intakes', durationMs: 5 }],
@@ -114,6 +123,11 @@ test('optical diagnostic JSON preserves nested phase and request evidence', () =
   const reported = JSON.parse(output);
   assert.equal(reported.event, 'phase-complete');
   assert.equal(reported.phaseDurationMs, 12);
+  assert.equal(reported.currentAwait, 'first acceptance response');
+  assert.equal(reported.firstAcceptance.acceptanceRequests, 1);
+  assert.equal(reported.firstAcceptance.firstSaveMatched, false);
+  assert.equal(reported.firstAcceptance.firstSaveFulfilled, false);
+  assert.equal(reported.firstAcceptance.reportReadFulfilled, false);
   assert.equal(reported.apiTransportAttempts, 2);
   assert.equal(reported.inFlight[0].method, 'POST');
   assert.equal(reported.recentBrowserRequests[0].status, 200);
@@ -126,6 +140,7 @@ test(
   async (t) => {
     const diagnosticsEnabled = process.env.CRS_TEST_DIAGNOSTICS === '1';
     let phase = 'runtime startup';
+    let currentAwait = 'runtime startup';
     let phaseStarted = Date.now();
     let completed = false;
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-mapping-shapes-'));
@@ -147,6 +162,45 @@ test(
     let browserApiFailed = 0;
     let evictedApiRequests = 0;
     let evictedBrowserRequests = 0;
+    let firstAcceptancePaths: { acceptance: string; report: string } | undefined;
+    let firstAcceptanceAcknowledgedAt: number | undefined;
+    const firstAcceptance = {
+      acceptanceRequests: 0,
+      acceptanceResponses: 0,
+      acceptanceFinished: 0,
+      acceptanceFailed: 0,
+      reportRequests: 0,
+      reportResponsesAfterAcknowledgement: 0,
+      reportFinishedAfterAcknowledgement: 0,
+      reportFailed: 0,
+      firstSaveMatched: false,
+      firstSaveFulfilled: false,
+      reportReadFulfilled: false,
+    };
+    const count = (
+      key:
+        | 'acceptanceRequests'
+        | 'acceptanceResponses'
+        | 'acceptanceFinished'
+        | 'acceptanceFailed'
+        | 'reportRequests'
+        | 'reportResponsesAfterAcknowledgement'
+        | 'reportFinishedAfterAcknowledgement'
+        | 'reportFailed',
+    ) => {
+      firstAcceptance[key] = Math.min(firstAcceptance[key] + 1, 1000);
+    };
+    const firstAcceptanceRoute = (request: Request) => {
+      if (phase !== 'guided queue first acceptance' || !firstAcceptancePaths) return undefined;
+      const path = new URL(request.url()).pathname;
+      if (request.method() === 'POST' && path === firstAcceptancePaths.acceptance)
+        return 'acceptance';
+      if (request.method() === 'GET' && path === firstAcceptancePaths.report) return 'report';
+      return undefined;
+    };
+    const afterFirstAcceptanceAcknowledgement = (request: Request) =>
+      firstAcceptanceAcknowledgedAt !== undefined &&
+      request.timing().startTime >= firstAcceptanceAcknowledgedAt;
     const routeSegments = new Set([
       'api',
       'profiles',
@@ -175,7 +229,9 @@ test(
         .join('/');
     const diagnosticSnapshot = () => ({
       phase,
+      currentAwait,
       phaseDurationMs: Date.now() - phaseStarted,
+      firstAcceptance,
       // Cumulative transport counts are not successful clinical operations.
       apiTransportAttempts: requestNumber,
       apiTransportSettled,
@@ -207,6 +263,7 @@ test(
     const enterPhase = (name: string) => {
       logDiagnostic('phase-complete');
       phase = name;
+      currentAwait = name;
       phaseStarted = Date.now();
       logDiagnostic('phase-start');
     };
@@ -254,6 +311,9 @@ test(
       const onRequest = (request: Request) => {
         const path = new URL(request.url()).pathname;
         if (!path.startsWith('/api/')) return;
+        const target = firstAcceptanceRoute(request);
+        if (target === 'acceptance') count('acceptanceRequests');
+        if (target === 'report') count('reportRequests');
         browserApiStarted++;
         if (browserInFlight.size === 16) {
           browserInFlight.delete(browserInFlight.keys().next().value!);
@@ -281,14 +341,32 @@ test(
         });
         if (recentBrowserRequests.length > 8) recentBrowserRequests.shift();
       };
-      const onRequestFinished = async (request: Request) =>
+      const onRequestFinished = async (request: Request) => {
+        const target = firstAcceptanceRoute(request);
+        if (target === 'acceptance') count('acceptanceFinished');
+        if (target === 'report' && afterFirstAcceptanceAcknowledgement(request))
+          count('reportFinishedAfterAcknowledgement');
         finish(request, (await request.response().catch(() => null))?.status() ?? 'failed');
-      const onRequestFailed = (request: Request) => finish(request, 'failed');
+      };
+      const onRequestFailed = (request: Request) => {
+        const target = firstAcceptanceRoute(request);
+        if (target === 'acceptance') count('acceptanceFailed');
+        if (target === 'report') count('reportFailed');
+        finish(request, 'failed');
+      };
+      const onResponse = (response: Response) => {
+        const target = firstAcceptanceRoute(response.request());
+        if (target === 'acceptance') count('acceptanceResponses');
+        if (target === 'report' && afterFirstAcceptanceAcknowledgement(response.request()))
+          count('reportResponsesAfterAcknowledgement');
+      };
       page.on('request', onRequest);
+      page.on('response', onResponse);
       page.on('requestfinished', onRequestFinished);
       page.on('requestfailed', onRequestFailed);
       removePageListeners = () => {
         page.off('request', onRequest);
+        page.off('response', onResponse);
         page.off('requestfinished', onRequestFinished);
         page.off('requestfailed', onRequestFailed);
       };
@@ -641,6 +719,10 @@ test(
     assert.equal(initialQueue.records.length, 20);
     const queueReportUrl = await fixtureReportUrl(api, prefix, queueItem.id);
     const queueGroupId = new URLSearchParams(queueReportUrl.split('?')[1]).get('group')!;
+    firstAcceptancePaths = {
+      acceptance: prefix + '/intakes/report-acceptance',
+      report: prefix + '/intakes/report-queue/' + encodeURIComponent(queueGroupId),
+    };
     const queueLinkSelector = '.import-detail-record-link:not([data-saved-record-id])';
     function acknowledgementTime(response: Response) {
       const timing = response.request().timing();
@@ -799,15 +881,28 @@ test(
       )
         return false;
       saveAcknowledgedAt = acknowledgementTime(response);
+      firstAcceptanceAcknowledgedAt = saveAcknowledgedAt;
+      firstAcceptance.firstSaveMatched = true;
       return true;
+    }).then((response) => {
+      firstAcceptance.firstSaveFulfilled = true;
+      return response;
     });
-    const savedReportRead = reportAfterAcknowledgement(() => saveAcknowledgedAt);
+    const savedReportRead = reportAfterAcknowledgement(() => saveAcknowledgedAt).then((detail) => {
+      firstAcceptance.reportReadFulfilled = true;
+      return detail;
+    });
     enterPhase('guided queue first acceptance');
+    currentAwait = 'click Confirm and save record';
     await page.getByRole('button', { name: 'Confirm and save record', exact: true }).click();
+    currentAwait = 'first acceptance response';
     const savedReceipt = await firstSave;
     assert.equal(savedReceipt.status(), 200);
+    currentAwait = 'first acceptance response finished';
     assert.equal(await savedReceipt.finished(), null);
+    currentAwait = 'first acceptance response body';
     assert.equal((await savedReceipt.json()).data.receipt.acceptedCount, 1);
+    currentAwait = 'post-acknowledgement report read';
     const savedReport = await savedReportRead;
     const savedRow = savedReport.records.records.find(
       (row) =>
