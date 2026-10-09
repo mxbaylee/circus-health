@@ -515,7 +515,7 @@ export async function readIntakePeoplePage(
       assertIntakeOwner(db, profileId);
       await prepareIntakeSourceDependencyHeaders(db, id);
       await prepareCollectionPeopleIndex(db, root, profileId, id);
-      return readCollectionPeoplePage(db, root, profileId, id, input);
+      return await readCollectionPeoplePage(db, root, profileId, id, input);
     },
     { operation: currentClinicalOperation(db) },
   );

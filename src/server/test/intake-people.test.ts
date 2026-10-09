@@ -189,7 +189,7 @@ test('native People commands preserve disposition, exact replay and Personal app
     (await getIntakePersonRead(f.db, f.root, f.profileId, item.id, person.id)).state,
     'saved',
   );
-  const savedPage = readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+  const savedPage = await readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
     groupId,
     personId: person.id,
     bytes: 1024,
@@ -246,11 +246,16 @@ test('native People reads preserve complete legacy proposals and exact paged evi
   clearIntakeStateCache(f.db);
   const work = intakeWorkCounters(f.db);
   const reader = openCollectionPeopleRead(f.db, f.root, f.profileId, item.id);
-  assert.deepEqual(
-    [...reader.pointers(groupId)].map((pointer) => reader.person(pointer)),
-    oracle.people,
+  const actualPeople: ReturnType<typeof reader.person>[] = [];
+  await intake.withVerifiedIntakeOriginalDescriptor(
+    { db: f.db, root: f.root, profileId: f.profileId, id: item.id },
+    async ({ assertRunning }) => {
+      for await (const pointer of reader.pointersCooperative(groupId, assertRunning))
+        actualPeople.push(reader.person(pointer));
+    },
   );
-  const page = readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+  assert.deepEqual(actualPeople, oracle.people);
+  const page = await readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
     groupId,
     limit: 1,
     bytes: 1024,
@@ -258,7 +263,7 @@ test('native People reads preserve complete legacy proposals and exact paged evi
   assert.equal(page.totalPeople, 2);
   assert.equal(page.counts.later, 1);
   assert.ok(page.nextCursor);
-  const targeted = readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+  const targeted = await readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
     groupId,
     personId: oracle.people[1]!.id,
     limit: 1,
@@ -268,8 +273,8 @@ test('native People reads preserve complete legacy proposals and exact paged evi
   assert.equal(targeted.people[0]!.kind, 'person');
   if (targeted.people[0]!.kind === 'person')
     assert.equal(targeted.people[0]!.person.id, oracle.people[1]!.id);
-  assert.throws(
-    () =>
+  await assert.rejects(
+    async () =>
       readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
         groupId,
         personId: 'missing-fictional-person',
@@ -298,7 +303,7 @@ test('native People reads preserve complete legacy proposals and exact paged evi
       JSON.parse(JSON.stringify(oracle.people[0])),
     );
   } else assert.deepEqual(first.person, oracle.people[0]);
-  const second = readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
+  const second = await readCollectionPeoplePage(f.db, f.root, f.profileId, item.id, {
     groupId,
     limit: 1,
     cursor: page.nextCursor!,

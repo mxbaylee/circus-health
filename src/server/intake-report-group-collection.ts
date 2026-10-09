@@ -760,12 +760,17 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
               .prepare('DELETE FROM people WHERE intake=? AND groupId=?')
               .run(source.id, groupId);
             const people = openCollectionPeopleRead(db, root, profileId, source.id);
-            for (const pointer of people.pointers(groupId))
-              cache
-                .prepare(
-                  'INSERT INTO people VALUES(?,?,?,1) ON CONFLICT(intake,groupId,state) DO UPDATE SET count=count+1',
-                )
-                .run(source.id, groupId, people.state(pointer));
+            await withVerifiedIntakeOriginalDescriptor(
+              { db, root, profileId, id: source.id },
+              async ({ assertRunning }) => {
+                for await (const pointer of people.pointersCooperative(groupId, assertRunning))
+                  cache
+                    .prepare(
+                      'INSERT INTO people VALUES(?,?,?,1) ON CONFLICT(intake,groupId,state) DO UPDATE SET count=count+1',
+                    )
+                    .run(source.id, groupId, people.state(pointer));
+              },
+            );
             for (const selected of change.changed) {
               const header = snapshot.member(selected.candidateId, selected.candidateVersionId);
               if (!header) throw changed();
@@ -994,12 +999,17 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           },
         );
         const people = openCollectionPeopleRead(db, root, profileId, source.id);
-        for (const pointer of people.pointers())
-          cache
-            .prepare(
-              'INSERT INTO people VALUES(?,?,?,1) ON CONFLICT(intake,groupId,state) DO UPDATE SET count=count+1',
-            )
-            .run(source.id, pointer.groupId, people.state(pointer));
+        await withVerifiedIntakeOriginalDescriptor(
+          { db, root, profileId, id: source.id },
+          async ({ assertRunning }) => {
+            for await (const pointer of people.pointersCooperative(undefined, assertRunning))
+              cache
+                .prepare(
+                  'INSERT INTO people VALUES(?,?,?,1) ON CONFLICT(intake,groupId,state) DO UPDATE SET count=count+1',
+                )
+                .run(source.id, pointer.groupId, people.state(pointer));
+          },
+        );
       }
       for (const row of cache.prepare('SELECT id FROM sources WHERE seen=0').iterate()) {
         removedSources.push(String(row.id));
@@ -1862,8 +1872,13 @@ export async function collectionReportGroupSummary(
           issuer = group ? evidence(view, group, 'sourceSystem') : null;
         const people = openCollectionPeopleRead(db, root, profileId, intakeId);
         let firstPerson: ReturnType<typeof people.pointer>;
-        for (const pointer of people.pointers(groupId))
-          if (!firstPerson || pointer.order < firstPerson.order) firstPerson = pointer;
+        await withVerifiedIntakeOriginalDescriptor(
+          { db, root, profileId, id: intakeId },
+          async ({ assertRunning }) => {
+            for await (const pointer of people.pointersCooperative(groupId, assertRunning))
+              if (!firstPerson || pointer.order < firstPerson.order) firstPerson = pointer;
+          },
+        );
         const memberId = group && scalar<string | null>(view, group, 'memberId'),
           selected =
             memberId && workflow && view.childCount(workflow, 'plans')

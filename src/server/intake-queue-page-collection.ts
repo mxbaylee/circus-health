@@ -165,7 +165,7 @@ export async function readCollectionReportGroupDetail(
         },
         queue,
       ),
-      people = readCollectionPeoplePage(db, root, profileId, pointer.intakeId, {
+      people = await readCollectionPeoplePage(db, root, profileId, pointer.intakeId, {
         groupId,
         personId: input.personId,
         q: input.peopleQuery,

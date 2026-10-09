@@ -1,9 +1,16 @@
 /** Complete selected People evidence; retained JSONL remains authoritative. */
 import type { DatabaseSync } from 'node:sqlite';
+import { setImmediate } from 'node:timers/promises';
 import { readFileSync } from 'node:fs';
 import { HttpError, clinicalReviewRevision } from './database.ts';
-import { assertIntakeOwner, verifyIntakeOriginal } from './intake.ts';
+import { currentClinicalOperation } from './clinical-operation.ts';
+import {
+  assertIntakeOwner,
+  verifyIntakeOriginal,
+  withVerifiedIntakeOriginalDescriptor,
+} from './intake.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 import {
   openIntakeCollectionEnvelope,
   selectedEnvelopeStore,
@@ -21,13 +28,9 @@ import { openReportMemberSnapshot } from './intake-report-member-state.ts';
 import { prepareRetainedPlanAccess, readRetainedPlanEvidence } from './intake-retained-plan.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { profileOriginal } from './profile-storage.ts';
-import { verifyIntakeFileHash } from './intake-files.ts';
-import {
-  canonicalLiteral,
-  validateJSONL,
-  MAX_INTAKE_BYTES,
-  type IntakeEntry,
-} from './intake-format.ts';
+import { intakeFileIdentity, verifyIntakeFileHashWork } from './intake-files.ts';
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
+import { canonicalLiteral, validateJSONL, MAX_INTAKE_BYTES } from './intake-format.ts';
 import { validatedIntakePeople } from './intake-people-format.ts';
 import {
   intakePersonProposalIdentity,
@@ -222,15 +225,17 @@ function context(db: DatabaseSync, root: string, profileId: string, intakeId: st
     if (selected.bytes > MAX_INTAKE_BYTES)
       throw new HttpError(413, 'CONVERSION_REQUIRED', 'Review a bounded JSONL conversion proposal');
     const path = profileOriginal(root, selected.path, profileId);
-    verifyIntakeFileHash(path, selected);
+    const identity = finishClinicalReviewWork(verifyIntakeFileHashWork(path, selected));
     const parsed = validateJSONL(readFileSync(path));
+    if (intakeFileIdentity(path) !== identity)
+      throw new HttpError(409, 'INTAKE_PERSON_SOURCE', 'Retained People proposal changed');
     if (!parsed.valid || !parsed.entries)
       throw new HttpError(
         409,
         'INTAKE_PERSON_SOURCE',
         'Retained People proposal is no longer valid',
       );
-    return { file: selected, entries: parsed.entries };
+    return { file: selected, entries: parsed.entries, path, identity };
   };
   return {
     db,
@@ -282,7 +287,7 @@ export interface CollectionPeoplePage {
   counts: Record<IntakePersonProposalState, number>;
   nextCursor: string | null;
 }
-export function readCollectionPeoplePage(
+export async function readCollectionPeoplePage(
   db: DatabaseSync,
   root: string,
   profileId: string,
@@ -296,7 +301,7 @@ export function readCollectionPeoplePage(
     view?: IntakeReportQueueView;
     q?: string;
   } = {},
-): CollectionPeoplePage {
+): Promise<CollectionPeoplePage> {
   const reader = openCollectionPeopleRead(db, root, profileId, intakeId),
     limit = input.limit ?? 50,
     budget = input.bytes ?? 128 * 1024,
@@ -350,86 +355,108 @@ export function readCollectionPeoplePage(
     used = 0,
     full = false,
     more = false;
-  for (const pointer of reader.pointers(input.groupId)) {
-    let person = query ? reader.person(pointer) : undefined;
-    if (person && !collectionPersonMatchesQuery(db, person, query)) continue;
-    const state = reader.state(pointer);
-    counts[state]++;
-    if (
-      input.view &&
-      input.view !== 'all' &&
-      state !== (input.view === 'active' ? 'pending' : 'later')
-    )
-      continue;
-    totalPeople++;
-    if (input.personId && pointer.id !== input.personId) continue;
-    if (pointer.id <= after) continue;
-    if (full || people.length >= limit) {
-      more = true;
-      continue;
-    }
-    person ??= reader.person(pointer);
-    const size = Buffer.byteLength(canonicalLiteral(person));
-    const item: CollectionPeoplePage['people'][number] =
-      size > budget
-        ? {
-            kind: 'reference',
-            reference: {
-              format: 'health-intake-person-reference-v2',
-              intakeId,
-              id: pointer.id,
-              binding: reader.binding,
-              bytes: size,
-              ...(person.saved ? { saved: person.saved } : {}),
-              selection: {
-                id: person.id,
-                version: person.version,
-                intakeVersion: person.intakeVersion,
-                state: person.state,
-              },
-              policy: {
-                selfMatch: !!person.selfMatch,
-                canAdd: !person.selfMatch && person.state !== 'saved',
-              },
-              matches: {
-                items: person.matches.map((match) => ({
-                  noteId: match.noteId,
-                  version: match.version,
-                  title: match.title.length > 200 ? match.title.slice(0, 197) + '…' : match.title,
-                })),
-                total: person.matchCount,
-                truncated: person.matchesTruncated,
-              },
-            },
-          }
-        : { kind: 'person', person };
-    const cost = Buffer.byteLength(canonicalLiteral(item));
-    if (people.length && used + cost > budget) {
-      more = true;
-      full = true;
-      continue;
-    }
-    people.push(item);
-    used += cost;
-    last = pointer.id;
-  }
-  reader.assertCurrent();
-  if (input.personId && !people.length)
-    throw new HttpError(
-      404,
-      'INTAKE_PERSON_NOT_FOUND',
-      'The selected People proposal is unavailable in this report view',
-    );
-  return {
-    format: 'health-intake-people-page-v2',
-    intakeId,
-    groupId: input.groupId || null,
-    selectedPersonId: input.personId || null,
-    people,
-    totalPeople,
-    counts,
-    nextCursor: more ? Buffer.from(JSON.stringify([binding, last])).toString('base64url') : null,
-  };
+  return withVerifiedIntakeOriginalDescriptor(
+    { db, root, profileId, id: intakeId },
+    async ({ assertRunning }) => {
+      const rendered = new Map<string, ReturnType<typeof reader.verifiedSource>>();
+      for await (const pointer of reader.pointersCooperative(input.groupId, assertRunning)) {
+        let person = query ? reader.person(pointer) : undefined;
+        if (person && !collectionPersonMatchesQuery(db, person, query)) continue;
+        const state = reader.state(pointer);
+        counts[state]++;
+        if (
+          input.view &&
+          input.view !== 'all' &&
+          state !== (input.view === 'active' ? 'pending' : 'later')
+        )
+          continue;
+        totalPeople++;
+        if (input.personId && pointer.id !== input.personId) continue;
+        if (pointer.id <= after) continue;
+        if (full || people.length >= limit) {
+          more = true;
+          continue;
+        }
+        person ??= reader.person(pointer);
+        const size = Buffer.byteLength(canonicalLiteral(person));
+        const item: CollectionPeoplePage['people'][number] =
+          size > budget
+            ? {
+                kind: 'reference',
+                reference: {
+                  format: 'health-intake-person-reference-v2',
+                  intakeId,
+                  id: pointer.id,
+                  binding: reader.binding,
+                  bytes: size,
+                  ...(person.saved ? { saved: person.saved } : {}),
+                  selection: {
+                    id: person.id,
+                    version: person.version,
+                    intakeVersion: person.intakeVersion,
+                    state: person.state,
+                  },
+                  policy: {
+                    selfMatch: !!person.selfMatch,
+                    canAdd: !person.selfMatch && person.state !== 'saved',
+                  },
+                  matches: {
+                    items: person.matches.map((match) => ({
+                      noteId: match.noteId,
+                      version: match.version,
+                      title:
+                        match.title.length > 200 ? match.title.slice(0, 197) + '…' : match.title,
+                    })),
+                    total: person.matchCount,
+                    truncated: person.matchesTruncated,
+                  },
+                },
+              }
+            : { kind: 'person', person };
+        const cost = Buffer.byteLength(canonicalLiteral(item));
+        if (people.length && used + cost > budget) {
+          more = true;
+          full = true;
+          continue;
+        }
+        people.push(item);
+        const verified = reader.verifiedSource();
+        const prior = rendered.get(verified.file.id);
+        if (prior && (prior.path !== verified.path || prior.identity !== verified.identity))
+          throw new HttpError(409, 'INTAKE_PERSON_SOURCE', 'Retained People proposal changed');
+        rendered.set(verified.file.id, verified);
+        used += cost;
+        last = pointer.id;
+      }
+      if (input.personId && !people.length)
+        throw new HttpError(
+          404,
+          'INTAKE_PERSON_NOT_FOUND',
+          'The selected People proposal is unavailable in this report view',
+        );
+      const result: CollectionPeoplePage = {
+        format: 'health-intake-people-page-v2',
+        intakeId,
+        groupId: input.groupId || null,
+        selectedPersonId: input.personId || null,
+        people,
+        totalPeople,
+        counts,
+        nextCursor: more
+          ? Buffer.from(JSON.stringify([binding, last])).toString('base64url')
+          : null,
+      };
+      reader.assertCurrent();
+      for (const proof of rendered.values())
+        if (
+          canonicalLiteral(file(db, proof.file.id)) !== canonicalLiteral(proof.file) ||
+          profileOriginal(root, proof.file.path, profileId) !== proof.path ||
+          intakeFileIdentity(proof.path) !== proof.identity
+        )
+          throw new HttpError(409, 'INTAKE_PERSON_SOURCE', 'Retained People proposal changed');
+      return result;
+    },
+  );
 }
 export function readCollectionPersonFragment(
   db: DatabaseSync,
@@ -473,191 +500,245 @@ export async function prepareCollectionPeopleIndex(
   options: { assertRunning?: () => void } = {},
 ) {
   const ctx = context(db, root, profileId, intakeId),
-    { view, flow } = ctx;
+    { view, flow } = ctx,
+    operation = currentClinicalOperation(db);
   if (ctx.get('complete') === POLICY) return;
   verifyIntakeOriginal(db, root, profileId, intakeId);
-  const assertCurrent = () => {
-    options.assertRunning?.();
-    ctx.assertCurrent();
-  };
-  if (flow && view.childCount(flow, 'plans'))
-    await prepareRetainedPlanAccess(db, profileId, intakeId, { assertRunning: assertCurrent });
-  const scratch = disposableSqlite('circus-people-index-');
-  const writer = createEnvelopeBuildWriter(db, ctx.source, ctx.name, ctx.version.rawVersion, {
-    assertRunning: assertCurrent,
-  });
-  try {
-    const sql = scratch.db;
-    sql.exec(
-      'CREATE TABLE membership(proposal TEXT,record TEXT,ordinal INTEGER,groupId TEXT,groupVersionId TEXT,memberId TEXT,candidate TEXT,version TEXT);CREATE INDEX byOccurrence ON membership(proposal,record);CREATE TABLE seen(id TEXT PRIMARY KEY);CREATE TABLE sources(ordinal INTEGER PRIMARY KEY,id TEXT);CREATE TABLE allowed(id TEXT PRIMARY KEY);',
-    );
-    let ordinal = 0;
-    const add = sql.prepare('INSERT INTO membership VALUES(?,?,?,?,?,?,?,?)');
-    const catalog = createReportSnapshotCatalog(db, ctx.source);
-    for (const group of intakeReviewChildren(view, flow, 'reportGroups')) {
-      const count = view.childCount(group, 'versions'),
-        current = count ? view.childAt(group, 'versions', count - 1) : undefined;
-      if (!current) continue;
-      const groupId = scalar<string>(view, group, 'id')!,
-        groupVersionId = scalar<string>(view, current, 'id')!,
-        memberId = scalar<string | null>(view, group, 'memberId') ?? null;
-      if (scalar(view, current, 'format') === 'health-intake-report-group-version-v2') {
-        const snapshot = openReportMemberSnapshot(
-          catalog,
-          view.child(current, 'members')
-            ? readIntakeReviewValue<IntakeReportMembersReference>(
-                view,
-                view.child(current, 'members')!,
-                16384,
-              )
-            : scalar<IntakeReportMembersReference>(view, current, 'members')!,
+  return withVerifiedIntakeOriginalDescriptor(
+    { db, root, profileId, id: intakeId, assertRunning: options.assertRunning },
+    async ({ assertRunning: assertPhysical }) => {
+      let active: { file: File; path: string; identity: string } | undefined;
+      const assertCurrent = () => {
+        options.assertRunning?.();
+        if (currentClinicalOperation(db) !== operation)
+          throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
+        assertPhysical();
+        ctx.assertCurrent();
+        if (
+          active &&
+          (canonicalLiteral(file(db, active.file.id)) !== canonicalLiteral(active.file) ||
+            profileOriginal(root, active.file.path, profileId) !== active.path ||
+            intakeFileIdentity(active.path) !== active.identity)
+        )
+          throw new HttpError(409, 'INTAKE_PERSON_SOURCE', 'Retained People proposal changed');
+      };
+      let units = 0;
+      const checkpoint = () => ++units === 64 && ((units = 0), true);
+      const cooperate = async () => {
+        assertCurrent();
+        const source = canonicalLiteral(intakeSourceVersion(db, intakeId));
+        const stamp = reviewReadStamp(db);
+        if (!stamp)
+          throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
+        await setImmediate();
+        assertCurrent();
+        if (
+          reviewReadStamp(db) !== stamp ||
+          canonicalLiteral(intakeSourceVersion(db, intakeId)) !== source
+        )
+          throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
+      };
+      if (flow && view.childCount(flow, 'plans'))
+        await prepareRetainedPlanAccess(db, profileId, intakeId, { assertRunning: assertCurrent });
+      const scratch = disposableSqlite('circus-people-index-');
+      const writer = createEnvelopeBuildWriter(db, ctx.source, ctx.name, ctx.version.rawVersion, {
+        assertRunning: assertCurrent,
+      });
+      try {
+        const sql = scratch.db;
+        sql.exec(
+          'CREATE TABLE membership(proposal TEXT,record TEXT,ordinal INTEGER,groupId TEXT,groupVersionId TEXT,memberId TEXT,candidate TEXT,version TEXT);CREATE INDEX byOccurrence ON membership(proposal,record,ordinal);CREATE TABLE seen(id TEXT PRIMARY KEY);CREATE TABLE sources(ordinal INTEGER PRIMARY KEY,id TEXT);CREATE TABLE allowed(id TEXT PRIMARY KEY);',
         );
-        for (let index = 0; index < snapshot.reference.memberCount; index++) {
-          const member = snapshot.memberAt(index)!;
-          let after: string | undefined;
-          do {
-            const page = snapshot.occurrenceDescriptors(member, { after, items: 64, bytes: 32768 });
-            for (const occurrence of page.occurrences) {
-              add.run(
-                JSON.stringify(occurrence.proposalId),
-                occurrence.recordId,
-                ordinal++,
-                groupId,
-                groupVersionId,
-                memberId,
-                member.candidateId,
-                member.candidateVersionId,
+        let ordinal = 0;
+        const add = sql.prepare('INSERT INTO membership VALUES(?,?,?,?,?,?,?,?)');
+        const catalog = createReportSnapshotCatalog(db, ctx.source);
+        for (const group of intakeReviewChildren(view, flow, 'reportGroups')) {
+          if (checkpoint()) await cooperate();
+          const count = view.childCount(group, 'versions'),
+            current = count ? view.childAt(group, 'versions', count - 1) : undefined;
+          if (!current) continue;
+          const groupId = scalar<string>(view, group, 'id')!,
+            groupVersionId = scalar<string>(view, current, 'id')!,
+            memberId = scalar<string | null>(view, group, 'memberId') ?? null;
+          if (scalar(view, current, 'format') === 'health-intake-report-group-version-v2') {
+            const snapshot = openReportMemberSnapshot(
+              catalog,
+              view.child(current, 'members')
+                ? readIntakeReviewValue<IntakeReportMembersReference>(
+                    view,
+                    view.child(current, 'members')!,
+                    16384,
+                  )
+                : scalar<IntakeReportMembersReference>(view, current, 'members')!,
+            );
+            for (let index = 0; index < snapshot.reference.memberCount; index++) {
+              if (checkpoint()) await cooperate();
+              const member = snapshot.memberAt(index)!;
+              let after: string | undefined;
+              do {
+                const page = snapshot.occurrenceDescriptors(member, {
+                  after,
+                  items: 64,
+                  bytes: 32768,
+                });
+                for (const occurrence of page.occurrences) {
+                  if (checkpoint()) await cooperate();
+                  add.run(
+                    JSON.stringify(occurrence.proposalId),
+                    occurrence.recordId,
+                    ordinal++,
+                    groupId,
+                    groupVersionId,
+                    memberId,
+                    member.candidateId,
+                    member.candidateVersionId,
+                  );
+                }
+                if (page.complete) break;
+                if (!page.after || page.after === after)
+                  throw Error('People occurrence scope did not advance');
+                after = page.after;
+              } while (true);
+            }
+          } else
+            for (const member of intakeReviewChildren(view, current, 'members')) {
+              if (checkpoint()) await cooperate();
+              // Preserve each physical occurrence for the ordered indexed lookup below.
+              for (const occurrence of intakeReviewChildren(view, member, 'occurrences')) {
+                if (checkpoint()) await cooperate();
+                add.run(
+                  JSON.stringify(scalar(view, occurrence, 'proposalId') ?? null),
+                  scalar(view, occurrence, 'recordId')!,
+                  ordinal++,
+                  groupId,
+                  groupVersionId,
+                  memberId,
+                  scalar(view, member, 'candidateId')!,
+                  scalar(view, member, 'candidateVersionId')!,
+                );
+              }
+            }
+        }
+        const validation = view.child(ctx.intake, 'validation');
+        let sourceOrdinal = 0;
+        if (validation && scalar(view, validation, 'valid'))
+          sql.prepare('INSERT INTO sources VALUES(?,NULL)').run(sourceOrdinal++);
+        for (const proposal of intakeReviewChildren(view, ctx.intake, 'proposals')) {
+          if (checkpoint()) await cooperate();
+          const id = scalar<string>(view, proposal, 'id')!;
+          sql.prepare('INSERT INTO sources VALUES(?,?)').run(sourceOrdinal++, id);
+          if (scalar(view, proposal, 'fileId') === id)
+            sql.prepare('INSERT OR IGNORE INTO allowed VALUES(?)').run(id);
+        }
+        let order = 0;
+        for (const source of sql.prepare('SELECT id FROM sources ORDER BY ordinal').iterate()) {
+          if (checkpoint()) await cooperate();
+          assertCurrent();
+          const proposalId = source.id === null ? null : String(source.id);
+          if (proposalId && !sql.prepare('SELECT 1 FROM allowed WHERE id=?').get(proposalId))
+            throw new HttpError(
+              404,
+              'INTAKE_PERSON_NOT_FOUND',
+              'People proposal source is unavailable',
+            );
+          const selected = ctx.entries(proposalId);
+          active = { file: selected.file, path: selected.path, identity: selected.identity };
+          for (const entry of selected.entries) {
+            if (checkpoint()) await cooperate();
+            const people = validatedIntakePeople(entry.value),
+              recordId = selected.file.id + ':line:' + entry.line;
+            for (let personOrdinal = 0; personOrdinal < people.length; personOrdinal++) {
+              if (checkpoint()) await cooperate();
+              const person = people[personOrdinal]!;
+              for (const member of sql
+                .prepare(
+                  'SELECT groupId,groupVersionId,memberId,candidate,version,ordinal FROM membership INDEXED BY byOccurrence WHERE proposal=? AND record=? ORDER BY ordinal',
+                )
+                .iterate(JSON.stringify(proposalId), recordId)) {
+                if (checkpoint()) await cooperate();
+                if (
+                  entry.value.report?.memberId !== undefined &&
+                  entry.value.report.memberId !== member.memberId
+                )
+                  throw new HttpError(
+                    409,
+                    'INTAKE_PERSON_SCOPE',
+                    'Named Person evidence no longer matches its retained report member',
+                  );
+                const identity = intakePersonProposalIdentity(
+                  intakeId,
+                  String(member.candidate),
+                  String(member.version),
+                  person,
+                );
+                if (!sql.prepare('INSERT OR IGNORE INTO seen VALUES(?)').run(identity.id).changes)
+                  continue;
+                const pointer: CollectionPersonPointer = {
+                  ...identity,
+                  order: order++,
+                  proposalId,
+                  line: entry.line,
+                  personOrdinal,
+                  groupId: String(member.groupId),
+                  groupVersionId: String(member.groupVersionId),
+                  memberId: member.memberId === null ? null : String(member.memberId),
+                  candidateId: String(member.candidate),
+                  candidateVersionId: String(member.version),
+                };
+                const text = JSON.stringify(pointer);
+                await writer.put('all:' + pointer.id, text);
+                assertCurrent();
+                await writer.put('g:' + workflowHash(pointer.groupId) + ':' + pointer.id, text);
+                assertCurrent();
+              }
+            }
+          }
+          active = undefined;
+        }
+        if (flow && view.has(flow, 'peopleDrafts')) {
+          const draftRecords = view.child(flow, 'peopleDrafts');
+          const drafts = await prepareIntakeJsonCanonical(
+            draftRecords ? view.recordChunks(draftRecords) : view.fieldChunks(flow, 'peopleDrafts'),
+            {
+              assertRunning: assertCurrent,
+              onWork: intakeJsonCanonicalWorkObserver(db, 'reconstruction'),
+            },
+          );
+          try {
+            for (const draft of drafts.arrayItems(drafts.root)) {
+              const field = (name: string) => {
+                const handle = drafts.field(draft, name);
+                if (!handle) return undefined;
+                let text = '';
+                for (const piece of drafts.pieces(handle)) {
+                  if (Buffer.byteLength(text) + Buffer.byteLength(piece) > 16384)
+                    throw Error('Selected People draft identity exceeds metadata budget');
+                  text += piece;
+                }
+                return JSON.parse(text);
+              };
+              await writer.put(
+                'draft:' + workflowHash([field('proposalId'), field('proposalVersion')]),
+                JSON.stringify(field('state')),
               );
             }
-            if (page.complete) break;
-            if (!page.after || page.after === after)
-              throw Error('People occurrence scope did not advance');
-            after = page.after;
-          } while (true);
-        }
-      } else
-        for (const member of intakeReviewChildren(view, current, 'members')) {
-          // SQL DISTINCT below implements occurrence.some without materializing history.
-          for (const occurrence of intakeReviewChildren(view, member, 'occurrences'))
-            add.run(
-              JSON.stringify(scalar(view, occurrence, 'proposalId') ?? null),
-              scalar(view, occurrence, 'recordId')!,
-              ordinal++,
-              groupId,
-              groupVersionId,
-              memberId,
-              scalar(view, member, 'candidateId')!,
-              scalar(view, member, 'candidateVersionId')!,
-            );
-        }
-    }
-    const validation = view.child(ctx.intake, 'validation');
-    let sourceOrdinal = 0;
-    if (validation && scalar(view, validation, 'valid'))
-      sql.prepare('INSERT INTO sources VALUES(?,NULL)').run(sourceOrdinal++);
-    for (const proposal of intakeReviewChildren(view, ctx.intake, 'proposals')) {
-      const id = scalar<string>(view, proposal, 'id')!;
-      sql.prepare('INSERT INTO sources VALUES(?,?)').run(sourceOrdinal++, id);
-      if (scalar(view, proposal, 'fileId') === id)
-        sql.prepare('INSERT OR IGNORE INTO allowed VALUES(?)').run(id);
-    }
-    let order = 0;
-    for (const source of sql.prepare('SELECT id FROM sources ORDER BY ordinal').iterate()) {
-      assertCurrent();
-      const proposalId = source.id === null ? null : String(source.id);
-      if (proposalId && !sql.prepare('SELECT 1 FROM allowed WHERE id=?').get(proposalId))
-        throw new HttpError(
-          404,
-          'INTAKE_PERSON_NOT_FOUND',
-          'People proposal source is unavailable',
-        );
-      const selected = ctx.entries(proposalId);
-      for (const entry of selected.entries) {
-        const people = validatedIntakePeople(entry.value),
-          recordId = selected.file.id + ':line:' + entry.line;
-        for (let personOrdinal = 0; personOrdinal < people.length; personOrdinal++) {
-          const person = people[personOrdinal]!;
-          for (const member of sql
-            .prepare(
-              'SELECT groupId,groupVersionId,memberId,candidate,version,min(ordinal) AS firstOrdinal FROM membership WHERE proposal=? AND record=? GROUP BY groupId,groupVersionId,memberId,candidate,version ORDER BY firstOrdinal',
-            )
-            .iterate(JSON.stringify(proposalId), recordId)) {
-            if (
-              entry.value.report?.memberId !== undefined &&
-              entry.value.report.memberId !== member.memberId
-            )
-              throw new HttpError(
-                409,
-                'INTAKE_PERSON_SCOPE',
-                'Named Person evidence no longer matches its retained report member',
-              );
-            const identity = intakePersonProposalIdentity(
-              intakeId,
-              String(member.candidate),
-              String(member.version),
-              person,
-            );
-            if (!sql.prepare('INSERT OR IGNORE INTO seen VALUES(?)').run(identity.id).changes)
-              continue;
-            const pointer: CollectionPersonPointer = {
-              ...identity,
-              order: order++,
-              proposalId,
-              line: entry.line,
-              personOrdinal,
-              groupId: String(member.groupId),
-              groupVersionId: String(member.groupVersionId),
-              memberId: member.memberId === null ? null : String(member.memberId),
-              candidateId: String(member.candidate),
-              candidateVersionId: String(member.version),
-            };
-            const text = JSON.stringify(pointer);
-            await writer.put('all:' + pointer.id, text);
-            await writer.put('g:' + workflowHash(pointer.groupId) + ':' + pointer.id, text);
+          } finally {
+            drafts.close();
           }
         }
-      }
-    }
-    if (flow && view.has(flow, 'peopleDrafts')) {
-      const draftRecords = view.child(flow, 'peopleDrafts');
-      const drafts = await prepareIntakeJsonCanonical(
-        draftRecords ? view.recordChunks(draftRecords) : view.fieldChunks(flow, 'peopleDrafts'),
-        {
-          assertRunning: assertCurrent,
-          onWork: intakeJsonCanonicalWorkObserver(db, 'reconstruction'),
-        },
-      );
-      try {
-        for (const draft of drafts.arrayItems(drafts.root)) {
-          const field = (name: string) => {
-            const handle = drafts.field(draft, name);
-            if (!handle) return undefined;
-            let text = '';
-            for (const piece of drafts.pieces(handle)) {
-              if (Buffer.byteLength(text) + Buffer.byteLength(piece) > 16384)
-                throw Error('Selected People draft identity exceeds metadata budget');
-              text += piece;
-            }
-            return JSON.parse(text);
-          };
-          await writer.put(
-            'draft:' + workflowHash([field('proposalId'), field('proposalVersion')]),
-            JSON.stringify(field('state')),
-          );
-        }
+        await writer.put('total', JSON.stringify(order));
+        assertCurrent();
+        await writer.flush();
+        assertCurrent();
+        await writer.put('complete', JSON.stringify(POLICY));
+        assertCurrent();
+        await writer.flush();
+        assertCurrent();
       } finally {
-        drafts.close();
+        scratch.close();
       }
-    }
-    await writer.put('total', JSON.stringify(order));
-    await writer.flush();
-    assertCurrent();
-    await writer.put('complete', JSON.stringify(POLICY));
-    await writer.flush();
-    assertCurrent();
-  } finally {
-    scratch.close();
-  }
+    },
+  );
 }
 
 export function openCollectionPeopleRead(
@@ -674,16 +755,25 @@ export function openCollectionPeopleRead(
       'PEOPLE_PREPARATION_REQUIRED',
       'Prepare complete retained People evidence',
     );
+  let cachedId: string | null | undefined, cached: ReturnType<typeof ctx.entries> | undefined;
+  const assertCached = () => {
+    if (
+      cached &&
+      (canonicalLiteral(file(db, cached.file.id)) !== canonicalLiteral(cached.file) ||
+        profileOriginal(root, cached.file.path, profileId) !== cached.path ||
+        intakeFileIdentity(cached.path) !== cached.identity)
+    )
+      throw new HttpError(409, 'INTAKE_PERSON_SOURCE', 'Retained People proposal changed');
+  };
   const policy = clinicalReviewRevision(db),
     assertCurrent = () => {
       ctx.assertCurrent();
       if (clinicalReviewRevision(db) !== policy)
         throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
+      assertCached();
     };
   const draft = (id: string, version: string) =>
     ctx.get<IntakePersonProposalState>('draft:' + workflowHash([id, version])) || 'pending';
-  let cachedId: string | null | undefined,
-    cached: { file: File; entries: IntakeEntry[] } | undefined;
   const text = (
     reader: IntakeCollectionEnvelopeReader,
     record: IntakeEnvelopeRecord,
@@ -728,25 +818,67 @@ export function openCollectionPeopleRead(
       assertCurrent();
       return selectedIntakePersonState(db, pointer.id, pointer.version, draft);
     },
-    *pointers(groupId?: string): Generator<CollectionPersonPointer> {
+    async *pointersCooperative(
+      groupId: string | undefined,
+      assertRunning: () => void,
+    ): AsyncGenerator<CollectionPersonPointer> {
       const prefix = groupId ? 'g:' + workflowHash(groupId) + ':' : 'all:';
-      let after: string | undefined = prefix;
-      do {
+      const operation = currentClinicalOperation(db);
+      let after: string | undefined = prefix,
+        units = 0;
+      const check = () => {
+        assertRunning();
+        if (currentClinicalOperation(db) !== operation)
+          throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
         assertCurrent();
+      };
+      const cooperate = async () => {
+        check();
+        const source = canonicalLiteral(intakeSourceVersion(db, intakeId)),
+          stamp = reviewReadStamp(db);
+        if (!stamp)
+          throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
+        await setImmediate();
+        check();
+        if (
+          reviewReadStamp(db) !== stamp ||
+          canonicalLiteral(intakeSourceVersion(db, intakeId)) !== source
+        )
+          throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
+        cachedId = undefined;
+        cached = undefined;
+      };
+      do {
+        check();
         const page = ctx.collections.range(ctx.collections.openView(), 'builds', ctx.name, {
           after,
           items: 64,
           bytes: 65536,
         });
         for (const item of page.items) {
+          if (++units === 64) {
+            units = 0;
+            await cooperate();
+          }
           if (!item.key.startsWith(prefix)) return;
           if (typeof item.value !== 'string') throw Error('Invalid People pointer');
+          const yieldedStamp = reviewReadStamp(db);
+          if (!yieldedStamp)
+            throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
           yield JSON.parse(item.value) as CollectionPersonPointer;
+          check();
+          if (reviewReadStamp(db) !== yieldedStamp)
+            throw new HttpError(409, 'INTAKE_PERSON_CHANGED', 'Refresh these People proposals');
         }
         if (page.complete) return;
         if (!page.after || page.after === after) throw Error('People index page did not advance');
         after = page.after;
       } while (true);
+    },
+    verifiedSource() {
+      assertCurrent();
+      if (!cached) throw Error('A People source was not read');
+      return { file: cached.file, path: cached.path, identity: cached.identity };
     },
     person(pointer: CollectionPersonPointer): CollectionPersonProposal {
       assertCurrent();

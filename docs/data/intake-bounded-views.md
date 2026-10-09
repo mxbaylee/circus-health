@@ -923,6 +923,26 @@ existing bounded path rather than acquiring a new full-scan lease. Cancellation
 or changed authority discards the private scratch and preserves the callers'
 final response and publication checks.
 
+People index preparation and native pointer consumers also cooperate after at
+most 64 structural work units, including metadata that produces no Person,
+duplicate occurrences, filtered pointers and rows beyond the requested page.
+The membership index exists before ingestion and streams every occurrence in
+retained order; first-match deduplication does not bypass member-binding refusal.
+Counts and cursors still describe the complete selected scope, not just the
+visible page.
+
+Preparation holds the original descriptor throughout and checks the active
+parsed proposal's verified physical identity across turns and derived writes.
+Completed index pointers are not approval or retained raw People values: using
+one re-verifies its selected source and exact identity/version. A returned People
+page additionally rechecks the sources of its rendered values before returning,
+with proof storage bounded by the existing page limit of at most 100 people.
+This avoids an accumulated all-proposal proof scan at every turn. New internal
+turns preserve the current source, SQL, registry and operation checks; ordinary
+derived writer commits are not mistaken for foreign source changes. The complete
+index marker remains last, and interrupted partial preparation is not a complete
+People scope.
+
 The host can prepare clinical projection as an opaque changed-row plan. It runs
 the existing projector synchronously inside a SQLite savepoint, captures the
 exact result and row changes, then rolls back before asynchronous envelope

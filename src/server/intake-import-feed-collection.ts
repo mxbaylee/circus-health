@@ -31,7 +31,7 @@ import type { IntakeClinicalReviewReference } from './intake-review-collection-s
 import { hashSourceScalar } from './intake-report-source-resolution-index.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { journalActivityBinding } from './journal-activity-index.ts';
-import { verifyIntakeOriginal } from './intake.ts';
+import { verifyIntakeOriginal, withVerifiedIntakeOriginalDescriptor } from './intake.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
 import type {
@@ -532,19 +532,29 @@ export async function readCollectionImportFeed(
             .prepare('DELETE FROM peopleMatches WHERE intake=? AND ordinal=?')
             .run(intakeId, ordinal);
         };
-        const visitPeople = (
+        const visitPeople = async (
           pointer: CollectionReportQueueGroupPointer & { intakeId: string },
           ordering: string,
         ) => {
           const matching = { pending: 0, later: 0, excluded: 0, saved: 0 },
             people = openCollectionPeopleRead(db, root, profileId, pointer.intakeId);
           let visible = 0;
-          for (const person of people.pointers(pointer.groupId)) {
-            if (query && !collectionPersonMatchesQuery(db, people.person(person), query)) continue;
-            const state = people.state(person);
-            matching[state]++;
-            if (view === 'all' || state === (view === 'active' ? 'pending' : 'later')) visible++;
-          }
+          await withVerifiedIntakeOriginalDescriptor(
+            { db, root, profileId, id: pointer.intakeId },
+            async ({ assertRunning }) => {
+              for await (const person of people.pointersCooperative(
+                pointer.groupId,
+                assertRunning,
+              )) {
+                if (query && !collectionPersonMatchesQuery(db, people.person(person), query))
+                  continue;
+                const state = people.state(person);
+                matching[state]++;
+                if (view === 'all' || state === (view === 'active' ? 'pending' : 'later'))
+                  visible++;
+              }
+            },
+          );
           for (const state of Object.keys(peopleCounts) as (keyof typeof peopleCounts)[])
             peopleCounts[state] += matching[state];
           kindCounts.person += visible;
@@ -831,7 +841,7 @@ export async function readCollectionImportFeed(
                 },
                 visible =
                   query && peopleChanged
-                    ? visitPeople(pointer, order)
+                    ? await visitPeople(pointer, order)
                     : view === 'all'
                       ? Object.values(summary.peopleCounts).reduce((a, b) => a + b, 0)
                       : summary.peopleCounts[view === 'active' ? 'pending' : 'later'];
@@ -959,7 +969,7 @@ export async function readCollectionImportFeed(
                 ordinal: pointer.ordinal,
                 bytes: Buffer.byteLength(canonicalLiteral(summary)),
               };
-            const visiblePeople = visitPeople(pointer, groupOrder);
+            const visiblePeople = await visitPeople(pointer, groupOrder);
             if (visiblePeople) {
               totalPeopleGroups++;
               scratch.db
