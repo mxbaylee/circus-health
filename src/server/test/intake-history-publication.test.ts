@@ -31,6 +31,7 @@ import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import { fixture, envelope } from './intake-identity-native-fixture.ts';
 import { getNativeIntakeIdentityReview } from '../intake-identity-native.ts';
+import { nativeIdentityPreviewCounts } from '../intake-identity-preview-cache.ts';
 
 function journalBytes(path: string): number {
   let bytes = 0;
@@ -1233,6 +1234,7 @@ if (process.env.CRS_IDENTITY_GROUNDING_DIAGNOSTIC === '1')
         counters: { ...counters },
         work: { ...intakeWorkCounters(f.db).warm },
         record: { ...record.operation },
+        previewCache: nativeIdentityPreviewCounts(f.db),
       });
       const delta = (before: Record<string, number>, after: Record<string, number>) =>
         Object.fromEntries(
@@ -1269,6 +1271,7 @@ if (process.env.CRS_IDENTITY_GROUNDING_DIAGNOSTIC === '1')
           return review;
         } finally {
           const after = point();
+          const counted = (key: keyof typeof before.work) => after.work[key] - before.work[key];
           const phase: Record<string, unknown> = {
             name,
             outcome,
@@ -1277,6 +1280,17 @@ if (process.env.CRS_IDENTITY_GROUNDING_DIAGNOSTIC === '1')
             processFsWrite: after.fsWrite - before.fsWrite,
             ...delta(before.counters, after.counters),
             intakeWork: delta(before.work, after.work),
+            identityPreparation: {
+              fullBuildEntries: counted('identityPreviewFullPreparations'),
+              borrowedPolicyHits: counted('collectionQueuePolicyBorrowHits'),
+              borrowedPolicyMisses: counted('collectionQueuePolicyBorrowMisses'),
+              validationNodes: counted('normalizeValidationNodes'),
+              preparedBytes: counted('collectionPreparedBytes'),
+              nodesWritten: counted('collectionNodesWritten'),
+              writtenBytes: counted('collectionWrittenBytes'),
+              catalogCheckpointChanges: counted('reportSnapshotCheckpointChanges'),
+            },
+            previewCache: { before: before.previewCache, after: after.previewCache },
             recordWork: name === 'directWarm' ? delta(before.record, after.record) : null,
           };
           phases.push(phase);
@@ -1336,7 +1350,7 @@ if (process.env.CRS_IDENTITY_GROUNDING_DIAGNOSTIC === '1')
                 after.identityPreviewArtifactChecks - start.identityPreviewArtifactChecks,
               artifactOccurrences:
                 after.identityPreviewArtifactOccurrences - start.identityPreviewArtifactOccurrences,
-              note: "Aggregate fixture-only observation. Cold and stable phases use the same HTTP route as the original 257-artifact fixture; directWarm matches its guarded native call. Record-version work is unavailable for HTTP phases because their request context does not inherit this test call's work scope; recordWorkDirectWarm covers only the direct call. Counter deltas exclude peak gauges. Failed phases retain partial counts. All diagnostic sizes remain below the 256-file verification cache boundary and do not prove the full-run outcome. Proof sweep elapsed includes caller HMAC/stat work between iterator rows, not isolated SQLite scan time. Stat/HMAC and immediate counts include other native work. Timing includes probe overhead and is not a gate.",
+              note: "Aggregate fixture-only observation. Cold and stable phases use the same HTTP route as the original 257-artifact fixture; directWarm matches its guarded native call. Full build entries count build() calls, not clinical record calls; policy borrow and catalog checkpoint counts do not isolate per-catalog causality. Record-version work is unavailable for HTTP phases because their request context does not inherit this test call's work scope; recordWorkDirectWarm covers only the direct call. Sparse intakeWork omits zeros; identityPreparation includes fixed zero-valued counts and previewCache reports bounded endpoint gauges. Counter deltas exclude peak gauges. Failed phases retain partial counts. All diagnostic sizes remain below the 256-file verification cache boundary and do not prove the full-run outcome. Proof sweep elapsed includes caller HMAC/stat work between iterator rows, not isolated SQLite scan time. Stat/HMAC and immediate counts include other native work. Timing includes probe overhead and is not a gate.",
             },
           }),
         );
