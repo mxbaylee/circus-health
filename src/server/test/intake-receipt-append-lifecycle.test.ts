@@ -20,6 +20,7 @@ import {
 } from '../intake-lookup-state.ts';
 import { retainedIntakeAcceptance } from '../intake-lookup-projection.ts';
 import {
+  iterateIntakeEnvelopeText,
   openIntakeCollectionEnvelope,
   selectedEnvelopeStore,
 } from '../intake-collection-envelope.ts';
@@ -28,6 +29,7 @@ import { intakeSourceVersion } from '../intake-state-access.ts';
 import { readIntakeEnvelope, stageIntakeEnvelope } from '../intake-authority.ts';
 import { buildVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
+import { recordDurabilityStatus } from '../record-versions.ts';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
 
 const line = (id: string) =>
@@ -56,7 +58,7 @@ async function fixture(t: test.TestContext, grouped = false) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-receipt-lifecycle-'));
   const profileId = 'fictional-receipt-lifecycle';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-  memoryRecordAuthority(db);
+  const authority = memoryRecordAuthority(db);
   t.after(() => {
     clearIntakeStateCache(db);
     db.close();
@@ -136,7 +138,7 @@ async function fixture(t: test.TestContext, grouped = false) {
       };
     }),
   };
-  return { db, root, profileId, input, selected, other };
+  return { db, root, profileId, input, selected, other, authority };
 }
 
 for (const failure of ['rollback', 'release'] as const)
@@ -292,46 +294,63 @@ for (const mismatch of [false, true])
         f.db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(f.selected.id)!.sha256,
       ),
     };
-    const view = openIntakeCollectionEnvelope(f.db, source);
-    const intake = view.child(view.root(), 'intake')!;
-    const workflow = view.child(intake, 'workflow')!;
-    const prior = view.childAt(workflow, 'reportAcceptances', 0)!;
-    const latest = view.childAt(workflow, 'reportAcceptances', 1)!;
-    const selected = selectedEnvelopeStore(f.db, source).collections;
-    const operationId = randomUUID();
-    selected.commitMaintenance(
-      selected.prepare(selected.openView(), {
-        operationId,
-        requestDigest: createHash('sha256').update(operationId).digest('hex'),
-        domainVersion: intakeSourceVersion(f.db, source.id).rawVersion,
-        changes: [
-          {
-            area: 'builds',
-            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
-            op: 'put',
-            key: 'complete',
-            value: JSON.stringify(view.logical),
-          },
-          {
-            area: 'builds',
-            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
-            op: 'put',
-            key: 'policy',
-            value: INTAKE_LOOKUP_INDEX_POLICY,
-          },
-          {
-            area: 'builds',
-            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
-            op: 'put',
-            key: schemaKey(
-              'lookup-acceptance-operation-first',
-              Buffer.from(f.input.operationId).toString('hex').toUpperCase(),
-            ),
-            value: view.address(mismatch ? prior : latest),
-          },
-        ],
-      }),
-    );
+    const publishPoint = (mismatched: boolean) => {
+      const view = openIntakeCollectionEnvelope(f.db, source);
+      const intake = view.child(view.root(), 'intake')!;
+      const workflow = view.child(intake, 'workflow')!;
+      const prior = view.childAt(workflow, 'reportAcceptances', 0)!;
+      const latest = view.childAt(workflow, 'reportAcceptances', 1)!;
+      const selected = selectedEnvelopeStore(f.db, source).collections;
+      const operationId = randomUUID();
+      selected.commitMaintenance(
+        selected.prepare(selected.openView(), {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: intakeSourceVersion(f.db, source.id).rawVersion,
+          changes: [
+            {
+              area: 'builds',
+              collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+              op: 'put',
+              key: 'complete',
+              value: JSON.stringify(view.logical),
+            },
+            {
+              area: 'builds',
+              collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+              op: 'put',
+              key: 'policy',
+              value: INTAKE_LOOKUP_INDEX_POLICY,
+            },
+            ...[
+              { operation: 'fictional-retained', record: prior },
+              { operation: f.input.operationId, record: mismatched ? prior : latest },
+            ].map(({ operation, record }) => ({
+              area: 'builds' as const,
+              collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+              op: 'put' as const,
+              key: schemaKey(
+                'lookup-acceptance-operation-first',
+                Buffer.from(operation).toString('hex').toUpperCase(),
+              ),
+              value: view.address(record),
+            })),
+          ],
+        }),
+      );
+    };
+    publishPoint(mismatch);
+    const beforeEnvelope = [...iterateIntakeEnvelopeText(f.db, source)].join('');
+    const newReceipt = JSON.parse(beforeEnvelope).intake.workflow.reportAcceptances.at(-1);
+    assert.equal(newReceipt.receipt.operationId, f.input.operationId);
+    const durableState = () => ({
+      objects: f.authority.objects.size,
+      sequence: recordDurabilityStatus(f.db)?.sequence,
+      transactions: Number(
+        f.db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n,
+      ),
+    });
+    const beforeState = durableState();
     const originalRun = StatementSync.prototype.run;
     let appendWrites = 0;
     StatementSync.prototype.run = function (
@@ -356,11 +375,35 @@ for (const mismatch of [false, true])
       StatementSync.prototype.run = originalRun;
     }
     t.diagnostic(JSON.stringify({ mismatch, changedVisits, appendWrites }));
+    assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-retained'), {
+      receipt: { operationId: 'fictional-retained' },
+      marker: 'earlier',
+    });
+    assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing-receipt'), null);
+    assert.equal([...iterateIntakeEnvelopeText(f.db, source)].join(''), beforeEnvelope);
+    assert.deepEqual(durableState(), beforeState);
     if (mismatch) {
       assert.ok(changedVisits > 1, 'Mismatched point forces full source derivation');
       assert.equal(appendWrites, 0, 'No append writes precede selected-point validation');
+      assert.throws(
+        () => retainedIntakeAcceptance(f.db, f.input.operationId),
+        /native catalog target changed/,
+        'Full catalog derivation must not authorize a corrupted selected index point',
+      );
+      assert.deepEqual(durableState(), beforeState);
+      publishPoint(false);
     } else {
       assert.equal(changedVisits, 1);
       assert.equal(appendWrites, 1);
     }
+    const repairedState = durableState();
+    if (mismatch) await prepareIntakeLookupIndices(f.db);
+    assert.deepEqual(retainedIntakeAcceptance(f.db, f.input.operationId), newReceipt);
+    assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-retained'), {
+      receipt: { operationId: 'fictional-retained' },
+      marker: 'earlier',
+    });
+    assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing-receipt'), null);
+    assert.equal([...iterateIntakeEnvelopeText(f.db, source)].join(''), beforeEnvelope);
+    assert.deepEqual(durableState(), repairedState);
   });
