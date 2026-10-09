@@ -8,6 +8,7 @@ import type { IntakeReviewIssue, IntakeReviewRecord } from '../shared/intake.ts'
 import type { IntakeReviewIssuesReference } from '../shared/intake-review-issues.ts';
 import { canonicalLiteral, parseLiteralJSON } from './intake-format.ts';
 import { selectedSequence } from './intake-selected-sequence.ts';
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { canonicalReviewValueChunks } from './intake-review-question-state.ts';
 import { registerReviewRecordField } from './intake-review-selected-record.ts';
 import { recordIntakeWork, recordIntakePeak, withIntakeWork } from './intake-work-accounting.ts';
@@ -292,12 +293,33 @@ export function reviewIssueForQuestion(
   return issues.findId ? issues.findId(id) : issues.find((issue) => issue.questionId === id);
 }
 export function inlineReviewRecordIssues(record: IntakeReviewRecord, bytes: number) {
-  if (!record.issuesReference) return Buffer.byteLength(canonicalLiteral(record.issues || []));
+  return finishClinicalReviewWork(inlineReviewRecordIssuesWork(record, bytes));
+}
+/** Hash the complete policy with point reads so no SQLite iterator survives a host turn. */
+export function* inlineReviewRecordIssuesWork(
+  record: IntakeReviewRecord,
+  bytes: number,
+): Generator<void, number, void> {
+  if (!record.issuesReference) {
+    const values = record.issues || [];
+    let used = 2;
+    for (let ordinal = 0; ordinal < values.length; ordinal++) {
+      if (ordinal) used++;
+      used += Buffer.byteLength(canonicalLiteral(values[ordinal]) ?? '');
+      yield;
+    }
+    if (!values.length) yield;
+    return used;
+  }
+  const issues = reviewIssueCollection(record);
+  const count = issues.length;
   const values: IntakeReviewIssue[] = [],
     hash = createHash('sha256').update('[');
   let used = 2,
     first = true;
-  for (const issue of reviewRecordIssues(record)) {
+  for (let ordinal = 0; ordinal < count; ordinal++) {
+    const issue = issues.at(ordinal);
+    if (!issue) throw Error('Issue policy scratch lost; prepare the current review again');
     const text = canonicalLiteral(issue);
     if (!first) hash.update(',');
     first = false;
@@ -305,7 +327,11 @@ export function inlineReviewRecordIssues(record: IntakeReviewRecord, bytes: numb
     used += Buffer.byteLength(text) + 1;
     if (used <= bytes) values.push(issue);
     else values.length = 0;
+    yield;
   }
+  if (!count) yield;
+  if (issues.length !== count)
+    throw Error('Issue policy scratch changed; prepare the current review again');
   record.issuesReference.token = hash.update(']').digest('hex');
   if (used <= bytes) {
     record.issues = values;

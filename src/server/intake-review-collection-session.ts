@@ -1,6 +1,6 @@
 import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { createHash } from 'node:crypto';
-import { inlineReviewRecordIssues, reviewRecordIssues } from './intake-review-issue-state.ts';
+import { inlineReviewRecordIssuesWork, reviewRecordIssues } from './intake-review-issue-state.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
@@ -209,7 +209,10 @@ export function* createCollectionClinicalReviewSessionWork(input: {
     );
     let issueInlineBytes = 128 * 1024;
     for (const record of review.records)
-      issueInlineBytes -= inlineReviewRecordIssues(record, Math.max(0, issueInlineBytes));
+      issueInlineBytes -= yield* inlineReviewRecordIssuesWork(
+        record,
+        Math.max(0, issueInlineBytes),
+      );
     const reviewHash = createHash('sha256').update(
       '[' + canonicalLiteral(review.reviewToken) + ',',
     );

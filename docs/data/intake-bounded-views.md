@@ -600,6 +600,13 @@ session releases only its run; authority changes invalidate old generations,
 and missing scratch is refused instead of treated as no blockers. The issue
 row/read/write and peak-value counters distinguish this disposable policy work
 from durable writes. The derived issue collection is never recovery authority.
+Final inline issue selection and complete issue-token hashing use indexed point
+reads with work checkpoints, including when the inline byte budget is exhausted.
+Already-inline and empty policies also checkpoint so a long record sequence cannot
+skip host turns.
+During this finalization, no scratch SQL iterator remains open across a host turn;
+cancellation or source invalidation refuses the attempt before publishing a partial
+issue token or list.
 
 Read-only record sections and their fragments share the existing one-session
 public review cache with record and review pages. They select the exact record
