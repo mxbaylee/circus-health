@@ -924,6 +924,96 @@ it('retains an uncertain report-wide source command and blocks overview Back unt
   fireEvent.click(screen.getByRole('button', { name: 'Back to Import' }));
   expect(back).toHaveBeenCalledOnce();
 });
+it('retries a failed later report-record page with the same cursor', async () => {
+  const first = record('first');
+  const detail = {
+    format: 'health-intake-report-detail-v2' as const,
+    group: header('visible-group'),
+    records: {
+      format: 'health-intake-report-record-page-v2' as const,
+      intakeId: first.intakeId,
+      version: 7,
+      scope: 'clinical_records' as const,
+      view: 'all' as const,
+      records: [],
+      totalRecords: 2,
+      nextCursor: 'fictional-later-cursor',
+    },
+    people: {
+      format: 'health-intake-people-page-v2' as const,
+      intakeId: first.intakeId,
+      groupId: first.groupId,
+      selectedPersonId: null,
+      people: [],
+      totalPeople: 0,
+      counts: { pending: 0, later: 0, excluded: 0, saved: 0 },
+      nextCursor: null,
+    },
+  };
+  const later = { ...detail, records: { ...detail.records, nextCursor: null } };
+  const reads: string[] = [];
+  const reloadFirstPage = vi.fn();
+  const onChanged = vi.fn();
+  let failed = false;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.includes('/report-queue/')) {
+        const cursor = url.searchParams.get('cursor');
+        reads.push(cursor || 'first');
+        if (cursor && !failed) {
+          failed = true;
+          return new Response(
+            JSON.stringify({
+              error: { code: 'UNAVAILABLE', message: 'Fictional later page unavailable.' },
+            }),
+            { status: 503, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        return json(cursor ? later : detail);
+      }
+      if (url.pathname.endsWith('/identity-review')) return json(identity);
+      if (url.pathname.endsWith('/report-source-review'))
+        return json({
+          format: 'health-intake-report-source-review-v2',
+          profileId: profile.id,
+          intakeId: first.intakeId,
+          intakeVersion: 7,
+          groupId: first.groupId,
+          groupVersionId: 'group-v1',
+          scopeToken: 'fictional-source-scope',
+          view: 'all',
+          targets: { items: [], total: 0, nextCursor: null },
+          coverage,
+          sourceEvidence: { items: [], total: 0, nextCursor: null },
+          conflictingSourceEvidence: false,
+        });
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <CollectionReportReview
+        initial={detail}
+        firstPage={{ reload: reloadFirstPage, error: null }}
+        selection={{ intakeId: first.intakeId, groupId: first.groupId }}
+        onBack={vi.fn()}
+        onChanged={onChanged}
+        onUseSource={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Next report records' }));
+  expect(await screen.findByText('Fictional later page unavailable.')).toBeVisible();
+  expect(screen.getByRole('heading', { name: 'Fictional chemistry report' })).toBeVisible();
+  expect(screen.getByText('Opening report records…')).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Retry report page' }));
+  await screen.findByRole('button', { name: 'First report records' });
+  expect(reads).toEqual(['fictional-later-cursor', 'fictional-later-cursor']);
+  expect(reloadFirstPage).not.toHaveBeenCalled();
+  expect(onChanged).not.toHaveBeenCalled();
+});
 it('keeps an uncertain native identity sheet mounted when refreshed discovery confirms or removes its report', async () => {
   const report = {
     id: 'visible-group',

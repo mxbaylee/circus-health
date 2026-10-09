@@ -1360,6 +1360,15 @@ export function CollectionReportReview({
       {resource.error && (
         <p role="alert">
           {resource.error.message}
+          {(cursor || peopleCursor) && (
+            <button
+              type="button"
+              disabled={contextPending || resource.loading || resource.refreshing}
+              onClick={resource.reload}
+            >
+              Retry report page
+            </button>
+          )}
           <button type="button" onClick={refresh}>
             Refresh report
           </button>
