@@ -1,4 +1,4 @@
-name: PR71 pinned optical report failure diagnostic
+name: PR71 pinned optical browser shard phase diagnostic
 on:
   push:
     branches: [codex/pr71-step0-workspace]
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  optical-report-failure:
+  optical-browser-shard:
     if: github.ref == 'refs/heads/codex/pr71-step0-workspace'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -39,28 +39,31 @@ jobs:
       - name: Install Chromium
         working-directory: source
         run: npx playwright install --with-deps chromium
-      - name: Run original optical case with bounded exact-query request probe
+      - name: Run original browser shard with bounded optical request and server phase probes
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          receipts="$RUNNER_TEMP/pr71-265-optical"
+          receipts="$RUNNER_TEMP/pr71-265-optical-shard"
           mkdir -p "$receipts"
           git rev-parse HEAD > "$receipts/source-head.txt"
           git -C ../diagnostic rev-parse HEAD > "$receipts/diagnostic-head.txt"
           test "$(git rev-parse HEAD)" = '265055994c99ecc0289916a6838ce990cced76c7'
           test "$(sha256sum ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs | cut -d ' ' -f 1)" = '9aab0c21d040b345134b015dc54535053efaeab52016c806278c96a34b50fd31'
-          sha256sum src/tests/browser/import-mapping-shapes.test.ts src/app/data/api.ts src/app/data/read-recovery.ts package-lock.json ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs ../diagnostic/.github/workflows/pr71-2a-checkpoint.yml > "$receipts/source-sha.txt"
-          env -i PATH="$PATH" HOME="$HOME" TMPDIR="$RUNNER_TEMP" CRS_TEST_DIAGNOSTICS=1 CRS_PDF_CONTROLLED_TEST=0 node --import ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs --test --test-concurrency=1 --test-reporter=spec src/tests/browser/import-mapping-shapes.test.ts 2>&1 | tee "$receipts/optical.log"
+          test "$(sha256sum ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs | cut -d ' ' -f 1)" = 'ad6907f9d29791ebc0847680fe0c8890b5bdf45d7c2581a820eb2b9b18136b0e'
+          git diff --exit-code
+          sha256sum src/tests/browser/import-mapping-shapes.test.ts src/tests/browser/runtime-child.ts src/server/intake-queue-native.ts src/app/data/api.ts src/app/data/read-recovery.ts src/scripts/test-suite.ts package-lock.json ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs ../diagnostic/.github/workflows/pr71-2a-checkpoint.yml > "$receipts/source-sha.txt"
+          loaders="--import $(realpath ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs) --import $(realpath ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs)"
+          env -i PATH="$PATH" HOME="$HOME" TMPDIR="$RUNNER_TEMP" NODE_OPTIONS="$loaders" CRS_TEST_DIAGNOSTICS=1 CRS_OPTICAL_REPORT_PHASE_DIAGNOSTIC=1 npm run test:browser:run -- --test-shard=6/6 2>&1 | tee "$receipts/optical-shard.log"
       - name: Checksum all available receipts
         if: always()
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/pr71-265-optical"
-          find "$RUNNER_TEMP/pr71-265-optical" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-265-optical/SHA256SUMS"
+          mkdir -p "$RUNNER_TEMP/pr71-265-optical-shard"
+          find "$RUNNER_TEMP/pr71-265-optical-shard" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-265-optical-shard/SHA256SUMS"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: pr71-265-optical
-          path: ${{ runner.temp }}/pr71-265-optical
+          name: pr71-265-optical-shard
+          path: ${{ runner.temp }}/pr71-265-optical-shard
           if-no-files-found: error
