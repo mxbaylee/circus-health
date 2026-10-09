@@ -9,6 +9,7 @@ import {
 import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import type { IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +18,7 @@ import type { Browser, Locator } from 'playwright';
 import type { ClinicalImportCorrectionHistoryPage } from '../../shared/clinical-import-corrections.ts';
 import type { readReviewDraftHistoryPage } from '../../server/intake-review-draft-state.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
+import { fetchFixtureApi } from './fixture-api-request.ts';
 
 for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'unclassified'])
   test(
@@ -61,7 +63,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       await pdfPage.close();
       await page.goto(url);
       async function request(path: string, body?: unknown) {
-        const r = await page.request.fetch(url + path, {
+        const r = await fetchFixtureApi(page.request, url + path, {
           method: body ? 'POST' : 'GET',
           headers: { Origin: url, 'Content-Type': 'application/json' },
           ...(body ? { data: body } : {}),
@@ -69,17 +71,29 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         assert(r.ok(), await r.text());
         return (await r.json()).data;
       }
+      let setupConnection: string | undefined;
+      const observeSetup = (incoming: IncomingMessage) => {
+        if (incoming.method === 'POST' && incoming.url === '/api/profile-setups')
+          setupConnection = incoming.headers.connection;
+      };
+      runtime.server.on('request', observeSetup);
       const setup = await request('/api/profile-setups', {
         fullName: 'Cookie Doe',
         name: 'Cookie Doe',
         birthDate: '1986-02-14',
-      });
+      }).finally(() => runtime.server.off('request', observeSetup));
+      assert.equal(
+        setupConnection,
+        'close',
+        'the fixture API request does not pool an idle socket',
+      );
       const profile = await request(`/api/profile-setups/${setup.setupId}/verify`, {
         acknowledged: true,
         recovery: setup.recoveryKit,
       });
       const prefix = `/api/profiles/${profile.id}`;
-      const upload = await page.request.post(url + prefix + '/intakes', {
+      const upload = await fetchFixtureApi(page.request, url + prefix + '/intakes', {
+        method: 'POST',
         headers: {
           Origin: url,
           'Content-Type': 'application/pdf',
