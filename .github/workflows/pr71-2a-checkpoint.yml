@@ -1,27 +1,25 @@
-name: PR71 pinned optical browser shard phase diagnostic
+name: PR71 pinned original history diagnostic
 on:
   push:
     branches: [codex/pr71-step0-workspace]
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
-  workflow_dispatch:
 
 jobs:
-  optical-browser-shard:
-    if: github.ref == 'refs/heads/codex/pr71-step0-workspace'
+  original-history-257:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/pr71-step0-workspace'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
-    env:
-      HUSKY: "0"
     steps:
+      # This workflow and loader belong only to the isolated diagnostic branch.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: diagnostic
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 265055994c99ecc0289916a6838ce990cced76c7
+          ref: e7e24f87da3cad2efb36bcd1da18dcaf5e4ffbfe
           path: source
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -31,39 +29,45 @@ jobs:
       - name: Install pinned source dependencies
         working-directory: source
         run: npm ci
-      - name: Install qpdf
-        run: sudo apt-get update && sudo apt-get install -y qpdf
-      - name: Build assets
-        working-directory: source
-        run: npm run build:assets
-      - name: Install Chromium
-        working-directory: source
-        run: npx playwright install --with-deps chromium
-      - name: Run original browser shard with bounded optical request and server phase probes
+      - name: Observe only the original guarded 257-artifact case
         working-directory: source
         shell: bash
+        env:
+          CRS_ARTIFACT_HISTORY_PHASES: '1'
+          CRS_ARTIFACT_HISTORY_DIAGNOSTICS: '1'
+          CRS_HISTORY257_DIAGNOSTIC: '1'
+          CRS_HISTORY257_PROFILE_DIR: ${{ runner.temp }}/pr71-history257/profiles
         run: |
           set -euo pipefail
-          receipts="$RUNNER_TEMP/pr71-265-optical-shard"
-          mkdir -p "$receipts"
-          git rev-parse HEAD > "$receipts/source-head.txt"
-          git -C ../diagnostic rev-parse HEAD > "$receipts/diagnostic-head.txt"
-          test "$(git rev-parse HEAD)" = '265055994c99ecc0289916a6838ce990cced76c7'
-          test "$(sha256sum ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs | cut -d ' ' -f 1)" = '2249051ae148cd6e04e26d91241afa7a752381983f0e2210bc2cfbbab568db02'
-          test "$(sha256sum ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs | cut -d ' ' -f 1)" = 'a968c6b540986f9700218cec522434de5dcafa756affbb28135866a2c13a380b'
-          git diff --exit-code
-          sha256sum src/tests/browser/import-mapping-shapes.test.ts src/tests/browser/runtime-child.ts src/server/intake-queue-native.ts src/app/data/api.ts src/app/data/read-recovery.ts src/scripts/test-suite.ts package-lock.json ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs ../diagnostic/.github/workflows/pr71-2a-checkpoint.yml > "$receipts/source-sha.txt"
-          loaders="--import $(realpath ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs) --import $(realpath ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs)"
-          env -i PATH="$PATH" HOME="$HOME" TMPDIR="$RUNNER_TEMP" NODE_OPTIONS="$loaders" CRS_TEST_DIAGNOSTICS=1 CRS_OPTICAL_REPORT_PHASE_DIAGNOSTIC=1 npm run test:browser:run -- --test-shard=6/6 2>&1 | tee "$receipts/optical-shard.log"
+          mkdir -p "$RUNNER_TEMP/pr71-history257/profiles"
+          git -C ../diagnostic rev-parse HEAD > "$RUNNER_TEMP/pr71-history257/diagnostic-head.txt"
+          test "$(git -C ../diagnostic rev-parse HEAD)" = "$GITHUB_SHA"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr71-history257/source-head.txt"
+          test "$(git rev-parse HEAD)" = 'e7e24f87da3cad2efb36bcd1da18dcaf5e4ffbfe'
+          test "$(sha256sum ../diagnostic/pr71-history257-loader.mjs | cut -d' ' -f1)" = '50eff16d8c94e98f4eaee3486474be9b21636e670f3a1da5c838a7e2d3cbd183'
+          sha256sum \
+            src/server/intake-state-collections.ts \
+            src/server/intake-state-storage.ts \
+            src/server/record-versions.ts \
+            src/server/clinical-review-work.ts \
+            src/server/clinical-review-artifact-proof.ts \
+            src/server/intake-identity-native.ts \
+            src/server/intake-file-work.ts \
+            src/server/test/intake-identity-native-artifact-history.test.ts \
+            ../diagnostic/pr71-history257-loader.mjs > "$RUNNER_TEMP/pr71-history257/source-sha.txt"
+          node --import=../diagnostic/pr71-history257-loader.mjs --test --test-concurrency=1 \
+            --test-name-pattern='^native warm identity cooperates across 257 retained proposal artifacts and duplicate occurrences$' \
+            src/server/test/intake-identity-native-artifact-history.test.ts \
+            > "$RUNNER_TEMP/pr71-history257/original257.log" 2>&1
       - name: Checksum all available receipts
         if: always()
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/pr71-265-optical-shard"
-          find "$RUNNER_TEMP/pr71-265-optical-shard" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-265-optical-shard/SHA256SUMS"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+          mkdir -p "$RUNNER_TEMP/pr71-history257"
+          find "$RUNNER_TEMP/pr71-history257" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-history257/SHA256SUMS"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         if: always()
         with:
-          name: pr71-265-optical-shard
-          path: ${{ runner.temp }}/pr71-265-optical-shard
+          name: pr71-history257-diagnostic
+          path: ${{ runner.temp }}/pr71-history257
           if-no-files-found: error
