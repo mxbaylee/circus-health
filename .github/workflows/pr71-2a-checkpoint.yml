@@ -38,7 +38,7 @@ jobs:
           CRS_IDENTITY_CPU_PROFILE_PHASE: stableHttp
         run: |
           set -o pipefail
-          mkdir -p "$OUTPUT"
+          mkdir -p "$OUTPUT/profiles"
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
           node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/grounding.log"
       - name: Hash diagnostic evidence
