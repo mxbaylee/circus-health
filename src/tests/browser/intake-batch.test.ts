@@ -8,10 +8,12 @@ import {
   fixtureNativeRecordReady,
 } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { fetchFixtureApi } from './fixture-api-request.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AppOptions } from '../../server/index.ts';
 import type { Browser } from 'playwright';
 import type { AddressInfo } from 'node:net';
+import type { IncomingMessage } from 'node:http';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
@@ -157,8 +159,13 @@ test(
       return { profileId: profile.id };
     });
     const prefix = `/api/profiles/${setup.profileId}`;
+    let probeFirstFixtureGet = true;
     const get = async (path: string) => {
-      const response = await page.request.get(url + path);
+      const options = probeFirstFixtureGet
+        ? { headers: { 'X-Fixture-Api-Probe': 'batch-get' } }
+        : undefined;
+      probeFirstFixtureGet = false;
+      const response = await fetchFixtureApi(page.request, url + path, options);
       const json = await response.json();
       assert(response.ok(), JSON.stringify(json));
       return json.data;
@@ -272,9 +279,21 @@ test(
     assert.equal(importRequests.length, 0, 'background reading never accepts a record');
 
     await waitFor(() => bridges.length === 1, 'first model pass');
-    const first = await get(
-      `${prefix}/intakes/${encodeURIComponent(initialBatch.items[0].intakeId)}`,
+    const firstPath = `${prefix}/intakes/${encodeURIComponent(initialBatch.items[0].intakeId)}`;
+    let fixtureConnection: string | undefined;
+    const observeFixtureGet = (incoming: IncomingMessage) => {
+      if (
+        incoming.method === 'GET' &&
+        incoming.url === firstPath &&
+        incoming.headers['x-fixture-api-probe'] === 'batch-get'
+      )
+        fixtureConnection = incoming.headers.connection;
+    };
+    runtime.server.on('request', observeFixtureGet);
+    const first = await get(firstPath).finally(() =>
+      runtime.server.off('request', observeFixtureGet),
     );
+    assert.equal(fixtureConnection, 'close', 'fixture API GET must not pool an idle socket');
     const firstText = (await bridges[0].callbacks.onTool!({
       tool: 'health_intake_source_text',
       arguments: { id: first.id },
@@ -407,7 +426,8 @@ test(
       'the captured original awaits clinical conversion while its reading is stopped',
     );
     assert.equal(second.collections.proposals.total, 0);
-    const secondOriginal = await page.request.get(
+    const secondOriginal = await fetchFixtureApi(
+      page.request,
       url + fixtureSourcePath(prefix, second.contentUrl),
     );
     assert.equal(
@@ -617,7 +637,10 @@ test(
       assert.equal(result.unit, 'ng/mL');
       assert.equal(result.date, '2026-09-01');
       assert(result.evidence.length > 0);
-      const original = await page.request.get(url + fixtureSourcePath(prefix, accepted.contentUrl));
+      const original = await fetchFixtureApi(
+        page.request,
+        url + fixtureSourcePath(prefix, accepted.contentUrl),
+      );
       assert.equal(
         await original.text(),
         `Fictional ${label} result 18 ng/mL; unread appendix retained.`,
