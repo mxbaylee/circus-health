@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync, StatementSync } from 'node:sqlite';
-import { openDatabase, HttpError, currentTransactionToken } from '../database.ts';
+import { openDatabase, HttpError, currentTransactionToken, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { uploadIntake, proposeConversion } from '../intake.ts';
@@ -22,6 +22,13 @@ import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { iterateIntakeEnvelopeText } from '../intake-collection-envelope.ts';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
 import { prepareIntakeLookupIndices } from '../intake-lookup-state.ts';
+import { readIntakeEnvelope, stageIntakeEnvelope } from '../intake-authority.ts';
+import { recordDurabilityStatus } from '../record-versions.ts';
+import {
+  retainedIntakeAcceptance,
+  maximumIntakeDiscoveryOrder,
+} from '../intake-lookup-projection.ts';
+import { buildVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 
 function line(id: string) {
@@ -205,6 +212,171 @@ for (const count of [1, 65])
       assert.equal(outsideRows, count, 'Every retained source participates in the final digest');
       if (count > 64)
         assert.equal(rowsAtHostTurn, 64, 'A real host turn occurs before scanning the next source');
+    },
+  );
+
+for (const retainedCount of [1, 65])
+  test(
+    `one public native acceptance revisits only changed receipt contributions after ${retainedCount} retained receipts`,
+    { timeout: 120000 },
+    async (t) => {
+      const root = mkdtempSync(join(tmpdir(), 'fictional-receipt-increment-'));
+      const profileId = 'fictional-receipts';
+      const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+      const authority = memoryRecordAuthority(db);
+      t.after(() => {
+        clearIntakeStateCache(db);
+        db.close();
+        rmSync(root, { recursive: true, force: true });
+      });
+      const selected = uploadIntake(db, root, profileId, {
+        filename: 'fictional-selected.jsonl',
+        bytes: Buffer.from(line('receipt-selected')),
+      });
+      const proposed = proposeConversion(db, root, profileId, selected.id, {
+        version: selected.version,
+        jsonlText: line('receipt-selected'),
+        summary: 'Fictional selected record',
+      });
+      const control = uploadIntake(db, root, profileId, {
+        filename: 'fictional-control.txt',
+        bytes: Buffer.from('Fictional unrelated original'),
+      });
+      const seed = (id: string, receipts: Array<Record<string, unknown>>) => {
+        const envelope = readIntakeEnvelope(db, { id }) as {
+          intake: { workflow?: Record<string, unknown> };
+        };
+        assert.ok(envelope?.intake);
+        envelope.intake.workflow ??= {};
+        envelope.intake.workflow.reportAcceptances = receipts;
+        transaction(db, () => stageIntakeEnvelope(db, { id }, envelope));
+      };
+      const retained = Array.from({ length: retainedCount }, (_, index) => ({
+        receipt: { operationId: `fictional-retained-${index}` },
+        marker: `fictional-history-${index}`,
+      }));
+      seed(selected.id, retained);
+      const controlReceipt = {
+        receipt: { operationId: 'fictional-control-receipt' },
+        marker: 'fictional-control',
+      };
+      seed(control.id, [controlReceipt]);
+      for (const source of [selected, control]) {
+        await buildIntakeCollectionEnvelope(db, { id: source.id });
+        await buildVerifiedWorkflowSummary(
+          db,
+          { id: source.id },
+          { mappingVersion: 'fictional-v1', isSourceContextVersion: () => false },
+        );
+      }
+      await prepareCollectionReviewMembership(db, { id: selected.id });
+      await prepareIntakeLookupIndices(db);
+      assert.deepEqual(retainedIntakeAcceptance(db, retained[0]!.receipt.operationId), retained[0]);
+      assert.deepEqual(
+        retainedIntakeAcceptance(db, controlReceipt.receipt.operationId),
+        controlReceipt,
+      );
+      const maximum = maximumIntakeDiscoveryOrder(db);
+      const proposalId = proposed.proposals.at(-1)!.id;
+      const reviewed = prepareCollectionClinicalReview(
+        db,
+        root,
+        profileId,
+        selected.id,
+        proposalId,
+      );
+      if (reviewed.status !== 'ready') throw Error('Expected selected native review');
+      const review = reviewed.session.review;
+      const input: IntakeReportAcceptanceRequest = {
+        operationId: randomUUID(),
+        blocks: [
+          {
+            intakeId: selected.id,
+            proposalId,
+            intakeVersion: review.version,
+            reviewToken: review.reviewToken,
+            selections: review.records.map((record) => ({
+              recordId: record.id,
+              candidateId: record.candidateId!,
+              candidateVersionId: record.candidateVersionId!,
+              mapping: record.mapping,
+            })),
+          },
+        ],
+      };
+      const saved = await acceptIntakeReportSelectionAsync(db, root, profileId, input);
+      assert.equal(saved.replayed, false);
+      assert.equal(saved.receipt.acceptedCount, 1);
+      const selectedAfterAcceptance = [...iterateIntakeEnvelopeText(db, { id: selected.id })].join(
+        '',
+      );
+      const emitted = JSON.parse(selectedAfterAcceptance);
+      const newReceipt = emitted.intake.workflow.reportAcceptances.at(-1);
+      assert.equal(newReceipt.receipt.operationId, input.operationId);
+      const beforeObjects = authority.objects.size;
+      const beforeSequence = recordDurabilityStatus(db)?.sequence;
+      const beforeTransactions = Number(
+        db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n,
+      );
+      const visited = new Map<string, number>();
+      const fresh = await prepareIntakeLookupIndices(db, {
+        onCheckpoint: ({ sourceId, visited: count }) => {
+          visited.set(sourceId, Math.max(visited.get(sourceId) ?? 0, count));
+        },
+      });
+      const changedVisits = visited.get(selected.id) ?? 0;
+      const controlVisits = visited.get(control.id) ?? 0;
+      t.diagnostic(
+        JSON.stringify({ retainedCount, changedVisits, controlVisits, prepared: fresh.prepared }),
+      );
+      assert.equal(fresh.prepared, 0, 'Existing complete v6 policy remains selected');
+      assert.equal(authority.objects.size, beforeObjects);
+      assert.equal(recordDurabilityStatus(db)?.sequence, beforeSequence);
+      assert.equal(
+        [...iterateIntakeEnvelopeText(db, { id: selected.id })].join(''),
+        selectedAfterAcceptance,
+      );
+      assert.equal(
+        Number(db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n),
+        beforeTransactions,
+      );
+      assert.equal(maximumIntakeDiscoveryOrder(db), maximum);
+      assert.deepEqual(retainedIntakeAcceptance(db, retained[0]!.receipt.operationId), retained[0]);
+      assert.deepEqual(retainedIntakeAcceptance(db, input.operationId), newReceipt);
+      assert.deepEqual(
+        retainedIntakeAcceptance(db, controlReceipt.receipt.operationId),
+        controlReceipt,
+      );
+      assert.equal(retainedIntakeAcceptance(db, 'fictional-missing-receipt'), null);
+      const replay = await acceptIntakeReportSelectionAsync(db, root, profileId, input);
+      assert.equal(replay.replayed, true);
+      assert.deepEqual(replay.receipt, saved.receipt);
+      db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
+        'fictional-raw-recert',
+        retainedCount,
+      );
+      const recertVisits = new Map<string, number>();
+      const recertified = await prepareIntakeLookupIndices(db, {
+        onCheckpoint: ({ sourceId, visited: count }) => {
+          recertVisits.set(sourceId, Math.max(recertVisits.get(sourceId) ?? 0, count));
+        },
+      });
+      t.diagnostic(
+        JSON.stringify({
+          retainedCount,
+          recertChangedVisits: recertVisits.get(selected.id) ?? 0,
+          recertControlVisits: recertVisits.get(control.id) ?? 0,
+          recertPrepared: recertified.prepared,
+        }),
+      );
+      assert.equal(recertified.prepared, 0);
+      assert.equal(recertVisits.get(selected.id) ?? 0, 0);
+      assert.equal(recertVisits.get(control.id) ?? 0, 0);
+      assert.equal(controlVisits, 0, 'Untouched source retains its private receipt projection');
+      assert.ok(
+        changedVisits <= 1,
+        `${changedVisits} changed-source receipt visits for one append`,
+      );
     },
   );
 // Two durable schema migrations plus coupled checkpoint preparation exercise
