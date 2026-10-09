@@ -8,6 +8,7 @@ import type {
   IntakeReportSourceCoverageReference,
 } from '../shared/intake-report-source-reference.ts';
 import { createHash, randomUUID } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import type { IntakeReportSourceCoverageEntry, IntakeReportSourceScope } from '../shared/intake.ts';
 import type { IntakeReportSourceExtensionV2 } from '../shared/intake-report-source-reference.ts';
 import type {
@@ -271,6 +272,14 @@ export async function prepareLegacyReportSourceState(
     latestMembers = await catalog.fork(),
     latestMemberLookup = await catalog.fork(),
     resolution = await createSourceResolutionIndex(catalog);
+  let visited = 0;
+  const checkpoint = async () => {
+    catalog.assertCurrent();
+    if (++visited % 64 === 0) {
+      await setImmediate();
+      catalog.assertCurrent();
+    }
+  };
   const addMembers = async (
     parent: IntakeEnvelopeRecord,
     lookup?: ReportSnapshotMapWriter,
@@ -303,6 +312,7 @@ export async function prepareLegacyReportSourceState(
       if (seen !== native.count) throw Error('Source member count mismatch');
     }
     for (const selected of selectedMembers()) {
+      await checkpoint();
       const identity = memberIdentity(selected);
       if (original) await resolution.originalMember(header.groupId, selected);
       else await resolution.memberScope(header.groupId, selected);
@@ -327,6 +337,7 @@ export async function prepareLegacyReportSourceState(
         'coverage',
       );
       for (const row of reportSourceSnapshotRows(native.map, 'coverage')) {
+        await checkpoint();
         const parsed = await prepareIntakeJsonCanonical(native.map.chunks(row.key), {
           assertRunning: catalog.assertCurrent,
           onWork: db ? intakeJsonCanonicalWorkObserver(db, 'warm') : undefined,
@@ -400,6 +411,7 @@ export async function prepareLegacyReportSourceState(
       return;
     }
     for (const entry of children(view, parent, 'coverageEntries')) {
+      await checkpoint();
       const selected = selectedSourceCoverage(
         view,
         entry,
@@ -431,6 +443,7 @@ export async function prepareLegacyReportSourceState(
   await addCoverage(record, true);
   let extensionOrdinal = 0;
   for (const extension of children(view, record, 'extensions')) {
+    await checkpoint();
     const lookup = await catalog.fork(),
       extensionId = text(view, extension, 'id')!;
     await addMembers(extension, lookup);
@@ -455,27 +468,32 @@ export async function prepareLegacyReportSourceState(
     operationId: header.operationId,
     recordAddress: view.address(record),
   };
-  await partition.put(
-    'meta',
-    JSON.stringify({
-      format: reference.format,
-      operationId: header.operationId,
-      recordAddress: reference.recordAddress,
-      headerHash: hash(header),
-      ...counts(view, record),
-    }),
+  const confirmationHash = await hashCanonicalReportSourceConfirmation(db, view, record, catalog),
+    resolved = await resolution.finish();
+  await partition.putMany(
+    [
+      {
+        key: 'meta',
+        value: JSON.stringify({
+          format: reference.format,
+          operationId: header.operationId,
+          recordAddress: reference.recordAddress,
+          headerHash: hash(header),
+          ...counts(view, record),
+        }),
+      },
+      { key: 'confirmationHash', value: confirmationHash },
+    ],
+    [
+      { key: 'coveredMembers', child: coveredMembers },
+      { key: 'coveredOccurrences', child: coveredOccurrences },
+      { key: 'extensions', child: extensions },
+      { key: 'authorities', child: authorities },
+      { key: 'latestMembers', child: latestMembers },
+      { key: 'latestMemberLookup', child: latestMemberLookup },
+      { key: 'resolution', child: resolved },
+    ],
   );
-  await partition.put(
-    'confirmationHash',
-    await hashCanonicalReportSourceConfirmation(db, view, record, catalog),
-  );
-  await partition.attach('coveredMembers', coveredMembers);
-  await partition.attach('coveredOccurrences', coveredOccurrences);
-  await partition.attach('extensions', extensions);
-  await partition.attach('authorities', authorities);
-  await partition.attach('latestMembers', latestMembers);
-  await partition.attach('latestMemberLookup', latestMemberLookup);
-  await partition.attach('resolution', await resolution.finish());
   await catalog.publish(snapshotId, partition);
   return reference;
 }
@@ -572,7 +590,15 @@ export async function prepareReportSourceExtension(
     resolution = await createSourceResolutionIndex(catalog, requiredReference(old, 'resolution')),
     coverage = await catalog.fork();
   // Retained noncumulative legacy snapshots can omit old members; preserve the exact current intersection.
+  let retainedVisited = 0;
   for (const item of rows(latestMembers, 'm:')) {
+    catalog.assertCurrent();
+    input.assertCurrent();
+    if (++retainedVisited % 64 === 0) {
+      await setImmediate();
+      catalog.assertCurrent();
+      input.assertCurrent();
+    }
     if (typeof item.value !== 'string') throw Error('Invalid source member identity');
     const member = JSON.parse(item.value) as { candidateId: string; candidateVersionId: string };
     const ordinal = Number(item.key.slice(2));
@@ -596,7 +622,11 @@ export async function prepareReportSourceExtension(
   let coverageCount = 0;
   do {
     const event = next.value!;
-    if (event.kind === 'member') {
+    if (event.kind === 'checkpoint') {
+      input.assertCurrent();
+      await setImmediate();
+      input.assertCurrent();
+    } else if (event.kind === 'member') {
       const identity = memberIdentity(event.member);
       await putSame(latestMemberLookup, 'm:' + schemaKey(...identity), '1');
       await resolution.memberScope(confirmation.header.groupId, event.member);

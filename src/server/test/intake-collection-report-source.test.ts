@@ -304,6 +304,63 @@ test('ten thousand retained members stream through one page without reading occu
   assert.equal(peak, 64);
 });
 
+test('nonmatching source members yield a work checkpoint before draining the collection', () => {
+  const f = fixture();
+  f.input.current = snapshot(
+    Array.from({ length: 65 }, (_, index) => ({
+      candidateId: 'fictional-unmatched-' + index,
+      candidateVersionId: 'fictional-version-' + index,
+      occurrences: [],
+    })),
+  );
+  let inspected = 0,
+    cancelled = false;
+  f.input.confirmation.hasMember = () => {
+    inspected++;
+    return false;
+  };
+  f.input.contributed = () => false;
+  f.input.assertCurrent = () => {
+    if (cancelled) throw Error('fictional cancellation');
+  };
+  const events = reportSourceExtensionEvents(f.input);
+  assert.deepEqual(events.next(), { value: { kind: 'checkpoint' }, done: false });
+  assert.ok(inspected > 0 && inspected <= 64);
+  cancelled = true;
+  assert.throws(() => events.next(), /fictional cancellation/);
+  assert.ok(inspected < 65);
+});
+
+test('already covered source occurrences yield without emitting duplicate coverage', () => {
+  const f = fixture('explicit_current_members');
+  f.input.current = snapshot([
+    {
+      candidateId: 'fictional-covered',
+      candidateVersionId: 'fictional-covered-version',
+      occurrences: Array.from({ length: 65 }, (_, index) => occurrence('fictional-' + index)),
+    },
+  ]);
+  f.input.confirmation.hasMember = () => true;
+  f.input.contributed = () => true;
+  let inspected = 0;
+  f.input.confirmation.hasOccurrence = () => {
+    inspected++;
+    return true;
+  };
+  const events = reportSourceExtensionEvents(f.input);
+  assert.equal(events.next().value!.kind, 'member');
+  assert.deepEqual(events.next(), { value: { kind: 'checkpoint' }, done: false });
+  assert.ok(inspected > 0 && inspected <= 64);
+  const remaining = [...events];
+  assert.equal(inspected, 65);
+  assert.ok(
+    !remaining.some((event) => event.kind === 'coverage' || event.kind === 'coverage-reference'),
+  );
+  const complete = remaining.at(-1)!;
+  assert.equal(complete.kind, 'complete');
+  if (complete.kind === 'complete') assert.equal(complete.coverageEntryCount, 0);
+});
+
 test('unknown occurrence fields stay in exact hashes but do not enlarge the authorized occurrence identity', () => {
   const f = fixture('explicit_current_members');
   Object.assign(f.version.members[1]!.occurrences[0]!, {

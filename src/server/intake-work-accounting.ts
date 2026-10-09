@@ -183,6 +183,7 @@ const hostTemplate = {
   reportMemberHashBytes: 0,
   reportMemberHashItems: 0,
   reportSnapshotCheckpointChanges: 0,
+  reportSnapshotCheckpointBatches: 0,
   packagePlanUnitIds: 0,
   packagePlanHashBytes: 0,
   collectionNodeReads: 0,

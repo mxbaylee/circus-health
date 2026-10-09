@@ -101,6 +101,7 @@ export interface ReportSourceExtensionInput {
   assertCurrent(): void;
 }
 export type ReportSourceExtensionEvent =
+  | { kind: 'checkpoint' }
   | { kind: 'member'; member: ReportSourceMemberHeader }
   | { kind: 'coverage'; entry: IntakeReportSourceCoverageEntry; extensionId: string }
   | {
@@ -245,8 +246,16 @@ export function* reportSourceExtensionEvents(
     '[' + literal(header.operationId) + ',' + literal(version.id) + ',' + literal(contextId) + ',[',
   );
   let memberCount = 0,
-    coverageEntryCount = 0;
+    coverageEntryCount = 0,
+    visited = 0;
+  function* checkpoint(): Generator<ReportSourceExtensionEvent> {
+    if (++visited % 64 !== 0) return;
+    input.assertCurrent();
+    yield { kind: 'checkpoint' };
+    input.assertCurrent();
+  }
   for (const member of members(current, input.assertCurrent)) {
+    yield* checkpoint();
     if (
       !confirmation.hasMember(member) &&
       (!input.contributed(member) || !input.pendingUnaccepted(member))
@@ -267,25 +276,29 @@ export function* reportSourceExtensionEvents(
         : intakeReportSourceReference(group, version),
       suffix = ',' + literal(sourceRef) + ']';
     for (const member of members(current, input.assertCurrent)) {
+      yield* checkpoint();
       if (!input.contributed(member)) continue;
-      const priorHas = (occurrence: Occurrence) => {
+      function* priorHas(occurrence: Occurrence): Generator<ReportSourceExtensionEvent, boolean> {
         if (!prior) return false;
-        for (const retained of members(prior, input.assertCurrent))
+        for (const retained of members(prior, input.assertCurrent)) {
+          yield* checkpoint();
           if (
             retained.candidateId === member.candidateId &&
             retained.candidateVersionId === member.candidateVersionId &&
             prior.hasOccurrence(retained, occurrence)
           )
             return true;
+        }
         return false;
-      };
+      }
       // Fork the hash after the exact full member grammar once per member, not once per occurrence.
       let prefix: Hash | undefined;
-      const entryId = (pieces: Iterable<string>) => {
+      function* entryId(pieces: Iterable<string>): Generator<ReportSourceExtensionEvent, string> {
         if (!prefix) {
           prefix = hash();
           update(prefix, '[' + literal(header.operationId) + ',' + literal(authorityEntryId) + ',');
           for (const chunk of current.canonicalMember(member)) {
+            yield* checkpoint();
             input.assertCurrent();
             update(prefix, chunk);
           }
@@ -294,12 +307,13 @@ export function* reportSourceExtensionEvents(
         recordIntakeWork('hashCalls');
         const target = prefix.copy();
         for (const chunk of pieces) {
+          yield* checkpoint();
           input.assertCurrent();
           update(target, chunk);
         }
         update(target, suffix);
         return 'report-source-coverage:' + target.digest('hex');
-      };
+      }
       if (current.occurrenceDescriptors) {
         if (
           !current.canonicalOccurrence ||
@@ -316,6 +330,7 @@ export function* reportSourceExtensionEvents(
             bytes: 128 * 1024,
           });
           for (const occurrence of page.occurrences) {
+            yield* checkpoint();
             if (
               confirmation.hasOccurrenceIdentity(member, occurrence.sourceIdentity) ||
               (prior &&
@@ -328,7 +343,7 @@ export function* reportSourceExtensionEvents(
               continue;
             const canonicalOccurrence = () => current.canonicalOccurrence!(occurrence);
             const entry = {
-              id: entryId(canonicalOccurrence()),
+              id: yield* entryId(canonicalOccurrence()),
               candidateId: member.candidateId,
               candidateVersionId: member.candidateVersionId,
               sourceRef,
@@ -349,9 +364,11 @@ export function* reportSourceExtensionEvents(
         } while (true);
       } else
         for (const occurrence of occurrences(current, member, input.assertCurrent)) {
-          if (confirmation.hasOccurrence(member, occurrence) || priorHas(occurrence)) continue;
+          yield* checkpoint();
+          if (confirmation.hasOccurrence(member, occurrence) || (yield* priorHas(occurrence)))
+            continue;
           const entry: IntakeReportSourceCoverageEntry = {
-            id: entryId([literal(occurrence)]),
+            id: yield* entryId([literal(occurrence)]),
             candidateId: member.candidateId,
             candidateVersionId: member.candidateVersionId,
             occurrence: { ...occurrence },

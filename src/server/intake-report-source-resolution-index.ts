@@ -96,6 +96,8 @@ export async function createSourceResolutionIndex(
     coverage = old ? await catalog.forkReference(required(old, 'coverage')) : await catalog.fork(),
     scopes = old ? await catalog.forkReference(required(old, 'scopes')) : await catalog.fork(),
     newScopes = await catalog.fork();
+  // Consecutive extensions share one private writer; attached roots remain immutable.
+  let lastVersion: { key: string; writer: ReportSnapshotMapWriter } | undefined;
   const addScope = async (scope: SourceResolutionScope) => {
     const key = 's:' + schemaKey(scope.groupId, scope.candidateId, scope.candidateVersionId),
       value = JSON.stringify({
@@ -123,11 +125,17 @@ export async function createSourceResolutionIndex(
       await addScope({ groupId, ...member });
     },
     async extension(target: SourceExtensionTarget, lookup: ReportSnapshotMapWriter) {
-      const key = 'v:' + schemaKey(target.groupVersionId),
-        previous = map.reference(key),
+      const key = 'v:' + schemaKey(target.groupVersionId);
+      let version = lastVersion?.key === key ? lastVersion.writer : undefined;
+      if (!version) {
+        const previous = map.reference(key);
         version = previous ? await catalog.forkReference(previous) : await catalog.fork();
-      await version.put('e:' + schemaOrdinal(target.ordinal), JSON.stringify(target));
-      await version.attach('m:' + schemaOrdinal(target.ordinal), lookup);
+        lastVersion = { key, writer: version };
+      }
+      await version.putMany(
+        [{ key: 'e:' + schemaOrdinal(target.ordinal), value: JSON.stringify(target) }],
+        [{ key: 'm:' + schemaOrdinal(target.ordinal), child: lookup }],
+      );
       await map.attach('v:' + schemaKey(target.groupVersionId), version);
     },
     async coverage(input: SourceCoverageTarget, query: SourceOccurrenceQuery) {
@@ -169,10 +177,14 @@ export async function createSourceResolutionIndex(
       await addScope(target);
     },
     async finish() {
-      await map.put('format', 'health-intake-source-resolution-index-v1');
-      await map.attach('originalMembers', members);
-      await map.attach('coverage', coverage);
-      await map.attach('scopes', scopes);
+      await map.putMany(
+        [{ key: 'format', value: 'health-intake-source-resolution-index-v1' }],
+        [
+          { key: 'originalMembers', child: members },
+          { key: 'coverage', child: coverage },
+          { key: 'scopes', child: scopes },
+        ],
+      );
       return map;
     },
   };

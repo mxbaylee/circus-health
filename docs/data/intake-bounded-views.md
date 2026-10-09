@@ -915,6 +915,24 @@ The source-hash, member-hash and reuse counters distinguish complete hashing fro
 repeated selection. This avoids rehashing the same shared report for every record;
 it does not eliminate its cold history traversal.
 
+Source-extension traversal emits a work checkpoint after at most 64 visited
+members, occurrences or canonical fragments, including nonmatching members and
+already-covered occurrences. The native consumer yields to the host and
+rechecks cancellation and selection at those checkpoints. Work checkpoints are
+not membership or coverage events and do not change extension IDs or counts.
+Cold source-state preparation also counts duplicate members and coverage entries
+when their writes are skipped. Retained-member intersection checks yield after
+at most 64 visited entries even when every member is unchanged. Cancellation and
+catalog authority are rechecked around those host turns.
+
+Snapshot checkpoints may combine string values and owned child references within
+the same 64-change limit. Foreign child writers and oversized batches are refused
+before any checkpoint mutation. Consecutive extensions for the same group version
+reuse one private writer; previously attached roots remain immutable, and switching
+versions forks the currently attached version root. Empty extensions and their
+ordering remain part of the retained history. Checkpoint-change and checkpoint-batch
+counters distinguish saved transactions from the logical changes they contain.
+
 Cold file verification yields between 256 KiB hash chunks. The session retains
 verified physical identities for every source dependency and the selected
 proposal in its private scratch, independently of the bounded open-source cache.

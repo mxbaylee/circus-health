@@ -60,7 +60,10 @@ export interface ReportSnapshotMapWriter extends ReportSnapshotMapReader {
   /** Exact lexical text; bounded chunks are attached through the existing byte codec. */
   putText(key: string, pieces: Iterable<string> | AsyncIterable<string>): Promise<void>;
   attach(key: string, child: ReportSnapshotMapWriter): Promise<void>;
-  putMany(entries: readonly { key: string; value: string }[]): Promise<void>;
+  putMany(
+    entries: readonly { key: string; value: string }[],
+    references?: readonly { key: string; child: ReportSnapshotMapWriter }[],
+  ): Promise<void>;
 }
 export interface ReportSnapshotCatalog {
   open(snapshotId: string): ReportSnapshotMapReader | undefined;
@@ -148,6 +151,7 @@ export function createReportSnapshotCatalog(
         withIntakeWork(db, 'warm', () =>
           recordIntakeWork('reportSnapshotCheckpointChanges', changes.length),
         );
+        withIntakeWork(db, 'warm', () => recordIntakeWork('reportSnapshotCheckpointBatches'));
         const id = randomUUID();
         collections.commitMaintenance(
           collections.prepare(collections.openView(), {
@@ -337,6 +341,18 @@ export function createReportSnapshotCatalog(
             },
           ],
     );
+    const attachment = (key: string, child: ReportSnapshotMapWriter): IntakeCollectionChange => {
+      const childName = names.get(child);
+      if (!childName) throw Error('Foreign report snapshot writer');
+      return {
+        area: 'builds',
+        collection: name,
+        op: 'putCollection',
+        key,
+        fromArea: 'builds',
+        fromCollection: childName,
+      };
+    };
     const result: ReportSnapshotMapWriter = {
       preceding(key) {
         assertCurrent();
@@ -380,31 +396,22 @@ export function createReportSnapshotCatalog(
       async delete(key) {
         await checkpoint([{ area: 'builds', collection: name, op: 'delete', key }]);
       },
-      async putMany(entries) {
-        if (entries.length > 64) throw Error('Report checkpoint exceeds bounded change batch');
-        await checkpoint(
-          entries.map(({ key, value }) => ({
+      async putMany(entries, references = []) {
+        if (entries.length + references.length > 64)
+          throw Error('Report checkpoint exceeds bounded change batch');
+        await checkpoint([
+          ...entries.map(({ key, value }): IntakeCollectionChange => ({
             area: 'builds',
             collection: name,
             op: 'put',
             key,
             value,
           })),
-        );
+          ...references.map(({ key, child }) => attachment(key, child)),
+        ]);
       },
       async attach(key, child) {
-        const childName = names.get(child);
-        if (!childName) throw Error('Foreign report snapshot writer');
-        await checkpoint([
-          {
-            area: 'builds',
-            collection: name,
-            op: 'putCollection',
-            key,
-            fromArea: 'builds',
-            fromCollection: childName,
-          },
-        ]);
+        await checkpoint([attachment(key, child)]);
       },
       async putText(key, pieces) {
         assertCurrent();
