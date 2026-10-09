@@ -305,7 +305,7 @@ test(
             sample.failureCategory = opticalReportFailureCategory(request.failure()?.errorText);`,
     `          if (sample) {
             sample.failureCategory = opticalReportFailureCategory(request.failure()?.errorText);
-            if (sample.afterAcknowledgement && sample.queryMatches) captureReportPhase();
+            if (sample.queryMatches) captureReportPhase();
           }`,
     "exact target failure capture",
   );

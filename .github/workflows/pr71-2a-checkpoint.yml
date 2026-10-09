@@ -49,8 +49,8 @@ jobs:
           git rev-parse HEAD > "$receipts/source-head.txt"
           git -C ../diagnostic rev-parse HEAD > "$receipts/diagnostic-head.txt"
           test "$(git rev-parse HEAD)" = '265055994c99ecc0289916a6838ce990cced76c7'
-          test "$(sha256sum ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs | cut -d ' ' -f 1)" = '9aab0c21d040b345134b015dc54535053efaeab52016c806278c96a34b50fd31'
-          test "$(sha256sum ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs | cut -d ' ' -f 1)" = 'ad6907f9d29791ebc0847680fe0c8890b5bdf45d7c2581a820eb2b9b18136b0e'
+          test "$(sha256sum ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs | cut -d ' ' -f 1)" = '2249051ae148cd6e04e26d91241afa7a752381983f0e2210bc2cfbbab568db02'
+          test "$(sha256sum ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs | cut -d ' ' -f 1)" = 'a968c6b540986f9700218cec522434de5dcafa756affbb28135866a2c13a380b'
           git diff --exit-code
           sha256sum src/tests/browser/import-mapping-shapes.test.ts src/tests/browser/runtime-child.ts src/server/intake-queue-native.ts src/app/data/api.ts src/app/data/read-recovery.ts src/scripts/test-suite.ts package-lock.json ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs ../diagnostic/.github/workflows/pr71-2a-checkpoint.yml > "$receipts/source-sha.txt"
           loaders="--import $(realpath ../diagnostic/.github/workflows/pr71-optical-report-failure-loader.mjs) --import $(realpath ../diagnostic/.github/workflows/pr71-optical-server-phase-loader.mjs)"
