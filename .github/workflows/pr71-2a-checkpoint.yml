@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 15
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-e476-optical
+      OUTPUT: /tmp/pr71-e476-stable-profile
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -30,22 +30,17 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Install scoped PDF extraction dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes qpdf
-      - run: npm run build:assets
-      - run: npx playwright install --with-deps chromium
-      - name: Observe both optical mappings on pinned source
+      - name: Count bounded publication and native review work on pinned source
         env:
-          CRS_TEST_DIAGNOSTICS: '1'
-          CRS_PDF_CONTROLLED_TEST: '0'
-          CRS_TEST_SCREENSHOTS: /tmp/pr71-e476-optical/screenshots
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
+          CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
+          CRS_IDENTITY_CPU_PROFILE_DIR: /tmp/pr71-e476-stable-profile/profiles
+          CRS_IDENTITY_CPU_PROFILE_PHASE: stableHttp
         run: |
           set -o pipefail
           mkdir -p "$OUTPUT"
           git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          node --test --test-concurrency=1 --test-reporter=spec src/tests/browser/import-mapping-shapes.test.ts 2>&1 | tee "$OUTPUT/optical.log"
+          node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/grounding.log"
       - name: Hash diagnostic evidence
         if: always()
         run: |
@@ -54,7 +49,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-e476-optical
-          path: /tmp/pr71-e476-optical
+          name: pr71-e476-stable-profile
+          path: /tmp/pr71-e476-stable-profile
           if-no-files-found: error
           retention-days: 14
