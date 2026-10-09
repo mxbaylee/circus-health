@@ -213,7 +213,14 @@ function FullReaderNote({
       <summary>Full retained reader note</summary>
       {(resource.loading || selectedUnit.loading) && <p role="status">Loading retained note…</p>}
       {resource.error && <p role="alert">{resource.error.message}</p>}
-      {selectedUnit.error && <p role="alert">{selectedUnit.error.message}</p>}
+      {selectedUnit.error && (
+        <p role="alert">
+          {selectedUnit.error.message}{' '}
+          <button className="text-link" type="button" onClick={selectedUnit.reload}>
+            Retry full reader note
+          </button>
+        </p>
+      )}
       {resource.data && !selectedUnit.loading && !selectedUnit.error && !unit && (
         <p role="alert">
           The processing record changed. Refresh reader observations before opening its current
