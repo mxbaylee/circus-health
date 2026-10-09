@@ -758,6 +758,19 @@ a failed check after selection refuses the request. Releasing a borrow releases
 only its pin. Closing, clearing or replacing the owner invalidates the borrow.
 Grounding changes still require the second complete policy construction.
 
+Within one preview request, the first complete build and its private scratch rows
+can survive the context reopen only while the exact pre-build SQL/registry
+witness, request key and grounding generation remain unchanged. The reopened
+context still verifies the complete required artifact set and freshly reads the
+original evidence; every original-evidence field must match before reuse. An
+unavailable or changed proof discards the derived rows and performs the second
+complete build. This does not refresh an earlier proof after writes, retain a
+policy across requests, or bypass artifact checks before snapshot work and at
+completion.
+The [native build-reuse regression](../../src/server/test/intake-identity-native-build-reuse.test.ts)
+counts two builds for cold grounding, one for an unchanged request and zero for
+an already retained response, while preserving the complete response.
+
 The controlled four- and 16-record HTTP flows each add four questions, then use one borrow and one fresh
 post-grounding policy, and return the same complete identity response as cache
 disposal and reconstruction. A separate comparison under unchanged authority

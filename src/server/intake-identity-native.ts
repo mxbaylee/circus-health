@@ -129,6 +129,7 @@ import {
   identityGroundingGeneration,
 } from './intake-identity-grounding.ts';
 import { selectedIdentityPeopleSnapshots } from './intake-identity-people.ts';
+import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 import {
   selfSnapshot,
   applyIdentityConfirmationPeople,
@@ -1885,6 +1886,21 @@ function previewReadKey(
     requestRevision(db),
   ]);
 }
+function sameOriginalEvidence(
+  first: Awaited<ReturnType<typeof evidence>>,
+  second: Awaited<ReturnType<typeof evidence>>,
+) {
+  return (
+    first.sourceHash === second.sourceHash &&
+    first.originalFingerprint === second.originalFingerprint &&
+    first.verificationMode === second.verificationMode &&
+    first.original.filename === second.original.filename &&
+    first.original.contentUrl === second.original.contentUrl &&
+    first.original.page === second.original.page &&
+    first.pageText === second.pageText &&
+    first.patientNameGrounded === second.patientNameGrounded
+  );
+}
 /** Membership, including accepted/non-target occurrences, determines every required proposal. */
 function* verifyPreviewArtifactsWork(context: Context, stored: Rows): Generator<void, void, void> {
   const { db, root, profileId, id } = context;
@@ -2171,7 +2187,32 @@ async function getNativeIntakeIdentityReviewInner(
     }
     try {
       const original = await evidence(context);
+      const firstStamp = reviewReadStamp(db),
+        firstKey =
+          firstStamp === undefined ? undefined : previewReadKey(db, root, profileId, id, groupId),
+        firstGrounding = identityGroundingGeneration(db),
+        firstOperation = currentClinicalOperation(db),
+        firstRegistry = intakeCollectionCacheGeneration(db);
+      // Callback-capable operation checks precede the closing SQL stamp; only
+      // callback-free liveness and generation checks follow it.
+      const firstBuildCurrent = () => {
+        if (
+          firstStamp === undefined ||
+          firstOperation === undefined ||
+          firstOperation !== currentClinicalOperation(db) ||
+          firstStamp !== reviewReadStamp(db) ||
+          firstKey !== previewReadKey(db, root, profileId, id, groupId) ||
+          firstStamp !== reviewReadStamp(db)
+        )
+          return false;
+        assertClinicalOperation(db, firstOperation);
+        return (
+          firstGrounding === identityGroundingGeneration(db) &&
+          firstRegistry === intakeCollectionCacheGeneration(db)
+        );
+      };
       let built = await build(context, original, stored);
+      let reuseFirstBuild = firstBuildCurrent();
       await runNativeIdentityWork(
         context,
         stored,
@@ -2185,10 +2226,7 @@ async function getNativeIntakeIdentityReviewInner(
           built.dates,
         ),
       );
-      // Rebuild after original proof so clinical and identity preview observe the same policy.
-      stored.db
-        .prepare("DELETE FROM rows WHERE section NOT IN ('initialIssues','initialExplicit')")
-        .run();
+      reuseFirstBuild = reuseFirstBuild && firstBuildCurrent();
       context.assertCurrent();
       // Capture before opening: even the asynchronous context read must belong
       // to the unchanged full reconstruction. Own writes suppress retention.
@@ -2200,7 +2238,14 @@ async function getNativeIntakeIdentityReviewInner(
       correctedPerson = correction();
       await runNativeIdentityWork(context, stored, verifyPreviewArtifactsWork(context, stored));
       const freshOriginal = await evidence(context);
-      built = await build(context, freshOriginal, stored);
+      reuseFirstBuild =
+        reuseFirstBuild && firstBuildCurrent() && sameOriginalEvidence(original, freshOriginal);
+      if (!reuseFirstBuild) {
+        stored.db
+          .prepare("DELETE FROM rows WHERE section NOT IN ('initialIssues','initialExplicit')")
+          .run();
+        built = await build(context, freshOriginal, stored);
+      } else stored.assertArtifacts();
       const catalog = createReportSnapshotCatalog(db, context.file, {
         catalog: 'report.snapshots',
         catalogArea: 'builds',

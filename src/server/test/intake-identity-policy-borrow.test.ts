@@ -364,10 +364,10 @@ for (const count of [4, 16] as const) {
       assert.equal(coldWork.collectionQueuePolicyBorrowHits || 0, 0);
       assert.equal(
         coldWork.collectionQueuePolicyBorrowMisses,
-        2,
-        'both cold passes constructed their own policy',
+        1,
+        'the stable first build constructs its policy once after disposable owners clear',
       );
-      assert.equal(coldWork.identityPreviewFullPreparations, 2);
+      assert.equal(coldWork.identityPreviewFullPreparations, 1);
       // Reconstructed output is detached from both earlier output and retained queue policy.
       if (firstIdentity.assignedPerson && reconstructed.assignedPerson) {
         assert.notEqual(firstIdentity.assignedPerson, reconstructed.assignedPerson);
