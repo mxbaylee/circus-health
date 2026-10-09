@@ -1,55 +1,64 @@
-name: PR 71 bounded workspace
-
+name: PR71 disposable owner-index comparison
 on:
   push:
     branches: [codex/pr71-step0-workspace]
     paths: [.github/workflows/pr71-2a-checkpoint.yml]
-
-permissions:
-  contents: read
-
-defaults:
-  run:
-    shell: bash
+  workflow_dispatch:
 
 jobs:
-  diagnose:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    env:
-      HUSKY: '0'
-      OUTPUT: /tmp/pr71-e476-stable-profile
+  owner-index-32:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # Publish this workflow and the reviewed loader only to an isolated diagnostic branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: e4763406356b1a3c5ec33568d18676bc0206e695
+          path: diagnostic
           persist-credentials: false
-          fetch-depth: 1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version-file: .nvmrc
+          ref: 0d88ab3fa12059945550da7c7439b8d532a6b950
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: source/.nvmrc
           package-manager-cache: false
-      - run: npm ci
-      - name: Count bounded publication and native review work on pinned source
-        env:
-          CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
-          CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
-          CRS_IDENTITY_CPU_PROFILE_DIR: /tmp/pr71-e476-stable-profile/profiles
-          CRS_IDENTITY_CPU_PROFILE_PHASE: stableHttp
+      - name: Install pinned source dependencies
+        working-directory: source
+        run: npm ci
+      - name: Run full and partial variants sequentially on one host
+        working-directory: source
+        shell: bash
         run: |
-          set -o pipefail
-          mkdir -p "$OUTPUT/profiles"
-          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
-          node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/grounding.log"
-      - name: Hash diagnostic evidence
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pr71-owner-index"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr71-owner-index/source-head.txt"
+          sha256sum src/server/record-versions.ts src/server/test/intake-history-publication.test.ts ../diagnostic/pr71-owner-index-loader.mjs > "$RUNNER_TEMP/pr71-owner-index/source-sha.txt"
+          status=0
+          for variant in full partial; do
+            if CRS_OWNER_INDEX_DIAGNOSTIC=1 CRS_OWNER_INDEX_VARIANT="$variant" CRS_OWNER_INDEX_COUNT=32 CRS_HISTORY_WAL_CHECKPOINT_PAGES=32768 \
+              node --import=../diagnostic/pr71-owner-index-loader.mjs --test --experimental-strip-types \
+                --test-name-pattern='^owner index matched publication: 32 artifacts$' \
+                src/server/test/intake-history-publication.test.ts \
+                > "$RUNNER_TEMP/pr71-owner-index/$variant.log" 2>&1; then
+              :
+            else
+              status=1
+            fi
+          done
+          exit "$status"
+      - name: Checksum all available receipts
         if: always()
+        shell: bash
         run: |
-          cd "$OUTPUT"
-          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          mkdir -p "$RUNNER_TEMP/pr71-owner-index"
+          find "$RUNNER_TEMP/pr71-owner-index" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-owner-index/SHA256SUMS"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: pr71-e476-stable-profile
-          path: /tmp/pr71-e476-stable-profile
+          name: pr71-owner-index-32
+          path: ${{ runner.temp }}/pr71-owner-index
           if-no-files-found: error
-          retention-days: 14
