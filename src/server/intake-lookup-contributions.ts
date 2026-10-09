@@ -28,6 +28,7 @@ export function boundedIntakeLookupText(pieces: Iterable<string>): string {
 export function* intakeLookupContributions(
   db: DatabaseSync,
   view: IntakeCollectionEnvelopeReader,
+  scope: 'all' | 'acceptances' = 'all',
 ): Generator<WorkflowIndexContribution | WorkflowIndexProgress> {
   const intake = view.child(view.root(), 'intake');
   const workflow = intake && view.child(intake, 'workflow');
@@ -55,7 +56,11 @@ export function* intakeLookupContributions(
   let maximumGroup: IntakeEnvelopeRecord | null = null;
   const cast = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n");
   cast.setReadBigInts(true);
-  for (let ordinal = 0, total = count('reportGroups'); ordinal < total; ordinal++) {
+  for (
+    let ordinal = 0, total = scope === 'all' ? count('reportGroups') : 0;
+    ordinal < total;
+    ordinal++
+  ) {
     const group = view.childAt(workflow, 'reportGroups', ordinal);
     if (!group) throw Error('Intake lookup report-group occurrence is unavailable');
     const text = field(group, 'discoveryOrder');
@@ -74,7 +79,7 @@ export function* intakeLookupContributions(
     }
     if (++visited % 64 === 0) yield { checkpoint: true };
   }
-  yield { index: 'lookup-discovery-maximum', key: [], target: maximumGroup };
+  if (scope === 'all') yield { index: 'lookup-discovery-maximum', key: [], target: maximumGroup };
   for (let ordinal = count('reportAcceptances') - 1; ordinal >= 0; ordinal--) {
     const acceptance = view.childAt(workflow, 'reportAcceptances', ordinal);
     if (!acceptance) throw Error('Intake lookup acceptance occurrence is unavailable');
@@ -109,6 +114,7 @@ export function* intakeLookupContributions(
       };
     if (++visited % 64 === 0) yield { checkpoint: true };
   }
+  if (scope === 'acceptances') return;
   for (let ordinal = 0, total = count('identityConfirmations'); ordinal < total; ordinal++) {
     const target = view.childAt(workflow, 'identityConfirmations', ordinal);
     if (!target) throw Error('Intake lookup identity occurrence is unavailable');

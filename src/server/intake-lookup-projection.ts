@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import {
   json,
@@ -21,9 +21,13 @@ import {
 } from './intake-collection-envelope.ts';
 import {
   boundedIntakeLookupText,
+  intakeLookupContributions,
   INTAKE_LOOKUP_SCOPE_BYTES,
 } from './intake-lookup-contributions.ts';
-import { readNativeIntakeLookupTarget } from './intake-lookup-state.ts';
+import {
+  preparedIntakeLookupReadToken,
+  readNativeIntakeLookupTarget,
+} from './intake-lookup-state.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 export {
   prepareIntakeLookupIndices,
@@ -66,6 +70,8 @@ interface Connection {
   counters: IntakeLookupCounters;
   hashes?: ReturnType<typeof disposableSqlite>;
   entries: WeakMap<object, Map<string, ProjectionRow>>;
+  nativeCatalog?: NativeLookupCatalog & { token: object };
+  catalogAttempt?: object;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -77,6 +83,9 @@ const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 function clearPayloadMemo(connection: Connection): void {
   connection.generation = {};
+  connection.catalogAttempt = undefined;
+  connection.nativeCatalog?.scratch.close();
+  connection.nativeCatalog = undefined;
   if (connection.hashes) {
     connection.hashes.close();
     connection.hashes = undefined;
@@ -719,13 +728,273 @@ export function prepareIntakeLookupProjection(db: DatabaseSync): object {
 export function intakeLookupProjectionGeneration(db: DatabaseSync): object | undefined {
   return connections.get(db)?.generation;
 }
+interface NativeLookupCatalog {
+  scratch: ReturnType<typeof disposableSqlite>;
+  generation: object;
+  attempt: object;
+  unsafeMaximum: boolean;
+}
+interface NativeLookupPointer {
+  source_id: string;
+  source_order: number;
+  source_hash: string;
+  authority_head: string;
+  address: string;
+}
+export function discardNativeIntakeLookupCatalog(db: DatabaseSync): void {
+  const connection = connections.get(db);
+  connection?.nativeCatalog?.scratch.close();
+  if (connection) connection.nativeCatalog = undefined;
+}
+/** Read-only, checkpointed derivation. No incomplete catalog can answer a miss. */
+export async function buildNativeIntakeLookupCatalog(
+  db: DatabaseSync,
+  frontierCurrent: () => boolean,
+  options: {
+    assertRunning?: () => void;
+    onCheckpoint?: (progress: { sourceId: string; visited: number }) => void | Promise<void>;
+  },
+): Promise<NativeLookupCatalog | undefined> {
+  const connection = connections.get(db);
+  const generation = connection?.generation;
+  if (!connection || !generation || !frontierCurrent()) return undefined;
+  if (connections.get(db) !== connection || connection.generation !== generation) return undefined;
+  const attempt = {};
+  connection.catalogAttempt = attempt;
+  const isCurrent = () =>
+    frontierCurrent() &&
+    connections.get(db) === connection &&
+    connection.generation === generation &&
+    connection.catalogAttempt === attempt;
+  // An expired global certificate cannot answer queries. Its private per-source
+  // derivations can still be reused after checking every current source binding.
+  const previous = connection.nativeCatalog;
+  connection.nativeCatalog = undefined;
+  const scratch = previous?.scratch ?? disposableSqlite('circus-intake-lookup-addresses-');
+  const seenEpoch = randomUUID();
+  let retained = false;
+  const stopClose = observeDatabaseClose(db, () => scratch.close());
+  try {
+    scratch.db.exec(`
+      CREATE TABLE IF NOT EXISTS sources(source_id TEXT PRIMARY KEY,source_order INTEGER,
+        source_hash TEXT,authority_head TEXT,seen_epoch TEXT) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS acceptances(operation TEXT,source_id TEXT,source_order INTEGER,
+        source_hash TEXT,authority_head TEXT,address TEXT,PRIMARY KEY(operation,source_id)) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS acceptance_order ON acceptances(operation,source_order);
+      CREATE INDEX IF NOT EXISTS acceptance_source ON acceptances(source_id);
+      CREATE TABLE IF NOT EXISTS maximum(singleton INTEGER PRIMARY KEY,source_id TEXT,source_order INTEGER,
+        source_hash TEXT,authority_head TEXT,address TEXT,value INTEGER);
+      DELETE FROM maximum;
+    `);
+    const put = scratch.db.prepare(`INSERT INTO acceptances VALUES(?,?,?,?,?,?)
+      ON CONFLICT(operation,source_id) DO UPDATE SET
+      source_order=excluded.source_order,source_hash=excluded.source_hash,
+      authority_head=excluded.authority_head,address=excluded.address`);
+    const putMaximum = scratch.db.prepare(`INSERT INTO maximum VALUES(1,?,?,?,?,?,?)
+      ON CONFLICT(singleton) DO UPDATE SET source_id=excluded.source_id,
+      source_order=excluded.source_order,source_hash=excluded.source_hash,
+      authority_head=excluded.authority_head,address=excluded.address,value=excluded.value
+      WHERE excluded.value>maximum.value`);
+    const cast = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n");
+    cast.setReadBigInts(true);
+    const checkpoint = async (sourceId: string, visited: number) => {
+      await options.onCheckpoint?.({ sourceId, visited });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      options.assertRunning?.();
+      return isCurrent();
+    };
+    const removeReceipts = async (sourceId: string) => {
+      while (true) {
+        const batch = scratch.db
+          .prepare('SELECT operation FROM acceptances WHERE source_id=? LIMIT 64')
+          .all(sourceId);
+        if (!batch.length) return true;
+        for (const row of batch)
+          scratch.db
+            .prepare('DELETE FROM acceptances WHERE operation=? AND source_id=?')
+            .run(row.operation!, sourceId);
+        if (!(await checkpoint(sourceId, 0))) return false;
+      }
+    };
+    let unsafeMaximum = false;
+    for (const row of originalSourceRows(db)) {
+      options.assertRunning?.();
+      if (!isCurrent()) return undefined;
+      const source = checkedNativeSource(db, row);
+      if (!source) {
+        if (!(await checkpoint(String(row.id), 0))) return undefined;
+        continue;
+      }
+      const view = nativeReader(db, source);
+      const group = readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
+      const prior = scratch.db.prepare('SELECT * FROM sources WHERE source_id=?').get(source.id);
+      const reuse =
+        prior?.source_order === source.source_order &&
+        prior.source_hash === source.sha256 &&
+        prior.authority_head === source.authority_head;
+      if (group) {
+        const text = boundedIntakeLookupText(view.fieldChunks(group, 'discoveryOrder'));
+        const value = cast.get(text)!.n as bigint | null;
+        if (value !== null) {
+          // Preserve the synchronous getter's refusal for any unsafe contributor,
+          // including a negative value that would not win the global maximum.
+          unsafeMaximum ||=
+            value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER);
+          putMaximum.run(
+            source.id,
+            source.source_order,
+            source.sha256,
+            source.authority_head,
+            view.address(group),
+            value,
+          );
+        }
+      }
+      let visited = 0;
+      if (!reuse) {
+        if (!(await removeReceipts(source.id))) return undefined;
+        for (const contribution of intakeLookupContributions(db, view, 'acceptances')) {
+          options.assertRunning?.();
+          if ('checkpoint' in contribution) {
+            if (!(await checkpoint(source.id, visited))) return undefined;
+            continue;
+          }
+          if (contribution.target)
+            put.run(
+              contribution.key[0]!,
+              source.id,
+              source.source_order,
+              source.sha256,
+              source.authority_head,
+              view.address(contribution.target),
+            );
+          visited++;
+        }
+        scratch.db
+          .prepare(
+            `INSERT INTO sources VALUES(?,?,?,?,?) ON CONFLICT(source_id)
+        DO UPDATE SET source_order=excluded.source_order,source_hash=excluded.source_hash,
+        authority_head=excluded.authority_head,seen_epoch=excluded.seen_epoch`,
+          )
+          .run(source.id, source.source_order, source.sha256, source.authority_head, seenEpoch);
+      } else
+        scratch.db
+          .prepare('UPDATE sources SET seen_epoch=? WHERE source_id=?')
+          .run(seenEpoch, source.id);
+      if (!(await checkpoint(source.id, visited))) return undefined;
+    }
+    if (!isCurrent()) return undefined;
+    let cursor: string | undefined;
+    while (true) {
+      const batch =
+        cursor === undefined
+          ? scratch.db
+              .prepare('SELECT source_id,seen_epoch FROM sources ORDER BY source_id LIMIT 64')
+              .all()
+          : scratch.db
+              .prepare(
+                'SELECT source_id,seen_epoch FROM sources WHERE source_id>? ORDER BY source_id LIMIT 64',
+              )
+              .all(cursor);
+      if (!batch.length) break;
+      for (const row of batch) {
+        if (row.seen_epoch === seenEpoch) continue;
+        if (!(await removeReceipts(String(row.source_id)))) return undefined;
+        scratch.db.prepare('DELETE FROM sources WHERE source_id=?').run(row.source_id!);
+      }
+      cursor = String(batch[batch.length - 1]!.source_id);
+      if (!(await checkpoint(cursor, 0))) return undefined;
+    }
+    retained = true;
+    return { scratch, generation, attempt, unsafeMaximum };
+  } finally {
+    stopClose();
+    if (!retained) scratch.close();
+  }
+}
+export function retainNativeIntakeLookupCatalog(
+  db: DatabaseSync,
+  catalog: NativeLookupCatalog,
+  token: object,
+): boolean {
+  const connection = connections.get(db);
+  if (
+    connection?.generation !== catalog.generation ||
+    connection.catalogAttempt !== catalog.attempt
+  ) {
+    catalog.scratch.close();
+    return false;
+  }
+  discardNativeIntakeLookupCatalog(db);
+  connection.nativeCatalog = { ...catalog, token };
+  return true;
+}
+function checkedNativeCatalog(db: DatabaseSync, connection: Connection) {
+  const catalog = connection.nativeCatalog;
+  if (!catalog) return undefined;
+  if (catalog.token === preparedIntakeLookupReadToken(db)) return catalog;
+  return undefined;
+}
+function assertNativeCatalogCurrent(db: DatabaseSync, catalog: { token: object }): void {
+  if (catalog.token !== preparedIntakeLookupReadToken(db)) {
+    discardNativeIntakeLookupCatalog(db);
+    fail('native catalog frontier changed');
+  }
+}
+function catalogTarget(
+  db: DatabaseSync,
+  pointer: NativeLookupPointer,
+  index: string,
+  key: readonly string[],
+) {
+  const source = db
+    .prepare(
+      `SELECT f.id,f.kind,f.sha256,f.details_json,f.rowid source_order,
+    s.authority_head,s.identity_first FROM source_files f LEFT JOIN ${table('sources')} s
+    ON s.source_id=f.id WHERE f.id=?`,
+    )
+    .get(pointer.source_id);
+  if (
+    !source ||
+    source.kind !== 'intake_original' ||
+    source.source_order !== pointer.source_order ||
+    source.sha256 !== pointer.source_hash ||
+    source.identity_first !== -1 ||
+    source.authority_head !== pointer.authority_head
+  )
+    return fail('native catalog source binding changed');
+  const selected = source as unknown as NativeSource;
+  const view = nativeReader(db, selected);
+  const record = readNativeIntakeLookupTarget(db, selected, view, index, key);
+  if (!record || view.address(record) !== pointer.address)
+    return fail('native catalog target changed');
+  return { view, record };
+}
 export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
-  current(db);
+  const connection = current(db);
   let maximum = db
     .prepare(
       `SELECT MAX(g.discovery_order) n FROM ${table('groups')} g JOIN ${table('sources')} s ON s.source_id=g.source_id WHERE s.identity_first IS NULL OR s.identity_first<>-1`,
     )
     .get()!.n;
+  const catalog = checkedNativeCatalog(db, connection);
+  if (catalog && !catalog.unsafeMaximum) {
+    const pointer = catalog.scratch.db.prepare('SELECT * FROM maximum WHERE singleton=1').get();
+    if (pointer) {
+      const { view, record } = catalogTarget(
+        db,
+        pointer as unknown as NativeLookupPointer,
+        'lookup-discovery-maximum',
+        [],
+      );
+      const text = boundedIntakeLookupText(view.fieldChunks(record, 'discoveryOrder'));
+      const value = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n").get(text)!.n;
+      if (value !== pointer.value) return fail('native catalog discovery value changed');
+      if (value !== null && (maximum === null || Number(value) > Number(maximum))) maximum = value;
+    }
+    assertNativeCatalogCurrent(db, catalog);
+    return Number(maximum || 0);
+  }
   for (const source of nativeSources(db)) {
     const view = nativeReader(db, source);
     const group = readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
@@ -748,7 +1017,7 @@ export function retainedIntakeAcceptanceReference(
   db: DatabaseSync,
   operationId: string,
 ): IntakeLookupReceiptReference | null {
-  current(db);
+  const connection = current(db);
   const row = db
     .prepare(
       `SELECT p.payload,s.source_id,s.source_order FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id WHERE a.operation_id=? AND (s.identity_first IS NULL OR s.identity_first<>-1) ORDER BY s.source_order LIMIT 1`,
@@ -759,6 +1028,24 @@ export function retainedIntakeAcceptanceReference(
     : null;
   let order = row ? Number(row.source_order) : Infinity;
   const nativeOperation = Buffer.from(operationId, 'utf8').toString('hex').toUpperCase();
+  const catalog = checkedNativeCatalog(db, connection);
+  if (catalog) {
+    const pointer = catalog.scratch.db
+      .prepare('SELECT * FROM acceptances WHERE operation=? ORDER BY source_order LIMIT 1')
+      .get(nativeOperation);
+    if (pointer && Number(pointer.source_order) < order) {
+      const { view, record } = catalogTarget(
+        db,
+        pointer as unknown as NativeLookupPointer,
+        'lookup-acceptance-operation-first',
+        [nativeOperation],
+      );
+      assertNativeCatalogCurrent(db, catalog);
+      return { mode: 'native', sourceId: String(pointer.source_id), view, record };
+    }
+    assertNativeCatalogCurrent(db, catalog);
+    return selected;
+  }
   for (const source of nativeSources(db)) {
     const view = nativeReader(db, source);
     const record = readNativeIntakeLookupTarget(
@@ -775,19 +1062,33 @@ export function retainedIntakeAcceptanceReference(
   }
   return selected;
 }
-type NativeSource = IntakeEnvelopeSource & { source_order: number; authority_head: string };
-function* nativeSources(db: DatabaseSync): Generator<NativeSource> {
-  for (const source of db
+type NativeSource = IntakeEnvelopeSource & {
+  source_order: number;
+  authority_head: string;
+  sha256: string;
+};
+function originalSourceRows(db: DatabaseSync) {
+  return db
     .prepare(
       `SELECT f.id,f.kind,f.sha256,f.details_json,f.rowid source_order,s.authority_head,s.identity_first FROM source_files f LEFT JOIN ${table('sources')} s ON s.source_id=f.id WHERE f.kind='intake_original' ORDER BY f.rowid`,
     )
-    .iterate()) {
-    const selected = source as unknown as NativeSource;
-    const binding = intakeEnvelopeAuthorityBinding(db, selected);
-    if (!hasIntakeCollectionEnvelope(db, selected)) continue;
-    if (source.identity_first !== -1 || source.authority_head !== binding.logicalHead)
-      return fail('native source projection binding is unavailable');
-    yield selected;
+    .iterate();
+}
+function checkedNativeSource(
+  db: DatabaseSync,
+  source: Record<string, unknown>,
+): NativeSource | undefined {
+  const selected = source as unknown as NativeSource;
+  const binding = intakeEnvelopeAuthorityBinding(db, selected);
+  if (!hasIntakeCollectionEnvelope(db, selected)) return undefined;
+  if (source.identity_first !== -1 || source.authority_head !== binding.logicalHead)
+    return fail('native source projection binding is unavailable');
+  return selected;
+}
+function* nativeSources(db: DatabaseSync): Generator<NativeSource> {
+  for (const row of originalSourceRows(db)) {
+    const source = checkedNativeSource(db, row);
+    if (source) yield source;
   }
 }
 function nativeReader(db: DatabaseSync, source: NativeSource): IntakeCollectionEnvelopeReader {

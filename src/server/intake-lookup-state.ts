@@ -18,6 +18,8 @@ import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 import {
   intakeLookupProjectionGeneration,
   prepareIntakeLookupProjection,
+  buildNativeIntakeLookupCatalog,
+  retainNativeIntakeLookupCatalog,
 } from './intake-lookup-projection.ts';
 
 export const INTAKE_LOOKUP_INDEX_POLICY = 'health-intake-lookup-index-v1';
@@ -46,6 +48,11 @@ function lookupReadCurrent(db: DatabaseSync, proof: PreparedLookupRead): boolean
     intakeCollectionCacheGeneration(db) === proof.registry &&
     intakeLookupProjectionGeneration(db) === proof.projection
   );
+}
+/** Only the exact fully prepared frontier may authorize the private address catalog. */
+export function preparedIntakeLookupReadToken(db: DatabaseSync): object | undefined {
+  const proof = preparedLookupReads.get(db);
+  return proof && lookupReadCurrent(db, proof) ? proof : undefined;
 }
 
 /** Compact selected source frontier; native auxiliary churn does not alter it. */
@@ -260,29 +267,43 @@ export async function prepareIntakeLookupIndices(
   const profile = db
     .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
     .get()?.value;
-  for (const row of db
-    .prepare(
-      "SELECT id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' ORDER BY rowid",
-    )
-    .iterate()) {
+  const proof: PreparedLookupRead | undefined =
+    beforeValidation !== undefined && typeof profile === 'string'
+      ? {
+          stamp: beforeValidation,
+          registry,
+          projection: completedProjection,
+          profile,
+          reused: prepared + reused,
+          discoveryRevision: '',
+        }
+      : undefined;
+  const catalog = proof
+    ? await buildNativeIntakeLookupCatalog(db, () => lookupReadCurrent(db, proof), options)
+    : undefined;
+  try {
+    for (const row of db
+      .prepare(
+        "SELECT id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' ORDER BY rowid",
+      )
+      .iterate()) {
+      options.assertRunning?.();
+      const source = row as unknown as IntakeEnvelopeSource;
+      if (!hasIntakeCollectionEnvelope(db, source)) continue;
+      const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
+      readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
+    }
+    const discoveryRevision = intakeDiscoveryRevision(db);
     options.assertRunning?.();
-    const source = row as unknown as IntakeEnvelopeSource;
-    if (!hasIntakeCollectionEnvelope(db, source)) continue;
-    const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
-    readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
+    if (proof && catalog && lookupReadCurrent(db, proof)) {
+      proof.discoveryRevision = discoveryRevision;
+      if (retainNativeIntakeLookupCatalog(db, catalog, proof)) preparedLookupReads.set(db, proof);
+    } else {
+      catalog?.scratch.close();
+    }
+    return { prepared, reused, discoveryRevision };
+  } catch (error) {
+    catalog?.scratch.close();
+    throw error;
   }
-  const discoveryRevision = intakeDiscoveryRevision(db);
-  options.assertRunning?.();
-  if (beforeValidation !== undefined && typeof profile === 'string') {
-    const proof: PreparedLookupRead = {
-      stamp: beforeValidation,
-      registry,
-      projection: completedProjection,
-      profile,
-      reused: prepared + reused,
-      discoveryRevision,
-    };
-    if (lookupReadCurrent(db, proof)) preparedLookupReads.set(db, proof);
-  }
-  return { prepared, reused, discoveryRevision };
 }

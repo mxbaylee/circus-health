@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync, StatementSync } from 'node:sqlite';
 import { setImmediate } from 'node:timers';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -69,6 +69,7 @@ for (const count of [1, 8])
             reportGroups: [{ discoveryOrder: index + 1 }],
             reportAcceptances: [
               { receipt: { operationId: `fictional-acceptance-${index}` }, marker: id },
+              { receipt: { operationId: 'fictional-duplicate' }, marker: id },
             ],
           },
         },
@@ -170,6 +171,56 @@ for (const count of [1, 8])
     // One selected lookup must not reread a growing unrelated source catalog.
     // Existing code returns 3 rows for one source and 24 for eight sources.
     assert.ok(sourceRows <= 3, `${sourceRows} warm original rows for ${count} sources`);
+    const selected = await countedNativeSourceRead(db, () =>
+      retainedIntakeAcceptance(db, 'fictional-duplicate'),
+    );
+    const late = await countedNativeSourceRead(db, () =>
+      retainedIntakeAcceptance(db, `fictional-acceptance-${count - 1}`),
+    );
+    const missing = await countedNativeSourceRead(db, () =>
+      retainedIntakeAcceptance(db, 'fictional-missing'),
+    );
+    const maximum = await countedNativeSourceRead(db, () => maximumIntakeDiscoveryOrder(db));
+    assert.deepEqual(selected.value, {
+      receipt: { operationId: 'fictional-duplicate' },
+      marker: 'fictional-source-0',
+    });
+    assert.deepEqual(late.value, {
+      receipt: { operationId: `fictional-acceptance-${count - 1}` },
+      marker: `fictional-source-${count - 1}`,
+    });
+    assert.equal(missing.value, null);
+    assert.equal(maximum.value, count);
+    const lookupReads = {
+      selected: selected.reads,
+      late: late.reads,
+      missing: missing.reads,
+      maximum: maximum.reads,
+    };
+    const afterLookupWork = { ...intakeWorkCounters(db).warm };
+    t.diagnostic(
+      JSON.stringify({
+        count,
+        lookupReads,
+        nativeNodeReads: afterLookupWork.collectionNodeReads - afterWork.collectionNodeReads,
+        nativeWitnessQueries:
+          afterLookupWork.collectionReadWitnessQueries - afterWork.collectionReadWitnessQueries,
+        nativeReadBytes: afterLookupWork.collectionReadBytes - afterWork.collectionReadBytes,
+      }),
+    );
+    assert.equal(intakeLookupCounters(db).projectionWrites, beforeLookup.projectionWrites);
+    assert.equal(authority.objects.size, beforeObjects);
+    assert.equal(recordDurabilityStatus(db)?.sequence, beforeSequence);
+    assert.equal(
+      Number(db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n),
+      beforeTransactions,
+    );
+    for (const [operation, reads] of Object.entries(lookupReads))
+      assert.equal(
+        reads.catalogRows,
+        0,
+        `${operation} enumerated ${reads.catalogRows} unrelated original rows after preparation`,
+      );
   });
 async function fixture(t: test.TestContext, raw: string) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-native-lookup-'));
@@ -228,6 +279,319 @@ async function lookupSourceRows(db: DatabaseSync, run: () => Promise<unknown>) {
   }
   return rows;
 }
+
+async function countedNativeSourceRead<T>(db: DatabaseSync, run: () => T) {
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  const originalIterate = StatementSync.prototype.iterate;
+  const originalGet = StatementSync.prototype.get;
+  const originalAll = StatementSync.prototype.all;
+  const statements = new WeakSet<StatementSync>();
+  const catalogStatements = new WeakSet<StatementSync>();
+  const reads = {
+    statements: 0,
+    rows: 0,
+    iterated: 0,
+    pointed: 0,
+    bulk: 0,
+    catalogQueries: 0,
+    catalogRows: 0,
+  };
+  DatabaseSync.prototype.prepare = function (sql: string) {
+    const statement = originalPrepare.call(this, sql);
+    if (this === db && /\bsource_files\b/i.test(sql)) {
+      statements.add(statement);
+      reads.statements++;
+      if (
+        /\bFROM\s+(?:(?:main|temp)\.)?source_files\b/i.test(sql) &&
+        !/\b(?:f\.)?id\s*(?:=|IN\b)/i.test(sql)
+      ) {
+        catalogStatements.add(statement);
+        reads.catalogQueries++;
+      }
+    }
+    return statement;
+  };
+  StatementSync.prototype.iterate = function (
+    this: StatementSync,
+    ...parameters: Parameters<StatementSync['iterate']>
+  ) {
+    const iterator = Reflect.apply(originalIterate, this, parameters) as ReturnType<
+      StatementSync['iterate']
+    >;
+    if (!statements.has(this)) return iterator;
+    const catalog = catalogStatements.has(this);
+    return (function* () {
+      for (const row of iterator) {
+        reads.rows++;
+        reads.iterated++;
+        if (catalog) reads.catalogRows++;
+        yield row;
+      }
+    })();
+  } as typeof StatementSync.prototype.iterate;
+  StatementSync.prototype.get = function (
+    this: StatementSync,
+    ...parameters: Parameters<StatementSync['get']>
+  ) {
+    const row = Reflect.apply(originalGet, this, parameters);
+    if (statements.has(this) && row) {
+      reads.rows++;
+      reads.pointed++;
+      if (catalogStatements.has(this)) reads.catalogRows++;
+    }
+    return row;
+  } as typeof StatementSync.prototype.get;
+  StatementSync.prototype.all = function (
+    this: StatementSync,
+    ...parameters: Parameters<StatementSync['all']>
+  ) {
+    const rows = Reflect.apply(originalAll, this, parameters) as ReturnType<StatementSync['all']>;
+    if (statements.has(this)) {
+      reads.rows += rows.length;
+      reads.bulk += rows.length;
+      if (catalogStatements.has(this)) reads.catalogRows += rows.length;
+    }
+    return rows;
+  } as typeof StatementSync.prototype.all;
+  try {
+    return { value: run(), reads };
+  } finally {
+    DatabaseSync.prototype.prepare = originalPrepare;
+    StatementSync.prototype.iterate = originalIterate;
+    StatementSync.prototype.get = originalGet;
+    StatementSync.prototype.all = originalAll;
+  }
+}
+
+async function countAcceptanceIdentityGets<T>(db: DatabaseSync, run: () => Promise<T>) {
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  const originalGet = StatementSync.prototype.get;
+  const statements = new WeakSet<StatementSync>();
+  let gets = 0;
+  DatabaseSync.prototype.prepare = function (sql: string) {
+    const statement = originalPrepare.call(this, sql);
+    if (this === db && sql.includes("typeof(json_extract(?,'$')) type")) statements.add(statement);
+    return statement;
+  };
+  StatementSync.prototype.get = function (
+    this: StatementSync,
+    ...parameters: Parameters<StatementSync['get']>
+  ) {
+    if (statements.has(this)) gets++;
+    return Reflect.apply(originalGet, this, parameters);
+  } as typeof StatementSync.prototype.get;
+  try {
+    return { result: await run(), gets };
+  } finally {
+    DatabaseSync.prototype.prepare = originalPrepare;
+    StatementSync.prototype.get = originalGet;
+  }
+}
+
+test('unrelated SQL recertification does not traverse retained acceptance bodies again', async (t) => {
+  const observed: Array<{ count: number; renewedGets: number }> = [];
+  for (const count of [1, 65]) {
+    const raw = JSON.stringify({
+      intake: {
+        version: 0,
+        workflow: {
+          format: 'health-intake-workflow-v1',
+          reportGroups: [{ discoveryOrder: 4 }],
+          reportAcceptances: Array.from({ length: count }, (_, index) => ({
+            receipt: { operationId: `fictional-receipt-${index}` },
+            marker: `fictional-${index}`,
+          })),
+        },
+      },
+    });
+    const f = await fixture(t, raw);
+    await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+    const cold = await countAcceptanceIdentityGets(f.db, () => prepareIntakeLookupIndices(f.db));
+    assert.equal(cold.gets, count);
+    assert.equal(cold.result.prepared, 0);
+    const beforeObjects = f.authority.objects.size;
+    const beforeSequence = recordDurabilityStatus(f.db)?.sequence;
+    f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-recertification', count);
+    const beforeLookup = { ...intakeLookupCounters(f.db) };
+    const beforeWork = { ...intakeWorkCounters(f.db).warm };
+    const beforeTransactions = Number(
+      f.db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n,
+    );
+    const renewed = await countAcceptanceIdentityGets(f.db, () => prepareIntakeLookupIndices(f.db));
+    const afterWork = { ...intakeWorkCounters(f.db).warm };
+    t.diagnostic(
+      JSON.stringify({
+        count,
+        coldReceiptIdentityGets: cold.gets,
+        renewedReceiptIdentityGets: renewed.gets,
+        renewedNodeReads: afterWork.collectionNodeReads - beforeWork.collectionNodeReads,
+        renewedWitnessQueries:
+          afterWork.collectionReadWitnessQueries - beforeWork.collectionReadWitnessQueries,
+        renewedReadBytes: afterWork.collectionReadBytes - beforeWork.collectionReadBytes,
+      }),
+    );
+    assert.equal(renewed.result.prepared, 0);
+    assert.equal(intakeLookupCounters(f.db).projectionWrites, beforeLookup.projectionWrites);
+    assert.equal(f.authority.objects.size, beforeObjects);
+    assert.equal(recordDurabilityStatus(f.db)?.sequence, beforeSequence);
+    assert.equal(
+      Number(f.db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n),
+      beforeTransactions,
+    );
+    observed.push({ count, renewedGets: renewed.gets });
+  }
+  for (const { count, renewedGets } of observed)
+    assert.equal(
+      renewedGets,
+      0,
+      `${count} unchanged receipts were traversed after SQL recertification`,
+    );
+});
+
+test('recertification derives a changed acceptance without revisiting 65 unchanged receipts', async (t) => {
+  const raw = JSON.stringify({
+    intake: {
+      version: 0,
+      workflow: {
+        format: 'health-intake-workflow-v1',
+        reportAcceptances: Array.from({ length: 65 }, (_, index) => ({
+          receipt: { operationId: `fictional-history-${index}` },
+        })),
+      },
+    },
+  });
+  const f = await fixture(t, raw);
+  await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+  const changedSource = { id: 'fictional-changing-source' };
+  registerRawIntakeFixture(
+    f.db,
+    changedSource.id,
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportAcceptances":[{"receipt":{"operationId":"fictional-old"},"marker":"changing"}]}}}',
+  );
+  await buildIntakeCollectionEnvelope(f.db, changedSource);
+  await buildVerifiedWorkflowSummary(f.db, changedSource, summaryOptions);
+  await prepareIntakeLookupIndices(f.db);
+  const reader = openIntakeCollectionEnvelope(f.db, changedSource);
+  const intake = reader.child(reader.root(), 'intake')!;
+  const workflow = reader.child(intake, 'workflow')!;
+  const acceptance = reader.childAt(workflow, 'reportAcceptances', 0)!;
+  const receipt = reader.child(acceptance, 'receipt')!;
+  const operationId = randomUUID();
+  transaction(f.db, () => {
+    stageIntakeEnvelopeFieldMutation(
+      f.db,
+      changedSource,
+      prepareIntakeEnvelopeFieldMutation(f.db, changedSource, {
+        reader,
+        record: receipt,
+        field: 'operationId',
+        jsonText: '"fictional-new"',
+        operationId,
+        requestDigest: createHash('sha256').update(operationId).digest('hex'),
+        domainVersion: 0,
+      }),
+    );
+  });
+  const beforeLookup = { ...intakeLookupCounters(f.db) };
+  const renewed = await countAcceptanceIdentityGets(f.db, () => prepareIntakeLookupIndices(f.db));
+  t.diagnostic(JSON.stringify({ renewedReceiptIdentityGets: renewed.gets }));
+  assert.ok(renewed.gets > 0 && renewed.gets <= 2);
+  assert.equal(retainedIntakeAcceptance(f.db, 'fictional-old'), null);
+  assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-new'), {
+    receipt: { operationId: 'fictional-new' },
+    marker: 'changing',
+  });
+  assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-history-64'), {
+    receipt: { operationId: 'fictional-history-64' },
+  });
+  assert.ok(intakeLookupCounters(f.db).projectionWrites > beforeLookup.projectionWrites);
+});
+
+test('native catalog prunes a removed original without retaining its acceptance', async (t) => {
+  const f = await lookupProofFixture(t);
+  const removed = { id: 'fictional-removed' };
+  registerRawIntakeFixture(
+    f.db,
+    removed.id,
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportAcceptances":[{"receipt":{"operationId":"fictional-removed-operation"}}]}}}',
+  );
+  await buildIntakeCollectionEnvelope(f.db, removed);
+  await buildVerifiedWorkflowSummary(f.db, removed, summaryOptions);
+  registerRawIntakeFixture(
+    f.db,
+    'fictional-tail',
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportAcceptances":[]}}}',
+  );
+  await prepareIntakeLookupIndices(f.db);
+  assert.ok(retainedIntakeAcceptance(f.db, 'fictional-removed-operation'));
+  const original = f.db.prepare('SELECT rowid,* FROM source_files WHERE id=?').get(removed.id)!;
+  transaction(f.db, () => {
+    f.db.prepare('DELETE FROM source_files WHERE id=?').run(removed.id);
+    f.db
+      .prepare(
+        `INSERT INTO source_files(id,provider_id,path,sha256,bytes,mime_type,kind,
+          coverage_status,batch_id,details_json) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        original.id,
+        original.provider_id,
+        original.path,
+        original.sha256,
+        original.bytes,
+        original.mime_type,
+        original.kind,
+        original.coverage_status,
+        original.batch_id,
+        original.details_json,
+      );
+  });
+  assert.ok(
+    Number(f.db.prepare('SELECT rowid FROM source_files WHERE id=?').get(removed.id)!.rowid) >
+      Number(original.rowid),
+  );
+  await prepareIntakeLookupIndices(f.db);
+  assert.ok(retainedIntakeAcceptance(f.db, 'fictional-removed-operation'));
+  f.db.prepare('DELETE FROM source_files WHERE id=?').run(removed.id);
+  await prepareIntakeLookupIndices(f.db);
+  assert.equal(retainedIntakeAcceptance(f.db, 'fictional-removed-operation'), null);
+  assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-proof'), {
+    receipt: { operationId: 'fictional-proof' },
+    marker: 'retained',
+  });
+});
+
+test('mixed legacy and native acceptance order survives a native catalog build', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-mixed-lookup-'));
+  const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
+  memoryRecordAuthority(db);
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  registerRawIntakeFixture(
+    db,
+    'fictional-legacy',
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":11}],"reportAcceptances":[{"receipt":{"operationId":"fictional-duplicate"},"marker":"legacy"}]}}}',
+  );
+  const native = { id: 'fictional-native' };
+  registerRawIntakeFixture(
+    db,
+    native.id,
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":13}],"reportAcceptances":[{"receipt":{"operationId":"fictional-duplicate"},"marker":"native"},{"receipt":{"operationId":"fictional-native-only"},"marker":"only"}]}}}',
+  );
+  await buildIntakeCollectionEnvelope(db, native);
+  await buildVerifiedWorkflowSummary(db, native, summaryOptions);
+  await prepareIntakeLookupIndices(db);
+  assert.deepEqual(retainedIntakeAcceptance(db, 'fictional-duplicate'), {
+    receipt: { operationId: 'fictional-duplicate' },
+    marker: 'legacy',
+  });
+  assert.deepEqual(retainedIntakeAcceptance(db, 'fictional-native-only'), {
+    receipt: { operationId: 'fictional-native-only' },
+    marker: 'only',
+  });
+  assert.equal(maximumIntakeDiscoveryOrder(db), 13);
+});
 
 const lookupProofFixture = async (t: test.TestContext) => {
   const f = await fixture(
@@ -288,6 +652,32 @@ for (const change of [
         peer.close();
       }
     }
+    const maximum = await countedNativeSourceRead(f.db, () => maximumIntakeDiscoveryOrder(f.db));
+    const retained = await countedNativeSourceRead(f.db, () =>
+      retainedIntakeAcceptance(f.db, 'fictional-proof'),
+    );
+    const missing = await countedNativeSourceRead(f.db, () =>
+      retainedIntakeAcceptance(f.db, 'fictional-missing'),
+    );
+    assert.equal(maximum.value, 7);
+    assert.deepEqual(retained.value, {
+      receipt: { operationId: 'fictional-proof' },
+      marker: 'retained',
+    });
+    assert.equal(missing.value, null);
+    assert.ok(maximum.reads.catalogRows >= 1);
+    assert.ok(retained.reads.catalogRows >= 1);
+    assert.ok(missing.reads.catalogRows >= 1);
+    t.diagnostic(
+      JSON.stringify({
+        change,
+        preprepareCatalogRows: [
+          maximum.reads.catalogRows,
+          retained.reads.catalogRows,
+          missing.reads.catalogRows,
+        ],
+      }),
+    );
     assert.ok(
       (await lookupSourceRows(f.db, async () => {
         const result = await prepareIntakeLookupIndices(f.db);
@@ -404,6 +794,94 @@ test('warm lookup preparation retains detached results and refuses accepted-head
   await assert.rejects(prepareIntakeLookupIndices(f.db));
 });
 
+test('discarding a native lookup cache removes its private address scratch', async (t) => {
+  const before = new Set(
+    readdirSync(tmpdir()).filter((name) => name.startsWith('circus-intake-lookup-addresses-')),
+  );
+  const f = await lookupProofFixture(t);
+  const created = readdirSync(tmpdir()).filter(
+    (name) => name.startsWith('circus-intake-lookup-addresses-') && !before.has(name),
+  );
+  assert.equal(created.length, 1);
+  clearIntakeLookupCache(f.db);
+  for (const name of created) assert.equal(existsSync(join(tmpdir(), name)), false);
+});
+
+for (const target of ['maximum', 'receipt'] as const)
+  test(`native ${target} catalog refuses a SQL change during its selected point read`, async (t) => {
+    const f = await lookupProofFixture(t);
+    const original = StatementSync.prototype.get;
+    let changed = false;
+    StatementSync.prototype.get = function (
+      this: StatementSync,
+      ...parameters: Parameters<StatementSync['get']>
+    ) {
+      const row = Reflect.apply(original, this, parameters);
+      if (
+        !changed &&
+        this.sourceSQL.includes('FROM source_files f LEFT JOIN') &&
+        this.sourceSQL.includes('WHERE f.id=?')
+      ) {
+        changed = true;
+        f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-point-change', target);
+      }
+      return row;
+    } as typeof StatementSync.prototype.get;
+    try {
+      assert.throws(
+        () =>
+          target === 'maximum'
+            ? maximumIntakeDiscoveryOrder(f.db)
+            : retainedIntakeAcceptance(f.db, 'fictional-proof'),
+        /frontier changed/,
+      );
+    } finally {
+      StatementSync.prototype.get = original;
+    }
+    assert.equal(changed, true);
+    assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+    assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-proof'), {
+      receipt: { operationId: 'fictional-proof' },
+      marker: 'retained',
+    });
+  });
+
+for (const change of ['cancel', 'sql'] as const)
+  test(`interrupted native catalog ${change} cannot certify a missing acceptance`, async (t) => {
+    const f = await lookupProofFixture(t);
+    clearIntakeLookupCache(f.db);
+    let checkpoints = 0;
+    if (change === 'cancel')
+      await assert.rejects(
+        prepareIntakeLookupIndices(f.db, {
+          onCheckpoint: () => {
+            checkpoints++;
+            throw Error('fictional catalog cancellation');
+          },
+        }),
+        /fictional catalog cancellation/,
+      );
+    else
+      await prepareIntakeLookupIndices(f.db, {
+        onCheckpoint: () => {
+          checkpoints++;
+          if (checkpoints === 1)
+            f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-catalog-change', 'yes');
+        },
+      });
+    assert.ok(checkpoints >= 1);
+    const missing = await countedNativeSourceRead(f.db, () =>
+      retainedIntakeAcceptance(f.db, 'fictional-missing'),
+    );
+    assert.equal(missing.value, null);
+    assert.ok(missing.reads.catalogRows >= 1);
+    assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+    assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-proof'), {
+      receipt: { operationId: 'fictional-proof' },
+      marker: 'retained',
+    });
+  });
+
 test('native lookup reproduces raw SQLite-first ancestors, duplicate receipt fields, scalar conversions and integer casts', async (t) => {
   const raw = `{"intake":{"version":0,"workflow":{
     "reportGroups":[{"discoveryOrder":"009fictional","discoveryOrder":700},null,{}],
@@ -424,6 +902,9 @@ test('native lookup reproduces raw SQLite-first ancestors, duplicate receipt fie
       "SELECT j.value FROM json_each(?,'$.intake.workflow.reportAcceptances') j WHERE json_extract(j.value,'$.receipt.operationId')=? LIMIT 1",
     )
     .get(raw, 'raw-first')!;
+  assert.deepEqual(retainedIntakeAcceptance(db, 'raw-first'), JSON.parse(String(retained.value)));
+  assert.equal(retainedIntakeAcceptance(db, 'raw-last'), null);
+  await prepareIntakeLookupIndices(db);
   assert.deepEqual(retainedIntakeAcceptance(db, 'raw-first'), JSON.parse(String(retained.value)));
   assert.equal(retainedIntakeAcceptance(db, 'raw-last'), null);
   for (const operation of ['\ud800', '\ufffd', '\ufffd'.repeat(3)]) {
@@ -449,6 +930,49 @@ test('native lookup reproduces raw SQLite-first ancestors, duplicate receipt fie
   assert.deepEqual(
     Array.from(iterateIntakeIdentityReferences(db), readIntakeIdentityReference),
     identities,
+  );
+});
+
+test('prepared native maximum still refuses an unsafe losing contributor', async (t) => {
+  const f = await fixture(
+    t,
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":7}]}}}',
+  );
+  await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+  registerRawIntakeFixture(
+    f.db,
+    'fictional-negative',
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":-9007199254740992}]}}}',
+  );
+  await buildIntakeCollectionEnvelope(f.db, { id: 'fictional-negative' });
+  await buildVerifiedWorkflowSummary(f.db, { id: 'fictional-negative' }, summaryOptions);
+  await prepareIntakeLookupIndices(f.db);
+  assert.throws(() => maximumIntakeDiscoveryOrder(f.db), /safe|integer|range/i);
+});
+
+test('tampered unrelated native metadata refuses before a negative acceptance lookup', async (t) => {
+  const f = await lookupProofFixture(t);
+  registerRawIntakeFixture(
+    f.db,
+    'fictional-other',
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportAcceptances":[{"receipt":{"operationId":"fictional-unrelated"}}]}}}',
+  );
+  await buildIntakeCollectionEnvelope(f.db, { id: 'fictional-other' });
+  await buildVerifiedWorkflowSummary(f.db, { id: 'fictional-other' }, summaryOptions);
+  await prepareIntakeLookupIndices(f.db);
+  f.db
+    .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+    .run(
+      '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportAcceptances":[{"receipt":{"operationId":"fictional-unrelated"}}],"reportAcceptances":{"bad":true}}}}',
+      'fictional-other',
+    );
+  await assert.rejects(
+    prepareIntakeLookupIndices(f.db),
+    /unsupported or duplicated original authority/,
+  );
+  assert.throws(
+    () => retainedIntakeAcceptance(f.db, 'fictional-missing'),
+    /unsupported or duplicated original authority/,
   );
 });
 
