@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHmac, createSecretKey, randomBytes } from 'node:crypto';
 import { HttpError } from './database.ts';
 import { intakeFileIdentity } from './intake-files.ts';
 import type { VerifiedClinicalArtifact } from './intake-review-collection-session.ts';
@@ -9,7 +9,7 @@ import type { VerifiedClinicalArtifact } from './intake-review-collection-sessio
 export function createClinicalReviewArtifactProof(sql: DatabaseSync, table: string) {
   if (!/^[a-z_]+$/.test(table)) throw Error('Invalid clinical artifact proof table');
   sql.exec(`CREATE TABLE ${table}(id TEXT PRIMARY KEY,path TEXT,identity TEXT,signature TEXT)`);
-  const key = randomBytes(32),
+  const key = createSecretKey(randomBytes(32)),
     signature = (id: string, path: string, identity: string) =>
       createHmac('sha256', key)
         .update(JSON.stringify([id, path, identity]))

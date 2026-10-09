@@ -4,8 +4,69 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import crypto from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import { createClinicalReviewArtifactProof } from '../clinical-review-artifact-proof.ts';
 import { intakeFileIdentity } from '../intake-files.ts';
+
+test('artifact proof prepares one private HMAC key per owner without skipping verification', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-key-')),
+    sql = new DatabaseSync(':memory:'),
+    originalSecretKey = crypto.createSecretKey,
+    originalHmac = crypto.createHmac;
+  let preparations = 0;
+  const usedKeys: Parameters<typeof crypto.createHmac>[1][] = [];
+  crypto.createSecretKey = function (
+    key: NodeJS.ArrayBufferView | string,
+    encoding?: BufferEncoding,
+  ) {
+    preparations++;
+    return typeof key === 'string' ? originalSecretKey(key, encoding!) : originalSecretKey(key);
+  };
+  crypto.createHmac = function (...args) {
+    usedKeys.push(args[1]);
+    return originalHmac(...args);
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    crypto.createSecretKey = originalSecretKey;
+    crypto.createHmac = originalHmac;
+    syncBuiltinESMExports();
+    sql.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const path = join(directory, 'source');
+  writeFileSync(path, 'Independently fictional proof-key source');
+  const artifact = { id: 'source', path, identity: intakeFileIdentity(path) },
+    first = createClinicalReviewArtifactProof(sql, 'first_proof'),
+    second = createClinicalReviewArtifactProof(sql, 'second_proof');
+  assert.equal(preparations, 2);
+  first.retain([artifact]);
+  for (let n = 0; n < 4; n++) {
+    first.assertContains([artifact.id]);
+    first.assertCurrent();
+  }
+  assert.equal(usedKeys.length, 9, 'retain and every membership/physical check still sign');
+  assert.equal(new Set(usedKeys).size, 1);
+  const key = usedKeys[0];
+  assert.ok(key instanceof crypto.KeyObject);
+  assert.equal(key.type, 'secret');
+  assert.equal(key.symmetricKeySize, 32);
+  assert.equal(
+    sql.prepare('SELECT signature FROM first_proof WHERE id=?').get(artifact.id)!.signature,
+    originalHmac('sha256', key.export())
+      .update(JSON.stringify([artifact.id, artifact.path, artifact.identity]))
+      .digest('hex'),
+    'prepared and raw key forms produce the same exact signature',
+  );
+  second.retain([artifact]);
+  assert.equal(usedKeys.length, 10);
+  assert.notEqual(usedKeys[9], key, 'owners never share a prepared key');
+  assert.equal(preparations, 2, 'repeated checks do not reprepare the key');
+  sql.prepare('UPDATE first_proof SET signature=? WHERE id=?').run('forged', artifact.id);
+  assert.throws(() => first.assertCurrent(), { code: 'SOURCE_CHANGED' });
+  second.assertCurrent();
+});
 
 test('aggregate verified artifact proofs preserve prior sessions and reject forged or missing scratch rows', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-proof-')),

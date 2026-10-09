@@ -932,7 +932,10 @@ Identity previews apply the same cooperative work boundary to complete retained
 membership, including historical, empty and duplicate proposal occurrences, and
 to payload hash chunks after file-cache eviction. Each verified identity is
 retained in signed owned scratch using the identity returned by verification; a
-later pass cannot replace an earlier baseline. A warm preview verifies this
+later pass cannot replace an earlier baseline. Each scratch proof prepares its
+own private 32-byte HMAC key once; each complete sweep still recomputes every
+signature and compares every physical identity, without repeated raw-key setup.
+Prepared keys are not shared between proof owners. A warm preview verifies this
 complete set once, detaches its response, then checks the retained identities
 and current authority again. That final metadata sweep does not rehash file
 payloads. Cancelling the last subscriber closes both the verifier and its
