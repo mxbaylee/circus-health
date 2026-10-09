@@ -12,9 +12,8 @@ import { readVerifiedWorkflowSummary } from './intake-workflow-state.ts';
 import { intakeSourceMetadata } from './intake-state-access.ts';
 import { readDurablePackageInventory } from './intake-package-state.ts';
 
-/** SQL selects matching compact accepted source rows in retained order; each
- * candidate is then checked against its selected authority. json_each's last
- * name occurrence preserves JSON.parse semantics for raw duplicate metadata. */
+/** SQL selects a superset from compact metadata in retained row order. The
+ * checked JavaScript metadata decides last-duplicate parent/name semantics. */
 export function evidenceSuppliedTarget(db: Database, root: string, profileId: string, id: string) {
   assertIntakeOwner(db, profileId);
   const parentId = intakeSourceMetadata(db, id).parentSourceFileId;
@@ -25,16 +24,27 @@ export function evidenceSuppliedTarget(db: Database, root: string, profileId: st
     const matches = db
       .prepare(
         `SELECT id,kind,sha256,details_json FROM source_files
-      WHERE json_extract(details_json,'$.intake.parentSourceFileId')=?
-      AND (SELECT value FROM json_each(json_extract(source_files.details_json,'$.intake'))
-        WHERE key='originalName' ORDER BY id DESC LIMIT 1)=?
+      WHERE kind='intake_original' AND EXISTS (
+        SELECT 1 FROM json_each(source_files.details_json) AS intake
+        WHERE intake.key='intake' AND intake.type='object'
+        AND EXISTS (
+          SELECT 1 FROM json_each(CASE WHEN intake.type='object' THEN intake.value ELSE '{}' END)
+          WHERE key='parentSourceFileId' AND value=?
+        )
+        AND EXISTS (
+          SELECT 1 FROM json_each(CASE WHEN intake.type='object' THEN intake.value ELSE '{}' END)
+          WHERE key='originalName' AND value=?
+        )
+      )
       ORDER BY rowid`,
       )
       .iterate(parentId, filename);
     for (const match of matches) {
       const source = match as unknown as IntakeEnvelopeSource;
       intakeEnvelopeAuthorityBinding(db, source);
-      if (intakeSourceMetadata(db, source.id).originalName === filename) return { id: source.id };
+      const metadata = intakeSourceMetadata(db, source.id);
+      if (metadata.parentSourceFileId === parentId && metadata.originalName === filename)
+        return { id: source.id };
     }
     const parent = getIntakeEvidenceHeader(db, root, profileId, parentId);
     if (parent.mimeType !== 'application/zip') return undefined;

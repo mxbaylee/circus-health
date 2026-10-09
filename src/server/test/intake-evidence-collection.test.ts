@@ -140,6 +140,71 @@ test('native HTML supplied-target lookup preserves sibling precedence and JSON l
   unchangedHydrations(f.db, before);
 });
 
+test('supplied-target lookup binds the last duplicate parent and preserves first sibling precedence', (t) => {
+  const f = fixture(t),
+    otherParent = 'fictional-other-parent';
+  const register = (id: string, filename: string, first: string | null, last: string | null) =>
+    registerRawIntakeFixture(
+      f.db,
+      id,
+      JSON.stringify({
+        intake: { originalName: filename, parentSourceFileId: first, version: 1 },
+      }).replace('"version"', '"parentSourceFileId":' + JSON.stringify(last) + ',"version"'),
+    );
+  register('fictional-wrong-parent', 'wrong-parent.txt', f.parent.id, otherParent);
+  register('fictional-right-parent', 'right-parent.txt', otherParent, f.parent.id);
+  register('fictional-later-sibling', 'notes.txt', otherParent, f.parent.id);
+  register('fictional-null-parent', 'null-parent.txt', f.parent.id, null);
+  register('fictional-null-first', 'null-first.txt', null, f.parent.id);
+  clearIntakeStateCache(f.db);
+  const before = { ...intakeWorkCounters(f.db).warm },
+    lookup = evidenceSuppliedTarget(f.db, f.root, f.profileId, f.child.id);
+  assert.equal(lookup('wrong-parent.txt'), undefined);
+  assert.deepEqual(lookup('right-parent.txt'), { id: 'fictional-right-parent' });
+  assert.deepEqual(lookup('notes.txt'), { id: f.sibling.id });
+  assert.equal(lookup('null-parent.txt'), undefined);
+  assert.deepEqual(lookup('null-first.txt'), { id: 'fictional-null-first' });
+  unchangedHydrations(f.db, before);
+});
+
+test('supplied-target lookup selects the last intake object before its parent and filename', (t) => {
+  const f = fixture(t);
+  for (const matches of [false, true]) {
+    const id = 'fictional-duplicate-intake-' + matches,
+      filename = 'duplicate-intake-' + matches + '.txt',
+      first = JSON.stringify({
+        version: 1,
+        originalName: matches ? 'earlier.txt' : filename,
+        parentSourceFileId: matches ? 'fictional-other-parent' : f.parent.id,
+      }),
+      last = JSON.stringify({
+        version: 1,
+        originalName: filename,
+        parentSourceFileId: matches ? f.parent.id : 'fictional-other-parent',
+      });
+    registerRawIntakeFixture(f.db, id, '{"intake":' + first + ',"\\u0069ntake":' + last + '}');
+  }
+  registerRawIntakeFixture(
+    f.db,
+    'fictional-scalar-first',
+    '{"intake":false,"intake":' +
+      JSON.stringify({
+        version: 1,
+        originalName: 'scalar-first.txt',
+        parentSourceFileId: f.parent.id,
+      }) +
+      '}',
+  );
+  clearIntakeStateCache(f.db);
+  const before = { ...intakeWorkCounters(f.db).warm },
+    lookup = evidenceSuppliedTarget(f.db, f.root, f.profileId, f.child.id);
+  assert.equal(lookup('duplicate-intake-false.txt'), undefined);
+  assert.deepEqual(lookup('duplicate-intake-true.txt'), { id: 'fictional-duplicate-intake-true' });
+  assert.equal(lookup('earlier.txt'), undefined);
+  assert.deepEqual(lookup('scalar-first.txt'), { id: 'fictional-scalar-first' });
+  unchangedHydrations(f.db, before);
+});
+
 test('paged automatic source capture precedes the returned pin and respects retain-only policy', async (t) => {
   const f = fixture(t),
     transitions: unknown[] = [];

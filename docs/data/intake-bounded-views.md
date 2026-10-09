@@ -469,7 +469,9 @@ search extracts only the requested indexed page under the existing per-page
 text budget. Following a reference requires checked reference/owner membership,
 and duplicate anchors remain ambiguous. External references are never fetched.
 Local HTML targets preserve the first retained sibling match and JavaScript's
-last duplicate filename property, then consult a complete selected package name
+last duplicate intake object, parent binding and filename properties. Candidate
+selection and the checked metadata must agree on both parent and name before
+returning a sibling. They then consult a complete selected package name
 index. Missing native indexes report pending rather than scanning a workflow.
 
 Public streamed uploads and plan/proposal creation select native authority
