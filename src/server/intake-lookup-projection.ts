@@ -59,6 +59,7 @@ export interface IntakeLookupCounters {
   payloadMemoClosed: number;
 }
 interface Connection {
+  generation: object;
   dispose: () => void;
   rebuild: boolean;
   schema: number;
@@ -75,6 +76,7 @@ const fail = (reason: string): never => {
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 function clearPayloadMemo(connection: Connection): void {
+  connection.generation = {};
   if (connection.hashes) {
     connection.hashes.close();
     connection.hashes = undefined;
@@ -103,6 +105,7 @@ function payloadMemo(connection: Connection) {
 }
 function create(db: DatabaseSync): Connection {
   const connection: Connection = {
+    generation: {},
     dispose: () => {},
     rebuild: false,
     schema: -1,
@@ -707,6 +710,14 @@ function current(db: DatabaseSync): Connection {
 export function reconcileActiveIntakeLookup(db: DatabaseSync): void {
   const connection = connections.get(db);
   if (connection && connection.schema !== -1 && currentTransactionToken(db)) current(db);
+}
+/** Complete the existing disposable projection before certifying a read-only
+ * preparation. Its opaque lifetime changes on close, rollback or cache loss. */
+export function prepareIntakeLookupProjection(db: DatabaseSync): object {
+  return current(db).generation;
+}
+export function intakeLookupProjectionGeneration(db: DatabaseSync): object | undefined {
+  return connections.get(db)?.generation;
 }
 export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
   current(db);

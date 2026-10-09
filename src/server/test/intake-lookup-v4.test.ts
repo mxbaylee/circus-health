@@ -23,12 +23,14 @@ import {
   retainedIntakeAcceptanceReference,
   intakeLookupCounters,
   clearIntakeLookupCache,
+  intakeLookupProjectionGeneration,
 } from '../intake-lookup-projection.ts';
 import {
   openIntakeIdentityReference,
   intakeIdentityTargetMembership,
 } from '../intake-identity-reference.ts';
 import { createIntakeStateStorage } from '../intake-state-storage.ts';
+import { clearIntakeCollectionCache } from '../intake-state-collections.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import {
   openIntakeCollectionEnvelope,
@@ -176,7 +178,7 @@ async function fixture(t: test.TestContext, raw: string) {
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
-  memoryRecordAuthority(db);
+  const authority = memoryRecordAuthority(db);
   registerRawIntakeFixture(db, 'original', raw);
   const source = { id: 'original' };
   const selected = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(source.id)!;
@@ -186,8 +188,221 @@ async function fixture(t: test.TestContext, raw: string) {
     sourceHash: String(selected.sha256),
   };
   await buildIntakeCollectionEnvelope(db, source);
-  return { db, source, identity };
+  return { db, source, identity, authority };
 }
+
+async function lookupSourceRows(db: DatabaseSync, run: () => Promise<unknown>) {
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  const original = StatementSync.prototype.iterate;
+  const statements = new WeakSet<StatementSync>();
+  let rows = 0;
+  DatabaseSync.prototype.prepare = function (sql: string) {
+    const statement = originalPrepare.call(this, sql);
+    if (
+      this === db &&
+      sql.includes("FROM source_files WHERE kind='intake_original' ORDER BY rowid")
+    )
+      statements.add(statement);
+    return statement;
+  };
+  StatementSync.prototype.iterate = function (
+    this: StatementSync,
+    ...parameters: Parameters<StatementSync['iterate']>
+  ) {
+    const iterator = Reflect.apply(original, this, parameters) as ReturnType<
+      StatementSync['iterate']
+    >;
+    if (!statements.has(this)) return iterator;
+    return (function* () {
+      for (const row of iterator) {
+        rows++;
+        yield row;
+      }
+    })();
+  } as typeof StatementSync.prototype.iterate;
+  try {
+    await run();
+  } finally {
+    DatabaseSync.prototype.prepare = originalPrepare;
+    StatementSync.prototype.iterate = original;
+  }
+  return rows;
+}
+
+const lookupProofFixture = async (t: test.TestContext) => {
+  const f = await fixture(
+    t,
+    JSON.stringify({
+      intake: {
+        version: 0,
+        workflow: {
+          format: 'health-intake-workflow-v1',
+          reportGroups: [{ discoveryOrder: 7 }],
+          reportAcceptances: [{ receipt: { operationId: 'fictional-proof' }, marker: 'retained' }],
+        },
+      },
+    }),
+  );
+  await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+  await prepareIntakeLookupIndices(f.db);
+  return f;
+};
+
+for (const change of [
+  'main',
+  'temp',
+  'temp-schema',
+  'registry',
+  'lookup-cache',
+  'rollback',
+  'peer',
+] as const)
+  test(`warm lookup preparation expires its exact proof after ${change}`, async (t) => {
+    const f = await lookupProofFixture(t);
+    const before = await prepareIntakeLookupIndices(f.db);
+    if (change === 'main')
+      f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-proof', 'changed');
+    if (change === 'temp') {
+      f.db.exec('CREATE TEMP TABLE fictional_lookup_proof(value INTEGER)');
+      await prepareIntakeLookupIndices(f.db);
+      f.db.exec('INSERT INTO fictional_lookup_proof VALUES(1)');
+    }
+    if (change === 'temp-schema')
+      f.db.exec('CREATE TEMP TABLE fictional_lookup_proof(value INTEGER)');
+    if (change === 'registry') clearIntakeCollectionCache(f.db);
+    if (change === 'lookup-cache') clearIntakeLookupCache(f.db);
+    if (change === 'rollback')
+      assert.throws(
+        () =>
+          transaction(f.db, () => {
+            f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-proof', 'rolled back');
+            throw Error('fictional rollback');
+          }),
+        /fictional rollback/,
+      );
+    if (change === 'peer') {
+      const peer = new DatabaseSync(f.db.location()!);
+      try {
+        peer.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-proof', 'peer changed');
+      } finally {
+        peer.close();
+      }
+    }
+    assert.ok(
+      (await lookupSourceRows(f.db, async () => {
+        const result = await prepareIntakeLookupIndices(f.db);
+        assert.equal(result.discoveryRevision, before.discoveryRevision);
+        assert.equal(result.prepared, 0);
+      })) >= 3,
+    );
+    assert.equal(await lookupSourceRows(f.db, () => prepareIntakeLookupIndices(f.db)), 0);
+    assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+    assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-proof'), {
+      receipt: { operationId: 'fictional-proof' },
+      marker: 'retained',
+    });
+  });
+
+test('warm lookup preparation checks cancellation and callback changes before reuse', async (t) => {
+  const f = await lookupProofFixture(t);
+  const objects = f.authority.objects.size;
+  await assert.rejects(
+    prepareIntakeLookupIndices(f.db, {
+      assertRunning: () => {
+        throw Error('fictional cancellation');
+      },
+    }),
+    /fictional cancellation/,
+  );
+  let changed = false;
+  assert.ok(
+    (await lookupSourceRows(f.db, () =>
+      prepareIntakeLookupIndices(f.db, {
+        assertRunning: () => {
+          if (changed) return;
+          changed = true;
+          f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-callback', 'changed');
+        },
+      }),
+    )) >= 3,
+  );
+  assert.equal(f.authority.objects.size, objects);
+});
+
+test('lookup preparation never certifies a callback change after final frontier validation', async (t) => {
+  const f = await lookupProofFixture(t);
+  clearIntakeLookupCache(f.db);
+  const original = StatementSync.prototype.iterate;
+  let sourceScans = 0;
+  let changed = false;
+  StatementSync.prototype.iterate = function (
+    this: StatementSync,
+    ...parameters: Parameters<StatementSync['iterate']>
+  ) {
+    if (this.sourceSQL.includes("FROM source_files WHERE kind='intake_original' ORDER BY rowid"))
+      sourceScans++;
+    return Reflect.apply(original, this, parameters);
+  } as typeof StatementSync.prototype.iterate;
+  try {
+    await prepareIntakeLookupIndices(f.db, {
+      assertRunning: () => {
+        if (sourceScans !== 3 || changed) return;
+        changed = true;
+        f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-tail', 'changed');
+      },
+    });
+  } finally {
+    StatementSync.prototype.iterate = original;
+  }
+  assert.equal(changed, true);
+  assert.ok((await lookupSourceRows(f.db, () => prepareIntakeLookupIndices(f.db))) >= 3);
+  assert.equal(await lookupSourceRows(f.db, () => prepareIntakeLookupIndices(f.db)), 0);
+});
+
+for (const target of ['collection', 'lookup'] as const)
+  test(`warm lookup preparation checks terminal ${target} registry invalidation`, async (t) => {
+    const f = await lookupProofFixture(t);
+    const original = StatementSync.prototype.get;
+    let armed = true;
+    StatementSync.prototype.get = function (
+      this: StatementSync,
+      ...parameters: Parameters<StatementSync['get']>
+    ) {
+      const result = Reflect.apply(original, this, parameters);
+      if (armed && this.sourceSQL.startsWith('SELECT total_changes() AS changes')) {
+        armed = false;
+        if (target === 'collection') clearIntakeCollectionCache(f.db);
+        else clearIntakeLookupCache(f.db);
+      }
+      return result;
+    } as typeof StatementSync.prototype.get;
+    try {
+      assert.ok((await lookupSourceRows(f.db, () => prepareIntakeLookupIndices(f.db))) >= 3);
+      assert.equal(armed, false);
+    } finally {
+      StatementSync.prototype.get = original;
+    }
+  });
+
+test('warm lookup preparation retains detached results and refuses accepted-head or profile drift', async (t) => {
+  const f = await lookupProofFixture(t);
+  const result = await prepareIntakeLookupIndices(f.db);
+  const expected = result.discoveryRevision;
+  result.discoveryRevision = 'fictional forged result';
+  result.reused = 999;
+  assert.deepEqual(await prepareIntakeLookupIndices(f.db), {
+    prepared: 0,
+    reused: 1,
+    discoveryRevision: expected,
+  });
+  const head = f.authority.objects.get('head')!;
+  f.authority.objects.delete('head');
+  await assert.rejects(prepareIntakeLookupIndices(f.db), /recovery|authority|head/i);
+  f.authority.objects.set('head', head);
+  await prepareIntakeLookupIndices(f.db);
+  f.db.prepare("UPDATE app_meta SET value='foreign-profile' WHERE key='owner_profile_id'").run();
+  await assert.rejects(prepareIntakeLookupIndices(f.db));
+});
 
 test('native lookup reproduces raw SQLite-first ancestors, duplicate receipt fields, scalar conversions and integer casts', async (t) => {
   const raw = `{"intake":{"version":0,"workflow":{
@@ -442,11 +657,13 @@ test('explicit lookup preparation alone publishes complete cold indexes, interru
   const { db, source } = await fixture(t, raw);
   const before = intakeWorkCounters(db);
   const frontier = intakeDiscoveryRevision(db);
+  clearIntakeLookupCache(db);
   let checkpoints = 0;
   await assert.rejects(
     prepareIntakeLookupIndices(db, {
       onCheckpoint() {
         checkpoints++;
+        assert.equal(intakeLookupProjectionGeneration(db), undefined);
         assert.throws(() => maximumIntakeDiscoveryOrder(db), /semantic indexes.*incomplete/);
         throw Error('fictional cold interruption');
       },

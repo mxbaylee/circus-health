@@ -12,10 +12,41 @@ import {
 import { intakeLookupContributions } from './intake-lookup-contributions.ts';
 import { schemaKey } from './intake-envelope-schema.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
+import { recordDurabilityStatus } from './record-versions.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
+import {
+  intakeLookupProjectionGeneration,
+  prepareIntakeLookupProjection,
+} from './intake-lookup-projection.ts';
 
 export const INTAKE_LOOKUP_INDEX_POLICY = 'health-intake-lookup-index-v1';
 export const INTAKE_LOOKUP_INDEX_COLLECTION = 'lookup.indexes';
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+interface PreparedLookupRead {
+  stamp: string;
+  registry: object;
+  projection: object;
+  profile: string;
+  reused: number;
+  discoveryRevision: string;
+}
+const preparedLookupReads = new WeakMap<DatabaseSync, PreparedLookupRead>();
+function lookupReadCurrent(db: DatabaseSync, proof: PreparedLookupRead): boolean {
+  const durability = recordDurabilityStatus(db);
+  const profile = db
+    .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
+    .get()?.value;
+  return (
+    durability?.configured === true &&
+    !durability.dirty &&
+    profile === proof.profile &&
+    reviewReadStamp(db) === proof.stamp &&
+    intakeCollectionCacheGeneration(db) === proof.registry &&
+    intakeLookupProjectionGeneration(db) === proof.projection
+  );
+}
 
 /** Compact selected source frontier; native auxiliary churn does not alter it. */
 export function intakeDiscoveryRevision(db: DatabaseSync): string {
@@ -94,6 +125,13 @@ export async function prepareIntakeLookupIndices(
 ) {
   if (db.isTransaction)
     throw Error('Intake lookup preparation requires an outside-transaction maintenance phase');
+  const prior = preparedLookupReads.get(db);
+  preparedLookupReads.delete(db);
+  options.assertRunning?.();
+  if (prior && lookupReadCurrent(db, prior)) {
+    preparedLookupReads.set(db, prior);
+    return { prepared: 0, reused: prior.reused, discoveryRevision: prior.discoveryRevision };
+  }
   let prepared = 0,
     reused = 0;
   for (const row of db
@@ -216,6 +254,12 @@ export async function prepareIntakeLookupIndices(
   }
   // Awaited checkpoints can allow a previously processed source to change.
   // Check each current header before granting a fully prepared result.
+  const completedProjection = prepareIntakeLookupProjection(db);
+  const beforeValidation = reviewReadStamp(db);
+  const registry = intakeCollectionCacheGeneration(db);
+  const profile = db
+    .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
+    .get()?.value;
   for (const row of db
     .prepare(
       "SELECT id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' ORDER BY rowid",
@@ -227,5 +271,18 @@ export async function prepareIntakeLookupIndices(
     const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
     readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
   }
-  return { prepared, reused, discoveryRevision: intakeDiscoveryRevision(db) };
+  const discoveryRevision = intakeDiscoveryRevision(db);
+  options.assertRunning?.();
+  if (beforeValidation !== undefined && typeof profile === 'string') {
+    const proof: PreparedLookupRead = {
+      stamp: beforeValidation,
+      registry,
+      projection: completedProjection,
+      profile,
+      reused: prepared + reused,
+      discoveryRevision,
+    };
+    if (lookupReadCurrent(db, proof)) preparedLookupReads.set(db, proof);
+  }
+  return { prepared, reused, discoveryRevision };
 }
