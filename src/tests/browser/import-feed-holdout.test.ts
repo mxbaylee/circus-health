@@ -289,6 +289,85 @@ const runtimeFailureReport = (
   client?: ReturnType<ReturnType<typeof observeFixtureClientConnections>['snapshot']>,
 ) => JSON.stringify({ route: diagnosticRoute(route), diagnostic, client });
 
+type PeopleRequestKind = 'preflight' | 'apply';
+type PeopleRequestEvent = 'started' | 'completed' | 'failed';
+const addPeopleButtonPattern = '^Add (?:1 person|2 people)$';
+function peopleRequestKind(prefix: string, method: string, path: string): PeopleRequestKind | null {
+  if (method === 'GET' && path.startsWith(prefix + '/intakes/people/')) return 'preflight';
+  if (method === 'POST' && path === prefix + '/intakes/people-apply') return 'apply';
+  return null;
+}
+function peopleRequestDiagnostics() {
+  const counts = {
+    preflight: { started: 0, completed: 0, failed: 0 },
+    apply: { started: 0, completed: 0, failed: 0 },
+  };
+  const recent: Array<{ kind: PeopleRequestKind; event: PeopleRequestEvent; status?: number }> = [];
+  let armed = false;
+  return {
+    arm() {
+      armed = true;
+      for (const kind of ['preflight', 'apply'] as const)
+        for (const event of ['started', 'completed', 'failed'] as const) counts[kind][event] = 0;
+      recent.length = 0;
+    },
+    record(kind: PeopleRequestKind | null, event: PeopleRequestEvent, status?: number) {
+      if (!armed || !kind) return;
+      counts[kind][event] = Math.min(1_000_000_000, counts[kind][event] + 1);
+      recent.push({
+        kind,
+        event,
+        ...(event === 'completed' && Number.isInteger(status) && status! >= 100 && status! <= 599
+          ? { status }
+          : {}),
+      });
+      if (recent.length > 4) recent.shift();
+    },
+    snapshot() {
+      return {
+        counts: {
+          preflight: { ...counts.preflight },
+          apply: { ...counts.apply },
+        },
+        recent: [...recent],
+      };
+    },
+  };
+}
+
+test('People request diagnostics retain only bounded fixed labels and counts', () => {
+  const prefix = '/api/profiles/private-profile';
+  const button = new RegExp(addPeopleButtonPattern);
+  assert.equal(button.test('Add 1 person'), true);
+  assert.equal(button.test('Add 2 people'), true);
+  assert.equal(button.test('Add private person'), false);
+  assert.equal(
+    peopleRequestKind(prefix, 'GET', prefix + '/intakes/people/private-id'),
+    'preflight',
+  );
+  assert.equal(peopleRequestKind(prefix, 'POST', prefix + '/intakes/people-apply'), 'apply');
+  assert.equal(peopleRequestKind(prefix, 'GET', prefix + '/intakes/import-feed'), null);
+  const trace = peopleRequestDiagnostics();
+  trace.record('apply', 'started');
+  assert.equal(trace.snapshot().counts.apply.started, 0);
+  trace.arm();
+  for (let index = 0; index < 8; index++) {
+    trace.record('preflight', 'started');
+    trace.record('preflight', 'completed', 200);
+  }
+  trace.record('apply', 'started');
+  trace.record('apply', 'failed');
+  trace.record('apply', 'completed', 999);
+  const snapshot = trace.snapshot();
+  assert.deepEqual(snapshot.counts, {
+    preflight: { started: 8, completed: 8, failed: 0 },
+    apply: { started: 1, completed: 1, failed: 1 },
+  });
+  assert.equal(snapshot.recent.length, 4);
+  assert.deepEqual(snapshot.recent.at(-1), { kind: 'apply', event: 'completed' });
+  assert.doesNotMatch(JSON.stringify(snapshot), /private-profile|private-id|people-apply/);
+});
+
 test('holdout transport diagnostics retain fixed socket state without private routes', () => {
   const privateRoute = '/api/profiles/private-profile/intakes/import-feed?private-token=secret';
   const capture = {
@@ -429,6 +508,7 @@ test(
     let requestNumber = 0;
     const inFlight = new Map<number, { method: string; path: string; started: number }>();
     const browserInFlight = new Map<Request, { method: string; path: string; started: number }>();
+    const peopleRequests = peopleRequestDiagnostics();
     const recentBrowserRequests: Array<{
       method: string;
       path: string;
@@ -437,6 +517,16 @@ test(
     }> = [];
     let peopleApplyStep = 'not started';
     let peopleApplyPosts = 0;
+    let postClickPeopleState:
+      | { state: 'not-captured' | 'capturing' | 'unavailable' }
+      | {
+          state: 'captured';
+          addButton: 'absent' | 'disabled' | 'enabled';
+          selectedCheckboxes: number;
+          alertPresent: boolean;
+          definiteFailureVisible: boolean;
+          uncertainFailureVisible: boolean;
+        } = { state: 'not-captured' };
     let completed = false;
     let failureDiagnosticsPrinted = false;
     let pageForDiagnostics: Page | undefined;
@@ -466,6 +556,8 @@ test(
       recentBrowserRequests,
       peopleApplyStep,
       peopleApplyPosts,
+      peopleRequests: peopleRequests.snapshot(),
+      postClickPeopleState,
     });
     t.signal.addEventListener(
       'abort',
@@ -585,6 +677,7 @@ test(
     page.on('request', (request) => {
       const path = new URL(request.url()).pathname;
       if (!path.startsWith(prefix + '/')) return;
+      peopleRequests.record(peopleRequestKind(prefix, request.method(), path), 'started');
       browserInFlight.set(request, {
         method: request.method(),
         path: diagnosticPath(path.slice(prefix.length)),
@@ -596,6 +689,11 @@ test(
       if (!started) return;
       browserInFlight.delete(request);
       const response = await request.response().catch(() => null);
+      peopleRequests.record(
+        peopleRequestKind(prefix, request.method(), new URL(request.url()).pathname),
+        'completed',
+        response?.status(),
+      );
       recentBrowserRequests.push({
         method: started.method,
         path: started.path,
@@ -605,6 +703,10 @@ test(
       if (recentBrowserRequests.length > 8) recentBrowserRequests.shift();
     });
     page.on('requestfailed', (request) => {
+      peopleRequests.record(
+        peopleRequestKind(prefix, request.method(), new URL(request.url()).pathname),
+        'failed',
+      );
       const started = browserInFlight.get(request);
       if (!started) return;
       browserInFlight.delete(request);
@@ -1110,9 +1212,45 @@ test(
       await route.continue();
       peopleApplyStep = 'first POST forwarded';
     });
+    peopleRequests.arm();
     peopleApplyStep = 'clicking Add 2 people';
     await page.getByRole('button', { name: 'Add 2 people', exact: true }).click();
     enterPhase('second Person failure feedback');
+    postClickPeopleState = { state: 'capturing' };
+    void page
+      .evaluate((buttonPattern) => {
+        const buttonLabel = new RegExp(buttonPattern);
+        const button = [...globalThis.document.querySelectorAll('button')].find((candidate) =>
+          buttonLabel.test(candidate.textContent?.trim() || ''),
+        );
+        const alerts = [...globalThis.document.querySelectorAll('[role="alert"]')].map(
+          (element) => element.textContent || '',
+        );
+        return {
+          state: 'captured' as const,
+          addButton: !button
+            ? ('absent' as const)
+            : button.disabled
+              ? ('disabled' as const)
+              : ('enabled' as const),
+          selectedCheckboxes: globalThis.document.querySelectorAll(
+            '.import-record input[type="checkbox"]:checked',
+          ).length,
+          alertPresent: alerts.length > 0,
+          definiteFailureVisible: alerts.some((value) =>
+            value.includes('The second fictional Person changed before saving.'),
+          ),
+          uncertainFailureVisible: alerts.some((value) =>
+            value.includes('The outcome is unconfirmed.'),
+          ),
+        };
+      }, addPeopleButtonPattern)
+      .then((snapshot) => {
+        postClickPeopleState = snapshot;
+      })
+      .catch(() => {
+        postClickPeopleState = { state: 'unavailable' };
+      });
     await page
       .getByText('The second fictional Person changed before saving.', { exact: true })
       .waitFor({ timeout: 0 });
