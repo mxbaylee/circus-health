@@ -11,7 +11,7 @@ import { launchBrowser, newTestPage } from './harness.ts';
 import { startProcessRuntime } from './process-runtime.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
-import type { Browser, Request, Response } from 'playwright';
+import type { Browser, ConsoleMessage, Request, Response } from 'playwright';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
 import type { CollectionReportDetail } from '../../shared/intake-clinical-pages.ts';
 import test from 'node:test';
@@ -101,6 +101,93 @@ const envelope = (proposed: boolean) => ({
 const opticalDiagnosticReport = (event: string, snapshot: Record<string, unknown>) =>
   JSON.stringify({ event, ...snapshot });
 
+const opticalFailureCategory = (reason: string | undefined) =>
+  reason?.includes('ERR_ABORTED')
+    ? 'aborted'
+    : reason?.includes('ERR_CONNECTION_RESET')
+      ? 'connection-reset'
+      : reason?.includes('ERR_TIMED_OUT')
+        ? 'timed-out'
+        : reason?.includes('ERR_FAILED')
+          ? 'failed'
+          : 'other';
+
+type ReportSample = {
+  afterAcknowledgement: boolean;
+  startedMs: number;
+  durationMs?: number;
+  outcome: 'started' | 'response' | 'finished' | 'failed';
+  failureCategory?: ReturnType<typeof opticalFailureCategory>;
+};
+
+function createReportSampleTracker() {
+  const samples: ReportSample[] = [];
+  const tracked = new WeakMap<object, { sample: ReportSample; started: number }>();
+  let overflow = 0;
+  return {
+    samples,
+    get overflow() {
+      return overflow;
+    },
+    start(request: object, now: number, phaseStarted: number, afterAcknowledgement: boolean) {
+      if (samples.length >= 4) {
+        overflow = Math.min(overflow + 1, 1000);
+        return;
+      }
+      const sample: ReportSample = {
+        afterAcknowledgement,
+        startedMs: now - phaseStarted,
+        outcome: 'started',
+      };
+      samples.push(sample);
+      tracked.set(request, { sample, started: now });
+    },
+    update(
+      request: object,
+      now: number,
+      outcome: ReportSample['outcome'],
+      afterAcknowledgement: boolean,
+      reason?: string,
+    ) {
+      const entry = tracked.get(request);
+      if (!entry) return;
+      entry.sample.outcome = outcome;
+      entry.sample.afterAcknowledgement = afterAcknowledgement;
+      entry.sample.durationMs = Math.max(0, now - entry.started);
+      if (outcome === 'failed') entry.sample.failureCategory = opticalFailureCategory(reason);
+    },
+  };
+}
+
+const opticalReportApiEvent = (line: string) => {
+  if (!line.startsWith('[Circus import] ')) return null;
+  try {
+    const event = JSON.parse(line.slice('[Circus import] '.length));
+    if (
+      event.method !== 'GET' ||
+      event.route !== '/profiles/:profile/intakes/report-queue/:item' ||
+      !['api.started', 'api.completed', 'api.failed', 'api.cancelled'].includes(event.event)
+    )
+      return null;
+    return {
+      event: event.event as 'api.started' | 'api.completed' | 'api.failed' | 'api.cancelled',
+      cancellation: ['caller', 'profile_changed', 'transport'].includes(event.cancellation)
+        ? (event.cancellation as 'caller' | 'profile_changed' | 'transport')
+        : null,
+      status:
+        Number.isInteger(event.status) && event.status >= 100 && event.status <= 599
+          ? (event.status as number)
+          : null,
+      durationMs:
+        Number.isFinite(event.durationMs) && event.durationMs >= 0
+          ? Math.min(Math.round(event.durationMs), 600000)
+          : null,
+    };
+  } catch {
+    return null;
+  }
+};
+
 test('optical diagnostic JSON preserves nested phase and request evidence', () => {
   const snapshot = {
     phase: 'top-level original upload',
@@ -134,6 +221,65 @@ test('optical diagnostic JSON preserves nested phase and request evidence', () =
   assert.doesNotMatch(output, /\[Object\]/);
 });
 
+test('optical report diagnostics retain exact failures and redact app cancellation', () => {
+  const tracker = createReportSampleTracker();
+  const target = {};
+  tracker.start(target, 110, 100, false);
+  const generalRing = new Map<object, number>([[target, 110]]);
+  for (let index = 0; index < 17; index++) {
+    if (generalRing.size === 16) generalRing.delete(generalRing.keys().next().value!);
+    generalRing.set({}, index);
+  }
+  assert.equal(generalRing.has(target), false);
+  tracker.update(target, 20110, 'failed', true, 'net::ERR_ABORTED');
+  assert.deepEqual(tracker.samples, [
+    {
+      afterAcknowledgement: true,
+      startedMs: 10,
+      durationMs: 20000,
+      outcome: 'failed',
+      failureCategory: 'aborted',
+    },
+  ]);
+  for (let index = 0; index < 1004; index++) tracker.start({}, index, 0, true);
+  assert.equal(tracker.samples.length, 4);
+  assert.equal(tracker.overflow, 1000);
+  assert.equal(opticalFailureCategory('private error text'), 'other');
+  assert.equal(opticalFailureCategory('net::ERR_CONNECTION_RESET'), 'connection-reset');
+  assert.equal(opticalFailureCategory('net::ERR_TIMED_OUT'), 'timed-out');
+  assert.equal(opticalFailureCategory('net::ERR_FAILED'), 'failed');
+  const safeEvent = opticalReportApiEvent(
+    '[Circus import] ' +
+      JSON.stringify({
+        event: 'api.cancelled',
+        method: 'GET',
+        route: '/profiles/:profile/intakes/report-queue/:item',
+        cancellation: 'caller',
+        durationMs: 15,
+        requestId: 'private-id',
+      }),
+  );
+  assert.deepEqual(safeEvent, {
+    event: 'api.cancelled',
+    cancellation: 'caller',
+    status: null,
+    durationMs: 15,
+  });
+  assert.doesNotMatch(JSON.stringify(safeEvent), /private-id/);
+  assert.equal(
+    opticalReportApiEvent(
+      '[Circus import] ' +
+        JSON.stringify({
+          event: 'api.cancelled',
+          method: 'GET',
+          route: '/profiles/:profile/intakes/report-queue/:item',
+          cancellation: 'private-reason',
+        }),
+    )?.cancellation,
+    null,
+  );
+});
+
 test(
   'encrypted browser accepts both proposed and top-level optical mappings through grouped identity and date review',
   { timeout: 420000 },
@@ -162,8 +308,11 @@ test(
     let browserApiFailed = 0;
     let evictedApiRequests = 0;
     let evictedBrowserRequests = 0;
-    let firstAcceptancePaths: { acceptance: string; report: string } | undefined;
+    let firstAcceptancePaths: { acceptance: string; report: string; intakeId: string } | undefined;
     let firstAcceptanceAcknowledgedAt: number | undefined;
+    const firstAcceptanceReport = createReportSampleTracker();
+    const reportRouteApiEvents: Array<NonNullable<ReturnType<typeof opticalReportApiEvent>>> = [];
+    let reportRouteApiOverflow = 0;
     const firstAcceptance = {
       acceptanceRequests: 0,
       acceptanceResponses: 0,
@@ -232,6 +381,11 @@ test(
       currentAwait,
       phaseDurationMs: Date.now() - phaseStarted,
       firstAcceptance,
+      firstAcceptanceReportSamples: firstAcceptanceReport.samples,
+      firstAcceptanceReportOverflow: firstAcceptanceReport.overflow,
+      // These app events cover the redacted report route, not one exact query.
+      reportRouteApiEvents,
+      reportRouteApiOverflow,
       // Cumulative transport counts are not successful clinical operations.
       apiTransportAttempts: requestNumber,
       apiTransportSettled,
@@ -307,13 +461,40 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser);
+    if (diagnosticsEnabled)
+      await page.addInitScript(() => {
+        try {
+          sessionStorage.setItem('circus:import-debug', '1');
+        } catch {
+          // Session storage may be unavailable on the initial blank page.
+        }
+      });
     if (diagnosticsEnabled) {
+      const onConsole = (message: ConsoleMessage) => {
+        if (phase !== 'guided queue first acceptance' || message.type() !== 'debug') return;
+        const event = opticalReportApiEvent(message.text());
+        if (!event) return;
+        if (reportRouteApiEvents.length < 8) reportRouteApiEvents.push(event);
+        else reportRouteApiOverflow = Math.min(reportRouteApiOverflow + 1, 1000);
+      };
+      page.on('console', onConsole);
       const onRequest = (request: Request) => {
         const path = new URL(request.url()).pathname;
         if (!path.startsWith('/api/')) return;
         const target = firstAcceptanceRoute(request);
         if (target === 'acceptance') count('acceptanceRequests');
-        if (target === 'report') count('reportRequests');
+        if (target === 'report') {
+          count('reportRequests');
+          if (
+            new URL(request.url()).searchParams.get('intakeId') === firstAcceptancePaths?.intakeId
+          )
+            firstAcceptanceReport.start(
+              request,
+              Date.now(),
+              phaseStarted,
+              afterFirstAcceptanceAcknowledgement(request),
+            );
+        }
         browserApiStarted++;
         if (browserInFlight.size === 16) {
           browserInFlight.delete(browserInFlight.keys().next().value!);
@@ -346,12 +527,28 @@ test(
         if (target === 'acceptance') count('acceptanceFinished');
         if (target === 'report' && afterFirstAcceptanceAcknowledgement(request))
           count('reportFinishedAfterAcknowledgement');
+        if (target === 'report')
+          firstAcceptanceReport.update(
+            request,
+            Date.now(),
+            'finished',
+            afterFirstAcceptanceAcknowledgement(request),
+          );
         finish(request, (await request.response().catch(() => null))?.status() ?? 'failed');
       };
       const onRequestFailed = (request: Request) => {
         const target = firstAcceptanceRoute(request);
         if (target === 'acceptance') count('acceptanceFailed');
-        if (target === 'report') count('reportFailed');
+        if (target === 'report') {
+          count('reportFailed');
+          firstAcceptanceReport.update(
+            request,
+            Date.now(),
+            'failed',
+            afterFirstAcceptanceAcknowledgement(request),
+            request.failure()?.errorText,
+          );
+        }
         finish(request, 'failed');
       };
       const onResponse = (response: Response) => {
@@ -359,12 +556,20 @@ test(
         if (target === 'acceptance') count('acceptanceResponses');
         if (target === 'report' && afterFirstAcceptanceAcknowledgement(response.request()))
           count('reportResponsesAfterAcknowledgement');
+        if (target === 'report')
+          firstAcceptanceReport.update(
+            response.request(),
+            Date.now(),
+            'response',
+            afterFirstAcceptanceAcknowledgement(response.request()),
+          );
       };
       page.on('request', onRequest);
       page.on('response', onResponse);
       page.on('requestfinished', onRequestFinished);
       page.on('requestfailed', onRequestFailed);
       removePageListeners = () => {
+        page.off('console', onConsole);
         page.off('request', onRequest);
         page.off('response', onResponse);
         page.off('requestfinished', onRequestFinished);
@@ -722,6 +927,7 @@ test(
     firstAcceptancePaths = {
       acceptance: prefix + '/intakes/report-acceptance',
       report: prefix + '/intakes/report-queue/' + encodeURIComponent(queueGroupId),
+      intakeId: queueItem.id,
     };
     const queueLinkSelector = '.import-detail-record-link:not([data-saved-record-id])';
     function acknowledgementTime(response: Response) {
