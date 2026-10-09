@@ -61,6 +61,14 @@ matching retained coverage receipt. SQL-compatible source lookup indexes use a
 separate first-property reader for retained raw JSON; ordinary workflow reads
 use JavaScript-compatible last-property selection.
 
+Queue refresh may reuse the effects of an exact selected logical transition
+chain. Missing or cyclic disposable transition rows select complete preparation
+instead; cycle detection retains constant additional memory without a history
+length cap. Equal roots have no changed effects. The effect iterator refuses a
+database write between chain validation and iteration, and its recursive query
+is bounded by the validated chain length. These temporary rows remain an
+optimization, never accepted evidence or recovery authority.
+
 Saved-record destination lookup checks both the requested attribution group and
 unscoped records. It selects current import records first, then import history
 from latest to oldest, and retains forward record order within a receipt. It

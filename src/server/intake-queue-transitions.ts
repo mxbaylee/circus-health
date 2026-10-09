@@ -90,24 +90,41 @@ export function collectionQueueTransitionEffects(
   if (!initialized.has(db)) return undefined;
   const start = canonicalLiteral(before),
     finish = canonicalLiteral(after);
-  let current = finish;
+  if (start === finish) return [];
+  const previous = db.prepare(`SELECT before FROM ${prefix} WHERE source=? AND after=?`);
+  const next = (head: string): string | undefined => {
+    const row = previous.get(sourceId, head);
+    return typeof row?.before === 'string' ? row.before : undefined;
+  };
+  let current = finish,
+    fast: string | undefined = finish,
+    steps = 0;
+  // Disposable rows may be corrupt. Floyd's check bounds memory without imposing
+  // a history-length limit or retaining every visited logical root.
   while (current !== start) {
-    const row = db
-      .prepare(`SELECT before FROM ${prefix} WHERE source=? AND after=?`)
-      .get(sourceId, current);
-    if (!row || row.before === current) return undefined;
-    current = String(row.before);
+    const prior = next(current);
+    if (prior === undefined) return undefined;
+    current = prior;
+    steps++;
+    if (!Number.isSafeInteger(steps)) return undefined;
+    for (let index = 0; index < 2 && fast !== undefined && fast !== start; index++)
+      fast = next(fast);
+    if (current !== start && current === fast) return undefined;
   }
+  const changes = db.prepare('SELECT total_changes() AS n');
+  changes.setReadBigInts(true);
+  const stamp = changes.get()!.n;
   return {
     *[Symbol.iterator]() {
+      if (changes.get()!.n !== stamp) throw Error('Queue transition changed before iteration');
       for (const step of db
         .prepare(
           `WITH RECURSIVE chain(after,before,depth) AS (
         SELECT after,before,0 FROM ${prefix} WHERE source=? AND after=?
-        UNION ALL SELECT t.after,t.before,c.depth+1 FROM ${prefix} t JOIN chain c ON t.after=c.before AND t.source=? WHERE c.before<>?
+        UNION ALL SELECT t.after,t.before,c.depth+1 FROM ${prefix} t JOIN chain c ON t.after=c.before AND t.source=? WHERE c.before<>? AND c.depth+1<?
       ) SELECT after FROM chain ORDER BY depth DESC`,
         )
-        .iterate(sourceId, finish, sourceId, start)) {
+        .iterate(sourceId, finish, sourceId, start, steps)) {
         const current = String(step.after);
         for (const row of db
           .prepare(
