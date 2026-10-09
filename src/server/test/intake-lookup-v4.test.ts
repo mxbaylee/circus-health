@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync, StatementSync } from 'node:sqlite';
+import { setImmediate } from 'node:timers';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { openDatabase, transaction, json } from '../database.ts';
+import { recordDurabilityStatus } from '../record-versions.ts';
 import {
   memoryRecordAuthority,
   registerRawIntakeFixture,
@@ -44,6 +47,128 @@ import {
 } from '../intake-lookup-state.ts';
 
 const summaryOptions = { mappingVersion: 'fictional-v1', isSourceContextVersion: () => false };
+
+for (const count of [1, 8])
+  test(`warm lookup preparation reads only changed retained sources among ${count} originals`, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-lookup-scope-'));
+    const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
+    const authority = memoryRecordAuthority(db);
+    t.after(() => {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    for (let index = 0; index < count; index++) {
+      const id = `fictional-source-${index}`;
+      const raw = JSON.stringify({
+        intake: {
+          version: 0,
+          workflow: {
+            format: 'health-intake-workflow-v1',
+            reportGroups: [{ discoveryOrder: index + 1 }],
+            reportAcceptances: [
+              { receipt: { operationId: `fictional-acceptance-${index}` }, marker: id },
+            ],
+          },
+        },
+      });
+      registerRawIntakeFixture(db, id, raw);
+      await buildIntakeCollectionEnvelope(db, { id });
+      await buildVerifiedWorkflowSummary(db, { id }, summaryOptions);
+    }
+    // Cold work is outside the measured window. Every source now has a selected,
+    // complete lookup policy and unchanged source/collection binding.
+    await prepareIntakeLookupIndices(db);
+    assert.equal(maximumIntakeDiscoveryOrder(db), count);
+    assert.deepEqual(retainedIntakeAcceptance(db, `fictional-acceptance-${count - 1}`), {
+      receipt: { operationId: `fictional-acceptance-${count - 1}` },
+      marker: `fictional-source-${count - 1}`,
+    });
+    const beforeWork = { ...intakeWorkCounters(db).warm };
+    const beforeLookup = { ...intakeLookupCounters(db) };
+    const beforeObjects = authority.objects.size;
+    const beforeSequence = recordDurabilityStatus(db)?.sequence;
+    const beforeTransactions = Number(
+      db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n,
+    );
+
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const originalIterate = StatementSync.prototype.iterate;
+    const sourceStatements = new WeakSet<StatementSync>();
+    let sourceScans = 0;
+    let sourceRows = 0;
+    let rowsAtFirstTurn = -1;
+    DatabaseSync.prototype.prepare = function (sql: string) {
+      const statement = originalPrepare.call(this, sql);
+      if (
+        this === db &&
+        sql.includes("FROM source_files WHERE kind='intake_original' ORDER BY rowid")
+      ) {
+        sourceStatements.add(statement);
+        sourceScans++;
+      }
+      return statement;
+    };
+    StatementSync.prototype.iterate = function (
+      this: StatementSync,
+      ...parameters: Parameters<StatementSync['iterate']>
+    ) {
+      const iterator = Reflect.apply(originalIterate, this, parameters) as ReturnType<
+        StatementSync['iterate']
+      >;
+      if (!sourceStatements.has(this)) return iterator;
+      return (function* () {
+        for (const row of iterator) {
+          sourceRows++;
+          yield row;
+        }
+      })();
+    } as typeof StatementSync.prototype.iterate;
+    let result: Awaited<ReturnType<typeof prepareIntakeLookupIndices>>;
+    try {
+      const firstTurn = new Promise<void>((resolve) =>
+        setImmediate(() => {
+          rowsAtFirstTurn = sourceRows;
+          resolve();
+        }),
+      );
+      result = await prepareIntakeLookupIndices(db);
+      await firstTurn;
+    } finally {
+      DatabaseSync.prototype.prepare = originalPrepare;
+      StatementSync.prototype.iterate = originalIterate;
+    }
+    const afterWork = { ...intakeWorkCounters(db).warm };
+    const afterLookup = { ...intakeLookupCounters(db) };
+    t.diagnostic(
+      JSON.stringify({
+        count,
+        sourceScans,
+        sourceRows,
+        rowsAtFirstTurn,
+        reused: result.reused,
+        nodeReads: afterWork.collectionNodeReads - beforeWork.collectionNodeReads,
+        witnessQueries:
+          afterWork.collectionReadWitnessQueries - beforeWork.collectionReadWitnessQueries,
+        readBytes: afterWork.collectionReadBytes - beforeWork.collectionReadBytes,
+      }),
+    );
+    assert.equal(result.prepared, 0);
+    assert.equal(afterLookup.projectionWrites, beforeLookup.projectionWrites);
+    assert.equal(authority.objects.size, beforeObjects);
+    assert.equal(recordDurabilityStatus(db)?.sequence, beforeSequence);
+    assert.equal(
+      Number(db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n),
+      beforeTransactions,
+    );
+    assert.equal(maximumIntakeDiscoveryOrder(db), count);
+    assert.deepEqual(retainedIntakeAcceptance(db, `fictional-acceptance-${count - 1}`), {
+      receipt: { operationId: `fictional-acceptance-${count - 1}` },
+      marker: `fictional-source-${count - 1}`,
+    });
+    // One selected lookup must not reread a growing unrelated source catalog.
+    // Existing code returns 3 rows for one source and 24 for eight sources.
+    assert.ok(sourceRows <= 3, `${sourceRows} warm original rows for ${count} sources`);
+  });
 async function fixture(t: test.TestContext, raw: string) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-native-lookup-'));
   const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
