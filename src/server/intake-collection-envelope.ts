@@ -2,10 +2,18 @@ import { types as utilTypes } from 'node:util';
 import {
   resolveSchemaMetadata,
   resolveSchemaFieldTarget,
-  schemaResolvedHeader,
   schemaResolvedTarget,
-  schemaResolvedOrder,
 } from './intake-schema-record-resolution.ts';
+import {
+  textValue,
+  cellChunks,
+  header,
+  order,
+  orderEntries,
+  iterateSchemaRecordValue,
+  createSchemaRecordCursor,
+  stepSchemaRecordCursor,
+} from './intake-schema-record-stream.ts';
 import type { Database } from './database.ts';
 import {
   intakeEnvelopeAuthorityBinding,
@@ -205,78 +213,8 @@ export function intakeEnvelopeFieldAccess(
 const fail = (reason: string): never => {
   throw Error(`Intake collection envelope: ${reason}`);
 };
-function textValue(store: EnvelopeCellReader, key: string, max = 8192): string {
-  const value = store.get(key);
-  if (typeof value === 'string') {
-    if (Buffer.byteLength(value) > max) fail('field exceeds bounded header');
-    return value;
-  }
-  if (!value || value.bytes > max) return fail('missing or fragmented schema header');
-  let result = '';
-  for (const text of cellChunks(store, key)) result += text;
-  return result;
-}
-function* cellChunks(store: EnvelopeCellReader, key: string): Generator<string> {
-  const value = store.get(key);
-  if (value === undefined) return fail('missing exact lexical cell');
-  if (typeof value === 'string') {
-    for (let at = 0; at < value.length;) {
-      let end = Math.min(at + 1024, value.length);
-      if (end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1]!)) end--;
-      yield value.slice(at, end);
-      at = end;
-    }
-    return;
-  }
-  const decoder = new TextDecoder('utf-8', { fatal: true });
-  let after: string | undefined,
-    read = 0;
-  do {
-    const page = store.chunks(value, after, 4096);
-    for (const bytes of page.chunks) {
-      read += bytes.length;
-      const text = decoder.decode(bytes, { stream: true });
-      if (text) yield text;
-    }
-    if (page.complete) break;
-    if (!page.after || page.after === after) fail('byte cursor did not advance');
-    after = page.after!;
-  } while (true);
-  const tail = decoder.decode();
-  if (tail) yield tail;
-  if (read !== value.bytes) fail('lexical cell byte count');
-}
 function target(value: unknown): SchemaTarget {
   return schemaResolvedTarget(value);
-}
-function header(store: EnvelopeCellReader, id: string): SchemaRecord {
-  if (!/^[a-f0-9]{64}$/.test(id)) return fail('record address');
-  return schemaResolvedHeader(textValue(store, 'r:' + id));
-}
-function order(value: string | IntakeByteValue): SchemaOrder {
-  if (typeof value !== 'string') return fail('fragmented order entry');
-  return schemaResolvedOrder(value);
-}
-function* orderEntries(store: EnvelopeCellReader, id: string): Generator<SchemaOrder> {
-  const prefix = 'o:' + id + ':';
-  let after = prefix,
-    seen = 0;
-  do {
-    const page = store.range(after, 64, 32768, prefix);
-    for (const item of page.items) {
-      if (!item.key.startsWith(prefix)) {
-        if (seen !== header(store, id).count) fail('record count');
-        return;
-      }
-      if (!/^\d{16}$/.test(item.key.slice(prefix.length))) fail('record order key');
-      seen++;
-      yield order(item.value);
-      after = item.key;
-    }
-    if (page.complete) break;
-    if (!page.items.length) fail('order cursor');
-  } while (true);
-  if (seen !== header(store, id).count) fail('record count');
 }
 export function* iterateSchemaEnvelopeText(
   store: EnvelopeCellReader,
@@ -302,25 +240,6 @@ export function* iterateSchemaEnvelopeText(
   yield* cellChunks(store, '$after');
   store.check();
 }
-function* iterateSchemaRecordValue(
-  store: EnvelopeCellReader,
-  id: string,
-  depth = 0,
-): Generator<string> {
-  if (depth > 128) fail('record depth');
-  const meta = header(store, id);
-  if (meta.shape === 'scalar') {
-    yield* cellChunks(store, 'c:' + id);
-    return;
-  }
-  for (const entry of orderEntries(store, id)) {
-    yield* cellChunks(store, 'c:' + entry.prefix);
-    if (entry.target.type === 'record')
-      yield* iterateSchemaRecordValue(store, entry.target.id, depth + 1);
-    else yield* cellChunks(store, 'c:' + entry.target.id);
-  }
-  yield* cellChunks(store, 's:' + id);
-}
 const schemaResolutionOwners = new WeakMap<
   EnvelopeCellReader,
   {
@@ -340,6 +259,10 @@ const schemaResolutionOwners = new WeakMap<
     ) => { target: SchemaTarget | undefined };
     clear: () => void;
     current: () => boolean;
+    createCursor: (id: string) => ReturnType<typeof createSchemaRecordCursor> | undefined;
+    nextCursor: (cursor: ReturnType<typeof createSchemaRecordCursor>) => IteratorResult<string>;
+    closeCursor: (cursor: ReturnType<typeof createSchemaRecordCursor>) => void;
+    canAdvance: () => boolean;
   }
 >();
 function inertSchemaControl(control: SchemaControl): string | undefined {
@@ -368,10 +291,7 @@ export function createSchemaEnvelopeReader(
 ): IntakeCollectionEnvelopeReader {
   const handles = new WeakMap<IntakeEnvelopeRecord, string>();
   const capturedControl = inertSchemaControl(control);
-  const ownedRead = (
-    id: string,
-    operation: { kind: 'header' } | { kind: 'field'; name: string },
-  ): SchemaRecord | { target: SchemaTarget | undefined } | undefined => {
+  const nativeOwner = () => {
     const owner = schemaResolutionOwners.get(store);
     if (!owner) return undefined;
     const validMethods = ['get', 'check', 'range', 'chunks'].every((name, index) => {
@@ -382,11 +302,27 @@ export function createSchemaEnvelopeReader(
         descriptor.value === owner.methods[index]
       );
     });
+    if (
+      !validMethods ||
+      !owner.current() ||
+      !capturedControl ||
+      inertSchemaControl(control) !== capturedControl ||
+      (fieldSelection !== 'first' && fieldSelection !== 'last')
+    ) {
+      owner.clear();
+      return undefined;
+    }
+    return owner;
+  };
+  const ownedRead = (
+    id: string,
+    operation: { kind: 'header' } | { kind: 'field'; name: string },
+  ): SchemaRecord | { target: SchemaTarget | undefined } | undefined => {
+    const owner = nativeOwner();
+    if (!owner) return undefined;
     const currentControl = inertSchemaControl(control);
     if (
       typeof id !== 'string' ||
-      !validMethods ||
-      !owner.current() ||
       !capturedControl ||
       currentControl !== capturedControl ||
       (fieldSelection !== 'first' && fieldSelection !== 'last')
@@ -608,8 +544,27 @@ export function createSchemaEnvelopeReader(
     logical: structuredClone(logical),
     root: () => resolve(control.root),
     *recordChunks(record) {
-      yield* iterateSchemaRecordValue(store, address(record));
-      store.check();
+      const id = address(record);
+      const owner = nativeOwner();
+      const cursor = owner?.canAdvance() ? owner.createCursor(id) : undefined;
+      if (!owner || !cursor) {
+        yield* iterateSchemaRecordValue(store, id);
+        store.check();
+        return;
+      }
+      try {
+        let owned = true;
+        while (true) {
+          owned &&= nativeOwner() === owner && owner.canAdvance();
+          const next = owned ? owner.nextCursor(cursor) : stepSchemaRecordCursor(cursor, store);
+          if (owned && nativeOwner() !== owner) fail('record stream authority changed');
+          if (next.done) break;
+          yield next.value;
+        }
+        store.check();
+      } finally {
+        owner.closeCursor(cursor);
+      }
     },
     subtree(record, options = {}) {
       const id = address(record);
@@ -1002,6 +957,10 @@ export function collectionCellReader(
         owner.field(view, mode, root, id, selection, name, area, collection),
       clear: owner.clear,
       current: owner.current,
+      createCursor: (id) => owner.createCursor(view, id, area, collection),
+      nextCursor: owner.nextCursor,
+      closeCursor: owner.closeCursor,
+      canAdvance: owner.canAdvance,
     });
   return { head, collections, store };
 }

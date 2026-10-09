@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
+import { StatementSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -13,8 +14,10 @@ import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { collectionCellReader, createSchemaEnvelopeReader } from '../intake-collection-envelope.ts';
 import { parseSchemaControl, schemaOrdinal } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { intakeSchemaRecordOwner } from '../intake-state-collections.ts';
+import { closeSchemaRecordCursor, stepSchemaRecordCursor } from '../intake-schema-record-stream.ts';
 
-async function fixture(t: test.TestContext, extras = 0) {
+async function fixture(t: test.TestContext, extras = 0, longLexical = false) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-schema-resolve-authority-'));
   const path = join(root, 'current.sqlite');
   const identity = {
@@ -24,11 +27,14 @@ async function fixture(t: test.TestContext, extras = 0) {
   };
   const db = openDatabase(path, identity.profileId);
   const authority = memoryRecordAuthority(db);
-  const initial = prepareInitialIntakeEnvelope(
+  const raw =
     '{"intake":{"version":0,"scope":{"subject":{"value":"old"},"subject":{"value":"new"}},"records":' +
-      JSON.stringify(Array.from({ length: extras }, (_, id) => ({ id }))) +
-      '}}',
-  );
+    JSON.stringify(Array.from({ length: extras }, (_, id) => ({ id }))) +
+    (longLexical
+      ? ',"inline":"' + 'x'.repeat(2048) + '","fragmented":"' + 'y'.repeat(10000) + '"'
+      : '') +
+    '}}';
+  const initial = prepareInitialIntakeEnvelope(raw);
   transaction(db, () => {
     db.prepare(
       'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
@@ -106,6 +112,7 @@ async function fixture(t: test.TestContext, extras = 0) {
     id,
     read,
     expected,
+    raw,
     nodes: cells.map(nodeFor),
   };
 }
@@ -179,6 +186,390 @@ test('actual retained schema resolved reads preserve complete bytes with measure
       elapsedMs,
     }),
   );
+});
+
+test('native record chunks share one owned read per iterator advancement', async (t) => {
+  const f = await fixture(t, 16);
+  const record = f.reader.root();
+  const iterator = f.reader.recordChunks(record)[Symbol.iterator]();
+  const before = structuredClone(intakeWorkCounters(f.db).warm);
+  const parts: string[] = [];
+  let steps = 0;
+  while (true) {
+    const next = iterator.next();
+    steps++;
+    if (next.done) break;
+    parts.push(next.value);
+  }
+  const after = structuredClone(intakeWorkCounters(f.db).warm);
+  const actual = parts.join('');
+  const witnesses = after.collectionReadWitnessQueries - before.collectionReadWitnessQueries;
+  assert.equal(actual, f.raw);
+  assert.equal(
+    createHash('sha256').update(actual).digest('hex'),
+    createHash('sha256').update(f.raw).digest('hex'),
+  );
+  t.diagnostic(JSON.stringify({ steps, bytes: Buffer.byteLength(actual), witnesses }));
+  assert.ok(witnesses <= 4 * steps + 16, 'one whole-call witness per native iterator advancement');
+});
+
+test('a caller-seeded lexical buffer cannot enter a native read certificate', async (t) => {
+  const f = await fixture(t, 1);
+  const owner = intakeSchemaRecordOwner(f.selected.collections)!;
+  const cursor = owner.createCursor(
+    f.selected.collections.openView(),
+    f.id,
+    'logical',
+    'envelope.data',
+  )!;
+  let replaced = false;
+  const fakePort = {
+    ...f.selected.store,
+    get(key: string) {
+      if (key.startsWith('c:')) {
+        replaced = true;
+        return 'x'.repeat(2048);
+      }
+      return f.selected.store.get(key);
+    },
+  };
+  const seeded = stepSchemaRecordCursor(cursor, fakePort);
+  assert.equal(seeded.done, false);
+  assert.equal(seeded.value, 'x'.repeat(1024));
+  assert.equal(replaced, true);
+  assert.throws(() => owner.nextCursor(cursor), /tainted record cursor/);
+});
+
+test('custom and replaced record range readers keep point-operation behavior', async (t) => {
+  const f = await fixture(t, 16);
+  const custom = createSchemaEnvelopeReader(
+    { ...f.selected.store },
+    f.control,
+    f.selected.head.logical,
+  );
+  assert.equal([...custom.recordChunks(custom.root())].join(''), f.raw);
+
+  const iterator = f.reader.recordChunks(f.reader.root())[Symbol.iterator]();
+  const first = iterator.next();
+  assert.equal(first.done, false);
+  const original = f.selected.collections.range;
+  let calls = 0;
+  f.selected.collections.range = function (...args) {
+    calls++;
+    return original(...args);
+  };
+  try {
+    let actual = first.value;
+    while (true) {
+      const next = iterator.next();
+      if (next.done) break;
+      actual += next.value;
+    }
+    assert.equal(actual, f.raw);
+    assert.ok(calls > 0, 'method replacement resumes through observable point reads');
+  } finally {
+    f.selected.collections.range = original;
+  }
+});
+
+test('native record cursor refuses reentry during its owner proof', async (t) => {
+  const f = await fixture(t, 1);
+  const owner = intakeSchemaRecordOwner(f.selected.collections)!;
+  const cursor = owner.createCursor(
+    f.selected.collections.openView(),
+    f.id,
+    'logical',
+    'envelope.data',
+  )!;
+  const original = f.authority.storage.read;
+  let nestedError: unknown;
+  let entered = false;
+  f.authority.storage.read = function (name) {
+    if (name === 'head' && !entered) {
+      entered = true;
+      try {
+        owner.nextCursor(cursor);
+      } catch (error) {
+        nestedError = error;
+      }
+    }
+    return original(name);
+  };
+  try {
+    assert.throws(() => owner.nextCursor(cursor), /poisoned record cursor/);
+    assert.equal(entered, true);
+    assert.match(String(nestedError), /reentrant record cursor/);
+  } finally {
+    f.authority.storage.read = original;
+    owner.closeCursor(cursor);
+  }
+});
+
+test('native record cursor refuses a step injected during final proof', async (t) => {
+  const f = await fixture(t, 1);
+  const owner = intakeSchemaRecordOwner(f.selected.collections)!;
+  const cursor = owner.createCursor(
+    f.selected.collections.openView(),
+    f.id,
+    'logical',
+    'envelope.data',
+  )!;
+  const original = f.authority.storage.read;
+  let heads = 0;
+  let injected = false;
+  f.authority.storage.read = function (name) {
+    if (name === 'head' && ++heads === 2) {
+      const extra = stepSchemaRecordCursor(cursor, f.selected.store);
+      assert.equal(extra.done, false);
+      injected = true;
+    }
+    return original(name);
+  };
+  try {
+    let refusal: unknown;
+    try {
+      owner.nextCursor(cursor);
+    } catch (error) {
+      refusal = error;
+    }
+    assert.ok(refusal, `injected=${injected}; heads=${heads}`);
+    assert.match(String(refusal), /record cursor authority changed/);
+    assert.equal(injected, true);
+  } finally {
+    f.authority.storage.read = original;
+    owner.closeCursor(cursor);
+  }
+});
+
+test('native record cursor refuses closure injected during final proof', async (t) => {
+  const f = await fixture(t, 1);
+  const owner = intakeSchemaRecordOwner(f.selected.collections)!;
+  const cursor = owner.createCursor(
+    f.selected.collections.openView(),
+    f.id,
+    'logical',
+    'envelope.data',
+  )!;
+  const original = f.authority.storage.read;
+  let heads = 0;
+  let closed = false;
+  f.authority.storage.read = function (name) {
+    if (name === 'head' && ++heads === 2) {
+      closeSchemaRecordCursor(cursor);
+      closed = true;
+    }
+    return original(name);
+  };
+  try {
+    assert.throws(() => owner.nextCursor(cursor), /record cursor authority changed/);
+    assert.equal(closed, true);
+  } finally {
+    f.authority.storage.read = original;
+    owner.closeCursor(cursor);
+  }
+});
+
+test('native record cursor refuses caught reentry from its closing SQL witness', async (t) => {
+  const f = await fixture(t, 1);
+  const owner = intakeSchemaRecordOwner(f.selected.collections)!;
+  const cursor = owner.createCursor(
+    f.selected.collections.openView(),
+    f.id,
+    'logical',
+    'envelope.data',
+  )!;
+  const prototype = StatementSync.prototype as unknown as {
+    get: (...parameters: unknown[]) => unknown;
+    sourceSQL: string;
+  };
+  const original = prototype.get;
+  let witnesses = 0;
+  let nestedError: unknown;
+  prototype.get = function (...parameters) {
+    if (this.sourceSQL.includes('total_changes()') && ++witnesses === 2) {
+      try {
+        owner.nextCursor(cursor);
+      } catch (error) {
+        nestedError = error;
+      }
+    }
+    return original.apply(this, parameters);
+  };
+  try {
+    assert.throws(() => owner.nextCursor(cursor), /record cursor authority changed/);
+    assert.match(String(nestedError), /reentrant record cursor/);
+  } finally {
+    prototype.get = original;
+    owner.closeCursor(cursor);
+  }
+});
+
+test('native record step refuses TEMP or selected-source drift before a chunk', async (t) => {
+  for (const change of ['temp', 'source'] as const) {
+    const f = await fixture(t, 1);
+    const owner = intakeSchemaRecordOwner(f.selected.collections)!;
+    const cursor = owner.createCursor(
+      f.selected.collections.openView(),
+      f.id,
+      'logical',
+      'envelope.data',
+    )!;
+    const original = f.authority.storage.read;
+    let changed = false;
+    let headReads = 0;
+    f.authority.storage.read = function (name) {
+      if (name === 'head') headReads++;
+      if (name === 'head' && headReads === 2 && !changed) {
+        changed = true;
+        if (change === 'temp') f.db.exec('CREATE TEMP TABLE fictional_record_step_change(value)');
+        else
+          f.db
+            .prepare('UPDATE source_files SET sha256=? WHERE id=?')
+            .run('d'.repeat(64), f.source.id);
+      }
+      return original(name);
+    };
+    try {
+      let refusal: unknown;
+      try {
+        owner.nextCursor(cursor);
+      } catch (error) {
+        refusal = error;
+      }
+      assert.ok(
+        refusal,
+        `${change} mutation did not refuse; changed=${changed}; heads=${headReads}`,
+      );
+      assert.match(String(refusal), /collection read authority changed|original source/);
+      assert.equal(changed, true);
+    } finally {
+      f.authority.storage.read = original;
+      owner.closeCursor(cursor);
+    }
+  }
+});
+
+test('same-logical maintenance between native chunks preserves exact lexical bytes', async (t) => {
+  const f = await fixture(t, 16);
+  const iterator = f.reader.recordChunks(f.reader.root())[Symbol.iterator]();
+  const first = iterator.next();
+  assert.equal(first.done, false);
+  const collections = f.selected.collections;
+  collections.commitMaintenance(
+    collections.prepare(collections.openView(), {
+      operationId: randomUUID(),
+      requestDigest: 'e'.repeat(64),
+      domainVersion: f.selected.head.logical.domainVersion,
+      changes: [
+        {
+          area: 'builds',
+          collection: 'fictional.record.step',
+          op: 'adoptCollection',
+          fromArea: 'logical',
+          fromCollection: 'envelope.data',
+        },
+      ],
+    }),
+  );
+  let actual = first.value;
+  while (true) {
+    const next = iterator.next();
+    if (next.done) break;
+    actual += next.value;
+  }
+  assert.equal(actual, f.raw);
+});
+
+test('record stream retains transaction point reads and lowers total native work', async (t) => {
+  const f = await fixture(t, 16);
+  assert.equal(
+    transaction(f.db, () => [...f.reader.recordChunks(f.reader.root())].join('')),
+    f.raw,
+  );
+
+  const getPrototype = StatementSync.prototype as unknown as {
+    get: (...parameters: unknown[]) => unknown;
+  };
+  const originalGet = getPrototype.get;
+  const sample = (custom: boolean) => {
+    clearIntakeStateCache(f.db);
+    const selected = collectionCellReader(f.db, f.source);
+    const reader = createSchemaEnvelopeReader(
+      custom ? { ...selected.store } : selected.store,
+      f.control,
+      selected.head.logical,
+    );
+    const before = structuredClone(intakeWorkCounters(f.db).warm);
+    let gets = 0;
+    getPrototype.get = function (...parameters) {
+      gets++;
+      return originalGet.apply(this, parameters);
+    };
+    let actual: string;
+    try {
+      actual = [...reader.recordChunks(reader.root())].join('');
+    } finally {
+      getPrototype.get = originalGet;
+    }
+    assert.equal(actual, f.raw);
+    const after = structuredClone(intakeWorkCounters(f.db).warm);
+    return {
+      gets,
+      witnesses: after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+      nodes: after.collectionNodeReads - before.collectionNodeReads,
+      items: after.collectionItemsRead - before.collectionItemsRead,
+    };
+  };
+  const fallback = sample(true);
+  const native = sample(false);
+  t.diagnostic(JSON.stringify({ fallback, native }));
+  assert.ok(native.witnesses < fallback.witnesses);
+  assert.ok(native.gets < fallback.gets);
+  assert.ok(native.nodes <= fallback.nodes);
+  assert.equal(native.items, fallback.items);
+});
+
+test('native record chunks preserve inline and fragmented lexical bytes and refuse buffered source drift', async (t) => {
+  const f = await fixture(t, 1, true);
+  const custom = createSchemaEnvelopeReader(
+    { ...f.selected.store },
+    f.control,
+    f.selected.head.logical,
+  );
+  assert.equal([...custom.recordChunks(custom.root())].join(''), f.raw);
+  const before = structuredClone(intakeWorkCounters(f.db).warm);
+  const pieces = [...f.reader.recordChunks(f.reader.root())];
+  const after = structuredClone(intakeWorkCounters(f.db).warm);
+  assert.equal(pieces.join(''), f.raw);
+  assert.ok(pieces.some((piece) => piece.includes('x'.repeat(1000))));
+  assert.ok(
+    after.collectionByteChunkReads > before.collectionByteChunkReads,
+    'fragmented lexical value used checked byte chunks',
+  );
+
+  const iterator = f.reader.recordChunks(f.reader.root())[Symbol.iterator]();
+  let buffered = false;
+  while (true) {
+    const next = iterator.next();
+    assert.equal(next.done, false);
+    if (next.value.includes('x'.repeat(1000))) {
+      buffered = true;
+      break;
+    }
+  }
+  assert.equal(buffered, true);
+  f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('d'.repeat(64), f.source.id);
+  assert.throws(() => iterator.next(), /original source|missing selected intake head/);
+});
+
+test('native record chunks recheck selected source before final done', async (t) => {
+  const f = await fixture(t, 1);
+  const root = f.reader.root();
+  const chunks = [...f.reader.recordChunks(root)].length;
+  const iterator = f.reader.recordChunks(root)[Symbol.iterator]();
+  for (let index = 0; index < chunks; index++) assert.equal(iterator.next().done, false);
+  f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('d'.repeat(64), f.source.id);
+  assert.throws(() => iterator.next(), /original source|missing selected intake head/);
 });
 
 test('resolved schema memo respects aggregate encoded bytes below the entry limit', async (t) => {

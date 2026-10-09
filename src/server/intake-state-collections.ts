@@ -46,6 +46,14 @@ import {
   resolveSchemaFieldTarget,
 } from './intake-schema-record-resolution.ts';
 import type { SchemaRecord, SchemaTarget } from './intake-envelope-schema.ts';
+import {
+  createSchemaRecordCursor,
+  stepSchemaRecordCursor,
+  closeSchemaRecordCursor,
+  schemaRecordCursorRevision,
+  type SchemaRecordCursor,
+} from './intake-schema-record-stream.ts';
+import type { EnvelopeCellReader } from './intake-collection-envelope.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 
 declare const viewBrand: unique symbol;
@@ -133,6 +141,15 @@ interface PreparedData {
   legacyBridge?: IntakeLegacyBridgeProof;
 }
 interface SchemaRecordOwner {
+  createCursor: (
+    view: IntakeCollectionView,
+    id: string,
+    area: IntakeCollectionArea,
+    collection: string,
+  ) => SchemaRecordCursor | undefined;
+  nextCursor: (cursor: SchemaRecordCursor) => IteratorResult<string>;
+  closeCursor: (cursor: SchemaRecordCursor) => void;
+  canAdvance: () => boolean;
   field: (
     view: IntakeCollectionView,
     mode: 'raw' | 'normalized',
@@ -843,6 +860,85 @@ export function createIntakeCollections(owner: {
     }
     return result;
   }
+  const readCollectionItem = (
+    pages: ReturnType<typeof tree>,
+    source: IntakeCollectionDescriptor | undefined,
+    key: string,
+  ): string | IntakeByteValue | undefined => {
+    const raw = pages.get(source?.root ?? null, key);
+    if (raw !== undefined) recordIntakeWork('collectionItemsRead');
+    return raw === undefined ? undefined : publicValue(raw, source!.kind);
+  };
+  const readCollectionRange = (
+    pages: ReturnType<typeof tree>,
+    source: IntakeCollectionDescriptor | undefined,
+    options: { after?: string; prefix?: string; items: number; bytes: number },
+  ) => {
+    integer(options.items, 1);
+    integer(options.bytes, 1);
+    if (options.items > 100 || options.bytes > 256 * 1024) invalid('collection range budget');
+    // A scoped range retains the existing exclusive cursor.
+    const keyPrefix = options.prefix,
+      after = options.after;
+    if (keyPrefix !== undefined) {
+      intakeTreeKey(keyPrefix);
+      if (typeof after !== 'string' || !after.startsWith(keyPrefix))
+        invalid('collection range cursor outside prefix');
+    }
+    const items: Array<{ key: string; value: string | IntakeByteValue }> = [];
+    let bytes = 0,
+      complete = true;
+    for (const item of pages.entries(source?.root ?? null, after)) {
+      if (keyPrefix !== undefined && !item.key.startsWith(keyPrefix)) break;
+      const size = Buffer.byteLength(item.key) + Buffer.byteLength(item.value);
+      if (items.length === options.items || bytes + size > options.bytes) {
+        complete = false;
+        break;
+      }
+      items.push({ key: item.key, value: publicValue(item.value, source!.kind) });
+      bytes += size;
+      recordIntakeWork('collectionItemsRead');
+    }
+    if (!complete && !items.length) invalid('collection range item exceeds byte budget');
+    return {
+      items,
+      bytes,
+      complete,
+      after: complete ? null : items.at(-1)!.key,
+      count: source?.root?.count ?? 0,
+    };
+  };
+  const readByteRange = (
+    pages: ReturnType<typeof tree>,
+    value: IntakeByteValue,
+    options: { after?: string; items: number; bytes: number },
+  ) => {
+    const retained = registryFor(db).byteValues.get(value);
+    if (!retained || retained.prefix !== prefix) invalid('foreign or expired byte value');
+    integer(options.items, 1);
+    integer(options.bytes, 1);
+    if (options.items > 64 || options.bytes > 256 * 1024) invalid('byte range budget');
+    const chunks: Buffer[] = [];
+    let bytes = 0,
+      after: string | null = null,
+      complete = true;
+    for (const item of pages.entries(retained.root, options.after)) {
+      const chunk = Buffer.from(item.value, 'base64');
+      if (!chunk.length || chunk.length > 4096 || chunk.toString('base64') !== item.value)
+        invalid('byte chunk representation');
+      recordIntakeWork('collectionByteChunkReads');
+      recordIntakeWork('collectionByteChunkReadBytes', chunk.length);
+      if (chunks.length === options.items || bytes + chunk.length > options.bytes) {
+        complete = false;
+        break;
+      }
+      chunks.push(chunk);
+      bytes += chunk.length;
+      after = item.key;
+    }
+    if (!complete && !chunks.length) invalid('byte range item exceeds budget');
+    return { chunks, bytes, complete, after: complete ? null : after };
+  };
   const api = {
     prepareLegacyBridge(input: {
       operationId: string;
@@ -1009,9 +1105,7 @@ export function createIntakeCollections(owner: {
         collectionName(name);
         const pages = readTree(),
           collection = descriptor(pages.get(readScope(view, area), name));
-        const result = pages.get(collection?.root ?? null, key);
-        if (result !== undefined) recordIntakeWork('collectionItemsRead');
-        return result === undefined ? undefined : publicValue(result, collection!.kind);
+        return readCollectionItem(pages, collection, key);
       });
     },
     rank(
@@ -1165,78 +1259,15 @@ export function createIntakeCollections(owner: {
     ) {
       return runRead((readTree) => {
         collectionName(name);
-        integer(options.items, 1);
-        integer(options.bytes, 1);
-        if (options.items > 100 || options.bytes > 256 * 1024) invalid('collection range budget');
-        // A scoped range retains the existing exclusive cursor. Its namespace
-        // must contain that cursor, so the first different key proves completion.
-        // Count below still describes the whole authenticated collection.
-        const prefix = options.prefix,
-          after = options.after;
-        if (prefix !== undefined) {
-          intakeTreeKey(prefix);
-          if (typeof after !== 'string' || !after.startsWith(prefix))
-            invalid('collection range cursor outside prefix');
-        }
         const pages = readTree(),
           collection = descriptor(pages.get(readScope(view, area), name));
-        const items: Array<{ key: string; value: string | IntakeByteValue }> = [];
-        let bytes = 0,
-          complete = true;
-        for (const item of pages.entries(collection?.root ?? null, after)) {
-          if (prefix !== undefined && !item.key.startsWith(prefix)) break;
-          const size = Buffer.byteLength(item.key) + Buffer.byteLength(item.value);
-          if (items.length === options.items || bytes + size > options.bytes) {
-            complete = false;
-            break;
-          }
-          items.push({
-            key: item.key,
-            value: publicValue(item.value, collection!.kind),
-          });
-          bytes += size;
-          recordIntakeWork('collectionItemsRead');
-        }
-        // A caller must increase its per-item window, not loop forever on an
-        // unchanging empty cursor. Stored values themselves are always bounded.
-        if (!complete && !items.length) invalid('collection range item exceeds byte budget');
-        return {
-          items,
-          bytes,
-          complete,
-          after: complete ? null : items.at(-1)!.key,
-          count: collection?.root?.count ?? 0,
-        };
+        return readCollectionRange(pages, collection, options);
       });
     },
     readBytes(value: IntakeByteValue, options: { after?: string; items: number; bytes: number }) {
       return runRead((readTree) => {
         selected();
-        const retained = registryFor(db).byteValues.get(value);
-        if (!retained || retained.prefix !== prefix) invalid('foreign or expired byte value');
-        integer(options.items, 1);
-        integer(options.bytes, 1);
-        if (options.items > 64 || options.bytes > 256 * 1024) invalid('byte range budget');
-        const chunks: Buffer[] = [];
-        let bytes = 0,
-          after: string | null = null,
-          complete = true;
-        for (const item of readTree().entries(retained.root, options.after)) {
-          const chunk = Buffer.from(item.value, 'base64');
-          if (!chunk.length || chunk.length > 4096 || chunk.toString('base64') !== item.value)
-            invalid('byte chunk representation');
-          recordIntakeWork('collectionByteChunkReads');
-          recordIntakeWork('collectionByteChunkReadBytes', chunk.length);
-          if (chunks.length === options.items || bytes + chunk.length > options.bytes) {
-            complete = false;
-            break;
-          }
-          chunks.push(chunk);
-          bytes += chunk.length;
-          after = item.key;
-        }
-        if (!complete && !chunks.length) invalid('byte range item exceeds budget');
-        return { chunks, bytes, complete, after: complete ? null : after };
+        return readByteRange(readTree(), value, options);
       });
     },
     replay(operationId: string, requestDigest: string): IntakeCollectionResult | undefined {
@@ -1774,9 +1805,123 @@ export function createIntakeCollections(owner: {
     },
   };
   // Lexical references are captured before this owner handle becomes public.
+  const recordCursorToken = Object.freeze({});
+  const issuedRecordCursors = new WeakSet<SchemaRecordCursor>();
+  const nativeRecordCursors = new WeakMap<
+    SchemaRecordCursor,
+    {
+      area: IntakeCollectionArea;
+      name: string;
+      binding: string;
+      collection: string;
+      source: IntakeCollectionDescriptor;
+      advancing: boolean;
+      poisoned: boolean;
+    }
+  >();
+  const selectedCursorBinding = (current: IntakeCollectionHead, area: IntakeCollectionArea) => {
+    return JSON.stringify(area === 'logical' ? current.logical : current.builds);
+  };
+  const createRecordCursor = (
+    view: IntakeCollectionView,
+    id: string,
+    area: IntakeCollectionArea,
+    name: string,
+  ): SchemaRecordCursor | undefined => {
+    if (db.isTransaction) return undefined;
+    return runRead((readTree, certificate) => {
+      collectionName(name);
+      const head = selected(certificate).head;
+      if (!head) invalid('missing selected envelope data');
+      const binding = selectedCursorBinding(head, area);
+      const source = descriptor(readTree().get(readScope(view, area, certificate), name));
+      if (!source) invalid('missing selected envelope data');
+      const cursor = createSchemaRecordCursor(id, recordCursorToken);
+      nativeRecordCursors.set(cursor, {
+        area,
+        name,
+        binding,
+        collection: JSON.stringify(source),
+        source,
+        advancing: false,
+        poisoned: false,
+      });
+      issuedRecordCursors.add(cursor);
+      return cursor;
+    });
+  };
+  const nextRecordCursor = (cursor: SchemaRecordCursor): IteratorResult<string> => {
+    const retained = nativeRecordCursors.get(cursor);
+    if (!retained || db.isTransaction) invalid('foreign or transaction record cursor');
+    if (retained.advancing) {
+      retained.poisoned = true;
+      invalid('reentrant record cursor');
+    }
+    if (retained.poisoned) invalid('poisoned record cursor');
+    const beforeRevision = schemaRecordCursorRevision(cursor, recordCursorToken);
+    if (beforeRevision === undefined) invalid('tainted record cursor');
+    retained.advancing = true;
+    try {
+      const result = runRead((readTree, certificate) => {
+        if (retained.poisoned) invalid('poisoned record cursor');
+        const pages = readTree();
+        const current = () => {
+          const head = selected(certificate).head;
+          if (!head || selectedCursorBinding(head, retained.area) !== retained.binding)
+            invalid('stale selected envelope');
+          const scope = retained.area === 'logical' ? head.logical.root : head.builds;
+          const source = descriptor(pages.get(scope, retained.name));
+          if (!source || JSON.stringify(source) !== retained.collection)
+            invalid('stale selected envelope data');
+        };
+        current();
+        const port: EnvelopeCellReader = {
+          check: current,
+          get: (key) => readCollectionItem(pages, retained.source, key),
+          range: (after, items, bytes, keyPrefix) =>
+            readCollectionRange(pages, retained.source, {
+              after,
+              prefix: keyPrefix,
+              items,
+              bytes,
+            }),
+          chunks: (value, after, bytes = 4096) =>
+            readByteRange(pages, value, { after, items: 64, bytes }),
+        };
+        const result = stepSchemaRecordCursor(cursor, port, recordCursorToken);
+        current();
+        ready();
+        if (retained.poisoned) invalid('poisoned record cursor');
+        return result;
+      });
+      if (
+        retained.poisoned ||
+        schemaRecordCursorRevision(cursor, recordCursorToken) !== beforeRevision + 1
+      )
+        invalid('record cursor authority changed');
+      return result;
+    } catch (error) {
+      nativeRecordCursors.delete(cursor);
+      closeSchemaRecordCursor(cursor);
+      throw error;
+    } finally {
+      retained.advancing = false;
+    }
+  };
+  const closeRecordCursor = (cursor: SchemaRecordCursor): void => {
+    if (!issuedRecordCursors.has(cursor)) invalid('foreign record cursor');
+    const retained = nativeRecordCursors.get(cursor);
+    if (retained?.advancing) {
+      retained.poisoned = true;
+      invalid('reentrant record cursor close');
+    }
+    if (!nativeRecordCursors.delete(cursor)) return;
+    closeSchemaRecordCursor(cursor);
+  };
   const schemaReadOperations = Object.freeze({
     collection: api.collection,
     get: api.get,
+    range: api.range,
     readBytes: api.readBytes,
   });
   const schemaMethods = Object.freeze({
@@ -1793,6 +1938,10 @@ export function createIntakeCollections(owner: {
       resolve: api.resolveSchemaRecord,
       field: api.resolveSchemaField,
       clear: api.clearSchemaRecordCache,
+      createCursor: createRecordCursor,
+      nextCursor: nextRecordCursor,
+      closeCursor: closeRecordCursor,
+      canAdvance: () => !db.isTransaction,
       current: () =>
         Object.entries(schemaMethods).every(([name, method]) => {
           const descriptor = Object.getOwnPropertyDescriptor(api, name);

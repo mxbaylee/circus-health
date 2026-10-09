@@ -11,6 +11,21 @@ The reader checks the selected source and logical root and rejects detached or
 stale addresses. Auxiliary progress, operation receipts, and derived indexes do not change
 the logical root or clinical review version.
 
+Native record-text streaming shares one authenticated collection read within each
+synchronous iterator advancement. The private cursor returns the existing exact
+lexical chunk only after its source, accepted-HEAD authority, selected collection,
+SQL/TEMP witness, registry and read epoch checks close. No active read certificate
+or tree-access port survives a yielded chunk. Existing bounded lexical and order
+buffers remain unchanged, as does the 128-node collection cache; this does not
+prefetch later chunks or introduce a whole-record or whole-history cache.
+The consuming operation still owns its original-file lease and physical checks.
+
+Unchanged logical selections can continue after derived maintenance under a new
+read admission. Transactions, custom readers and replaced reader methods keep
+the checked point-read path. Once a cursor takes that fallback, its buffered
+state cannot re-enter the native authenticated path. Reentrant advancement and
+failed admission close the native cursor without exposing its pending chunk.
+
 ## Workflow counts and joins
 
 `readVerifiedWorkflowSummary` returns exact counts only when the selected summary
