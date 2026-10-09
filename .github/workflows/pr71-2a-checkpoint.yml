@@ -1,4 +1,4 @@
-name: PR71 disposable projection metadata tuple comparison
+name: PR71 committed node payload decomposition
 on:
   push:
     branches: [codex/pr71-step0-workspace]
@@ -6,20 +6,20 @@ on:
   workflow_dispatch:
 
 jobs:
-  projection-tuple-32:
+  node-payload-32:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      # Publish this workflow and reviewed loader only to an isolated diagnostic branch.
+      # Diagnostic branch only; never merge this workflow into the implementation.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: diagnostic
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 0d88ab3fa12059945550da7c7439b8d532a6b950
+          ref: 8b1652ef567a4447851a94d1a204c5e846f4eade
           path: source
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -29,37 +29,29 @@ jobs:
       - name: Install pinned source dependencies
         working-directory: source
         run: npm ci
-      - name: Compare unchanged object and tuple projection sequentially
+      - name: Inspect committed fictional node payloads after unchanged publication
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/pr71-projection-tuple"
-          git rev-parse HEAD > "$RUNNER_TEMP/pr71-projection-tuple/source-head.txt"
-          test "$(git rev-parse HEAD)" = '0d88ab3fa12059945550da7c7439b8d532a6b950'
-          sha256sum src/server/record-versions.ts src/server/test/intake-history-publication.test.ts ../diagnostic/pr71-projection-tuple-loader.mjs > "$RUNNER_TEMP/pr71-projection-tuple/source-sha.txt"
-          status=0
-          for variant in object tuple; do
-            if CRS_PROJECTION_TUPLE_DIAGNOSTIC=1 CRS_PROJECTION_TUPLE_VARIANT="$variant" CRS_PROJECTION_TUPLE_COUNT=32 CRS_HISTORY_WAL_CHECKPOINT_PAGES=32768 \
-              node --import=../diagnostic/pr71-projection-tuple-loader.mjs --test --experimental-strip-types \
-                --test-name-pattern="^projection tuple matched publication: $variant 32 artifacts$" \
-                src/server/test/intake-history-publication.test.ts \
-                > "$RUNNER_TEMP/pr71-projection-tuple/$variant.log" 2>&1; then
-              :
-            else
-              status=1
-            fi
-          done
-          exit "$status"
+          mkdir -p "$RUNNER_TEMP/pr71-node-payload"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr71-node-payload/source-head.txt"
+          test "$(git rev-parse HEAD)" = '8b1652ef567a4447851a94d1a204c5e846f4eade'
+          sha256sum src/server/intake-state-tree.ts src/server/record-versions.ts src/server/test/intake-history-publication.test.ts ../diagnostic/pr71-node-payload-loader.mjs > "$RUNNER_TEMP/pr71-node-payload/source-sha.txt"
+          CRS_NODE_PAYLOAD_DIAGNOSTIC=1 CRS_NODE_PAYLOAD_COUNT=32 CRS_HISTORY_WAL_CHECKPOINT_PAGES=32768 \
+            node --import=../diagnostic/pr71-node-payload-loader.mjs --test --experimental-strip-types \
+              --test-name-pattern='^committed node payload decomposition: 32 artifacts$' \
+              src/server/test/intake-history-publication.test.ts \
+              > "$RUNNER_TEMP/pr71-node-payload/probe.log" 2>&1
       - name: Checksum all available receipts
         if: always()
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/pr71-projection-tuple"
-          find "$RUNNER_TEMP/pr71-projection-tuple" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-projection-tuple/SHA256SUMS"
+          mkdir -p "$RUNNER_TEMP/pr71-node-payload"
+          find "$RUNNER_TEMP/pr71-node-payload" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-node-payload/SHA256SUMS"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: pr71-projection-tuple-32
-          path: ${{ runner.temp }}/pr71-projection-tuple
+          name: pr71-node-payload-32
+          path: ${{ runner.temp }}/pr71-node-payload
           if-no-files-found: error
