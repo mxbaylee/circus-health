@@ -77,7 +77,7 @@ interface Connection {
   hashes?: ReturnType<typeof disposableSqlite>;
   entries: WeakMap<object, Map<string, ProjectionRow>>;
   nativeCatalog?: NativeLookupCatalog & { token: object };
-  nativeReceiptAppend?: NativeReceiptAppend;
+  nativeReceiptAppend?: { members: ReadonlyMap<string, NativeReceiptAppend> };
   catalogAttempt?: object;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
@@ -827,33 +827,89 @@ export function retainNativeIntakeReceiptAppend(
   before: string,
   after: string,
 ): void {
+  retainNativeIntakeReceiptAppendBatch(db, [{ basis, proof, reader, source, before, after }]);
+}
+export function retainNativeIntakeReceiptAppendBatch(
+  db: Database,
+  items: readonly {
+    basis: object;
+    proof: object;
+    reader: IntakeCollectionEnvelopeReader;
+    source: IntakeEnvelopeSource;
+    before: string;
+    after: string;
+  }[],
+): void {
   const connection = connections.get(db);
-  const prior = receiptAppendBases.get(basis);
-  receiptAppendBases.delete(basis);
+  if (!items.length || items.length > 100) {
+    if (connection) {
+      connection.nativeReceiptAppend = undefined;
+      connection.catalogAttempt = undefined;
+    }
+    return;
+  }
+  const bases = items.map((item) => {
+    const prior = receiptAppendBases.get(item.basis);
+    receiptAppendBases.delete(item.basis);
+    return prior;
+  });
   if (!connection) return;
   connection.nativeReceiptAppend = undefined;
+  connection.catalogAttempt = undefined;
+  const members = new Map<string, NativeReceiptAppend>();
+  let bytes = 0;
+  for (const [index, item] of items.entries()) {
+    const prior = bases[index];
+    if (
+      !prior ||
+      prior.db !== db ||
+      prior.generation !== connection.generation ||
+      prior.catalog !== connection.nativeCatalog ||
+      prior.sourceId !== item.source.id ||
+      prior.sourceHash !== item.source.sha256 ||
+      prior.before !== item.before ||
+      members.has(item.source.id)
+    )
+      return;
+    const rows = consumeWorkflowReceiptAppendProof(
+      item.proof,
+      db,
+      item.source,
+      item.reader,
+      item.before,
+      item.after,
+    );
+    if (!rows || rows.length > 64) return;
+    const detached = rows.map(({ operation, address }) => ({ operation, address }));
+    bytes +=
+      Buffer.byteLength(item.source.id) +
+      Buffer.byteLength(prior.sourceHash) +
+      Buffer.byteLength(item.before) +
+      Buffer.byteLength(item.after);
+    for (const row of detached)
+      bytes += Buffer.byteLength(row.operation) + Buffer.byteLength(row.address);
+    if (bytes > 1024 * 1024) return;
+    members.set(item.source.id, {
+      catalog: prior.catalog,
+      generation: prior.generation,
+      sourceId: prior.sourceId,
+      sourceOrder: prior.sourceOrder,
+      sourceHash: prior.sourceHash,
+      before: prior.before,
+      after: item.after,
+      rows: detached,
+    });
+  }
   if (
-    !prior ||
-    prior.db !== db ||
-    prior.generation !== connection.generation ||
-    prior.catalog !== connection.nativeCatalog ||
-    prior.sourceId !== source.id ||
-    prior.sourceHash !== source.sha256 ||
-    prior.before !== before
+    !members.size ||
+    members.size !== items.length ||
+    [...members.values()].some(
+      (member) =>
+        member.catalog !== connection.nativeCatalog || member.generation !== connection.generation,
+    )
   )
     return;
-  const rows = consumeWorkflowReceiptAppendProof(proof, db, source, reader, before, after);
-  if (!rows || rows.length > 64) return;
-  connection.nativeReceiptAppend = {
-    catalog: prior.catalog,
-    generation: prior.generation,
-    sourceId: prior.sourceId,
-    sourceOrder: prior.sourceOrder,
-    sourceHash: prior.sourceHash,
-    before: prior.before,
-    after,
-    rows: rows.map(({ operation, address }) => ({ operation, address })),
-  };
+  connection.nativeReceiptAppend = { members };
 }
 /** Read-only, checkpointed derivation. No incomplete catalog can answer a miss. */
 export async function buildNativeIntakeLookupCatalog(
@@ -878,6 +934,8 @@ export async function buildNativeIntakeLookupCatalog(
   // An expired global certificate cannot answer queries. Its private per-source
   // derivations can still be reused after checking every current source binding.
   const previous = connection.nativeCatalog;
+  const appendBatch = connection.nativeReceiptAppend;
+  connection.nativeReceiptAppend = undefined;
   connection.nativeCatalog = undefined;
   const scratch = previous?.scratch ?? disposableSqlite('circus-intake-lookup-addresses-');
   const seenEpoch = randomUUID();
@@ -941,7 +999,7 @@ export async function buildNativeIntakeLookupCatalog(
         prior?.source_order === source.source_order &&
         prior.source_hash === source.sha256 &&
         prior.authority_head === source.authority_head;
-      const append = connection.nativeReceiptAppend;
+      const append = appendBatch?.members.get(source.id);
       let reuseAppend =
         !reuse &&
         !!append &&
@@ -1031,7 +1089,6 @@ export async function buildNativeIntakeLookupCatalog(
         scratch.db
           .prepare('UPDATE sources SET seen_epoch=? WHERE source_id=?')
           .run(seenEpoch, source.id);
-      if (append?.sourceId === source.id) connection.nativeReceiptAppend = undefined;
       if (!(await checkpoint(source.id, visited))) return undefined;
     }
     if (!isCurrent()) return undefined;

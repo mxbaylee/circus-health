@@ -1,7 +1,7 @@
 /** Coupled acceptance uses one clinical projection and one selected envelope
  * fork per original; repeated blocks never compete for the same source head. */
 import { createHash } from 'node:crypto';
-import { HttpError, type Database } from './database.ts';
+import { HttpError, revision, type Database } from './database.ts';
 import { canonicalLiteral, cloneLiteral } from './intake-format.ts';
 import {
   collectionClinicalProjectionContext,
@@ -18,6 +18,7 @@ import {
 import {
   openIntakeCollectionEnvelope,
   selectedEnvelopeStore,
+  type IntakeCollectionEnvelopeReader,
 } from './intake-collection-envelope.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
 import {
@@ -32,12 +33,17 @@ import {
 import { createReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
 import {
   createNativeAcceptanceEffects,
+  beginOwnedGroupedAcceptanceTransition,
   nativeAcceptanceDecisions,
   nativeAcceptanceReceiptChanges,
   prepareNativeIntakeAcceptance,
   validateSingleAcceptanceReceipt,
   type NativeAcceptanceEffects,
 } from './intake-collection-acceptance.ts';
+import {
+  nativeIntakeReceiptAppendBasis,
+  retainNativeIntakeReceiptAppendBatch,
+} from './intake-lookup-projection.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import type { IntakeReviewDecision, IntakeAtomicAcceptanceReceipt } from '../shared/intake.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -202,6 +208,15 @@ export async function prepareNativeIntakeAcceptanceGroup(
     at = new Date().toISOString();
   const prepared: Array<{
     id: string;
+    source: IntakeEnvelopeSource;
+    before: string | undefined;
+    after: string;
+    basis?: object;
+    receiptAppend?: {
+      proof: object;
+      reader: IntakeCollectionEnvelopeReader;
+      logical: string;
+    };
     value: Awaited<ReturnType<typeof prepareIntakeEnvelopeMutation>>;
   }> = [];
   try {
@@ -288,6 +303,20 @@ export async function prepareNativeIntakeAcceptanceGroup(
       if (!group) grouped.set(block.member.source.id, (group = []));
       group.push(block);
     }
+    const appendBases = new Map<string, object>();
+    if (input.retainReportReceipt !== false)
+      for (const [id, group] of grouped) {
+        const first = group[0]!;
+        if (!first.member.version.logicalBinding) break;
+        const basis = nativeIntakeReceiptAppendBasis(
+          db,
+          first.member.source,
+          first.member.version.logicalBinding,
+        );
+        if (!basis) break;
+        appendBases.set(id, basis);
+      }
+    if (appendBases.size !== grouped.size) appendBases.clear();
     for (const [id, group] of grouped) {
       const first = group[0]!,
         source = first.member.source,
@@ -295,6 +324,8 @@ export async function prepareNativeIntakeAcceptanceGroup(
         catalog = createReportSnapshotCatalog(db, source, { assertRunning: assertCurrent }),
         acceptance = createNativeAcceptanceEffects();
       let needsReview: boolean | undefined;
+      let receiptAppend:
+        { proof: object; reader: IntakeCollectionEnvelopeReader; logical: string } | undefined;
       const contributors = group.map((block) => {
         const proposalId = block.member.context.proposal.proposalId,
           intake = reader.child(reader.root(), 'intake')!,
@@ -373,6 +404,7 @@ export async function prepareNativeIntakeAcceptanceGroup(
         },
         additionalLogicalChanges: () => catalog.finalChanges(),
         prepareDerived: async (value) => {
+          receiptAppend = undefined;
           const derived = await input.prepareDerived(source, {
             ...value,
             affected: affected(),
@@ -381,6 +413,12 @@ export async function prepareNativeIntakeAcceptanceGroup(
           if (typeof derived.needsReview !== 'boolean')
             throw Error('Approval needs complete updated workflow facts');
           needsReview = derived.needsReview;
+          if (derived.receiptAppend)
+            receiptAppend = {
+              proof: derived.receiptAppend,
+              reader: value.reader,
+              logical: JSON.stringify(value.logical),
+            };
           return [...derived.changes, ...preparedClinicalEvidenceChanges(projection, id)];
         },
         derivedIntakeState: () => {
@@ -389,7 +427,17 @@ export async function prepareNativeIntakeAcceptanceGroup(
         },
       });
       if (!value.prepared) throw Error('Resolve complete approval replay before preparation');
-      prepared.push({ id, value });
+      prepared.push({
+        id,
+        source,
+        before: first.member.version.logicalBinding,
+        after: JSON.stringify(
+          selectedEnvelopeStore(db, source).collections.inspectPrepared(value.prepared).logical,
+        ),
+        basis: appendBases.get(id),
+        receiptAppend,
+        value,
+      });
     }
     assertCurrent();
     let disposed = false;
@@ -404,37 +452,73 @@ export async function prepareNativeIntakeAcceptanceGroup(
       apply() {
         if (disposed) throw Error('Disposed approval preparation');
         assertCurrent();
-        applyPreparedClinicalProjectionGroup(db, projection);
-        for (const member of blocks)
-          assertPreparedClinicalProjectionMember(
-            db,
-            projection,
-            member.index,
-            member.member.session,
-          );
-        for (const item of prepared)
-          selectedEnvelopeStore(db, { id: item.id }).collections.stage(item.value.prepared!);
-        for (const block of blocks) {
-          const { context, source } = block.member,
-            clinical = block.imported.clinical;
-          db.prepare(
-            "UPDATE manual_batches SET status='verified',verified_at=?,coverage_json=?,notes=? WHERE id=?",
-          ).run(
-            block.imported.at,
-            JSON.stringify({
-              sourceIntake: source.id,
-              rawPreserved: true,
-              validation: context.validation,
-              imported: block.imported,
-              clinicalProjection: clinical ? 'reviewed' : 'none',
-            }),
-            clinical
-              ? 'Explicitly accepted clinical projection, original assertions and evidence preserved.'
-              : 'Verified original hash and JSONL syntax/provenance. All source occurrences retained; repeated content is counted, not merged as clinical events. Clinical mapping and source truth are unreviewed.',
-            source.batch_id,
-          );
+        retainNativeIntakeReceiptAppendBatch(db, []);
+        const append =
+          input.retainReportReceipt !== false &&
+          prepared.every(
+            (item) =>
+              !!item.before &&
+              !!item.basis &&
+              !!item.receiptAppend &&
+              item.receiptAppend.logical === item.after,
+          )
+            ? prepared.map((item) => ({
+                source: item.source,
+                before: item.before!,
+                after: item.after,
+                basis: item.basis!,
+                proof: item.receiptAppend!.proof,
+                reader: item.receiptAppend!.reader,
+              }))
+            : undefined;
+        const transition = append?.length ? beginOwnedGroupedAcceptanceTransition(db) : undefined;
+        try {
+          applyPreparedClinicalProjectionGroup(db, projection);
+          for (const member of blocks)
+            assertPreparedClinicalProjectionMember(
+              db,
+              projection,
+              member.index,
+              member.member.session,
+            );
+          for (const item of prepared)
+            selectedEnvelopeStore(db, { id: item.id }).collections.stage(item.value.prepared!);
+          for (const block of blocks) {
+            const { context, source } = block.member,
+              clinical = block.imported.clinical;
+            db.prepare(
+              "UPDATE manual_batches SET status='verified',verified_at=?,coverage_json=?,notes=? WHERE id=?",
+            ).run(
+              block.imported.at,
+              JSON.stringify({
+                sourceIntake: source.id,
+                rawPreserved: true,
+                validation: context.validation,
+                imported: block.imported,
+                clinicalProjection: clinical ? 'reviewed' : 'none',
+              }),
+              clinical
+                ? 'Explicitly accepted clinical projection, original assertions and evidence preserved.'
+                : 'Verified original hash and JSONL syntax/provenance. All source occurrences retained; repeated content is counted, not merged as clinical events. Clinical mapping and source truth are unreviewed.',
+              source.batch_id,
+            );
+          }
+          if (transition) {
+            db.prepare(
+              "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ).run(String(revision(db) + 1));
+            transition.seal({
+              operationId: input.operationId,
+              fingerprint: input.fingerprint,
+              receipt,
+              sources: append!,
+            });
+          }
+          return structuredClone(receipt);
+        } catch (error) {
+          transition?.close();
+          throw error;
         }
-        return structuredClone(receipt);
       },
       dispose() {
         if (disposed) return;

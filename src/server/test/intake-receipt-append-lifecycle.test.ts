@@ -30,28 +30,29 @@ import { buildVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
 
-const line = JSON.stringify({
-  format: 'health-record-v1',
-  id: 'fictional-receipt',
-  kind: 'document',
-  payload: { text: 'Fictional receipt source' },
-  provenance: {
-    capturedVia: 'Fictional export',
-    sourceSystem: 'Fictional clinic',
-    sourceRecordId: 'fictional-receipt',
-    evidenceClass: 'provider_export',
-    locator: 'page 1',
-  },
-  coverage: { status: 'complete_response', notes: [] },
-  clinical: {
+const line = (id: string) =>
+  JSON.stringify({
+    format: 'health-record-v1',
+    id,
     kind: 'document',
-    subject: 'self',
-    documentTitle: 'Fictional receipt',
-    date: '2026-01-01',
-  },
-});
+    payload: { text: 'Fictional receipt source ' + id },
+    provenance: {
+      capturedVia: 'Fictional export',
+      sourceSystem: 'Fictional clinic',
+      sourceRecordId: id,
+      evidenceClass: 'provider_export',
+      locator: 'page 1',
+    },
+    coverage: { status: 'complete_response', notes: [] },
+    clinical: {
+      kind: 'document',
+      subject: 'self',
+      documentTitle: 'Fictional receipt ' + id,
+      date: '2026-01-01',
+    },
+  });
 
-async function fixture(t: test.TestContext) {
+async function fixture(t: test.TestContext, grouped = false) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-receipt-lifecycle-'));
   const profileId = 'fictional-receipt-lifecycle';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
@@ -63,45 +64,66 @@ async function fixture(t: test.TestContext) {
   });
   const selected = uploadIntake(db, root, profileId, {
     filename: 'fictional-receipt.jsonl',
-    bytes: Buffer.from(line),
+    bytes: Buffer.from(line('fictional-receipt')),
   });
   const proposed = proposeConversion(db, root, profileId, selected.id, {
     version: selected.version,
-    jsonlText: line,
+    jsonlText: line('fictional-receipt'),
     summary: 'Fictional receipt',
   });
-  const envelope = readIntakeEnvelope(db, { id: selected.id }) as {
-    intake: { workflow?: Record<string, unknown> };
-  };
-  envelope.intake.workflow ??= {};
-  envelope.intake.workflow.reportAcceptances = [
-    { receipt: { operationId: 'fictional-retained' }, marker: 'earlier' },
-  ];
-  transaction(db, () => stageIntakeEnvelope(db, { id: selected.id }, envelope));
-  await buildIntakeCollectionEnvelope(db, { id: selected.id });
-  await buildVerifiedWorkflowSummary(
-    db,
-    { id: selected.id },
-    {
-      mappingVersion: 'fictional-v1',
-      isSourceContextVersion: () => false,
-    },
-  );
-  await prepareCollectionReviewMembership(db, { id: selected.id });
+  const other = grouped
+    ? uploadIntake(db, root, profileId, {
+        filename: 'fictional-other.jsonl',
+        bytes: Buffer.from(line('fictional-other')),
+      })
+    : undefined;
+  const otherProposed = other
+    ? proposeConversion(db, root, profileId, other.id, {
+        version: other.version,
+        jsonlText: line('fictional-other'),
+        summary: 'Fictional other receipt',
+      })
+    : undefined;
+  for (const { source, operation } of [
+    { source: selected, operation: 'fictional-retained' },
+    ...(other ? [{ source: other, operation: 'fictional-other-retained' }] : []),
+  ]) {
+    const envelope = readIntakeEnvelope(db, { id: source.id }) as {
+      intake: { workflow?: Record<string, unknown> };
+    };
+    envelope.intake.workflow ??= {};
+    envelope.intake.workflow.reportAcceptances = [
+      { receipt: { operationId: operation }, marker: 'earlier' },
+    ];
+    transaction(db, () => stageIntakeEnvelope(db, { id: source.id }, envelope));
+    await buildIntakeCollectionEnvelope(db, { id: source.id });
+    await buildVerifiedWorkflowSummary(
+      db,
+      { id: source.id },
+      {
+        mappingVersion: 'fictional-v1',
+        isSourceContextVersion: () => false,
+      },
+    );
+    await prepareCollectionReviewMembership(db, { id: source.id });
+  }
   await prepareIntakeLookupIndices(db);
   assert.deepEqual(retainedIntakeAcceptance(db, 'fictional-retained'), {
     receipt: { operationId: 'fictional-retained' },
     marker: 'earlier',
   });
-  const proposalId = proposed.proposals.at(-1)!.id;
-  const reviewed = prepareCollectionClinicalReview(db, root, profileId, selected.id, proposalId);
-  if (reviewed.status !== 'ready') throw Error('Expected selected fictional review');
-  const review = reviewed.session.review;
   const input: IntakeReportAcceptanceRequest = {
     operationId: randomUUID(),
     blocks: [
-      {
-        intakeId: selected.id,
+      { source: selected, proposal: proposed },
+      ...(other && otherProposed ? [{ source: other, proposal: otherProposed }] : []),
+    ].map(({ source, proposal }) => {
+      const proposalId = proposal.proposals.at(-1)!.id;
+      const reviewed = prepareCollectionClinicalReview(db, root, profileId, source.id, proposalId);
+      if (reviewed.status !== 'ready') throw Error('Expected selected fictional review');
+      const review = reviewed.session.review;
+      return {
+        intakeId: source.id,
         proposalId,
         intakeVersion: review.version,
         reviewToken: review.reviewToken,
@@ -111,10 +133,10 @@ async function fixture(t: test.TestContext) {
           candidateVersionId: record.candidateVersionId!,
           mapping: record.mapping,
         })),
-      },
-    ],
+      };
+    }),
   };
-  return { db, root, profileId, input, selected };
+  return { db, root, profileId, input, selected, other };
 }
 
 for (const failure of ['rollback', 'release'] as const)
@@ -184,6 +206,78 @@ for (const failure of ['rollback', 'release'] as const)
         f.input.operationId,
       );
       assert.ok(changedVisits > 1, 'Committed failure must derive complete receipt scope');
+    }
+  });
+
+for (const failure of ['rollback', 'release'] as const)
+  test(`grouped receipt append is all-or-nothing after an owned ${failure} failure`, async (t) => {
+    const f = await fixture(t, true);
+    assert.ok(f.other);
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const originalExec = DatabaseSync.prototype.exec;
+    let armed = false;
+    let failed = false;
+    const outcomes: Array<{ committed: boolean; succeeded: boolean }> = [];
+    const stop = observeTransactionOutcome(f.db, (outcome) => {
+      if (armed) outcomes.push({ committed: outcome.committed, succeeded: outcome.succeeded });
+    });
+    DatabaseSync.prototype.prepare = function (sql: string) {
+      if (this === f.db && sql.startsWith("UPDATE manual_batches SET status='verified'"))
+        armed = true;
+      return originalPrepare.call(this, sql);
+    };
+    DatabaseSync.prototype.exec = function (sql: string) {
+      if (
+        this === f.db &&
+        armed &&
+        !failed &&
+        (failure === 'rollback'
+          ? sql === "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'"
+          : sql === 'DELETE FROM __record_changed' && !this.isTransaction)
+      ) {
+        failed = true;
+        throw Error('fictional grouped ' + failure + ' failure');
+      }
+      return originalExec.call(this, sql);
+    };
+    try {
+      await assert.rejects(
+        acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, f.input),
+        new RegExp(`fictional grouped ${failure} failure`),
+      );
+    } finally {
+      DatabaseSync.prototype.prepare = originalPrepare;
+      DatabaseSync.prototype.exec = originalExec;
+      stop();
+    }
+    assert.equal(armed, true);
+    assert.equal(failed, true);
+    assert.deepEqual(outcomes, [{ committed: failure === 'release', succeeded: false }]);
+    if (failure === 'release') f.db.exec('DELETE FROM __record_changed');
+    const visits = new Map<string, number>();
+    await prepareIntakeLookupIndices(f.db, {
+      onCheckpoint: ({ sourceId, visited }) => {
+        visits.set(sourceId, Math.max(visits.get(sourceId) ?? 0, visited));
+      },
+    });
+    for (const operation of ['fictional-retained', 'fictional-other-retained'])
+      assert.deepEqual(retainedIntakeAcceptance(f.db, operation), {
+        receipt: { operationId: operation },
+        marker: 'earlier',
+      });
+    if (failure === 'rollback') {
+      assert.equal(retainedIntakeAcceptance(f.db, f.input.operationId), null);
+    } else {
+      assert.equal(
+        (
+          retainedIntakeAcceptance(f.db, f.input.operationId) as {
+            receipt: { operationId: string };
+          }
+        ).receipt.operationId,
+        f.input.operationId,
+      );
+      assert.ok((visits.get(f.selected.id) ?? 0) > 1);
+      assert.equal(visits.get(f.other.id), 1);
     }
   });
 

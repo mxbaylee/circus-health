@@ -44,6 +44,7 @@ import { intakeSourceVersion } from './intake-state-access.ts';
 import {
   nativeIntakeReceiptAppendBasis,
   retainNativeIntakeReceiptAppend,
+  retainNativeIntakeReceiptAppendBatch,
 } from './intake-lookup-projection.ts';
 import {
   collectionClinicalProjectionContext,
@@ -716,6 +717,7 @@ export async function prepareNativeIntakeAcceptance(
       apply() {
         if (disposed) throw Error('Disposed acceptance preparation');
         assertCurrent();
+        retainNativeIntakeReceiptAppendBatch(db, []);
         const footprint =
           reportReceipt && input.retainReportReceipt !== false
             ? captureAcceptanceFootprint(db)
@@ -1126,6 +1128,72 @@ function observeOwnedAcceptanceTransition(
     registry.set(saved.source.id, retainedTransition);
     while (registry.size > 64) registry.delete(registry.keys().next().value!);
   });
+}
+/** Grouped approvals have one journal outcome, but never mint a single-source
+ * batch-revalidation transition. The caller captures before its first write. */
+export function beginOwnedGroupedAcceptanceTransition(db: Database) {
+  const token = currentTransactionToken(db);
+  if (!token) throw Error('Grouped acceptance transition requires an ordinary transaction');
+  const footprint = captureAcceptanceFootprint(db);
+  let stop = () => {},
+    sealed = false,
+    closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    stop();
+    footprint.close();
+  };
+  return {
+    close,
+    seal(input: {
+      operationId: string;
+      fingerprint: string;
+      receipt: IntakeAtomicAcceptanceReceipt;
+      sources: readonly {
+        source: IntakeEnvelopeSource;
+        before: string;
+        after: string;
+        basis: object;
+        proof: object;
+        reader: IntakeCollectionEnvelopeReader;
+      }[];
+    }) {
+      if (closed || sealed) throw Error('Grouped acceptance transition is already sealed');
+      sealed = true;
+      const receipt = structuredClone(input.receipt);
+      const sources = input.sources.map((item) => ({
+        ...item,
+        source: { id: item.source.id, sha256: item.source.sha256 },
+      }));
+      footprint.seal();
+      stop = observeTransactionOutcome(db, (outcome) => {
+        if (outcome.token !== token) return;
+        const exact = footprint.eligible();
+        close();
+        if (
+          !exact ||
+          !outcome.committed ||
+          !outcome.succeeded ||
+          outcome.intakeMaintenance ||
+          sources.some(
+            (item) => intakeSourceVersion(db, item.source.id).logicalBinding !== item.after,
+          )
+        )
+          return;
+        const row = db
+          .prepare('SELECT fingerprint,result_json FROM __record_transactions WHERE operation_id=?')
+          .get(input.operationId);
+        if (
+          !row ||
+          row.fingerprint !== input.fingerprint ||
+          canonicalLiteral(JSON.parse(String(row.result_json))) !== canonicalLiteral(receipt)
+        )
+          return;
+        retainNativeIntakeReceiptAppendBatch(db, sources);
+      });
+    },
+  };
 }
 function transitionCurrent(
   db: Database,
