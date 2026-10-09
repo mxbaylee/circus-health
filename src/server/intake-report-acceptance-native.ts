@@ -38,10 +38,12 @@ import {
 import { buildReportContextLookup } from './intake-report-context.ts';
 import { prepareSourceContextClassificationDerived } from './intake-source-context-state.ts';
 import { prepareWorkflowAcceptanceDerived } from './intake-workflow-update.ts';
+import { prepareIntakeLookupIndices } from './intake-lookup-projection.ts';
 import {
-  assertIntakeDiscoveryRevision,
-  prepareIntakeLookupIndices,
-} from './intake-lookup-projection.ts';
+  consumeIntakeDiscoveryAdmission,
+  disposeIntakeDiscoveryAdmission,
+  prepareIntakeDiscoveryAdmission,
+} from './intake-discovery-admission.ts';
 import type {
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceResult,
@@ -410,19 +412,26 @@ export async function applyNativeAcceptanceGroup(
           },
         });
         try {
-          const receipt = intakeTransaction(
-            db,
-            () => {
-              assertRunning();
-              for (const check of publicationChecks.values()) check();
-              assertIntakeDiscoveryRevision(db, lookup.discoveryRevision);
-              const result = prepared.apply();
-              options.retainResult?.(result);
-              return result;
-            },
-            { operationId: selected.operationId, fingerprint },
-          );
-          return { receipt, replayed: false, durability: flushIntake(db, root, profileId) };
+          const admission = await prepareIntakeDiscoveryAdmission(db, lookup.discoveryRevision, {
+            assertRunning,
+          });
+          try {
+            const receipt = intakeTransaction(
+              db,
+              () => {
+                assertRunning();
+                for (const check of publicationChecks.values()) check();
+                consumeIntakeDiscoveryAdmission(db, admission);
+                const result = prepared.apply();
+                options.retainResult?.(result);
+                return result;
+              },
+              { operationId: selected.operationId, fingerprint },
+            );
+            return { receipt, replayed: false, durability: flushIntake(db, root, profileId) };
+          } finally {
+            disposeIntakeDiscoveryAdmission(admission);
+          }
         } finally {
           prepared.dispose();
         }

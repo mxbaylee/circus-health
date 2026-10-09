@@ -612,6 +612,19 @@ authority proof and checks the current owner and caller cancellation guard befor
 resuming. A changed proof refuses the attempt; closing or aborting the generator
 releases its private policy scratch.
 
+Grouped native acceptance and single native import prepare their final complete
+original-source discovery digest outside the publication transaction. The scan
+uses exact rowid pagination and yields after at most 64 sources, retaining no
+live iterator across a turn. Its one-use admission binds the original raw
+database and TEMP proof, current physical accepted HEAD, profile, clinical
+operation, and disposable generations; the transaction rechecks that proof
+after its existing selected-source publication guards and before the first
+accepted change. Any intervening application transaction, local or peer write,
+authority change, cancellation, or failed proof discards admission. This moves the final
+full-frontier traversal out of the transaction; it does not reduce its total
+source visits, replace selected original-file checks, or make other cold
+preparation changed-source-only.
+
 Grounded source-scope checks retain a lazy, ordered verified prefix on the opened
 collection scope. Each new row still reads the original group and current version
 before comparing boundaries, preserving duplicate order, version selection and
@@ -826,9 +839,9 @@ rows; that counter does not measure all SQLite disk work.
 A controlled comparison uses four complete policy-like traversals and three repeat borrows:
 
 | Question count | Native hydrations, uncached → recipes | Native node reads, uncached → recipes | Unchanged parsed bytes | Added scratch read / write bytes | MAC input bytes |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 8 | 35 → 8 | 15,242 → 5,408 | 92,548 | 76,335 / 22,618 | 123,873 |
-| 32 | 131 → 32 | 90,143 → 35,151 | 346,636 | 280,077 / 90,532 | 464,012 |
+| -------------: | ------------------------------------: | ------------------------------------: | ---------------------: | -------------------------------: | --------------: |
+|              8 |                                35 → 8 |                        15,242 → 5,408 |                 92,548 |                  76,335 / 22,618 |         123,873 |
+|             32 |                              131 → 32 |                       90,143 → 35,151 |                346,636 |                 280,077 / 90,532 |         464,012 |
 
 These stable cases have 27 and 99 recipe hits and no discarded rows. They show
 fewer repeated native value reads alongside added scratch and authentication

@@ -5,7 +5,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { openDatabase, HttpError } from '../database.ts';
+import { DatabaseSync, StatementSync } from 'node:sqlite';
+import { openDatabase, HttpError, currentTransactionToken } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { uploadIntake, proposeConversion } from '../intake.ts';
@@ -20,6 +21,8 @@ import {
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { iterateIntakeEnvelopeText } from '../intake-collection-envelope.ts';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
+import { prepareIntakeLookupIndices } from '../intake-lookup-state.ts';
+import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 
 function line(id: string) {
   return JSON.stringify({
@@ -43,6 +46,167 @@ function line(id: string) {
     },
   });
 }
+
+for (const count of [1, 65])
+  test(
+    `native public acceptance admits a complete ${count}-source frontier outside its transaction`,
+    { timeout: 120000 },
+    async (t) => {
+      const root = mkdtempSync(join(tmpdir(), 'fictional-frontier-acceptance-'));
+      const profileId = 'fictional-frontier';
+      const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+      // Count public acceptance work without filesystem journal publication;
+      // the original integration cases below retain that durability coverage.
+      memoryRecordAuthority(db);
+      t.after(() => {
+        clearIntakeStateCache(db);
+        db.close();
+        rmSync(root, { recursive: true, force: true });
+      });
+      const original = uploadIntake(db, root, profileId, {
+        filename: 'fictional-selected.jsonl',
+        bytes: Buffer.from(line('frontier-selected')),
+      });
+      const proposed = proposeConversion(db, root, profileId, original.id, {
+        version: original.version,
+        jsonlText: line('frontier-selected'),
+        summary: 'Fictional selected record',
+      });
+      for (let index = 1; index < count; index++) {
+        const unrelated = uploadIntake(db, root, profileId, {
+          filename: `fictional-unrelated-${index}.txt`,
+          bytes: Buffer.from(`Fictional unrelated original ${index}`),
+        });
+        await buildIntakeCollectionEnvelope(db, { id: unrelated.id });
+      }
+      await buildIntakeCollectionEnvelope(db, { id: original.id });
+      await prepareCollectionReviewMembership(db, { id: original.id });
+      await prepareIntakeLookupIndices(db);
+      const proposalId = proposed.proposals.at(-1)!.id;
+      const reviewed = prepareCollectionClinicalReview(
+        db,
+        root,
+        profileId,
+        original.id,
+        proposalId,
+      );
+      if (reviewed.status !== 'ready') throw Error('Expected selected native review');
+      const review = reviewed.session.review;
+      const input: IntakeReportAcceptanceRequest = {
+        operationId: randomUUID(),
+        blocks: [
+          {
+            intakeId: original.id,
+            proposalId,
+            intakeVersion: review.version,
+            reviewToken: review.reviewToken,
+            selections: review.records.map((record) => ({
+              recordId: record.id,
+              candidateId: record.candidateId!,
+              candidateVersionId: record.candidateVersionId!,
+              mapping: record.mapping,
+            })),
+          },
+        ],
+      };
+      const prepare = DatabaseSync.prototype.prepare;
+      const get = StatementSync.prototype.get;
+      const all = StatementSync.prototype.all;
+      const iterate = StatementSync.prototype.iterate;
+      const queries = new WeakMap<StatementSync, 'paged' | 'complete'>();
+      let outsideRows = 0,
+        insideRows = 0,
+        rowsAtHostTurn = -1;
+      let hostTurn: Promise<void> | undefined;
+      const countRow = (statement: StatementSync, row: unknown) => {
+        const kind = queries.get(statement);
+        if (!kind || !row) return;
+        if (currentTransactionToken(db)) insideRows++;
+        else if (kind === 'paged') {
+          outsideRows++;
+          hostTurn ??= new Promise<void>((resolve) =>
+            setImmediate(() => {
+              rowsAtHostTurn = outsideRows;
+              resolve();
+            }),
+          );
+        }
+      };
+      DatabaseSync.prototype.prepare = function (sql: string) {
+        const statement = prepare.call(this, sql);
+        if (
+          this === db &&
+          sql.includes("FROM source_files WHERE kind='intake_original'") &&
+          sql.includes('ORDER BY rowid')
+        ) {
+          if (sql.includes('frontier_rowid')) queries.set(statement, 'paged');
+          else if (sql.startsWith('SELECT id,kind,sha256,details_json '))
+            queries.set(statement, 'complete');
+        }
+        return statement;
+      };
+      StatementSync.prototype.get = function (
+        this: StatementSync,
+        ...parameters: Parameters<StatementSync['get']>
+      ) {
+        const row = Reflect.apply(get, this, parameters);
+        countRow(this, row);
+        return row;
+      } as typeof StatementSync.prototype.get;
+      StatementSync.prototype.all = function (
+        this: StatementSync,
+        ...parameters: Parameters<StatementSync['all']>
+      ) {
+        const rows = Reflect.apply(all, this, parameters) as ReturnType<StatementSync['all']>;
+        for (const row of rows) countRow(this, row);
+        return rows;
+      } as typeof StatementSync.prototype.all;
+      StatementSync.prototype.iterate = function (
+        this: StatementSync,
+        ...parameters: Parameters<StatementSync['iterate']>
+      ) {
+        const statement = this;
+        const rows = Reflect.apply(iterate, statement, parameters) as ReturnType<
+          StatementSync['iterate']
+        >;
+        return (function* () {
+          for (const row of rows) {
+            countRow(statement, row);
+            yield row;
+          }
+        })();
+      } as typeof StatementSync.prototype.iterate;
+      let saved: Awaited<ReturnType<typeof acceptIntakeReportSelectionAsync>>;
+      try {
+        saved = await acceptIntakeReportSelectionAsync(db, root, profileId, input);
+        await hostTurn;
+      } finally {
+        DatabaseSync.prototype.prepare = prepare;
+        StatementSync.prototype.get = get;
+        StatementSync.prototype.all = all;
+        StatementSync.prototype.iterate = iterate;
+      }
+      assert.equal(saved.receipt.acceptedCount, 1);
+      assert.equal(saved.replayed, false);
+      const replay = await acceptIntakeReportSelectionAsync(db, root, profileId, input);
+      assert.equal(replay.replayed, true);
+      assert.deepEqual(replay.receipt, saved.receipt);
+      const documents = db.prepare('SELECT title FROM documents').all();
+      assert.deepEqual(
+        documents.map((row) => row.title),
+        ['Fictional frontier-selected'],
+      );
+      t.diagnostic(JSON.stringify({ count, outsideRows, insideRows, rowsAtHostTurn }));
+      assert.equal(
+        insideRows,
+        0,
+        'Complete source enumeration must precede the application transaction',
+      );
+      assert.equal(outsideRows, count, 'Every retained source participates in the final digest');
+      if (count > 64)
+        assert.equal(rowsAtHostTurn, 64, 'A real host turn occurs before scanning the next source');
+    },
+  );
 // Two durable schema migrations plus coupled checkpoint preparation exercise
 // host integration. Work-count assertions, rather than this safety timeout,
 // qualify scaling; slower CI filesystems need time to finish those writes.

@@ -2515,8 +2515,12 @@ export async function importIntakeRead(
               { prepareSourceContextClassificationDerived } =
                 await import('./intake-source-context-state.ts'),
               { prepareWorkflowAcceptanceDerived } = await import('./intake-workflow-update.ts'),
-              { prepareIntakeLookupIndices, assertIntakeDiscoveryRevision } =
-                await import('./intake-lookup-projection.ts'),
+              { prepareIntakeLookupIndices } = await import('./intake-lookup-projection.ts'),
+              {
+                prepareIntakeDiscoveryAdmission,
+                consumeIntakeDiscoveryAdmission,
+                disposeIntakeDiscoveryAdmission,
+              } = await import('./intake-discovery-admission.ts'),
               { buildReportContextLookup } = await import('./intake-report-context.ts');
             await prepareRetainedPlanAccess(db, profileId, id, { assertRunning });
             const mappingVersion = () =>
@@ -2667,16 +2671,25 @@ export async function importIntakeRead(
               });
               if (!prepared.prepared) throw Error('Unexpected private acceptance replay');
               try {
-                intakeTransaction(
+                const admission = await prepareIntakeDiscoveryAdmission(
                   db,
-                  () => {
-                    assertRunning();
-                    assertDerived?.();
-                    assertIntakeDiscoveryRevision(db, lookup.discoveryRevision);
-                    prepared.apply();
-                  },
-                  { operationId, fingerprint },
+                  lookup.discoveryRevision,
+                  { assertRunning },
                 );
+                try {
+                  intakeTransaction(
+                    db,
+                    () => {
+                      assertRunning();
+                      assertDerived?.();
+                      consumeIntakeDiscoveryAdmission(db, admission);
+                      prepared.apply();
+                    },
+                    { operationId, fingerprint },
+                  );
+                } finally {
+                  disposeIntakeDiscoveryAdmission(admission);
+                }
               } finally {
                 prepared.dispose();
               }
