@@ -110,6 +110,7 @@ export function createOwnershipSourceSnapshotPreparation(
       catalogArea: 'builds',
     });
   let finished = false;
+  let published = false;
   const assertCurrent = () => {
     options.assertRunning?.();
     catalog.assertCurrent();
@@ -141,6 +142,17 @@ export function createOwnershipSourceSnapshotPreparation(
   };
   return {
     assertCurrent,
+    assertPublishedCurrent(reference: OwnershipSourceSnapshotReference) {
+      if (!published || JSON.stringify(reference.source) !== JSON.stringify(binding))
+        throw Error('Ownership source snapshot was not published by this preparation');
+      options.assertRunning?.();
+      if (clinicalReviewRevision(db) !== basis)
+        throw Error('Ownership source evidence changed after publication');
+      assertOwnershipSourceSnapshot(db, reference);
+      options.assertRunning?.();
+      if (clinicalReviewRevision(db) !== basis)
+        throw Error('Ownership source evidence changed after publication');
+    },
     async prepareSplit(input: {
       previous?: OwnershipSourceSnapshotReference;
       sourceRecordIds: () => Iterable<string>;
@@ -237,6 +249,7 @@ export function createOwnershipSourceSnapshotPreparation(
           if (disposed) throw Error('Disposed ownership source snapshots');
           assertCurrent();
           collections.commitMaintenance(prepared);
+          published = true;
         },
         dispose() {
           if (disposed) return;

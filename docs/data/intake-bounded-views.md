@@ -1069,6 +1069,22 @@ Person edit can select new warnings without overwriting historical scope rows.
 See the [identity API](../../src/server/INTAKE.md#common-report-identity-review)
 for proof, warning-selector and logical confirmation boundaries.
 
+Native ownership identity snapshot preparation fills its private issue-hash sort
+through indexed reads of the complete current issue policy. Matching and skipped
+issues both count toward host turns, with current source and operation checks after
+each turn and before using the sorted result. The prepared sort can be replayed
+for source membership and report union without refilling the policy or holding a
+SQLite iterator across those turns. Referenced policies keep a mutation witness
+through replay, including same-count edits; native private issue scratch also
+refuses an intervening SQL write. Native inline policies receive a synchronous
+complete canonical check within the existing 128 KiB allowance after maintenance
+and before source snapshot handoff. Manually supplied inline arrays retain the
+legacy synchronous full-array compatibility cost. The legacy hash grammar and
+SQL ordering remain:
+the synchronous selector preserves duplicate hashes, while native snapshot
+membership skips them with an indexed distinct seek. Published snapshots still
+require the source catalog's complete membership and current-authority checks.
+
 The snapshot owner authenticates a complete-evidence alias and source/group
 locator in the existing build report catalog. Fresh complete evidence remains
 required before an accepted alias can reuse retained rows. First certification

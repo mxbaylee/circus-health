@@ -26,6 +26,7 @@ export interface ReviewPolicyValueCollection<T extends { id: string }> extends I
 export type ReviewIssueCollection = ReviewPolicyValueCollection<IntakeReviewIssue>;
 const providers = new WeakMap<IntakeReviewIssuesReference, ReviewIssueCollection>();
 const references = new WeakMap<object, IntakeReviewIssuesReference>();
+const revisions = new WeakMap<ReviewIssueCollection, () => string>();
 
 const encodeIssue = (issue: { id: string }, reset = false) =>
   JSON.stringify({
@@ -96,6 +97,7 @@ export function reviewIssueFactory(
     storage
       .prepare('INSERT INTO intake_review_issue_scope VALUES(?,?,?,?,0)')
       .run(scope, run, input.sourceId, input.generation);
+    let mutationEpoch = 0n;
     const check = () => {
       input.assertCurrent();
       const count = storage
@@ -131,6 +133,7 @@ export function reviewIssueFactory(
           storage
             .prepare('UPDATE intake_review_issue_policy_v2 SET value=? WHERE scope=? AND ordinal=?')
             .run(text, scope, row.ordinal);
+          mutationEpoch++;
           withIntakeWork(db, 'warm', () =>
             recordIntakeWork('reviewIssuePolicyWrittenBytes', Buffer.byteLength(text)),
           );
@@ -142,6 +145,7 @@ export function reviewIssueFactory(
           storage
             .prepare('UPDATE intake_review_issue_policy_v2 SET value=? WHERE scope=? AND ordinal=?')
             .run(encodeIssue(target, stored.reset), scope, row.ordinal);
+          mutationEpoch++;
           return true;
         },
       });
@@ -161,6 +165,16 @@ export function reviewIssueFactory(
         throw Error('Issue policy scratch lost; prepare the current review again');
     };
     const seq = selectedSequence(values);
+    const privateWitness =
+      storage !== db
+        ? {
+            changes: storage.prepare('SELECT total_changes() AS n'),
+            schema: storage.prepare('PRAGMA main.schema_version'),
+            tempSchema: storage.prepare('PRAGMA temp.schema_version'),
+            peer: storage.prepare('PRAGMA data_version'),
+          }
+        : undefined;
+    privateWitness?.changes.setReadBigInts(true);
     const sink: ReviewPolicyValueCollection<T> = {
       [Symbol.iterator]: values,
       get length() {
@@ -182,11 +196,14 @@ export function reviewIssueFactory(
       some: (predicate) => seq.some(predicate),
       markQuestionReset(id) {
         check();
-        storage
-          .prepare(
-            "UPDATE intake_review_issue_policy_v2 SET value=json_set(value,'$.reset',1) WHERE scope=? AND id=?",
-          )
-          .run(scope, id);
+        if (
+          storage
+            .prepare(
+              "UPDATE intake_review_issue_policy_v2 SET value=json_set(value,'$.reset',1) WHERE scope=? AND id=?",
+            )
+            .run(scope, id).changes
+        )
+          mutationEpoch++;
       },
       questionWasReset(id) {
         check();
@@ -213,6 +230,7 @@ export function reviewIssueFactory(
         storage
           .prepare('INSERT INTO intake_review_issue_policy_v2 VALUES(?,?,?,?,?,?,?)')
           .run(scope, run, input.sourceId, input.generation, ordinal, issue.id, value);
+        mutationEpoch++;
         withIntakeWork(db, 'warm', () => {
           recordIntakeWork('reviewIssuePolicyRows', 1);
           recordIntakeWork('reviewIssuePolicyWrittenBytes', Buffer.byteLength(value));
@@ -225,6 +243,17 @@ export function reviewIssueFactory(
     // other typed policy rows are exposed by their own explicit read contracts.
     providers.set(ref, sink as unknown as ReviewIssueCollection);
     references.set(sink, ref);
+    revisions.set(sink as unknown as ReviewIssueCollection, () => {
+      check();
+      if (!privateWitness) return String(mutationEpoch);
+      return [
+        mutationEpoch,
+        privateWitness.changes.get()?.n,
+        privateWitness.schema.get()?.schema_version,
+        privateWitness.tempSchema.get()?.schema_version,
+        privateWitness.peer.get()?.data_version,
+      ].join(':');
+    });
     return sink;
   };
   return Object.assign(create, {
@@ -281,6 +310,9 @@ export function reviewIssueCollection(
   const result = providers.get(record.issuesReference);
   if (!result) throw Error('Unprepared complete issue policy');
   return result;
+}
+export function reviewIssueCollectionRevision(issues: ReviewIssueCollection) {
+  return revisions.get(issues)?.();
 }
 export function reviewRecordIssues(record: Pick<IntakeReviewRecord, 'issues' | 'issuesReference'>) {
   return selectedSequence(reviewIssueCollection(record));

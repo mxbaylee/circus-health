@@ -1,13 +1,20 @@
 import { disposableSqlite } from './disposable-sqlite.ts';
+import { createHash } from 'node:crypto';
+import { canonicalLiteral } from './intake-format.ts';
 import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import {
   ownershipIdentityIssueIncluded,
   type OwnershipIdentityIssues,
 } from './ownership-identity-snapshots.ts';
-import { reviewRecordIssues } from './intake-review-issue-state.ts';
+import {
+  reviewIssueCollection,
+  reviewIssueCollectionRevision,
+  reviewRecordIssues,
+} from './intake-review-issue-state.ts';
 import { selectedSequence } from './intake-selected-sequence.ts';
 import {
   ownershipSortedValues,
+  prepareOwnershipSortedValues,
   ownershipDistinctValues,
   ownershipHoldMessageWork,
   bindOwnershipHoldMessage,
@@ -119,18 +126,90 @@ export function correctedOccurrence(
     personId: a.personId,
   };
 }
+const identityIssueHash = (i: import('../shared/intake.ts').IntakeReviewIssue) =>
+  i.kind === 'identity' &&
+  (i.textAnchor ||
+    i.questionId ||
+    i.resolution?.outcome === 'unknown' ||
+    i.resolution?.outcome === 'other_person')
+    ? ownershipHash([i.prompt, i.textAnchor, i.questionId, i.resolution?.outcome])
+    : undefined;
 export const ownershipIdentityIssues = (record: IntakeReviewRecord) =>
   ownershipSortedValues(function* () {
-    for (const i of reviewRecordIssues(record))
-      if (
-        i.kind === 'identity' &&
-        (i.textAnchor ||
-          i.questionId ||
-          i.resolution?.outcome === 'unknown' ||
-          i.resolution?.outcome === 'other_person')
-      )
-        yield ownershipHash([i.prompt, i.textAnchor, i.questionId, i.resolution?.outcome]);
+    for (const issue of reviewRecordIssues(record)) {
+      const hash = identityIssueHash(issue);
+      if (hash !== undefined) yield hash;
+    }
   });
+export const prepareOwnershipIdentityIssues = async (
+  record: IntakeReviewRecord,
+  assertCurrent: () => void,
+) => {
+  const issues = reviewIssueCollection(record);
+  const issuesField = record.issues;
+  const referenceField = record.issuesReference;
+  const inline = Array.isArray(issues);
+  const count = issues.length;
+  const revision = reviewIssueCollectionRevision(issues);
+  const initial = inline ? createHash('sha256').update('[') : undefined;
+  let inspected = 0;
+  const sorted = await prepareOwnershipSortedValues(
+    {
+      get length() {
+        return issues.length;
+      },
+      at(ordinal) {
+        return issues.at(ordinal);
+      },
+      revision() {
+        return reviewIssueCollectionRevision(issues);
+      },
+    },
+    (issue) => {
+      if (initial) {
+        if (inspected++) initial.update(',');
+        initial.update(canonicalLiteral(issue));
+      }
+      return identityIssueHash(issue);
+    },
+    () => {
+      assertCurrent();
+      if (
+        record.issues !== issuesField ||
+        record.issuesReference !== referenceField ||
+        (referenceField && reviewIssueCollection(record) !== issues)
+      )
+        throw Error('Ownership identity issue policy changed during preparation');
+    },
+  );
+  const digest = initial?.update(']').digest('hex');
+  return {
+    ...sorted,
+    assertSame(assertTerminal: () => void = assertCurrent) {
+      assertTerminal();
+      if (
+        record.issues !== issuesField ||
+        record.issuesReference !== referenceField ||
+        issues.length !== count ||
+        reviewIssueCollectionRevision(issues) !== revision
+      )
+        throw Error('Ownership identity issue policy changed during preparation');
+      if (inline) {
+        const current = createHash('sha256').update('[');
+        for (let ordinal = 0; ordinal < count; ordinal++) {
+          const issue = issues.at(ordinal);
+          if (issue === undefined)
+            throw Error('Ownership identity issue policy changed during preparation');
+          if (ordinal) current.update(',');
+          current.update(canonicalLiteral(issue));
+        }
+        if (issues.length !== count || current.update(']').digest('hex') !== digest)
+          throw Error('Ownership identity issue policy changed during preparation');
+      }
+      assertTerminal();
+    },
+  };
+};
 const holds = new WeakMap<
   IntakeReviewRecord,
   { before: IntakeReviewRecord['identityReview']; hold: IntakeReviewRecord['identityReview'] }

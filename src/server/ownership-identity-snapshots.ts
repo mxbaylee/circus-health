@@ -1,4 +1,8 @@
-import { ownershipIdentityIssues, ownershipSourceAuthority } from './record-ownership-authority.ts';
+import {
+  prepareOwnershipIdentityIssues,
+  ownershipSourceAuthority,
+} from './record-ownership-authority.ts';
+import { setImmediate } from 'node:timers/promises';
 import { latestOwnershipDecision } from './ownership-journal.ts';
 /** Ownership issue membership shares the checked immutable string-set codec. Its
  * wrapper identifies hashes as reviewed identity evidence, never source IDs. */
@@ -33,13 +37,14 @@ export async function prepareOwnershipIdentityIssueSnapshot(
   factory: ReturnType<typeof createOwnershipSourceSnapshotPreparation>,
   values: () => Iterable<string>,
   previous?: OwnershipIdentityIssues,
+  options: { deferMaintenance?: boolean } = {},
 ) {
   const snapshot = await factory.prepareSplit({
     previous: previous && !Array.isArray(previous) ? previous.snapshot : undefined,
     sourceRecordIds: values,
     movingSourceRecordIds: () => [],
   });
-  await factory.finishMaintenance();
+  if (!options.deferMaintenance) await factory.finishMaintenance();
   return { format: 'health-ownership-identity-issues-v1', snapshot: snapshot.remaining } as const;
 }
 
@@ -77,28 +82,43 @@ export async function prepareOwnershipIdentitySnapshots(
     const previous = source.identity
       ? ownershipSourceAuthority(db, source.identity)?.identityIssues
       : undefined;
-    const values = function* () {
-      let previous: string | undefined;
-      for (const hash of ownershipIdentityIssues(record)) {
-        if (hash !== previous) {
-          yield hash;
-          previous = hash;
-        }
+    const factory = input.factory(source.intakeId);
+    const sorted = await prepareOwnershipIdentityIssues(record, () => factory.assertCurrent());
+    try {
+      const values = () => sorted.distinctValues();
+      let reference: OwnershipIdentityIssuesReference | undefined;
+      if (!prepared) {
+        reference = await prepareOwnershipIdentityIssueSnapshot(factory, values, previous, {
+          deferMaintenance: true,
+        });
       }
-    };
-    if (!prepared) {
-      const reference = await prepareOwnershipIdentityIssueSnapshot(
-        input.factory(source.intakeId),
-        values,
-        previous,
-      );
-      sql
-        .prepare('INSERT INTO ownership_identity_snapshots VALUES(?,?,?)')
-        .run(source.intakeId, source.recordId, JSON.stringify(reference));
+      if (input.report && source.reportMember && source.intakeId === input.report.intakeId) {
+        const put = sql.prepare('INSERT OR IGNORE INTO ownership_identity_union VALUES(?)');
+        let inspected = 0;
+        for (const value of values()) {
+          factory.assertCurrent();
+          put.run(value);
+          if (++inspected % 16 === 0) {
+            await setImmediate();
+            factory.assertCurrent();
+          }
+        }
+        factory.assertCurrent();
+      }
+      if (!prepared) await factory.finishMaintenance();
+      if (reference) factory.assertPublishedCurrent(reference.snapshot);
+      else factory.assertCurrent();
+      sorted.assertSame(() => {
+        if (reference) factory.assertPublishedCurrent(reference.snapshot);
+        else factory.assertCurrent();
+      });
+      if (reference)
+        sql
+          .prepare('INSERT INTO ownership_identity_snapshots VALUES(?,?,?)')
+          .run(source.intakeId, source.recordId, JSON.stringify(reference));
+    } finally {
+      sorted.close();
     }
-    if (input.report && source.reportMember && source.intakeId === input.report.intakeId)
-      for (const value of values())
-        sql.prepare('INSERT OR IGNORE INTO ownership_identity_union VALUES(?)').run(value);
   }
   let report: OwnershipIdentityIssuesReference | undefined;
   if (input.report) {
@@ -111,10 +131,16 @@ export async function prepareOwnershipIdentitySnapshots(
     report = await prepareOwnershipIdentityIssueSnapshot(
       input.factory(input.report.intakeId),
       function* () {
-        for (const row of sql
-          .prepare('SELECT value FROM ownership_identity_union ORDER BY value')
-          .iterate())
-          yield String(row.value);
+        let row = sql
+          .prepare('SELECT value FROM ownership_identity_union ORDER BY value LIMIT 1')
+          .get() as { value: string } | undefined;
+        const next = sql.prepare(
+          'SELECT value FROM ownership_identity_union WHERE value>? ORDER BY value LIMIT 1',
+        );
+        while (row) {
+          yield row.value;
+          row = next.get(row.value) as { value: string } | undefined;
+        }
       },
       prior,
     );

@@ -1,6 +1,7 @@
 import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { registerLiteralSharedValue } from './intake-format.ts';
 import { createHash } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { selectedSequence } from './intake-selected-sequence.ts';
 import { registerReviewRecordField } from './intake-review-selected-record.ts';
@@ -24,6 +25,92 @@ export function ownershipSortedValues(read: () => Iterable<string>, unique = fal
       scratch.close();
     }
   });
+}
+
+/** Fill a private sort cooperatively; point reads and keyset replay never suspend a live iterator. */
+export async function prepareOwnershipSortedValues<T>(
+  read: {
+    readonly length: number;
+    at(ordinal: number): T | undefined;
+    revision?(): string | undefined;
+  },
+  valueOf: (value: T) => string | undefined,
+  assertCurrent: () => void,
+) {
+  const scratch = disposableSqlite('circus-ownership-identity-');
+  let closed = false;
+  try {
+    scratch.db.exec(
+      'CREATE TABLE values_(ordinal INTEGER PRIMARY KEY,value TEXT NOT NULL); CREATE INDEX sorted ON values_(value,ordinal);',
+    );
+    const put = scratch.db.prepare('INSERT INTO values_(value) VALUES(?)');
+    assertCurrent();
+    const count = read.length;
+    const revision = read.revision?.();
+    const assertValid = () => {
+      assertCurrent();
+      if (read.length !== count || read.revision?.() !== revision)
+        throw Error('Ownership identity issue policy changed during preparation');
+    };
+    for (let ordinal = 0; ordinal < count; ordinal++) {
+      assertValid();
+      const issue = read.at(ordinal);
+      if (issue === undefined)
+        throw Error('Ownership identity issue policy changed during preparation');
+      const value = valueOf(issue);
+      if (value !== undefined) put.run(value);
+      if ((ordinal + 1) % 16 === 0) {
+        await setImmediate();
+        assertValid();
+      }
+    }
+    if (!count) {
+      await setImmediate();
+      assertValid();
+    }
+    assertValid();
+    const first = scratch.db.prepare(
+      'SELECT ordinal,value FROM values_ ORDER BY value,ordinal LIMIT 1',
+    );
+    const next = scratch.db.prepare(
+      'SELECT ordinal,value FROM values_ WHERE (value,ordinal)>(?,?) ORDER BY value,ordinal LIMIT 1',
+    );
+    const nextDistinct = scratch.db.prepare(
+      'SELECT ordinal,value FROM values_ WHERE value>? ORDER BY value,ordinal LIMIT 1',
+    );
+    const sequence = (distinct: boolean) =>
+      selectedSequence(function* () {
+        if (closed) throw Error('Closed ownership identity sort');
+        assertValid();
+        let row = first.get() as { ordinal: number; value: string } | undefined;
+        while (row) {
+          assertValid();
+          yield row.value;
+          if (closed) throw Error('Closed ownership identity sort');
+          assertValid();
+          row = (distinct ? nextDistinct.get(row.value) : next.get(row.value, row.ordinal)) as
+            { ordinal: number; value: string } | undefined;
+        }
+        assertValid();
+      });
+    return {
+      assertCurrent: assertValid,
+      values() {
+        return sequence(false);
+      },
+      distinctValues() {
+        return sequence(true);
+      },
+      close() {
+        if (closed) return;
+        closed = true;
+        scratch.close();
+      },
+    };
+  } catch (error) {
+    scratch.close();
+    throw error;
+  }
 }
 export function ownershipDistinctValues(read: () => Iterable<string>) {
   return selectedSequence(function* () {
