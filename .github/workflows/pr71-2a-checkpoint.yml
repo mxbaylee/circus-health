@@ -18,41 +18,27 @@ jobs:
     timeout-minutes: 15
     env:
       HUSKY: '0'
-      OUTPUT: /tmp/pr71-projection-comparison
+      OUTPUT: /tmp/pr71-e476-grounding
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 15036736e60cabbacdc48cc8229297373b9e0eaf
-          path: before
-          persist-credentials: false
-          fetch-depth: 1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: 12c9bd4bf1ca600c3b30e49d73bd93cabe342a0d
-          path: after
+          ref: e4763406356b1a3c5ec33568d18676bc0206e695
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version-file: after/.nvmrc
+          node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-        working-directory: before
-      - run: npm ci
-        working-directory: after
-      - name: Compare bounded projection work on one host including final drains
+      - name: Count bounded publication and native review work on pinned source
         env:
           CRS_IDENTITY_GROUNDING_DIAGNOSTIC: '1'
           CRS_IDENTITY_GROUNDING_DIAGNOSTIC_EXTENDED: '1'
         run: |
           set -o pipefail
           mkdir -p "$OUTPUT"
-          status=0
-          for source in before after; do
-            git -C "$source" rev-parse HEAD > "$OUTPUT/$source-source-sha.txt"
-            (cd "$source" && node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts) 2>&1 | tee "$OUTPUT/$source.log" || status=1
-          done
-          exit "$status"
+          git rev-parse HEAD > "$OUTPUT/source-sha.txt"
+          node --test --test-name-pattern='native identity grounding phase counts: 32 new artifacts' src/server/test/intake-history-publication.test.ts 2>&1 | tee "$OUTPUT/grounding.log"
       - name: Hash diagnostic evidence
         if: always()
         run: |
@@ -61,7 +47,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr71-projection-comparison
-          path: /tmp/pr71-projection-comparison
+          name: pr71-e476-grounding
+          path: /tmp/pr71-e476-grounding
           if-no-files-found: error
           retention-days: 14
