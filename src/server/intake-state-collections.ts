@@ -1889,7 +1889,6 @@ export function createIntakeCollections(owner: {
             readByteRange(pages, value, { after, items: 64, bytes }),
         };
         const result = stepSchemaRecordCursor(cursor, port, recordCursorToken);
-        current();
         ready();
         if (retained.poisoned) invalid('poisoned record cursor');
         return result;

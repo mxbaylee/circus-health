@@ -76,8 +76,8 @@ async function fixture(t: test.TestContext, extras = 0, longLexical = false) {
     'envelope.data',
   )!;
   const prefix = intakeNamespace(identity) + 'node:';
-  function nodeFor(cell: string) {
-    let ref = descriptor.root;
+  function nodeFor(cell: string, root = descriptor.root) {
+    let ref = root;
     while (ref) {
       const key = prefix + ref.hash;
       const raw = String(db.prepare('SELECT value FROM main.app_meta WHERE key=?').get(key)!.value);
@@ -113,7 +113,8 @@ async function fixture(t: test.TestContext, extras = 0, longLexical = false) {
     read,
     expected,
     raw,
-    nodes: cells.map(nodeFor),
+    nodes: cells.map((cell) => nodeFor(cell)),
+    directoryNode: nodeFor('envelope.data', selected.head.logical.root),
   };
 }
 
@@ -446,6 +447,94 @@ test('native record step refuses TEMP or selected-source drift before a chunk', 
       f.authority.storage.read = original;
       owner.closeCursor(cursor);
     }
+  }
+});
+
+test('native record step refuses after-entry local ABA, rollback, registry, and final HEAD loss', async (t) => {
+  for (const change of [
+    'logical-aba',
+    'descriptor-aba',
+    'rollback',
+    'registry',
+    'head-loss',
+  ] as const) {
+    const f = await fixture(t, 1);
+    const owner = intakeSchemaRecordOwner(f.selected.collections)!;
+    const cursor = owner.createCursor(
+      f.selected.collections.openView(),
+      f.id,
+      'logical',
+      'envelope.data',
+    )!;
+    const original = f.authority.storage.read;
+    let headReads = 0;
+    let changed = false;
+    f.authority.storage.read = function (name) {
+      if (name === 'head' && ++headReads === 2) {
+        changed = true;
+        if (change === 'head-loss') return null;
+        if (change === 'registry') clearIntakeStateCache(f.db);
+        else {
+          const node = change === 'descriptor-aba' ? f.directoryNode : f.nodes[0]!;
+          if (change === 'rollback') f.db.exec('SAVEPOINT record_step_rollback');
+          f.db
+            .prepare('UPDATE main.app_meta SET value=? WHERE key=?')
+            .run(node.raw + ' ', node.key);
+          if (change === 'rollback') f.db.exec('ROLLBACK TO record_step_rollback');
+          else f.db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run(node.raw, node.key);
+          if (change === 'rollback') f.db.exec('RELEASE record_step_rollback');
+        }
+      }
+      return original(name);
+    };
+    try {
+      assert.throws(() => owner.nextCursor(cursor), /authority|record|head|storage/i);
+      assert.equal(changed, true, `${change} reached the final physical proof`);
+      assert.equal(headReads, 2);
+      assert.throws(() => owner.nextCursor(cursor), /foreign|poisoned|tainted|record cursor/i);
+    } finally {
+      f.authority.storage.read = original;
+      owner.closeCursor(cursor);
+    }
+  }
+});
+
+test('native record step refuses an after-entry peer commit', async (t) => {
+  const f = await fixture(t, 1);
+  const peer = openDatabase(f.path, f.authority.profileId);
+  t.after(() => {
+    if (peer.isOpen) peer.close();
+  });
+  f.authority.attach(peer);
+  const owner = intakeSchemaRecordOwner(f.selected.collections)!;
+  const cursor = owner.createCursor(
+    f.selected.collections.openView(),
+    f.id,
+    'logical',
+    'envelope.data',
+  )!;
+  const original = f.authority.storage.read;
+  let headReads = 0;
+  let changed = false;
+  f.authority.storage.read = function (name) {
+    if (name === 'head' && ++headReads === 2) {
+      changed = true;
+      peer
+        .prepare('UPDATE main.app_meta SET value=? WHERE key=?')
+        .run(f.directoryNode.raw + ' ', f.directoryNode.key);
+      peer
+        .prepare('UPDATE main.app_meta SET value=? WHERE key=?')
+        .run(f.directoryNode.raw, f.directoryNode.key);
+    }
+    return original(name);
+  };
+  try {
+    assert.throws(() => owner.nextCursor(cursor), /authority|record|head|storage/i);
+    assert.equal(changed, true);
+    assert.equal(headReads, 2);
+  } finally {
+    f.authority.storage.read = original;
+    owner.closeCursor(cursor);
   }
 });
 
