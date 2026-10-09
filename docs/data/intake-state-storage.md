@@ -153,6 +153,12 @@ Selected envelope consumers reuse at most 32 storage handles per database after 
 
 Ordinary domain publication retains the existing accepted-record transaction and clinical revision behavior. Maintenance publication is narrower: a private host capability binds exact before/after heads, source details/pins, intended result and changed rows. The database verifies the captured write set and readback. It permits auxiliary changes or a separately certified representation transition, never a caller Boolean authorizing clinical-revision suppression. A derived projection may prepare against the exact prospective logical descriptor, checkpoint auxiliary work, then reprepare against the latest auxiliary head. The final owner verifies that its logical descriptor is unchanged and its added changes are auxiliary only.
 
+Collection-node staging uses one 32 KiB-bounded immutable collision read to
+determine whether a node was newly inserted, followed by the separate bounded
+readback. The insertion result also drives the written-node counters. It does
+not change the accepted transaction, collision refusal, durable journal or
+recovery authority; it removes a duplicate metadata lookup for each staged node.
+
 Maintenance metadata checks reuse at most two lazily prepared SQL statements within
 one synchronous preparation, transaction-entry or readback invocation. They still
 execute the separate length and value reads in their original order for every

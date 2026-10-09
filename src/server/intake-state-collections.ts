@@ -36,6 +36,7 @@ import {
   decodeIntakeTreeNode,
   intakeTreeRef,
   intakeTreeKey,
+  INTAKE_TREE_PAGE_BYTES,
   INTAKE_TREE_VALUE_BYTES,
   type IntakeTreeCachedNode,
   type IntakeTreeReadCertificate,
@@ -381,7 +382,7 @@ export function createIntakeCollections(owner: {
   prefix: string;
   ready: () => void;
   get: (key: string, maxBytes?: number) => unknown;
-  immutable: (key: string, value: string) => void;
+  immutable: (key: string, value: string, maxBytes?: number) => boolean;
   invalidate: () => void;
   legacyMaterialization: (head: Head) => IntakeStateMaterialization;
 }) {
@@ -1745,10 +1746,9 @@ export function createIntakeCollections(owner: {
         // bytes are private; writes/readback remain inside the existing transaction.
         for (const row of data.writes) {
           if (row.key === headKey) continue;
-          const existed = get(row.key) !== undefined;
-          immutable(row.key, row.value);
+          const inserted = immutable(row.key, row.value, INTAKE_TREE_PAGE_BYTES);
           if (get(row.key) !== row.value) invalid('collection staged readback');
-          if (!existed) {
+          if (inserted) {
             recordIntakeWork('collectionNodesWritten');
             recordIntakeWork('collectionWrittenBytes', Buffer.byteLength(row.value));
           }

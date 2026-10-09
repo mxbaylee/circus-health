@@ -90,6 +90,264 @@ function mutate(
   return transaction(db, () => store.stage(prepared));
 }
 
+test('immutable staging makes one bounded collision read and one bounded readback per new node', (t) => {
+  const { db, identity } = fixture(t);
+  const nodePrefix = intakeNamespace(identity) + 'node:';
+  const boundedReads = new Map<string, number>();
+  const unboundedReads = new Map<string, number>();
+  const inserted = new Set<string>();
+  const nativePrepare = db.prepare.bind(db);
+  let staging = false;
+  t.mock.method(db, 'prepare', (sql: string) => {
+    const statement = nativePrepare(sql);
+    if (
+      sql.startsWith('SELECT length(CAST(value AS BLOB))') ||
+      sql === 'SELECT value FROM app_meta WHERE key=?'
+    ) {
+      const reads = sql.startsWith('SELECT length(CAST(value AS BLOB))')
+        ? boundedReads
+        : unboundedReads;
+      const get = statement.get;
+      statement.get = (...args) => {
+        const key = args.at(-1);
+        if (staging && typeof key === 'string' && key.startsWith(nodePrefix))
+          reads.set(key, (reads.get(key) ?? 0) + 1);
+        return Reflect.apply(get, statement, args);
+      };
+    }
+    if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
+      const run = statement.run;
+      statement.run = (...args) => {
+        const result = Reflect.apply(run, statement, args);
+        const key = args[0];
+        if (staging && typeof key === 'string' && key.startsWith(nodePrefix)) inserted.add(key);
+        return result;
+      };
+    }
+    return statement;
+  });
+  const store = createIntakeStateStorage(db, identity).collections;
+  mutate(
+    db,
+    store,
+    [{ area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'before' }],
+    1,
+  );
+  const operationId = randomUUID();
+  const prepared = store.prepare(store.openView(), {
+    operationId,
+    requestDigest: digest(operationId),
+    domainVersion: 2,
+    changes: [
+      { area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'after' },
+      { area: 'logical', collection: 'fictional', op: 'put', key: 'second', value: 'fictional' },
+    ],
+  });
+  boundedReads.clear();
+  unboundedReads.clear();
+  inserted.clear();
+  const before = intakeWorkCounters(db).warm.collectionNodesWritten;
+  const result = transaction(db, () => {
+    staging = true;
+    try {
+      return store.stage(prepared);
+    } finally {
+      staging = false;
+    }
+  });
+  assert.ok(inserted.size > 0);
+  for (const key of inserted) {
+    assert.equal(boundedReads.get(key), 2, 'new node needs bounded collision and readback reads');
+    assert.equal(unboundedReads.get(key) ?? 0, 0, 'no unbounded duplicate collision read');
+  }
+  assert.equal(intakeWorkCounters(db).warm.collectionNodesWritten - before, inserted.size);
+  assert.equal(store.get(store.openView(), 'logical', 'fictional', 'second'), 'fictional');
+  assert.deepEqual(store.replay(operationId, digest(operationId)), result);
+});
+
+test('immutable staging reuses an existing equal node without counting a new write', (t) => {
+  const { db, identity, rebuild } = fixture(t);
+  const nodePrefix = intakeNamespace(identity) + 'node:';
+  const rolledBack = new Map<string, string>();
+  const secondInserts = new Set<string>();
+  const nativePrepare = db.prepare.bind(db);
+  let phase: 'setup' | 'rollback' | 'second' = 'setup';
+  let equalKey = '';
+  let equalReads = 0;
+  t.mock.method(db, 'prepare', (sql: string) => {
+    const statement = nativePrepare(sql);
+    if (sql.startsWith('SELECT length(CAST(value AS BLOB))')) {
+      const get = statement.get;
+      statement.get = (...args) => {
+        if (phase === 'second' && args.at(-1) === equalKey) equalReads++;
+        return Reflect.apply(get, statement, args);
+      };
+    }
+    if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
+      const run = statement.run;
+      statement.run = (...args) => {
+        const result = Reflect.apply(run, statement, args);
+        const [key, value] = args;
+        if (typeof key === 'string' && key.startsWith(nodePrefix) && typeof value === 'string') {
+          if (phase === 'rollback') rolledBack.set(key, value);
+          if (phase === 'second') secondInserts.add(key);
+        }
+        return result;
+      };
+    }
+    return statement;
+  });
+  const store = createIntakeStateStorage(db, identity).collections;
+  mutate(
+    db,
+    store,
+    [{ area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'before' }],
+    1,
+  );
+  const selectedBefore = store.binding(store.openView());
+  const operationId = randomUUID();
+  const changes: IntakeCollectionChange[] = [
+    { area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'after' },
+  ];
+  const candidate = () =>
+    store.prepare(store.openView(), {
+      operationId,
+      requestDigest: digest(operationId),
+      domainVersion: 2,
+      changes,
+    });
+  const first = candidate();
+  assert.throws(
+    () =>
+      transaction(db, () => {
+        phase = 'rollback';
+        try {
+          store.stage(first);
+          throw Error('fictional rollback');
+        } finally {
+          phase = 'setup';
+        }
+      }),
+    /fictional rollback/,
+  );
+  assert.ok(rolledBack.size > 0);
+  const [key, equalValue] = rolledBack.entries().next().value!;
+  equalKey = key;
+  transaction(db, () => {
+    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(equalKey, equalValue);
+  });
+  assert.deepEqual(store.binding(store.openView()), selectedBefore);
+  const second = candidate();
+  const before = intakeWorkCounters(db).warm.collectionNodesWritten;
+  const result = transaction(db, () => {
+    phase = 'second';
+    try {
+      return store.stage(second);
+    } finally {
+      phase = 'setup';
+    }
+  });
+  assert.equal(equalReads, 2, 'equal node still receives collision and readback checks');
+  assert.equal(secondInserts.has(equalKey), false);
+  assert.equal(intakeWorkCounters(db).warm.collectionNodesWritten - before, secondInserts.size);
+  assert.equal(store.get(store.openView(), 'logical', 'fictional', 'first'), 'after');
+  const selectedAfter = store.binding(store.openView());
+  const writesAfter = intakeWorkCounters(db).warm.collectionNodesWritten;
+  assert.deepEqual(store.replay(operationId, digest(operationId)), result);
+  assert.deepEqual(store.binding(store.openView()), selectedAfter);
+  assert.equal(intakeWorkCounters(db).warm.collectionNodesWritten, writesAfter);
+  const recovered = createIntakeStateStorage(rebuild(), identity).collections;
+  assert.equal(recovered.get(recovered.openView(), 'logical', 'fictional', 'first'), 'after');
+});
+
+for (const failure of [
+  'oversized collision row',
+  'different collision row',
+  'changed readback',
+] as const)
+  test(`immutable staging refuses ${failure} without publishing a head`, (t) => {
+    const { db, identity } = fixture(t);
+    const nodePrefix = intakeNamespace(identity) + 'node:';
+    const inserted = new Set<string>();
+    const nativePrepare = db.prepare.bind(db);
+    let staging = false;
+    let injected = false;
+    t.mock.method(db, 'prepare', (sql: string) => {
+      const statement = nativePrepare(sql);
+      if (sql.startsWith('SELECT length(CAST(value AS BLOB))')) {
+        const get = statement.get;
+        statement.get = (...args) => {
+          const row = Reflect.apply(get, statement, args);
+          const key = args.at(-1);
+          if (!staging || injected || typeof key !== 'string' || !key.startsWith(nodePrefix))
+            return row;
+          if (failure === 'oversized collision row' && row === undefined) {
+            assert.equal(args[0], 32 * 1024);
+            injected = true;
+            return { bytes: 32 * 1024 + 1, value: undefined };
+          }
+          if (failure === 'different collision row' && row === undefined) {
+            assert.equal(args[0], 32 * 1024);
+            injected = true;
+            return { bytes: 19, value: 'different fictional' };
+          }
+          if (failure === 'changed readback' && inserted.has(key) && row) {
+            injected = true;
+            return { ...row, value: 'tampered fictional node' };
+          }
+          return row;
+        };
+      }
+      if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
+        const run = statement.run;
+        statement.run = (...args) => {
+          const result = Reflect.apply(run, statement, args);
+          const key = args[0];
+          if (staging && typeof key === 'string' && key.startsWith(nodePrefix)) inserted.add(key);
+          return result;
+        };
+      }
+      return statement;
+    });
+    const store = createIntakeStateStorage(db, identity).collections;
+    mutate(
+      db,
+      store,
+      [{ area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'before' }],
+      1,
+    );
+    const before = store.binding(store.openView());
+    const operationId = randomUUID();
+    const prepared = store.prepare(store.openView(), {
+      operationId,
+      requestDigest: digest(operationId),
+      domainVersion: 2,
+      changes: [
+        { area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'after' },
+      ],
+    });
+    assert.throws(
+      () =>
+        transaction(db, () => {
+          staging = true;
+          try {
+            store.stage(prepared);
+          } finally {
+            staging = false;
+          }
+        }),
+      failure === 'oversized collision row'
+        ? /stored row bytes/
+        : failure === 'different collision row'
+          ? /immutable collision/
+          : /staged readback/,
+    );
+    assert.equal(injected, true);
+    assert.deepEqual(store.binding(store.openView()), before);
+    assert.equal(store.get(store.openView(), 'logical', 'fictional', 'first'), 'before');
+    assert.equal(store.replay(operationId, digest(operationId)), undefined);
+  });
+
 test('v4 selected maps, sequences and byte chunks survive accepted-journal rebuild without v3 hydration', (t) => {
   const { db, identity, rebuild } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;

@@ -208,13 +208,14 @@ export function createIntakeStateStorage(
     // invalidation after rollback or uncertain durable publication.
     cacheFor(db);
   }
-  function immutable(key: string, serialized: string) {
-    const old = get(key);
+  function immutable(key: string, serialized: string, maxBytes?: number): boolean {
+    const old = get(key, maxBytes);
     if (old !== undefined) {
       if (old !== serialized) invalid('immutable collision');
-      return;
+      return false;
     }
     insertMeta.run(key, serialized);
+    return true;
   }
   function cachedBasis(basis: Basis, selectedHead: string): CachedBasis {
     freezeValidatedIntakeJson(basis.value);
