@@ -1,4 +1,4 @@
-name: PR71 bounded node codec comparison
+name: PR71 pinned artifact-history preparation diagnostic
 on:
   push:
     branches: [codex/pr71-step0-workspace]
@@ -6,20 +6,24 @@ on:
   workflow_dispatch:
 
 jobs:
-  node-codec-32:
+  artifact-history-257:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 18
     permissions:
       contents: read
+    env:
+      HUSKY: "0"
+      CRS_ARTIFACT_HISTORY_PHASES: "1"
+      CRS_ARTIFACT_HISTORY_DIAGNOSTICS: "1"
     steps:
-      # Diagnostic branch only; never merge into the implementation branch.
+      # Diagnostic branch only; the implementation checkout is pinned independently.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: diagnostic
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 8b1652ef567a4447851a94d1a204c5e846f4eade
+          ref: afecf9f2fc80fe219d74b05a69bfdee9a72a1477
           path: source
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -29,31 +33,27 @@ jobs:
       - name: Install pinned source dependencies
         working-directory: source
         run: npm ci
-      - name: Compare bounded node representations serially
+      - name: Run original 257-artifact fixture with aggregate preparation probe
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/pr71-node-codec"
-          git rev-parse HEAD > "$RUNNER_TEMP/pr71-node-codec/source-head.txt"
-          test "$(git rev-parse HEAD)" = '8b1652ef567a4447851a94d1a204c5e846f4eade'
-          sha256sum src/server/intake-state-tree.ts src/server/intake-state-graph.ts src/server/record-versions.ts src/server/test/intake-history-publication.test.ts ../diagnostic/pr71-node-codec-loader.mjs > "$RUNNER_TEMP/pr71-node-codec/source-sha.txt"
-          for mode in plain compressed; do
-            CRS_NODE_CODEC_DIAGNOSTIC=1 CRS_NODE_CODEC_MODE="$mode" CRS_NODE_CODEC_COUNT=32 CRS_HISTORY_WAL_CHECKPOINT_PAGES=32768 \
-              node --import=../diagnostic/pr71-node-codec-loader.mjs --test --experimental-strip-types \
-                --test-name-pattern='^bounded node codec comparison: 32 artifacts$' \
-                src/server/test/intake-history-publication.test.ts \
-                > "$RUNNER_TEMP/pr71-node-codec/$mode.log" 2>&1
-          done
+          mkdir -p "$RUNNER_TEMP/pr71-afec-history"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr71-afec-history/source-head.txt"
+          git -C ../diagnostic rev-parse HEAD > "$RUNNER_TEMP/pr71-afec-history/diagnostic-head.txt"
+          test "$(git rev-parse HEAD)" = 'afecf9f2fc80fe219d74b05a69bfdee9a72a1477'
+          sha256sum src/server/test/intake-identity-native-artifact-history.test.ts src/server/intake-workflow-command.ts src/server/intake-envelope-mutation.ts src/server/intake-envelope-build.ts src/server/intake-state-collections.ts src/server/record-versions.ts src/scripts/test-suite.ts package-lock.json ../diagnostic/.github/workflows/pr71-2a-checkpoint.yml > "$RUNNER_TEMP/pr71-afec-history/source-sha.txt"
+          npm run test:history -- --test-name-pattern='^native warm identity cooperates across 257 retained proposal artifacts and duplicate occurrences$' \
+            2>&1 | tee "$RUNNER_TEMP/pr71-afec-history/history.log"
       - name: Checksum all available receipts
         if: always()
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/pr71-node-codec"
-          find "$RUNNER_TEMP/pr71-node-codec" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-node-codec/SHA256SUMS"
+          mkdir -p "$RUNNER_TEMP/pr71-afec-history"
+          find "$RUNNER_TEMP/pr71-afec-history" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-afec-history/SHA256SUMS"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: pr71-node-codec-32
-          path: ${{ runner.temp }}/pr71-node-codec
+          name: pr71-afec-history-preparation
+          path: ${{ runner.temp }}/pr71-afec-history
           if-no-files-found: error
