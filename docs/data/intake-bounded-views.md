@@ -736,6 +736,15 @@ If cancellation rejects a newly prepared session, queue lease or plan before
 handoff, its producer disposes that result before admitting the next operation.
 Uncoordinated writes, including rolled-back writes, still invalidate held proofs.
 
+Report-queue page and group GETs bind this slot to their HTTP response lifetime.
+A disconnect removes a waiting read before preparation starts; an active read
+checks cancellation through queue preparation and before returning its result.
+Its existing preparation cleanup finishes before the next owner enters. Normal
+parsed GET completion does not cancel the response. This applies to reads, not
+acceptance replay: disconnecting a review cannot undo an accepted record or
+authorize another write. Source, profile and physical-evidence checks remain
+unchanged, and cancellation does not increase the browser's read deadline.
+
 Source-attention list preparation joins this operation slot, including its dirty
 count reconciliation. A concurrent attention GET waits for native conversion
 instead of changing its raw SQL witness between checkpoints. Trusted nested

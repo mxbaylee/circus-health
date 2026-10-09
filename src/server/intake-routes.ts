@@ -144,11 +144,20 @@ export async function handleIntakeRoute({
       peopleCursor: params.get('peopleCursor'),
       personId: params.get('personId') || undefined,
     };
-    respond(
-      action
-        ? await getIntakeReportQueueGroupRead(db, root, profileId, action, window)
-        : await listIntakeReportQueueRead(db, root, profileId, window),
-    );
+    const lifetime = intakeIdentityRequestLifetime(req, res);
+    try {
+      const result = action
+        ? await getIntakeReportQueueGroupRead(db, root, profileId, action, window, {
+            signal: lifetime.signal,
+          })
+        : await listIntakeReportQueueRead(db, root, profileId, window, {
+            signal: lifetime.signal,
+          });
+      lifetime.signal.throwIfAborted();
+      respond(result);
+    } finally {
+      lifetime.dispose();
+    }
   } else if (method === 'GET' && id === 'source-attention' && !action)
     respond(await listSourceAttentionRead(db, profileId, Number(params.get('offset') || 0)));
   else if (method === 'GET' && id === 'limits') respond(intakeLimits());

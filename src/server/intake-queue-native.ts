@@ -1,4 +1,8 @@
-import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Explicit preparation of the complete visible queue, followed by bounded read contracts. */
 import { setImmediate } from 'node:timers/promises';
@@ -378,16 +382,23 @@ export async function listIntakeReportQueueRead(
   root: string,
   profileId: string,
   input: QueueInput = {},
+  options: { signal?: AbortSignal } = {},
 ) {
   return runExclusiveClinicalOperation(
     db,
-    async () => {
+    async (operation) => {
+      const assertRunning = () => {
+        assertClinicalOperation(db, operation);
+        options.signal?.throwIfAborted();
+      };
+      assertRunning();
       if (!hasNativeIntakeQueue(db, profileId))
         return listIntakeReportQueue(db, root, profileId, input);
-      await prepareCollectionQueueRead(db, root, profileId);
+      await prepareCollectionQueueRead(db, root, profileId, { assertRunning });
+      assertRunning();
       return readCollectionReportQueuePage(db, root, profileId, nativeWindow(input));
     },
-    { operation: currentClinicalOperation(db) },
+    { operation: currentClinicalOperation(db), signal: options.signal },
   );
 }
 export async function getIntakeReportQueueGroupRead(
@@ -396,16 +407,31 @@ export async function getIntakeReportQueueGroupRead(
   profileId: string,
   groupId: string,
   input: QueueInput = {},
+  options: { signal?: AbortSignal } = {},
 ) {
   return runExclusiveClinicalOperation(
     db,
-    async () => {
+    async (operation) => {
+      const assertRunning = () => {
+        assertClinicalOperation(db, operation);
+        options.signal?.throwIfAborted();
+      };
+      assertRunning();
       if (!hasNativeIntakeQueue(db, profileId))
         return getIntakeReportQueueGroup(db, root, profileId, groupId, input);
-      await prepareCollectionQueueRead(db, root, profileId);
-      return readCollectionReportGroupDetail(db, root, profileId, groupId, nativeWindow(input));
+      await prepareCollectionQueueRead(db, root, profileId, { assertRunning });
+      assertRunning();
+      const detail = await readCollectionReportGroupDetail(
+        db,
+        root,
+        profileId,
+        groupId,
+        nativeWindow(input),
+      );
+      assertRunning();
+      return detail;
     },
-    { operation: currentClinicalOperation(db) },
+    { operation: currentClinicalOperation(db), signal: options.signal },
   );
 }
 export async function listIntakeImportFeedRead(

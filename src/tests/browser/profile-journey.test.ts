@@ -1,5 +1,6 @@
 import { launchBrowser, newTestPage } from './harness.ts';
 import { startProcessRuntime } from './process-runtime.ts';
+import { fetchFixtureApi } from './fixture-api-request.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import {
   fixtureApi,
@@ -253,7 +254,8 @@ test(
     await page.getByLabel('Pronouns', { exact: true }).waitFor();
     assert.equal(await page.getByLabel('Pronouns', { exact: true }).inputValue(), 'they/them');
 
-    const profile = (await (await page.request.get(url + '/api/profiles')).json()).data[0];
+    const profile = (await (await fetchFixtureApi(page.request, url + '/api/profiles')).json())
+      .data[0];
     const prefix = `/api/profiles/${profile.id}`;
     async function saveOneRecord(buttonName = 'Confirm & save') {
       const pending = fixtureBrowserResponse(
@@ -314,9 +316,11 @@ test(
       .getByText('1 saved', { exact: true })
       .waitFor();
     const deliveries = (
-      await (await page.request.get(`${url}/api/profiles/${profile.id}/intakes`)).json()
+      await (
+        await fetchFixtureApi(page.request, `${url}/api/profiles/${profile.id}/intakes`)
+      ).json()
     ).data;
-    const downloaded = await page.request.get(url + deliveries[0].contentUrl);
+    const downloaded = await fetchFixtureApi(page.request, url + deliveries[0].contentUrl);
     assert(downloaded.ok());
     assert.deepEqual(await downloaded.body(), original);
 
@@ -469,7 +473,7 @@ test(
     assert.equal(links.length, 2);
     const originals = await Promise.all(
       links.map(async (link) =>
-        Buffer.from(await (await page.request.get(link)).body()).toString(),
+        Buffer.from(await (await fetchFixtureApi(page.request, link)).body()).toString(),
       ),
     );
     assert(originals.includes(original.toString()));
@@ -511,7 +515,9 @@ test(
       .getByText('This exact record is already saved to your profile.', { exact: true })
       .waitFor();
     const retained = (
-      await (await page.request.get(`${url}/api/profiles/${profile.id}/intakes`)).json()
+      await (
+        await fetchFixtureApi(page.request, `${url}/api/profiles/${profile.id}/intakes`)
+      ).json()
     ).data.find((item: { filename: string }) => item.filename === 'fictional-second-results.jsonl');
     const api = fixtureApi(page, url);
     const retainedPath = prefix + '/intakes/' + encodeURIComponent(retained.id);
@@ -595,13 +601,17 @@ test(
     await page.goto(url + '/#/sources');
     await page.getByRole('heading', { name: 'Sources', exact: true }).waitFor();
     assert.equal(await page.getByText('fictional-results.jsonl', { exact: true }).count(), 0);
-    const allProfiles = (await (await page.request.get(url + '/api/profiles')).json()).data;
+    const allProfiles = (await (await fetchFixtureApi(page.request, url + '/api/profiles')).json())
+      .data;
     const second = allProfiles.find(
       (p: { id: string; name: string }) => p.name === 'Second Fictional Person',
     );
     assert.equal(
-      (await (await page.request.get(`${url}/api/profiles/${second.id}/intakes`)).json()).data
-        .length,
+      (
+        await (
+          await fetchFixtureApi(page.request, `${url}/api/profiles/${second.id}/intakes`)
+        ).json()
+      ).data.length,
       0,
     );
     assert.deepEqual(errors, []);
