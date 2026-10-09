@@ -12,6 +12,25 @@ import type { IntakePersonApplyRequest } from '../../shared/intake-people';
 
 const sourceGate = vi.hoisted(() => ({
   listener: undefined as ((pending: boolean) => void) | undefined,
+  flush: undefined as (() => Promise<boolean>) | undefined,
+}));
+vi.mock('../../app/features/import/ImportDetailReview', () => ({
+  ImportDetailReview: ({
+    beforeCloseRef,
+  }: {
+    beforeCloseRef?: { current: (() => Promise<boolean>) | null };
+  }) => {
+    useEffect(() => {
+      if (!beforeCloseRef) return;
+      const flush = () => sourceGate.flush?.() ?? Promise.resolve(true);
+      beforeCloseRef.current = flush;
+      return () => {
+        if (beforeCloseRef.current === flush) beforeCloseRef.current = null;
+      };
+    }, [beforeCloseRef]);
+    return null;
+  },
+  ImportRecordDetail: () => null,
 }));
 vi.mock('../../app/features/import/ImportSourceTextBrowser', () => ({
   ImportSourceTextBrowser: ({
@@ -66,11 +85,12 @@ const json = (data: unknown, status = 200) =>
 beforeEach(() => {
   sessionStorage.clear();
   sourceGate.listener = undefined;
+  sourceGate.flush = undefined;
   replaceProfiles([profile]);
   selectProfile(profile);
 });
 
-it('keeps Add People disabled while source review is pending after receipt recovery', async () => {
+it('blocks Add People when source review becomes pending before or during an awaited close', async () => {
   const people = [person('Fictional Ellis'), person('Fictional Rowan')];
   const operationId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
   sessionStorage.setItem(`circus-health:report-acceptance:${profile.id}`, operationId);
@@ -180,7 +200,11 @@ it('keeps Add People disabled while source review is pending after receipt recov
     }),
   );
   render(
-    <MemoryRouter>
+    <MemoryRouter
+      initialEntries={[
+        '/intakes/import-feed?view=deferred&intake=fictional-intake&group=fictional-group&record=fictional-record',
+      ]}
+    >
       <CollectionImportReview
         initial={feed}
         path="/intakes/import-feed?view=deferred"
@@ -201,6 +225,26 @@ it('keeps Add People disabled while source review is pending after receipt recov
   await waitFor(() => expect(peopleListReads).toBeGreaterThanOrEqual(2));
   await waitFor(() => expect(add).toBeEnabled());
   expect(sourceGate.listener).toBeTypeOf('function');
+  let enteredFlush!: () => void;
+  let finishFlush!: (allowed: boolean) => void;
+  const entered = new Promise<void>((resolve) => {
+    enteredFlush = resolve;
+  });
+  sourceGate.flush = () => {
+    enteredFlush();
+    return new Promise<boolean>((resolve) => {
+      finishFlush = resolve;
+    });
+  };
+  fireEvent.click(add);
+  await entered;
+  await act(async () => {
+    sourceGate.listener!(true);
+    finishFlush(true);
+  });
+  expect(selectedPersonReads).toBe(0);
+  expect(writes).toHaveLength(0);
+  sourceGate.flush = undefined;
   await act(async () => sourceGate.listener!(true));
   // Soft assertions preserve the complete held/released causal trace on red.
   expect.soft(add).toBeDisabled();

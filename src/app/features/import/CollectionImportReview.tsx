@@ -147,16 +147,18 @@ export function CollectionImportReview({
   const [confirmedSavedIds, setConfirmedSavedIds] = useState<string[]>([]);
   const [recentPeople, setRecentPeople] = useState<SavedPersonDestination[]>([]);
   const [pendingSources, setPendingSources] = useState<Set<string>>(() => new Set());
+  const pendingSourcesRef = useRef(pendingSources);
   const inlineBeforeClose = useRef<(() => Promise<boolean>) | null>(null);
   const sourcePending = pendingSources.size > 0;
-  const sourcePendingChange = (key: string, pending: boolean) =>
-    setPendingSources((current) => {
-      if (current.has(key) === pending) return current;
-      const next = new Set(current);
-      if (pending) next.add(key);
-      else next.delete(key);
-      return next;
-    });
+  const sourcePendingChange = (key: string, pending: boolean) => {
+    const current = pendingSourcesRef.current;
+    if (current.has(key) === pending) return;
+    const next = new Set(current);
+    if (pending) next.add(key);
+    else next.delete(key);
+    pendingSourcesRef.current = next;
+    setPendingSources(next);
+  };
   const queryParams = new URLSearchParams(path.split('?')[1]);
   queryParams.set('view', view);
   queryParams.set('limit', '40');
@@ -403,6 +405,8 @@ export function CollectionImportReview({
     !!acceptance.recoveryOperationId ||
     bulk.pending ||
     repairPending;
+  const reviewBlocked = useRef(false);
+  reviewBlocked.current = mutationPending || sourcePending;
   const authorityUnavailable =
     !!page.error ||
     page.loading ||
@@ -428,8 +432,9 @@ export function CollectionImportReview({
     selectionWindowKey,
   });
   async function beforeReviewChange() {
-    if (mutationPending || sourcePending) return false;
-    return (await inlineBeforeClose.current?.()) ?? true;
+    if (reviewBlocked.current || pendingSourcesRef.current.size) return false;
+    const allowed = (await inlineBeforeClose.current?.()) ?? true;
+    return allowed && !reviewBlocked.current && !pendingSourcesRef.current.size;
   }
   async function saveRows(rows: CollectionFeedRecord[]) {
     if (mutationPending || sourcePending || authorityUnavailable || !rows.length)
@@ -512,6 +517,7 @@ export function CollectionImportReview({
       if (
         mutationPending ||
         sourcePending ||
+        pendingSourcesRef.current.size ||
         authorityUnavailable ||
         peoplePage.loading ||
         peoplePage.refreshing ||
