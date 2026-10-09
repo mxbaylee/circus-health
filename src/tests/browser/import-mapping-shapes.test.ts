@@ -112,8 +112,14 @@ const opticalFailureCategory = (reason: string | undefined) =>
           ? 'failed'
           : 'other';
 
+const opticalTimingAfterAcknowledgement = (requestStartMs: number, acknowledgedAt?: number) =>
+  requestStartMs > 0 && acknowledgedAt !== undefined
+    ? requestStartMs >= acknowledgedAt
+    : ('unknown' as const);
+
 type ReportSample = {
-  afterAcknowledgement: boolean;
+  observedAfterAcknowledgement: boolean | 'unknown';
+  timingAfterAcknowledgement: boolean | 'unknown';
   startedMs: number;
   durationMs?: number;
   outcome: 'started' | 'response' | 'finished' | 'failed';
@@ -122,37 +128,47 @@ type ReportSample = {
 
 function createReportSampleTracker() {
   const samples: ReportSample[] = [];
-  const tracked = new WeakMap<object, { sample: ReportSample; started: number }>();
+  const tracked = new Map<object, { sample: ReportSample; started: number }>();
   let overflow = 0;
   return {
     samples,
     get overflow() {
       return overflow;
     },
-    start(request: object, now: number, phaseStarted: number, afterAcknowledgement: boolean) {
+    start(request: object, now: number, phaseStarted: number, acknowledgementObservedAt?: number) {
       if (samples.length >= 4) {
         overflow = Math.min(overflow + 1, 1000);
         return;
       }
       const sample: ReportSample = {
-        afterAcknowledgement,
+        observedAfterAcknowledgement:
+          acknowledgementObservedAt === undefined ? 'unknown' : now >= acknowledgementObservedAt,
+        timingAfterAcknowledgement: 'unknown',
         startedMs: now - phaseStarted,
         outcome: 'started',
       };
       samples.push(sample);
       tracked.set(request, { sample, started: now });
     },
+    acknowledged(now: number) {
+      for (const entry of tracked.values())
+        entry.sample.observedAfterAcknowledgement = entry.started >= now;
+    },
     update(
       request: object,
       now: number,
       outcome: ReportSample['outcome'],
-      afterAcknowledgement: boolean,
+      requestStartMs: number,
+      acknowledgedAt?: number,
       reason?: string,
     ) {
       const entry = tracked.get(request);
       if (!entry) return;
       entry.sample.outcome = outcome;
-      entry.sample.afterAcknowledgement = afterAcknowledgement;
+      entry.sample.timingAfterAcknowledgement = opticalTimingAfterAcknowledgement(
+        requestStartMs,
+        acknowledgedAt,
+      );
       entry.sample.durationMs = Math.max(0, now - entry.started);
       if (outcome === 'failed') entry.sample.failureCategory = opticalFailureCategory(reason);
     },
@@ -224,27 +240,35 @@ test('optical diagnostic JSON preserves nested phase and request evidence', () =
 test('optical report diagnostics retain exact failures and redact app cancellation', () => {
   const tracker = createReportSampleTracker();
   const target = {};
-  tracker.start(target, 110, 100, false);
+  tracker.start(target, 110, 100);
+  assert.equal(tracker.samples[0]?.observedAfterAcknowledgement, 'unknown');
   const generalRing = new Map<object, number>([[target, 110]]);
   for (let index = 0; index < 17; index++) {
     if (generalRing.size === 16) generalRing.delete(generalRing.keys().next().value!);
     generalRing.set({}, index);
   }
   assert.equal(generalRing.has(target), false);
-  tracker.update(target, 20110, 'failed', true, 'net::ERR_ABORTED');
+  tracker.update(target, 20110, 'failed', 0, 100, 'net::ERR_ABORTED');
+  assert.equal(tracker.samples[0]?.observedAfterAcknowledgement, 'unknown');
+  tracker.acknowledged(120);
   assert.deepEqual(tracker.samples, [
     {
-      afterAcknowledgement: true,
+      observedAfterAcknowledgement: false,
+      timingAfterAcknowledgement: 'unknown',
       startedMs: 10,
       durationMs: 20000,
       outcome: 'failed',
       failureCategory: 'aborted',
     },
   ]);
-  for (let index = 0; index < 1004; index++) tracker.start({}, index, 0, true);
+  tracker.start({}, 130, 100, 120);
+  assert.equal(tracker.samples[1]?.observedAfterAcknowledgement, true);
+  for (let index = 0; index < 1004; index++) tracker.start({}, index, 0, 120);
   assert.equal(tracker.samples.length, 4);
   assert.equal(tracker.overflow, 1000);
   assert.equal(opticalFailureCategory('private error text'), 'other');
+  assert.equal(opticalTimingAfterAcknowledgement(0, 100), 'unknown');
+  assert.equal(opticalTimingAfterAcknowledgement(120, 100), true);
   assert.equal(opticalFailureCategory('net::ERR_CONNECTION_RESET'), 'connection-reset');
   assert.equal(opticalFailureCategory('net::ERR_TIMED_OUT'), 'timed-out');
   assert.equal(opticalFailureCategory('net::ERR_FAILED'), 'failed');
@@ -310,6 +334,8 @@ test(
     let evictedBrowserRequests = 0;
     let firstAcceptancePaths: { acceptance: string; report: string; intakeId: string } | undefined;
     let firstAcceptanceAcknowledgedAt: number | undefined;
+    let firstAcceptanceAcknowledgedObservedAt: number | undefined;
+    let firstAcceptanceAcknowledgedMs: number | undefined;
     const firstAcceptanceReport = createReportSampleTracker();
     const reportRouteApiEvents: Array<NonNullable<ReturnType<typeof opticalReportApiEvent>>> = [];
     let reportRouteApiOverflow = 0;
@@ -381,6 +407,7 @@ test(
       currentAwait,
       phaseDurationMs: Date.now() - phaseStarted,
       firstAcceptance,
+      firstAcceptanceAcknowledgedMs: firstAcceptanceAcknowledgedMs ?? null,
       firstAcceptanceReportSamples: firstAcceptanceReport.samples,
       firstAcceptanceReportOverflow: firstAcceptanceReport.overflow,
       // These app events cover the redacted report route, not one exact query.
@@ -492,7 +519,7 @@ test(
               request,
               Date.now(),
               phaseStarted,
-              afterFirstAcceptanceAcknowledgement(request),
+              firstAcceptanceAcknowledgedObservedAt,
             );
         }
         browserApiStarted++;
@@ -532,7 +559,8 @@ test(
             request,
             Date.now(),
             'finished',
-            afterFirstAcceptanceAcknowledgement(request),
+            request.timing().startTime,
+            firstAcceptanceAcknowledgedAt,
           );
         finish(request, (await request.response().catch(() => null))?.status() ?? 'failed');
       };
@@ -545,7 +573,8 @@ test(
             request,
             Date.now(),
             'failed',
-            afterFirstAcceptanceAcknowledgement(request),
+            request.timing().startTime,
+            firstAcceptanceAcknowledgedAt,
             request.failure()?.errorText,
           );
         }
@@ -561,7 +590,8 @@ test(
             response.request(),
             Date.now(),
             'response',
-            afterFirstAcceptanceAcknowledgement(response.request()),
+            response.request().timing().startTime,
+            firstAcceptanceAcknowledgedAt,
           );
       };
       page.on('request', onRequest);
@@ -1088,6 +1118,9 @@ test(
         return false;
       saveAcknowledgedAt = acknowledgementTime(response);
       firstAcceptanceAcknowledgedAt = saveAcknowledgedAt;
+      firstAcceptanceAcknowledgedObservedAt = Date.now();
+      firstAcceptanceAcknowledgedMs = firstAcceptanceAcknowledgedObservedAt - phaseStarted;
+      firstAcceptanceReport.acknowledged(firstAcceptanceAcknowledgedObservedAt);
       firstAcceptance.firstSaveMatched = true;
       return true;
     }).then((response) => {
