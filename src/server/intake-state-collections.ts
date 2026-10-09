@@ -49,7 +49,7 @@ import {
 import type { SchemaRecord, SchemaTarget } from './intake-envelope-schema.ts';
 import {
   createSchemaRecordCursor,
-  stepSchemaRecordCursor,
+  stepSchemaRecordCursorBatch,
   closeSchemaRecordCursor,
   schemaRecordCursorRevision,
   type SchemaRecordCursor,
@@ -1932,7 +1932,7 @@ export function createIntakeCollections(owner: {
           chunks: (value, after, bytes = 4096) =>
             readByteRange(pages, value, { after, items: 64, bytes }),
         };
-        const result = stepSchemaRecordCursor(cursor, port, recordCursorToken);
+        const result = stepSchemaRecordCursorBatch(cursor, port, recordCursorToken);
         ready();
         if (retained.poisoned) invalid('poisoned record cursor');
         return result;

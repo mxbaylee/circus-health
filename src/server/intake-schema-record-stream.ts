@@ -1,6 +1,7 @@
 import { schemaResolvedHeader, schemaResolvedOrder } from './intake-schema-record-resolution.ts';
 import type { SchemaOrder, SchemaRecord } from './intake-envelope-schema.ts';
 import type { EnvelopeCellReader } from './intake-collection-envelope.ts';
+import { recordIntakeWork } from './intake-work-accounting.ts';
 
 const fail = (reason: string): never => {
   throw Error(`Intake collection envelope: ${reason}`);
@@ -108,6 +109,8 @@ export interface SchemaRecordCursor {
 interface CursorState {
   active: EnvelopeCellReader | undefined;
   iterator: Generator<string>;
+  pending: string | undefined;
+  pendingDone: boolean;
   closed: boolean;
   ownerToken: object | undefined;
   tainted: boolean;
@@ -121,6 +124,8 @@ export function createSchemaRecordCursor(id: string, ownerToken?: object): Schem
   const state: CursorState = {
     active: undefined,
     iterator: undefined!,
+    pending: undefined,
+    pendingDone: false,
     closed: false,
     ownerToken,
     tainted: false,
@@ -155,11 +160,108 @@ export function stepSchemaRecordCursor(
   state.revision++;
   state.active = port;
   try {
+    if (state.pending !== undefined) {
+      port.check();
+      const value = state.pending;
+      state.pending = undefined;
+      return { done: false, value };
+    }
+    if (state.pendingDone) {
+      port.check();
+      state.pendingDone = false;
+      state.closed = true;
+      return { done: true, value: undefined };
+    }
     const result = state.iterator.next();
     if (result.done) state.closed = true;
     return result;
   } catch (error) {
     state.closed = true;
+    throw error;
+  } finally {
+    state.active = undefined;
+  }
+}
+
+function utf8Prefix(text: string, maxBytes: number): [string, string] {
+  let end = 0;
+  let bytes = 0;
+  for (const scalar of text) {
+    const next = Buffer.byteLength(scalar);
+    if (bytes + next > maxBytes) break;
+    bytes += next;
+    end += scalar.length;
+  }
+  if (end === 0) return fail('lexical fragment byte budget');
+  return [text.slice(0, end), text.slice(end)];
+}
+
+/** The fixed owner can consume a few lexical pieces under one fresh read seal. */
+export function stepSchemaRecordCursorBatch(
+  cursor: SchemaRecordCursor,
+  port: EnvelopeCellReader,
+  ownerToken: object,
+): IteratorResult<string> {
+  const state = cursors.get(cursor);
+  if (!state) return fail('foreign record cursor');
+  if (ownerToken !== state.ownerToken) {
+    state.tainted = true;
+    state.revision++;
+    return fail('tainted record cursor');
+  }
+  if (state.closed || state.active) return fail('closed record cursor');
+  if (state.tainted) return fail('tainted record cursor');
+  state.revision++;
+  state.active = port;
+  try {
+    let text = '';
+    let bytes = 0;
+    for (let pieces = 0; pieces < 4; pieces++) {
+      if (state.pendingDone) {
+        port.check();
+        state.pendingDone = false;
+        state.closed = true;
+        return { done: true, value: undefined };
+      }
+      let next: IteratorResult<string>;
+      if (state.pending !== undefined) {
+        port.check();
+        next = { done: false, value: state.pending };
+        state.pending = undefined;
+      } else {
+        recordIntakeWork('nativeSchemaRecordIntrinsicAdvances');
+        next = state.iterator.next();
+      }
+      if (next.done) {
+        if (text) {
+          state.pendingDone = true;
+          break;
+        }
+        state.closed = true;
+        return next;
+      }
+      const part = next.value;
+      const partBytes = Buffer.byteLength(part);
+      if (partBytes > 4099) return fail('lexical fragment byte budget');
+      if (bytes + partBytes <= 4096) {
+        text += part;
+        bytes += partBytes;
+        continue;
+      }
+      if (text) {
+        state.pending = part;
+        break;
+      }
+      const [prefix, suffix] = utf8Prefix(part, 4096);
+      text = prefix;
+      state.pending = suffix;
+      break;
+    }
+    return { done: false, value: text };
+  } catch (error) {
+    state.closed = true;
+    state.pending = undefined;
+    state.pendingDone = false;
     throw error;
   } finally {
     state.active = undefined;
@@ -176,6 +278,8 @@ export function closeSchemaRecordCursor(cursor: SchemaRecordCursor): void {
   }
   state.revision++;
   state.closed = true;
+  state.pending = undefined;
+  state.pendingDone = false;
   state.iterator.return(undefined);
 }
 

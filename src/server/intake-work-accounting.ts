@@ -89,6 +89,7 @@ const hostTemplate = {
   identitySnapshotAliasHits: 0,
   collectionByteChunkReads: 0,
   collectionByteChunkReadBytes: 0,
+  nativeSchemaRecordIntrinsicAdvances: 0,
   identityFragmentLegacyReadBytes: 0,
   identityPreviewFullPreparations: 0,
   identityPreviewArtifactChecks: 0,

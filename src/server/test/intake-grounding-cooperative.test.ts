@@ -1,10 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { readdirSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { canonicalLiteral } from '../intake-format.ts';
+import { openDatabase, transaction } from '../database.ts';
+import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
+import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import { collectionCellReader, createSchemaEnvelopeReader } from '../intake-collection-envelope.ts';
+import { parseSchemaControl } from '../intake-envelope-schema.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import { collectionWorkflowReviewScope } from '../intake-review-collection.ts';
 import type { ReportSnapshotCatalog } from '../intake-report-snapshot-catalog.ts';
 import { retainedEnvelopeReader } from './helpers/retained-envelope-reader.ts';
@@ -183,6 +192,147 @@ function fixture(t: test.TestContext) {
     receipt,
   };
 }
+
+async function nativeBoundaryFixture(t: test.TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-native-grounding-boundary-'));
+  const profileId = 'fictional-native-boundary';
+  const sourceId = 'fictional-original';
+  const sourceHash = 'c'.repeat(64);
+  const db = openDatabase(join(root, 'current.sqlite'), profileId);
+  memoryRecordAuthority(db);
+  const group: IntakeReportGroup = {
+    id: 'fictional-group',
+    basis: 'report_anchor',
+    sourceFileId: sourceId,
+    sourceHash,
+    sourceSystem: 'Fictional clinic',
+    memberId: null,
+    report: {
+      key: 'fictional-group',
+      title: 'Fictional report',
+      anchor: { locator: 'page 1', text: 'Fictional report' },
+      subject: { locator: 'page 1', text: 'Patient: Fictional Iris Meadow' },
+    },
+    versions: [
+      {
+        id: 'fictional-version',
+        createdAt: '2026-01-02',
+        title: 'Current',
+        members: [],
+        contributionId: 'fictional-contribution',
+        raw: Array.from({ length: 2000 }, (_, n) => ({ n, literal: 'Fictional evidence' })),
+      } as IntakeReportGroup['versions'][number],
+    ],
+  };
+  const initial = prepareInitialIntakeEnvelope(
+    JSON.stringify({
+      intake: { version: 0, workflow: { reportGroups: [group] } },
+    }),
+  );
+  transaction(db, () => {
+    db.prepare(
+      'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+    ).run(sourceId, 'fictional.json', sourceHash, 0, 'intake_original', initial.detailsJson);
+    createIntakeStateStorage(db, { profileId, intakeId: sourceId, sourceHash }).stage(
+      initial.state,
+      randomUUID(),
+    );
+  });
+  t.after(() => {
+    clearIntakeStateCache(db);
+    if (db.isOpen) db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const source = { id: sourceId, kind: 'intake_original' as const, sha256: sourceHash };
+  await buildIntakeCollectionEnvelope(db, source);
+  const selected = collectionCellReader(db, source);
+  const control = parseSchemaControl(
+    selected.collections.get(
+      selected.collections.openView(),
+      'logical',
+      'envelope.control',
+      'representation',
+    ),
+  );
+  const view = createSchemaEnvelopeReader(selected.store, control, selected.head.logical);
+  const scope = collectionWorkflowReviewScope({
+    view,
+    catalog: new Proxy({} as ReportSnapshotCatalog, {
+      get() {
+        throw Error('Grounding boundary opened a snapshot');
+      },
+    }),
+    metadataBytes: 64 * 1024,
+    packageEvidence: false,
+    activeReceipt: () => true,
+    originalFingerprint: () => 'fictional-original-fingerprint',
+    reportSource: () => undefined,
+  });
+  t.after(() => scope.close?.());
+  const record = scope.groupRecords()[Symbol.iterator]().next().value!;
+  const header = scope.groupHeader(record);
+  const current = scope.currentGroupVersion(record);
+  assert.ok(current);
+  const currentChunks = [...view.recordChunks(current)];
+  t.diagnostic(
+    JSON.stringify({
+      nativeCurrentChunks: currentChunks.length,
+      nativeCurrentBytes: Buffer.byteLength(currentChunks.join('')),
+    }),
+  );
+  assert.ok(currentChunks.length > 16);
+  const boundary = scope.groundingBoundary(profileId, sourceId, sourceHash);
+  return { db, sourceId, header, boundary };
+}
+
+test('native grounding bounds intrinsic record advances before a host turn and refuses source drift', async (t) => {
+  const f = await nativeBoundaryFixture(t);
+  const before = intakeWorkCounters(f.db).warm.nativeSchemaRecordIntrinsicAdvances;
+  let firstTurn = -1;
+  let changed = false;
+  await assert.rejects(
+    runClinicalReviewWork(f.boundary.boundaryFingerprintWork!(f.header), {
+      capture() {
+        if (firstTurn < 0) {
+          firstTurn = intakeWorkCounters(f.db).warm.nativeSchemaRecordIntrinsicAdvances - before;
+          setImmediate(() => {
+            f.db
+              .prepare('UPDATE source_files SET sha256=? WHERE id=?')
+              .run('d'.repeat(64), f.sourceId);
+            changed = true;
+          });
+        }
+        return () => {};
+      },
+    }),
+    /original source|missing selected intake head|authority changed/,
+  );
+  assert.equal(changed, true);
+  assert.ok(firstTurn > 0, 'the first host turn interrupted raw current-version scanning');
+  assert.ok(firstTurn <= 60, 'one initial yield and at most four raw advances per later output');
+  t.diagnostic(JSON.stringify({ firstTurnRawAdvances: firstTurn }));
+});
+
+test('native grounding cancellation stops at the checked record boundary', async (t) => {
+  const f = await nativeBoundaryFixture(t);
+  const controller = new AbortController();
+  const before = intakeWorkCounters(f.db).warm.nativeSchemaRecordIntrinsicAdvances;
+  let firstTurn = -1;
+  await assert.rejects(
+    runClinicalReviewWork(f.boundary.boundaryFingerprintWork!(f.header), {
+      signal: controller.signal,
+      capture() {
+        if (firstTurn < 0) {
+          firstTurn = intakeWorkCounters(f.db).warm.nativeSchemaRecordIntrinsicAdvances - before;
+          setImmediate(() => controller.abort());
+        }
+        return () => {};
+      },
+    }),
+    /abort/i,
+  );
+  assert.ok(firstTurn > 0 && firstTurn <= 60);
+});
 
 test('retained native grounding proof hashes the exact full current version and inspects noncompeting history cooperatively', async (t) => {
   const f = fixture(t);

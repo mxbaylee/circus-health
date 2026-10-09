@@ -11,11 +11,20 @@ import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state
 import { intakeNamespace } from '../intake-state-evidence.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
-import { collectionCellReader, createSchemaEnvelopeReader } from '../intake-collection-envelope.ts';
+import {
+  collectionCellReader,
+  createSchemaEnvelopeReader,
+  type EnvelopeCellReader,
+} from '../intake-collection-envelope.ts';
 import { parseSchemaControl, schemaOrdinal } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { intakeSchemaRecordOwner } from '../intake-state-collections.ts';
-import { closeSchemaRecordCursor, stepSchemaRecordCursor } from '../intake-schema-record-stream.ts';
+import {
+  closeSchemaRecordCursor,
+  createSchemaRecordCursor,
+  stepSchemaRecordCursor,
+  stepSchemaRecordCursorBatch,
+} from '../intake-schema-record-stream.ts';
 
 async function fixture(t: test.TestContext, extras = 0, longLexical = false) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-schema-resolve-authority-'));
@@ -28,7 +37,9 @@ async function fixture(t: test.TestContext, extras = 0, longLexical = false) {
   const db = openDatabase(path, identity.profileId);
   const authority = memoryRecordAuthority(db);
   const raw =
-    '{"intake":{"version":0,"scope":{"subject":{"value":"old"},"subject":{"value":"new"}},"records":' +
+    '{"intake":{"version":0,"scope":{"subject":{"value":"old"},"subject":{"value":' +
+    JSON.stringify(longLexical ? 'z'.repeat(10000) : 'new') +
+    '}},"records":' +
     JSON.stringify(Array.from({ length: extras }, (_, id) => ({ id }))) +
     (longLexical
       ? ',"inline":"' + 'x'.repeat(2048) + '","fragmented":"' + 'y'.repeat(10000) + '"'
@@ -214,6 +225,113 @@ test('native record chunks share one owned read per iterator advancement', async
   assert.ok(witnesses <= 4 * steps + 16, 'one whole-call witness per native iterator advancement');
 });
 
+test('native record chunks amortize tiny lexical pieces within a bounded admission', async (t) => {
+  const f = await fixture(t, 16);
+  const custom = createSchemaEnvelopeReader(
+    { ...f.selected.store },
+    f.control,
+    f.selected.head.logical,
+  );
+  const pointPieces = [...custom.recordChunks(custom.root())];
+  assert.equal(pointPieces.join(''), f.raw);
+  assert.ok(pointPieces.length > 64, 'the fixture exercises many small structural pieces');
+
+  const record = f.reader.root();
+  const before = structuredClone(intakeWorkCounters(f.db).warm);
+  const pieces = [...f.reader.recordChunks(record)];
+  const after = structuredClone(intakeWorkCounters(f.db).warm);
+  const witnesses = after.collectionReadWitnessQueries - before.collectionReadWitnessQueries;
+  assert.equal(pieces.join(''), f.raw);
+  t.diagnostic(
+    JSON.stringify({ pointPieces: pointPieces.length, ownedPieces: pieces.length, witnesses }),
+  );
+  assert.ok(
+    pieces.length <= Math.ceil(pointPieces.length / 4) + 1,
+    'one owned return may carry up to four exact lexical pieces',
+  );
+  assert.ok(witnesses <= 4 * (pieces.length + 1) + 16);
+});
+
+test('a decoder carry splits at a scalar boundary and pending fallback stays checked', () => {
+  const id = 'a'.repeat(64);
+  const token = {};
+  const cursor = createSchemaRecordCursor(id, token);
+  const scalar = Buffer.from('\ud83d\ude42');
+  const first = Buffer.concat([Buffer.from('"' + 'x'.repeat(4092)), scalar.subarray(0, 3)]);
+  const second = Buffer.concat([
+    scalar.subarray(3),
+    Buffer.from('x'.repeat(4089)),
+    scalar,
+    Buffer.from('yz'),
+  ]);
+  const third = Buffer.from('"');
+  const expected = '"' + 'x'.repeat(4092) + '\ud83d\ude42' + 'x'.repeat(4089) + '\ud83d\ude42yz"';
+  assert.equal(first.length, 4096);
+  assert.equal(second.length, 4096);
+  let valid = true;
+  let checks = 0;
+  const port: EnvelopeCellReader = {
+    get(key) {
+      if (key === 'r:' + id) return '{"kind":"scalar","shape":"scalar","count":0}';
+      if (key === 'c:' + id)
+        return {
+          kind: 'bytes',
+          bytes: first.length + second.length + third.length,
+          chunks: 3,
+        } as ReturnType<EnvelopeCellReader['get']>;
+      throw Error('unexpected lexical key');
+    },
+    range() {
+      throw Error('unexpected order range');
+    },
+    chunks(_value, after) {
+      if (after === undefined) return { chunks: [first], complete: false, after: 'first' };
+      if (after === 'first') return { chunks: [second], complete: false, after: 'second' };
+      if (after === 'second') return { chunks: [third], complete: true, after: null };
+      throw Error('unexpected byte cursor');
+    },
+    check() {
+      checks++;
+      if (!valid) throw Error('source changed');
+    },
+  };
+  const prefix = stepSchemaRecordCursorBatch(cursor, port, token);
+  assert.equal(prefix.done, false);
+  assert.equal(Buffer.byteLength(prefix.value!), 4093);
+  valid = false;
+  assert.throws(() => stepSchemaRecordCursor(cursor, port), /source changed/);
+  assert.ok(checks > 0);
+
+  const clean = createSchemaRecordCursor(id, token);
+  valid = true;
+  const head = stepSchemaRecordCursorBatch(clean, port, token);
+  const middle = stepSchemaRecordCursorBatch(clean, port, token);
+  const tail = stepSchemaRecordCursorBatch(clean, port, token);
+  assert.equal(head.value! + middle.value! + tail.value!, expected);
+  assert.equal(Buffer.byteLength(middle.value!), 4093);
+  assert.equal(Buffer.byteLength(tail.value!), 7);
+  assert.equal(stepSchemaRecordCursorBatch(clean, port, token).done, true);
+
+  const fallback = createSchemaRecordCursor(id, token);
+  const fallbackHead = stepSchemaRecordCursorBatch(fallback, port, token);
+  const fallbackParts = [fallbackHead.value!];
+  for (;;) {
+    const part = stepSchemaRecordCursor(fallback, port);
+    if (part.done) break;
+    fallbackParts.push(part.value);
+  }
+  assert.equal(fallbackParts.join(''), expected);
+
+  const doneCursor = createSchemaRecordCursor(id, token);
+  const shortPort: EnvelopeCellReader = {
+    ...port,
+    get: (key) => (key === 'r:' + id ? '{"kind":"scalar","shape":"scalar","count":0}' : 'z'),
+  };
+  assert.equal(stepSchemaRecordCursorBatch(doneCursor, shortPort, token).value, 'z');
+  valid = false;
+  assert.throws(() => stepSchemaRecordCursor(doneCursor, shortPort), /source changed/);
+});
+
 test('a caller-seeded lexical buffer cannot enter a native read certificate', async (t) => {
   const f = await fixture(t, 1);
   const owner = intakeSchemaRecordOwner(f.selected.collections)!;
@@ -307,11 +425,11 @@ test('native record cursor refuses reentry during its owner proof', async (t) =>
 });
 
 test('native record cursor refuses a step injected during final proof', async (t) => {
-  const f = await fixture(t, 1);
+  const f = await fixture(t, 16, true);
   const owner = intakeSchemaRecordOwner(f.selected.collections)!;
   const cursor = owner.createCursor(
     f.selected.collections.openView(),
-    f.id,
+    f.reader.address(f.reader.root()),
     'logical',
     'envelope.data',
   )!;
@@ -649,6 +767,59 @@ test('native record chunks preserve inline and fragmented lexical bytes and refu
   assert.equal(buffered, true);
   f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('d'.repeat(64), f.source.id);
   assert.throws(() => iterator.next(), /original source|missing selected intake head/);
+});
+
+test('real fragmented native cursor resumes through method and transaction fallback', async (t) => {
+  const f = await fixture(t, 1, true);
+  const expected = '{"value":' + JSON.stringify('z'.repeat(10000)) + '}';
+  const start = () => f.reader.recordChunks(f.reader.resolve(f.id))[Symbol.iterator]();
+  const untilFragment = (iterator: Iterator<string>) => {
+    let text = '';
+    let found = false;
+    while (!found) {
+      const next = iterator.next();
+      assert.equal(next.done, false);
+      text += next.value;
+      found = next.value.includes('z'.repeat(1000));
+    }
+    return text;
+  };
+  const finish = (iterator: Iterator<string>) => {
+    let text = '';
+    for (;;) {
+      const next = iterator.next();
+      if (next.done) return text;
+      text += next.value;
+    }
+  };
+
+  const replaced = start();
+  const first = untilFragment(replaced);
+  const original = f.selected.collections.readBytes;
+  let byteCalls = 0;
+  f.selected.collections.readBytes = function (...args) {
+    byteCalls++;
+    return original(...args);
+  };
+  try {
+    const pending = replaced.next();
+    assert.equal(pending.done, false);
+    assert.equal(byteCalls, 0, 'the prefetched fragment belongs to the shared cursor');
+    assert.equal(first + pending.value + finish(replaced), expected);
+    assert.ok(byteCalls > 0, 'generic fallback resumes checked byte reads');
+  } finally {
+    f.selected.collections.readBytes = original;
+  }
+
+  const transactional = start();
+  const prefix = untilFragment(transactional);
+  const remainder = transaction(f.db, () => finish(transactional));
+  assert.equal(prefix + remainder, expected);
+
+  const stale = start();
+  untilFragment(stale);
+  f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('d'.repeat(64), f.source.id);
+  assert.throws(() => stale.next(), /original source|missing selected intake head/);
 });
 
 test('native record chunks recheck selected source before final done', async (t) => {
