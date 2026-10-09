@@ -162,6 +162,154 @@ test('cached collection nodes cannot outlive missing, corrupt or replaced accept
   }
 });
 
+test('collection state returns detached selected logical and build descriptors, including absence', (t) => {
+  const f = fixture(t);
+  const selected = f.store.collection(f.store.openView(), 'logical', 'values');
+  const initial = f.store.collectionState('logical', 'values', true);
+  assert.deepEqual(initial.logical, f.store.binding(f.store.openView())!.logical);
+  assert.deepEqual(initial.collection, selected);
+  assert.equal(initial.buildCollection, undefined);
+  assert.deepEqual(f.store.collectionState('logical', 'missing', true), {
+    logical: initial.logical,
+    collection: undefined,
+    buildCollection: undefined,
+  });
+
+  const operationId = randomUUID();
+  const prepared = f.store.prepare(f.store.openView(), {
+    operationId,
+    requestDigest: digest(operationId),
+    domainVersion: 1,
+    changes: [
+      { area: 'builds', collection: 'values', op: 'put', key: 'only-build', value: 'draft' },
+    ],
+  });
+  transaction(f.db, () => f.store.stage(prepared));
+  const state = f.store.collectionState('logical', 'values', true);
+  assert.deepEqual(
+    state.logical,
+    initial.logical,
+    'auxiliary publication does not alter logical state',
+  );
+  assert.deepEqual(state.collection, selected);
+  assert.deepEqual(
+    state.buildCollection,
+    f.store.collection(f.store.openView(), 'builds', 'values'),
+  );
+  assert.deepEqual(
+    f.store.collectionState('builds', 'values', true).collection,
+    state.buildCollection,
+  );
+  assert.deepEqual(
+    f.store.collectionState('builds', 'values', true).buildCollection,
+    state.buildCollection,
+  );
+  assert.equal(f.store.collectionState('logical', 'values').buildCollection, undefined);
+  state.logical!.domainVersion = 999;
+  state.collection!.root!.count = 999;
+  state.buildCollection!.root!.count = 999;
+  const fresh = f.store.collectionState('logical', 'values', true);
+  assert.equal(fresh.logical!.domainVersion, 1);
+  assert.notEqual(fresh.collection!.root!.count, 999);
+  assert.notEqual(fresh.buildCollection!.root!.count, 999);
+});
+
+test('collection state rejects invalid primitives and transaction-only repairs cannot seed later reads', (t) => {
+  const f = fixture(t);
+  assert.throws(() => f.store.collectionState('other' as 'logical', 'values'), /collection area/);
+  assert.throws(() => f.store.collectionState('logical', ''), /collection name/);
+  assert.throws(
+    () => f.store.collectionState('logical', 'values', 'yes' as unknown as boolean),
+    /collection build selector/,
+  );
+  const directoryKey = f.prefix + 'node:' + f.store.binding(f.store.openView())!.logical.root!.hash;
+  const directory = {
+    key: directoryKey,
+    raw: String(
+      f.db.prepare('SELECT value FROM main.app_meta WHERE key=?').get(directoryKey)!.value,
+    ),
+  };
+  f.db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', directory.key);
+  f.db.exec('SAVEPOINT fictional_state_repair');
+  try {
+    restore(f.db, directory);
+    assert.deepEqual(
+      f.store.collectionState('logical', 'values').collection,
+      f.store.collection(f.store.openView(), 'logical', 'values'),
+      'transaction reads use current raw authority',
+    );
+    f.db.exec('ROLLBACK TO fictional_state_repair; RELEASE fictional_state_repair');
+    assert.throws(() => f.store.collectionState('logical', 'values'), /tree|schema|collection/);
+  } finally {
+    if (f.db.isTransaction)
+      f.db.exec('ROLLBACK TO fictional_state_repair; RELEASE fictional_state_repair');
+    restore(f.db, directory);
+  }
+  assert.ok(f.store.collectionState('logical', 'values').collection);
+});
+
+function duringCollectionState(f: ReturnType<typeof fixture>, mutate: () => void) {
+  const prior = f.authority.storage.read;
+  const before = { ...intakeWorkCounters(f.db).warm };
+  let fired = false;
+  f.authority.storage.read = (name) => {
+    const work = intakeWorkCounters(f.db).warm;
+    if (
+      name === 'head' &&
+      !fired &&
+      work.collectionNodeReads + work.collectionNodeCacheHits >
+        before.collectionNodeReads + before.collectionNodeCacheHits
+    ) {
+      fired = true;
+      mutate();
+    }
+    return prior(name);
+  };
+  return {
+    read: () => f.store.collectionState('logical', 'values', true),
+    fired: () => fired,
+    restore: () => {
+      f.authority.storage.read = prior;
+    },
+  };
+}
+
+for (const kind of [
+  'physical-head',
+  'local-restored',
+  'peer-restored',
+  'main-schema',
+  'temp-schema',
+  'registry',
+] as const)
+  test(`collection state refuses closing authority drift: ${kind}`, (t) => {
+    const f = fixture(t);
+    const originalHead = Buffer.from(f.authority.objects.get('head')!);
+    const leaf = f.ancestors.at(-1)!;
+    const peer = kind === 'peer-restored' ? new DatabaseSync(f.file) : undefined;
+    const pending = duringCollectionState(f, () => {
+      if (kind === 'physical-head') f.authority.objects.delete('head');
+      else if (kind === 'registry') clearIntakeStateCache(f.db);
+      else if (kind === 'main-schema') f.db.exec('CREATE TABLE fictional_state_drift(value TEXT)');
+      else if (kind === 'temp-schema')
+        f.db.exec('CREATE TEMP TABLE fictional_state_drift(value TEXT)');
+      else {
+        const writer = peer ?? f.db;
+        writer.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run('{}', leaf.key);
+        restore(writer, leaf);
+      }
+    });
+    try {
+      assert.throws(pending.read, /head|authority|changed|stale|generation|collection|read/i);
+      assert.equal(pending.fired(), true, 'the mutation follows actual selected node work');
+    } finally {
+      pending.restore();
+      peer?.close();
+      f.authority.objects.set('head', originalHead);
+    }
+    assert.ok(f.store.collectionState('logical', 'values').collection);
+  });
+
 for (const scoped of [false, true])
   for (const kind of [
     'local-restored',

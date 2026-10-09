@@ -46,6 +46,16 @@ Bounded synchronous collection reads can also reuse authenticated pages from the
 
 Transactions neither skip raw page reads nor certify pages: observing a transaction rotates the private read epoch, so a rolled-back repair or DDL change cannot leave a trusted page. Mutation and staging invalidate that epoch. Bounded synchronous collection preparation starts its own fresh epoch and can reuse retained pages only within its private certificate; it never borrows its caller's proof. It checks physical authority again before returning, and the closing SQL/registry witness must still match the entry snapshot. Input callbacks that change that authority or start nested preparation invalidate the whole result, including provisional preparation capabilities. No certificate authorizes publication, skips the existing stage checks, or spans a checkpoint or yield. Nested reads have separate lexical certificates; a nested mutator invalidates its enclosing read. Main and TEMP schema checks remain distinct because a TEMP table or view can shadow an already prepared unqualified node query. Promises and escaping iterators cannot be returned by this synchronous boundary. Cache disposal, source changes, refusal and closure require fresh authentication.
 
+Snapshot catalog checks read their logical binding and selected descriptor, plus
+the same-name build descriptor when required, through one fixed synchronous
+owner operation. It returns detached metadata, not an authority capability or a
+retained cache. The existing source-row check remains separate; the owner checks
+physical accepted HEAD at entry and completion and seals the exact SQL, registry
+and read-epoch witness. Transactions retain the separate raw point operations.
+The counted catalog regression reduces five physical HEAD reads and 22 witness
+queries to three and four respectively; it does not establish whole-history
+latency or change any publication, checkpoint or cancellation boundary.
+
 Transaction-bound preparation keeps the raw-page fallback but also seals its
 entry read epoch, registry generation, transaction identity and exact SQL witness
 before returning a capability. A callback cannot clear the registry or start a

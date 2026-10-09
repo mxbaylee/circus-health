@@ -24,6 +24,7 @@ import {
 } from '../intake-collection-envelope.ts';
 import { schemaKey, parseSchemaControl } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { createReportSnapshotCatalog } from '../intake-report-snapshot-catalog.ts';
 function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-envelope-schema-')),
     identity = {
@@ -60,6 +61,31 @@ function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
     source: { id: identity.intakeId, kind: 'intake_original', sha256: identity.sourceHash },
   };
 }
+
+test('snapshot catalog binding uses one bounded authenticated owner observation', async (t) => {
+  const { db, source, authority } = fixture(t, { intake: { version: 1 } });
+  await buildIntakeCollectionEnvelope(db, source);
+  const catalog = createReportSnapshotCatalog(db, source);
+  let heads = 0;
+  const read = authority.storage.read;
+  authority.storage.read = (name) => {
+    if (name === 'head') heads++;
+    return read(name);
+  };
+  catalog.assertCurrent();
+  heads = 0;
+  const before = { ...intakeWorkCounters(db).warm };
+  catalog.assertCurrent();
+  const after = intakeWorkCounters(db).warm;
+  t.diagnostic(
+    JSON.stringify({
+      physicalHeadReads: heads,
+      witnessQueries: after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+    }),
+  );
+  assert.equal(heads, 3, 'source binding plus owner entry and closing physical HEAD');
+  assert.equal(after.collectionReadWitnessQueries - before.collectionReadWitnessQueries, 4);
+});
 
 test('named lexical field access resolves once and preserves raw structured, duplicate and fragmented values', async (t) => {
   const giant = '🦊\\\"'.repeat(9000),

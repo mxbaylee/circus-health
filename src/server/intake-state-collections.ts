@@ -1005,6 +1005,50 @@ export function createIntakeCollections(owner: {
         return value && structuredClone(value);
       });
     },
+    /** A fixed synchronous observation, not a reusable authority capability. */
+    collectionState(
+      area: IntakeCollectionArea,
+      name: string,
+      includeBuild = false,
+    ): {
+      logical: IntakeCollectionHead['logical'] | undefined;
+      collection: IntakeCollectionDescriptor | undefined;
+      buildCollection: IntakeCollectionDescriptor | undefined;
+    } {
+      if (area !== 'logical' && area !== 'builds') invalid('collection area');
+      collectionName(name);
+      if (typeof includeBuild !== 'boolean') invalid('collection build selector');
+      const raw = () => {
+        const head = api.binding(api.openView()),
+          collection = api.collection(api.openView(), area, name);
+        return {
+          logical: head?.logical,
+          collection,
+          buildCollection: includeBuild
+            ? api.collection(api.openView(), 'builds', name)
+            : undefined,
+        };
+      };
+      if (db.isTransaction) return raw();
+      return runRead((readTree, certificate) => {
+        if (!certificate) return raw();
+        const head = selected(certificate).head,
+          pages = readTree(),
+          collection = descriptor(
+            pages.get(
+              area === 'logical' ? (head?.logical.root ?? null) : (head?.builds ?? null),
+              name,
+            ),
+          ),
+          buildCollection = includeBuild
+            ? area === 'builds'
+              ? collection
+              : descriptor(pages.get(head?.builds ?? null, name))
+            : undefined;
+        ready();
+        return structuredClone({ logical: head?.logical, collection, buildCollection });
+      });
+    },
     /** Fixed authenticated schema operations; callers cannot insert fabricated proofs. */
     resolveSchemaRecord(
       view: IntakeCollectionView,

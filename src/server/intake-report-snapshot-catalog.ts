@@ -102,21 +102,18 @@ export function createReportSnapshotCatalog(
 ): ReportSnapshotCatalog {
   const initial = selectedEnvelopeStore(db, input),
     { source, collections } = initial;
-  const head = collections.binding(collections.openView());
-  if (!head) throw Error('Report snapshots require selected collection authority');
-  const logical = JSON.stringify(head.logical),
-    version = head.logical.domainVersion;
   const selectedCatalog = options.catalog ?? REPORT_SNAPSHOT_CATALOG;
-  const selectedArea = options.catalogArea ?? 'logical',
-    initialCatalog = JSON.stringify(
-      collections.collection(collections.openView(), selectedArea, selectedCatalog) ?? null,
-    );
-  const initialIdentityBuildCatalog =
-    selectedCatalog === REPORT_SNAPSHOT_CATALOG && selectedArea === 'logical'
-      ? JSON.stringify(
-          collections.collection(collections.openView(), 'builds', REPORT_SNAPSHOT_CATALOG) ?? null,
-        )
-      : undefined;
+  const selectedArea = options.catalogArea ?? 'logical';
+  const initialState = collections.collectionState(
+    selectedArea,
+    selectedCatalog,
+    selectedCatalog === REPORT_SNAPSHOT_CATALOG && selectedArea === 'logical',
+  );
+  if (!initialState.logical) throw Error('Report snapshots require selected collection authority');
+  const logical = JSON.stringify(initialState.logical),
+    version = initialState.logical.domainVersion,
+    initialCatalog = JSON.stringify(initialState.collection ?? null),
+    initialIdentityBuildCatalog = JSON.stringify(initialState.buildCollection ?? null);
   let borrowedIdentityBuild = false;
   const catalog = 'report.catalog.' + randomUUID();
   let initialized = false;
@@ -129,15 +126,15 @@ export function createReportSnapshotCatalog(
     const current = selectedEnvelopeStore(db, source);
     if (
       current.source.sha256 !== source.sha256 ||
-      current.source.details_json !== source.details_json ||
-      JSON.stringify(collections.binding(collections.openView())?.logical) !== logical ||
-      JSON.stringify(
-        collections.collection(collections.openView(), selectedArea, selectedCatalog) ?? null,
-      ) !== initialCatalog ||
+      current.source.details_json !== source.details_json
+    )
+      throw Error('Stale report snapshot source or logical state');
+    const state = collections.collectionState(selectedArea, selectedCatalog, borrowedIdentityBuild);
+    if (
+      JSON.stringify(state.logical) !== logical ||
+      JSON.stringify(state.collection ?? null) !== initialCatalog ||
       (borrowedIdentityBuild &&
-        JSON.stringify(
-          collections.collection(collections.openView(), 'builds', REPORT_SNAPSHOT_CATALOG) ?? null,
-        ) !== initialIdentityBuildCatalog)
+        JSON.stringify(state.buildCollection ?? null) !== initialIdentityBuildCatalog)
     )
       throw Error('Stale report snapshot source or logical state');
   };
