@@ -26,6 +26,40 @@ export const INTAKE_LOOKUP_INDEX_POLICY = 'health-intake-lookup-index-v1';
 export const INTAKE_LOOKUP_INDEX_COLLECTION = 'lookup.indexes';
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
+function discoveryHash(profile: string) {
+  const revision = createHash('sha256');
+  revision.update(JSON.stringify([INTAKE_LOOKUP_INDEX_POLICY, profile]));
+  return revision;
+}
+function addDiscoverySource(
+  revision: ReturnType<typeof createHash>,
+  db: DatabaseSync,
+  source: IntakeEnvelopeSource,
+) {
+  const binding = intakeEnvelopeAuthorityBinding(db, source);
+  revision.update(
+    JSON.stringify([source.id, source.sha256, binding.key, binding.logicalHead ?? binding.head]),
+  );
+}
+/** Each GET is complete before the caller may yield; rowid never becomes a JS number. */
+function originalSourceCursor(db: DatabaseSync) {
+  const first = db.prepare(
+    "SELECT rowid AS lookup_rowid,id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' ORDER BY rowid LIMIT 1",
+  );
+  const next = db.prepare(
+    "SELECT rowid AS lookup_rowid,id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' AND rowid>? ORDER BY rowid LIMIT 1",
+  );
+  first.setReadBigInts(true);
+  next.setReadBigInts(true);
+  return (cursor?: bigint) => {
+    const row = (cursor === undefined ? first.get() : next.get(cursor)) as
+      (IntakeEnvelopeSource & { lookup_rowid: bigint }) | undefined;
+    if (row && typeof row.lookup_rowid !== 'bigint')
+      throw Error('Intake discovery source order is unavailable');
+    return row;
+  };
+}
+
 interface PreparedLookupRead {
   stamp: string;
   registry: object;
@@ -57,23 +91,19 @@ export function preparedIntakeLookupReadToken(db: DatabaseSync): object | undefi
 
 /** Compact selected source frontier; native auxiliary churn does not alter it. */
 export function intakeDiscoveryRevision(db: DatabaseSync): string {
-  const revision = createHash('sha256');
   const profile = db
     .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
     .get()?.value;
   if (typeof profile !== 'string' || !profile)
     throw Error('Intake lookup profile binding is unavailable');
-  revision.update(JSON.stringify([INTAKE_LOOKUP_INDEX_POLICY, profile]));
+  const revision = discoveryHash(profile);
   for (const row of db
     .prepare(
       "SELECT id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' ORDER BY rowid",
     )
     .iterate()) {
     const source = row as unknown as IntakeEnvelopeSource;
-    const binding = intakeEnvelopeAuthorityBinding(db, source);
-    revision.update(
-      JSON.stringify([source.id, source.sha256, binding.key, binding.logicalHead ?? binding.head]),
-    );
+    addDiscoverySource(revision, db, source);
   }
   return revision.digest('hex');
 }
@@ -141,12 +171,26 @@ export async function prepareIntakeLookupIndices(
   }
   let prepared = 0,
     reused = 0;
-  for (const row of db
-    .prepare(
-      "SELECT id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' ORDER BY rowid",
-    )
-    .iterate()) {
-    const source = row as unknown as IntakeEnvelopeSource;
+  const initialProfile = db
+    .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
+    .get()?.value;
+  if (typeof initialProfile !== 'string' || !initialProfile)
+    throw Error('Intake lookup profile binding is unavailable');
+  const initialRevision = discoveryHash(initialProfile);
+  const readInitial = originalSourceCursor(db);
+  let initialCursor: bigint | undefined;
+  let initialRows = 0;
+  for (;;) {
+    if (initialRows > 0 && initialRows % 64 === 0) {
+      options.assertRunning?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      options.assertRunning?.();
+    }
+    const source = readInitial(initialCursor);
+    if (!source) break;
+    initialCursor = source.lookup_rowid;
+    addDiscoverySource(initialRevision, db, source);
+    initialRows++;
     if (!hasIntakeCollectionEnvelope(db, source)) continue;
     const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
     const { collections } = selectedEnvelopeStore(db, source);
@@ -259,6 +303,7 @@ export async function prepareIntakeLookupIndices(
     ]);
     prepared++;
   }
+  const initialDigest = initialRevision.digest('hex');
   // Awaited checkpoints can allow a previously processed source to change.
   // Check each current header before granting a fully prepared result.
   const completedProjection = prepareIntakeLookupProjection(db);
@@ -282,18 +327,53 @@ export async function prepareIntakeLookupIndices(
     ? await buildNativeIntakeLookupCatalog(db, () => lookupReadCurrent(db, proof), options)
     : undefined;
   try {
-    for (const row of db
-      .prepare(
-        "SELECT id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' ORDER BY rowid",
-      )
-      .iterate()) {
-      options.assertRunning?.();
-      const source = row as unknown as IntakeEnvelopeSource;
-      if (!hasIntakeCollectionEnvelope(db, source)) continue;
-      const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
-      readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
+    let discoveryRevision: string;
+    if (!proof) {
+      // No read certificate may be minted on this legacy fallback path.
+      for (const row of db
+        .prepare(
+          "SELECT id,kind,sha256,details_json FROM source_files WHERE kind='intake_original' ORDER BY rowid",
+        )
+        .iterate()) {
+        options.assertRunning?.();
+        const source = row as unknown as IntakeEnvelopeSource;
+        if (!hasIntakeCollectionEnvelope(db, source)) continue;
+        const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
+        readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
+      }
+      discoveryRevision = intakeDiscoveryRevision(db);
+    } else {
+      const current = () => {
+        options.assertRunning?.();
+        if (!lookupReadCurrent(db, proof)) throw Error('Intake discovery source frontier changed');
+      };
+      current();
+      const revision = discoveryHash(proof.profile);
+      const readFinal = originalSourceCursor(db);
+      let cursor: bigint | undefined;
+      let scanned = 0;
+      for (;;) {
+        if (scanned > 0 && scanned % 64 === 0) {
+          current();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          current();
+        }
+        const source = readFinal(cursor);
+        if (!source) break;
+        cursor = source.lookup_rowid;
+        options.assertRunning?.();
+        if (hasIntakeCollectionEnvelope(db, source)) {
+          const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
+          readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
+        }
+        addDiscoverySource(revision, db, source);
+        scanned++;
+      }
+      current();
+      discoveryRevision = revision.digest('hex');
     }
-    const discoveryRevision = intakeDiscoveryRevision(db);
+    if (discoveryRevision !== initialDigest)
+      throw Error('Intake discovery source frontier changed during preparation');
     options.assertRunning?.();
     if (proof && catalog && lookupReadCurrent(db, proof)) {
       proof.discoveryRevision = discoveryRevision;

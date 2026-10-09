@@ -12,6 +12,7 @@ import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import {
   openIntakeCollectionEnvelope,
   selectedEnvelopeStore,
+  type IntakeCollectionEnvelopeReader,
 } from '../intake-collection-envelope.ts';
 import { prepareIntakeEnvelopeMutation } from '../intake-envelope-mutation.ts';
 import {
@@ -19,7 +20,10 @@ import {
   readVerifiedWorkflowSummary,
   openSelectedAcceptedDestinations,
 } from '../intake-workflow-state.ts';
-import { prepareWorkflowAcceptanceDerived } from '../intake-workflow-update.ts';
+import {
+  consumeWorkflowReceiptAppendProof,
+  prepareWorkflowAcceptanceDerived,
+} from '../intake-workflow-update.ts';
 import { createNativeAcceptanceEffects } from '../intake-collection-acceptance.ts';
 import { buildModelIntakeSectionIndexes } from '../intake-model-section-build.ts';
 import { openCollectionModelIntakeBackend } from '../intake-model-collection-backend.ts';
@@ -134,6 +138,9 @@ for (const coupled of [false, true])
     });
     effects.questionAddresses.push(view.address(q));
     let needsReview: boolean | undefined;
+    let appendProof: object | undefined;
+    let appendReader: IntakeCollectionEnvelopeReader | undefined;
+    let appendLogical: string | undefined;
     const prepared = await prepareIntakeEnvelopeMutation(db, source, {
       reader: view,
       operationId,
@@ -235,9 +242,66 @@ for (const coupled of [false, true])
           },
         });
         needsReview = result.needsReview;
+        if (!coupled) {
+          appendProof = result.receiptAppend;
+          appendReader = derived.reader;
+          appendLogical = JSON.stringify(derived.logical);
+        }
         return result.changes;
       },
     });
+    if (!coupled) {
+      assert.ok(appendProof && appendReader && appendLogical);
+      const oldLogical = JSON.stringify(view.logical);
+      assert.equal(
+        consumeWorkflowReceiptAppendProof(
+          appendProof,
+          db,
+          { ...source, id: 'fictional-other' },
+          appendReader,
+          oldLogical,
+          appendLogical,
+        ),
+        undefined,
+      );
+      assert.equal(
+        consumeWorkflowReceiptAppendProof(appendProof, db, source, view, oldLogical, appendLogical),
+        undefined,
+      );
+      assert.equal(
+        consumeWorkflowReceiptAppendProof(
+          appendProof,
+          db,
+          source,
+          appendReader,
+          oldLogical,
+          oldLogical,
+        ),
+        undefined,
+      );
+      assert.deepEqual(
+        consumeWorkflowReceiptAppendProof(
+          appendProof,
+          db,
+          source,
+          appendReader,
+          oldLogical,
+          appendLogical,
+        ),
+        [],
+      );
+      assert.equal(
+        consumeWorkflowReceiptAppendProof(
+          appendProof,
+          db,
+          source,
+          appendReader,
+          oldLogical,
+          appendLogical,
+        ),
+        undefined,
+      );
+    }
     assert.equal(
       needsReview,
       true,

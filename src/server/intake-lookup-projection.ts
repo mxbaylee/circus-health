@@ -6,6 +6,7 @@ import {
   observeTransactionOutcome,
   currentTransactionToken,
   rejectCurrentTransaction,
+  type Database,
 } from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
@@ -16,6 +17,7 @@ import {
 import {
   hasIntakeCollectionEnvelope,
   openIntakeCollectionEnvelope,
+  selectedEnvelopeStore,
   type IntakeCollectionEnvelopeReader,
   type IntakeEnvelopeRecord,
 } from './intake-collection-envelope.ts';
@@ -25,9 +27,12 @@ import {
   INTAKE_LOOKUP_SCOPE_BYTES,
 } from './intake-lookup-contributions.ts';
 import {
+  INTAKE_LOOKUP_INDEX_COLLECTION,
+  INTAKE_LOOKUP_INDEX_POLICY,
   preparedIntakeLookupReadToken,
   readNativeIntakeLookupTarget,
 } from './intake-lookup-state.ts';
+import { consumeWorkflowReceiptAppendProof } from './intake-workflow-update.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 export {
   prepareIntakeLookupIndices,
@@ -61,6 +66,7 @@ export interface IntakeLookupCounters {
   projectionBytes: number;
   payloadMemoCreated: number;
   payloadMemoClosed: number;
+  nativeReceiptRowsWritten: number;
 }
 interface Connection {
   generation: object;
@@ -71,6 +77,7 @@ interface Connection {
   hashes?: ReturnType<typeof disposableSqlite>;
   entries: WeakMap<object, Map<string, ProjectionRow>>;
   nativeCatalog?: NativeLookupCatalog & { token: object };
+  nativeReceiptAppend?: NativeReceiptAppend;
   catalogAttempt?: object;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
@@ -86,6 +93,7 @@ function clearPayloadMemo(connection: Connection): void {
   connection.catalogAttempt = undefined;
   connection.nativeCatalog?.scratch.close();
   connection.nativeCatalog = undefined;
+  connection.nativeReceiptAppend = undefined;
   if (connection.hashes) {
     connection.hashes.close();
     connection.hashes = undefined;
@@ -135,6 +143,7 @@ function create(db: DatabaseSync): Connection {
       projectionBytes: 0,
       payloadMemoCreated: 0,
       payloadMemoClosed: 0,
+      nativeReceiptRowsWritten: 0,
     },
   };
   const stopOutcome = observeTransactionOutcome(db, (outcome) => {
@@ -734,6 +743,20 @@ interface NativeLookupCatalog {
   attempt: object;
   unsafeMaximum: boolean;
 }
+interface NativeReceiptAppend {
+  catalog: NativeLookupCatalog & { token: object };
+  generation: object;
+  sourceId: string;
+  sourceOrder: number;
+  sourceHash: string;
+  before: string;
+  after: string;
+  rows: readonly { operation: string; address: string }[];
+}
+interface NativeReceiptAppendBasis extends Omit<NativeReceiptAppend, 'after' | 'rows'> {
+  db: DatabaseSync;
+}
+const receiptAppendBases = new WeakMap<object, NativeReceiptAppendBasis>();
 interface NativeLookupPointer {
   source_id: string;
   source_order: number;
@@ -744,7 +767,93 @@ interface NativeLookupPointer {
 export function discardNativeIntakeLookupCatalog(db: DatabaseSync): void {
   const connection = connections.get(db);
   connection?.nativeCatalog?.scratch.close();
-  if (connection) connection.nativeCatalog = undefined;
+  if (connection) {
+    connection.nativeCatalog = undefined;
+    connection.nativeReceiptAppend = undefined;
+  }
+}
+/** The old complete source/index is checked before the owner starts its write. */
+export function nativeIntakeReceiptAppendBasis(
+  db: DatabaseSync,
+  source: IntakeEnvelopeSource,
+  before: string,
+): object | undefined {
+  const connection = connections.get(db);
+  const catalog = connection?.nativeCatalog;
+  if (!connection || !catalog || typeof source.sha256 !== 'string') return undefined;
+  const row = db
+    .prepare('SELECT rowid source_order FROM source_files WHERE id=? AND kind=? AND sha256=?')
+    .get(source.id, 'intake_original', source.sha256);
+  if (!row || !Number.isSafeInteger(row.source_order)) return undefined;
+  const prior = catalog.scratch.db
+    .prepare('SELECT * FROM sources WHERE source_id=?')
+    .get(source.id);
+  if (
+    !prior ||
+    prior.source_order !== row.source_order ||
+    prior.source_hash !== source.sha256 ||
+    prior.authority_head !== before
+  )
+    return undefined;
+  const { collections } = selectedEnvelopeStore(db, source);
+  const selected = collections.openView();
+  const complete =
+    (collections.get(selected, 'builds', 'envelope.indexes', 'complete') === before &&
+      collections.get(selected, 'builds', 'envelope.indexes', 'policy') ===
+        'health-intake-workflow-index-v6') ||
+    (collections.get(selected, 'builds', INTAKE_LOOKUP_INDEX_COLLECTION, 'complete') === before &&
+      collections.get(selected, 'builds', INTAKE_LOOKUP_INDEX_COLLECTION, 'policy') ===
+        INTAKE_LOOKUP_INDEX_POLICY);
+  if (!complete) return undefined;
+  const basis = {};
+  receiptAppendBases.set(basis, {
+    db,
+    catalog,
+    generation: connection.generation,
+    sourceId: source.id,
+    sourceOrder: Number(row.source_order),
+    sourceHash: source.sha256,
+    before,
+  });
+  return basis;
+}
+/** Retain only disposable per-source input, never a read token or answer. */
+export function retainNativeIntakeReceiptAppend(
+  db: Database,
+  basis: object,
+  proof: object,
+  reader: IntakeCollectionEnvelopeReader,
+  source: IntakeEnvelopeSource,
+  before: string,
+  after: string,
+): void {
+  const connection = connections.get(db);
+  const prior = receiptAppendBases.get(basis);
+  receiptAppendBases.delete(basis);
+  if (!connection) return;
+  connection.nativeReceiptAppend = undefined;
+  if (
+    !prior ||
+    prior.db !== db ||
+    prior.generation !== connection.generation ||
+    prior.catalog !== connection.nativeCatalog ||
+    prior.sourceId !== source.id ||
+    prior.sourceHash !== source.sha256 ||
+    prior.before !== before
+  )
+    return;
+  const rows = consumeWorkflowReceiptAppendProof(proof, db, source, reader, before, after);
+  if (!rows || rows.length > 64) return;
+  connection.nativeReceiptAppend = {
+    catalog: prior.catalog,
+    generation: prior.generation,
+    sourceId: prior.sourceId,
+    sourceOrder: prior.sourceOrder,
+    sourceHash: prior.sourceHash,
+    before: prior.before,
+    after,
+    rows: rows.map(({ operation, address }) => ({ operation, address })),
+  };
 }
 /** Read-only, checkpointed derivation. No incomplete catalog can answer a miss. */
 export async function buildNativeIntakeLookupCatalog(
@@ -778,18 +887,18 @@ export async function buildNativeIntakeLookupCatalog(
     scratch.db.exec(`
       CREATE TABLE IF NOT EXISTS sources(source_id TEXT PRIMARY KEY,source_order INTEGER,
         source_hash TEXT,authority_head TEXT,seen_epoch TEXT) WITHOUT ROWID;
-      CREATE TABLE IF NOT EXISTS acceptances(operation TEXT,source_id TEXT,source_order INTEGER,
-        source_hash TEXT,authority_head TEXT,address TEXT,PRIMARY KEY(operation,source_id)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS acceptances(operation TEXT,source_id TEXT,source_order INTEGER,address TEXT,
+        PRIMARY KEY(operation,source_id)) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS acceptance_order ON acceptances(operation,source_order);
       CREATE INDEX IF NOT EXISTS acceptance_source ON acceptances(source_id);
       CREATE TABLE IF NOT EXISTS maximum(singleton INTEGER PRIMARY KEY,source_id TEXT,source_order INTEGER,
         source_hash TEXT,authority_head TEXT,address TEXT,value INTEGER);
       DELETE FROM maximum;
     `);
-    const put = scratch.db.prepare(`INSERT INTO acceptances VALUES(?,?,?,?,?,?)
+    const put = scratch.db.prepare(`INSERT INTO acceptances VALUES(?,?,?,?)
       ON CONFLICT(operation,source_id) DO UPDATE SET
-      source_order=excluded.source_order,source_hash=excluded.source_hash,
-      authority_head=excluded.authority_head,address=excluded.address`);
+      source_order=excluded.source_order,address=excluded.address`);
+    const putAppend = scratch.db.prepare('INSERT OR IGNORE INTO acceptances VALUES(?,?,?,?)');
     const putMaximum = scratch.db.prepare(`INSERT INTO maximum VALUES(1,?,?,?,?,?,?)
       ON CONFLICT(singleton) DO UPDATE SET source_id=excluded.source_id,
       source_order=excluded.source_order,source_hash=excluded.source_hash,
@@ -832,6 +941,37 @@ export async function buildNativeIntakeLookupCatalog(
         prior?.source_order === source.source_order &&
         prior.source_hash === source.sha256 &&
         prior.authority_head === source.authority_head;
+      const append = connection.nativeReceiptAppend;
+      let reuseAppend =
+        !reuse &&
+        !!append &&
+        append.catalog === previous &&
+        append.generation === generation &&
+        append.sourceId === source.id &&
+        append.sourceOrder === source.source_order &&
+        append.sourceHash === source.sha256 &&
+        append.before === prior?.authority_head &&
+        append.after === source.authority_head &&
+        prior?.source_order === source.source_order &&
+        prior.source_hash === source.sha256;
+      if (reuseAppend && append) {
+        for (const item of append.rows) {
+          const selected = readNativeIntakeLookupTarget(
+            db,
+            source,
+            view,
+            'lookup-acceptance-operation-first',
+            [item.operation],
+          );
+          const existing = scratch.db
+            .prepare('SELECT address FROM acceptances WHERE operation=? AND source_id=?')
+            .get(item.operation, source.id);
+          if (!selected || view.address(selected) !== (existing?.address ?? item.address)) {
+            reuseAppend = false;
+            break;
+          }
+        }
+      }
       if (group) {
         const text = boundedIntakeLookupText(view.fieldChunks(group, 'discoveryOrder'));
         const value = cast.get(text)!.n as bigint | null;
@@ -851,7 +991,17 @@ export async function buildNativeIntakeLookupCatalog(
         }
       }
       let visited = 0;
-      if (!reuse) {
+      if (reuseAppend && append) {
+        for (const item of append.rows) {
+          connection.counters.nativeReceiptRowsWritten += Number(
+            putAppend.run(item.operation, source.id, source.source_order, item.address).changes,
+          );
+        }
+        visited = append.rows.length;
+        scratch.db
+          .prepare('UPDATE sources SET authority_head=?,seen_epoch=? WHERE source_id=?')
+          .run(source.authority_head, seenEpoch, source.id);
+      } else if (!reuse) {
         if (!(await removeReceipts(source.id))) return undefined;
         for (const contribution of intakeLookupContributions(db, view, 'acceptances')) {
           options.assertRunning?.();
@@ -860,13 +1010,13 @@ export async function buildNativeIntakeLookupCatalog(
             continue;
           }
           if (contribution.target)
-            put.run(
-              contribution.key[0]!,
-              source.id,
-              source.source_order,
-              source.sha256,
-              source.authority_head,
-              view.address(contribution.target),
+            connection.counters.nativeReceiptRowsWritten += Number(
+              put.run(
+                contribution.key[0]!,
+                source.id,
+                source.source_order,
+                view.address(contribution.target),
+              ).changes,
             );
           visited++;
         }
@@ -881,6 +1031,7 @@ export async function buildNativeIntakeLookupCatalog(
         scratch.db
           .prepare('UPDATE sources SET seen_epoch=? WHERE source_id=?')
           .run(seenEpoch, source.id);
+      if (append?.sourceId === source.id) connection.nativeReceiptAppend = undefined;
       if (!(await checkpoint(source.id, visited))) return undefined;
     }
     if (!isCurrent()) return undefined;
@@ -1031,7 +1182,11 @@ export function retainedIntakeAcceptanceReference(
   const catalog = checkedNativeCatalog(db, connection);
   if (catalog) {
     const pointer = catalog.scratch.db
-      .prepare('SELECT * FROM acceptances WHERE operation=? ORDER BY source_order LIMIT 1')
+      .prepare(
+        `SELECT a.operation,a.address,s.source_id,s.source_order,s.source_hash,
+        s.authority_head FROM acceptances a JOIN sources s ON s.source_id=a.source_id
+        WHERE a.operation=? AND a.source_order=s.source_order ORDER BY a.source_order LIMIT 1`,
+      )
       .get(nativeOperation);
     if (pointer && Number(pointer.source_order) < order) {
       const { view, record } = catalogTarget(

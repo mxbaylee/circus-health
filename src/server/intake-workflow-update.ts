@@ -51,6 +51,7 @@ import {
   proposalLookupIndexContributions,
   acceptanceLookupIndexContributions,
 } from './intake-lookup-proposal.ts';
+import type { WorkflowIndexContribution } from './intake-workflow-index.ts';
 import {
   INTAKE_LOOKUP_INDEX_COLLECTION,
   INTAKE_LOOKUP_INDEX_POLICY,
@@ -74,6 +75,11 @@ export interface WorkflowProposalUpdate extends IntakeEnvelopeDerivedPreparation
     reportAcceptanceAddresses: readonly string[];
     identityReceiptAddresses: readonly string[];
   };
+  onAcceptanceLookupContribution?: (
+    contribution: WorkflowIndexContribution,
+    reader: IntakeCollectionEnvelopeReader,
+  ) => void;
+  onAcceptanceLookupComplete?: () => void;
   mappingVersion: string;
   currentMappingVersion?: () => string;
   /** Complete retained source-context classification, with the staged occurrence view. */
@@ -85,6 +91,38 @@ export interface WorkflowProposalUpdate extends IntakeEnvelopeDerivedPreparation
   onCheckpoint?: () => void | Promise<void>;
   /** Exact prospective facts, before the host selects this prepared root. */
   onFacts?: (facts: Readonly<WorkflowCountFacts>) => void;
+}
+interface ReceiptAppendProof {
+  db: Database;
+  sourceId: string;
+  sourceHash: string | undefined;
+  reader: IntakeCollectionEnvelopeReader;
+  before: string;
+  after: string;
+  rows: readonly { operation: string; address: string }[];
+}
+const receiptAppendProofs = new WeakMap<object, ReceiptAppendProof>();
+export function consumeWorkflowReceiptAppendProof(
+  proof: object,
+  db: Database,
+  source: IntakeEnvelopeSource,
+  reader: IntakeCollectionEnvelopeReader,
+  before: string,
+  after: string,
+): readonly { operation: string; address: string }[] | undefined {
+  const retained = receiptAppendProofs.get(proof);
+  if (
+    retained?.db === db &&
+    retained.sourceId === source.id &&
+    retained.sourceHash === source.sha256 &&
+    retained.reader === reader &&
+    retained.before === before &&
+    retained.after === after
+  ) {
+    receiptAppendProofs.delete(proof);
+    return retained.rows;
+  }
+  return undefined;
 }
 
 /** Owned command compilers supply the closed impact family. Receipt, review
@@ -146,6 +184,9 @@ export async function prepareWorkflowAcceptanceDerived(
   source: IntakeEnvelopeSource,
   input: WorkflowProposalUpdate & { acceptance: NativeAcceptanceEffects },
 ) {
+  const receiptRows = new Map<string, string>();
+  let boundedReceiptRows = true,
+    completeReceiptScope = false;
   const candidates = new Map(
     input.affected.candidateChanges.map((item) => [item.versionAddress, item]),
   );
@@ -167,10 +208,39 @@ export async function prepareWorkflowAcceptanceDerived(
       needsReview = workflowCountsFromFacts(facts).needsReview;
       input.onFacts?.(facts);
     },
+    onAcceptanceLookupContribution(contribution, reader) {
+      if (
+        contribution.index !== 'lookup-acceptance-operation-first' ||
+        !contribution.target ||
+        !boundedReceiptRows
+      )
+        return;
+      receiptRows.set(contribution.key[0]!, reader.address(contribution.target));
+      if (receiptRows.size > 64) {
+        boundedReceiptRows = false;
+        receiptRows.clear();
+      }
+    },
+    onAcceptanceLookupComplete() {
+      completeReceiptScope = true;
+    },
   });
   if (needsReview === undefined)
     throw Error('Acceptance requires a checked complete workflow summary');
-  return { changes, needsReview };
+  const receiptAppend = boundedReceiptRows && completeReceiptScope ? {} : undefined;
+  if (receiptAppend) {
+    const before = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
+    receiptAppendProofs.set(receiptAppend, {
+      db,
+      sourceId: source.id,
+      sourceHash: source.sha256,
+      reader: input.reader,
+      before: JSON.stringify(before.logical),
+      after: JSON.stringify(input.logical),
+      rows: [...receiptRows].map(([operation, address]) => ({ operation, address })),
+    });
+  }
+  return { changes, needsReview, receiptAppend };
 }
 
 /** No prior complete proof => no derived publication; the new domain reads pending. */
@@ -608,12 +678,14 @@ export async function prepareWorkflowProposalDerived(
         { source, unchangedLookupScopes: true },
       );
   for (const contribution of lookupContributions) {
+    input.onAcceptanceLookupContribution?.(contribution, afterFirst);
     const key = schemaKey(contribution.index, ...contribution.key);
     for (const collection of updateLookup ? [indexes, lookup] : [indexes]) {
       if (contribution.target) await put(collection, key, afterFirst.address(contribution.target));
       else pending.push({ area: 'builds', collection, op: 'delete', key });
     }
   }
+  if (input.acceptance) input.onAcceptanceLookupComplete?.();
   await flush();
   const overlay: IntakeCollectionEnvelopeReader = {
     ...staged,

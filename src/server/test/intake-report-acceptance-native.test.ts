@@ -319,15 +319,37 @@ for (const retainedCount of [1, 65])
         db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n,
       );
       const visited = new Map<string, number>();
-      const fresh = await prepareIntakeLookupIndices(db, {
-        onCheckpoint: ({ sourceId, visited: count }) => {
-          visited.set(sourceId, Math.max(visited.get(sourceId) ?? 0, count));
-        },
-      });
+      const run = StatementSync.prototype.run;
+      let privateReceiptRowsWritten = 0;
+      StatementSync.prototype.run = function (
+        this: StatementSync,
+        ...parameters: Parameters<StatementSync['run']>
+      ) {
+        const result = Reflect.apply(run, this, parameters) as ReturnType<StatementSync['run']>;
+        if (/\b(?:INTO|UPDATE|FROM)\s+acceptances\b/i.test(this.sourceSQL))
+          privateReceiptRowsWritten += Number(result.changes);
+        return result;
+      } as typeof StatementSync.prototype.run;
+      let fresh: Awaited<ReturnType<typeof prepareIntakeLookupIndices>>;
+      try {
+        fresh = await prepareIntakeLookupIndices(db, {
+          onCheckpoint: ({ sourceId, visited: count }) => {
+            visited.set(sourceId, Math.max(visited.get(sourceId) ?? 0, count));
+          },
+        });
+      } finally {
+        StatementSync.prototype.run = run;
+      }
       const changedVisits = visited.get(selected.id) ?? 0;
       const controlVisits = visited.get(control.id) ?? 0;
       t.diagnostic(
-        JSON.stringify({ retainedCount, changedVisits, controlVisits, prepared: fresh.prepared }),
+        JSON.stringify({
+          retainedCount,
+          changedVisits,
+          controlVisits,
+          privateReceiptRowsWritten,
+          prepared: fresh.prepared,
+        }),
       );
       assert.equal(fresh.prepared, 0, 'Existing complete v6 policy remains selected');
       assert.equal(authority.objects.size, beforeObjects);
@@ -373,6 +395,11 @@ for (const retainedCount of [1, 65])
       assert.equal(recertVisits.get(selected.id) ?? 0, 0);
       assert.equal(recertVisits.get(control.id) ?? 0, 0);
       assert.equal(controlVisits, 0, 'Untouched source retains its private receipt projection');
+      assert.equal(
+        privateReceiptRowsWritten,
+        1,
+        'One append writes only its new private receipt row',
+      );
       assert.ok(
         changedVisits <= 1,
         `${changedVisits} changed-source receipt visits for one append`,

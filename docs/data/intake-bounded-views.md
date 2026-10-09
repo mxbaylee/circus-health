@@ -633,6 +633,31 @@ full-frontier traversal out of the transaction; it does not reduce its total
 source visits, replace selected original-file checks, or make other cold
 preparation changed-source-only.
 
+Lookup-index preparation also pages its initial source traversal by exact rowid,
+yielding after 64 originals, including already prepared and legacy sources.
+After maintenance, the certified path combines final selected-index validation
+and the discovery digest in one paged traversal. Its original read proof must
+survive every turn, and its complete digest must match the initial traversal;
+source insertion, removal or reordering cannot turn a partial pass into a
+complete certificate. This removes one redundant final source scan, not the
+remaining complete-source work. The uncertified compatibility fallback remains
+synchronous and grants no read token. The separate private catalog traversal
+still owns its existing iterator and checkpoints.
+
+An eligible single-participant native acceptance can extend the private receipt
+address catalog with only its newly appended lookup keys. The workflow compiler
+issues a one-use proof only after completely validating its append contributions;
+the acceptance owner binds the final prepared logical root and successful durable
+outcome. Fresh preparation still validates the complete current source frontier,
+checks every new selected lookup address, and creates a new global read proof.
+No prior global proof receives credit for the owner's writes. Existing receipt
+rows join the freshly validated source head instead of being rewritten when that
+head changes. Detached append metadata is bounded to 64 keys and one pending
+source per connection; eviction, unsupported/multi-participant paths, unknown
+replacement or mismatched proof use complete derivation. These are optimization
+bounds, not acceptance limits. Readers and authority capabilities are not retained
+in the detached append metadata.
+
 Grounded source-scope checks retain a lazy, ordered verified prefix on the opened
 collection scope. Each new row still reads the original group and current version
 before comparing boundaries, preserving duplicate order, version selection and

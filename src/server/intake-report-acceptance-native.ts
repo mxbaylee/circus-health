@@ -408,6 +408,7 @@ export async function applyNativeAcceptanceGroup(
             return {
               changes: [...plans, ...classifier.changes, ...result.changes],
               needsReview: result.needsReview,
+              receiptAppend: result.receiptAppend,
             };
           },
         });

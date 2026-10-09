@@ -42,6 +42,10 @@ import {
 } from './intake-collection-envelope.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
 import {
+  nativeIntakeReceiptAppendBasis,
+  retainNativeIntakeReceiptAppend,
+} from './intake-lookup-projection.ts';
+import {
   collectionClinicalProjectionContext,
   type CollectionClinicalReviewSession,
 } from './intake-review-collection-session.ts';
@@ -496,7 +500,11 @@ export async function prepareNativeIntakeAcceptance(
         affected: NativeProposalAffected;
         acceptance: NativeAcceptanceEffects;
       },
-    ): Promise<{ changes: readonly IntakeCollectionChange[]; needsReview: boolean }>;
+    ): Promise<{
+      changes: readonly IntakeCollectionChange[];
+      needsReview: boolean;
+      receiptAppend?: object;
+    }>;
     assertRunning?: () => void;
   },
 ) {
@@ -576,6 +584,12 @@ export async function prepareNativeIntakeAcceptance(
           .digest('hex'),
       effects = createNativeAcceptanceEffects(),
       collections = selectedEnvelopeStore(db, file).collections;
+    const receiptAppendBasis =
+      input.retainReportReceipt === false || !before.logicalBinding
+        ? undefined
+        : nativeIntakeReceiptAppendBasis(db, file, before.logicalBinding);
+    let receiptAppend:
+      { logical: string; proof: object; reader: IntakeCollectionEnvelopeReader } | undefined;
     const reportReceipt = structuredClone(
       input.reportReceipt?.({
         imported: structuredClone(imported),
@@ -616,6 +630,7 @@ export async function prepareNativeIntakeAcceptance(
         : undefined,
       assertRunning: assertCurrent,
       prepareDerived: async (value) => {
+        receiptAppend = undefined;
         if (reportReceipt) {
           for (const changed of value.affected.candidateChanges) {
             if (changed.kind !== 'update') {
@@ -645,6 +660,13 @@ export async function prepareNativeIntakeAcceptance(
         if (typeof result.needsReview !== 'boolean')
           throw Error('Acceptance requires exact updated workflow facts');
         needsReview = result.needsReview;
+        if (receiptAppendBasis && reportReceipt && result.receiptAppend && before.logicalBinding) {
+          receiptAppend = {
+            logical: JSON.stringify(value.logical),
+            proof: result.receiptAppend,
+            reader: value.reader,
+          };
+        }
         return [...result.changes, ...preparedClinicalEvidenceChanges(projection, file.id)];
       },
       derivedIntakeState: () => {
@@ -738,6 +760,14 @@ export async function prepareNativeIntakeAcceptance(
                 operationId: input.operationId,
                 fingerprint: input.fingerprint,
                 receipt: reportReceipt,
+                receiptAppend:
+                  receiptAppendBasis && receiptAppend?.logical === expectedLogical
+                    ? {
+                        basis: receiptAppendBasis,
+                        proof: receiptAppend.proof,
+                        reader: receiptAppend.reader,
+                      }
+                    : undefined,
                 simple:
                   unchangedVersionHeaders &&
                   reportReceipt.receipts[0]!.proposalId !== null &&
@@ -868,6 +898,11 @@ interface CertifiedTransition {
   fingerprint: string;
   receipt: IntakeAtomicAcceptanceReceipt;
   simple: boolean;
+  receiptAppend?: {
+    basis: object;
+    proof: object;
+    reader: IntakeCollectionEnvelopeReader;
+  };
 }
 const bases = new WeakMap<NativeBatchRevalidationBasis, BasisState>(),
   activeBases = new WeakMap<Database, Map<NativeBatchRevalidationBasis, BasisState>>(),
@@ -1049,7 +1084,7 @@ function observeOwnedAcceptanceTransition(
   if (!token) throw Error('Acceptance transition requires an ordinary transaction');
   const saved: CertifiedTransition = {
     ...input,
-    source: { id: input.source.id },
+    source: { id: input.source.id, sha256: input.source.sha256 },
     receipt: structuredClone(input.receipt),
   };
   const stop = observeTransactionOutcome(db, (outcome) => {
@@ -1074,10 +1109,21 @@ function observeOwnedAcceptanceTransition(
       canonicalLiteral(JSON.parse(String(row.result_json))) !== canonicalLiteral(saved.receipt)
     )
       return;
+    if (saved.receiptAppend)
+      retainNativeIntakeReceiptAppend(
+        db,
+        saved.receiptAppend.basis,
+        saved.receiptAppend.proof,
+        saved.receiptAppend.reader,
+        saved.source,
+        saved.before,
+        saved.after,
+      );
     let registry = transitions.get(db);
     if (!registry) transitions.set(db, (registry = new Map()));
     registry.delete(saved.source.id);
-    registry.set(saved.source.id, saved);
+    const { receiptAppend: _consumedAppend, ...retainedTransition } = saved;
+    registry.set(saved.source.id, retainedTransition);
     while (registry.size > 64) registry.delete(registry.keys().next().value!);
   });
 }

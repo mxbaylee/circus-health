@@ -65,7 +65,11 @@ export async function prepareNativeIntakeAcceptanceGroup(
         affected: NativeProposalAffected;
         acceptance: NativeAcceptanceEffects;
       },
-    ): Promise<{ changes: readonly IntakeCollectionChange[]; needsReview: boolean }>;
+    ): Promise<{
+      changes: readonly IntakeCollectionChange[];
+      needsReview: boolean;
+      receiptAppend?: object;
+    }>;
     assertRunning?: () => void;
   },
 ) {
