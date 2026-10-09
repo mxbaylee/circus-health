@@ -22,6 +22,17 @@ Typed nested collection values capture an existing checked map, sequence or byte
 
 A preparation contains at most 64 primitive changes, 4,096 changed rows and 8 MiB of encoded writes. Retained preparations are capped at eight and 16 MiB together; the page cache holds 128 pages and byte/collection reference registries are bounded. Large commands checkpoint private incomplete builds in smaller batches and yield to the event loop, then select a fixed number of roots. They do not publish partial domain changes. Opaque preparations are source/head bound, disposable and transaction scoped; replay is resolved before issuing a new one-use maintenance capability. Existing identical immutable rows do not enlarge the allowed changed set.
 
+Identity snapshot inline deltas coalesce at most 64 entries or 64 KiB of key/value
+bytes per checkpoint, while retaining checked host yields every 16 desired rows.
+Text-leaf writes and suffix deletion retain their 16-change batches. Workflow
+summary builds flush at 60 pending changes, leaving room for a two-change ranked
+contribution and its progress marker within the owner's 64-change ceiling.
+Separate checked yields retain the earlier 15-change cooperation cadence. An
+empty workflow checkpoint omits publication only after freshly reading an exact
+matching authenticated progress marker; its callback, host yield and subsequent
+authority check still run. These reduce repeated path-copy writes without
+changing final snapshot certification or granting authority across host turns.
+
 Adjacent inline puts to the same map now share one bounded tree preparation. All
 inputs are validated, including values later overwritten in the same batch; the
 last put to a key wins. At most the existing 64 changes are sorted and partitioned

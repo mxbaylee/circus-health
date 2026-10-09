@@ -71,6 +71,42 @@ async function select(f: Fixture, catalog: ReportSnapshotCatalog) {
   await commit(f, await catalog.finalChanges());
 }
 const text = (reader: ReportSnapshotMapReader) => [...reader.chunks('warning')].join('');
+
+test('real snapshot catalog commits 64 inline entries together and refuses a 65-entry batch', async (t) => {
+  const f = await fixture(t);
+  let checkpoints = 0;
+  const catalog = createReportSnapshotCatalog(
+      f.db,
+      { id: f.original.id },
+      {
+        catalogArea: 'builds',
+        onCheckpoint: () => {
+          checkpoints++;
+        },
+      },
+    ),
+    writer = await catalog.fork(),
+    entries = Array.from({ length: 64 }, (_, n) => ({
+      key: 'fictional:' + String(n).padStart(4, '0'),
+      value: 'retained-' + n,
+    })),
+    before = checkpoints;
+  await writer.putMany(entries);
+  assert.equal(checkpoints - before, 1);
+  for (const { key, value } of entries) assert.equal(writer.get(key), value);
+  await assert.rejects(
+    writer.putMany([...entries, { key: 'overflow', value: 'refused' }]),
+    /bounded change batch/,
+  );
+  assert.equal(checkpoints - before, 1);
+  assert.equal(writer.get('overflow'), undefined);
+  await catalog.publish('fictional-inline-batch', writer);
+  await select(f, catalog);
+  clearIntakeCollectionCache(f.db);
+  const retained = catalogFor(f).open('fictional-inline-batch')!;
+  for (const { key, value } of entries) assert.equal(retained.get(key), value);
+});
+
 const prefix =
     '{"kind":"model_birth_date_mismatch","modelBirthDate":"1990-01-01","savedBirthDate":"1991-01-01","personName":"Fictional ',
   suffix = '"}';

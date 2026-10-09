@@ -18,6 +18,7 @@ class FictionalMap implements ReportSnapshotMapWriter {
   readonly changed: string[] = [];
   readonly removed: string[] = [];
   readonly batches: number[] = [];
+  readonly batchBytes: number[] = [];
   constructor(values: Iterable<[string, string]> = []) {
     this.values = new Map(values);
   }
@@ -66,6 +67,9 @@ class FictionalMap implements ReportSnapshotMapWriter {
   }
   async putMany(entries: readonly { key: string; value: string }[]) {
     this.batches.push(entries.length);
+    this.batchBytes.push(
+      entries.reduce((total, entry) => total + Buffer.byteLength(entry.key + entry.value), 0),
+    );
     for (const entry of entries) await this.put(entry.key, entry.value);
   }
   async putText(key: string, chunks: Iterable<string> | AsyncIterable<string>) {
@@ -145,7 +149,7 @@ test('delta skips unchanged values, preserves identical duplicate derived keys, 
   await delta.certify(writer);
   assert.deepEqual(writer.changed, ['member:0020', 'targetLookup:retained']);
   assert.deepEqual(writer.removed, ['targetLookup:obsolete', 'warnings:tail']);
-  assert.ok(writer.batches.every((count) => count <= 16));
+  assert.ok(writer.batches.every((count) => count <= 64));
   const immutable = immutableSnapshot(writer);
   await delta.certify(immutable);
   const certificate = identitySnapshotDeltaCertificate(immutable);
@@ -156,6 +160,41 @@ test('delta skips unchanged values, preserves identical duplicate derived keys, 
     () => identitySnapshotDeltaCertificate(new FictionalMap(writer.values)),
     /not certified|cannot certify/,
   );
+});
+
+test('delta coalesces inline changes within both the 64-row and 64 KiB limits', async (t) => {
+  for (const size of [12, 2000]) {
+    const { writer, delta } = fixture(t),
+      expected = Array.from({ length: 130 }, (_, n): [string, string] => [
+        'member:' + String(n).padStart(4, '0'),
+        String(n).padStart(size, 'x'),
+      ]);
+    for (const [key, value] of expected) await delta.put(key, value);
+    await delta.finishCleanup();
+    await delta.certify(writer);
+    assert.deepEqual([...writer.values], expected);
+    assert.ok(writer.batches.every((count) => count <= 64));
+    assert.ok(writer.batchBytes.every((bytes) => bytes <= 64 * 1024));
+    assert.deepEqual(writer.batches, size === 12 ? [64, 64, 2] : [32, 32, 32, 32, 2]);
+  }
+});
+
+test('delta still yields and refuses stale authority before a buffered inline batch is full', async (t) => {
+  const { writer, delta } = fixture(t);
+  let stale = false;
+  writer.assertCurrent = () => {
+    if (stale) throw Error('Fictional authority changed at host yield');
+  };
+  for (let n = 0; n < 15; n++) await delta.put('member:' + n, 'fictional');
+  assert.equal(writer.batches.length, 0);
+  const turn = setImmediate(() => {
+    stale = true;
+  });
+  t.after(() => clearImmediate(turn));
+  await assert.rejects(delta.put('member:15', 'fictional'), /authority changed at host yield/);
+  assert.equal(stale, true);
+  assert.equal(writer.values.size, 0, 'the unpublished batch remains private after refusal');
+  assert.equal(writer.batches.length, 0);
 });
 
 test('delta flushes a pending occurrence before membership construction and rejects conflicting duplicate values', async (t) => {

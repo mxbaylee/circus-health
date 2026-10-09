@@ -144,7 +144,7 @@ export function createReportSnapshotCatalog(
       async () => {
         assertCurrent();
         if (!changes.length) return;
-        if (changes.length > 16) throw Error('Report checkpoint exceeds bounded change batch');
+        if (changes.length > 64) throw Error('Report checkpoint exceeds bounded change batch');
         withIntakeWork(db, 'warm', () =>
           recordIntakeWork('reportSnapshotCheckpointChanges', changes.length),
         );
@@ -381,7 +381,7 @@ export function createReportSnapshotCatalog(
         await checkpoint([{ area: 'builds', collection: name, op: 'delete', key }]);
       },
       async putMany(entries) {
-        if (entries.length > 16) throw Error('Report checkpoint exceeds bounded change batch');
+        if (entries.length > 64) throw Error('Report checkpoint exceeds bounded change batch');
         await checkpoint(
           entries.map(({ key, value }) => ({
             area: 'builds',

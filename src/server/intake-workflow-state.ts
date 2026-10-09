@@ -178,6 +178,9 @@ export async function buildVerifiedWorkflowSummary(
     factCollection = 'workflow.' + buildId + '.facts',
     dependencyCollection = 'workflow.' + buildId + '.dependencies';
   const changes: IntakeCollectionChange[] = [];
+  // A ranked contribution can add two changes; leave room for it and the marker.
+  const checkpointChanges = 60;
+  let lastYieldSize = 0;
   let inspected = 0,
     factCount = 0,
     phase: 'indexes' | 'counts' = 'indexes';
@@ -206,28 +209,46 @@ export async function buildVerifiedWorkflowSummary(
   };
   const checkpoint = async () => {
     const batch = changes.splice(0);
+    const marker = JSON.stringify({
+      format: policy,
+      state: 'building',
+      binding,
+      pins,
+      phase,
+      inspected,
+      factCount,
+      indexCollection,
+      factCollection,
+    });
     batch.push({
       area: 'builds',
       collection: 'workflow.builds',
       op: 'put',
       key: buildId,
-      value: JSON.stringify({
-        format: policy,
-        state: 'building',
-        binding,
-        pins,
-        phase,
-        inspected,
-        factCount,
-        indexCollection,
-        factCollection,
-      }),
+      value: marker,
     });
-    commit(batch);
+    if (batch.length > 1) commit(batch);
+    else {
+      current();
+      if (collections.get(collections.openView(), 'builds', 'workflow.builds', buildId) !== marker)
+        commit(batch);
+    }
+    lastYieldSize = 0;
     await options.onCheckpoint?.();
     await new Promise<void>((resolve) => setImmediate(resolve));
     current();
   };
+  const checkpointOrYield = async () => {
+    if (changes.length >= checkpointChanges) await checkpoint();
+    else if (changes.length - lastYieldSize >= 15) {
+      current();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      current();
+      lastYieldSize = changes.length;
+    }
+  };
+  const checkpointOrYieldDue = () =>
+    changes.length >= checkpointChanges || changes.length - lastYieldSize >= 15;
   const semanticComplete = collections.get(
     collections.openView(),
     'builds',
@@ -252,7 +273,7 @@ export async function buildVerifiedWorkflowSummary(
         key: contribution.key,
         value: contribution.value,
       });
-      if (changes.length >= 15) await checkpoint();
+      if (checkpointOrYieldDue()) await checkpointOrYield();
     }
     for (const [reader, contributions] of [
       [view, workflowIndexContributions(view)],
@@ -285,7 +306,7 @@ export async function buildVerifiedWorkflowSummary(
             value: JSON.stringify(contribution.rank),
           });
         inspected++;
-        if (changes.length >= 15) await checkpoint();
+        if (checkpointOrYieldDue()) await checkpointOrYield();
       }
     await checkpoint();
     for (const contribution of workflowUnitIndexContributions(view, (index, key) => {
@@ -312,7 +333,7 @@ export async function buildVerifiedWorkflowSummary(
         value: view.address(contribution.target),
       });
       inspected++;
-      if (changes.length >= 15) await checkpoint();
+      if (checkpointOrYieldDue()) await checkpointOrYield();
     }
     await checkpoint();
     commit([
@@ -355,7 +376,7 @@ export async function buildVerifiedWorkflowSummary(
       value: JSON.stringify({ key, facts }),
     });
     factCount++;
-    if (changes.length >= 15) await checkpoint();
+    if (checkpointOrYieldDue()) await checkpointOrYield();
   };
   const tick = async () => {
     if (++inspected % 64 === 0) await checkpoint();
@@ -410,7 +431,7 @@ export async function buildVerifiedWorkflowSummary(
         op: 'put',
         ...contribution,
       });
-      if (changes.length >= 15) await checkpoint();
+      if (checkpointOrYieldDue()) await checkpointOrYield();
     }
   }
   changes.push({

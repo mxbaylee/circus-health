@@ -288,7 +288,7 @@ function configureIdentitySnapshotDelta(
       checkPublished();
       const value = prefix.join(''),
         cost = Buffer.byteLength(key) + size;
-      if (pending.length && (pending.length === 16 || pendingBytes + cost > 64 * 1024))
+      if (pending.length && (pending.length === 64 || pendingBytes + cost > 64 * 1024))
         await flush();
       pending.push({ key, value });
       pendingBytes += cost;
