@@ -1,4 +1,4 @@
-name: PR71 disposable projection payload decomposition
+name: PR71 disposable projection metadata tuple comparison
 on:
   push:
     branches: [codex/pr71-step0-workspace]
@@ -6,13 +6,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  projection-payload-32:
+  projection-tuple-32:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      # Publish this workflow and the reviewed loader only to an isolated diagnostic branch.
+      # Publish this workflow and reviewed loader only to an isolated diagnostic branch.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: diagnostic
@@ -29,29 +29,37 @@ jobs:
       - name: Install pinned source dependencies
         working-directory: source
         run: npm ci
-      - name: Measure one full-index fictional publication
+      - name: Compare unchanged object and tuple projection sequentially
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/pr71-projection-payload"
-          git rev-parse HEAD > "$RUNNER_TEMP/pr71-projection-payload/source-head.txt"
+          mkdir -p "$RUNNER_TEMP/pr71-projection-tuple"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr71-projection-tuple/source-head.txt"
           test "$(git rev-parse HEAD)" = '0d88ab3fa12059945550da7c7439b8d532a6b950'
-          sha256sum src/server/record-versions.ts src/server/test/intake-history-publication.test.ts ../diagnostic/pr71-projection-payload-loader.mjs > "$RUNNER_TEMP/pr71-projection-payload/source-sha.txt"
-          CRS_PROJECTION_PAYLOAD_DIAGNOSTIC=1 CRS_PROJECTION_PAYLOAD_COUNT=32 CRS_HISTORY_WAL_CHECKPOINT_PAGES=32768 \
-            node --import=../diagnostic/pr71-projection-payload-loader.mjs --test --experimental-strip-types \
-              --test-name-pattern='^record projection payload decomposition: 32 artifacts$' \
-              src/server/test/intake-history-publication.test.ts \
-              > "$RUNNER_TEMP/pr71-projection-payload/payload.log" 2>&1
+          sha256sum src/server/record-versions.ts src/server/test/intake-history-publication.test.ts ../diagnostic/pr71-projection-tuple-loader.mjs > "$RUNNER_TEMP/pr71-projection-tuple/source-sha.txt"
+          status=0
+          for variant in object tuple; do
+            if CRS_PROJECTION_TUPLE_DIAGNOSTIC=1 CRS_PROJECTION_TUPLE_VARIANT="$variant" CRS_PROJECTION_TUPLE_COUNT=32 CRS_HISTORY_WAL_CHECKPOINT_PAGES=32768 \
+              node --import=../diagnostic/pr71-projection-tuple-loader.mjs --test --experimental-strip-types \
+                --test-name-pattern="^projection tuple matched publication: $variant 32 artifacts$" \
+                src/server/test/intake-history-publication.test.ts \
+                > "$RUNNER_TEMP/pr71-projection-tuple/$variant.log" 2>&1; then
+              :
+            else
+              status=1
+            fi
+          done
+          exit "$status"
       - name: Checksum all available receipts
         if: always()
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/pr71-projection-payload"
-          find "$RUNNER_TEMP/pr71-projection-payload" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-projection-payload/SHA256SUMS"
+          mkdir -p "$RUNNER_TEMP/pr71-projection-tuple"
+          find "$RUNNER_TEMP/pr71-projection-tuple" -type f ! -name SHA256SUMS -print0 | xargs -0 -r sha256sum > "$RUNNER_TEMP/pr71-projection-tuple/SHA256SUMS"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: pr71-projection-payload-32
-          path: ${{ runner.temp }}/pr71-projection-payload
+          name: pr71-projection-tuple-32
+          path: ${{ runner.temp }}/pr71-projection-tuple
           if-no-files-found: error
