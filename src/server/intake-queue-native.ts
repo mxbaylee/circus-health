@@ -5,7 +5,7 @@ import { setImmediate } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError, clinicalReviewRevision } from './database.ts';
-import { assertIntakeOwner } from './intake.ts';
+import { assertIntakeOwner, withVerifiedIntakeOriginalDescriptor } from './intake.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { visibilityCondition, visibilitySQL } from './visibility.ts';
 import { prepareIntakeSourceDependencyHeaders } from './intake-source-text-dependencies.ts';
@@ -311,15 +311,26 @@ async function prepareCollectionQueueReadNow(
         }
       let count = 0;
       if (!narrow)
-        for (const member of collectionReportQueueMembers(db, profileId, id)) {
-          scratch.db
-            .prepare('INSERT OR IGNORE INTO proposals VALUES(?,?)')
-            .run(id, JSON.stringify(member.proposalId));
-          if (++count % 64 === 0) {
-            await setImmediate();
-            assertCurrent();
-          }
-        }
+        await withVerifiedIntakeOriginalDescriptor(
+          { db, root, profileId, id, assertRunning: assertCurrent },
+          async ({ assertRunning }) => {
+            for await (const member of collectionReportQueueMembers(
+              db,
+              profileId,
+              id,
+              undefined,
+              assertRunning,
+            )) {
+              scratch.db
+                .prepare('INSERT OR IGNORE INTO proposals VALUES(?,?)')
+                .run(id, JSON.stringify(member.proposalId));
+              if (++count % 64 === 0) {
+                await setImmediate();
+                assertRunning();
+              }
+            }
+          },
+        );
       scratch.db
         .prepare('UPDATE sources SET logical=? WHERE id=?')
         .run(canonicalLiteral(intakeSourceVersion(db, id)), id);

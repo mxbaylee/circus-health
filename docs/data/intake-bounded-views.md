@@ -905,6 +905,24 @@ not eagerly traverse the installation. These certificates and indexes remain
 disposable; retained accepted identity evidence keeps its existing policy and
 does not become unreviewed solely because the original-grounding cache is cleared.
 
+Native report-member preparation yields after at most 64 structural work units,
+including retained groups and versions, fallback candidates, ownership rows,
+group callbacks and members that do not produce a visible result. Scratch
+indexes exist before ingestion; ordered traversal does not defer a full source
+sort or distinct-membership copy until the first result. A separate retained-only
+membership index preserves duplicate-candidate fallback and report-anchor
+precedence without admitting later fallback rows into that baseline.
+
+Each full-scan consumer holds the existing verified-original descriptor through
+the entire traversal. New internal turns recheck the current operation, selected
+source, SQL witness and cache generation before continuing; the physical lease
+rejects path or inode replacement. A consumer may perform ordinary derived
+preparation between emitted members, but must still retain the same selected
+source and original physical identity. Indexed record-page windows keep their
+existing bounded path rather than acquiring a new full-scan lease. Cancellation
+or changed authority discards the private scratch and preserves the callers'
+final response and publication checks.
+
 The host can prepare clinical projection as an opaque changed-row plan. It runs
 the existing projector synchronously inside a SQLite savepoint, captures the
 exact result and row changes, then rolls back before asynchronous envelope

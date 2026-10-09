@@ -4,11 +4,14 @@ import { collectionClinicalProjectionContext } from './intake-review-collection-
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete selected report membership traversal for native clinical record queues. */
 import { createHash } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import type { DatabaseSync } from 'node:sqlite';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { HttpError, clinicalReviewRevision } from './database.ts';
-import { assertIntakeOwner } from './intake.ts';
+import { assertIntakeOwner, withVerifiedIntakeOriginalDescriptor } from './intake.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
+import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 import {
   openIntakeCollectionEnvelope,
   type IntakeEnvelopeRecord,
@@ -122,12 +125,13 @@ export function currentCollectionReportQueueMember(
   };
 }
 /** Returns every historical owned candidate/version exactly once per report group. */
-export function* collectionReportQueueMembers(
+export async function* collectionReportQueueMembers(
   db: DatabaseSync,
   profileId: string,
   intakeId: string,
-  onGroup?: (group: CollectionReportQueueGroupPointer) => void,
-): Generator<CollectionReportQueueMember> {
+  onGroup: ((group: CollectionReportQueueGroupPointer) => void) | undefined,
+  assertRunning: () => void,
+): AsyncGenerator<CollectionReportQueueMember> {
   assertIntakeOwner(db, profileId);
   const file = db
     .prepare(
@@ -167,14 +171,46 @@ export function* collectionReportQueueMembers(
   try {
     const cache = scratch.db;
     cache.exec(
-      'CREATE TABLE groups(ordinal INTEGER PRIMARY KEY,id TEXT NOT NULL,basis TEXT NOT NULL,ordering TEXT NOT NULL,address TEXT,span INTEGER);CREATE TABLE members(groupOrdinal INTEGER,candidate TEXT,version TEXT,ordering TEXT,PRIMARY KEY(groupOrdinal,candidate,version));CREATE TABLE owners(candidate TEXT,version TEXT,groupId TEXT,PRIMARY KEY(candidate,version));CREATE INDEX byCandidateVersion ON members(candidate,version);',
+      'CREATE TABLE groups(ordinal INTEGER PRIMARY KEY,id TEXT NOT NULL,basis TEXT NOT NULL,ordering TEXT NOT NULL,address TEXT,span INTEGER);CREATE INDEX groupOrder ON groups(ordering,ordinal);CREATE INDEX groupId ON groups(id,ordinal);CREATE TABLE members(groupOrdinal INTEGER,candidate TEXT,version TEXT,ordering TEXT,PRIMARY KEY(groupOrdinal,candidate,version));CREATE INDEX byCandidateVersion ON members(candidate,version);CREATE INDEX memberOrder ON members(groupOrdinal,ordering);CREATE TABLE retainedMembership(candidate TEXT,version TEXT,PRIMARY KEY(candidate,version));CREATE TABLE owners(candidate TEXT,version TEXT,groupId TEXT,PRIMARY KEY(candidate,version));',
     );
     const groupInsert = cache.prepare('INSERT INTO groups VALUES(?,?,?,?,?,?)'),
       memberInsert = cache.prepare(
         'INSERT INTO members VALUES(?,?,?,?) ON CONFLICT(groupOrdinal,candidate,version) DO UPDATE SET ordering=min(ordering,excluded.ordering)',
-      );
+      ),
+      retainedInsert = cache.prepare('INSERT OR IGNORE INTO retainedMembership VALUES(?,?)');
+    const operation = currentClinicalOperation(db);
+    let generation = intakeCollectionCacheGeneration(db);
+    let work = 0;
+    const check = (internalYield: boolean) => {
+      assertRunning();
+      if (operation && currentClinicalOperation(db) !== operation)
+        throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+      assertIntakeOwner(db, profileId);
+      if (internalYield && intakeCollectionCacheGeneration(db) !== generation)
+        throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+      view.root();
+    };
+    const checkpoint = () => {
+      if (++work < 64) return false;
+      work = 0;
+      return true;
+    };
+    const cooperate = async () => {
+      const source = canonicalLiteral(intakeSourceVersion(db, intakeId));
+      const stamp = reviewReadStamp(db);
+      if (!stamp) throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+      check(true);
+      await setImmediate();
+      check(true);
+      if (
+        reviewReadStamp(db) !== stamp ||
+        canonicalLiteral(intakeSourceVersion(db, intakeId)) !== source
+      )
+        throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+    };
     let ordinal = 0;
     for (const group of children(workflow, 'reportGroups')) {
+      if (checkpoint()) await cooperate();
       const id = value<string>(group, 'id')!,
         basis = value<string>(group, 'basis')!;
       const first = view.childAt(group, 'versions', 0);
@@ -187,6 +223,7 @@ export function* collectionReportQueueMembers(
       groupInsert.run(ordinal, id, basis, order, view.address(group), 0);
       let memberOrdinal = 0;
       for (const version of children(group, 'versions')) {
+        if (checkpoint()) await cooperate();
         if (value(version, 'format') === 'health-intake-report-group-version-v2') {
           const snapshot = openReportMemberSnapshot(
             catalog,
@@ -200,25 +237,30 @@ export function* collectionReportQueueMembers(
               member.candidateVersionId,
               '1:' + String(memberOrdinal++).padStart(16, '0'),
             );
+            retainedInsert.run(member.candidateId, member.candidateVersionId);
+            if (checkpoint()) await cooperate();
           }
         } else
-          for (const member of children(version, 'members'))
+          for (const member of children(version, 'members')) {
+            const candidateId = value<string>(member, 'candidateId')!,
+              versionId = value<string>(member, 'candidateVersionId')!;
             memberInsert.run(
               ordinal,
-              value<string>(member, 'candidateId')!,
-              value<string>(member, 'candidateVersionId')!,
+              candidateId,
+              versionId,
               '1:' + String(memberOrdinal++).padStart(16, '0'),
             );
+            retainedInsert.run(candidateId, versionId);
+            if (checkpoint()) await cooperate();
+          }
       }
       cache.prepare('UPDATE groups SET span=? WHERE ordinal=?').run(memberOrdinal, ordinal);
       ordinal++;
     }
-    // The legacy fallback covers versions absent from retained groups, including duplicate IDs.
-    cache.exec(
-      'CREATE TABLE retainedMembership AS SELECT DISTINCT candidate,version FROM members;CREATE UNIQUE INDEX retainedKey ON retainedMembership(candidate,version);',
-    );
+    // This is the retained-only snapshot. Fallback inserts must not change later decisions.
     let candidateOrdinal = 0;
     for (const candidate of children(workflow, 'candidates')) {
+      if (checkpoint()) await cooperate();
       const candidateId = value<string>(candidate, 'id')!;
       const id =
         'report-group:' +
@@ -228,6 +270,7 @@ export function* collectionReportQueueMembers(
       let versionOrdinal = 0,
         firstFallback = true;
       for (const version of children(candidate, 'versions')) {
+        if (checkpoint()) await cooperate();
         const versionId = value<string>(version, 'id')!;
         if (
           value(version, 'sourceContext') ||
@@ -281,19 +324,28 @@ export function* collectionReportQueueMembers(
     const owner = cache.prepare(
       'INSERT INTO owners VALUES(?,?,?) ON CONFLICT(candidate,version) DO UPDATE SET groupId=excluded.groupId',
     );
-    for (const basis of ['candidate_fallback', 'report_anchor'])
-      for (const row of cache
-        .prepare(
-          'SELECT m.candidate,m.version,g.id FROM groups g JOIN members m ON m.groupOrdinal=g.ordinal WHERE g.basis=? ORDER BY g.ordinal,m.ordering',
-        )
-        .iterate(basis))
-        owner.run(String(row.candidate), String(row.version), String(row.id));
+    const orderedMembers = cache.prepare(
+      'SELECT candidate,version,ordering FROM members INDEXED BY memberOrder WHERE groupOrdinal=? ORDER BY ordering',
+    );
+    for (const basis of ['candidate_fallback', 'report_anchor']) {
+      for (const group of cache
+        .prepare('SELECT ordinal,id,basis FROM groups ORDER BY ordinal')
+        .iterate()) {
+        if (checkpoint()) await cooperate();
+        for (const member of orderedMembers.iterate(group.ordinal)) {
+          if (checkpoint()) await cooperate();
+          if (group.basis === basis)
+            owner.run(String(member.candidate), String(member.version), String(group.id));
+        }
+      }
+    }
     if (onGroup)
       for (const group of cache
         .prepare(
-          'SELECT ordinal,id,basis,ordering,address,span FROM groups ORDER BY ordering,ordinal',
+          'SELECT ordinal,id,basis,ordering,address,span FROM groups INDEXED BY groupOrder ORDER BY ordering,ordinal',
         )
-        .iterate())
+        .iterate()) {
+        if (checkpoint()) await cooperate();
         onGroup({
           ordinal: Number(group.ordinal),
           groupId: String(group.id),
@@ -302,70 +354,90 @@ export function* collectionReportQueueMembers(
           address: group.address === null ? null : String(group.address),
           memberSpan: Number(group.span),
         });
+      }
     let previousGroup = -1,
       memberOrder = 0;
-    for (const row of cache
+    const selectedOwner = cache.prepare(
+      'SELECT groupId FROM owners WHERE candidate=? AND version=?',
+    );
+    for (const group of cache
       .prepare(
-        'SELECT g.ordinal,g.id,g.ordering,m.candidate,m.version,m.ordering AS memberOrdering,g.span FROM groups g JOIN members m ON m.groupOrdinal=g.ordinal JOIN owners o ON o.candidate=m.candidate AND o.version=m.version AND o.groupId=g.id ORDER BY g.ordering,g.ordinal,m.ordering',
+        'SELECT ordinal,id,ordering,span FROM groups INDEXED BY groupOrder ORDER BY ordering,ordinal',
       )
       .iterate()) {
-      const candidateId = String(row.candidate),
-        versionId = String(row.version);
-      const candidate = view.find('candidate', workflow, candidateId, { match: 'last' }),
-        version = candidate && view.find('version', candidate, versionId);
-      if (!candidate || !version || value(version, 'sourceContext') || value(version, 'peopleOnly'))
-        continue;
-      const draft = view.childCount(workflow, 'reviewDrafts')
-        ? view.lookup('draft-candidate-version-last', [JSON.stringify(candidateId), versionId])
-        : undefined;
-      let occurrence: IntakeEnvelopeRecord | undefined;
-      const count = view.childCount(version, 'occurrences');
-      if (draft)
-        occurrence = view.lookup('version-occurrence-last', [
-          view.address(version),
-          JSON.stringify(value(draft, 'proposalId') ?? null),
-          value<string>(draft, 'recordId')!,
-        ]);
-      occurrence ??= count ? view.childAt(version, 'occurrences', count - 1) : undefined;
-      if (!occurrence) continue;
-      let accepted = value(version, 'status') === 'accepted';
-      if (!accepted && view.childCount(workflow, 'decisions'))
-        accepted = !!view.lookup('accepted-candidate-version', [
-          JSON.stringify(candidateId),
-          versionId,
-        ]);
-      const latest = view.childAt(
-        candidate,
-        'versions',
-        view.childCount(candidate, 'versions') - 1,
-      )!;
-      const state: IntakeReportQueueRecordState = accepted
-        ? 'accepted'
-        : value(version, 'status') === 'kept_original'
-          ? 'kept_original'
-          : value(version, 'status') === 'superseded' || value(latest, 'id') !== versionId
-            ? 'superseded'
-            : draft && value(draft, 'disposition') === 'review_later'
-              ? 'deferred'
-              : 'pending';
-      if (previousGroup !== Number(row.ordinal)) {
-        previousGroup = Number(row.ordinal);
-        memberOrder = 0;
+      if (checkpoint()) await cooperate();
+      for (const row of orderedMembers.iterate(group.ordinal)) {
+        if (checkpoint()) await cooperate();
+        const candidateId = String(row.candidate),
+          versionId = String(row.version);
+        if (selectedOwner.get(candidateId, versionId)?.groupId !== group.id) continue;
+        const candidate = view.find('candidate', workflow, candidateId, { match: 'last' }),
+          version = candidate && view.find('version', candidate, versionId);
+        if (
+          !candidate ||
+          !version ||
+          value(version, 'sourceContext') ||
+          value(version, 'peopleOnly')
+        )
+          continue;
+        const draft = view.childCount(workflow, 'reviewDrafts')
+          ? view.lookup('draft-candidate-version-last', [JSON.stringify(candidateId), versionId])
+          : undefined;
+        let occurrence: IntakeEnvelopeRecord | undefined;
+        const count = view.childCount(version, 'occurrences');
+        if (draft)
+          occurrence = view.lookup('version-occurrence-last', [
+            view.address(version),
+            JSON.stringify(value(draft, 'proposalId') ?? null),
+            value<string>(draft, 'recordId')!,
+          ]);
+        occurrence ??= count ? view.childAt(version, 'occurrences', count - 1) : undefined;
+        if (!occurrence) continue;
+        let accepted = value(version, 'status') === 'accepted';
+        if (!accepted && view.childCount(workflow, 'decisions'))
+          accepted = !!view.lookup('accepted-candidate-version', [
+            JSON.stringify(candidateId),
+            versionId,
+          ]);
+        const latest = view.childAt(
+          candidate,
+          'versions',
+          view.childCount(candidate, 'versions') - 1,
+        )!;
+        const state: IntakeReportQueueRecordState = accepted
+          ? 'accepted'
+          : value(version, 'status') === 'kept_original'
+            ? 'kept_original'
+            : value(version, 'status') === 'superseded' || value(latest, 'id') !== versionId
+              ? 'superseded'
+              : draft && value(draft, 'disposition') === 'review_later'
+                ? 'deferred'
+                : 'pending';
+        if (previousGroup !== Number(group.ordinal)) {
+          previousGroup = Number(group.ordinal);
+          memberOrder = 0;
+        }
+        const emittedSource = canonicalLiteral(intakeSourceVersion(db, intakeId));
+        yield {
+          groupOrdinal: Number(group.ordinal),
+          groupId: String(group.id),
+          groupOrder: String(group.ordering),
+          memberOrder:
+            Number(group.span) >= 0 && String(row.ordering).startsWith('1:')
+              ? Number(String(row.ordering).slice(2))
+              : memberOrder++,
+          candidateId,
+          candidateVersionId: versionId,
+          proposalId: value<string | null>(occurrence, 'proposalId') ?? null,
+          recordId: value<string>(occurrence, 'recordId')!,
+          state,
+        };
+        // A consumer may prepare derived review state here; the selected source must not change.
+        check(false);
+        if (canonicalLiteral(intakeSourceVersion(db, intakeId)) !== emittedSource)
+          throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+        generation = intakeCollectionCacheGeneration(db);
       }
-      yield {
-        groupOrdinal: Number(row.ordinal),
-        groupId: String(row.id),
-        groupOrder: String(row.ordering),
-        memberOrder:
-          Number(row.span) >= 0 && String(row.memberOrdering).startsWith('1:')
-            ? Number(String(row.memberOrdering).slice(2))
-            : memberOrder++,
-        candidateId,
-        candidateVersionId: versionId,
-        proposalId: value<string | null>(occurrence, 'proposalId') ?? null,
-        recordId: value<string>(occurrence, 'recordId')!,
-        state,
-      };
     }
   } finally {
     scratch.close();
@@ -494,92 +566,105 @@ export async function readCollectionIntakeReportRecords(
       const physical = disposableSqlite('circus-report-record-proof-');
       try {
         const artifacts = createClinicalReviewArtifactProof(physical.db, 'clinical_artifacts');
-        for (const member of window
-          ? window.members()
-          : collectionReportQueueMembers(db, profileId, intakeId)) {
-          if (input.groupId && member.groupId !== input.groupId) continue;
-          if (view !== 'all' && member.state !== (view === 'active' ? 'pending' : 'deferred'))
-            continue;
-          if (!window) totalRecords++;
-          const order =
-            member.groupOrder +
-            ':' +
-            String(member.groupOrdinal).padStart(12, '0') +
-            ':' +
-            String(member.memberOrder).padStart(12, '0') +
-            ':' +
-            JSON.stringify([member.candidateId, member.candidateVersionId]);
-          if (order <= after) continue;
-          if (pageFull || records.length >= limit) {
-            remaining = true;
-            continue;
-          }
-          if (!cached || cachedProposal !== member.proposalId) {
-            if (cached?.status === 'ready') cached.session.close();
-            cached = undefined;
-            cached = await prepareCollectionClinicalReviewAsync(
-              db,
-              root,
-              profileId,
-              intakeId,
-              member.proposalId,
-              { assertRunning: () => queue?.assertActive() },
+        const consumeMembers = async (assertRunning: () => void) => {
+          for await (const member of window
+            ? window.members()
+            : collectionReportQueueMembers(db, profileId, intakeId, undefined, assertRunning)) {
+            if (input.groupId && member.groupId !== input.groupId) continue;
+            if (view !== 'all' && member.state !== (view === 'active' ? 'pending' : 'deferred'))
+              continue;
+            if (!window) totalRecords++;
+            const order =
+              member.groupOrder +
+              ':' +
+              String(member.groupOrdinal).padStart(12, '0') +
+              ':' +
+              String(member.memberOrder).padStart(12, '0') +
+              ':' +
+              JSON.stringify([member.candidateId, member.candidateVersionId]);
+            if (order <= after) continue;
+            if (pageFull || records.length >= limit) {
+              remaining = true;
+              continue;
+            }
+            if (!cached || cachedProposal !== member.proposalId) {
+              if (cached?.status === 'ready') cached.session.close();
+              cached = undefined;
+              cached = await prepareCollectionClinicalReviewAsync(
+                db,
+                root,
+                profileId,
+                intakeId,
+                member.proposalId,
+                { assertRunning: () => queue?.assertActive() },
+              );
+              cachedProposal = member.proposalId;
+            }
+            if (cached.status !== 'ready') throw new IntakeReviewFragmentRequired(cached.reference);
+            artifacts.retain(
+              collectionClinicalProjectionContext(cached.session).verifiedArtifacts(),
             );
-            cachedProposal = member.proposalId;
+            const record = cached.session.record(
+              member.recordId,
+              member.candidateId,
+              member.candidateVersionId,
+            );
+            if (!record)
+              throw new HttpError(
+                409,
+                'REPORT_REFERENCE_UNAVAILABLE',
+                'A report reference no longer matches its retained proposal; inspect the original',
+              );
+            const reviewed = reviewedIntakeQueueRecord(record, member.state),
+              selectable = reviewed.selectable;
+            const row = {
+              groupId: member.groupId,
+              proposalId: member.proposalId,
+              reviewToken: cached.session.review.reviewToken,
+              queueState: member.state,
+              selectable,
+            };
+            const expanded: CollectionIntakeReportRecordPage['records'][number] = {
+              ...row,
+              kind: 'record',
+              record: reviewed,
+            };
+            const cost = Buffer.byteLength(canonicalLiteral(expanded));
+            const item: CollectionIntakeReportRecordPage['records'][number] =
+              cost > byteBudget
+                ? {
+                    ...row,
+                    kind: 'record_reference',
+                    selection: {
+                      recordId: record.id,
+                      candidateVersionId: record.candidateVersionId,
+                    },
+                    reference: {
+                      format: 'health-intake-clinical-review-reference-v2',
+                      reviewToken: cached.session.review.reviewToken,
+                      section: 'records',
+                      ordinal: cached.session.review.records.indexOf(record),
+                      bytes: Buffer.byteLength(canonicalLiteral(record)),
+                    },
+                  }
+                : expanded;
+            const size = Buffer.byteLength(canonicalLiteral(item));
+            if (records.length && usedBytes + size > byteBudget) {
+              pageFull = true;
+              remaining = true;
+              continue;
+            }
+            records.push(item);
+            usedBytes += size;
+            last = order;
           }
-          if (cached.status !== 'ready') throw new IntakeReviewFragmentRequired(cached.reference);
-          artifacts.retain(collectionClinicalProjectionContext(cached.session).verifiedArtifacts());
-          const record = cached.session.record(
-            member.recordId,
-            member.candidateId,
-            member.candidateVersionId,
+        };
+        if (window) await consumeMembers(() => queue?.assertCurrent());
+        else
+          await withVerifiedIntakeOriginalDescriptor(
+            { db, root, profileId, id: intakeId, assertRunning: () => queue?.assertCurrent() },
+            async ({ assertRunning }) => consumeMembers(assertRunning),
           );
-          if (!record)
-            throw new HttpError(
-              409,
-              'REPORT_REFERENCE_UNAVAILABLE',
-              'A report reference no longer matches its retained proposal; inspect the original',
-            );
-          const reviewed = reviewedIntakeQueueRecord(record, member.state),
-            selectable = reviewed.selectable;
-          const row = {
-            groupId: member.groupId,
-            proposalId: member.proposalId,
-            reviewToken: cached.session.review.reviewToken,
-            queueState: member.state,
-            selectable,
-          };
-          const expanded: CollectionIntakeReportRecordPage['records'][number] = {
-            ...row,
-            kind: 'record',
-            record: reviewed,
-          };
-          const cost = Buffer.byteLength(canonicalLiteral(expanded));
-          const item: CollectionIntakeReportRecordPage['records'][number] =
-            cost > byteBudget
-              ? {
-                  ...row,
-                  kind: 'record_reference',
-                  selection: { recordId: record.id, candidateVersionId: record.candidateVersionId },
-                  reference: {
-                    format: 'health-intake-clinical-review-reference-v2',
-                    reviewToken: cached.session.review.reviewToken,
-                    section: 'records',
-                    ordinal: cached.session.review.records.indexOf(record),
-                    bytes: Buffer.byteLength(canonicalLiteral(record)),
-                  },
-                }
-              : expanded;
-          const size = Buffer.byteLength(canonicalLiteral(item));
-          if (records.length && usedBytes + size > byteBudget) {
-            pageFull = true;
-            remaining = true;
-            continue;
-          }
-          records.push(item);
-          usedBytes += size;
-          last = order;
-        }
         artifacts.assertCurrent();
         const current = intakeSourceVersion(db, intakeId);
         queue?.assertCurrent();

@@ -19,7 +19,11 @@ import {
   identityGroundingGeneration,
   identityGroundingSourceStamp,
 } from './intake-identity-grounding.ts';
-import { assertIntakeOwner, verifyIntakeOriginal } from './intake.ts';
+import {
+  assertIntakeOwner,
+  verifyIntakeOriginal,
+  withVerifiedIntakeOriginalDescriptor,
+} from './intake.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
@@ -950,35 +954,45 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           )
           .run(source.id);
         cache.prepare('DELETE FROM receipts WHERE owner=?').run(source.id);
-        for (const member of collectionReportQueueMembers(db, profileId, source.id, (group) =>
-          cache
-            .prepare('INSERT INTO groups VALUES(?,?,?,?,?,?,?)')
-            .run(
+        await withVerifiedIntakeOriginalDescriptor(
+          { db, root, profileId, id: source.id },
+          async ({ assertRunning }) => {
+            for await (const member of collectionReportQueueMembers(
+              db,
+              profileId,
               source.id,
-              group.groupId,
-              group.order,
-              group.address,
-              group.basis,
-              group.ordinal,
-              group.memberSpan ?? -1,
-            ),
-        )) {
-          withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueMemberRows'));
-          cache
-            .prepare('INSERT INTO members VALUES(?,?,?,?,?,?,?,?,?)')
-            .run(
-              source.id,
-              member.groupId,
-              member.memberOrder,
-              member.candidateId,
-              member.candidateVersionId,
-              JSON.stringify(member),
-              member.groupOrdinal,
-              member.state,
-              memberOrderKey(member),
-            );
-          changeMemberCount(source.id, member, 1);
-        }
+              (group) =>
+                cache
+                  .prepare('INSERT INTO groups VALUES(?,?,?,?,?,?,?)')
+                  .run(
+                    source.id,
+                    group.groupId,
+                    group.order,
+                    group.address,
+                    group.basis,
+                    group.ordinal,
+                    group.memberSpan ?? -1,
+                  ),
+              assertRunning,
+            )) {
+              withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueMemberRows'));
+              cache
+                .prepare('INSERT INTO members VALUES(?,?,?,?,?,?,?,?,?)')
+                .run(
+                  source.id,
+                  member.groupId,
+                  member.memberOrder,
+                  member.candidateId,
+                  member.candidateVersionId,
+                  JSON.stringify(member),
+                  member.groupOrdinal,
+                  member.state,
+                  memberOrderKey(member),
+                );
+              changeMemberCount(source.id, member, 1);
+            }
+          },
+        );
         const people = openCollectionPeopleRead(db, root, profileId, source.id);
         for (const pointer of people.pointers())
           cache
