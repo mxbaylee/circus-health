@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import nodeCrypto, { createHash, randomUUID } from 'node:crypto';
 import nodeFs, { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
@@ -96,14 +96,50 @@ test(
   async (t) => {
     const f = await fixture(t, true, 3, false, undefined, undefined, true);
     const preparations = () => intakeWorkCounters(f.db).warm.identityPreviewFullPreparations;
+    const originalHash = nodeCrypto.createHash;
+    const commitments = { build: 0, certification: 0 };
+    const observeHash = ((...args: Parameters<typeof createHash>) => {
+      const hash = Reflect.apply(originalHash, nodeCrypto, args);
+      const update = hash.update;
+      hash.update = function (this: typeof hash, ...values: Parameters<typeof update>) {
+        if (values[0] === '[{') {
+          const stack = new Error().stack;
+          if (stack?.includes('identityScopeCommitmentsWork'))
+            commitments[stack.includes('verifyAliasEvidenceWork') ? 'certification' : 'build']++;
+        }
+        return Reflect.apply(update, this, values);
+      } as typeof update;
+      return hash;
+    }) as typeof createHash;
+    assert.equal(Reflect.set(nodeCrypto, 'createHash', observeHash), true);
+    syncBuiltinESMExports();
+    t.after(() => {
+      assert.equal(Reflect.set(nodeCrypto, 'createHash', originalHash), true);
+      syncBuiltinESMExports();
+    });
 
     const beforeCold = preparations();
+    const beforeGrounding = intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations;
     const cold = await f.review();
     assert.ok(cold.scopeReference);
     assert.equal(
       preparations() - beforeCold,
-      2,
-      'cold grounding still needs its second full build',
+      1,
+      'cold grounding prepares one complete preview after retaining its original facts',
+    );
+    assert.equal(
+      commitments.build,
+      1,
+      'cold grounding does not construct a discarded preview scope commitment',
+    );
+    assert.equal(
+      commitments.certification,
+      1,
+      'initial snapshot certification independently reconstructs its retained commitment',
+    );
+    assert.equal(
+      intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations - beforeGrounding,
+      1,
     );
     assert.equal(nativeIdentityPreviewCounts(f.db).entries, 0);
     const scopePage = (token: string, cursor?: string) =>
@@ -119,12 +155,20 @@ test(
     assert.equal(coldTail.nextCursor, null);
 
     const beforeStable = preparations();
+    const commitmentsBeforeStable = { ...commitments };
     const stable = await f.review();
     assert.deepEqual(stable, cold);
     assert.equal(
       preparations() - beforeStable,
       1,
       'stable proof should reuse its first full build',
+    );
+    assert.equal(commitments.build - commitmentsBeforeStable.build, 1);
+    assert.equal(commitments.certification - commitmentsBeforeStable.certification, 0);
+    assert.equal(
+      intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations - beforeGrounding,
+      1,
+      'stable grounding does not add another discovery pass',
     );
     assert.equal(nativeIdentityPreviewCounts(f.db).entries, 1);
     const stablePage = await scopePage(stable.scopeReference!.scopeToken);
@@ -135,8 +179,11 @@ test(
     );
 
     const beforeWarm = preparations();
+    const commitmentsBeforeWarm = { ...commitments };
     assert.deepEqual(await f.review(), stable);
     assert.equal(preparations() - beforeWarm, 0, 'retained wire still performs no full build');
+    assert.equal(commitments.build - commitmentsBeforeWarm.build, 0);
+    assert.equal(commitments.certification - commitmentsBeforeWarm.certification, 0);
   },
 );
 

@@ -779,6 +779,7 @@ test(
   async (t) => {
     const f = await fixture(t, true, 1, false, undefined, undefined, true);
     const before = intakeWorkCounters(f.db).warm.identityPreviewFullPreparations;
+    const groundingBefore = intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations;
     const controller = new AbortController();
     const cancelled = getNativeIntakeIdentityReview(
       f.db,
@@ -790,7 +791,10 @@ test(
     );
     const refused = assert.rejects(cancelled, { name: 'AbortError' });
     const live = getNativeIntakeIdentityReview(f.db, f.root, f.profileId, f.original.id, f.groupId);
-    while (intakeWorkCounters(f.db).warm.identityPreviewFullPreparations === before) {
+    while (
+      intakeWorkCounters(f.db).warm.identityPreviewFullPreparations === before &&
+      intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations === groundingBefore
+    ) {
       t.signal.throwIfAborted();
       await setImmediate();
     }
@@ -800,8 +804,12 @@ test(
     assert.ok(value.scopeReference);
     assert.equal(
       intakeWorkCounters(f.db).warm.identityPreviewFullPreparations - before,
-      2,
-      'one shared cold preparation, including its required post-grounding rebuild',
+      1,
+      'one shared cold preparation constructs its complete preview after grounding discovery',
+    );
+    assert.equal(
+      intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations - groundingBefore,
+      1,
     );
     value.scopeReference!.report.text = 'Caller mutation';
     const next = await f.review();
@@ -900,6 +908,7 @@ test(
   async (t) => {
     const f = await fixture(t, true, 1, false, undefined, undefined, true);
     const before = intakeWorkCounters(f.db).warm.identityPreviewFullPreparations;
+    const groundingBefore = intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations;
     const controller = new AbortController();
     const cancelled = fetch(f.base + 'identity-review?groupId=' + encodeURIComponent(f.groupId), {
       signal: controller.signal,
@@ -911,7 +920,10 @@ test(
         identityCompleted = true;
       },
     );
-    while (intakeWorkCounters(f.db).warm.identityPreviewFullPreparations === before) {
+    while (
+      intakeWorkCounters(f.db).warm.identityPreviewFullPreparations === before &&
+      intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations === groundingBefore
+    ) {
       t.signal.throwIfAborted();
       await setImmediate();
     }
@@ -931,7 +943,11 @@ test(
     assert.equal(response.status, 200);
     const value = await response.json();
     assert.ok(value.data.scopeReference);
-    assert.equal(intakeWorkCounters(f.db).warm.identityPreviewFullPreparations - before, 2);
+    assert.equal(intakeWorkCounters(f.db).warm.identityPreviewFullPreparations - before, 1);
+    assert.equal(
+      intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations - groundingBefore,
+      1,
+    );
   },
 );
 

@@ -483,6 +483,11 @@ export function selectedIdentityReviewGroundingLookups(
     return value;
   }
   const work = {
+    /** Presence only chooses preparation work; it never authenticates a boundary. */
+    *originalGroundingPresentWork(group: Group): Generator<void, boolean, void> {
+      assertCurrent();
+      return grounded.get(db)?.has(selectedOriginalDateKey(boundary, group)) === true;
+    },
     *subjectGroundedWork(group: Group): Generator<void, boolean, void> {
       const { entry, current } = yield* lookupWork(group);
       return current && entry?.subject === true;

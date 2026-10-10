@@ -137,6 +137,7 @@ import {
 } from './intake-identity-policy.ts';
 import {
   retainSelectedIdentityGroundingWork,
+  selectedIdentityReviewGroundingLookups,
   identityGroundingGeneration,
 } from './intake-identity-grounding.ts';
 import { selectedIdentityPeopleSnapshots } from './intake-identity-people.ts';
@@ -1046,8 +1047,15 @@ async function build(
   context: Context,
   original: Awaited<ReturnType<typeof evidence>>,
   stored: Rows,
+  purpose: 'complete' | 'grounding' = 'complete',
 ) {
-  withIntakeWork(context.db, 'warm', () => recordIntakeWork('identityPreviewFullPreparations'));
+  withIntakeWork(context.db, 'warm', () =>
+    recordIntakeWork(
+      purpose === 'complete'
+        ? 'identityPreviewFullPreparations'
+        : 'identityPreviewGroundingPreparations',
+    ),
+  );
   const { db, root, profileId, id, view, workflow, group, scope } = context;
   const currentSelf = selfSnapshot(db),
     people = selectedIdentityPeopleSnapshots(db);
@@ -1415,13 +1423,19 @@ async function build(
     closeCached();
   }
   phase.assertCurrent();
-  // A report with no current occurrence still inspects all retained receipts.
-  if (!receipts) receipts = await run(scope.receiptsWork!());
   const dates = originalSubjectBirthDateEvidence(
     original.pageText,
     group.report!.subject!.text,
     group.report!.anchor.text,
   );
+  // A cold grounding pass never publishes its preliminary policy or scope.
+  // Close the same original physical proof before retaining only grounding facts.
+  if (purpose === 'grounding') {
+    await phase.finish();
+    return { groundingOnly: true as const, groundedQuestions, groundedNameQuestions, dates };
+  }
+  // A report with no current occurrence still inspects all retained receipts.
+  if (!receipts) receipts = await run(scope.receiptsWork!());
   const collected = await run(
     collectEvidencedIdentityWork(
       stored.sequence<IntakeReviewIssue>('issues'),
@@ -1778,6 +1792,7 @@ async function build(
       : {};
   await phase.finish();
   return {
+    groundingOnly: false as const,
     display,
     evidenceCommitment,
     originalSourceHash: original.sourceHash,
@@ -1836,7 +1851,7 @@ async function pageReference(
 }
 async function writeSnapshot(
   context: Context,
-  built: Awaited<ReturnType<typeof build>>,
+  built: Extract<Awaited<ReturnType<typeof build>>, { groundingOnly: false }>,
   stored: Rows,
   catalog: ReturnType<typeof createReportSnapshotCatalog>,
   purpose: 'preview' | 'confirmation',
@@ -2525,8 +2540,23 @@ async function getNativeIntakeIdentityReviewInner(
           firstRegistry === intakeCollectionCacheGeneration(db)
         );
       };
-      let built = await build(context, original, stored);
-      let reuseFirstBuild = firstBuildCurrent();
+      const grounding = selectedIdentityReviewGroundingLookups(
+        db,
+        context.scope.groundingBoundary(profileId, id, context.file.sha256),
+      );
+      const originalGroundingPresent = await runNativeIdentityWork(
+        context,
+        stored,
+        grounding.originalGroundingPresentWork(context.group),
+      );
+      const firstBuild = await build(
+        context,
+        original,
+        stored,
+        originalGroundingPresent ? 'complete' : 'grounding',
+      );
+      const firstCurrent = firstBuildCurrent();
+      let reuseFirstBuild = !firstBuild.groundingOnly && firstCurrent;
       await runNativeIdentityWork(
         context,
         stored,
@@ -2534,10 +2564,10 @@ async function getNativeIntakeIdentityReviewInner(
           db,
           context.scope.groundingBoundary(profileId, id, context.file.sha256),
           context.group,
-          built.groundedQuestions,
+          firstBuild.groundedQuestions,
           original.patientNameGrounded,
-          built.groundedNameQuestions,
-          built.dates,
+          firstBuild.groundedNameQuestions,
+          firstBuild.dates,
         ),
       );
       reuseFirstBuild = reuseFirstBuild && firstBuildCurrent();
@@ -2554,16 +2584,22 @@ async function getNativeIntakeIdentityReviewInner(
       const freshOriginal = await evidence(context);
       reuseFirstBuild =
         reuseFirstBuild && firstBuildCurrent() && sameOriginalEvidence(original, freshOriginal);
+      let built: Extract<Awaited<ReturnType<typeof build>>, { groundingOnly: false }>;
       if (!reuseFirstBuild) {
         stored.db
           .prepare("DELETE FROM rows WHERE section NOT IN ('initialIssues','initialExplicit')")
           .run();
-        built = await build(context, freshOriginal, stored);
-      } else
+        const complete = await build(context, freshOriginal, stored);
+        if (complete.groundingOnly) throw Error('Missing complete native identity preview');
+        built = complete;
+      } else {
+        if (firstBuild.groundingOnly) throw Error('Missing complete native identity preview');
+        built = firstBuild;
         await stored.withVerifiedTerminal(
           { assertCurrent: context.assertCurrent },
           () => undefined,
         );
+      }
       const catalog = createReportSnapshotCatalog(db, context.file, {
         catalog: 'report.snapshots',
         catalogArea: 'builds',
@@ -3088,6 +3124,7 @@ async function confirmNativeIntakeIdentityScopeInner(
       try {
         const original = await evidence(context),
           built = await build(context, original, stored);
+        if (built.groundingOnly) throw Error('Missing complete native identity confirmation');
         await runNativeIdentityArtifactVerification(context, stored);
         const preparedPerson =
           input.personSelection && 'newPerson' in input.personSelection

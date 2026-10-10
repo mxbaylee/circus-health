@@ -337,9 +337,10 @@ for (const count of [4, 16] as const) {
       );
       assert.equal(
         firstWork.identityPreviewFullPreparations,
-        2,
-        'both existing identity build passes remain',
+        1,
+        'grounding discovery constructs only the final complete identity preview',
       );
+      assert.equal(firstWork.identityPreviewGroundingPreparations, 1);
       const beforeCold = reviewReadStamp(state.db);
       clearCollectionReportQueues(state.db);
       clearNativeIdentityPreviews(state.db);

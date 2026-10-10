@@ -93,6 +93,7 @@ const hostTemplate = {
   collectionByteChunkReadBytes: 0,
   identityFragmentLegacyReadBytes: 0,
   identityPreviewFullPreparations: 0,
+  identityPreviewGroundingPreparations: 0,
   identityPreviewArtifactChecks: 0,
   identityPreviewArtifactOccurrences: 0,
   reviewIssuePolicyRows: 0,

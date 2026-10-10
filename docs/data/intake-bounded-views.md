@@ -1175,9 +1175,20 @@ unavailable or changed proof discards the derived rows and performs the second
 complete build. This does not refresh an earlier proof after writes, retain a
 policy across requests, or bypass artifact checks before snapshot work and at
 completion.
+When original grounding is absent, preparation runs only the occurrence, question
+and date prefix needed to establish it, closing the same original physical proof.
+This prefix cannot return a usable preview. A complete build still follows fresh
+original-evidence comparison and grounding publication. Grounding presence chooses
+this strategy, not authority; present but stale grounding keeps the existing full
+first-build and rebuild behavior.
 The [native build-reuse regression](../../src/server/test/intake-identity-native-build-reuse.test.ts)
-counts two builds for cold grounding, one for an unchanged request and zero for
-an already retained response, while preserving the complete response.
+counts one grounding prefix and one complete build for missing grounding, one
+complete build for an unchanged request and zero for an already retained response.
+It also counts actual preview scope-commitment construction while preserving the
+complete response. Initial snapshot certification constructs one additional
+commitment; the regression counts and requires that work separately. Work
+accounting reports prefix and complete entries separately;
+neither count includes all remaining publication and physical verification work.
 
 The controlled four- and 16-record HTTP flows each add four questions, then use one borrow and one fresh
 post-grounding policy, and return the same complete identity response as cache

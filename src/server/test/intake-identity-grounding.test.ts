@@ -14,6 +14,7 @@ import {
   selectedIdentityReviewGroundingLookups,
 } from '../intake-identity-grounding.ts';
 import { reviewReadStamp } from '../intake-clinical-review-read-cache.ts';
+import { finishClinicalReviewWork } from '../clinical-review-work.ts';
 import type { IntakeReportGroup } from '../../shared/intake.ts';
 
 const group = (id: string): IntakeReportGroup => ({
@@ -57,6 +58,47 @@ const sqlStamp = (db: DatabaseSync) =>
     db.prepare('PRAGMA schema_version').get()!.schema_version,
     db.prepare('PRAGMA temp.schema_version').get()!.schema_version,
   ]);
+
+test('native grounding presence distinguishes absent from empty negative without authenticating stale boundaries', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    const selected = group('fictional-empty-grounding');
+    const present = () =>
+      finishClinicalReviewWork(
+        selectedIdentityReviewGroundingLookups(db, selectedBoundary).originalGroundingPresentWork(
+          selected,
+        ),
+      );
+    assert.equal(present(), false);
+    retainSelectedIdentityGrounding(db, selectedBoundary, selected, [], false);
+    assert.equal(present(), true, 'empty negative grounding still exists');
+    assert.equal(
+      selectedIdentityReviewGroundingLookups(db, selectedBoundary).subjectGrounded(selected),
+      false,
+    );
+    retainSelectedIdentityGrounding(db, selectedBoundary, selected, [], true);
+    assert.equal(
+      selectedIdentityReviewGroundingLookups(db, selectedBoundary).subjectGrounded(selected),
+      true,
+    );
+    const stale = selectedIdentityReviewGroundingLookups(db, {
+      ...selectedBoundary,
+      boundaryFingerprint: () => 'fictional-stale-boundary',
+    });
+    assert.equal(finishClinicalReviewWork(stale.originalGroundingPresentWork(selected)), true);
+    assert.equal(stale.subjectGrounded(selected), false);
+    const held = selectedIdentityReviewGroundingLookups(db, selectedBoundary);
+    clearIdentityGrounding(db);
+    assert.throws(
+      () => finishClinicalReviewWork(held.originalGroundingPresentWork(selected)),
+      /Identity grounding snapshot changed/,
+    );
+    assert.equal(present(), false);
+  } finally {
+    clearIdentityGrounding(db);
+    db.close();
+  }
+});
 
 test('grounding source certificates change only their actual live proof owner and clear never restores old captures', () => {
   const db = new DatabaseSync(':memory:');
