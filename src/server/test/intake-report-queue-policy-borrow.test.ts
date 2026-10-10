@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import nodeFs, { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import nodeFs, { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
@@ -14,6 +14,10 @@ import { attachRecordDurability } from '../record-versions.ts';
 import {
   contributorAuthorityPath,
   openContributorRecordStorage,
+  captureContributorRecordWriteWitness,
+  contributorRecordWriteWitnessSequence,
+  closeContributorRecordWriteWitness,
+  type ContributorRecordWriteWitness,
 } from '../contributor-record-storage.ts';
 import { uploadIntake, ensureNativeIntakeSchema } from '../intake.ts';
 import {
@@ -47,19 +51,9 @@ function fixture(t: test.TestContext) {
     db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
   const storage = openContributorRecordStorage(root, profileId, { initialize: true });
   attachRecordDurability(db, { profileId, storage });
-  let writes = 0,
-    publications = 0;
-  const write = storage.writeImmutable.bind(storage),
-    publish = storage.publishHead.bind(storage);
-  storage.writeImmutable = (name, bytes) => {
-    writes++;
-    write(name, bytes);
-  };
-  storage.publishHead = (bytes) => {
-    publications++;
-    publish(bytes);
-  };
+  let writeWitness: ContributorRecordWriteWitness | undefined;
   t.after(() => {
+    if (writeWitness) closeContributorRecordWriteWitness(writeWitness);
     clearCollectionReportQueues(db);
     if (db.isOpen) {
       clearIntakeStateCache(db);
@@ -67,7 +61,25 @@ function fixture(t: test.TestContext) {
     }
     rmSync(root, { recursive: true, force: true });
   });
-  return { root, profileId, db, writes: () => writes, publications: () => publications };
+  return {
+    root,
+    profileId,
+    db,
+    // Capture after setup, at the first no-write span. Retain the original
+    // factory witness across all subsequent reads, including refusal checks.
+    writes: () => {
+      writeWitness ??= captureContributorRecordWriteWitness(storage);
+      assert.ok(writeWitness);
+      return contributorRecordWriteWitnessSequence(storage, writeWitness);
+    },
+    publications: () => {
+      const authority = contributorAuthorityPath(root, profileId);
+      return JSON.stringify({
+        head: readFileSync(join(authority, 'head')).toString('base64'),
+        objects: readdirSync(join(authority, 'objects')).sort(),
+      });
+    },
+  };
 }
 async function retained(t: test.TestContext, count = 1) {
   const f = fixture(t);

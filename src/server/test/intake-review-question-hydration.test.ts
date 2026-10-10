@@ -6,7 +6,7 @@ import {
   preparedClinicalReviewRead,
 } from '../intake-clinical-review-read-cache.ts';
 import { selectionAuthority } from '../intake-selection-authority.ts';
-import nodeFs, { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import nodeFs, { mkdtempSync, rmSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
@@ -17,6 +17,10 @@ import { attachRecordDurability } from '../record-versions.ts';
 import {
   contributorAuthorityPath,
   openContributorRecordStorage,
+  captureContributorRecordWriteWitness,
+  contributorRecordWriteWitnessSequence,
+  closeContributorRecordWriteWitness,
+  type ContributorRecordWriteWitness,
 } from '../contributor-record-storage.ts';
 import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
@@ -86,17 +90,36 @@ async function countedQuestionHydrationFixture(
     : memoryRecordAuthority(db);
   let acceptedWrites = 0,
     publications = 0;
-  const write = authority.storage.writeImmutable.bind(authority.storage);
-  authority.storage.writeImmutable = (name, bytes) => {
-    acceptedWrites++;
-    write(name, bytes);
+  if (!contributor) {
+    const write = authority.storage.writeImmutable.bind(authority.storage);
+    authority.storage.writeImmutable = (name, bytes) => {
+      acceptedWrites++;
+      write(name, bytes);
+    };
+    const publish = authority.storage.publishHead.bind(authority.storage);
+    authority.storage.publishHead = (bytes) => {
+      publications++;
+      publish(bytes);
+    };
+  }
+  let writeWitness: ContributorRecordWriteWitness | undefined;
+  // Capture once after setup without replacing the genuine factory methods.
+  const writeCount = () => {
+    if (!contributor) return acceptedWrites;
+    writeWitness ??= captureContributorRecordWriteWitness(authority.storage);
+    assert.ok(writeWitness);
+    return contributorRecordWriteWitnessSequence(authority.storage, writeWitness);
   };
-  const publish = authority.storage.publishHead.bind(authority.storage);
-  authority.storage.publishHead = (bytes) => {
-    publications++;
-    publish(bytes);
+  const publicationState = () => {
+    if (!contributor) return publications;
+    const base = contributorAuthorityPath(directory, 'fictional-question-hydration');
+    return JSON.stringify({
+      head: readFileSync(join(base, 'head')).toString('base64'),
+      objects: readdirSync(join(base, 'objects')).sort(),
+    });
   };
   t.after(() => {
+    if (writeWitness) closeContributorRecordWriteWitness(writeWitness);
     scratch.close();
     clearIntakeStateCache(db);
     db.close();
@@ -166,7 +189,8 @@ async function countedQuestionHydrationFixture(
     reportSource: () => undefined,
   });
   const before = structuredClone(intakeWorkCounters(db));
-  const initialWrites = acceptedWrites;
+  const initialWrites = writeCount(),
+    initialPublication = publicationState();
   const selected = scope.questions('candidate:fictional-hydration', 'version:fictional-hydration');
   assert.ok(
     !Array.isArray(selected),
@@ -196,7 +220,12 @@ async function countedQuestionHydrationFixture(
   // and checks that mutation of one borrowed question did not enter the recipe.
   const first = reviewRecordQuestions(record).at(0)!;
   assert.equal([...canonicalReviewValueChunks(first)].join(''), canonicalLiteral(questions[0]));
-  assert.equal(acceptedWrites, initialWrites, 'policy reuse publishes no accepted evidence');
+  assert.equal(writeCount(), initialWrites, 'policy reuse writes no accepted evidence');
+  assert.equal(
+    publicationState(),
+    initialPublication,
+    'policy reuse publishes no accepted evidence',
+  );
   return {
     count,
     sourceWork,
@@ -209,8 +238,8 @@ async function countedQuestionHydrationFixture(
     view,
     questions,
     directory,
-    acceptedWrites: () => acceptedWrites,
-    publications: () => publications,
+    acceptedWrites: writeCount,
+    publications: publicationState,
   };
 }
 

@@ -118,6 +118,57 @@ const readOwners = new WeakMap<
     physical: ReturnType<typeof captureRecordHeadPhysical>;
   }
 >();
+declare const writeWitnessBrand: unique symbol;
+export interface ContributorRecordWriteWitness {
+  readonly [writeWitnessBrand]: true;
+}
+interface ContributorWriteData {
+  owner: ContributorReadOwner;
+  selection: object;
+  sequence: bigint;
+}
+const writeWitnesses = new WeakMap<ContributorRecordWriteWitness, ContributorWriteData>();
+/** Only a genuine open writer can issue this attempt-scoped immutable roster. */
+export function captureContributorRecordWriteWitness(
+  storage: object,
+): ContributorRecordWriteWitness | undefined {
+  const owner = readOwnerFactories.get(storage);
+  if (!owner) return undefined;
+  if (!readOwnerMethodsCurrent(owner) || !owner.writable()) fail('record writer unavailable');
+  const witness = Object.freeze({}) as ContributorRecordWriteWitness;
+  writeWitnesses.set(witness, {
+    owner,
+    selection: owner.selection(),
+    sequence: owner.immutableSequence(),
+  });
+  return witness;
+}
+export function contributorRecordWriteWitnessCurrent(
+  storage: object,
+  witness: ContributorRecordWriteWitness,
+): boolean {
+  const data = writeWitnesses.get(witness);
+  return (
+    !!data &&
+    data.owner.storage === storage &&
+    data.owner.selection() === data.selection &&
+    data.owner.writable() &&
+    data.owner.immutableSequence() >= data.sequence &&
+    readOwnerMethodsCurrent(data.owner)
+  );
+}
+export function contributorRecordWriteWitnessSequence(
+  storage: object,
+  witness: ContributorRecordWriteWitness,
+): bigint {
+  if (!contributorRecordWriteWitnessCurrent(storage, witness))
+    fail('record writer witness changed');
+  const data = writeWitnesses.get(witness)!;
+  return data.owner.immutableSequence() - data.sequence;
+}
+export function closeContributorRecordWriteWitness(witness: ContributorRecordWriteWitness): void {
+  writeWitnesses.delete(witness);
+}
 function readOwnerMethodsCurrent(owner: ContributorReadOwner): boolean {
   for (const [name, expected] of [
     ['read', owner.read],
